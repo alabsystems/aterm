@@ -563,7 +563,8 @@ impl Predictor {
     /// by a line that had already confirmed).
     pub fn overlay(&mut self, now: Instant) -> &[Prediction] {
         self.expire(now);
-        &self.preds[..self.visible_count()]
+        // `visible_count` is a leading run of `preds`, so this is always `Some`.
+        self.preds.get(..self.visible_count()).unwrap_or(&[])
     }
 
     /// Retire the guesses whose glitch window has elapsed — [`Self::overlay`]'s
@@ -716,7 +717,8 @@ impl Predictor {
             .map(|p| {
                 let row = usize::from(p.row);
                 let col = usize::from(p.col);
-                (row, col, row + 1, col + 1)
+                // Widened from `u16`: neither sum can saturate.
+                (row, col, row.saturating_add(1), col.saturating_add(1))
             })
             .reduce(|(r0, c0, r1, c1), (s0, d0, s1, d1)| {
                 (r0.min(s0), c0.min(d0), r1.max(s1), c1.max(d1))

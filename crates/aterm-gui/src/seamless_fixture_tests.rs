@@ -33,6 +33,11 @@ const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hand
 /// Every `(release, desk)` checked in — pinned so a lost fixture directory is
 /// a red test rather than a guard that silently checks less. Each release
 /// appends its own rows when it adds its directory (docs/RELEASING.md).
+///
+/// The release cutter reads this table FROM THIS SOURCE: `ship cut` refuses
+/// unless the release it succeeds has a row here
+/// (`aterm-release`'s `gates::handoff_fixture_gate`). Keep it a literal table
+/// of `("vX.Y.0", "<desk>")` pairs; a table the gate cannot read stops the cut.
 const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.91.0", "claude-code-1049"),
     ("v0.91.0", "history"),
@@ -43,6 +48,12 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.92.0", "incident-55x149"),
     ("v0.92.0", "shell-integration"),
     ("v0.92.0", "twelve-panes"),
+    ("v0.94.0", "claude-code-1049"),
+    ("v0.94.0", "history"),
+    ("v0.94.0", "history-carry"),
+    ("v0.94.0", "incident-55x149"),
+    ("v0.94.0", "shell-integration"),
+    ("v0.94.0", "twelve-panes"),
 ];
 
 /// What one desk's producer committed to (`parent.toml`, written beside the

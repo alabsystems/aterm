@@ -52,7 +52,11 @@ pub(super) fn point_backward(grid: &dyn BufferAccess, p: ViPoint) -> Option<ViPo
         // the provable i32::MIN negation-overflow Level-0 obligation.
         let top = grid.total_lines().saturating_neg();
         if p.line > top {
-            Some(ViPoint::new(p.line - 1, grid.cols().saturating_sub(1)))
+            // `p.line > top` just held, so this never saturates.
+            Some(ViPoint::new(
+                p.line.saturating_sub(1),
+                grid.cols().saturating_sub(1),
+            ))
         } else {
             None
         }
@@ -245,8 +249,9 @@ pub fn paragraph_up(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint {
     let mut line = point.line;
 
     // Move up at least one line.
+    // Each decrement below runs under `line > top`, so none saturates.
     if line > top {
-        line -= 1;
+        line = line.saturating_sub(1);
     } else {
         return ViPoint::new(top, 0);
     }
@@ -255,7 +260,7 @@ pub fn paragraph_up(grid: &dyn BufferAccess, point: ViPoint) -> ViPoint {
         if is_line_empty(grid, line) {
             return ViPoint::new(line, 0);
         }
-        line -= 1;
+        line = line.saturating_sub(1);
     }
 
     ViPoint::new(top, 0)

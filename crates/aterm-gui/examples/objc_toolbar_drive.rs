@@ -14,7 +14,7 @@
 //! in `aterm_gui::toolbar_drive` and this file supplies only the main thread
 //! and the exit code. The contract those codes carry (`0` pass / `1` finding /
 //! `2` NOT RUN / `3` hung) is stated there and read by
-//! `aterm_verify::stages::toolbar_drive_outcome`.
+//! `aterm_verify::stages::objc_toolbar_outcome`.
 
 /// The drive could not execute here. NOT a pass — see the module docs in
 /// `aterm_gui::toolbar_drive`.

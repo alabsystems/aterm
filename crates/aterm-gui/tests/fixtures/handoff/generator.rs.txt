@@ -2,26 +2,42 @@
 // Copyright 2026 Andrew Yates
 //
 // THE HANDOFF FIXTURE GENERATOR — not compiled here. This is the exact code
-// that wrote `v0.92.0/`: it was appended, uncommitted, to
-// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.92.0
+// that wrote `v0.94.0/`: it was appended, uncommitted, to
+// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.94.0
 // tag, where it reuses that file's `FakeApp`, `old_session`, `ENV_LOCK`,
-// `RestoreVar` and `pipe_pair`, and runs that release's own capture, writer
-// and consumer. It differs from what wrote `v0.91.0/` in the release strings
-// and nonce seeds, v0.92.0's window carry (messages, not status bars), the
-// layout writer (`write_once_to`), the per-session shell-integration posture
-// in `parent.toml` and the self-check, and a fifth desk,
-// `shell-integration`, for the nonce carry v0.92.0 added. README.md in this
-// directory says how to adapt it for the next release.
+// `RestoreVar`, `pipe_pair`, `env_guard`, `this_build` and `child_proof_from`,
+// and runs that release's own capture ladder, history carry, writer and
+// consumer. It differs from what wrote `v0.92.0/` in the release strings and
+// nonce seeds; the capture (`carry_for_wire` per session at the budgets
+// `App::capture_parked_screens` prices, then `settle_wire_carries`, where
+// v0.92.0 still ran the v0.91.0 loop); the foreground holder the park stamps
+// on every record; the fork lane's history carry (the export, then
+// `stamp_manifest`, so a session with more history than its checkpoint holds
+// names a `.s<id>.hist` sidecar); `write_outgoing`'s repaint set and
+// `Result`; a self-check that also runs the adoption proof and the history
+// import; and a sixth desk, `history-carry`, for the record fields
+// v0.93.0/v0.94.0 added. It ran with `ATERM_BUILD_GIT_COMMIT` set to the tag's
+// short commit, so `parent.toml`'s `producer_commit` names the release rather
+// than `<commit>-dirty` (the appended generator is the worktree's only
+// change). README.md in this directory says how to adapt it for the next
+// release.
 
 // ------------------------------------------ HANDOFF FIXTURE GENERATOR (P0-7)
 //
 // Appended, uncommitted, to a RELEASE worktree's `seamless_carry_tests.rs`:
-// writes that release's producer bytes for four desks into
+// writes that release's producer bytes for each desk into
 // `$ATERM_HANDOFF_FIXTURE_OUT/<desk>/` for the main tree's cross-version
 // guard (`seamless_fixture_tests.rs`). See the fixture README.
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
-const FIXTURE_TARGET_BUILD: u64 = 1_790_200_000;
+/// A successor NEWER than v0.94.0 (build 1790526323): the hop these desks
+/// stand for. It decides the wire caps (`WireCaps::for_target`) and that the
+/// history is exported at all (`handoff_history::exports_for_target`).
+const FIXTURE_TARGET_BUILD: u64 = 1_790_600_000;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
+/// v0.94.0's decode-authority budget (`app_update_handoff`'s private
+/// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`), copied: the capture prices history
+/// against it.
+const FX_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 fn fx_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -46,7 +62,7 @@ struct FxDesk {
 fn fx_record(local_id: u64, title: &str) -> SessionRecord {
     SessionRecord {
         local_id,
-        sid: format!("s-{:020x}", 0x0092_0000_0000_u64 + local_id * 0x1_0101),
+        sid: format!("s-{:020x}", 0x0094_0000_0000_u64 + local_id * 0x1_0101),
         parent: None,
         state: "alive".to_string(),
         title: title.to_string(),
@@ -56,10 +72,19 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         icon: None,
         role: None,
         attention: None,
+        questions: None,
         control: None,
         frozen_path: false,
         identity: None,
         topics: Vec::new(),
+        // Stamped by the park capture (`fx_write`, as `stamp_fg_holders`).
+        fg_holder: None,
+        rekey: false,
+        loader: false,
+        // Stamped by the history carry's join (`stamp_manifest`).
+        history: None,
+        history_dropped: 0,
+        history_lost: 0,
     }
 }
 
@@ -84,6 +109,7 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         role: None,
         attention: None,
         identity: None,
+        questions: None,
     }))
 }
 
@@ -137,11 +163,11 @@ fn fx_window(
 }
 
 fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
-    // v0.92.0 carries the unified messages, not status bars: the update's
-    // flow row as the real App posts it and hands it over.
+    // The unified messages: the update's flow row as the real App posts it
+    // and hands it over.
     let carried = if installing {
         let mut app = crate::App::headless_for_test();
-        app.post_message(crate::update_words::installing("0.93.0"));
+        app.post_message(crate::update_words::installing("0.95.0"));
         app.carried_messages()
     } else {
         crate::session_store::MessagesCarry::default()
@@ -152,8 +178,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         outer_x: Some(96),
         outer_y: Some(48),
         status_bar_rows: u16::from(installing),
-        bars: Vec::new(),
-        update_verified_unix_ms: installing.then_some(1_790_270_000_000),
+        update_verified_unix_ms: installing.then_some(1_790_530_000_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
     }
@@ -229,45 +254,152 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
     }
 }
 
-/// The v0.92.0 capture loop (`capture_parked_screens`, unchanged from v0.91.0
-/// but for the shell-integration nonce `checkpoint_carry` now carries), for desks whose
-/// budgets are ample: history 256 when admitted, else visible-only; a shape
-/// refusal lowers to visible-only; and the park's own `screen_digest`.
-fn fx_capture(
-    sessions: &[FxSession],
-) -> (
-    Vec<(u64, TerminalCheckpoint)>,
-    Vec<crate::handoff_carry::CarrySource>,
-) {
-    let mut screens = Vec::new();
+/// `app_update_handoff::optional_carry_fits` (private there), copied.
+fn fx_optional_carry_fits(
+    used: u64,
+    own_mandatory: u64,
+    optional: u64,
+    later_mandatory: u64,
+    ceiling: u64,
+) -> bool {
+    used.checked_add(own_mandatory)
+        .and_then(|total| total.checked_add(optional))
+        .and_then(|total| total.checked_add(later_mandatory))
+        .is_some_and(|total| total <= ceiling)
+}
+
+/// What v0.94.0's park capture hands the worker for one desk.
+struct FxCapture {
+    screens: Vec<(u64, TerminalCheckpoint)>,
+    repaint: Vec<u64>,
+    sources: Vec<crate::handoff_carry::CarrySource>,
+    heads: Vec<crate::handoff_history::HistoryHead>,
+    screen_digest: [u8; 32],
+}
+
+/// v0.94.0's capture (`App::capture_parked_screens`) over a desk whose time
+/// is ample: the pool's mandatory visible grids reserved first, then each
+/// session carried by `carry_for_wire` with 256 lines of history when the
+/// cell and byte budgets admit it after that reserve, its history head and
+/// (at an exact rung) its control carry's head taken under the same lock;
+/// then the pool committed by `settle_wire_carries`. The repaint set is the
+/// sessions whose rung `needs_repaint`.
+fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
+    let mut cells_reserve = 0_u64;
+    let mut bytes_reserve = 0_u64;
+    for s in sessions {
+        let guard = s.term.lock().unwrap();
+        let (rows, cols) = (guard.rows(), guard.cols());
+        cells_reserve = cells_reserve.saturating_add(mandatory_checkpoint_cells(rows, cols));
+        bytes_reserve = bytes_reserve
+            .saturating_add(checkpoint_capture_budget_bytes(rows, cols, 0).unwrap_or(u64::MAX));
+    }
+    let mut wire = Vec::new();
     let mut sources = Vec::new();
-    let mut cells = 0_u64;
-    let mut latched = false;
+    let mut heads = Vec::new();
+    let mut capture_cells = 0_u64;
+    let mut capture_budget = 0_u64;
+    let mut history_latched_off = false;
     for s in sessions {
         let id = s.record.local_id;
         let guard = s.term.lock().unwrap();
+        assert!(guard.partial_sequence_state().is_none(), "session {id} is at Ground");
         let (rows, cols) = (guard.rows(), guard.cols());
-        let mut history = if latched { 0 } else { max_handoff_history_lines() };
-        let mut per = admit_checkpoint_dimensions(&mut cells, rows, cols, history, true);
-        if per.is_none() && history != 0 {
-            history = 0;
-            latched = true;
-            per = admit_checkpoint_dimensions(&mut cells, rows, cols, 0, true);
+        let own_cells = mandatory_checkpoint_cells(rows, cols);
+        let own_bytes = checkpoint_capture_budget_bytes(rows, cols, 0).unwrap_or(u64::MAX);
+        cells_reserve = cells_reserve.saturating_sub(own_cells);
+        bytes_reserve = bytes_reserve.saturating_sub(own_bytes);
+        let carry = max_handoff_history_lines();
+        let history_cells = u64::from(cols).saturating_mul(u64::from(carry));
+        let history_bytes = checkpoint_capture_budget_bytes(rows, cols, carry)
+            .map_or(u64::MAX, |carried| carried.saturating_sub(own_bytes));
+        let fits_cells = fx_optional_carry_fits(
+            capture_cells,
+            own_cells,
+            history_cells,
+            cells_reserve,
+            max_handoff_aggregate_grid_cells(),
+        );
+        let fits_bytes = fx_optional_carry_fits(
+            capture_budget,
+            own_bytes,
+            history_bytes,
+            bytes_reserve,
+            FX_CAPTURE_BUDGET_BYTES,
+        );
+        let history = if !history_latched_off && fits_cells && fits_bytes {
+            carry
+        } else {
+            0
+        };
+        assert!(
+            checkpoint_capture_budget_bytes(rows, cols, 0)
+                .and_then(|bytes| capture_budget.checked_add(bytes))
+                .is_some_and(|total| total <= FX_CAPTURE_BUDGET_BYTES),
+            "session {id}: inside the decode-authority budget"
+        );
+        let (checkpoint, rung, cause) =
+            carry_for_wire(&guard, id, history, &mut capture_cells, caps);
+        assert_eq!(
+            rung,
+            CarryRung::Full,
+            "session {id}: an honest desk is carried at the top rung ({cause:?})"
+        );
+        if history != 0 && rung == CarryRung::VisibleOnly {
+            history_latched_off = true;
         }
-        assert!(per.is_some(), "session {id} admitted by v0.92.0");
-        let mut cp = guard.checkpoint_carry(history as usize).expect("Ground");
-        if let Some(refusal) = checkpoint_shape_refusal(id, &cp) {
-            assert_ne!(history, 0, "session {id}: {refusal}");
-            latched = true;
-            cp = guard.checkpoint_carry(0).expect("Ground");
-            assert!(checkpoint_shape_refusal(id, &cp).is_none());
+        capture_budget = checkpoint_capture_budget_bytes(
+            checkpoint.rows,
+            checkpoint.cols,
+            checkpoint.history_lines,
+        )
+        .map_or(u64::MAX, |bytes| capture_budget.saturating_add(bytes));
+        heads.push(crate::handoff_history::capture_head(id, &guard));
+        if rung.keeps_control_carry() {
+            sources.push(handoff_carry::capture_head(id, &guard, &s.term, &s.turns, true));
         }
-        sources.push(handoff_carry::capture_head(id, &guard, &s.term, &s.turns, true));
         drop(guard);
-        screens.push((id, cp));
+        wire.push(WireCarry {
+            local_id: id,
+            checkpoint,
+            rung,
+        });
     }
-    screen_digest(&screens).expect("the v0.92.0 park commits this desk");
-    (screens, sources)
+    let screen_digest =
+        settle_wire_carries(&mut wire, caps).expect("the v0.94.0 park commits this desk");
+    sources.retain(|source: &crate::handoff_carry::CarrySource| {
+        wire.iter()
+            .any(|carry| carry.local_id == source.local_id() && carry.rung.keeps_control_carry())
+    });
+    let mut screens = Vec::new();
+    let mut repaint = Vec::new();
+    for carry in wire {
+        if carry.rung.needs_repaint() {
+            repaint.push(carry.local_id);
+        }
+        screens.push((carry.local_id, carry.checkpoint));
+    }
+    assert!(repaint.is_empty(), "an honest desk repaints nothing");
+    FxCapture {
+        screens,
+        repaint,
+        sources,
+        heads,
+        screen_digest,
+    }
+}
+
+/// Every line of `t`'s history-holding grid (the saved primary under an
+/// alternate screen), as text.
+fn fx_history_text(t: &Terminal) -> Vec<String> {
+    let grid = t.main_grid();
+    (0..grid.scrollback_lines())
+        .map(|i| {
+            grid.get_history_line(i)
+                .map(|l| l.to_string().trim_end().to_string())
+                .unwrap_or_default()
+        })
+        .collect()
 }
 
 fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
@@ -277,10 +409,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     aterm_log::env::set("XDG_RUNTIME_DIR", &scratch);
     aterm_log::env::set("HOME", &scratch);
     let dir = crate::control_auth::socket_dir().expect("control dir");
+    std::fs::create_dir_all(&dir).unwrap();
 
-    let (screens, sources) = fx_capture(&desk.sessions);
-    let controls = handoff_carry::export(&sources);
-    drop(sources);
+    let caps = WireCaps::for_target(FIXTURE_TARGET_BUILD);
+    let capture = fx_capture(&desk.sessions, caps);
+    let screens = &capture.screens;
     // Real PTYs: the self-check below adopts them with this release's own
     // consumer, which refuses a master that is not a tty.
     let mut masters = Vec::new();
@@ -315,24 +448,79 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             })
             .collect(),
     };
-    let manifest = SessionHandoff {
+    // THE FOREGROUND HOLDER the park reads for every session and stamps on
+    // its record (`stamp_fg_holders`): the shell itself at a prompt, else the
+    // job it runs.
+    let mut records: Vec<SessionRecord> = desk.sessions.iter().map(|s| s.record.clone()).collect();
+    for (i, record) in records.iter_mut().enumerate() {
+        let index = i32::try_from(i).unwrap();
+        let holder = if record.title == "zsh" {
+            40_000 + index
+        } else {
+            41_000 + index
+        };
+        record.fg_holder = Some(holder).filter(|holder| *holder > 0);
+    }
+    let mut manifest = SessionHandoff {
         schema: SessionHandoff::SCHEMA,
-        sessions: desk.sessions.iter().map(|s| s.record.clone()).collect(),
+        sessions: records,
         window: None,
         connections: desk.connections.clone(),
         next_turn_id: desk.next_turn_id,
         outgoing_build: Some(crate::running_build_number()),
     };
     let nonce = format!("{:032x}", desk.nonce_seed);
+    // The worker, as `prepare_outgoing_artifacts` runs it on the fork lane:
+    // the control carry's export, then the history carry's (the lane's
+    // `HistoryPlan::Deferred`, exported now with every reader parked) and its
+    // join, then the writer.
+    let controls = handoff_carry::export(&capture.sources);
+    assert!(
+        crate::handoff_history::exports_for_target(
+            crate::running_build_number(),
+            FIXTURE_TARGET_BUILD
+        ),
+        "v0.94.0 exports history to this successor"
+    );
+    let results = crate::handoff_history::HistoryPlan::Deferred(
+        desk.sessions
+            .iter()
+            .map(|s| (s.record.local_id, Arc::clone(&s.term)))
+            .collect(),
+    )
+    .results(&dir);
+    let verdicts = crate::handoff_history::stamp_manifest(
+        &mut manifest,
+        screens,
+        &capture.heads,
+        results,
+        &dir,
+        &nonce,
+    );
+    assert_eq!(verdicts.len(), desk.sessions.len(), "{}", desk.name);
+    for (local_id, joined) in &verdicts {
+        assert_eq!(
+            (joined.dropped, joined.fallback),
+            (0, None),
+            "{}: session {local_id}'s whole history crosses",
+            desk.name
+        );
+    }
     let outgoing = write_outgoing(
         &manifest,
         &fds,
-        &screens,
+        screens,
+        &capture.repaint,
         Some(desk.window.clone()),
         &controls,
         &nonce,
     )
-    .expect("the v0.92.0 writer publishes this desk");
+    .expect("the v0.94.0 writer publishes this desk");
+    assert_eq!(
+        outgoing.screen_digest, capture.screen_digest,
+        "{}: the written bytes are the committed ones",
+        desk.name
+    );
     let manifest_path = std::path::PathBuf::from(&outgoing.manifest_path);
     let layout_path = manifest_path.with_extension("layout.toml");
     crate::restore::write_once_to(&layout_path, &desk.layout).expect("layout sidecar");
@@ -370,17 +558,16 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let mut copied = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap().flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !name.starts_with(&stem) {
+        if !name.starts_with(&format!("{stem}.")) {
             continue;
         }
         let keep = name == manifest_name
             || name.ends_with(".layout.toml")
             || name.ends_with(".grid")
             || name.ends_with(".altgrid")
-            || name.ends_with(".ctl");
-        if !keep {
-            continue;
-        }
+            || name.ends_with(".ctl")
+            || name.ends_with(".hist");
+        assert!(keep, "{}: an attempt file this generator does not know: {name}", desk.name);
         let bytes = std::fs::read(entry.path()).unwrap();
         if name == manifest_name {
             let text = String::from_utf8(bytes).unwrap();
@@ -407,12 +594,25 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let mut session_rows = String::new();
     for rec in &published.sessions {
         let carry = rec.screen.as_ref().unwrap();
+        assert!(!carry.repaint, "{}: session {} is exact", desk.name, rec.local_id);
         std::fs::write(
             out.join(format!("s{}.meta.json", rec.local_id)),
             carry.meta.as_bytes(),
         )
         .unwrap();
         let cp = &screens.iter().find(|(id, _)| *id == rec.local_id).unwrap().1;
+        let take = rec
+            .history
+            .as_deref()
+            .and_then(crate::handoff_history::parse_stamp)
+            .map_or(0, |(_, _, take)| take);
+        assert_eq!(
+            take > 0,
+            copied.contains(&format!("{stem}.s{}.hist", rec.local_id)),
+            "{}: session {} names its history sidecar exactly when it has one",
+            desk.name,
+            rec.local_id
+        );
         session_rows.push_str(&format!(
             "[[session]]\nlocal_id = {}\nrows = {}\ncols = {}\nhistory_lines = {}\nalt_grid = {}\ncontrol = {}\nrequire_shell_integration_nonce = {}\n",
             rec.local_id,
@@ -426,6 +626,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         if let Some(nonce) = cp.shell_integration_nonce {
             session_rows.push_str(&format!("shell_integration_nonce = \"{}\"\n", nonce.to_hex()));
         }
+        session_rows.push_str(&format!(
+            "history_take = {take}\nhistory_lost = {}\nfg_holder = {}\n",
+            rec.history_lost,
+            rec.fg_holder.unwrap_or(0),
+        ));
         session_rows.push('\n');
     }
     let identities = fds
@@ -435,9 +640,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         .collect::<Vec<_>>()
         .join(", ");
     let parent = format!(
-        "# What the v0.92.0 producer committed to for this desk. Generated by a\n\
-         # throwaway test in a v0.92.0 worktree; see ../../README.md.\n\
-         producer_version = \"0.92.0\"\n\
+        "# What the v0.94.0 producer committed to for this desk. Generated by a\n\
+         # throwaway test in a v0.94.0 worktree; see ../../README.md.\n\
+         producer_version = \"0.94.0\"\n\
          producer_commit = \"{commit}\"\n\
          outgoing_build = {build}\n\
          manifest = \"{manifest_name}\"\n\
@@ -471,18 +676,29 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     std::fs::write(out.join("parent.toml"), parent).unwrap();
 
     // SELF-CHECK: this release's OWN consumer adopts its own desk exactly —
-    // every session, the layout placed, the same digests — so the fixture is
-    // an honest desk and not one the release itself would have refused.
+    // every session, nothing repainted, the layout placed, the same digests,
+    // the proof the parent expects — and the history import after Commit
+    // gives each session its parent's whole history. So the fixture is an
+    // honest desk and not one the release itself would have refused.
     let (ready_read, ready_write) = pipe_pair("ready");
     let (commit_read, commit_write) = pipe_pair("commit");
+    // SAFETY: `getppid` is a side-effect-free libc getter.
+    let parent_pid = unsafe { libc::getppid() };
     aterm_log::env::set(ENV_MANIFEST, &manifest_path);
     aterm_log::env::set(ENV_NONCE, &nonce);
     aterm_log::env::set(ENV_FDS, fds.encode());
     aterm_log::env::set(ENV_LAYOUT, &layout_path);
     aterm_log::env::set(ENV_READY_FD, ready_write.to_string());
     aterm_log::env::set(ENV_COMMIT_FD, commit_read.to_string());
+    aterm_log::env::set(ENV_PARENT_PID, parent_pid.to_string());
+    match read_process_birth(parent_pid) {
+        Some(birth) => aterm_log::env::set(ENV_PARENT_BIRTH, birth.to_wire()),
+        None => aterm_log::env::unset(ENV_PARENT_BIRTH),
+    }
+    aterm_log::env::set(ENV_TARGET, this_build().unwrap());
     let incoming = take_incoming();
     assert_eq!(incoming.adopted.len(), desk.sessions.len(), "{}", desk.name);
+    assert_eq!(incoming.repainted_tabs(), 0, "{}", desk.name);
     assert!(incoming.layout.is_some(), "{}: the layout places every session", desk.name);
     assert_eq!(incoming.screen_digest, Some(outgoing.screen_digest), "{}", desk.name);
     assert_eq!(incoming.layout_digest, Some(layout), "{}", desk.name);
@@ -495,6 +711,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         assert!(adopted.checkpoint.is_some(), "{}", desk.name);
         let carried = &screens.iter().find(|(id, _)| *id == adopted.local_id).unwrap().1;
         let restored = adopted.checkpoint.as_ref().unwrap();
+        assert_eq!(restored.grid, carried.grid, "{}", desk.name);
         assert_eq!(restored.shell_integration_nonce, carried.shell_integration_nonce, "{}", desk.name);
         assert_eq!(
             restored.modes.require_shell_integration_nonce,
@@ -503,11 +720,71 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name
         );
         assert_eq!(adopted.control.is_some(), rec.control.is_some(), "{}", desk.name);
+        assert_eq!(
+            adopted.history.carry.is_some(),
+            rec.history.is_some(),
+            "{}: session {}'s history sidecar is taken",
+            desk.name,
+            adopted.local_id
+        );
     }
-    for fd in masters
+    let ((child, ready, _), adopted) =
+        child_proof_from(incoming).unwrap_or_else(|| panic!("{}: the child proves", desk.name));
+    let expected = adoption_proof(
+        &nonce,
+        crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+        crate::build_info::GIT_COMMIT,
+        &layout,
+        &outgoing.screen_digest,
+        &fds.entries,
+    )
+    .unwrap();
+    assert_eq!(child, expected, "{}: the proof is the parent's", desk.name);
+    // The ready signal owns its write end now, and closes it.
+    drop(ready);
+    for mut item in adopted {
+        let parent = fx_history_text(
+            &desk
+                .sessions
+                .iter()
+                .find(|s| s.record.local_id == item.local_id)
+                .unwrap()
+                .term
+                .lock()
+                .unwrap(),
+        );
+        let checkpoint = item.checkpoint.take().unwrap();
+        let mut history = std::mem::take(&mut item.history);
+        let successor = Arc::new(Mutex::new(Terminal::new(checkpoint.rows, checkpoint.cols)));
+        crate::spawn::hydrate_adopted_engine(
+            &successor,
+            Some(&checkpoint),
+            None,
+            None,
+            None,
+            item.local_id,
+            &mut history,
+        );
+        let report =
+            crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+                session: item.local_id,
+                term: Arc::clone(&successor),
+                history,
+            }])
+            .remove(0);
+        assert_eq!(report.failed, None, "{}: session {}", desk.name, item.local_id);
+        assert_eq!(report.lost(), 0, "{}: session {}", desk.name, item.local_id);
+        assert_eq!(
+            fx_history_text(&successor.lock().unwrap()),
+            parent,
+            "{}: session {}'s whole history crosses",
+            desk.name,
+            item.local_id
+        );
+    }
+    for fd in slaves
         .into_iter()
-        .chain(slaves)
-        .chain([ready_read, ready_write, commit_read, commit_write])
+        .chain([ready_read, commit_read, commit_write])
     {
         aterm_pty::close_fd(fd);
     }
@@ -538,7 +815,7 @@ fn fx_incident_desk() -> FxDesk {
     let shell = fx_session(1, "zsh", fx_shell(55, 149, 400, "/home/dev/src/aterm", 1));
     FxDesk {
         name: "incident-55x149",
-        nonce_seed: 0x0092_0001,
+        nonce_seed: 0x0094_0001,
         window: fx_window_carry(55, 149, true),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -566,7 +843,7 @@ fn fx_claude_desk() -> FxDesk {
     let shell = fx_session(1, "zsh", fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2));
     FxDesk {
         name: "claude-code-1049",
-        nonce_seed: 0x0092_0002,
+        nonce_seed: 0x0094_0002,
         window: fx_window_carry(ROWS, COLS * 2 + 1, false),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -602,7 +879,7 @@ fn fx_history_desk() -> FxDesk {
     sessions[1].record.user_title = Some("logs".to_string());
     FxDesk {
         name: "history",
-        nonce_seed: 0x0092_0003,
+        nonce_seed: 0x0094_0003,
         window: fx_window_carry(40, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -700,7 +977,7 @@ fn fx_twelve_pane_desk() -> FxDesk {
         .collect();
     FxDesk {
         name: "twelve-panes",
-        nonce_seed: 0x0092_0004,
+        nonce_seed: 0x0094_0004,
         window: fx_window_carry(46, 168, false),
         sessions,
         layout: RestoreManifest::new(vec![window_a, window_b]),
@@ -710,7 +987,7 @@ fn fx_twelve_pane_desk() -> FxDesk {
 }
 
 /// A shell signing its OSC 133/633 marks with its tab's nonce: what `spawn`
-/// installs for a shell with integration, and what v0.92.0's carry sends.
+/// installs for a shell with integration, and what the carry sends.
 fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8) -> Terminal {
     let mut t = Terminal::new(rows, cols);
     t.authorize_shell_integration(nonce);
@@ -732,21 +1009,27 @@ fn fx_signed_shell(rows: u16, cols: u16, nonce: [u8; 32], cwd: &str, flavour: u8
     t
 }
 
-/// THE SHAPE v0.92.0 CHANGED: each shell's authorized shell-integration nonce
+/// The shape v0.92.0 changed: each shell's authorized shell-integration nonce
 /// rides the carry (meta key `shell_integration_nonce`), so the successor
 /// authorizes the same value and the shells' marks keep counting. Two shells
 /// with different nonces (the nonce is per tab), one of them in 1049 with an
-/// editor, split side by side.
+/// editor, split side by side. Shells spawned with integration by v0.94.0
+/// also read its re-key file and its body pointer (`rekey`, `loader`).
 fn fx_shell_integration_desk() -> FxDesk {
     use crate::restore::{RestoreManifest, SplitKind};
-    let a = fx_signed_shell(30, 100, [0x92; 32], "/home/dev/src/aterm", 1);
-    let mut b = fx_signed_shell(30, 99, [0x29; 32], "/home/dev/notes", 2);
+    let a = fx_signed_shell(30, 100, [0x94; 32], "/home/dev/src/aterm", 1);
+    let mut b = fx_signed_shell(30, 99, [0x49; 32], "/home/dev/notes", 2);
     b.process(b"vim notes.md\r\n\x1b[?1049h\x1b[H\x1b[2J# notes\x1b[30;1H\x1b[7m notes.md \x1b[0m\x1b[2;1H");
+    let mut sessions = vec![fx_session(0, "zsh", a), fx_session(1, "vim", b)];
+    for session in &mut sessions {
+        session.record.rekey = true;
+        session.record.loader = true;
+    }
     FxDesk {
         name: "shell-integration",
-        nonce_seed: 0x0092_0005,
+        nonce_seed: 0x0094_0005,
         window: fx_window_carry(30, 200, false),
-        sessions: vec![fx_session(0, "zsh", a), fx_session(1, "vim", b)],
+        sessions,
         layout: RestoreManifest::new(vec![fx_window(
             30,
             200,
@@ -761,20 +1044,63 @@ fn fx_shell_integration_desk() -> FxDesk {
     }
 }
 
+/// THE SHAPES v0.93.0/v0.94.0 CHANGED. The history carry: a shell whose
+/// history is deeper than the checkpoint's 256 lines, and one running `less`
+/// in 1049, whose checkpoint carries none of its shell's history (the saved
+/// primary rides at its visible rows), so the `.hist` sidecar carries all of
+/// it. The records carry what v0.93.0/v0.94.0 added beside it: a running
+/// `history_lost` from an earlier handoff, the foreground holder, the
+/// integration's `rekey` and `loader`, and the `questions` word (on the
+/// record and, in lockstep, on its layout leaf).
+fn fx_history_carry_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, RestoredSplitTree, RestoredView, SplitKind};
+    let deep = fx_shell(40, 120, 1500, "/home/dev/src/aterm", 6);
+    let mut paged = fx_shell(40, 119, 1000, "/home/dev/logs", 7);
+    paged.process(b"less build.log\r\n\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    for r in 1..40 {
+        paged.process(format!("\x1b[{r};1Hbuild.log line {r:03}").as_bytes());
+    }
+    paged.process(b"\x1b[40;1H\x1b[7mbuild.log lines 1-39\x1b[0m");
+    let mut sessions = vec![fx_session(0, "zsh", deep), fx_session(1, "less", paged)];
+    for session in &mut sessions {
+        session.record.rekey = true;
+        session.record.loader = true;
+    }
+    sessions[0].record.history_lost = 12;
+    sessions[1].record.questions = Some("recommended".to_string());
+    let mut pager = fx_leaf(1, "less", Some("/home/dev/logs"));
+    if let RestoredSplitTree::Leaf {
+        view: RestoredView::Terminal(leaf),
+    } = &mut pager
+    {
+        leaf.questions = Some("recommended".to_string());
+    } else {
+        unreachable!("fx_leaf builds a terminal leaf");
+    }
+    FxDesk {
+        name: "history-carry",
+        nonce_seed: 0x0094_0006,
+        window: fx_window_carry(40, 240, false),
+        sessions,
+        layout: RestoreManifest::new(vec![fx_window(
+            40,
+            240,
+            vec![fx_tab(fx_split(
+                SplitKind::Vertical,
+                fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
+                pager,
+            ))],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
 #[test]
 #[ignore = "writes release fixtures; run by name with --ignored"]
 fn generate_handoff_fixtures() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
-    let _restore = [
-        RestoreVar::new("XDG_RUNTIME_DIR"),
-        RestoreVar::new("HOME"),
-        RestoreVar::new(ENV_MANIFEST),
-        RestoreVar::new(ENV_NONCE),
-        RestoreVar::new(ENV_FDS),
-        RestoreVar::new(ENV_LAYOUT),
-        RestoreVar::new(ENV_READY_FD),
-        RestoreVar::new(ENV_COMMIT_FD),
-    ];
+    let _restore = env_guard();
     let scratch =
         std::env::temp_dir().join(format!("aterm-handoff-fixture-gen-{}", std::process::id()));
     for desk in [
@@ -783,6 +1109,7 @@ fn generate_handoff_fixtures() {
         fx_history_desk(),
         fx_twelve_pane_desk(),
         fx_shell_integration_desk(),
+        fx_history_carry_desk(),
     ] {
         fx_write(&desk, &scratch);
     }

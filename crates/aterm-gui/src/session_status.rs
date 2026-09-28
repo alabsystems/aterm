@@ -41,8 +41,10 @@ use aterm_core::terminal::Terminal;
 #[path = "session_program.rs"]
 pub(crate) mod program;
 
-/// At most this often is one session's screen re-read for its agent verdict,
-/// whatever `tab_status`'s observation interval: 4 Hz per session.
+/// Screen/cursor changes re-read one session's agent zone at most this often,
+/// whatever `tab_status`'s observation interval: 4 Hz per session. A changed
+/// program retains its separate classification clock so identity transitions
+/// are not postponed by a same-zone redraw.
 pub(crate) const AGENT_MIN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The whole-screen fingerprint and only the final `tail_rows` rows, read in
@@ -126,7 +128,11 @@ struct AgentWatch {
     cursor_seen: Option<crate::presence::Cursor>,
     /// [`zone_hash`] of the rows last classified.
     zone_hash: Option<u64>,
-    /// When the classifier last ran — the [`AGENT_MIN_INTERVAL`] floor.
+    /// When the live zone was last read, even if its hash was unchanged —
+    /// the [`AGENT_MIN_INTERVAL`] floor bounds terminal work, not verdicts.
+    read_at: Option<Instant>,
+    /// When the verdict was last classified. A new foreground program retains
+    /// its existing re-read timing after an unchanged-zone sampling read.
     classified_at: Option<Instant>,
     /// The program the last classification ran under; a different one forces
     /// a re-read even over an unchanged zone.
@@ -1681,6 +1687,19 @@ pub(crate) fn summary_text(status: &Status) -> Option<String> {
     })
 }
 
+/// An identified agent's published phase as chrome's activity line, in the
+/// band's words (`busy`, `bash approval`, `logged out`). `None` for a phase
+/// its reader has no evidence for, which leaves the line to
+/// [`summary_text`].
+pub(crate) fn agent_activity_text(phase: &crate::presence::AgentPhase) -> Option<String> {
+    use crate::presence::AgentPhase as P;
+    Some(match phase {
+        P::Prompt { detail } => crate::presence::prompt_band_word(detail.as_deref()),
+        P::Unknown => return None,
+        other => other.band_word().to_string(),
+    })
+}
+
 /// Map one session's status onto the tab's INDEPENDENT indicator bits.
 ///
 /// `dirty` is never claimed here: it means unsaved editor state, which a
@@ -2238,15 +2257,22 @@ impl StatusObserver {
             pgid: -1,
             ..AgentWatch::default()
         });
-        let moved = w.seq_seen != Some(generation)
-            || w.cursor_seen != Some(cursor)
-            || w.program_seen.as_ref() != Some(program);
+        let program_moved = w.program_seen.as_ref() != Some(program);
+        let moved =
+            w.seq_seen != Some(generation) || w.cursor_seen != Some(cursor) || program_moved;
         if !moved {
             return false;
         }
-        let floor = w
-            .classified_at
-            .is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
+        // A new program used the classification floor before read throttling
+        // was added. Keep that transition prompt even if a same-zone read
+        // happened recently; ordinary screen/cursor changes use the exact
+        // read time to cap terminal work.
+        let last = if program_moved {
+            w.classified_at
+        } else {
+            w.read_at
+        };
+        let floor = last.is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL);
         if !floor {
             w.followup = true;
         }
@@ -2349,9 +2375,40 @@ impl StatusObserver {
             // Not read this time (unchanged, or deferred by the floor): look
             // again next interval if anything is still owed — a moved seq or
             // program, or a resolution in flight whose answer is not yet read.
-            w.followup = resolving || program_moved || screen_moved;
+            // A handback is to a REAL group (the shell an exited agent leaves
+            // in front); a move to no group (`-1`) hands no frame back, and
+            // the program-resolution retry owes it no wake
+            // (`ProgramResolutionRetry`'s Tier-1 bind).
+            let handback = group_moved && pgid > 0;
+            w.followup = resolving || program_moved || screen_moved || handback;
+            if group_moved {
+                // The read gate ran before the foreground-group syscall, so
+                // a recent unchanged-zone read can suppress the frame that
+                // hands an exited agent back to the shell. Invalidate its old
+                // program verdict and owe ONE immediate follow-up when the
+                // pre-existing classification floor would have allowed it.
+                // The next sweep reads the new group's frame without adding
+                // a syscall under this sweep's terminal lock.
+                w.program_seen = None;
+                if handback
+                    && w.classified_at
+                        .is_none_or(|at| now.saturating_duration_since(at) >= AGENT_MIN_INTERVAL)
+                    && let Some(slot) = self.sessions.get_mut(&session)
+                {
+                    // This is a group handback, not the ordinary final-frame
+                    // follow-up that waits for an output burst to pause.
+                    w.output_at = None;
+                    slot.next_due = now;
+                    self.next_due_any = Some(self.next_due_any.map_or(now, |due| due.min(now)));
+                }
+            }
             return AgentStep::default();
         };
+        // Charge every successful terminal read. A repaint can advance the
+        // screen generation without changing the live-zone hash; if only a
+        // changed verdict charged this floor, a 50 ms status interval would
+        // extract the full screen at 20 Hz instead of the promised 4 Hz.
+        w.read_at = Some(now);
         let moved = screen_moved;
         w.seq_seen = Some(generation);
         w.cursor_seen = Some(cursor);
@@ -2808,6 +2865,10 @@ impl crate::App {
             let group_changed = previous_group.is_some();
             if let Some(previous) = previous_group {
                 crate::claude_footer::stop(id, previous);
+                // A program started or ended in this tab: the crash journal
+                // names the leaves that run one (D16), and a silent job start
+                // wakes nothing else it would capture on.
+                self.crash_journal.note_activity();
             }
             let resolve = pgid > 0
                 && self.session_status.program_due(
@@ -3047,13 +3108,26 @@ impl crate::App {
     }
 
     /// Short status text for this session's chrome, or `None` when there is
-    /// nothing honest to say.
+    /// nothing honest to say. An identified agent's published phase says what
+    /// the shell's quiet or running cannot (`idle`, `bash approval`); an exit
+    /// is the shell's to say.
     pub(crate) fn session_status_text(&self, session: u64) -> Option<String> {
-        self.session_status.status(session).and_then(summary_text)
+        let status = self.session_status.status(session);
+        if status.is_none_or(|s| s.phase != Phase::Exited)
+            && let (_, Some(reading)) = self.session_status.agent_reading(session)
+            && let Some(text) = agent_activity_text(&reading.phase)
+        {
+            return Some(text);
+        }
+        status.and_then(summary_text)
     }
 
+    /// Moves with the shell status and with the published agent reading, so
+    /// chrome recomposes when either line would read differently.
     pub(crate) fn session_status_revision(&self, session: u64) -> u64 {
-        self.session_status.revision(session)
+        self.session_status
+            .revision(session)
+            .wrapping_add(self.session_status.agent_reading(session).0)
     }
 
     /// This session's contribution to its tab's indicator bits. A session with
@@ -5989,6 +6063,43 @@ mod tests {
         assert_eq!(summary_text(&status(None)).as_deref(), Some("running"));
     }
 
+    /// An agent silent at its prompt or at a box is a shell's `quiet
+    /// (heuristic)`; its published phase is what the activity line says.
+    #[test]
+    fn chrome_says_the_agent_phase_not_the_shell_guess() {
+        use crate::presence::AgentPhase as P;
+        let text = |p: P| agent_activity_text(&p);
+        assert_eq!(text(P::Busy).as_deref(), Some("busy"));
+        assert_eq!(text(P::Idle).as_deref(), Some("idle"));
+        assert_eq!(text(P::Survey).as_deref(), Some("idle"));
+        assert_eq!(text(P::Question).as_deref(), Some("question"));
+        assert_eq!(
+            text(P::Prompt {
+                detail: Some("question".into())
+            })
+            .as_deref(),
+            Some("question"),
+            "the question tool's box approves nothing"
+        );
+        assert_eq!(
+            text(P::Prompt {
+                detail: Some("bash:not-read-only".into())
+            })
+            .as_deref(),
+            Some("bash approval")
+        );
+        assert_eq!(
+            text(P::Wall {
+                kind: aterm_phase::WallKind::Auth,
+                reset: None,
+                until: None,
+            })
+            .as_deref(),
+            Some("logged out")
+        );
+        assert_eq!(text(P::Unknown), None, "no evidence: the shell's line");
+    }
+
     /// The chrome's `detail` was seeded `None` and never written, so every tab
     /// read plain `running` while the wire named the program. The sweep now
     /// folds `executing_detail` onto the published status through
@@ -6427,6 +6538,229 @@ mod agent_verdict_tests {
             ),
             "the resolved program re-reads an unchanged zone"
         );
+    }
+
+    /// A redraw can advance the screen generation without changing the live
+    /// zone or its verdict. At a 50 ms status interval, each such redraw used
+    /// to repeat the full-screen read because only classification charged the
+    /// 250 ms floor. The changed ready frame is deferred, then published at
+    /// the next due read rather than lost.
+    #[test]
+    fn unchanged_zone_reads_charge_the_agent_rate_floor() {
+        use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
+        let ready = screen(INLINE_REPL_READY);
+        let top = ready
+            .iter()
+            .position(|row| row.starts_with('─'))
+            .expect("the prompt box's top rule");
+        let mut busy = ready.clone();
+        busy[top - 1] = "✶ Deliberating… (3s · thinking)".to_string();
+        let claude = Some("claude".to_string());
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let t0 = Instant::now();
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+        let first = obs.agent_observe(
+            1,
+            g(1),
+            Some(busy.clone()),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            t0,
+        );
+        assert_eq!(first.publish.map(|p| p.0), Some("busy"));
+
+        let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+        let same = obs.agent_observe(
+            1,
+            g(2),
+            Some(busy),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            redrawn_at,
+        );
+        assert!(same.publish.is_none(), "same zone needs no new verdict");
+
+        let early = redrawn_at + Duration::from_millis(50);
+        assert!(
+            !obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, early),
+            "a second full-screen read 50 ms after an unchanged read is too soon"
+        );
+        let deferred = obs.agent_observe(
+            1,
+            g(3),
+            None,
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            early,
+        );
+        assert!(deferred.publish.is_none());
+        assert!(obs.agents[&1].followup, "the changed frame remains owed");
+
+        let due = redrawn_at + super::AGENT_MIN_INTERVAL;
+        assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, due));
+        let changed = obs.agent_observe(
+            1,
+            g(3),
+            Some(ready),
+            Cursor::Unknown,
+            claude,
+            100,
+            false,
+            due,
+        );
+        assert_eq!(changed.publish.map(|p| p.0), Some("idle"));
+    }
+
+    /// A newly resolved foreground program keeps the pre-existing
+    /// classification clock: a same-zone read must not postpone its verdict.
+    #[test]
+    fn a_program_change_is_not_delayed_by_an_unchanged_zone_read() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let old = Some("claude".to_string());
+        let new = Some("codex".to_string());
+        let rows = vec!["$ ls".to_string()];
+        let t0 = Instant::now();
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &old, t0));
+        let _ = obs.agent_observe(
+            1,
+            g(1),
+            Some(rows.clone()),
+            Cursor::Unknown,
+            old.clone(),
+            100,
+            false,
+            t0,
+        );
+        let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &old, redrawn_at));
+        let same = obs.agent_observe(
+            1,
+            g(2),
+            Some(rows.clone()),
+            Cursor::Unknown,
+            old,
+            100,
+            false,
+            redrawn_at,
+        );
+        assert!(same.publish.is_none());
+        let transitioned_at = redrawn_at + Duration::from_millis(50);
+        assert!(
+            obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &new, transitioned_at),
+            "the new program may be classified despite the recent same-zone read"
+        );
+        let _ = obs.agent_observe(
+            1,
+            g(2),
+            Some(rows),
+            Cursor::Unknown,
+            new.clone(),
+            100,
+            false,
+            transitioned_at,
+        );
+        assert_eq!(obs.agents[&1].program_seen, Some(new));
+    }
+
+    /// The foreground group is discovered after the screen-read decision.
+    /// When an unchanged read just charged that floor, the departing agent's
+    /// shell handback gets one immediate follow-up instead of waiting for the
+    /// next 250 ms status tick.
+    #[test]
+    fn group_change_after_unchanged_read_gets_immediate_followup() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let frame = aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_OFFER);
+        let mut exited = frame.clone();
+        exited.push("$ ".to_string());
+        let claude = Some("claude".to_string());
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let evidence = super::Evidence {
+            pin: None,
+            shell: None,
+            lifecycle: None,
+            foreground_job: None,
+            activity: super::ActivitySample {
+                alt_screen: false,
+                content_seq: 1,
+                last_input: None,
+                last_output: None,
+            },
+        };
+        let t0 = Instant::now();
+        let _ = obs.observe(1, &evidence, t0);
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+        let first = obs.agent_observe(
+            1,
+            g(1),
+            Some(frame.clone()),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            t0,
+        );
+        assert_eq!(
+            first.publish.and_then(|p| p.3),
+            Some(aterm_phase::Program::Claude)
+        );
+
+        let redrawn_at = t0 + super::AGENT_MIN_INTERVAL;
+        let _ = obs.observe(1, &evidence, redrawn_at);
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, redrawn_at));
+        let same = obs.agent_observe(
+            1,
+            g(2),
+            Some(frame),
+            Cursor::Unknown,
+            claude.clone(),
+            100,
+            false,
+            redrawn_at,
+        );
+        assert!(same.publish.is_none());
+
+        let group_moved_at = redrawn_at + Duration::from_millis(50);
+        obs.note_output(1, group_moved_at);
+        let _ = obs.observe(1, &evidence, group_moved_at);
+        assert!(!obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &claude, group_moved_at));
+        let deferred = obs.agent_observe(
+            1,
+            g(3),
+            None,
+            Cursor::Unknown,
+            claude,
+            200,
+            false,
+            group_moved_at,
+        );
+        assert!(deferred.publish.is_none());
+        assert!(obs.due(1, group_moved_at), "the new group is due now");
+        assert_eq!(obs.next_wake(), Some(group_moved_at));
+
+        assert!(obs.agent_zone_wanted(1, g(3), Cursor::Unknown, &None, group_moved_at));
+        let handback = obs.agent_observe(
+            1,
+            g(3),
+            Some(exited),
+            Cursor::Unknown,
+            None,
+            200,
+            false,
+            group_moved_at,
+        );
+        assert_eq!(handback.publish.map(|p| p.0), Some("-"));
     }
 
     /// THE FINAL FRAME OF A BURST THAT LANDED BETWEEN LOOKS (2026-09-24,

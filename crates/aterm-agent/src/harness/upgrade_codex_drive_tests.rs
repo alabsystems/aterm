@@ -1002,6 +1002,69 @@ fn fake_update_verb(dir: &Path, home: &Path, new_pid: u32) -> PathBuf {
     exe
 }
 
+/// THE VERB INHERITS NOTHING BUT ITS STDIO. A descriptor this process holds
+/// without close-on-exec — the stand-in for the Metal shader-cache files the
+/// GUI holds (measured 2026-09-27) — must not reach the vendor's verb, so it
+/// cannot reach the daemon the verb starts, which outlives the GUI (the
+/// product fd-hygiene sweep of 2026-09-27). The verb reports what it finds
+/// open before it answers: its stdout is the detector's positive control,
+/// and the answer being read proves the verb ran.
+#[test]
+fn the_daemon_update_verb_inherits_nothing_but_its_stdio() {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("verb-fds");
+    let null = std::fs::File::open("/dev/null").expect("open /dev/null");
+    // `F_DUPFD` clears close-on-exec on the copy; the floor keeps the number
+    // clear of the ones a shell takes for itself while it runs a script.
+    // SAFETY: `null` is live for the call; `F_DUPFD` returns a fresh
+    // descriptor or -1 and touches no memory.
+    let raw = unsafe { libc::fcntl(null.as_raw_fd(), libc::F_DUPFD, 64) };
+    assert!(raw >= 64, "F_DUPFD: {}", std::io::Error::last_os_error());
+    // SAFETY: `raw` was just created here and nothing else owns it.
+    let held = unsafe { OwnedFd::from_raw_fd(raw) };
+    // SAFETY: `F_GETFD` reads one descriptor's flag word.
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFD) };
+    assert_eq!(
+        flags & libc::FD_CLOEXEC,
+        0,
+        "PRECONDITION: the stand-in must be inheritable, or the test proves nothing"
+    );
+    let exe = dir.join("codex");
+    let report = dir.join("fds");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\n\
+             r=''\n\
+             [ -e /dev/fd/1 ] && r='stdout '\n\
+             [ -e /dev/fd/{raw} ] && r=\"${{r}}held \"\n\
+             printf '%send' \"$r\" > '{report}'\n\
+             echo '{{\"status\":\"updated\",\"installedVersion\":\"0.157.1\",\
+             \"runningVersion\":\"0.157.1\"}}'\n",
+            report = report.display(),
+        ),
+    )
+    .expect("verb");
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    // A long ceiling: the verb exits at once, and a first exec of a fresh
+    // script can wait on the system's code assessment under load.
+    let answer = update_daemon(&exe, &[], Duration::from_secs(120));
+    drop(held);
+    assert_eq!(
+        answer.map(|v| v.to_string()),
+        Ok("0.157.1".to_string()),
+        "PRECONDITION: the verb must run and answer"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&report).expect("the verb's report"),
+        "stdout end",
+        "fd {raw}, held without close-on-exec, reached the vendor's verb"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 const PACKAGE: &str = r#"{"layoutVersion":1,"version":"0.157.0","entrypoint":"bin/codex"}"#;
 const DAEMON: u32 = 4_000_010;
 const DAEMON_NEW: u32 = 4_000_011;
@@ -1898,7 +1961,9 @@ fn a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up()
 /// rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the ledger,
 /// nothing typed at that look), whose first notice the next look types, with
 /// a READY marker of its own. NEGATIVE CONTROL: the owner's `--skip` of the
-/// build holds the rested round where it is, however long it rests.
+/// build holds the rested round where it is, however long it rests, and says
+/// `wait:skipped` — the host's last word, as in the Claude lane — and a
+/// `--defer` not run out holds it too, looked at again (`wait:deferred`).
 #[test]
 fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
     let mut rig = embedded_ready("emb-rearm", |_| {});
@@ -1925,12 +1990,28 @@ fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
         failed_at: now_s() - upgrade::RETRY_S,
         ..rig.state()
     };
-    rig.settle_keeping(&St {
-        request: Request::Skip("0.157.1".into()),
-        request_tab: TAB.into(),
-        ..rested.clone()
-    });
-    assert_eq!(rig.visit(None).step, "wait:failed:unanswered", "skipped");
+    // Held by the owner's word, the rested round says so as the Claude lane
+    // does: `wait:skipped` is the host's last word (a newer build or the
+    // owner's next word wakes it), never a `wait:failed:<why>` looked at every
+    // ten minutes for ever; a deferral is looked at again until it runs out.
+    for (request, word, last) in [
+        (Request::Skip("0.157.1".into()), "wait:skipped", true),
+        (Request::DeferUntil(now_s() + 3_600), "wait:deferred", false),
+    ] {
+        rig.settle_keeping(&St {
+            request,
+            request_tab: TAB.into(),
+            ..rested.clone()
+        });
+        let held = rig.visit(None);
+        assert_eq!(held.step, word);
+        assert_eq!(
+            super::super::after(&held.step, 9) == super::super::After::Finished,
+            last,
+            "{word}"
+        );
+        assert_eq!(rig.state().phase, rested.phase, "{word}: not re-armed");
+    }
     rig.settle_keeping(&rested);
     assert_eq!(rig.visit(None).step, "rearmed:unanswered");
     assert_eq!(rig.typed().len(), typed, "a new round types nothing itself");

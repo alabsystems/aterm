@@ -877,3 +877,109 @@ mod proptest_disk_backed {
         }
     }
 }
+
+// ── Eager promotion under memory pressure ───────────────────────────────────
+
+/// Push `n` lines just under 200 bytes, reporting whether the watermark was
+/// ever seen at Yellow or above.
+///
+/// Sampled per push, not read at the end, because the mechanism under test
+/// RELIEVES the pressure that triggers it: promoting a block drops
+/// `budgeted_bytes` below the 50% Yellow-exit threshold, so a fixture that
+/// spent the whole run promoting reads Green afterwards. A final-state check
+/// would report "never reached Yellow" for the run that exercised the path
+/// hardest.
+fn pressure_lines(sb: &mut DiskBackedScrollback, n: usize) -> bool {
+    let mut saw_yellow = false;
+    for i in 0..n {
+        sb.push_str(&format!("{i:04}{}", "x".repeat(196)))
+            .expect("push into disk-backed scrollback");
+        saw_yellow |= sb.watermark_level() >= WatermarkLevel::Yellow;
+    }
+    saw_yellow
+}
+
+/// A disk-backed scrollback whose ordinary promotion boundary is out of reach.
+fn pressure_fixture(path: &std::path::Path, budget: usize) -> DiskBackedScrollback {
+    let config = DiskBackedScrollbackConfig::new(path)
+        .with_hot_limit(HOT_LIMIT)
+        .with_warm_limit(2000)
+        .with_block_size(10)
+        .with_memory_budget(budget);
+    DiskBackedScrollback::with_config(config).expect("create disk scrollback")
+}
+
+/// Lines each arm pushes.
+const LINES: usize = 150;
+
+/// Far above [`LINES`], so `hot.len() >= hot_limit` — the ORDINARY promotion
+/// boundary — cannot be reached by either arm. That is what lets "anything
+/// outside hot" mean "the eager path fired" and nothing else.
+const HOT_LIMIT: usize = 200;
+
+// The claim above is the test's load-bearing one, so it is checked rather than
+// asserted in prose.
+const _: () = assert!(HOT_LIMIT > LINES);
+
+/// The disk-backed twin of `watermark_eager_promotion_fires_under_pressure`.
+///
+/// `push_line` promotes hot→warm at `hot.len() >= block_size` once the watermark
+/// reaches Yellow (disk_backed.rs), a whole block earlier than the ordinary
+/// `hot.len() >= hot_limit` boundary. Only the in-memory backend had a test for
+/// that; this path had none in the crate, and the gap was invisible because the
+/// file that once covered it (`src/pressure_tests.rs`) was never `mod`-declared
+/// and so never compiled — it still named the pre-hysteresis
+/// `pressure_level_from_budget` API that #5233 replaced.
+///
+/// THE CONTROL IS THE POINT. The same [`LINES`] lines under a budget they cannot
+/// stress must stay wholly in hot: without that arm a green result here would
+/// equally be explained by eviction, by a block_size promotion that fires at
+/// every level, or by a fixture that never reached Yellow at all.
+#[test]
+fn disk_backed_eager_promotion_fires_under_pressure() {
+    use aterm_tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+
+    // CONTROL: a budget those lines cannot stress. Nothing leaves hot.
+    let mut calm = pressure_fixture(&dir.path().join("calm.dtrm"), 100_000_000);
+    assert!(
+        !pressure_lines(&mut calm, LINES),
+        "control fixture must never reach Yellow; budgeted={} budget={}",
+        calm.budgeted_bytes(),
+        calm.memory_budget(),
+    );
+    assert_eq!(
+        calm.hot_line_count(),
+        LINES,
+        "with no pressure and hot_limit={HOT_LIMIT} unreached, every line stays \
+         hot; warm={} cold={}",
+        calm.warm_line_count(),
+        calm.cold_line_count(),
+    );
+
+    // …and the same push under a budget those lines DO stress.
+    let mut tight = pressure_fixture(&dir.path().join("tight.dtrm"), 20_000);
+    assert!(
+        pressure_lines(&mut tight, LINES),
+        "fixture must actually reach the Yellow watermark; final level={:?} \
+         budgeted={} budget={}",
+        tight.watermark_level(),
+        tight.budgeted_bytes(),
+        tight.memory_budget(),
+    );
+    assert!(
+        tight.hot_line_count() < HOT_LIMIT,
+        "the ordinary hot_limit boundary must stay unreached, or this test \
+         cannot tell eager promotion from it; hot={}",
+        tight.hot_line_count(),
+    );
+    assert!(
+        tight.warm_line_count() > 0 || tight.cold_line_count() > 0,
+        "eager promotion should move data out of hot under Yellow pressure; \
+         hot={} warm={} cold={}",
+        tight.hot_line_count(),
+        tight.warm_line_count(),
+        tight.cold_line_count(),
+    );
+}

@@ -1505,3 +1505,12 @@ fn the_clock_is_held_through_the_login_wall() {
     );
     assert_eq!(reasked.step, "announced:2", "{reasked:?}");
 }
+
+/// The notices queued behind the weekly limit, the same day: none typed
+/// behind the first, a copy typed again straight away at most
+/// `upgrade::REQUEUE_MAX` times and past that once per rest or on the
+/// owner's word, the give-up 0.93.0 spent on them rested and re-armed, and
+/// the Tier-1 bind of `harness_upgrade_limit_queue_model` — over this
+/// module's apparatus.
+#[path = "upgrade_queued_tests.rs"]
+mod queued;

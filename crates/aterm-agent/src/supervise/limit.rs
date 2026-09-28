@@ -344,15 +344,19 @@ pub fn zone_offset_s(zone: &str) -> Option<i64> {
 
 /// `+hhmm` / `-hh:mm` as seconds.
 pub fn parse_zone(text: &str) -> Option<i64> {
-    let (sign, rest) = text.split_at(text.find(['+', '-']).filter(|&i| i == 0)? + 1);
+    let (negative, rest) = match text.strip_prefix('+') {
+        Some(rest) => (false, rest),
+        None => (true, text.strip_prefix('-')?),
+    };
     let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
     if digits.len() != 4 {
         return None;
     }
-    let h: i64 = digits[..2].parse().ok()?;
-    let m: i64 = digits[2..].parse().ok()?;
-    let v = h * 3600 + m * 60;
-    Some(if sign == "-" { -v } else { v })
+    // Two ASCII digits each: `u8` fields, so the sum below is bounded by type.
+    let h: u8 = digits.get(..2)?.parse().ok()?;
+    let m: u8 = digits.get(2..)?.parse().ok()?;
+    let v = i64::from(h) * 3600 + i64::from(m) * 60;
+    Some(if negative { -v } else { v })
 }
 
 /// Whether `c` would break a payload that promises to be ONE LINE.
@@ -395,6 +399,22 @@ pub fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `date +%z`'s answer, and the shapes near it: the sign is the first
+    /// byte, exactly four digits follow (a `:` between them is tolerated),
+    /// and anything else is refused rather than read.
+    #[test]
+    fn a_zone_is_a_sign_and_four_digits() {
+        assert_eq!(parse_zone("+0130"), Some(5_400));
+        assert_eq!(parse_zone("-0700"), Some(-25_200));
+        assert_eq!(parse_zone("+07:00"), Some(25_200));
+        assert_eq!(parse_zone("+0000"), Some(0));
+        assert_eq!(parse_zone("0700"), None, "no sign");
+        assert_eq!(parse_zone("+070"), None, "three digits");
+        assert_eq!(parse_zone("x+0700"), None, "sign not first");
+        assert_eq!(parse_zone("+1\u{e9}1"), None, "not four digits");
+        assert_eq!(parse_zone(""), None);
+    }
 
     /// The test's zone table: what `date` answers on a machine that knows
     /// these two zones, in mid-September (daylight time).

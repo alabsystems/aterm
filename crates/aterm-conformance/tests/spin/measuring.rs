@@ -58,9 +58,13 @@ fn probe(shape: &str, window: &str, extra: &[&str]) {
              passed, which is the 200 kHz spin class that cost the owner 79% CPU and a 335 ms \
              input p99 (docs/RELEASE-PROOF-DISCIPLINE.md).\n  {report}\n--- probe stderr ---\n{stderr}"
         ),
+        // The paint rows' reading of the same protocol (2026-09-26): the probe
+        // decided nothing, so the message opens with the gate's COULD NOT RUN
+        // sentinel and the row is could-not-run, never a finding — and never
+        // green either: the MEASURE tier's receipt says `measured no`.
         Some(2) => panic!(
-            "SPIN CONFORMANCE COULD NOT RUN [{shape}]: the probe decided nothing, which is not \
-             a pass.\n  {report}\n--- probe stderr ---\n{stderr}"
+            "aterm-gate: COULD NOT RUN — SPIN CONFORMANCE COULD NOT RUN [{shape}]: the probe \
+             decided nothing, which is not a pass.\n  {report}\n--- probe stderr ---\n{stderr}"
         ),
         code => panic!(
             "spin probe [{shape}] died abnormally (exit {code:?}, the protocol is 0/1/2)\n\

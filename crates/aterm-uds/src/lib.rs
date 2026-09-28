@@ -61,7 +61,7 @@ pub mod rand;
 /// trust-mc proofs for [`rand::hex_encode`] (compiled only under `cfg(kani)`).
 mod rand_kani_proofs;
 /// Unix-only: inherit two descriptors into a child at fixed numbers — the fabric
-/// bridge's launch. See [`spawnfd`].
+/// bridge's launch — or, from `pre_exec`, nothing above stdio. See [`spawnfd`].
 #[cfg(unix)]
 pub mod spawnfd;
 

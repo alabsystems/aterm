@@ -1551,7 +1551,7 @@ mod tests {
 
     /// Every band row of design §1 that this slice paints, as `(name, slot, the
     /// whole line)`. The lines are the mocks' rows through the composer; the
-    /// story row is 121 cells, so the whole line is read at 160 columns.
+    /// story row is 126 cells, so the whole line is read at 160 columns.
     fn rows(now: Instant) -> Vec<(&'static str, Slot, &'static str)> {
         let role = || Some("worker:claude-satcomp".to_string());
         let mut out = vec![
@@ -1572,7 +1572,7 @@ mod tests {
                     },
                     now - Duration::from_secs(192),
                 ),
-                "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41%  \u{27df} 12ms",
+                "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms",
             ),
             (
                 "driving",
@@ -1590,7 +1590,7 @@ mod tests {
                     },
                     now - Duration::from_secs(8),
                 ),
-                "agent:claude-manager  busy 8s  \u{25b8} @s-1e91  \u{2709}1 report\u{2190}\u{2713}worker  ctx 77%  \u{27df} 5ms",
+                "agent:claude-manager  busy 8s  \u{25b8} @s-1e91  \u{2709}1 report\u{2190}\u{2713}worker  ctx 77% left  \u{27df} 5ms",
             ),
             (
                 "prompt",
@@ -1612,7 +1612,7 @@ mod tests {
                     },
                     now,
                 ),
-                "worker:claude-satcomp  prompt\u{00b7}bash  \u{25c2} manager  \u{2709}0  ctx 38%  \u{27df} 4ms",
+                "worker:claude-satcomp  bash approval 0s  \u{25c2} manager  \u{2709}0  ctx 38% left  \u{27df} 4ms",
             ),
             (
                 "question",
@@ -1626,7 +1626,7 @@ mod tests {
                     },
                     now - Duration::from_secs(120),
                 ),
-                "worker:claude-satcomp  question 2m00s  \u{2014}  \u{2709}0  ctx 12% \u{26a0}  \u{27df} 6ms",
+                "worker:claude-satcomp  question 2m00s  \u{2014}  \u{2709}0  ctx 12% left \u{26a0}  \u{27df} 6ms",
             ),
             (
                 "limited",
@@ -1648,7 +1648,7 @@ mod tests {
                     },
                     now - Duration::from_secs(40),
                 ),
-                "worker:claude-satcomp  limited \u{2192} 19:30 \u{00b7} 1d 22h  \u{2014}  \u{2709}3 task\u{2190}\u{2713}manager  ctx 9% \u{26a0}  \u{27df} 5ms",
+                "worker:claude-satcomp  limited \u{2192} 19:30 \u{00b7} 1d 22h  \u{2014}  \u{2709}3 task\u{2190}\u{2713}manager  ctx 9% left \u{26a0}  \u{27df} 5ms",
             ),
             (
                 "hold-fleet-lost",
@@ -1672,7 +1672,7 @@ mod tests {
                     },
                     now - Duration::from_secs(40),
                 ),
-                "worker:claude-satcomp  idle 40s  \u{2298} hold fabric-lost \u{00b7}fleet\u{1f512}  \u{2709}1 \u{2191}2  ctx 41%  \u{2715} lost",
+                "worker:claude-satcomp  idle 40s  \u{2298} hold fabric-lost \u{00b7}fleet\u{1f512}  \u{2709}1 \u{2191}2  ctx 41% left  \u{2715} lost",
             ),
             (
                 "attention",
@@ -1687,7 +1687,7 @@ mod tests {
                     },
                     now,
                 ),
-                "worker:claude-satcomp  needs a decision  \u{2014}  \u{2709}0  ctx 50%  \u{27df} 3ms",
+                "worker:claude-satcomp  needs a decision  \u{2014}  \u{2709}0  ctx 50% left  \u{27df} 3ms",
             ),
             (
                 "stalled",
@@ -1703,7 +1703,7 @@ mod tests {
                     },
                     now - Duration::from_secs(120),
                 ),
-                "worker:claude-satcomp  busy 2m00s  \u{2014}  \u{2709}0  ctx 91%  ~ 7s",
+                "worker:claude-satcomp  busy 2m00s  \u{2014}  \u{2709}0  ctx 91% left  ~ 7s",
             ),
         ];
         // The story row: three settled turns, then a hold that lifted.
@@ -1754,7 +1754,7 @@ mod tests {
         out.push((
             "story",
             s,
-            "worker:claude-satcomp  \u{25c7} quiet since 2m09s \u{00b7} 3 turns \u{00b7} 1 mail \u{00b7} held 1m00s, resumed 1m00s ago  \u{2014}  \u{2709}1 note\u{2190}\u{2713}h-x  ctx 41%  \u{27df} 12ms",
+            "worker:claude-satcomp  \u{25c7} quiet since 2m09s \u{00b7} 3 turns \u{00b7} 1 mail \u{00b7} held 1m00s, resumed 1m00s ago  \u{2014}  \u{2709}1 note\u{2190}\u{2713}h-x  ctx 41% left  \u{27df} 12ms",
         ));
         out
     }
@@ -2168,7 +2168,10 @@ mod tests {
                 "1 timed out".to_string()
             ]
         );
-        assert_eq!(w.sentence, "busy, 1 turn, 1 timed out, context 40 percent");
+        assert_eq!(
+            w.sentence,
+            "busy, 1 turn, 1 timed out, context 40 percent left"
+        );
         // The same story on an IDLE worker is the quiet row.
         s.absorb(
             Facts {
@@ -2190,7 +2193,7 @@ mod tests {
         assert_eq!(w.phase, "\u{25c7} quiet");
         assert_eq!(
             w.sentence,
-            "quiet, since 3s, 1 turn, 1 timed out, context 40 percent"
+            "quiet, since 3s, 1 turn, 1 timed out, context 40 percent left"
         );
     }
 
@@ -2398,7 +2401,7 @@ mod tests {
             "{}",
             a.fit(160)
         );
-        assert_eq!(a.sentence, "limited, resets 19:30, context 9 percent");
+        assert_eq!(a.sentence, "limited, resets 19:30, context 9 percent left");
         // Unplaceable: the reset alone, no figure.
         let mut u = Slot::new(now);
         u.absorb(

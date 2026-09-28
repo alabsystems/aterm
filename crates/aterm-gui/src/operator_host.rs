@@ -882,9 +882,14 @@ impl ControlHandle {
         };
         fault.fleet_fault = Some(effective_reason);
         drop(fault);
+        // What clears it depends on the queue (in-doubt events, sessions
+        // still to rebaseline): `aterm fleet status` names what it waits on.
         self.surface_notice(
             u64::MAX,
-            "The aterm operator stopped accepting events and actions after a fleet fault.",
+            &format!(
+                "Stopped: {}. Start with `aterm fleet status`.",
+                fault_words(effective_reason)
+            ),
         );
         self.notify();
     }
@@ -958,9 +963,13 @@ impl ControlHandle {
         compose_generation(generation, epoch, occurrence)
     }
 
+    /// The notice for a managed session's new attention, naming the session
+    /// by its sid (`@s-…`, as `aterm fleet status` lists it) — never by its
+    /// title or screen, which the program in it writes.
     fn surface_attention(
         &self,
         local_id: u64,
+        sid: &str,
         condition: AttentionCondition,
         outcome: EnqueueOutcome,
     ) {
@@ -976,16 +985,15 @@ impl ControlHandle {
             return;
         }
         let body = match condition {
-            AttentionCondition::ApprovalRequired => {
-                "A managed session is waiting for human approval."
-            }
-            AttentionCondition::SessionExited => "A managed session exited.",
-            AttentionCondition::Escalation => "A managed session requires human attention.",
+            // Any box: an approval, or the agent's question tool.
+            AttentionCondition::ApprovalRequired => format!("@{sid} is waiting for you."),
+            AttentionCondition::SessionExited => format!("@{sid} exited."),
+            AttentionCondition::Escalation => format!("@{sid} needs you."),
             AttentionCondition::Changed
             | AttentionCondition::Ready
             | AttentionCondition::SuspectedStuck => return,
         };
-        self.surface_notice(local_id, body);
+        self.surface_notice(local_id, &body);
     }
 
     /// Block without polling the control socket. A [`NEXT_PEER_PROBE`] ceiling
@@ -1077,7 +1085,10 @@ impl ControlHandle {
             .map_or(u64::MAX, |session| session.local_id);
         self.surface_notice(
             local_id,
-            "A managed session requires human attention after an operator claim expired.",
+            &format!(
+                "@{} needs you: the operator did not handle it in time.",
+                event.sid
+            ),
         );
     }
 
@@ -1317,6 +1328,7 @@ impl ControlHandle {
         occurrences.insert(sid.to_string(), occurrence);
         self.surface_attention(
             observed.local_id,
+            sid,
             condition,
             EnqueueOutcome::Enqueued(event_id),
         );
@@ -1794,6 +1806,7 @@ impl EventSink for DurableSink {
             };
         let condition = Self::condition(candidate.kind);
         let local_id = candidate.local_id;
+        let sid = candidate.sid.clone();
         let outcome = match queue.enqueue(NewEvent::new(
             candidate.sid,
             generation,
@@ -1815,7 +1828,8 @@ impl EventSink for DurableSink {
             }
         };
         if !matches!(outcome, EnqueueOutcome::Unmanaged) {
-            self.control.surface_attention(local_id, condition, outcome);
+            self.control
+                .surface_attention(local_id, &sid, condition, outcome);
             self.control.notify();
         }
         Ok(())
@@ -2626,6 +2640,18 @@ impl ApprovalReading {
     }
 }
 
+/// A fleet fault in a person's words, for the notice ([`FleetFaultReason::as_str`]
+/// is the status and audit token).
+fn fault_words(reason: FleetFaultReason) -> &'static str {
+    match reason {
+        FleetFaultReason::ObserverOverflow => "it fell behind the sessions' events",
+        FleetFaultReason::ObserverPanicked => "its session watcher crashed",
+        FleetFaultReason::DurableStateUnavailable => "its saved queue cannot be read or written",
+        FleetFaultReason::ActuatorIntegrity => "a key it sent could not be checked",
+        FleetFaultReason::DurabilityUncertain => "a crash left its saved queue in doubt",
+    }
+}
+
 /// Whether aterm-phase's parser, or the reader the screen identifies, sees a
 /// box on `rows`.
 fn phase_sees_a_box(rows: &[String]) -> bool {
@@ -2911,16 +2937,19 @@ mod tests {
 
         control.surface_attention(
             7,
+            "s-7",
             AttentionCondition::Ready,
             EnqueueOutcome::Enqueued(event_id),
         );
         control.surface_attention(
             7,
+            "s-7",
             AttentionCondition::ApprovalRequired,
             EnqueueOutcome::Unmanaged,
         );
         control.surface_attention(
             7,
+            "s-7",
             AttentionCondition::ApprovalRequired,
             EnqueueOutcome::Coalesced {
                 event_id,
@@ -2934,19 +2963,18 @@ mod tests {
 
         control.surface_attention(
             7,
+            "s-7",
             AttentionCondition::ApprovalRequired,
             EnqueueOutcome::Enqueued(event_id),
         );
         let approval = rx.try_recv().unwrap();
         assert_eq!(approval.session, 7);
         assert_eq!(approval.title.as_deref(), Some("aterm operator"));
-        assert_eq!(
-            approval.body,
-            "A managed session is waiting for human approval."
-        );
+        assert_eq!(approval.body, "@s-7 is waiting for you.");
 
         control.surface_attention(
             8,
+            "s-8",
             AttentionCondition::SessionExited,
             EnqueueOutcome::Coalesced {
                 event_id,
@@ -2956,7 +2984,7 @@ mod tests {
         let exited = rx.try_recv().unwrap();
         assert_eq!(exited.session, 8);
         assert_eq!(exited.title.as_deref(), Some("aterm operator"));
-        assert_eq!(exited.body, "A managed session exited.");
+        assert_eq!(exited.body, "@s-8 exited.");
         assert!(rx.try_recv().is_err());
     }
 
@@ -4278,7 +4306,11 @@ mod tests {
         sink.maintenance();
         let first_notice = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(first_notice.session, u64::MAX);
-        assert!(first_notice.body.contains("human attention"));
+        assert!(
+            first_notice
+                .body
+                .contains("needs you: the operator did not handle it in time")
+        );
         let escalated = queue.snapshot(event_id).unwrap();
         assert!(escalated.escalated);
         assert_eq!(escalated.condition, AttentionCondition::Escalation);
@@ -4421,7 +4453,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("next must surface the escalation before returning it");
         assert_eq!(notice.session, u64::MAX);
-        assert!(notice.body.contains("human attention"));
+        assert!(
+            notice
+                .body
+                .contains("needs you: the operator did not handle it in time")
+        );
 
         control.surface_escalation_once(&store, &escalation.event);
         assert!(
@@ -4474,7 +4510,10 @@ mod tests {
             u64::MAX,
             "fleet faults bypass focus suppression"
         );
-        assert!(notice.body.contains("stopped accepting events"));
+        assert_eq!(
+            notice.body,
+            "Stopped: it fell behind the sessions' events. Start with `aterm fleet status`."
+        );
         let status = control.command_status().unwrap();
         assert!(status.contains("\"state\":\"faulted\""), "{status}");
         assert!(status.contains("observer-overflow"), "{status}");
@@ -4505,7 +4544,7 @@ mod tests {
                 .is_ok()
         );
         let control = ControlHandle::new("test-notice-retry".to_string(), notify_tx);
-        control.surface_notice(7, "A managed session requires human attention.");
+        control.surface_notice(7, "@s-a needs you.");
         assert!(
             control.shared.pending_notice.lock().unwrap().is_some(),
             "a full shared notification queue must not silently drop the alert"
@@ -4516,7 +4555,7 @@ mod tests {
         let retried = notify_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(retried.session, 7);
         assert_eq!(retried.title.as_deref(), Some("aterm operator"));
-        assert!(retried.body.contains("human attention"));
+        assert!(retried.body.contains("needs you"));
         assert!(control.shared.pending_notice.lock().unwrap().is_none());
     }
 

@@ -1597,33 +1597,39 @@ fn login_rows(jsonl: &str) -> impl Iterator<Item = (LoginRow, Option<u64>)> + '_
         if is_auth_wall_row(&v) {
             return Some((LoginRow::Wall, at));
         }
-        // The person's `Login successful` comes in two shapes: 2.1.281 writes
-        // it as a `user` row's `message.content` (the incident's session,
-        // 14:33:36 UTC); 2.1.283 as a `system` row, `subtype`
-        // `local_command`, with a top-level `content` (the owner's other
-        // session, 14:33:54 UTC the same day — measured; read as neither,
-        // the wall stood until the model next answered).
         let lifted = match v.get("type").and_then(Value::as_str) {
             Some("assistant") => v
                 .get("message")
                 .and_then(|m| m.get("model"))
                 .and_then(Value::as_str)
                 .is_some_and(is_model_id),
-            Some("user") => v
-                .get("message")
-                .and_then(|m| m.get("content"))
-                .and_then(Value::as_str)
-                .is_some_and(login_succeeded),
-            Some("system") => {
-                v.get("subtype").and_then(Value::as_str) == Some("local_command")
-                    && v.get("content")
-                        .and_then(Value::as_str)
-                        .is_some_and(login_succeeded)
-            }
-            _ => false,
+            _ => is_login_success_row(&v),
         };
         lifted.then_some((LoginRow::Lifted, at))
     })
+}
+
+/// Whether one transcript row is a person's `/login` that FINISHED
+/// ([`login_succeeded`]). It comes in two shapes: 2.1.281 writes it as a
+/// `user` row's `message.content` (the incident's session, 14:33:36 UTC);
+/// 2.1.283 as a `system` row, `subtype` `local_command`, with a top-level
+/// `content` (the owner's other session, 14:33:54 UTC the same day —
+/// measured; read as neither, the wall stood until the model next answered).
+fn is_login_success_row(v: &Value) -> bool {
+    match v.get("type").and_then(Value::as_str) {
+        Some("user") => v
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(Value::as_str)
+            .is_some_and(login_succeeded),
+        Some("system") => {
+            v.get("subtype").and_then(Value::as_str) == Some("local_command")
+                && v.get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(login_succeeded)
+        }
+        _ => false,
+    }
 }
 
 /// THE SESSION STANDS AT THE LOGIN WALL, by its transcript (`jsonl`, a
@@ -1690,9 +1696,209 @@ pub fn notice_undelivered(jsonl: &str, marker: &str) -> bool {
 /// carrying `marker` at all — a tail too short to judge it by.
 #[must_use]
 pub fn notice_fate(jsonl: &str, marker: &str) -> Option<bool> {
-    let (mut armed, mut undelivered) = (false, None);
+    notice_fate_of(jsonl, marker).map(|fate| fate == NoticeFate::Wall)
+}
+
+/// What became of ONE NOTICE, by the transcript ([`notice_fate_of`]): whether
+/// its own turn reached the model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeFate {
+    /// Nothing has answered its own turn yet (the turn is in flight).
+    Open,
+    /// The session's own model answered its own turn: it was read as asked.
+    Answered,
+    /// THE LOGIN WALL answered its own turn ([`is_auth_wall_row`]): it never
+    /// reached the model ([`notice_undelivered`]).
+    Wall,
+    /// A USAGE LIMIT answered its own turn ([`is_limit_row`]) and the model
+    /// has written nothing since: the notice waits in the conversation,
+    /// unread, and reaches the model with the next turn that gets past the
+    /// limit — Claude Code's own `Continuing automatically at …` at the
+    /// reset, or anyone's message. NOT TAKEN: it is no ask the agent could
+    /// answer, and a second notice typed meanwhile only queues behind it
+    /// (the owner's report of 2026-09-27: four of them, delivered at once).
+    Queued,
+    /// A usage limit answered it, and the model TOOK it later, at `.0` (unix
+    /// seconds; `None` when the row names no time) — the first row of the
+    /// session's own model after it: as history in a turn the reset or a
+    /// person began, together with every notice queued beside it. Its
+    /// window opens then (the driver holds the clock until that row).
+    Taken(Option<u64>),
+}
+
+/// THE FATE of the latest notice carrying `marker` in `jsonl` (a transcript's
+/// tail): the first decisive main-chain assistant row after it — the login
+/// wall's, a usage limit's (after which the model's first row is the
+/// notice TAKEN), or the model's own. Claude Code's other rows of its own
+/// (`No response requested.`, an API error) are passed over, as a subagent's
+/// rows are. `None` where the tail holds no such notice.
+#[must_use]
+pub fn notice_fate_of(jsonl: &str, marker: &str) -> Option<NoticeFate> {
+    notice_scan(jsonl, marker).map(|scan| scan.fate)
+}
+
+/// UNTIL WHEN A NOTICE QUEUED BEHIND A USAGE LIMIT WAITS ON IT (review of
+/// 2026-09-27: a queued notice held the upgrade `limited` with no bound, and
+/// a session simply left idle past its reset — the weekly limit continues on
+/// its own only after `/rate-limit-options`, and a person's Esc cancels even
+/// that — or answered by a limit that names no reset, waited until a person
+/// typed): the latest notice carrying `marker` is [`NoticeFate::Queued`] in
+/// `jsonl`, and the limit row that last answered it names its reset
+/// (`quotaLimits.resetsAt`, unix seconds) — or, naming none (an API rate
+/// limit, a model's own bucket), holds for [`REASK_S`] from when it was
+/// written. `Some(0)`: a person's `/login` finished after that row (an
+/// account switched: the owner's session of 2026-09-27 went on so), or the
+/// row names neither — the limit is over by the transcript's word, and the
+/// screen alone says whether one stands. `None`: the notice is not queued.
+/// Past it, a notice still queued never reached the model: the driver types
+/// it again as the same ask ([`Facts::undelivered`]), where the screen
+/// shows no limit — straight away while the conversation holds at most
+/// [`REQUEUE_MAX`] upgrade notices untaken ([`queued_copies`]), past that
+/// once a rest has run ([`Scan::rests_until`]).
+#[must_use]
+pub fn queued_until(jsonl: &str, marker: &str) -> Option<u64> {
+    notice_scan(jsonl, marker)?.queued_until()
+}
+
+/// HOW MANY UPGRADE NOTICES THE CONVERSATION HOLDS UNTAKEN while the latest
+/// notice carrying `marker` is [`NoticeFate::Queued`] in `jsonl`: every
+/// notice the upgrade typed since the session's own model last wrote a row
+/// — this one's copies and any other's (an earlier ask's, an earlier round's,
+/// one typed for another target, an older build's), whatever answered each
+/// (a usage limit, the login wall) — all of which reach the agent together
+/// once a turn gets past the limit (the owner's report of 2026-09-27: four
+/// of them at once). `0`: the notice is not queued. What bounds typing it
+/// again ([`REQUEUE_MAX`]); only a row of the session's own model starts the
+/// count again (a `/login` does not: the notices stay in the conversation).
+#[must_use]
+pub fn queued_copies(jsonl: &str, marker: &str) -> u32 {
+    notice_scan(jsonl, marker).map_or(0, |scan| scan.queued_copies())
+}
+
+/// What [`notice_scan`] found of the latest notice carrying a marker, and of
+/// the conversation it waits in — one read of the tail for all of it
+/// ([`notice_fate_of`], [`queued_until`], [`queued_copies`],
+/// [`Scan::rests_until`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scan {
+    /// Its fate ([`notice_fate_of`]).
+    pub fate: NoticeFate,
+    /// While it is queued, until when the limit that answered it holds by
+    /// the transcript's word ([`queued_until`]; `None` here: the row named
+    /// nothing to go by, or a `/login` finished since).
+    pub until: Option<u64>,
+    /// The upgrade notices the conversation holds that the session's model
+    /// has not taken — typed since its last row of its own, this one
+    /// included, whatever their marker and whatever answered each
+    /// ([`queued_copies`] reads it while the notice is queued).
+    pub untaken: u32,
+    /// When the limit row that last answered it was written (unix seconds;
+    /// `None`: not queued, or the row names no time).
+    pub answered_at: Option<u64>,
+    /// When it was typed (unix seconds; `None`: its row names no time).
+    pub typed_at: Option<u64>,
+}
+
+impl Scan {
+    /// [`queued_until`] of this scan.
+    #[must_use]
+    pub fn queued_until(&self) -> Option<u64> {
+        (self.fate == NoticeFate::Queued).then(|| self.until.unwrap_or(0))
+    }
+
+    /// [`queued_copies`] of this scan.
+    #[must_use]
+    pub fn queued_copies(&self) -> u32 {
+        if self.fate == NoticeFate::Queued {
+            self.untaken
+        } else {
+            0
+        }
+    }
+
+    /// UNTIL WHEN A FULL QUEUE RESTS (review of 2026-09-27): once the
+    /// conversation holds more than [`REQUEUE_MAX`] upgrade notices untaken
+    /// ([`queued_copies`]) and the limit that answered the latest is over by
+    /// the transcript's word, that notice is typed once more by itself only
+    /// [`queue_rest`] after the word ran out — the reset its row named, or
+    /// [`REASK_S`] after the row where it named none or a `/login` ended it.
+    /// Held for good instead, an idle session whose limit had long ended
+    /// waited for a person to type, and the owner was told it "moves once
+    /// that ends". The rest GROWS with every copy the model has not read —
+    /// [`RETRY_S`], then twice, four and eight times that, then a day — so a
+    /// limit that names no reset and lasts for days adds a handful of copies
+    /// and then one a day, never one every two and a half hours for as long
+    /// as it stands. `None`: not queued, or the limit row names no time —
+    /// nothing to count a rest from; the queue then waits for the session to
+    /// go on or the owner's word.
+    #[must_use]
+    pub fn rests_until(&self) -> Option<u64> {
+        if self.fate != NoticeFate::Queued {
+            return None;
+        }
+        let at = self.answered_at?;
+        Some(
+            self.until
+                .unwrap_or(0)
+                .max(at.saturating_add(REASK_S))
+                .saturating_add(queue_rest(self.untaken)),
+        )
+    }
+}
+
+/// THE LONGEST A FULL QUEUE RESTS before one more copy: a day. What bounds
+/// the copies a usage limit that lasts for days adds, once the rest has
+/// grown to it ([`queue_rest`]): one a day.
+pub const QUEUE_REST_MAX_S: u64 = 24 * 3_600;
+
+/// How many times a full queue's rest doubles before it reaches
+/// [`QUEUE_REST_MAX_S`]: the copies that go after a rest shorter than a day,
+/// at most, while the model reads none of them ([`queue_rest`]). Four today:
+/// two, four, eight and sixteen hours. The derived model's `Daily`
+/// (`aterm_spec::derive::harness_upgrade_limit_queue_model`).
+pub const QUEUE_REST_DOUBLINGS: u32 = {
+    let mut k = 0;
+    while RETRY_S << k < QUEUE_REST_MAX_S {
+        k += 1;
+    }
+    k
+};
+
+/// HOW LONG A FULL QUEUE OF `untaken` NOTICES RESTS before the upgrade types
+/// one more copy by itself ([`Scan::rests_until`]; the owner, 2026-09-27: a
+/// limit whose row names no reset still added a copy every `REASK_S +
+/// RETRY_S` — two and a half hours, about ten a day — for as long as it
+/// lasted). The rest doubles with every copy the model has not read beyond
+/// the `1 + REQUEUE_MAX` a full queue holds: [`RETRY_S`] for the first,
+/// then twice, four and eight times that, then [`QUEUE_REST_MAX_S`] for
+/// every one after. Every copy the limit answered again is its own word that
+/// it still stands, so each one more is worth less; and a model's row of its
+/// own starts the count again ([`queued_copies`]), so the next limit's queue
+/// rests two hours again. The owner's `Upgrade now` still types one more at
+/// once, whatever the rest.
+#[must_use]
+pub fn queue_rest(untaken: u32) -> u64 {
+    let over = untaken.saturating_sub(REQUEUE_MAX + 1);
+    if over >= QUEUE_REST_DOUBLINGS {
+        QUEUE_REST_MAX_S
+    } else {
+        (RETRY_S << over).min(QUEUE_REST_MAX_S)
+    }
+}
+
+/// [`notice_fate_of`], with — while the notice is queued — until when the
+/// limit that answered it holds, when that limit's row was written, how many
+/// upgrade notices wait untaken, and when the notice was typed: one read of
+/// `jsonl` for every question the driver asks of it (`queue_facts`).
+#[must_use]
+pub fn notice_scan(jsonl: &str, marker: &str) -> Option<Scan> {
+    let (mut armed, mut fate, mut until) = (false, None, None);
+    let (mut answered_at, mut typed_at, mut untaken) = (None, None, 0_u32);
     for line in jsonl.lines() {
-        if !line.contains("\"user\"") && !line.contains("assistant") {
+        if !line.contains("\"user\"")
+            && !line.contains("assistant")
+            && !line.contains("Login successful")
+        {
             continue;
         }
         let Ok(v) = aterm_json::from_str::<Value>(line) else {
@@ -1701,30 +1907,170 @@ pub fn notice_fate(jsonl: &str, marker: &str) -> Option<bool> {
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
             continue;
         }
+        if armed && fate == Some(NoticeFate::Queued) && is_login_success_row(&v) {
+            until = None;
+            continue;
+        }
         match v.get("type").and_then(Value::as_str) {
             Some("user") => {
-                if v.get("message")
-                    .is_some_and(|m| is_announcement(m) && line.contains(marker))
-                {
-                    (armed, undelivered) = (true, Some(false));
+                if v.get("message").is_some_and(is_announcement) {
+                    // One more notice in the conversation the model has not
+                    // taken, whatever it carries.
+                    untaken = untaken.saturating_add(1);
+                    if line.contains(marker) {
+                        (armed, fate, until, answered_at) =
+                            (true, Some(NoticeFate::Open), None, None);
+                        typed_at = row_time(&v);
+                    }
                 }
             }
-            Some("assistant") if armed => {
-                if is_auth_wall_row(&v) {
-                    (armed, undelivered) = (false, Some(true));
-                } else if v
+            Some("assistant") => {
+                let own = v
                     .get("message")
                     .and_then(|m| m.get("model"))
                     .and_then(Value::as_str)
-                    .is_some_and(is_model_id)
-                {
-                    armed = false;
+                    .is_some_and(is_model_id);
+                if armed {
+                    if is_auth_wall_row(&v) {
+                        (armed, fate, until) = (false, Some(NoticeFate::Wall), None);
+                    } else if is_limit_row(&v) {
+                        fate = Some(NoticeFate::Queued);
+                        until = limit_holds_until(&v);
+                        answered_at = row_time(&v);
+                    } else if own {
+                        armed = false;
+                        until = None;
+                        fate = Some(if fate == Some(NoticeFate::Queued) {
+                            NoticeFate::Taken(row_time(&v))
+                        } else {
+                            NoticeFate::Answered
+                        });
+                    }
+                }
+                // The model's own row: every notice before it was taken.
+                if own {
+                    untaken = 0;
                 }
             }
             _ => {}
         }
     }
-    undelivered
+    fate.map(|fate| Scan {
+        fate,
+        until,
+        untaken,
+        answered_at,
+        typed_at,
+    })
+}
+
+/// A transcript row's `timestamp`, in unix seconds.
+fn row_time(v: &Value) -> Option<u64> {
+    v.get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(super::upgrade_models::parse_utc)
+}
+
+/// Until when one limit row ([`is_limit_row`]) holds the session: the reset
+/// it names (`quotaLimits.resetsAt`), else [`REASK_S`] after it was written,
+/// else `None`.
+fn limit_holds_until(v: &Value) -> Option<u64> {
+    v.get("quotaLimits")
+        .and_then(|q| q.get("resetsAt"))
+        .and_then(Value::as_u64)
+        .or_else(|| row_time(v).map(|at| at.saturating_add(REASK_S)))
+}
+
+/// THE USAGE LIMIT'S SIGNATURE in a transcript row, as Claude Code writes it
+/// (measured 2026-09-27 in the owner's sessions `25e3b26e…` and
+/// `77eb4f89…`, Claude Code 2.1.280 and 2.1.281: each of the eight notices
+/// 0.93.0 typed into them at the weekly limit was answered within two
+/// seconds by one): a main-chain `<synthetic>` assistant row flagged
+/// `isApiErrorMessage`, whose `error` is `rate_limit` — its text `You've hit
+/// your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)` — or whose
+/// text the supervisor's own wall table reads as a limit
+/// ([`aterm_phase::classify_wall`], [`aterm_phase::WallKind::reads_limited`]:
+/// a session, weekly, model-bucket, spend or API rate limit), never a
+/// second pattern of the upgrade's own.
+fn is_limit_row(v: &Value) -> bool {
+    if v.get("type").and_then(Value::as_str) != Some("assistant")
+        || v.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || v.get("isApiErrorMessage").and_then(Value::as_bool) != Some(true)
+    {
+        return false;
+    }
+    if v.get("error").and_then(Value::as_str) == Some("rate_limit") {
+        return true;
+    }
+    v.get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|p| {
+                p.get("text")
+                    .and_then(Value::as_str)
+                    .and_then(aterm_phase::classify_wall)
+                    .is_some_and(|kind| kind.reads_limited())
+            })
+        })
+}
+
+/// UNTIL WHEN THE SESSION STANDS AT A USAGE LIMIT, by its transcript (`jsonl`,
+/// a tail): the last main-chain row that says whether the model can answer —
+/// a row of the session's own model, or Claude Code's limit row
+/// ([`is_limit_row`]) — is the limit's, and it names the instant the limit
+/// resets (`quotaLimits.resetsAt`, unix seconds: `1791046800`, Oct 3 10:00
+/// PDT, on every limit row of the owner's session of 2026-09-27) — or, naming
+/// none (an API rate limit: `API Error: Rate limit reached`), [`REASK_S`]
+/// after it was written, as a notice queued behind such a row waits
+/// ([`queued_until`]; review of 2026-09-27: read as no limit at all, a
+/// pending upgrade typed a fresh notice minutes after one, behind a notice
+/// of an earlier round still queued). `None`: the model answered last, the
+/// tail holds no limit row, or the row names neither a reset nor a time.
+/// What keeps even the FIRST notice out of a session whose limit banner has
+/// left the screen — a person's Esc on `Continuing automatically at …`, a
+/// screen the recogniser misses ([`Facts::limited`] until then); past that
+/// instant the session can take a turn again.
+///
+/// A person's `/login` that FINISHED after the limit row
+/// ([`is_login_success_row`]) ends it too (review of 2026-09-27: in the
+/// owner's session the weekly row, reset Oct 3, was followed by `Login
+/// successful` at 19:57:47Z — an account switched — and a pending upgrade
+/// held `limited` for days, which no `--now` waives): the transcript no
+/// longer knows of a limit, and the screen judges, as
+/// [`login_lifted_at`] leaves it for the login wall.
+#[must_use]
+pub fn transcript_limit_until(jsonl: &str) -> Option<u64> {
+    let mut until = None;
+    for line in jsonl.lines() {
+        if !line.contains("assistant") && !line.contains("Login successful") {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if is_login_success_row(&v) {
+            until = None;
+            continue;
+        }
+        if v.get("type").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        if is_limit_row(&v) {
+            until = limit_holds_until(&v);
+        } else if v
+            .get("message")
+            .and_then(|m| m.get("model"))
+            .and_then(Value::as_str)
+            .is_some_and(is_model_id)
+        {
+            until = None;
+        }
+    }
+    until
 }
 
 /// What a transcript's tail says of the login to an upgrade ([`transcript_login`]).
@@ -1778,9 +2124,10 @@ pub fn login_wall(agent: Agent, rows: &[String]) -> bool {
 
 /// The ask number of the next notice ([`Step::Announce`]) of an upgrade in
 /// `phase`: one more than the asks it has made — except where its last
-/// notice NEVER REACHED THE MODEL (`undelivered`, [`notice_undelivered`]),
-/// which spent no ask: typed again as the same ask (and so with the same
-/// READY marker).
+/// notice NEVER REACHED THE MODEL (`undelivered`: the login wall's,
+/// [`notice_undelivered`], or one a usage limit answered and that limit is
+/// over, [`queued_until`]), which spent no ask: typed again as the same ask
+/// (and so with the same READY marker).
 #[must_use]
 pub fn announce_asks(phase: &Phase, undelivered: bool) -> u32 {
     match phase {
@@ -2141,6 +2488,16 @@ pub struct Facts {
     /// to. Nothing is typed, and no clock of the upgrade runs, while this
     /// stands ([`gate_announce`], [`next_step`], [`clock_held`]); no
     /// person's `--now` waives it — a person cannot make the notice read.
+    ///
+    /// The transcript says it too (the owner's report of 2026-09-27): a
+    /// latest notice whose own turn the limit answered and that the model
+    /// has not taken since ([`NoticeFate::Queued`], read by the driver) is a
+    /// session at its limit whatever the screen shows — the banner a
+    /// person's Esc dismissed, a screen the recogniser misses — so no second
+    /// notice is typed behind the first, and its window does not run. Until
+    /// that limit is over by the transcript's word ([`queued_until`]); past
+    /// it, the notice is [`Facts::undelivered`] — or, the conversation's
+    /// queue full, [`Facts::queued`].
     pub limited: bool,
     /// THE SESSION STANDS AT THE LOGIN WALL: its screen shows the auth wall
     /// ([`login_wall`], the supervisor's own recogniser), or its transcript's
@@ -2160,7 +2517,34 @@ pub struct Facts {
     /// point the notice could be typed — never waits out its window for it,
     /// and never gives up on it. (A give-up spent on it is taken back before
     /// the reducer is asked: [`rearmed`].)
+    ///
+    /// The same for a notice a USAGE LIMIT answered whose limit is over by the
+    /// transcript's word ([`queued_until`]: the reset its row names has
+    /// passed, a `/login` finished since, or — a row naming no reset —
+    /// [`REASK_S`] ran) while the screen shows none (review of 2026-09-27):
+    /// a session left idle past its reset never took the notice, and it is
+    /// typed again as the same ask — never behind a limit that stands:
+    /// straight away while the conversation holds at most [`REQUEUE_MAX`]
+    /// upgrade notices the model has not taken ([`queued_copies`]), past that
+    /// only once the queue has rested or on the owner's word
+    /// ([`Facts::queued`] until then).
     pub undelivered: bool,
+    /// THE CONVERSATION'S QUEUE IS FULL (review of 2026-09-27): its latest
+    /// upgrade notice was answered by a usage limit that is over by the
+    /// transcript's word and the screen's, but more than [`REQUEUE_MAX`]
+    /// notices already wait in the conversation untaken ([`queued_copies`]),
+    /// and the rest before one more ([`Scan::rests_until`]: [`queue_rest`]
+    /// after the limit's word ran out, longer for every copy) has not run, nor has the owner's
+    /// `--now` come since the latest was typed. Every copy the limit answered
+    /// is its own word that it still stood, so nothing is typed behind them
+    /// ([`gate_announce`]: `queued`) and no clock runs ([`clock_held`]) —
+    /// until a turn gets past the limit and the model takes them all
+    /// (anyone's message, Claude Code's own at a reset), the rest runs out
+    /// (one copy more), or the owner presses `Upgrade now` (one copy more:
+    /// that is the person asking). Held with no end instead, an idle session
+    /// whose limit had long ended waited for good, `Upgrade now` moved
+    /// nothing, and the owner was told it "moves once that ends".
+    pub queued: bool,
     /// Seconds the READY answer the upgrade acts on has stood unacted on,
     /// the driver's stamp ([`ready_since`]; 0: no such answer now, or one
     /// first heard at this very look) — held, like every clock of the
@@ -2284,7 +2668,11 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 /// WALL ([`Facts::login`]): it waits `login` — a notice typed there is
 /// answered by the wall and read by no model (the 2026-09-27 incident: four
 /// of them, each met by `Login expired · Please run /login`). Nothing waives
-/// either, the owner's `--now` included.
+/// either, the owner's `--now` included. Nor is one whose conversation
+/// already holds a FULL QUEUE of notices it has not taken
+/// ([`Facts::queued`]): it waits `queued` — the driver lifts that fact
+/// itself for the owner's `--now` given since the latest notice, and once
+/// the queue has rested.
 #[must_use]
 pub fn gate_announce(f: &Facts) -> Gate {
     if f.held {
@@ -2298,6 +2686,9 @@ pub fn gate_announce(f: &Facts) -> Gate {
     }
     if f.login {
         return Gate::Wait("login");
+    }
+    if f.queued {
+        return Gate::Wait("queued");
     }
     let at_break = f.background_point && matches!(f.status.as_str(), "idle" | "busy" | "shell");
     if f.status != "idle" && !at_break {
@@ -2507,7 +2898,40 @@ pub const REASK_S: u64 = 30 * 60;
 /// agent, releases the agent ([`release_prompt`]), and still honours a READY
 /// answer to one of its notices that comes late ([`GAVE_UP`]) — until the next
 /// round, [`RETRY_S`] later, asks again. Never a forced restart.
+///
+/// ONLY A NOTICE THE MODEL COULD READ COUNTS (the owner's report of
+/// 2026-09-27: four notices typed into a session at its weekly limit read as
+/// `no READY answer after 4 notices`). A notice that never reached the model
+/// — the login wall's ([`Facts::undelivered`]), or one a usage limit answered
+/// and that limit is over ([`queued_until`]) — is typed again as the same
+/// ask, and none is typed behind a notice the limit still holds
+/// ([`Facts::limited`]).
 pub const MAX_ASKS: u32 = 4;
+
+/// The most times a notice a usage limit answered is typed again STRAIGHT
+/// AWAY before the model takes one ([`queued_copies`],
+/// [`Facts::undelivered`]): at most `1 + REQUEUE_MAX` upgrade notices wait in
+/// the conversation untaken at once — this ask's copies and any other
+/// notice's — and past that one more only after each rest
+/// ([`Scan::rests_until`], [`Facts::queued`]). The owner's report of
+/// 2026-09-27 was four notices typed behind the weekly limit and delivered
+/// at once; the fix types a queued notice again once its limit is over by
+/// the transcript's word (a reset passed, a `/login`, or [`REASK_S`] after a
+/// limit row naming no reset), and a row naming no reset is over by that word
+/// every [`REASK_S`] however long the limit really stands — so unbounded,
+/// the same notice would pile up a copy every half hour. Each copy the limit
+/// answers again is the limit's own word that it still stands; past the
+/// bound the upgrade waits `queued` for the session's model to write a row
+/// of its own (a turn that got past the limit — Claude Code's own at the
+/// reset, a person's, a peer's), which takes every copy at once and opens the
+/// ask's window — or for the queue's rest ([`queue_rest`]: [`RETRY_S`],
+/// growing with every copy the model has not read, up to a day) after the
+/// limit's word ran out, when one copy more goes (the review of 2026-09-27:
+/// held for good, an idle session whose limit had ended was never asked
+/// again), or for the owner's `--now`, one copy more at once. Derived model:
+/// `aterm_spec::derive::harness_upgrade_limit_queue_model` (`RetypeMax`,
+/// and `Daily` for [`QUEUE_REST_DOUBLINGS`]).
+pub const REQUEUE_MAX: u32 = 2;
 
 /// Seconds a STOPPED round of an upgrade ([`Phase::Failed`], whatever stopped
 /// it) rests before the upgrade starts a new one ([`Step::Rearm`]): one
@@ -2519,14 +2943,27 @@ pub const MAX_ASKS: u32 = 4;
 /// would ever ask it again). A round asks for at most `MAX_ASKS × REASK_S`
 /// before it gives up; resting exactly as long again keeps the nagging to at
 /// most half of any stretch of time, one round on, one round off, however
-/// long the agent's work lasts. And it BOUNDS THE SILENCE: at an agent that
-/// can read, the longest stretch with no notice is the give-up's own window
-/// after the last notice plus this rest, `REASK_S + RETRY_S` (two and a half
-/// hours today) — where the stop that is not a give-up (a refused signal, a
-/// relaunch that never came up, a conversation resumed elsewhere) rests the
-/// same, once. The rest is not held at a usage limit: the round it starts
-/// types nothing there (a limited session is never asked), so no clock needs
-/// holding for it.
+/// long the agent's work lasts. And it BOUNDS THE SILENCE, though not to one
+/// rest (the no-stall review of 2026-09-27). At an agent that can read, the
+/// stretch with no notice after a round's last one is the give-up's window,
+/// `REASK_S`, plus the rest: this, stretched up to
+/// `RETRY_S << RETRY_BACKOFF_MAX_SHIFT` for a stop that repeats
+/// ([`rest_extension`]). A late READY the gave-up round hears holds the new
+/// round back while the answer stands ([`retry_due`]: the round acts on it
+/// instead), and one the agent's own work outlives is voided [`DRAIN_S`]
+/// after it — the rest then begins again at the void, a whole `RETRY_S`. So
+/// the longest silence is `REASK_S + rest + DRAIN_S + RETRY_S`, reached by a
+/// READY heard just before the rest runs out: five hours today after a first
+/// stop, eleven after one repeated to the cap (two and a half and eight and a
+/// half with no late READY). Any other stop (a refused signal, a relaunch
+/// that never came up, a conversation resumed elsewhere) hears no late READY:
+/// its silence is its rest. Whatever else a late READY's restart waits on
+/// ends the stretch when it passes, with the restart or the void, never with
+/// a notice — the settle, a turn in progress, aterm's hold, a person's box or
+/// draft (voided [`HOLD_S`] into its hold): the agent's or a person's to end,
+/// not the upgrade's silence. The rest is not held at a usage limit: the
+/// round it starts types nothing there (a limited session is never asked),
+/// so no clock needs holding for it.
 pub const RETRY_S: u64 = MAX_ASKS as u64 * REASK_S;
 
 const _: () = assert!(RETRY_S >= REASK_S);
@@ -2638,8 +3075,8 @@ pub fn retry_due(phase: &Phase, failed_s: u64, ready: bool) -> bool {
 /// work under the agent still outlives by a whole [`REASK_S`] of the answer's
 /// own ([`Facts::ready_s`]): the new notice SUPERSEDES that answer — it is no
 /// longer the agent's last word after the latest notice — where a void would
-/// type the release line ("nothing will restart this session") only for the
-/// next notice to contradict it. Each re-ask names what runs (the driver's
+/// type the release line ("no restart is coming now") only for the next
+/// notice to follow it on its heels. Each re-ask names what runs (the driver's
 /// [`running_clause`]), and past [`MAX_ASKS`] the upgrade gives up and says
 /// what held it. `gave-up` is what the owner's `--now` re-arms.
 ///
@@ -2690,6 +3127,17 @@ pub fn retry_due(phase: &Phase, failed_s: u64, ready: bool) -> bool {
 /// notices (the 2026-09-27 incident: 0.93.0 spent all four into the wall and
 /// gave up at 07:03) is asked about as [`rearmed`] makes it, unless a READY
 /// came first.
+///
+/// A NOTICE QUEUED BEHIND A USAGE LIMIT ([`NoticeFate::Queued`], the owner's
+/// report of 2026-09-27: four notices typed into a session at its weekly
+/// limit reached the agent at once) was never read: the driver reads it as
+/// [`Facts::limited`], so nothing is typed behind it and its window waits
+/// for the model to take it — or, its limit over by the transcript's word
+/// ([`queued_until`]) and none on the screen, as [`Facts::undelivered`]:
+/// typed again as the same ask, at once while the conversation's queue has
+/// room ([`REQUEUE_MAX`]), else — [`Facts::queued`], `queued` — once it has
+/// rested or on the owner's `--now`. Only a notice the model could read
+/// spends one of [`MAX_ASKS`].
 #[must_use]
 pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
     if retry_due(phase, f.failed_s, ready) {
@@ -2884,10 +3332,11 @@ pub fn ready_since(prior: u64, ready: bool, f: &Facts, now_s: u64) -> u64 {
 /// gets the whole window once it can read again. The same at THE LOGIN WALL
 /// ([`Facts::login`]): what a notice's reader cannot answer, no clock runs
 /// on — and, the wall lifted, the driver starts the clock again from the
-/// lift the transcript records ([`login_lifted_at`]).
+/// lift the transcript records ([`login_lifted_at`]). And behind a FULL
+/// QUEUE ([`Facts::queued`]): the notice waits in the conversation unread.
 #[must_use]
 pub fn clock_held(phase: &Phase, f: &Facts, now_s: u64) -> Phase {
-    if f.limited || f.login {
+    if f.limited || f.login || f.queued {
         clock_held_until(phase, now_s)
     } else {
         phase.clone()

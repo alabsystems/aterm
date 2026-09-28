@@ -737,8 +737,10 @@ fn call_role(code: &[u8], open: usize) -> CallRole {
 /// Tables whose `&str` elements are names a parent STRIPS from, or SETS in, a child's
 /// environment, never reads: a family name listed in one is not a read of it. The
 /// child-env deny list, and the verify gate's git stamp — the `aterm-gui` build
-/// script's inputs, handed to the gate's own child builds (`aterm_verify::GIT_STAMP_ENV`).
-const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS", "GIT_STAMP_ENV"];
+/// script's inputs, handed to the gate's own child builds (`aterm_verify::GIT_STAMP_ENV`);
+/// and the release artifact the gate hands its paint and spin suites
+/// (`aterm_verify::stages::RELEASE_BIN_VARS`).
+const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS", "GIT_STAMP_ENV", "RELEASE_BIN_VARS"];
 
 /// The one place a RETIRED name may be named in shipped code: the doctor's detector,
 /// which reads PRESENCE only (`var_os(name).is_some()`), never acts on it, and tells a

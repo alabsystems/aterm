@@ -71,6 +71,11 @@ pub const SIXEL_MAX_DIMENSION: usize = 4096;
 /// buffer-growth) guard; [`SIXEL_MAX_IMAGE_BYTES`] is the materialization guard.
 pub const SIXEL_MAX_PIXELS: usize = 4 * 1024 * 1024;
 
+/// The six pixel rows a sixel byte paints, top first: bit `row` of the data
+/// value. Iterated as masks rather than computed as `1 << row`, so the paint
+/// loops carry no shift whose range a reader (or the verifier) has to bound.
+const SIXEL_ROW_MASKS: [u8; 6] = [1, 2, 4, 8, 16, 32];
+
 /// Maximum decoded-image byte budget (packed RGBA, 4 bytes/px) a single sixel
 /// sequence may materialize at [`unhook`](SixelDecoder::unhook).
 ///
@@ -345,7 +350,8 @@ impl SixelDecoder {
         // attributes when nothing was painted inside the declared box.
         let width = self.max_x.max(self.declared_w).min(SIXEL_MAX_DIMENSION);
         let height = self.max_y.max(self.declared_h).min(SIXEL_MAX_DIMENSION);
-        if width == 0 || height == 0 || width.saturating_mul(height) > SIXEL_MAX_PIXELS {
+        let total = width.saturating_mul(height);
+        if width == 0 || height == 0 || total > SIXEL_MAX_PIXELS {
             // Drop buffers and report nothing for a degenerate OR over-cap image.
             // The over-cap case would be rejected downstream anyway; refuse to
             // compose the width*height buffer rather than materialize it first.
@@ -374,18 +380,26 @@ impl SixelDecoder {
         // `0x00000000` for unpainted and `0xFF00_0000 | color` for painted
         // pixels, so rows copy verbatim and all padding is TRANSPARENT (0).
         let stride = self.alloc_width;
-        let mut pixels = Vec::with_capacity(width * height);
+        // `total` is the pixel count the cap check above bounded; the `min`
+        // cannot change it, and restates that bound AT the allocations, where
+        // the verifier can see it (it does not carry the early return down).
+        let total = total.min(SIXEL_MAX_PIXELS);
+        let mut pixels = Vec::with_capacity(total);
         let in_w = width.min(stride);
+        let pad = width.saturating_sub(in_w);
         for y in 0..height.min(self.alloc_height) {
             // In bounds: y < alloc_height and in_w <= stride, and the raster
-            // is exactly alloc_width * alloc_height long (ensure_capacity).
-            let start = y * stride;
-            pixels.extend_from_slice(&self.raster[start..start + in_w]);
+            // is exactly alloc_width * alloc_height long (ensure_capacity) —
+            // so `get` is always `Some`; one check per ROW, not per pixel.
+            let start = y.saturating_mul(stride);
+            if let Some(row) = self.raster.get(start..start.saturating_add(in_w)) {
+                pixels.extend_from_slice(row);
+            }
             // Right-edge pad for width > stride: never painted ⇒ transparent.
-            pixels.resize(pixels.len() + (width - in_w), TRANSPARENT);
+            pixels.resize(pixels.len().saturating_add(pad).min(total), TRANSPARENT);
         }
         // Rows at/below alloc_height were never painted ⇒ fully transparent.
-        pixels.resize(width * height, TRANSPARENT);
+        pixels.resize(total, TRANSPARENT);
         self.release();
         Some(SixelImage {
             width,
@@ -578,8 +592,8 @@ impl SixelDecoder {
                     // Single column (no DECGRI repeat) — the common case for a
                     // plain sixel stream. Store directly; `fill` over one
                     // element is pure overhead here.
-                    for row in 0..6 {
-                        if bits & (1 << row) == 0 {
+                    for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
+                        if bits & mask == 0 {
                             continue;
                         }
                         let py = self.band_top.saturating_add(row);
@@ -595,8 +609,8 @@ impl SixelDecoder {
                         }
                     }
                 } else {
-                    for row in 0..6 {
-                        if bits & (1 << row) == 0 {
+                    for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
+                        if bits & mask == 0 {
                             continue;
                         }
                         let py = self.band_top.saturating_add(row);
@@ -654,8 +668,8 @@ impl SixelDecoder {
             if px >= self.alloc_width {
                 break;
             }
-            for row in 0..6 {
-                if bits & (1 << row) == 0 {
+            for (row, mask) in SIXEL_ROW_MASKS.into_iter().enumerate() {
+                if bits & mask == 0 {
                     continue;
                 }
                 let py = self.band_top.saturating_add(row);

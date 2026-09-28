@@ -6,7 +6,8 @@
 //! the `apps/aterm-mac/Info.plist` template via in-process string substitution
 //! (CFBundleShortVersionString, sealed `CFBundleVersion = n`, ATermGitCommit
 //! with the `-dirty` rule matching aterm-gui/build.rs), copy the static
-//! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns), nest
+//! resources (ShellIntegration/, Help.html, Credits.html, aterm.icns) and the
+//! successor's handoff policy (`publish/handoff-policy.toml`), nest
 //! atpkg + aterm-ctl + aterm-cli in Contents/MacOS, and write the
 //! `dist/aterm-<ver>-build.txt` provenance record. No `.metadata_never_index` marker
 //! (see [`assemble`]: inert for Spotlight, and its one reader is deleted).
@@ -565,7 +566,63 @@ pub fn assemble(spec: &BundleSpec) -> Result<PathBuf, String> {
     // self-provisioning bundle — the client's own `atpkg` lane installs the
     // toolchain from the network on first launch, and nothing is sealed here.
 
+    // --- 6e. the successor's handoff policy (plan P0-5) ----------------------
+    // HERE, BEFORE `sign::sign_app`, and that order is the whole point: the
+    // signature seals `Contents/`, so the file the outgoing build reads from
+    // this bundle — only after this bundle passed its codesign check — is the
+    // one this cut wrote. Copied byte for byte from the checked-in source,
+    // after the same strict read the pre-claim gate ran.
+    let policy = place_handoff_policy(&spec.repo_root, &app)?;
+    println!("    handoff policy: {policy}");
+
     Ok(app)
+}
+
+/// Read the checked-in handoff policy
+/// ([`aterm_update_core::handoff_policy::SOURCE_PATH`]) the way the cutter
+/// must: strictly — an unknown key is a typo that would ship as a policy no
+/// producer follows, and the reserved `seamless` key is refused by name — and
+/// return its exact text with what it says. Shared by the pre-claim gate and
+/// the bundle step, so both judge the same bytes by the same rule.
+pub fn handoff_policy_for_cut(
+    repo_root: &Path,
+) -> Result<(String, aterm_update_core::handoff_policy::HandoffPolicy), String> {
+    use aterm_update_core::handoff_policy::{HandoffPolicy, MAX_POLICY_BYTES, SOURCE_PATH};
+    let path = repo_root.join(SOURCE_PATH);
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "read {}: {e} — every release seals a handoff policy into its bundle (empty is \
+             `schema = 1` alone)",
+            path.display()
+        )
+    })?;
+    if u64::try_from(text.len()).unwrap_or(u64::MAX) > MAX_POLICY_BYTES {
+        return Err(format!(
+            "{} is {} bytes; producers ignore a policy over {MAX_POLICY_BYTES}",
+            path.display(),
+            text.len()
+        ));
+    }
+    let policy = HandoffPolicy::parse_for_cut(&text).map_err(|why| {
+        format!(
+            "{} is not a policy producers can follow: {why}",
+            path.display()
+        )
+    })?;
+    Ok((text, policy))
+}
+
+/// Write the checked-in handoff policy into the bundle at
+/// [`aterm_update_core::handoff_policy::BUNDLE_PATH`], byte for byte, after
+/// [`handoff_policy_for_cut`] judged it. Returns what it says.
+pub fn place_handoff_policy(
+    repo_root: &Path,
+    app: &Path,
+) -> Result<aterm_update_core::handoff_policy::HandoffPolicy, String> {
+    let (text, policy) = handoff_policy_for_cut(repo_root)?;
+    let dest = app.join(aterm_update_core::handoff_policy::BUNDLE_PATH);
+    std::fs::write(&dest, text.as_bytes()).map_err(|e| format!("write {}: {e}", dest.display()))?;
+    Ok(policy)
 }
 
 fn copy_exe(src: &Path, dst: &Path) -> Result<(), String> {

@@ -86,6 +86,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         upgrading: false,
         taskless: false,
         person: None,
+        reach: Default::default(),
         login_back: false,
     }
 }
@@ -122,6 +123,14 @@ fn restarts(a: &TurnEndAction, want: &Restart, rule: &str) -> bool {
 fn typed(rule: &'static str) -> TurnEndAction {
     TurnEndAction::Type {
         text: "keep going".to_string(),
+        rule_id: rule,
+    }
+}
+
+/// A wall's act as typed: the vendor's line quoted ([`wall_retry_text`]).
+fn retried(rule: &'static str, cause: ApiCause, r: &TurnEndReading) -> TurnEndAction {
+    TurnEndAction::Type {
+        text: wall_retry_text(rule, cause, &r.wall_message),
         rule_id: rule,
     }
 }
@@ -526,7 +535,10 @@ fn a_529_backs_off_then_continues_exactly_once_per_step_for_ever() {
         at(&mut st, &same, t + MIN - Duration::from_secs(1)),
         TurnEndAction::WaitUntil { .. }
     ));
-    assert_eq!(act(&mut st, &same, t + MIN), typed(RULE_API_RETRY));
+    assert_eq!(
+        act(&mut st, &same, t + MIN),
+        retried(RULE_API_RETRY, ApiCause::Server, &same)
+    );
     assert!(
         awaits(&decide_turn_end(&st, &same, &cfg(), t + MIN), t + MIN),
         "the retry's point not seen yet"
@@ -542,13 +554,19 @@ fn a_529_backs_off_then_continues_exactly_once_per_step_for_ever() {
         at(&mut st, &back, again),
         TurnEndAction::WaitUntil { until, .. } if until == again + 5 * MIN
     ));
-    assert_eq!(act(&mut st, &same, again + 5 * MIN), typed(RULE_API_RETRY));
+    assert_eq!(
+        act(&mut st, &same, again + 5 * MIN),
+        retried(RULE_API_RETRY, ApiCause::Server, &same)
+    );
     let third = again + 6 * MIN;
     assert!(matches!(
         at(&mut st, &back, third),
         TurnEndAction::WaitUntil { until, .. } if until == third + 15 * MIN
     ));
-    assert_eq!(act(&mut st, &same, third + 15 * MIN), typed(RULE_API_RETRY));
+    assert_eq!(
+        act(&mut st, &same, third + 15 * MIN),
+        retried(RULE_API_RETRY, ApiCause::Server, &same)
+    );
     let mut next = third + 16 * MIN;
     for wait in [30, 60, 60, 60] {
         assert!(
@@ -557,7 +575,7 @@ fn a_529_backs_off_then_continues_exactly_once_per_step_for_ever() {
         );
         assert_eq!(
             act(&mut st, &same, next + wait * MIN),
-            typed(RULE_API_RETRY)
+            retried(RULE_API_RETRY, ApiCause::Server, &same)
         );
         next += (wait + 1) * MIN;
     }
@@ -588,6 +606,7 @@ fn an_api_error_is_retried_on_the_ladder_and_retries_off_escalate() {
         WallKind::ApiError {
             code: Some(400),
             retryable: false,
+            cause: aterm_phase::ApiCause::Server,
         },
         "API Error: 400 bad request",
         Some(3 * MIN),
@@ -597,7 +616,10 @@ fn an_api_error_is_retried_on_the_ladder_and_retries_off_escalate() {
         worked: None,
         ..r.clone()
     };
-    assert_eq!(at(&mut st, &same, t + MIN), typed(RULE_API_RETRY));
+    assert_eq!(
+        at(&mut st, &same, t + MIN),
+        retried(RULE_API_RETRY, ApiCause::Server, &same)
+    );
     let mut off = cfg();
     off.retry_api_errors = false;
     let mut st = TurnEndState::default();
@@ -1806,6 +1828,7 @@ fn a_wall_is_its_own_rules_even_where_the_upgrade_owns_the_turn_ends() {
             WallKind::ApiError {
                 code: Some(500),
                 retryable: true,
+                cause: aterm_phase::ApiCause::Server,
             },
             "API Error: 500 Internal server error",
         ),
@@ -1843,7 +1866,10 @@ fn a_wall_is_its_own_rules_even_where_the_upgrade_owns_the_turn_ends() {
         worked: None,
         ..overloaded
     };
-    assert_eq!(act(&mut st, &same, t + MIN), typed(RULE_API_RETRY));
+    assert_eq!(
+        act(&mut st, &same, t + MIN),
+        retried(RULE_API_RETRY, ApiCause::Server, &same)
+    );
 }
 
 /// THE CONTINUATION A WALL'S ACT OWES IS PAID AT A POINT THE UPGRADE OWNS.
@@ -2633,5 +2659,308 @@ fn a_persons_declined_question_is_held_for_the_grace() {
     assert!(
         first.rule_id().is_some(),
         "the control acts at once: {first:?}"
+    );
+}
+
+const ENOTFOUND: &str =
+    "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+
+fn api_wall(
+    cause: ApiCause,
+    message: &str,
+    worked: Option<Duration>,
+    reach: Reach,
+) -> TurnEndReading {
+    TurnEndReading {
+        reach,
+        ..walled(
+            WallKind::ApiError {
+                code: None,
+                retryable: cause != ApiCause::Config,
+                cause,
+            },
+            message,
+            worked,
+        )
+    }
+}
+
+/// The point read again with no work since.
+fn again(r: &TurnEndReading) -> TurnEndReading {
+    TurnEndReading {
+        worked: None,
+        ..r.clone()
+    }
+}
+
+/// AN API NEVER REACHED, ITS REACH NOT MEASURED (`drive watch`, a route the
+/// host cannot reproduce): tried on the SHORT ladder — 1, 2, 5, then every 5
+/// minutes from each appearance — in words that quote the vendor, never
+/// `keep going`, and never an ask.
+#[test]
+fn an_unreachable_wall_is_retried_on_the_short_ladder_while_its_reach_is_unknown() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let r = api_wall(
+        ApiCause::Unreachable,
+        ENOTFOUND,
+        Some(3 * MIN),
+        Reach::Unknown,
+    );
+    assert!(waits_until(&at(&mut st, &r, t), t + MIN));
+    let same = again(&r);
+    let want = retried(RULE_API_RETRY, ApiCause::Unreachable, &same);
+    assert_eq!(act(&mut st, &same, t + MIN), want);
+    let TurnEndAction::Type { text, .. } = &want else {
+        unreachable!()
+    };
+    assert!(
+        text.starts_with("Claude Code reported \"API Error: Can't reach"),
+        "{text}"
+    );
+    // Each try meets the wall again after the vendor's ~3 minutes of retries.
+    let mut next = t + MIN;
+    for wait in [2, 5, 5, 5] {
+        next += 3 * MIN;
+        assert!(
+            waits_until(&at(&mut st, &r, next), next + wait * MIN),
+            "{wait}"
+        );
+        assert_eq!(act(&mut st, &same, next + wait * MIN), want, "{wait}");
+        next += wait * MIN;
+    }
+}
+
+/// THE MEASURE DECIDES. The host measures the API definitely DOWN: nothing is
+/// typed into it for the hold (15 min), then one try all the same — so a
+/// wrong measure holds a worker no longer. It measures it reachable again:
+/// continued at once, in words that say so; met by the wall again, spaced on
+/// the short ladder. NEGATIVE CONTROL: the server's own failure ignores the
+/// measure — a 503 keeps its ladder under an Up.
+#[test]
+fn a_measured_outage_types_nothing_until_the_hold_and_a_reachable_api_at_once() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let down = api_wall(
+        ApiCause::Unreachable,
+        ENOTFOUND,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    assert!(waits_until(&at(&mut st, &down, t), t + 15 * MIN));
+    assert!(waits_until(
+        &at(&mut st, &again(&down), t + 14 * MIN),
+        t + 15 * MIN
+    ));
+    assert_eq!(
+        act(&mut st, &again(&down), t + 15 * MIN),
+        retried(RULE_API_RETRY, ApiCause::Unreachable, &down)
+    );
+    // The try meets the wall again; the API is measured back at +20 min.
+    let met = t + 18 * MIN;
+    assert!(waits_until(&at(&mut st, &down, met), met + 15 * MIN));
+    let up = TurnEndReading {
+        reach: Reach::Up {
+            since: met + 2 * MIN,
+        },
+        ..again(&down)
+    };
+    let back = retried(RULE_API_BACK, ApiCause::Unreachable, &up);
+    assert_eq!(act(&mut st, &up, met + 2 * MIN), back);
+    let TurnEndAction::Type { text, .. } = &back else {
+        unreachable!()
+    };
+    assert!(text.contains("the API is reachable again now"), "{text}");
+    // Met again under an Up: the measure was wrong, or the API still fails —
+    // the next back-act waits the ladder's first rung.
+    let later_ = met + 5 * MIN;
+    let up_again = TurnEndReading {
+        worked: Some(3 * MIN),
+        ..up.clone()
+    };
+    assert!(waits_until(&at(&mut st, &up_again, later_), later_ + MIN));
+    // The control: the server's own failure keeps its ladder under an Up.
+    let mut st = TurnEndState::default();
+    let server = TurnEndReading {
+        reach: Reach::Up { since: t },
+        ..walled(
+            WallKind::ApiError {
+                code: Some(503),
+                retryable: true,
+                cause: ApiCause::Server,
+            },
+            "API Error: 503 Service unavailable",
+            Some(3 * MIN),
+        )
+    };
+    assert!(waits_until(&at(&mut st, &server, t), t + MIN));
+}
+
+/// A REPLY CUT OFF (the Mac slept mid-response): continued at once, in words
+/// that say it may be incomplete; met again, on the short ladder. Under a
+/// measured outage it takes the hold like an unreachable API.
+#[test]
+fn a_cut_off_reply_is_continued_at_once_then_on_the_short_ladder() {
+    let sleep = "API Error: Your computer went to sleep mid-response. The response above may be \
+                 incomplete.";
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let r = api_wall(ApiCause::CutOff, sleep, Some(40 * MIN), Reach::Unknown);
+    let cut = retried(RULE_API_CUTOFF, ApiCause::CutOff, &r);
+    assert_eq!(act(&mut st, &r, t), cut);
+    let TurnEndAction::Type { text, .. } = &cut else {
+        unreachable!()
+    };
+    assert!(text.contains("your last reply may be incomplete"), "{text}");
+    // Met again after a minute of the vendor's retries: the ladder's first rung.
+    let met = t + MIN;
+    let quick = api_wall(ApiCause::CutOff, sleep, Some(MIN), Reach::Unknown);
+    assert!(waits_until(&at(&mut st, &quick, met), met + MIN));
+    let mut st = TurnEndState::default();
+    let down = api_wall(
+        ApiCause::CutOff,
+        sleep,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    assert!(waits_until(&at(&mut st, &down, t), t + 15 * MIN));
+}
+
+/// A CERTIFICATE OR PROXY REFUSAL is never an ask by default (a captive
+/// portal and an intercepting proxy clear by themselves): tried on the short
+/// ladder. The host's verified handshake is NO evidence it has gone — the
+/// host trusts the platform's store, the agent its own — so an `Up` leaves
+/// it on the same ladder, in words that never say the API is reachable
+/// again (the review of 2026-09-27: an inspecting root only the keychain
+/// trusts read Up at once, and "reachable again" was typed on every rung).
+/// NEGATIVE CONTROL: the same `Up` at an unreachable wall continues it at
+/// once under `api-back@v1`. Only `retry_api_errors = false` escalates it,
+/// as every API wall.
+#[test]
+fn a_certificate_or_proxy_refusal_is_retried_never_asked() {
+    let cert = "API Error: Unable to connect to API: Self-signed certificate detected";
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let r = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Unknown);
+    assert!(waits_until(&at(&mut st, &r, t), t + MIN));
+    assert_eq!(
+        act(&mut st, &again(&r), t + MIN),
+        retried(RULE_API_RETRY, ApiCause::Config, &r)
+    );
+    let mut st = TurnEndState::default();
+    let up = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Up { since: t });
+    assert!(waits_until(&at(&mut st, &up, t), t + MIN), "no act at once");
+    let tried = act(&mut st, &again(&up), t + MIN);
+    assert_eq!(tried, retried(RULE_API_RETRY, ApiCause::Config, &up));
+    let TurnEndAction::Type { text, .. } = &tried else {
+        unreachable!()
+    };
+    assert!(!text.contains("reachable"), "{text}");
+    // Met again under the same Up: the ladder's next rung, still a retry.
+    let met = t + 2 * MIN;
+    let again_up = api_wall(ApiCause::Config, cert, Some(MIN), Reach::Up { since: t });
+    assert!(waits_until(&at(&mut st, &again_up, met), met + 2 * MIN));
+    // The control: an unreachable wall under the same Up, at once.
+    let mut st = TurnEndState::default();
+    let back = api_wall(
+        ApiCause::Unreachable,
+        ENOTFOUND,
+        Some(MIN),
+        Reach::Up { since: t },
+    );
+    assert_eq!(
+        act(&mut st, &back, t),
+        retried(RULE_API_BACK, ApiCause::Unreachable, &back)
+    );
+    let mut off = cfg();
+    off.retry_api_errors = false;
+    let mut st = TurnEndState::default();
+    st.observe(&r, t);
+    assert!(is_escalate(
+        &decide_turn_end(&st, &r, &off, t),
+        "retry_api_errors is off"
+    ));
+}
+
+/// A RETRY THAT LED TO REAL WORK ENDS THE EPISODE. The supervisor journal of
+/// 2026-09-26: six sleep cut-offs in a row, each continuation working 14 to
+/// 63 minutes before the next. Each is a new wall, continued at once — never
+/// the sixth rung of one ladder. NEGATIVE CONTROL: a try that met the wall
+/// after only the vendor's own retries (3 minutes) climbs the ladder.
+#[test]
+fn a_retry_that_led_to_real_work_ends_the_episode() {
+    let sleep = "API Error: Your computer went to sleep mid-response. The response above may be \
+                 incomplete.";
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let mut now = t;
+    for worked in [14, 49, 63, 10, 32, 20] {
+        let r = api_wall(ApiCause::CutOff, sleep, Some(worked * MIN), Reach::Unknown);
+        assert_eq!(
+            act(&mut st, &r, now),
+            retried(RULE_API_CUTOFF, ApiCause::CutOff, &r),
+            "after {worked} min of work"
+        );
+        now += (worked + 1) * MIN;
+    }
+    let vendor_only = api_wall(ApiCause::CutOff, sleep, Some(3 * MIN), Reach::Unknown);
+    assert!(waits_until(&at(&mut st, &vendor_only, now), now + MIN));
+}
+
+/// THE OUTAGE OF 2026-09-27, 18:16–19:15Z. NEGATIVE CONTROL first: read as
+/// that day's supervisor read it — no wall — each `ENOTFOUND` after the
+/// vendor's ~3 minutes of retries is an ordinary turn end, continued at once
+/// with `keep going` (the journal's sixteen `CONTINUED … rule=continue@v1`).
+/// Then as it reads now: an unreachable wall the host measures down — tried
+/// once per hold, never at every appearance — and continued once, the
+/// moment the host measures the API back.
+#[test]
+fn the_2026_09_27_outage_is_held_then_continued_once_the_api_is_back() {
+    let t = t0();
+    let unread = TurnEndReading {
+        said_tail: Some(ENOTFOUND.to_string()),
+        ..idle(ENOTFOUND, Some(3 * MIN))
+    };
+    let mut st = TurnEndState::default();
+    let mut blind = 0;
+    for i in 0..14 {
+        let now = t + i * 3 * MIN;
+        if act(&mut st, &unread, now) == typed(RULE_CONTINUE) {
+            blind += 1;
+        }
+    }
+    assert_eq!(blind, 14, "the day's reading typed into every appearance");
+
+    let mut st = TurnEndState::default();
+    let down = api_wall(
+        ApiCause::Unreachable,
+        ENOTFOUND,
+        Some(3 * MIN),
+        Reach::Down { since: t },
+    );
+    let mut typed_into_outage = 0;
+    let mut now = t;
+    let back_at = t + 59 * MIN;
+    while now < back_at {
+        let a = act(&mut st, &down, now);
+        if matches!(a, TurnEndAction::Type { .. }) {
+            typed_into_outage += 1;
+            now += 3 * MIN; // the vendor's retries, then the wall again
+        } else {
+            now += MIN;
+            let _ = act(&mut st, &again(&down), now);
+        }
+    }
+    assert!(
+        typed_into_outage <= 4,
+        "one try per 15-minute hold at most, not one per appearance: {typed_into_outage}"
+    );
+    let up = TurnEndReading {
+        reach: Reach::Up { since: back_at },
+        ..again(&down)
+    };
+    assert_eq!(
+        act(&mut st, &up, back_at + Duration::from_secs(20)),
+        retried(RULE_API_BACK, ApiCause::Unreachable, &up)
     );
 }

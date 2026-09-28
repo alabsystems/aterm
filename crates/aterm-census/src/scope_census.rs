@@ -57,9 +57,9 @@
 //! because it is the recall knob rather than the safety obligation, and a
 //! vocabulary migration with no waiver channel would be rejected on contact.
 //!
-//! ONE implementation, THREE consumers, so verb, instrument and gate cannot
-//! diverge: `cargo xtask gate scope`, `cargo run -p aterm-census -- <root>
-//! --scope`, and tools/freeze-safety-gate/build.rs (obligation 5).
+//! ONE implementation, TWO consumers, so runner and gate cannot diverge: the
+//! `aterm-census` bin (`targo --unverified run -p aterm-census -- [<root>]
+//! --scope`), and tools/freeze-safety-gate/build.rs (obligation 5).
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -737,8 +737,9 @@ fn run_scope_census_over(
         let _ = writeln!(
             log,
             "gate scope: FAILED — {failures} obligation violation(s) across {} claim(s). \
-             This census blocks BOTH `cargo xtask gate scope` and the `cargo build` of \
-             tools/freeze-safety-gate. OB-13/14/15/16/18 have NO waiver channel.",
+             This census blocks BOTH `targo --unverified run -p aterm-census -- --scope` \
+             and the build of tools/freeze-safety-gate. OB-13/14/15/16/18 have NO waiver \
+             channel.",
             claims.len()
         );
         return CensusOutcome { ok: false, log };

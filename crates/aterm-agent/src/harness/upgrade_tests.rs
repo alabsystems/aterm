@@ -869,6 +869,7 @@ fn idle_facts() -> Facts {
         limited: false,
         login: false,
         undelivered: false,
+        queued: false,
         ready_s: 0,
         failed_s: 0,
     }
@@ -3071,13 +3072,20 @@ fn break_with_work() -> Facts {
 }
 
 /// ONE ROUND ON, ONE ROUND OFF: the rest is one round's worth of asking, so
-/// the nagging is at most half of any stretch, and the longest silence at an
-/// agent that can read is the give-up's window plus the rest.
+/// the nagging is at most half of any stretch, and the silence after a first
+/// stop that hears no late READY is the give-up's window plus the rest. That
+/// is NOT the longest silence: a late READY the agent's own work outlives
+/// adds a drain and a second rest ([`RETRY_S`]'s doc;
+/// `upgrade_stall_tests::the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest`).
 #[test]
 fn the_rest_is_one_rounds_worth_of_asking() {
     assert_eq!(RETRY_S, u64::from(MAX_ASKS) * REASK_S);
     assert_eq!(span(RETRY_S), "2h");
-    assert_eq!(span(REASK_S + RETRY_S), "2h30m", "the longest silence");
+    assert_eq!(
+        span(REASK_S + RETRY_S),
+        "2h30m",
+        "the silence after a first stop with no late READY"
+    );
 }
 
 /// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
@@ -3298,5 +3306,419 @@ fn a_limited_session_is_rearmed_but_never_asked_while_limited() {
             Step::Wait("limited")
         );
         assert_eq!(gate_announce(&limited), Gate::Wait("limited"));
+    }
+}
+
+// ------------------------------------ the notices queued behind a limit (2026-09-27)
+
+/// The owner's session of 2026-09-27 (`25e3b26e…`, tab
+/// `s-c543f4e0edd3439e5791`): its fourth notice's READY marker, as 0.93.0
+/// typed it.
+const QUEUED_MARKER: &str = "ATERM-UPGRADE-READY-6a57ff7a";
+
+fn json_text(text: &str) -> String {
+    aterm_json::to_string(&Value::from(text)).expect("json")
+}
+
+/// A notice with `marker`, typed at `ts`.
+fn notice_row(ts: &str, marker: &str) -> String {
+    let text = prepare_prompt(&v("2.1.280"), &v("2.1.283"), Source::Managed, marker);
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"timestamp":"{ts}","version":"2.1.280"}}"#,
+        json_text(&text)
+    )
+}
+
+/// CLAUDE CODE'S OWN ANSWER AT THE WEEKLY LIMIT, as the owner's transcript
+/// holds it (row 2427, 2026-09-27T15:06:40.380Z, the first notice's turn;
+/// ids cut, every key the readers look at kept).
+fn limit_row(ts: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"{ts}","message":{{"diagnostics":null,"id":"m","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 3 at 10am (America/Los_Angeles)"}}],"context_management":null}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":1791046800,"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.280"}}"#
+    )
+}
+
+/// A row of the session's own model saying `text` at `ts`.
+fn said_row(ts: &str, text: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"assistant","timestamp":"{ts}","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}]}},"version":"2.1.280"}}"#,
+        json_text(text)
+    )
+}
+
+/// A person's message at `ts` (the owner's `first, continue`).
+fn person_row(ts: &str, text: &str) -> String {
+    format!(
+        r#"{{"parentUuid":"p","isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"timestamp":"{ts}","version":"2.1.280"}}"#,
+        json_text(text)
+    )
+}
+
+/// A NOTICE THE LIMIT ANSWERED IS QUEUED, NEVER READ AS ASKED (the owner's
+/// report of 2026-09-27: 0.93.0 typed four notices into a session parked at
+/// its weekly limit, each answered within two seconds by Claude Code's
+/// `rate_limit` row, and when the session went on all four reached the agent
+/// at once). Its fate is `Queued` until the model writes a row of its own,
+/// and then `Taken` at that row's time — the moment its window opens. The
+/// login wall's reading is unchanged by it: a limit is no wall. NEGATIVE
+/// CONTROLS: a notice the model answered is `Answered`, one the wall
+/// answered `Wall`, one nothing has answered yet `Open`; a limit hit BEFORE
+/// the notice (the wind-down turn's) leaves the notice's own fate its own; an
+/// API error that is no limit and a warning are passed over; a subagent's
+/// limit is not the session's; a limit row Claude Code writes without the
+/// `error` key is read by the wall table's words.
+#[test]
+fn a_notice_the_limit_answered_is_queued_until_the_model_takes_it() {
+    let m = QUEUED_MARKER;
+    let notice = notice_row("2026-09-27T15:06:39.624Z", m);
+    let queued = [notice.clone(), limit_row("2026-09-27T15:06:40.380Z")].join("\n");
+    assert_eq!(notice_fate_of(&queued, m), Some(NoticeFate::Queued));
+    assert_eq!(notice_fate(&queued, m), Some(false), "a limit is no wall");
+    assert!(!notice_undelivered(&queued, m));
+    let taken = [
+        queued.clone(),
+        person_row("2026-09-27T19:57:55.873Z", "first, continue"),
+        said_row(
+            "2026-09-27T19:58:05.554Z",
+            "I'm pushing first. After that I'll get to a clean stopping point for the upgrade.",
+        ),
+    ]
+    .join("\n");
+    assert_eq!(
+        notice_fate_of(&taken, m),
+        Some(NoticeFate::Taken(Some(1_790_539_085))),
+        "taken when the model first wrote after it"
+    );
+    // HOW LONG IT WAITS ON ITS LIMIT (review of 2026-09-27): the reset its
+    // row names; a row naming none, REASK_S from when it was written; a
+    // `/login` finished since, over (0) — in both of Claude Code's shapes.
+    assert_eq!(queued_until(&queued, m), Some(1_791_046_800));
+    let unstamped = [
+        notice.clone(),
+        limit_row("2026-09-27T15:06:40.380Z").replace(r#""resetsAt":1791046800,"#, ""),
+    ]
+    .join("\n");
+    assert_eq!(queued_until(&unstamped, m), Some(1_790_521_600 + REASK_S));
+    let login_2_1_281 = person_row(
+        "2026-09-27T19:57:47Z",
+        "<local-command-stdout>Login successful</local-command-stdout>",
+    );
+    let login_2_1_283 = r#"{"isSidechain":false,"type":"system","subtype":"local_command","content":"<local-command-stdout>Login successful</local-command-stdout>","timestamp":"2026-09-27T19:57:47Z"}"#;
+    for login in [login_2_1_281.as_str(), login_2_1_283] {
+        let switched = [queued.as_str(), login].join("\n");
+        assert_eq!(notice_fate_of(&switched, m), Some(NoticeFate::Queued));
+        assert_eq!(queued_until(&switched, m), Some(0), "{login}");
+        let hit_again = [switched.clone(), limit_row("2026-09-27T19:58:00Z")].join("\n");
+        assert_eq!(
+            queued_until(&hit_again, m),
+            Some(1_791_046_800),
+            "a limit again after the login holds it again"
+        );
+    }
+    assert_eq!(queued_until(&taken, m), None, "taken: no longer queued");
+    // NEGATIVE CONTROLS.
+    let answered = [notice.clone(), said_row("2026-09-27T15:06:50Z", "Saved.")].join("\n");
+    assert_eq!(notice_fate_of(&answered, m), Some(NoticeFate::Answered));
+    assert_eq!(queued_until(&answered, m), None);
+    let wound_down = [
+        limit_row("2026-09-27T15:04:28.344Z"),
+        notice.clone(),
+        said_row("2026-09-27T15:07:00Z", "Saved."),
+    ]
+    .join("\n");
+    assert_eq!(
+        notice_fate_of(&wound_down, m),
+        Some(NoticeFate::Answered),
+        "a limit before the notice is not its answer"
+    );
+    assert_eq!(notice_fate_of(&notice, m), Some(NoticeFate::Open));
+    assert_eq!(
+        notice_fate_of(&queued, "ATERM-UPGRADE-READY-00000000"),
+        None
+    );
+    let overloaded = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"API Error: 529 Overloaded"}]},"isApiErrorMessage":true,"error":"unknown"}"#;
+    assert_eq!(
+        notice_fate_of(&[notice.as_str(), overloaded].join("\n"), m),
+        Some(NoticeFate::Open),
+        "an API error that is no limit is passed over, as before"
+    );
+    let warning = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"Approaching usage limit · resets 7:30pm"}]},"isApiErrorMessage":true}"#;
+    assert_eq!(
+        notice_fate_of(&[notice.as_str(), warning].join("\n"), m),
+        Some(NoticeFate::Open),
+        "a warning is no limit"
+    );
+    let subagent = limit_row("2026-09-27T15:06:40Z")
+        .replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert_eq!(
+        notice_fate_of(&[notice.clone(), subagent].join("\n"), m),
+        Some(NoticeFate::Open),
+        "a subagent's limit is not the session's"
+    );
+    let unkeyed = limit_row("2026-09-27T15:06:40Z")
+        .replace(r#""error":"rate_limit","#, "")
+        .replace("weekly limit", "session limit");
+    assert_eq!(
+        notice_fate_of(&[notice, unkeyed].join("\n"), m),
+        Some(NoticeFate::Queued),
+        "the wall table's words read it"
+    );
+}
+
+/// THE REDUCER ON A QUEUED NOTICE: one queued behind the limit (read
+/// [`Facts::limited`] by the driver) is never asked again or given up on
+/// however long it waits, and its window waits with it. NEGATIVE CONTROL:
+/// the same notice read and left with no READY is given up on after the
+/// last ask, as before — a round that then rests and asks again
+/// ([`RETRY_S`]).
+#[test]
+fn a_queued_notice_is_never_given_up_on() {
+    let tired = Phase::Announced {
+        at_s: 1_000,
+        asks: MAX_ASKS,
+    };
+    let late = 1_000 + REASK_S;
+    let queued = Facts {
+        limited: true,
+        ..idle_facts()
+    };
+    for now in [late, late + 10 * REASK_S] {
+        assert_eq!(
+            next_step(&tired, &queued, false, now),
+            Step::Wait("limited")
+        );
+    }
+    assert_eq!(
+        clock_held(&tired, &queued, late),
+        Phase::Announced {
+            at_s: late,
+            asks: MAX_ASKS
+        },
+        "its window waits with it"
+    );
+    // NEGATIVE CONTROL.
+    assert_eq!(next_step(&tired, &idle_facts(), false, late), Step::GiveUp);
+    assert_eq!(
+        next_step(
+            &tired,
+            &Facts {
+                background_point: true,
+                status: "busy".to_string(),
+                ..idle_facts()
+            },
+            false,
+            late
+        ),
+        Step::GiveUp
+    );
+}
+
+/// THE LIMIT'S RESET, FROM THE TRANSCRIPT ([`transcript_limit_until`]): while
+/// the session's last word is Claude Code's limit row, the instant it names
+/// (`quotaLimits.resetsAt`) is how long the session stands at its limit —
+/// what keeps even a first notice out of it once the banner has left the
+/// screen. Claude Code's other rows of its own are passed over. A limit row
+/// naming no reset holds [`REASK_S`] from when it was written, as a notice
+/// queued behind one waits (review of 2026-09-27: read as no limit, a
+/// pending upgrade typed a fresh notice minutes after one). NEGATIVE
+/// CONTROLS: the model answering after it ends it; a row naming neither a
+/// reset nor a time, a subagent's and none at all say nothing.
+#[test]
+fn the_limit_stands_until_the_reset_its_row_names() {
+    let limit = limit_row("2026-09-27T15:04:28.344Z");
+    let answered = said_row("2026-09-27T14:00:00Z", "Working.");
+    let no_response = r#"{"isSidechain":false,"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#;
+    assert_eq!(
+        transcript_limit_until(&[answered.clone(), limit.clone()].join("\n")),
+        Some(1_791_046_800)
+    );
+    assert_eq!(
+        transcript_limit_until(&[limit.as_str(), no_response].join("\n")),
+        Some(1_791_046_800),
+        "passed over"
+    );
+    // NEGATIVE CONTROLS.
+    let later = said_row("2026-09-27T19:58:05.554Z", "Pushing first.");
+    assert_eq!(
+        transcript_limit_until(&[limit.clone(), later].join("\n")),
+        None
+    );
+    let unstamped = limit.replace(r#""resetsAt":1791046800,"#, "");
+    assert_eq!(
+        transcript_limit_until(&unstamped),
+        Some(1_790_521_468 + REASK_S),
+        "no reset named: REASK_S from its row"
+    );
+    let untimed = unstamped.replace(r#""timestamp":"2026-09-27T15:04:28.344Z","#, "");
+    assert!(!untimed.contains("timestamp"), "{untimed}");
+    assert_eq!(transcript_limit_until(&untimed), None);
+    let subagent = limit.replace(r#""isSidechain":false"#, r#""isSidechain":true"#);
+    assert_eq!(
+        transcript_limit_until(&[answered.clone(), subagent].join("\n")),
+        None
+    );
+    assert_eq!(transcript_limit_until(&answered), None);
+    assert_eq!(transcript_limit_until(""), None);
+    // A `/login` that finished after it ends it (review of 2026-09-27: the
+    // owner's `Login successful` at 19:57:47Z, an account switched, the
+    // reset days off) — and a limit hit again after it stands again.
+    let login = person_row(
+        "2026-09-27T19:57:47Z",
+        "<local-command-stdout>Login successful</local-command-stdout>",
+    );
+    assert_eq!(
+        transcript_limit_until(&[limit.clone(), login.clone()].join("\n")),
+        None
+    );
+    assert_eq!(
+        transcript_limit_until(&[login, limit].join("\n")),
+        Some(1_791_046_800),
+        "a login before the limit ends nothing"
+    );
+}
+
+/// THE COPIES OF A QUEUED NOTICE, COUNTED UNTIL THE MODEL TAKES ONE
+/// ([`REQUEUE_MAX`]): every upgrade notice typed since the model's last row
+/// of its own is one more in the conversation, untaken — this notice's copies
+/// and another's (an earlier round's: review of 2026-09-27), whatever
+/// answered each (a limit, the login wall: the same review — a wall's answer
+/// restarted the count, and limit and wall answers in turn could stack more
+/// than the bound); a `/login` between them takes none (the copies stay); a
+/// row of the model's own starts the count again. The FULL queue's rest
+/// ([`Scan::rests_until`]) counts from the latest copy's limit row: its
+/// reset, or [`REASK_S`] after a row naming none, then [`RETRY_S`]. NEGATIVE
+/// CONTROLS: a notice not queued — answered, taken, open behind a queued
+/// copy — has none counted, and no rest; a marker nothing carries, none.
+#[test]
+fn the_copies_of_a_queued_notice_are_counted_until_the_model_takes_one() {
+    let m = QUEUED_MARKER;
+    let at = |h: u32| format!("2026-09-27T{h:02}:06:39Z");
+    let copy = |h: u32, marker: &str| [notice_row(&at(h), marker), limit_row(&at(h))];
+    let rows = |parts: &[&[String]]| parts.concat().join("\n");
+    assert_eq!(queued_copies(&rows(&[&copy(15, m)]), m), 1);
+    let three = rows(&[&copy(15, m), &copy(16, m), &copy(17, m)]);
+    assert_eq!(queued_copies(&three, m), 3);
+    assert_eq!(queued_until(&three, m), Some(1_791_046_800));
+    let login = person_row(
+        "2026-09-27T15:30:00Z",
+        "<local-command-stdout>Login successful</local-command-stdout>",
+    );
+    assert_eq!(
+        queued_copies(&rows(&[&copy(15, m), &[login], &copy(16, m)]), m),
+        2,
+        "a /login takes no copy"
+    );
+    let took = [
+        person_row("2026-09-27T15:40:00Z", "first, continue"),
+        said_row("2026-09-27T15:40:10Z", "Pushing first."),
+    ];
+    assert_eq!(
+        queued_copies(&rows(&[&copy(15, m), &copy(16, m), &took, &copy(17, m)]), m),
+        1,
+        "the model's row starts the count again"
+    );
+    // NEGATIVE CONTROLS.
+    let taken = rows(&[&copy(15, m), &copy(16, m), &took]);
+    assert!(matches!(
+        notice_fate_of(&taken, m),
+        Some(NoticeFate::Taken(_))
+    ));
+    assert_eq!(queued_copies(&taken, m), 0, "taken");
+    let answered = rows(&[
+        &copy(15, m),
+        &[
+            notice_row(&at(16), m),
+            said_row("2026-09-27T16:06:50Z", "Saved."),
+        ],
+    ]);
+    assert_eq!(queued_copies(&answered, m), 0, "answered");
+    let open = rows(&[&copy(15, m), &[notice_row(&at(16), m)]]);
+    assert_eq!(notice_fate_of(&open, m), Some(NoticeFate::Open));
+    assert_eq!(queued_copies(&open, m), 0, "open");
+    let other = "ATERM-UPGRADE-READY-504f8ea5";
+    assert_eq!(
+        queued_copies(
+            &rows(&[&copy(15, other), &copy(16, other), &copy(17, m)]),
+            m
+        ),
+        3,
+        "another notice's copies wait untaken in the same conversation"
+    );
+    let walled = r#"{"isSidechain":false,"type":"assistant","timestamp":"2026-09-27T16:06:40Z","message":{"model":"<synthetic>","content":[{"type":"text","text":"Login expired · Please run /login"}]},"isApiErrorMessage":true,"error":"authentication_failed"}"#;
+    assert_eq!(
+        queued_copies(
+            &rows(&[
+                &copy(15, m),
+                &[notice_row(&at(16), m), walled.to_string()],
+                &copy(17, m)
+            ]),
+            m
+        ),
+        3,
+        "a copy the login wall answered is untaken too"
+    );
+    assert_eq!(queued_copies(&three, "ATERM-UPGRADE-READY-00000000"), 0);
+
+    // THE REST of a full queue, from the latest copy's limit row.
+    let scan = notice_scan(&three, m).expect("queued");
+    assert_eq!(
+        scan.rests_until(),
+        Some(1_791_046_800 + RETRY_S),
+        "a named reset, then the rest"
+    );
+    let unnamed = three.replace(r#""resetsAt":1791046800,"#, "");
+    let last_row = notice_scan(&unnamed, m)
+        .and_then(|scan| scan.answered_at)
+        .expect("the last limit row's time");
+    assert_eq!(
+        notice_scan(&unnamed, m).and_then(|scan| scan.rests_until()),
+        Some(last_row + REASK_S + RETRY_S),
+        "no reset named: REASK_S, then the rest"
+    );
+    assert_eq!(notice_scan(&taken, m).and_then(|s| s.rests_until()), None);
+    assert_eq!(notice_scan(&open, m).and_then(|s| s.rests_until()), None);
+
+    // A queue past its room rests longer for every copy unread: five
+    // copies, the named reset, then eight hours.
+    let five = rows(&[
+        &copy(13, m),
+        &copy(14, m),
+        &copy(15, m),
+        &copy(16, m),
+        &copy(17, m),
+    ]);
+    assert_eq!(
+        notice_scan(&five, m).and_then(|scan| scan.rests_until()),
+        Some(1_791_046_800 + 4 * RETRY_S),
+        "five unread: the rest doubled twice"
+    );
+}
+
+/// THE FULL QUEUE'S REST GROWS WITH EVERY COPY UNREAD, UP TO A DAY (the
+/// owner, 2026-09-27: a limit naming no reset still added a copy every two
+/// and a half hours for as long as it stood): two hours for the queue at its
+/// room's end (`1 + REQUEUE_MAX` unread), then four, eight and sixteen, then
+/// a day for every count past that — `QUEUE_REST_DOUBLINGS` rests shorter
+/// than a day. NEGATIVE CONTROLS: the rest never exceeds a day, however many
+/// wait (a count the scan saturates at), and a queue with room — which types
+/// again straight away, never after a rest — reads the first rest.
+#[test]
+fn a_full_queues_rest_doubles_per_copy_unread_up_to_a_day() {
+    let full = REQUEUE_MAX + 1;
+    assert_eq!(RETRY_S, 2 * 3_600);
+    assert_eq!(QUEUE_REST_MAX_S, 86_400);
+    assert_eq!(QUEUE_REST_DOUBLINGS, 4);
+    let hours: Vec<u64> = (full..full + 7).map(|n| queue_rest(n) / 3_600).collect();
+    assert_eq!(hours, [2, 4, 8, 16, 24, 24, 24]);
+    let short = (full..full + 20)
+        .filter(|n| queue_rest(*n) < QUEUE_REST_MAX_S)
+        .count();
+    assert_eq!(short, usize::try_from(QUEUE_REST_DOUBLINGS).expect("small"));
+    // NEGATIVE CONTROLS.
+    for n in [full + 30, 1_000, u32::MAX] {
+        assert_eq!(queue_rest(n), QUEUE_REST_MAX_S, "{n}");
+    }
+    for n in 0..full {
+        assert_eq!(queue_rest(n), RETRY_S, "{n}");
     }
 }

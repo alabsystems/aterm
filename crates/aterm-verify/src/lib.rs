@@ -70,10 +70,18 @@
 //!  * Independent stages run CONCURRENTLY ([`sched`]) while the OUTPUT stays in
 //!    the ladder's declared order, so the run stays scannable. Concurrency is
 //!    constrained by the resource each stage actually contends for (see
-//!    [`plan::Lane`]) and the stages that MEASURE — the measuring tests
+//!    [`plan::Lane`]) and the stages whose verdict depends on the clock — the
+//!    deadline tests ([`stages::DEADLINE_TESTS`]), the measuring tests
 //!    ([`stages::MEASURING_TESTS`]) and the two smokes — run exclusively, because
 //!    a gate that decides "present starvation" while a lint compiles on the other
 //!    seven cores would be measuring the gate, not the build.
+//!  * TWO TIERS (2026-09-26, [`plan::Tier`]). The merge contract — a bare
+//!    `tools/verify.sh` — is the LAND tier: correctness. The stages that measure
+//!    the machine or the release artifact ([`plan::MEASURE_TIER`]) are the
+//!    MEASURE tier, run by `--measure` and `--full`, named in the default run's
+//!    verdict as `not part of the merge contract`, recorded as `measured yes|no`
+//!    in the receipt ([`verdict::measured`]) and required by the release cutter
+//!    for the tree it cuts.
 //!  * Exit codes distinguish FAILED from COULD-NOT-RUN (`1` vs `3`) — the
 //!    distinction the 633-line BLOCKING `.githooks/pre-push` reasoned about
 //!    before it was demoted to advisory on 2026-08-24 (it had separate "✗ LINT
@@ -107,7 +115,9 @@
 //!    git checkout with a Trust stage2 installed, which is to say: never.
 
 pub mod changed;
+pub mod checkers;
 pub mod cli;
+pub mod differential;
 pub mod disk;
 pub mod exec;
 pub mod glob;
@@ -128,6 +138,7 @@ pub mod smoke;
 pub mod smoke_stages;
 pub mod snapshot;
 pub mod stages;
+pub mod testrun;
 pub mod toolchain;
 pub mod verdict;
 
@@ -311,6 +322,22 @@ pub struct Ctx {
     /// until the hour-long test stage ahead of it printed; this line is the
     /// early read, and it names the outcome.
     pub progress_log: Option<std::fs::File>,
+    /// `--baseline`: this run records main's own reds — HEAD must be a clean
+    /// commit of `origin/main` — and publishes its receipt for branches to be
+    /// judged against ([`differential`]).
+    pub baseline: bool,
+    /// `--test-jobs`: how many test binaries the test stage runs at once
+    /// ([`testrun`]; [`testrun::DEFAULT_JOBS`] unless the flag says otherwise).
+    pub test_jobs: u32,
+    /// The `RUST_TEST_THREADS` [`Ctx::with_pinned_child_facts`] pinned, which
+    /// the test stage divides between the binaries it runs at once. `None`
+    /// until it pinned one ([`Ctx::test_threads`] then answers the machine's
+    /// parallelism, as the pin would).
+    pub test_threads: Option<u32>,
+    /// The program cargo runs in place of each test binary to record it
+    /// ([`testrun::RECORD_FLAG`]): this very binary, unless a test names the
+    /// built `aterm-verify` because it runs the gate in-process.
+    pub test_recorder: Option<PathBuf>,
 }
 
 /// The git stamp [`Ctx::with_pinned_child_facts`] hands every child: the inputs
@@ -449,7 +476,67 @@ impl Ctx {
             disk_floor: None,
             disk_free: None,
             progress_log: None,
+            baseline: false,
+            test_jobs: testrun::DEFAULT_JOBS,
+            test_threads: None,
+            test_recorder: None,
         }
+    }
+
+    /// The cores a load average is read against: the machine's parallelism.
+    #[must_use]
+    pub fn cores(&self) -> u32 {
+        std::thread::available_parallelism()
+            .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+    }
+
+    /// How many test binaries run at once ([`Ctx::test_jobs`], at least one).
+    #[must_use]
+    pub fn test_jobs(&self) -> usize {
+        usize::try_from(self.test_jobs.max(1)).unwrap_or(1)
+    }
+
+    /// The `RUST_TEST_THREADS` the run pinned, or the machine's parallelism.
+    #[must_use]
+    pub fn test_threads(&self) -> u32 {
+        self.test_threads.unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map_or(1, |n| u32::try_from(n.get()).unwrap_or(u32::MAX))
+        })
+    }
+
+    /// The recording runner ([`Ctx::test_recorder`]): the named program, else
+    /// this process's own executable.
+    #[must_use]
+    pub fn test_recorder(&self) -> Option<PathBuf> {
+        self.test_recorder
+            .clone()
+            .or_else(|| std::env::current_exe().ok())
+    }
+
+    /// `--test-jobs <n>` ([`Ctx::test_jobs`]).
+    #[must_use]
+    pub fn with_test_jobs(mut self, jobs: Option<std::num::NonZeroU32>) -> Self {
+        if let Some(n) = jobs {
+            self.test_jobs = n.get();
+        }
+        self
+    }
+
+    /// A `--baseline` run ([`Ctx::baseline`]).
+    #[must_use]
+    pub fn with_baseline(mut self, baseline: bool) -> Self {
+        self.baseline = baseline;
+        self
+    }
+
+    /// The checkout the caller ran the gate from: the snapshot's source, or
+    /// the root itself. Receipts and the base are read and written there.
+    #[must_use]
+    pub fn caller_root(&self) -> PathBuf {
+        self.snapshot_of
+            .clone()
+            .unwrap_or_else(|| self.root.clone())
     }
 
     /// This run's root is a snapshot of `caller`. `tree` is the state the
@@ -567,6 +654,7 @@ impl Ctx {
         );
         self.notes
             .push(format!("child env: RUST_TEST_THREADS pinned to {threads}"));
+        self.test_threads = threads.parse().ok();
         self.child_env_add
             .push(("RUST_TEST_THREADS".into(), threads.into()));
         self
@@ -720,23 +808,30 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 /// Run the whole gate: ladder and verdict. Returns the process exit code.
 ///
 /// `out` receives, in this order: the [`toolchain_header`] line, the lease line,
-/// the prelude rungs, the `verify: source …` line (a git root only) and any
-/// `verify:` notes (the snapshot's lanes, the pinned child facts), `verify:
+/// the prelude rungs, the `verify: NARROWED …` line ([`narrowing_note`]) for a
+/// `--changed` or `--scope` run, the `verify: source …` line (a git root only),
+/// the `verify: checkers …` line ([`checkers`]) and any `verify:` notes (the
+/// snapshot's lanes, the pinned child facts), the `verify: base …` line (what
+/// the run is judged against, [`differential`]; a git root only), `verify:
 /// lanes over the cap: …` lines naming any lane the cap could not remove, the
 /// `verify: disk …` line (the free space on the volume holding the run's root,
 /// what its lanes hold, and what this run needs — with the terms of the sum,
 /// or as the `--disk-floor` in force), the ladder in declared order with a
-/// `  time  ` line under each stage — or, in its place, a `source identity`
-/// COULD NOT RUN row for a git checkout the gate cannot read, or a `disk
+/// `  time  ` line under each stage (with the machine's load at its two ends
+/// when it could be read) — or, in its place, a `source identity` COULD NOT
+/// RUN row for a git checkout the gate cannot read, a `baseline preflight`
+/// COULD NOT RUN row for a `--baseline` that cannot be one, or a `disk
 /// preflight` COULD NOT RUN row for a volume with less free than that
-/// ([`disk`]) — the `source identity` row when the toolchain or the source
-/// tree moved mid-run, and the verdict (or the gate-defect `FAIL` and
-/// `VERIFY: COULD NOT RUN` lines) — byte-for-byte in the vocabulary
-/// `tools/verify.sh` established. Live progress goes to stderr so a long stage
-/// is not silent without polluting the scannable part, and every stage's
-/// [`finish_line`] — its outcome word included — goes to [`Ctx::progress_log`]
-/// the moment the stage ends, in the order stages FINISH rather than the order
-/// they print.
+/// ([`disk`]) — the `source identity` row when the toolchain, a spec checker
+/// or the source tree moved mid-run, the `verify: MEASURE tier — …` line of a
+/// run of the MEASURE tier, the verdict (or the gate-defect `FAIL` and
+/// `VERIFY: COULD NOT RUN` lines), and after it the `verify: baseline …` line
+/// of a `--baseline` run (its receipt is filed only once the verdict is out)
+/// — byte-for-byte in the vocabulary `tools/verify.sh` established. Live
+/// progress goes to stderr so a long stage is not silent
+/// without polluting the scannable part, and every stage's [`finish_line`] —
+/// its outcome word included — goes to [`Ctx::progress_log`] the moment the
+/// stage ends, in the order stages FINISH rather than the order they print.
 ///
 /// # Errors
 /// Propagates write failures on `out`.
@@ -760,8 +855,13 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     let _lease = if ctx.tools.have_targo() {
         let prefix = toolchain::atpkg_prefix(&ctx.env.home, ctx.env.xdg_config_home.as_deref());
         let who = format!(
-            "aterm-verify (pid {}) \u{2014} the merge contract in {}",
+            "aterm-verify (pid {}) \u{2014} {} in {}",
             std::process::id(),
+            if ctx.mode.runs(plan::Tier::Land) {
+                "the merge contract"
+            } else {
+                "the MEASURE tier"
+            },
             ctx.root.display()
         );
         let taken = lease::take(&prefix, &ctx.tools.stage2_dir, &who, lease::WAIT);
@@ -775,20 +875,34 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     for r in &ctx.prelude {
         out.write_all(r.render().as_bytes())?;
     }
+    // A NARROWED RUN SAYS SO BEFORE IT SPENDS AN HOUR (2026-09-26): until then
+    // the only word that a `--changed` or `--scope` run cannot discharge the
+    // merge contract was its verdict, printed after the whole ladder.
+    if let Some(note) = narrowing_note(&ctx.scope) {
+        writeln!(out, "{note}")?;
+    }
 
     // WHAT THIS RUN IS VERIFYING, captured before anything is planned and
     // re-checked while it runs (2026-09-13). The 14 h run this answers was
     // pulled four times mid-ladder and printed one verdict over all of them.
+    // The toolchain half carries the spec checkers the tests will run
+    // (2026-09-26, [`checkers`]): resolved once, here, named on the ladder
+    // and in the receipt, and re-resolved with the compiler before every stage.
+    let mut toolchain = ctx.tools.identity(&ctx.path_env, &ctx.scratch);
+    toolchain.checkers = Some(checkers::Checkers::capture(&ctx.env.home, &ctx.path_env));
     let tripwire = identity::Tripwire::arm_against(
         &ctx.root,
         &ctx.path_env,
         ctx.source_baseline.clone(),
-        ctx.tools.identity(&ctx.path_env, &ctx.scratch),
+        toolchain,
     );
     if let Some(line) =
         tripwire.header_line(&snapshot::place(&ctx.root, ctx.snapshot_of.as_deref()))
     {
         out.write_all(line.as_bytes())?;
+    }
+    if let Some(c) = &tripwire.toolchain.checkers {
+        out.write_all(c.header_line().as_bytes())?;
     }
     for note in &ctx.notes {
         writeln!(out, "{note}")?;
@@ -807,6 +921,55 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         out.write_all(verdict.text.as_bytes())?;
         out.flush()?;
         return Ok(verdict.exit);
+    }
+
+    // WHAT THIS RUN IS JUDGED AGAINST, settled before anything is spent
+    // (2026-09-26, [`differential`]): main's receipt for the run's base, or
+    // the absolute rule and why. A `--baseline` that cannot be one — a dirty
+    // tree, a HEAD that is not main's — is refused here, before an hour of
+    // stages, and leaves no receipt: it would record reds that are not main's.
+    let caller = ctx.caller_root();
+    let head = match &tripwire.source {
+        identity::SourceIdentity::Git(tree) => Some(tree),
+        _ => None,
+    };
+    if ctx.baseline {
+        let refusal = match head {
+            Some(tree) => {
+                differential::baseline_refusal(&caller, &tree.head, !tree.dirty.is_empty())
+            }
+            None => Some("this root is not a git checkout, so it has no commit to baseline".into()),
+        };
+        if let Some(why) = refusal {
+            let mut r = Report::new("baseline preflight");
+            r.cannot_run(format!("--baseline refused: {why}"));
+            out.write_all(r.render().as_bytes())?;
+            let mut reports = ctx.prelude.clone();
+            reports.push(r);
+            let verdict = verdict::verdict(ctx.mode, &ctx.scope, &ladder::tally(&reports));
+            out.write_all(verdict.text.as_bytes())?;
+            out.flush()?;
+            return Ok(verdict.exit);
+        }
+    }
+    // A base serves only a run made by the tools it was made by (2026-09-27,
+    // third review): this run's, as its receipt will name them.
+    let tools = run_tools(ctx, &tripwire);
+    // A `--measure` run is judged by the absolute rule: the MEASURE tier is
+    // not part of the merge contract, and a release cut takes its receipt only
+    // when nothing in it was red — so no red of it is ever inherited.
+    let base_plan = head.map(|tree| {
+        if ctx.mode.runs(plan::Tier::Land) {
+            differential::resolve(&caller, &tree.head, ctx.baseline, &tools)
+        } else {
+            differential::Plan::Absolute {
+                why: MEASURE_IS_ABSOLUTE.to_string(),
+                chain: None,
+            }
+        }
+    });
+    if let (Some(plan), Some(tree)) = (&base_plan, head) {
+        out.write_all(plan.header_line(ctx.baseline, &tree.head).as_bytes())?;
     }
 
     // THE DISK, before anything is built (2026-09-21). Two contract runs died
@@ -871,7 +1034,13 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // say which — the progress lines that could have were never written to a
     // file. The line decides nothing; `decisions` readers skip it.
     let t0 = Instant::now();
-    let clocks: Mutex<Vec<Option<(Duration, Duration)>>> = Mutex::new(vec![None; plan.len()]);
+    type Clock = (Duration, Duration, Option<ladder::StageLoad>);
+    let clocks: Mutex<Vec<Option<Clock>>> = Mutex::new(vec![None; plan.len()]);
+    // THE MACHINE'S LOAD AT EACH STAGE'S START AND END (2026-09-26), on the
+    // stage's `time` line, in the receipt and under the verdict's timing
+    // label ([`ladder::StageLoad`]) — until then only the opt-in `--timings`
+    // TSV (retired 2026-09-27) knew whether a red came from a busy machine.
+    let cores = ctx.cores();
 
     // Stages run concurrently, so a long one would otherwise be silent until its
     // turn to print arrives. The START line is stderr-only and terminal-only.
@@ -886,6 +1055,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         |spec| {
             let started = Instant::now();
             let begun = t0.elapsed();
+            let load_start = exec::load_average();
             if progress {
                 eprintln!("verify: start  {}", spec.title);
             }
@@ -902,6 +1072,9 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             };
             tripwire.stage_finished();
             let ran = started.elapsed();
+            let load_end = exec::load_average();
+            let mut report = report;
+            report.load = ladder::StageLoad::of(load_start, load_end, cores);
             let finished = finish_line(&spec.title, outcome_word(&report), begun, ran);
             if progress {
                 eprint!("{finished}");
@@ -914,7 +1087,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             if let Some(i) = plan.iter().position(|s| std::ptr::eq(s, spec))
                 && let Ok(mut c) = clocks.lock()
             {
-                c[i] = Some((begun, ran));
+                c[i] = Some((begun, ran, report.load));
             }
             report
         },
@@ -924,8 +1097,8 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
             // the script wrote unbuffered, and a buffered port would look hung.
             let clock = clocks.lock().ok().and_then(|c| c.get(i).copied().flatten());
             let mut text = report.render();
-            if let Some((begun, ran)) = clock {
-                text.push_str(&time_line(begun, ran));
+            if let Some((begun, ran, load)) = clock {
+                text.push_str(&time_line(begun, ran, load));
             }
             if err.is_none()
                 && let Err(e) = out.write_all(text.as_bytes()).and_then(|()| out.flush())
@@ -942,12 +1115,22 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // The check a stage start may have cached is never cached here: a tree
     // that moved during the LAST stage is as unverified as one that moved
     // during the first.
-    if let Some(why) = tripwire.check(Duration::ZERO) {
+    let moved = tripwire.check(Duration::ZERO);
+    if let Some(why) = &moved {
         let mut r = Report::new("source identity");
-        r.cannot_run(identity::tripped_label(&why));
+        r.cannot_run(identity::tripped_label(why));
         out.write_all(r.render().as_bytes())?;
         reports.push(r);
     }
+    // DID THIS RUN MEASURE THE TREE (2026-09-26) — asked of the MEASURE
+    // tier's own stages, never of the run's verdict: a `--full` run whose
+    // Kani floor skipped still measured, and one whose paint row went red did
+    // not, whatever main's receipt excuses.
+    let stage_reports = &reports[ctx.prelude.len()..ctx.prelude.len() + plan.len()];
+    let measured = ctx
+        .mode
+        .runs(plan::Tier::Measure)
+        .then(|| verdict::measured(&plan, stage_reports, &ctx.scope, moved.is_some()));
 
     // A PLANNED STAGE THAT DECIDED NOTHING IS INVISIBLE TO THE VERDICT.
     //
@@ -979,16 +1162,144 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     }
 
     let tally = ladder::tally(&reports);
-    let verdict = verdict::verdict(ctx.mode, &ctx.scope, &tally);
-    write_receipt(ctx, &tripwire, &verdict, &tally);
+    let now = epoch_secs();
+    let against = base_plan
+        .as_ref()
+        .map_or_else(differential::Against::absolute, |p| p.against(now));
+    let verdict = verdict::verdict_against(ctx.mode, &ctx.scope, &tally, &against);
+    let since_from = base_plan.as_ref().and_then(|p| p.since_from(now));
+    let judged = Judged {
+        tools: &tools,
+        against: &against,
+        since_from: since_from.as_ref(),
+        now,
+        moved: moved.is_some(),
+        measured: measured.as_ref().map(Result::is_ok),
+        loads: stage_reports
+            .iter()
+            .filter_map(|r| r.load.map(|l| (l, r.title.clone())))
+            .collect(),
+    };
+    // THE VERDICT IS DELIVERED BEFORE IT IS RECORDED (2026-09-27, third
+    // review). The receipt was filed first, so a ladder whose verdict could
+    // not be written — its reader gone — exited COULD NOT RUN while the store
+    // said `merge-contract yes` for the tree, which the release cutter counts
+    // as gated: the exit code and the record disagreed. Now a verdict that
+    // cannot be written leaves no receipt, as every other unwritable ladder
+    // line does; and once it is out, nothing after it changes the exit code.
+    if let Some(m) = &measured {
+        out.write_all(verdict::measured_line(m).as_bytes())?;
+    }
     out.write_all(verdict.text.as_bytes())?;
     out.flush()?;
+    let standing = write_receipt(ctx, &tripwire, &verdict, &tally, &judged);
+    if ctx.baseline
+        && let (Some(text), Some(tree)) = (standing, head)
+    {
+        let _ = out
+            .write_all(publish_line(&caller, &tree.head, &text, ctx).as_bytes())
+            .and_then(|()| out.flush());
+    }
     Ok(verdict.exit)
 }
 
-/// Record what this run decided about this commit, where the release cutter's
-/// receipt report (`crates/aterm-release/src/gates.rs` `receipt_report`) reads
-/// it ([`receipt`]).
+/// The compiler, the spec checkers and the build environment this run used,
+/// as its receipt names them: `<stage2 bin dir> trustc <commit-hash>`
+/// (`unknown` when trustc named none), the checkers' summary, and the compile
+/// and test-run configuration every child inherits from this process
+/// ([`differential::build_env`]) — what a base must have been made by
+/// ([`differential::tools_differ`]).
+fn run_tools(ctx: &Ctx, tripwire: &identity::Tripwire) -> differential::Tools {
+    differential::Tools {
+        toolchain: format!(
+            "{} trustc {}",
+            ctx.tools.stage2_dir.display(),
+            tripwire.toolchain.commit.as_deref().unwrap_or("unknown")
+        ),
+        checkers: tripwire
+            .toolchain
+            .checkers
+            .as_ref()
+            .map(checkers::Checkers::summary)
+            .unwrap_or_default(),
+        build_env: Some(differential::build_env(std::env::vars_os())),
+    }
+}
+
+/// Seconds since the epoch, now.
+fn epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Why a `--measure` run has no base: the `verify: base …` line's reason.
+pub const MEASURE_IS_ABSOLUTE: &str = "a --measure run is judged by the absolute rule: the \
+     MEASURE tier is not part of the merge contract, and a release cut takes its receipt \
+     only when nothing in it was red";
+
+/// How a run was judged, for its receipt.
+struct Judged<'a> {
+    /// What ran it: the tools its base was compared with ([`run_tools`]).
+    tools: &'a differential::Tools,
+    against: &'a differential::Against,
+    /// Where each failure's since is carried from.
+    since_from: Option<&'a differential::BaseReds>,
+    now: u64,
+    /// The source or the compiler moved under the run (the tripwire fired):
+    /// some of its findings came from other bytes or tools than the commit's,
+    /// so its receipt lists none ([`write_receipt`]).
+    moved: bool,
+    /// Whether the run measured the tree ([`verdict::measured`]); `None` for
+    /// a run that did not run the MEASURE tier.
+    measured: Option<bool>,
+    /// The load around each stage that could be read, with its title.
+    loads: Vec<(ladder::StageLoad, String)>,
+}
+
+/// Publish a `--baseline` run's receipt ([`differential::publish`]) and say
+/// what happened, in one line. A failure costs other machines the baseline,
+/// never this run its verdict: the receipt already stands in the store every
+/// worktree of this repository reads.
+fn publish_line(caller: &Path, head: &str, text: &str, ctx: &Ctx) -> String {
+    let reds = receipt::Receipt::parse(text)
+        .and_then(|r| r.failures)
+        .map_or(0, |f| f.len());
+    match differential::publish(caller, head, text, &ctx.scratch) {
+        Ok(()) => format!(
+            "verify: baseline published — {} {} now carries main's receipt for {} ({reds} \
+             red(s)); a branch whose base is {} is judged against it\n",
+            differential::MAIN_REMOTE,
+            differential::NOTES_REF,
+            differential::short(head),
+            differential::short(head)
+        ),
+        Err(why) => format!(
+            "verify: baseline NOT published ({why}) — the receipt stands in this repository's \
+             store, which every worktree here reads; other machines see it only once a \
+             --baseline run publishes\n"
+        ),
+    }
+}
+
+/// Record what this run decided about this commit and its tree, where the
+/// release cutter's receipt report (`crates/aterm-release/src/gates.rs`
+/// `receipt_report`) reads it ([`receipt`]): filed under the commit and under
+/// `<commit>^{tree}`, naming the scope (`changed:<base>` for a change-scoped
+/// run), the compiler and the spec checkers the run used. A run of the MEASURE
+/// tier also says whether it measured the tree (`measured yes|no`) and files
+/// under the measure keys the cutter's MEASURE requirement reads
+/// (`gates::measure_report`); a `--measure` run files there only.
+///
+/// AND WHAT FAILED (2026-09-26): every finding, itemized, with when main first
+/// went red on it (carried from `judged.since_from` while main stays red on
+/// it), the reds that chain held which this run could not see
+/// ([`differential::hidden_failures`]), the base the run was judged against
+/// and the findings it judged INHERITED — what a later run's differential
+/// verdict reads ([`differential`]). A run whose source or compiler moved
+/// under it lists no failures, so it can never serve as a base. Returns the
+/// receipt text now standing under the commit, which a `--baseline` run
+/// publishes.
 ///
 /// Only a run with a SOURCE IDENTITY over a CLEAN tree leaves one: a root
 /// that is not a git checkout has no commit to key a receipt by, and a run
@@ -1002,9 +1313,11 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 /// — a reader counts it as no pass and names it, never mistaking it for a
 /// judgement.
 /// A run that never reached its verdict writes NOTHING: no snapshot, an
-/// unreadable source, a volume with less free than the run needs ([`disk`]),
-/// or a ladder that could not be written (`main` exits 3 on the write error
-/// before this is called), so the last real judgement of the commit stands.
+/// unreadable source, a refused `--baseline`, a volume with less free than the
+/// run needs ([`disk`]), or a ladder that could not be written — its verdict
+/// included, which is written before this is called (2026-09-27, third
+/// review; `main` exits 3 on the write error) — so the last real judgement of
+/// the commit stands.
 /// What used to be wrong was upstream of here: a child that never spawned, or
 /// died of `No space left on device`, was a `FAIL` row of a finding's
 /// severity, so a run that limped to its verdict would have written `verdict
@@ -1015,9 +1328,10 @@ fn write_receipt(
     tripwire: &identity::Tripwire,
     verdict: &verdict::Verdict,
     tally: &ladder::Tally,
-) {
+    judged: &Judged<'_>,
+) -> Option<String> {
     let identity::SourceIdentity::Git(tree) = &tripwire.source else {
-        return;
+        return None;
     };
     if !tree.dirty.is_empty() {
         eprintln!(
@@ -1025,16 +1339,23 @@ fn write_receipt(
              commit holds; commit, then run the gate on the commit you push",
             tree.head
         );
-        return;
+        return None;
     }
+    let caller = ctx.caller_root();
+    let tools = judged.tools.clone();
+    // What the verdict excused, by id: every finding judged INHERITED.
+    let (base, inherited) = match judged.against {
+        differential::Against::Base(base) => (
+            Some(base.commit.clone()),
+            differential::inherited_ids(tally, base),
+        ),
+        differential::Against::Absolute(_) => (None, Vec::new()),
+    };
     let r = receipt::Receipt {
         head: tree.head.clone(),
+        tree: receipt::tree_of(&caller, &tree.head),
         mode: ctx.mode.as_str().to_string(),
-        scope: match &ctx.scope {
-            Scope::Workspace => "workspace".to_string(),
-            Scope::Crate(c) => format!("crate:{c}"),
-            Scope::Changed(_) => "changed".to_string(),
-        },
+        scope: ctx.scope.receipt_word(),
         verdict: match verdict.exit {
             exit::PASS => "PASS",
             exit::FAILED => "FAIL",
@@ -1042,6 +1363,7 @@ fn write_receipt(
         }
         .to_string(),
         merge_contract: verdict.claims_merge_contract,
+        measured: judged.measured,
         skipped: if tally.skips.is_empty() {
             "none".to_string()
         } else {
@@ -1054,39 +1376,85 @@ fn write_receipt(
             // One line, always: a newline here would forge a second key.
             s.replace('\n', " ")
         },
-        when: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
+        toolchain: tools.toolchain,
+        checkers: tools.checkers,
+        build_env: tools.build_env,
+        // NO LIST FROM A RUN THAT MOVED (2026-09-27): its verdict is COULD NOT
+        // RUN, but a list would still serve as main's reds to judge a branch
+        // against ([`differential::usable`]), with findings from bytes or tools
+        // other than the commit's.
+        failures: (!judged.moved).then(|| {
+            differential::recorded_failures(tally, judged.since_from, &tree.head, judged.now)
+        }),
+        base,
+        inherited,
+        baseline: ctx.baseline,
+        // The reds its since chain held that this run could not itemize — a
+        // test log it could not account for hides every one of that stage's —
+        // so their clocks run on (2026-09-27, second review).
+        hidden: if judged.moved {
+            Vec::new()
+        } else {
+            differential::hidden_failures(tally, judged.since_from)
+        },
+        loads: judged.loads.clone(),
+        when: judged.now,
     };
-    let caller = ctx.snapshot_of.clone().unwrap_or_else(|| ctx.root.clone());
     match receipt::write(&caller, &r) {
-        Ok(receipt::Written::Stored(_)) => {}
-        Ok(receipt::Written::KeptWholeTree(path)) => eprintln!(
-            "verify: {} keeps its whole-tree receipt ({}); this run ({}, scope {}) does not \
-             replace it",
-            r.head,
-            path.display(),
-            r.verdict,
-            r.scope
-        ),
-        Err(e) => eprintln!(
-            "verify: cannot write the gate receipt for {} (from {}): {e} — the release \
-             cutter will count this commit as ungated",
-            r.head,
-            caller.display()
-        ),
+        Ok(receipt::Written::Stored(_)) => Some(r.render()),
+        Ok(receipt::Written::KeptWholeTree(path)) => {
+            eprintln!(
+                "verify: {} keeps its whole-tree receipt ({}); this run ({}, scope {}) does not \
+                 replace it",
+                r.head,
+                path.display(),
+                r.verdict,
+                r.scope
+            );
+            std::fs::read_to_string(&path).ok()
+        }
+        Err(e) => {
+            eprintln!(
+                "verify: cannot write the gate receipt for {} (from {}): {e} — the release \
+                 cutter will count this commit as ungated",
+                r.head,
+                caller.display()
+            );
+            Some(r.render())
+        }
     }
+}
+
+/// The line a NARROWED run prints at its start, before any stage: why it is
+/// narrower than the merge contract, and that even a green verdict will not
+/// discharge it — its receipt will say `scope <scope>` and `merge-contract
+/// no`, which the release cutter does not count as gated. `None` for the
+/// whole-tree run. The verdict still says the same at the end; this is so a
+/// reader does not learn it an hour late.
+#[must_use]
+pub fn narrowing_note(scope: &Scope) -> Option<String> {
+    let why = scope.narrowing()?;
+    Some(format!(
+        "verify: NARROWED — {why}. Even green, this run CANNOT discharge the merge contract \
+         (the whole tree with nothing skipped: `tools/verify.sh` with no --changed or --scope); \
+         its receipt will say `scope {}` and `merge-contract no`, which the release cutter does \
+         not count as gated.",
+        scope.receipt_word()
+    ))
 }
 
 /// The `  time  ` line under a stage: how long it ran, and when it started
 /// relative to the ladder — that offset is time spent waiting to start: for its
 /// lane, an earlier exclusive stage, or the lanes it is ordered after; an
 /// EXCLUSIVE stage also waits for every earlier unfinished stage in any lane,
-/// `Pure` included, and until nothing else is running.
+/// `Pure` included, and until nothing else is running — and, since
+/// 2026-09-26, the machine's one-minute load at the stage's start and end
+/// ([`ladder::StageLoad`]), when both could be read.
 #[must_use]
-pub fn time_line(begun: Duration, ran: Duration) -> String {
+pub fn time_line(begun: Duration, ran: Duration, load: Option<ladder::StageLoad>) -> String {
+    let load = load.map_or_else(String::new, |l| format!("; load {}", l.describe()));
     format!(
-        "  time  {:.1}s (started +{:.1}s)\n",
+        "  time  {:.1}s (started +{:.1}s{load})\n",
         ran.as_secs_f64(),
         begun.as_secs_f64()
     )
@@ -1197,6 +1565,25 @@ pub fn have_on_path(name: &str, path: &OsStr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE TIME LINE CARRIES THE MACHINE'S LOAD (2026-09-26) when both ends
+    /// were read, and reads as it always did when they were not.
+    #[test]
+    fn the_time_line_names_the_load_at_the_stage_s_two_ends() {
+        let d = |s: f64| Duration::from_secs_f64(s);
+        assert_eq!(
+            time_line(d(12.34), d(4.5), None),
+            "  time  4.5s (started +12.3s)\n"
+        );
+        assert_eq!(
+            time_line(
+                d(12.34),
+                d(4.5),
+                ladder::StageLoad::of(Some(74.82), Some(80.1), 14)
+            ),
+            "  time  4.5s (started +12.3s; load 74.82 -> 80.10 on 14 cores)\n"
+        );
+    }
 
     #[test]
     fn locate_root_walks_up_to_the_marker_pair() {

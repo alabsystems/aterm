@@ -1698,19 +1698,13 @@ impl App {
         let timeline: Vec<chrome::TimelineNote> = {
             let tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             // Walk the retained deque BACKWARDS and stop after the tail we keep:
-            // `since(None)`'s filter is a no-op, so this yields exactly what
-            // collecting all ~512 events and then doing `.rev().take(TAIL)` did —
-            // same notes, same newest-first order the tooltip/menu contract wants
-            // — while holding the leaf mutex for five steps instead of a full walk.
+            // the newest-first order the tooltip/menu contract wants, and the
+            // rows the chrome leaves out (an agent's verdict moves, typing, bus
+            // traffic) are cut BEFORE the cap, or a burst of them would leave
+            // no row at all. The walk stops at the fifth kept row, so the leaf
+            // mutex is held for a handful of steps, the whole ring at worst.
             // `now` stays captured outside the lock, so the ages are unchanged too.
-            tl.since(None)
-                .rev()
-                .take(chrome::TIMELINE_TAIL)
-                .map(|e| chrome::TimelineNote {
-                    kind: e.kind,
-                    age_ms: now.saturating_sub(e.t_ms),
-                })
-                .collect()
+            chrome::timeline_tail(tl.since(None).rev().map(|e| (e.kind, e.t_ms)), now)
         };
         let can_rename = self.can_rename_session(retry_window);
         let upgrade = sid.as_ref().and_then(|sid| {
@@ -5242,6 +5236,11 @@ impl App {
                 highlight,
                 keyboard,
             });
+            // The modal owns the wheel. Neither a fraction banked on the
+            // previous surface nor one swallowed under this card may pay for
+            // a notch on the next surface.
+            ws.scroll_residual = 0.0;
+            ws.scroll_residual_x = 0.0;
             // Stale from a previous pop; the next splice records the real one.
             ws.tab_menu_rect = None;
             if let Some(w) = &ws.os_window {
@@ -5321,6 +5320,8 @@ impl App {
             ws.tab_menu_rect = None;
             return false;
         }
+        ws.scroll_residual = 0.0;
+        ws.scroll_residual_x = 0.0;
         ws.tab_menu_rect = None;
         if let Some(w) = &ws.os_window {
             w.request_redraw();
@@ -7660,6 +7661,43 @@ mod session_chrome_app_tests {
         assert!(
             tip.starts_with(&label) && tip.contains("description: purpose text"),
             "{tip:?}"
+        );
+    }
+
+    /// The gather cuts the rows the chrome leaves out BEFORE its cap: a burst
+    /// of agent verdict moves and typing after a directory change still shows
+    /// the change and the start in the tab menu.
+    #[test]
+    fn session_chrome_gather_cuts_agent_moves_before_the_tail_cap() {
+        let mut app = App::headless_for_test();
+        {
+            let ctx = &app.pool.get(0).expect("session 0").ctx;
+            let mut tl = ctx.timeline.lock().unwrap();
+            tl.record("cwd-change", "cwd=/tmp".into());
+            for _ in 0..crate::session_chrome::TIMELINE_TAIL + 2 {
+                tl.record("agent-change", "agent=busy".into());
+                tl.record("human", "bytes=1".into());
+            }
+        }
+        let titles = app.tab_titles(WindowId(0));
+        let ext = app.tab_chrome_ext(WindowId(0), &titles);
+        let rows: Vec<&str> = ext[0]
+            .menu
+            .iter()
+            .filter_map(|e| match e {
+                TabMenuEntry::Header(h) if h.contains(" \u{b7} ") => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|r| r.starts_with("changed directory \u{b7} ")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .all(|r| !r.starts_with("agent-change") && !r.starts_with("human")),
+            "{rows:?}"
         );
     }
 

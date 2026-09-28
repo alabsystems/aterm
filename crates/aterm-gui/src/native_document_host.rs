@@ -1599,6 +1599,33 @@ pub(crate) fn acquire_advisory_lock_within(
     }
 }
 
+/// An advisory lock [`acquire_advisory_lock_within`] took, released by `LOCK_UN`
+/// when this drops — not by the close alone. The retry above rides out a PEER'S
+/// fork residue; this removes OUR OWN. A child another thread forks while the lock
+/// is held holds a copy of every descriptor until it execs, so a lock released
+/// only by the close stays taken on that copy for the child's whole fork->execve
+/// window (523 ms at the pathological tail measured above), and the next contender
+/// — the next save, the config thread's `aterm.toml` write, the journal's 25 ms
+/// event-loop take of its own lock — waits out or is refused for a lock nobody
+/// holds. `LOCK_UN` releases the open file description itself, the child's copy
+/// included (the product fd-hygiene sweep of 2026-09-27). One `Drop` covers every
+/// exit, early refusals included.
+pub(crate) struct HeldAdvisoryLock(File);
+
+impl HeldAdvisoryLock {
+    /// Adopt `lock_file`, which the caller has just locked through
+    /// [`acquire_advisory_lock_within`].
+    pub(crate) fn adopt(lock_file: File) -> Self {
+        Self(lock_file)
+    }
+}
+
+impl Drop for HeldAdvisoryLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 /// The save path's rendering of [`acquire_advisory_lock_within`]: same loop, same
 /// rules, this module's vocabulary.
 fn acquire_write_lock_within(lock_file: &File, budget: std::time::Duration) -> Result<(), String> {
@@ -1655,7 +1682,7 @@ const PREFLIGHT_RETRY_BUDGET: std::time::Duration = std::time::Duration::from_mi
 /// on. Side-effect free: see [`PREFLIGHT_RETRY_BUDGET`].
 fn lock_and_verify_target(
     baseline: &AtomicFileBaseline,
-) -> Result<(File, usize), AtomicCommitResult> {
+) -> Result<(HeldAdvisoryLock, usize), AtomicCommitResult> {
     let target = &baseline.target;
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
@@ -1690,6 +1717,9 @@ fn lock_and_verify_target(
         .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
     acquire_write_lock(&lock_file)
         .map_err(|message| atomic_failed(AtomicSaveStage::Preflight, message))?;
+    // Every refusal below re-enters the preflight retry, whose next take must not
+    // meet this attempt's own fork residue.
+    let lock = HeldAdvisoryLock::adopt(lock_file);
 
     if let Err(error) = validate_atomic_target(target) {
         return Err(atomic_validation_failure(
@@ -1707,7 +1737,7 @@ fn lock_and_verify_target(
             message: "target changed since it was read".to_string(),
         });
     }
-    Ok((lock_file, baseline_limit))
+    Ok((lock, baseline_limit))
 }
 
 fn commit_atomic_bytes_with_seed(
@@ -2478,6 +2508,39 @@ mod tests {
             AtomicCommitResult::Committed(_)
         ));
         assert_eq!(fs::read(&path).unwrap(), b"after");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The save lock is FREE the instant its hold drops, even while a copy of the
+    /// holder's description lives. The copy stands in for a shell another thread
+    /// forked mid-save: a forked child holds every descriptor until it execs, and a
+    /// lock released by the close alone lives on in that copy, so the next save or
+    /// `aterm.toml` write — or a refused preflight's own retry — met a lock nobody
+    /// held (the product fd-hygiene sweep of 2026-09-27). The refusals after
+    /// acquisition drop the same guard this success path returns.
+    #[test]
+    fn a_released_save_lock_is_free_while_a_forked_copy_of_it_lives() {
+        let path = unique_file("save-lock-forked-copy", b"before");
+        let contents = read_atomic_file(&path, DEFAULT_DOCUMENT_LIMIT, false).unwrap();
+        let lock_path = path.parent().unwrap().join(format!(
+            ".{}.aterm-write.lock",
+            path.file_name().unwrap().to_string_lossy()
+        ));
+
+        let Ok((held, _)) = lock_and_verify_target(&contents.baseline) else {
+            panic!("an uncontended preflight takes the save lock");
+        };
+        let forked_copy = held.0.try_clone().unwrap();
+        // Released by `LOCK_UN` (the guard's drop) while the forked copy lives.
+        drop(held);
+
+        let next = open_write_lock(&lock_path).unwrap();
+        assert!(
+            next.try_lock().is_ok(),
+            "the save lock outlived its hold on the forked copy of its description"
+        );
+        drop(next);
+        drop(forked_copy);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

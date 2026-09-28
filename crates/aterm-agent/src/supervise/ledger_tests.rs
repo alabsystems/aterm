@@ -823,6 +823,19 @@ fn since_drops_what_came_before_it() {
 /// `--since` takes Unix milliseconds or a time word: a date (local midnight),
 /// a date and time (local, or the zone it names). Anything else is refused
 /// rather than read as zero.
+/// A malformed `--since` is refused (`None`, so the CLI says why), never a
+/// panic: a year too large for the millisecond arithmetic, and a four-BYTE
+/// zone suffix whose byte 2 is inside a character.
+#[test]
+fn a_malformed_since_is_refused_not_a_panic() {
+    assert_eq!(parse_since("4294967295-01-01", 0), None);
+    assert_eq!(parse_since("4294967295-12-31T23:59:59Z", 0), None);
+    assert_eq!(parse_since("2026-09-14T10:30+1\u{e9}1", 0), None);
+    // Controls: the same shapes in range still parse.
+    assert!(parse_since("2026-09-14T10:30+0130", 0).is_some());
+    assert!(parse_since("9999-01-01", 0).is_some());
+}
+
 #[test]
 fn since_takes_ms_or_a_time_word() {
     // 2026-09-14T00:00:00Z

@@ -50,7 +50,7 @@ const IGNORES: &str = "*.log\n/target/\n/target-*/\n/.aterm-verify/\n";
 const FIRST_STAGE: &str = "=== test compile (";
 
 /// The test compile's argv, which the fixtures' drivers match on.
-const TEST_COMPILE_ARGV: &str = "--unverified test --workspace --no-fail-fast --no-run";
+const TEST_COMPILE_ARGV: &str = "--unverified test --workspace --no-fail-fast --no-run --message-format=json-render-diagnostics";
 
 fn path_env() -> std::ffi::OsString {
     std::env::var_os("PATH").unwrap_or_default()
@@ -122,6 +122,8 @@ exec sleep 300
 GUI
     cat >target-drivers/debug/aterm-ctl <<'CTL'
 #!/bin/sh
+# The smoke pins its socket with `--sock <path>` before the verb.
+if [ "$1" = --sock ]; then shift 2; fi
 case "$1" in
   cursor)  echo "OK row=0 col=0" ;;
   metrics) echo "OK frames=41 max_input_present_ms=8.100 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0 perf_reduced=0 wake_heals=0 " ;;
@@ -163,16 +165,14 @@ impl Fixture {
         ] {
             script(&root.join(rel), "exit 0");
         }
-        // The delivery, live-lane and atpkg publish suites come from their ROSTERS,
-        // never from a hand-written copy: the copy drifted the moment a roster grew
-        // (2026-09-17).
-        for name in aterm_verify::stages::DELIVERY_SUITES {
-            script(&root.join("tools").join(name), "exit 0");
-        }
-        for name in aterm_verify::stages::LIVE_ATERM_SUITES {
-            script(&root.join("tools").join(name), "exit 0");
-        }
-        for name in aterm_verify::stages::ATPKG_SUITES {
+        // The delivery suites, the live lanes, the atpkg pack and the objc drivers
+        // come from their ROSTERS, never from a hand-written copy: the copy
+        // drifted the moment a roster grew (2026-09-17).
+        for name in aterm_verify::stages::DELIVERY_SUITES
+            .into_iter()
+            .chain(aterm_verify::stages::LIVE_ATERM_SUITES)
+            .chain([aterm_verify::stages::ATPKG_DRIVEN_SUITE])
+        {
             script(&root.join("tools").join(name), "exit 0");
         }
         script(
@@ -190,16 +190,7 @@ impl Fixture {
         );
         // The one `aterm` the live lanes are handed.
         script(&root.join("target-drivers/debug/aterm"), "exit 0");
-        for ex in [
-            "objc_live_class_audit",
-            "objc_ime_drive",
-            "objc_toolbar_drive",
-            "objc_window_drive",
-            "objc_event_drive",
-            "objc_alert_drive",
-            "objc_swizzle_drive",
-            "objc_bound_drive",
-        ] {
+        for (_, ex) in aterm_verify::stages::OBJC_DRIVER_EXAMPLES {
             script(
                 &root.join("target-drivers/debug/examples").join(ex),
                 "exit 0",
@@ -247,6 +238,12 @@ impl Fixture {
     }
 
     fn ctx(&self) -> Ctx {
+        self.ctx_at(&self.root)
+    }
+
+    /// [`Self::ctx`] over another checkout of the fixture (a clone), with the
+    /// fixture's own toolchain and scratch.
+    fn ctx_at(&self, root: &Path) -> Ctx {
         let mut env = EnvSnapshot::capture();
         env.trust_stage2_bin = Some(self.stage2.clone());
         env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
@@ -257,7 +254,7 @@ impl Fixture {
         // too: a fixture's empty lanes are budgeted cold. The preflight laws
         // below set their own requirement, or their own budget and reading.
         Ctx::new(
-            self.root.clone(),
+            root.to_path_buf(),
             Mode::Fast,
             Scope::workspace(),
             env,
@@ -552,6 +549,65 @@ fn a_compiler_rewritten_mid_run_never_claims_the_contract() {
     assert!(ladder.contains("=== source identity ==="), "{ladder}");
 }
 
+/// A SPEC CHECKER THAT MOVES MID-RUN IS A MOVED TOOLCHAIN (2026-09-26). The
+/// tests run `ty`, `trust-ir` and `ay` through the atpkg store's shim, so an
+/// `aterm pkg update` re-pointing `bin/ty` during the run splits the test stage
+/// across two checkers exactly as a re-sealed compiler splits it across two
+/// frontends. The calm run names the checker on its `verify: checkers` line and
+/// is not COULD NOT RUN — the negative control; the run whose build re-points
+/// the shim is COULD NOT RUN and names what moved.
+#[test]
+fn a_spec_checker_repointed_mid_run_never_claims_the_contract() {
+    let repo = Fixture::new("atv-env-checker");
+    let home = repo.base.join("home");
+    let store_bin = aterm_verify::checkers::store_bin_dir(&home);
+    let (one, two) = (
+        home.join("store/ty/1/bin/ty"),
+        home.join("store/ty/2/bin/ty"),
+    );
+    script(&one, "echo 'ty 1'");
+    script(&two, "echo 'ty 2'");
+    let shim = |target: &Path| format!("#!/bin/sh\nexec '{}' \"$@\"\n", target.display());
+    write(&store_bin.join("ty"), &shim(&one));
+    let relay = store_bin.join("ty");
+    repo.with_targo(&format!(
+        "cp '{new}' '{relay}.new' && mv '{relay}.new' '{relay}'",
+        new = repo.base.join("shim-two").display(),
+        relay = relay.display()
+    ));
+    write(&repo.base.join("shim-two"), &shim(&two));
+    let ctx = || {
+        let mut ctx = repo.ctx();
+        ctx.env.home = home.clone();
+        ctx
+    };
+
+    let (calm, calm_code) = repo.run(&ctx());
+    assert_ne!(calm_code, exit::COULD_NOT_RUN, "{calm}");
+    let one = fs::canonicalize(&one).expect("the first build");
+    assert!(
+        calm.contains(&format!(
+            "verify: checkers ty = {} (atpkg store, ty 1); ",
+            one.display()
+        )),
+        "the checker the tests run is named: {calm}"
+    );
+
+    repo.arm_trigger();
+    let (ladder, code) = repo.run(&ctx());
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
+    let two = fs::canonicalize(&two).expect("the second build");
+    assert!(
+        ladder.contains(&format!(
+            "checker ty moved: {} -> {}",
+            one.display(),
+            two.display()
+        )),
+        "the checker that moved is named: {ladder}"
+    );
+}
+
 /// A caller repo with every kind of uncommitted change a developer has.
 struct Caller {
     base: PathBuf,
@@ -695,6 +751,7 @@ fn the_snapshot_verifies_the_callers_head_and_diff_and_ignores_later_caller_move
         ToolchainIdentity {
             files: vec![],
             commit: None,
+            checkers: None,
         },
     );
     let digest = caller_tree.dirty_digest(&path_env()).expect("dirty");
@@ -806,6 +863,7 @@ fn a_snapshot_run_arms_on_the_tree_its_sync_verified() {
     let none = || ToolchainIdentity {
         files: vec![],
         commit: None,
+        checkers: None,
     };
     let armed = Tripwire::arm_against(&s.root, &path_env(), Some(s.tree.clone()), none());
     assert_eq!(armed.check(Duration::ZERO), None, "nothing moved yet");
@@ -1035,6 +1093,7 @@ fn no_toolchain() -> ToolchainIdentity {
     ToolchainIdentity {
         files: vec![],
         commit: None,
+        checkers: None,
     }
 }
 
@@ -1876,6 +1935,15 @@ fn a_sync_never_writes_through_a_symlink_in_the_snapshot() {
 fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
     let repo = Fixture::new("atv-env-ownlog");
     repo.git_init().with_targo("true");
+    // Every run of the gate binary verifies a SNAPSHOT (2026-09-27), and the
+    // fixture's driver stand-ins are ignored files a snapshot does not carry:
+    // without them every driven row is COULD NOT RUN and the exit below could
+    // not tell a moving tree from a missing driver. Tracked, they travel.
+    git(&repo.root, &["add", "-f", "target-drivers"]);
+    git(
+        &repo.root,
+        &["commit", "-q", "-m", "the driver stand-ins, tracked"],
+    );
     let log = repo.root.join("gate-run.out");
 
     let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
@@ -1969,16 +2037,19 @@ fn a_tracked_file_moving_gets_no_log_remedy() {
 /// — so the receipt is checked against the SAME head the ladder printed, and
 /// against the verdict it reached.
 ///
-/// This fixture's ladder skips the GUI smoke (`--skip-gui-smoke`), so the
-/// run does not discharge the merge contract and the receipt says so: a skip is
-/// not a pass, and the receipt is where that survives the run.
+/// This fixture's stage2 has no tippy, so the ladder skips the lint and the run
+/// does not discharge the merge contract, and the receipt says so: a skip is
+/// not a pass, and the receipt is where that survives the run. (Until
+/// 2026-09-26 the skip that cost it was the GUI smoke's; that smoke is the
+/// MEASURE tier's now, which the merge contract does not run.)
 #[test]
 fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
     let repo = Fixture::new("atv-env-receipt");
     repo.git_init().with_targo("true");
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
 
-    let (ladder, _code) = repo.run(&repo.ctx());
+    let ctx = repo.ctx();
+    let (ladder, _code) = repo.run(&ctx);
     assert!(
         ladder.contains(&format!("verify: source {head} in place ")),
         "{ladder}"
@@ -2004,8 +2075,48 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         "the receipt's merge-contract line and the ladder's sentence are one claim, not two"
     );
     assert!(
-        !r.merge_contract && r.skipped.contains("gui smoke"),
+        !r.merge_contract && r.skipped.contains("tippy lint"),
         "a skipping run says WHICH skip cost it the contract: {r:?}"
+    );
+    assert_eq!(
+        r.measured, None,
+        "a run of the merge contract says nothing about measuring: {text}"
+    );
+    assert!(
+        !path
+            .with_file_name(aterm_verify::receipt::measure_key(&head))
+            .exists(),
+        "and files nothing where the release cutter looks for a measurement"
+    );
+    // It is filed under the commit's TREE too, with the same text, and it
+    // names the compiler and the spec checkers the ladder named.
+    let tree_sha = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
+    assert_eq!(r.tree.as_deref(), Some(tree_sha.as_str()), "{text}");
+    let by_tree = path.with_file_name(aterm_verify::receipt::tree_key(&tree_sha));
+    assert_eq!(
+        fs::read_to_string(&by_tree).expect("the tree receipt"),
+        text,
+        "one run, one receipt, filed twice"
+    );
+    assert_eq!(
+        r.toolchain,
+        format!("{} trustc unknown", ctx.tools.stage2_dir.display()),
+        "the fixture's stage2 has no trustc to name a commit"
+    );
+    let named = ladder
+        .lines()
+        .find_map(|l| l.strip_prefix("verify: checkers "))
+        .and_then(|l| l.split(" — as the spec tests find them").next())
+        .unwrap_or_else(|| panic!("no `verify: checkers` line: {ladder}"));
+    assert_eq!(
+        r.checkers, named,
+        "the receipt records the checkers the ladder named"
+    );
+    assert!(
+        ["ty = ", "trust-ir = ", "ay = "]
+            .iter()
+            .all(|c| r.checkers.contains(c)),
+        "{r:?}"
     );
     // …and it lives in the git common dir, which every worktree of the
     // repository shares and no TreeState reads.
@@ -2024,6 +2135,266 @@ fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
         tree.dirty.keys().all(|p| !p.contains("receipt")),
         "the receipt entered the source identity: {:?}",
         tree.dirty.keys().collect::<Vec<_>>()
+    );
+}
+
+/// A VERDICT NOBODY READ IS NOT RECORDED (2026-09-27, third review). The
+/// receipt was filed before the verdict was written, so a run whose reader
+/// went away at the verdict exited COULD NOT RUN (`main` exits 3 on the write
+/// error) while the store held its receipt — the exit code and the record
+/// disagreeing about one run. Now the verdict is delivered first: when it
+/// cannot be, no receipt is filed.
+#[test]
+fn a_verdict_that_could_not_be_written_files_no_receipt() {
+    /// A reader that goes away at the verdict.
+    struct GoneAtTheVerdict(Vec<u8>);
+    impl std::io::Write for GoneAtTheVerdict {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if String::from_utf8_lossy(buf).contains("=== verdict ===") {
+                return Err(std::io::Error::other("the reader went away"));
+            }
+            self.0.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let repo = Fixture::new("atv-env-unread");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let mut out = GoneAtTheVerdict(Vec::new());
+    let err = aterm_verify::run(&repo.ctx(), &mut out).expect_err("the verdict was not written");
+    assert!(err.to_string().contains("the reader went away"), "{err}");
+    let ladder = String::from_utf8_lossy(&out.0);
+    assert!(ladder.contains("=== test"), "the ladder ran: {ladder}");
+    let store = aterm_verify::receipt::dir(&repo.root).expect("the receipt store");
+    assert!(
+        !store.join(&head).exists(),
+        "a verdict nobody read left a receipt:\n{ladder}"
+    );
+    // The control: the same run, read, files one.
+    let (_ladder, _code) = repo.run(&repo.ctx());
+    assert!(store.join(&head).exists(), "a read verdict is recorded");
+}
+
+/// A `--measure` RUN FILES ITS RECEIPT APART (2026-09-26), end to end over a
+/// real git fixture. It is judged by the absolute rule and says why before
+/// any stage, runs the MEASURE tier alone, and — this fixture has no window,
+/// so the pacing smoke skips — says it did not measure the tree and why. Its
+/// receipt stands under `measure-<commit>` and `measure-tree-<tree>` saying
+/// `measured no`, and NOT under the commit or its tree, where a merge
+/// receipt (and main's list of reds) belongs. A merge-contract run after it
+/// files the commit's key and leaves the measurement standing.
+#[test]
+fn a_measure_run_files_its_receipt_under_the_measure_keys_only() {
+    let repo = Fixture::new("atv-env-measure");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let tree = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
+    let store = aterm_verify::receipt::dir(&repo.root).expect("the receipt store");
+    let key = |k: &str| store.join(k);
+    use aterm_verify::receipt::{Receipt, measure_key, tree_key};
+    let read = |k: &str| {
+        Receipt::parse(&fs::read_to_string(key(k)).unwrap_or_else(|e| panic!("{k}: {e}")))
+            .unwrap_or_else(|| panic!("{k} does not parse"))
+    };
+
+    let mut ctx = repo.ctx();
+    ctx.mode = Mode::Measure;
+    let (ladder, code) = repo.run(&ctx);
+    assert_eq!(code, exit::PASS, "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "verify: base — {}: every red counts (the absolute rule)",
+            aterm_verify::MEASURE_IS_ABSOLUTE
+        )),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(
+            "verify: MEASURE tier — NOT MEASURED: `gui typing-pacing smoke` skipped: gui smoke \
+             (--skip-gui-smoke)"
+        ),
+        "{ladder}"
+    );
+    assert!(!ladder.contains(FIRST_STAGE), "{ladder}");
+    let measured = read(&measure_key(&head));
+    assert_eq!(
+        (
+            measured.mode.as_str(),
+            measured.measured,
+            measured.merge_contract
+        ),
+        ("measure", Some(false), false),
+        "{measured:?}"
+    );
+    assert_eq!(read(&measure_key(&tree_key(&tree))), measured);
+    for merge_key in [head.clone(), tree_key(&tree)] {
+        assert!(
+            !key(&merge_key).exists(),
+            "a --measure run filed `{merge_key}`, where a merge receipt belongs"
+        );
+    }
+
+    let (ladder, _) = repo.run(&repo.ctx());
+    assert!(!ladder.contains("verify: MEASURE tier —"), "{ladder}");
+    assert_eq!(read(&head).mode, "fast");
+    assert_eq!(
+        read(&measure_key(&head)),
+        measured,
+        "the merge-contract run left the measurement standing"
+    );
+}
+
+/// THE SAME BYTES UNDER ANOTHER COMMIT ID FIND THE RUN'S RECEIPT, FROM ANY
+/// WORKTREE (2026-09-26). A run's receipt is filed under `HEAD^{tree}` as
+/// well as HEAD, in the git common dir, so each of the three ways a gated tree
+/// reaches a new commit id finds it by that tree: a MESSAGE-ONLY AMEND (the
+/// `Co-Authored-By` line added after the run), an IDENTICAL-TREE REBASE onto
+/// another parent, and a checkout of either from a SIBLING WORKTREE. Each new
+/// id has no receipt of its own — the negative control that keyed by commit
+/// alone, as before, they vouched for nothing. The reader's half, the cutter
+/// counting such a commit as gated, is pinned in `aterm-release`
+/// (`gates::published_commit_tests`).
+#[test]
+fn a_reworded_rebased_or_sibling_commit_finds_the_runs_receipt_by_its_tree() {
+    let repo = Fixture::new("atv-env-receipt-tree");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let tree_sha = git(&repo.root, &["rev-parse", "HEAD^{tree}"]);
+    repo.run(&repo.ctx());
+    let store = aterm_verify::receipt::dir(&repo.root).expect("the receipt store");
+    let by_tree = |root: &Path, commit: &str| {
+        let tree = aterm_verify::receipt::tree_of(root, commit).expect("a tree");
+        let dir = aterm_verify::receipt::dir(root).expect("the store");
+        fs::read_to_string(dir.join(aterm_verify::receipt::tree_key(&tree)))
+            .ok()
+            .and_then(|t| aterm_verify::receipt::Receipt::parse(&t))
+    };
+    assert!(store.join(&head).is_file(), "the run left its receipt");
+
+    // A message-only amend: a new id over the same tree.
+    git(
+        &repo.root,
+        &["commit", "-q", "--amend", "-m", "fixture, reworded"],
+    );
+    let amended = git(&repo.root, &["rev-parse", "HEAD"]);
+    assert_ne!(amended, head);
+    assert!(
+        !store.join(&amended).exists(),
+        "no receipt under the new id"
+    );
+    let r = by_tree(&repo.root, &amended).expect("found by its tree");
+    assert_eq!(
+        (r.head.as_str(), r.tree.as_deref()),
+        (head.as_str(), Some(tree_sha.as_str()))
+    );
+
+    // An identical-tree rebase: the same tree over another parent.
+    let empty = git(&repo.root, &["hash-object", "-t", "tree", "/dev/null"]);
+    let base = git(&repo.root, &["commit-tree", &empty, "-m", "another base"]);
+    let rebased = git(
+        &repo.root,
+        &[
+            "commit-tree",
+            &tree_sha,
+            "-p",
+            &base,
+            "-m",
+            "fixture, rebased",
+        ],
+    );
+    assert!(!store.join(&rebased).exists());
+    assert_eq!(
+        by_tree(&repo.root, &rebased).map(|r| r.head),
+        Some(head.clone())
+    );
+
+    // A sibling worktree sitting at the rebased commit reads the same store.
+    let linked = repo.base.join("linked");
+    git(
+        &repo.root,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            linked.to_str().expect("utf-8"),
+            &rebased,
+        ],
+    );
+    assert_eq!(
+        aterm_verify::receipt::dir(&linked).expect("its store"),
+        store
+    );
+    assert_eq!(by_tree(&linked, &rebased).map(|r| r.head), Some(head));
+
+    // The control: a commit with other bytes finds nothing by its tree.
+    write(&repo.root.join("other.txt"), "other bytes\n");
+    git(&repo.root, &["add", "other.txt"]);
+    git(&repo.root, &["commit", "-q", "-m", "other bytes"]);
+    let other = git(&repo.root, &["rev-parse", "HEAD"]);
+    assert_eq!(by_tree(&repo.root, &other), None);
+}
+
+/// A NARROWED RUN SAYS SO AT ITS START (2026-09-26), not only in the verdict
+/// an hour later: the `verify: NARROWED` line comes before the first stage (a
+/// real `--changed` run prints its selection report first, which is what chose
+/// the scope; this ladder is handed the scope directly), and
+/// the receipt then names what the run was narrowed to — `changed:<base>` for
+/// a change-scoped run (a bare `changed` before), `crate:<name>` for a scoped
+/// one. The negative control: a whole-tree run prints no such line.
+#[test]
+fn a_narrowed_run_says_so_before_its_first_stage_and_its_receipt_names_its_base() {
+    let repo = Fixture::new("atv-env-narrowed");
+    repo.git_init().with_targo("true");
+    let head = git(&repo.root, &["rev-parse", "HEAD"]);
+    let path = aterm_verify::receipt::dir(&repo.root)
+        .expect("the receipt store")
+        .join(&head);
+    let standing = || {
+        aterm_verify::receipt::Receipt::parse(&fs::read_to_string(&path).expect("a receipt"))
+            .expect("it parses")
+    };
+    let before_first_stage = |ladder: &str, needle: &str| {
+        let at = ladder
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?}: {ladder}"));
+        let stage = ladder.find("\n=== ").expect("a stage");
+        assert!(
+            at < stage,
+            "{needle:?} came after the first stage: {ladder}"
+        );
+    };
+
+    let mut changed = repo.ctx();
+    changed.scope = Scope::changed("origin/main", Vec::new(), true);
+    let (ladder, _) = repo.run(&changed);
+    before_first_stage(
+        &ladder,
+        "verify: NARROWED — change-scoped against origin/main",
+    );
+    assert!(
+        ladder.contains("its receipt will say `scope changed:origin/main` and `merge-contract no`"),
+        "{ladder}"
+    );
+    let r = standing();
+    assert_eq!(
+        (r.scope.as_str(), r.merge_contract),
+        ("changed:origin/main", false)
+    );
+
+    let mut scoped = repo.ctx();
+    scoped.scope = Scope::from_option(Some("crate-x".into()));
+    let (ladder, _) = repo.run(&scoped);
+    before_first_stage(&ladder, "verify: NARROWED — scoped to -p crate-x");
+    assert_eq!(standing().scope, "crate:crate-x");
+
+    let (ladder, _) = repo.run(&repo.ctx());
+    assert!(
+        !ladder.contains("verify: NARROWED"),
+        "a whole-tree run: {ladder}"
     );
 }
 
@@ -2056,6 +2427,7 @@ fn a_dirty_or_narrowed_run_leaves_the_commits_whole_tree_receipt_standing() {
         merge_contract: true,
         skipped: "none".into(),
         when: 1,
+        ..aterm_verify::receipt::Receipt::default()
     };
 
     // A --changed run over uncommitted work verified bytes no commit holds:
@@ -2121,6 +2493,7 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
         merge_contract: true,
         skipped: "none".into(),
         when: 1,
+        ..aterm_verify::receipt::Receipt::default()
     };
     aterm_verify::receipt::write(&repo.root, &prior).expect("the prior receipt is written");
 
@@ -2353,4 +2726,477 @@ fn the_free_space_is_read_after_the_cap_removes_the_lanes() {
         "the lane was not removed: {ladder}"
     );
     assert!(ladder.contains(FIRST_STAGE), "{ladder}");
+}
+
+// ---------------------------------------------------------------------------
+// THE DIFFERENTIAL VERDICT (2026-09-26): a run judged against main's receipt
+// for its base. `aterm_verify::differential` holds the unit laws; these run the
+// real ladder over a fixture repo with a real `origin`.
+// ---------------------------------------------------------------------------
+
+/// A libtest log in which `-p x --test probe` fails each `(name, message)`.
+fn failing_tests(failures: &[(&str, &str)]) -> String {
+    let mut s = format!(
+        "     Running tests/probe.rs (target/debug/deps/probe-abc)\n\nrunning {} tests\n",
+        failures.len() + 1
+    );
+    for (name, _) in failures {
+        s.push_str(&format!("test {name} ... FAILED\n"));
+    }
+    s.push_str("test fine ... ok\n\nfailures:\n\n");
+    for (name, message) in failures {
+        s.push_str(&format!(
+            "---- {name} stdout ----\n\nthread '{name}' panicked at crates/x/tests/probe.rs:9:5:\n\
+             {message}\nnote: run with `RUST_BACKTRACE=1` environment variable to display a \
+             backtrace\n\n"
+        ));
+    }
+    s.push_str("\nfailures:\n");
+    for (name, _) in failures {
+        s.push_str(&format!("    {name}\n"));
+    }
+    s.push_str(&format!(
+        "\ntest result: FAILED. 1 passed; {} failed; 0 ignored; 0 measured; 0 filtered out; \
+         finished in 0.01s\n\nerror: test failed, to rerun pass `-p x --test probe`\n",
+        failures.len()
+    ));
+    s
+}
+
+impl Fixture {
+    /// A `targo` whose TEST RUN prints `<base>/tests.out` and fails when that
+    /// file exists — outside the tree, so what fails can change between runs
+    /// while the commits stay put — and answers the smokes either way. The
+    /// test run's argv carries the recording runner's `--config` between
+    /// `--tests` and its libtest separator (2026-09-26); this stand-in runs no
+    /// runner, so it is the whole test run, as cargo's serial run was.
+    fn with_failing_tests(&self) -> &Self {
+        // A compiler that names its commit: a base serves only a run made by
+        // the same one, and one that names none can be told from no other
+        // (2026-09-27, third review).
+        script(
+            &self.stage2.join("trustc"),
+            "echo 'rustc 1.99.0-dev (trustc 0.1.0)'; echo 'commit-hash: f1f1f1f1f1f1'",
+        );
+        script(
+            &self.stage2.join("targo"),
+            &format!(
+                "case \"$*\" in\n  *\"--tests \"*\"-- --skip measuring::\"*)\n    \
+                 if [ -e '{out}' ]; then cat '{out}'; exit 101; fi ;;\nesac\n{smoke}",
+                out = self.base.join("tests.out").display(),
+                smoke = self.answering_smoke()
+            ),
+        );
+        self
+    }
+
+    fn tests_fail(&self, failures: &[(&str, &str)]) {
+        write(&self.base.join("tests.out"), &failing_tests(failures));
+    }
+
+    /// A bare `origin` beside the repo, `main` pushed to it and fetched back,
+    /// and a committer identity of the fixture's own (a `--baseline` commits
+    /// a note).
+    fn with_origin(&self) -> PathBuf {
+        let bare = self.base.join("origin.git");
+        git(
+            &self.base,
+            &["init", "-q", "--bare", bare.to_str().expect("utf-8")],
+        );
+        git(
+            &self.root,
+            &["remote", "add", "origin", bare.to_str().expect("utf-8")],
+        );
+        git(
+            &self.root,
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        git(&self.root, &["fetch", "-q", "origin"]);
+        for (k, v) in [
+            ("user.name", "gate"),
+            ("user.email", "gate@example.invalid"),
+        ] {
+            git(&self.root, &["config", "--local", k, v]);
+        }
+        bare
+    }
+
+    /// A commit on a branch off main: HEAD is no longer main's.
+    fn branch_commit(&self, what: &str) -> String {
+        git(&self.root, &["switch", "-q", "-C", "feature"]);
+        write(&self.root.join("README"), what);
+        git(&self.root, &["add", "README"]);
+        git(&self.root, &["commit", "-q", "-m", what]);
+        git(&self.root, &["rev-parse", "HEAD"])
+    }
+
+    /// The receipt the store holds for `commit`.
+    fn receipt(&self, commit: &str) -> aterm_verify::receipt::Receipt {
+        let path = aterm_verify::receipt::dir(&self.root)
+            .expect("the receipt store")
+            .join(commit);
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("no receipt at {}: {e}", path.display()));
+        aterm_verify::receipt::Receipt::parse(&text)
+            .unwrap_or_else(|| panic!("the receipt does not parse: {text:?}"))
+    }
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..9]
+}
+
+/// A RED MAIN ALREADY HAS IS INHERITED; A NEW ONE BLOCKS; AN OLD ONE BLOCKS
+/// AGAIN. One fixture, one `origin`, real runs:
+///
+/// 1. On main itself the run is judged by the absolute rule (HEAD IS main)
+///    and its receipt lists the red test, since this commit.
+/// 2. On a branch whose base is that commit, the same test failing the same
+///    way (only its pid differs: run-to-run noise) is INHERITED: `0 new, 1
+///    inherited (red on main since <main>)`, exit 0 — this fixture skips the
+///    GUI smoke, so no contract — and the receipt names the base and the
+///    inherited id, carrying main's since.
+/// 3. The same test failing DIFFERENTLY is new, and so is a second test
+///    beside the inherited one: exit 1.
+/// 4. Main's red made 25 hours old is past the cap: it blocks again.
+#[test]
+fn a_red_main_already_has_is_inherited_and_a_new_one_blocks() {
+    let repo = Fixture::new("atv-env-diff");
+    repo.git_init().with_failing_tests();
+    repo.with_origin();
+    let main = git(&repo.root, &["rev-parse", "HEAD"]);
+    let id = "-p x --test probe -- probe";
+
+    repo.tests_fail(&[("probe", "lock held by pid 4411")]);
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "verify: base — {} is itself on origin/main: a run on main has no base to inherit \
+             from: every red counts (the absolute rule)",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    let on_main = repo.receipt(&main);
+    let listed = on_main.failures.clone().expect("a failure list");
+    assert_eq!(listed.len(), 1, "{on_main:?}");
+    assert_eq!(
+        (listed[0].id.as_str(), listed[0].since.as_str()),
+        (id, main.as_str())
+    );
+    assert_eq!((on_main.base, on_main.inherited.len()), (None, 0));
+    // THE MACHINE'S LOAD RIDES WITH THE VERDICT (2026-09-26): where the host
+    // answers a load average, every stage's `time` line names it and the
+    // receipt holds one `load` line per stage — the test stage's among them.
+    if aterm_verify::exec::load_average().is_some() {
+        let times: Vec<&str> = ladder
+            .lines()
+            .filter(|l| l.starts_with("  time  "))
+            .collect();
+        assert!(!times.is_empty(), "{ladder}");
+        for t in &times {
+            assert!(t.contains("; load ") && t.ends_with(" cores)"), "{t}");
+        }
+        assert_eq!(on_main.loads.len(), times.len(), "{:?}", on_main.loads);
+        assert!(
+            on_main
+                .loads
+                .iter()
+                .any(|(l, title)| title == "test (--workspace)" && l.cores > 0),
+            "{:?}",
+            on_main.loads
+        );
+    }
+
+    // 2. The branch, the same failure told differently in its noise.
+    let feature = repo.branch_commit("a change that breaks nothing");
+    repo.tests_fail(&[("probe", "lock held by pid 97")]);
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert!(
+        ladder.contains(&format!(
+            "verify: base {} (the merge-base with origin/main) — main's receipt {} lists 1 red(s)",
+            short(&main),
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert_eq!(code, exit::PASS, "nothing new failed:\n{ladder}");
+    assert!(
+        !ladder.contains(MERGE_CONTRACT_SENTENCE),
+        "a skip is still a skip: {ladder}"
+    );
+    assert!(
+        ladder.contains(&format!(
+            "0 new, 1 inherited (red on main since {})",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert!(ladder.contains(" skipped, 1 inherited) —"), "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "      - {id} (red on main since {}, 1 h)",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    let judged = repo.receipt(&feature);
+    assert_eq!(judged.base.as_deref(), Some(main.as_str()));
+    assert_eq!(judged.inherited, [id]);
+    let carried = &judged.failures.clone().expect("a failure list")[0];
+    assert_eq!(
+        (carried.since.as_str(), carried.since_when),
+        (main.as_str(), listed[0].since_when),
+        "main's since is carried, not restarted"
+    );
+    assert!(!judged.merge_contract);
+
+    // 3. Failing differently, and a second red beside the inherited one.
+    repo.tests_fail(&[("probe", "lock lost")]);
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains("1 new, 0 inherited, judged against"),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!(
+            "      - {id} — red on main too, but failing differently"
+        )),
+        "{ladder}"
+    );
+    repo.tests_fail(&[("probe", "lock held by pid 1"), ("fresh", "a new bug")]);
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains("1 new, 1 inherited (red on main since"),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains("      - -p x --test probe -- fresh\n"),
+        "{ladder}"
+    );
+    assert!(
+        repo.receipt(&feature).inherited == [id],
+        "the inherited one is still named"
+    );
+
+    // 4. Main red on it for 25 hours: past the cap.
+    let store = aterm_verify::receipt::dir(&repo.root).expect("store");
+    let stale = listed[0].since_when - 25 * 3600;
+    for key in [
+        main.clone(),
+        aterm_verify::receipt::tree_key(&git(
+            &repo.root,
+            &["rev-parse", &format!("{main}^{{tree}}")],
+        )),
+    ] {
+        let path = store.join(key);
+        let text = fs::read_to_string(&path).expect("main's receipt");
+        let aged = text.replace(
+            &format!(" {} {} ", main, listed[0].since_when),
+            &format!(" {main} {stale} "),
+        );
+        assert_ne!(aged, text, "the fail line was rewritten");
+        fs::write(&path, aged).expect("write");
+    }
+    repo.tests_fail(&[("probe", "lock held by pid 5")]);
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains("0 new, 0 inherited, 1 red on main past the 24 h cap"),
+        "{ladder}"
+    );
+    assert!(ladder.contains("PAST THE 24 h CAP"), "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "      - {id} (red on main since {}, 25 h)",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert!(repo.receipt(&feature).inherited.is_empty());
+}
+
+/// NO BASE RECEIPT, NO DIFFERENTIAL: the absolute rule, said before any stage
+/// and under the verdict. Without `origin/main` at all, and with it but no run
+/// ever made on the base: the same red blocks, and the receipt still lists it.
+#[test]
+fn without_a_base_receipt_every_red_counts_and_the_run_says_why() {
+    let repo = Fixture::new("atv-env-nobase");
+    repo.git_init().with_failing_tests();
+    repo.tests_fail(&[("probe", "lock held")]);
+
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains(
+            "verify: base — this repository has no origin/main to be judged against: every red \
+             counts (the absolute rule)"
+        ),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains("(No differential — this repository has no origin/main"),
+        "{ladder}"
+    );
+
+    repo.with_origin();
+    let main = git(&repo.root, &["rev-parse", "HEAD"]);
+    // The main commit's own receipt from the run above predates origin, and
+    // it is main's receipt all the same — so remove it: no run on the base.
+    let store = aterm_verify::receipt::dir(&repo.root).expect("store");
+    fs::remove_dir_all(&store).expect("empty the store");
+    let feature = repo.branch_commit("a change");
+    let (ladder, code) = repo.run(&repo.ctx());
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "verify: base — no usable receipt for the base {} (the merge-base with origin/main): \
+             no receipt",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!(
+            "`tools/verify.sh --baseline` on {} records one",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains("1 gate(s) decided AGAINST the tree"),
+        "{ladder}"
+    );
+    let r = repo.receipt(&feature);
+    assert_eq!((r.base, r.failures.map(|f| f.len())), (None, Some(1)));
+}
+
+/// `--baseline` PUBLISHES MAIN'S REDS, AND ANOTHER MACHINE IS JUDGED AGAINST
+/// THEM. The gate binary, run with `--baseline` on main, pushes its receipt
+/// as a note to `origin`'s `refs/notes/aterm-verify`. A fresh CLONE — its own
+/// receipt store, empty — makes a branch commit and runs: it finds no receipt
+/// for its base in its store, fetches the note, and inherits the red. The
+/// refusals: a branch commit and a dirty tree are no baseline, COULD NOT RUN
+/// before any stage, and leave no receipt.
+#[test]
+fn a_baseline_publishes_mains_reds_and_another_clone_is_judged_against_them() {
+    let repo = Fixture::new("atv-env-baseline");
+    repo.git_init().with_failing_tests();
+    let bare = repo.with_origin();
+    let main = git(&repo.root, &["rev-parse", "HEAD"]);
+    repo.tests_fail(&[("probe", "lock held by pid 12")]);
+
+    // In process, in place: the fixture's driver stand-ins are ignored files
+    // a snapshot does not carry, and every run of the gate binary verifies a
+    // snapshot (2026-09-27). The flag itself is `cli`'s to parse.
+    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    assert_eq!(
+        code,
+        exit::FAILED,
+        "main is red, and a baseline says so:\n{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!("verify: baseline — main at {}", short(&main))),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!(
+            "verify: baseline published — origin refs/notes/aterm-verify now carries main's \
+             receipt for {} (1 red(s))",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    let published = git(
+        &bare,
+        &["notes", "--ref=refs/notes/aterm-verify", "show", &main],
+    );
+    let note = aterm_verify::receipt::Receipt::parse(&format!("{published}\n"))
+        .unwrap_or_else(|| panic!("the note is a receipt: {published:?}"));
+    assert!(note.baseline && note.head == main, "{note:?}");
+    assert_eq!(note.failures.as_ref().map(Vec::len), Some(1));
+
+    // Another machine: a clone, whose receipt store has never seen a run.
+    let clone = repo.base.join("clone");
+    git(
+        &repo.base,
+        &[
+            "clone",
+            "-q",
+            bare.to_str().expect("utf-8"),
+            clone.to_str().expect("utf-8"),
+        ],
+    );
+    assert!(
+        aterm_verify::receipt::dir(&clone)
+            .map(|d| !d.join(&main).exists())
+            .unwrap_or(true),
+        "the clone's store is its own"
+    );
+    let copied = Command::new("cp")
+        .arg("-R")
+        .arg(repo.root.join("target-drivers"))
+        .arg(clone.join("target-drivers"))
+        .status()
+        .expect("cp runs");
+    assert!(
+        copied.success(),
+        "the driver stand-ins, ignored, beside the clone's tree"
+    );
+    git(&clone, &["switch", "-q", "-c", "feature"]);
+    write(&clone.join("README"), "elsewhere\n");
+    git(&clone, &["add", "README"]);
+    git(
+        &clone,
+        &["commit", "-q", "-m", "a change on another machine"],
+    );
+    repo.tests_fail(&[("probe", "lock held by pid 3")]);
+    let (ladder, code) = repo.run(&repo.ctx_at(&clone));
+    assert!(
+        ladder.contains(&format!(
+            "verify: base {} (the merge-base with origin/main) — main's note {} lists 1 red(s)",
+            short(&main),
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(&format!(
+            "0 new, 1 inherited (red on main since {})",
+            short(&main)
+        )),
+        "{ladder}"
+    );
+    assert_eq!(code, exit::PASS, "{ladder}");
+
+    // Refusals: a branch commit is not main's, and a dirty tree gets no receipt.
+    let feature = repo.branch_commit("not main");
+    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    assert!(
+        ladder.contains(&format!(
+            "--baseline refused: HEAD {} is not a commit of origin/main",
+            short(&feature)
+        )),
+        "{ladder}"
+    );
+    assert!(!ladder.contains(FIRST_STAGE), "no stage ran: {ladder}");
+    assert!(
+        !aterm_verify::receipt::dir(&repo.root)
+            .expect("store")
+            .join(&feature)
+            .exists(),
+        "a refused baseline leaves no receipt"
+    );
+    git(&repo.root, &["switch", "-q", "--detach", &main]);
+    write(&repo.root.join("README"), "uncommitted\n");
+    let (ladder, code) = repo.run(&repo.ctx().with_baseline(true));
+    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
+    assert!(
+        ladder.contains("--baseline refused: the tree has uncommitted work"),
+        "{ladder}"
+    );
 }

@@ -165,9 +165,15 @@ impl Line {
     /// boundary shows its newer rows and not its older ones, which is the same
     /// rule the surrounding text obeys.
     ///
+    /// ## Who calls it outside the tests
+    ///
+    /// The update handoff's link-stripping rung (`aterm-gui`'s
+    /// `seamless::strip_blob_links`): it compares every record it decoded with
+    /// the bytes it was read from, and the record's size with the wire cap, so
+    /// a line it does not strip is carried byte for byte.
+    ///
     /// [`Scrollback::image_rows_dropped_by_compression`]: crate::Scrollback::image_rows_dropped_by_compression
     #[must_use]
-    #[cfg(test)]
     pub fn serialize(&self) -> Vec<u8> {
         // The estimate is only a capacity hint (never affects the serialized
         // bytes), so it is computed with saturating arithmetic and bounded

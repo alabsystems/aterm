@@ -3161,11 +3161,25 @@ pub(crate) mod paste_order {
     /// TEST-ONLY: the jobs and retained bytes `sink`'s serializer holds
     /// admitted right now (the job being written included); `(0, 0)` when it
     /// has no serializer.
+    ///
+    /// "`sink`'s" is decided by the sink, never by its fd number: the entry
+    /// under `sink.master()` counts only when its `Weak` points at `sink`
+    /// itself. Test fixtures build BORROWED sinks on pipes they close
+    /// themselves, so a closed fixture's serializer can stay registered under
+    /// a number the next fixture's `pipe()` is handed — and stay LIVE, since
+    /// each job it still drains holds the old sink. Pruning dead sinks (what
+    /// `enqueue` and [`pin_ordering_for_test`] do) cannot drop that entry;
+    /// only the identity check can refuse it. Measured 2026-09-27: the merge
+    /// contract's 18-thread run read `(225, 306092)` — a finished motion-flood
+    /// fixture's budget — for a fresh sink that had queued nothing. The
+    /// pointer compare is sound for a dead entry too: a `Weak` keeps its
+    /// allocation, so its address cannot be reused while the entry holds it.
     #[cfg(test)]
     pub(crate) fn admitted_for_test(sink: &Arc<SinkWriter>) -> (u64, u64) {
         REG.lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(&sink.master())
+            .filter(|serializer| std::ptr::eq(serializer.sink.as_ptr(), Arc::as_ptr(sink)))
             .map_or((0, 0), |serializer| {
                 let used = serializer.budget.used.load(Ordering::Acquire);
                 (used >> 32, used & u64::from(u32::MAX))
@@ -17629,6 +17643,120 @@ mod smooth_scroll_tests {
             "a delta after the rest window tracks from the settling band, not the parked one \
              ({rested})"
         );
+    }
+
+    /// THE CARD OWNS THE WHEEL, WHATEVER DEVICE MADE IT. The seam swallows a
+    /// whole row while the tab context menu is up ("a notch scrolls nothing
+    /// and reports nothing"); the sub-notch half of direct manipulation
+    /// answers BEFORE the seam, so it must decline for the card the same way:
+    /// sub-row trackpad deltas under an open card arm no band, shift nothing,
+    /// scroll nothing, take no engine lock, and leave the card up. FAILED
+    /// before the gate: the first delta probed the route under the lock,
+    /// armed a tracked glide and parked the engine a row deeper under the
+    /// card, where a notch moved nothing.
+    #[test]
+    fn a_sub_row_precise_delta_under_the_tab_menu_is_swallowed_like_a_notch() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        let term = seed_history(&app, wid);
+        let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        assert!(cell_h >= 4, "fixture: a cell tall enough to split");
+        let dy = (cell_h / 4) as f64;
+        let acq = crate::term_lock_acquisitions_on_this_thread;
+        let t0 = std::time::Instant::now();
+        crate::app_input::pin_wheel_clock(Some(t0));
+        assert!(
+            app.open_tab_context_menu_at_chip(wid, 0),
+            "the card opens at the chip"
+        );
+
+        // Two quarter-row deltas: half a row, so no whole row banks and both
+        // take the sub-notch half.
+        let before = acq();
+        for _ in 0..2 {
+            app.on_mouse_wheel(
+                wid,
+                MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
+            );
+        }
+        assert_eq!(
+            acq() - before,
+            0,
+            "the card's delta never probes the engine"
+        );
+        {
+            let ws = &app.windows[&wid];
+            assert!(ws.tab_menu.is_some(), "the delta did not dismiss the card");
+            assert!(ws.scroll_glide.is_none(), "…nor arm a band under it");
+            assert_eq!(ws.scroll_frac_px, 0, "…nor shift the presented band");
+            assert!(ws.overscroll.is_none());
+        }
+        assert_eq!(
+            term_lock(&term).grid().display_offset(),
+            0,
+            "…nor scroll the viewport underneath it"
+        );
+
+        // NEGATIVE CONTROL: the card down, one more quarter row (the seam's
+        // bank now holds three quarters — still no whole row) moves the band.
+        assert!(app.close_tab_menu(wid));
+        app.on_mouse_wheel(
+            wid,
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, dy)),
+        );
+        crate::app_input::pin_wheel_clock(None);
+        let ws = &app.windows[&wid];
+        assert!(
+            ws.scroll_glide.is_some(),
+            "the same delta arms the tracked band once the card is gone"
+        );
+        assert_eq!(i64::from(ws.scroll_frac_px), cell_h - dy as i64);
+        assert_eq!(term_lock(&term).grid().display_offset(), 1);
+    }
+
+    #[test]
+    fn tab_menu_discards_banked_wheel_fractions_at_both_boundaries() {
+        use winit::dpi::PhysicalPosition;
+        use winit::event::MouseScrollDelta;
+
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        let _term = seed_history(&app, wid);
+        let (cell_w, cell_h) = app.win_cell_size(wid);
+        let vertical =
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(0.0, cell_h as f64 / 2.0));
+        let horizontal =
+            MouseScrollDelta::PixelDelta(PhysicalPosition::new(cell_w as f64 / 2.0, 0.0));
+
+        // A previous grid gesture must not contribute credit to the card.
+        assert!(app.wheel_notches(wid, vertical).is_none());
+        assert!(app.wheel_notches(wid, horizontal).is_none());
+        assert_eq!(app.windows[&wid].scroll_residual, 0.5);
+        assert_eq!(app.windows[&wid].scroll_residual_x, 0.5);
+        assert!(app.open_tab_context_menu_at_chip(wid, 0));
+        assert_eq!(app.windows[&wid].scroll_residual, 0.0);
+        assert_eq!(app.windows[&wid].scroll_residual_x, 0.0);
+
+        // Both swipes are swallowed by the card, including their fractional
+        // banks. Closing it must discard that credit before the grid resumes.
+        app.on_mouse_wheel(wid, vertical);
+        app.on_mouse_wheel(wid, horizontal);
+        assert_eq!(app.windows[&wid].scroll_residual, 0.5);
+        assert_eq!(app.windows[&wid].scroll_residual_x, 0.5);
+        assert!(app.close_tab_menu(wid));
+        assert_eq!(app.windows[&wid].scroll_residual, 0.0);
+        assert_eq!(app.windows[&wid].scroll_residual_x, 0.0);
+
+        // NEGATIVE CONTROL: without the close reset, these half-row/cell
+        // deltas would pay off the swallowed halves and emit phantom notches.
+        assert!(app.wheel_notches(wid, vertical).is_none());
+        assert!(app.wheel_notches(wid, horizontal).is_none());
+        assert_eq!(app.windows[&wid].scroll_residual, 0.5);
+        assert_eq!(app.windows[&wid].scroll_residual_x, 0.5);
     }
 
     /// DIRECT MANIPULATION — a 120 Hz precise stream at a constant 1 row per

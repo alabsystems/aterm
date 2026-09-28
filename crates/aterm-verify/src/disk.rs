@@ -433,7 +433,7 @@ pub fn parse_du(text: &str, lanes: usize) -> Option<Vec<u64>> {
 /// out the clock; a killed child's drains are left to end when its pipes
 /// close, never waited for. The wait polls like [`crate::exec`]'s stage
 /// children do: std has no wait with a deadline, and this crate has no `libc`.
-fn output_within(mut cmd: Command, deadline: Duration) -> Result<Output, String> {
+pub(crate) fn output_within(mut cmd: Command, deadline: Duration) -> Result<Output, String> {
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

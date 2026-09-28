@@ -3624,13 +3624,24 @@ pub(crate) fn connect_socket_nonblocking(path: &str) -> std::io::Result<CtlStrea
     for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
         *slot = *byte as libc::c_char;
     }
+    // Flagged close-on-exec AT CREATION where the platform can: this runs on the
+    // control worker while the successor's other threads spawn helpers, and a
+    // spawned child inherits every descriptor not yet flagged when it execs — a
+    // dial left unflagged for that window rides into the helper for its whole
+    // life (the product fd-hygiene sweep of 2026-09-27). Darwin has no
+    // `SOCK_CLOEXEC`, so there the `fcntl` pair below is the best available.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let kind = libc::SOCK_STREAM;
     // SAFETY: socket returns a fresh descriptor, owned immediately on success.
-    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    let raw = unsafe { libc::socket(libc::AF_UNIX, kind, 0) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     // SAFETY: both operations target this live, exclusively owned descriptor.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0
         || unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0
     {
@@ -4155,6 +4166,36 @@ mod tests {
             Ok(true),
             "teardown hint blocked or missed the initial live listener"
         );
+    }
+
+    /// The teardown dial leaves this function already close-on-exec and
+    /// non-blocking — a POST-CONDITION pin, not a test of the atomicity the product
+    /// fd-hygiene sweep of 2026-09-27 fixed: Linux now flags the socket inside
+    /// `socket(2)` itself (a spawn on another thread can no longer inherit it
+    /// unflagged), which this macOS host neither compiles nor runs; Darwin, which
+    /// has no `SOCK_CLOEXEC`, keeps the `fcntl` pair and its microsecond window.
+    #[cfg(unix)]
+    #[test]
+    fn the_teardown_dial_is_close_on_exec_and_non_blocking() {
+        use std::os::fd::AsRawFd;
+        let dir = aterm_tempfile::TempDir::new_in("/tmp").unwrap();
+        let path = dir.path().join("cloexec.sock");
+        let listener = aterm_uds::CtlListener::bind(&path).unwrap();
+        let stream = connect_socket_nonblocking(path.to_str().unwrap()).unwrap();
+
+        // SAFETY: both reads target this test's own live descriptor.
+        let fd_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+        let status_flags = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+        assert!(
+            fd_flags >= 0 && fd_flags & libc::FD_CLOEXEC != 0,
+            "the dial is inherited across exec: F_GETFD = {fd_flags:#x}"
+        );
+        assert!(
+            status_flags >= 0 && status_flags & libc::O_NONBLOCK != 0,
+            "the dial blocks: F_GETFL = {status_flags:#x}"
+        );
+        drop(stream);
+        drop(listener);
     }
 
     #[test]

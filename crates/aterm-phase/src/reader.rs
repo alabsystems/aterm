@@ -638,8 +638,8 @@ fn program_word(program: &str) -> String {
 mod tests {
     use super::*;
     use crate::prompt::fixtures::{
-        BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION, MEMORY_BANNER_BUSY,
-        MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
+        API_ERROR_ENOTFOUND, BOX_BASH_TOUCH, CODEX_TRUST, END_529, GOAL_ACTIVE_SUGGESTION,
+        MEMORY_BANNER_BUSY, MEMORY_BANNER_IDLE, TRUST, bash_one_row, composer, rows, screen,
     };
     use crate::prompt::{CancelEffect, PromptKind, Role, Select};
     use crate::wall::WallKind;
@@ -890,6 +890,38 @@ mod tests {
         assert_eq!(b.phase, Phase::Prompt);
         assert_eq!(b.prompt.map(|p| p.kind), Some(PromptKind::Trust));
         assert_eq!(b.wall, None);
+
+        // Claude Code 2.1.283's own shape: the outage's `⏺ API Error` is the
+        // wall the turn ended on. While the vendor still retries under it
+        // (its spinner row says so, `esc to interrupt` below), the screen is
+        // busy and no wall is read.
+        let e = read(Some("claude"), &screen(API_ERROR_ENOTFOUND), Some(3));
+        assert_eq!(e.phase, Phase::Idle);
+        assert_eq!(
+            e.wall.map(|w| (w.kind, w.placement)),
+            Some((
+                WallKind::ApiError {
+                    code: None,
+                    retryable: true,
+                    cause: crate::wall::ApiCause::Unreachable,
+                },
+                crate::wall::Placement::ErrorRow,
+            ))
+        );
+        let mut retrying = screen(API_ERROR_ENOTFOUND);
+        let done = retrying
+            .iter()
+            .position(|r| r.starts_with("✻ Worked"))
+            .expect("the done row");
+        retrying[done] =
+            "✻ Can't reach the API server · Retrying in 2m · attempt 7/10 (esc to interrupt)"
+                .to_string();
+        let last = retrying.len() - 1;
+        retrying[last] =
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt".to_string();
+        let busy = read(Some("claude"), &retrying, None);
+        assert_eq!(busy.phase, Phase::Busy);
+        assert_eq!(busy.wall, None);
     }
 
     /// The 2026-09-24 incident's screen: the spinner still running, so the

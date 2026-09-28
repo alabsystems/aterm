@@ -181,7 +181,8 @@ impl Ctl {
     ///
     /// If `fd` names no open socket — refused before anything takes ownership
     /// of the number, see [`inherited_socket`] — or if the descriptor cannot be
-    /// duplicated for the reader half.
+    /// duplicated onto its close-on-exec copy or for the reader half (either
+    /// way the inherited number is closed).
     pub fn adopt(fd: RawFd) -> io::Result<Self> {
         inherited_socket(fd)?;
         // THIS CALL REACHES THE CRATE'S ONE `unsafe` BLOCK — see
@@ -193,7 +194,16 @@ impl Ctl {
         // exception. `from_raw_fd` on an inherited number is the one place this
         // crate takes ownership of a descriptor it did not create: exactly once
         // per number, at startup, before anything else touches it.
-        let owned = unsafe_adopt(fd);
+        //
+        // AND THE NUMBER ITSELF IS NOT KEPT. The launcher's `dup2` had to clear
+        // `FD_CLOEXEC` for it to survive the exec, and nothing sets it again, so
+        // a child this process spawns (`hostname`'s `uname -n`) inherited the
+        // bridge's aterm authority and kept aterm's end from reading EOF — the
+        // fail-closed halt — for as long as that child lived. `try_clone` is
+        // `F_DUPFD_CLOEXEC`: the connection moves to a flagged copy and the
+        // temporary's drop closes the unflagged number (the product fd-hygiene
+        // sweep of 2026-09-27).
+        let owned = unsafe_adopt(fd).try_clone()?;
         let stream = UnixStream::from(owned);
         Self::from_stream(stream)
     }

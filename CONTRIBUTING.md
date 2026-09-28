@@ -74,20 +74,21 @@ What you *can* run on this snapshot, all on the pinned toolchain:
 
 * `cargo test --locked` for every crate you touched. This is the one that
   matters, and the expectation is that it is green on a fresh clone.
-* `cargo run -q -p xtask -- gate <check>` for the source-walk lanes. These
-  shell out to nothing — they are in-process walks of the checked-in tree —
-  so they run anywhere the workspace builds: `drift`, `dormant`, `mainloop`,
-  `lockorder`, `wasmloop`, `scope`, `lazyinit`, `fault` and `counts`. Run the
-  ones touching your change. A bare `gate` prints the list of checks and fails.
+* `cargo run -q -p aterm-census -- . [--mainloop|--locks|--wasm|--scope|--lazy-init]`
+  for the source-walk censuses: main-loop reach, the lock-order graph, the
+  wasm process, scope cardinality and lazy-init reentrancy. They shell out to
+  nothing — they are in-process walks of the checked-in tree — so they run
+  anywhere the workspace builds; with no flag it runs the main-loop and
+  lock-order pair, and `--help` prints the list. Run the ones touching your
+  change.
 
-**`gate all` is not that ladder**, and a red `gate all` here is not evidence
-about your change. `crates/xtask/src/gate.rs` marks the verb MANUAL ONLY —
-nothing invokes it automatically — and its roster includes `lint`, whose tippy
-and trustfmt lanes drive the development line's own toolchain. A lane that
-could not run is reported as reaching *no verdict*, and `gate lint` — and so
-`gate all` — returns failure for it rather than a pass, deliberately: a check
-that did not run must never read as a check that passed. Run the specific
-lanes above instead.
+**`xtask gate` is not that ladder.** Its verbs are checks the development
+line's ladder shells into, and they drive that line's own
+toolchain: `gate lint`'s trustfmt passes and the cross-cell type-checks among
+them. A check that could not run is reported as reaching *no verdict* and
+returns failure rather than a pass, deliberately: a check that did not run must
+never read as a check that passed. So a red `xtask gate` verb here is not
+evidence about your change; the tests and censuses above are.
 
 If a change affects how the window looks or feels, also run a real aterm
 instance, capture the rendered frame through `aterm ctl image`, and include

@@ -2,735 +2,69 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! The local enforcement gate — aterm's replacement for CI (there is NO CI).
+//! The xtask gate verbs: the checks the merge gate (`tools/verify.sh`, i.e.
+//! `crates/aterm-verify`) shells into this binary for. There is NO CI.
 //!
-//! Run via `targo --unverified run -p xtask -- gate <check>`. The merge gate
-//! (`tools/verify.sh`, crates/aterm-verify/src/stages.rs) calls four of these
-//! verbs and no others: `lint --fmt-only`, `forge` and `cells-foreign` on every
-//! tier, and `cells` under `--full`. The rest are manual. Read the stage code,
-//! not this sentence, for the live list. Never a hook, never CI (owner decision). This header used to also claim an
-//! `aterm-dev gate` surface; there is none — that crate's `SUBS` registry
-//! lists visual-judge / audit /
-//! verify-proofs / setup-trust and nothing else (checked 2026-07-31).
+//! Run as `targo --unverified run -p xtask -- gate <verb>`. Every verb here has
+//! an automatic caller in `crates/aterm-verify/src/stages.rs`; read that, not
+//! this list, for which tier runs which:
 //!
-//! The structured checks here are the ones plain shell cannot express:
+//! - `lint` (`--fmt-only` is the documented oracle spelling; the two are the
+//!   same run): the formatter, three passes folded into one verdict —
+//!   `targo-fmt --all --check` over the workspace; a per-file `trustfmt --check`
+//!   sweep over every tracked `.rs` outside `vendor/`, at the edition of the
+//!   crate that owns it, which reaches what `--all` cannot (sources pulled in
+//!   with `include!`, and every crate outside `members = ["crates/*"]`); and
+//!   `fmt editions`, a finding whenever a file's `rustfmt.toml` resolves a
+//!   different edition than its manifest declares, since every hand-run
+//!   formatter reads the former. Tippy is not here: the gate's Tippy stage
+//!   drives it directly.
+//! - `forge`: the third-party surface policy, [`aterm_forge::check::check_report`]
+//!   — the same function `cargo forge check` runs, so the gate and the hand-run
+//!   tool cannot disagree. `tools/forge-budget.tsv` is the authority on the
+//!   numbers it ratchets.
+//! - `cells [--cell NAME]…`: every forge cell, type-checked by a compiler for its
+//!   own triple, under the policy in `tools/cross-cell-gate.tsv`.
+//! - `cells-foreign`: `cells` narrowed to the cells no box in this fleet hosts
+//!   ([`FLEET_HOST_TRIPLES`]), whose verdict is the same wherever it runs.
 //!
-//! - `drift`: ADVERTISE-vs-IMPLEMENT. Every capability `TerminalCapabilities`
-//!   advertises (`field: true` in `aterm_capabilities()`) must have a real
-//!   implementation witness in the tree. Fail-closed on unknown capabilities, so
-//!   adding a flag without registering a witness is caught. This catches the
-//!   `kitty_graphics`/`soft_fonts` "advertised but the payload is discarded" class.
-//! - `dormant`: COMPUTED-BUT-UNCONSUMED. Every feature value the engine computes
-//!   must have at least one live (non-test) consumer in its required crate.
-//!   Catches the `bidi_visual_order_cells`-with-no-renderer class. Entries are
-//!   `enforced` once the feature is wired; until then they are reported as
-//!   `pending` (the roadmap, in the gate).
-//! - `mainloop`: MAIN-LOOP COMPLETENESS CENSUS (L0 whole-Mac-freeze CLASS). A
-//!   width change used to rewrap the ENTIRE scrollback synchronously on the
-//!   event-loop thread under the per-session `term` mutex (42s freeze). That site
-//!   is fixed by an offload; this is the standing CLASS guard. Implemented in the
-//!   shared `crates/aterm-census` library (obligations OB-1..OB-6: see its docs),
-//!   which walks `crates/aterm-gui/src` from each main-thread ROOT + one
-//!   `term_lock` hop and FAILS (printing root -> path -> sink + repair options)
-//!   on any unjustified synchronous reach to an UNBOUNDED O(history) sink. The
-//!   SAME library is fused into `tools/freeze-safety-gate/build.rs`, so the
-//!   census is ALSO an automatic, build-blocking obligation — this verb is the
-//!   manual entry point, not the only teeth.
-//! - `lockorder`: LOCK-ORDER CENSUS (L0-DEADLOCK, lock-graph sense; OB-7 in the
-//!   same shared `crates/aterm-census` library, fused into the same
-//!   freeze-safety-gate build). Statically enumerates every lock-acquisition
-//!   site and every acquired-while-holding pair across the GUI-process crates,
-//!   requires the global lock graph ACYCLIC, and FAILS naming both sites of
-//!   every edge of any cycle (plus the repair guidance). NO waiver channel
-//!   exists, by design — an allowlisted cycle would be a standing deadlock.
-//!   Design authority: docs/RFC-trust-temporal-extraction.md §2.1c.
-//! - `wasmloop`: WASM-PROCESS CENSUS (L0-FREEZE, browser-tab analog; OB-8..OB-12
-//!   in the same shared `crates/aterm-census` library, fused into the same
-//!   freeze-safety-gate build). The wasm renderer modules are their own
-//!   single-threaded process (lock-order is a documented VACUOUS posture there,
-//!   tripwired by an OB-12 thread-spawn sweep); the census walks the modules'
-//!   public JS-callable surface and FAILS on any unregistered synchronous reach
-//!   to an UNBOUNDED sink, while any registered standing finding is reported as
-//!   a candidate L0 hazard every run (the survey's two — the synchronous wasm
-//!   `resize` reflow — were fixed 2026-07-14 by the cooperative offload; the
-//!   registry is empty today).
-//! - `scope`: SCOPE-CARDINALITY CENSUS (the "one enforcer, N instances" class;
-//!   OB-13..OB-18 in the same shared `crates/aterm-census` library, fused into
-//!   the same freeze-safety-gate build). A model that verifies a LOCAL property
-//!   of ONE instance of an enforcing structure is silent about a refactor that
-//!   MULTIPLIES the instances: `FlashLimiter` proves ≤ 2 ignitions per rolling
-//!   second for one limiter and stays GREEN when every split pane gets its own,
-//!   while the retina — there is only one — sees 2N. The census turns each such
-//!   doc-comment claim into a pinned ownership CHAIN from the scope root down to
-//!   the enforcing state plus a CLOSED set of every other place it may live,
-//!   re-derived from the tree every run. Only the vocabulary lock (OB-17) has a
-//!   waiver channel; the cardinality obligations have none. THIS BULLET WAS
-//!   MISSING until 2026-08-31 while the verb was dispatched AND an
-//!   [`ALL_ROSTER`] entry, which made the `all` sentence below self-inconsistent
-//!   — it claimed to run "every check above" and ran one that was not above.
-//! - `lazyinit`: LAZY-INIT REENTRANCY CENSUS (L0-DEADLOCK, REENTRANCY sense;
-//!   OB-19..OB-21 in the same shared `crates/aterm-census` library, fused into
-//!   the same freeze-safety-gate build). `lockorder` asks whether two threads
-//!   can take two locks in opposite orders; this asks whether ONE thread can
-//!   arrive twice at the same lazy cell. `Once::call` marks a cell RUNNING
-//!   before it runs the initializer, so an initializer that reaches a blocking
-//!   touch of its own cell — `get_or_init`, `call_once`, a `LazyLock` deref —
-//!   waits for itself, forever, with no timeout and no log line. That shipped
-//!   in v0.65.0/v0.66.0 (`debug_seamless_reexec_armed`, fixed by 9811b83c) and
-//!   froze the terminal on the main thread at the first automatic update apply.
-//!   The lazy-init graph is required ACYCLIC, with NO waiver channel.
-//! - `fault`: INJECTED-BUT-UNEXERCISED. Every fault point injected into production
-//!   code (`fault::triggered("name")`, M7 FAULT-INJECT) must be armed by some test,
-//!   and every armed name must have a real injection site. Keeps the deterministic
-//!   fault-injection harness honest — an untested fail-closed path rots silently.
-//! - `forge`: THIRD-PARTY SURFACE POLICY. The shipped `aterm` binary resolves 88
-//!   third-party packages / 1,223,829 lines of Rust on aarch64-apple-darwin and
-//!   190 / 2,741,175 on Linux (MEASURED 2026-08-31 on this tree with
-//!   `cargo run -q -p aterm-forge --bin aterm-forge -- --root <repo> survey`,
-//!   whose CROSS-CELL SUMMARY prints one row per cell; the same five pairs are
-//!   the `third_party_packages`/`third_party_loc` ceilings in
-//!   `tools/forge-budget.tsv`, and `[OB-14]` reports all 28 ratchet rows GREEN
-//!   *at ceiling*, which is the two-sided check that these are the live values
-//!   and not a stale transcription) — code this repository neither owns nor
-//!   verifies, and the reason `.cargo/config.toml` still carries
-//!   `-Ztrust-verify=off`. DO NOT TRUST THESE TWO NUMBERS OVER THE RATCHET
-//!   FILE, and the reason is in this header's own history. Every figure here is
-//!   a snapshot of a surface the retirement campaign is actively shrinking:
-//!   this paragraph RECORDED 153 / 2,081,414 and 248 / 3,844,574 for
-//!   2026-08-22 and 91 / 1,275,882 and 191 / 2,765,600 for 2026-08-30 (both
-//!   pairs quoted as the header wrote them — neither was re-derived here), and
-//!   the second pair does not match any state of the ledger: at 44324b41d, the
-//!   2026-08-30 rebaseline itself, `git show 44324b41d:tools/forge-budget.tsv`
-//!   ratchets those two cells at 89 / 1,249,065 and 191 / 2,766,411. Prose
-//!   drifts from the ledger within a day here. `tools/forge-budget.tsv` is the
-//!   authority; a number in this file is a reading of it, correct on the day it
-//!   was typed.
-//!   This verb re-derives that surface from
-//!   `cargo tree --locked --offline` (never
-//!   `cargo metadata --filter-platform`, whose feature-unified resolve over-counts
-//!   the macOS root by 28%) and fails on any of SIX obligation families: the
-//!   provenance/license/NOTICE attestation (`[OB-1]`..`[OB-10]`), a
-//!   `[patch.crates-io]` path fork nobody reviewed (`[OB-11]`), a fork that is not
-//!   the package the graph actually resolves — an UNPATCHED sibling version
-//!   beside it, or a dead patch (`[OB-12]`), a path the carve ledger records as
-//!   deleted that EXISTS again (`[OB-13]`), a measured surface over its
-//!   ratchet ceiling (`[OB-14]`), and a `[patch.crates-io]` entry that CAPTURES
-//!   a `[dev-dependencies]` differential oracle — pointing the oracle at the
-//!   very implementation it exists to check, so it compares a thing with itself
-//!   and passes forever (`[OB-15]`). `[OB-15]` is fail-capable, not decorative:
-//!   `crates/aterm-forge/src/check.rs` raises `✗ FAIL [OB-15]` on a captured
-//!   oracle and downgrades to a NOTE only for the deliberate version-pin escape,
-//!   which is what `arrayvec` reports on this tree (aterm-alloc pins `=0.7.7`,
-//!   which the 0.7.8 shim cannot satisfy, so a registry copy survives to be
-//!   compared against). This header said "five" until 2026-08-31; `[OB-15]` had
-//!   simply never been added to the list.
-//!
-//!   THE PROVENANCE FINDINGS THIS HEADER USED TO NAME ARE CLOSED (2026-08-30).
-//!   It said the verb was red on purpose because `vendor/winit` shipped without
-//!   its provenance files and its `// LOCAL PATCH (aterm):` sites carried no
-//!   Apache-2.0 §4(b) notice; d8a78e6d repaired exactly that on 2026-08-23
-//!   (`.cargo_vcs_info.json`, `Cargo.toml.orig`, the empty `[workspace]` stub,
-//!   the notices, and a byte-diff instrument that no longer trusts our own
-//!   markers), and the winnow shadow went with the `toml_edit` fork on
-//!   2026-08-27. MEASURED on this tree 2026-09-01 by running the verb: every
-//!   obligation family passes and `gate forge` exits 0, printing
-//!   `gate forge: GREEN — 5 vendored fork(s) reviewed + 8 first-party patch
-//!   target(s), all live across 5 cell(s) with no unpatched sibling; 0 carved
-//!   path(s) still absent; provenance attested; 10 note(s).` Attest's own line
-//!   inside that run reads `PASS — 10 obligations held over 5 vendored fork(s)
-//!   (+ [OB-1]/[OB-2] over 8 first-party patch target(s))`.
-//!
-//!   THE 2026-08-31 READING OF THE SAME LINE SAID `6` AND `9 note(s)`, and the
-//!   two differences are one change: `core_maths` became the seventh
-//!   first-party patch target, and because it was the vendored `libm` fork's
-//!   only parent on mac-arm and wasm-cpu, `[OB-12]` now records libm as live in
-//!   3 of 5 cells — the tenth note. A partial cell set is a NOTE by design
-//!   ("recorded so a SHRINKING cell set is visible"), not a failure.
-//!
-//!   THE EIGHTH LANDED THE SAME DAY and moved the count without moving the
-//!   notes: `once_cell` -> crates/aterm-once-cell, live in all five cells, so
-//!   `[OB-12]` has nothing partial to record and the total stays at 10. It is
-//!   the first first-party patch target that is LIVE CODE rather than a facade
-//!   — ten third-party crates call it on four of the five cells — which is why
-//!   its crate carries behaviour tests with planted controls beside the usual
-//!   liveness tripwire. `[OB-15]` is unchanged and still reports exactly one
-//!   NOTE, `arrayvec`: `once_cell` is named in no manifest in this repository,
-//!   so it captures no oracle and takes none.
-//!
-//!   `[OB-14]` WAS RED HERE, AND IT WAS A MEASUREMENT RATHER THAN A
-//!   REGRESSION. That incident is now closed by 44324b41d ("the ratchet
-//!   measured whatever this laptop's cargo cache held", 2026-08-30) and the
-//!   record below is kept as history, because the failure mode — a COMMITTED
-//!   number that depends on an UNVERSIONED local cache — is one this repo
-//!   should recognise on sight if it is ever built again.
-//!
-//!   WHAT WAS SEEN. All four cells of the then-current matrix read exactly 713
-//!   lines over ceiling — mac-arm 1,276,595 vs 1,275,882, linux 2,766,313 vs
-//!   2,765,600, win 3,613,542 vs 3,612,829, wasm 1,173,295 vs 1,172,582 —
-//!   while `Cargo.lock`, `vendor/`, `crates/aterm-forge` and
-//!   `tools/forge-budget.tsv` were all untouched since 1676527d wrote those
-//!   ceilings from the live values, and while every package, build-script,
-//!   proc-macro and duplicate-name row was still exactly AT its ceiling. No
-//!   third-party code had entered the graph; the same 713 in four cells was the
-//!   signature of one shared package measured differently, not of drift.
-//!
-//!   THE CAUSE was [`aterm_forge::loc::package_dir`]: a `[patch.crates-io]`
-//!   fork was measured from a PRISTINE registry checkout of the same version
-//!   when one happened to be unpacked locally, and from `vendor/<name>` when
-//!   none was. That order was deliberate (editing a fork must not move the
-//!   ledger) but it made a committed number depend on an unversioned cache.
-//!   MEASURED 2026-08-30 by unpacking both published `.crate`s into a scratch
-//!   `CARGO_HOME`: pristine `winit 0.30.13` is 59,252 `*.rs` lines against the
-//!   fork's 59,937 (+685), pristine `smol_str 0.2.2` is 1,368 against 1,396
-//!   (+28) — 713 exactly, in every cell that carried winit, which was all four.
-//!   With those two directories present the same tree measured 1,275,882 /
-//!   2,765,600 / 3,612,829 / 1,172,582 and `cargo forge check` exited 0.
-//!
-//!   THE RESOLUTION, and it went the second of the two ways this paragraph used
-//!   to leave open. 44324b41d REVERSED the order: `package_dir` now resolves a
-//!   patched package to the path that COMPILES — the workspace member for a
-//!   first-party replacement, `vendor/<name>` for a fork — and consults the
-//!   registry only for packages nothing patches. The argument recorded at the
-//!   branch is that the old rule's stated purpose was STABILITY and it never
-//!   delivered it: a number that moves with `cargo fetch` is not stable, it is
-//!   only stable on one laptop; and what aterm SHIPS is the fork, readable on
-//!   every machine from the repository alone. The signal the old rule protected
-//!   was not lost — fork-vs-upstream drift is attest's `[OB-7]`, which diffs
-//!   the fork against its pinned upstream and, on a machine with no pristine
-//!   copy, reports itself UNVERIFIED by name rather than silently satisfied.
-//!   Every cell was then rebaselined in that same commit, and each
-//!   `third_party_loc` row in `tools/forge-budget.tsv` carries the reason in its
-//!   own justification column ("NOT DEPENDENCY DRIFT, A UNITS CHANGE"). The
-//!   evidence that no dependency moved is in the shape of the diff, not in the
-//!   assertion: VERIFIED with `git show 44324b41d -- tools/forge-budget.tsv`,
-//!   that commit rewrites exactly five rows — the `third_party_loc` of all five
-//!   cells — and touches no `third_party_packages`, `build_scripts`,
-//!   `proc_macros` or `duplicate_names` row at all.
-//!
-//!   THE FOUR-CELL FIGURES ABOVE ARE THE RECORD OF THAT INCIDENT AND ARE LEFT
-//!   AS THEY WERE MEASURED. They were already not the shape of the matrix: on
-//!   2026-08-30 the single `wasm` cell was found to be rooted at the `aterm`
-//!   BINARY, which nothing compiles for wasm32, and it was replaced by the two
-//!   cells rooted at the modules aterm actually ships to a browser — `wasm-cpu`
-//!   (`aterm-wasm`) and `wasm-gpu` (`aterm-gpu-web`), which MEASURE 25
-//!   third-party packages / 246,067 lines and 62 / 957,778 on this tree today
-//!   (`aterm-forge … survey`, 2026-08-31; the same four figures are those
-//!   cells' ratchet ceilings, all GREEN at ceiling). Those two pairs were
-//!   seeded at 27 / 255,826 and 64 / 984,913 — VERIFIED with
-//!   `git show c09ee7378:tools/forge-budget.tsv`, the commit that created the
-//!   cells, one day earlier and one `package_dir` order ago. A reader meeting
-//!   both pairs should attribute the difference to 44324b41d's units change
-//!   plus the retirement campaign, and should settle it by reading
-//!   `tools/forge-budget.tsv` rather than this paragraph. The
-//!   `wasm 1,173,295 vs 1,172,582` arm of the incident has no successor, and
-//!   THAT IS A NARROWER STATEMENT THAN THIS HEADER USED TO MAKE. It claimed the
-//!   skew "is a THREE-cell phenomenon now" and that "the two browser cells
-//!   cannot exhibit it". Only the first half of the reasoning holds: MEASURED
-//!   with `cargo tree --locked --offline -p aterm-wasm` / `-p aterm-gpu-web
-//!   --target wasm32-unknown-unknown -e normal`, neither browser graph contains
-//!   `winit` or `smol_str`, so the 713 lines (winit +685, smol_str +28) reach
-//!   neither. But the SKEW is not the same thing as that one arm: both wasm
-//!   cells carry the vendored `libm` fork (wasm-gpu carries `indexmap` too),
-//!   and 44324b41d duly moved them — wasm-cpu 255,826 -> 255,841 and wasm-gpu
-//!   984,913 -> 985,011, in the same five-row diff cited above. So the
-//!   pristine-cache skew was a FIVE-cell phenomenon of unequal size, not a
-//!   three-cell one, and the browser cells exhibited a small version of exactly
-//!   what the native cells exhibited a large one of.
-//!   `aterm_forge::resolve::default_cells` carries the cell correction; the two
-//!   wasm rows in `tools/forge-budget.tsv` carry it in the ratchet.
-//!
-//!   THE RATCHET IS NO LONGER CALIBRATED TO ONE MACHINE'S CARGO CACHE, which
-//!   was the whole finding. It had been: every ceiling ever written to
-//!   `tools/forge-budget.tsv` was written by m21, which must have held both
-//!   pristine trees since those were the numbers it recorded; m22 held neither
-//!   and could not acquire them by using cargo, because a patched package's
-//!   lock entry is source-less and cargo never downloads the crate it replaced
-//!   (`cargo fetch` is a no-op for it, and the `.crate` is not in the cache
-//!   either). The instruction that came with that diagnosis still stands and is
-//!   why the repair was a re-derivation rather than a headroom grant: DO NOT
-//!   clear a skew like this with `--update --allow-regress`, because those 713
-//!   lines were aterm's OWN fork edits and recording them as a third-party
-//!   regression would have baked the headroom in forever. One trace of the old
-//!   dependency survives on purpose: `[OB-7]`'s fork-vs-upstream diff still
-//!   wants a pristine copy at `vendor/.forge/<name>/pristine/`, and on this box
-//!   it says so out loud, MEASURED in the 2026-08-31 run quoted above: "NOTE
-//!   [OB-7] fork `winit` cannot be diffed: no pristine copy of `winit 0.30.13`
-//!   under `vendor/.forge/winit/pristine/` or the local registry src. This
-//!   obligation is therefore UNVERIFIED for it, not satisfied." That is the
-//!   correct place for the cache dependency to live: in an obligation that
-//!   reports its own blindness, not in a committed number.
-//!
-//!   Implemented in `crates/aterm-forge` and shared VERBATIM with the
-//!   `cargo forge check` verb ([`aterm_forge::check::check_report`]) — the same
-//!   one-implementation-two-consumers shape the census gates use, so the gate and
-//!   the hand-run tool cannot diverge. Compiles nothing: it reads `Cargo.lock`,
-//!   the `vendor/` tree, `vendor/forge.toml`, `tools/forge-budget.tsv` and FIVE
-//!   offline `cargo tree` resolutions — one per cell of
-//!   [`aterm_forge::resolve::default_cells`], which has been five (mac-arm,
-//!   linux, win, wasm-cpu, wasm-gpu) since the wasm cell was split in two on
-//!   2026-08-30. This header said "four" until 2026-08-31.
-//! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` +
-//!   `targo-fmt --all --check` and a per-file `trustfmt --check` sweep over
-//!   everything `--all` cannot reach. (grep_guard and the license sweep are
-//!   stages of the merge gate, `tools/verify.sh`, not lanes here.) BOTH are
-//!   the stage2's own branded drivers, invoked directly and never resolved off
-//!   PATH: the stage2 ships no `cargo-clippy` and no `cargo-fmt`, so `cargo
-//!   clippy` / `cargo fmt` would either die at component lookup or find stock
-//!   Rust's, which drives a stable rustc that rejects this workspace's
-//!   `-Ztrust-verify=off` and formats to a different style than the tree is in.
-//!
-//!   THE TIPPY LANE LINTS EVERY MEMBER, AND SAYS SO IN NUMBERS (2026-08-26).
-//!   It did not, until now, and the shortfall was invisible from the output.
-//!   Cargo stops scheduling new units at the first one that fails, so under
-//!   `-D warnings` the FIRST red crate ended the run and every crate cargo had
-//!   not started yet went unlinted — while the verdict line still said `gate
-//!   lint: FAILED — findings in: tippy`, which reads like a statement about the
-//!   whole workspace and was a statement about a prefix of it. Fix one crate,
-//!   re-run, meet the next: that is exactly the 2026-08-11 sequence below, and
-//!   it repeated three more times in August. MEASURED on this tree the day this
-//!   was written: the aborting form reported 3 findings, all in `atpkg`; the
-//!   same tree with `--keep-going` reported 9, in `atpkg`, `aterm-conformance`
-//!   and `aterm-gui`.
-//!
-//!   Two things changed. The argv gained `--keep-going`, and it now comes from
-//!   [`aterm_verify::stages::tippy_args`] — the one builder `tools/verify.sh`'s
-//!   Tippy stage already uses — so the gate and the script cannot cover
-//!   different amounts of the tree under the same word. And the lane REPORTS
-//!   ITS OWN COVERAGE: a clean run says how many members it linted and names
-//!   the one thing a green run still does not reach (targets behind
-//!   `required-features`); a failing run names the red members and says out
-//!   loud that its finding list is a floor, since a member downstream of a
-//!   failed LIB has no metadata to be linted against. See
-//!   [`tippy_clean_coverage`] and [`tippy_finding_coverage`].
-//!
-//!   AND NOW IT LINTS THE `required-features` TARGETS TOO (2026-08-27). The
-//!   declaration above was true and useless: `--all-targets` skips every target
-//!   whose `required-features` are off, silently, and this tree has SIX —
-//!   `aterm-gui`'s three `bench-support` benches, its `control-conformance`
-//!   bin, and `aterm-scrollback`'s two `disk-tier` benches. Nothing linted or
-//!   even BUILT them, which is how a broken bench build survived four days in
-//!   August; and because the perf campaign's count gates and reach guards live
-//!   inside those benches, an unbuilt bench is a gate that stopped existing
-//!   without a word. The lane now runs a SECOND tippy invocation with those
-//!   features on ([`aterm_verify::stages::tippy_gated_args`]), folds its
-//!   verdict in with `worst`, and prints its own coverage line.
-//!
-//!   WHAT IT COSTS, measured on this box (m21) with a warm `target-tippy`, and
-//!   stated rather than assumed because a lane nobody will wait for is a lane
-//!   that gets bypassed. No-op re-run: pass one 12.1 s, pass two 11.4 s — the
-//!   tippy lane roughly DOUBLES and still finishes inside half a minute. After
-//!   an edit that invalidates `aterm-gui`: 43.4 s + 22.6 s (+52%). The one
-//!   genuinely expensive run is the FIRST after a fresh `target-tippy`, where
-//!   pass two compiles the wider feature set from scratch: 33.7 s. Everything
-//!   below the two packages is a cache hit from pass one either way. Ten
-//!   seconds a run — half a minute, once — for six targets that had no linter
-//!   at all. The pair
-//!   ([`aterm_verify::stages::GATED_LINT_FEATURES`]) is checked against
-//!   `crates/*/Cargo.toml` by test, so a seventh gated target cannot be added
-//!   without either extending the table or reddening that test.
-//!
-//!   THE FMT LANE IS ARMED (2026-08-26). It was not, for a month: `cargo fmt`
-//!   could not dispatch, the lane reported NOT RUN, and its NOT RUN was
-//!   exempted from blocking. The tree was reformatted (254 files) and the lane
-//!   pointed at `targo-fmt`, which the stage2 has shipped all along. This
-//!   REVERSES a standing rule of this repo — "never mass-reformat; keep the
-//!   linter green instead" — at the owner's explicit instruction; the rule is
-//!   gone rather than merely unenforced, and every place that stated it has
-//!   been updated. `--no-fmt` still excludes formatting and only formatting,
-//!   and now prints itself as an opt-out rather than as policy. See
-//!   [`gate_lint_with`].
-//!
-//!   WHAT THE ARMING REACHES. It arms `gate lint` and, through [`ALL_ROSTER`],
-//!   `gate all` — and since 2026-08-31 it arms the MERGE CONTRACT too.
-//!   `tools/verify.sh` is a different binary (`crates/aterm-verify`) with its
-//!   own stage list, and that list had a Tippy stage and NO fmt stage: measured
-//!   the same day, `targo-fmt` and `trustfmt` appeared nowhere in
-//!   `crates/aterm-verify/src` outside a toolchain-inventory doc comment. The
-//!   limit was declared rather than hidden, which is not the same as covered —
-//!   with the pre-push hook advisory since 2026-08-24, NOTHING ran a formatter
-//!   over this tree unless a human chose to, and three consecutive rebases of
-//!   `main` arrived with drift (5 files, 2, 1), one of them in a crate
-//!   `targo-fmt --all` structurally cannot see. `plan.rs` now carries a
-//!   `Formatting` stage that shells `gate lint --fmt-only` — this lane's both
-//!   passes and no other lane — so the merge contract now checks formatting
-//!   and blocks on drift.
-//!
-//!   AND THE LANE NOW SWEEPS WHAT `--all` CANNOT REACH (2026-08-31). This
-//!   header used to record the second limit as "nor does `--all` reach the four
-//!   out-of-workspace crates" and leave it there. Both halves were wrong. The
-//!   count was wrong — MEASURED, there are ELEVEN tracked manifests outside
-//!   `members = ["crates/*"]`, not four: astream-oracle, aterm-link,
-//!   libc-oracle plus its `under-test` and `conformance` crates,
-//!   tools/temporal-extract plus its `refine` and `refine-smt` crates,
-//!   tools/freeze-safety-gate, experiments/title-neural-poc, and
-//!   crates/aterm-scrollback/fuzz, which sits under `crates/` and is
-//!   nevertheless its own workspace. (It was TEN when this pass was written a
-//!   day earlier; `aterm-link` landed in between, arriving with fifteen
-//!   never-formatted files — which is the argument for the pass, not a
-//!   footnote to it: a whole crate can join this tree and be format-checked by
-//!   nothing.) And the SHAPE was
-//!   wrong: out-of-workspace crates are only half the blind spot, because a
-//!   file `include!`d rather than `mod`-declared is invisible to `--all` even
-//!   inside a member — that is how `crates/aterm-core/src/terminal/
-//!   handler_dec_refinement.rs` and `crates/aterm-shell-integration/src/
-//!   tests.rs` were never once format-checked.
-//!
-//!   Declaring a limit is not covering it, so the lane grew a SECOND PASS
-//!   ([`fmt_sweep`]) on the same pattern the tippy lane already uses for its
-//!   `required-features` targets: a per-file `trustfmt --check` over every
-//!   TRACKED `.rs` outside `vendor/`, at each file's own crate edition, folded
-//!   into the lane's verdict with `worst`. MEASURED on this tree the day it
-//!   landed: `targo-fmt --all --check` exits 0 over 1,752 tracked files while
-//!   the sweep named 51 drifted — 9 registered in [`FMT_SWEEP_EXCLUSIONS`] with
-//!   a reason (generated drawlists and grep-guard fixtures whose SHAPE is the
-//!   thing under test, all reprinted every run and never waived) and 42
-//!   FINDINGS: 42 files that had no formatter at all and no diagnostic saying
-//!   so. All 42 were formatted in the commit that armed this pass, so the sweep
-//!   names 9 today and every one of the 9 is a registered exclusion — an ARMED
-//!   GREEN, not an unarmed one. It costs 7.5 s (two runs, both 7.5 s), needs no
-//!   compiler, and its red fixture plants an `include!`-only source in a scratch
-//!   tree and requires both a RED and a GREEN-once-formatted.
-//!
-//!   A LANE THAT DID NOT RUN IS NOT A LANE THAT FAILED. [`LaneVerdict`] is
-//!   three-valued for that reason, and it is not academic: it is what
-//!   `trustfmt: FAILED (exit Some(1))` was really saying for that month, which
-//!   made this verb unable to pass on this machine for any input — so it
-//!   stopped being read, which is how three lint regressions on 2026-08-11
-//!   (atpkg dead code, an aterm-effects lint the atpkg abort hid, a
-//!   rebase-reverted install staging) reached `main` under a gate that was red
-//!   about something else entirely. [`LintLane`] carries the blocking policy.
-//!
-//!   THE IDENTITY-GUARD ABORT IS NOT A LINT RESULT. Branded Tippy authenticates
-//!   its own toolchain (see [`TIPPY_IDENTITY_ABORTS`]), and any create/unlink/
-//!   rename in ANY ancestor of the stage2 sysroot mid-run aborts it — a run can
-//!   lint clean, print `Finished dev profile`, and still exit non-zero. This
-//!   lane retries that signature and only that signature; a real `-D warnings`
-//!   failure is never retried into a pass.
-//!
-//!   RUNNING IT BY HAND — two traps. The path must be CANONICAL: a toolchain
-//!   reached through a symlink (the rustup entry, the store's `current`) is
-//!   refused outright ("traverses a symlink or non-canonical path"); use the
-//!   physical directory `aterm help rust` prints as the gates' toolchain. (This
-//!   verb is safe either way — discovery canonicalizes — but a human copying a
-//!   symlinked path is not.) And give each concurrent invoker its OWN `CARGO_TARGET_DIR`:
-//!   the guarded window spans cargo's build-lock WAIT, so a shared
-//!   `target-tippy` leaves a fast crate exposed for as long as it is queued.
-//!   The working single-crate form of this lane is:
-//!   `PATH="<the gates' toolchain>:$PATH"
-//!   CARGO_TARGET_DIR=<root>/target-tippy TRUST_NO_MIGRATE_WARN=1 targo-tippy
-//!   -p <crate> --all-targets -- -D warnings` (add `--no-deps` to see one
-//!   crate's own findings when a workspace peer is red). For the whole tree by
-//!   hand, use `--workspace --all-targets --keep-going` — without `--keep-going`
-//!   you get the first red crate and nothing after it. To see EVERY finding
-//!   including the ones a red crate would mask, drop `-- -D warnings`
-//!   altogether: warnings then stay warnings, nothing fails, and every member
-//!   is linted in one pass.
-//! - `counts`: COMPUTED-ONLY PROOF INVENTORY. Counts ordinary `#[kani::proof]`
-//!   attributes under workspace crates, fails closed on scan/read errors or an
-//!   empty inventory, and rejects a hand-maintained README total. The semantic
-//!   harness-name closure remains the generated-manifest/spec-link L1 gate.
-//! - `miri`: UB-FLOOR (skip-if-unavailable). Runs `cargo +nightly miri test` over
-//!   the allocator/buffer/grid crates when a nightly miri is installed; otherwise
-//!   prints a clear SKIP and passes (never a hard fail on a box without miri).
-//! - `perf`: MEM-BUDGET retained-heap ceiling (M2); wall-clock baseline deferred.
-//! - `linux` (opt-in, NOT in `all`): the codebase must keep compiling for
-//!   `x86_64-unknown-linux-gnu` (no macOS-only API sneaks in un-cfg-gated). With
-//!   `cargo-zigbuild` on PATH it checks the WHOLE WORKSPACE (zig cc cross-compiles
-//!   the zstd C-dep); else the pure-Rust engine. Skips gracefully if that rustup
-//!   target is absent. Matches M5's "uname-gated state probe".
-//! - `web` (opt-in, NOT in `all`): the two web renderers — `aterm-wasm` (CPU)
-//!   and `aterm-gpu-web` (GPU/WebGL2) — must keep BUILDING for
-//!   `wasm32-unknown-unknown`. Everything else in this file checks the HOST
-//!   target, so every `#[cfg(target_arch = "wasm32")]` block (the
-//!   `wasm_bindgen` exports, the async WebGL surface init) is otherwise never
-//!   compiled by anything; this verb is the only thing that compiles them.
-//!   It cross-builds on the toolchain that HAS the target ($ATERM_WASM_TOOLCHAIN,
-//!   default `stable`) from a neutral cwd, because `rust-toolchain.toml` pins the
-//!   Trust fork and the Trust sysroot has no wasm32 std. It SKIPS only on a
-//!   pre-flight fact about the box — no rustup, rustup cannot list targets, or the
-//!   target is absent — and every skip says NOTHING WAS COMPILED out loud. A build
-//!   that RUNS and fails is a FAILURE, never re-read as a skip from its stderr:
-//!   that inversion made this verb a permanent green skip until 2026-08-31, and
-//!   `gate linux` carried the identical bug. These are also the two packages `forge`'s `wasm-cpu`
-//!   and `wasm-gpu` cells are rooted at — one definition of "what aterm ships
-//!   to a browser", read by both verbs.
-//! - `cells` (in `tools/verify.sh --full`, NOT in `gate all`): EVERY forge cell,
-//!   type-checked by a compiler FOR ITS OWN TRIPLE. `gate web` and `gate linux`
-//!   each cover one target and were both written as opt-in one-offs; this verb
-//!   covers the whole matrix from ONE definition of what a cell is —
-//!   `aterm_forge::resolve::default_cells()`, called and not copied — so the
-//!   cells `forge` MEASURES and the cells a compiler READS can never disagree.
-//!   Measured 2026-09-01 on m21: mac-arm 114/114 packages, linux 230/253, win
-//!   147/159, wasm-cpu 54/62, wasm-gpu 90/103; 106 s cold and ~19 s warm for all
-//!   five. RE-MEASURED 2026-09-17 on m17-tower, where `linux` is the native cell
-//!   and the test-target pass of 2026-09-16 is in the price: 235.7 s cold,
-//!   2.1 s warm, 55.7 s after one core-crate edit — and RED, because `mac-arm`
-//!   is the cross cell there and no policy row covers `aarch64-apple-darwin`
-//!   (`BUILD-SCRIPT(ring)`, 58 of its 76 in-repo crates unread). That verdict
-//!   difference between two boxes on one tree is why the WHOLE matrix is still
-//!   opt-in and only `cells-foreign` is in `gate all`.
-//!   `--cell NAME` (repeatable) is the fast loop. The four cross cells
-//!   ride a toolchain that carries the triple, from a neutral cwd; the host cell
-//!   rides the repo pin with NO `--target` (`.cargo/config.toml`'s corollary),
-//!   and cannot ride upstream at all because `crates/trust-gate`'s build script
-//!   refuses a non-Trust compiler when HOST == TARGET. Nothing is written inside
-//!   the repo — unlike `gate web` and `gate linux`, which both point
-//!   `CARGO_TARGET_DIR` at `<repo>/target`.
-//!   THE PACKAGE COUNT IS NOT THE NUMBER THIS VERB IS ABOUT. `linux 206/253` was
-//!   at its floor and GREEN on 2026-09-01 while EVERY ONE of aterm's eighteen
-//!   compiled first-party crates went unread on that cell — `ring` and
-//!   `zstd-sys` bundle C, their build scripts died for want of a cross C
-//!   toolchain, and took the whole upward closure with them. So the verb now
-//!   also owes a second count it cannot excuse away: every IN-REPO package in a
-//!   cell's graph that is not a proc macro must be type-checked for that cell's
-//!   triple, or the cell is RED. The two build scripts are SHIMMED rather than
-//!   excused — cargo's own `[target.<triple>.<links>]` override, passed with
-//!   `--config` so no file exists to leak, on rows that pin the exact version
-//!   whose script was read and assert it emits nothing a compiler reads. That
-//!   took linux from 206 to 230 and win from 123 to 147, and every remaining
-//!   unreached package on both is a host-only proc macro or a build dep of one.
-//!   `cdep` (excuse) rows are still supported and there are none left; every
-//!   other error fails the cell, and a per-cell coverage FLOOR fails a run that
-//!   type-checks fewer packages than the last one did.
-//!   AND A CELL NOTHING WAS COMPILED FOR IS NOT A PASS. A box with no std for a
-//!   triple SKIPS that cell, which is right — no change to this repository can
-//!   install one, and a red nobody can clear is a red nobody reads — but the row
-//!   carried `ok: true` and the verdict still read `GREEN — all 5 cells
-//!   type-check`. Measured 2026-09-17 with no cross std and no native cell: five
-//!   `SKIPPED(no-std)` rows, zero compilers, that sentence, exit 0. A skip is now
-//!   its own state ([`CellOutcome`]): the run still exits 0, and it forfeits the
-//!   matrix claim ([`MATRIX_CLAIM`], which only [`cells_verdict`] may spell),
-//!   naming every cell it did not compile. `tools/verify.sh` reads that sentence
-//!   and counts the stage as a SKIP, so the whole-tree verdict cannot say
-//!   `merge contract satisfied` over cells no compiler read.
-//! - `cells-foreign` (IN `all` since 2026-09-17): the same verb as `cells`,
-//!   narrowed to the cells NO box in this fleet runs natively — `win`,
-//!   `wasm-cpu`, `wasm-gpu` and, since the matrix grew to the six SHIPPED
-//!   triples on 2026-09-18, `mac-x64`, `linux-arm` and `win-arm` — derived from
-//!   `default_cells()` and [`FLEET_HOST_TRIPLES`], never typed out.
-//!   THE POINT IS THAT IT IS ALWAYS ON:
-//!   `cells` was the only thing in the tree that compiles aterm for a triple the
-//!   box is not, and it was opt-in, so Windows broke under a green tree four
-//!   times on 2026-09-16 and was repaired by hand four times — 36c0d4c44's own
-//!   body says why it landed: "From a Unix box the build is clean, which is
-//!   exactly why it landed". The cells left out
-//!   are each NATIVE on some box, where the ordinary build/test/tippy lanes
-//!   already compile them, and each carries a verdict that differs by who asks
-//!   (`cshim` rows are declined on the host; a `floor` counts host artifacts a
-//!   cross run cannot produce) — so they stay in the opt-in whole-matrix verb.
-//!   MEASURED 2026-09-17 on m17-tower, when it was three cells: 90.5 s cold,
-//!   1.2 s warm, 16.6 s after one core-crate edit, against a `gate all` that
-//!   costs 251.0-542.6 s on the same box (the spread is `perf`'s release
-//!   harness, warm or cold) — +3.0% to +6.6%. Five cells since 2026-09-18,
-//!   re-measured 2026-09-27 on m7 (see [`gate_cells_foreign`]: 394 s cold into
-//!   12.1 GiB with incremental on, 2.6 GiB with it off as `tools/verify.sh`
-//!   runs it). It leaves those target dirs, outside the repo, in
-//!   `$ATERM_CELL_TARGET_DIR` (default: `$XDG_CACHE_HOME/aterm/cells/<checkout>`,
-//!   which is disk-backed and one per checkout — see [`cell_target_dir`] for why
-//!   it is not the temp dir, and why worktrees may not share it).
-//! - `certified` (opt-in, NOT in `all`): the KERNEL-CERTIFIED standard,
-//!   enforced locally. Compiles `crates/xtask/certified-corpus/*.rs` through
-//!   the Trust driver under `CERTIFY_FLAG` and requires TWO independent
-//!   conditions: exit 0 (full static discharge) AND — the one the exit code
-//!   cannot see — every obligation of every block kernel-certified by the clean
-//!   zero-trust CIC kernel rather than merely solver-trusted, judged by parsing
-//!   the driver's notes. A broken parse contract goes RED as "PARSE CONTRACT
-//!   BROKEN"; it never degrades to a pass. With no Trust toolchain it answers
-//!   NOT RUN and exits 3 (COULD NOT RUN), naming the remedy.
-//! - `citations`: A CLAIM WITH NO WITNESS. Prose on the release + packaging
-//!   surface that CITES something by name — a repo path, or a test-shaped
-//!   identifier — must cite something that exists, or say in the sentence that
-//!   it does not (an absence is a claim too) or which other tree owns it. This
-//!   is the gap `drift` leaves: drift proves an advertised capability has a
-//!   witness, and cannot see a comment whose stated proof is a test that was
-//!   renamed out from under it. Roster and rules in
-//!   `crates/xtask/src/citations.rs`.
-//! - `nonvacuity`: the meta-obligation over [`ALL_ROSTER`] on its own, cheap
-//!   enough (a few file reads) to run without paying for the roster it audits.
-//!   Described in full below; `all` runs it too, at the end.
-//! - `all`: the [`ALL_ROSTER`] gates — drift, dormant, mainloop, lockorder,
-//!   wasmloop, scope, lazyinit, fault, forge, counts, perf, lint,
-//!   cells-foreign, citations — plus
-//!   `nonvacuity` at the end. That enumeration is hand-kept: it drifted twice
-//!   (below), and `citations` joining the roster on 2026-09-17 left it a verb
-//!   short. A test held it to the const from then until the 2026-09-24
-//!   test-audit trim retired it with the other prose pins. That is every check above EXCEPT the ones
-//!   [`OPT_IN_OUTSIDE_ROSTER`] names: `linux` (needs the Linux target), `web`
-//!   (needs the wasm32 target), `cells` (the WHOLE matrix, whose verdict is a
-//!   fact about the box as well as the tree — `tools/verify.sh --full` runs it,
-//!   and `cells-foreign` is the always-on half), `miri` (needs a nightly miri
-//!   toolchain) and `certified` (needs a Trust toolchain) — each opt-in because
-//!   it depends on something a plain checkout does not have. That const is DERIVED from the
-//!   dispatch arms, because this sentence said "the four" for a day after
-//!   `cells` became the fifth while `main.rs`'s derived usage already said five.
-//!   That was the SECOND time this sentence drifted: until 2026-08-31 it
-//!   was inconsistent in BOTH directions: it excluded `web` and `certified`
-//!   from a bulleted list they had never been on, and it silently included
-//!   `scope`, which is dispatched and IS a roster entry but had no bullet. The
-//!   fix was to document the three missing verbs above rather than to trim the
-//!   sentence, because the roster is the authority and the prose has to match it.
-//!   MANUAL ONLY — nothing invokes `all` itself. This line used to read "what the
-//!   pre-push hook runs"; MEASURED 2026-07-31, that was false, and it is now
-//!   false twice over: `.githooks/pre-push` was demoted to ADVISORY on
-//!   2026-08-24 (the paint guard having made a blocking hook cost twelve
-//!   minutes), its 2026-09-17 successor read a gate receipt rather than a verb,
-//!   and on 2026-09-25 the hook was deleted outright (no hooks, by the owner's
-//!   mandate). Nothing automatic runs this verb; tools/verify.sh invokes `lint
-//!   --fmt-only`, `forge` and `cells-foreign` on every tier (and `cells` under
-//!   `--full`); `perf` has NO automated caller (it measures, and belongs behind
-//!   `--full`).
-//!
-//!   `forge` IS GREEN, AND COST IS THE ONLY ARGUMENT LEFT AGAINST WIRING IT IN.
-//!   This paragraph used to say the verb "is RED on this tree today, so wiring
-//!   it into verify.sh would stop every merge until the winit provenance files
-//!   are dealt with". That was false on 2026-08-31 and had been for a day: the
-//!   provenance findings closed on 2026-08-23 (d8a78e6d) — as the `forge`
-//!   bullet above already said, 200 lines earlier, which is how long a stale
-//!   sentence can sit beside its own correction — and the `[OB-14]` ratchet skew
-//!   closed on 2026-08-30 (44324b41d). MEASURED by running the verb on this
-//!   tree (2026-09-01): exit 0, verdict `gate forge: GREEN — 5 vendored fork(s)
-//!   reviewed + 7 first-party patch target(s), all live across 5 cell(s) with no
-//!   unpatched sibling; 0 carved path(s) still absent; provenance attested;
-//!   10 note(s).`
-//!
-//!   SO HERE IS THE COST, since that is now the whole decision. MEASURED on m22
-//!   with `/usr/bin/time -p` over four consecutive warm runs of the built
-//!   binary: 13.8 s, 12.1 s, 12.1 s, 13.1 s wall (~9 s of it user CPU). Where it
-//!   goes: NOT the resolves — one `cargo tree --locked --offline` for a cell is
-//!   0.21 s, and `aterm-forge attest` end-to-end is 0.31 s. It is the `*.rs`
-//!   line walk over the whole third-party surface, which `aterm-forge survey`
-//!   isolates at 12.6 s for all five cells and 3.9 s for one. Narrowing does not
-//!   help: `check --cell mac-arm` still costs 13.7 s, because `[OB-14]` calls
-//!   `budget::run(root, false, None)` with no cell filter — the ratchet compares
-//!   every row of `tools/forge-budget.tsv` on every run by design, since a
-//!   surface that only shrinks on one target has not shrunk. So the honest
-//!   figure for wiring `forge` into verify.sh is a FLAT ~12–14 s added to every
-//!   invocation, needing no compiler and no network (it reads `Cargo.lock`,
-//!   `vendor/`, `vendor/forge.toml`, the budget file and five offline resolves).
-//!   DECIDED 2026-09-25 under the owner's standing direction: the gate itself, as
-//!   `StageId::Forge` in the xtask lane (re-measured that day at 9.1 s wall with
-//!   xtask warm). A gate behind `--full` has no automatic caller either, which
-//!   is how `cells` missed a Windows break for two days. That DEPARTS from the
-//!   2026-09-25 triage's recommended default — `--full`, because forge's inputs
-//!   change rarely and `--full` already pays for the whole cells matrix — and
-//!   the departure is deliberate (recorded 2026-09-27): `--full` runs only when
-//!   a person types it, so the rare change that matters (a `Cargo.lock` bump,
-//!   a fork re-pin, a vendored file edited) would reach `main` unjudged, and the
-//!   flat 9 s is spent in the xtask lane, beside the build, not after it.
-//!
-//! THE NON-VACUITY OBLIGATION ([`NON_VACUITY_REGISTRY`]). Six times on
-//! 2026-07-31 a gate in this repo was found ASSERTING MORE THAN IT VERIFIED —
-//! `gate drift` had been vacuous since it was written (its witness scan walked
-//! gate.rs itself, so every `Proof::Needle` literal was its own witness).
-//! Careful reading demonstrably does not catch that class; only a mechanical
-//! obligation does. So every entry of [`ALL_ROSTER`] must be paired here with
-//! a named red-fixture test that plants a violation and asserts the gate
-//! reports FAILURE — and `every_all_roster_gate_has_a_red_fixture` fails
-//! `cargo test -p xtask` (which tools/verify.sh runs at workspace scope, line
-//! 331) when a roster entry has none. (The registry once also admitted an
-//! explicit "known gap"; no gate has needed one since the perf and lint
-//! fixtures landed, and the variant was deleted on 2026-09-25.) The registry's
-//! `drives` field states exactly what each fixture calls, so a COMPONENT-level
-//! demonstration can never be read as a VERB-level one. The same check runs as the verb
-//! `gate nonvacuity`, and at the END of `gate all` — so the honest score is
-//! printed at the moment a human is about to read the word GREEN, and a
-//! violated obligation fails `gate all` itself. That score is two counts, not
-//! a fraction: "N/M roster gate(s) proven red at the VERB; C at a COMPONENT
-//! only", each derived from [`NON_VACUITY_REGISTRY`] by [`report_non_vacuity`]
-//! — read it there rather than from prose. This sentence
-//! quoted "9/10 … KNOWN GAP: perf" long after the roster reached thirteen and
-//! `perf` got a verb-level fixture, which is exactly the drift the split-count
-//! wording above it was introduced to prevent.
-//!
-//! See docs/EXCEED_GHOSTTY_PLAN.md.
+//! A verb that could not look says so — NOT RUN, COULD NOT RUN, SKIPPED — and
+//! never prints a pass for it: see [`LaneVerdict`] and [`CellOutcome`].
 
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use aterm_verify::scope::Scope;
-
 use crate::driver::{DRIVER_REMEDY, cargo_driver, export_driver_as_cargo, rustc_host_triple};
-use crate::{collect_rs_files, workspace_root};
+use crate::workspace_root;
 
-/// `rest` is everything after the check name. Two verbs read it — `gate cells`
-/// (`--cell NAME`) and `gate lint` (`--no-fmt` / `--fmt-only`) — and every
-/// other verb ignores it.
-/// NOTHING in the tree passes `--no-fmt`: `.githooks/pre-push` did until its
-/// 2026-08-24 demotion; the flag now exists only for a human who types it, which
-/// is exactly the shape [`LintLane`] argues an escape hatch should have.
+/// A gate verb: its name, and the check it runs on the arguments after it.
+type Verb = (&'static str, fn(&[String]) -> bool);
+
+/// Every verb `gate` dispatches, in the order the usage line prints them. ONE
+/// table: the dispatch reads it and the usage lines (here and in `main.rs`) are
+/// printed from it, so a verb cannot be dispatched without being listed.
+const VERBS: &[Verb] = &[
+    ("lint", gate_lint),
+    ("forge", |_| gate_forge()),
+    ("cells", gate_cells),
+    ("cells-foreign", |_| gate_cells_foreign()),
+];
+
+/// The verb names, for the usage lines.
+pub(crate) fn verb_names() -> Vec<&'static str> {
+    VERBS.iter().map(|(name, _)| *name).collect()
+}
+
+/// `rest` is everything after the verb name.
 pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
-    let ok = match check {
-        Some("drift") => gate_drift(),
-        Some("dormant") => gate_dormant(),
-        Some("mainloop") => gate_mainloop(),
-        Some("lockorder") => gate_lockorder(),
-        Some("wasmloop") => gate_wasmloop(),
-        Some("scope") => gate_scope(),
-        Some("lazyinit") => gate_lazyinit(),
-        Some("fault") => gate_fault(),
-        Some("forge") => gate_forge(),
-        Some("linux") => gate_linux(),
-        Some("web") => gate_web(),
-        Some("cells") => gate_cells(rest),
-        Some("cells-foreign") => gate_cells_foreign(),
-        // Three-valued: NOT RUN (no toolchain) is exit 3, never a pass or a finding.
-        Some("certified") => return gate_certified(),
-        Some("lint") => gate_lint_args(rest),
-        Some("counts") => gate_counts(),
-        Some("miri") => gate_miri(),
-        Some("perf") => gate_perf(),
-        Some("citations") => crate::citations::gate_citations(),
-        // The meta-obligation on its own: cheap (a few file reads), so it can
-        // be run without paying for the roster it audits. `all` runs it too.
-        Some("nonvacuity") => report_non_vacuity(),
-        Some("all") => {
-            // Run all; report every failure (don't short-circuit) so one run
-            // surfaces the full picture, then fail if any failed.
-            let results: Vec<(&str, bool)> = ALL_ROSTER
-                .iter()
-                .map(|(name, check)| (*name, check()))
-                .collect();
-            let mut failed: Vec<&str> = results
-                .iter()
-                .filter(|(_, ok)| !ok)
-                .map(|(n, _)| *n)
-                .collect();
-            // THE META-OBLIGATION, run here too: a roster of ten green gates
-            // means nothing if one of them cannot go red. This is the same
-            // check `cargo test -p xtask` enforces — run at the exact moment a
-            // human is about to read the word GREEN.
-            if !report_non_vacuity() {
-                failed.push("non-vacuity");
-            }
-            if failed.is_empty() {
-                eprintln!(
-                    "\ngate all: GREEN — {} all passed.",
-                    roster_names().join(", ")
-                );
-                true
-            } else {
-                eprintln!("\ngate all: FAILED — {}", failed.join(", "));
-                false
-            }
-        }
-        other => {
-            // DERIVED, not typed. This line was a hand-typed verb list until
-            // 2026-09-17, in the very file whose header brags that `main.rs`
-            // derives its usage from [`roster_names`] / [`opt_in_names`] so the
-            // two could not disagree — and it is the surface a human reads at
-            // the exact moment they got a verb wrong. A verb can no longer be
-            // dispatched without appearing here, because there is nowhere else
-            // to put it. `unknown_verb_usage_names_every_dispatched_verb` reads
-            // this string back against the dispatch arms above.
-            eprintln!(
-                "usage: xtask gate <{}>\n(unknown check {other:?})",
-                usage_verbs().join("|")
-            );
-            false
-        }
+    let Some((_, verb)) = VERBS.iter().find(|(name, _)| Some(*name) == check) else {
+        eprintln!(
+            "usage: xtask gate <{}>\n(unknown check {check:?})",
+            verb_names().join("|")
+        );
+        return ExitCode::FAILURE;
     };
-    if ok {
+    if verb(rest) {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
@@ -738,1152 +72,13 @@ pub(crate) fn run(check: Option<&str>, rest: &[String]) -> ExitCode {
 }
 
 // ---------------------------------------------------------------------------
-// THE `all` ROSTER + the NON-VACUITY OBLIGATION over it
-// ---------------------------------------------------------------------------
-
-/// A roster entry: the verb's name and the check it runs.
-type RosterEntry = (&'static str, fn() -> bool);
-
-/// The gates `gate all` runs, in order. ONE definition with TWO readers — the
-/// `all` arm above and [`NON_VACUITY_REGISTRY`]'s meta-test — so a gate cannot
-/// join the roster without acquiring a red fixture (or an explicit gap), and
-/// cannot leave the roster while a stale registry entry still claims it.
-const ALL_ROSTER: &[RosterEntry] = &[
-    ("drift", gate_drift),
-    ("dormant", gate_dormant),
-    ("mainloop", gate_mainloop),
-    ("lockorder", gate_lockorder),
-    ("wasmloop", gate_wasmloop),
-    ("scope", gate_scope),
-    ("lazyinit", gate_lazyinit),
-    ("fault", gate_fault),
-    ("forge", gate_forge),
-    ("counts", gate_counts),
-    ("perf", gate_perf),
-    ("lint", gate_lint),
-    // THE ONLY CROSS-TRIPLE COMPILE IN THE ROSTER, and the newest entry:
-    // `cells` itself stays opt-in (its verdict is machine-dependent — see
-    // `FLEET_HOST_TRIPLES`), so what joins `all` is the subset of forge's
-    // cells that NO box in this fleet runs natively. Measured 2026-09-17 on
-    // m17-tower: +16.6 s after a core-crate edit, +1.2 s when nothing
-    // changed, on a verb that already costs 251.0-542.6 s.
-    ("cells-foreign", gate_cells_foreign),
-    ("citations", crate::citations::gate_citations),
-];
-
-/// Every verb `run` dispatches, in the order the usage line prints them: the
-/// meta-verb that runs the roster, the roster itself, the opt-ins `all` leaves
-/// out, and the meta-verb that audits the roster. ONE definition; the usage
-/// line is its only consumer, and `unknown_verb_usage_names_every_dispatched_verb`
-/// checks it against the dispatch arms.
-fn usage_verbs() -> Vec<&'static str> {
-    let mut v = vec!["all"];
-    v.extend(roster_names());
-    v.extend(opt_in_names());
-    v.push("nonvacuity");
-    v
-}
-
-pub(crate) fn roster_names() -> Vec<&'static str> {
-    ALL_ROSTER.iter().map(|(name, _)| *name).collect()
-}
-
-/// The dispatched verbs [`ALL_ROSTER`] deliberately omits — each opt-in because
-/// it needs something a plain checkout does not have. ONE definition, read by
-/// the module doc above and by
-/// `the_opt_in_list_is_exactly_the_dispatched_verbs_outside_the_roster`, which
-/// derives it from the dispatch arms so the prose cannot drift again: the header
-/// said "the four" for a day after `cells` became the fifth.
-///
-/// `cells` IS STILL HERE ON PURPOSE, AND THE REASON IS NOT COST. It was the only
-/// cross-triple compile in the tree and it was opt-in, which is why Windows
-/// broke unseen four times on 2026-09-16. The cost was measured on 2026-09-17
-/// and is small — 55.7 s for all five cells after a core-crate edit, against a
-/// `gate all` that costs 251.0-542.6 s on the same box. What keeps the FULL matrix out
-/// is that its verdict is a fact about the BOX as much as about the tree: on
-/// m17-tower the `mac-arm` cell is RED (`BUILD-SCRIPT(ring)` — no policy row
-/// covers `aarch64-apple-darwin`, where cc-rs has no Apple SDK) and the `linux`
-/// cell overshoots a floor recorded as a cross cell on the Mac. A roster gate
-/// that cannot pass on a whole platform for any input is the verdict-that-cannot-
-/// vary [`LaneVerdict`] exists to prevent. So the ALWAYS-ON half is
-/// `cells-foreign` — the cells no box hosts, whose verdict is the same
-/// everywhere — and `cells` keeps the whole-matrix claim, the policy audits and
-/// `tools/verify.sh --full`.
-const OPT_IN_OUTSIDE_ROSTER: &[&str] = &["cells", "certified", "linux", "miri", "web"];
-
-/// [`OPT_IN_OUTSIDE_ROSTER`] for `main.rs`'s usage line, so the two surfaces
-/// cannot disagree the way they did when one said four and the other five.
-pub(crate) fn opt_in_names() -> Vec<&'static str> {
-    OPT_IN_OUTSIDE_ROSTER.to_vec()
-}
-
-/// How a roster gate's ABILITY TO GO RED is established: `test` — a `#[test] fn`
-/// in `file` (workspace-relative) — plants a violation and asserts a RED verdict.
-/// There is no "known gap" alternative: every roster gate has been shown to fail,
-/// and a gate nobody can show failing does not join the roster.
-struct RedFixture {
-    gate: &'static str,
-    test: &'static str,
-    file: &'static str,
-    /// EXACTLY what the fixture calls. A component-level demonstration (one
-    /// lane's function, not the verb) must say so here; only a fixture that
-    /// calls the verb's own reporting function may claim the verb. Prose, for the
-    /// reader — the machine-checked half is `calls`.
-    drives: &'static str,
-    /// The symbol the fixture MUST mention, checked as a substring of its
-    /// body. Without this the obligation is satisfiable by a fixture that
-    /// never touches the gate — `assert!(!false);` in a correctly-named
-    /// `#[test]` scored as proof, which is the very defect this registry
-    /// exists to stop, one level up. It cannot prove the call is REACHED
-    /// (that needs coverage, not a substring), but it does bind the fixture
-    /// to the gate it claims, and the registry already knew this symbol.
-    calls: &'static str,
-    /// Does the fixture drive the VERB, or only a component of it? The
-    /// printed score separates the two rather than counting them together —
-    /// `lint`'s first fixture drove one lane's function, not `gate_lint`, and a
-    /// score that calls both "verb-level" over-claims exactly like the
-    /// verdict line this repo fixed this morning.
-    verb_level: bool,
-}
-
-/// One entry per [`ALL_ROSTER`] gate — fail-closed in both directions.
-const NON_VACUITY_REGISTRY: &[RedFixture] = &[
-    RedFixture {
-        gate: "cells-foreign",
-        test: "a_foreign_cell_under_its_floor_fails_the_cells_verb",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB's implementation: cells_under_policy() — `gate cells`' whole body \
-                 after it reads the policy: member list, forge's per-cell graph, the cross \
-                 compile for the cell's own triple, and the verdict — for the foreign cell \
-                 `wasm-cpu` over the real workspace: GREEN under the shipped policy, then RED \
-                 with that cell's floor raised past its graph, a count only the compile can \
-                 fall short of (2026-09-24; until then only the compiler-free \
-                 cell_matrix_audit had been shown red, and it still is, by \
-                 a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit). SKIPS loudly \
-                 on a box with no wasm32 std",
-        calls: "cells_under_policy",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "citations",
-        test: "a_path_citation_that_resolves_to_nothing_fails_the_citations_verb",
-        file: "crates/xtask/src/citations.rs",
-        drives: "the VERB: citations_report() over a temp tree whose one \
-                 rostered doc cites a script that is there (GREEN), then one \
-                 that is not (RED, naming the PATH rule and quoting the \
-                 citation), then the same dangling citation admitted as \
-                 retired (GREEN again) — the escape proved to be an escape, \
-                 not a hole; its two siblings do the same for an undefined \
-                 test name and for a roster entry that names nothing",
-        calls: "citations_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "drift",
-        test: "an_unwitnessed_capability_advertised_true_fails_the_drift_verb",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: drift_report() with the REAL WITNESS_REGISTRY over a \
-                 fixture root whose advertise file is mutated to advertise a \
-                 capability with no implementation witness (GREEN before, RED \
-                 after, GREEN again once the witness lands)",
-        calls: "drift_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "dormant",
-        test: "deleting_the_only_consumer_fails_the_dormant_verb",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: dormant_report() with the REAL registry entry for \
-                 `apply_bidi_reorder` over a copy of the real render_cells.rs \
-                 with its consumer lines deleted (GREEN before, RED after)",
-        calls: "dormant_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "mainloop",
-        test: "synthetic_prefix_resize_shape_is_red_with_path",
-        file: "crates/aterm-census/src/lib.rs",
-        drives: "the VERB's implementation: run_mainloop_census() over a \
-                 synthetic tree that reintroduces the synchronous \
-                 term_lock(..).resize(..) shape (OB-5 RED with the path)",
-        calls: "run_mainloop_census",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "lockorder",
-        test: "synthetic_cross_boundary_abba_is_red_across_the_namespace",
-        file: "crates/aterm-census/src/lock_order.rs",
-        drives: "the VERB's implementation: run_lock_order_census() over a \
-                 synthetic tree carrying an A-B/B-A cycle across the \
-                 vendored-namespace boundary (OB-7 RED naming both sites)",
-        calls: "run_synth_files",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "wasmloop",
-        test: "synthetic_reintroduced_sync_resize_is_red_ob10",
-        file: "crates/aterm-census/src/wasm_census.rs",
-        drives: "the VERB's implementation: run_wasm_census() over a synthetic \
-                 tree that puts the synchronous self.term.resize(..) back into \
-                 a wasm resize export (OB-10 RED at its site)",
-        calls: "run_wasm_census",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "scope",
-        test: "a_per_pane_word_decorations_map_fails_the_flash_limiter_chain",
-        file: "crates/aterm-census/src/scope_census.rs",
-        drives: "the VERB's implementation: run_scope_census_over() with the \
-                 REAL flash-limiter claim over a copy of the real \
-                 aterm-gui/src/lib.rs made per-pane (OB-13 RED)",
-        calls: "run_one",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "lazyinit",
-        test: "the_v065_self_recursive_once_lock_is_red_with_its_path",
-        file: "crates/aterm-census/src/lazy_init.rs",
-        drives: "the VERB's implementation: run_lazy_init_census()'s derivation \
-                 and verdict, over the EXACT v0.65.0 `debug_seamless_reexec_armed` \
-                 source that shipped a permanent main-thread park (OB-19 RED \
-                 naming the cell and the accessor it calls back into); the \
-                 shipped repair of the same site is GREEN in the sibling test",
-        calls: "run_synth_sources",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "fault",
-        test: "an_unarmed_injection_site_fails_the_fault_verb",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: fault_report() over a synthetic tree whose injected \
-                 fault point no test arms (and the mirror direction: an armed \
-                 name with no injection site)",
-        calls: "fault_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "forge",
-        test: "a_reinstated_carved_module_reds_the_forge_verb",
-        file: "crates/aterm-forge/tests/red_fixtures.rs",
-        drives: "the VERB: check_report() — the exact symbol `gate_forge` calls — \
-                 over a miniature aterm workspace built in CARGO_TARGET_TMPDIR \
-                 around a REAL copy of vendor/indexmap. GREEN first (a fixture that \
-                 is red for an unrelated reason proves nothing), then RED once the \
-                 module `vendor/forge.toml` records as CARVED is reinstated \
-                 ([OB-13], naming the path and quoting the ledger's reason), then \
-                 GREEN again when it is removed — so the verb is shown to move in \
-                 BOTH directions, not merely to be stuck red. Four sibling \
-                 fixtures in the same file drive the same verb through the other \
-                 obligation families: an_unreviewed_patch_entry_reds_the_forge_verb \
-                 ([OB-11], a flawless-in-every-other-respect fork with no \
-                 REVIEWED_VENDORED_CRATES row), \
-                 a_notice_that_omits_a_registered_fork_reds_the_forge_verb ([OB-6], \
-                 proving the DELEGATED attest half reaches the verdict rather than \
-                 being reported and dropped), \
-                 an_unpatched_sibling_version_reds_the_forge_verb ([OB-12] — the \
-                 unpatched-sibling shape synthesized, which cargo itself reports \
-                 as nothing at all), and \
-                 a_ledger_that_disagrees_with_the_tree_reds_the_forge_verb ([OB-17] — \
-                 a `[forge] cells` row forge does not measure, then `[[fork]]` \
-                 blocks at a version the tree does not carry, with a §4(b) flag \
-                 the license does not owe and with a census namespace the review \
-                 registry does not give, each RED, and GREEN again on the \
-                 repair). NOT COVERED: [OB-14], the ratchet ceiling. Its \
-                 comparison is proven by aterm-forge's own budget unit tests, not \
-                 through this verb, so a wiring slip that computed the ratchet \
-                 verdict and dropped it would survive these five fixtures.",
-        calls: "check_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "counts",
-        test: "an_empty_inventory_and_a_hand_maintained_total_fail_the_counts_verb",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: counts_report() over synthetic roots — an empty \
-                 proof inventory, a README asserting a numeric harness total, \
-                 an unreadable README, a Clean island AGENTS.md does not name \
-                 and an unreadable AGENTS.md (each RED; the clean root GREEN)",
-        calls: "counts_report",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "perf",
-        test: "every_perf_lane_can_turn_the_verb_red",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: gate_perf_with() over a lane provider that fails ONE \
-                 lane at a time, all ten in turn, each required to turn the \
-                 verdict red on its own — plus a clean sweep proving the verb is \
-                 not stuck red and asks for every lane once in order, and that \
-                 the trend lane receives the real lanes_ok rather than a \
-                 constant. What this catches is the vacuity a component test \
-                 cannot: a lane computed and then DROPPED (`ok &= f()` slipping \
-                 to `f();`), which makes the gate green by not listening. The \
-                 lane VALUES are proven separately by perf.rs's own decision \
-                 tests (compare_boundary_is_inclusive_pass, keyed_compare_fails_only_\
-                 the_collapsed_metric, trend_same_box_regression_trips_and_other_\
-                 boxes_do_not); this pins the wiring between them. NOT COVERED: \
-                 that the live measurement bindings inside LivePerfLanes select \
-                 the right corpora — that still needs a fixture workspace and a \
-                 toolchain compile.",
-        calls: "gate_perf_with",
-        verb_level: true,
-    },
-    RedFixture {
-        gate: "lint",
-        test: "every_lint_lane_can_turn_the_verb_red",
-        file: "crates/xtask/src/gate.rs",
-        drives: "the VERB: gate_lint_with() over a lane provider that gives ONE \
-                 lane at a time a FINDING (tippy / trustfmt), each \
-                 required to turn the verdict red on its own, plus a clean sweep \
-                 pinning order and arity. The NO-VERDICT half is \
-                 every_not_run_lane_blocks_the_verdict, which drives the same verb \
-                 with one lane NOT RUN and requires EACH to block on its own — it \
-                 replaced a fixture that required both answers of the old \
-                 LintLane::not_run_blocks, an exemption removed when the fmt lane \
-                 was armed; only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out \
-                 pins that the surviving non-blocking path is the FLAG and \
-                 nothing else. The fail-closed branches are driven for real by \
-                 an_absent_toolchain_fails_each_lint_lane_closed_on_its_own, which \
-                 runs LiveLintLanes against a stage2 dir holding neither \
-                 targo-tippy nor targo-fmt and requires each lane to answer NotRun \
-                 SEPARATELY — an earlier fixture asserted only their conjunction, \
-                 which left any single arm free to stop failing closed unnoticed \
-                 — and by \
-                 the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked, \
-                 which mutates a stub targo-fmt through absent / drift-on-stdout / \
-                 error-on-stderr / clean, so the ARMED lane is proven able to go \
-                 red AND proven not to go red for the wrong reason. SCOPE NOTE: that \
-                 last fixture drives fmt_workspace_pass(), i.e. PASS ONE of the fmt \
-                 lane only. Pass two — the trustfmt sweep over the files \
-                 `targo-fmt --all` cannot reach — has its own pair, \
-                 a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed \
-                 (a scratch git tree whose sole offender is `include!`d, required RED \
-                 and then GREEN on the repair alone) and \
-                 the_fmt_sweep_is_not_run_without_a_trustfmt (its own fail-closed \
-                 branch, reached directly because pass one returns before it). NOT \
-                 COVERED: that a file `targo-fmt --all` DOES reach agrees with its \
-                 per-file formatting — that is a measurement (zero disagreements over \
-                 1,752 files on 2026-08-31), not a fixture.",
-        calls: "gate_lint_with",
-        verb_level: true,
-    },
-];
-
-/// Run the non-vacuity obligation over the live tree and print its verdict —
-/// including, on success, the HONEST SCORE (how many roster gates are proven red
-/// at the verb, and which only at a component), so the word GREEN is never read
-/// without it. Returns `false` if the obligation is violated.
-fn report_non_vacuity() -> bool {
-    let root = workspace_root();
-    let violations = non_vacuity_violations(&roster_names(), NON_VACUITY_REGISTRY, &|rel| {
-        std::fs::read_to_string(root.join(rel)).ok()
-    });
-    if violations.is_empty() {
-        // Report VERB-level and COMPONENT-level separately. Counting them together
-        // said "N gates have a red fixture that plants a violation and asserts
-        // FAILURE" while one of the N only demonstrated a component — the same
-        // over-claim, in the same sentence position, as the verdict line this repo
-        // corrected this morning. The score sits next to GREEN; it has to be exact.
-        let component: Vec<&str> = NON_VACUITY_REGISTRY
-            .iter()
-            .filter(|e| !e.verb_level)
-            .map(|e| e.gate)
-            .collect();
-        eprintln!(
-            "\n=== non-vacuity: {}/{} roster gate(s) proven red at the VERB; \
-             {} at a COMPONENT only ===",
-            ALL_ROSTER.len() - component.len(),
-            ALL_ROSTER.len(),
-            component.len(),
-        );
-        for c in &component {
-            eprintln!(
-                "  COMPONENT ONLY: `{c}`'s fixture drives part of the verb, not the verb — \
-                 the verb itself has not been shown to go red."
-            );
-        }
-        true
-    } else {
-        eprintln!(
-            "\n=== non-vacuity: FAILED — a `gate all` entry asserts more than anyone has shown it verifies ==="
-        );
-        for v in &violations {
-            eprintln!("{v}");
-        }
-        false
-    }
-}
-
-/// THE MECHANICAL OBLIGATION: every [`ALL_ROSTER`] gate is paired with a red
-/// fixture, and every named fixture EXISTS, is a `#[test]`,
-/// and asserts a NEGATIVE outcome. Returns one line per violation (empty ⇒
-/// discharged).
-///
-/// Pure in its inputs — `read(rel)` supplies file text — so the real meta-test
-/// drives the real tree while this checker's OWN red fixtures drive planted
-/// registries. WHAT IT CANNOT CHECK, stated plainly: no static check can tell
-/// whether a test's assertions actually exercise the gate. It proves a named,
-/// `#[test]`-annotated, NEGATIVE-asserting fixture exists; the `drives` field
-/// records the scope claim for a human, and is not verified.
-fn non_vacuity_violations(
-    roster: &[&str],
-    registry: &[RedFixture],
-    read: &dyn Fn(&str) -> Option<String>,
-) -> Vec<String> {
-    let mut out = Vec::new();
-    for (i, e) in registry.iter().enumerate() {
-        if registry.iter().take(i).any(|p| p.gate == e.gate) {
-            out.push(format!(
-                "  '{}' has more than one NON_VACUITY_REGISTRY entry (which one is the proof?)",
-                e.gate
-            ));
-        }
-        if !roster.contains(&e.gate) {
-            out.push(format!(
-                "  '{}' is registered as a red fixture but is NOT in the `all` roster \
-                 (stale entry: delete it, or restore the gate)",
-                e.gate
-            ));
-        }
-    }
-    for gate in roster {
-        let Some(entry) = registry.iter().find(|e| e.gate == *gate) else {
-            out.push(format!(
-                "  '{gate}' is in the `all` roster with NO NON_VACUITY_REGISTRY entry — \
-                 nobody has shown it can fail. Add a red-fixture test that plants a \
-                 violation and asserts FAILURE."
-            ));
-            continue;
-        };
-        let RedFixture {
-            test,
-            file,
-            drives,
-            calls,
-            ..
-        } = entry;
-        if drives.trim().is_empty() {
-            out.push(format!(
-                "  '{gate}': the fixture `{test}` records no `drives` scope — say \
-                 whether it drives the verb or a component"
-            ));
-        }
-        let Some(text) = read(file) else {
-            out.push(format!(
-                "  '{gate}': the fixture file {file} could not be read — the \
-                 registered proof does not exist"
-            ));
-            continue;
-        };
-        match test_fn_body(&text, test) {
-            Err(why) => out.push(format!("  '{gate}': fixture `{test}` in {file}: {why}")),
-            Ok(body) => {
-                // Comments are NOT source. Densifying the raw body let
-                // `// we used to assert!(!ok) here` satisfy the negative-
-                // assertion check — a fixture proved by its own commentary.
-                let code: String = body
-                    .lines()
-                    .map(|l| l.split_once("//").map_or(l, |(before, _)| before))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                // Whitespace-insensitive: the formatter, not the author,
-                // decides whether `assert!(` and `!ok` share a line.
-                let dense: String = code.chars().filter(|c| !c.is_whitespace()).collect();
-                if !dense.contains("assert!(!") {
-                    out.push(format!(
-                        "  '{gate}': fixture `{test}` in {file} contains no NEGATIVE \
-                         assertion (`assert!(!…)`) — a red fixture must assert the \
-                         gate FAILS, not that it passes"
-                    ));
-                }
-                // BIND THE FIXTURE TO THE GATE. Without this the obligation
-                // is satisfied by any correctly-named `#[test]` containing a
-                // negative assertion — `assert!(!false);` scored as proof.
-                // A substring cannot prove the call is REACHED, but it does
-                // stop a fixture that never mentions the gate from claiming it.
-                if !dense.contains(
-                    &calls
-                        .chars()
-                        .filter(|c| !c.is_whitespace())
-                        .collect::<String>(),
-                ) {
-                    out.push(format!(
-                        "  '{gate}': fixture `{test}` in {file} never mentions `{calls}` \
-                         — it cannot be a demonstration that THIS gate goes red"
-                    ));
-                }
-            }
-        }
-    }
-    out
-}
-
-/// The source text of `#[test] fn <name>() { … }`, or why it could not be
-/// located. Segmentation uses rustfmt's closing-brace-at-fn-indent invariant —
-/// the same lexical contract the census walker relies on (and the same honest
-/// limit: it is a text scan, not a parse).
-fn test_fn_body<'a>(text: &'a str, name: &str) -> Result<&'a str, String> {
-    let needle = format!("fn {name}(");
-    // The FIRST occurrence that starts a definition line: a mention inside a
-    // string or a trailing comment must not be mistaken for the fn itself.
-    let (line_start, at) = text
-        .match_indices(&needle)
-        .map(|(at, _)| (text[..at].rfind('\n').map_or(0, |i| i + 1), at))
-        .find(|(line_start, at)| text[*line_start..*at].chars().all(char::is_whitespace))
-        .ok_or_else(|| {
-            format!("no definition line starting `{needle}` in the file — renamed or deleted?")
-        })?;
-    let indent = &text[line_start..at];
-    // Walk back over attributes / comments / blank lines: `#[test]` must be
-    // among them, or this is a helper fn rather than a test.
-    let mut attributed = false;
-    let mut ignored = false;
-    for line in text[..line_start].lines().rev() {
-        let t = line.trim();
-        // `#[ignore]` makes a fixture that EXISTS but never RUNS — proof on paper
-        // and nothing at the moment it is needed, which is this obligation's whole
-        // subject. The walk-back already reads these lines, so rejecting it is free.
-        if t.starts_with("#[ignore") {
-            ignored = true;
-        }
-        if t == "#[test]" {
-            attributed = true;
-            break;
-        }
-        if !(t.is_empty() || t.starts_with("//") || t.starts_with("#[")) {
-            break;
-        }
-    }
-    if !attributed {
-        return Err(format!(
-            "`{name}` is not annotated `#[test]` — it cannot fail the build"
-        ));
-    }
-    if ignored {
-        return Err(format!(
-            "`{name}` is `#[ignore]`d — it exists but never runs, so it proves nothing"
-        ));
-    }
-    let close = format!("\n{indent}}}");
-    let end = text[at..]
-        .find(&close)
-        .map(|i| at + i + close.len())
-        .ok_or_else(|| {
-            format!("no closing brace at `{name}`'s indent — is the file rustfmt-clean?")
-        })?;
-    Ok(&text[line_start..end])
-}
-
-// ---------------------------------------------------------------------------
-// Source scanning helpers
-// ---------------------------------------------------------------------------
-
-/// Is this file a test-only source file (excluded from "implementation" scans)?
-/// Shared with the census crate (one definition — the gates and the
-/// build-blocking census must agree on what "implementation source" means).
-use aterm_census::is_test_file;
-
-/// All non-test `*.rs` files under `crates/`, optionally excluding one file by
-/// suffix (e.g. the advertise site itself).
-///
-/// THIS FILE is always excluded, and that exclusion is load-bearing rather than
-/// tidy. `WITNESS_REGISTRY` spells each `Proof::Needle` out as a string literal
-/// on an ordinary (non-comment) line of gate.rs, so while gate.rs was in the
-/// scan every needle witnessed ITSELF and `gate drift` could not go red. MEASURED
-/// 2026-07-31: `grep -rn handle_decdld crates apps` returned exactly one hit —
-/// the registry entry at the `soft_fonts` witness — and flipping `soft_fonts` to
-/// `true` in `aterm_capabilities()` with no DRCS code anywhere still printed
-/// "gate drift: GREEN — 16 advertised capabilities all have implementation
-/// witnesses". `gate_fault` already carves itself out for exactly this reason
-/// (see its `xtask/src/gate.rs` skip); the witness scan had been missed.
-fn impl_source_files(root: &Path, exclude_suffix: Option<&str>) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let _ = collect_rs_files(&root.join("crates"), &mut files);
-    files
-        .into_iter()
-        .filter(|p| !is_test_file(p))
-        .filter(|p| !p.to_string_lossy().ends_with("xtask/src/gate.rs"))
-        .filter(|p| match exclude_suffix {
-            Some(suf) => !p.to_string_lossy().ends_with(suf),
-            None => true,
-        })
-        .collect()
-}
-
-/// Does any non-test source line under `root/crates/` contain `needle`
-/// (excluding the advertise site `terminal_core.rs`)?
-///
-/// "non-test" is BOTH file-level and region-level, exactly as for `gate
-/// dormant`: a mention inside a `#[cfg(test)]` module of an ordinary source
-/// file is not an implementation witness (see [`live_source_lines`]).
-fn needle_present(root: &Path, needle: &str) -> bool {
-    impl_source_files(root, Some("terminal_core.rs"))
-        .iter()
-        .filter_map(|file| std::fs::read_to_string(file).ok())
-        .any(|text| live_source_lines(&text).any(|l| l.contains(needle)))
-}
-
-/// Count non-test source lines under `root/consumer_path` (a file OR a dir)
-/// that reference `symbol` as a USE, not its definition. The `fn <symbol>`
-/// definition line is excluded so pointing the check at the crate that also
-/// DEFINES the symbol still measures real consumers.
-///
-/// "non-test" is BOTH file-level and region-level. DEFECT (fixed): the exclusion
-/// was `is_test_file` alone, which is a FILE filter, so a `#[cfg(test)] mod
-/// tests` inside an ordinary source file counted as a live consumer — a symbol
-/// used only by its own unit tests read as load-bearing, and `gate dormant`
-/// reported a wiring the shipped build does not have. [`live_reference_lines`]
-/// skips the regions too. (`aterm-census`'s shared masker,
-/// `lock_order::mask_gated_items`, is `pub(crate)`; hence a local window here
-/// rather than a reuse.)
-fn consumer_count(root: &Path, symbol: &str, consumer_path: &str) -> usize {
-    let target = root.join(consumer_path);
-    let mut files = Vec::new();
-    if target.is_file() {
-        files.push(target);
-    } else {
-        let _ = collect_rs_files(&target, &mut files);
-    }
-    let def_marker = format!("fn {symbol}");
-    let mut count = 0;
-    for file in files.into_iter().filter(|p| !is_test_file(p)) {
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            count += live_reference_lines(&text, symbol, &def_marker);
-        }
-    }
-    count
-}
-
-/// The lines of ONE source file that reference `symbol` outside a comment,
-/// outside its `fn <symbol>` definition, and OUTSIDE every `#[cfg(test)]`
-/// region — that last exclusion being the one a file filter cannot make.
-fn live_reference_lines(text: &str, symbol: &str, def_marker: &str) -> usize {
-    live_source_lines(text)
-        .filter(|line| line.contains(symbol) && !line.contains(def_marker))
-        .count()
-}
-
-/// The lines of ONE source file that the shipped build compiles as code: not a
-/// `//` comment line, and outside every `#[cfg(test)]` region. The one window
-/// both `gate drift`'s witness scan and `gate dormant`'s consumer count read
-/// through, so the two cannot disagree about what "implementation" means.
-///
-/// The window opens on a line whose trimmed form starts `#[cfg(test)]` and
-/// closes at the end of the gated item: brace depth back to zero on a line that
-/// closed a brace, a `;`-terminated line (a body-less item), or a `,`-terminated
-/// line AT THE ATTRIBUTE'S OWN INDENT (an enum variant, a match arm — the indent
-/// equality is what keeps a wrapped signature's parameter lines out).
-///
-/// Braces are counted lexically, literals INCLUDED, so an unbalanced `'{'` in
-/// test code over-extends the window. That direction HIDES lines — a consumer
-/// from `gate dormant`, a witness from `gate drift` — and so turns either gate
-/// RED, never green, which is the safe way round for checks whose red means
-/// "no live code does this". MEASURED on this tree: identical dormant counts
-/// for all five registry entries, and every region except each file's trailing
-/// test module closes exactly.
-fn live_source_lines(text: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut gate_indent = 0;
-    let mut in_test = false;
-    text.lines().filter(move |line| {
-        let trimmed = line.trim_start();
-        let indent = line.len() - trimmed.len();
-        if !in_test && trimmed.starts_with("#[cfg(test)]") {
-            in_test = true;
-            depth = 0;
-            gate_indent = indent;
-        }
-        if !in_test {
-            return !trimmed.starts_with("//");
-        }
-        let opens = line.matches('{').count();
-        let closes = line.matches('}').count();
-        depth = depth.saturating_add(opens).saturating_sub(closes);
-        let item_ended = closes > 0
-            || trimmed.ends_with(';')
-            || (trimmed.ends_with(',') && indent == gate_indent);
-        if depth == 0 && item_ended {
-            in_test = false;
-        }
-        false
-    })
-}
-
-// ---------------------------------------------------------------------------
-// G-DRIFT: advertise-vs-implement
-// ---------------------------------------------------------------------------
-
-/// The implementation evidence required for an advertised capability.
-enum Proof {
-    /// A substring that must appear in non-test source (outside the advertise file).
-    Needle(&'static str),
-    /// A path (relative to the workspace root) that must exist.
-    Path(&'static str),
-}
-
-struct Witness {
-    cap: &'static str,
-    proof: Proof,
-    /// What implements it (for the failure message when a `true` flag lacks it).
-    desc: &'static str,
-}
-
-/// One entry per field of `TerminalCapabilities`. Fail-closed: if
-/// `aterm_capabilities()` advertises a `true` capability with NO entry here, the
-/// gate fails (a new flag must register its witness). Capabilities advertised
-/// `false` are not required to have a live witness (that is the honest state).
-const WITNESS_REGISTRY: &[Witness] = &[
-    Witness {
-        cap: "true_color",
-        proof: Proof::Needle("fn parse_extended_color"),
-        desc: "SGR 38;2/48;2 truecolor (handler_sgr.rs)",
-    },
-    Witness {
-        cap: "color_256",
-        proof: Proof::Path("crates/aterm-core/src/terminal/color_resolve.rs"),
-        desc: "256-color palette resolution",
-    },
-    Witness {
-        cap: "hyperlinks",
-        proof: Proof::Needle("fn handle_osc_8"),
-        desc: "OSC 8 hyperlinks",
-    },
-    Witness {
-        cap: "sixel_graphics",
-        proof: Proof::Path("crates/aterm-sixel"),
-        desc: "Sixel DCS decoder crate",
-    },
-    Witness {
-        cap: "iterm_images",
-        proof: Proof::Needle("fn handle_osc_1337"),
-        desc: "iTerm2 OSC 1337 inline images",
-    },
-    Witness {
-        cap: "kitty_graphics",
-        proof: Proof::Needle("fn handle_kitty_command"),
-        desc: "Kitty graphics APC 'G' decode + display (KITTY-CORE)",
-    },
-    Witness {
-        cap: "clipboard",
-        proof: Proof::Needle("fn handle_osc_52"),
-        desc: "OSC 52 clipboard",
-    },
-    Witness {
-        cap: "shell_integration",
-        proof: Proof::Path("crates/aterm-shell-integration"),
-        desc: "OSC 133/633 shell integration",
-    },
-    Witness {
-        cap: "synchronized_output",
-        proof: Proof::Needle("synchronized_output"),
-        desc: "DEC mode 2026 synchronized output",
-    },
-    Witness {
-        cap: "kitty_keyboard",
-        proof: Proof::Path("crates/aterm-core/src/terminal/keyboard_mode.rs"),
-        desc: "Kitty keyboard protocol",
-    },
-    Witness {
-        cap: "soft_fonts",
-        proof: Proof::Needle("fn handle_decdld"),
-        desc: "DRCS/DECDLD soft fonts",
-    },
-    Witness {
-        cap: "unicode",
-        proof: Proof::Path("crates/aterm-grapheme"),
-        desc: "Unicode grapheme segmentation",
-    },
-    Witness {
-        cap: "bracketed_paste",
-        proof: Proof::Needle("bracketed_paste"),
-        desc: "DEC mode 2004 bracketed paste",
-    },
-    Witness {
-        cap: "focus_reporting",
-        proof: Proof::Needle("focus_reporting"),
-        desc: "DEC mode 1004 focus reporting",
-    },
-    Witness {
-        cap: "mouse_tracking",
-        proof: Proof::Needle("mouse_mode"),
-        desc: "DEC mode 1000 mouse tracking",
-    },
-    Witness {
-        cap: "alternate_screen",
-        proof: Proof::Needle("alternate_screen"),
-        desc: "DEC mode 1049 alternate screen",
-    },
-];
-
-/// Parse `aterm_capabilities()` from `terminal_core.rs`, returning each
-/// `field -> advertised(bool)` pair.
-fn parse_advertised_caps(root: &Path) -> Result<Vec<(String, bool)>, String> {
-    let path = root.join("crates/aterm-types/src/terminal_core.rs");
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("read {path:?}: {e}"))?;
-    let start = text
-        .find("fn aterm_capabilities()")
-        .ok_or("aterm_capabilities() not found")?;
-    let body = &text[start..];
-    let end = body.find('}').unwrap_or(body.len());
-    let body = &body[..end];
-    let mut out = Vec::new();
-    for line in body.lines() {
-        let t = line.trim();
-        if t.starts_with("//") {
-            continue;
-        }
-        // Match `name: true,` / `name: false,`
-        if let Some((name, rest)) = t.split_once(':') {
-            let name = name.trim();
-            // Tolerate a trailing line comment: `synchronized_output: true, // DEC`
-            // used to yield the value `true, // DEC`, which matched neither literal
-            // and DROPPED the field — leaving that capability out of the gate's
-            // coverage entirely, with no diagnostic. A capability this parser cannot
-            // read is a capability it did not check, so it must not vanish quietly.
-            let val = rest.split("//").next().unwrap_or(rest);
-            let val = val.trim().trim_end_matches(',').trim();
-            if val == "true" {
-                out.push((name.to_string(), true));
-            } else if val == "false" {
-                out.push((name.to_string(), false));
-            } else if !val.is_empty() {
-                return Err(format!(
-                    "{}: capability `{name}` has a value this gate cannot read ({val:?}); \
-                     a capability that is not parsed is not checked",
-                    path.display()
-                ));
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn gate_drift() -> bool {
-    let (ok, log) = drift_report(&workspace_root(), WITNESS_REGISTRY);
-    eprint!("{log}");
-    ok
-}
-
-/// `gate drift` over an arbitrary root and witness registry, returning the
-/// verdict plus the transcript the verb prints. Rooted so a red fixture can
-/// plant a violation in a copy of the tree — until 2026-08-01 nothing had ever
-/// driven this verb to FAILURE (the drift fix that day proved the witness scan
-/// no longer witnesses itself, which is a precondition, not the verdict).
-fn drift_report(root: &Path, registry: &[Witness]) -> (bool, String) {
-    let mut log = String::new();
-    let _ = writeln!(log, "=== gate drift (advertise-vs-implement) ===");
-    let caps = match parse_advertised_caps(root) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = writeln!(log, "gate drift: FAILED to parse capabilities: {e}");
-            return (false, log);
-        }
-    };
-    if caps.is_empty() {
-        let _ = writeln!(
-            log,
-            "gate drift: FAILED — parsed zero capabilities (parser broke?)"
-        );
-        return (false, log);
-    }
-    let mut failures = Vec::new();
-    for (cap, advertised) in &caps {
-        let entry = registry.iter().find(|w| w.cap == cap);
-        match entry {
-            None => {
-                // Fail-closed only when an UNKNOWN cap is advertised true.
-                if *advertised {
-                    failures.push(format!(
-                        "  '{cap}' is advertised true but has NO witness registered in gate.rs \
-                         (add a Witness entry mapping it to its implementation)"
-                    ));
-                }
-            }
-            Some(w) if *advertised => {
-                let present = match &w.proof {
-                    Proof::Needle(n) => needle_present(root, n),
-                    Proof::Path(p) => root.join(p).exists(),
-                };
-                if !present {
-                    failures.push(format!(
-                        "  '{cap}' advertised true but witness MISSING: {} (expected {})",
-                        w.desc,
-                        match &w.proof {
-                            Proof::Needle(n) => format!("source containing `{n}`"),
-                            Proof::Path(p) => format!("path {p}"),
-                        }
-                    ));
-                }
-            }
-            Some(_) => { /* advertised false: no witness required */ }
-        }
-    }
-    let advertised_true = caps.iter().filter(|(_, a)| *a).count();
-    if failures.is_empty() {
-        let _ = writeln!(
-            log,
-            "gate drift: GREEN — {advertised_true} advertised capabilities all have implementation witnesses; \
-             {} honestly advertised false.",
-            caps.len() - advertised_true
-        );
-        (true, log)
-    } else {
-        let _ = writeln!(log, "gate drift: FAILED — advertise-vs-implement drift:");
-        for f in &failures {
-            let _ = writeln!(log, "{f}");
-        }
-        let _ = writeln!(
-            log,
-            "  Fix: implement the capability, or set its `aterm_capabilities()` flag false \
-             (honest non-advertisement)."
-        );
-        (false, log)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// G-DORMANT: computed-but-unconsumed
-// ---------------------------------------------------------------------------
-
-struct DormantWatch {
-    feature: &'static str,
-    /// The symbol the engine computes (the producer).
-    producer: &'static str,
-    /// The crate dir whose non-test code MUST reference the producer.
-    consumer_path: &'static str,
-    /// `true` once the feature is wired: the gate then FAILS if the consumer
-    /// disappears. `false` while the wiring is still pending (reported, not failed).
-    enforced: bool,
-}
-
-/// Features that must not be computed-and-dropped. Flip `enforced` to true as
-/// each is wired (the milestone that wires it owns the flip).
-const DORMANCY_REGISTRY: &[DormantWatch] = &[
-    // M1 WIRE-BIDI: the render snapshot (cell_frame_into) must invoke the
-    // visual-reorder pass, so BOTH renderers + the image capture get visual
-    // order. Enforced: the gate fails if render_cells.rs stops calling it.
-    DormantWatch {
-        feature: "bidi visual reorder",
-        producer: "apply_bidi_reorder",
-        consumer_path: "crates/aterm-core/src/terminal/render_cells.rs",
-        enforced: true,
-    },
-    // M1 WIRE-MODIFIERS: Caps/Num Lock must be folded into the key modifier byte
-    // (winit omits lock state). Enforced: the key path must consume lock_modifiers.
-    DormantWatch {
-        feature: "caps/num lock modifiers",
-        producer: "lock_modifiers",
-        consumer_path: "crates/aterm-gui/src/app_input.rs",
-        enforced: true,
-    },
-    // WIRE-COLORSCHEME: the engine reports/pushes the OS color scheme (DEC 2031 +
-    // DSR ?996n). Feeding it the REAL OS appearance is the GUI's job — now WIRED:
-    // `app_window::attach_os_window` seeds it from winit `Window::theme()` and
-    // `WindowEvent::ThemeChanged` forwards live OS toggles, both via
-    // `app_colorscheme::apply_os_color_scheme` → `Terminal::set_color_scheme`.
-    DormantWatch {
-        feature: "OS color-scheme source",
-        producer: "set_color_scheme",
-        consumer_path: "crates/aterm-gui/src",
-        enforced: true,
-    },
-    // WIRE-INBAND-SIZE: DEC mode 2048 must emit a report on enable AND on resize.
-    // Enforced: the report builder must be called (handler_dec enable + resize).
-    DormantWatch {
-        feature: "in-band size report (DEC 2048)",
-        producer: "push_in_band_size_report",
-        consumer_path: "crates/aterm-core/src/terminal",
-        enforced: true,
-    },
-    // OSC 9;4 taskbar progress: the OSC 9 handler must parse it into state.
-    // Enforced: handle_osc_9 must consume the ConEmu parser.
-    DormantWatch {
-        feature: "OSC 9;4 taskbar progress",
-        producer: "parse_conemu_taskbar_progress",
-        consumer_path: "crates/aterm-core/src/terminal/handler_osc_notify.rs",
-        enforced: true,
-    },
-];
-
-fn gate_dormant() -> bool {
-    let (ok, log) = dormant_report(&workspace_root(), DORMANCY_REGISTRY);
-    eprint!("{log}");
-    ok
-}
-
-/// `gate dormant` over an arbitrary root and registry, returning the verdict
-/// plus the transcript the verb prints. Rooted so a red fixture can delete the
-/// only consumer in a COPY of the real file and watch the gate go red.
-fn dormant_report(root: &Path, registry: &[DormantWatch]) -> (bool, String) {
-    let mut log = String::new();
-    let _ = writeln!(log, "=== gate dormant (computed-but-unconsumed) ===");
-    let mut failures = Vec::new();
-    let mut pending = 0;
-    for w in registry {
-        let count = consumer_count(root, w.producer, w.consumer_path);
-        if w.enforced && count == 0 {
-            failures.push(format!(
-                "  '{}' is DORMANT: `{}` has zero live consumers in {} (computed but never used)",
-                w.feature, w.producer, w.consumer_path
-            ));
-        } else if !w.enforced {
-            pending += 1;
-            let _ = writeln!(
-                log,
-                "  pending: '{}' (`{}` -> {}): {} consumer(s); not yet enforced",
-                w.feature, w.producer, w.consumer_path, count
-            );
-        }
-    }
-    if failures.is_empty() {
-        let _ = writeln!(
-            log,
-            "gate dormant: GREEN — {} enforced feature(s) consumed, {pending} pending wiring.",
-            registry.iter().filter(|w| w.enforced).count()
-        );
-        (true, log)
-    } else {
-        let _ = writeln!(
-            log,
-            "gate dormant: FAILED — features computed but never consumed:"
-        );
-        for f in &failures {
-            let _ = writeln!(log, "{f}");
-        }
-        (false, log)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// G-MAINLOOP: MAIN-LOOP COMPLETENESS CENSUS (L0 whole-Mac-freeze CLASS)
-// ---------------------------------------------------------------------------
-//
-// The census implementation lives in `crates/aterm-census` — ONE shared library
-// with TWO consumers, so the manual verb and the build-blocking gate can never
-// diverge:
-//
-//   * THIS verb (`cargo xtask gate mainloop`, part of `gate all`), and
-//   * `tools/freeze-safety-gate/build.rs`, which fuses the census into the SAME
-//     `cargo build` as the temporal proof gate — the AUTOMATIC, fail-closed
-//     obligation (no annotation/opt-in needed from the code under scan).
-//
-// See the crate docs for the obligation list (OB-1..OB-6: marker↔registry —
-// the marker sweep scoped to the DERIVED GUI-process closure, the same scan
-// set OB-7 derives, out-of-closure workspace markers reported rather than
-// registry-checked — root resolution, justified+defined offload boundaries,
-// boundary presence, no guarded synchronous reach, no direct sink call) and
-// the honest precision limits (lexical walk of crates/aterm-gui/src + one
-// term_lock hop).
-
-fn gate_mainloop() -> bool {
-    let outcome = aterm_census::run_mainloop_census(&workspace_root());
-    eprint!("{}", outcome.log);
-    outcome.ok
-}
-
-// ---------------------------------------------------------------------------
-// G-LOCKORDER: LOCK-ORDER CENSUS (L0-DEADLOCK, lock-graph sense)
-// ---------------------------------------------------------------------------
-//
-// The second engine of the RFC §2.1c L0-DEADLOCK entry (the first — the
-// model sense — is ty's CHECK_DEADLOCK on every derived temporal model).
-// Shared `crates/aterm-census` implementation (obligation OB-7), fused into
-// the same tools/freeze-safety-gate build; this verb is the manual entry
-// point. There is NO waiver channel: a detected lock-order cycle can only be
-// fixed, never allowlisted.
-
-fn gate_lockorder() -> bool {
-    let outcome = aterm_census::run_lock_order_census(&workspace_root());
-    eprint!("{}", outcome.log);
-    outcome.ok
-}
-
-// ---------------------------------------------------------------------------
-// G-WASMLOOP: WASM-PROCESS CENSUS (L0-FREEZE, browser-tab analog)
-// ---------------------------------------------------------------------------
-//
-// The third census of the shared `crates/aterm-census` library (obligations
-// OB-8..OB-12), fused into the same freeze-safety-gate build; this verb is
-// the manual entry point. The wasm renderer modules (aterm-wasm /
-// aterm-gpu-web / aterm-effects-web) are their OWN process: single-threaded
-// by target (wasm32-unknown-unknown, no atomics), so the lock-order
-// obligation is VACUOUS there (documented posture + the OB-12 spawn
-// tripwire, not dead graph machinery) — but the L0-FREEZE obligation
-// transfers: the hosting JS event loop is the liveness-critical context, and
-// the census fails on any UNregistered synchronous entry-point reach to the
-// shared UNBOUNDED sinks, while any REGISTERED standing finding is
-// re-detected and reported as a candidate L0 hazard every run (the survey's
-// two — both modules' synchronous `resize` — were fixed 2026-07-14 by the
-// cooperative offload; the registry is empty today).
-
-fn gate_wasmloop() -> bool {
-    let outcome = aterm_census::run_wasm_census(&workspace_root());
-    eprint!("{}", outcome.log);
-    outcome.ok
-}
-
-// ---------------------------------------------------------------------------
-// G-SCOPE: SCOPE-CARDINALITY CENSUS (the "one enforcer, N instances" class)
-// ---------------------------------------------------------------------------
-//
-// The fourth census of the shared `crates/aterm-census` library (obligations
-// OB-13..OB-18), fused into the same freeze-safety-gate build; this verb is
-// the manual entry point. A model that verifies a LOCAL property of ONE
-// instance of an enforcing structure says nothing about a refactor that
-// MULTIPLIES the instances — the flash limiter proves 2 ignitions/second for
-// one limiter, and stays green if every split pane gets its own while the
-// retina sees 2N. The census pins each safety budget's ownership chain from
-// its scope root down to the enforcing state, closes the set of other places
-// that state may live, and re-derives both from the tree every build. Only
-// the vocabulary lock (OB-17) has a waiver channel; the cardinality
-// obligations have none.
-
-fn gate_scope() -> bool {
-    let outcome = aterm_census::run_scope_census(&workspace_root());
-    eprint!("{}", outcome.log);
-    outcome.ok
-}
-
-// ---------------------------------------------------------------------------
-// G-LAZYINIT: LAZY-INIT REENTRANCY CENSUS (L0-DEADLOCK, reentrancy sense)
-// ---------------------------------------------------------------------------
-//
-// The same ONE-IMPLEMENTATION-TWO-CONSUMERS shape as the four censuses above:
-// this verb and tools/freeze-safety-gate/build.rs both call
-// `aterm_census::run_lazy_init_census`.
-//
-// `lockorder` asks whether two threads can take two locks in opposite orders.
-// This asks the other reentrancy question: can ONE thread arrive twice at the
-// same lazy cell? `Once::call` marks a cell RUNNING before it runs the
-// initializer, so an initializer that reaches a blocking touch of its own cell
-// waits for itself — a permanent park with no timeout, no panic and no log
-// line. That shipped in v0.65.0 and v0.66.0 (`debug_seamless_reexec_armed`,
-// fixed by 9811b83c) and froze the terminal on the first automatic update
-// apply, on the winit main thread. Like the lock graph, this graph has NO
-// waiver channel: a cycle can only be fixed.
-
-fn gate_lazyinit() -> bool {
-    let outcome = aterm_census::run_lazy_init_census(&workspace_root());
-    eprint!("{}", outcome.log);
-    outcome.ok
-}
-
-// ---------------------------------------------------------------------------
 // G-FORGE: THIRD-PARTY SURFACE POLICY (provenance, patch liveness, the ratchet)
 // ---------------------------------------------------------------------------
 //
-// The same ONE-IMPLEMENTATION-TWO-CONSUMERS shape as the four censuses above,
-// with `crates/aterm-forge` in the shared-library role:
-//
-//   * THIS verb (`cargo run -p xtask -- gate forge`, part of `gate all`), and
-//   * `cargo forge check` — the hand-run tool, which calls the SAME
-//     `check::check_report` and turns its bool into the exit code.
-//
-// So the gate cannot judge the tree by one rule while the tool a human runs
-// judges it by another. See the crate docs for the obligation list
-// (`[OB-1]`..`[OB-14]`) and the honest precision limits (a `cargo tree` resolve
-// plus lexical reads — no compilation, so a fork's SOURCE is never compared
-// against upstream, only its provenance metadata).
+// `crates/aterm-forge` owns the obligations (`[OB-1]`..`[OB-15]`, see its crate
+// docs); this verb and `cargo forge check` both call `check::check_report`. It
+// compiles nothing: it reads `Cargo.lock`, `vendor/`, `vendor/forge.toml`,
+// `tools/forge-budget.tsv` and one offline `cargo tree` per cell.
 
 fn gate_forge() -> bool {
     // forge resolves its cells with `$CARGO tree`; hand it the host driver when
@@ -1895,326 +90,8 @@ fn gate_forge() -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// G-LINT
+// THE TOOLCHAIN AND THE PROCESS HELPERS
 // ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// G-CERTIFIED (kernel-certified verification standard, locally enforced)
-// ---------------------------------------------------------------------------
-
-/// The corpus driver: THE toolchain's `trustc` ([`trust_toolchain`] — the discovery
-/// `tools/verify.sh` and `gate lint` run, whose order includes the rustup `trust`
-/// toolchain), or `None` when no pinned toolchain resolves. A `rustup run trust
-/// trustc` fallback stood beside it until 2026-09-24: a second route to the same
-/// compiler once the rustup toolchain became a discovery candidate, so it went.
-fn certified_driver(tools: &aterm_verify::Toolchain) -> Option<PathBuf> {
-    tools.have_targo().then(|| tools.stage2_dir.join("trustc"))
-}
-
-/// The verification flag the corpus compiles under. MEASURED 2026-07-31 against
-/// trustc 0.1.0 (rustc 1.99.0-dev, ccc7939e4): `rustc -Z help | grep trust`
-/// lists NEITHER `trust-verify-full` NOR `trust-verify-certified` — both spellings
-/// this gate was written against are gone, and trustc rejects the old one with
-/// "error: unknown unstable option: `trust-verify-full`". `-Ztrust-policy=certify`
-/// is the live successor; its own help text calls it "the release gate, `targo
-/// trust certify`" and says it "demands FULL static discharge and fails on every
-/// unproved obligation". Same class of rename the tree already documents for
-/// `-Zno-trust-verify=yes` -> `-Ztrust-verify=off` (.cargo/config.toml, verify.sh).
-const CERTIFY_FLAG: &str = "-Ztrust-policy=certify";
-
-/// Did the driver reject the verification flag itself, rather than return a
-/// verdict about the corpus? Matched on rustc's exact wording, MEASURED from the
-/// stale-flag run: "error: unknown unstable option: `trust-verify-full`".
-fn flag_was_rejected(stderr: &str) -> bool {
-    stderr.contains("unknown unstable option")
-}
-
-/// One `note: Trust verification: …` block from the driver's stderr.
-struct CertifyBlock {
-    proved: usize,
-    failed: usize,
-    unknown: usize,
-    timed_out: usize,
-    runtime_checked: usize,
-    obligations: usize,
-    /// The `= note: of which N kernel-certified …` follow-up, if it was emitted.
-    kernel_certified: Option<usize>,
-}
-
-/// The integer immediately preceding `label` on `line` ("… 3 proved, …" -> 3).
-fn count_before(line: &str, label: &str) -> Option<usize> {
-    let head = line[..line.find(label)?].trim_end();
-    let digits: String = head
-        .chars()
-        .rev()
-        .take_while(char::is_ascii_digit)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    digits.parse().ok()
-}
-
-/// THE PARSE CONTRACT over trustc's verification notes. MEASURED 2026-08-01
-/// against `trustc 0.1.0` (rustc 1.99.0-dev, ccc7939e4) compiling the live
-/// corpus — these two lines verbatim, with the source-snippet lines trustc
-/// prints between them elided (they carry no counters):
-///
-/// ```text
-/// note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-///    = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; …)
-/// ```
-///
-/// Each `Trust verification:` line opens a block; the following
-/// `kernel-certified` note (emitted per block) fills it in. Deliberately
-/// PERMISSIVE about ordering and surrounding text, STRICT about the counters it
-/// needs: a line it cannot parse yields no block, and zero blocks is a FAILURE
-/// in [`judge_kernel_certification`] rather than a silent pass.
-fn parse_certify_blocks(stderr: &str) -> Vec<CertifyBlock> {
-    let mut out: Vec<CertifyBlock> = Vec::new();
-    for line in stderr.lines() {
-        if line.contains("Trust verification:") {
-            let get = |label| count_before(line, label);
-            if let (Some(proved), Some(failed), Some(unknown), Some(timed_out), Some(rt), Some(n)) = (
-                get(" proved"),
-                get(" failed"),
-                get(" unknown"),
-                get(" timed out"),
-                get(" runtime-checked"),
-                get(" obligation(s)"),
-            ) {
-                out.push(CertifyBlock {
-                    proved,
-                    failed,
-                    unknown,
-                    timed_out,
-                    runtime_checked: rt,
-                    obligations: n,
-                    kernel_certified: None,
-                });
-            }
-        } else if line.contains("kernel-certified")
-            && let (Some(block), Some(n)) =
-                (out.last_mut(), count_before(line, " kernel-certified"))
-        {
-            block.kernel_certified = Some(n);
-        }
-    }
-    out
-}
-
-/// KERNEL CERTIFICATION, asserted rather than merely surfaced: every obligation
-/// in every reported block must be proved AND re-checked by the clean CIC
-/// kernel. Returns the total kernel-certified obligation count, or the reason
-/// the standard was not met.
-///
-/// FAIL-CLOSED ON ITS OWN CONTRACT: no parsable block, or a block with no
-/// `kernel-certified` note, is an ERROR ("the note format changed") — never a
-/// pass. That is the whole point: the previous version of this gate printed
-/// GREEN off the exit code alone and said so honestly in its header; a parser
-/// that silently found nothing would be a regression to exactly that state
-/// while claiming more.
-fn judge_kernel_certification(stderr: &str) -> Result<usize, String> {
-    let blocks = parse_certify_blocks(stderr);
-    if blocks.is_empty() {
-        return Err(
-            "PARSE CONTRACT BROKEN — no `note: Trust verification: N proved, … out of M \
-             obligation(s)` line in the driver's output. Nothing was checked. Re-probe the \
-             driver's note format and update parse_certify_blocks()."
-                .to_string(),
-        );
-    }
-    let mut certified = 0;
-    for (i, b) in blocks.iter().enumerate() {
-        // EVIDENCE, not merely CONSISTENCY. DEFECT (fixed): a block reporting
-        // `0 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of
-        // 0 obligation(s)` plus `of which 0 kernel-certified` satisfied every
-        // test below — nothing failed, `proved == obligations`, `kc ==
-        // obligations` — so a corpus file that raises NO obligation passed as
-        // evidence of kernel certification and printed CERTIFIED over `Ok(0)`.
-        if b.obligations == 0 {
-            return Err(format!(
-                "block {i}: 0 obligation(s) — VACUOUS, so it is not evidence of anything. \
-                 Nothing was proved and nothing was kernel-certified. Either this file raises \
-                 no Level-0 obligation under {CERTIFY_FLAG} (give it code that does, or drop it \
-                 from the corpus), or the driver stopped attributing obligations to it."
-            ));
-        }
-        let Some(kc) = b.kernel_certified else {
-            return Err(format!(
-                "PARSE CONTRACT BROKEN — verification block {i} reported no `of which N \
-                 kernel-certified` note. Either the driver stopped emitting it (re-probe and \
-                 update the contract) or those obligations are NOT kernel-certified."
-            ));
-        };
-        if b.failed + b.unknown + b.timed_out > 0 {
-            return Err(format!(
-                "block {i}: {} failed, {} unknown, {} timed out — not fully discharged",
-                b.failed, b.unknown, b.timed_out
-            ));
-        }
-        if b.proved != b.obligations || b.runtime_checked > 0 {
-            return Err(format!(
-                "block {i}: only {} of {} obligation(s) statically proved ({} runtime-checked) — \
-                 a runtime check is not a kernel certification",
-                b.proved, b.obligations, b.runtime_checked
-            ));
-        }
-        if kc != b.obligations {
-            return Err(format!(
-                "block {i}: {kc} of {} obligation(s) kernel-certified — the rest are \
-                 solver-trusted. THIS is the regression the exit code cannot see.",
-                b.obligations
-            ));
-        }
-        certified += kc;
-    }
-    Ok(certified)
-}
-
-/// `gate certified` — enforce the KERNEL-CERTIFIED standard locally.
-///
-/// Compiles the curated `crates/xtask/certified-corpus/*.rs` (functions whose
-/// Level-0 safety obligations the clean zero-trust CIC kernel can reconstruct)
-/// through the Trust driver under [`CERTIFY_FLAG`] and requires exit 0.
-///
-/// TWO independent conditions, both required:
-///   * EXIT 0 under `certify` — FULL STATIC DISCHARGE. MEASURED RED: an
-///     obligation the solver cannot discharge (probe: a nonlinear `a * b`
-///     bound) returns unknown and trustc aborts non-zero.
-///   * [`judge_kernel_certification`] over the driver's notes — every
-///     obligation of every block proved AND kernel-certified by the clean CIC
-///     kernel. This closes what the header used to list as NOT PROVEN: a
-///     regression from kernel-certified to merely solver-trusted keeps exit 0
-///     (certify fails only on UNPROVED obligations) and is now caught by the
-///     parse contract instead of being left for a human to notice in a note.
-///
-/// The parse contract's own fragility is handled fail-closed: if the note
-/// format changes, the gate goes RED saying "PARSE CONTRACT BROKEN", exactly as
-/// a renamed `-Z` flag goes RED as "STALE-FLAG". It never degrades to a pass.
-///
-/// With no Trust toolchain it answers NOT RUN — exit 3, the repo's COULD-NOT-RUN
-/// code — naming the remedy: nothing was compiled, so nothing about the corpus was
-/// decided, and that is neither a pass nor a finding. (It printed `SKIP` and exited
-/// 0 until 2026-09-24.)
-fn gate_certified() -> ExitCode {
-    eprintln!(
-        "=== gate certified (corpus must fully discharge under {CERTIFY_FLAG}, \
-         every obligation kernel-certified) ==="
-    );
-    let tools = trust_toolchain();
-    let Some(driver) = certified_driver(&tools) else {
-        eprintln!(
-            "gate certified: NOT RUN — {}. Nothing was compiled, so nothing about the corpus \
-             was decided.",
-            tools.missing_targo_label()
-        );
-        return ExitCode::from(3);
-    };
-    let dir = workspace_root().join("crates/xtask/certified-corpus");
-    let mut entries: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().map(|x| x == "rs").unwrap_or(false))
-            .collect(),
-        Err(e) => {
-            eprintln!("gate certified: FAILED — cannot read {dir:?}: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-    entries.sort();
-    if entries.is_empty() {
-        eprintln!("gate certified: FAILED — certified-corpus is empty");
-        return ExitCode::FAILURE;
-    }
-    let out = std::env::temp_dir().join("aterm_certified_gate");
-    let _ = std::fs::create_dir_all(&out);
-    let mut all_ok = true;
-    for f in &entries {
-        let name = f
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        let rlib = out.join(format!("{name}.rlib"));
-        // Captured rather than inherited so a REJECTED FLAG can be told apart
-        // from a verification verdict — see `flag_was_rejected`. The notes are
-        // forwarded verbatim either way, so nothing a human would have seen is
-        // lost.
-        let output = Command::new(&driver)
-            .args(["--edition", "2021", "--crate-type", "lib"])
-            .arg(f)
-            .arg(CERTIFY_FLAG)
-            .arg("-o")
-            .arg(&rlib)
-            .current_dir(workspace_root())
-            .output();
-        match output {
-            Ok(o) => {
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                eprint!("{stderr}");
-                if o.status.success() {
-                    // Exit 0 is FULL STATIC DISCHARGE. Kernel certification is a
-                    // STRICTLY STRONGER claim that lives only in the notes — so
-                    // read them, and fail closed if they are absent or short.
-                    match judge_kernel_certification(&stderr) {
-                        Ok(n) => eprintln!(
-                            "  CERTIFIED      {name} — {n} obligation(s) kernel-certified by the \
-                             clean CIC kernel"
-                        ),
-                        Err(why) => {
-                            eprintln!("  NOT-CERTIFIED  {name} — {why}");
-                            all_ok = false;
-                        }
-                    }
-                } else if flag_was_rejected(&stderr) {
-                    // This is an ENVIRONMENT/STALE-FLAG break, and reporting it
-                    // as "the corpus regressed" would send the reader hunting a
-                    // proof problem that does not exist. Trust renames unstable
-                    // options; the gate must say so in its own words.
-                    eprintln!(
-                        "  STALE-FLAG     {name} — {} rejected `{CERTIFY_FLAG}` as an unknown \
-                         unstable option. The corpus was NOT verified. Re-probe with \
-                         `trustc -Z help | grep trust` and update CERTIFY_FLAG.",
-                        driver.display()
-                    );
-                    all_ok = false;
-                } else {
-                    eprintln!(
-                        "  NOT-DISCHARGED {name} (exit {:?}) — an obligation is unproved under \
-                         the certify policy",
-                        o.status.code()
-                    );
-                    all_ok = false;
-                }
-            }
-            Err(e) => {
-                eprintln!("  ERROR          {name}: {e}");
-                all_ok = false;
-            }
-        }
-    }
-    // Both conditions are now asserted, so say both — and no more. What remains
-    // outside this gate's reach is the CORPUS itself: it proves nothing about
-    // functions nobody added to `certified-corpus/`.
-    if all_ok {
-        eprintln!(
-            "gate certified: GREEN — every corpus obligation FULLY DISCHARGED under \
-             {CERTIFY_FLAG} and KERNEL-CERTIFIED by the clean CIC kernel (counts per file above)."
-        );
-    } else {
-        eprintln!(
-            "gate certified: FAILED — the corpus did not fully discharge, an obligation was \
-             solver-trusted rather than kernel-certified, or the flag/note contract is stale; \
-             see the per-file line."
-        );
-    }
-    if all_ok {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    }
-}
 
 /// THE toolchain, resolved by `aterm_verify::Toolchain` — the SAME code
 /// `tools/verify.sh`'s driver runs, not a second copy of the same rules.
@@ -2249,102 +126,13 @@ pub(crate) fn trust_toolchain() -> aterm_verify::Toolchain {
     )
 }
 
-/// The two signatures branded Tippy emits when its TOOLCHAIN-IDENTITY guard
-/// trips. Neither is a lint result: the run can lint completely clean, print
-/// `Finished dev profile`, and still exit non-zero.
-///
-/// `AuthenticatedDriverExecution::capture` snapshots the stage2 sysroot's whole
-/// ANCESTOR-DIRECTORY CHAIN (up to `/`) plus `trustc`/`tippy-driver` — dev, ino,
-/// mode, nlink, uid, gid, mtime, ctime for each — and re-validates before AND
-/// after the guarded operation. An entry created, removed or renamed in ANY
-/// ancestor mid-run aborts it. A `$HOME/trust` rebuild relinking stage2 is the
-/// realistic trigger; sampling this box's real chain at 4 Hz for 15 minutes
-/// found zero churn, so it is rare but genuinely environmental.
-/// Attempts allowed for a tippy run aborted by the identity guard. Three is
-/// generous for an abort whose trigger is a one-off filesystem event; a run
-/// that trips it three times is telling you the tree is not quiet.
-const TIPPY_IDENTITY_RETRIES: u32 = 3;
-
-const TIPPY_IDENTITY_ABORTS: [&str; 2] = [
-    "branded Tippy driver identity changed",
-    "compiler identity changed while Targo was running",
-];
-
-/// [`run_shell`] with extra environment, an optional directory prepended to PATH
-/// (the Trust tools resolve sibling drivers — `tippy` finds `tippy-driver`,
-/// `cargo fmt` finds `trustfmt` — by looking along PATH), and a TEE of stderr so
-/// a caller can tell a transient environment abort, or a missing toolchain
-/// COMPONENT, from a real finding. The tippy and trustfmt lanes both need that
-/// discrimination; the guard scripts do not, and use [`run_shell`].
-fn run_shell_env_capturing(
-    desc: &str,
-    program: &str,
-    args: &[&str],
-    envs: &[(&str, &str)],
-    path_prefix: Option<&Path>,
-    cwd: &Path,
-) -> (bool, String) {
-    use std::io::Read as _;
-    eprintln!("  $ {program} {}", args.join(" "));
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .current_dir(cwd)
-        .stderr(std::process::Stdio::piped());
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    if let Some(prefix) = path_prefix {
-        let existing = std::env::var_os("PATH").unwrap_or_default();
-        let mut entries = vec![prefix.to_path_buf()];
-        entries.extend(std::env::split_paths(&existing));
-        match std::env::join_paths(entries) {
-            Ok(joined) => {
-                command.env("PATH", joined);
-            }
-            Err(e) => eprintln!("  {desc}: could not extend PATH ({e}); using inherited PATH"),
-        }
-    }
-    let mut child = match command.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  {desc}: could not run ({e})");
-            return (false, String::new());
-        }
-    };
-    let mut captured = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let mut buf = Vec::new();
-        let _ = err.read_to_end(&mut buf);
-        captured = String::from_utf8_lossy(&buf).into_owned();
-        // TEE: the operator must still see the findings live, exactly as the
-        // uncaptured lanes print them.
-        eprint!("{captured}");
-    }
-    match child.wait() {
-        Ok(s) if s.success() => (true, captured),
-        Ok(s) => {
-            eprintln!("  {desc}: FAILED (exit {:?})", s.code());
-            (false, captured)
-        }
-        Err(e) => {
-            eprintln!("  {desc}: could not run ({e})");
-            (false, captured)
-        }
-    }
-}
-
 /// Run a tool capturing BOTH streams, teeing each so the operator sees the
 /// report exactly as a hand-run prints it. Returns `(exit-ok, stdout, stderr)`.
 ///
-/// Why not [`run_shell_env_capturing`]: that one pipes stderr and drains it to
-/// EOF before reaping the child, which is correct only while nothing is written
-/// to the OTHER stream. The fmt lane needs both — its findings land on stdout
-/// and its environment faults on stderr — and draining two pipes in sequence
-/// DEADLOCKS the moment the one not being read fills its 64 KiB buffer. A real
-/// drift report does that immediately: the 254-file one measured here is ~250
-/// KiB of stdout. `Command::output()` drains both concurrently, which is the
-/// whole reason it is used instead.
+/// Both streams, drained CONCURRENTLY by `Command::output()`: the formatter's
+/// findings land on stdout and its environment faults on stderr, and draining
+/// two pipes in sequence deadlocks the moment the one not being read fills its
+/// 64 KiB buffer (a real drift report is ~250 KiB of stdout).
 fn run_capturing_both(
     desc: &str,
     program: &Path,
@@ -2382,45 +170,6 @@ fn run_capturing_both(
     }
 }
 
-fn run_shell(desc: &str, program: &str, args: &[&str]) -> bool {
-    run_shell_path(desc, Path::new(program), args)
-}
-
-/// [`run_shell`] through the HOST DRIVER (`crate::driver::cargo_driver`): the
-/// store's targo on a product-provisioned box, `$CARGO` under a driver, bare
-/// `cargo` last — with the lane flag `verb` needs from that driver. The two
-/// aterm-core perf lanes spelled `run_shell(.., "cargo", ["test", ..])` until
-/// 2026-09-18 and could not spawn on a box with no `cargo` on PATH.
-fn run_shell_driver(desc: &str, verb: &str, args: &[&str]) -> bool {
-    let driver = cargo_driver();
-    let argv = driver.argv(verb, args);
-    let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    run_shell_path(desc, &driver.program, &argv)
-}
-
-fn run_shell_path(desc: &str, program: &Path, args: &[&str]) -> bool {
-    eprintln!("  $ {} {}", program.display(), args.join(" "));
-    let status = Command::new(program)
-        .args(args)
-        .current_dir(workspace_root())
-        .status();
-    match status {
-        Ok(s) if s.success() => true,
-        Ok(s) => {
-            eprintln!("  {desc}: FAILED (exit {:?})", s.code());
-            false
-        }
-        Err(e) => {
-            eprintln!("  {desc}: could not run ({e})");
-            false
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// G-LINUX (M5: the headless engine must stay cross-platform — Linux-clean)
-// ---------------------------------------------------------------------------
-
 /// Is `bin` resolvable on `PATH`?
 fn on_path(bin: &str) -> bool {
     Command::new("sh")
@@ -2429,79 +178,6 @@ fn on_path(bin: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
-}
-
-/// The pre-flight BOTH cross-compile gates (`web`, `linux`) run before they build:
-/// pick the toolchain that carries `target`, and prove this box has it. Returns the
-/// toolchain name, or `None` having already printed the skip.
-///
-/// It exists because a skip must be a decision about the BOX, taken BEFORE anything
-/// compiles. Until 2026-08-31 both gates decided it AFTERWARDS, by sniffing the
-/// build's stderr for `can't find crate for `std``: since `rust-toolchain.toml` pins
-/// the Trust fork, whose sysroot carries only the host triple, that string was
-/// guaranteed, so both gates were permanent GREEN SKIPS and no cross-target
-/// regression could ever have failed either one. Keep the decision here, keep it
-/// ahead of the build, and keep the two gates on one copy of it.
-fn cross_preflight(gate: &str, target: &str, env_var: &str) -> Option<RustupToolchain> {
-    let toolchain = std::env::var(env_var).unwrap_or_else(|_| String::from("stable"));
-    if !on_path("rustup") {
-        eprintln!(
-            "{gate}: SKIPPED — no rustup on PATH, so the `{toolchain}` toolchain that carries the \
-             {target} std cannot be selected. NOTHING WAS COMPILED for {target}."
-        );
-        return None;
-    }
-    let installed = match Command::new("rustup")
-        .args([
-            "target",
-            "list",
-            "--installed",
-            "--toolchain",
-            toolchain.as_str(),
-        ])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Ok(o) => {
-            eprintln!(
-                "{gate}: SKIPPED — rustup cannot list targets for `{toolchain}`: {}",
-                String::from_utf8_lossy(&o.stderr).trim_end()
-            );
-            eprintln!("{gate}:   NOTHING WAS COMPILED for {target}.");
-            return None;
-        }
-        Err(e) => {
-            eprintln!(
-                "{gate}: SKIPPED — could not ask rustup which targets `{toolchain}` carries \
-                 ({e}). NOTHING WAS COMPILED for {target}."
-            );
-            return None;
-        }
-    };
-    if !toolchain_lists_target(&installed, target) {
-        eprintln!(
-            "{gate}: SKIPPED — the `{toolchain}` toolchain has no {target} std, so this cannot be \
-             cross-compiled here.\n\
-             {gate}:   NOTHING WAS COMPILED for {target}.\n\
-             {gate}:   install it:  rustup target add {target} --toolchain {toolchain}\n\
-             {gate}:   (`--toolchain` is not optional — this repo's default toolchain is the Trust \
-             fork, which refuses `rustup target add`.)"
-        );
-        return None;
-    }
-    match RustupToolchain::resolve(&toolchain) {
-        Ok(tc) => {
-            eprintln!(
-                "{gate}: cross-building on the `{toolchain}` toolchain (${env_var} overrides): {}",
-                tc.cargo.display()
-            );
-            Some(tc)
-        }
-        Err(e) => {
-            eprintln!("{gate}: SKIPPED — {e}. NOTHING WAS COMPILED for {target}.");
-            None
-        }
-    }
 }
 
 /// A neutral build cwd for a cross-compile, because cargo discovers config by walking
@@ -2531,172 +207,6 @@ fn neutral_build_cwd(gate: &str) -> Option<std::path::PathBuf> {
 /// target would sail past the pre-flight and fail the build instead of skipping.
 fn toolchain_lists_target(listing: &str, target: &str) -> bool {
     listing.lines().any(|l| l.trim() == target)
-}
-
-/// `gate web` — the web renderers (`aterm-wasm` CPU, `aterm-gpu-web` GPU/WebGL2)
-/// exist ONLY to run in the Electron renderer on `wasm32`. `gate all`/clippy check
-/// the HOST target, so every `#[cfg(target_arch = "wasm32")]` block — the
-/// `wasm_bindgen` exports, the async WebGL surface init — is otherwise NEVER
-/// compiled. This verb is the only thing that proves the web crates still build for
-/// their real target. Kept OUT of `gate all` (like `gate linux`): it's an optional
-/// cross-compile; run it on demand (or before pushing web changes).
-///
-/// THE CROSS-BUILD RIDES UPSTREAM STABLE, and that is what the plumbing below is
-/// for. `rust-toolchain.toml` pins the Trust toolchain, whose sysroot carries no
-/// `wasm32-unknown-unknown` std, so a bare `cargo build --target
-/// wasm32-unknown-unknown` from the workspace cannot succeed in this repo at ALL —
-/// it dies with ``error[E0463]: can't find crate for `std` ``. Until 2026-08-31
-/// this gate matched that very message in stderr and answered `SKIPPED … Not a
-/// failure`, which made it a permanent GREEN SKIP on every box the web crates are
-/// edited on: the one gate that compiles them for their shipping target never
-/// actually ran, and no wasm regression could ever have failed it. The remedy it
-/// printed could not work either — plain `rustup target add` is refused by the
-/// Trust toolchain ("does not support components"). Two rules keep it honest now,
-/// and neither may be quietly relaxed:
-///
-/// 1. The build runs on a toolchain that HAS the target — `ATERM_WASM_TOOLCHAIN`,
-///    default `stable`, the same lane and the same reason as
-///    `tools/wasm-bench/run.sh` — from a NEUTRAL cwd, because cargo discovers
-///    config by walking the cwd upward and `.cargo/config.toml` carries
-///    `-Ztrust-verify=off` for the native triple, which upstream stable rejects as
-///    an unknown `-Z` on every HOST unit (build scripts, proc macros) of a
-///    `--target` build. That neutral cwd is load-bearing; deleting it turns this
-///    gate red with a flag-parse error that names no wasm crate.
-/// 2. A SKIP is a decision about the BOX, taken BEFORE the build, and it says out
-///    loud that nothing was compiled. A build that runs and fails is a FAILURE —
-///    it is never re-read as a skip, whatever its stderr happens to say.
-fn gate_web() -> bool {
-    const TARGET: &str = "wasm32-unknown-unknown";
-    eprintln!("=== gate web (aterm-wasm + aterm-gpu-web build for {TARGET}) ===");
-    let Some(toolchain) = cross_preflight("gate web", TARGET, "ATERM_WASM_TOOLCHAIN") else {
-        return true;
-    };
-
-    // ---- the build. Neutral cwd per rule 1; `+simd128` and the workspace target
-    // dir match tools/wasm-bench/run.sh so this gate compiles the SHIPPING
-    // configuration rather than a near neighbour of it. `--locked` because a gate
-    // may not rewrite the tree's committed Cargo.lock on its way to an answer.
-    let Some(neutral) = neutral_build_cwd("web") else {
-        return false;
-    };
-    let root = workspace_root();
-    let out = toolchain
-        .cargo()
-        .current_dir(&neutral)
-        .env("RUSTFLAGS", "-C target-feature=+simd128")
-        .env("CARGO_TARGET_DIR", root.join("target"))
-        .arg("build")
-        .arg("--locked")
-        .arg("--target")
-        .arg(TARGET)
-        .args(["-p", "aterm-wasm", "-p", "aterm-gpu-web"])
-        .arg("--manifest-path")
-        .arg(root.join("Cargo.toml"))
-        .output();
-    let _ = std::fs::remove_dir_all(&neutral);
-    match out {
-        Ok(o) if o.status.success() => {
-            eprintln!(
-                "gate web: GREEN — aterm-wasm + aterm-gpu-web build for {TARGET} on {}.",
-                toolchain.name
-            );
-            true
-        }
-        Ok(o) => {
-            eprintln!("gate web: FAILED — the web renderers no longer build for {TARGET}:");
-            eprint!("{}", String::from_utf8_lossy(&o.stderr));
-            false
-        }
-        Err(e) => {
-            eprintln!("gate web: FAILED — could not run cargo ({e}).");
-            false
-        }
-    }
-}
-
-/// `gate linux` — the codebase must keep compiling for Linux, so a macOS-only API
-/// never sneaks in un-cfg-gated. Verified by a type-check against the Linux target.
-/// When `cargo-zigbuild` is on PATH it checks the WHOLE WORKSPACE (its `zig cc` shim
-/// cross-compiles the zstd C-dep); otherwise it falls back to the pure-Rust engine
-/// (`aterm-core --no-default-features`, no C-dep). Opt-in (NOT in `gate all`) —
-/// matches the plan's M5 "uname-gated state probe".
-///
-/// This doc comment spent its life attached to `on_path` instead of this function,
-/// which is how the paragraph below went unread for as long as it was wrong. The
-/// check rides the toolchain that HAS the Linux std (`ATERM_LINUX_TOOLCHAIN`,
-/// default `stable`) from a neutral cwd, via [`cross_preflight`] and
-/// [`neutral_build_cwd`] — the SAME plumbing as `gate web`, for the same reason: a
-/// bare `cargo check --target x86_64-unknown-linux-gnu` from the workspace inherits
-/// `rust-toolchain.toml`'s Trust pin, whose sysroot has only the host triple, so it
-/// could never pass. Until 2026-08-31 this gate then matched `can't find crate for
-/// `std`` in its own stderr and answered `SKIPPED … Not a failure` — a permanent
-/// green skip, with a remedy (`rustup target add` with no `--toolchain`) the Trust
-/// toolchain refuses. A skip is now a pre-flight fact about the box; a build that
-/// runs and fails is a FAILURE.
-fn gate_linux() -> bool {
-    const TARGET: &str = "x86_64-unknown-linux-gnu";
-    let have_zig = on_path("cargo-zigbuild") && on_path("zig");
-    if have_zig {
-        eprintln!("=== gate linux (WHOLE WORKSPACE cross-compiles for {TARGET}, via zig cc) ===");
-    } else {
-        eprintln!(
-            "=== gate linux (engine cross-compiles for {TARGET}; install cargo-zigbuild for the full workspace) ==="
-        );
-    }
-    let Some(toolchain) = cross_preflight("gate linux", TARGET, "ATERM_LINUX_TOOLCHAIN") else {
-        return true;
-    };
-    let Some(neutral) = neutral_build_cwd("linux") else {
-        return false;
-    };
-
-    // Same plumbing, same reasons, as `gate web`: the toolchain that HAS the target,
-    // from a neutral cwd, `--locked` so a gate cannot rewrite the tree's Cargo.lock,
-    // and the workspace target dir so repeat runs are incremental.
-    let root = workspace_root();
-    let mut cmd = toolchain.cargo();
-    cmd.current_dir(&neutral)
-        .env("CARGO_TARGET_DIR", root.join("target"))
-        .arg("check")
-        .arg("--locked")
-        .arg("--target")
-        .arg(TARGET)
-        .arg("--manifest-path")
-        .arg(root.join("Cargo.toml"));
-    if have_zig {
-        // zig cc translates the rustc triple cc-rs passes, so the zstd C-dep builds.
-        cmd.arg("--workspace");
-        cmd.env(format!("CC_{TARGET}"), "cargo-zigbuild zig cc --");
-        cmd.env(format!("CXX_{TARGET}"), "cargo-zigbuild zig c++ --");
-    } else {
-        // No C cross-compiler: check the pure-Rust engine (drops the zstd C-dep).
-        cmd.args(["-p", "aterm-core", "--no-default-features"]);
-    }
-    let out = cmd.output();
-    let _ = std::fs::remove_dir_all(&neutral);
-    match out {
-        Ok(o) if o.status.success() => {
-            let scope = if have_zig {
-                "the whole workspace is"
-            } else {
-                "the headless engine is"
-            };
-            eprintln!(
-                "gate linux: GREEN — {scope} Linux-clean (checked on {}).",
-                toolchain.name
-            );
-            true
-        }
-        Ok(o) => {
-            eprintln!("gate linux: FAILED — no longer compiles for {TARGET}:");
-            eprint!("{}", String::from_utf8_lossy(&o.stderr));
-            false
-        }
-        Err(e) => {
-            eprintln!("gate linux: FAILED — could not run cargo ({e}).");
-            false
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3188,7 +698,7 @@ const SKIPPED_NO_STD: &str = "SKIPPED(no-std)";
 /// rather than a convenience. An uninstalled std is a fact about the BOX,
 /// repairable by one `rustup target add`, identical on every checkout of the
 /// tree — so blocking on it would be a red that no change to this repository
-/// could clear, and [`LintLane`] records at length what a permanent red costs
+/// could clear, and [`LaneVerdict`] records what a permanent red costs
 /// (three lint-red commits reached `main` under a gate that could not pass).
 /// So: exit 0, and the MATRIX CLAIM is forfeit — the same discipline
 /// `aterm_verify::verdict` holds for the run as a whole, where a skipped stage
@@ -3716,8 +1226,8 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
 // ---------------------------------------------------------------------------
 
 /// THE TRIPLES SOME BOX IN THIS FLEET RUNS NATIVELY. A claim about MACHINES,
-/// not about targets, and the whole reason [`gate_cells_foreign`] can be an
-/// [`ALL_ROSTER`] entry on a day when `cells` itself cannot.
+/// not about targets, and the whole reason [`gate_cells_foreign`] can run on
+/// every tier of the merge gate on a day when `cells` itself cannot.
 ///
 /// A cell whose triple somebody HOSTS is a cell whose `gate cells` verdict
 /// depends on who is asking — measured on 2026-09-17, not reasoned about:
@@ -3738,8 +1248,8 @@ fn run_cell_test_pass(job: &TestPassJob<'_>) -> Result<TestPass, String> {
 /// of aterm's own crates down with them. In the same run the `linux` cell, whose
 /// floor of 230 was recorded as a CROSS cell on the Mac, reached 266 as the HOST
 /// cell here and printed `gained coverage … raise it by hand` — and raising it
-/// would fail the Mac. A roster gate that cannot pass on a whole platform for
-/// ANY input is a verdict that carries no information, which is the disease
+/// would fail the Mac. A gate that cannot pass on a whole platform for ANY
+/// input is a verdict that carries no information, which is the disease
 /// [`LaneVerdict`] was written to end.
 ///
 /// So the always-on subset is the cells NO box hosts, and this const is the half
@@ -3779,7 +1289,8 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
         .collect()
 }
 
-/// `xtask gate cells-foreign` — the cross-triple compile `gate all` runs.
+/// `xtask gate cells-foreign` — the cross-triple compile every tier of the
+/// merge gate runs (`StageId::ForeignCells` in `crates/aterm-verify`).
 ///
 /// THE HOLE THIS FILLS. `cells` was the only thing in this tree that compiles
 /// aterm for a triple the box is not, and it was OPT-IN: `tools/verify.sh
@@ -3797,9 +1308,9 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// first three until 2026-09-18): the cells no box in this fleet runs
 /// natively, which is exactly the set whose verdict is the SAME wherever it is
 /// run. `mac-arm`, `mac-x64` and `linux` stay behind the opt-in `cells` verb
-/// because each is native on some box — where the ordinary build, test and tippy lanes,
-/// `gate linux` and the shipped release already compile it — and cross on
-/// another, and the gate's verdict for them differs between the two. The two
+/// because each is native on some box — where the ordinary test and tippy
+/// lanes and the shipped release already compile it — and cross on another,
+/// and the gate's verdict for them differs between the two. The two
 /// mechanisms, and the red one of them is in right now, are in
 /// [`FLEET_HOST_TRIPLES`].
 ///
@@ -3833,12 +1344,7 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// tree sits above.) The 39 s the subset drops is almost all the HOST cell, and
 /// the host cell is the one that buys the least: its triple is the one every
 /// other stage of `tools/verify.sh` already compiles, and it pays for it a
-/// second time because this verb never shares the repo's `target/`. Against
-/// `gate all` itself, measured on the same box the same hour and BOTH numbers
-/// given because they are not the same run: 542.6 s wall / 4,182 s user with
-/// `perf`'s release harness cold, 251.0 s with it warm. So this gate is +3.0% of
-/// a cold `gate all` and +6.6% of a warm one after an edit, and +1.2 s on either
-/// when nothing changed.
+/// second time because this verb never shares the repo's `target/`.
 ///
 /// THE OTHER COST, since it is not seconds. The three cells of 2026-09-17 left
 /// 5.0 GB of target directories behind (win 3.6 G — it is the one owed the
@@ -3856,14 +1362,12 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// `x86_64-unknown-linux-gnu` reaches this gate on NO box, because those two
 /// cells are not in it; they are covered by the native lanes of whichever box
 /// hosts them, and by `cells` under `tools/verify.sh --full`. What is new is
-/// that Windows and wasm are compiled on EVERY box, on every `gate all`, instead
+/// that Windows and wasm are compiled on EVERY box, on every gate run, instead
 /// of on whoever remembered to type `--full`.
 ///
-/// AND WHO RUNS IT. `all` is MANUAL — nothing in the tree invokes it, and there
-/// is no git hook (the `.githooks/pre-push` that once did was deleted on
-/// 2026-09-25, by the owner's no-hooks mandate). The automatic half is
-/// `StageId::ForeignCells` in `crates/aterm-verify`'s FAST plan, decided
-/// 2026-09-25 under the owner's standing direction on the 2026-09-17 numbers;
+/// AND WHO RUNS IT: `StageId::ForeignCells` in `crates/aterm-verify`'s FAST
+/// plan, decided 2026-09-25 under the owner's standing direction on the
+/// 2026-09-17 numbers;
 /// its real cost is the `CARGO_INC=0` row above (8 s when nothing changed,
 /// 278 s after a core edit on a loaded M5 Max, 2.6 GiB cold). A snapshot's run
 /// builds into the snapshot's own cells lane beside it
@@ -3875,8 +1379,8 @@ fn gate_cells_foreign() -> bool {
     let cells = foreign_cells();
     // FAIL-CLOSED, and this is not a theoretical arm: `gate_cells` reads an
     // EMPTY selection as THE WHOLE MATRIX, so a [`FLEET_HOST_TRIPLES`] grown to
-    // cover every cell would turn this gate into the five-cell run it was split
-    // out of, inside `gate all`, silently.
+    // cover every cell would turn this gate into the whole-matrix run it was
+    // split out of, on every tier, silently.
     if cells.is_empty() {
         eprintln!(
             "gate cells-foreign: FAILED — FLEET_HOST_TRIPLES now names every cell's triple, so \
@@ -3908,12 +1412,11 @@ fn gate_cells_foreign() -> bool {
 /// narrowed run: every cell has a `floor` row, every `floor` row still has a
 /// cell, and no cell has two.
 ///
-/// It is a function rather than three loops inside a 900-line verb for the
-/// reason the header gives about `drift`: a check nobody has ever seen fail is a
-/// check nobody has verified. Inline, the only way to drive it was to compile
-/// five triples; out here `a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit`
-/// plants all three violations and asserts a RED verdict in `cargo test -p
-/// xtask`, which is what [`NON_VACUITY_REGISTRY`] registers for `cells-foreign`.
+/// It is a function rather than three loops inside a 900-line verb because a
+/// check nobody has ever seen fail is a check nobody has verified. Inline, the
+/// only way to drive it was to compile five triples; out here
+/// `a_shrunken_matrix_or_a_missing_floor_fails_the_cells_audit` plants all three
+/// violations and asserts a RED verdict in `targo --unverified test -p xtask`.
 ///
 /// Returns one line per violation — empty means discharged.
 fn cell_matrix_audit(
@@ -3973,9 +1476,9 @@ fn cell_matrix_audit(
 /// wasm-gpu cells cannot be COMPILED here — no cross std is installed — so ten
 /// of the thirteen consumers are held by source reading and by
 /// tests/consumers.rs, never by a type checker. BOTH DEFECTS ABOVE LIVED IN
-/// EXACTLY THAT GAP." Cargo resolves all five cells offline, `forge` measures all
-/// five, and `gate all` compiles none of them: every claim about the other four
-/// was a claim about a graph, not about a program.
+/// EXACTLY THAT GAP." Cargo resolved all five cells offline and `forge`
+/// measured all five, and nothing compiled any of them: every claim about the
+/// other four was a claim about a graph, not about a program.
 ///
 /// THE PREMISE THAT TURNED OUT TO BE FALSE is the reason this verb can exist.
 /// "No cross std is installed" was true of the toolchain `rust-toolchain.toml`
@@ -4003,11 +1506,11 @@ fn cell_matrix_audit(
 ///     NEUTRAL cwd — cargo discovers config by walking the cwd upward, and
 ///     `-Ztrust-verify=off` is a flag only Trust understands, so an in-repo cwd
 ///     kills an upstream cross build at flag-parse on its first unit. Same
-///     reason, same trick, as `gate web` and `gate linux`.
+///     reason, same trick, as `tools/wasm-bench/run.sh`.
 ///
-/// NOTHING IS WRITTEN INSIDE THE REPO. `gate web` and `gate linux` both point
-/// `CARGO_TARGET_DIR` at `<repo>/target`; this one never does, and refuses to
-/// start if `$ATERM_CELL_TARGET_DIR` points inside the workspace. `--locked`
+/// NOTHING IS WRITTEN INSIDE THE REPO. The cells never build into
+/// `<repo>/target`, and the verb refuses to start if `$ATERM_CELL_TARGET_DIR`
+/// points inside the workspace. `--locked`
 /// keeps `Cargo.lock` untouched, and the policy file is read-only to this gate.
 ///
 /// THE C DEPENDENCIES, AND WHY THEY ARE NO LONGER AN EXCUSE. Two dependencies
@@ -5288,8 +2791,7 @@ fn cell_cache_root_from(
 
 /// Where a cell's build artifacts go: OUTSIDE the repo, and on a DISK.
 ///
-/// `gate web` and `gate linux` both point `CARGO_TARGET_DIR` at `<repo>/target`
-/// and this one may not — a verification gate that writes into the tree it is
+/// Never `<repo>/target`: a verification gate that writes into the tree it is
 /// judging can invalidate the very build a developer is mid-way through, and the
 /// brief for this verb makes it a hard rule. `$ATERM_CELL_TARGET_DIR` overrides
 /// for a caller who wants the cache somewhere specific, and is REFUSED if it
@@ -5299,7 +2801,7 @@ fn cell_cache_root_from(
 /// guarding against the first. The default was [`std::env::temp_dir`], and on
 /// every mainstream Linux that is `/tmp` — which systemd mounts as a tmpfs,
 /// i.e. RAM. These cells leave GIGABYTES behind by design (5.0 GB for the three
-/// foreign ones alone, and the doc on [`cells_foreign_verdict`] measured it), so
+/// foreign ones alone, and the doc on [`gate_cells_foreign`] measured it), so
 /// the default turned a verification gate into a memory leak: on m17-tower a
 /// `/tmp/aterm-cells` reached 13.6 GB and took the box's swap with it, and the
 /// only warning was a doc line telling the reader to point the override at a
@@ -5459,37 +2961,33 @@ fn checkout_cache_key(root: &Path) -> String {
     format!("{name}-{hash:016x}")
 }
 
-/// The verdict ONE lint lane reached. THREE-valued on purpose.
+// ---------------------------------------------------------------------------
+// G-LINT: THE FORMATTER ORACLE
+// ---------------------------------------------------------------------------
+
+/// The verdict a formatter pass reached. THREE-valued on purpose.
 ///
-/// "The lane ran and found nothing", "the lane ran and found something" and
-/// "the lane never ran" are three different facts, and for this gate's whole
-/// life the third has been wearing the second's clothes. The disguise was
-/// `trustfmt: FAILED (exit Some(1))`: the Trust stage2 tree ships `trustfmt`
-/// and `targo-fmt` but NO `cargo-fmt`, so `cargo fmt` answers
-/// `error: 'cargo-fmt' is not installed for the custom toolchain 'trust'` and
-/// exits 1 — a missing COMPONENT rendered as a formatting FINDING.
-///
-/// The cost of that one mislabel is the reason this type exists. `gate lint`
-/// could not pass on this machine for any input, and a verdict that cannot vary
-/// carries no information, so it stopped being read — and three lint-red
-/// commits reached `main` underneath a gate that was red about something else
-/// entirely. A gate that reaches no verdict must never render one.
+/// "Ran and found nothing", "ran and found something" and "never ran" are three
+/// different facts. For a month the third wore the second's clothes —
+/// `trustfmt: FAILED (exit Some(1))` was `cargo fmt` failing to find a
+/// `cargo-fmt` the Trust stage2 does not ship — so the verb could not pass for
+/// any input, stopped being read, and three lint regressions reached `main`
+/// under it. A pass that reaches no verdict never renders one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum LaneVerdict {
-    /// The lane RAN, over the real tree, and found nothing.
+    /// The pass RAN, over the real tree, and found nothing.
     Clean,
-    /// The lane RAN and found something. Always blocks, on every lane.
+    /// The pass RAN and found drift. Blocks.
     Finding,
-    /// The lane did not run. It is NOT clean and it is NOT a finding: nothing
-    /// about the tree was learned. It blocks on every lane (see [`LintLane`]).
+    /// The pass did not run: nothing about the tree was learned. Blocks, under
+    /// its own headline, because "could not tell" is not "clean".
     NotRun,
 }
 
 impl LaneVerdict {
-    /// Fold two verdicts about the SAME lane, keeping the more alarming — a
-    /// lane made of several passes (the fmt lane's three, tippy's two) is only
-    /// `Clean` when every one of them ran and passed, and a real finding must
-    /// not be downgraded to NOT RUN by a later pass that could not run.
+    /// Fold two verdicts, keeping the more alarming: the lane is `Clean` only
+    /// when every pass ran and passed, and a finding is never downgraded to
+    /// NOT RUN by a later pass that could not run.
     fn worst(self, other: Self) -> Self {
         match (self, other) {
             (Self::Finding, _) | (_, Self::Finding) => Self::Finding,
@@ -5499,396 +2997,119 @@ impl LaneVerdict {
     }
 }
 
-/// The two lanes `gate lint` folds into one verdict, in run order.
-///
-/// A [`LaneVerdict::NotRun`] on ANY of them blocks. There used to be one
-/// exemption — the fmt lane's — and it was removed when the lane was armed
-/// (2026-08-26), because the argument that bought it is dead. That argument was
-/// STRUCTURAL: "no change to this repository can conjure a `cargo-fmt` into a
-/// stage2 that does not ship one", so blocking would have been a PERMANENT red
-/// rather than a repair request, and a permanent red is what teaches operators
-/// to stop reading a gate. But the stage2 does ship a formatter — `targo-fmt`,
-/// beside `trustfmt` — and this lane now calls it directly, so NOT RUN here is
-/// once again an ordinary repairable environment fault: build the stage2. It is
-/// also the SAME fault the tippy lane already blocks on out of the same
-/// directory, which means the exemption was buying nothing but a quieter report
-/// on a machine that was already blocked.
-///
-/// The escape hatch survives, and it is now the only one: `--no-fmt`, which a
-/// caller has to ask for OUT LOUD and which prints itself on every run. A lane
-/// that goes quiet because a binary is missing is how this one sat unchecked
-/// for a month; a lane that goes quiet because someone typed a flag is a
-/// decision with a name on it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LintLane {
-    Tippy,
-    Trustfmt,
-}
+/// The verdict lines `gate lint` prints. An exit code cannot tell a finding from
+/// a pass that never ran, so the words carry what the code cannot.
+const LINT_VERDICT_FAILED: &str = "gate lint: FAILED";
+const LINT_VERDICT_NO_VERDICT: &str = "gate lint: COULD NOT RUN";
+const LINT_VERDICT_GREEN: &str = "gate lint: GREEN";
 
-const LINT_LANES: [LintLane; 2] = [LintLane::Tippy, LintLane::Trustfmt];
-
-impl LintLane {
-    /// The lane's name in the report, and in the hook's diagnostics.
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Tippy => "tippy",
-            Self::Trustfmt => "trustfmt",
-        }
-    }
-}
-
-/// WHICH LANES `gate lint` RUNS, as a value rather than a pair of booleans.
-///
-/// There are two narrowings and they are opposites, so a `bool` cannot carry
-/// both without one call site meaning the reverse of another. Both are DECISIONS
-/// — somebody typed a flag — and neither is ever inferred from the machine, the
-/// tree or the clock. Whatever is not run is named in the verdict line, so a
-/// bare `GREEN` keeps meaning what it has always meant: every lane ran, and
-/// every lane was clean.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LaneSelection {
-    /// Every lane. The default, and what `gate all` means.
-    All,
-    /// `--no-fmt`: every lane except the formatter.
-    NoFmt,
-    /// `--fmt-only`: the formatter lane and nothing else — both of its passes,
-    /// `targo-fmt --all` over the workspace and the per-file sweep over the
-    /// sources `--all` cannot reach. It needs no compiler and no build: it is
-    /// the cheap half of this verb, and it exists so that running the check
-    /// costs seconds rather than a whole tippy pass. That matters because
-    /// NOTHING else invokes this verb automatically — there is no git hook (the
-    /// `.githooks/pre-push` that once ran it was deleted on 2026-09-25) — so the
-    /// only formatting check the tree gets is `tools/verify.sh`'s Formatting
-    /// stage and whatever a human chooses to run, and a check nobody can afford
-    /// is a check nobody runs.
-    FmtOnly,
-}
-
-impl LaneSelection {
-    /// Whether `lane` runs under this selection.
-    const fn includes(self, lane: LintLane) -> bool {
-        match self {
-            Self::All => true,
-            Self::NoFmt => !matches!(lane, LintLane::Trustfmt),
-            Self::FmtOnly => matches!(lane, LintLane::Trustfmt),
-        }
-    }
-
-    /// What to print for a lane this selection leaves out. Every one of these
-    /// says the same two things: nothing was learned about that lane, and the
-    /// omission was asked for on the command line.
-    fn excluded_note(self, lane: LintLane) -> String {
-        match self {
-            Self::All => unreachable!("LaneSelection::All excludes no lane"),
-            Self::NoFmt => "  trustfmt: NOT RUN — excluded by --no-fmt. FORMATTING WAS NOT \
-                 CHECKED, in EITHER pass: neither `targo-fmt --all` over the workspace nor \
-                 the per-file sweep over the sources `--all` cannot reach. This is an \
-                 explicit opt-out asked for on the command line, not a default: the tree IS \
-                 held to this toolchain's formatter, and a plain `gate lint` checks both \
-                 passes and blocks on drift in either. Nothing else is narrowed."
-                .to_string(),
-            Self::FmtOnly => format!(
-                "  {}: NOT RUN — excluded by --fmt-only. Nothing was learned about it. This \
-                 flag narrows to the FORMATTER and says so; it is not a lint, and a green \
-                 line from it is never a statement about anything else in this verb.",
-                lane.label()
-            ),
-        }
-    }
-}
-
-/// Where a `gate lint` lane's verdict comes from — the seam that lets a test
-/// fail ONE lane and watch the verb follow. Testing the three together only
-/// proves their conjunction; it leaves each individual arm free to stop
-/// failing closed without anything noticing.
-trait LintLanes {
-    fn run(&mut self, lane: LintLane) -> LaneVerdict;
-}
-
-/// The real lanes: Trust's linter and formatter over a real root.
-struct LiveLintLanes<'a> {
-    root: &'a Path,
-    tools: &'a Path,
-    /// Set when `tools` carries a `targo` that is NOT the toolchain
-    /// `rust-toolchain.toml` pins (see [`trust_toolchain`]). The tippy lane
-    /// then answers NOT RUN and says why, instead of linting the workspace with
-    /// whatever frontend that directory happens to hold — the one failure this
-    /// verb must never render as GREEN.
-    pin_refusal: Option<String>,
-}
-
-impl LiveLintLanes<'_> {
-    /// ONE tippy invocation, with the identity-abort retry the lane has always
-    /// had — factored out so the workspace pass and the `required-features`
-    /// pass cannot drift into different retry, environment or reporting
-    /// behaviour.
-    ///
-    /// RETRY THE IDENTITY ABORT, AND ONLY THAT. See [`TIPPY_IDENTITY_ABORTS`]:
-    /// the guard can trip on a clean run, so reporting it as red is a lie in
-    /// one direction — and retrying anything else would be a lie in the far
-    /// worse direction, turning a genuine `-D warnings` failure into a pass.
-    /// The match is on the abort signature alone.
-    ///
-    /// The window is wider than the compile: it spans cargo's BUILD-LOCK WAIT,
-    /// so with one shared `target-tippy` a two-second leaf crate can sit
-    /// exposed for minutes queued behind another build. That is why the crates
-    /// observed failing were the FAST ones, and why concurrent invokers should
-    /// each use their own `CARGO_TARGET_DIR`.
-    ///
-    /// The identity abort is the OTHER not-run hiding in this gate: when it
-    /// exhausts the retries NOTHING WAS LINTED, so the honest answer is
-    /// `NotRun` — which still blocks (see [`LintLane`]), but tells the operator
-    /// to wait for the tree to go quiet rather than hunt a lint finding that
-    /// was never reported.
-    fn tippy_pass(
-        &self,
-        bin: &Path,
-        argv_owned: &[String],
-        pass: TippyPass,
-        members: usize,
-    ) -> LaneVerdict {
-        let argv: Vec<&str> = argv_owned.iter().map(String::as_str).collect();
-        for attempt in 1..=TIPPY_IDENTITY_RETRIES {
-            let (ok, stderr) = run_shell_env_capturing(
-                "tippy",
-                &bin.to_string_lossy(),
-                &argv,
-                &[
-                    (
-                        "CARGO_TARGET_DIR",
-                        self.root.join("target-tippy").to_string_lossy().as_ref(),
-                    ),
-                    ("TRUST_NO_MIGRATE_WARN", "1"),
-                ],
-                Some(self.tools),
-                self.root,
-            );
-            if ok {
-                eprintln!("  tippy: {}", pass.clean_coverage(members));
-                return LaneVerdict::Clean;
-            }
-            let aborted = TIPPY_IDENTITY_ABORTS.iter().any(|sig| stderr.contains(sig));
-            if !aborted {
-                // A real finding (or any other failure): report it — and report
-                // HOW MUCH the finding list covers, because with a red member
-                // that is no longer "all of it".
-                eprintln!("  tippy: {}", pass.finding_coverage(&stderr, members));
-                return LaneVerdict::Finding;
-            }
-            if attempt == TIPPY_IDENTITY_RETRIES {
-                eprintln!(
-                    "  tippy: NOT RUN — toolchain-identity abort on all \
-                     {TIPPY_IDENTITY_RETRIES} attempts, so NOTHING WAS LINTED. This is \
-                     an environment abort, not a clean lint and not a finding: \
-                     something changed an ancestor of the stage2 sysroot mid-run (a \
-                     $HOME/trust rebuild will do it). Re-run once the tree is quiet."
-                );
-                return LaneVerdict::NotRun;
-            }
-            eprintln!(
-                "  tippy: toolchain-identity abort (attempt \
-                 {attempt}/{TIPPY_IDENTITY_RETRIES}) — transient, retrying"
-            );
-        }
-        LaneVerdict::Finding
-    }
-}
-
-impl LintLanes for LiveLintLanes<'_> {
-    fn run(&mut self, lane: LintLane) -> LaneVerdict {
-        match lane {
-            // THE linter here is Trust's, not stock Rust's. The stage2 tree ships
-            // `targo-tippy` and ships NO `cargo-clippy`, so plain `cargo clippy`
-            // resolves whatever `cargo-clippy` is on PATH — Homebrew's, typically
-            // — which drives a stable rustc and dies on this workspace's
-            // `-Ztrust-verify=off` before linting a line, then reports an
-            // environment break in the shape of a lint finding.
-            //
-            // Resolve and invoke exactly as tools/verify.sh does, so verb and
-            // gate cannot disagree about what "lint" means: the same candidate
-            // order, the same separate CARGO_TARGET_DIR (tippy's flags differ
-            // from the main build's; one shared dir makes them thrash each
-            // other's cache), and tippy's own directory first on PATH so it
-            // finds its `tippy-driver`.
-            LintLane::Tippy if self.pin_refusal.is_some() => {
-                eprintln!(
-                    "  tippy: NOT RUN — {}. Nothing was linted; this is not a clean lint.",
-                    self.pin_refusal.as_deref().unwrap_or_default()
-                );
-                LaneVerdict::NotRun
-            }
-            // TWO PASSES, ONE VERDICT. `[LiveLintLanes::tippy_pass]` owns the
-            // invocation, the environment and the identity-abort retry; this
-            // arm owns only WHICH two argvs get run and how their verdicts
-            // fold.
-            LintLane::Tippy => match resolve_tippy(self.tools) {
-                Some(bin) => {
-                    // THE ARGV IS `aterm_verify`'s, not a second copy of it.
-                    // This lane's contract is "lint exactly as tools/verify.sh
-                    // does"; two hand-written arrays can honour that on the day
-                    // they are written and not the day after, and `--keep-going`
-                    // landing in one of them alone would mean the two verbs
-                    // covered different amounts of the workspace under the same
-                    // word. One builder, two consumers.
-                    let scope = Scope::workspace();
-                    let members = workspace_member_count(self.root);
-                    let main = self.tippy_pass(
-                        &bin,
-                        &aterm_verify::stages::tippy_args(&scope),
-                        TippyPass::Workspace,
-                        members,
-                    );
-                    // PASS TWO REACHES WHAT `--all-targets` CANNOT. Cargo skips
-                    // every target whose `required-features` are off and says
-                    // nothing about it, so the first pass built none of the six
-                    // in `GATED_LINT_FEATURES` — three `aterm-gui` benches, its
-                    // conformance bin, two `aterm-scrollback` benches. That
-                    // blind spot is not hypothetical: it hid a broken bench
-                    // build for four days, and the campaign's count gates and
-                    // reach guards live IN those benches, so an unbuilt bench
-                    // is a gate that quietly stopped existing.
-                    //
-                    // Skipped when the first pass reached no verdict: with the
-                    // toolchain aborting there is nothing to learn from asking
-                    // it again, and `worst` already blocks.
-                    if main == LaneVerdict::NotRun {
-                        return main;
-                    }
-                    let Some(gated_argv) = aterm_verify::stages::tippy_gated_args(&scope) else {
-                        return main;
-                    };
-                    let gated =
-                        self.tippy_pass(&bin, &gated_argv, TippyPass::RequiredFeatures, members);
-                    main.worst(gated)
-                }
-                None => {
-                    eprintln!(
-                        "  tippy: NOT RUN — no targo-tippy in {}. Nothing was \
-                         linted; this is not a clean lint. Build the Trust stage2 \
-                         (`python3 x.py build --stage 2` in $HOME/trust) and re-run.",
-                        self.tools.display()
-                    );
-                    LaneVerdict::NotRun
-                }
-            },
-            // THE FORMATTER IS `targo-fmt`, INVOKED DIRECTLY — never `cargo fmt`.
-            //
-            // This lane spent a month reporting NOT RUN behind a `cargo fmt`
-            // that could not dispatch: the Trust stage2 ships `trustfmt` AND
-            // the branded driver `targo-fmt` beside it, and ships no
-            // `cargo-fmt`, so `cargo fmt` died at rustup's component lookup
-            // having read not one line of Rust. The driver was there the whole
-            // time. Nothing was ever wrong with this tree's access to a
-            // formatter — only with how this lane asked for one.
-            //
-            // ONLY the stage2's own driver is accepted, and it is NOT resolved
-            // off PATH. A `cargo-fmt`/`rustfmt` found on PATH is stock Rust's
-            // formatter — a different formatter with a different style — and
-            // holding this tree to it under the pinned toolchain's name is the
-            // same accident [`resolve_tippy`]'s pin check exists to prevent.
-            //
-            // TWO PASSES, because ONE of them structurally cannot see part of
-            // the tree. Pass one is `targo-fmt --all --check`: cargo's own
-            // target discovery over the WORKSPACE, i.e. `crates/*`. It is the
-            // authority on everything it reaches and it reaches most of the
-            // tree. What it cannot reach is not a bug in it — it is what
-            // `--all` MEANS: a file is reached only if it is a workspace
-            // member's target root or an out-of-line `mod` descendant of one.
-            // A file pulled in with `include!`, and every file of a crate
-            // outside `members = ["crates/*"]`, is invisible to it forever, and
-            // was invisible with no diagnostic at all. Pass two
-            // ([`fmt_sweep`]) closes that: a per-file `trustfmt --check` over
-            // every TRACKED `.rs`, folded in with `worst` — the same shape the
-            // tippy lane already uses for its `required-features` pass.
-            LintLane::Trustfmt => self
-                .fmt_workspace_pass()
-                .worst(fmt_sweep(self.root, self.tools))
-                .worst(fmt_edition_agreement(self.root)),
-        }
-    }
-}
-
-impl LiveLintLanes<'_> {
-    /// PASS ONE of the trustfmt lane, on its own: `targo-fmt --all --check`.
-    ///
-    /// Named and separated so a fixture can drive the WORKSPACE pass without
-    /// also needing a `trustfmt`, a git checkout and a file list — the four
-    /// verdicts this pass has to tell apart are a property of THIS pass, and a
-    /// test that reached them through the folded lane would be asserting about
-    /// two passes while claiming to be about one. That is the same
-    /// over-claim [`TippyPass`] exists to prevent one level up.
-    fn fmt_workspace_pass(&self) -> LaneVerdict {
-        let driver = self.tools.join(TRUSTFMT_DRIVER);
-        if !driver.is_file() {
-            // Checked BEFORE spawning: the answer is a stat(), and a
-            // spawn would print a `FAILED (exit …)` line this lane
-            // would then have to retract.
-            eprintln!(
-                "  trustfmt: NOT RUN — no `{TRUSTFMT_DRIVER}` in {}. FORMATTING WAS NOT \
-                         CHECKED, so nothing was learned about this tree. This is a missing \
-                         toolchain, NOT a clean tree and NOT a finding. Build the Trust stage2 \
-                         (`python3 x.py build --stage 2` in $HOME/trust), or point TRUST_STAGE2_BIN \
-                         at one that is built, and re-run. To run the rest of the lint without \
-                         this lane, ask for it OUT LOUD: `gate lint --no-fmt`.",
-                self.tools.display()
-            );
-            return LaneVerdict::NotRun;
-        }
-        let (ok, stdout, stderr) = run_capturing_both(
-            "trustfmt",
-            &driver,
-            &["--all", "--check"],
-            self.tools,
-            self.root,
+/// `gate lint` and `gate lint --fmt-only` — the same run: the formatter's three
+/// passes over the tree, from THE toolchain ([`trust_toolchain`]).
+fn gate_lint(args: &[String]) -> bool {
+    if let Some(bad) = args.iter().find(|a| a.as_str() != "--fmt-only") {
+        eprintln!(
+            "gate lint: unknown argument `{bad}`; nothing was run.\n\
+             usage: xtask gate lint [--fmt-only]   (the formatter; tippy is the gate's Tippy stage)"
         );
-        if ok {
-            eprintln!(
-                "  trustfmt: clean — every target `targo-fmt --all` discovers across \
-                         the workspace is formatted. That is the WORKSPACE, not the tree; the \
-                         sweep below is what covers the rest."
-            );
-            LaneVerdict::Clean
-        } else if stdout.contains(FMT_DIFF_MARKER) {
-            // A NON-ZERO EXIT IS NOT YET A FINDING. `targo-fmt` exits 1
-            // both for "the tree is unformatted" and for "I could not
-            // look at the tree" (an unresolvable manifest, a `trustfmt`
-            // missing from PATH). Telling those apart by exit code is
-            // the exact mislabel that made this verb unreadable for a
-            // month, so it is told apart by OUTPUT — see
-            // [`FMT_DIFF_MARKER`].
-            //
-            // PATHS, not files. `targo-fmt` reports one path per MODULE
-            // PATH it reached a source through, so a file pulled into a
-            // test target with `#[path = "../src/x.rs"]` is listed twice
-            // — MEASURED: the 254-file reformat that armed this lane was
-            // reported as 264 paths, ten of them aterm-release `src/`
-            // files seen a second time through `tests/../src/`.
-            let paths = fmt_diff_paths(&stdout).len();
-            eprintln!(
-                "  trustfmt: FINDING — drift at {paths} path(s) (a source reached \
-                         through two module paths is listed under each, so this is an upper \
-                         bound on files). The diff is printed above. Fix the whole tree with \
-                         `{} --all` from {}.",
-                driver.display(),
-                self.root.display()
-            );
-            LaneVerdict::Finding
-        } else {
-            eprintln!(
-                "  trustfmt: NOT RUN — `{TRUSTFMT_DRIVER}` exited non-zero WITHOUT \
-                         reporting a single `{FMT_DIFF_MARKER}…` line, so it never got as far as \
-                         reading the tree. That is an environment fault, not a formatting \
-                         finding. Its own words were:\n{}",
-                stderr.trim_end()
-            );
-            LaneVerdict::NotRun
+        return false;
+    }
+    eprintln!("=== gate lint (targo-fmt --all + the per-file trustfmt sweep + fmt editions) ===");
+    let root = workspace_root();
+    let toolchain = trust_toolchain();
+    // A refused directory holds a `targo` that is not the pinned toolchain; its
+    // formatter is not the one the tree is held to, so it is not run at all.
+    let verdict = if toolchain.refused.is_some() {
+        eprintln!(
+            "  trustfmt: NOT RUN — {}. Nothing was format-checked.",
+            toolchain.missing_targo_label()
+        );
+        LaneVerdict::NotRun
+    } else {
+        fmt_lane(&root, &toolchain.stage2_dir)
+    };
+    lint_verdict(verdict)
+}
+
+/// The three passes, every one run whatever the others found, folded with
+/// [`LaneVerdict::worst`].
+fn fmt_lane(root: &Path, tools: &Path) -> LaneVerdict {
+    fmt_workspace_pass(root, tools)
+        .worst(fmt_sweep(root, tools))
+        .worst(fmt_edition_agreement(root))
+}
+
+/// Print the verdict line for `verdict`; `true` only for [`LaneVerdict::Clean`].
+fn lint_verdict(verdict: LaneVerdict) -> bool {
+    match verdict {
+        LaneVerdict::Clean => {
+            eprintln!("{LINT_VERDICT_GREEN}");
+            true
         }
+        LaneVerdict::Finding => {
+            eprintln!("{LINT_VERDICT_FAILED} — formatting drift, named above");
+            false
+        }
+        LaneVerdict::NotRun => {
+            eprintln!(
+                "{LINT_VERDICT_NO_VERDICT} — a formatter pass never ran, so NOTHING was learned \
+                 about the tree. This is not a finding and it is not a clean tree."
+            );
+            false
+        }
+    }
+}
+
+/// PASS ONE: `targo-fmt --all --check`, cargo's own target discovery over the
+/// workspace. The stage2's branded driver, invoked by path and never resolved
+/// off PATH: a `cargo-fmt`/`rustfmt` found there is stock Rust's formatter, a
+/// different style under the pinned toolchain's name.
+fn fmt_workspace_pass(root: &Path, tools: &Path) -> LaneVerdict {
+    let driver = tools.join(TRUSTFMT_DRIVER);
+    if !driver.is_file() {
+        // Checked BEFORE spawning: the answer is a stat().
+        eprintln!(
+            "  trustfmt: NOT RUN — no `{TRUSTFMT_DRIVER}` in {}. FORMATTING WAS NOT CHECKED. This \
+             is a missing toolchain, NOT a clean tree and NOT a finding: `aterm pkg install \
+             trust`, or point TRUST_STAGE2_BIN at a built stage2, and re-run.",
+            tools.display()
+        );
+        return LaneVerdict::NotRun;
+    }
+    let (ok, stdout, stderr) =
+        run_capturing_both("trustfmt", &driver, &["--all", "--check"], tools, root);
+    if ok {
+        eprintln!(
+            "  trustfmt: clean — every target `targo-fmt --all` discovers across the workspace \
+             is formatted. That is the WORKSPACE, not the tree; the sweep below covers the rest."
+        );
+        LaneVerdict::Clean
+    } else if stdout.contains(FMT_DIFF_MARKER) {
+        // A NON-ZERO EXIT IS NOT YET A FINDING: `targo-fmt` exits 1 both for
+        // "unformatted" and for "could not look" (see [`FMT_DIFF_MARKER`]).
+        // Paths, not files: a source reached through two module paths (a
+        // `#[path]` include from a test target) is listed under each.
+        let paths = fmt_diff_paths(&stdout).len();
+        eprintln!(
+            "  trustfmt: FINDING — drift at {paths} path(s) (an upper bound on files). The diff \
+             is printed above. Fix the whole tree with `{} --all` from {}.",
+            driver.display(),
+            root.display()
+        );
+        LaneVerdict::Finding
+    } else {
+        eprintln!(
+            "  trustfmt: NOT RUN — `{TRUSTFMT_DRIVER}` exited non-zero WITHOUT reporting a single \
+             `{FMT_DIFF_MARKER}…` line, so it never read the tree. That is an environment fault, \
+             not a formatting finding. Its own words were:\n{}",
+            stderr.trim_end()
+        );
+        LaneVerdict::NotRun
     }
 }
 
 /// Trust's branded `cargo fmt` driver, as it is named in the stage2 bin dir.
 /// It drives `trustfmt`, which it finds as a sibling on PATH — which is why
-/// the lane hands it [`LiveLintLanes::tools`] as a PATH prefix.
+/// the pass hands it the toolchain directory as a PATH prefix.
 const TRUSTFMT_DRIVER: &str = "targo-fmt";
 
 /// How a formatting FINDING names each file, on STDOUT.
@@ -5915,76 +3136,22 @@ const FMT_DIFF_MARKER: &str = "Diff in ";
 /// `rustfmt.toml`, no cargo in the middle.
 const TRUSTFMT_BIN: &str = "trustfmt";
 
-/// Paths whose SHAPE is load-bearing, so holding them to the formatter would
-/// destroy the thing they exist to say. Each row carries its reason, and the
-/// reasons are quoted from the files themselves — an exclusion nobody can
-/// justify in a sentence is a waiver wearing a registry's clothes.
-///
-/// These are REPORTED on every run, never silently skipped: the wasm and scope
-/// censuses print their standing findings every build for the same reason, and
-/// a formatter exclusion that goes quiet is how a "temporary" one becomes
-/// permanent. A row that no longer reproduces (the file is formatted anyway) is
-/// reported as STALE so the registry cannot rot into a list of files nobody
-/// checks — see [`fmt_sweep_partition`] for why that is a report and not a
-/// failure.
-const FMT_SWEEP_EXCLUSIONS: &[(&str, &str)] = &[
-    (
-        "crates/aterm-core/tests/support/replay_corpus_data.rs",
-        "@generated — \"Adversarial determinism corpora (machine-generated from a hazard \
-         sweep)\". The single source of truth is the generator, and the content is const \
-         `&[&[u8]]` records the formatter would reflow into thousands of lines.",
-    ),
-    (
-        "crates/aterm-effects/src/animal_glyphs_gen.rs",
-        "@generated const drawlists. aterm-effects/src/lib.rs states the reason in the open: \
-         pulled in with `include!` (not `mod`) \"so `cargo fmt` — whose single source of truth \
-         for this file is the generator, not rustfmt — never reflows the const drawlists out \
-         from under it\". Formatting it here would defeat that decision by another route.",
-    ),
-    (
-        "crates/aterm-effects/src/cat_glyphs_gen.rs",
-        "@generated const drawlists, produced by `cargo run -p aterm-effects --example \
-         gen_cat_glyphs` and kept honest by the `cat_glyphs_gen_matches_assets` drift test. \
-         The `include!` in lib.rs exists precisely to keep the formatter off it; reformatting \
-         here would put the file and its generator permanently out of agreement.",
-    ),
-    (
-        "crates/aterm-effects/src/dog_glyphs_gen.rs",
-        "@generated const drawlists for the dog roster, on the same terms as \
-         cat_glyphs_gen.rs: the generator is the single source of truth, a drift test compares \
-         the two, and the `include!` is what keeps rustfmt out of that loop. Formatting it \
-         would make the drift test the thing that fails.",
-    ),
-    (
-        "crates/aterm-effects/src/pet_glyphs_gen.rs",
-        "@generated const drawlists for the pet roster, on the same terms as \
-         cat_glyphs_gen.rs: generator-owned content, a `*_matches_assets` drift test, and an \
-         `include!` chosen so the formatter never reflows it out from under either.",
-    ),
-    (
-        "crates/aterm-effects/src/robi_glyphs_gen.rs",
-        "@generated const drawlists for the robi roster, on the same terms as \
-         cat_glyphs_gen.rs: generator-owned content, a `*_matches_assets` drift test, and an \
-         `include!` chosen so the formatter never reflows it out from under either.",
-    ),
-    (
-        "tools/grep-guard-fixtures/must_fire/alias_then_call_same_line.rs",
-        "The SHAPE IS THE FIXTURE: \"Alias and work on ONE line — the binding must register \
-         before the hit test.\" rustfmt splits `let u = &mut *t; u.hydrate(rows);` onto two \
-         lines, which is the exact case this fixture requires grep_guard to catch.",
-    ),
-    (
-        "tools/grep-guard-fixtures/must_fire/split_receiver_chain.rs",
-        "The SHAPE IS THE FIXTURE: \"rustfmt breaks long chains itself, so the receiver and \
-         the work land on different lines without anyone intending a bypass.\" rustfmt joins \
-         this chain back onto one line and the case stops existing.",
-    ),
-    (
-        "tools/grep-guard-fixtures/must_silent/wrapped_chain_offload.rs",
-        "The SHAPE IS THE FIXTURE: a deliberately wrapped chain ending in the SAFE offload, \
-         the must-be-silent twin of split_receiver_chain.rs. rustfmt unwraps it and the \
-         negative case stops testing the wrapped form.",
-    ),
+/// Tracked sources the sweep does not hold to the formatter, because their LAYOUT
+/// is their content. A drifted file listed here is not a finding.
+const FMT_SWEEP_EXCLUSIONS: &[&str] = &[
+    // Machine-generated corpus records (const `&[&[u8]]`); the generator owns them.
+    "crates/aterm-core/tests/support/replay_corpus_data.rs",
+    // Generated const drawlists, `include!`d so rustfmt never reflows them out from
+    // under their generator and its `*_matches_assets` drift test.
+    "crates/aterm-effects/src/animal_glyphs_gen.rs",
+    "crates/aterm-effects/src/cat_glyphs_gen.rs",
+    "crates/aterm-effects/src/dog_glyphs_gen.rs",
+    "crates/aterm-effects/src/pet_glyphs_gen.rs",
+    "crates/aterm-effects/src/robi_glyphs_gen.rs",
+    // grep_guard L0 fixtures whose line breaks are the case under test.
+    "tools/grep-guard-fixtures/must_fire/alias_then_call_same_line.rs",
+    "tools/grep-guard-fixtures/must_fire/split_receiver_chain.rs",
+    "tools/grep-guard-fixtures/must_silent/wrapped_chain_offload.rs",
 ];
 
 /// Every TRACKED `*.rs` path outside `vendor/`, repo-relative, sorted.
@@ -6123,80 +3290,6 @@ fn relative_to(abs: &str, root: &Path, canonical_root: Option<&Path>) -> String 
     abs.to_owned()
 }
 
-/// Split measured drift against [`FMT_SWEEP_EXCLUSIONS`]: what must be fixed,
-/// what is registered with a reason, and which registry rows no longer
-/// reproduce.
-///
-/// Pure, so the partition is tested without a toolchain. A STALE row is
-/// reported but does NOT redden the lane, and the asymmetry is deliberate: a
-/// file that got formatted anyway is a good outcome, and failing the gate for
-/// it would punish the repair. A row that stops reproducing still has to be
-/// deleted — it is printed on every run until someone does — but the message is
-/// "delete this row", not "the tree is broken".
-///
-/// `exclusions` is the APPLICABLE subset — rows whose file exists under the
-/// root being swept — because [`fmt_sweep`] is also driven over scratch roots
-/// by its own red fixture, where every row of a registry about THIS repository
-/// would otherwise report STALE and bury the finding under nine lines of noise.
-/// A row naming a file that exists nowhere is the other rot direction and is
-/// caught by test, not here: see
-/// `every_fmt_sweep_exclusion_names_a_real_file_and_a_real_reason`, which
-/// `cargo test -p xtask` runs — and which tools/verify.sh runs at workspace
-/// scope, so a deleted or renamed exclusion target fails the merge contract.
-fn fmt_sweep_partition<'a>(
-    drifted: &std::collections::BTreeSet<String>,
-    exclusions: &'a [(&'a str, &'a str)],
-) -> (Vec<String>, Vec<&'a (&'a str, &'a str)>, Vec<&'a str>) {
-    let findings: Vec<String> = drifted
-        .iter()
-        .filter(|p| !exclusions.iter().any(|(path, _)| *path == p.as_str()))
-        .cloned()
-        .collect();
-    let standing: Vec<&(&str, &str)> = exclusions
-        .iter()
-        .filter(|(path, _)| drifted.contains(*path))
-        .collect();
-    let stale: Vec<&str> = exclusions
-        .iter()
-        .filter(|(path, _)| !drifted.contains(*path))
-        .map(|(path, _)| *path)
-        .collect();
-    (findings, standing, stale)
-}
-
-/// PASS TWO of the trustfmt lane: hold every tracked `.rs` file `targo-fmt
-/// --all` cannot reach to the same formatter.
-///
-/// WHY IT SWEEPS THE WHOLE TREE INSTEAD OF THE COMPLEMENT. The obvious
-/// optimisation is to check only the files pass one misses, and it was rejected
-/// on purpose: computing that complement means MODELLING cargo's target
-/// discovery plus rustfmt's `mod` recursion, and a model that drifts drops a
-/// file out of BOTH passes with nothing to say so — which is precisely the bug
-/// this pass exists to fix, rebuilt one level up. Sweeping everything has no
-/// such failure mode, and it makes the two passes cross-check: if `--all` ever
-/// silently stops covering something, this pass still sees it.
-///
-/// The residual risk of checking a file pass one already covers is a
-/// DISAGREEMENT — a file whose in-crate formatting differs from its per-file
-/// formatting. MEASURED 2026-08-31: zero disagreements. Of the 1,752 tracked
-/// `.rs` files outside `vendor/`, `targo-fmt --all --check` exits 0 while this
-/// sweep named 51 before its findings were repaired, and every one of the 51 is
-/// genuinely unreachable by `--all` — sources pulled in with `include!`, plus
-/// the crates outside `members = ["crates/*"]` (there are eleven such
-/// manifests: astream-oracle, aterm-link, libc-oracle and its two sub-crates,
-/// tools/temporal-extract and its two, tools/freeze-safety-gate,
-/// experiments/title-neural-poc, and crates/aterm-scrollback/fuzz, which lives
-/// under `crates/` but is its own workspace). `--skip-children` is what buys the
-/// agreement: each file is judged alone, at top-level indentation, which is also
-/// how `--all` formats an out-of-line `mod` file.
-///
-/// COST, stated because a lane nobody will wait for is a lane that gets
-/// bypassed: 7.5 s and 7.5 s over two MEASURED runs of all 1,752 files, batched
-/// into one invocation per edition. That is on top of pass one, and it needs no
-/// compiler — trustfmt parses and prints, it does not build. Of the 51 it named
-/// on arrival, 9 are registered exclusions and 42 were findings; all 42 were
-/// formatted in the arming commit, so it names 9 today and all 9 are
-/// exclusions.
 /// PASS THREE of the trustfmt lane: EVERY OTHER SPELLING OF THE FORMATTER
 /// AGREES WITH THIS ONE.
 ///
@@ -6349,6 +3442,17 @@ fn toml_edition(text: &str) -> Option<String> {
         })
 }
 
+/// PASS TWO: hold every tracked `.rs` file outside `vendor/` to the same
+/// formatter, per file, at the edition of the crate that owns it.
+///
+/// It sweeps the WHOLE tree rather than the complement of pass one on purpose:
+/// computing that complement means modelling cargo's target discovery and
+/// rustfmt's `mod` recursion, and a model that drifts drops a file out of BOTH
+/// passes silently. Sweeping everything makes the passes cross-check instead.
+/// `--skip-children` judges each file alone, at top-level indentation, which is
+/// how `--all` formats an out-of-line `mod` file, so the two never disagree
+/// (measured 2026-08-31: zero disagreements over 1,752 files). It needs no
+/// compiler and costs seconds.
 fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     let bin = tools.join(TRUSTFMT_BIN);
     if !bin.is_file() {
@@ -6449,15 +3553,12 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
             // that) left the swept set in silence. Name them, and do not call the
             // sweep clean while any remain.
             if !out.status.success() {
-                for line in stderr.lines() {
-                    let line = line.trim();
-                    let Some(rest) = line.strip_prefix("error") else {
-                        continue;
-                    };
-                    // `error[E0123]: …` and `error: …` both carry the path after the
-                    // first `:`; keep the whole line, it is the operator's evidence.
-                    let _ = rest;
-                    unread.push(line.to_string());
+                // `error[E0123]: …` and `error: …` both carry the path after the
+                // first `:`; keep the whole line, it is the operator's evidence.
+                for line in stderr.lines().map(str::trim) {
+                    if line.starts_with("error") {
+                        unread.push(line.to_string());
+                    }
                 }
             }
             for abs in fmt_diff_paths(&stdout) {
@@ -6465,13 +3566,6 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
             }
         }
     }
-    // Only rows that name a file present under THIS root can be judged here;
-    // see [`fmt_sweep_partition`] for why the other direction is a test.
-    let applicable: Vec<(&str, &str)> = FMT_SWEEP_EXCLUSIONS
-        .iter()
-        .filter(|(path, _)| root.join(path).is_file())
-        .copied()
-        .collect();
     if !unread.is_empty() {
         eprintln!(
             "  trustfmt sweep: NOT RUN — `{TRUSTFMT_BIN}` could not read {} file(s) in a batch \
@@ -6484,26 +3578,18 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
         }
         return LaneVerdict::NotRun;
     }
-    let (findings, standing, stale) = fmt_sweep_partition(&drifted, &applicable);
-    for (path, reason) in &standing {
-        eprintln!("  trustfmt sweep: STANDING EXCLUSION {path} — {reason}");
-    }
-    for path in &stale {
-        eprintln!(
-            "  trustfmt sweep: STALE EXCLUSION {path} is registered in FMT_SWEEP_EXCLUSIONS but \
-             is formatted anyway. Delete the row: a registry the tree has outgrown teaches \
-             readers that the rows are not checked. (Reported, not failed — the file being \
-             formatted is the good outcome.)"
-        );
-    }
+    let findings: Vec<&String> = drifted
+        .iter()
+        .filter(|p| !FMT_SWEEP_EXCLUSIONS.contains(&p.as_str()))
+        .collect();
     if findings.is_empty() {
         eprintln!(
             "  trustfmt sweep: clean — {} tracked `.rs` file(s) checked per-file at their own \
-             crate edition ({}), including every source `targo-fmt --all` cannot reach. \
-             {} registered exclusion(s) reported above, never waived.",
+             crate edition ({}), including every source `targo-fmt --all` cannot reach \
+             ({} excluded by FMT_SWEEP_EXCLUSIONS).",
             files.len(),
             editions.join(", "),
-            standing.len()
+            FMT_SWEEP_EXCLUSIONS.len()
         );
         return LaneVerdict::Clean;
     }
@@ -6519,858 +3605,12 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     }
     eprintln!(
         "    Fix each with `{} --edition <that crate's edition> --unstable-features \
-         --skip-children <path>` (drop `--check` to write), or register it in \
-         FMT_SWEEP_EXCLUSIONS with a reason if its SHAPE is load-bearing — but read the \
-         existing rows first: the bar is a fixture or a generator whose output the formatter \
-         would destroy, not \"this one is awkward\".",
+         --skip-children <path>` (drop `--check` to write). FMT_SWEEP_EXCLUSIONS is for a \
+         fixture or a generator's output whose layout the formatter would destroy, and \
+         nothing else.",
         bin.display()
     );
     LaneVerdict::Finding
-}
-
-/// The tippy binary in `tools` — `targo-tippy`, the one name the Trust
-/// toolchain ships (the pre-rebrand `targo-clippy` is retired). `None` means
-/// NOT RUN — never "clean".
-fn resolve_tippy(tools: &Path) -> Option<PathBuf> {
-    Some(tools.join("targo-tippy")).filter(|path| path.is_file())
-}
-
-/// How many members `--workspace` covers. The manifest says
-/// `members = ["crates/*"]`, so one directory under `crates/` holding a
-/// `Cargo.toml` is one member; nothing else in the tree is in the workspace.
-///
-/// This is the DENOMINATOR of the coverage sentence below, and it is computed
-/// rather than written down for the same reason `gate counts` refuses a
-/// hand-maintained total: a number in prose is right on the day it is typed.
-/// `0` (an unreadable or absent `crates/`) is reported as "unknown" instead of
-/// as a confident zero — see [`tippy_clean_coverage`].
-fn workspace_member_count(root: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(root.join("crates")) else {
-        return 0;
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| e.path().join("Cargo.toml").is_file())
-        .count()
-}
-
-/// WHICH of the tippy lane's two passes a report line is about.
-///
-/// They cover different things, and a sentence borrowed from the other one is
-/// a false claim in both directions: "2 of 71 workspace members" said of a
-/// two-package pass overstates what ran, and "targets behind
-/// `required-features` are not in this pass" said of the pass that IS them is
-/// simply wrong. One enum, two report sentences, no chance of crossing them.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum TippyPass {
-    /// `--workspace --all-targets`: every member, default features.
-    Workspace,
-    /// `-p … --features …`: only the targets `--all-targets` refuses to build.
-    RequiredFeatures,
-}
-
-impl TippyPass {
-    fn clean_coverage(self, members: usize) -> String {
-        match self {
-            Self::Workspace => tippy_clean_coverage(members),
-            Self::RequiredFeatures => tippy_gated_clean_coverage(),
-        }
-    }
-
-    fn finding_coverage(self, stderr: &str, members: usize) -> String {
-        match self {
-            Self::Workspace => tippy_finding_coverage(stderr, members),
-            Self::RequiredFeatures => tippy_gated_finding_coverage(stderr),
-        }
-    }
-}
-
-/// What a ZERO-EXIT tippy run is entitled to claim — pass one, the workspace.
-///
-/// A clean exit from `--workspace --all-targets` means cargo built and linted
-/// every unit it scheduled and none failed, so every member really was reached
-/// — that part is not a guess. What it still does not reach is named in the
-/// same breath, because `--all-targets` does not build a target whose
-/// `required-features` are off. That used to be where the sentence stopped, and
-/// stopping there is what let a broken bench build sit unnoticed for four days;
-/// the second pass now closes it, and this line points at it rather than
-/// shrugging.
-fn tippy_clean_coverage(members: usize) -> String {
-    let scope = if members == 0 {
-        "the workspace".to_string()
-    } else {
-        format!("all {members} workspace members")
-    };
-    format!(
-        "clean — {scope} linted, every target `--all-targets` builds under default \
-         features. Targets gated behind `required-features` are not in this pass; the \
-         `required-features` pass below is what reaches them."
-    )
-}
-
-/// What a ZERO-EXIT `required-features` pass is entitled to claim — pass two.
-///
-/// It names the count and the features so the claim is checkable against
-/// `crates/*/Cargo.toml` by eye, and the table it is derived from is checked
-/// against them by test.
-fn tippy_gated_clean_coverage() -> String {
-    let mut pairs: Vec<String> = aterm_verify::stages::GATED_LINT_FEATURES
-        .iter()
-        .map(|(pkg, feat)| format!("{pkg}/{feat}"))
-        .collect();
-    pairs.sort_unstable();
-    format!(
-        "clean — required-features pass: every target behind {} also linted, so the \
-         `--all-targets` blind spot above is closed rather than merely declared.",
-        pairs.join(", ")
-    )
-}
-
-/// What a FAILING `required-features` pass is entitled to claim.
-///
-/// Deliberately NOT [`tippy_finding_coverage`]: that sentence counts against
-/// the whole workspace (85 members, MEASURED 2026-08-31 by
-/// [`workspace_member_count`] over `crates/*/Cargo.toml`; this comment said 71
-/// until then, which is why the count is computed and not written down), and
-/// this pass compiles two packages. It names the
-/// red members and says which pass they are red in, so a reader can tell a
-/// finding that only the second pass can see (a bench nothing else builds)
-/// from one the first pass would have caught anyway.
-fn tippy_gated_finding_coverage(stderr: &str) -> String {
-    let failed = tippy_failed_members(stderr);
-    let named = if failed.is_empty() {
-        "no member named itself in the output".to_string()
-    } else {
-        failed.join(", ")
-    };
-    format!(
-        "FINDING in the required-features pass ({named}). This pass builds the targets \
-         `--all-targets` skips, so a finding here may be one NOTHING ELSE LINTS — check \
-         the target name in the error, not just the crate. Same floor caveat as the \
-         workspace pass: a member whose dependency failed to compile was not linted at \
-         all, so this list is a lower bound."
-    )
-}
-
-/// What a FAILING tippy run is entitled to claim — deliberately weaker.
-///
-/// `--keep-going` keeps cargo scheduling after a unit fails, so one red crate
-/// no longer ends the run; but a member whose DEPENDENCY failed to compile
-/// cannot be linted at all, because there is no metadata to lint it against.
-/// So the finding list after a failure is a FLOOR, not a census, and this
-/// sentence says which members were red so the reader can judge the gap
-/// instead of assuming there is none.
-fn tippy_finding_coverage(stderr: &str, members: usize) -> String {
-    let failed = tippy_failed_members(stderr);
-    let of = if members == 0 {
-        String::new()
-    } else {
-        format!(" of {members}")
-    };
-    if failed.is_empty() {
-        return "FINDING — tippy exited non-zero without naming a crate it could not compile, \
-                so this gate cannot say how much of the workspace was linted. Read the output \
-                above."
-            .to_string();
-    }
-    format!(
-        "FINDING in {}{of} workspace member(s): {}. `--keep-going` linted every other member \
-         whose dependencies compiled, so the list above is a FLOOR, not a census — a member \
-         downstream of a failed LIB could not be linted at all. Re-run after fixing these.",
-        failed.len(),
-        failed.join(", ")
-    )
-}
-
-/// The packages cargo reported it could not compile, deduplicated, in the
-/// order they were first seen.
-///
-/// Cargo writes one ``error: could not compile `<pkg>` (<target>) due to …``
-/// line per FAILED TARGET, so a crate with a red lib and a red test appears
-/// twice; the coverage sentence counts MEMBERS, not targets, hence the dedupe.
-/// Parsed from text rather than `--message-format=json` on purpose: this lane
-/// tees tippy's own output to the operator verbatim, and switching the format
-/// would replace the report they are reading with a wall of JSON.
-fn tippy_failed_members(stderr: &str) -> Vec<String> {
-    const HEAD: &str = "error: could not compile `";
-    let mut seen: Vec<String> = Vec::new();
-    for line in stderr.lines() {
-        let Some(rest) = line.trim_start().strip_prefix(HEAD) else {
-            continue;
-        };
-        let Some((name, _)) = rest.split_once('`') else {
-            continue;
-        };
-        if !name.is_empty() && !seen.iter().any(|s| s == name) {
-            seen.push(name.to_string());
-        }
-    }
-    seen
-}
-
-/// The verdict lines `gate lint` prints, and the ONLY strings a consumer may
-/// discriminate on — an exit code alone cannot tell a finding from a lane that
-/// never ran, so the words carry what the code cannot.
-///
-/// `.githooks/pre-push` used to grep them, until 2026-09-17; the hook is deleted
-/// (2026-09-25), so no reader outside this file discriminates on these; one that
-/// starts to must quote them exactly. (A test-only checker for stale hook quotes
-/// guarded that dormant coupling until the 2026-09-24 test-audit trim removed it:
-/// it examined nothing while the hook quoted nothing.)
-const LINT_VERDICT_FAILED: &str = "gate lint: FAILED";
-const LINT_VERDICT_NO_VERDICT: &str = "gate lint: COULD NOT RUN";
-const LINT_VERDICT_GREEN: &str = "gate lint: GREEN";
-
-/// The roster's view of the verb: every lane, nothing excluded. `gate all` runs
-/// this one, so the full-fat lint is what a bare `gate all` means.
-fn gate_lint() -> bool {
-    gate_lint_args(&[])
-}
-
-fn gate_lint_args(args: &[String]) -> bool {
-    let root = workspace_root();
-    let toolchain = trust_toolchain();
-    let tools = toolchain.stage2_dir.clone();
-    // A refused directory is one this verb must not lint from. `have_targo`
-    // already answers no for it, so ask the toolchain for its own diagnosis
-    // rather than re-deriving the condition here.
-    let pin_refusal = toolchain
-        .refused
-        .is_some()
-        .then(|| toolchain.missing_targo_label());
-    // Both narrowings are hand-typed opt-outs, declared at the call site rather
-    // than inferred: see `gate_lint_with`. Asking for both at once is a
-    // contradiction rather than an intersection, and is refused rather than
-    // silently resolved — an operator who typed both does not know which one
-    // they are getting, and neither would a reader of the transcript.
-    let no_fmt = args.iter().any(|a| a == "--no-fmt");
-    let fmt_only = args.iter().any(|a| a == "--fmt-only");
-    let selection = match (no_fmt, fmt_only) {
-        (true, true) => {
-            eprintln!(
-                "gate lint: REFUSED — `--no-fmt` and `--fmt-only` are opposites and both were \
-                 given. Pick one; nothing was run."
-            );
-            return false;
-        }
-        (true, false) => LaneSelection::NoFmt,
-        (false, true) => LaneSelection::FmtOnly,
-        (false, false) => LaneSelection::All,
-    };
-    gate_lint_with(
-        &mut LiveLintLanes {
-            root: &root,
-            tools: &tools,
-            pin_refusal,
-        },
-        selection,
-    )
-}
-
-/// The `gate lint` VERB: run every selected lane, fold the verdicts, report.
-///
-/// Every lane runs even after one fails — a lint report that stops at the first
-/// finding tells you less than one that ran everything, and this repo has
-/// already paid for that once: `aterm-effects` was lint-red for a day because
-/// `atpkg`'s errors aborted the workspace run before tippy reached it.
-///
-/// THAT SAME BUG HAD A SECOND STOREY, one level down, and it outlived the fix
-/// here by a fortnight: running every LANE does nothing about cargo stopping at
-/// the first failing CRATE inside the tippy lane. `aterm-effects` was
-/// unreachable in that incident not because a lane was skipped but because
-/// cargo never scheduled it. Both floors are closed now — this loop runs every
-/// lane, and `--keep-going` makes the tippy lane run every member (see the
-/// module header).
-///
-/// THREE OUTCOMES, not two. A FINDING is a statement about the tree and blocks.
-/// A NOT-RUN is a statement about the MACHINE and also blocks, under a
-/// different headline, because "we could not tell" is not "clean" — but the
-/// operator is sent to fix a toolchain, not to hunt a lint. Every lane blocks on
-/// both; see [`LintLane`] for why the fmt lane's old exemption is gone.
-///
-/// THE ONE NON-BLOCKING PATH IS `include_fmt == false`, and it is a decision
-/// rather than an accident: somebody typed `--no-fmt`. It still never passes
-/// silently — the verdict word is qualified with exactly which lane sat out, so
-/// bare `GREEN` continues to mean what it has always meant: every lane ran, and
-/// every lane was clean.
-fn gate_lint_with(lanes: &mut dyn LintLanes, selection: LaneSelection) -> bool {
-    eprintln!("=== gate lint (tippy -D warnings + trustfmt) ===");
-    let mut findings: Vec<&str> = Vec::new();
-    let mut blocked_not_run: Vec<&str> = Vec::new();
-    let mut skipped: Vec<&str> = Vec::new();
-    for lane in LINT_LANES {
-        if !selection.includes(lane) {
-            eprintln!("{}", selection.excluded_note(lane));
-            skipped.push(lane.label());
-            continue;
-        }
-        match lanes.run(lane) {
-            LaneVerdict::Clean => {}
-            LaneVerdict::Finding => findings.push(lane.label()),
-            LaneVerdict::NotRun => blocked_not_run.push(lane.label()),
-        }
-    }
-    // A FINDING OUTRANKS A NOT-RUN in the headline. If tippy found real errors
-    // and the formatter could not run, the thing the developer must act on is
-    // the errors; the missing formatter is reported on its own line and still
-    // blocks, so nothing is lost by ranking it second.
-    if !findings.is_empty() {
-        eprintln!(
-            "{LINT_VERDICT_FAILED} — findings in: {}",
-            findings.join(", ")
-        );
-        if !blocked_not_run.is_empty() {
-            eprintln!(
-                "  (and {} reached no verdict at all — see above)",
-                blocked_not_run.join(", ")
-            );
-        }
-        return false;
-    }
-    if !blocked_not_run.is_empty() {
-        eprintln!(
-            "{LINT_VERDICT_NO_VERDICT} — {} never ran, so NOTHING was learned about the tree. \
-             This is not a finding and it is not a clean lint.",
-            blocked_not_run.join(", ")
-        );
-        return false;
-    }
-    if skipped.is_empty() {
-        eprintln!("{LINT_VERDICT_GREEN}");
-    } else {
-        eprintln!(
-            "{LINT_VERDICT_GREEN} — but NOT CHECKED: {}. Every lane that ran was clean.",
-            skipped.join(", ")
-        );
-    }
-    true
-}
-
-// ---------------------------------------------------------------------------
-// G-COUNTS (computed-only proof inventory; no hand-maintained prose total;
-// every in-build proof island named where AGENTS.md lists what is verified)
-// ---------------------------------------------------------------------------
-
-/// Recompute `(harnesses, files)` over the workspace's shipping/test crates:
-/// `harnesses` is the number of matching lines, `files` is the number of files with
-/// at least one match. The walk reuses [`collect_rs_files`] (skips `target/`) and
-/// propagates every collection/read error instead of silently undercounting.
-///
-/// Exact trimmed-line matching counts an ordinary proof attribute only where it
-/// is actually applied. Comments, strings, and `proof_for_contract` are distinct
-/// categories and do not inflate this inventory.
-fn kani_proof_counts(root: &Path) -> std::io::Result<(usize, usize)> {
-    let mut files = Vec::new();
-    collect_rs_files(&root.join("crates"), &mut files)?;
-    let (mut harnesses, mut hit_files) = (0usize, 0usize);
-    for file in &files {
-        let text = std::fs::read_to_string(file)?;
-        let n = text
-            .lines()
-            .filter(|line| is_ordinary_kani_proof_attr(line))
-            .count();
-        if n > 0 {
-            harnesses += n;
-            hit_files += 1;
-        }
-    }
-    Ok((harnesses, hit_files))
-}
-
-fn is_ordinary_kani_proof_attr(line: &str) -> bool {
-    line.trim() == "#[kani::proof]"
-}
-
-fn proof_inventory_is_valid(harnesses: usize, files: usize) -> bool {
-    harnesses > 0 && files > 0 && files <= harnesses
-}
-
-/// Numeric proof totals in README prose rot immediately as the tree evolves.
-/// Reject the old claim shape if it reappears; the live gate output is the sole
-/// count authority.
-fn readme_asserts_proof_inventory(readme: &str) -> bool {
-    const MARKER: &str = "`#[kani::proof]` harnesses";
-    readme.lines().any(|line| {
-        line.find(MARKER)
-            .is_some_and(|idx| line[..idx].chars().any(|c| c.is_ascii_digit()))
-    })
-}
-
-/// The opener of a Clean proof island (`clean { … }`), spelled the only way an
-/// island can be: alone on its line, at the top of a file a `#[cfg(clean_islands)]`
-/// `mod` reads (inline, it would not lex on the upstream-stable lanes).
-fn is_clean_island_opener(line: &str) -> bool {
-    line.trim() == "clean {"
-}
-
-/// Every `crates/` file carrying a Clean proof island, `/`-separated and relative
-/// to `root`, sorted.
-///
-/// An island is the one proof the compiler discharges during an ordinary
-/// `--unverified` build — the Clean CIC kernel checks it even under
-/// `-Ztrust-verify=off` — so AGENTS.md's "What IS actually verified today,
-/// exhaustively" table must name each one. It said `in-compilation verification |
-/// nowhere` while an island was being checked in every build, because nothing
-/// compared that table with the tree.
-fn clean_island_files(root: &Path) -> std::io::Result<Vec<String>> {
-    let mut files = Vec::new();
-    collect_rs_files(&root.join("crates"), &mut files)?;
-    let mut islands = Vec::new();
-    for file in &files {
-        if std::fs::read_to_string(file)?
-            .lines()
-            .any(is_clean_island_opener)
-        {
-            let rel = file.strip_prefix(root).unwrap_or(file);
-            islands.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    islands.sort();
-    Ok(islands)
-}
-
-fn gate_counts() -> bool {
-    let (ok, log) = counts_report(&workspace_root());
-    eprint!("{log}");
-    ok
-}
-
-/// `gate counts` over an arbitrary root, returning the verdict plus the
-/// transcript the verb prints. Rooted so a red fixture can plant each of the
-/// failure conditions (empty inventory, hand-maintained README total,
-/// unreadable README, a Clean island AGENTS.md does not name, unreadable
-/// AGENTS.md) and watch the gate go red on every one.
-fn counts_report(root: &Path) -> (bool, String) {
-    let mut log = String::new();
-    let _ = writeln!(
-        log,
-        "=== gate counts (computed-only crate proof inventory) ==="
-    );
-    let (harnesses, files) = match kani_proof_counts(root) {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = writeln!(log, "gate counts: FAILED — could not scan workspace ({e})");
-            return (false, log);
-        }
-    };
-
-    let readme_path = root.join("README.md");
-    let readme = match std::fs::read_to_string(&readme_path) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = writeln!(
-                log,
-                "gate counts: FAILED — could not read {readme_path:?} ({e})"
-            );
-            return (false, log);
-        }
-    };
-
-    if !proof_inventory_is_valid(harnesses, files) {
-        let _ = writeln!(
-            log,
-            "gate counts: FAILED — invalid/empty crate proof inventory \
-             ({harnesses} harnesses across {files} files)"
-        );
-        return (false, log);
-    }
-    if readme_asserts_proof_inventory(&readme) {
-        let _ = writeln!(
-            log,
-            "gate counts: FAILED — README.md contains a hand-maintained numeric \
-             `#[kani::proof]` total; use this computed inventory instead"
-        );
-        return (false, log);
-    }
-
-    let islands = match clean_island_files(root) {
-        Ok(i) => i,
-        Err(e) => {
-            let _ = writeln!(
-                log,
-                "gate counts: FAILED — could not scan crates/ for Clean islands ({e})"
-            );
-            return (false, log);
-        }
-    };
-    let agents_path = root.join("AGENTS.md");
-    let agents = match std::fs::read_to_string(&agents_path) {
-        Ok(t) => t,
-        Err(e) => {
-            let _ = writeln!(
-                log,
-                "gate counts: FAILED — could not read {agents_path:?} ({e})"
-            );
-            return (false, log);
-        }
-    };
-    let unlisted: Vec<&str> = islands
-        .iter()
-        .map(String::as_str)
-        .filter(|path| !agents.contains(path))
-        .collect();
-    if !unlisted.is_empty() {
-        let _ = writeln!(
-            log,
-            "gate counts: FAILED — Clean proof island(s) the compiler checks on every \
-             build are missing from AGENTS.md's \"What IS actually verified today, \
-             exhaustively\" table: {}. Add a row naming the file and what its theorems \
-             are about",
-            unlisted.join(", ")
-        );
-        return (false, log);
-    }
-
-    let _ = writeln!(
-        log,
-        "gate counts: GREEN — live inventory: {harnesses} ordinary `#[kani::proof]` \
-         harnesses across {files} crate files; no hand-maintained README total; {} \
-         Clean island file(s), each named in AGENTS.md",
-        islands.len()
-    );
-    (true, log)
-}
-
-// ---------------------------------------------------------------------------
-// G-MIRI (UB-floor; skip-if-unavailable — never a hard fail without a nightly miri)
-// ---------------------------------------------------------------------------
-
-/// Run `cargo +nightly miri test` over the unsafe-bearing leaf crates IF a nightly
-/// miri is installed; otherwise print a clear SKIP and pass. Mirrors `gate_linux`'s
-/// skip-don't-fail discipline: a box without miri is not a merge-contract failure,
-/// but where miri IS present it is a real UB floor. Opt-in (NOT in `gate all`).
-fn gate_miri() -> bool {
-    // Probe for a nightly miri without committing to a heavy run: `+nightly miri --version`.
-    let probe = Command::new("cargo")
-        .args(["+nightly", "miri", "--version"])
-        .current_dir(workspace_root())
-        .output();
-    let have_miri = matches!(probe, Ok(ref o) if o.status.success());
-    if !have_miri {
-        // The old remedy assumed the nightly TOOLCHAIN was present and only miri
-        // missing. On a box with no nightly at all — the common case — `rustup
-        // +nightly component add miri` answers "toolchain is not installed", so the
-        // operator's next command failed too. Print the probe's own words and both
-        // steps, and say that nothing was checked.
-        let why = match probe {
-            Ok(ref o) => String::from_utf8_lossy(&o.stderr).trim_end().to_string(),
-            Err(ref e) => e.to_string(),
-        };
-        if !why.is_empty() {
-            eprintln!("gate miri: `cargo +nightly miri --version` failed: {why}");
-        }
-        eprintln!(
-            "gate miri: SKIPPED — no nightly miri on this box. NOTHING WAS CHECKED for UB.\n\
-             gate miri:   install it:  rustup toolchain install nightly && \
-             rustup +nightly component add miri"
-        );
-        return true;
-    }
-
-    eprintln!("=== gate miri (UB floor: cargo +nightly miri test over alloc/buffer/grid) ===");
-    let ok = run_shell(
-        "miri",
-        "cargo",
-        &[
-            "+nightly",
-            "miri",
-            "test",
-            "-p",
-            "aterm-alloc",
-            "-p",
-            "aterm-buffer",
-            "-p",
-            "aterm-grid",
-        ],
-    );
-    if ok {
-        eprintln!("gate miri: GREEN — no UB detected.");
-    } else {
-        eprintln!("gate miri: FAILED — miri reported undefined behavior.");
-    }
-    ok
-}
-
-// ---------------------------------------------------------------------------
-// G-FAULT (M7: every injected fault point must be exercised by a test)
-// ---------------------------------------------------------------------------
-
-/// Extract the string-literal first argument of every `marker("…")` call in
-/// `text`. For marker `triggered`, returns the names in `fault::triggered("x")`;
-/// note `arm` also matches `disarm("x")` (substring) — intentional, both mean a
-/// test touches that fault point.
-fn extract_call_string_args(text: &str, marker: &str) -> Vec<String> {
-    let pat = format!("{marker}(\"");
-    let mut out = Vec::new();
-    let mut rest = text;
-    while let Some(i) = rest.find(&pat) {
-        let after = &rest[i + pat.len()..];
-        match after.find('"') {
-            Some(end) => {
-                out.push(after[..end].to_string());
-                rest = &after[end + 1..];
-            }
-            None => break,
-        }
-    }
-    out
-}
-
-/// FAULT discipline (M7 FAULT-INJECT): a fault point injected into production code
-/// (`fault::triggered("name")`) that no test arms is an untested fail-closed path —
-/// dead weight that rots. Conversely a test that arms a name with no injection site
-/// is a stale/typo'd fault. Enforce both directions so the harness stays honest.
-/// The registry's own self-tests (`fault.rs`) are excluded — they arm synthetic
-/// names to test the registry itself, not real injection sites.
-fn gate_fault() -> bool {
-    let (ok, log) = fault_report(&workspace_root());
-    eprint!("{log}");
-    ok
-}
-
-/// `gate fault` over an arbitrary root, returning the verdict plus the
-/// transcript the verb prints. Rooted so a red fixture can plant an unarmed
-/// injection site (and its mirror, an armed name with no site) in a synthetic
-/// tree and watch both directions go red.
-fn fault_report(root: &Path) -> (bool, String) {
-    let mut log = String::new();
-    let _ = writeln!(log, "=== gate fault (injected-but-unexercised) ===");
-    let mut files = Vec::new();
-    // Discarding this error let a half-walked tree shrink the census silently, and
-    // the "N fault point(s) injected, all exercised" count is itself derived from
-    // the truncation — so the number a reader would check it against moves WITH the
-    // defect. `counts_report` propagates the same error; so does this now.
-    if let Err(e) = collect_rs_files(&root.join("crates"), &mut files) {
-        let _ = writeln!(
-            log,
-            "gate fault: FAILED — could not scan crates/ ({e}); the injection census is incomplete."
-        );
-        return (false, log);
-    }
-
-    let mut injected: std::collections::BTreeMap<String, String> = Default::default();
-    let mut unreadable: Vec<String> = Vec::new();
-    let mut armed: std::collections::BTreeSet<String> = Default::default();
-    for file in &files {
-        let rel = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .into_owned();
-        if rel == "crates/aterm-core/src/fault.rs" || rel == "crates/xtask/src/gate.rs" {
-            // The harness's own definition + self-tests, and THIS scanner (whose doc
-            // comments + pattern strings mention `triggered("…")` literally).
-            continue;
-        }
-        let text = match std::fs::read_to_string(file) {
-            Ok(t) => t,
-            Err(e) => {
-                // A file this scan cannot read is a fault point it cannot see.
-                unreadable.push(format!("{rel} ({e})"));
-                continue;
-            }
-        };
-        if !is_test_file(file) {
-            for name in extract_call_string_args(&text, "triggered") {
-                injected.entry(name).or_insert_with(|| rel.clone());
-            }
-        }
-        // `arm("x")` also catches `disarm("x")`; collect `with_armed("x")` too.
-        for name in extract_call_string_args(&text, "arm") {
-            armed.insert(name);
-        }
-        for name in extract_call_string_args(&text, "with_armed") {
-            armed.insert(name);
-        }
-    }
-
-    let mut failures = Vec::new();
-    // A file the scan could not read may hold an injection site or the test that
-    // arms one, so the census below is not a census while any remain.
-    for entry in &unreadable {
-        failures.push(format!(
-            "  could not read {entry} — the injection census is incomplete"
-        ));
-    }
-    for (name, site) in &injected {
-        if !armed.contains(name) {
-            failures.push(format!(
-                "  fault '{name}' injected at {site} but NO test arms it (untested fail-closed path)"
-            ));
-        }
-    }
-    for name in &armed {
-        if !injected.contains_key(name) {
-            failures.push(format!(
-                "  fault '{name}' is armed by a test but has NO injection site (stale/typo'd fault)"
-            ));
-        }
-    }
-
-    if failures.is_empty() {
-        let _ = writeln!(
-            log,
-            "gate fault: GREEN — {} fault point(s) injected, all exercised by a test.",
-            injected.len()
-        );
-        (true, log)
-    } else {
-        let _ = writeln!(
-            log,
-            "gate fault: FAILED — fault-injection registry is inconsistent:"
-        );
-        for f in &failures {
-            let _ = writeln!(log, "{f}");
-        }
-        (false, log)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// G-PERF (M2): the DETERMINISTIC memory budget is enforced now; the wall-clock
-// throughput baseline (tools/golden/perf-baseline.json) is the remaining piece.
-// ---------------------------------------------------------------------------
-
-/// The ten lanes `gate perf` ANDs into one verdict, in run order.
-///
-/// Named so the verb's aggregation is testable. The failure this guards against
-/// is not a lane returning the wrong answer — `perf.rs` has its own decision
-/// tests for that — it is a lane's answer being COMPUTED AND THEN DROPPED, the
-/// one-character `ok &= f()` -> `f();` slip that makes a gate green by not
-/// listening. That slip is invisible to review and to every component test.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum PerfLane {
-    MemBudget,
-    PerfScaling,
-    Throughput,
-    Pathological,
-    ScrollScrub,
-    Search,
-    Restore,
-    Resize,
-    Wasm,
-    Trend,
-}
-
-/// The nine MEASURING lanes, in the order the verb runs them. `Trend` is not
-/// here: it is the tenth, and it needs the AND of these nine as an input.
-const PERF_MEASURING_LANES: [PerfLane; 9] = [
-    PerfLane::MemBudget,
-    PerfLane::PerfScaling,
-    PerfLane::Throughput,
-    PerfLane::Pathological,
-    PerfLane::ScrollScrub,
-    PerfLane::Search,
-    PerfLane::Restore,
-    PerfLane::Resize,
-    PerfLane::Wasm,
-];
-
-/// Where a `gate perf` lane's verdict comes from. The real implementation
-/// measures the live tree; a test substitutes one that fails a chosen lane.
-trait PerfLanes {
-    /// `lanes_ok` is the AND of the nine measuring lanes, and is meaningful
-    /// only for [`PerfLane::Trend`].
-    fn run(
-        &mut self,
-        lane: PerfLane,
-        trend: &mut Vec<crate::perf::TrendSample>,
-        lanes_ok: bool,
-    ) -> bool;
-}
-
-/// The live-tree lanes: two deterministic allocation gates spawned here, plus
-/// the eight in `perf.rs` that measure and compare against committed baselines.
-struct LivePerfLanes;
-
-impl PerfLanes for LivePerfLanes {
-    fn run(
-        &mut self,
-        lane: PerfLane,
-        trend: &mut Vec<crate::perf::TrendSample>,
-        lanes_ok: bool,
-    ) -> bool {
-        match lane {
-            // Both are DETERMINISTIC (allocation-based, no wall-clock) so they
-            // never flake, and self-contained in aterm-core. MEM-BUDGET is a
-            // retained-heap ceiling; PERF-BASELINE catches per-line/per-cell
-            // O(n)-allocation regressions in steady-state processing.
-            PerfLane::MemBudget => run_shell_driver(
-                "mem-budget",
-                "test",
-                &["-p", "aterm-core", "--test", "mem_budget"],
-            ),
-            PerfLane::PerfScaling => run_shell_driver(
-                "perf-scaling",
-                "test",
-                &["-p", "aterm-core", "--test", "perf_scaling"],
-            ),
-            // Median-of-N MB/s of the parse/process hot path against a committed,
-            // generously-thresholded baseline: catches a CATASTROPHIC regression
-            // (debug-build slip, algorithmic blow-up, lock contention) but never
-            // flakes on a slower box. Report-only PASS with no baseline.
-            PerfLane::Throughput => crate::perf::gate_throughput(trend),
-            // Per-corpus hostile-input floors, each against its OWN baseline, so a
-            // class-specific regression cannot hide behind a healthy mixed number.
-            PerfLane::Pathological => crate::perf::gate_pathological(trend),
-            // Scrollback-scrub read-path floors over a 100k+-line tiered fill —
-            // the dimension the compressed tiers are structurally most at risk of
-            // losing to an all-RAM page list.
-            PerfLane::ScrollScrub => crate::perf::gate_scroll_scrub(trend),
-            // E0 keyed-floor lanes. `resize` carries the 42s-freeze-class ABSOLUTE
-            // fences, which hold even with no baseline; `wasm` skips with notice on
-            // a box without the node/wasm toolchain.
-            PerfLane::Search => crate::perf::gate_search(trend),
-            PerfLane::Restore => crate::perf::gate_restore(trend),
-            PerfLane::Resize => crate::perf::gate_resize(trend),
-            PerfLane::Wasm => crate::perf::gate_wasm(trend),
-            // Same-box trend ledger (audit §5.6): the multi-machine floors are
-            // deliberately generous, so this holds every metric to 0.70x of THIS
-            // box's recent best. Green runs append to the committed ledger.
-            PerfLane::Trend => crate::perf::gate_trend(trend, lanes_ok),
-        }
-    }
-}
-
-fn gate_perf() -> bool {
-    gate_perf_with(&mut LivePerfLanes)
-}
-
-/// The `gate perf` VERB: run every lane, AND every result, report.
-///
-/// Every lane runs even after one fails — a perf report that stops at the first
-/// regression tells you less than one that measures all ten.
-fn gate_perf_with(lanes: &mut dyn PerfLanes) -> bool {
-    eprintln!("=== gate perf ===");
-    let mut trend: Vec<crate::perf::TrendSample> = Vec::new();
-    let mut ok = true;
-    for lane in PERF_MEASURING_LANES {
-        ok &= lanes.run(lane, &mut trend, true);
-    }
-    ok &= lanes.run(PerfLane::Trend, &mut trend, ok);
-    // Eight of the ten lanes return `true` without measuring anything when their
-    // prerequisite or baseline is missing — each says so on its own line, and the
-    // verdict then asserted that all ten floors held. That is the `gate web`
-    // untruth, in a gate that IS in ALL_ROSTER, so it was the last word `gate all`
-    // printed about performance. A verdict may not claim more than the lanes did.
-    let unmeasured = crate::perf::take_unmeasured();
-    if ok && !unmeasured.is_empty() {
-        eprintln!(
-            "gate perf: GREEN — every lane that MEASURED was within bounds. NOT MEASURED \
-             this pass ({}): {}. Those floors were not evaluated.",
-            unmeasured.len(),
-            unmeasured.join(", ")
-        );
-    } else if ok {
-        eprintln!(
-            "gate perf: GREEN — MEM-BUDGET + PERF-BASELINE (allocation) + wall-clock throughput + pathological + scroll-scrub + search + restore + resize (incl. absolute fences) + wasm floors + same-box trend within bounds."
-        );
-    } else {
-        eprintln!(
-            "gate perf: FAILED — perf regression (memory, allocation scaling, a lane floor: throughput / pathological / scroll-scrub / search / restore / resize / wasm, a resize absolute fence, or the same-box trend ledger)."
-        );
-    }
-    ok
 }
 
 #[cfg(test)]
@@ -7488,564 +3728,50 @@ mod cell_cache_root_tests {
 }
 
 #[cfg(test)]
-mod tippy_identity_retry_tests {
-    use super::*;
-
-    /// THE IDENTITY ABORT IS RETRIED; A REAL FINDING IS NOT.
-    ///
-    /// Both directions matter and only one of them is obvious. Retrying the
-    /// abort is what stops a clean tree reading as red. NOT retrying anything
-    /// else is what stops a genuine `-D warnings` failure being retried into a
-    /// pass — the far worse error, and the reason the match is on the abort
-    /// signature alone rather than on "did it fail".
-    #[test]
-    fn only_the_identity_abort_is_retried() {
-        // Non-vacuity: the signatures the lane matches on must be the ones
-        // branded Tippy actually prints, so a reworded upstream message shows
-        // up here rather than as a silently un-retried abort.
-        assert!(
-            TIPPY_IDENTITY_ABORTS
-                .iter()
-                .any(|s| s.contains("driver identity changed"))
-        );
-        assert!(
-            TIPPY_IDENTITY_ABORTS
-                .iter()
-                .any(|s| s.contains("while Targo was running"))
-        );
-
-        let abort = "error: branded Tippy driver identity changed: selected Trust \
-                     toolchain directory ancestor /Users changed identity or contents";
-        let finding = "error: unused variable: `now`\nerror: could not compile";
-        let is_abort = |text: &str| TIPPY_IDENTITY_ABORTS.iter().any(|sig| text.contains(sig));
-
-        assert!(is_abort(abort), "the guard trip must be recognised");
-        assert!(
-            !is_abort(finding),
-            "a real -D warnings finding must NEVER be retried into a pass"
-        );
-        // The budget is finite: an abort that never clears has to fail, or a
-        // permanently churning tree would spin here forever. Checked at COMPILE
-        // time — it is a claim about a constant, and a runtime assert over
-        // constants is exactly the vacuous shape this session spent four rounds
-        // removing.
-        const { assert!(TIPPY_IDENTITY_RETRIES >= 2 && TIPPY_IDENTITY_RETRIES <= 5) };
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    // ------------------------------------------------------------------
-    // THE TIPPY LANE'S COVERAGE SENTENCE.
-    //
-    // The lane's old failure mode was not that it lied on purpose; it was that
-    // it said nothing about coverage at all, so a reader supplied the missing
-    // half themselves and always supplied "all of it". These pin the two
-    // claims it now makes, in both directions.
-    // ------------------------------------------------------------------
-
+    /// THE VERDICT RULE: only a pass that RAN and found nothing passes the verb. A
+    /// finding blocks, a pass that never ran blocks under its own headline, and
+    /// an argument the verb does not know runs nothing (`--no-fmt`, the flag that
+    /// once dropped this lane, now has nothing left to drop).
     #[test]
-    fn the_lint_argv_is_the_one_verify_sh_uses_and_it_does_not_stop_at_the_first_crate() {
-        // Not a copy of the array: the SAME builder. If the two ever diverge,
-        // `gate lint` and `tools/verify.sh` cover different amounts of the
-        // workspace while printing the same word, which is the defect this
-        // whole lane was rewritten for.
-        let argv = aterm_verify::stages::tippy_args(&Scope::workspace());
+    fn a_lane_that_never_ran_is_blocked_with_no_verdict_not_a_pass() {
+        assert!(lint_verdict(LaneVerdict::Clean));
+        assert!(!lint_verdict(LaneVerdict::Finding));
+        assert!(!lint_verdict(LaneVerdict::NotRun));
         assert_eq!(
-            argv,
-            [
-                "--workspace",
-                "--all-targets",
-                "--keep-going",
-                "--",
-                "-D",
-                "warnings"
-            ],
-            "the gate lints the whole workspace and keeps going past a red crate"
-        );
-    }
-
-    #[test]
-    fn a_clean_run_counts_the_members_and_still_names_what_it_did_not_reach() {
-        let s = tippy_clean_coverage(71);
-        assert!(s.contains("all 71 workspace members"), "{s}");
-        // `--all-targets` skips every target whose `required-features` are off,
-        // and this tree has six of them. Pass one still does not reach them —
-        // what changed is that it now points at the pass that does, instead of
-        // shrugging the gap off onto "whoever turns the feature on".
-        assert!(s.contains("required-features"), "{s}");
-        // An unreadable `crates/` must not be reported as a confident zero.
-        let unknown = tippy_clean_coverage(0);
-        assert!(!unknown.contains("all 0"), "{unknown}");
-        assert!(unknown.contains("the workspace"), "{unknown}");
-    }
-
-    #[test]
-    fn the_second_pass_says_which_features_it_turned_on() {
-        let s = tippy_gated_clean_coverage();
-        for (pkg, feat) in aterm_verify::stages::GATED_LINT_FEATURES {
-            assert!(s.contains(&format!("{pkg}/{feat}")), "{s}");
-        }
-    }
-
-    /// THE REACH GUARD FOR THE REACH GUARDS. A seventh `required-features`
-    /// target added to any manifest is a seventh target nothing lints, and the
-    /// only reason the first six were found at all is that somebody went
-    /// looking. This derives the answer from `crates/*/Cargo.toml` instead, so
-    /// the table cannot fall behind the tree without a red test naming the
-    /// pair that is missing.
-    #[test]
-    fn the_gated_feature_table_matches_every_required_features_target() {
-        let root = crate::workspace_root();
-        let mut found: Vec<(String, String)> = Vec::new();
-        let entries = std::fs::read_dir(root.join("crates")).expect("crates/ is readable");
-        for entry in entries.filter_map(Result::ok) {
-            let manifest = entry.path().join("Cargo.toml");
-            let Ok(text) = std::fs::read_to_string(&manifest) else {
-                continue;
-            };
-            // The PACKAGE name, read from the `[package]` table — not the
-            // directory name and not the first `name =` in the file (that
-            // would pick up a `[[bin]]`). `-p` takes the package name, and
-            // nothing makes it equal to either of the other two.
-            let Some(pkg) = text
-                .lines()
-                .map(str::trim)
-                .skip_while(|l| *l != "[package]")
-                .find_map(|l| l.strip_prefix("name = "))
-                .map(|n| n.trim().trim_matches('"').to_string())
-            else {
-                continue;
-            };
-            for line in text.lines() {
-                let line = line.trim();
-                // Only the DECLARATION, never the prose about it: the manifests
-                // discuss `required-features` in comments right beside it.
-                let Some(list) = line.strip_prefix("required-features") else {
-                    continue;
-                };
-                let Some(list) = list.trim_start().strip_prefix('=') else {
-                    continue;
-                };
-                for feat in list.trim().trim_matches(['[', ']']).split(',') {
-                    let feat = feat.trim().trim_matches('"');
-                    if !feat.is_empty() {
-                        found.push((pkg.clone(), feat.to_string()));
-                    }
-                }
-            }
-        }
-        found.sort();
-        found.dedup();
-        let mut declared: Vec<(String, String)> = aterm_verify::stages::GATED_LINT_FEATURES
-            .iter()
-            .map(|(p, f)| ((*p).to_string(), (*f).to_string()))
-            .collect();
-        declared.sort();
-        assert!(
-            !found.is_empty(),
-            "the manifest scan found nothing — it broke"
+            LaneVerdict::Clean.worst(LaneVerdict::NotRun),
+            LaneVerdict::NotRun,
+            "a pass that never ran must not be folded away by a clean one"
         );
         assert_eq!(
-            found, declared,
-            "GATED_LINT_FEATURES has drifted from the manifests. Every (package, feature) \
-             pair that gates a target MUST be here, or `--all-targets` builds that target \
-             for nobody and its lints — and any count gate or reach guard living in it — \
-             stop existing silently. That is the four-day bench break, restated."
+            LaneVerdict::NotRun.worst(LaneVerdict::Finding),
+            LaneVerdict::Finding,
+            "a finding must not be downgraded to NOT RUN by a pass that could not run"
         );
+        assert!(!gate_lint(&["--no-fmt".to_string()]));
     }
 
+    /// With a stage2 dir holding neither `targo-fmt` nor `trustfmt`, over a root
+    /// that is no checkout, every pass answers NOT RUN — the one answer that also
+    /// tells the operator the tree was never examined.
     #[test]
-    fn a_failing_run_names_the_red_members_and_calls_its_list_a_floor() {
-        // Two failing TARGETS of one crate are one failing MEMBER.
-        let stderr = "\
-warning: unused variable: `x`
-error: could not compile `atpkg` (test \"tar_oracle\") due to 3 previous errors
-error: could not compile `atpkg` (lib test) due to 2 previous errors
-error: could not compile `aterm-gui` (lib) due to 1 previous error
-";
-        assert_eq!(tippy_failed_members(stderr), ["atpkg", "aterm-gui"]);
-        let s = tippy_finding_coverage(stderr, 71);
-        assert!(s.contains("FINDING in 2 of 71"), "{s}");
-        assert!(s.contains("atpkg") && s.contains("aterm-gui"), "{s}");
-        // The honesty clause: after a failure the list is a lower bound, because
-        // a member downstream of a failed lib was never linted at all.
-        assert!(s.contains("FLOOR"), "{s}");
-    }
-
-    #[test]
-    fn a_failure_that_names_no_crate_refuses_to_claim_a_coverage_number() {
-        // `targo-tippy` can exit non-zero for reasons that are not a lint
-        // finding in any crate (a broken manifest, a missing driver). Inventing
-        // "0 of 71" there would be the same over-claim in the other direction.
-        let s = tippy_finding_coverage("error: failed to parse manifest\n", 71);
-        assert!(s.contains("cannot say how much"), "{s}");
-        assert!(!s.contains("FINDING in 0"), "{s}");
-    }
-
-    // ------------------------------------------------------------------
-    // VERB-LEVEL red proofs for `gate lint` and `gate perf`.
-    //
-    // Both gates were registered non-vacuity gaps: `perf` had never been shown
-    // to fail at all, and `lint`'s only red fixture drove one lane's function, a
-    // component. A gate nobody has watched go red is a gate nobody has shown
-    // is listening.
-    // ------------------------------------------------------------------
-
-    /// Fails exactly one lane; records the order lanes were asked for.
-    struct StubLanes {
-        fail: Option<PerfLane>,
-        seen: Vec<(PerfLane, bool)>,
-    }
-
-    impl PerfLanes for StubLanes {
-        fn run(
-            &mut self,
-            lane: PerfLane,
-            _trend: &mut Vec<crate::perf::TrendSample>,
-            lanes_ok: bool,
-        ) -> bool {
-            self.seen.push((lane, lanes_ok));
-            Some(lane) != self.fail
-        }
-    }
-
-    #[test]
-    fn every_perf_lane_can_turn_the_verb_red() {
-        // THE VACUITY THIS KILLS: a lane whose result is computed and then
-        // dropped (`ok &= f()` slipping to `f();`) makes `gate perf` green by
-        // not listening, and no component test can see it. So: fail each lane
-        // in turn and require the VERB's verdict to follow, one lane at a time.
-        let all: Vec<PerfLane> = PERF_MEASURING_LANES
-            .iter()
-            .copied()
-            .chain(std::iter::once(PerfLane::Trend))
-            .collect();
-        for lane in all {
-            let mut stub = StubLanes {
-                fail: Some(lane),
-                seen: Vec::new(),
-            };
-            assert!(
-                !gate_perf_with(&mut stub),
-                "gate perf stayed GREEN with lane {lane:?} failing — its result \
-                 is not reaching the verdict"
-            );
-        }
-    }
-
-    /// A GREEN VERDICT MAY NOT CLAIM MORE THAN THE LANES MEASURED.
-    ///
-    /// Eight of the ten perf lanes return `true` without measuring anything when a
-    /// tool or a baseline is missing — each says so on its own line, and the verdict
-    /// then asserted that all ten floors held. That is the inversion `gate web`
-    /// carried until 2026-08-31, here in a gate that IS in ALL_ROSTER. A lane that
-    /// did not measure must reach the last line the operator reads.
-    #[test]
-    fn a_green_verdict_names_the_lanes_that_measured_nothing() {
-        let _ = crate::perf::take_unmeasured(); // start from a clean channel
-
-        // Nothing skipped: the verdict is the unqualified one.
-        let mut stub = StubLanes {
-            fail: None,
-            seen: Vec::new(),
-        };
-        assert!(gate_perf_with(&mut stub));
-        assert!(
-            crate::perf::take_unmeasured().is_empty(),
-            "no lane reported a skip, so the channel must be empty"
-        );
-
-        // A lane that measured nothing must survive into the verdict's input.
-        crate::perf::note_unmeasured("wasm (no wasm-bindgen)");
-        crate::perf::note_unmeasured("trend (seed run, no same-box history)");
-        let taken = crate::perf::take_unmeasured();
-        assert_eq!(
-            taken,
-            vec![
-                "wasm (no wasm-bindgen)".to_string(),
-                "trend (seed run, no same-box history)".to_string()
-            ],
-            "the channel preserves every unmeasured lane, in order"
-        );
-        assert!(
-            crate::perf::take_unmeasured().is_empty(),
-            "taking drains the channel, so one run cannot inherit another's skips"
-        );
-    }
-
-    #[test]
-    fn a_clean_sweep_is_green_and_runs_every_lane_once() {
-        // The other half: the verb is not stuck red either, and it really does
-        // ask for all ten lanes, in order, exactly once.
-        let mut stub = StubLanes {
-            fail: None,
-            seen: Vec::new(),
-        };
-        assert!(gate_perf_with(&mut stub));
-        let order: Vec<PerfLane> = stub.seen.iter().map(|(l, _)| *l).collect();
-        let expected: Vec<PerfLane> = PERF_MEASURING_LANES
-            .iter()
-            .copied()
-            .chain(std::iter::once(PerfLane::Trend))
-            .collect();
-        assert_eq!(order, expected, "every lane must run, once, in order");
-    }
-
-    #[test]
-    fn the_trend_lane_is_told_whether_the_measuring_lanes_held() {
-        // `gate_trend`'s contract takes `lanes_ok` because a trend reading over
-        // a run whose floors already failed means something different. Pass it
-        // a constant and the ledger silently records the wrong thing.
-        let mut clean = StubLanes {
-            fail: None,
-            seen: Vec::new(),
-        };
-        let _ = gate_perf_with(&mut clean);
-        assert_eq!(clean.seen.last().map(|(_, ok)| *ok), Some(true));
-
-        let mut broken = StubLanes {
-            fail: Some(PerfLane::Search),
-            seen: Vec::new(),
-        };
-        let _ = gate_perf_with(&mut broken);
-        assert_eq!(
-            broken.seen.last().map(|(_, ok)| *ok),
-            Some(false),
-            "a failed measuring lane must reach the trend lane as lanes_ok=false"
-        );
-    }
-
-    /// Gives one lint lane a chosen verdict and the rest `Clean`; records which
-    /// lanes were asked for.
-    struct StubLintLanes {
-        lane: Option<LintLane>,
-        verdict: LaneVerdict,
-        seen: Vec<LintLane>,
-    }
-
-    impl StubLintLanes {
-        fn failing(lane: LintLane) -> Self {
-            Self {
-                lane: Some(lane),
-                verdict: LaneVerdict::Finding,
-                seen: Vec::new(),
-            }
-        }
-        fn not_running(lane: LintLane) -> Self {
-            Self {
-                lane: Some(lane),
-                verdict: LaneVerdict::NotRun,
-                seen: Vec::new(),
-            }
-        }
-        fn all_clean() -> Self {
-            Self {
-                lane: None,
-                verdict: LaneVerdict::Clean,
-                seen: Vec::new(),
-            }
-        }
-    }
-
-    impl LintLanes for StubLintLanes {
-        fn run(&mut self, lane: LintLane) -> LaneVerdict {
-            self.seen.push(lane);
-            if self.lane == Some(lane) {
-                self.verdict
-            } else {
-                LaneVerdict::Clean
-            }
-        }
-    }
-
-    #[test]
-    fn every_lint_lane_can_turn_the_verb_red() {
-        // ONE LANE AT A TIME. Failing both together only proves their
-        // conjunction — it leaves each arm free to stop failing closed with
-        // nothing noticing, which is exactly what the old fixture allowed.
-        //
-        // A FINDING blocks on EVERY lane, fmt included: the NOT-RUN exemption
-        // that keeps this gate usable is not a licence for the fmt lane to
-        // report drift and be ignored.
-        for lane in LINT_LANES {
-            let mut stub = StubLintLanes::failing(lane);
-            assert!(
-                !gate_lint_with(&mut stub, LaneSelection::All),
-                "gate lint stayed GREEN with lane {lane:?} reporting a FINDING — its \
-                 result is not reaching the verdict"
-            );
-            assert!(
-                stub.seen.contains(&lane),
-                "lane {lane:?} was never asked, so the assertion above proved nothing"
-            );
-        }
-    }
-
-    /// THE VERDICT RULE, stated as a test: a NOT-RUN lane blocks, on EVERY
-    /// lane, and the loop proves it lane by lane rather than in conjunction —
-    /// so a single arm cannot quietly stop failing closed.
-    ///
-    /// This replaces `a_not_run_lane_blocks_exactly_when_its_policy_says_so`,
-    /// which required BOTH answers of the old `LintLane::not_run_blocks` to be
-    /// exercised and so would fail on today's uniform policy. That is the right
-    /// failure for it to have had: the fmt lane's exemption was the one thing it
-    /// pinned, and the exemption is gone (see [`LintLane`]). What must NOT be
-    /// lost with it is the other half — that a lane which never ran is never
-    /// read as clean — so that is asserted here for every lane.
-    #[test]
-    fn every_not_run_lane_blocks_the_verdict() {
-        for lane in LINT_LANES {
-            let mut stub = StubLintLanes::not_running(lane);
-            let verdict = gate_lint_with(&mut stub, LaneSelection::All);
-            assert!(
-                stub.seen.contains(&lane),
-                "lane {lane:?} was never asked, so this case proved nothing"
-            );
-            assert!(
-                !verdict,
-                "lane {lane:?} reached NO VERDICT and gate lint passed anyway — \
-                 'cannot tell' was rendered as 'clean'"
-            );
-        }
-    }
-
-    /// THE ONE NON-BLOCKING PATH, pinned so it stays the only one: an explicit
-    /// `--no-fmt` passes where the identical lane reporting NOT RUN blocks.
-    /// A lane that goes quiet because someone typed a flag is a decision; a lane
-    /// that goes quiet because a binary is missing is the month-long outage this
-    /// change ended, and the two must never be spelled the same way.
-    #[test]
-    fn only_an_explicit_no_fmt_lets_the_fmt_lane_sit_out() {
-        let mut asked = StubLintLanes::not_running(LintLane::Trustfmt);
-        assert!(
-            !gate_lint_with(&mut asked, LaneSelection::All),
-            "a fmt lane that reached no verdict must block like any other lane"
-        );
-
-        let mut excluded = StubLintLanes::all_clean();
-        assert!(gate_lint_with(&mut excluded, LaneSelection::NoFmt));
-        assert!(
-            !excluded.seen.contains(&LintLane::Trustfmt),
-            "--no-fmt must SKIP the lane, not run it and ignore the answer"
-        );
-    }
-
-    /// Tippy specifically. Named because it is the load-bearing half: a linter
-    /// that never started must never be mistaken for a clean lint, which is the
-    /// exact confusion the fmt fix could have spread if the exemption had been
-    /// written per-outcome instead of per-lane.
-    #[test]
-    fn a_missing_linter_is_blocked_with_no_verdict_not_a_pass() {
-        let mut stub = StubLintLanes::not_running(LintLane::Tippy);
-        assert!(!gate_lint_with(&mut stub, LaneSelection::All));
-    }
-
-    #[test]
-    fn a_clean_lint_is_green_and_runs_every_lane_once() {
-        let mut stub = StubLintLanes::all_clean();
-        assert!(gate_lint_with(&mut stub, LaneSelection::All));
-        assert_eq!(stub.seen, LINT_LANES, "every lane must run, once, in order");
-    }
-
-    /// `--no-fmt` (the deleted push hook's setting; today only a human types
-    /// it) must SKIP the fmt lane, not run it
-    /// — asserted by the lane never being asked — and must not disturb the
-    /// others' verdicts.
-    #[test]
-    fn no_fmt_skips_the_fmt_lane_and_nothing_else() {
-        let mut stub = StubLintLanes::all_clean();
-        assert!(gate_lint_with(&mut stub, LaneSelection::NoFmt));
-        assert_eq!(
-            stub.seen,
-            vec![LintLane::Tippy],
-            "--no-fmt must skip fmt and keep every other lane"
-        );
-        // …and it narrows NOTHING else: tippy still blocks under --no-fmt.
-        let mut red = StubLintLanes::failing(LintLane::Tippy);
-        assert!(!gate_lint_with(&mut red, LaneSelection::NoFmt));
-    }
-
-    /// `--fmt-only` is `--no-fmt`'s opposite and must be as narrow: the
-    /// formatter lane runs, NOTHING else does, and the other lane is reported
-    /// as not checked rather than silently dropped.
-    ///
-    /// The second half is the one worth pinning. A narrowing flag that also
-    /// stopped BLOCKING would be the same defect this verb has already paid for
-    /// once, wearing a new name — so a fmt lane that finds drift still fails the
-    /// verb under `--fmt-only`, and a fmt lane that could not run still blocks.
-    #[test]
-    fn fmt_only_runs_the_fmt_lane_and_nothing_else() {
-        let mut stub = StubLintLanes::all_clean();
-        assert!(gate_lint_with(&mut stub, LaneSelection::FmtOnly));
-        assert_eq!(
-            stub.seen,
-            vec![LintLane::Trustfmt],
-            "--fmt-only must run the formatter lane alone"
-        );
-
-        // It still blocks on what it DOES look at, in both directions.
-        let mut red = StubLintLanes::failing(LintLane::Trustfmt);
-        assert!(!gate_lint_with(&mut red, LaneSelection::FmtOnly));
-        let mut absent = StubLintLanes::not_running(LintLane::Trustfmt);
-        assert!(!gate_lint_with(&mut absent, LaneSelection::FmtOnly));
-
-        // And it narrows nothing about the lanes it skipped: a red tippy is
-        // invisible here, which is exactly why the verdict line names what was
-        // not checked.
-        let mut tippy_red = StubLintLanes::failing(LintLane::Tippy);
-        assert!(gate_lint_with(&mut tippy_red, LaneSelection::FmtOnly));
-        assert!(!tippy_red.seen.contains(&LintLane::Tippy));
-    }
-
-    /// The two narrowings are opposites, so asking for both is a contradiction.
-    /// `includes` must not quietly resolve it in either direction — the caller
-    /// refuses, and this pins that there is no selection value that means both.
-    #[test]
-    fn the_two_narrowings_are_opposites_and_cover_every_lane_between_them() {
-        for lane in LINT_LANES {
-            assert!(LaneSelection::All.includes(lane));
-            assert_ne!(
-                LaneSelection::NoFmt.includes(lane),
-                LaneSelection::FmtOnly.includes(lane),
-                "{lane:?} must be in exactly one of the two narrowings"
-            );
-        }
-    }
-
-    #[test]
-    fn an_absent_toolchain_fails_each_lint_lane_closed_on_its_own() {
-        // The REAL lanes, each isolated: with a stage2 dir holding neither
-        // targo-tippy nor targo-fmt, nothing was linted and nothing was
-        // format-checked. "Nothing ran" must never read as "clean" — and here
-        // it reads as NOT RUN, which is stronger than "not clean": it is the
-        // only answer that also tells the operator the tree was never examined.
+    fn an_absent_toolchain_fails_the_fmt_lane_closed() {
         let tmp = std::env::temp_dir().join(format!("aterm-gate-lint-red-{}", std::process::id()));
         let root = tmp.join("root");
         let tools = tmp.join("empty-stage2");
         let _ = std::fs::create_dir_all(&root);
         let _ = std::fs::create_dir_all(&tools);
-        let mut live = LiveLintLanes {
-            root: &root,
-            tools: &tools,
-            pin_refusal: None,
-        };
-        let tippy = live.run(LintLane::Tippy);
-        let fmt = live.run(LintLane::Trustfmt);
+        let workspace = fmt_workspace_pass(&root, &tools);
+        let lane = fmt_lane(&root, &tools);
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
-            tippy,
-            LaneVerdict::NotRun,
-            "a missing linter must not report a clean lint"
-        );
-        assert_eq!(
-            fmt,
+            workspace,
             LaneVerdict::NotRun,
             "a missing formatter must not report clean formatting"
         );
-        assert_eq!(resolve_tippy(&tools), None);
+        assert_eq!(lane, LaneVerdict::NotRun);
     }
 
     /// PASS THREE, IN BOTH DIRECTIONS: a crate whose `rustfmt.toml` edition
@@ -8159,12 +3885,8 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         assert_eq!(verdict, LaneVerdict::Finding, "2015 is not 2024");
     }
 
-    /// PASS TWO fails closed on a missing formatter, on its OWN.
-    ///
-    /// The sibling above proves the LANE answers NOT RUN with an empty stage2,
-    /// but it never reaches the sweep: pass one returns before it. So this
-    /// drives [`fmt_sweep`] directly, which is the only way to see whether the
-    /// new pass has its own fail-closed branch or is inheriting one.
+    /// PASS TWO fails closed on a missing formatter on its OWN, over the real
+    /// tree — not by inheriting pass one's NOT RUN.
     #[test]
     fn the_fmt_sweep_is_not_run_without_a_trustfmt() {
         let tmp =
@@ -8190,9 +3912,8 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     /// unformatted source is NOT a module of the crate, it is `include!`d, so a
     /// `targo-fmt --all` over the same tree would report nothing at all.
     ///
-    /// SKIPS, loudly, when `trustfmt` or `git` is absent — the same posture
-    /// `gate miri` takes. A skip is not a pass and is not counted as one: it
-    /// prints why, so a green test run on a bare box cannot be read as evidence.
+    /// SKIPS, loudly, when `trustfmt` or `git` is absent: it prints why, so a
+    /// green test run on a bare box cannot be read as evidence.
     #[test]
     fn a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed() {
         let tools = trust_toolchain().stage2_dir;
@@ -8261,61 +3982,6 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         );
     }
 
-    /// The registry arithmetic, in all three directions at once.
-    #[test]
-    fn the_fmt_sweep_partition_separates_findings_standing_and_stale() {
-        const REGISTRY: &[(&str, &str)] = &[
-            (
-                "kept/generated.rs",
-                "generated; the generator is the source of truth",
-            ),
-            ("gone/formatted.rs", "was load-bearing once"),
-        ];
-        let drifted: std::collections::BTreeSet<String> = ["kept/generated.rs", "real/drift.rs"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
-        let (findings, standing, stale) = fmt_sweep_partition(&drifted, REGISTRY);
-        assert_eq!(findings, vec!["real/drift.rs".to_string()]);
-        assert_eq!(standing.len(), 1);
-        assert_eq!(standing[0].0, "kept/generated.rs");
-        assert_eq!(stale, vec!["gone/formatted.rs"]);
-        // A registered file must NEVER reach the finding list: that is the
-        // whole contract, and it is the half a reader is entitled to see pinned.
-        assert!(!findings.contains(&"kept/generated.rs".to_string()));
-    }
-
-    /// Every registry row names a path that exists, and gives a real reason.
-    ///
-    /// Fail-closed against the two ways this registry rots: a row for a file
-    /// that was deleted or renamed (which silently protects nothing) and a row
-    /// whose "reason" is a shrug. The floor is arbitrary but enforced: "TODO" and
-    /// "hard" are not engineering judgement, and a registry entry nobody can
-    /// justify in a sentence is a waiver with better manners.
-    #[test]
-    fn every_fmt_sweep_exclusion_names_a_real_file_and_a_real_reason() {
-        const MIN_REASON: usize = 120;
-        let root = workspace_root();
-        for (path, reason) in FMT_SWEEP_EXCLUSIONS {
-            assert!(
-                root.join(path).is_file(),
-                "FMT_SWEEP_EXCLUSIONS names {path}, which does not exist — delete the row or \
-                 fix the path"
-            );
-            assert!(
-                reason.trim().len() >= MIN_REASON,
-                "the exclusion reason for {path} is {} chars; say why the file's SHAPE is \
-                 load-bearing (>= {MIN_REASON})",
-                reason.trim().len()
-            );
-        }
-        let mut seen: Vec<&str> = FMT_SWEEP_EXCLUSIONS.iter().map(|(p, _)| *p).collect();
-        seen.sort_unstable();
-        let before = seen.len();
-        seen.dedup();
-        assert_eq!(before, seen.len(), "a path is registered twice");
-    }
-
     /// The edition comes from the CRATE, never from `rustfmt.toml` alone.
     ///
     /// These four are the real cases, over the real tree: a member that names
@@ -8370,60 +4036,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         assert!(paths.contains("/w:1/x/y.rs"), "got {paths:?}");
     }
 
-    /// A `targo-tippy` that is not the PINNED toolchain's must never lint.
-    ///
-    /// The stub directory below is exactly what the golden-path PATH fallback
-    /// used to adopt sight unseen: a `targo`, a `targo-tippy`, and no branded
-    /// `trustc`. `resolve_tippy` finds the linter there — that is the point —
-    /// so the only thing standing between this verb and a GREEN printed over a
-    /// different lint set is the refusal, and this pins that the lane takes it
-    /// BEFORE spawning anything. Mutation: with `pin_refusal: None` the same
-    /// directory runs (the stub exits 0) and the lane answers Clean, so NOT RUN
-    /// here is a reading of the toolchain and not a lane that cannot pass.
-    #[test]
-    fn a_tippy_that_is_not_the_pinned_toolchain_is_not_run() {
-        let tmp = std::env::temp_dir().join(format!("aterm-pin-lane-{}", std::process::id()));
-        let root = tmp.join("root");
-        let tools = tmp.join("impostor");
-        let _ = std::fs::remove_dir_all(&tmp);
-        std::fs::create_dir_all(&root).expect("root");
-        std::fs::create_dir_all(&tools).expect("impostor");
-        write_exec(&tools.join("targo"), "#!/bin/sh\nexit 0\n");
-        write_exec(&tools.join("targo-tippy"), "#!/bin/sh\nexit 0\n");
-        assert!(
-            resolve_tippy(&tools).is_some(),
-            "the linter IS findable there — the refusal is the only thing stopping it"
-        );
-
-        let mut refused = LiveLintLanes {
-            root: &root,
-            tools: &tools,
-            pin_refusal: Some("not the pinned toolchain".to_string()),
-        };
-        assert_eq!(refused.run(LintLane::Tippy), LaneVerdict::NotRun);
-        assert!(
-            !gate_lint_with(
-                &mut StubLintLanes::not_running(LintLane::Tippy),
-                LaneSelection::All
-            ),
-            "and a NOT-RUN tippy blocks the verdict"
-        );
-
-        let mut unguarded = LiveLintLanes {
-            root: &root,
-            tools: &tools,
-            pin_refusal: None,
-        };
-        assert_eq!(
-            unguarded.run(LintLane::Tippy),
-            LaneVerdict::Clean,
-            "mutation: without the refusal this very directory reports a clean lint"
-        );
-        let _ = std::fs::remove_dir_all(&tmp);
-    }
-
-    /// THE ARMED LANE, driven through all four verdicts against the real
-    /// `LiveLintLanes` — because an armed lane that cannot go red is worse than
+    /// THE WORKSPACE PASS, driven through all four verdicts — because an armed lane that cannot go red is worse than
     /// an unarmed one, and an armed lane that goes red for the WRONG reason is
     /// how this one lost a month.
     ///
@@ -8441,14 +4054,9 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     /// differ here ONLY in which stream the stub writes to, and the lane is
     /// required to tell them apart anyway.
     ///
-    /// IT DRIVES [`LiveLintLanes::fmt_workspace_pass`], NOT `run(Trustfmt)`,
-    /// since the fmt sweep joined the lane on 2026-08-31. All four verdicts
-    /// below are statements about the WORKSPACE pass; folding the sweep in
-    /// would make every one of them a statement about a conjunction, and case 4
-    /// in particular would then pass or fail on whether this scratch directory
-    /// happens to be a git checkout with a `trustfmt` beside it — a fixture
-    /// answering about the wrong thing. The sweep has its own red fixture,
-    /// `a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed`.
+    /// It drives [`fmt_workspace_pass`] alone, not [`fmt_lane`]: all four verdicts
+    /// are statements about the WORKSPACE pass, and the sweep has its own red
+    /// fixture, `a_planted_include_only_source_reds_the_fmt_sweep_and_greens_when_fixed`.
     #[test]
     fn the_armed_fmt_lane_separates_drift_from_a_toolchain_that_never_looked() {
         let tmp = std::env::temp_dir().join(format!("aterm-fmt-lane-{}", std::process::id()));
@@ -8458,15 +4066,9 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         std::fs::create_dir_all(&root).expect("root");
         std::fs::create_dir_all(&tools).expect("stage2");
 
-        let live = LiveLintLanes {
-            root: &root,
-            tools: &tools,
-            pin_refusal: None,
-        };
-
         // 1. No driver at all: a missing toolchain is never a clean tree.
         assert_eq!(
-            live.fmt_workspace_pass(),
+            fmt_workspace_pass(&root, &tools),
             LaneVerdict::NotRun,
             "a stage2 with no `{TRUSTFMT_DRIVER}` must report NOT RUN — never \
              FAILED, and never CLEAN: nothing was read"
@@ -8478,7 +4080,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             "#!/bin/sh\necho 'Diff in /x/y.rs:3:'\nexit 1\n",
         );
         assert_eq!(
-            live.fmt_workspace_pass(),
+            fmt_workspace_pass(&root, &tools),
             LaneVerdict::Finding,
             "a run that named a drifted file IS a finding and must block"
         );
@@ -8490,7 +4092,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             "#!/bin/sh\necho 'failed to start cargo metadata' >&2\nexit 1\n",
         );
         assert_eq!(
-            live.fmt_workspace_pass(),
+            fmt_workspace_pass(&root, &tools),
             LaneVerdict::NotRun,
             "a non-zero exit with no `Diff in` line is an environment fault, not \
              a formatting finding — rendering it as one is the original bug"
@@ -8498,7 +4100,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
 
         // 4. Clean, so none of the above is the lane having stopped answering.
         write_exec(&tools.join(TRUSTFMT_DRIVER), "#!/bin/sh\nexit 0\n");
-        assert_eq!(live.fmt_workspace_pass(), LaneVerdict::Clean);
+        assert_eq!(fmt_workspace_pass(&root, &tools), LaneVerdict::Clean);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
@@ -8515,889 +4117,12 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         }
     }
 
-    // The census walker's unit tests (parse_fn_def / guard_vars / term_hop_calls
-    // / synthetic RED+GREEN trees) moved WITH the implementation to
-    // `crates/aterm-census` — run `cargo test -p aterm-census`.
-    use super::{
-        ALL_ROSTER, DORMANCY_REGISTRY, DormantWatch, NON_VACUITY_REGISTRY, RedFixture,
-        WITNESS_REGISTRY, certified_driver, counts_report, dormant_report, drift_report,
-        extract_call_string_args, fault_report, flag_was_rejected, impl_source_files,
-        is_ordinary_kani_proof_attr, judge_kernel_certification, needle_present,
-        non_vacuity_violations, proof_inventory_is_valid, readme_asserts_proof_inventory,
-        roster_names,
-    };
-    use crate::workspace_root;
-    use std::path::{Path, PathBuf};
-
-    // -----------------------------------------------------------------------
-    // Fixture-tree helpers (the same discipline crates/aterm-census uses: work
-    // on REAL text where possible, and assert every mutation actually applied
-    // — a stale `from` would make the whole demonstration vacuous).
-    // -----------------------------------------------------------------------
-
-    fn fixture_root(name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!("aterm-gate-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create fixture root");
-        root
-    }
-
-    fn write_file(root: &Path, rel: &str, text: &str) {
-        let path = root.join(rel);
-        std::fs::create_dir_all(path.parent().expect("rel has a parent")).expect("mkdir");
-        std::fs::write(path, text).expect("write fixture file");
-    }
-
-    /// Copy one repo-relative file out of the live checkout into `root`.
-    fn copy_real_file(root: &Path, rel: &str) {
-        let from = workspace_root().join(rel);
-        let text = std::fs::read_to_string(&from)
-            .unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
-        write_file(root, rel, &text);
-    }
-
-    /// Delete every line of a fixture file containing `symbol`, asserting the
-    /// deletion applied (else the RED below would prove nothing).
-    fn delete_lines_containing(root: &Path, rel: &str, symbol: &str) {
-        let path = root.join(rel);
-        let before = std::fs::read_to_string(&path).expect("read for mutation");
-        let after: String = before
-            .lines()
-            .filter(|l| !l.contains(symbol))
-            .map(|l| format!("{l}\n"))
-            .collect();
-        assert_ne!(
-            before.lines().count(),
-            after.lines().count(),
-            "no line of {rel} mentions `{symbol}` — the mutation is stale, so this \
-             demonstration proves nothing"
-        );
-        std::fs::write(&path, after).expect("write mutation");
-    }
-
-    fn mutate(root: &Path, rel: &str, from: &str, to: &str) {
-        let path = root.join(rel);
-        let before = std::fs::read_to_string(&path).expect("read for mutation");
-        let after = before.replace(from, to);
-        assert_ne!(
-            before, after,
-            "the mutation no longer applies to {rel} (looking for `{from}`) — the pinned \
-             text is stale, so this demonstration proves nothing"
-        );
-        std::fs::write(&path, after).expect("write mutation");
-    }
-
-    /// A renamed `-Z` flag must not be reported as a corpus regression. The
-    /// first string is trustc's verbatim output when `gate certified` was
-    /// finally able to run (2026-07-31); the second is a genuine verdict.
+    /// A cell's toolchain pre-flight ([`cell_toolchain`]) must match the
+    /// installed-target listing LINE-EXACTLY: a sloppy `contains` reads a
+    /// neighbouring triple as the one asked for, and the cell then fails at the
+    /// build instead of being reported as SKIPPED(no-std).
     #[test]
-    fn a_rejected_flag_is_told_apart_from_a_verification_verdict() {
-        assert!(flag_was_rejected(
-            "error: unknown unstable option: `trust-verify-full`\n"
-        ));
-        assert!(!flag_was_rejected(
-            "note: unknown or timed-out obligations are unproved coverage gaps\n\
-             error: aborting due to 2 previous errors\n"
-        ));
-    }
-
-    /// A scanner that scans its own registry proves nothing. Before the
-    /// `xtask/src/gate.rs` exclusion this assertion FAILED: gate.rs was in the
-    /// walk, so every `Proof::Needle` string literal in `WITNESS_REGISTRY` was
-    /// its own witness and `gate drift` could not go red.
-    #[test]
-    fn witness_scan_excludes_the_registry_that_declares_the_needles() {
-        let scanned = impl_source_files(&workspace_root(), Some("terminal_core.rs"));
-        assert!(
-            !scanned
-                .iter()
-                .any(|p| p.to_string_lossy().ends_with("xtask/src/gate.rs")),
-            "gate.rs is in its own witness scan; every Needle would witness itself"
-        );
-        // And the consequence, stated directly: the registry's own text is not
-        // evidence. `Proof::Needle(` appears on ordinary lines of gate.rs and
-        // (by construction — it is this gate's private vocabulary) nowhere else
-        // in the tree's non-test source.
-        assert!(
-            !needle_present(&workspace_root(), "Proof::Needle("),
-            "the witness registry is witnessing itself"
-        );
-    }
-
-    /// The live loaded gun this gate exists to catch. `soft_fonts` is advertised
-    /// FALSE today with the in-source note "Advertise false until a real DRCS
-    /// implementation lands"; MEASURED 2026-07-31, `grep -rn handle_decdld
-    /// crates apps` hits only the registry entry below — there is no DRCS code.
-    /// Flipping the flag to `true` used to print "gate drift: GREEN — 16
-    /// advertised capabilities all have implementation witnesses" (verified by
-    /// hand before the fix). If DRCS ever lands, THIS assertion flipping is the
-    /// correct signal to retarget the fixture at another unimplemented needle —
-    /// not a spurious failure.
-    #[test]
-    fn a_needle_with_no_implementation_is_not_witnessed() {
-        assert!(
-            !needle_present(&workspace_root(), "fn handle_decdld"),
-            "soft_fonts' witness is satisfied with no DRCS implementation in the tree"
-        );
-        // Guard the fixture itself: it is only meaningful while that IS the
-        // registered proof for soft_fonts.
-        let w = WITNESS_REGISTRY
-            .iter()
-            .find(|w| w.cap == "soft_fonts")
-            .expect("soft_fonts must stay registered");
-        assert!(
-            matches!(&w.proof, super::Proof::Needle(n) if *n == "fn handle_decdld"),
-            "retarget this fixture: soft_fonts' registered proof changed"
-        );
-    }
-
-    /// The corpus driver is the DISCOVERED toolchain's `trustc` — the pinned one, or
-    /// none: a refused impostor or an empty directory yields no driver, so the verb
-    /// answers NOT RUN instead of compiling with something that is not the pin.
-    #[test]
-    fn certified_drives_only_the_discovered_pinned_trustc() {
-        let dir = std::env::temp_dir().join(format!("aterm_gate_certified_{}", std::process::id()));
-        let bin = dir.join("bin");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("lib/rustlib")).expect("mkdir");
-        std::fs::create_dir_all(&bin).expect("mkdir");
-        let exe = |name: &str, body: String| {
-            let p = bin.join(name);
-            std::fs::write(&p, body).expect("write");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                    .expect("chmod");
-            }
-        };
-        let discover = || {
-            aterm_verify::Toolchain::discover_with_store(
-                Some(&bin),
-                Path::new("/unused"),
-                None,
-                std::ffi::OsStr::new(""),
-                Some("trust"),
-            )
-        };
-        assert_eq!(certified_driver(&discover()), None, "no toolchain: NOT RUN");
-        exe("targo", "#!/bin/sh\nexit 0\n".into());
-        assert_eq!(
-            certified_driver(&discover()),
-            None,
-            "an impostor (no trustc): NOT RUN"
-        );
-        exe("trustc", format!("#!/bin/sh\necho '{}'\n", dir.display()));
-        let tools = discover();
-        assert_eq!(
-            certified_driver(&tools),
-            Some(tools.stage2_dir.join("trustc"))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn extracts_triggered_names() {
-        let src = r#"if crate::fault::triggered("kitty.chunk_alloc") || x { }"#;
-        assert_eq!(
-            extract_call_string_args(src, "triggered"),
-            vec!["kitty.chunk_alloc".to_string()]
-        );
-    }
-
-    #[test]
-    fn arm_pattern_also_catches_disarm_but_not_with_armed() {
-        let src = r#"arm("a"); disarm("b"); with_armed("c", || {});"#;
-        // `arm("` is a substring of `disarm("` (intended) but NOT of `with_armed("`.
-        let mut got = extract_call_string_args(src, "arm");
-        got.sort();
-        assert_eq!(got, vec!["a".to_string(), "b".to_string()]);
-        assert_eq!(
-            extract_call_string_args(src, "with_armed"),
-            vec!["c".to_string()]
-        );
-    }
-
-    #[test]
-    fn no_match_returns_empty() {
-        assert!(extract_call_string_args("let x = 1;", "triggered").is_empty());
-    }
-
-    #[test]
-    fn ordinary_kani_proof_attribute_match_is_exact() {
-        assert!(is_ordinary_kani_proof_attr("    #[kani::proof]"));
-        assert!(!is_ordinary_kani_proof_attr(
-            "// #[kani::proof] is documentation"
-        ));
-        assert!(!is_ordinary_kani_proof_attr(
-            "#[kani::proof_for_contract(Parser::step)]"
-        ));
-    }
-
-    #[test]
-    fn proof_inventory_requires_real_harnesses_and_files() {
-        assert!(proof_inventory_is_valid(2, 1));
-        assert!(!proof_inventory_is_valid(0, 0));
-        assert!(!proof_inventory_is_valid(1, 2));
-    }
-
-    #[test]
-    fn readme_may_reference_live_inventory_but_not_assert_a_numeric_total() {
-        assert!(readme_asserts_proof_inventory(
-            "There are 9 `#[kani::proof]` harnesses in this snapshot."
-        ));
-        assert!(!readme_asserts_proof_inventory(
-            "Run the computed proof-inventory gate for live totals."
-        ));
-    }
-
-    // -----------------------------------------------------------------------
-    // RED FIXTURES: each plants a violation and asserts the VERB reports
-    // FAILURE. Registered in NON_VACUITY_REGISTRY; the meta-test below fails
-    // the build if any roster gate loses its fixture.
-    // -----------------------------------------------------------------------
-
-    /// G-DRIFT, verb level. The REAL [`WITNESS_REGISTRY`] over a fixture
-    /// advertise file: GREEN while the capability is advertised false, RED the
-    /// moment it is advertised true with no implementation witness, GREEN again
-    /// once the witness lands. The third leg matters — without it the RED could
-    /// be structural (a fixture root where nothing can ever be witnessed).
-    #[test]
-    fn an_unwitnessed_capability_advertised_true_fails_the_drift_verb() {
-        let root = fixture_root("drift-red");
-        // `unicode`'s registered proof is Proof::Path("crates/aterm-grapheme"),
-        // so the fixture provides it; `soft_fonts`' is Proof::Needle("fn
-        // handle_decdld"), which nothing in the fixture implements yet.
-        write_file(&root, "crates/aterm-grapheme/src/lib.rs", "// grapheme\n");
-        write_file(
-            &root,
-            "crates/aterm-types/src/terminal_core.rs",
-            "pub fn aterm_capabilities() -> TerminalCapabilities {\n\
-             \x20   TerminalCapabilities {\n\
-             \x20       unicode: true,\n\
-             \x20       soft_fonts: false,\n\
-             \x20   }\n\
-             }\n",
-        );
-
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(ok, "the honest fixture must be GREEN first:\n{log}");
-
-        mutate(
-            &root,
-            "crates/aterm-types/src/terminal_core.rs",
-            "soft_fonts: false",
-            "soft_fonts: true",
-        );
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(
-            !ok,
-            "advertising soft_fonts with no DRCS implementation MUST fail drift:\n{log}"
-        );
-        assert!(
-            log.contains("'soft_fonts' advertised true but witness MISSING"),
-            "the diagnostic must name the capability and its missing witness:\n{log}"
-        );
-
-        // And the mirror: land the witness, and the same tree goes GREEN — so
-        // the RED above is the missing implementation, not the fixture shape.
-        write_file(
-            &root,
-            "crates/aterm-core/src/terminal/handler_decdld.rs",
-            "fn handle_decdld(&mut self) {}\n",
-        );
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(ok, "a real witness must satisfy the gate:\n{log}");
-
-        // Fail-closed on an UNKNOWN capability advertised true.
-        mutate(
-            &root,
-            "crates/aterm-types/src/terminal_core.rs",
-            "unicode: true,",
-            "unicode: true,\n        teleportation: true,",
-        );
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(
-            !ok,
-            "an unregistered advertised capability must fail:\n{log}"
-        );
-        assert!(
-            log.contains("'teleportation' is advertised true but has NO witness registered"),
-            "the fail-closed branch must name the unregistered capability:\n{log}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// G-DRIFT's witness scan is region-level, not only file-level — the same
-    /// exclusion `gate dormant` gained in [`live_reference_lines`]. Before the
-    /// scan went through [`live_source_lines`], a `#[cfg(test)]` module inside an
-    /// ORDINARY source file witnessed an advertised capability the shipped
-    /// build does not have: this fixture printed GREEN with `soft_fonts: true`
-    /// and DRCS nowhere but a unit test.
-    #[test]
-    fn a_cfg_test_only_mention_does_not_witness_a_capability() {
-        let root = fixture_root("drift-cfg-test");
-        write_file(&root, "crates/aterm-grapheme/src/lib.rs", "// grapheme\n");
-        write_file(
-            &root,
-            "crates/aterm-types/src/terminal_core.rs",
-            "pub fn aterm_capabilities() -> TerminalCapabilities {\n\
-             \x20   TerminalCapabilities {\n\
-             \x20       unicode: true,\n\
-             \x20       soft_fonts: true,\n\
-             \x20   }\n\
-             }\n",
-        );
-        // An ordinary (non-test) file whose ONLY mention of the needle is its
-        // unit-test module.
-        write_file(
-            &root,
-            "crates/aterm-core/src/terminal/handler_dcs.rs",
-            "pub fn handle_dcs() {}\n\
-             \n\
-             #[cfg(test)]\n\
-             mod tests {\n\
-             \x20   fn handle_decdld(_: &[u8]) {}\n\
-             \n\
-             \x20   #[test]\n\
-             \x20   fn t() {\n\
-             \x20       handle_decdld(b\"\");\n\
-             \x20   }\n\
-             }\n",
-        );
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(
-            !ok,
-            "a #[cfg(test)]-only `fn handle_decdld` must not witness soft_fonts:\n{log}"
-        );
-        assert!(
-            log.contains("'soft_fonts' advertised true but witness MISSING"),
-            "the diagnostic must name the capability:\n{log}"
-        );
-
-        // The mirror: the same needle on a line OUTSIDE the test region is a
-        // witness, so the RED above is the region, not the file.
-        mutate(
-            &root,
-            "crates/aterm-core/src/terminal/handler_dcs.rs",
-            "pub fn handle_dcs() {}\n",
-            "pub fn handle_dcs() {}\n\npub fn handle_decdld(_: &[u8]) {}\n",
-        );
-        let (ok, log) = drift_report(&root, WITNESS_REGISTRY);
-        assert!(
-            ok,
-            "a live `fn handle_decdld` must satisfy the gate:\n{log}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// G-DORMANT, verb level, driven by the REAL registry entry over a COPY of
-    /// the real consumer file: `render_cells.rs` calls `apply_bidi_reorder`
-    /// exactly once (line 886 on 2026-08-01, plus one comment mention the
-    /// counter already ignores). Delete those lines — the WIRE-BIDI regression
-    /// this watch exists for — and the gate must go red.
-    #[test]
-    fn deleting_the_only_consumer_fails_the_dormant_verb() {
-        let watch = DORMANCY_REGISTRY
-            .iter()
-            .find(|w| w.producer == "apply_bidi_reorder")
-            .expect("the bidi watch must stay registered (retarget this fixture if it moves)");
-        assert!(
-            watch.enforced,
-            "this fixture only demonstrates the ENFORCED arm"
-        );
-        let root = fixture_root("dormant-red");
-        copy_real_file(&root, watch.consumer_path);
-
-        let (ok, log) = dormant_report(&root, std::slice::from_ref(watch));
-        assert!(
-            ok,
-            "the unmutated real consumer file must be GREEN, or the RED below proves \
-             nothing:\n{log}"
-        );
-
-        delete_lines_containing(&root, watch.consumer_path, watch.producer);
-        let (ok, log) = dormant_report(&root, std::slice::from_ref(watch));
-        assert!(
-            !ok,
-            "a producer with zero live consumers MUST fail the dormant gate:\n{log}"
-        );
-        assert!(
-            log.contains("is DORMANT") && log.contains("apply_bidi_reorder"),
-            "the diagnostic must name the dormant producer:\n{log}"
-        );
-
-        // The PENDING arm is reported, never failed — assert that distinction
-        // directly, since it is the reason an entry can sit at zero consumers.
-        let pending = [DormantWatch {
-            feature: watch.feature,
-            producer: watch.producer,
-            consumer_path: watch.consumer_path,
-            enforced: false,
-        }];
-        let (ok, log) = dormant_report(&root, &pending);
-        assert!(ok, "a pending watch must not fail the gate:\n{log}");
-        assert!(log.contains("pending:"), "log:\n{log}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// G-FAULT, verb level, BOTH directions: an injected fault point no test
-    /// arms (the untested fail-closed path M7 exists to prevent), and its
-    /// mirror, a test arming a name with no injection site.
-    #[test]
-    fn an_unarmed_injection_site_fails_the_fault_verb() {
-        let root = fixture_root("fault-red");
-        write_file(
-            &root,
-            "crates/demo/src/alloc.rs",
-            "pub fn chunk() -> Option<u8> {\n\
-             \x20   if crate::fault::triggered(\"demo.chunk_alloc\") {\n\
-             \x20       return None;\n\
-             \x20   }\n\
-             \x20   Some(0)\n\
-             }\n",
-        );
-
-        let (ok, log) = fault_report(&root);
-        assert!(!ok, "an unarmed injection site MUST fail the gate:\n{log}");
-        assert!(
-            log.contains("'demo.chunk_alloc' injected at") && log.contains("NO test arms it"),
-            "the diagnostic must name the site and the direction:\n{log}"
-        );
-
-        // Arm it from a test file: GREEN. (So the RED above is the missing
-        // test, not the fixture tree.)
-        write_file(
-            &root,
-            "crates/demo/tests/fault_demo.rs",
-            "#[test]\nfn t() {\n    with_armed(\"demo.chunk_alloc\", || {});\n}\n",
-        );
-        let (ok, log) = fault_report(&root);
-        assert!(ok, "an armed injection site must pass:\n{log}");
-
-        // The mirror direction: a stale/typo'd arm with no injection site.
-        write_file(
-            &root,
-            "crates/demo/tests/stale.rs",
-            "#[test]\nfn t2() {\n    arm(\"demo.ghost\");\n}\n",
-        );
-        let (ok, log) = fault_report(&root);
-        assert!(!ok, "an armed name with no site MUST fail the gate:\n{log}");
-        assert!(
-            log.contains("'demo.ghost'") && log.contains("NO injection site"),
-            "the diagnostic must name the stale fault:\n{log}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// G-COUNTS, verb level, every failure condition: an empty inventory (the
-    /// scan broke, or every harness was deleted), a README that reasserts a
-    /// hand-maintained numeric total, a Clean island AGENTS.md's verified table
-    /// does not name, and an unreadable README or AGENTS.md (fail-closed).
-    #[test]
-    fn an_empty_inventory_and_a_hand_maintained_total_fail_the_counts_verb() {
-        let root = fixture_root("counts-red");
-        write_file(
-            &root,
-            "crates/demo/src/lib.rs",
-            "#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn p() {}\n}\n",
-        );
-        write_file(
-            &root,
-            "README.md",
-            "Run the computed proof-inventory gate for live totals.\n",
-        );
-        write_file(&root, "AGENTS.md", "| in-compilation | nowhere |\n");
-        let (ok, log) = counts_report(&root);
-        assert!(ok, "the honest fixture must be GREEN first:\n{log}");
-        assert!(log.contains("1 ordinary `#[kani::proof]`"), "log:\n{log}");
-        assert!(log.contains("0 Clean island file(s)"), "log:\n{log}");
-
-        // (a) EMPTY INVENTORY.
-        delete_lines_containing(&root, "crates/demo/src/lib.rs", "#[kani::proof]");
-        let (ok, log) = counts_report(&root);
-        assert!(!ok, "an empty proof inventory MUST fail the gate:\n{log}");
-        assert!(
-            log.contains("invalid/empty crate proof inventory"),
-            "log:\n{log}"
-        );
-
-        // (b) HAND-MAINTAINED README TOTAL.
-        write_file(
-            &root,
-            "crates/demo/src/lib.rs",
-            "#[cfg(kani)]\nmod proofs {\n    #[kani::proof]\n    fn p() {}\n}\n",
-        );
-        write_file(
-            &root,
-            "README.md",
-            "There are 9 `#[kani::proof]` harnesses in this snapshot.\n",
-        );
-        let (ok, log) = counts_report(&root);
-        assert!(
-            !ok,
-            "a hand-maintained README total MUST fail the gate:\n{log}"
-        );
-        assert!(log.contains("hand-maintained numeric"), "log:\n{log}");
-
-        // (c) A CLEAN ISLAND AGENTS.md DOES NOT NAME — the shape that let the
-        // verified table say "nowhere" while the compiler checked an island.
-        write_file(
-            &root,
-            "README.md",
-            "Run the computed proof-inventory gate for live totals.\n",
-        );
-        let island = "crates/demo/src/island.rs";
-        write_file(
-            &root,
-            island,
-            "// a proof island\nclean {\n    theorem t : True := trivial\n}\n",
-        );
-        let (ok, log) = counts_report(&root);
-        assert!(!ok, "an island AGENTS.md does not name MUST fail:\n{log}");
-        assert!(log.contains(island), "the refusal names the file:\n{log}");
-        write_file(
-            &root,
-            "AGENTS.md",
-            &format!("| Clean proof island | `{island}` | its theorem |\n"),
-        );
-        let (ok, log) = counts_report(&root);
-        assert!(ok, "naming the island turns the gate GREEN again:\n{log}");
-        assert!(log.contains("1 Clean island file(s)"), "log:\n{log}");
-
-        // (d) UNREADABLE AGENTS.md — fail closed, never a silent pass.
-        std::fs::remove_file(root.join("AGENTS.md")).expect("remove AGENTS.md");
-        let (ok, log) = counts_report(&root);
-        assert!(!ok, "a missing AGENTS.md MUST fail the gate closed:\n{log}");
-        assert!(log.contains("could not read"), "log:\n{log}");
-
-        // (e) UNREADABLE README — fail closed, never a silent pass.
-        std::fs::remove_file(root.join("README.md")).expect("remove README");
-        let (ok, log) = counts_report(&root);
-        assert!(!ok, "a missing README MUST fail the gate closed:\n{log}");
-        assert!(log.contains("could not read"), "log:\n{log}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    // -----------------------------------------------------------------------
-    // THE NON-VACUITY OBLIGATION ITSELF — and, because a gate that cannot go
-    // red is the very defect this exists to catch, a table of fixtures proving
-    // THIS check goes red too.
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn every_all_roster_gate_has_a_red_fixture() {
-        let root = workspace_root();
-        let violations = non_vacuity_violations(&roster_names(), NON_VACUITY_REGISTRY, &|rel| {
-            std::fs::read_to_string(root.join(rel)).ok()
-        });
-        assert!(
-            violations.is_empty(),
-            "NON-VACUITY OBLIGATION VIOLATED — a `gate all` entry asserts more than anyone \
-             has shown it verifies:\n{}\n  Fix: add a red-fixture test that plants a violation \
-             and asserts the gate FAILS, and register it in NON_VACUITY_REGISTRY.",
-            violations.join("\n")
-        );
-    }
-
-    const GOOD_FIXTURE_FILE: &str = "mod tests {\n    #[test]\n    fn f() {\n        \
-                                     assert!(!thing());\n    }\n}\n";
-
-    /// THE OBLIGATION GOES RED on every shape of missing proof, one labelled
-    /// row each. A row is a roster, ONE registry entry and the text of the
-    /// fixture file that entry points at (`None`: unreadable), with the one
-    /// violation it must produce — or none, for the controls, so the check is
-    /// not simply rejecting everything.
-    #[test]
-    fn the_obligation_goes_red_on_every_shape_of_missing_proof() {
-        fn fixture(test: &'static str) -> RedFixture {
-            fixture_for("drift", test)
-        }
-        fn fixture_for(gate: &'static str, test: &'static str) -> RedFixture {
-            RedFixture {
-                gate,
-                test,
-                file: "x.rs",
-                drives: "the verb",
-                calls: "thing",
-                verb_level: true,
-            }
-        }
-        struct Row {
-            what: &'static str,
-            roster: &'static [&'static str],
-            entry: RedFixture,
-            file: Option<&'static str>,
-            /// The one violation expected, by a substring of it; `None` = accepted.
-            red: Option<&'static str>,
-        }
-        let rows = [
-            Row {
-                what: "CONTROL: a registered gate with a negative fixture",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: Some(GOOD_FIXTURE_FILE),
-                red: None,
-            },
-            Row {
-                what: "a roster gate with no entry",
-                roster: &["drift", "newgate"],
-                entry: fixture("f"),
-                file: Some(GOOD_FIXTURE_FILE),
-                red: Some("'newgate' is in the `all` roster with NO"),
-            },
-            Row {
-                what: "a fixture file that does not exist",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: None,
-                red: Some("could not be read"),
-            },
-            Row {
-                what: "a fixture renamed away",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: Some(
-                    "mod tests {\n    #[test]\n    fn g() {\n        assert!(!x());\n    }\n}\n",
-                ),
-                red: Some("renamed or deleted"),
-            },
-            // Present, but a plain helper — it can never fail the build.
-            Row {
-                what: "a fixture that is not a #[test]",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: Some("mod tests {\n    fn f() {\n        assert!(!x());\n    }\n}\n"),
-                red: Some("not annotated `#[test]`"),
-            },
-            // THE HEART OF IT: a registered fixture that only ever asserts
-            // SUCCESS is exactly the vacuous gate this obligation exists to catch.
-            Row {
-                what: "a fixture with no negative assertion",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: Some(
-                    "mod tests {\n    #[test]\n    fn f() {\n        assert!(thing());\n    }\n}\n",
-                ),
-                red: Some("no NEGATIVE assertion"),
-            },
-            Row {
-                what: "a stale entry for a gate that left the roster",
-                roster: &[],
-                entry: fixture_for("removed", "f"),
-                file: Some(GOOD_FIXTURE_FILE),
-                red: Some("NOT in the `all` roster"),
-            },
-            // `test_fn_body` is bounded by the closing brace at fn indent, so a
-            // LATER test's negative assertion is not lent to the fixture…
-            Row {
-                what: "a later test's negative assertion is not read into the fixture",
-                roster: &["drift"],
-                entry: fixture("a"),
-                file: Some(
-                    "mod tests {\n    #[test]\n    fn a() {\n        assert!(thing());\n    }\n\
-                     \n    #[test]\n    fn b() {\n        assert!(!thing());\n    }\n}\n",
-                ),
-                red: Some("no NEGATIVE assertion"),
-            },
-            // …and starts at the fixture's own line, so an EARLIER one's is not
-            // either.
-            Row {
-                what: "an earlier test's negative assertion is not read into the fixture",
-                roster: &["drift"],
-                entry: fixture("b"),
-                file: Some(
-                    "mod tests {\n    #[test]\n    fn a() {\n        assert!(!thing());\n    }\n\
-                     \n    #[test]\n    fn b() {\n        assert!(thing());\n    }\n}\n",
-                ),
-                red: Some("no NEGATIVE assertion"),
-            },
-            // A mention inside a string literal is not the definition: were it
-            // taken for one, the walk back from it would find no `#[test]`.
-            Row {
-                what: "a `fn f(` inside a string literal is not the fixture",
-                roster: &["drift"],
-                entry: fixture("f"),
-                file: Some(
-                    "mod tests {\n    const N: &str = \"fn f(\";\n    #[test]\n    \
-                     fn f() {\n        assert!(!thing());\n    }\n}\n",
-                ),
-                red: None,
-            },
-        ];
-        for row in &rows {
-            let file = row.file;
-            let v = non_vacuity_violations(row.roster, std::slice::from_ref(&row.entry), &|_| {
-                file.map(str::to_string)
-            });
-            match row.red {
-                None => assert!(v.is_empty(), "{}: must be accepted: {v:?}", row.what),
-                Some(needle) => assert!(
-                    v.len() == 1 && v[0].contains(needle),
-                    "{}: must go red with `{needle}`: {v:?}",
-                    row.what
-                ),
-            }
-        }
-    }
-
-    /// The roster is the single source of truth for BOTH readers: if the `all`
-    /// verb ever stops running a roster entry (or grows one the registry never
-    /// sees), the obligation above is measuring the wrong set.
-    #[test]
-    fn the_roster_is_the_only_definition_of_what_gate_all_runs() {
-        let names = roster_names();
-        assert_eq!(names.len(), ALL_ROSTER.len());
-        assert!(
-            names.contains(&"perf") && names.contains(&"lint") && names.contains(&"drift"),
-            "{names:?}"
-        );
-        let mut sorted = names.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(
-            sorted.len(),
-            names.len(),
-            "duplicate roster entry: {names:?}"
-        );
-    }
-
-    /// [`OPT_IN_OUTSIDE_ROSTER`] is exactly the dispatched verbs that are not
-    /// roster entries, derived from the dispatch arms rather than counted by a
-    /// reader. The module header said `gate all` omits "the four" while `cells`
-    /// was a dispatched fifth, and `main.rs`'s own derived usage said five — two
-    /// surfaces of one fact, disagreeing.
-    #[test]
-    fn the_opt_in_list_is_exactly_the_dispatched_verbs_outside_the_roster() {
-        let src = std::fs::read_to_string(crate::workspace_root().join("crates/xtask/src/gate.rs"))
-            .expect("gate.rs is readable");
-        let body = src
-            .split_once("pub(crate) fn run(")
-            .expect("the dispatch exists")
-            .1;
-        let body = &body[..body.find("\n}\n").expect("the dispatch closes")];
-        // Meta-verbs, not checks: one runs the roster, one audits it.
-        let meta = ["all", "nonvacuity"];
-        let roster = roster_names();
-        let mut dispatched_outside: Vec<String> = Vec::new();
-        for (i, _) in body.match_indices("Some(\"") {
-            let rest = &body[i + "Some(\"".len()..];
-            let Some(end) = rest.find('"') else { continue };
-            let verb = &rest[..end];
-            if roster.contains(&verb) || meta.contains(&verb) {
-                continue;
-            }
-            dispatched_outside.push(verb.to_string());
-        }
-        dispatched_outside.sort_unstable();
-        dispatched_outside.dedup();
-        assert_eq!(
-            dispatched_outside, OPT_IN_OUTSIDE_ROSTER,
-            "OPT_IN_OUTSIDE_ROSTER must name every dispatched verb outside ALL_ROSTER"
-        );
-    }
-
-    /// The usage line names EXACTLY the verbs `run` dispatches — derived from
-    /// the dispatch arms, the way `the_opt_in_list_is_exactly_the_dispatched_verbs_outside_the_roster`
-    /// derives the opt-in list. Before 2026-09-17 the line was a hand-typed
-    /// literal; `citations` joining the roster is what made a second
-    /// hand-maintained verb list in this file visible as the same defect the
-    /// header already records against `main.rs`'s.
-    #[test]
-    fn unknown_verb_usage_names_every_dispatched_verb() {
-        let src = std::fs::read_to_string(crate::workspace_root().join("crates/xtask/src/gate.rs"))
-            .expect("gate.rs is readable");
-        let body = src
-            .split_once("pub(crate) fn run(")
-            .expect("the dispatch exists")
-            .1;
-        let body = &body[..body.find("\n}\n").expect("the dispatch closes")];
-        let mut dispatched: Vec<String> = Vec::new();
-        for (i, _) in body.match_indices("Some(\"") {
-            let rest = &body[i + "Some(\"".len()..];
-            let Some(end) = rest.find('"') else { continue };
-            dispatched.push(rest[..end].to_string());
-        }
-        dispatched.sort_unstable();
-        dispatched.dedup();
-        let mut printed: Vec<String> = usage_verbs().iter().map(|s| (*s).to_string()).collect();
-        printed.sort_unstable();
-        printed.dedup();
-        assert_eq!(
-            printed, dispatched,
-            "the usage line and the dispatch arms must name the same verbs"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // G-CERTIFIED: the kernel-certification parse contract
-    // -----------------------------------------------------------------------
-
-    /// trustc 0.1.0's output, MEASURED 2026-08-01 compiling
-    /// `crates/xtask/certified-corpus/guarded_cursor_advance.rs` with
-    /// `-Ztrust-policy=certify` (two functions, one obligation each). The note
-    /// lines are verbatim; the source-snippet lines trustc interleaves are
-    /// elided, and one `-->` line per block is kept so the parser is exercised
-    /// against interleaved non-note text rather than a clean pair.
-    const MEASURED_CERTIFY_STDERR: &str = "\
-note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> crates/xtask/certified-corpus/guarded_cursor_advance.rs:13:1
-   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
-
-note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-checked out of 1 obligation(s)
-  --> crates/xtask/certified-corpus/guarded_cursor_advance.rs:18:1
-   = note: of which 1 kernel-certified by the clean CIC kernel (zero-trust re-check; runtime-check elision requires exact MIR Assert identity)
-";
-
-    #[test]
-    fn kernel_certification_is_asserted_not_merely_surfaced() {
-        assert_eq!(judge_kernel_certification(MEASURED_CERTIFY_STDERR), Ok(2));
-
-        // THE REGRESSION THE EXIT CODE CANNOT SEE: still fully discharged
-        // (certify passes, exit 0) but the kernel no longer re-checks it.
-        let solver_trusted =
-            MEASURED_CERTIFY_STDERR.replace("of which 1 kernel", "of which 0 kernel");
-        let err = judge_kernel_certification(&solver_trusted).expect_err("must be RED");
-        assert!(err.contains("solver-trusted"), "{err}");
-
-        // The parse contract fails CLOSED, never open.
-        let no_note = MEASURED_CERTIFY_STDERR
-            .lines()
-            .filter(|l| !l.contains("kernel-certified"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let err = judge_kernel_certification(&no_note).expect_err("must be RED");
-        assert!(err.contains("PARSE CONTRACT BROKEN"), "{err}");
-        let err = judge_kernel_certification("").expect_err("must be RED");
-        assert!(err.contains("PARSE CONTRACT BROKEN"), "{err}");
-
-        // An unproved / runtime-checked obligation is not a certification.
-        let unknown = "note: Trust verification: 0 proved, 0 failed, 1 unknown, 0 timed out, \
-                       0 runtime-checked out of 1 obligation(s)\n   = note: of which 0 \
-                       kernel-certified by the clean CIC kernel\n";
-        assert!(
-            judge_kernel_certification(unknown)
-                .expect_err("must be RED")
-                .contains("not fully discharged")
-        );
-        let runtime = "note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, \
-                       1 runtime-checked out of 2 obligation(s)\n   = note: of which 1 \
-                       kernel-certified by the clean CIC kernel\n";
-        assert!(
-            judge_kernel_certification(runtime)
-                .expect_err("must be RED")
-                .contains("runtime-checked")
-        );
-    }
-    /// `gate web`'s pre-flight must match the installed-target listing LINE-EXACTLY.
-    /// Before 2026-08-31 the gate had no pre-flight at all: it ran the build on the
-    /// repo's Trust toolchain (which has no wasm32 std), then matched
-    /// `can't find crate for `std`` in the stderr and called the whole thing
-    /// `SKIPPED … Not a failure` — so it was a permanent green skip. The pre-flight
-    /// is what replaced that, and a sloppy `contains` here would hand the same
-    /// silence back in a new shape.
-    #[test]
-    fn web_preflight_matches_installed_targets_exactly() {
+    fn a_toolchain_lists_a_target_only_line_exactly() {
         let listing = "aarch64-apple-darwin\nwasm32-unknown-unknown\n";
         assert!(super::toolchain_lists_target(
             listing,
@@ -9421,6 +4146,7 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         // Nothing installed at all is the skip case, not a match.
         assert!(!super::toolchain_lists_target("", "wasm32-unknown-unknown"));
     }
+
     // -----------------------------------------------------------------------
     // `gate cells` — the pure halves, each pinned by the mistake it cost.
     // -----------------------------------------------------------------------
@@ -9851,7 +4577,7 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
 
     /// THE OTHER HALF OF THE SAME DECISION, pinned so it cannot be "fixed" into
     /// a blocker. An uninstalled std is a fact about the box that no change to
-    /// this repository can clear, and `LintLane` records what a permanent red
+    /// this repository can clear, and `LaneVerdict` records what a permanent red
     /// costs. So a skip exits 0 — and a cell that RAN and failed does not.
     #[test]
     fn a_skip_does_not_block_a_checkout_and_a_cell_that_ran_and_failed_does() {
@@ -10195,9 +4921,9 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
     /// Both halves are load-bearing and both are asserted here, because the
     /// failure this gate exists to stop is a subset that quietly becomes
     /// something else: too small and Windows stops being compiled anywhere (the
-    /// four hand-found breaks of 2026-09-16); too large and `gate all` inherits a cell whose
-    /// verdict depends on which box ran it, which is how a gate stops being
-    /// read at all.
+    /// four hand-found breaks of 2026-09-16); too large and every tier of the
+    /// merge gate inherits a cell whose verdict depends on which box ran it,
+    /// which is how a gate stops being read at all.
     #[test]
     fn the_always_on_cell_subset_is_every_cell_no_box_in_this_fleet_hosts() {
         let all = aterm_forge::resolve::default_cells();
@@ -10229,21 +4955,11 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         // exists; wasm is the other thing no box compiles natively.
         assert!(
             foreign.iter().any(|c| c.triple == "x86_64-pc-windows-msvc"),
-            "the Windows cell is the whole reason `cells-foreign` is in the roster"
+            "the Windows cell is the whole reason `cells-foreign` runs on every tier"
         );
         assert!(
             foreign.iter().any(|c| c.triple == "wasm32-unknown-unknown"),
             "no box in this fleet runs wasm32 natively either"
-        );
-        // THE ROSTER AND THE OPT-IN LIST SAY THE SAME THING AS THIS TEST.
-        assert!(
-            super::roster_names().contains(&"cells-foreign"),
-            "`gate all` must run the always-on subset: {:?}",
-            super::roster_names()
-        );
-        assert!(
-            super::OPT_IN_OUTSIDE_ROSTER.contains(&"cells"),
-            "the whole-matrix verb stays opt-in — its verdict is machine-dependent"
         );
     }
 
@@ -10254,8 +4970,8 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
     /// that can check it are the machines. If this box runs a cell's triple
     /// natively and that triple is not in the const, the always-on gate is
     /// compiling a NATIVE cell here and a CROSS cell elsewhere — different
-    /// `cshim` decisions, a `floor` that counts host artifacts — and `gate all`
-    /// would be answering a different question depending on who typed it. That
+    /// `cshim` decisions, a `floor` that counts host artifacts — and the merge
+    /// gate would be answering a different question depending on who ran it. That
     /// is the state the whole matrix is in today, and this test is what keeps the
     /// subset out of it.
     #[test]

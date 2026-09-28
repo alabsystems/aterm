@@ -198,17 +198,23 @@ fn write_layout(
         } else {
             // `0 < kk < n`, so both halves are non-empty.
             let split = kk.max(0) as usize;
+            // Split the BYTES: the output is bytes, and a byte split can only
+            // fail on length (guarded), where `str::split_at` also panics off
+            // a char boundary — impossible for these ASCII digits, but not
+            // something the verifier (or a future caller) can see.
+            let digits = digits.as_bytes();
             let (head, tail) = digits.split_at(split.min(digits.len()));
-            out.extend_from_slice(head.as_bytes());
+            out.extend_from_slice(head);
             out.push(b'.');
-            out.extend_from_slice(tail.as_bytes());
+            out.extend_from_slice(tail);
         }
     } else {
-        let (head, tail) = digits.split_at(1.min(digits.len()));
-        out.extend_from_slice(head.as_bytes());
+        let digits_b = digits.as_bytes();
+        let (head, tail) = digits_b.split_at(1.min(digits_b.len()));
+        out.extend_from_slice(head);
         if !tail.is_empty() {
             out.push(b'.');
-            out.extend_from_slice(tail.as_bytes());
+            out.extend_from_slice(tail);
         }
         out.push(b'e');
         out.push(if exp10 < 0 { b'-' } else { b'+' });

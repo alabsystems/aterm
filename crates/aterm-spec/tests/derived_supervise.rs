@@ -515,3 +515,98 @@ fn the_decline_is_carried_out_and_a_keystroke_is_never_written_twice() {
     }
     assert!(!m.action_enabled("HarnessDown", &st), "{st:?}");
 }
+
+/// THE NETWORK WALL (the outage of 2026-09-27): a measured outage typed
+/// into at most once a hold of wall time, and at most two acts at once per
+/// episode, however the measure flaps, lies or is lost — proven; the
+/// supervisor of that day (`Buggy = 1`: at once at every appearance,
+/// whatever the measure) is caught on both. And the first is no restatement
+/// of `Act`'s guard (the review of 2026-09-27): `Carry = 1` — the hold's
+/// clock carried across an episode's appearances, the guard untouched — is
+/// caught by it too. The machine stays enrolled in the spec-link registry,
+/// so the non-vacuity sweep keeps both invariants falsifiable.
+#[test]
+fn the_network_wall_proves_and_catches_typing_into_a_measured_outage() {
+    let m = aterm_spec::derive::supervisor_network_wall_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == m.name),
+        "the network wall must stay enrolled in the spec-link registry"
+    );
+    aterm_spec::verify::prove_and_catch_scalar(
+        &m,
+        "supervisor network wall: a measured outage typed into at most once a hold; at most \
+         two acts at once per episode",
+    );
+    // The hold measured from the episode's first appearance, not each one:
+    // after one hold, the outage's next appearance is typed into at once —
+    // with `Act`'s guard unchanged, so only an invariant over what the
+    // episode accumulates can see it.
+    let carry = aterm_spec::interp::with_consts(&m, &[("Carry", 1)]);
+    let (at, broken) = aterm_spec::interp::bmc(&carry).expect_err("Carry = 1 is caught");
+    assert_eq!(
+        broken, "AMeasuredOutageIsTypedIntoAtMostOnceAHold",
+        "{at:?}"
+    );
+    assert_eq!(at["dacts"], 2, "the second act into the outage: {at:?}");
+
+    // The committed decision, step by step. The network fails and the host
+    // measures it down: the wall's appearance waits the whole hold, then one
+    // try all the same.
+    let hold = m.consts.iter().find(|c| c.0 == "Hold").unwrap().1;
+    let mut s = m.init_state();
+    for a in ["NetFails", "MeasureDown", "Unreachable"] {
+        assert!(m.fire(a, &mut s), "{a} at {s:?}");
+    }
+    for _ in 0..hold {
+        assert!(!m.action_enabled("Act", &s), "{s:?}");
+        assert!(m.fire("Tick", &mut s));
+    }
+    assert!(m.fire("Act", &mut s), "one try at the hold: {s:?}");
+    // It meets the wall again, and the probe LIES — up while the agent's
+    // route is down: continued at once, the once; met again, the next Up
+    // act waits a rung, and a flap through Down does not buy another.
+    for a in ["MetUnreachable", "MeasureLies"] {
+        assert!(m.fire(a, &mut s), "{a} at {s:?}");
+    }
+    assert!(m.fire("Act", &mut s), "at once on the measure: {s:?}");
+    assert!(m.fire("MetUnreachable", &mut s));
+    assert!(!m.action_enabled("Act", &s), "a second Up act waits: {s:?}");
+    for a in ["MeasureDown", "MeasureLies"] {
+        assert!(m.fire(a, &mut s), "{a} at {s:?}");
+    }
+    assert!(!m.action_enabled("Act", &s), "the flap is spaced: {s:?}");
+    // The API truly back while the wall shows: continued at once.
+    let mut up = m.init_state();
+    for a in [
+        "NetFails",
+        "MeasureDown",
+        "Unreachable",
+        "NetReturns",
+        "MeasureUp",
+    ] {
+        assert!(m.fire(a, &mut up), "{a} at {up:?}");
+    }
+    assert!(m.action_enabled("Act", &up), "{up:?}");
+    // A reply cut off after real work is a new episode: continued at once.
+    let mut c = m.init_state();
+    for a in ["CutOff", "Act", "WorkedThenCutOff"] {
+        assert!(m.fire(a, &mut c), "{a} at {c:?}");
+    }
+    assert!(m.action_enabled("Act", &c), "{c:?}");
+
+    // The day's supervisor, caught twice.
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut b = buggy.init_state();
+    for a in ["NetFails", "MeasureDown", "Unreachable", "Act"] {
+        assert!(buggy.fire(a, &mut b), "{a} at {b:?}");
+    }
+    assert!(!buggy.check_invariant("AMeasuredOutageIsTypedIntoAtMostOnceAHold", &b));
+    let mut q = buggy.init_state();
+    assert!(buggy.fire("NetFails", &mut q) && buggy.fire("Unreachable", &mut q));
+    for _ in 0..3 {
+        assert!(buggy.fire("Act", &mut q) && buggy.fire("MetUnreachable", &mut q));
+    }
+    assert!(!buggy.check_invariant("AtMostTwoActsAtOncePerEpisode", &q));
+}

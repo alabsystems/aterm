@@ -22,8 +22,9 @@
 //!
 //! ONE implementation, TWO consumers (so the verb and the gate cannot diverge):
 //!
-//!   * `cargo xtask gate mainloop` (crates/xtask/src/gate.rs) — the standalone
-//!     verb: part of `gate all`, and invoked by tools/verify.sh.
+//!   * the `aterm-census` bin (`targo --unverified run -p aterm-census --
+//!     --mainloop`, src/main.rs) — the standalone runner, which also points
+//!     today's walker at any other checkout.
 //!
 //!     THIS PARAGRAPH WAS THE LAST SURVIVING COPY of a claim the rest of the
 //!     repo corrected in twenty files, and it was the load-bearing one: it said
@@ -48,8 +49,8 @@
 //!
 //! * OB-1  marker ↔ registry: every `// COST: UNBOUNDED(<dim>)` marker maps to
 //!   a registered sink AND every registered sink is still marked at its
-//!   definition (both directions, mirroring `gate drift`'s witnesses). The
-//!   sweep's SCOPE is the DERIVED GUI-process closure — the same
+//!   definition (both directions). The sweep's SCOPE is the DERIVED
+//!   GUI-process closure — the same
 //!   [`scan_set::derive_gui_scan_set`] result OB-7 consumes (workspace
 //!   members' `src/` only; vendored code carries no aterm markers by
 //!   definition and is not swept); a marker in a workspace crate OUTSIDE the
@@ -1184,7 +1185,8 @@ pub fn run_mainloop_census(root: &Path) -> CensusOutcome {
             log,
             "gate mainloop: FAILED — {failures} obligation violation(s) ({hazard_hits} \
              main-thread-reachable unbounded-work site(s)). This census blocks BOTH \
-             `cargo xtask gate mainloop` and the `cargo build` of tools/freeze-safety-gate."
+             `targo --unverified run -p aterm-census -- --mainloop` and the build of \
+             tools/freeze-safety-gate."
         );
         return CensusOutcome { ok: false, log };
     }

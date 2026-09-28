@@ -29,6 +29,17 @@ use aterm_verify::ladder::Report;
 use aterm_verify::{Ctx, EnvSnapshot, Scope, Toolchain, changed, exec, exit, identity, snapshot};
 
 fn main() {
+    // CARGO'S RUNNER, NOT THE GATE (2026-09-26): the test stage has cargo run
+    // this binary in place of every test binary, to record how cargo starts
+    // it (`aterm_verify::testrun`). Answered before anything else — no CLI,
+    // no lock, no snapshot — and never as a gate run.
+    let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    if raw
+        .first()
+        .is_some_and(|a| a == aterm_verify::testrun::RECORD_FLAG)
+    {
+        std::process::exit(aterm_verify::testrun::record_main(&raw[1..]));
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let parsed = match cli::parse(args) {
         Ok(a) => a,
@@ -136,12 +147,14 @@ fn main() {
                 .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
         )
         .with_gui_smoke_skipped(parsed.skip_gui_smoke)
+        .with_baseline(parsed.baseline)
         .with_notes(identity::own_output_note(&excluded))
         .in_snapshot_of(snap.caller.clone(), snap.tree.clone(), snap.notes.clone())
         // AFTER the snapshot is chosen, because the git stamp is resolved from the
         // root this run will actually build — and BEFORE any stage runs, because the
         // whole point is that every child of one run is given the same answer.
-        .with_pinned_child_facts(parsed.test_threads);
+        .with_pinned_child_facts(parsed.test_threads)
+        .with_test_jobs(parsed.test_jobs);
     if let Some(gib) = parsed.disk_floor_gib {
         ctx = ctx.with_disk_floor(gib * aterm_verify::disk::GIB);
     }

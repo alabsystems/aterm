@@ -2721,10 +2721,7 @@ impl SettingsApp {
                     return EventResult::Handled;
                 }
                 view.reset_all_confirmation = true;
-                view.feedback = Some(
-                    "Reset all scalar settings? Lists, maps, custom records, and unknown keys stay in aterm.toml."
-                        .to_string(),
-                );
+                view.feedback = Some(RESET_ALL_SCOPE.to_string());
                 cx.repaint(crate::native_app::DamageRegion::All);
                 EventResult::Handled
             }
@@ -3902,6 +3899,9 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
             if let Some(retired) = retired_packages_override(view, key) {
                 return retired;
             }
+            if let Some(old) = old_spelling_override(view, key) {
+                return old;
+            }
             let schema = crate::native_config_language::config_schema_entry(key);
             let retired = crate::native_config_language::retired_config_key(key);
             let compatibility = retired.is_none() && native_compatibility_only_key(key);
@@ -3917,7 +3917,7 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                             )
                         } else {
                             schema.map_or_else(
-                                || "Forward-compatible config key".to_string(),
+                                || "Unknown key".to_string(),
                                 |entry| entry.label.to_string(),
                             )
                         }
@@ -3928,6 +3928,8 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                     || {
                         if compatibility {
                             "No effect in this build · Open Manual…".to_string()
+                        } else if schema.is_none() {
+                            unknown_key_preview(key)
                         } else {
                             manual_override_preview(raw, schema)
                         }
@@ -3983,6 +3985,41 @@ fn retired_packages_override(view: &SettingsViewState, key: &str) -> Option<Manu
         preview: format!("{effect} · Open Manual…"),
         known: true,
         reset_safe: true,
+    })
+}
+
+/// A KEY THIS BUILD STILL READS UNDER AN OLD NAME, on Settings ▸ Modified: `game_font`
+/// (a serde alias of `display_font`) and 0.93.0's `[harness]` approval switches, which
+/// still limit the supervisor unless written `true`
+/// (`aterm_agent::supervise::config::retired_key_note`). Neither has a schema entry, so
+/// without this each fell to "Unknown key · Ignored by this aterm" while Manual says the
+/// old key still applies — two stories about one key, and the false one on a safety
+/// limit. No reset: neither has a schema entry to reset through.
+fn old_spelling_override(view: &SettingsViewState, key: &str) -> Option<ManualOverride> {
+    let (label, effect) = if key == prefs::LEGACY_EDIT_DISPLAY_FONT {
+        let current = view
+            .field_by_key(prefs::EDIT_DISPLAY_FONT)
+            .map_or(prefs::EDIT_DISPLAY_FONT, |field| field.label);
+        (format!("Old spelling of {current}"), "Still applies")
+    } else {
+        let value = view
+            .raw_values
+            .get(key)
+            .and_then(|raw| raw.trim().parse::<bool>().ok());
+        aterm_agent::supervise::config::retired_key_note(key.strip_prefix("harness.")?, value)?;
+        let effect = if value == Some(true) {
+            "No effect"
+        } else {
+            "Still limits approvals"
+        };
+        ("Retired supervisor setting".to_string(), effect)
+    };
+    Some(ManualOverride {
+        key: key.to_string(),
+        label,
+        preview: format!("{effect} · Open Manual…"),
+        known: true,
+        reset_safe: false,
     })
 }
 
@@ -4073,16 +4110,32 @@ fn counted_value_label(singular: &str, plural: &str, count: usize) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
+/// What Reset All asks before it clears anything. The confirm handler clears the
+/// Settings controls' keys (and the retired `[packages]` spellings), never a
+/// Manual-only key (`prefs::manual_only_key`, which covers the lists, maps and
+/// asset paths), a Manual-schema key with no control, a custom record, or an
+/// unknown key.
+const RESET_ALL_SCOPE: &str = "Reset every Settings control to its default? Manual-only keys, lists, maps, custom records, and unknown keys stay.";
+
+/// What Modified says about a key this build does not read. It never echoes
+/// the value, which may be a secret.
+const UNKNOWN_KEY_PREVIEW: &str = "Ignored by this aterm · Open Manual to inspect";
+
+/// The near miss first when there is one — the same one Manual names — because
+/// a typo is the reading that has a fix.
+fn unknown_key_preview(key: &str) -> String {
+    crate::native_config_language::nearest_config_key(key).map_or_else(
+        || UNKNOWN_KEY_PREVIEW.to_string(),
+        |near| format!("Did you mean {near}? · Open Manual to inspect"),
+    )
+}
+
 fn manual_override_preview(
     raw: &str,
     schema: Option<&crate::native_config_language::ConfigSchemaEntry>,
 ) -> String {
     let Some(schema) = schema else {
-        let bytes = raw.len();
-        let noun = if bytes == 1 { "byte" } else { "bytes" };
-        return format!(
-            "Current forward-compatible value · {bytes} {noun} · Open Manual to inspect"
-        );
+        return UNKNOWN_KEY_PREVIEW.to_string();
     };
 
     use crate::native_config_language::ConfigSchemaKind;
@@ -6867,7 +6920,7 @@ fn feedback_bar(
         let visual_lines = [
             (
                 "settings/status/visual",
-                "Reset all scalars?",
+                "Reset every Settings control?",
                 StyleRef::Plain,
             ),
             (
@@ -6882,7 +6935,7 @@ fn feedback_bar(
             ),
             (
                 "settings/status/unknown",
-                "Unknown keys stay.",
+                "Manual-only and unknown keys stay.",
                 StyleRef::Quiet,
             ),
         ];
@@ -6891,10 +6944,7 @@ fn feedback_bar(
         let status = UiNode::new(
             "settings/status",
             UiContent::Group(GroupSpec {
-                label: Some(
-                    "Reset all scalar preferences? Lists and maps stay. Custom records stay. Unknown keys stay."
-                        .to_string(),
-                ),
+                label: Some(RESET_ALL_SCOPE.to_string()),
                 role: SemanticRole::Status,
                 style: StyleRef::Plain,
             }),
@@ -6949,7 +6999,7 @@ fn feedback_bar(
                     UiContent::Button(
                         Control::new(
                             ButtonSpec::new(
-                                "Confirm Reset All of scalar preferences; preserve lists, maps, custom records, and unknown keys",
+                                "Confirm Reset All of settings; preserve lists, maps, custom records, and unknown keys",
                             )
                             .visual_label("Reset All"),
                             ActionId::new("settings/reset-all-confirm"),
@@ -7278,7 +7328,7 @@ fn compact_feedback_parts(
                 UiContent::Button(
                     Control::new(
                         ButtonSpec::new(
-                            "Confirm Reset All of scalar preferences; preserve lists, maps, custom records, and unknown keys",
+                            "Confirm Reset All of settings; preserve lists, maps, custom records, and unknown keys",
                         )
                         .visual_label("Reset"),
                         ActionId::new("settings/reset-all-confirm"),
@@ -7291,9 +7341,8 @@ fn compact_feedback_parts(
         return Some(CompactFeedbackParts {
             status: paint_status(
                 "settings/status",
-                "Reset all scalar preferences? Lists and maps stay. Custom records stay. Unknown keys stay."
-                    .to_string(),
-                "Reset scalars?".to_string(),
+                RESET_ALL_SCOPE.to_string(),
+                "Reset settings?".to_string(),
             ),
             actions: Some(actions),
             action_count: 2,
@@ -9397,7 +9446,7 @@ fn top_music_suppression_reason_for_output(
         && motion.performance_reduced
         && field_bool(state, prefs::EDIT_LOAD_ADAPTIVE_MOTION, true)
     {
-        return Some("On, currently suppressed by adaptive performance mode.");
+        return Some("On, currently suppressed under heavy load.");
     }
     None
 }
@@ -9412,7 +9461,7 @@ fn top_music_suppression_visual(reason: &str) -> &'static str {
         "On, currently silent while this window is unfocused." => "Window unfocused",
         "On, currently suppressed by Motion: Reduced." => "Motion reduced",
         "On, currently suppressed by system Reduce Motion." => "Reduce Motion on",
-        "On, currently suppressed by adaptive performance mode." => "Adaptive limit",
+        "On, currently suppressed under heavy load." => "Heavy load",
         _ => "Music silent",
     }
 }
@@ -9823,7 +9872,7 @@ fn top_section_card(
             "theme",
             "Terminal color theme",
             detail(
-                "Choose terminal colors; the preview is the real aterm renderer.",
+                "Choose terminal colors with a live preview.",
                 "Preview terminal colors.",
             ),
             top_preview(
@@ -9954,13 +10003,13 @@ fn top_section_card(
             "keyword-kitties",
             "Keyword kitties",
             detail(
-                // DISCOVERABILITY (2026-07-24 UX audit): this card was the
-                // ONLY place the whole feature is named, and it mentioned just
-                // one of the three ways a cat appears. The owner reported
+                // DISCOVERABILITY (2026-07-24 UX audit): this card is the
+                // ONLY place the whole feature is named. The owner reported
                 // "writing kitty is suppose to cause the toy kitty to appear …
-                // why!" — a question this sentence now answers up front.
-                "Cats appear beside cat words, ride the cursor when you type \
-                 fast, and come when you type \u{201c}kitty\u{201d}.",
+                // why!" — a typed "kitty" echoes and is decorated like any cat
+                // word, so the sentence says so. The cat on the cursor belongs
+                // to the trail, not to this switch, so it is not claimed here.
+                "Cats appear beside cat words, including a \u{201c}kitty\u{201d} you type.",
                 "Show kitties for cat words.",
             ),
             None,
@@ -10026,7 +10075,10 @@ fn top_settings_landscape_section(
         let preview_row_height = row_height.max(96.0);
         let preview_row = UiNode::new(
             format!("settings/top/landscape/{}", key_fragment(key)),
-            UiContent::Group(GroupSpec::new(format!("{} and live preview", key))),
+            UiContent::Group(GroupSpec::new(format!(
+                "{} and live preview",
+                top_choice_short_title(key, key)
+            ))),
         )
         .layout(
             Layout::row()
@@ -10195,11 +10247,7 @@ fn display_faces_card(
     top_card(
         "display-faces",
         "Display faces — mix up to three",
-        Some(
-            "Toggle up to three faces on and the letters MIX between them \
-             (a fourth bumps the oldest); all off = the regular font. Bundled \
-             display faces, each under an open licence.",
-        ),
+        Some("Turn on up to three to mix them; all off uses your font."),
         None,
         rows,
         width,
@@ -10245,7 +10293,7 @@ fn cursor_kitty_card(
         // have), so every line it keeps is a line the wake row below cannot
         // use, and the picker's own options say pet vs kitty anyway.
         (width != SettingsWidth::Compact)
-            .then_some("The pet walks your line; the plain kitty flies. Off removes the trail."),
+            .then_some("Pets walk your line; the flying kitty flies. Off removes the trail."),
         None,
         rows,
         width,
@@ -10331,7 +10379,7 @@ fn tab_color_page(
     let (card, _height) = top_card(
         "tab-color",
         "Selected-tab color",
-        Some("Exact hex editing lives on the Window page under Chrome."),
+        Some("Exact hex values are set in Manual."),
         None,
         vec![wheel, status, reset],
         width,
@@ -10347,19 +10395,15 @@ fn tab_color_page(
 /// path through the versioned config lane, which re-decodes the image on the
 /// spot); the status line reports the committed path plus the decode verdict;
 /// "Detach" clears the key so every terminal tab returns to the flat theme
-/// background. The legibility dim slider lives on the Appearance page with the
-/// other registered rows (this page points there).
+/// background. The dim and text-tint keys have no Settings row; the hint says
+/// they are set in Manual.
 fn wallpaper_page(
     state: &SettingsViewState,
     width: SettingsWidth,
     viewport: LogicalRect,
 ) -> Vec<UiNode> {
-    const DESCRIPTION: &str = "The picture is cover-scaled to the window and shows through \
-         every cell that carries the default background; selections and colored \
-         backgrounds still paint over it.";
-    const HINT: &str = "Appearance page extras: \"Wallpaper dim\" tones the image toward \
-         the theme background; \"Wallpaper text tint\" colors the text to match the \
-         picture behind it.";
+    const DESCRIPTION: &str = "Selections and colored backgrounds still paint over the picture.";
+    const HINT: &str = "Wallpaper dim and text tint are set in Manual.";
 
     let text_width = settings_card_text_width(viewport, width, SettingsRoute::Wallpaper);
     let mut out = page_heading(
@@ -10608,7 +10652,7 @@ fn top_settings_page(
             } else if cx.motion.serious {
                 "Serious Mode is hiding playful effects. Turning one on disables Serious Mode and keeps the others off."
             } else {
-                "The choices most people actually change. Every control saves immediately."
+                "Every control saves immediately."
             },
         )
     };
@@ -11060,10 +11104,7 @@ fn manual_override_disclosure(
     ordinal: usize,
     total: usize,
 ) -> String {
-    let mut parts = vec![format!(
-        "Manual override {} of {total}; exact TOML preserved",
-        ordinal + 1
-    )];
+    let mut parts = vec![format!("Manual override {} of {total}", ordinal + 1)];
     if let Some(timing) = prefs::application_timing(&authored.key) {
         parts.push(timing.to_string());
     }
@@ -12593,13 +12634,8 @@ fn settings_count_summary(
         "settings"
     };
     if global_search && manual_matches > 0 {
-        let control_noun = if native_total == 1 {
-            "control"
-        } else {
-            "controls"
-        };
         let key_noun = if manual_matches == 1 { "key" } else { "keys" };
-        format!("{native_total} native {control_noun} · {manual_matches} Manual config {key_noun}")
+        format!("{native_total} {setting_noun} · {manual_matches} Manual config {key_noun}")
     } else if width == SettingsWidth::Compact {
         format!("{native_total} {setting_noun}")
     } else {
@@ -12924,9 +12960,9 @@ fn motion_suppression(
     {
         return Some(EffectDisclosure::new(
             EffectNoteKind::Inactive,
-            "Currently inactive because load-adaptive motion shedding is active",
-            "Inactive · Adaptive load limit",
-            "Currently inactive: adaptive performance limit",
+            "Currently inactive under heavy load",
+            "Inactive · Heavy load",
+            "Currently inactive: heavy load",
         ));
     }
     None
@@ -14114,9 +14150,7 @@ fn config_application_projection(
 /// row-label semantic node retain [`prefs::application_timing`] verbatim.
 fn visual_application_timing(key: &str) -> Option<&'static str> {
     prefs::application_timing(key).map(|timing| match timing {
-        "Applies on a fresh launch; an authenticated update handoff preserves the live size" => {
-            "Fresh launch"
-        }
+        "Applies next launch; an update keeps the current size" => "Next launch",
         "Applies next launch" => "Next launch",
         "Applies to new sessions" => "New sessions",
         prefs::HARNESS_TIMING => "Supervision now · launcher: new sessions",
@@ -14217,7 +14251,8 @@ fn smart_title_health_height(
         // 2× Dynamic-Type control instead of clipping both the card and form.
         (1 + smart_title_health_summary_lines(state, fit)) as f32 * line_height + 24.0
     } else {
-        28.0_f32.max(22.0 * scale) + 6.0 * line_height + 24.0
+        let lines = 1 + smart_title_health_copy(state).status_lines().count();
+        28.0_f32.max(22.0 * scale) + lines as f32 * line_height + 24.0
     }
 }
 
@@ -14233,11 +14268,24 @@ struct SmartTitleHealthCopy {
 }
 
 impl SmartTitleHealthCopy {
+    /// The status lines under the headline, in paint order. A slot with nothing
+    /// to report is empty and paints nothing.
+    fn status_lines(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        [
+            ("locality", self.locality.as_str()),
+            ("transport", self.transport.as_str()),
+            ("readiness", self.readiness.as_str()),
+            ("detail", self.detail.as_str()),
+        ]
+        .into_iter()
+        .filter(|(_, text)| !text.is_empty())
+    }
+
     fn compact_summary(&self) -> String {
-        format!(
-            "{}  ·  {}  ·  {}  ·  {}",
-            self.locality, self.transport, self.readiness, self.detail
-        )
+        self.status_lines()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("  ·  ")
     }
 }
 
@@ -14281,8 +14329,7 @@ fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
         );
         let locality = match health.locality {
             TitleSummaryLocality::ManagedLocal => {
-                "Attested runtime closure: every runtime code file passed pinned Apple Developer ID, Ollama code identity, permissions, and stable-identity checks; repeated before context is sent; direct loopback; cloud integration disabled."
-                    .to_string()
+                "Local Ollama, checked before each request; nothing leaves this device.".to_string()
             }
             TitleSummaryLocality::UnattestedLoopback => {
                 "Untrusted localhost: not proof of local-only; explicit network consent required."
@@ -14299,22 +14346,21 @@ fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
             TitleSummaryLocality::NotApplicable
                 if health.provider == crate::app_config::TitleSummaryProvider::Builtin =>
             {
-                "On-device heuristics; no process, model, credential, or network access."
-                    .to_string()
+                "Runs on this device; nothing is sent.".to_string()
             }
             TitleSummaryLocality::NotApplicable => "No provider connection is active.".to_string(),
         };
         let readiness = match health.provider {
             crate::app_config::TitleSummaryProvider::Ollama => {
                 let runtime = if health.managed_install_present {
-                    "managed runtime candidate found (attested before launch)"
+                    "aterm-managed Ollama installed"
                 } else {
-                    "managed runtime absent (no automatic download)"
+                    "aterm-managed Ollama not installed (aterm does not download it)"
                 };
                 let model = if health.model_ready {
-                    "latest request confirmed the configured model"
+                    "model ready"
                 } else {
-                    "latest request has not confirmed model readiness"
+                    "model not confirmed yet"
                 };
                 format!("{runtime}  ·  {model}")
             }
@@ -14324,9 +14370,8 @@ fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
                     |model| format!("Model {model} is provider-hosted; aterm installs nothing."),
                 )
             }
-            crate::app_config::TitleSummaryProvider::Builtin => {
-                "Activity uses the built-in deterministic summarizer.".to_string()
-            }
+            // The headline already names the provider and says Ready.
+            crate::app_config::TitleSummaryProvider::Builtin => String::new(),
             crate::app_config::TitleSummaryProvider::Off => {
                 "Generated Activity is off; an authored Description remains available.".to_string()
             }
@@ -14336,7 +14381,8 @@ fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
             crate::app_config::TitleSummaryProvider::Builtin
                 | crate::app_config::TitleSummaryProvider::Off
         ) {
-            "Transport not used.".to_string()
+            // Nothing is sent, so there is no transport to describe.
+            String::new()
         } else {
             let timeout = health.timeout.map_or_else(
                 || "timeout unknown".to_string(),
@@ -14386,7 +14432,8 @@ fn smart_title_health_copy(state: &SettingsViewState) -> SmartTitleHealthCopy {
                 refresh.as_secs().max(1)
             )
         } else {
-            "No provider error reported.".to_string()
+            // No error and nothing scheduled: the headline carries the state.
+            String::new()
         };
         (
             headline,
@@ -14439,13 +14486,14 @@ fn smart_title_health_card(
     // here could drift from it, and the card would be allocated a height for
     // a different string than the one it paints.
     let summary = copy.compact_summary();
+    let status: Vec<(&'static str, String)> = copy
+        .status_lines()
+        .map(|(key, text)| (key, text.to_string()))
+        .collect();
     let SmartTitleHealthCopy {
         headline,
         headline_style,
-        locality,
-        transport,
-        readiness,
-        detail,
+        ..
     } = copy;
 
     let status_line = |key: &str, text: String, role: SemanticRole, style: StyleRef| {
@@ -14455,7 +14503,7 @@ fn smart_title_health_card(
         )
         .layout(Layout::default().height(Length::Fixed(line_height)))
     };
-    let mut children = if compact {
+    let children = if compact {
         vec![
             status_line("state", headline, SemanticRole::Status, headline_style),
             wrapped_copy_node(
@@ -14470,7 +14518,7 @@ fn smart_title_health_card(
             .0,
         ]
     } else {
-        vec![
+        let mut children = vec![
             UiNode::new(
                 "settings/smart-titles/health/heading",
                 UiContent::Text(TextSpec {
@@ -14481,40 +14529,17 @@ fn smart_title_health_card(
             )
             .layout(Layout::default().height(Length::Fixed(heading_height))),
             status_line("state", headline, SemanticRole::Status, headline_style),
-            status_line(
-                "locality",
-                locality,
-                SemanticRole::Status,
-                StyleRef::Primary,
-            ),
-            status_line(
-                "transport",
-                transport,
-                SemanticRole::Status,
-                StyleRef::Primary,
-            ),
-            status_line(
-                "readiness",
-                readiness,
-                SemanticRole::Status,
-                StyleRef::Primary,
-            ),
-            status_line(
-                "detail",
-                detail,
-                SemanticRole::Status,
-                smart_title_summary_style(state),
-            ),
-        ]
+        ];
+        children.extend(status.into_iter().map(|(key, text)| {
+            let style = if key == "detail" {
+                smart_title_summary_style(state)
+            } else {
+                StyleRef::Primary
+            };
+            status_line(key, text, SemanticRole::Status, style)
+        }));
+        children
     };
-    if !compact {
-        children.push(status_line(
-            "precedence",
-            "Authored Description wins; generated Activity is its fallback.".to_string(),
-            SemanticRole::Text,
-            StyleRef::Quiet,
-        ));
-    }
     UiNode::new(
         "settings/smart-titles/health",
         UiContent::Group(GroupSpec::new("Smart Titles runtime health").style(StyleRef::Secondary)),
@@ -15201,9 +15226,10 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         "Full Disk Access is the single grant macOS offers for this, and it is the only durable \
          answer to the \"access data from other applications\" request: macOS records that answer \
          against one running process and offers no setting of its own for it, so it returns each \
-         time aterm's process is replaced. Measured on this Mac: with the grant held, that request \
-         stopped entirely. Its reach to your Documents, Desktop and Downloads folders, to network \
-         and removable drives, and to sessions that were already open has not been measured here. \
+         time aterm's process is replaced. Measured by aterm on macOS 26.6: with the grant held, \
+         that request stopped entirely. Its reach to your Documents, Desktop and Downloads \
+         folders, to network and removable drives, and to sessions that were already open has \
+         not been measured. \
          Cloud-storage folders, the photo and media libraries and App Management are separate \
          settings this grant does not reach."
     };
@@ -15270,7 +15296,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
                 // claim to Apple's documentation. `fda_coverage_measured` is
                 // still false because it gates five classes at once and only
                 // this one was measured — the arm stays, its sentence changes.
-                rows.push("Other applications' data \u{2014} measured on this Mac: with Full Disk Access held, this request stopped".to_string());
+                rows.push("Other applications' data \u{2014} measured by aterm on macOS 26.6: with Full Disk Access held, this request stopped".to_string());
                 continue;
             }
             rows.push(format!(
@@ -15293,8 +15319,7 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         rows
     };
     let trade = "Full disk access on a terminal is broad: everything you run in aterm could then \
-                 read everything this account can read. The value is that you decide that once, \
-                 knowingly \u{2014} not quietly.";
+                 read everything this account can read.";
     // A HELD GRANT READS DIFFERENTLY FROM A MISSING ONE (2026-09-10). With the
     // coverage measurement unrun, `prompt_possible` stays true after the owner
     // grants Full Disk Access, and the line used to stay byte-identical — so
@@ -15303,10 +15328,10 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
         // The measured half and the unmeasured half, kept apart. Saying only
         // "an interruption cannot be ruled out" to an owner who has just fixed
         // the exact thing they came here to fix reads as "it did not work".
-        "Granted, and measured on this Mac: the \"access data from other applications\" request \
-         stopped. Your Documents, Desktop and Downloads folders, network and removable drives, \
-         and sessions that were already open have not been measured here, so an interruption from \
-         those cannot be ruled out."
+        "Granted. Measured by aterm on macOS 26.6: the \"access data from other applications\" \
+         request stopped. Your Documents, Desktop and Downloads folders, network and removable \
+         drives, and sessions that were already open have not been measured, so an interruption \
+         from those cannot be ruled out."
     } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
     } else {
@@ -15326,9 +15351,8 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
             bundle.display()
         ));
     }
-    let observation = "aterm reports only what its own check observed, never the switch in System \
-                       Settings: a switch that reads on while every check quietly fails is exactly \
-                       the failure worth seeing.";
+    let observation =
+        "This shows what aterm's own check found, never the switch in System Settings.";
     // §3.7's suppression branch. It fires for the identity classes whose grants
     // do not survive a build — and it says what actually happened, which is
     // that a rebuild invalidated them, not that the owner refused anything.
@@ -16424,9 +16448,6 @@ fn setting_row(
         label.push_str("  ·  ");
         label.push_str(&note.visual);
     }
-    if stream_fade_is_conditional {
-        label.push_str("  ·  Focused live output only");
-    }
     let visual_label = if width == SettingsWidth::Compact && settings_text_scale() > 1.25 {
         // At platform-large text the complete provenance/policy string remains
         // on the semantic wrapper. Paint the direct control name so a useful
@@ -17184,39 +17205,10 @@ fn about_page(
         .filter(|(key, _)| !matches!(*key, "tagline" | "author" | "company" | "site"))
         .map(|(key, value)| ((*key).to_string(), value.clone()))
         .collect::<Vec<_>>();
-    let support_rows = vec![
-        (
-            "Project".to_string(),
-            value("site", "Local source checkout"),
-        ),
-        (
-            "Interface".to_string(),
-            if large_type_narrow {
-                "Native tab UI"
-            } else {
-                "Native semantic tab app"
-            }
-            .to_string(),
-        ),
-        (
-            "Capture".to_string(),
-            if large_type_narrow {
-                "App-render pixels"
-            } else {
-                "Exact app-render pixels"
-            }
-            .to_string(),
-        ),
-        (
-            "Accessibility".to_string(),
-            if large_type_narrow {
-                "Native UI tree"
-            } else {
-                "Structured native tree"
-            }
-            .to_string(),
-        ),
-    ];
+    let support_rows = vec![(
+        "Website".to_string(),
+        value("site", "Local source checkout"),
+    )];
     let metadata_value_width = about_metadata_value_width(viewport_width, width);
     // Painted LINES, not facts: a long non-code value (the compiler line)
     // wraps at its " · " separators, and the card must buy that height.
@@ -17232,11 +17224,7 @@ fn about_page(
     } else {
         "BUILD INFORMATION"
     };
-    let support_heading = if large_type_narrow {
-        "SUPPORT"
-    } else {
-        "RUNTIME & SUPPORT"
-    };
+    let support_heading = "PROJECT";
     let build = metadata_card(
         "about/provenance",
         build_heading,
@@ -17304,10 +17292,8 @@ fn about_page(
                 };
                 let heading = if index == 0 {
                     support_heading
-                } else if large_type_narrow {
-                    "SUPPORT · MORE"
                 } else {
-                    "RUNTIME & SUPPORT · CONTINUED"
+                    "PROJECT · CONTINUED"
                 };
                 let height = ABOUT_METADATA_CARD_PADDING * 2.0
                     + metadata_heading_height
@@ -17327,7 +17313,7 @@ fn about_page(
                 // The ordinary compact support card stacks full-width prose.
                 // At maximum Dynamic Type that card is taller than the exact
                 // phone section budget; the responsive metadata card keeps the
-                // same four facts complete and elides only their paint labels.
+                // same fact complete and elides only its paint label.
                 support
             } else {
                 compact_about_support(about)
@@ -17472,10 +17458,8 @@ fn about_page(
                 };
                 let heading = if index == 0 {
                     support_heading
-                } else if large_type_narrow {
-                    "SUPPORT \u{00b7} MORE"
                 } else {
-                    "RUNTIME & SUPPORT \u{00b7} CONTINUED"
+                    "PROJECT \u{00b7} CONTINUED"
                 };
                 sections.push(chunk_card(key, heading, rows));
             }
@@ -17497,11 +17481,7 @@ fn about_page(
         ];
     }
     state.record_result_page_limit(0);
-    let mut out = vec![hero, details];
-    if width == SettingsWidth::Wide && viewport_height >= 840.0 {
-        out.push(about_principles());
-    }
-    out
+    vec![hero, details]
 }
 
 fn compact_about_support(about: &AboutState) -> UiNode {
@@ -17537,13 +17517,15 @@ fn compact_about_support(about: &AboutState) -> UiNode {
             .layout(Layout::default().height(Length::Fixed(21.0))),
         ])
     };
+    let heading_height = 20.0_f32.max(16.0 * settings_text_scale());
     UiNode::new(
         "about/support",
-        UiContent::Group(GroupSpec::new("Runtime & support").style(StyleRef::Secondary)),
+        UiContent::Group(GroupSpec::new("Project").style(StyleRef::Secondary)),
     )
     .layout(
         Layout::column()
-            .height(Length::Fixed(230.0_f32.max(190.0 * settings_text_scale())))
+            // Padding, the heading, one gap and the one 40pt row.
+            .height(Length::Fixed(24.0 + heading_height + 6.0 + 40.0))
             .padding(Insets::all(12.0))
             .gap(6.0),
     )
@@ -17551,100 +17533,13 @@ fn compact_about_support(about: &AboutState) -> UiNode {
         UiNode::new(
             "about/support/heading",
             UiContent::Text(TextSpec {
-                text: "RUNTIME & SUPPORT".to_string(),
+                text: "PROJECT".to_string(),
                 role: SemanticRole::Heading,
                 style: StyleRef::Quiet,
             }),
         )
-        .layout(
-            Layout::default().height(Length::Fixed(20.0_f32.max(16.0 * settings_text_scale()))),
-        ),
-        row("project", "Project", site.to_string()),
-        row(
-            "interface",
-            "Interface",
-            "Native semantic tab app".to_string(),
-        ),
-        row("capture", "Capture", "Exact app-render pixels".to_string()),
-        row(
-            "accessibility",
-            "Accessibility",
-            "Structured native tree".to_string(),
-        ),
-    ])
-}
-
-fn about_principles() -> UiNode {
-    let principles = [
-        (
-            "one-surface",
-            "ONE SURFACE",
-            "One tab system for terminals, tools, and documents.",
-        ),
-        (
-            "visible-state",
-            "VISIBLE STATE",
-            "One structured model drives pixels and accessibility.",
-        ),
-        (
-            "native-default",
-            "NATIVE BY DEFAULT",
-            "Keyboard speed meets native window behavior.",
-        ),
-    ];
-    UiNode::new(
-        "about/principles",
-        UiContent::Group(GroupSpec::new("aterm design principles").style(StyleRef::Secondary)),
-    )
-    .layout(
-        Layout::column()
-            .height(Length::Fixed(140.0))
-            .padding(Insets::all(18.0))
-            .gap(10.0),
-    )
-    .children(vec![
-        UiNode::new(
-            "about/principles-heading",
-            UiContent::Text(TextSpec {
-                text: "WHY ATERM".to_string(),
-                role: SemanticRole::Heading,
-                style: StyleRef::Quiet,
-            }),
-        )
-        .layout(Layout::default().height(Length::Fixed(22.0))),
-        UiNode::new(
-            "about/principles-grid",
-            UiContent::Group(GroupSpec::new("Design principle summaries")),
-        )
-        .layout(Layout::row().height(Length::Fill).gap(22.0))
-        .children(
-            principles
-                .into_iter()
-                .map(|(key, heading, detail)| {
-                    UiNode::new(
-                        format!("about/principle/{key}"),
-                        UiContent::Group(GroupSpec::new(heading)),
-                    )
-                    .layout(Layout::column().width(Length::Fill).gap(4.0))
-                    .children(vec![
-                        UiNode::new(
-                            format!("about/principle/{key}/heading"),
-                            UiContent::Text(TextSpec::heading(heading)),
-                        )
-                        .layout(Layout::default().height(Length::Fixed(24.0))),
-                        UiNode::new(
-                            format!("about/principle/{key}/detail"),
-                            UiContent::Text(TextSpec {
-                                text: detail.to_string(),
-                                role: SemanticRole::Text,
-                                style: StyleRef::Quiet,
-                            }),
-                        )
-                        .layout(Layout::default().height(Length::Fixed(42.0))),
-                    ])
-                })
-                .collect(),
-        ),
+        .layout(Layout::default().height(Length::Fixed(heading_height))),
+        row("website", "Website", site.to_string()),
     ])
 }
 
@@ -20497,7 +20392,7 @@ const MESSAGES_TAGS_ALL: &str = "settings/messages/filter/tags-all";
 
 /// The caption under the "Explain heavy load" switch (design ruling 262).
 const MESSAGES_EXPLAIN_LOAD_CAPTION: &str =
-    "Show a line on the band when the Mac is too busy to keep up.";
+    "Show a message when this computer is too busy to keep up.";
 
 /// A collapsed entry: one line, 30·s pt (design ruling 262).
 fn messages_row_height() -> f32 {
@@ -20552,7 +20447,7 @@ fn messages_visible<'a>(
 /// only what it told you. One line at every width (it fits the 286.5 pt phone
 /// page, `page_subtitles_fit_compact_and_minimum_medium_content_measure`).
 fn messages_page_subtitle(_width: SettingsWidth) -> &'static str {
-    "Everything aterm reported, newest first."
+    "What aterm reported, newest first."
 }
 
 /// The count line's words: `42 messages`, or `12 of 42` under a filter. The
@@ -23826,13 +23721,13 @@ fn settings_fields_subtitle(
     modified_only: bool,
 ) -> &'static str {
     if global_search && width == SettingsWidth::Compact {
-        "Controls and Manual config keys."
+        "Settings and Manual keys."
     } else if global_search {
-        "Native controls and matching Manual keys."
+        "Matching settings and Manual keys."
     } else if modified_only && width == SettingsWidth::Compact {
-        "Native and Manual overrides."
+        "Settings you changed."
     } else if modified_only {
-        "Edit native overrides here; Manual entries stay listed separately."
+        "Settings you changed, including Manual-only keys."
     } else {
         route_subtitle(route, width)
     }
@@ -23841,18 +23736,18 @@ fn settings_fields_subtitle(
 fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
     if width == SettingsWidth::Compact {
         return match route {
-            SettingsRoute::Appearance => "Theme, color, contrast, and selection.",
+            SettingsRoute::Appearance => "Colors, contrast, and selection.",
             SettingsRoute::TextFonts => "Fonts, display faces, shaping, and glyphs.",
             // Names SOUND: the Sound menu lives on this page now, and a
             // subtitle that promises only "visual trails" hides it.
             SettingsRoute::CursorMotion => "Cursor, motion, trails, and sound.",
             SettingsRoute::CursorKitty => "Your cursor's cat.",
-            SettingsRoute::WindowTabs => "Padding, chrome, and Smart Titles.",
+            SettingsRoute::WindowTabs => "Padding, restore, and title status.",
             SettingsRoute::TabColor => "Any color for your selected tab.",
             SettingsRoute::Wallpaper => "An image behind every terminal tab.",
             SettingsRoute::KeyboardInput => "Keyboard, paste safety, and local echo.",
-            SettingsRoute::Terminal => "Shell, scrollback, protocols, and sessions.",
-            SettingsRoute::Security => "Permissions and containment.",
+            SettingsRoute::Terminal => "Scrollback and text direction.",
+            SettingsRoute::Security => "Permissions and privacy.",
             SettingsRoute::Home
             | SettingsRoute::Modified
             | SettingsRoute::Manual
@@ -23863,30 +23758,25 @@ fn route_subtitle(route: SettingsRoute, width: SettingsWidth) -> &'static str {
         };
     }
     match route {
-        SettingsRoute::Appearance => "Theme, color, contrast, and selection behavior.",
+        SettingsRoute::Appearance => "Colors, contrast, selection, and Matrix rain.",
         SettingsRoute::TextFonts => {
             "Typography, bundled display faces, shaping, fallback, and glyph rendering."
         }
-        SettingsRoute::CursorMotion => {
-            "Cursor form, motion policy, visual trails, and every sound aterm makes."
-        }
+        SettingsRoute::CursorMotion => "Cursor, motion, trail intensity, and sound.",
         // The second clause was "and how far its rainbow wake reaches" — the
         // page's promise of the `cursor_trail_wake_ms` dial, retired 2026-09-16
         // because nothing read it. A subtitle that describes a control the page
-        // does not have is the same defect as the control itself.
-        SettingsRoute::CursorKitty => {
-            "The companion that walks your line, and the art it walks it with."
-        }
-        SettingsRoute::WindowTabs => {
-            "Window geometry, title and Description formatting, live Activity, and chrome."
-        }
+        // does not have is the same defect as the control itself. The "art"
+        // clause went for the same reason: `cursor_nyan_sprite` is Manual-only.
+        SettingsRoute::CursorKitty => "The companion that walks your line.",
+        SettingsRoute::WindowTabs => "Window padding, session restore, and Smart Titles status.",
         SettingsRoute::TabColor => "A free-pick spectrum for the selected tab's color.",
         SettingsRoute::Wallpaper => {
             "A picture behind every terminal tab; settings and other app tabs stay plain."
         }
         SettingsRoute::KeyboardInput => "Keyboard, clipboard, paste safety, and local echo.",
-        SettingsRoute::Terminal => "Shell, scrollback, terminal protocols, and session behavior.",
-        SettingsRoute::Security => "Explicit permissions and containment policy.",
+        SettingsRoute::Terminal => "Scrollback, search depth, text direction, and character width.",
+        SettingsRoute::Security => "Program permissions and privacy.",
         SettingsRoute::Home
         | SettingsRoute::Modified
         | SettingsRoute::Manual
@@ -24215,22 +24105,20 @@ mod tests {
         );
         assert_eq!(
             settings_count_summary(1, 1, true, SettingsWidth::Wide),
-            "1 native control · 1 Manual config key"
+            "1 setting · 1 Manual config key"
         );
         assert_eq!(
             settings_count_summary(2, 3, true, SettingsWidth::Compact),
-            "2 native controls · 3 Manual config keys"
+            "2 settings · 3 Manual config keys"
         );
         assert_eq!(counted_value_label("entry", "entries", 0), "0 entries");
         assert_eq!(counted_value_label("entry", "entries", 1), "1 entry");
         assert_eq!(counted_value_label("entry", "entries", 2), "2 entries");
+        assert_eq!(manual_override_preview("1", None), UNKNOWN_KEY_PREVIEW);
+        assert_eq!(manual_override_preview("12", None), UNKNOWN_KEY_PREVIEW);
         assert_eq!(
-            manual_override_preview("1", None),
-            "Current forward-compatible value · 1 byte · Open Manual to inspect"
-        );
-        assert_eq!(
-            manual_override_preview("12", None),
-            "Current forward-compatible value · 2 bytes · Open Manual to inspect"
+            unknown_key_preview("scrollback_lnies"),
+            "Did you mean scrollback_lines? · Open Manual to inspect"
         );
     }
 
@@ -25627,7 +25515,7 @@ mod tests {
                 },
                 true,
             ),
-            Some("On, currently suppressed by adaptive performance mode.")
+            Some("On, currently suppressed under heavy load.")
         );
         assert_eq!(
             top_music_suppression_reason_for_output(
@@ -27237,7 +27125,10 @@ mod tests {
                 // for: the claim stops at the OBSERVING HOST. It may not be
                 // stated for adopted sessions, which is what the `responsible`
                 // assertion below still pins.
-                assert!(app_data.contains("measured on this Mac"), "{app_data}");
+                assert!(
+                    app_data.contains("measured by aterm on macOS 26.6"),
+                    "{app_data}"
+                );
                 assert!(
                     !app_data.contains("Apple-documented"),
                     "a measurement is no longer reported as documentation: {app_data}"
@@ -28718,11 +28609,13 @@ mod tests {
         assert!(label("transport").contains("42s timeout"));
         assert!(label("transport").contains("direct connection (forced)"));
         assert!(label("transport").contains("TLS/CA not used"));
-        assert!(label("readiness").contains("no automatic download"));
-        assert!(label("readiness").contains("latest request has not confirmed model readiness"));
+        assert!(
+            label("readiness")
+                .contains("aterm-managed Ollama not installed (aterm does not download it)")
+        );
+        assert!(label("readiness").contains("model not confirmed yet"));
         assert!(label("detail").contains("managed runtime is not installed"));
         assert!(label("detail").contains("Error retry"));
-        assert!(label("precedence").contains("Authored Description wins"));
 
         {
             let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -28773,14 +28666,7 @@ mod tests {
             let keys = if height <= 420.0 {
                 vec!["state", "summary"]
             } else {
-                vec![
-                    "state",
-                    "locality",
-                    "transport",
-                    "readiness",
-                    "detail",
-                    "precedence",
-                ]
+                vec!["state", "locality", "transport", "readiness", "detail"]
             };
             for key in keys {
                 let node = compact
@@ -35099,16 +34985,11 @@ mod tests {
             .compile(wide.viewport)
             .unwrap();
         let hero = about.semantic(&UiKey::new("about/hero")).unwrap();
-        assert!(
-            about.semantic(&UiKey::new("about/principles")).is_none(),
-            "the short viewport keeps every shown card whole"
-        );
         // WHETHER THIS VIEWPORT STACKS OR PAGES IS THE CONTENT'S DECISION, and
         // it sits right on the line: hero 238 + gap 12 + card 346 = 596 against
         // 594 of content. TWO POINTS. It stacked until `about_fields` learned to
         // name the running copy and, when a second install exists, the other one
-        // — 64pt of new facts. The page concedes by paging, the same ladder it
-        // already walks when it drops `about/principles` at short heights.
+        // — 64pt of new facts. The page concedes by paging.
         //
         // `hero.rect.y <= 40` and "details sit below the hero" together say ONE
         // thing: this viewport does not paginate. That was an arithmetic
@@ -35209,8 +35090,8 @@ mod tests {
         assert!(
             tall_about
                 .semantic(&UiKey::new("about/principles"))
-                .is_some(),
-            "large windows use the extra vertical measure intentionally"
+                .is_none(),
+            "About carries facts about this copy, not design principles"
         );
 
         let compact_about_cx = view_cx_at(474.0, 658.0);
@@ -35425,15 +35306,13 @@ mod tests {
                     );
                 }
             }
-            for label in ["Project", "Interface", "Capture", "Accessibility"] {
-                let key = format!("about/support/row/{}", key_fragment(label));
-                if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
-                    seen.insert(key, node.rect.height);
-                    assert!(
-                        node.rect.bottom() <= cx.viewport.bottom() + 0.01,
-                        "Support row {label} on page {page} extends past the viewport"
-                    );
-                }
+            let key = format!("about/support/row/{}", key_fragment("Website"));
+            if let Some(node) = tree.semantic(&UiKey::new(key.clone())) {
+                seen.insert(key, node.rect.height);
+                assert!(
+                    node.rect.bottom() <= cx.viewport.bottom() + 0.01,
+                    "Support row Website on page {page} extends past the viewport"
+                );
             }
         }
         let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
@@ -35464,16 +35343,14 @@ mod tests {
                 height,
             );
         }
-        for label in ["Project", "Interface", "Capture", "Accessibility"] {
-            let key = format!("about/support/row/{}", key_fragment(label));
-            let height = seen.get(&key).copied().unwrap_or_else(|| {
-                panic!("missing complete Medium support metadata {key} on every page")
-            });
-            assert!(
-                height >= 28.0,
-                "Support row {key} collapsed to {height:.1}pt (rows are 28pt)"
-            );
-        }
+        let key = format!("about/support/row/{}", key_fragment("Website"));
+        let height = seen.get(&key).copied().unwrap_or_else(|| {
+            panic!("missing complete Medium support metadata {key} on every page")
+        });
+        assert!(
+            height >= 28.0,
+            "Support row {key} collapsed to {height:.1}pt (rows are 28pt)"
+        );
         let previous = details
             .hits
             .iter()
@@ -39826,15 +39703,15 @@ mod tests {
         let status = confirmation
             .semantic(&UiKey::new("settings/status"))
             .expect("scope disclosure");
-        assert_eq!(
-            status.label,
-            "Reset all scalar preferences? Lists and maps stay. Custom records stay. Unknown keys stay."
-        );
+        assert_eq!(status.label, RESET_ALL_SCOPE);
         for (key, preserved) in [
-            ("settings/status/visual", "Reset all scalars?"),
+            ("settings/status/visual", "Reset every Settings control?"),
             ("settings/status/collections", "Lists and maps stay."),
             ("settings/status/records", "Custom records stay."),
-            ("settings/status/unknown", "Unknown keys stay."),
+            (
+                "settings/status/unknown",
+                "Manual-only and unknown keys stay.",
+            ),
         ] {
             assert!(
                 confirmation.semantic(&UiKey::new(key)).is_none(),
@@ -42446,7 +42323,7 @@ mod tests {
             "On, currently silent while this window is unfocused.",
             "On, currently suppressed by Motion: Reduced.",
             "On, currently suppressed by system Reduce Motion.",
-            "On, currently suppressed by adaptive performance mode.",
+            "On, currently suppressed under heavy load.",
         ] {
             let compiled = UiTree::new(top_music_suppression_node(reason))
                 .compile(LogicalRect::new(0.0, 0.0, 234.5, page_subtitle_height()))
@@ -42524,7 +42401,7 @@ mod tests {
                     .semantic(&UiKey::new("settings/status"))
                     .unwrap()
                     .label,
-                "Reset all scalar preferences? Lists and maps stay. Custom records stay. Unknown keys stay."
+                RESET_ALL_SCOPE
             );
 
             let (mut runtime, instance, view) = setup();
@@ -43561,6 +43438,41 @@ theme = "Nord"
     }
 
     #[test]
+    fn modified_calls_a_key_this_build_still_reads_by_what_it_does_not_unknown() {
+        let source = "game_font = \"pixel\"\n[harness]\napprove_all = false\nauto_reads = true\n";
+        let snapshot = VersionedConfigService::new(source.to_string())
+            .unwrap()
+            .snapshot();
+        let state = SettingsViewState::from_snapshot(&snapshot).unwrap();
+        let overrides = authored_manual_overrides(&state);
+        let row = |key: &str| {
+            overrides
+                .iter()
+                .find(|entry| entry.key == key)
+                .unwrap_or_else(|| panic!("{key} has a Modified row"))
+        };
+
+        let font = row(prefs::LEGACY_EDIT_DISPLAY_FONT);
+        assert_eq!(font.label, "Old spelling of Display face");
+        assert_eq!(font.preview, "Still applies · Open Manual…");
+        assert!(font.known && !font.reset_safe);
+
+        let limit = row("harness.approve_all");
+        assert_eq!(limit.label, "Retired supervisor setting");
+        assert_eq!(limit.preview, "Still limits approvals · Open Manual…");
+        assert!(limit.known && !limit.reset_safe);
+
+        let inert = row("harness.auto_reads");
+        assert_eq!(inert.preview, "No effect · Open Manual…");
+        assert!(
+            overrides
+                .iter()
+                .all(|entry| entry.preview != UNKNOWN_KEY_PREVIEW),
+            "a key this build reads is never called ignored"
+        );
+    }
+
+    #[test]
     fn modified_manual_previews_are_typed_bounded_and_do_not_echo_unknown_values() {
         let secret = "do-not-render-this-forward-compatible-secret";
         let source = format!(
@@ -43583,8 +43495,8 @@ theme = "Nord"
         let unknown = overrides
             .iter()
             .find(|entry| entry.key == "future_secret")
-            .expect("forward-compatible override");
-        assert!(unknown.preview.contains("forward-compatible value"));
+            .expect("unknown-key override");
+        assert_eq!(unknown.label, "Unknown key");
         assert!(unknown.preview.contains("Open Manual to inspect"));
         assert!(!unknown.preview.contains(secret));
 
@@ -44910,7 +44822,7 @@ enabled = true
             ("Window padding", "padding"),
             ("Paste safety", "paste"),
             ("Keyboard", "Predictive echo"),
-            ("Scrollback", "Searchable lines"),
+            ("Scrollback", "Searchable scrollback lines"),
             ("Text direction & width", "right-to-left"),
             ("Permissions", "request access"),
             // The This Mac box must say the second way its rows apply — the
@@ -45000,7 +44912,7 @@ enabled = true
             let expected_timing = if key == prefs::EDIT_GPU {
                 "Applies next launch"
             } else {
-                "Applies on a fresh launch; an authenticated update handoff preserves the live size"
+                "Applies next launch; an update keeps the current size"
             };
             let (index, field) = state
                 .legacy
@@ -46286,7 +46198,7 @@ enabled = true
                     performance_reduced: true,
                     ..crate::native_app::ViewMotionCx::default()
                 },
-                "Adaptive load limit",
+                "Heavy load",
             ),
             (
                 "motion = \"full\"\ncursor_trail = true\n",
@@ -47834,7 +47746,7 @@ enabled = true
     #[test]
     fn keyboard_safety_footnote_is_fully_painted_on_desktop_and_compact_pages() {
         let expected = prefs::group_footnote("Keyboard").unwrap();
-        let warning = "Manual's Always mode is unsafe at prompts.";
+        let warning = "Always, set in Manual, can show a password.";
         for (variant, viewport_width, viewport_height) in
             [("desktop", 1_224.0, 722.0), ("compact", 568.0, 658.0)]
         {
@@ -48363,7 +48275,7 @@ enabled = true
         let range = compiled
             .semantic(&UiKey::new("settings/results-range"))
             .expect("search results always disclose their visible window");
-        assert_eq!(range.label, "2 native controls · 9 Manual config keys");
+        assert_eq!(range.label, "2 settings · 9 Manual config keys");
         // Later pages keep the classic one-result-per-step window (the audit
         // found only page 1 broken).
         runtime
@@ -48457,7 +48369,9 @@ enabled = true
     ///
     /// The first two were never a compact-layout property: [`page_insets`]
     /// caps the content column at [`page_maximum`]'s 720 in EVERY width class,
-    /// so they were unreadable at every window size. The renderer's own fit
+    /// so they were unreadable at every window size. (Both are one short line
+    /// now; the wrap path stays, and this still proves nothing is elided.) The
+    /// renderer's own fit
     /// audit is the judge — `overflow=true` is the painter reporting that it
     /// elided — and the complete sentence has to survive on the semantic label
     /// as well as on glass.
@@ -48475,12 +48389,9 @@ enabled = true
             for (key, tail) in [
                 (
                     "settings/top/wallpaper/description",
-                    "selections and colored backgrounds still paint over it.",
+                    "still paint over the picture.",
                 ),
-                (
-                    "settings/wallpaper/hint",
-                    "colors the text to match the picture behind it.",
-                ),
+                ("settings/wallpaper/hint", "are set in Manual."),
             ] {
                 let label = compiled
                     .semantic(&UiKey::new(key))
@@ -48492,10 +48403,6 @@ enabled = true
                     "{context}: {key} keeps its whole sentence: {label}"
                 );
                 let painted = painted_copy_lines(&compiled, key);
-                assert!(
-                    painted.len() > 1,
-                    "{context}: {key} does not fit one line and must wrap: {painted:?}"
-                );
                 assert!(
                     painted.iter().all(|line| !line.contains('…')),
                     "{context}: {key} paints no ellipsis: {painted:?}"
@@ -48524,14 +48431,10 @@ enabled = true
         assert_zero_top_paint(&compiled, "Window at 744×420");
         let painted = painted_copy_lines(&compiled, SUMMARY);
         assert!(
-            painted.len() > 1,
-            "the consolidated row does not fit one line and must wrap: {painted:?}"
-        );
-        assert!(
             painted
                 .last()
-                .is_some_and(|line| line.ends_with("No provider error reported.")),
-            "the clause saying whether anything is wrong reaches glass: {painted:?}"
+                .is_some_and(|line| line.ends_with("nothing is sent.")),
+            "the whole consolidated row reaches glass: {painted:?}"
         );
         assert!(
             painted.iter().all(|line| !line.contains('…')),
@@ -48552,10 +48455,12 @@ enabled = true
         assert!(state.replace_title_summary_health(failing));
         let compiled = settings_route_at(&state, &cx);
         let painted = painted_copy_lines(&compiled, SUMMARY);
+        // Joined: the error may wrap across lines; it must not be clipped.
         assert!(
             painted
-                .iter()
-                .any(|line| line.contains("managed runtime is not installed")),
+                .join(" ")
+                .contains("managed runtime is not installed")
+                && painted.iter().all(|line| !line.contains('…')),
             "the error text the Danger colour is about reaches glass: {painted:?}"
         );
     }

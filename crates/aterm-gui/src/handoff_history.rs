@@ -77,6 +77,15 @@
 //!   its limit keeps up to one ring (1,000 lines) fewer than the outgoing
 //!   process held until new output refills the ring.
 //!
+//! A SUCCESSOR'S HANDOFF POLICY that carries no scrollback (`carry =
+//! "visible"` or `"repaint"`, `aterm_update_core::handoff_policy`) is followed
+//! here too, not only by the screen carry: under such a ceiling nothing is
+//! exported ([`HistoryPlan::Withheld`] — the launched lane does not start its
+//! export when it already knows the policy, and its park stops one it started
+//! before it did, removing every sidecar), no sidecar is named, and the join
+//! COUNTS every line the park saw as left behind, said as the policy's
+//! ([`Fallback::Withheld`]). A `full` ceiling is the carry above, unchanged.
+//!
 //! The sidecar is in NEITHER adoption-proof digest and no schema moved: an
 //! older successor skips the record keys and adopts exactly as before (the
 //! outgoing process retires the unread sidecar), and an older outgoing
@@ -108,6 +117,7 @@ use std::time::Duration;
 use aterm_core::grid::{HistoryFence, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal};
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::{Terminal, TerminalCheckpoint};
+use aterm_update_core::handoff_policy::CarryCeiling;
 
 /// The sidecar's first bytes. The version is in the magic: a successor that
 /// does not know it drops the sidecar (and counts its lines).
@@ -394,6 +404,10 @@ pub(crate) struct ExportResults {
     /// The exporter had not finished when asked: the sessions it had not
     /// reached carry today's bounded history, counted.
     pub(crate) unfinished: bool,
+    /// Nothing was exported because the successor's handoff policy carries no
+    /// scrollback ([`HistoryPlan::Withheld`]): the join's "not exported" is
+    /// the policy's, and says so ([`Fallback::Withheld`]).
+    pub(crate) withheld: bool,
 }
 
 /// The outgoing process's export worker — see the module doc. Dropping it
@@ -434,6 +448,16 @@ pub(crate) enum HistoryPlan {
     /// done — never beside the park, where its chunk reads would contend with
     /// the capture's and the layout's terminal locks.
     Deferred(Vec<(u64, Arc<Mutex<Terminal>>)>),
+    /// The successor's signed handoff policy carries NO scrollback (a `carry`
+    /// ceiling of `"visible"` or `"repaint"`,
+    /// [`CarryCeiling::carries_scrollback`]): nothing is exported — an export
+    /// the launched lane started before it had read the policy is stopped,
+    /// and every sidecar it wrote removed — and no sidecar is named. The join
+    /// still runs over the park's heads, so each session's lines that do not
+    /// cross (all of them, the screen carrying none under such a ceiling) are
+    /// COUNTED on its record like any other loss, said as the policy's
+    /// ([`Fallback::Withheld`]).
+    Withheld,
 }
 
 impl std::fmt::Debug for HistoryPlan {
@@ -442,16 +466,54 @@ impl std::fmt::Debug for HistoryPlan {
             Self::Unexported => formatter.write_str("Unexported"),
             Self::Exported(export) => formatter.debug_tuple("Exported").field(export).finish(),
             Self::Deferred(sessions) => write!(formatter, "Deferred({} sessions)", sessions.len()),
+            Self::Withheld => formatter.write_str("Withheld"),
         }
     }
 }
 
 impl HistoryPlan {
+    /// THE FORK LANE'S PLAN, under the ceiling its park was taken under:
+    /// [`Self::Withheld`] when that ceiling carries no scrollback (and
+    /// `sessions` is never asked), else the handed sessions to export on the
+    /// worker once the capture is done ([`Self::Deferred`]), or
+    /// [`Self::Unexported`] when `sessions` has none to give (a rollback, no
+    /// control dir). The fork lane's ceiling is the one its worker holds the
+    /// policy to: a policy read after the park that asks for less refuses the
+    /// whole capture before this plan runs.
+    pub(crate) fn deferred_under(
+        ceiling: CarryCeiling,
+        sessions: impl FnOnce() -> Option<Vec<(u64, Arc<Mutex<Terminal>>)>>,
+    ) -> Self {
+        if !ceiling.carries_scrollback() {
+            return Self::Withheld;
+        }
+        sessions().map_or(Self::Unexported, Self::Deferred)
+    }
+
+    /// THE LAUNCHED LANE'S PLAN, under the ceiling its park read the policy
+    /// at: the export that ran beside the launch ([`Self::Exported`]), or
+    /// [`Self::Unexported`] without one — and [`Self::Withheld`] when that
+    /// ceiling carries no scrollback, `export` dropped here, which stops its
+    /// worker and removes every sidecar it wrote. (The park gate already
+    /// stops such an export before it waits on it; this is the last word, so
+    /// no export can reach the worker past a ceiling that forbids it.)
+    pub(crate) fn exported_under(ceiling: CarryCeiling, export: Option<HistoryExporter>) -> Self {
+        if !ceiling.carries_scrollback() {
+            drop(export);
+            return Self::Withheld;
+        }
+        export.map_or(Self::Unexported, Self::Exported)
+    }
+
     /// What the export produced, as the worker's join takes it (see the
     /// variants for when each runs).
     pub(crate) fn results(self, dir: &Path) -> ExportResults {
         match self {
             Self::Unexported => ExportResults::default(),
+            Self::Withheld => ExportResults {
+                withheld: true,
+                ..ExportResults::default()
+            },
             // Stopped at the park already; this collects what it finished.
             Self::Exported(export) => export.finish(Duration::ZERO),
             Self::Deferred(sessions) => {
@@ -946,6 +1008,9 @@ pub(crate) enum Fallback {
     /// More output arrived between the export and the park than the
     /// checkpoint carries, so the two do not meet.
     Outrun,
+    /// The successor's signed handoff policy carries no scrollback
+    /// ([`HistoryPlan::Withheld`]): nothing was exported, by request.
+    Withheld,
 }
 
 impl Fallback {
@@ -956,6 +1021,7 @@ impl Fallback {
             Self::NotExported => "its history was not exported before the park",
             Self::FenceMoved => "its history was rewrapped, cleared or reset after the export",
             Self::Outrun => "more output arrived after the export than the screen carry holds",
+            Self::Withheld => "the successor's handoff policy carries no scrollback",
         }
     }
 }
@@ -1058,6 +1124,11 @@ pub(crate) fn stamp_manifest(
             head.fence,
             carried_history(checkpoint),
         );
+        // A withheld plan exported nothing, so every session it left lines
+        // behind for is "not exported" — at the policy's request, and said so.
+        if results.withheld && joined.fallback == Some(Fallback::NotExported) {
+            joined.fallback = Some(Fallback::Withheld);
+        }
         if joined.take > 0
             && let Some(export) = export
         {
@@ -1115,8 +1186,25 @@ pub(crate) fn log_verdicts(verdicts: &[(u64, Joined)]) {
             carried.join(" ")
         );
     }
+    // The policy's withholding is one decision, said once: which tabs, and how
+    // many lines stay behind in each.
+    let withheld: Vec<String> = verdicts
+        .iter()
+        .filter(|(_, joined)| joined.fallback == Some(Fallback::Withheld) && joined.dropped > 0)
+        .map(|(id, joined)| format!("{id}:{}", joined.dropped))
+        .collect();
+    if !withheld.is_empty() {
+        aterm_log::info!(
+            "update apply: {}, so no tab's scrollback crosses; {} tab(s) leave theirs behind, \
+             counted (status history_lost=; session:lines {})",
+            Fallback::Withheld.words(),
+            withheld.len(),
+            withheld.join(" ")
+        );
+    }
     for (local_id, joined) in verdicts {
         match joined.fallback {
+            Some(Fallback::Withheld) => {}
             Some(why) if joined.dropped > 0 => aterm_log::warn!(
                 "update apply: session {local_id} carries the screen carry's bounded history — \
                  {}; {} line(s) of its scrollback stay behind, counted (status history_lost=)",

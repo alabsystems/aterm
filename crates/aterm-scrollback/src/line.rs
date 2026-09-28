@@ -509,6 +509,30 @@ impl Line {
         self.hyperlinks.as_deref().map(SmallVec::as_slice)
     }
 
+    /// Drop every hyperlink span, and nothing else: the text, the attrs, the
+    /// flags (`WRAPPED` included), the underline colours and the images stay
+    /// exactly as they were, so the line reads and renders the same with no
+    /// link under it.
+    ///
+    /// Why this exists: a self-update carries each screen line as one record
+    /// whose size the wire bounds (`16 KiB + cols * 512` bytes), and a line of
+    /// a few OSC 8 links with 8 KiB URLs is past that bound on its own. With
+    /// no way to drop only the links, the producer's one answer was to carry
+    /// that whole screen blank (the 2026-09-22/23 update audit, plan P2-4);
+    /// with it, only the link destinations of that one line are lost. The
+    /// cleared line serializes exactly like a line that never had a link
+    /// (`hyperlinks` goes back to `None`, not an empty vector), so the result
+    /// is canonical on the wire.
+    ///
+    /// ENSURES: !self.has_hyperlinks()
+    // Skip: the residual row is drop glue for the replaced Option<Box<SmallVec>>
+    // sidecar (std/alloc internals through SmallVec — the drop-glue lane), as
+    // for `set_underline_colors`. Field replacement only; unit-tested.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn clear_hyperlinks(&mut self) {
+        self.hyperlinks = None;
+    }
+
     /// Get the underline-colour spans (SGR 58), if any.
     #[must_use]
     #[inline]

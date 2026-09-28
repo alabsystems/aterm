@@ -15,28 +15,41 @@
 //! docs and the usage below now spell the bare command; `--fast` stays
 //! accepted, a no-op, so a script that types it keeps working.
 //!
+//! **`--measure` IS THE ONE MODE ADDED SINCE** (2026-09-26): the MEASURE tier
+//! ([`crate::plan::Tier`]) — the stages that measure the machine or the release
+//! artifact — left the default ladder, so the merge contract stopped judging a
+//! push by how busy the box was, and a release cut requires it instead.
+//!
 //! One addition for the bash shim that execs this driver: `--root <dir>` (the
 //! shim already resolved the repo root from its own path, and a compiled binary
 //! cannot). It changes no stage's decision.
 //!
 //! THE GATE READS NO ENVIRONMENT KNOB OF ITS OWN (2026-09-24). Every setting a
 //! person gives the gate is a flag here — `--stage-timeout`, `--test-threads`,
-//! `--snapshot`, `--log`/`--no-log`, `--skip-gui-smoke`, `--machine-lock-dir` —
-//! because this crate links into the shipped `aterm` (`aterm help rust`), where
-//! the owner's rule admits no environment variable that changes what it does
-//! (`aterm-update-core`'s `env_reads` gate).
+//! `--test-jobs`, `--snapshot`, `--log`/`--no-log`, `--skip-gui-smoke`,
+//! `--machine-lock-dir` — because this crate links into the shipped `aterm`
+//! (`aterm help rust`), where the owner's rule admits no environment variable
+//! that changes what it does (`aterm-update-core`'s `env_reads` gate).
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
-/// The per-commit merge contract — the DEFAULT, what a bare `tools/verify.sh`
-/// runs (`--fast` spells it and changes nothing) — or `--full` (+ the trust-mc /
-/// Kani floor, the cross-cell type-check and the Codex live upgrade).
+/// Which TIERS a run runs ([`crate::plan::Tier`]).
+///
+/// * `Fast` — the LAND tier, the per-commit merge contract: the DEFAULT, what
+///   a bare `tools/verify.sh` runs (`--fast` spells it and changes nothing).
+/// * `Measure` — `--measure` (2026-09-26): the MEASURE tier alone — the
+///   release artifact's paint and spin matrices and the build they judge, and
+///   the typing-pacing smoke. Not the merge contract; what a release cut
+///   requires green for the tree it cuts.
+/// * `Full` — `--full`: both tiers, plus the trust-mc / Kani floor, the
+///   cross-cell type-check, the startup comparison and the Codex live upgrade.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     #[default]
     Fast,
+    Measure,
     Full,
 }
 
@@ -45,7 +58,21 @@ impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
             Mode::Fast => "fast",
+            Mode::Measure => "measure",
             Mode::Full => "full",
+        }
+    }
+
+    /// Does this mode run `tier`? The LAND tier is every mode's but
+    /// `--measure`'s, the MEASURE tier is `--measure`'s and `--full`'s, and
+    /// the `--full`-only stages are `--full`'s alone.
+    #[must_use]
+    pub fn runs(self, tier: crate::plan::Tier) -> bool {
+        use crate::plan::Tier;
+        match tier {
+            Tier::Land => self != Mode::Measure,
+            Tier::Measure => self != Mode::Fast,
+            Tier::Full => self == Mode::Full,
         }
     }
 }
@@ -77,6 +104,10 @@ pub struct Args {
     /// `--test-threads <n>`: the `RUST_TEST_THREADS` every child is pinned to.
     /// `None` pins the machine's parallelism ([`crate::Ctx::with_pinned_child_facts`]).
     pub test_threads: Option<NonZeroU32>,
+    /// `--test-jobs <n>`: how many test binaries the test stage runs at once,
+    /// splitting the pinned `RUST_TEST_THREADS` between them ([`crate::testrun`]).
+    /// `None` keeps [`crate::testrun::DEFAULT_JOBS`]; `1` is one at a time.
+    pub test_jobs: Option<NonZeroU32>,
     /// `--snapshot <dir>`: where the snapshot lives, in place of
     /// `<root>-verify.noindex` ([`crate::snapshot`]).
     pub snapshot: Option<PathBuf>,
@@ -92,6 +123,10 @@ pub struct Args {
     /// place of the per-user one ([`crate::snapshot::machine_lock_dir`]). The
     /// gate's own fixture tests give every throwaway repo its own.
     pub machine_lock_dir: Option<PathBuf>,
+    /// `--baseline`: record MAIN's own reds — HEAD a clean commit of
+    /// `origin/main`, the whole tree — and publish the receipt for branches to
+    /// be judged against ([`crate::differential`]).
+    pub baseline: bool,
     pub help: bool,
 }
 
@@ -118,10 +153,18 @@ pub enum ParseError {
     StageTimeoutNeedsSeconds,
     /// `--test-threads` with no value, or one that is not a positive count.
     TestThreadsNeedsCount,
+    /// `--test-jobs` with no value, or one that is not a positive count.
+    TestJobsNeedsCount,
     /// A path flag (`--snapshot`, `--log`, `--machine-lock-dir`) with no value.
     NeedsPath(String),
     /// `--log <path>` and `--no-log` together.
     LogAndNoLog,
+    /// `--baseline` with `--scope` or `--changed`: a baseline is main's reds
+    /// over the WHOLE tree, and a narrowed run records none.
+    BaselineNarrowed,
+    /// `--baseline` with `--measure`: a baseline is main's reds for the merge
+    /// contract, and a `--measure` run runs no stage of it.
+    BaselineMeasure,
     Unknown(String),
 }
 
@@ -148,10 +191,21 @@ impl ParseError {
             ParseError::TestThreadsNeedsCount => {
                 "verify: --test-threads needs a positive whole number".to_string()
             }
+            ParseError::TestJobsNeedsCount => {
+                "verify: --test-jobs needs a positive whole number".to_string()
+            }
             ParseError::NeedsPath(flag) => format!("verify: {flag} needs a path"),
             ParseError::LogAndNoLog => {
                 "verify: --log <path> and --no-log contradict each other; pick one".to_string()
             }
+            ParseError::BaselineNarrowed => "verify: --baseline records main's reds over the \
+                                             whole tree; it cannot be narrowed (--scope, \
+                                             --changed)"
+                .to_string(),
+            ParseError::BaselineMeasure => "verify: --baseline records main's reds for the merge \
+                                            contract; --measure runs the MEASURE tier alone, \
+                                            which is not part of it"
+                .to_string(),
             ParseError::Unknown(a) => format!("verify: unknown argument: {a}"),
         }
     }
@@ -172,9 +226,11 @@ where
         match a.as_str() {
             "--fast" => out.mode = Mode::Fast,
             "--full" => out.mode = Mode::Full,
+            "--measure" => out.mode = Mode::Measure,
             "--changed" => out.changed = true,
             "--no-log" => out.no_log = true,
             "--skip-gui-smoke" => out.skip_gui_smoke = true,
+            "--baseline" => out.baseline = true,
             "-h" | "--help" => out.help = true,
             "--scope" => {
                 let v = it.next().unwrap_or_default();
@@ -205,6 +261,9 @@ where
             }
             "--test-threads" => {
                 out.test_threads = Some(parse_threads(&it.next().unwrap_or_default())?);
+            }
+            "--test-jobs" => {
+                out.test_jobs = Some(parse_jobs(&it.next().unwrap_or_default())?);
             }
             "--snapshot" | "--log" | "--machine-lock-dir" => {
                 let v = path_value(&a, it.next().unwrap_or_default())?;
@@ -241,6 +300,8 @@ where
                     out.stage_timeout = Some(parse_stage_timeout(v)?);
                 } else if let Some(v) = a.strip_prefix("--test-threads=") {
                     out.test_threads = Some(parse_threads(v)?);
+                } else if let Some(v) = a.strip_prefix("--test-jobs=") {
+                    out.test_jobs = Some(parse_jobs(v)?);
                 } else if let Some((flag, v)) =
                     a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f))
                 {
@@ -262,6 +323,12 @@ where
     }
     if out.log.is_some() && out.no_log {
         return Err(ParseError::LogAndNoLog);
+    }
+    if out.baseline && (out.scope.is_some() || out.changed) {
+        return Err(ParseError::BaselineNarrowed);
+    }
+    if out.baseline && out.mode == Mode::Measure {
+        return Err(ParseError::BaselineMeasure);
     }
     Ok(out)
 }
@@ -303,6 +370,13 @@ fn parse_threads(v: &str) -> Result<NonZeroU32, ParseError> {
         .map_err(|_| ParseError::TestThreadsNeedsCount)
 }
 
+/// A `--test-jobs` value: a positive whole number.
+fn parse_jobs(v: &str) -> Result<NonZeroU32, ParseError> {
+    v.trim()
+        .parse::<NonZeroU32>()
+        .map_err(|_| ParseError::TestJobsNeedsCount)
+}
+
 /// The `--help` text: the script's own header, kept as the contract it
 /// documents. `{CEILING}` is substituted by [`usage`] from
 /// [`crate::exec::DEFAULT_CHILD_CEILING`] — print [`usage`], never this. The
@@ -319,37 +393,55 @@ main merge-queue. There is exactly one way to verify, so there is exactly one
 way for a reviewer (human or AI) to be wrong about it: run this.
 
   tools/verify.sh                   # the per-commit gate (the merge contract)
-  tools/verify.sh --full            # the gate + trust-mc + cross-cells
+  tools/verify.sh --measure         # the MEASURE tier (a release cut requires it)
+  tools/verify.sh --full            # both tiers + trust-mc + cross-cells
                                     #   + the Codex live upgrade
   tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
   tools/verify.sh --scope <crate>   # narrow the test compile, test run,
-                                    #   measuring tests, doctests and lint
-                                    #   to one crate (+ guards)
+                                    #   deadline and measuring tests, doctests
+                                    #   and lint to one crate (+ guards)
   tools/verify.sh --scope aterm-grid
+  tools/verify.sh --baseline        # on a commit of main: record + publish main's reds
 
-(no flag) : THE GATE, and the merge contract: targo test --workspace and its
-            doctests + tippy + formatting + the zero-tolerance grep guards and
-            license headers + the delivery-tooling suites (installer, cargo pin,
-            export policy, release preflight, site sync, dev signing identity)
+(no flag) : THE GATE, and the merge contract: the LAND tier — targo test
+            --workspace and its doctests + the deadline tests (run alone) +
+            tippy + formatting + the zero-tolerance grep guards and license
+            headers + the delivery-tooling suites (installer, cargo pin,
+            export policy, release preflight, site sync, dev signing identity,
+            the atpkg index and publish producers) + the atpkg end-to-end pack
             + the L0 temporal-safety gate + gate forge and gate cells-foreign
             (the cells no fleet box hosts, each for its own triple, which needs
             rustup's `stable` with the four foreign std targets or is a SKIP
             that withholds the merge contract) + a headless control-socket
             smoke (the AI-first spine must never regress, so every gate run
             proves the socket still answers) + the foreground handback lane,
-            which drives a private headless aterm.
+            which drives a private headless aterm. It does not run the MEASURE
+            tier, and its verdict names every stage it left out under `MEASURE
+            tier: not part of the merge contract` — never a silent skip.
 --fast    : the default, spelled out. It changes nothing and nothing needs it;
             it is accepted so a script that types it keeps working.
---full    : everything the default runs, PLUS the lint of the required-features
-            targets, the trust-mc / Kani BMC harnesses *when those tools are
-            installed* (skipped-not-failed when absent — see docs/PROCESS.md),
-            the cross-cell type-check (every forge cell, each for its own
-            triple; ~19 s warm and ~106 s cold when the matrix had five cells)
-            and the startup-comparison harness's own test, PLUS — last, run
-            alone, ~10 min — the Codex live upgrade,
-            which reads THIS machine's managed store and the vendor's current
-            Codex, so it is not in the per-commit contract (a named skip when
-            the store holds no older Codex).
+--measure : the MEASURE tier alone: the stages that measure the machine or the
+            release artifact rather than decide correctness — the fat-LTO
+            release build of aterm and the paint and spin matrices that judge
+            it, and the gui typing-pacing smoke (a real window's latencies).
+            NOT the merge contract. Its receipt is filed apart (measure-<commit>,
+            measure-tree-<tree>) and says `measured yes` only when every
+            MEASURE stage ran over the whole tree and was green with nothing
+            skipped; a release cut refuses to claim a build number without one
+            for the tree it cuts.
+--full    : both tiers — everything the default and --measure run — PLUS the
+            sealed fabric rung (aterm-link --features sealed, a transport no
+            shipped binary carries), the lint of the required-features
+            targets, the trust-mc / Kani BMC
+            harnesses *when those tools are installed* (skipped-not-failed when
+            absent — see docs/PROCESS.md), the cross-cell type-check (every
+            forge cell, each for its own triple; ~19 s warm and ~106 s cold
+            when the matrix had five cells) and the startup-comparison
+            harness's own test, PLUS — last, run alone, ~10 min — the Codex
+            live upgrade, which reads THIS machine's managed store and the
+            vendor's current Codex, so it is not in the per-commit contract (a
+            named skip when the store holds no older Codex). Its receipt is
+            filed as a merge-contract receipt AND as a MEASURE one.
 --scope   : restrict the targo test/doctest/lint to `-p <crate>`; the guards
             and the socket smoke always run whole-tree (they are cheap and
             global).
@@ -363,6 +455,40 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             crates' tests read files no dependency edge names. If the scope
             cannot be computed honestly the run WIDENS to the whole workspace,
             because a broken narrower must do MORE work, never less.
+            A --scope or --changed run says so BEFORE any stage runs (a
+            `verify: NARROWED` line), and its receipt names the narrowing:
+            `scope crate:<crate>` or `scope changed:<base>`.
+
+JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
+            BASE — the merge-base with origin/main (for a branch that merged
+            main, the main commit it merged) — looked up in the receipt store
+            every worktree shares, then in the git note refs/notes/aterm-verify
+            (fetched from origin when the store has none; a HEAD holding a
+            local main commit origin/main lacks has no base). A red main lists
+            with the same failure (same test, every character it printed —
+            only where the run happened, thread ids, pids, measured durations,
+            build hashes, frame addresses and commit ids masked) is INHERITED:
+            named, not blocking. Any other red is NEW and blocks, and so is a
+            hang, a crash (even after its test result), a log that cannot
+            account for its failures, and a red that reads as a clock running
+            out. The verdict says `N new, M
+            inherited (red on main since <sha>)`; a run whose every red is
+            inherited may claim the merge contract, and its receipt names them
+            (`inherited` lines). An inherited red main has had for more than
+            24 h blocks again. No usable receipt for the base: every red
+            counts, as it always did, and the ladder says why before any stage.
+--baseline: run on a clean commit of origin/main (a spare worktree at
+            `git switch --detach origin/main`), the whole tree: records main's
+            own reds — when main first went red on each is carried from the
+            nearest earlier receipt on main, after fetching main's published
+            notes — and publishes the receipt as a git note under
+            refs/notes/aterm-verify at origin, so branches on any machine are
+            judged against it. Refused (COULD NOT RUN, no receipt) on a dirty
+            tree, a HEAD that is not main's, or notes it cannot fetch, and a
+            usage error with --measure, which runs no stage of the merge
+            contract.
+            A --measure run is judged by the absolute rule: nothing is
+            inherited into the MEASURE tier.
 
 --snapshot <dir>: every run verifies a SNAPSHOT — a git worktree at
             <root>-verify.noindex (or this dir) synced to this checkout's HEAD,
@@ -392,12 +518,20 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             invoking shell's, so the contract measures the same thing whoever
             typed the command. The run's notes say which.
 
+--test-jobs <n>: how many test binaries the test stage runs at once (default
+            {TEST_JOBS}), each with RUST_TEST_THREADS divided between them; the
+            few that cannot share the machine run alone first with all of it.
+            cargo records how it would start each binary and the gate runs
+            them, printing their logs in cargo's order; 1 is one at a time.
+
 --log <path> | --no-log: the gate keeps its own copy of the ladder under
             <root>/.aterm-verify/logs (the newest 20); --log moves it and
             --no-log keeps none.
 
---skip-gui-smoke: skip the windowed latency smoke. A NAMED skip: the run is
-            refused the merge-contract verdict and its receipt vouches for nothing.
+--skip-gui-smoke: skip the windowed latency smoke, a MEASURE-tier stage (the
+            default gate does not run it). A NAMED skip: a --full run is refused
+            the merge-contract verdict, and no receipt it leaves says `measured
+            yes`.
 
 --machine-lock-dir <dir>: one gate runs per machine — a second waits (up to
             three hours) on a per-user lock under ~/Library/Caches/aterm-verify
@@ -415,8 +549,9 @@ gate that hangs has decided nothing and says nothing. --stage-timeout <seconds>
 moves that ceiling; --stage-timeout off removes it and restores the unbounded
 wait.
 
-exit 0  everything that ran was green (the verdict says which green)
-exit 1  a gate FAILED — a real finding about the tree
+exit 0  nothing NEW failed: everything that ran was green, or every red was
+        inherited from main's receipt (the verdict says which)
+exit 1  a gate FAILED — a real finding about the tree (against main: a NEW red)
 exit 2  usage error
 exit 3  COULD NOT RUN — the environment is broken; nothing was decided
 ";
@@ -443,6 +578,7 @@ pub fn usage() -> String {
         )
         .replace("{DISK_COLD_NEED}", &crate::disk::gib(disk.need(0)))
         .replace("{DISK_LANE_CAP}", &crate::disk::gib(disk.lane_cap))
+        .replace("{TEST_JOBS}", &crate::testrun::DEFAULT_JOBS.to_string())
 }
 
 /// A whole-unit English rendering of the child ceiling ("3-hour", "90-minute"),
@@ -551,6 +687,53 @@ mod tests {
         assert_eq!(a.scope.as_deref(), Some("aterm-grid"));
         assert_eq!(ok(&["--full", "--fast"]).mode, Mode::Fast);
         assert_eq!(ok(&["--fast", "--full"]).mode, Mode::Full);
+        assert_eq!(ok(&["--full", "--measure"]).mode, Mode::Measure);
+        assert_eq!(ok(&["--measure", "--fast"]).mode, Mode::Fast);
+    }
+
+    /// THE TIERS, BY MODE (2026-09-26): the default runs the LAND tier — the
+    /// merge contract — and not the MEASURE tier; `--measure` runs the MEASURE
+    /// tier and nothing of the contract; `--full` runs both and its own three
+    /// stages. A mode that ran neither tier would run nothing, and one that
+    /// ran the MEASURE tier by default would put the machine's load back into
+    /// every push's verdict.
+    #[test]
+    fn each_mode_runs_exactly_its_tiers() {
+        use crate::plan::Tier;
+        let runs = |m: Mode| [Tier::Land, Tier::Measure, Tier::Full].map(|t| m.runs(t));
+        assert_eq!(runs(Mode::Fast), [true, false, false]);
+        assert_eq!(runs(Mode::Measure), [false, true, false]);
+        assert_eq!(runs(Mode::Full), [true, true, true]);
+        assert_eq!(Mode::Measure.as_str(), "measure");
+        let text = usage();
+        assert!(
+            text.contains("tools/verify.sh --measure         # the MEASURE tier"),
+            "{text}"
+        );
+        assert!(
+            text.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("`MEASURE tier: not part of the merge contract`"),
+            "the help says the default names what it left out: {text}"
+        );
+        // A baseline is main's reds for the merge contract; `--measure` runs
+        // none of it, so the two together are a usage error, not a quiet run.
+        assert_eq!(
+            parse(["--measure", "--baseline"]),
+            Err(ParseError::BaselineMeasure)
+        );
+        assert_eq!(
+            parse(["--baseline", "--full", "--measure"]),
+            Err(ParseError::BaselineMeasure),
+            "the last mode wins, and it is --measure"
+        );
+        assert!(ok(&["--measure", "--full", "--baseline"]).baseline);
+        assert!(
+            ParseError::BaselineMeasure
+                .message()
+                .contains("--measure runs the MEASURE tier alone")
+        );
     }
 
     #[test]
@@ -599,11 +782,74 @@ mod tests {
         assert_eq!((a.mode, a.changed), (Mode::Full, true));
     }
 
+    /// `--test-jobs` (2026-09-26): both spellings, a positive count or a usage
+    /// error naming the flag, and the help names the default the constant sets.
+    #[test]
+    fn test_jobs_is_a_positive_count_and_the_help_names_its_default() {
+        assert_eq!(ok(&["--test-jobs", "3"]).test_jobs, NonZeroU32::new(3));
+        assert_eq!(ok(&["--test-jobs=1"]).test_jobs, NonZeroU32::new(1));
+        assert_eq!(ok(&[]).test_jobs, None, "not given keeps the default");
+        for bad in [
+            vec!["--test-jobs"],
+            vec!["--test-jobs=0"],
+            vec!["--test-jobs", "two"],
+        ] {
+            assert_eq!(
+                parse(bad.clone()),
+                Err(ParseError::TestJobsNeedsCount),
+                "{bad:?}"
+            );
+        }
+        let text = usage();
+        assert!(!text.contains("{TEST_JOBS}"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "(default\n            {})",
+                crate::testrun::DEFAULT_JOBS
+            )),
+            "{text}"
+        );
+    }
+
     #[test]
     fn the_base_defaults_to_main_and_only_the_flag_moves_it() {
         let given = ok(&["--changed", "--base", "HEAD~1"]);
         assert_eq!(given.base_ref(), "HEAD~1");
         assert_eq!(ok(&["--changed"]).base_ref(), "main");
+    }
+
+    #[test]
+    fn a_baseline_is_the_whole_tree_or_a_usage_error() {
+        assert!(!ok(&[]).baseline, "a run is no baseline unless asked");
+        assert!(ok(&["--baseline"]).baseline);
+        let full = ok(&["--full", "--baseline"]);
+        assert!(
+            full.baseline && full.mode == Mode::Full,
+            "either tier may baseline"
+        );
+        assert!(ok(&["--baseline", "--skip-gui-smoke"]).baseline);
+        for narrowed in [
+            vec!["--baseline", "--scope", "aterm-grid"],
+            vec!["--scope=aterm-grid", "--baseline"],
+            vec!["--baseline", "--changed"],
+            vec!["--changed", "--base", "main", "--baseline"],
+        ] {
+            assert_eq!(
+                parse(narrowed.iter().copied()),
+                Err(ParseError::BaselineNarrowed),
+                "{narrowed:?}"
+            );
+        }
+        assert!(
+            ParseError::BaselineNarrowed
+                .message()
+                .contains("--baseline")
+        );
+        assert!(usage().contains("--baseline"), "the help names it");
+        assert!(
+            usage().contains("N new, M\n            inherited (red on main since <sha>)"),
+            "the help says what a judged verdict prints"
+        );
     }
 
     #[test]
@@ -678,7 +924,14 @@ mod tests {
     #[test]
     fn usage_documents_every_frozen_flag_and_every_exit_code() {
         let text = usage();
-        for flag in ["--fast", "--full", "--scope <crate>", "--changed", "--base"] {
+        for flag in [
+            "--fast",
+            "--measure",
+            "--full",
+            "--scope <crate>",
+            "--changed",
+            "--base",
+        ] {
             assert!(text.contains(flag), "usage must document {flag}");
         }
         for code in ["exit 0", "exit 1", "exit 2", "exit 3"] {

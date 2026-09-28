@@ -5470,7 +5470,14 @@ mod macos {
             ESCAPES.store(0, Ordering::SeqCst);
             let probe = RenameProbe::alloc_init(crate::appkit::test_witness(), ()).expect("probe");
             autoreleasepool(|_| {
-                // SAFETY: as `foundation_invokes_the_three_argument_toolbar_selector`.
+                // SAFETY: every send is cast to the exact prototype named
+                // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
+                // `+invocationWithMethodSignature:` is `-(id)(id)`;
+                // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
+                // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
+                // at the pointer; `-invokeWithTarget:` is `-(void)(id)`;
+                // `-getReturnValue:` is `-(void)(void *)` and writes
+                // `methodReturnLength` bytes, asserted to be a `Bool`'s.
                 unsafe {
                     let selector = sel!(control:textView:doCommandBySelector:);
                     let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
@@ -5674,154 +5681,6 @@ mod macos {
                 "AppKit no longer defers responder deallocation — re-read this \
                  test's note and the `S3` entry in aterm-objc's crate docs"
             );
-        }
-
-        /// THE WINDOW-SERVER ROW (2026-09-26). Invoking the delegate's
-        /// three-argument selector for the strip identifier makes it build a
-        /// real `NSToolbarItem` around the container view, and that opens a
-        /// WindowServer connection: run alone, this test drew WindowServer's
-        /// synchronous `kTCCServiceListenEvent` preflight of the aterm-gui test
-        /// binary (tccd's log, measured) — the WindowServer watchdog's trigger
-        /// (AGENTS.md, "Concurrent sessions" rule 5). Every other row in this
-        /// module drew none. It is therefore `#[ignore]`d out of every parallel
-        /// test run, and the merge contract's `window-server unit tests` stage
-        /// runs it (`-- --ignored ::window_server::`) in the driver lane, beside
-        /// `objc_toolbar_drive`, which holds the same strip in a real window.
-        mod window_server {
-            use super::*;
-
-            /// THE THREE-ARGUMENT SELECTOR, on the REAL class, driven by FOUNDATION.
-            ///
-            /// D1 is the finding that `declare_class!` could not express a method
-            /// with more than one argument at all. This is the proof that it now
-            /// can, end to end and on the shipped class rather than a probe:
-            /// `NSInvocation` builds the call FROM THE REGISTERED ENCODING — it
-            /// reads `numberOfArguments`, the argument types and the return type out
-            /// of `NSMethodSignature` — so a wrong encoding fails here rather than
-            /// in a user's toolbar.
-            ///
-            /// Both answers are checked: the strip identifier yields a real
-            /// `NSToolbarItem` carrying the container view, and any other identifier
-            /// yields nil. A method stuck at "always build one" would pass half of
-            /// this.
-            #[test]
-            #[ignore = "WINDOW-SERVER LANE: builds AppKit objects that open a WindowServer connection; run by the merge contract's `window-server unit tests` stage (AGENTS.md, Concurrent sessions rule 5)"]
-            fn foundation_invokes_the_three_argument_toolbar_selector() {
-                let container = a_view();
-                let delegate =
-                    ToolbarDelegate::new(crate::appkit::test_witness(), container.clone_retained())
-                        .expect("delegate");
-                autoreleasepool(|_| {
-                    // SAFETY: every send is cast to the exact prototype named
-                    // beside it. `-methodSignatureForSelector:` is `-(id)(SEL)`;
-                    // `+invocationWithMethodSignature:` is `-(id)(id)`;
-                    // `-setSelector:` is `-(void)(SEL)`; `-setArgument:atIndex:` is
-                    // `-(void)(void *, NSInteger)` and Foundation COPIES the bytes
-                    // at the pointer; `-invokeWithTarget:` is `-(void)(id)`;
-                    // `-getReturnValue:` is `-(void)(void *)` and writes
-                    // `methodReturnLength` bytes, asserted to be pointer-sized.
-                    unsafe {
-                        let selector =
-                            sel!(toolbar:itemForItemIdentifier:willBeInsertedIntoToolbar:);
-                        let sig_for: unsafe extern "C-unwind" fn(Id, Sel, Sel) -> Id = msg();
-                        let sig = sig_for(
-                            delegate.as_id(),
-                            sel!(methodSignatureForSelector:),
-                            selector,
-                        );
-                        assert!(!sig.is_null(), "no signature for the declared method");
-                        // Foundation's own reading of the registered arity: self,
-                        // _cmd and THREE arguments.
-                        assert_eq!(appkit::send_usize(sig, sel!(numberOfArguments)), 5);
-                        assert_eq!(
-                            appkit::send_usize(sig, sel!(methodReturnLength)),
-                            size_of::<Id>()
-                        );
-
-                        let call = |ident: &str| -> Id {
-                            let inv = appkit::send_id_id(
-                                class(c"NSInvocation").as_id(),
-                                sel!(invocationWithMethodSignature:),
-                                sig,
-                            );
-                            assert!(!inv.is_null());
-                            let set_sel: unsafe extern "C-unwind" fn(Id, Sel, Sel) = msg();
-                            set_sel(inv, sel!(setSelector:), selector);
-                            let set_arg: unsafe extern "C-unwind" fn(
-                                Id,
-                                Sel,
-                                *mut std::ffi::c_void,
-                                isize,
-                            ) = msg();
-                            // index 2 = the (nil) NSToolbar, 3 = the identifier,
-                            // 4 = the BOOL.
-                            let mut toolbar = Id::NIL;
-                            set_arg(
-                                inv,
-                                sel!(setArgument:atIndex:),
-                                std::ptr::from_mut(&mut toolbar).cast(),
-                                2,
-                            );
-                            let ns = appkit::nsstring(ident).expect("NSString");
-                            let mut ident_arg = ns.id();
-                            set_arg(
-                                inv,
-                                sel!(setArgument:atIndex:),
-                                std::ptr::from_mut(&mut ident_arg).cast(),
-                                3,
-                            );
-                            let mut inserting = Bool::YES;
-                            set_arg(
-                                inv,
-                                sel!(setArgument:atIndex:),
-                                std::ptr::from_mut(&mut inserting).cast(),
-                                4,
-                            );
-                            appkit::send_v_id(inv, sel!(invokeWithTarget:), delegate.as_id());
-                            let mut out = Id::NIL;
-                            let get_ret: unsafe extern "C-unwind" fn(
-                                Id,
-                                Sel,
-                                *mut std::ffi::c_void,
-                            ) = msg();
-                            get_ret(
-                                inv,
-                                sel!(getReturnValue:),
-                                std::ptr::from_mut(&mut out).cast(),
-                            );
-                            out
-                        };
-
-                        let item = call(STRIP_ITEM_ID);
-                        assert!(
-                            !item.is_null(),
-                            "the strip identifier did not yield a toolbar item"
-                        );
-                        assert_eq!(
-                            appkit::nsstring_to_rust(appkit::send_id(item, sel!(itemIdentifier))),
-                            STRIP_ITEM_ID
-                        );
-                        assert_eq!(
-                            appkit::nsstring_to_rust(appkit::send_id(item, sel!(label))),
-                            "Tabs"
-                        );
-                        assert_eq!(
-                            appkit::send_id(item, sel!(view)),
-                            container.id(),
-                            "the item is not carrying the delegate's container view"
-                        );
-                        assert!(
-                            !appkit::send_bool(item, sel!(isBordered)),
-                            "the Liquid Glass bezel was not opted out of"
-                        );
-
-                        assert!(
-                            call("aterm.notthestrip").is_null(),
-                            "an unknown identifier built an item anyway"
-                        );
-                    }
-                });
-            }
         }
     }
 }

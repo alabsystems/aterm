@@ -557,6 +557,7 @@ fn every_wall_row_is_read_by_kind() {
             WallKind::ApiError {
                 code: Some(429),
                 retryable: true,
+                cause: ApiCause::Server,
             },
         ),
         (
@@ -564,6 +565,7 @@ fn every_wall_row_is_read_by_kind() {
             WallKind::ApiError {
                 code: Some(400),
                 retryable: false,
+                cause: ApiCause::Server,
             },
         ),
         (
@@ -571,6 +573,7 @@ fn every_wall_row_is_read_by_kind() {
             WallKind::ApiError {
                 code: None,
                 retryable: true,
+                cause: ApiCause::Server,
             },
         ),
     ] {

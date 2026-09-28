@@ -3084,22 +3084,20 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Opacity requires macOS GPU rendering; other renderers stay solid. Text over translucent backgrounds uses at least 4.5:1 contrast."
         }
         "Paste safety" => {
-            "Confirm unbracketed multiline paste. Bracketed paste bypasses it. macOS asks with a sheet, Windows with a dialog, Linux with an in-window banner."
+            "Asks before pasting more than one line into a program that does not use bracketed paste."
         }
-        "Motion" => {
-            "Automatic follows system motion when available and reduces effects under load by default. Full allows motion; Reduced limits it. Load adaptation is in Manual."
-        }
+        "Motion" => "Automatic also reduces motion under heavy load; turn that off in Manual.",
         "Keyboard" => {
-            "Predictive echo waits for confirmed echo and useful latency; passwords are never predicted. Manual's Always mode is unsafe at prompts."
+            "Predictive echo: Adaptive shows typed text early on a slow connection, never at a password prompt. Always, set in Manual, can show a password."
         }
         "Scrollback" => {
-            "Scrollback limit 0 is unlimited. Older lines beyond the Cmd-F/socket cap may give partial results. Set Searchable lines to 0 for live-screen-only search."
+            "Scrollback limit 0 keeps every line. Find searches the newest Searchable scrollback lines; set it to 0 to search only the screen."
         }
         "Text direction & width" => {
             "Bidirectional mode reorders right-to-left text. Ambiguous width uses one or two cells and affects new text, not existing cells."
         }
         "Stream fade" => {
-            "Fresh live-bottom output fades. It is instant with Reduce Motion, an unfocused window, full-screen apps, scrollback, input, or Serious Mode."
+            "New output fades in. It is instant with Reduce Motion, an unfocused window, full-screen apps, scrollback, input, or Serious Mode."
         }
         // The Sound box's consequence copy states the ONE fact its rows cannot:
         // this box holds TWO independent audio paths, not one. Every row except
@@ -3155,7 +3153,7 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
         "Light & GPU" => {
             "Bloom, shimmer, and HDR gracefully fall back when the display path cannot provide them."
         }
-        "Rendering" => "Variable weight needs a font with a wght axis; static fonts ignore it.",
+        "Rendering" => "Variable font weight needs a variable font; other fonts ignore it.",
         "Matrix rain" => {
             "Rain follows activity and drains when idle. View ▸ Matrix Rain overrides one session. Serious Mode and Reduce Motion disable it."
         }
@@ -3171,7 +3169,9 @@ pub(crate) fn group_footnote(caption: &str) -> Option<&'static str> {
             "Automatic updates keeps the installed ALab tools up to date in the background and applies at once — off stops it, on starts it again; typed aterm pkg commands work either way. Install ALab tools lets aterm download them (several GB) and add new tools later; it applies at the next package check, and off installs nothing you did not ask for. Announce upstream cargo/rustc prints one line before a rerouted Rust tool runs."
         }
         "Smart Titles" => {
-            "Activity is a generated fallback when a session has no authored Description. Built-in stays on-device. On macOS, aterm auto-starts Ollama only after every file in its bounded runtime code closure passes pinned structural-signature, Apple Developer-ID Team, code-identifier, ownership, permission, and stable-identity checks; it repeats the closure check before terminal context is sent, clears inherited environment, disables cloud integration, and uses direct loopback. A pre-existing localhost service and every custom service remain untrusted network providers and require explicit consent. Other platforms never auto-execute a managed runtime without a platform attestation anchor. Environment proxy honors HTTP(S)_PROXY and NO_PROXY; Direct bypasses them. For HTTPS OpenAI-compatible endpoints, an explicit CA bundle replaces platform roots. Recent terminal text may be sent. Credential filtering is conservative but heuristic and cannot identify every secret; use Built-in or managed local Ollama when terminal context must stay on-device. Credentials and certificates are path-only—never stored here."
+            "Activity shows only when a tab has no Description. Built-in and aterm-managed \
+             Ollama keep terminal text on this device. Any other service receives recent \
+             terminal text only with your consent, and filtering cannot catch every secret."
         }
         "Permissions" => {
             "Off by default. Programs request access; Secure Keyboard Entry stops \
@@ -3202,9 +3202,7 @@ pub(crate) const HARNESS_APPROVE_TIMING: &str =
 /// value's lifecycle.
 pub(crate) fn application_timing(key: &str) -> Option<&'static str> {
     match key {
-        EDIT_COLUMNS | EDIT_LINES => Some(
-            "Applies on a fresh launch; an authenticated update handoff preserves the live size",
-        ),
+        EDIT_COLUMNS | EDIT_LINES => Some("Applies next launch; an update keeps the current size"),
         // NOT `packages.enabled` (Phase 4): the window's package loop re-reads it (the
         // retired `auto_update` folded in) before every pass and every few seconds of a
         // park, so it is live — no timing to disclose. `[update] enabled` is read once per
@@ -3274,12 +3272,8 @@ pub(crate) fn application_has_live_effect(key: &str) -> bool {
 /// users why a future launch may not use the TOML value they are editing.
 pub(crate) fn environment_precedence(key: &str) -> Option<&'static str> {
     Some(match key {
-        EDIT_COLUMNS => {
-            "--columns overrides on a fresh launch; an authenticated update handoff preserves the live grid"
-        }
-        EDIT_LINES => {
-            "--lines overrides on a fresh launch; an authenticated update handoff preserves the live grid"
-        }
+        EDIT_COLUMNS => "a launch --columns overrides this value",
+        EDIT_LINES => "a launch --lines overrides this value",
         EDIT_GPU => "a launch --cpu or --gpu overrides this value (the last one given wins)",
         EDIT_FONT_PX => "a launch --font-px overrides this value",
         EDIT_FONT_FAMILY => "a launch --font overrides this value",
@@ -3312,6 +3306,8 @@ fn security_label(key: &str) -> &'static str {
         }
         EDIT_ALLOW_NOTIFICATIONS => "Allow desktop notifications",
         EDIT_ALLOW_PALETTE_RECONFIGURE => "Allow programs to set indexed colors (OSC 4/21)",
+        // "(new sessions)" stays in the name: at Compact width with large text the
+        // row paints the name alone, without its timing (`setting_row`).
         EDIT_ALLOW_KITTY_FILE_TRANSFER => "Allow local files for Kitty graphics (new sessions)",
         _ => "Security option",
     }
@@ -7761,9 +7757,7 @@ listen = \"127.0.0.1:7777\" # local only
         for key in [super::EDIT_COLUMNS, super::EDIT_LINES] {
             assert_eq!(
                 super::application_timing(key),
-                Some(
-                    "Applies on a fresh launch; an authenticated update handoff preserves the live size"
-                )
+                Some("Applies next launch; an update keeps the current size")
             );
         }
         for key in [
@@ -7910,23 +7904,23 @@ listen = \"127.0.0.1:7777\" # local only
         );
 
         let keyboard = super::group_footnote("Keyboard").unwrap();
-        assert!(keyboard.contains("confirmed echo"));
-        assert!(keyboard.contains("passwords"));
-        assert!(keyboard.contains("Manual's Always mode is unsafe"));
+        assert!(keyboard.contains("slow connection"));
+        assert!(keyboard.contains("password prompt"));
+        assert!(keyboard.contains("Always, set in Manual"));
         let paste = super::group_footnote("Paste safety").unwrap();
-        assert!(paste.contains("unbracketed multiline paste"));
-        assert!(paste.contains("Bracketed paste bypasses it"));
+        assert!(paste.contains("more than one line"));
+        assert!(paste.contains("does not use bracketed paste"));
         let scrollback = super::group_footnote("Scrollback").unwrap();
-        assert!(scrollback.contains("Cmd-F/socket cap"));
-        assert!(scrollback.contains("partial results"));
-        assert!(scrollback.contains("Set Searchable lines to 0 for live-screen-only search"));
+        assert!(scrollback.contains("keeps every line"));
+        assert!(scrollback.contains("Find searches the newest Searchable scrollback lines"));
+        assert!(scrollback.contains("set it to 0 to search only the screen"));
         let semantics = super::group_footnote("Text direction & width").unwrap();
         assert!(semantics.contains("reorders right-to-left text"));
         assert!(semantics.contains("one or two cells"));
         assert!(semantics.contains("not existing cells"));
         let rendering = super::group_footnote("Rendering").unwrap();
-        assert!(rendering.contains("needs a font with a wght axis"));
-        assert!(rendering.contains("static fonts ignore it"));
+        assert!(rendering.contains("needs a variable font"));
+        assert!(rendering.contains("other fonts ignore it"));
         assert_eq!(
             field(super::EDIT_ALLOW_PALETTE_RECONFIGURE).label,
             "Allow programs to set indexed colors (OSC 4/21)"
@@ -8040,14 +8034,15 @@ listen = \"127.0.0.1:7777\" # local only
             assert!(matches!(super::edit_kind(key), EditKind::Integer), "{key}");
         }
         assert!(
-            super::group_footnote("Smart Titles").is_some_and(|note| note.contains("Activity")
-                && note.contains("untrusted network providers")
-                && note.contains("HTTP(S)_PROXY")
-                && note.contains("replaces platform roots")
-                && note.contains("heuristic")
-                && note.contains("cannot identify every secret")
-                && note.contains("path-only")),
-            "the group must explain precedence, provider trust, transport, and the limits of secret handling"
+            super::group_footnote("Smart Titles").is_some_and(|note| note
+                .contains("Activity shows only when a tab has no Description")
+                && note.contains(
+                    "Built-in and aterm-managed Ollama keep terminal text on this device"
+                )
+                && note.contains("recent terminal text only with your consent")
+                && note.contains("cannot catch every secret")),
+            "the group must say when Activity shows, which providers keep terminal text on \
+             this device, that any other needs consent, and the limit of secret filtering"
         );
     }
 

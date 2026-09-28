@@ -17,8 +17,11 @@
 //! ivar with a destructor, so registering, messaging and swizzling them on a
 //! worker satisfies `MainThread::new_unchecked`'s second form. The parts that
 //! genuinely need the main thread — a real `NSApplication`, a real event, and
-//! the `dladdr` question A2 asks — are in
-//! `examples/objc_swizzle_drive.rs`, which owns a `fn main`.
+//! the `dladdr` question A2 asks — are driven on the fork's own install, in
+//! `aterm-gui`'s `examples/objc_window_drive.rs` (stage 15: the IMP of
+//! `-[NSApplication sendEvent:]` has left AppKit's image) and
+//! `examples/objc_event_drive.rs` (stage 8: every `NSEvent` shape sent through
+//! it).
 
 #![cfg(target_os = "macos")]
 

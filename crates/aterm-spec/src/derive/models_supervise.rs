@@ -4,7 +4,8 @@
 //! The supervisor's own bounded machines (aterm-agent `supervise`, lane B2):
 //! the session claim it acts under, the focus-then-Enter choice it makes on
 //! an unnumbered dialog, the turn-end policy, the keys it sends to answer
-//! Claude Code's question dialog, and the keystrokes of a decline.
+//! Claude Code's question dialog, the keystrokes of a decline, and when it
+//! types into an API error the network caused.
 
 use super::Model;
 
@@ -1049,6 +1050,208 @@ pub fn supervisor_decline_keys_model() -> Model {
             invariant NeverTheBareNo: bare == 0;
             invariant NeverSubmitsAnotherText: foreign == 0;
             invariant NoKeyIntoTheComposer: composer == 0;
+        }
+    }
+}
+
+/// THE NETWORK WALL (aterm-agent `supervise/policy/turn_end.rs`,
+/// `wall_action`'s arms for an API error that never reached the API and a
+/// reply the connection cut off; the outage of 2026-09-27, when a worker's
+/// `API Error: Can't reach the API server — check your internet or DNS
+/// (ENOTFOUND)` was typed into sixteen times in an hour, 0.5 s after each
+/// appearance): WHEN the supervisor types into such a wall, given what the
+/// session's host MEASURES of the API's reach — and nothing else it may
+/// believe.
+///
+/// The decision, as committed: a network never reached is tried on the
+/// short ladder while its reach is not measured (`Rung1`, then `Rung2` for
+/// every try after — the real 1, 2, 5 min, clamped at the last); it is
+/// continued AT ONCE the first time the host measures the API reachable
+/// again, and each later Up act is spaced by the Up acts before it (a
+/// measure that lies, or an API that still fails, costs the ladder's own
+/// count, never a burst); while the host measures it definitely DOWN
+/// nothing is typed into it before `Hold` (the real `down_hold`, 15 min)
+/// from its appearance, and one try is made then all the same, so a wrong
+/// Down strands no one; a reply cut off is continued at once and then on
+/// the same ladder, by the tries made — and under a Down it takes the
+/// hold like an unreachable API. A try that led to real work before the
+/// wall came back (the real `progress`) ends the EPISODE: its counts start
+/// over (the six sleep cut-offs of 2026-09-26, each after 14–63 min of
+/// work, are each continued at once).
+///
+/// `net` is the world (1 the agent's route works); `verdict` the host's
+/// measure the loop reads (0 unknown — nobody measures, a custom route, a
+/// stale measure, a timeout or a TLS failure; 1 down; 2 up), which moves
+/// in EVERY direction, truthfully or not: `MeasureDown`/`MeasureUp` follow
+/// the world, `MeasureLost` forgets it, `MeasureLies` says up while the
+/// agent's route is down (a probe whose route works while the agent's does
+/// not), `MeasureWrongDown` says down while it works — so a flapping or
+/// lying probe is covered, not assumed away. `wall` is 0 while the worker
+/// works, 1 while the wall shows (a point), 2 while the supervisor's act is
+/// in flight; `cause` 0 unreachable, 1 cut off; `waited` the ticks since
+/// this appearance (one tick is one minute at Tier-1, saturating at
+/// `Hold`, the longest any verdict waits); `tries` and `ups` the episode's
+/// acts and its acts on an Up measure (the real `attempts` and `ups`,
+/// saturating where the ladder clamps). Ghosts: `quick` counts the
+/// episode's acts made at the very appearance (`waited == 0`) — the day's
+/// sixteen were all such; `dacts` the episode's acts typed while the host
+/// measured the API down, and `dticks` the ticks the episode has spent at
+/// its wall — neither read by any guard, and neither reset by an act.
+///
+/// The invariants, each about what the episode ACCUMULATES rather than
+/// one decision (so neither is `Act`'s guard restated: a guard-level one —
+/// "an act on a Down measure has `Hold <= waited`" — holds by construction
+/// and would prove nothing, the review of 2026-09-27):
+/// AMeasuredOutageIsTypedIntoAtMostOnceAHold — the k-th act typed into a
+/// measured outage comes at least k holds of wall time into its episode
+/// (k up to 2, saturating), however the measure flaps, lies or is lost in
+/// between; it rests on the hold being measured from each APPEARANCE (an
+/// act restarts `waited`), which `Carry = 1` breaks — the hold's clock
+/// carried across the episode's appearances, as a decider keeping the
+/// episode's first `since` would: after one hold, every re-appearance
+/// under a Down measure is typed into at once — caught with `Act`'s guard
+/// untouched. And AtMostTwoActsAtOncePerEpisode — an episode gets at most
+/// one act at once for a reply cut off and one for the API measured back
+/// (`AtOnce`); every other act waits at least a rung. `Buggy = 1` is the
+/// supervisor of that day: it acts at once at every appearance, whatever
+/// the measure — caught typing into a measured outage at once, and acting
+/// at once a third time. Tier-1 (aterm-agent
+/// `tests/supervise_conformance_network_wall.rs`) walks every reachable
+/// state with the REAL `decide_turn_end` and `TurnEndState` in tow and
+/// checks it types exactly where `Act` is enabled, under the rule and in
+/// the words the model names, and otherwise waits until exactly the tick
+/// `Act` becomes enabled; the `Buggy` model disagrees with it.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_network_wall_model() -> Model {
+    crate::ty_model! {
+        SupervisorNetworkWall {
+            const Buggy = 0;
+            const Carry = 0;
+            const Rung1 = 1;
+            const Rung2 = 2;
+            const Hold = 3;
+            const AtOnce = 2;
+            var net = 1;
+            var verdict = 0;
+            var wall = 0;
+            var cause = 0;
+            var waited = 0;
+            var tries = 0;
+            var ups = 0;
+            var quick = 0;
+            var dacts = 0;
+            var dticks = 0;
+
+            // ---- the world ----
+            action NetFails when (net == 1) {
+                net = 0;
+            }
+            action NetReturns when (net == 0) {
+                net = 1;
+            }
+
+            // ---- the host's measure, in every direction ----
+            action MeasureDown when (net == 0 && (verdict == 0 || verdict == 2)) {
+                verdict = 1;
+            }
+            action MeasureUp when (net == 1 && (verdict == 0 || verdict == 1)) {
+                verdict = 2;
+            }
+            action MeasureLost when (verdict == 1 || verdict == 2) {
+                verdict = 0;
+            }
+            action MeasureLies when (net == 0 && (verdict == 0 || verdict == 1)) {
+                verdict = 2;
+            }
+            action MeasureWrongDown when (net == 1 && (verdict == 0 || verdict == 2)) {
+                verdict = 1;
+            }
+
+            // ---- the vendor gives up on a request: a wall, a new episode ----
+            action Unreachable when (wall == 0 && net == 0) {
+                wall = 1;
+                cause = 0;
+                waited = 0;
+            }
+            action CutOff when (wall == 0) {
+                wall = 1;
+                cause = 1;
+                waited = 0;
+            }
+
+            // ---- time at the wall ----
+            action Tick when (wall == 1 && waited <= Hold - 1) {
+                waited = waited + 1;
+                dticks = if dticks <= Hold + Hold - 1 { dticks + 1 } else { dticks };
+            }
+
+            // ---- the supervisor types its act ----
+            action Act when (
+                wall == 1 && (
+                    Buggy == 1 ||
+                    (cause == 0 && verdict == 2 &&
+                        (ups == 0 || (ups == 1 && Rung1 <= waited) || (ups == 2 && Rung2 <= waited))) ||
+                    (verdict == 1 && Hold <= waited) ||
+                    (cause == 0 && verdict == 0 &&
+                        ((tries == 0 && Rung1 <= waited) || (1 <= tries && Rung2 <= waited))) ||
+                    (cause == 1 && (verdict == 0 || verdict == 2) &&
+                        (tries == 0 || (tries == 1 && Rung1 <= waited) ||
+                            (tries == 2 && Rung2 <= waited)))
+                )
+            ) {
+                dacts = if verdict == 1 && dacts <= 1 { dacts + 1 } else { dacts };
+                quick = if waited == 0 && quick <= AtOnce { quick + 1 } else { quick };
+                ups = if cause == 0 && verdict == 2 && ups <= 1 { ups + 1 } else { ups };
+                tries = if tries <= 1 { tries + 1 } else { tries };
+                wall = 2;
+                waited = if Carry == 1 { waited } else { 0 };
+            }
+
+            // ---- what the act led to ----
+            // The vendor's own retries (minutes), then the wall again: the
+            // episode's next appearance, its counts kept.
+            action MetUnreachable when (wall == 2 && net == 0) {
+                wall = 1;
+                cause = 0;
+            }
+            action MetCutOff when (wall == 2) {
+                wall = 1;
+                cause = 1;
+            }
+            // Real work, then the wall again: a new episode.
+            action WorkedThenUnreachable when (wall == 2 && net == 0) {
+                wall = 1;
+                cause = 0;
+                tries = 0;
+                ups = 0;
+                quick = 0;
+                dacts = 0;
+                dticks = 0;
+            }
+            action WorkedThenCutOff when (wall == 2) {
+                wall = 1;
+                cause = 1;
+                tries = 0;
+                ups = 0;
+                quick = 0;
+                dacts = 0;
+                dticks = 0;
+            }
+            // Taken: the worker works on, the wall gone — the episode over.
+            action Taken when (wall == 2 && net == 1) {
+                wall = 0;
+                cause = 0;
+                tries = 0;
+                ups = 0;
+                quick = 0;
+                dacts = 0;
+                dticks = 0;
+            }
+
+            invariant AMeasuredOutageIsTypedIntoAtMostOnceAHold:
+                dacts == 0 || (dacts == 1 && Hold <= dticks) || Hold + Hold <= dticks;
+            invariant AtMostTwoActsAtOncePerEpisode: quick <= AtOnce;
         }
     }
 }

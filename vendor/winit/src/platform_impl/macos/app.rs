@@ -243,8 +243,8 @@ unsafe fn send_event_body(app: Id, cmd: Sel, event: Id) {
 /// and the containment's `the_event_constants_match_the_binding`) is DELETED,
 /// not ported — `winit` is not a workspace member, so no compiler here would
 /// ever see it. The first two cases run for real in `aterm-objc`'s
-/// `examples/objc_swizzle_drive.rs`; the constants are checked against the SDK
-/// by `aterm-objc`'s `winit_seam_constants.rs`; the reasoning is in the roadmap.
+/// `tests/swizzle.rs` (and on this fork's install in `aterm-gui`'s window and event
+/// drives); the constants by `aterm-objc`'s `winit_seam_constants.rs`; see the roadmap.
 ///
 /// # Panics
 ///

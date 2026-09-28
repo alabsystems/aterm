@@ -965,7 +965,8 @@ pub use models_glyphs::*;
 pub use models_gui::*;
 pub use models_harness::*;
 pub use models_harness_host::{
-    harness_exit_record_model, harness_relaunch_on_exit_model, harness_upgrade_look_model,
+    harness_exit_record_model, harness_relaunch_on_exit_model,
+    harness_restored_first_attempt_model, harness_upgrade_look_model,
     harness_worker_lifecycle_model,
 };
 pub use models_input::input_unread_gate_model;
@@ -994,7 +995,8 @@ pub use models_session::*;
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_supervise::{
     supervisor_claim_model, supervisor_decline_keys_model, supervisor_focus_choice_model,
-    supervisor_host_turn_end_model, supervisor_question_answer_model, supervisor_turn_end_model,
+    supervisor_host_turn_end_model, supervisor_network_wall_model,
+    supervisor_question_answer_model, supervisor_turn_end_model,
 };
 pub use models_title_summary::*;
 pub use models_typed_rekey::typed_rekey_model;

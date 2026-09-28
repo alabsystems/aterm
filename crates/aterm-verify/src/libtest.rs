@@ -67,6 +67,10 @@
 //! `     Running <target> (<path>)` or `   Doc-tests <crate>` line — and only
 //! the lines after it are read. A backticked `Running \`…\`` line is a nested
 //! `cargo run` inside a test, not a binary of this run, and does not move it.
+//! Since 2026-09-26 the test stage runs the binaries itself, several at a
+//! time ([`crate::testrun`]), and each one's log is its own, headed by the
+//! `Running` line the gate writes in front of it — so the anchor is that
+//! binary's header, and the note names the one binary that hung.
 
 use std::collections::BTreeMap;
 
@@ -117,7 +121,7 @@ const VERDICT_WORDS: [&str; 4] = ["ok", "FAILED", "ignored", "bench"];
 const MODE_SUFFIXES: [&str; 3] = [" - should panic", " - compile fail", " - compile"];
 
 /// cargo's test-binary header, with its verb dropped.
-fn header(line: &str) -> Option<String> {
+pub(crate) fn header(line: &str) -> Option<String> {
     let t = line.trim_start();
     if let Some(rest) = t.strip_prefix("Running ") {
         (rest.contains(" (") && rest.ends_with(')') && !rest.contains('`'))
@@ -127,6 +131,26 @@ fn header(line: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Why a `targo test` child that exited 0 decided nothing ([`ran_no_test`]).
+pub const RAN_NO_TEST: &str = "cargo announced test binaries and not one printed a libtest \
+     `test result:` line, so no test ran — a runner the caller's cargo config or environment \
+     names for this host (`target.<triple>.runner`, `CARGO_TARGET_<TRIPLE>_RUNNER`) outranks the \
+     gate's and started them in its place, or they exited before their harness; nothing was \
+     decided about them";
+
+/// Did a `targo test` child's log announce test binaries — cargo's `Running`
+/// / `Doc-tests` headers — and then print not one libtest `test result:`
+/// line? Then whatever ran in the binaries' place ran no test
+/// ([`crate::ladder::Report::decide_test_child`]). A log with no header ran
+/// nothing to count, and one binary with a result is a run.
+#[must_use]
+pub fn ran_no_test(log: &str) -> bool {
+    if log.contains('\x1b') {
+        return ran_no_test(&strip_ansi(log));
+    }
+    log.lines().any(|l| header(l).is_some()) && !log.lines().any(|l| l.starts_with("test result: "))
 }
 
 /// `running N test(s)` — the count.
@@ -157,7 +181,7 @@ fn slow_in(line: &str) -> Option<&str> {
 /// Drop every CSI escape (`ESC [` … a final byte in `@`–`~`) and every other
 /// two-byte escape, so a coloured log reads exactly like a plain one. Only
 /// called when the log has an `ESC` in it.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(at) = rest.find('\x1b') {
@@ -340,7 +364,7 @@ pub fn scan(log: &str) -> Option<Unfinished> {
 }
 
 /// The path in a `Running <target> (<path>)` header — the binary to re-run.
-fn binary_path(header: &str) -> Option<&str> {
+pub(crate) fn binary_path(header: &str) -> Option<&str> {
     header.rsplit_once(" (")?.1.strip_suffix(')')
 }
 
@@ -422,8 +446,9 @@ pub fn note(log: &str) -> Option<String> {
 }
 
 /// The words a test prints when the MACHINE refused it, not the tree: a
-/// previous run's daemons still alive (aterm-link's world harness), or a paint
-/// take its own instrument disowns as starved (the probe's exit 3). A red row
+/// previous run's daemons still alive (aterm-link's world harness), a paint
+/// take its own instrument disowns as starved (the probe's exit 3), or a paint
+/// or spin probe that decided nothing (exit 2, since 2026-09-26). A red row
 /// under this sentinel says nothing about the code, so the gate records it as
 /// COULD NOT RUN — the same severity as a full disk — and the receipt says
 /// `verdict COULD-NOT-RUN`, never `FAIL`.
@@ -448,7 +473,10 @@ pub const COULD_NOT_RUN_SENTINEL: &str = "aterm-gate: COULD NOT RUN";
 ///   unread;
 /// * every binary cargo reported failed (`error: test failed, to rerun pass`)
 ///   printed a `test result: FAILED.` line — a binary that died of a signal
-///   prints no result, and a crash is a finding.
+///   prints no result, and a crash is a finding;
+/// * no binary exited other than libtest's 101 ([`abnormal_exit`]): one that
+///   printed its result and THEN died of a signal is a crash too
+///   (2026-09-27, second review).
 ///
 /// EVERY BLOCK IS ITS OWN FAILURE (2026-09-23). One `--no-fail-fast` log holds
 /// many binaries, and two of them can fail a test of the same bare name — a
@@ -491,6 +519,9 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
             }
             in_list = false;
         }
+        if current.is_none() && abnormal_exit(line) {
+            return None;
+        }
         if line.starts_with("test result: FAILED.") {
             results += 1;
             current = None;
@@ -518,6 +549,194 @@ pub fn environment_refusals(log: &str) -> Option<Vec<String>> {
             named.dedup();
             named.into_iter().map(str::to_string).collect()
         })
+}
+
+/// One failed test, as a `--no-fail-fast` `targo test` log accounts for it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailedTest {
+    /// cargo's re-run spec for the binary that failed it — `-p atpkg --test
+    /// index_probe`, `-p aterm-gui --lib`, `-p x --doc` — the text between the
+    /// backticks of its `error: test failed, to rerun pass` line. It names the
+    /// package and the target, which a `Running` header does not
+    /// (`tests/paint.rs` exists in more than one crate).
+    pub spec: String,
+    /// The test's name as libtest listed it.
+    pub name: String,
+    /// Everything its `---- <name> stdout ----` block held.
+    pub block: String,
+    /// The block carries [`COULD_NOT_RUN_SENTINEL`]: the machine refused this
+    /// test, so it decided nothing.
+    pub refused: bool,
+}
+
+/// cargo's word that a test binary did NOT exit with libtest's 101: the
+/// `Caused by:` it puts under the re-run line, and the `process didn't exit
+/// successfully: `…` (signal: 11, SIGSEGV)` under that — a signal, another
+/// exit status, a spawn error. cargo prints neither for a 101 (a plain failed
+/// test), so outside a test's own block either one means the binary ended in
+/// something its `test result:` line does not account for: a teardown crash, a
+/// background thread's abort after the summary (2026-09-27, second review —
+/// the crash was in no finding, and the one red it did list was main's).
+fn abnormal_exit(line: &str) -> bool {
+    line.trim_end() == "Caused by:"
+        || line
+            .trim_start()
+            .starts_with("process didn't exit successfully")
+}
+
+/// cargo's `error: test failed, to rerun pass `<spec>`` (or the doctest
+/// spelling) — the spec.
+fn rerun_spec(line: &str) -> Option<&str> {
+    let rest = line
+        .strip_prefix("error: test failed, to rerun pass `")
+        .or_else(|| line.strip_prefix("error: doctest failed, to rerun pass `"))?;
+    let spec = rest.split('`').next()?;
+    (!spec.is_empty()).then_some(spec)
+}
+
+/// Every failed test in a failed `targo test` child's log, each with the
+/// binary that failed it ([`FailedTest::spec`]) — `None` unless the log
+/// accounts for every failure, so a failure it cannot name is never dropped
+/// from a list a reader will compare against another run's.
+///
+/// The same accounting [`environment_refusals`] demands, for the same reason:
+///
+/// * at least one `---- <name> stdout ----` block, and every block is
+///   followed by the `error: test failed, to rerun pass` line of the binary
+///   that printed it (that line is how a block gets its spec);
+/// * the names libtest LISTS under its closing `failures:` are exactly the
+///   blocks' names, counted with multiplicity;
+/// * every binary cargo reported failed printed a `test result: FAILED.`
+///   line. A binary that died of a signal prints none, and a re-exec child
+///   that failed prints a result with no re-run line of its own — both leave
+///   the log unaccounted, and the caller falls back to judging the whole row;
+/// * PER BINARY (2026-09-27): the names listed since the last re-run line are
+///   exactly the blocks read since it, and no `test result:` or re-run line
+///   arrives inside an open block. A test whose own output quotes a nested
+///   cargo log — the gate's contract tests panic with fixture ladders — had its
+///   block cut at the nested re-run line and credited to the nested spec, and
+///   the rest of its message never reached the fingerprint;
+/// * THE CLOSING LIST IS WHOLE (2026-09-27, second review): once a `failures:`
+///   line closes a binary's blocks, only its listed names (four-space
+///   indented), blank lines and its `test result:` may follow. A test whose own
+///   message holds a line reading `failures:` — an oracle's list of failing
+///   cases — had its block closed there, and every line after it that was not
+///   a four-space name fell outside any block: dropped from the fingerprint;
+/// * every binary exited with libtest's 101 ([`abnormal_exit`]): one that
+///   printed its `test result:` and then died of a signal accounted for its
+///   failures, and the crash was in no finding.
+#[must_use]
+pub fn failed_tests(log: &str) -> Option<Vec<FailedTest>> {
+    if log.contains('\x1b') {
+        return failed_tests(&strip_ansi(log));
+    }
+    let mut done: Vec<FailedTest> = Vec::new();
+    // Blocks read since the last re-run line: (name, text, refused).
+    let mut pending: Vec<(String, String, bool)> = Vec::new();
+    let mut listed: Vec<&str> = Vec::new();
+    // Names listed, and whether a `test result: FAILED.` came, since the last
+    // re-run line: one binary's accounting.
+    let mut listed_here: Vec<&str> = Vec::new();
+    let mut result_here = false;
+    let mut current: Option<usize> = None;
+    let mut in_list = false;
+    // A `failures:` line closed this binary's blocks: its closing list, up to
+    // its `test result:`.
+    let mut closing = false;
+    let (mut results, mut binaries) = (0usize, 0usize);
+    for line in log.lines() {
+        if let Some(name) = line
+            .strip_prefix("---- ")
+            .and_then(|r| r.strip_suffix(" stdout ----"))
+        {
+            // A block after the closing list: one of the two was a message's.
+            if closing {
+                return None;
+            }
+            current = Some(pending.len());
+            in_list = false;
+            pending.push((name.to_string(), String::new(), false));
+            continue;
+        }
+        if line == "failures:" {
+            // A second closing list: the first was a line of a message.
+            if closing {
+                return None;
+            }
+            closing = !pending.is_empty();
+            current = None;
+            in_list = true;
+            continue;
+        }
+        if in_list {
+            if let Some(name) = line.strip_prefix("    ") {
+                listed.push(name.trim_end());
+                listed_here.push(name.trim_end());
+                continue;
+            }
+            if line.trim().is_empty() {
+                continue;
+            }
+            in_list = false;
+        }
+        // Anything but the result after the closing list: the `failures:`
+        // that opened it was a line of a test's message, and the rest of that
+        // message fell outside every block.
+        if closing && !line.starts_with("test result: ") {
+            return None;
+        }
+        // A result or a re-run line inside a test's own output is a nested
+        // log: which binary any block belongs to can no longer be told.
+        if current.is_some() && (line.starts_with("test result: ") || rerun_spec(line).is_some()) {
+            return None;
+        }
+        // A binary that did not exit with libtest's 101.
+        if current.is_none() && abnormal_exit(line) {
+            return None;
+        }
+        if line.starts_with("test result: ") {
+            closing = false;
+        }
+        if line.starts_with("test result: FAILED.") {
+            results += 1;
+            result_here = true;
+            current = None;
+        }
+        if let Some(spec) = rerun_spec(line) {
+            let mut blocks: Vec<&str> = pending.iter().map(|(name, ..)| name.as_str()).collect();
+            blocks.sort_unstable();
+            listed_here.sort_unstable();
+            if !result_here || blocks != listed_here {
+                return None;
+            }
+            listed_here.clear();
+            result_here = false;
+            binaries += 1;
+            current = None;
+            done.extend(pending.drain(..).map(|(name, block, refused)| FailedTest {
+                spec: spec.to_string(),
+                name,
+                block,
+                refused,
+            }));
+            continue;
+        }
+        if let Some(at) = current {
+            let block = &mut pending[at];
+            block.2 |= line.contains(COULD_NOT_RUN_SENTINEL);
+            block.1.push_str(line);
+            block.1.push('\n');
+        }
+    }
+    let mut named: Vec<&str> = done.iter().map(|t| t.name.as_str()).collect();
+    named.sort_unstable();
+    listed.sort_unstable();
+    (pending.is_empty()
+        && !done.is_empty()
+        && listed == named
+        && binaries > 0
+        && results == binaries)
+        .then_some(done)
 }
 
 #[cfg(test)]
@@ -1001,7 +1220,9 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for (file, arms) in [
             ("crates/aterm-link/tests/harness/mod.rs", 1),
-            ("crates/aterm-conformance/tests/paint/measuring.rs", 1),
+            // Exit 2 (decided nothing) and exit 3 (unproved), 2026-09-26.
+            ("crates/aterm-conformance/tests/paint/measuring.rs", 2),
+            ("crates/aterm-conformance/tests/spin/measuring.rs", 1),
         ] {
             let text =
                 std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
@@ -1010,6 +1231,162 @@ mod tests {
                 arms,
                 "{file} must print `{COULD_NOT_RUN_SENTINEL}` in each of its {arms} refusal arm(s)"
             );
+        }
+    }
+
+    /// EVERY FAILED TEST, WITH THE BINARY THAT FAILED IT. Two binaries, three
+    /// failures, one of them a refusal: each is named with its binary's re-run
+    /// spec and its own block, and the refusal is marked. Two binaries failing
+    /// a test of the same bare name stay two failures with two specs.
+    #[test]
+    fn a_failed_test_log_names_each_failure_with_its_binarys_rerun_spec() {
+        let log = format!(
+            "   Compiling x v0.1.0\n{}{}\x1b[1merror\x1b[0m: 2 targets failed:\n    \
+             `-p x --test probe`\n    `-p x --test world`\n",
+            failed_binary(
+                "probe",
+                &[
+                    (
+                        "index_probe_two",
+                        "\nthread 'index_probe_two' panicked at crates/x/tests/probe.rs:9:5:\nlock held",
+                    ),
+                    ("shared_name", "\nplain failure"),
+                ]
+            ),
+            failed_binary("world", &[("shared_name", &refused("strays alive"))]),
+        );
+        let got = failed_tests(&log).expect("every failure is accounted for");
+        let seen: Vec<(&str, &str, bool)> = got
+            .iter()
+            .map(|t| (t.spec.as_str(), t.name.as_str(), t.refused))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                ("-p x --test probe", "index_probe_two", false),
+                ("-p x --test probe", "shared_name", false),
+                ("-p x --test world", "shared_name", true),
+            ]
+        );
+        assert!(got[0].block.contains("lock held"), "{:?}", got[0]);
+        assert!(!got[0].block.contains("plain failure"), "{:?}", got[0]);
+        assert!(got[1].block.contains("plain failure"), "{:?}", got[1]);
+    }
+
+    /// A LOG THAT CANNOT ACCOUNT FOR A FAILURE ITEMIZES NOTHING, so a failure
+    /// the list would miss is never dropped from a comparison: a binary that
+    /// died of a signal (a re-run line with no `test result:`), a block the
+    /// closing list does not name, and a block no re-run line claims.
+    #[test]
+    fn a_log_that_cannot_account_for_every_failure_itemizes_nothing() {
+        let one = failed_binary("probe", &[("a", "\nboom")]);
+        assert!(failed_tests(&one).is_some(), "the control: {one}");
+        let crashed = format!(
+            "{one}     Running tests/crash.rs (target/debug/deps/crash-1)\n\nrunning 1 test\n\
+             error: test failed, to rerun pass `-p x --test crash`\n\nCaused by:\n  process \
+             didn't exit successfully: `crash-1` (signal: 11, SIGSEGV)\n"
+        );
+        assert_eq!(failed_tests(&crashed), None, "a crash is not itemizable");
+        assert_eq!(
+            failed_tests(&one.replace("failures:\n    a\n", "failures:\n    a\n    b\n")),
+            None,
+            "a listed failure with no block"
+        );
+        let unclaimed = one.replace(
+            "error: test failed, to rerun pass `-p x --test probe`\n",
+            "",
+        );
+        assert_eq!(failed_tests(&unclaimed), None, "a block no binary claims");
+        assert_eq!(failed_tests("running 0 tests\n"), None);
+        assert_eq!(failed_tests(""), None);
+    }
+
+    /// A TEST THAT QUOTES A NESTED CARGO LOG IS NOT ITEMIZED (2026-09-27): the
+    /// gate's own contract tests panic with fixture ladders, and the nested
+    /// log's result and re-run lines inside the block used to cut it short and
+    /// credit it to the nested spec — whether the nested log is a whole failed
+    /// binary (its own list balances its own block) or only its tail.
+    #[test]
+    fn a_block_that_quotes_a_nested_cargo_log_itemizes_nothing() {
+        let nested = failed_binary("inner", &[("x", "\ninner boom")]);
+        let outer = failed_binary(
+            "outer",
+            &[(
+                "quotes",
+                &format!(
+                    "\nthread 'quotes' panicked at src/a.rs:1:1:\nladder:\n{nested}tail of the message"
+                ),
+            )],
+        );
+        assert_eq!(failed_tests(&outer), None, "{outer}");
+        let tail_only = failed_binary(
+            "outer",
+            &[(
+                "quotes",
+                "\nthread 'quotes' panicked at src/a.rs:1:1:\ntest result: FAILED. 0 passed; 1 \
+                 failed\nerror: test failed, to rerun pass `-p inner --lib`\nrest",
+            )],
+        );
+        assert_eq!(failed_tests(&tail_only), None, "{tail_only}");
+        // The control: the same block without the nested lines is itemized.
+        let plain = failed_binary("outer", &[("quotes", "\nthread 'quotes' panicked\nrest")]);
+        assert_eq!(failed_tests(&plain).map(|t| t.len()), Some(1));
+    }
+
+    /// A `failures:` LINE IN A TEST'S OWN MESSAGE (2026-09-27, second review)
+    /// — an oracle listing the cases that disagreed — closed its block, and
+    /// every line after it that was not a four-space name fell outside every
+    /// block, so a branch adding failing cases hashed as main's. Now anything
+    /// but the closing list's names and its `test result:` after a `failures:`
+    /// that closed blocks leaves the log unaccounted — whether the message's
+    /// list is indented two spaces or four, and whichever block holds it.
+    #[test]
+    fn a_failures_line_in_a_message_itemizes_nothing() {
+        for cases in ["  case_07: got 3 want 4", "    case_07"] {
+            let msg = format!(
+                "\nthread 'corpus' panicked at src/a.rs:1:1:\nthe corpus disagreed\nfailures:\n{cases}"
+            );
+            let last = failed_binary("oracle", &[("corpus", &msg)]);
+            assert_eq!(failed_tests(&last), None, "{last}");
+            let first = failed_binary("oracle", &[("corpus", &msg), ("other", "\nboom")]);
+            assert_eq!(failed_tests(&first), None, "{first}");
+        }
+        // The control: the same message without its `failures:` line.
+        let plain = failed_binary(
+            "oracle",
+            &[("corpus", "\nthe corpus disagreed\n  case_07: got 3 want 4")],
+        );
+        let got = failed_tests(&plain).expect("accounted for");
+        assert!(got[0].block.contains("case_07"), "{:?}", got[0].block);
+    }
+
+    /// A BINARY THAT PRINTED ITS RESULT AND THEN DIED (2026-09-27, second
+    /// review): a crash in teardown, or a background thread's abort after the
+    /// summary. Its listed failures balance its blocks, so the log read as
+    /// accounted for and the crash was in no finding. cargo says so under the
+    /// re-run line — `Caused by:` and `process didn't exit successfully: …
+    /// (signal: …)`, as it does for any exit but libtest's 101, and as the
+    /// gate's own test runner writes it — and either line leaves the log
+    /// unaccounted, and no refusal.
+    #[test]
+    fn a_binary_that_died_after_its_result_is_not_accounted_for() {
+        let one = failed_binary("render", &[("t", "\nknown red")]);
+        assert!(failed_tests(&one).is_some(), "the control: {one}");
+        let refusing = failed_binary("render", &[("t", &refused("strays alive"))]);
+        assert!(environment_refusals(&refusing).is_some(), "{refusing}");
+        for why in [
+            "(signal: 11, SIGSEGV: invalid memory reference)",
+            "(killed by a signal)",
+            "(exit status: 134)",
+        ] {
+            let tail = format!(
+                "\nCaused by:\n  process didn't exit successfully: `target/debug/deps/render-abc` \
+                 {why}\n"
+            );
+            let crashed = format!("{one}{tail}");
+            assert_eq!(failed_tests(&crashed), None, "{crashed}");
+            let crashed = format!("{refusing}{tail}");
+            assert_eq!(environment_refusals(&crashed), None, "{crashed}");
         }
     }
 }

@@ -1056,7 +1056,7 @@ pub const VERBS: &[VerbSpec] = &[
          driving|driven|attention|limited|hold> band=\"<row>\" sentence=\"<spoken>\"` — what \
          the human sees of the presence band under the front window's tab bar: the rim's \
          colour state, the severity, the band row's six slots fitted to the window's width \
-         (role, phase and since, hand, mail, `ctx <n>%`, fabric — two spaces between slots; \
+         (role, phase and since, hand, mail, `ctx <n>% left`, fabric — two spaces between slots; \
          `\"\"` when the row is folded) and the sentence a screen reader gets. Both quoted values escape `\"` and \
          `\\`. The band never carries command text, a mail body, an OSC title or a limit \
          message, so neither does this line. Off macOS there is no menu bar: the `menu \
@@ -2974,7 +2974,8 @@ pub const VERBS: &[VerbSpec] = &[
          conversation in the tab (`aterm harness upgrade --status` has the rest): state \
          `pending`, `announced`, `restarting`, `deferred`, `skipped`, `stalled` or `done`, \
          the target version, the wait or stall (`settling`, `attended`, `awaiting-ready`, \
-         `next-round:<span>` for a round resting before it asks again, `overdue` ...), \
+         `next-round:<span>` for a round resting before it asks again, `ready` for one \
+         that gave up and acts on a late READY, `overdue` ...), \
          and how long the session has been behind (for `done`, \
          how long ago it finished). One main-thread hop per call, not per session; the \
          client `ls` \

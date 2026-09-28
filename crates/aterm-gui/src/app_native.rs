@@ -1224,8 +1224,9 @@ impl HandoffFailureLane {
     ///
     /// AND `death` IS THE SAME CORRECTION ONE LEVEL FURTHER DOWN. The outcome is a
     /// total classification of what the WORKER did, but `ChildDied` is not a
-    /// classification of anything — it is proof EOF, which a refusing successor, a
-    /// faulting one and a starved one all produce identically. The evidence the
+    /// classification of anything — it is the candidate ending before its proof,
+    /// which a refusing successor, a faulting one and a starved one all produce
+    /// identically. The evidence the
     /// worker gathered at that instant is what separates them; see
     /// [`crate::ChildDeathEvidence`]. Every other outcome ignores it, because every
     /// other outcome describes a candidate THIS process ended.
@@ -6438,7 +6439,7 @@ impl App {
     /// candidate then fails preparation immediately rather than after parking
     /// every reader and spending a third of a second on `codesign`.
     #[cfg(unix)]
-    fn spawn_staged_handoff_preverification(&mut self, build: u64) {
+    pub(crate) fn spawn_staged_handoff_preverification(&mut self, build: u64) {
         let snapshot = self.native_updater_service.snapshot();
         let current_build = snapshot.current_build;
         let stage = snapshot
@@ -6506,6 +6507,15 @@ impl App {
                     .as_ref()
                     .err()
                     .map(|error| format!("{which} failed pre-park verification: {error}"));
+                // THE SUCCESSOR'S HANDOFF POLICY (plan P0-5), which the verifier
+                // read only because the bundle passed; a refusal carries none.
+                let policy = passed.as_ref().ok().and_then(|read| {
+                    aterm_update_core::handoff_policy::adopt(
+                        read,
+                        current_build,
+                        &format!("{which} build {build}"),
+                    )
+                });
                 *slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) =
@@ -6516,6 +6526,7 @@ impl App {
                         at: std::time::Instant::now(),
                         passed: passed.is_ok(),
                         reason,
+                        policy,
                     });
             });
         if spawned.is_err() {
@@ -13529,6 +13540,7 @@ mod tests {
                 },
                 passed: false,
                 reason: Some(reason.to_string()),
+                policy: None,
             });
             if case == 5 {
                 app.auto_apply_manual_only.as_mut().unwrap().dmg_sha256 = [0xcd; 32];
@@ -13644,6 +13656,7 @@ mod tests {
                     at: std::time::Instant::now(),
                     passed: true,
                     reason: None,
+                    policy: None,
                 });
                 assert_eq!(app.arm_native_auto_apply(11, &"ab".repeat(32)), case != 7);
                 assert_eq!(
@@ -15827,6 +15840,7 @@ mod tests {
                     at: std::time::Instant::now(),
                     passed: true,
                     reason: None,
+                    policy: None,
                 });
         }
         let current_build = app.native_updater_service.snapshot().current_build;
@@ -16870,6 +16884,7 @@ mod tests {
                 at: std::time::Instant::now(),
                 passed: false,
                 reason: None,
+                policy: None,
             });
         assert_eq!(app.cached_handoff_preverification(&download), Some(false));
         assert_eq!(

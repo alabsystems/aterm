@@ -893,10 +893,10 @@ impl<C: Ctl> Session<'_, C> {
     /// and the loop looks again once the box has LEFT; a box it escalates —
     /// with the reason kept for the escalation's text ([`Session::box_reason`])
     /// — is a review point, and so is anything that is not a box, the same
-    /// approval back after two presses, a guard that matched no row of this
-    /// very box, a box that did not move after the press, and a fallback
-    /// press withheld because the session survey is open
-    /// ([`Pressing::Withheld`]). A press the server skipped because the box
+    /// approval back after two presses, a press whose box row aterm could not
+    /// find on this very screen (its guard matched no row), a box that did
+    /// not move after the press, and a fallback press withheld because the
+    /// session survey is open ([`Pressing::Withheld`]). A press the server skipped because the box
     /// left or the fenced screen moved, parked on a hold, or backed off
     /// after `ERR busy …`/`ERR rate`, is followed by a fresh read and a fresh
     /// decision — never the same press again. When the connection is lost
@@ -1340,7 +1340,7 @@ impl<C: Ctl> Session<'_, C> {
                     // The very screen we parsed, and the guard found no row:
                     // under the safe rules this box is not one the supervisor
                     // answers; at full power it is read and tried again.
-                    let why = "the guarded press matched no row";
+                    let why = "aterm could not find the box's row";
                     if self.retries_presses(opts, review, rule_id) {
                         return self.press_missed(&turn, allow, &what, why, review);
                     }
@@ -1392,7 +1392,8 @@ impl<C: Ctl> Session<'_, C> {
     /// FULL POWER'S ANSWER TO A PRESS THAT DID NOT LAND (the philosophy review
     /// of 2026-09-25: the box did not change after the press, a streak of
     /// fenced presses that did not land, a focus move that did not land, or
-    /// a guard that matched no row of the very box read — each handed the box
+    /// a box row aterm could not find on the very screen read (its guard
+    /// matched no row) — each handed the box
     /// to a person, and the box was never tried again; headless, nobody could
     /// answer): [`Self::box_back_off`], journaled `WAITING seq=<n> the press
     /// did not land (<why>) …`.

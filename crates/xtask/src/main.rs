@@ -2,61 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! aterm build-graph tasks — the ALWAYS-RUN nodes of TRUST_VACUITY_GATE §2.
+//! aterm's build-graph tasks. Four subcommands:
 //!
-//! Four subcommands, all independent of any one crate's `cargo test` binary
-//! (finding 5 — "the teeth are there, the wiring isn't"). The two always-run
-//! nodes are described below; `gate <check>` (see `gate.rs`) and `verify` (the
-//! `tools/verify.sh` driver) are the other two:
-//!
-//!   * `harness-manifest` (§2.1 / finding 1a): enumerate every REAL
-//!     `#[kani::proof] fn` across the workspace `crates/` and write a
-//!     `HarnessManifest` JSON to `target/trust/harness-manifest.json` in the exact
-//!     shape `trust-ir spec-link --harness-manifest` expects
-//!     (`{"harnesses":[{"name","span"}]}`). This is the data trust-ir's L1 resolves
-//!     `proof_name` against (the standalone IR has no compiler/DefId view, so the
-//!     manifest must be produced HERE and handed to spec-link).
-//!
-//!   * `spec-link` (§2.5 / finding 5): the always-run cross-reference node. It (1)
-//!     regenerates the manifest, (2) builds the anchor graph from the EMBEDDED models +
-//!     external ISOLATION `.tla` + the cross-crate-collected `proof_anchor!`s
-//!     (aterm-scrollback / aterm-grid / aterm-search, linked with `spec-anchors` ON in
-//!     THIS binary),
-//!     (3) lowers it with `aterm_spec::ir::lower_to_ir` (now emitting `proof` lines),
-//!     and (4) shells `trust-ir spec-link --harness-manifest … --require-manifest`.
-//!     The text-only artifact is explicitly design-only (it has no compiler
-//!     `FuncId`s), so this node requires a structurally clean design-only report:
-//!     S0/S1, Ob.1/Ob.4, proof-name resolution (L1), and mandatory projection
-//!     labels (L2). Aterm's in-process closure remains the fail-closed Ob.3
-//!     coverage gate.
-//!
-//! NOTE on scope: the in-SOURCE `path_confine` / `window_routing` `#[cfg(test)]`
-//! anchors collect ONLY in aterm-gui's test binary (inventory sees only LINKED object
-//! code), so the FULL ISOLATION + window_routing in-source set is enforced by the
-//! `spec_xref_gate` there. THIS node enforces the embedded models, the external
-//! ISOLATION specs, and the cross-crate PROOF anchors — i.e. the L1 teeth that the
-//! manifest unlocks — independent of that test binary.
+//!   * `harness-manifest`: enumerate every REAL `#[kani::proof] fn` across the
+//!     workspace `crates/` and write a `HarnessManifest` JSON to
+//!     `target/trust/harness-manifest.json` in the shape `trust-ir spec-link
+//!     --harness-manifest` expects (`{"harnesses":[{"name","span"}]}`) — the data
+//!     trust-ir's L1 resolves `proof_name` against. aterm-gui's
+//!     `spec_xref_closure` runs it.
+//!   * `gate <verb>`: the checks the merge gate shells into this binary for
+//!     (`gate.rs`).
+//!   * `perf [--record]`: the measuring perf lanes and the same-box trend ledger
+//!     (`perf.rs`). It has no automatic caller; it measures.
+//!   * `verify [args…]`: `tools/verify.sh`, the `cargo verify` alias's target.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-use aterm_spec::tla_check::TlaSpec;
-use aterm_spec::xref::{self, SpecModule};
-
-mod citations;
 mod driver;
 mod gate;
 mod perf;
-
-// Force the proof-anchor-bearing rlibs into the link graph: `inventory` only collects
-// `submit!`s from LINKED object code, and a bin that references NOTHING from these
-// crates would let the linker drop their rlibs (and the `spec_proof_anchors` module's
-// `proof_anchor!` consts with them). The `extern crate` declarations + the
-// `force_link` reference below pull them in so `xref::proof_anchors()` sees the kani
-// half cross-crate (the same mechanism aterm-gui's test binary relies on).
-extern crate aterm_grid;
-extern crate aterm_scrollback;
-extern crate aterm_search;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
@@ -72,32 +37,28 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("spec-link") => spec_link(),
         Some("gate") => gate::run(
             args.get(2).map(String::as_str),
             args.get(3..).unwrap_or_default(),
         ),
+        Some("perf") => {
+            if perf::run() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Some("verify") => verify(&args[2..]),
         _ => {
-            // Both lists are `gate.rs`'s own; a hand-typed subset sat here for
-            // months, and the opt-in half disagreed with gate.rs's own header
-            // (four there, five here) until 2026-09-13.
-            let roster = gate::roster_names().join("|");
-            let opt_in = gate::opt_in_names().join("|");
             eprintln!(
-                "usage: xtask <harness-manifest|spec-link|gate <check>|verify [args…]>\n\
+                "usage: xtask <harness-manifest|gate <verb>|perf [--record]|verify [args…]>\n\
                  \n\
                  harness-manifest  enumerate #[kani::proof] fns -> target/trust/harness-manifest.json\n\
-                 spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
-                 gate <check>      local enforcement gate (NO CI): all|{roster}|nonvacuity,\n\
-                                   plus the ones `all` leaves out: {opt_in}\n\
-                                   `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt;\n\
-                                   --no-fmt drops the formatter lane and\n\
-                                   --fmt-only keeps only it (both passes, no compiler,\n\
-                                   seconds), nothing else narrowed either way\n\
-                                   see docs/EXCEED_GHOSTTY_PLAN.md\n\
+                 gate <verb>       the merge gate's xtask checks: {}\n\
+                 perf [--record]   the perf lanes against tools/golden (--record rewrites them)\n\
                  verify [args…]    run THE gate, tools/verify.sh, forwarding every argument\n\
-                                   (this is what the `cargo verify` alias dispatches to)"
+                 \x20                 (this is what the `cargo verify` alias dispatches to)",
+                gate::verb_names().join("|")
             );
             ExitCode::FAILURE
         }
@@ -247,14 +208,9 @@ fn write_harness_manifest() -> std::io::Result<PathBuf> {
     Ok(out_path)
 }
 
-/// Recursive `*.rs` collection (skips `target/` + hidden dirs). The
-/// implementation moved to `aterm-census` — the shared census library that
-/// `gate mainloop` AND tools/freeze-safety-gate's build.rs both consume — so
-/// the file-walk semantics (and its Trust-L0-hardened byte-comparison shape)
-/// cannot diverge between the gates and the build-blocking census. Re-exported
-/// here because every xtask scan (harness-manifest, drift, fault, counts) uses
-/// the same walk.
-pub(crate) use aterm_census::collect_rs_files;
+/// Recursive `*.rs` collection (skips `target/` + hidden dirs), the census
+/// library's walk, so the manifest reads the tree the censuses read.
+use aterm_census::collect_rs_files;
 
 /// Extract `<ident>` from a `(pub )?(unsafe )?fn <ident>…` line; `None` otherwise.
 fn parse_fn_name(line: &str) -> Option<String> {
@@ -334,143 +290,4 @@ fn json_str(s: &str) -> String {
     }
     out.push('"');
     out
-}
-
-// ---------------------------------------------------------------------------
-// spec-link (finding 5) — the always-run cross-reference node
-// ---------------------------------------------------------------------------
-
-/// Touch a symbol from each proof-anchor-bearing crate so the linker retains its rlib
-/// (and the `spec_proof_anchors` `inventory::submit!` consts). `black_box` defeats
-/// dead-code elimination of the reference itself.
-fn force_link() {
-    std::hint::black_box(aterm_scrollback::DEFAULT_LINE_LIMIT);
-    std::hint::black_box(aterm_grid::MAX_GRID_ROWS);
-    std::hint::black_box(aterm_search::MAX_SEARCH_MATCHES);
-}
-
-fn spec_link() -> ExitCode {
-    force_link();
-    // (1) Regenerate the manifest the L1 resolution needs.
-    let manifest = match write_harness_manifest() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("xtask spec-link: could not write harness manifest: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // (2) Build the anchor graph from THIS binary's linked object code: every embedded
-    // model + every external ISOLATION `.tla` + the cross-crate `proof_anchor!`s.
-    let mut modules: Vec<SpecModule> = xref::model_registry()
-        .into_iter()
-        .map(SpecModule::Embedded)
-        .collect();
-    let dir = aterm_spec_models::specs_dir();
-    let mut external = 0usize;
-    for entry in std::fs::read_dir(&dir).expect("read aterm-spec-models specs/") {
-        let path = entry.expect("dir entry").path();
-        if path.is_dir() || path.extension().and_then(|e| e.to_str()) != Some("tla") {
-            continue;
-        }
-        let spec = TlaSpec::parse_file(&path)
-            .unwrap_or_else(|e| panic!("failed to parse external spec {path:?}: {e}"));
-        modules.push(SpecModule::External(spec));
-        external += 1;
-    }
-
-    let refs: Vec<_> = xref::refinements().collect();
-    let waivers: Vec<_> = xref::waivers().collect();
-    let proofs: Vec<_> = xref::proof_anchors().collect();
-    eprintln!(
-        "xtask spec-link: anchor graph — {} module(s) ({} external ISOLATION), {} refinement(s), \
-         {} waiver(s), {} proof anchor(s)",
-        modules.len(),
-        external,
-        refs.len(),
-        waivers.len(),
-        proofs.len()
-    );
-    assert!(
-        !proofs.is_empty(),
-        "xtask spec-link: ZERO proof anchors collected — the cross-crate `proof_anchor!` \
-         inventory (aterm-scrollback / aterm-grid / aterm-search with `spec-anchors`) did not \
-         link. The L1 proof-name teeth would be untested."
-    );
-
-    // (3) Lower to a byte-conforming `.trust_irtxt` (now emitting `proof` lines).
-    let module_txt =
-        aterm_spec::ir::lower_to_ir("aterm_xtask_spec_link", &modules, &refs, &waivers, &proofs);
-    let out_dir = workspace_root().join("target").join("trust");
-    std::fs::create_dir_all(&out_dir).expect("mk target/trust");
-    let ir_path = out_dir.join("xtask-spec-link.trust_irtxt");
-    std::fs::write(&ir_path, &module_txt).expect("write .trust_irtxt");
-
-    // (4) Shell `trust-ir spec-link --harness-manifest … --require-manifest`.
-    let trust_ir = match aterm_spec::verify::find_trust_ir() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "xtask spec-link: VERIFICATION GATE — `trust-ir` not found; install it \
-                 (`aterm pkg install trust-ir`). The always-run spec-link node FAILS rather \
-                 than silently skipping."
-            );
-            return ExitCode::FAILURE;
-        }
-    };
-    let out = Command::new(&trust_ir)
-        .arg("spec-link")
-        // aterm emits TEXT (`lower_to_ir`); trust-ir 0.2.0 maps the `.trust_ir`
-        // extension to BINARY, so pin the format explicitly.
-        .arg("--format")
-        .arg("text")
-        .arg(&ir_path)
-        .arg("--harness-manifest")
-        .arg(&manifest)
-        .arg("--require-manifest")
-        .output()
-        .unwrap_or_else(|e| panic!("failed to run {trust_ir:?} spec-link: {e}"));
-    let report = format!(
-        "{}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    eprintln!("--- trust-ir spec-link (xtask always-run node) ---\n{report}");
-    let structurally_clean =
-        aterm_spec::ir::spec_link_report_is_clean(out.status.success(), &report);
-    // BUG (fixed): the count is load-bearing (it must be EVERY anchor, not
-    // some of them) but it was scored with two loose `contains` calls over the
-    // whole report — "harness manifest" could match any line, including an
-    // `error: harness manifest ... is structurally invalid` one, and the count
-    // phrase matched as a PREFIX, so any longer sentence that merely BEGAN
-    // "checked <n> proof binding..." was accepted as proof that all <n>
-    // resolved. Anchor on ONE whole line that carries both facts and require
-    // the count phrase to END it, exactly as trust-ir prints it:
-    //   spec-link: harness manifest <path> (<n> harness(es)), checked <k> proof binding(s)
-    let want_proofs = format!(
-        "checked {} proof binding{}",
-        proofs.len(),
-        if proofs.len() == 1 { "" } else { "s" }
-    );
-    let proof_evidence = report
-        .lines()
-        .map(str::trim)
-        .any(|line| line.contains("harness manifest") && line.ends_with(&want_proofs));
-    if structurally_clean && proof_evidence {
-        eprintln!(
-            "xtask spec-link: GREEN (STRUCTURAL, DESIGN-ONLY) — trust-ir checked S0/S1 + \
-             Ob.1/Ob.4 + L2 and resolved every proof_name against the manifest (L1) over the \
-             embedded models, external ISOLATION specs, and {} proof anchor(s). The artifact is \
-             explicitly non-certifying because it carries no compiler FuncIds; aterm's in-process \
-             closure separately enforces Ob.3 coverage.",
-            proofs.len()
-        );
-        ExitCode::SUCCESS
-    } else {
-        eprintln!(
-            "xtask spec-link: FAILED — trust-ir reported a structural violation, an unexpected \
-             non-certification reason, or did not prove manifest use (see above)."
-        );
-        ExitCode::FAILURE
-    }
 }

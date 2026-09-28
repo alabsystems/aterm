@@ -1032,7 +1032,9 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                         let masters_quiet = !handoff_masters_have_activity(live);
                         let masters_alive = !handoff_masters_closed(live);
                         assert_eq!(masters_quiet, *quiet_masters, "the real peek over {desk}");
-                        for land_waits in [0, PRELAUNCH_LAND_MAX_WAITS] {
+                        for (land_waits, land_gate_relaxed) in
+                            [(0, false), (PRELAUNCH_LAND_MAX_WAITS, false), (0, true)]
+                        {
                             let real = prelaunch_park_admitted(
                                 ParkGateFacts {
                                     mode,
@@ -1041,18 +1043,21 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                                     masters_quiet,
                                     masters_alive,
                                     land_waits,
+                                    land_gate_relaxed,
                                     held_for: std::time::Duration::ZERO,
                                 },
                                 prelaunch_hold_cap(mode),
                             ) == ParkGate::Park;
-                            let bound_waited =
-                                phase == ApplyPhase::Land && land_waits >= PRELAUNCH_LAND_MAX_WAITS;
+                            // The successor's policy (plan P0-5) brings the
+                            // bound forward; it relaxes nothing else.
+                            let bound_waited = phase == ApplyPhase::Land
+                                && (land_waits >= PRELAUNCH_LAND_MAX_WAITS || land_gate_relaxed);
                             assert_eq!(
                                 real,
                                 model_parks && masters_alive && (masters_quiet || bound_waited),
                                 "{mode:?} quiet={quiet} {phase:?} {desk} after {land_waits} \
-                                 waits: the shipping gate parks exactly where the model \
-                                 does and the masters allow"
+                                 waits, policy-relaxed={land_gate_relaxed}: the shipping gate \
+                                 parks exactly where the model does and the masters allow"
                             );
                         }
                     }
@@ -1094,6 +1099,7 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
                     masters_quiet: true,
                     masters_alive: true,
                     land_waits: 0,
+                    land_gate_relaxed: false,
                     held_for: std::time::Duration::ZERO,
                 },
                 prelaunch_hold_cap(mode),

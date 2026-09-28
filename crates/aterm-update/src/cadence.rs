@@ -292,6 +292,20 @@ impl Cadence {
         MAX_BACKOFF.max(self.base.saturating_mul(MAX_BACKOFF_INTERVALS))
     }
 
+    /// The longest one [`wait`] of this schedule can take, plus the post-wake
+    /// [`WAKE_SETTLE`] the loop may add after it: the ceiling, spread by the
+    /// jitter's upper edge (a hold is capped at the ceiling and never spread).
+    ///
+    /// The check loop publishes it as its heartbeat's budget while it waits
+    /// (`checker_watch`, plan P2-1): the longest silence between two stamps that is
+    /// still a healthy loop. Derived here, from the same ceiling and jitter
+    /// [`Self::delay_at`] uses, so a later change to either cannot leave the
+    /// watchdog judging a wait it no longer knows the length of.
+    pub(crate) fn max_wait(&self) -> Duration {
+        let cap = u64::try_from(self.cap().as_millis()).unwrap_or(u64::MAX);
+        Duration::from_millis(cap.saturating_mul(100 + JITTER_PCT) / 100) + WAKE_SETTLE
+    }
+
     /// The nominal (pre-jitter) wait: `base` doubled once per consecutive failure,
     /// clamped to [`Self::cap`] — or, while a run of unreachable-network failures is
     /// within [`OFFLINE_RETRY`], that rung; or, after a healthy check that found the
@@ -582,6 +596,66 @@ mod tests {
     #[test]
     fn healthy_cadence_is_the_base_interval() {
         assert_eq!(Cadence::new(BASE).nominal(), BASE);
+    }
+
+    /// THE WATCHDOG'S BUDGET COVERS EVERY WAIT THE SCHEDULE CAN TAKE (plan P2-1).
+    /// `max_wait` is what the heartbeat is judged against while the loop waits, so
+    /// a wait longer than it would read as a stall of a healthy loop: swept over
+    /// the shipped interval and a fast test base, every failure depth, the offline
+    /// and in-flight ladders, a hold past the ceiling, a deferral held to its own
+    /// window (`Cadence::deferred`) and every jitter byte, no delay (plus the wake
+    /// settle) exceeds it.
+    #[test]
+    fn max_wait_bounds_every_delay_the_schedule_can_take() {
+        let now = Instant::now();
+        for base in [BASE, Duration::from_secs(INTERVAL_SECS)] {
+            let mut schedules = Vec::new();
+            let mut c = Cadence::new(base);
+            for _ in 0..24 {
+                schedules.push(c);
+                c.failed();
+            }
+            let mut offline = Cadence::new(base);
+            for _ in 0..8 {
+                offline.failed_offline();
+                schedules.push(offline);
+            }
+            for checks in 0..8 {
+                let mut in_flight = Cadence::new(base);
+                in_flight.succeeded(checks);
+                schedules.push(in_flight);
+            }
+            let mut held = Cadence::new(base);
+            held.hold_until(now + Duration::from_secs(24 * 3600));
+            schedules.push(held);
+            // A deferral held to its own window (`Cadence::deferred`, the rate-limited
+            // arm): the window the check stamped, and one far past the ceiling.
+            for window in [base * 14 / 10, Duration::from_secs(24 * 3600)] {
+                for entropy in [0u8, 255] {
+                    let mut deferred = Cadence::new(base);
+                    deferred.deferred(Some(now + window), now, entropy);
+                    schedules.push(deferred);
+                }
+            }
+            for s in schedules {
+                for entropy in 0..=u8::MAX {
+                    assert!(
+                        s.delay_at(now, entropy) + WAKE_SETTLE <= s.max_wait(),
+                        "{s:?} at entropy {entropy}: {:?} + settle > {:?}",
+                        s.delay_at(now, entropy),
+                        s.max_wait()
+                    );
+                }
+            }
+        }
+        // …and it is not vacuous: at the shipped interval it is exactly the
+        // schedule's own LONGEST_WAIT (the 40-minute ceiling, +20 %, + the settle),
+        // the bound `no_wait_exceeds_the_longest_wait` shows is reached.
+        assert_eq!(
+            Cadence::new(Duration::from_secs(INTERVAL_SECS)).max_wait(),
+            LONGEST_WAIT
+        );
+        assert_eq!(LONGEST_WAIT, Duration::from_secs(48 * 60) + WAKE_SETTLE);
     }
 
     #[test]

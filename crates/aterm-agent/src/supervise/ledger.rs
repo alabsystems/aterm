@@ -1129,7 +1129,9 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             let (sign, z) = z.split_at(1);
             let (zh, zm) = match z.split_once(':') {
                 Some(pair) => pair,
-                None if z.len() == 4 => z.split_at(2),
+                // Byte 2 must be a char boundary: a 4-BYTE suffix like `1é1`
+                // is not four digits, and `split_at` would panic inside it.
+                None if z.len() == 4 && z.is_char_boundary(2) => z.split_at(2),
                 None => (z, "0"),
             };
             let v = i64::from(num(zh)?) * 3600 + i64::from(num(zm)?) * 60;
@@ -1149,7 +1151,13 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
             offset = z;
         }
     }
-    Some((days_from_civil(y, mo, d) * 86_400 + secs - offset) * 1000)
+    // Checked: the year is up to ten digits, and `9999999999-01-01` in
+    // milliseconds does not fit an `i64` — refused, not wrapped or panicked.
+    days_from_civil(y, mo, d)
+        .checked_mul(86_400)?
+        .checked_add(secs)?
+        .checked_sub(offset)?
+        .checked_mul(1000)
 }
 
 // ------------------------------------------------------------------ text and md

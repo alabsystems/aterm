@@ -1,14 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for the live upgrade's model priority list
-//! (`harness::upgrade_models`, spec `HarnessModelPriority`).
+//! Tier-1 binding for the live upgrade's model priority list, its model
+//! ladder and its model switch (`harness::upgrade_models`, specs
+//! `HarnessModelPriority`, `HarnessModelLadder` and `HarnessModelSwitch`).
 //!
 //! A `ty`-green model on its own is a statement about the DESCRIPTION of the
 //! code. These tests make it a statement about the code that compiled: they
 //! drive the real `Priority::admit`, `render`/`parse` and
-//! `upgrade_models::target_allowed` over every reachable state of the derived
-//! model, project what those produce onto the model's variables, and check
+//! `upgrade_models::target_allowed` (the list), `model_moves_now` (the
+//! ladder), and `model_read_step`, `model_due`, `model_to`,
+//! `ModelRecord::settle`/`due_clock`/`asked` and `live_model_at` (the switch)
+//! over every reachable state of the derived models, project what those
+//! produce onto the models' variables, and check
 //! every observed transition against the same model checked at Tier 0 — by
 //! the in-process interpreter always, and additionally by `ty trace validate`
 //! wherever that binary is installed. FORGED successors the model must refuse
@@ -23,6 +27,8 @@ use aterm_spec::verify;
 mod ladder;
 #[path = "conformance_upgrade_models/priority.rs"]
 mod priority;
+#[path = "conformance_upgrade_models/switch.rs"]
+mod switch;
 
 type Vars = BTreeMap<&'static str, i64>;
 

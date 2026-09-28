@@ -250,14 +250,95 @@ impl AgentPhase {
     /// The word the band prints: [`Self::word`], except that a wall the band
     /// has always called `limited` (a usage window, a model bucket, spend, an
     /// API rate limit — [`aterm_phase::WallKind::reads_limited`]) keeps that
-    /// word (design §1: `limited → 19:30 · 1d 22h`), and any other wall is
-    /// its kind (`overloaded`, `context`).
+    /// word (design §1: `limited → 19:30 · 1d 22h`), an API error the network
+    /// caused says what went wrong ([`api_cause_words`]: `can't reach the
+    /// API`, `reply cut off`, `TLS/proxy refused`), any other wall is the
+    /// state it leaves the session in (the menu bar's
+    /// `status_item::wall_words`), and a parked survey is `idle`: the worker
+    /// waits at its composer either way.
     pub(crate) fn band_word(&self) -> &'static str {
         match self {
             Self::Wall { kind, .. } if kind.reads_limited() => "limited",
-            Self::Wall { kind, .. } => kind.name(),
+            Self::Wall { kind, .. } => api_cause_words(*kind)
+                .unwrap_or_else(|| crate::status_item::wall_words(kind.name())),
+            Self::Survey => "idle",
             other => other.word(),
         }
+    }
+
+    /// What the band's age counts from: its phase word, a box by the kind the
+    /// band names ([`prompt_band_word`]), so a box that follows another
+    /// starts its own age.
+    fn age_key(&self) -> std::borrow::Cow<'static, str> {
+        match self {
+            Self::Prompt { detail } => prompt_band_word(detail.as_deref()).into(),
+            other => other.band_word().into(),
+        }
+    }
+}
+
+/// A box's kind in a person's words: the kind before the colon of
+/// `kind[:verdict]` (`bash:not-read-only` → `bash`), the hyphenated kinds
+/// spelled out (`plan-exit` → `plan`). `None` for a box of no named kind.
+/// The band and the menu bar (`status_item::agent_escalation`) both say it.
+pub(crate) fn prompt_kind_words(detail: Option<&str>) -> Option<&str> {
+    let kind = detail
+        .and_then(|d| d.split(':').next())
+        .filter(|k| !k.is_empty() && *k != "other")?;
+    Some(match kind {
+        "plan-enter" => "plan mode",
+        "plan-exit" => "plan",
+        "held-message" => "held message",
+        "goal-proposal" => "goal",
+        "computer-use" => "computer use",
+        "read-outside-setting" => "outside read",
+        "model-switch" => "model switch",
+        "trust" => "folder trust",
+        "powershell" => "PowerShell",
+        other => other,
+    })
+}
+
+/// A box in the band's words: `bash approval`, `plan approval`; the agent's
+/// question tool is a `question`, never an approval
+/// ([`aterm_phase::PromptKind::Question`]); a box of no named kind is
+/// `approval`.
+pub(crate) fn prompt_band_word(detail: Option<&str>) -> String {
+    match prompt_kind_words(detail) {
+        Some("question") => "question".to_string(),
+        Some(kind) => format!("{kind} approval"),
+        None => "approval".to_string(),
+    }
+}
+
+/// The tab's and the menu's words for an API error that never reached the
+/// API ([`aterm_phase::ApiCause::Unreachable`]). Not `offline`: most of that
+/// family — `Connection refused — a firewall or proxy may be blocking it`,
+/// `Request timed out`, `No response from API` — is no machine offline, and
+/// the words promise nothing the harness may not do (the outage of
+/// 2026-09-27).
+pub(crate) const API_UNREACHABLE: &str = "can't reach the API";
+/// … a reply the connection cut off ([`aterm_phase::ApiCause::CutOff`]).
+pub(crate) const API_CUT_OFF: &str = "reply cut off";
+/// … a certificate or proxy the connection refused
+/// ([`aterm_phase::ApiCause::Config`]).
+pub(crate) const API_REFUSED: &str = "TLS/proxy refused";
+
+/// What an API error the NETWORK caused is called on the tab, in the menu and
+/// in the notification — the cause the vendor's own line names
+/// ([`aterm_phase::ApiCause`]), never a plan: nothing here knows what the
+/// session's supervisor will do, or when (its `WAITING` is its journal's).
+/// `None` for the server's own failure (a status, words the catalog does not
+/// name) and every other wall: its kind's name stands.
+pub(crate) fn api_cause_words(kind: aterm_phase::WallKind) -> Option<&'static str> {
+    match kind {
+        aterm_phase::WallKind::ApiError { cause, .. } => match cause {
+            aterm_phase::ApiCause::Unreachable => Some(API_UNREACHABLE),
+            aterm_phase::ApiCause::CutOff => Some(API_CUT_OFF),
+            aterm_phase::ApiCause::Config => Some(API_REFUSED),
+            aterm_phase::ApiCause::Server => None,
+        },
+        _ => None,
     }
 }
 
@@ -292,9 +373,11 @@ pub(crate) enum AgentVerdict {
     /// that identity, `program`, for the rest of the foreground job: a box
     /// hides the composer, and Codex's composer holding a draft names
     /// nothing). `subject` is the approval
-    /// box's command or path, folded to one clipped line, for the host's own
-    /// menu row and notification ([`crate::status_item::escalation`]) — never
-    /// for the wire or the band; `None` unless the phase is a prompt.
+    /// box's command or path, folded to one clipped line — or, at an API
+    /// error the network caused, its cause in words ([`api_cause_words`]) —
+    /// for the host's own menu row and notification
+    /// ([`crate::status_item::escalation`]), never for the wire or the band;
+    /// `None` for every other phase.
     Agent {
         reading: AgentReading,
         by_frame: bool,
@@ -544,6 +627,9 @@ pub(crate) fn classify(
     let phase = if !r.phase_authoritative {
         AgentPhase::Unknown
     } else if let Some(w) = r.wall {
+        // An API error the network caused names its cause for the menu row
+        // and the notification: the wire word stays `wall:api-error`.
+        subject = api_cause_words(w.kind).map(str::to_string);
         wall(w.kind, w.reset)
     } else {
         match r.phase {
@@ -965,19 +1051,20 @@ impl StoryVerb {
         })
     }
 
-    /// WHO decided a told point, for the spoken sentence (`approved by
-    /// watcher`, `chose by harness`): the harness for [`Self::Chose`], a
-    /// watcher for every other told word. Saying "watcher" for a choice the
-    /// harness made would misname who acted for the human.
+    /// WHO acted on a told point, for the spoken sentence (`approved by
+    /// watcher`, `chose by harness`, `compacted by worker`): the harness for
+    /// [`Self::Chose`], the worker for [`Self::Compacted`] (the watcher only
+    /// saw it happen), a watcher for every other told word. Saying "watcher"
+    /// for what the harness or the worker did would misname who acted.
     pub(crate) const fn teller(self) -> &'static str {
         match self {
             Self::Chose => "harness",
+            Self::Compacted => "worker",
             Self::Approval
             | Self::Dismissed
             | Self::Reconnected
             | Self::Timeout
             | Self::Exit
-            | Self::Compacted
             | Self::Warned
             | Self::Turn
             | Self::TurnTimedOut
@@ -1154,8 +1241,12 @@ impl Slot {
             let agent = facts.agent;
             let word_moved = self.agent.as_ref().map(|a| a.phase.word())
                 != agent.as_ref().map(|a| a.phase.word());
-            if word_moved {
+            if self.agent.as_ref().map(|a| a.phase.age_key())
+                != agent.as_ref().map(|a| a.phase.age_key())
+            {
                 self.agent_since = now;
+            }
+            if word_moved {
                 match agent.as_ref().map(|a| &a.phase) {
                     Some(AgentPhase::Question) => self.note(StoryVerb::Question, now),
                     Some(AgentPhase::Wall { .. }) => {
@@ -2048,9 +2139,11 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
         let mut clauses = Vec::new();
         let mut spoken = word.to_string();
         match &agent.phase {
-            AgentPhase::Prompt { detail: Some(d) } => {
-                spoken = format!("prompt, {d}");
-                (format!("prompt\u{00b7}{d}"), clauses, spoken)
+            AgentPhase::Prompt { detail } => {
+                let word = prompt_band_word(detail.as_deref());
+                clauses.push(fmt_dur(now.saturating_duration_since(slot.agent_since)));
+                spoken.clone_from(&word);
+                (word, clauses, spoken)
             }
             AgentPhase::Wall { reset, until, .. } => {
                 // `limited → 19:30 · 1d 22h`: the reset the notice named, then
@@ -2182,16 +2275,17 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
     }
 
     // ctx
+    // The context LEFT (`<n>% until auto-compact`, `<n>% context left`).
     let ctx = match slot.agent.as_ref().and_then(|a| a.context_pct) {
-        Some(pct) if pct <= CTX_WARN_PCT => format!("ctx {pct}% \u{26a0}"),
-        Some(pct) => format!("ctx {pct}%"),
+        Some(pct) if pct <= CTX_WARN_PCT => format!("ctx {pct}% left \u{26a0}"),
+        Some(pct) => format!("ctx {pct}% left"),
         None => String::new(),
     };
     let spoken_ctx = slot
         .agent
         .as_ref()
         .and_then(|a| a.context_pct)
-        .map(|p| format!("context {p} percent"));
+        .map(|p| format!("context {p} percent left"));
 
     // fabric
     let (fabric, spoken_fabric) = match slot.link {
@@ -2411,11 +2505,11 @@ mod tests {
         let w = words(&s, now + Duration::from_secs(192), 0);
         assert_eq!(
             w.fit(120),
-            "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41%  \u{27df} 12ms"
+            "worker:claude-satcomp  busy 3m12s  \u{25c2} manager \u{00b7} turn 41  \u{2709}2 task\u{2190}\u{2713}manager  ctx 41% left  \u{27df} 12ms"
         );
         assert_eq!(
             w.sentence,
-            "driven by manager, turn 41, busy, 2 unread, task from manager, agent, context 41 percent"
+            "driven by manager, turn 41, busy, 2 unread, task from manager, agent, context 41 percent left"
         );
         assert_eq!(w.tone, Tone::Info);
         assert_eq!(s.level(0), Level::Driven);
@@ -2430,13 +2524,13 @@ mod tests {
         let s = driven(now);
         let w = words(&s, now + Duration::from_secs(192), 0);
         let at = |cols| w.fit(cols);
-        assert_eq!(width(&at(120)), 89, "the whole line: {}", at(120));
-        assert!(!at(85).contains("\u{27df}"), "rtt goes first: {}", at(85));
-        assert!(at(85).contains("3m12s"));
-        assert!(!at(78).contains("3m12s"), "then since: {}", at(78));
-        assert!(at(78).contains("worker:claude-satcomp"));
-        assert!(!at(70).contains("worker:claude"), "then role: {}", at(70));
-        assert!(at(70).contains("ctx 41%"));
+        assert_eq!(width(&at(120)), 94, "the whole line: {}", at(120));
+        assert!(!at(90).contains("\u{27df}"), "rtt goes first: {}", at(90));
+        assert!(at(90).contains("3m12s"));
+        assert!(!at(83).contains("3m12s"), "then since: {}", at(83));
+        assert!(at(83).contains("worker:claude-satcomp"));
+        assert!(!at(75).contains("worker:claude"), "then role: {}", at(75));
+        assert!(at(75).contains("ctx 41% left"));
         assert!(!at(50).contains("ctx"), "then ctx: {}", at(50));
         assert!(at(50).contains("task\u{2190}\u{2713}manager"));
         assert!(!at(40).contains("task"), "then the mail detail: {}", at(40));
@@ -2985,8 +3079,42 @@ mod tests {
         );
         assert_eq!(s.tone(now, 0), Tone::Warn);
         let w = words(&s, now, 0);
-        assert_eq!(w.phase, "prompt\u{00b7}bash");
-        assert_eq!(w.ctx, "ctx 12% \u{26a0}");
+        assert_eq!(w.phase, "bash approval");
+        assert_eq!(w.since, ["0s"], "the wait's age, as a question's");
+        assert_eq!(w.ctx, "ctx 12% left \u{26a0}");
+        // The classifier's verdict and an unnamed kind stay off the band.
+        assert_eq!(
+            prompt_band_word(Some("bash:not-read-only")),
+            "bash approval"
+        );
+        assert_eq!(prompt_band_word(Some("other")), "approval");
+        assert_eq!(prompt_band_word(None), "approval");
+        // The question tool asks; it approves nothing.
+        assert_eq!(prompt_band_word(Some("question")), "question");
+        assert_eq!(prompt_band_word(Some("plan-exit")), "plan approval");
+        assert_eq!(
+            prompt_band_word(Some("read-outside-setting")),
+            "outside read approval"
+        );
+        // A box that follows another, with no busy reading between, starts
+        // its own age; the same box's next reading keeps it.
+        let box_of = |seq, detail: &str| Facts {
+            agent_seq: seq,
+            agent: Some(AgentReading {
+                phase: AgentPhase::Prompt {
+                    detail: Some(detail.into()),
+                },
+                context_pct: Some(12),
+            }),
+            ..Facts::default()
+        };
+        let later = now + Duration::from_secs(65);
+        s.absorb(box_of(2, "bash:not-read-only"), later);
+        assert_eq!(words(&s, later, 0).since, ["1m05s"], "the same box");
+        s.absorb(box_of(3, "edit"), later);
+        let w = words(&s, later, 0);
+        assert_eq!(w.phase, "edit approval");
+        assert_eq!(w.since, ["0s"], "a new box's own age");
     }
 
     /// No command text, body, title or limit message reaches the words: a
@@ -3226,10 +3354,12 @@ mod tests {
             K::ApiError {
                 code: Some(500),
                 retryable: true,
+                cause: aterm_phase::ApiCause::Server,
             },
             K::ApiError {
                 code: Some(429),
                 retryable: true,
+                cause: aterm_phase::ApiCause::Server,
             },
             K::Overloaded,
             K::Memory,
@@ -3241,10 +3371,15 @@ mod tests {
                 reset: None,
                 until: None,
             };
-            let band = if kind.reads_limited() {
-                "limited"
-            } else {
-                kind.name()
+            // The state the wall leaves the session in, the menu bar's words.
+            let band = match kind {
+                _ if kind.reads_limited() => "limited",
+                K::Context => "context full",
+                K::Auth => "logged out",
+                K::Memory => "memory critical",
+                K::ApiError { .. } => "API error",
+                K::Overloaded => "service overloaded",
+                other => panic!("{other:?} reads limited"),
             };
             assert_eq!(phase.band_word(), band, "{kind:?}");
         }
@@ -3574,7 +3709,7 @@ mod tests {
         assert_eq!(v.detail(), None);
         match &v {
             AgentVerdict::Agent { reading, .. } => {
-                assert_eq!(reading.phase.band_word(), "memory");
+                assert_eq!(reading.phase.band_word(), "memory critical");
             }
             AgentVerdict::NotAgent => panic!("claude is an agent by name"),
         }
@@ -3642,6 +3777,94 @@ mod tests {
             t0(),
         );
         assert_eq!(wall.subject(), None);
+    }
+
+    /// AN API ERROR SAYS WHAT WENT WRONG, NEVER A PLAN (the outage of
+    /// 2026-09-27): Claude Code 2.1.283's `⏺ API Error: Can't reach the API
+    /// server … (ENOTFOUND)` is `can't reach the API` on the tab and in the
+    /// menu row — not `offline` (a refused connection or a timeout is no
+    /// machine offline), and not `continuing when …`: nothing here knows
+    /// the supervisor's plan — a reply cut off is `reply cut off`, a
+    /// certificate or proxy refused `TLS/proxy refused`. The wire word stays
+    /// `wall:api-error` for every cause. NEGATIVE CONTROLS: the server's own
+    /// failure (a 529, a 503) keeps its kind's word and names no subject.
+    #[test]
+    fn an_api_wall_says_its_cause_and_claims_no_plan() {
+        use aterm_phase::prompt::fixtures::{
+            API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_SLEEP, screen,
+        };
+        use aterm_phase::{ApiCause, WallKind};
+        let wall = |cause| AgentPhase::Wall {
+            kind: WallKind::ApiError {
+                code: None,
+                retryable: cause != ApiCause::Config,
+                cause,
+            },
+            reset: None,
+            until: None,
+        };
+        for (cause, band) in [
+            (ApiCause::Unreachable, "can't reach the API"),
+            (ApiCause::CutOff, "reply cut off"),
+            (ApiCause::Config, "TLS/proxy refused"),
+            (ApiCause::Server, "API error"),
+        ] {
+            let phase = wall(cause);
+            assert_eq!(phase.band_word(), band, "{cause:?}");
+            assert_eq!(phase.word(), "wall:api-error", "{cause:?}");
+            for claim in ["offline", "continuing", "reachable"] {
+                assert!(!band.contains(claim), "{band}");
+            }
+        }
+        let now = t0();
+        let out = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(API_ERROR_ENOTFOUND),
+            Cursor::Unknown,
+            now,
+        );
+        assert_eq!(out.word(), "wall:api-error");
+        assert_eq!(out.subject(), Some(API_UNREACHABLE));
+        let mut slot = Slot::new(now);
+        slot.agent = out.reading().cloned();
+        let said = words(&slot, now, 0);
+        assert_eq!(said.phase, "can't reach the API", "{said:?}");
+        assert!(!said.sentence.contains("offline"), "{}", said.sentence);
+        let cut = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(API_ERROR_SLEEP),
+            Cursor::Unknown,
+            now,
+        );
+        assert_eq!(cut.subject(), Some(API_CUT_OFF));
+        // The controls: the server's own failure.
+        let overloaded = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(API_ERROR_529),
+            Cursor::Unknown,
+            now,
+        );
+        assert_eq!(overloaded.word(), "wall:overloaded");
+        assert_eq!(overloaded.subject(), None);
+        assert_eq!(
+            AgentPhase::Wall {
+                kind: WallKind::ApiError {
+                    code: Some(503),
+                    retryable: true,
+                    cause: ApiCause::Server,
+                },
+                reset: None,
+                until: None,
+            }
+            .band_word(),
+            "API error"
+        );
     }
 
     /// THE FRESH PANE (the live run of 2026-09-26: Claude Code 2.1.283 in a

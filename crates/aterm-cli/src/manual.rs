@@ -453,8 +453,22 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   continue_per_hour [0]    at most this many typed acts per session per hour; 0 is
                            no cap
   rules_file [none]        a file whose text is appended to every continuation
-  retry_api_errors [true]  retry an API error or an overload for ever, 1, 5, 15, 30,
-                           then every 60 min
+  retry_api_errors [true]  answer an API error by what it says, never with an ask:
+                           a network never reached is continued within about a
+                           minute of the API being reachable again (while this
+                           instance checks it: `probe_api`), else tried 1, 2, 5,
+                           then every 5 min; a certificate or proxy refusal is
+                           tried on that ladder alone; a reply cut off is
+                           continued at once; the server's own failure or an
+                           overload waits 1, 5, 15, 30, then every 60 min. Each
+                           try quotes Claude Code's line to the agent.
+  probe_api [true]         while a session waits at an API error the network caused,
+                           let this instance check api.anthropic.com is reachable
+                           (a resolve, a connect and a verified TLS handshake; no
+                           request, at most one every 15-60 s, none while nothing
+                           waits) — never on a base URL, a cloud provider or a
+                           proxy; false never checks, and such a wall is tried on
+                           the time ladder alone
   resume_limits [true]     continue a minute past a usage or spend limit's reset
   model_fallback ["opus"]  on a model-bucket limit, the agent relaunched on this
                            model (`--model`, session-only), and back at its reset;
@@ -509,9 +523,17 @@ KEY USAGE
   died); it is asked again every 30 minutes while that work runs, four notices at
   most, and then that round gives up and says what held it. NO STOP IS FOR GOOD: a
   round that gave up, was refused or whose restart stopped rests two hours (one
-  round's worth of asking) and then a NEW ROUND starts by itself (`rearmed:<why>`
-  on the ledger, new READY markers), asked under every gate a first notice is —
-  never at a usage limit. Claude Code's
+  round's worth of asking; the same stop again rests four, then eight) and then
+  a NEW ROUND starts by itself (`rearmed:<why>` on the ledger, new READY
+  markers), asked under every gate a first notice is — never at a usage limit. A notice a usage limit answered is not asked again
+  until the model takes it: nothing is typed behind it. Once that limit is over
+  and the screen shows none (the reset the limit named has passed, a `/login`
+  finished, or 30 minutes for a limit that names no reset), the notice is typed
+  again as the same ask — straight away until three upgrade notices wait
+  untaken; from then on it waits `queued` until the session goes on, `--now`
+  (one copy more), or a rest after the limit's word ran out (one copy more):
+  two hours, doubling with every further copy the model has not read, up to a
+  day — so a limit that lasts for days adds one copy a day. Claude Code's
   own keep-awake is not work: the `caffeinate` it starts as its own child every turn
   and stops ~30 s after; one a shell started (a Bash tool's) is. It then sends
   SIGTERM (`signal term pid=<n>`: that one process, and never under a hold), heals
@@ -2256,9 +2278,16 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      force-pushes nothing); a worker whose turns keep
                      ending short, or ending on "done", waits a back-off that
                      doubles, 2 min to an hour — never escalated as "done"; a
-                     session with no turn yet gets nothing; an API error or an
-                     overload is retried for ever (1, 5, 15, 30, then every 60
-                     min); a usage or spend limit is continued a minute past its
+                     session with no turn yet gets nothing; an API error is
+                     answered by what it says, never with an ask, each try
+                     quoting Claude Code's line (a network never reached, or a
+                     certificate or proxy refused: 1, 2, 5, then every 5 min —
+                     the window's host continues it within about a minute of
+                     measuring the API reachable, and holds it up to 15 min
+                     while it measures it down; a reply cut off: at once, then
+                     that ladder; the server's own failure or an overload: for
+                     ever, 1, 5, 15, 30, then every 60 min); a usage or spend
+                     limit is continued a minute past its
                      reset, never bought — the --max-s is stretched past it
                      (`EXTEND until=<UTC> reset=<text>`), and a limit it waits
                      out raises no badge (Claude Code's own `continuing
@@ -2286,7 +2315,7 @@ SUPERVISING A WORKER (a coding agent in another tab; its @sid from `aterm ctl ls
                      false`, the browser step of a lost login — is yours: the
                      worker's `attention` meta reads `claude <kind>: <command,
                      path or question, ≤64 cells; else the box's own first row>
-                     (<why>)` (a limit's: `limited: <message> reset=<when>`) and
+                     (<why>)` (a limit's: `limited: <message>`) and
                      ONE kind=ask reaches --mail's manager per review point, only
                      while fabric=connected; the badge clears when the point has
                      left the screen (your `key`/`turn` answering it is the

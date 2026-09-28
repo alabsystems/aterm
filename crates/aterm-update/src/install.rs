@@ -18,7 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, same_volume};
+use aterm_update_core::{FileLock, Sentinel, ensure_private_dir, handoff_policy, same_volume};
 
 use crate::manifest::{Manifest, Ready};
 use crate::paths::Staging;
@@ -39,7 +39,21 @@ pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 /// is itself bounded, so reaching this means the holder is wedged — and a wedged
 /// holder must not be able to stop a terminal from opening. Deferring costs one
 /// launch's update; hanging costs the application.
-const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+pub(crate) const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How long the BACKGROUND lane — the update checker's stage and publish, and the
+/// floor ratchet under them — waits for the stage, apply or floor lock before giving
+/// the cycle up (the 2026-09-22/23 update audit, plan P2-1).
+///
+/// Every one of those waits was a blocking `flock` on the checker thread, so one
+/// stopped or hung holder in any aterm process parked the thread that finds and
+/// stages updates, silently, for as long as the holder stayed stopped. Generous,
+/// because nothing here is on a launch or a frozen screen: every legitimate holder
+/// of the apply and floor locks is itself bounded well inside it, and the stage lock
+/// is held across a sibling's download — which this cycle could only have waited
+/// for, and the next cycle finds staged. A timeout is that cycle's ordinary failure,
+/// retried on the loop's backoff, never a wedge.
+pub(crate) const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Ceiling on the cross-volume `ditto` of the candidate bundle.
 ///
@@ -1921,6 +1935,14 @@ fn ensure_current_trial_receipt(
 /// mountpoint inside our `0700` staging dir (never `/Volumes`), so an abnormal exit
 /// can't leak a browsable `/Volumes/aterm*` mount and repeated same-named volumes
 /// can't collide (F19).
+///
+/// EVERY `hdiutil` IS BOUNDED (plan P2-1, round three). These run on the update
+/// checker's thread, inside a check, while it holds the process's check lane and
+/// the machine-wide `checker.lock` — so an `hdiutil` that never returned (a
+/// detach waiting on a wedged disk-arbitration daemon, an attach on a hung image)
+/// parked the checker for good, and no replacement could ever take the lane. A
+/// timeout is a failed attach (retried, then the stage fails for this check) or a
+/// detach given up on (the `mnt-*` sweep reclaims it next time).
 struct Mounted {
     mountpoint: PathBuf,
 }
@@ -1995,10 +2017,8 @@ impl Mounted {
             std::fs::create_dir_all(mountpoint).map_err(|e| format!("create mountpoint: {e}"))?;
             cmd.arg("-mountpoint").arg(mountpoint);
         }
-        let out = cmd
-            .arg(dmg)
-            .output()
-            .map_err(|e| format!("spawn hdiutil attach: {e}"))?;
+        let out =
+            crate::verify::output_within(cmd.arg(dmg), "hdiutil attach", HDIUTIL_ATTACH_WAIT)?;
         if !out.status.success() {
             if let Some(mountpoint) = mountpoint {
                 let _ = std::fs::remove_dir_all(mountpoint);
@@ -2045,10 +2065,13 @@ impl Mounted {
                             .map(str::trim)
                             .filter(|dev| dev.starts_with("/dev/"))
                         {
-                            let _ = Command::new("/usr/bin/hdiutil")
-                                .args(["detach", "-force"])
-                                .arg(dev)
-                                .output();
+                            let _ = crate::verify::output_within(
+                                Command::new("/usr/bin/hdiutil")
+                                    .args(["detach", "-force"])
+                                    .arg(dev),
+                                "hdiutil detach",
+                                HDIUTIL_DETACH_WAIT,
+                            );
                         }
                         Err(
                             "default mountpoint: hdiutil attached but named no mount point"
@@ -2063,14 +2086,25 @@ impl Mounted {
 
 impl Drop for Mounted {
     fn drop(&mut self) {
-        let _ = Command::new("/usr/bin/hdiutil")
-            .args(["detach", "-force"])
-            .arg(&self.mountpoint)
-            .output();
+        let _ = crate::verify::output_within(
+            Command::new("/usr/bin/hdiutil")
+                .args(["detach", "-force"])
+                .arg(&self.mountpoint),
+            "hdiutil detach",
+            HDIUTIL_DETACH_WAIT,
+        );
         // The private mountpoint is our own empty dir once detached; reclaim it.
         let _ = std::fs::remove_dir_all(&self.mountpoint);
     }
 }
+
+/// The bound on one `hdiutil attach` ([`Mounted`]): it reads and checksums the
+/// whole image, seconds for a release DMG on any disk; minutes means it is hung.
+const HDIUTIL_ATTACH_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The bound on one `hdiutil detach -force` ([`Mounted`]): immediate when the
+/// image is attached and when it is not.
+const HDIUTIL_DETACH_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Best-effort reconciliation of leftover private mountpoints (`mnt-*`) from a prior
 /// run that was killed mid-stage (its `Mounted::drop` never ran), so stale mounts
@@ -2082,10 +2116,13 @@ fn sweep_stale_mounts(staging: &Staging) {
     for e in entries.flatten() {
         if e.file_name().to_string_lossy().starts_with("mnt-") {
             let p = e.path();
-            let _ = Command::new("/usr/bin/hdiutil")
-                .args(["detach", "-force"])
-                .arg(&p)
-                .output();
+            let _ = crate::verify::output_within(
+                Command::new("/usr/bin/hdiutil")
+                    .args(["detach", "-force"])
+                    .arg(&p),
+                "hdiutil detach",
+                HDIUTIL_DETACH_WAIT,
+            );
             let _ = std::fs::remove_dir_all(&p);
         }
     }
@@ -2158,12 +2195,18 @@ fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
 /// first was hoisted here originally, and the second is the one that fails on a
 /// hand-installed bundle — silently, inside the successor, five seconds after
 /// the terminal parked.
+///
+/// ON A PASS, AND ONLY THEN, it also reads the candidate's handoff policy
+/// (`aterm_update_core::handoff_policy`, plan P0-5) — after every check above has
+/// authenticated the bundle, still under the apply lock, so the file read is the
+/// one the verified signature seals and no publication can swap the stage between
+/// the check and the read.
 pub fn preverify_staged_handoff_candidate(
     current_build: u64,
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-) -> Result<(), String> {
+) -> Result<handoff_policy::PolicyRead, String> {
     let Some(staging) = Staging::resolve() else {
         return Err("no private staging root is available".to_string());
     };
@@ -2174,6 +2217,7 @@ pub fn preverify_staged_handoff_candidate(
         current_commit,
         expected_build,
         expected_commit,
+        &handoff_policy::read_from_bundle,
     )
 }
 
@@ -2273,7 +2317,9 @@ fn preverify_installed_rollback_source(
 /// so the refusal ladder is provable against a temp staging root without a
 /// signed fixture bundle (a missing/unsigned candidate must refuse BEFORE any
 /// caller could park a reader on its behalf). `installed` is the resolved
-/// bundle root the swap would replace, injected for the same reason.
+/// bundle root the swap would replace, injected for the same reason, and
+/// `read_policy` the handoff-policy reader, so a test can prove it is never
+/// called on a bundle that failed any check.
 fn preverify_staged_handoff_candidate_at(
     staging: &Staging,
     installed: Option<&Path>,
@@ -2281,7 +2327,8 @@ fn preverify_staged_handoff_candidate_at(
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-) -> Result<(), String> {
+    read_policy: &dyn Fn(&Path) -> handoff_policy::PolicyRead,
+) -> Result<handoff_policy::PolicyRead, String> {
     // Serialize against a concurrent publication/apply exactly like the swap
     // path: verifying a half-published candidate proves nothing.
     //
@@ -2332,7 +2379,13 @@ fn preverify_staged_handoff_candidate_at(
     // LAST, deliberately. Every check above is about the INCOMING bytes and is
     // the more common refusal, so it keeps naming itself first; this one is
     // about the machine's install and, when it fires, it fires forever.
-    preverify_installed_rollback_source(installed, current_build, current_commit)
+    preverify_installed_rollback_source(installed, current_build, current_commit)?;
+    // THE POLICY IS READ HERE AND NOWHERE EARLIER (plan P0-5): every refusal
+    // above returned before this line, so a bundle that failed its codesign
+    // policy, its sealed identity or its authorization never has a byte of its
+    // policy read — and `_lock` is still held, so the stage read is the one just
+    // verified.
+    Ok(read_policy(&staging.staged_app))
 }
 
 /// Upper bound on the changelog text a `ready.toml` may carry.
@@ -2394,8 +2447,9 @@ fn publish_verified_stage(staging: &Staging, incoming: &Path, ready: &Ready) -> 
             crate::MAX_LEDGER_BYTES
         ));
     }
-    let _publish_lock =
-        FileLock::acquire(&staging.apply_lock).map_err(|error| format!("publish lock: {error}"))?;
+    // Bounded (plan P2-1): this runs on the checker thread, under the stage lock.
+    let _publish_lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+        .map_err(|error| format!("publish lock: {error}"))?;
 
     // Invalidate the old generation first. Lock-free status readers may briefly
     // observe "absent", but never an old marker paired with the new bundle.
@@ -5106,7 +5160,8 @@ staged_at = "2026-08-17T00:00:00Z"
         let (s, root) = temp_staging();
 
         // Nothing staged: refuse immediately.
-        let absent = preverify_staged_handoff_candidate_at(&s, None, 10, None, None, None);
+        let absent =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, None, None, NEVER_READ);
         assert!(
             absent.clone().unwrap_err().contains("no verified update"),
             "{absent:?}"
@@ -5114,14 +5169,16 @@ staged_at = "2026-08-17T00:00:00Z"
 
         // Staged but not strictly newer than the running build.
         write_ready(&s, 20);
-        let stale = preverify_staged_handoff_candidate_at(&s, None, 20, None, None, None);
+        let stale =
+            preverify_staged_handoff_candidate_at(&s, None, 20, None, None, None, NEVER_READ);
         assert!(
             stale.clone().unwrap_err().contains("strictly newer"),
             "{stale:?}"
         );
 
         // Staged build is not the artifact the updater reducer authorized.
-        let wrong = preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(21), None);
+        let wrong =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(21), None, NEVER_READ);
         assert!(
             wrong
                 .clone()
@@ -5133,9 +5190,143 @@ staged_at = "2026-08-17T00:00:00Z"
         // Right identity on the marker, but no verifiable bundle exists at the
         // staged path: the sealed-identity gate must fail closed.
         let unverifiable =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None);
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
         assert!(unverifiable.is_err(), "{unverifiable:?}");
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The handoff-policy reader for a pre-verification that must refuse: a read
+    /// is the failure (plan P0-5 — no refused bundle's policy is ever read).
+    const NEVER_READ: &dyn Fn(&Path) -> handoff_policy::PolicyRead = &|path| {
+        panic!(
+            "a refused candidate's handoff policy was read: {}",
+            path.display()
+        )
+    };
+
+    /// A staged `.app` shaped like a release — an `Info.plist` naming `build` and
+    /// a handoff policy asking every producer for blank screens — that carries NO
+    /// signature. Returns the policy it holds, as a reader would parse it.
+    fn unsigned_bundle_with_a_policy(app: &Path, build: u64) -> handoff_policy::PolicyRead {
+        let contents = app.join("Contents");
+        std::fs::create_dir_all(contents.join("MacOS")).unwrap();
+        std::fs::create_dir_all(contents.join("Resources")).unwrap();
+        std::fs::write(
+            contents.join("Info.plist"),
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n\
+                 <key>CFBundleExecutable</key><string>aterm</string>\n\
+                 <key>CFBundleVersion</key><string>{build}</string>\n\
+                 <key>ATermGitCommit</key>\
+                 <string>0123456789abcdef0123456789abcdef01234567</string>\n\
+                 </dict></plist>\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(contents.join("MacOS/aterm"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(
+            app.join(handoff_policy::BUNDLE_PATH),
+            "schema = 1\ncarry = \"repaint\"\npark_quiet_gate_at_land = \"relaxed\"\n",
+        )
+        .unwrap();
+        handoff_policy::read_from_bundle(app)
+    }
+
+    /// A HANDOFF POLICY IN AN UNVERIFIED BUNDLE IS NEVER READ (the 2026-09-22/23
+    /// update audit, plan P0-5). The policy's whole authority is the signature
+    /// that seals it with the successor's code, so the pre-verification reads it
+    /// only once every check has passed — here the codesign policy refuses an
+    /// unsigned stage whose marker, plist and policy all look right, and the
+    /// reader must never run. Both candidate shapes: a staged download, and an
+    /// installed bundle an activation would exec.
+    #[test]
+    fn a_handoff_policy_in_an_unverified_bundle_is_never_read() {
+        let (s, root) = temp_staging();
+        write_ready(&s, 20);
+        let held = unsigned_bundle_with_a_policy(&s.staged_app, 20);
+        assert!(
+            matches!(held, handoff_policy::PolicyRead::Parsed(policy)
+                if policy.carry == Some(handoff_policy::CarryCeiling::Repaint)),
+            "PRECONDITION: the unsigned stage holds a policy a reader would follow: {held:?}"
+        );
+        let reads = std::cell::Cell::new(0_u32);
+        let counting = |path: &Path| {
+            reads.set(reads.get() + 1);
+            handoff_policy::read_from_bundle(path)
+        };
+        let refused =
+            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, &counting);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("bundle policy")),
+            "the unsigned stage fails its codesign policy: {refused:?}"
+        );
+        assert_eq!(reads.get(), 0, "the refused stage's policy was never read");
+
+        let installed = root.join("Applications").join("aterm.app");
+        let held = unsigned_bundle_with_a_policy(&installed, 20);
+        assert!(
+            matches!(held, handoff_policy::PolicyRead::Parsed(_)),
+            "{held:?}"
+        );
+        let refused =
+            crate::preverify_installed_at(&installed, 0, 10, 20, "0123456789ab", &counting);
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("bundle policy")),
+            "the unsigned installed bundle fails its codesign policy: {refused:?}"
+        );
+        assert_eq!(
+            reads.get(),
+            0,
+            "the refused activation's policy was never read"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// AN ACTIVATION'S PRE-VERIFY RUNS UNDER THE APPLY LOCK, as the staged lane's
+    /// does. A sibling's swap renames a new bundle onto the installed path while it
+    /// holds that lock; the check and the policy read must both land on one side
+    /// of it, or the policy of the bundle swapped in after the check is read and
+    /// cached under the verified one's name. Here a sibling holds the lock for
+    /// 400 ms: the pre-verify must not verify, or read anything, until it lets go.
+    /// RED before the fix: nothing waited — the unsigned bundle was refused within
+    /// milliseconds, inside the sibling's swap.
+    #[test]
+    fn an_activation_pre_verify_waits_out_a_siblings_swap_before_it_verifies() {
+        let (s, root) = temp_staging();
+        let installed = root.join("Applications").join("aterm.app");
+        let _ = unsigned_bundle_with_a_policy(&installed, 20);
+        let sibling = FileLock::acquire(&s.apply_lock).expect("the sibling's swap holds it");
+        let hold = std::time::Duration::from_millis(400);
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            drop(sibling);
+        });
+        let started = std::time::Instant::now();
+        let refused = crate::preverify_installed_locked(
+            Some(&s),
+            &installed,
+            10,
+            20,
+            "0123456789ab",
+            NEVER_READ,
+        );
+        let waited = started.elapsed();
+        releaser.join().expect("the sibling let go");
+        assert!(
+            waited >= hold,
+            "the check ran inside the sibling's swap ({waited:?} < {hold:?})"
+        );
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("bundle policy")),
+            "then it verified, and refused the unsigned bundle: {refused:?}"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -7160,6 +7351,17 @@ mod launchd_copy_tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
 
+    /// HOW LONG A FIXTURE THAT MUST FINISH MAY TAKE (2026-09-27): a hang
+    /// detector, never a latency budget. The one-shot wrapper replay and the
+    /// completed and malformed copies below each end as soon as their fixture
+    /// does, so a passing test pays none of it; the 5 s these waits carried
+    /// went red when the merge contract ran the module beside other builds at
+    /// load 50-100 (the push-gate audit, 2026-09-24). A wedged fixture still
+    /// fails, after a minute. The deadline the module is ABOUT —
+    /// `launchd_submit_and_remove_share_the_real_callers_deadline` — keeps its
+    /// own seconds: there the clock is the property under test.
+    const FIXTURE_FINISHES: Duration = Duration::from_secs(60);
+
     fn budget_model() -> aterm_spec::derive::Model {
         aterm_spec::ty_model! {
             LaunchdCopyDeadline {
@@ -7475,7 +7677,7 @@ mod launchd_copy_tests {
                         .arg(payload)
                         .arg(&calls),
                     "one-shot wrapper fixture",
-                    Duration::from_secs(5),
+                    FIXTURE_FINISHES,
                 )
                 .unwrap();
                 assert!(exit.success(), "{stderr}");
@@ -7771,7 +7973,7 @@ exit 0
         let (status, stderr) = ditto_via_launchd_using(
             &[],
             "fixture unpack",
-            Duration::from_secs(5),
+            FIXTURE_FINISHES,
             &staging.root,
             &launchctl,
         )
@@ -7793,7 +7995,7 @@ exit 0
         let error = ditto_via_launchd_using(
             &[],
             "fixture unpack",
-            Duration::from_secs(5),
+            FIXTURE_FINISHES,
             &staging.root,
             &launchctl,
         )

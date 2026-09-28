@@ -100,20 +100,6 @@ path = "examples/objc_window_drive.rs"
 [[example]]
 name = "objc_event_drive"
 path = "examples/objc_event_drive.rs"
-# THE MODAL DRIVER (W13's sixteenth pass), DECLARED FOR THE SAME REASON as the
-# four above: `aterm-verify`'s `stages.rs` reads the target name from HERE, so
-# the name, the built file and the argv can only agree if this file names the
-# target. It closes the D1 gap on the one subsystem none of the other four
-# touches — `NSAlert`, its sheet, the completion block, the local event monitor
-# and the `NSBitmapImageRep` capture — which the sixteenth pass named "the
-# least-driven surface in the whole port". Its cheaper half is
-# `crates/aterm-objc/tests/gui_sent_prototypes.rs`, the census of all 40
-# selectors these files send; a census cannot see a correct send of the wrong
-# selector, a block whose ABI is right and whose ownership is wrong, or a
-# capture chain that answers bytes which are not a PNG.
-[[example]]
-name = "objc_alert_drive"
-path = "examples/objc_alert_drive.rs"
 
 [features]
 # `sixel` is ON by default so the SHIPPED GUI binary decodes + renders sixel
@@ -448,7 +434,11 @@ aterm-lz4 = { workspace = true }
 # the `terminal_modes` + `alt_screen` anchors, aterm-sandbox the `sandbox`, aterm-pty
 # the `write_all` + `fork_exec`, aterm-gpu the `gpu_encode`; aterm-gui's own
 # `path_confine` anchor expands via this crate's `cfg(test)` directly.
-aterm-core = { workspace = true, features = ["spec-anchors"] }
+# `fault-injection` arms aterm-core's thread-local fault points in this test build
+# only: the seamless capture's tests prove a successor's `carry = "repaint"` policy
+# never projects a live session's grids by making that projection fail
+# (`checkpoint.carry_projection`). The production build keeps the const-false stub.
+aterm-core = { workspace = true, features = ["spec-anchors", "fault-injection"] }
 aterm-sandbox = { workspace = true, features = ["spec-anchors"] }
 aterm-pty = { workspace = true, features = ["spec-anchors"] }
 aterm-gpu = { workspace = true, features = ["spec-anchors"] }

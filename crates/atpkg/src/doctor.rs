@@ -419,6 +419,10 @@ pub struct Probes {
     /// The C toolchain's verdict ([`crate::prereq::probe`]), or `None` when this report
     /// does not probe it (the default: a fixture never meets the machine's compiler).
     pub cc: Option<crate::prereq::CcVerdict>,
+    /// Claude Code's session-quality survey, as `~/.claude/settings.json` leaves it
+    /// ([`claude_survey_off`]), or `None` when this report does not read that file (the
+    /// default: a fixture has no Claude settings).
+    pub claude_survey_off: Option<bool>,
 }
 
 impl Default for Probes {
@@ -435,8 +439,39 @@ impl Default for Probes {
             stub_env: crate::reroute::StubEnv::default(),
             index_head: false,
             cc: None,
+            claude_survey_off: None,
         }
     }
+}
+
+/// Whether Claude Code's session-quality survey (its optional 1/2/3/0 rating prompt) is
+/// OFF under this `~/.claude/settings.json` text.
+///
+/// Read from Claude Code itself (2.1.283, the eligibility function): the survey returns
+/// early when `CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY` is set, and otherwise appears with
+/// probability `settings.feedbackSurveyRate ?? <remote default>` — the setting's own
+/// schema text is "Probability (0–1) that the session quality survey appears when
+/// eligible". So it is off when `feedbackSurveyRate` is `0`, or when the settings
+/// file's `env` block sets the variable to a true-ish value. Anything else — no file,
+/// unreadable JSON, no key — leaves the vendor's default, which shows it.
+///
+/// Why aterm cares: the survey draws under the prompt of a session the harness is
+/// supervising and waits for a keypress no one is there to give.
+#[must_use]
+pub fn claude_survey_off(settings_json: &str) -> bool {
+    let Ok(v) = aterm_json::from_str::<aterm_json::Value>(settings_json) else {
+        return false;
+    };
+    if v.get("feedbackSurveyRate")
+        .and_then(aterm_json::Value::as_f64)
+        == Some(0.0)
+    {
+        return true;
+    }
+    v.get("env")
+        .and_then(|e| e.get("CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"))
+        .and_then(aterm_json::Value::as_str)
+        .is_some_and(|x| !matches!(x.trim(), "" | "0" | "false"))
 }
 
 /// The environment knobs deleted on 2026-09-23 (Phase 4's update opt-outs) and
@@ -733,6 +768,11 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         config_notes: cfg.config_notes(),
         ignored_prefix: cfg.ignored_prefix.clone(),
         retired_env: retired_opt_outs_exported(),
+        claude_survey_off: home.as_deref().and_then(|h| {
+            std::fs::read_to_string(h.join(".claude").join("settings.json"))
+                .ok()
+                .map(|t| claude_survey_off(&t))
+        }),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
         cc: Some(crate::prereq::probe(path.as_deref())),
@@ -2382,6 +2422,27 @@ pub fn run_with(
             }
         };
         let _ = writeln!(out, "{p}: ok — {program}: {line}");
+    }
+    // (10h) CLAUDE CODE'S SESSION SURVEY. Its optional rating prompt
+    // draws under the input of a session the harness supervises and waits for a key. It
+    // is a Claude Code SETTING, so this report says which way it is set and names the one
+    // line that turns it off — aterm writes nothing into an agent's settings itself.
+    if installed.iter().any(|(program, _)| *program == "claude")
+        && let Some(off) = probes.claude_survey_off
+    {
+        if off {
+            let _ = writeln!(
+                out,
+                "{p}: ok — claude: the session-quality survey is off (~/.claude/settings.json)"
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "{p}: warn — claude: the session-quality survey (Claude Code's optional rating \
+                 prompt) can appear and wait under a supervised prompt — turn it off with \
+                 \"feedbackSurveyRate\": 0 in ~/.claude/settings.json"
+            );
+        }
     }
     // EVERY problem, not the first one. This scan used to `.find()`, so a second failing
     // program was invisible until the first was fixed — a diagnostic that reveals its
@@ -6379,7 +6440,77 @@ mod tests {
     /// absent — outside aterm the same note (review, 2026-09-24: laid or not, no stub
     /// answers in such a shell), inside aterm SHADOWED with the remedy.
     #[cfg(unix)]
+    /// (10h) Claude Code's session survey: the two switches Claude Code itself reads
+    /// turn it off, and nothing else does.
     #[test]
+    fn the_claude_session_survey_is_off_only_by_the_switches_claude_reads() {
+        assert!(claude_survey_off(r#"{"feedbackSurveyRate": 0}"#));
+        assert!(claude_survey_off(
+            r#"{"feedbackSurveyRate": 0.0, "model": "x"}"#
+        ));
+        assert!(claude_survey_off(
+            r#"{"env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1"}}"#
+        ));
+        // The vendor's default shows it: no key, a non-zero rate, a falsy env value,
+        // unreadable JSON.
+        assert!(!claude_survey_off("{}"));
+        assert!(!claude_survey_off(r#"{"feedbackSurveyRate": 0.05}"#));
+        assert!(!claude_survey_off(
+            r#"{"env": {"CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "0"}}"#
+        ));
+        assert!(!claude_survey_off("not json"));
+    }
+
+    /// (10h) The row: a managed `claude` gets `ok` with the survey off, `warn` naming the
+    /// one line to add with it on, and no row at all when the report did not read the
+    /// settings (every fixture).
+    #[test]
+    fn a_managed_claude_reports_its_session_survey_setting() {
+        let l = layout("agent-survey");
+        let v283 = crate::vendor_direct::Version::parse("2.1.283")
+            .unwrap()
+            .build_id();
+        install(&l, "claude", v283);
+        let home = synthetic_home("agent-survey");
+        let now = crate::flow::rfc3339_to_unix("2026-09-28T00:00:00Z").unwrap();
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let rows = |off: Option<bool>| -> Vec<String> {
+            let mut out: Vec<u8> = Vec::new();
+            let _ = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                now,
+                None,
+                "doctor",
+                &Probes {
+                    claude_survey_off: off,
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut std::io::sink(),
+            );
+            String::from_utf8_lossy(&out)
+                .lines()
+                .filter(|line| line.contains("session-quality survey"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let on = rows(Some(false));
+        assert_eq!(on.len(), 1, "{on:?}");
+        assert!(on[0].contains("doctor: warn — claude:"), "{on:?}");
+        assert!(
+            on[0].contains(r#""feedbackSurveyRate": 0"#),
+            "names the fix: {on:?}"
+        );
+        let off = rows(Some(true));
+        assert_eq!(off.len(), 1, "{off:?}");
+        assert!(off[0].contains("doctor: ok — claude:"), "{off:?}");
+        assert!(rows(None).is_empty(), "no settings read, no row");
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed() {
         let l = layout("agent-outside");
         install(&l, "ay", 19);

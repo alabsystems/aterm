@@ -33,6 +33,21 @@ use crate::snapshot_path;
 use crate::term_lock;
 use crate::{App, accessibility, control_auth};
 
+/// How long a test waits for a reply the capture path owes it — every capture,
+/// encode and publication worker test in this file. The encoders run at
+/// `Background` QoS (`crate::qos::Role::Background`), the class macOS starves
+/// first: in a full `--workspace` run on a host at load average near 50
+/// (2026-09-27, several suites at once) a 10 s wait timed out (`visual capture
+/// worker reply: Timeout`) and passed alone three times out of three, and under
+/// the merge contract a render measured past 10 s on 2026-09-23 and 2026-09-24
+/// and then answered (`two_window_capture_rebinds_unequal_complete_render_contexts`,
+/// `headless_cursor_fx_tests`' image replies). A wait ends the moment the reply
+/// comes, so this bound only decides how long a worker that never runs takes to
+/// fail the test (the quarantine reaper's `REAPER_PATIENCE`, control.rs, is the
+/// same fix for the same class).
+#[cfg(test)]
+const WORKER_PATIENCE: Duration = Duration::from_secs(60);
+
 const DEFERRED_GPU_CAPTURE_LIMIT: usize = 8;
 const GPU_CAPTURE_PENDING: &str = "capture pending: waiting for the requested GPU drawable";
 
@@ -8886,6 +8901,15 @@ fn stitch_presented_client_into_window_rgba(
 /// only those current alpha values, and leave current RGB untouched. Any isolated
 /// non-opaque platform pixel in an ordinary client row is stale capture content,
 /// not outer shape, and is ignored.
+///
+/// WHAT THE PLATFORM DID NOT PHOTOGRAPH IS NOT SHAPE (day five, D27): the part of
+/// a window past the display's edge comes back fully transparent — every
+/// column of it alpha 0 — and the flood took it all, so a 2148 px window on a
+/// 2002 px-wide screen lost `Details ›` and the tab pill to transparency. A
+/// window's outer shape never has a column (or row) with no ink at all, so such
+/// a column is read as not photographed: its shape is its mirror column's
+/// (the window's rounded outline is symmetric), or opaque when that one was not
+/// photographed either ([`photographed_shape_alpha`]).
 #[cfg(any(target_os = "macos", test))]
 fn multiply_platform_outer_shape_alpha(
     current_rgba: &mut [u8],
@@ -8918,6 +8942,8 @@ fn multiply_platform_outer_shape_alpha(
     if width == 0 || height == 0 {
         return Ok(());
     }
+    let shape = photographed_shape_alpha(platform_alpha, width, height);
+    let platform_alpha = shape.as_ref();
 
     let mut queued = vec![false; pixels];
     let mut boundary = std::collections::VecDeque::new();
@@ -8966,6 +8992,52 @@ fn multiply_platform_outer_shape_alpha(
         }
     }
     Ok(())
+}
+
+/// The platform shape mask with every column and row the platform did not
+/// photograph (no ink at all: past the display's edge) replaced by its mirror
+/// across the window's centre, or opaque where that is unphotographed too
+/// ([`multiply_platform_outer_shape_alpha`], day five, D27). Borrowed as-is when
+/// every column and row has ink — the common case costs one scan.
+#[cfg(any(target_os = "macos", test))]
+fn photographed_shape_alpha(
+    alpha: &[u8],
+    width: usize,
+    height: usize,
+) -> std::borrow::Cow<'_, [u8]> {
+    let mut col_ink = vec![false; width];
+    let mut row_ink = vec![false; height];
+    for (index, value) in alpha.iter().enumerate() {
+        if *value != 0 {
+            col_ink[index % width] = true;
+            row_ink[index / width] = true;
+        }
+    }
+    if col_ink.iter().all(|ink| *ink) && row_ink.iter().all(|ink| *ink) {
+        return std::borrow::Cow::Borrowed(alpha);
+    }
+    let mut shape = alpha.to_vec();
+    for x in (0..width).filter(|x| !col_ink[*x]) {
+        let mirror = width - 1 - x;
+        for y in 0..height {
+            shape[y * width + x] = if col_ink[mirror] {
+                alpha[y * width + mirror]
+            } else {
+                255
+            };
+        }
+    }
+    for y in (0..height).filter(|y| !row_ink[*y]) {
+        let mirror = height - 1 - y;
+        for x in 0..width {
+            shape[y * width + x] = if row_ink[mirror] {
+                shape[mirror * width + x]
+            } else {
+                255
+            };
+        }
+    }
+    std::borrow::Cow::Owned(shape)
 }
 
 /// Composite a straight-RGBA overlay over `destination`, clipped to `clip`.
@@ -10392,6 +10464,41 @@ mod chrome_output_tests {
         );
     }
 
+    /// DAY FIVE, D27: the part of a window past the display's right edge comes
+    /// back from the platform with no ink at all; it is not outer shape, so the
+    /// renderer's pixels there keep their alpha, and the off-screen corners
+    /// take the on-screen corners' mirrored shape. NEGATIVE CONTROL (the old
+    /// flood): every unphotographed pixel went transparent.
+    #[test]
+    fn mac_window_stitch_keeps_what_the_platform_did_not_photograph() {
+        let (width, height) = (8_u32, 4_u32);
+        let mut platform_alpha = vec![255_u8; (width * height) as usize];
+        // Columns 5..8 are past the screen's edge: never photographed.
+        for y in 0..height {
+            for x in 5..width {
+                platform_alpha[(y * width + x) as usize] = 0;
+            }
+        }
+        // The on-screen left corners: transparent tip, half-covered neighbour.
+        for y in [0, height - 1] {
+            platform_alpha[(y * width) as usize] = 0;
+            platform_alpha[(y * width + 1) as usize] = 128;
+        }
+        let mut window = Vec::with_capacity((width * height * 4) as usize);
+        for _ in 0..(width * height) {
+            window.extend_from_slice(&[10, 20, 30, 200]);
+        }
+        multiply_platform_outer_shape_alpha(&mut window, width, height, &platform_alpha).unwrap();
+        let alpha = |x: u32, y: u32| window[((y * width + x) * 4 + 3) as usize];
+        // The off-screen middle keeps the renderer's alpha.
+        assert_eq!((alpha(6, 1), alpha(7, 2), alpha(5, 1)), (200, 200, 200));
+        // The off-screen corners are the on-screen ones, mirrored.
+        assert_eq!((alpha(7, 0), alpha(7, 3)), (0, 0));
+        assert_eq!((alpha(6, 0), alpha(6, 3)), (100, 100));
+        // The on-screen corners are unchanged.
+        assert_eq!((alpha(0, 0), alpha(1, 0), alpha(2, 1)), (0, 100, 200));
+    }
+
     #[test]
     fn sigusr_windowed_snapshot_roundtrips_exact_non_cell_destination_and_present_passes() {
         // 3×2 deliberately cannot be expressed as this fixture's hypothetical
@@ -11035,7 +11142,7 @@ mod terminal_split_capture_tests {
             reply: early_reply,
         });
         let early = early_rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("pre-baseline image reply")
             .expect_err("a recording with no successful frame must defer");
         assert!(
@@ -11205,7 +11312,7 @@ mod terminal_split_capture_tests {
             reply,
         });
         let (_, _, png) = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
             .expect("recording still succeeds")
             .value;
@@ -11891,7 +11998,7 @@ mod terminal_split_capture_tests {
             reply: tx,
         });
         let (_, _, png) = rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
             .expect("split image succeeds")
             .value;
@@ -12058,17 +12165,6 @@ mod encode_worker_tests {
     use super::*;
     use crate::control_auth::ensure_private_dir;
     use std::time::Duration;
-
-    /// How long a test waits for a reply the capture path owes it. The
-    /// encoders run at `Background` QoS (`crate::qos::Role::Background`),
-    /// the class macOS starves first: in a full `--workspace` run on a host
-    /// at load average near 50 (2026-09-27, several suites at once) a 10 s
-    /// wait timed out (`visual capture worker reply: Timeout`) and passed
-    /// alone three times out of three. A wait ends the moment the reply
-    /// comes, so this bound only decides how long a worker that never runs
-    /// takes to fail the test (the quarantine reaper's `REAPER_PATIENCE`,
-    /// control.rs, is the same fix for the same class).
-    const WORKER_PATIENCE: Duration = Duration::from_secs(60);
 
     fn unique_dir(label: &str) -> std::path::PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -15214,7 +15310,6 @@ mod window_render_context_capture_tests {
     use super::App;
     use crate::{Backend, MetricsView, WindowId, control_auth};
     use aterm_core::terminal::CursorStyle;
-    use std::time::Duration;
 
     #[derive(Debug, PartialEq)]
     struct BoundContext {
@@ -15272,13 +15367,9 @@ mod window_render_context_capture_tests {
             reply: tx,
         });
         // This test checks render-context rebinding, not capture latency: a
-        // hang detector, not a latency budget. Under the full merge contract
-        // (14 test threads on a loaded machine) this render measured past 10 s
-        // on 2026-09-23 and 2026-09-24 and then answered; a full-suite run can
-        // deschedule the image worker behind other CPU work. A wedged worker
-        // still fails.
+        // hang detector, not a latency budget (`WORKER_PATIENCE`).
         let mut retained = rx
-            .recv_timeout(Duration::from_secs(60))
+            .recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
             .expect("image capture succeeds");
         retained
@@ -15853,7 +15944,7 @@ mod headless_cursor_fx_tests {
                 cancel: crate::control::CaptureCancellation::new(),
                 reply: tx,
             });
-            rx.recv_timeout(Duration::from_secs(10))
+            rx.recv_timeout(crate::app_introspect::WORKER_PATIENCE)
                 .expect("image worker reply")
                 .expect("capture under load succeeds");
             assert!(
@@ -15963,7 +16054,7 @@ mod headless_cursor_fx_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply: tx,
         });
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
             .expect("headless singer image succeeds");
 
@@ -16044,7 +16135,7 @@ mod headless_cursor_fx_tests {
             cancel: crate::control::CaptureCancellation::new(),
             reply: tx,
         });
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(crate::app_introspect::WORKER_PATIENCE)
             .expect("image worker reply")
             .expect("classic kitty image succeeds");
 

@@ -9,12 +9,16 @@ use std::sync::OnceLock;
 
 /// Resolve a caller-supplied artifact or freshen the shared RELEASE build.
 ///
-/// The dedicated target avoids repeatedly rebuilding dependencies with the
-/// outer integration test's different feature set. Paint and spin intentionally
-/// share it, and since the package-identity sweep below they really do: after
-/// the first build every other caller — and
-/// the gate's own priming stage — gets a freshness check measured at 0.2 s,
-/// where an alternation between two packages used to relink for 208 s.
+/// Under the gate the first arm answers: the measuring stage builds the
+/// release `aterm` itself and hands it over in `ATERM_PAINT_BIN` and
+/// `ATERM_SPIN_BIN` (`aterm-verify`'s `RELEASE_BIN_VARS`), so the suites judge
+/// the artifact that stage just built and never build one of their own. The
+/// build below is a hand run's. Its dedicated target avoids repeatedly
+/// rebuilding dependencies with the outer integration test's different feature
+/// set; paint and spin intentionally share it, and since the package-identity
+/// sweep below they really do: after the first build the other gets a
+/// freshness check measured at 0.2 s, where an alternation between two
+/// packages used to relink for 208 s.
 pub(crate) fn release_bin(root: &Path, overrides: &[&str]) -> PathBuf {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
     BIN.get_or_init(|| {

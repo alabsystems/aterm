@@ -177,11 +177,14 @@ pub(crate) fn update_installed_title(version: Option<&str>) -> String {
 #[cfg(any(unix, test))]
 pub(crate) const UPDATE_INSTALLED_DETAIL: &str = crate::update_words::INSTALL_FROM_MENU;
 /// An update the lane has stopped trying by itself: the person's next step is
-/// the Version menu's "Install aterm vX now" — the row's `Install now`.
-pub(crate) const UPDATE_DIDNT_INSTALL: &str = "Update didn't install";
+/// the Version menu's "Install aterm vX now" — the row's `Install now`. In
+/// the band's one failure grammar (ruling 309: main's `Update didn't install`
+/// read apart from every other `Couldn't …` beside it).
+pub(crate) const UPDATE_DIDNT_INSTALL: &str = "Couldn't install the update";
 /// An attempt that failed with no staged build left to retry (main's words,
-/// ruling 68): a failure row with the details page.
-pub(crate) const UPDATE_DIDNT_FINISH: &str = "Update didn't finish";
+/// ruling 68, in the failure grammar since ruling 309): a failure row with
+/// the details page.
+pub(crate) const UPDATE_DIDNT_FINISH: &str = "Couldn't finish the update";
 /// The install waits on work only the person can save or close (the close
 /// preflight's blocker, painted beneath it — ruling 143's editor block, said
 /// on its own row when no flow row is up to say it).
@@ -1036,7 +1039,6 @@ impl App {
                         self.restate_staged_bar_posture(*staged_build);
                     }
                     self.note_update_outcome(crate::update_words::outcome(
-                        '\u{21bb}',
                         "Update waiting",
                         "one tab couldn't move to the new version \u{b7} tries again when \
                          that tab changes",
@@ -1074,7 +1076,6 @@ impl App {
                             // Fault echo, and the lane has it — a self-retry is a
                             // RECORD (ruling 143).
                             self.note_update_outcome(crate::update_words::outcome(
-                                '\u{21bb}',
                                 &format!("Couldn't install aterm v{version}"),
                                 crate::update_words::TRIES_AGAIN,
                                 aterm_messages::Severity::Info,
@@ -1104,7 +1105,6 @@ impl App {
                     // person's own press is told.
                     if source_is_automatic(source) {
                         self.note_update_outcome(crate::update_words::outcome(
-                            '\u{26a0}',
                             UPDATE_DIDNT_FINISH,
                             &format!("the next check downloads it again \u{b7} {message}"),
                             aterm_messages::Severity::Warn,
@@ -1162,7 +1162,6 @@ impl App {
                 build,
             ),
             None => crate::update_words::outcome(
-                '\u{26a0}',
                 title,
                 crate::update_words::INSTALL_FROM_MENU,
                 aterm_messages::Severity::Warn,
@@ -3508,8 +3507,8 @@ pub(crate) mod tests {
     /// AN UNATTENDED FAILURE WITH NO STAGE IS A RECORD (audit 2026-09-24,
     /// design ruling 213): the artifact is gone, nothing can be pressed, and
     /// the next check re-stages it — so the automatic lane writes one record
-    /// and posts no row; a person's own press still gets `Update didn't
-    /// finish` on the glass.
+    /// and posts no row; a person's own press still gets `Couldn't finish
+    /// the update` on the glass.
     #[test]
     fn an_automatic_failure_with_no_stage_is_a_record_and_a_press_is_a_row() {
         let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
@@ -3527,14 +3526,17 @@ pub(crate) mod tests {
         );
         assert_eq!(app.messages.log().len(), before + 1, "one record");
         let said = app.update_record_text().expect("on record");
-        assert!(said.starts_with("Update didn't finish \u{2014} "), "{said}");
+        assert!(
+            said.starts_with("Couldn't finish the update \u{2014} "),
+            "{said}"
+        );
         assert!(said.contains("the staged artifact was retired"), "{said}");
 
         let mut pressed = App::headless_for_test();
         pressed.react_to_update_apply_outcome("manual", failed(), false);
         assert_eq!(
             pressed.update_row_text().as_deref(),
-            Some("Update didn't finish \u{2014} "),
+            Some("Couldn't finish the update \u{2014} "),
             "a person's press is told on the glass"
         );
     }
@@ -3542,7 +3544,7 @@ pub(crate) mod tests {
     /// NO ✓ BESIDE A FAILURE (ruling 159). The staged row leaves resolved `Ok`
     /// once the bytes are installed (`InstalledNeedsRelaunch`) — true — and
     /// WITHDRAWN when the artifact is gone (`Failed` with no staged build),
-    /// with no outcome to claim: only `Update didn't finish` speaks.
+    /// with no outcome to claim: only `Couldn't finish the update` speaks.
     #[test]
     fn a_gone_artifact_never_echoes_installed_beside_its_failure() {
         use aterm_messages::{LogState, Outcome, Retired};

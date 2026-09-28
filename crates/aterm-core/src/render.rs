@@ -1185,11 +1185,14 @@ pub enum BandIcon {
     Dot,
     /// `…` — three dots.
     More,
+    /// `⊖` — a bar cut out of a disc: a removal in flight (design ruling
+    /// 304; the `·` it replaced read as a bullet, not an icon).
+    Remove,
 }
 
 impl BandIcon {
     /// Every icon, in its index order ([`Self::index`]).
-    pub const ALL: [BandIcon; 12] = [
+    pub const ALL: [BandIcon; 13] = [
         Self::Info,
         Self::Success,
         Self::Warn,
@@ -1202,6 +1205,7 @@ impl BandIcon {
         Self::Alert,
         Self::Dot,
         Self::More,
+        Self::Remove,
     ];
 
     /// The icon that stands in for `ch`, the band's glyph; `None` for any
@@ -1221,6 +1225,7 @@ impl BandIcon {
             '!' => Self::Alert,
             '\u{00b7}' => Self::Dot,
             '\u{2026}' => Self::More,
+            '\u{2296}' => Self::Remove,
             _ => return None,
         })
     }
@@ -1241,6 +1246,7 @@ impl BandIcon {
             Self::Alert => '!',
             Self::Dot => '\u{00b7}',
             Self::More => '\u{2026}',
+            Self::Remove => '\u{2296}',
         }
     }
 

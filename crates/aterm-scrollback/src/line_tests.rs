@@ -1458,3 +1458,74 @@ fn serialization_drops_the_image_and_keeps_everything_else() {
         "images are deliberately not on the wire — see Line::serialize"
     );
 }
+
+/// `clear_hyperlinks` DROPS THE LINKS AND NOTHING ELSE (the 2026-09-22/23
+/// update audit, plan P2-4). A self-update's producer uses it on a screen line
+/// whose record is past the wire's size bound, so the line must still read,
+/// render and wrap exactly as it did: the text, the attrs, `WRAPPED`, the
+/// underline colours and the images all stay. And the cleared line must
+/// serialize byte-for-byte like one that never had a link, because the wire
+/// only admits canonical records.
+///
+/// RED before the fix: `Line` had no way to drop only its hyperlinks (the
+/// field is private and nothing wrote it after construction), so this does
+/// not compile on the old crate.
+#[test]
+fn clearing_hyperlinks_drops_the_links_and_keeps_everything_else() {
+    let red = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
+    let styled = || {
+        let mut rle: Rle<CellAttrs> = Rle::new();
+        for _ in 0..8 {
+            rle.push(red);
+        }
+        rle
+    };
+    let links = vec![
+        HyperlinkSpan::with_id(
+            0,
+            4,
+            Arc::from("https://a.test/long"),
+            Some(Arc::from("id-1")),
+        ),
+        HyperlinkSpan::new(5, 8, Arc::from("https://b.test")),
+    ];
+    let dress = |line: &mut Line| {
+        line.set_wrapped(true);
+        line.set_underline_colors(vec![UnderlineColorSpan::new(0, 8, 0x01_10_20_30)]);
+        line.set_images(vec![ImageSpan::new(6, 8, 0, 0, test_image(1, 2, 16))]);
+    };
+    let mut line = Line::with_hyperlinks("abcd efg", styled(), links);
+    dress(&mut line);
+    let mut never_linked = Line::with_hyperlinks("abcd efg", styled(), Vec::new());
+    dress(&mut never_linked);
+    assert!(
+        line.has_hyperlinks(),
+        "PRECONDITION: the line carries links"
+    );
+
+    line.clear_hyperlinks();
+    assert!(!line.has_hyperlinks());
+    assert_eq!(line.hyperlink_count(), 0);
+    assert!(
+        line.hyperlinks().is_none(),
+        "back to None, not an empty vector"
+    );
+    assert!(line.get_hyperlink(1).is_none());
+    assert_eq!(line.as_str(), Some("abcd efg"));
+    assert!(line.is_wrapped());
+    assert_eq!(line.get_attr(3), red);
+    assert_eq!(line.get_attr(7), red);
+    assert_eq!(line.get_underline_color(7), Some(0x01_10_20_30));
+    assert_eq!(line.image_count(), 1);
+    assert!(line.get_image(6).is_some());
+    assert_eq!(
+        line.serialize(),
+        never_linked.serialize(),
+        "byte-identical to a line that never had a link"
+    );
+
+    // A line with no link is left exactly as it was.
+    let before = never_linked.serialize();
+    never_linked.clear_hyperlinks();
+    assert_eq!(never_linked.serialize(), before);
+}

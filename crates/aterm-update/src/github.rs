@@ -1685,7 +1685,12 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
         // boot apply that wins the lock first simply consumes the marker — the
         // re-read below then finds nothing to retire, which is the honest outcome:
         // an installed build from a revoked machine is `min_build`'s to yank.
-        match aterm_update_core::FileLock::acquire(&staging.apply_lock) {
+        // Bounded (plan P2-1): this is the checker thread, and a wedged apply-lock
+        // holder used to park it here for good. The `Err` arm already retries.
+        match aterm_update_core::FileLock::acquire_within(
+            &staging.apply_lock,
+            crate::install::BACKGROUND_LOCK_WAIT,
+        ) {
             Ok(_apply_lock) => {
                 if Ready::read_publishable(&staging)
                     .is_some_and(|still| still.build_number == staged.build_number)
@@ -1942,8 +1947,27 @@ fn check_and_stage_inner(current_build: u64, source: &Source) -> Result<Option<S
     // processes so two app instances can't clobber the shared download/staged
     // scratch. Separate from the apply lock so this (possibly long) download never
     // blocks a starting instance's apply path.
-    let _stage_lock = aterm_update_core::FileLock::acquire(&staging.stage_lock)
-        .map_err(|e| format!("stage lock: {e}"))?;
+    //
+    // BOUNDED (plan P2-1). A blocking wait here parked the checker thread behind any
+    // holder, including one stopped mid-download, for as long as it stayed stopped.
+    // A holder past the bound is another process staging (the next check reads what
+    // it staged) or a wedged one (the next check tries again): either way this
+    // check's answer is the same, and waiting forever for it was never one.
+    let _stage_lock = aterm_update_core::FileLock::acquire_within(
+        &staging.stage_lock,
+        crate::install::BACKGROUND_LOCK_WAIT,
+    )
+    .map_err(|e| {
+        if e.kind() == std::io::ErrorKind::TimedOut {
+            format!(
+                "stage lock: another aterm process has been staging an update for more than \
+                 {} s; this check stands down and the next one reads what it staged",
+                crate::install::BACKGROUND_LOCK_WAIT.as_secs()
+            )
+        } else {
+            format!("stage lock: {e}")
+        }
+    })?;
     // Re-check under the lock: another instance may have just staged this build.
     // Same terminal-healthy reasoning as the pre-lock check above — and the same
     // `Some` answer, so the sibling's freshly-won stage arms THIS process's

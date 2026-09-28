@@ -435,7 +435,7 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 44;
+const DEADLINE_OWNER_SLOTS: usize = 45;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
@@ -785,6 +785,17 @@ pub(crate) enum DeadlineOwner {
     /// owes, and the end of a reopened layout's probation, when the image still
     /// carries its mark. An idle window owes neither.
     CrashJournal = 43,
+    /// The update checker's watchdog (`crate::update_checker_watch`, plan P2-1):
+    /// ONE wake at the instant the background check loop's heartbeat would go
+    /// stale — twice its phase's budget past its last stamp. A healthy loop
+    /// re-stamps long before it, so this wakes an idle window about once an hour
+    /// to find it fresh; a window with no checker (headless, automatic checks
+    /// off, an uninstalled copy) never arms it.
+    ///
+    /// 44 and not 40: this was written against a tree where 40 was free, and
+    /// main's `SystemStrain` (40) through `CrashJournal` (43) reached main
+    /// first. The table is an APPEND-ONLY WIRE CONTRACT, so this one moves.
+    UpdateChecker = 44,
 }
 
 impl DeadlineOwner {
@@ -833,6 +844,7 @@ impl DeadlineOwner {
             41 => Self::SessionWaits,
             42 => Self::InputWatch,
             43 => Self::CrashJournal,
+            44 => Self::UpdateChecker,
             _ => Self::None,
         }
     }
@@ -884,6 +896,7 @@ impl DeadlineOwner {
             Self::SessionWaits => "session_waits",
             Self::InputWatch => "input_watch",
             Self::CrashJournal => "crash_journal",
+            Self::UpdateChecker => "update_checker",
         }
     }
 }
@@ -5564,6 +5577,10 @@ mod histogram_tests {
         // edge is never charged to another owner.
         assert_eq!(DeadlineOwner::from_raw(43), DeadlineOwner::CrashJournal);
         assert_eq!(DeadlineOwner::CrashJournal.as_str(), "crash_journal");
+        // Slot 44 is the update checker's watchdog (plan P2-1): its one wake at
+        // the heartbeat's stale instant is never charged to another owner.
+        assert_eq!(DeadlineOwner::from_raw(44), DeadlineOwner::UpdateChecker);
+        assert_eq!(DeadlineOwner::UpdateChecker.as_str(), "update_checker");
         // Slot 22 is a tombstone (2026-09-22): the config banner's owner
         // retired with `config_notice.rs`, and the number stays taken under a
         // label no live owner wears, so an older wire reader never attributes

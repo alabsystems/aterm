@@ -1233,8 +1233,8 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        `LIMITED seq=<n> handled: …`. Under the [harness]
                        `resume_limits = false` it is the manager's: the
                        worker's attention is set (`meta set attention
-                       owner=supervisor limited: <message> reset=<when>`, cut at
-                       200 bytes), the same text posted as `kind=control` mail
+                       owner=supervisor limited: <message>`, cut at 200
+                       bytes), the same text posted as `kind=control` mail
                        from the worker's session to yours (--inbox, else
                        $ATERM_PARENT_SESSION_ID) only while the worker's
                        `status` says fabric=connected, and one `ESCALATED
@@ -1268,8 +1268,17 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        streak (nothing is ever escalated as \"done\"); a
                        session nobody has asked anything yet (its launch
                        screen) is no turn end and gets nothing. Walls: an API
-                       error or an overload is retried for ever, 1, 5, 15,
-                       30, then every 60 min from each appearance; a usage or
+                       error is answered by what it says, never with an ask,
+                       each try quoting Claude Code's own line — a network
+                       never reached, or a certificate or proxy refused, is
+                       tried 1, 2, 5, then every 5 min from each appearance
+                       (the window's host continues one as soon as it
+                       measures the API reachable again, and holds it up to
+                       15 min while it measures it down; nothing here
+                       measures), a reply cut off is continued at once and
+                       then on that ladder, and the server's own failure or
+                       an overload is retried for ever, 1, 5, 15, 30, then
+                       every 60 min from each appearance; a usage or
                        spend limit is continued a minute past its reset
                        (nothing is ever bought; the notice again after a
                        continuation waits 10 min from then, then 30; the screen

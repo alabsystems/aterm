@@ -39,9 +39,9 @@
 //!      cross-instance nesting of one identity needs an instance order this
 //!      census cannot see.
 //!
-//! Consumers (same fan-out as the main-loop census, so the verb and the gate
-//! cannot diverge): `cargo xtask gate lockorder`, the fused
-//! `tools/freeze-safety-gate/build.rs` build, and the `aterm-census` bin.
+//! Consumers (same fan-out as the main-loop census, so the runner and the gate
+//! cannot diverge): the fused `tools/freeze-safety-gate/build.rs` build, and
+//! the `aterm-census` bin (`targo --unverified run -p aterm-census -- --locks`).
 //!
 //! PRECISION: see [`LOCK_PRECISION_NOTE`] — printed in every RED diagnostic
 //! and quoted in docs/temporal-safety-gate.md.
@@ -2939,8 +2939,8 @@ pub fn run_lock_order_census(root: &Path) -> CensusOutcome {
             log,
             "gate lockorder: FAILED — {failures} obligation violation(s). A lock-order \
              cycle has NO waiver channel (L0-DEADLOCK: none, ever) — it can only be \
-             fixed. This census blocks BOTH `cargo xtask gate lockorder` and the \
-             `cargo build` of tools/freeze-safety-gate."
+             fixed. This census blocks BOTH `targo --unverified run -p aterm-census -- \
+             --locks` and the build of tools/freeze-safety-gate."
         );
         return CensusOutcome { ok: false, log };
     }

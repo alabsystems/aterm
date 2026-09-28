@@ -92,10 +92,34 @@
 //!   goes on the back-off ([`TurnEndState::observe`]); it was escalated as
 //!   "not taken" until 2026-09-24.
 //!
-//! **Walls** ([`aterm_phase::wall`]). An API error or an overload (retryable
-//! or not): wait out [`TurnEndTiming::retry_backoff`] (1, 5, 15, 30, 60 min;
-//! the last for every retry after) from each appearance and continue after
-//! each, for ever. A usage window or a spend limit: waited out, handled and
+//! **Walls** ([`aterm_phase::wall`]). An API error is answered by what it
+//! says went wrong ([`aterm_phase::ApiCause`]; the outage of 2026-09-27,
+//! when a worker's `API Error: Can't reach the API server … (ENOTFOUND)`
+//! was typed into sixteen times in an hour, is why), and never by an ask —
+//! each wait is in the journal as a `WAITING` row (the tab names what went
+//! wrong, not the wait: nothing carries the plan to the window):
+//! * **the network never reached** — the worker is continued as soon as
+//!   the session's host MEASURES the API reachable again ([`Reach::Up`]:
+//!   decided at once, and seen by the loop within about a minute of the
+//!   network's return — the host's probe cadence and the loop's wait
+//!   step); until then it is tried on [`TurnEndTiming::net_backoff`] (1, 2,
+//!   5, then every 5 min), a blind try costing only the vendor's own
+//!   retries — and while the host measures the API definitely DOWN
+//!   ([`Reach::Down`]), nothing is typed into it for up to
+//!   [`TurnEndTiming::down_hold`] (15 min), so a wrong measure holds no one
+//!   longer;
+//! * **a certificate or proxy refused** — the same, except that an `Up`
+//!   is no evidence for it (the host verifies against the platform's trust
+//!   store, the agent against its own): it stays on the ladder;
+//! * **a reply cut off** — continued at once, then on the same ladder;
+//! * **the server's own failure** (a status, an overload) — wait out
+//!   [`TurnEndTiming::retry_backoff`] (1, 5, 15, 30, 60 min; the last for
+//!   every retry after) from each appearance and continue after each.
+//!
+//! Each act quotes the vendor's own line to the worker ([`wall_retry_text`])
+//! rather than the rote continuation, and a retry that led to real work
+//! ([`TurnEndTiming::progress`]) ends the episode: the next wall starts its
+//! ladder again. A usage window or a spend limit: waited out, handled and
 //! nobody told, when the vendor says it goes on by itself (`continuing
 //! automatically at …`) — continued only if it has not gone on a
 //! [`TurnEndTiming::reset_grace`] past its reset — and otherwise a usage
@@ -139,6 +163,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
+use aterm_phase::ApiCause;
 use aterm_phase::phase::{Phase, is_done_row, last_said_row, status_row};
 use aterm_phase::wall::WallKind;
 
@@ -148,8 +173,69 @@ use super::super::config::SupervisorConfig;
 pub const RULE_CONTINUE: &str = "continue@v1";
 /// The worker's own suggestion accepted.
 pub const RULE_SUGGESTION: &str = "continue-suggestion@v1";
-/// A continuation after an overload or a retryable API error's wait.
+/// A continuation after an overload or an API error's wait (and the one
+/// try at the ceiling while the network is measured down).
 pub const RULE_API_RETRY: &str = "api-retry@v1";
+/// A continuation once the host measures the API reachable again, after
+/// an API error that never reached it.
+pub const RULE_API_BACK: &str = "api-back@v1";
+/// A continuation after a reply the connection cut off.
+pub const RULE_API_CUTOFF: &str = "api-cutoff@v1";
+
+/// What every wall act ends with: where to carry on, and not to repeat a
+/// step whose result the failure may have eaten.
+const CARRY_ON: &str = "Carry on from where you stopped; if the result of your last step is \
+missing, check whether it ran before you repeat it.";
+
+/// What is typed at an API wall's act: the vendor's own line, quoted — so
+/// the words cannot say more than the screen did — and what follows from
+/// it. `rule` is the act's ([`RULE_API_BACK`], [`RULE_API_CUTOFF`],
+/// [`RULE_API_RETRY`]); `cause` the wall's.
+#[must_use]
+pub fn wall_retry_text(rule: &str, cause: ApiCause, message: &str) -> String {
+    let said = message.trim();
+    match (rule, cause) {
+        (RULE_API_BACK, _) => {
+            format!(
+                "Claude Code reported \"{said}\", and the API is reachable again now. {CARRY_ON}"
+            )
+        }
+        (_, ApiCause::CutOff) => format!(
+            "Claude Code reported \"{said}\", so your last reply may be incomplete. Carry on \
+             from where it stopped; if the result of your last step is missing, check whether it \
+             ran before you repeat it."
+        ),
+        (_, ApiCause::Unreachable | ApiCause::Config) => {
+            format!("Claude Code reported \"{said}\"; trying again. {CARRY_ON}")
+        }
+        (_, ApiCause::Server) => format!("Claude Code reported \"{said}\". {CARRY_ON}"),
+    }
+}
+
+/// What the session's host last MEASURED of the agent's route to its API
+/// ([`crate::supervise::IdleHost::reach`]) — never read off the screen.
+/// `since` is when the measure last changed to what it says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Reach {
+    /// Nobody measures it here (`drive watch`), or the route is one the
+    /// host cannot reproduce (a base URL, a cloud provider, a proxy).
+    #[default]
+    Unknown,
+    Down {
+        since: Instant,
+    },
+    Up {
+        since: Instant,
+    },
+}
+
+/// A wall's own continuation: its next appearance is the act's to count.
+fn is_wall_retry(rule: &str) -> bool {
+    matches!(
+        rule,
+        RULE_API_RETRY | RULE_API_BACK | RULE_API_CUTOFF | RULE_LIMIT_RESUME
+    )
+}
 /// A continuation past a usage window's reset.
 pub const RULE_LIMIT_RESUME: &str = "usage-resume@v1";
 /// The agent relaunched on the fallback model on a model bucket.
@@ -446,10 +532,25 @@ pub struct TurnEndTiming {
     /// short turn more in a row doubles it, up to [`Self::short_backoff_max`].
     pub short_backoff: Duration,
     pub short_backoff_max: Duration,
-    /// The wait before each retry of an API error or an overload, counted
-    /// from the wall's appearance; the last is the wait before every retry
-    /// after it.
+    /// The wait before each retry of the server's own failure (a status,
+    /// an overload), counted from the wall's appearance; the last is the
+    /// wait before every retry after it.
     pub retry_backoff: Vec<Duration>,
+    /// The same for an API that was never reached or refused a certificate
+    /// or proxy, and a reply cut off, where the reach is not measured up:
+    /// short, because a blind try costs only the vendor's own retries (about
+    /// 3 minutes of them in the outage of 2026-09-27) and a long rung is an
+    /// agent left waiting after the network came back.
+    pub net_backoff: Vec<Duration>,
+    /// How long nothing is typed into an API the host measures definitely
+    /// down before one try all the same — the most a wrong measure holds a
+    /// worker.
+    pub down_hold: Duration,
+    /// The busy work between a wall's act and the wall's next appearance
+    /// that ends its episode: real work, where the vendor's own retries run
+    /// about 3 minutes. A reply the Mac's sleep cut off after an hour of
+    /// work is a new wall, not the seventh retry of the last.
+    pub progress: Duration,
     /// How long past a usage window's reset the continuation waits.
     pub reset_grace: Duration,
     /// How long past the time a notice that goes on BY ITSELF named
@@ -483,6 +584,9 @@ impl Default for TurnEndTiming {
             short_backoff: min(2),
             short_backoff_max: min(60),
             retry_backoff: vec![min(1), min(5), min(15), min(30), min(60)],
+            net_backoff: vec![min(1), min(2), min(5)],
+            down_hold: min(15),
+            progress: min(5),
             reset_grace: Duration::from_secs(60),
             auto_resume_grace: min(10),
             limit_backoff: vec![min(10), min(30)],
@@ -567,6 +671,10 @@ pub struct TurnEndReading {
     /// `⎿  Login successful` under the `❯ /login` a person typed), what
     /// lifts a lost login the policy saw ([`decide_turn_end`]'s login hold).
     pub login_back: bool,
+    /// What the session's host measures of the API's reach — the loop's to
+    /// set, at a wall that never reached the API or was cut off, as it sets
+    /// [`Self::restartable`]; [`Reach::Unknown`] from the screen.
+    pub reach: Reach,
     /// How long ago a PERSON last typed or pasted into the session through
     /// its window (the server's `status human_ms=`; a control-socket write
     /// is not a person's), or the draft in the composer last changed — the
@@ -633,6 +741,7 @@ impl TurnEndReading {
             taskless: reading.fresh,
             person: None,
             login_back: claude && aterm_phase::login_restored(rows),
+            reach: Reach::Unknown,
         }
     }
 
@@ -755,6 +864,9 @@ struct WallTrack {
     class: WallClass,
     since: Instant,
     attempts: usize,
+    /// The acts made because the host measured the API reachable again
+    /// ([`RULE_API_BACK`]): the next is spaced on the ladder by their count.
+    ups: usize,
 }
 
 /// A model switch this policy made (owner decision 3).
@@ -1036,12 +1148,18 @@ impl TurnEndState {
             }
             (None, None) => {}
         }
-        let retried = awaited.is_some_and(|r| r == RULE_API_RETRY || r == RULE_LIMIT_RESUME);
+        let retried = awaited.is_some_and(is_wall_retry);
         match reading.wall.map(class_of) {
             Some(class) => match &mut self.wall {
                 Some(t) if t.class == class => {
                     if retried {
                         t.since = now;
+                        // The act led to real work before the wall came
+                        // back: a new episode, its ladder from the start.
+                        if reading.worked.is_some_and(|w| w >= self.timing.progress) {
+                            t.attempts = 0;
+                            t.ups = 0;
+                        }
                     }
                 }
                 _ => {
@@ -1049,6 +1167,7 @@ impl TurnEndState {
                         class,
                         since: now,
                         attempts: 0,
+                        ups: 0,
                     });
                     self.fallback_unmade = false;
                 }
@@ -1097,10 +1216,19 @@ impl TurnEndState {
         };
         if matches!(
             rule,
-            RULE_API_RETRY | RULE_LIMIT_RESUME | RULE_CONSENT | RULE_COMPACT | RULE_LOGIN
+            RULE_API_RETRY
+                | RULE_API_BACK
+                | RULE_API_CUTOFF
+                | RULE_LIMIT_RESUME
+                | RULE_CONSENT
+                | RULE_COMPACT
+                | RULE_LOGIN
         ) && let Some(t) = &mut self.wall
         {
             t.attempts += 1;
+            if rule == RULE_API_BACK {
+                t.ups += 1;
+            }
         }
     }
 
@@ -1728,8 +1856,23 @@ fn act_at_point(
             rule_id: rule,
         })
     };
+    let type_as = |rule: &'static str, text: &str| {
+        budgeted(TurnEndAction::Type {
+            text: with_rules(text, reading.rules.as_deref()),
+            rule_id: rule,
+        })
+    };
     if let Some(kind) = reading.wall {
-        return wall_action(state, reading, cfg, now, kind, &budgeted, &continue_as);
+        return wall_action(
+            state,
+            reading,
+            cfg,
+            now,
+            kind,
+            &budgeted,
+            &continue_as,
+            &type_as,
+        );
     }
     // A LOST LOGIN THE POLICY SAW is waited out off the screen too: its track
     // stands (`/login` typed or not) and the worker has not worked since. The
@@ -1906,6 +2049,7 @@ fn retry_wait(state: &TurnEndState, attempts: usize) -> Option<Duration> {
 }
 
 /// The wall policies (module header).
+#[allow(clippy::too_many_arguments)]
 fn wall_action(
     state: &TurnEndState,
     reading: &TurnEndReading,
@@ -1914,6 +2058,7 @@ fn wall_action(
     kind: WallKind,
     budgeted: &dyn Fn(TurnEndAction) -> TurnEndAction,
     continue_as: &dyn Fn(&'static str) -> TurnEndAction,
+    type_as: &dyn Fn(&'static str, &str) -> TurnEndAction,
 ) -> TurnEndAction {
     let track = state.wall.as_ref().filter(|t| t.class == class_of(kind));
     let since = track.map_or(now, |t| t.since);
@@ -1932,17 +2077,79 @@ fn wall_action(
             if !cfg.retry_api_errors {
                 return esc(format!("{}: {msg} (retry_api_errors is off)", kind.name()));
             }
-            let Some(wait) = retry_wait(state, attempts) else {
-                return continue_as(RULE_API_RETRY);
+            let cause = match kind {
+                WallKind::ApiError { cause, .. } => cause,
+                _ => ApiCause::Server,
             };
-            let due = later(since, wait);
-            if now < due {
-                return TurnEndAction::WaitUntil {
-                    until: due,
-                    why: format!("{} retry {}", kind.name(), attempts + 1),
-                };
+            let ups = track.map_or(0, |t| t.ups);
+            let t = &state.timing;
+            let act = |rule: &'static str| type_as(rule, &wall_retry_text(rule, cause, msg));
+            let wait_then = |due: Instant, why: String, act: TurnEndAction| {
+                if now < due {
+                    TurnEndAction::WaitUntil { until: due, why }
+                } else {
+                    act
+                }
+            };
+            // A ladder's rung for the act after `n`, from this appearance.
+            let rung = |ladder: &[Duration], n: usize| {
+                crate::supervise::ladder::Ladder(ladder)
+                    .at(n)
+                    .map_or(now, |w| later(since, w))
+            };
+            match (cause, reading.reach) {
+                // Measured reachable again: continued at once, then spaced on
+                // the short ladder by the acts this measure has made (it met
+                // the wall again: the measure was wrong, or the API still
+                // fails). NOT a certificate or proxy refusal: the host's
+                // handshake is verified against the platform's trust store,
+                // the agent's against its own (`NODE_EXTRA_CA_CERTS`; the
+                // vendor's `SELF_SIGNED_CERT_IN_CHAIN … an authority Claude
+                // Code doesn't trust`), so on a network whose inspecting
+                // root only the keychain trusts the host reads Up while the
+                // agent is refused — and "the API is reachable again" would
+                // be typed at once, then on every rung, and be false each
+                // time (the review of 2026-09-27). It stays on the ladder.
+                (ApiCause::Unreachable, Reach::Up { .. }) => wait_then(
+                    ups.checked_sub(1)
+                        .map_or(since, |n| rung(&t.net_backoff, n)),
+                    format!("api-error back but met again: retry {}", ups + 1),
+                    act(RULE_API_BACK),
+                ),
+                // Measured definitely down: nothing typed into it for up to
+                // the hold, then one try all the same.
+                (
+                    ApiCause::Unreachable | ApiCause::Config | ApiCause::CutOff,
+                    Reach::Down { .. },
+                ) => wait_then(
+                    later(since, t.down_hold),
+                    "api-error: the API is unreachable; continuing when it is reachable, or \
+                         at this try"
+                        .to_string(),
+                    act(RULE_API_RETRY),
+                ),
+                (ApiCause::Unreachable, Reach::Unknown)
+                | (ApiCause::Config, Reach::Unknown | Reach::Up { .. }) => wait_then(
+                    rung(&t.net_backoff, attempts),
+                    format!("api-error retry {}", attempts + 1),
+                    act(RULE_API_RETRY),
+                ),
+                // A reply cut off: continued at once, then on the short
+                // ladder.
+                (ApiCause::CutOff, _) => wait_then(
+                    attempts
+                        .checked_sub(1)
+                        .map_or(since, |n| rung(&t.net_backoff, n)),
+                    format!("api-error cut off: retry {}", attempts + 1),
+                    act(RULE_API_CUTOFF),
+                ),
+                // The server's own failure: its ladder, whatever the reach.
+                (ApiCause::Server, _) => wait_then(
+                    rung(&t.retry_backoff, attempts),
+                    format!("{} retry {}", kind.name(), attempts + 1),
+                    act(RULE_API_RETRY),
+                ),
             }
-            continue_as(RULE_API_RETRY)
         }
         WallKind::UsageSession | WallKind::UsageWeekly | WallKind::Spend => {
             if reading.resumes_by_itself && cfg.resume_limits {

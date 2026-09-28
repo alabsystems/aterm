@@ -40,8 +40,9 @@ lenient (law L3 of the 2026-09-22/23 audit).
 | `seamless-<pid>-<nonce>.layout.toml` | The layout sidecar, exactly as written. |
 | `seamless-<pid>-<nonce>.s<id>.grid` / `.altgrid` | Each session's main and inactive grid sidecars, exactly as written. |
 | `seamless-<pid>-<nonce>.s<id>.ctl` | Each session's control-carry sidecar, exactly as written. |
+| `seamless-<pid>-<nonce>.s<id>.hist` | Each session's history-carry sidecar, exactly as written (from v0.94.0, for a session whose history is deeper than its checkpoint carries). |
 | `s<id>.meta.json` | A copy of the meta JSON the manifest embeds for session `<id>`, extracted so it can be reviewed. The guard checks that it equals the embedded copy. |
-| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. |
+| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, which the guard does not read yet. |
 
 The bytes are unchanged with one exception. The manifest names each grid
 sidecar by its absolute path in the producer's private directory, and the
@@ -83,13 +84,58 @@ desk for the shape v0.92.0 changed:
   nonce, and the guard checks that this build reassembles both from the
   older producer's meta. v0.92.0 is the first release whose rows carry them.
 
-`generator.rs.txt` is the v0.92.0 generator, the template for the next
+## The v0.94.0 desks
+
+The same five desks, written by v0.94.0's producer, plus one desk for the
+shapes v0.93.0 and v0.94.0 changed. v0.93.0 has no directory, so nothing
+checks what its producer writes.
+
+v0.94.0's producer differs from v0.92.0's in four ways that reach these
+bytes:
+
+- The capture is the producer ladder: `carry_for_wire` for each session at
+  the budgets `App::capture_parked_screens` prices, then
+  `settle_wire_carries`. Every session here is carried at the top rung
+  (`CarryRung::Full`), so the repaint set is empty.
+- Every record carries the foreground holder the park reads (`fg_holder`):
+  the shell's pid at a prompt, else the job's.
+- The history carry. The generator runs the fork lane's export and join
+  (`HistoryPlan::Deferred`, then `handoff_history::stamp_manifest`) for a
+  successor newer than v0.94.0. A session whose history is deeper than its
+  checkpoint carries (256 lines, or none under an alternate screen) names a
+  `.s<id>.hist` sidecar on its record (`history = "<len> <sha> <take>"`).
+- The self-check also runs the adoption proof and, after Commit, the history
+  import. Every session gets its parent's whole history back, line for line.
+
+The new desk:
+
+- `history-carry`: a shell with 1,500 lines of history, and a shell with
+  1,000 lines running `less` in 1049, whose checkpoint carries none of that
+  history, so its sidecar carries all of it. The records also carry the other
+  fields v0.93.0 and v0.94.0 added: a running `history_lost` from an earlier
+  handoff, `rekey` and `loader` for shells spawned with integration, and a
+  `questions` word, which is also on its layout leaf. The `shell-integration`
+  desk's shells carry `rekey` and `loader` as well.
+
+`generator.rs.txt` is the v0.94.0 generator, the template for the next
 release.
 
 ## Adding the next release's fixtures
 
 Do this once for each release, after its tag exists (see docs/RELEASING.md,
 "Every release adds its handoff fixtures").
+
+`ship cut` enforces it. Before the claim, the cut of the next release refuses
+unless this release's directory exists, at least one desk in it holds a
+`parent.toml`, and `PINNED_DESKS` has at least one row for it
+(`gates::handoff_fixture_gate` in `crates/aterm-release/src/gates.rs`). The
+gate reads those rows from the source of `seamless_fixture_tests.rs`, so keep
+them in the table's shape: one `("vX.Y.0", "<desk>")` pair per row. "This
+release" is the newest version in `RELEASES.ledger`, other than the one being
+cut, whose `vX.Y.0` tag is on origin. So a recut asks for the same directory
+as its first attempt, and a claim that was abandoned and then skipped is
+passed over for the release before it. The fixtures can only come from the tag, so add them while it is
+fresh. A `--dry-run` of the next cut shows whether they are in.
 
 1. Make a worktree at the tag, outside the repo tree. The `.noindex` suffix
    keeps Spotlight out of it:
@@ -106,24 +152,31 @@ Do this once for each release, after its tag exists (see docs/RELEASING.md,
 2. Append `generator.rs.txt` (in this directory) to that worktree's
    `crates/aterm-gui/src/seamless_carry_tests.rs`, and adapt it to that
    release's API:
-   - `fx_capture` must be that release's own capture path, not the v0.91.0
-     loop that the template copies (0.92.0 still captured that way). From the
-     first release carrying the 2026-09-22/23 update audit's producer ladder,
-     that is `carry_for_wire` for each session and then `settle_wire_carries`
-     over the pool. The repaint set is the sessions whose rung has
-     `CarryRung::needs_repaint`.
-   - From that release on, `write_outgoing` takes the repaint set after the
-     screens and returns a `Result`.
-   - Keep the five desks, and add a desk for any shape that release changed.
+   - `fx_capture` must be that release's own capture path. The template
+     copies v0.94.0's: `carry_for_wire` for each session at the budgets
+     `App::capture_parked_screens` prices, then `settle_wire_carries` over
+     the pool. The repaint set is the sessions whose rung has
+     `CarryRung::needs_repaint`. If the release changed the capture, copy
+     the change.
+   - `fx_write` must run the release's own worker steps in its order. In
+     v0.94.0 that is the control carry's export, then the history carry's
+     export and `stamp_manifest`, then `write_outgoing`, then the layout.
+   - Give every record field the release added a value that a real session
+     would carry, and keep the generator's self-check passing.
+   - Keep the six desks, and add a desk for any shape that release changed.
 3. Run the generator, still in the worktree:
 
    ```sh
+   ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
    ATERM_HANDOFF_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
      targo --unverified test -p aterm-gui --lib -- generate_handoff_fixtures --ignored
    ```
 
    It refuses a desk that the release's own capture would not park, or that
-   its own consumer would not adopt exactly.
+   its own consumer would not adopt exactly. `ATERM_BUILD_GIT_COMMIT` keeps
+   `producer_commit` the release's commit: without it, the appended generator
+   makes the build read the tree as dirty and write `<commit>-dirty`. It
+   reaches no fixture byte except that `parent.toml` field.
 4. In the main tree, add the new `(release, desk)` rows to `PINNED_DESKS` in
    `seamless_fixture_tests.rs` and run the guard:
 

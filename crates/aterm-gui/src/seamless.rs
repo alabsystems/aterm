@@ -1799,7 +1799,7 @@ pub(crate) fn mandatory_checkpoint_cells(rows: u16, cols: u16) -> u64 {
 /// the same reason `has_alt` is `true` at the pre-capture admission). `None` for
 /// a geometry `dimension_grid_cap` refuses outright.
 #[must_use]
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32) -> Option<u64> {
     dimension_grid_cap(rows, cols, history)?.checked_mul(2)
 }
@@ -1812,6 +1812,21 @@ pub(crate) fn checkpoint_capture_budget_bytes(rows: u16, cols: u16, history: u32
 #[cfg(unix)]
 pub(crate) fn max_handoff_aggregate_grid_cells() -> u64 {
     MAX_HANDOFF_AGGREGATE_GRID_CELLS
+}
+
+/// The byte ceiling on ONE serialized line record of a carried grid at `cols`:
+/// 16 KiB of framing plus 512 bytes per column. Every consumer since the line
+/// codec went on the wire enforces this same number (v0.91.0's
+/// `checkpoint_grid_is_canonical` spelled it inline), so it is a wire fact the
+/// producer must honour, never one it may raise.
+///
+/// Named on its own because the producer's link-stripping rung
+/// ([`strip_over_cap_links`]) must ask the question the strict decoder asks —
+/// which records are over it — with the same arithmetic.
+fn line_record_cap(cols: u16) -> usize {
+    16usize
+        .saturating_mul(1024)
+        .saturating_add(usize::from(cols).saturating_mul(512))
 }
 
 /// The strict decode of one grid blob that must hold exactly `history + rows`
@@ -1828,9 +1843,7 @@ fn strict_grid_lines(
     // content and full record framing from the authenticated column count before
     // the decoder allocates any line payload or sidecars.
     let content_cap = usize::from(cols).saturating_mul(256);
-    let record_cap = 16usize
-        .saturating_mul(1024)
-        .saturating_add(usize::from(cols).saturating_mul(512));
+    let record_cap = line_record_cap(cols);
     // A carried checkpoint is `history` scrollback records followed by exactly
     // `rows` visible records. `history` is bounded by the caller's meta check, so
     // this total can never be inflated by the payload itself.
@@ -2160,7 +2173,10 @@ fn repaint_checkpoint_within(
 /// are now a way to CHOOSE a rung, never a refusal: every rung's carry passes
 /// this build's own predicates, so the producer never sends what its own
 /// consumer would reject, and the worst case is one blank tab that redraws.
-/// Ordered from most to least faithful.
+/// Ranked by the loss each names, least first; a carry that suffered two
+/// losses (its links stripped, then its scrollback dropped by the self-check)
+/// is labelled with the larger, which is why `max` combines them. The ladder
+/// tries them in its own order ([`carry_for_wire`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg(any(unix, test))]
 pub(crate) enum CarryRung {
@@ -2170,6 +2186,20 @@ pub(crate) enum CarryRung {
     /// A predicate refused the carried scrollback, so the screen went without
     /// it: the visible grid and every scalar exactly.
     VisibleOnly,
+    /// A line record past the wire's per-record byte cap refused the exact
+    /// screen, so it went with the HYPERLINKS of exactly those lines dropped
+    /// ([`strip_over_cap_links`]): every character, attribute, underline
+    /// colour and wrap flag is exact, as is every scalar, and the scrollback
+    /// is kept when it fits. Only OSC 8 link destinations are
+    /// long enough to push an honest line past that cap (a few 8 KiB URLs in
+    /// one row), and they used to cost the whole screen — the Repaint rung
+    /// below, a blank tab until the program redrew (plan P2-4).
+    ///
+    /// Ranked below [`Self::VisibleOnly`] so that a stripped carry whose
+    /// scrollback the self-check drops later stays labelled StrippedLinks —
+    /// its links are still gone. The ladder nevertheless tries it at each
+    /// scrollback depth before giving that depth up ([`carry_for_wire`]).
+    StrippedLinks,
     /// The screen's grids exactly, with the scalar fields that broke a meta
     /// bound clamped ([`sanitize_checkpoint_for_wire`]).
     Sanitized,
@@ -2182,8 +2212,14 @@ pub(crate) enum CarryRung {
 impl CarryRung {
     /// The successor must make the program redraw (`ScreenCarry::repaint`):
     /// what is on its screen is not exactly what the program last drew.
+    ///
+    /// Not [`Self::StrippedLinks`]: its text, attributes and cursor are
+    /// exactly what the program drew, so a redraw has nothing to correct on
+    /// screen. It would cost a full-screen program a redraw and a shell a
+    /// resize bounce to restore a link destination that a shell's output
+    /// never re-emits anyway.
     #[must_use]
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) const fn needs_repaint(self) -> bool {
         matches!(self, Self::Sanitized | Self::Repaint)
     }
@@ -2191,10 +2227,16 @@ impl CarryRung {
     /// The session's control carry (`handoff_carry::capture_head`) travels
     /// with it only while the screen it describes is the one carried: its
     /// differ state diffs the program's next frame against that screen.
+    ///
+    /// [`Self::StrippedLinks`] keeps it: the differ's state is the rows'
+    /// TEXT (`AltArchiveDiffer::prev`/`below`), and the turn ledger is not
+    /// about the grid at all, so a screen that lost only its link
+    /// destinations is still the screen that state describes. Dropping it
+    /// would start the archive a new baseline behind a gap for no reason.
     #[must_use]
-    #[cfg(unix)]
+    #[cfg(any(unix, test))]
     pub(crate) const fn keeps_control_carry(self) -> bool {
-        matches!(self, Self::Full | Self::VisibleOnly)
+        matches!(self, Self::Full | Self::VisibleOnly | Self::StrippedLinks)
     }
 }
 
@@ -2204,6 +2246,7 @@ impl std::fmt::Display for CarryRung {
         formatter.write_str(match self {
             Self::Full => "full",
             Self::VisibleOnly => "visible-only",
+            Self::StrippedLinks => "stripped-links",
             Self::Sanitized => "sanitized",
             Self::Repaint => "repaint",
         })
@@ -2346,18 +2389,24 @@ fn keep_shell_integration_authority(
     blank
 }
 
-/// The Repaint rung for a session whose projection is `source`: its sanitized
-/// scalar state on a blank canonical screen, priced against `aggregate_cells`
-/// at the successor's `caps` ([`repaint_checkpoint_within`]).
+/// The Repaint rung for a session whose scalar state is `meta`: that state,
+/// sanitized, on a blank canonical screen, priced against `aggregate_cells` at
+/// the successor's `caps` ([`repaint_checkpoint_within`]).
+///
+/// It takes the META, not a projection: the rung reads nothing of the grids, and
+/// a session that reaches it without one already in hand takes its scalars from
+/// [`Terminal::carry_meta_abandoning_partial`], which projects no grid at all.
+///
+/// [`Terminal::carry_meta_abandoning_partial`]:
+///     aterm_core::terminal::Terminal::carry_meta_abandoning_partial
 #[cfg(any(unix, test))]
 fn repaint_carry(
-    source: &TerminalCheckpoint,
+    meta: &CheckpointMeta,
     aggregate_cells: &mut u64,
     caps: WireCaps,
 ) -> TerminalCheckpoint {
-    let meta = CheckpointMeta::from_checkpoint(source);
-    repaint_checkpoint_within(Some(&meta), aggregate_cells, caps)
-        .unwrap_or_else(|| unadmitted_blank_carry(&meta))
+    repaint_checkpoint_within(Some(meta), aggregate_cells, caps)
+        .unwrap_or_else(|| unadmitted_blank_carry(meta))
 }
 
 /// The first grid blob of `checkpoint` over the byte cap its own geometry and
@@ -2382,23 +2431,280 @@ fn grid_over_cap(local_id: u64, checkpoint: &TerminalCheckpoint) -> Option<Scree
     })
 }
 
+/// The GRID predicates one carry must pass at the successor's `caps`, named —
+/// `None` when it passes them all: this build's shape check (parser Ground, the
+/// inactive grid paired with its cursor, both blobs canonical at the declared
+/// record count, which holds every line record under [`line_record_cap`]), the
+/// grid byte caps, and the successor's own line decoder where it is older than
+/// this build's ([`WireCaps::line_decoder_refusal`]).
+///
+/// One function so every grid-exact rung of [`carry_for_wire`] — the exact
+/// screen and the one with over-cap links dropped — is judged by the same
+/// question, in the same order, as `screen_digest` asks it.
+#[cfg(any(unix, test))]
+fn grid_refusal(local_id: u64, checkpoint: &TerminalCheckpoint, caps: WireCaps) -> Option<String> {
+    checkpoint_shape_refusal(local_id, checkpoint)
+        .or_else(|| grid_over_cap(local_id, checkpoint))
+        .map(|refusal| refusal.to_string())
+        .or_else(|| {
+            caps.line_decoder_refusal(checkpoint)
+                .map(|why| format!("session {local_id}: {why}"))
+        })
+}
+
+/// The META half of a grid-exact rung: clamp whatever scalar breaks a meta
+/// bound ([`sanitize_checkpoint_for_wire`]), which lowers the carry to at least
+/// [`CarryRung::Sanitized`] and says so in `causes`. `None` when a bound has no
+/// clamp; the carry then goes to the Repaint rung, and `causes` says why.
+#[cfg(any(unix, test))]
+fn clamp_carry_meta(
+    checkpoint: &mut TerminalCheckpoint,
+    rung: CarryRung,
+    causes: &mut Vec<String>,
+) -> Option<CarryRung> {
+    if checkpoint_meta_bound_violation(&CheckpointMeta::from_checkpoint(checkpoint)).is_none() {
+        return Some(rung);
+    }
+    match sanitize_checkpoint_for_wire(checkpoint) {
+        Ok(clamped) => {
+            causes.push(format!(
+                "meta out of bounds at {}x{}, clamped: {}",
+                checkpoint.rows,
+                checkpoint.cols,
+                clamped
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+            Some(rung.max(CarryRung::Sanitized))
+        }
+        Err(why) => {
+            causes.push(why);
+            None
+        }
+    }
+}
+
+/// Commit one carry [`carry_for_wire`] chose: charge the aggregate what its
+/// admission priced, log the rung when it is below Full, and name the causes.
+#[cfg(any(unix, test))]
+fn commit_carry(
+    local_id: u64,
+    checkpoint: TerminalCheckpoint,
+    rung: CarryRung,
+    charged: u64,
+    aggregate_cells: &mut u64,
+    causes: &[String],
+) -> (TerminalCheckpoint, CarryRung, Option<String>) {
+    *aggregate_cells = charged;
+    let cause = (!causes.is_empty()).then(|| causes.join("; "));
+    log_degraded_carry(local_id, rung, cause.as_deref().unwrap_or_default());
+    (checkpoint, rung, cause)
+}
+
+/// THE LINK-STRIPPING RUNG'S TRANSFORM (the 2026-09-22/23 update audit, plan
+/// P2-4): drop the hyperlinks of every line record in `checkpoint`'s grids
+/// that is over [`line_record_cap`], and nothing else, returning how many lines
+/// lost them. `None`, with `checkpoint` untouched, when no line lost a link —
+/// there is then nothing this rung can change.
+///
+/// Why only those lines: an OSC 8 URL may be 8 KiB, and a row of a handful of
+/// one-cell links carries each URL once per span, so eight links in an
+/// 80-column pane make a 65 KiB record against a 57 KiB cap. That one record
+/// made the whole blob non-canonical, and every rung above Repaint failed with
+/// it: the tab went blank until its program redrew, for a line whose text was
+/// never the problem. Every other line, and every scalar, is carried exactly;
+/// the stripped lines keep their text, attributes, underline colours and wrap
+/// flag ([`Line::clear_hyperlinks`]).
+///
+/// Nothing here decides admission: the caller re-judges the result with the
+/// same predicates as the exact rungs ([`grid_refusal`]).
+///
+/// [`Line::clear_hyperlinks`]: aterm_core::scrollback::Line::clear_hyperlinks
+#[cfg(any(unix, test))]
+fn strip_over_cap_links(checkpoint: &mut TerminalCheckpoint) -> Option<usize> {
+    strip_affordable(checkpoint).ok()?;
+    let record_cap = line_record_cap(checkpoint.cols);
+    let rows = usize::from(checkpoint.rows);
+    let main = usize::try_from(checkpoint.history_lines)
+        .ok()
+        .and_then(|history| rows.checked_add(history))
+        .and_then(|records| strip_blob_links(&checkpoint.grid, records, record_cap));
+    // The inactive grid never carries history.
+    let alt = checkpoint
+        .alt_grid
+        .as_deref()
+        .and_then(|alt| strip_blob_links(alt, rows, record_cap));
+    let mut lost = 0_usize;
+    if let Some((grid, lines)) = main {
+        checkpoint.grid = grid;
+        lost = lost.saturating_add(lines);
+    }
+    if let Some((alt_grid, lines)) = alt {
+        checkpoint.alt_grid = Some(alt_grid);
+        lost = lost.saturating_add(lines);
+    }
+    (lost > 0).then_some(lost)
+}
+
+/// At most this many actual grid bytes may be decoded and re-serialized by one
+/// link-stripping attempt while every PTY reader is parked. The capture's
+/// geometry-based price is not an upper bound on OSC 8 URL bytes, including on
+/// a visible-only screen: a 24x80 pane can hold megabytes of one-cell links.
+/// Four MiB still admits that pane's 24 rows of 16 links with 8 KiB URLs, while
+/// a larger one falls to Repaint instead of doing unbounded work in the freeze.
+#[cfg(any(unix, test))]
+const MAX_LINK_STRIP_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Whether the link-stripping rung may decode `checkpoint`'s grids at all:
+/// bounded by their actual bytes for EVERY carry, and, with scrollback, by what
+/// the capture PRICED that depth at ([`checkpoint_capture_budget_bytes`]);
+/// else the cause, named.
+///
+/// BOUNDED BEFORE ANYTHING IS DECODED. The strip decodes a whole grid blob,
+/// allocates every span's URL afresh, re-serializes every record to check it and
+/// then the grid again: a few times the blob, inside the frozen window, where the
+/// capture checks its deadline only between sessions. Scrollback is the optional
+/// part of a carry and is priced by its dimensions, not its bytes, so terminal
+/// output alone can make a carried depth hundreds of megabytes (rows of one-cell
+/// links with 8 KiB URLs) that the price never saw. Such a depth is not decoded:
+/// the ladder goes straight on to the screen without scrollback, as it did before
+/// links could be stripped. A visible screen above the absolute bound goes to
+/// Repaint instead. Its projection is already paid for, but decoding and
+/// re-serializing it would be a second, unbounded cost inside the freeze.
+#[cfg(any(unix, test))]
+fn strip_affordable(checkpoint: &TerminalCheckpoint) -> Result<(), String> {
+    let held = wire_bytes(checkpoint);
+    if held > MAX_LINK_STRIP_BYTES {
+        return Err(format!(
+            "its grids hold {held} bytes, past the {MAX_LINK_STRIP_BYTES}-byte link-strip work \
+             bound, so they are not decoded to strip links"
+        ));
+    }
+    if checkpoint.history_lines == 0 {
+        return Ok(());
+    }
+    let priced =
+        checkpoint_capture_budget_bytes(checkpoint.rows, checkpoint.cols, checkpoint.history_lines)
+            .unwrap_or(0);
+    if held > priced {
+        return Err(format!(
+            "with {} history line(s) its grids hold {held} bytes, past the {priced} this \
+             capture prices that depth at, so they are not decoded to strip links",
+            checkpoint.history_lines
+        ));
+    }
+    Ok(())
+}
+
+/// One grid blob of `records` line records with the hyperlinks of every record
+/// over `record_cap` dropped, re-serialized, and how many records lost them —
+/// `None` when none did, or when the blob is not exactly `records` records
+/// that the block decoder reads back LOSSLESSLY.
+///
+/// The decode is the lenient one because the strict decoder refuses exactly
+/// the over-cap records this is for. Lenient is not trusted blindly: every
+/// decoded line must re-serialize to the very bytes it was read from, record
+/// by record, and the header must declare `records`, so a line this does not
+/// strip is carried byte-for-byte as the engine serialized it — and the walk
+/// yields each record's true size, which is what the cap is compared with.
+#[cfg(any(unix, test))]
+fn strip_blob_links(blob: &[u8], records: usize, record_cap: usize) -> Option<(Vec<u8>, usize)> {
+    let header = u32::try_from(records).ok()?.to_le_bytes();
+    if blob.get(..4)? != header.as_slice() {
+        return None;
+    }
+    let mut lines = aterm_core::scrollback::deserialize_lines(blob);
+    if lines.len() != records {
+        return None;
+    }
+    let mut offset = header.len();
+    let mut lost = 0_usize;
+    for line in &mut lines {
+        let record = line.serialize();
+        let end = offset.checked_add(record.len())?;
+        if blob.get(offset..end)? != record.as_slice() {
+            return None;
+        }
+        offset = end;
+        if record.len() > record_cap && line.has_hyperlinks() {
+            line.clear_hyperlinks();
+            lost = lost.saturating_add(1);
+        }
+    }
+    (offset == blob.len() && lost > 0)
+        .then(|| (aterm_core::scrollback::serialize_lines(&lines), lost))
+}
+
+/// The link-stripping rung at one scrollback depth (plan P2-4): drop the
+/// links of `checkpoint`'s over-cap line records ([`strip_over_cap_links`])
+/// and re-judge it by the same grid predicates as the exact rungs
+/// ([`grid_refusal`]). `true` when the stripped carry passes them, and
+/// `causes` says how many lines lost their links; `false` when there was no
+/// such line, or when the stripped carry is still refused (`causes` names
+/// that refusal) — `checkpoint` may then hold the stripped grids, which is
+/// harmless: the Repaint rung reads only its scalars.
+#[cfg(any(unix, test))]
+fn strip_links_for_wire(
+    local_id: u64,
+    checkpoint: &mut TerminalCheckpoint,
+    caps: WireCaps,
+    causes: &mut Vec<String>,
+) -> bool {
+    if let Err(why) = strip_affordable(checkpoint) {
+        causes.push(why);
+        return false;
+    }
+    let Some(lines) = strip_over_cap_links(checkpoint) else {
+        return false;
+    };
+    let cap = line_record_cap(checkpoint.cols);
+    if let Some(refusal) = grid_refusal(local_id, checkpoint, caps) {
+        causes.push(format!(
+            "with the links of its {lines} line(s) over the {cap}-byte line-record cap \
+             dropped, still: {refusal}"
+        ));
+        return false;
+    }
+    causes.push(format!(
+        "{lines} line(s) over the {cap}-byte line-record cap lost their links; their text is \
+         exact"
+    ));
+    true
+}
+
 /// THE PRODUCER'S LADDER for one session (the 2026-09-22/23 update audit, plan
 /// P0-1a): the most faithful carry of `terminal` that this build's own wire
 /// predicates admit at the successor's `caps`, the rung it was carried at, and
 /// why it is below Full. TOTAL: there is no refusal — every predicate that fails
 /// picks the next rung, and the last rung is a blank canonical screen.
 ///
-/// The rungs, in order: the screen with `want_history` lines of scrollback
-/// ([`CarryRung::Full`]); without them ([`CarryRung::VisibleOnly`]); either
-/// one with its out-of-bound scalars clamped ([`CarryRung::Sanitized`]); a
-/// blank screen carrying the sanitized scalar state ([`CarryRung::Repaint`]).
-/// Each is judged by the predicates `screen_digest` and the consumer run —
+/// The rungs, in the order they are tried: the screen with `want_history`
+/// lines of scrollback ([`CarryRung::Full`]); the same with the links of its
+/// over-cap line records dropped ([`CarryRung::StrippedLinks`], plan P2-4);
+/// the screen without scrollback ([`CarryRung::VisibleOnly`]); that with its
+/// over-cap links dropped (StrippedLinks again); any of these with its
+/// out-of-bound scalars clamped ([`CarryRung::Sanitized`]); a blank screen
+/// carrying the sanitized scalar state ([`CarryRung::Repaint`]). Each is
+/// judged by the predicates `screen_digest` and the consumer run —
 /// [`WireCaps::admit`] (per-grid and aggregate cells, charged to
 /// `aggregate_cells` only for the carry returned), [`checkpoint_shape_refusal`],
 /// the grid byte caps, the successor's own line decoder where it is older than
 /// this build's ([`WireCaps::line_decoder_refusal`]), and
 /// [`checkpoint_meta_bound_violation`] — which used to run first in
 /// `screen_digest`, past the point where anything could still be lowered.
+///
+/// WHY THE LINKS GO BEFORE THE SCROLLBACK, although StrippedLinks ranks below
+/// VisibleOnly: the strip drops only the link destinations of the lines that
+/// are over the cap, so at a given depth it loses less than giving up the
+/// depth would. A link-dense line in the scrollback used to cost the whole
+/// scrollback — and, because the capture latches history off for every later
+/// session once one lands on VisibleOnly
+/// (`app_update_handoff::capture_parked_screens`), every later tab's
+/// scrollback too. The rank is what [`CarryRung`]'s `max` combines when the
+/// self-check later drops a stripped carry's scrollback: its links are still
+/// gone, so it stays StrippedLinks.
 ///
 /// PRICED AS THE CONSUMER PRICES IT: the inactive grid is charged only when
 /// the engine really has one ([`Terminal::has_inactive_grid`]), which is what
@@ -2456,51 +2762,44 @@ pub(crate) fn carry_for_wire(
                  carry leaves that partial sequence out, as CAN would"
             );
         }
-        if let Some(refusal) = checkpoint_shape_refusal(local_id, &checkpoint)
-            .or_else(|| grid_over_cap(local_id, &checkpoint))
-            .map(|refusal| refusal.to_string())
-            .or_else(|| {
-                caps.line_decoder_refusal(&checkpoint)
-                    .map(|why| format!("session {local_id}: {why}"))
-            })
-        {
-            causes.push(refusal);
-            projection = Some(checkpoint);
-            continue;
-        }
-        let mut rung = if history == want_history {
-            CarryRung::Full
-        } else {
-            CarryRung::VisibleOnly
-        };
-        if checkpoint_meta_bound_violation(&CheckpointMeta::from_checkpoint(&checkpoint)).is_some()
-        {
-            match sanitize_checkpoint_for_wire(&mut checkpoint) {
-                Ok(clamped) => {
-                    rung = CarryRung::Sanitized;
-                    causes.push(format!(
-                        "meta out of bounds at {rows}x{cols}, clamped: {}",
-                        clamped
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ));
-                }
-                Err(why) => {
-                    causes.push(why);
+        let rung = match grid_refusal(local_id, &checkpoint, caps) {
+            None if history == want_history => CarryRung::Full,
+            None => CarryRung::VisibleOnly,
+            Some(refusal) => {
+                causes.push(refusal);
+                if !strip_links_for_wire(local_id, &mut checkpoint, caps, &mut causes) {
                     projection = Some(checkpoint);
-                    break;
+                    continue;
                 }
+                CarryRung::StrippedLinks
+            }
+        };
+        match clamp_carry_meta(&mut checkpoint, rung, &mut causes) {
+            Some(rung) => {
+                return commit_carry(
+                    local_id,
+                    checkpoint,
+                    rung,
+                    charged,
+                    aggregate_cells,
+                    &causes,
+                );
+            }
+            // No grid-exact rung can fix a scalar with no clamp.
+            None => {
+                projection = Some(checkpoint);
+                break;
             }
         }
-        *aggregate_cells = charged;
-        let cause = (!causes.is_empty()).then(|| causes.join("; "));
-        log_degraded_carry(local_id, rung, cause.as_deref().unwrap_or_default());
-        return (checkpoint, rung, cause);
     }
-    let source = projection.unwrap_or_else(|| terminal.checkpoint_carry_abandoning_partial(0).0);
-    let checkpoint = repaint_carry(&source, aggregate_cells, caps);
+    // The scalars of the projection the ladder last refused, or — when every
+    // depth was refused before anything was projected — the engine's own, read
+    // without projecting a grid.
+    let meta = projection.as_ref().map_or_else(
+        || terminal.carry_meta_abandoning_partial(),
+        CheckpointMeta::from_checkpoint,
+    );
+    let checkpoint = repaint_carry(&meta, aggregate_cells, caps);
     let cause = causes.join("; ");
     log_degraded_carry(local_id, CarryRung::Repaint, &cause);
     (checkpoint, CarryRung::Repaint, Some(cause))
@@ -2508,8 +2807,19 @@ pub(crate) fn carry_for_wire(
 
 /// The Repaint rung taken directly, for a session the capture loop's own
 /// budget cannot afford at any higher rung (the decode-authority budget,
-/// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`, which only the producer prices). The
-/// same carry [`carry_for_wire`] ends on, with `cause` as its reason.
+/// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`, which only the producer prices), and for
+/// every session under a successor's `carry = "repaint"` policy. The same carry
+/// [`carry_for_wire`] ends on, with `cause` as its reason.
+///
+/// NO GRID IS PROJECTED: the scalars come from
+/// [`Terminal::carry_meta_abandoning_partial`]. This used to take the whole
+/// visible carry — both grids serialized inside the frozen window — only to read
+/// its scalars, so the policy a successor seals to route an older producer around
+/// a slow or panicking grid serializer still ran that serializer for every
+/// session.
+///
+/// [`Terminal::carry_meta_abandoning_partial`]:
+///     aterm_core::terminal::Terminal::carry_meta_abandoning_partial
 #[cfg(any(unix, test))]
 pub(crate) fn repaint_carry_for_wire(
     terminal: &aterm_core::terminal::Terminal,
@@ -2518,10 +2828,61 @@ pub(crate) fn repaint_carry_for_wire(
     caps: WireCaps,
     cause: String,
 ) -> (TerminalCheckpoint, CarryRung, Option<String>) {
-    let source = terminal.checkpoint_carry_abandoning_partial(0).0;
-    let checkpoint = repaint_carry(&source, aggregate_cells, caps);
+    let meta = terminal.carry_meta_abandoning_partial();
+    let checkpoint = repaint_carry(&meta, aggregate_cells, caps);
     log_degraded_carry(local_id, CarryRung::Repaint, &cause);
     (checkpoint, CarryRung::Repaint, Some(cause))
+}
+
+/// [`carry_for_wire`] under a CEILING the successor's signed handoff policy set
+/// (the 2026-09-22/23 update audit, plan P0-5,
+/// [`aterm_update_core::handoff_policy`]): the highest rung this producer may
+/// carry the session at becomes the lower of its own ladder's answer and the
+/// policy's.
+///
+/// * [`CarryCeiling::Full`](aterm_update_core::handoff_policy::CarryCeiling::Full)
+///   — the ladder as it ships; exactly [`carry_for_wire`].
+/// * `Visible` — the ladder with no scrollback asked for, and a carry the ladder
+///   would call [`CarryRung::Full`] labelled [`CarryRung::VisibleOnly`], which is
+///   what it is. Every lower rung the ladder picks stands.
+/// * `Repaint` — the blank canonical screen ([`repaint_carry_for_wire`]) for
+///   every session, whatever its content.
+///
+/// ONLY EVER LOWER. The policy chooses among rungs this build's own predicates
+/// already admit; it cannot make a carry the ladder refused, raise a cap, or
+/// reach anything the consumer checks — the carry it produces is one this
+/// producer could have produced without it. That is why it is safe to take the
+/// ceiling from the successor's bundle: see the policy module for the trust
+/// argument.
+#[cfg(any(unix, test))]
+pub(crate) fn carry_for_wire_within(
+    terminal: &aterm_core::terminal::Terminal,
+    local_id: u64,
+    want_history: u32,
+    aggregate_cells: &mut u64,
+    caps: WireCaps,
+    ceiling: aterm_update_core::handoff_policy::CarryCeiling,
+) -> (TerminalCheckpoint, CarryRung, Option<String>) {
+    use aterm_update_core::handoff_policy::CarryCeiling;
+    match ceiling {
+        CarryCeiling::Full => {
+            carry_for_wire(terminal, local_id, want_history, aggregate_cells, caps)
+        }
+        CarryCeiling::Visible => {
+            let (checkpoint, rung, cause) =
+                carry_for_wire(terminal, local_id, 0, aggregate_cells, caps);
+            (checkpoint, rung.max(CarryRung::VisibleOnly), cause)
+        }
+        CarryCeiling::Repaint => repaint_carry_for_wire(
+            terminal,
+            local_id,
+            aggregate_cells,
+            caps,
+            "the successor's handoff policy carries every session as a blank screen its \
+             program redraws"
+                .to_string(),
+        ),
+    }
 }
 
 /// One session's screen as the producer will commit it, and the rung it was
@@ -2584,10 +2945,11 @@ fn drop_carried_history(checkpoint: &mut TerminalCheckpoint) -> bool {
     true
 }
 
-/// Whether a carry has a rung below it: anything above Repaint, and a Repaint
-/// carry bigger than the smallest blank screen (a pool-wide refusal may still
-/// shrink it — 24x80 at most, then 1x1 — as [`repaint_checkpoint_within`]'s
-/// own fallback does).
+/// Whether a carry has a rung below it: anything above Repaint (a
+/// [`CarryRung::StrippedLinks`] carry included — its scrollback, then its
+/// screen, can still go), and a Repaint carry bigger than the smallest blank
+/// screen (a pool-wide refusal may still shrink it — 24x80 at most, then 1x1 —
+/// as [`repaint_checkpoint_within`]'s own fallback does).
 #[cfg(any(unix, test))]
 fn is_lowerable(carry: &WireCarry) -> bool {
     carry.rung != CarryRung::Repaint || (carry.checkpoint.rows, carry.checkpoint.cols) != (1, 1)
@@ -2606,9 +2968,18 @@ fn largest_lowerable(carries: &[WireCarry], cost: fn(&TerminalCheckpoint) -> u64
 }
 
 /// Lower one carry a single step, priced against every OTHER carry's cells:
-/// drop its scrollback when `repaint` is false and it has some; else carry it
-/// at the Repaint rung; and a carry already there becomes a smaller blank
-/// screen (24x80 at most, then 1x1).
+/// drop its scrollback when `repaint` is false and it has some (a
+/// [`CarryRung::StrippedLinks`] carry stays at that rung — its links are still
+/// gone); when `repaint` is true and the carry is still exact, drop the links
+/// of its over-cap line records if that alone makes its grids pass
+/// ([`strip_over_cap_links`], plan P2-4); else carry it at the Repaint rung;
+/// and a carry already there becomes a smaller blank screen (24x80 at most,
+/// then 1x1).
+///
+/// The link step is the ladder's own, repeated here because the self-check
+/// is the net for a producer bug the ladder did not see: a carry blamed for a
+/// link-dense line should lose that line's links, as it would have in
+/// [`carry_for_wire`], not its whole screen.
 #[cfg(any(unix, test))]
 fn lower_wire_carry(
     carries: &mut [WireCarry],
@@ -2635,6 +3006,29 @@ fn lower_wire_carry(
         );
         return;
     }
+    // The self-check's salvage path also clones the whole blob before it tries
+    // the strip. Refuse over-budget work BEFORE that copy, just as the initial
+    // ladder refuses it before decode and re-serialization.
+    if repaint
+        && carry.rung < CarryRung::StrippedLinks
+        && strip_affordable(&carry.checkpoint).is_ok()
+    {
+        let mut stripped = carry.checkpoint.clone();
+        let mut said = Vec::new();
+        if strip_links_for_wire(carry.local_id, &mut stripped, caps, &mut said) {
+            carry.checkpoint = stripped;
+            carry.rung = CarryRung::StrippedLinks;
+            log_degraded_carry(
+                carry.local_id,
+                carry.rung,
+                &format!(
+                    "the capture's self-check refused its carry: {why}; {}",
+                    said.join("; ")
+                ),
+            );
+            return;
+        }
+    }
     let mut meta = CheckpointMeta::from_checkpoint(&carry.checkpoint);
     if carry.rung == CarryRung::Repaint {
         (meta.rows, meta.cols) = if meta.rows > 24 || meta.cols > 80 {
@@ -2660,7 +3054,9 @@ fn lower_wire_carry(
 /// commit again, instead of refusing the update.
 ///
 /// * A refusal naming a session replaces that session's carry with its
-///   Repaint carry — at most once per session.
+///   Repaint carry — at most once per session — unless dropping the links of
+///   its over-cap line records makes its grids pass: then it is carried at
+///   the StrippedLinks rung instead, also at most once.
 /// * The pool over the aggregate cell budget, or over the 256 MiB of real
 ///   grid bytes, lowers its LARGEST session: its scrollback first, then its
 ///   screen.
@@ -2670,14 +3066,14 @@ fn lower_wire_carry(
 ///   construction and a test pins as unreachable.
 ///
 /// Bounded: every lowering moves one carry strictly down (its history, once;
-/// its screen, once; a blank screen to 24x80, then 1x1), so at most four per
-/// session happen.
+/// its over-cap links, once; its screen, once; a blank screen to 24x80, then
+/// 1x1), so at most five per session happen.
 #[cfg(any(unix, test))]
 pub(crate) fn settle_wire_carries(
     carries: &mut [WireCarry],
     caps: WireCaps,
 ) -> Result<[u8; 32], ScreenDigestRefusal> {
-    let mut lowerings_left = carries.len().saturating_mul(4);
+    let mut lowerings_left = carries.len().saturating_mul(5);
     loop {
         let refusal = match screen_digest_refs(
             carries
@@ -2877,8 +3273,9 @@ pub(crate) struct OutgoingHandoff {
 /// so the successor can be launched with the manifest's path before this runs;
 /// it is echoed in the result and written as the manifest's first line.
 ///
-/// `repaint` names the sessions the capture carried below its exact rungs
-/// ([`CarryRung::needs_repaint`]: a clamped or blank screen), whose
+/// `repaint` names the sessions the capture carried with a screen that is not
+/// exactly what the program drew ([`CarryRung::needs_repaint`]: a clamped or
+/// blank screen; a screen that lost only link destinations is not one), whose
 /// `ScreenCarry::repaint` tells the successor to make the program redraw. The
 /// flag is covered by no digest, so it cannot move the proof.
 #[cfg(unix)]
@@ -5826,7 +6223,7 @@ mod tests {
 
     /// Whether a v0.91.0-vintage consumer's line decoder admits every grid of
     /// `checkpoint` — the check its all-or-nothing adoption runs per session.
-    fn v0_91_consumer_decodes(checkpoint: &TerminalCheckpoint) -> bool {
+    pub(super) fn v0_91_consumer_decodes(checkpoint: &TerminalCheckpoint) -> bool {
         v0_91_line_decoder_admits(
             &checkpoint.grid,
             checkpoint.rows,
@@ -8662,6 +9059,13 @@ mod ladder_tests;
 #[cfg(all(test, unix))]
 #[path = "seamless_fixture_tests.rs"]
 mod fixture_tests;
+
+/// THE WHOLE-APP CAPTURE PROPERTY (plan P1-6): the fork lane's park over a
+/// real headless App's pool, written by the shipping writer and adopted by
+/// this build's successor.
+#[cfg(all(test, unix))]
+#[path = "seamless_app_capture_tests.rs"]
+mod app_capture_tests;
 
 #[cfg(test)]
 mod f4_adoption_proof_asymmetry {

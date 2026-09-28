@@ -2519,18 +2519,19 @@ fn a_resume_past_the_build_never_consults_the_provenance_gate() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_resume_gate_is_the_fresh_cuts_gate_on_this_machine() {
+    let rerun = gates::Rerun::resume();
     let fresh = gates::trust_stage2_bin()
         .and_then(|bin| {
-            gates::provenance_gate_with(&bin.join("trustc"), keep_the_installed_toolchain)
+            gates::provenance_gate_with(&bin.join("trustc"), keep_the_installed_toolchain, &rerun)
         })
         .map_err(|e| e.to_string());
-    let resumed = publish::toolchain_provenance_gate_with(keep_the_installed_toolchain)
+    let resumed = publish::toolchain_provenance_gate_with(keep_the_installed_toolchain, &rerun)
         .map_err(|e| e.to_string());
     assert_eq!(resumed, fresh);
     let mut j = journal();
     j.done = vec!["lock".into()];
     let through_the_rule = publish::resume_provenance_gate(&j, || {
-        publish::toolchain_provenance_gate_with(keep_the_installed_toolchain)
+        publish::toolchain_provenance_gate_with(keep_the_installed_toolchain, &rerun)
     })
     .map_err(|e| e.to_string());
     match (&fresh, &through_the_rule) {

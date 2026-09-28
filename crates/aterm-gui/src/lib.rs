@@ -414,6 +414,9 @@ mod handoff_rendezvous;
 /// The in-GUI supervisor host: every Claude Code session this instance owns
 /// is supervised under aterm.toml's `[harness]` policy, with nothing typed.
 mod harness_host;
+/// The instance's one probe of the API's reach, carried out for the
+/// supervisor host while a session waits at an API error the network caused.
+mod harness_netprobe;
 #[cfg(windows)]
 mod hdr_win;
 mod human_input;
@@ -705,6 +708,9 @@ mod tray_raster;
 mod turn_ledger;
 mod type_scale;
 mod update_apply_trouble;
+/// The update checker's watchdog on the event loop (plan P2-1): a stale heartbeat
+/// is logged, warned about once and replaced under a new generation.
+mod update_checker_watch;
 mod update_control;
 mod update_screen;
 mod vi_keys;
@@ -4504,6 +4510,10 @@ enum Wake {
     /// A socket check completed without a newer downloaded stage. Reconcile
     /// failures, retirement and installed-only activation through worker facts.
     UpdateCheckCompleted,
+    /// The background checker changed heartbeat phase. An idle window may have
+    /// folded a deadline for its previous phase; re-read the atomic beat on the
+    /// next `about_to_wait` and fold the new phase's deadline.
+    UpdateCheckerPhase,
     /// Retired overlay test seam. Shipping changes supply exact bytes through
     /// `ConfigReloadObserved`; no durable completion can request a pathname
     /// reopen on the event loop.
@@ -7459,7 +7469,7 @@ pub(crate) fn driver_event_loop_builder<T: 'static>(
 
 /// [`driver_event_loop_builder`] under [`LaunchPosture::QUIET_DRIVER`]: the
 /// spelling for a driver nothing in which needs the process to be the active
-/// app at launch, which is all seven.
+/// app at launch, which is every one of them.
 #[must_use]
 pub fn quiet_driver_event_loop_builder<T: 'static>() -> winit::event_loop::EventLoopBuilder<T> {
     driver_event_loop_builder(LaunchPosture::QUIET_DRIVER)
@@ -11296,6 +11306,10 @@ struct WindowState {
     poof_row_above_buf: Vec<char>,
     /// The row BELOW the probed cursor row (see `poof_row_above_buf`).
     poof_row_below_buf: Vec<char>,
+    /// Far Rainbow Kitty witness rows for composed frames. The exact cell
+    /// extraction and these rows share one terminal hold; their row buffers
+    /// return here after projection so steady animation frames allocate none.
+    composed_witness_rows: app_render::ComposedWitnessRows,
     /// Last focused terminal/screen coordinate space consumed by the cursor
     /// effect family: `(Terminal::render_identity(), alternate_screen)`.
     /// Main and alternate grids reuse one session but carry unrelated cursor
@@ -13771,6 +13785,7 @@ impl WindowState {
             single_pane_row_probe_cache: app_render::SinglePaneRowProbeCache::default(),
             poof_row_above_buf: Vec::new(),
             poof_row_below_buf: Vec::new(),
+            composed_witness_rows: app_render::ComposedWitnessRows::default(),
             cursor_effect_coordinate_space: None,
             cursor_scroll_state: None,
             blink_epoch_seen: 0,
@@ -14314,6 +14329,15 @@ struct HandoffPreverification {
     /// ad-hoc-signed bundle refused six applies of v0.85.0 and the status
     /// row blamed the staged update).
     reason: Option<String>,
+    /// The candidate's signed HANDOFF POLICY, when it asks THIS build for
+    /// something (the 2026-09-22/23 update audit, plan P0-5,
+    /// [`aterm_update_core::handoff_policy`]): read from the candidate bundle
+    /// inside the same pre-verification, only after it `passed`, and already
+    /// narrowed to this producer — a policy for other builds, an empty one, or a
+    /// file that could not be followed is `None`, and was logged once when read.
+    /// The park reads it by the same (build, commit, artifact) key
+    /// (`App::handoff_policy_at_park`).
+    policy: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
 }
 
 /// How long a pre-park verification verdict may substitute for re-running the
@@ -14381,9 +14405,10 @@ enum UpdateHandoffOutcome {
 /// channel without proving adoption — the evidence a bare
 /// [`UpdateHandoffOutcome::ChildDied`] does not carry.
 ///
-/// `ChildDied` IS PROOF EOF AND NOTHING MORE (`app_update_handoff`'s
-/// `wait_handoff_ready`, the `0 =>` arm). Three unrelated events arrive through it
-/// identically:
+/// `ChildDied` IS THE CANDIDATE ENDING BEFORE ITS PROOF AND NOTHING MORE
+/// (`app_update_handoff`'s `wait_handoff_ready`: proof EOF, or the candidate's own
+/// termination seen while a stray copy of the write end held EOF back). Three
+/// unrelated events arrive through it identically:
 ///   * a successor that REFUSED the handoff and dropped the channel deliberately
 ///     (it never became the authorized build; its overlap authority was partial);
 ///   * a successor image that RAN and then FAULTED;
@@ -16767,6 +16792,10 @@ struct App {
     /// install updates" share (`App::note_update_health`). Separate from
     /// `update_health_said`, which keeps only the last warning's words.
     update_health_latched: Vec<String>,
+    /// The update checker's watchdog (`update_checker_watch`, plan P2-1): which
+    /// stalled checker generation it has already acted on, so one stall is
+    /// logged, warned about and replaced once.
+    update_checker_watch: update_checker_watch::CheckerWatchState,
     /// This copy is dev-marked (`tools/dev-app.sh`) — `Some`, with the dev-channel
     /// watch's last reading of where it stands (`Wake::DevBuildStanding`), for
     /// Settings ▸ Software Update to say instead of the move-it remedy; `None` for any
@@ -20186,6 +20215,7 @@ impl App {
             update_verified: None,
             update_health_said: None,
             update_health_latched: Vec::new(),
+            update_checker_watch: update_checker_watch::CheckerWatchState::default(),
             dev_build: None,
             #[cfg(unix)]
             update_switch_on_record: None,
@@ -23920,6 +23950,11 @@ impl ApplicationHandler<Wake> for App {
         {
             self.try_pending_native_auto_apply(false);
         }
+        // THE UPDATE CHECKER'S WATCHDOG (plan P2-1): two atomic loads on the way into
+        // every park; a stale heartbeat is logged, warned about once and replaced
+        // under a new generation. Its one wake is folded below (`UpdateChecker`), so
+        // an idle window still looks the moment a stall becomes one.
+        self.watch_update_checker();
         // PROVENANCE: one off-thread measurement per process, logged once and never acted
         // on — a tracked aterm is not relaunched (`crate::provenance_repair`).
         #[cfg(target_os = "macos")]
@@ -24712,6 +24747,18 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 reader_resume,
                 metrics::DeadlineOwner::ReaderResume,
+            );
+        }
+        // The instant the update checker's heartbeat would go stale: the watchdog's
+        // look above must run then even on a window nothing else wakes (the 4.6-day
+        // silence was in an idle process). `None` with no checker, and while a stall
+        // it has already acted on stands.
+        if let Some(stale_at) = self.update_checker_deadline() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                stale_at,
+                metrics::DeadlineOwner::UpdateChecker,
             );
         }
         // Post-update REALIZED ⬆️ arrow sweep: at TTL, drop it — retitle the version
@@ -25794,6 +25841,10 @@ impl ApplicationHandler<Wake> for App {
                 self.request_native_update_reconcile(
                     app_native::NativeUpdateReconcilePurpose::StageAvailable,
                 );
+            }
+            Wake::UpdateCheckerPhase => {
+                // The event itself carries no authority or work: `about_to_wait`
+                // reads the heartbeat and folds its current phase's deadline.
             }
             Wake::ReadDims {
                 session,
@@ -38662,6 +38713,16 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // Rung 2: when a strictly-newer build stages, surface the persistent
         // update-ready nudge (`Wake::UpdateStaged` -> `App.relaunch`).
         let staged_proxy = event_loop.create_proxy();
+        // A checker can move from Settings (whose conservative watchdog deadline
+        // is over an hour away) into a shorter-budget lock wait or check without
+        // any other GUI event. Wake only on PHASE changes so an idle window folds
+        // that new deadline promptly; 10 Hz download progress stamps stay silent.
+        let checker_proxy = std::sync::Mutex::new(event_loop.create_proxy());
+        aterm_update::checker_watch::WATCH.set_phase_wake(Box::new(move || {
+            if let Ok(proxy) = checker_proxy.lock() {
+                let _ = proxy.send_event(Wake::UpdateCheckerPhase);
+            }
+        }));
         // LIVE PROGRESS of the updater's own downloads → the update STATUS BAR.
         // Process-wide (`OnceLock`): every check this process runs — the loop
         // below, a manual "Check for Updates" — reports through it, from its own
@@ -39004,7 +39065,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // The writer's lane: every windowed launch, whatever `restore_session` says
     // now (the setting is read again on every capture, as the quit reads it).
     // A launch that reopened a crash journal writes its own on probation for
-    // `crash_journal::PROBATION`, so a layout that stops aterm cannot loop.
+    // `crash_journal::PROBATION`, so a layout that stops aterm cannot loop —
+    // marked a second chance's when the brake let a stopped one through
+    // (ruling 285).
     let mut crash_journal = crash_journal::Lane::new(
         if headless {
             None
@@ -39013,8 +39076,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         },
         std::process::id(),
     );
-    if journal_claim.reopened.is_some() {
-        crash_journal.begin_probation(Instant::now());
+    if let Some(reopened) = journal_claim.reopened.as_ref() {
+        crash_journal.begin_probation(Instant::now(), reopened.second_chance);
     }
     // W3: a COLD restore's first window reopens at its PERSISTED grid, not the
     // config default — the size half of window 1's geometry (the position and
@@ -39584,6 +39647,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // the crash row wins the one `crash.last` slot when both are there.
         let crash = logging::take_crash_evidence();
         let killed = logging::take_kill_evidence();
+        // What a journal note's `Open log` opens (day five, D18): the crash
+        // log, else the killed run's log, else the log dir's `aterm.log`.
+        let note_log = crash
+            .as_ref()
+            .map(|evidence| evidence.path.clone())
+            .or_else(|| killed.as_ref().map(|evidence| evidence.log.clone()))
+            .or_else(|| logging::log_dir().map(|dir| dir.join("aterm.log")));
         // THE RECOVERY CENSUS reads what those scans just renamed, so it starts after
         // them, on a thread of its own. Only the daily driver's cold start writes a row
         // here; an update successor writes its row at its Commit, when it becomes the
@@ -39605,11 +39675,17 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
                 crate::logging::stderr_line!("aterm-gui: {sentence}");
             }
             let log = logging::log_dir().map(|dir| dir.join("aterm.log"));
+            // An agent the supervisor host relaunches on its conversation in
+            // its reopened tab is not lost (P6a, ruling 293).
+            let relaunching = harness
+                .as_ref()
+                .is_some_and(harness_host::HostHandle::relaunches_restored);
             message_inbox::queue_message(message_reporters::journal_reopened_message(
                 reopened,
                 crash.as_ref(),
                 killed.as_ref(),
                 log.as_deref(),
+                relaunching,
             ));
         } else if let Some(evidence) = crash {
             crate::logging::stderr_line!("aterm-gui: {}", evidence.sentence());
@@ -39622,7 +39698,10 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // from a newer schema, or skipped by the brake — is said, never dropped
         // in silence.
         for note in &journal_claim.notes {
-            message_inbox::queue_message(message_reporters::journal_note_message(note));
+            message_inbox::queue_message(message_reporters::journal_note_message(
+                note,
+                note_log.as_deref(),
+            ));
         }
     }
     // Seed the process-global search index depth cap (config `search_history_lines`)
@@ -39960,6 +40039,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         update_verified: None,
         update_health_said: None,
         update_health_latched: Vec::new(),
+        update_checker_watch: update_checker_watch::CheckerWatchState::default(),
         dev_build: dev_marked.then_some(crate::update_screen::DevBuildPage { standing: None }),
         #[cfg(unix)]
         update_switch_on_record: None,
@@ -40800,10 +40880,12 @@ mod overlap_handoff_tests {
         let (model, mut failed_state) = overlap_model_at_proof_ready();
         assert!(failed_commit.try_begin_commit());
         overlap_model_step(&model, &mut failed_state, "MainWinsCommitArbiter");
-        // This is the genuine shipping post-proof failure seam: if the child
-        // exited, the atomic Commit pipe write returns EPIPE and the caller uses
-        // this exact arbiter transition. There is deliberately no synthetic
-        // child-death observer or `try_wait` transition.
+        // This is the shipping post-proof failure seam once the main thread's
+        // Commit has won the arbiter: if the child exited, the atomic Commit pipe
+        // write returns EPIPE and the caller uses this exact arbiter transition.
+        // A death the worker's non-reaping liveness probe sees FIRST rejects
+        // through the ordinary worker arm (`WorkerWinsRejectArbiter`); nothing
+        // here reaps (`try_wait`), which would destroy the group sweep's pin.
         assert!(failed_commit.commit_failed_to_rejecting());
         overlap_model_step(&model, &mut failed_state, "CommitWriteFails");
         assert_eq!(failed_commit.phase(), HandoffAttemptPhase::Rejecting);

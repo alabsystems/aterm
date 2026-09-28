@@ -1097,6 +1097,10 @@ pub fn model_registry() -> Vec<Model> {
         atpkg_full_pass_rule_model(),
         atpkg_published_spacing_model(),
         harness_capture_worker_lifecycle_model(),
+        // Cold restore's one worker gives every tab a first relaunch attempt
+        // before retrying a waiting tab. Tier-1 drives the real restored
+        // worker with a waiting first tab and a healthy second one.
+        harness_restored_first_attempt_model(),
         // The package pass record: the atpkg pass as the WRITER of `status.toml`'s stamps
         // and the schedulers that read them. Tier-1 drives the real pass and the real
         // `pkg_check` readers over a real record (atpkg `cli` tests).
@@ -1142,6 +1146,18 @@ pub fn model_registry() -> Vec<Model> {
         // `conformance_login_wall` over the real readers, reducer and
         // turn-end decider on every reachable state; no `#[refines]` anchors.
         harness_login_wall_model(),
+        // The notice queued behind a usage limit (the owner's report of
+        // 2026-09-27): no ask typed behind a notice the model has not taken,
+        // a queued notice typed again straight away at most `REQUEUE_MAX`
+        // times and past that once per rest — a rest that grows with every
+        // copy unread, so at most `Daily` copies go after a rest shorter than
+        // a day — no give-up before `MAX_ASKS`
+        // asks the model took, and never quiet while an ask it could read is
+        // owed — a full queue included. Tier-1 in aterm-agent's
+        // `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`) over the
+        // real readers, `queue_facts`, clock and reducer on every reachable
+        // state; no `#[refines]` anchors.
+        harness_upgrade_limit_queue_model(),
         // The live upgrade's Codex branch: when the shared daemon may be moved
         // onto the managed build. Tier-1 bound in aterm-agent's
         // `harness::upgrade_codex` tests to the real `daemon_step` over every
@@ -1157,6 +1173,24 @@ pub fn model_registry() -> Vec<Model> {
         // WHEN a due model move is taken (the 2026-09-25 incident's ladder).
         // Tier-1 in aterm-agent tests/conformance_upgrade_models/ladder.rs.
         harness_model_ladder_model(),
+        // The live upgrade's model SWITCH (2026-09-27): the rule (`model_due`,
+        // same family first, then the list), the ladder (`model_moves_now`),
+        // the announcement's stickiness (`model_to`) and the settle step
+        // (`ModelRecord::settle`, the due clock, the ask) as one
+        // conversation's lifecycle. Tier-1 bound in aterm-agent's
+        // `conformance_upgrade_models` (`switch` module) to the real visit
+        // (`upgrade_models::model_read_step`, which `upgrade_drive::model_judge`
+        // wraps, and `model_to`) and relaunch (`ModelRecord::asked`,
+        // `live_model_at`) over every reachable state; no `#[refines]` anchors.
+        harness_model_switch_model(),
+        // The supervisor at a network wall (an API error that never reached
+        // the API, a reply cut off): when it types, given what the host
+        // measures of the API's reach — a measured outage typed into at most
+        // once a hold, at most two acts at once per episode however the
+        // measure flaps, lies or is lost. Tier-1 in aterm-agent's
+        // `tests/supervise_conformance_network_wall.rs` over the real
+        // `decide_turn_end`; no `#[refines]` anchors.
+        supervisor_network_wall_model(),
         // A pending stub waiting for its program against the pass installing it: it reads
         // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
         // decision (`pending_wait_step`) in `atpkg::cli`'s tests.

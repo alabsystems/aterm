@@ -184,7 +184,7 @@ fn the_incident_replays_to_a_restart_never_a_stall() {
     .join("\n");
     assert!(!answered(&st, Some(&early)));
     // Once the release is typed the round's markers are forgotten: the agent
-    // was told nothing will restart it, and nothing does.
+    // was told no restart is coming now, and none of this round's does.
     st.released();
     assert!(st.release.is_empty());
     assert!(!answered(&st, Some(&tail)));
@@ -1427,6 +1427,13 @@ enum Holds {
     /// The agent's own background work, under a READY heard
     /// [`upgrade::DRAIN_S`] ago.
     Background,
+    /// The same work, under the same READY, looked at from A BREAK of it
+    /// ([`upgrade::Facts::background_point`]) — where the owner's tab of
+    /// 2026-09-27 took nearly every step — and the step held to what a break
+    /// may do ([`upgrade::break_step`]): nothing is ended and no release is
+    /// typed there. Decided for a gave-up round's late READY only
+    /// ([`at_a_break`]).
+    Break,
     /// The restart's signal is refused by the kernel, or a re-ask's plan
     /// by the relaunch — the round abandoned.
     Refused,
@@ -1581,9 +1588,15 @@ struct Decided {
 /// typed under [`upgrade::gate_release`] ([`St::released`]) or the word that
 /// owes it ([`owed_word`]); and the host's reading of the word — its LAST
 /// WORD ([`after`] is Finished) at a point the agent can read is the model's
-/// `Look` (the window's host takes no step at a limit). `None` where `holds`
-/// cannot be met: a refusal needs a restart, or a re-ask, to refuse.
+/// `Look` (the window's host takes no step at a limit). At a break
+/// ([`Holds::Break`]) the step is the one [`upgrade::break_step`] leaves, and
+/// no release is typed. `None` where `holds` cannot be met: a refusal needs a
+/// restart, or a re-ask, to refuse; a break is decided only where
+/// [`at_a_break`] says.
 fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
+    if holds == Holds::Break && !at_a_break(s) {
+        return None;
+    }
     let (mut st, mut f, now, mut tail) = real_of(s, history);
     let sf = agent_file();
     match holds {
@@ -1591,8 +1604,9 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             f.approval_box = true;
             f.hold_s = upgrade::HOLD_S;
         }
-        Holds::Background => {
+        Holds::Background | Holds::Break => {
             f.background = vec!["zsh".to_string()];
+            f.background_point = holds == Holds::Break;
             st.ready_since = now - upgrade::DRAIN_S;
         }
         Holds::Nothing | Holds::Refused => {}
@@ -1604,7 +1618,11 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
         f.ready_s = now - st.ready_since;
     }
     st.time_failed(&mut f, now);
-    let step = upgrade::requested_step(&Request::None, &st.phase, &f, ready, now, &st.to);
+    let mut step = upgrade::requested_step(&Request::None, &st.phase, &f, ready, now, &st.to);
+    // At a break nothing is ended, whatever the plan says (the driver's rule).
+    if f.background_point {
+        step = upgrade::break_step(step);
+    }
     let reask = step == Step::Announce && st.phase != Phase::Pending;
     if holds == Holds::Refused && !(step == Step::Terminate || reask) {
         return None;
@@ -1675,7 +1693,8 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
         // The model's conversation has a task: never restarted afresh.
         Step::Fresh => unreachable!("a conversation with a task: {f:?}"),
     };
-    if release_is_next(&step, &word) && !st.release.is_empty() {
+    // Never at a break: that is the notice's alone (the driver's rule).
+    if release_is_next(&step, &word) && !st.release.is_empty() && !f.background_point {
         let text = tail.join("\n");
         if let Some(why) = release_void(&st, &sf, TAB, Some(&text)) {
             assert_eq!(why, "directed", "the model's agent is the notice's");
@@ -1732,6 +1751,18 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     })
 }
 
+/// The states decided AT A BREAK ([`Holds::Break`]): a round that gave up,
+/// holding a late READY to one of its markers — the owner's stall of
+/// 2026-09-27, whose tab took nearly every step at a break of the agent's own
+/// work. The answer the work outlives past the drain is voided there as at
+/// an idle point (`Void`, the release it owes typed at the next idle point),
+/// never waited on for good: until that day the break answered `background`
+/// before the drain's bound was ever asked, and the model — which has no
+/// breaks — could not see it.
+fn at_a_break(s: &S) -> bool {
+    s["phase"] == 2 && s["ready"] == 1 && s["live"] == 1
+}
+
 /// THE UPGRADE'S QUIET WORD — nothing it would do for the agent at this look
 /// (the model's `Look`): its last word ([`After::Finished`]), or a stopped
 /// round resting before its next (`wait:failed`), which the window looks at
@@ -1776,8 +1807,10 @@ fn reachable(m: &Model) -> Vec<S> {
 /// idle look, the reducer's own step is the ONE the model's guards enable (a
 /// wait where none is); held by a person, the void exactly where the model
 /// voids; held by the agent's own work, the re-ask or give-up over the READY
-/// where the model takes one, else its void; refused, the round abandoned — and the model, firing the same actions in
-/// the same order, lands where the real record does.
+/// where the model takes one, else its void; at a break of that work, the
+/// void exactly where the model voids; refused, the round abandoned — and the
+/// model, firing the same actions in the same order, lands where the real
+/// record does.
 fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
     let lands = || {
         let mut t = s.clone();
@@ -1804,6 +1837,13 @@ fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
             let want = held.into_iter().find(|a| m.action_enabled(a, s));
             let took = d.actions.first().copied().filter(|a| held.contains(a));
             want == took && (want.is_none() || lands())
+        }
+        // At a break of that work: the void exactly where the model voids —
+        // the break's old `wait:background` (or any wait) there is no step
+        // the model has, and so a disagreement.
+        Holds::Break => {
+            let voided = d.actions.first() == Some(&"Void");
+            m.action_enabled("Void", s) == voided && (!voided || lands())
         }
         Holds::Refused => {
             d.actions.first() == Some(&"Abandon") && m.action_enabled("Abandon", s) && lands()
@@ -1882,10 +1922,15 @@ fn defective() -> Vec<(&'static str, Model)> {
 /// actions land: at an idle look the one reducer step; under a person's hold
 /// past the drain, the void exactly where the model voids; under the agent's
 /// own work past it, the re-ask that supersedes the READY (or the give-up
-/// over it) where the model takes one, else the void; under a refused signal or plan, the round abandoned and its release
-/// typed; the release dropped exactly where the model drops it; and the last
-/// word only where the model says it. Each state is decided over its plain
-/// transcript and, where it fits, over THE SECOND REVIEW'S HISTORY — a peer's
+/// over it) where the model takes one, else the void; AT A BREAK of that
+/// work, a gave-up round's late READY voided exactly where the model voids
+/// (the no-stall review's S2: the break's old `wait:background` is a
+/// disagreement, so reverting the break's void in [`upgrade::next_step`]
+/// turns this red); under a refused signal or plan, the round abandoned and
+/// its release typed; the release dropped exactly where the model drops it;
+/// and the last word only where the model says it. Each state is decided
+/// over its plain transcript and, where it fits, over THE SECOND REVIEW'S
+/// HISTORY — a peer's
 /// message the agent answered with READY — whose release a void owes and the
 /// pre-fix reading dropped. No step says the host's last word over a release
 /// owed. The conversation's own moves (`Direct`, `AgentReady`,
@@ -1905,6 +1950,8 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
     let mut disagree: BTreeMap<&str, usize> = defective.iter().map(|(n, _)| (*n, 0)).collect();
     let mut taken = std::collections::BTreeSet::new();
     let mut histories = 0;
+    // At a break: the late READYs decided there, and those the model voids.
+    let (mut breaks, mut voided_at_breaks) = (0, 0);
     for s in &states {
         for history in [false, true] {
             if history && !history_fits(s) {
@@ -1915,11 +1962,32 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
                 Holds::Nothing,
                 Holds::Person,
                 Holds::Background,
+                Holds::Break,
                 Holds::Refused,
             ] {
                 let Some(d) = decide(s, holds, history) else {
                     continue;
                 };
+                if holds == Holds::Break {
+                    breaks += 1;
+                    if model.action_enabled("Void", s) {
+                        voided_at_breaks += 1;
+                        // THE BREAK BEFORE THE FIX, as a decision: it waited
+                        // `background` over the answer, for good. The model
+                        // refuses it — so reverting the break's void in
+                        // `upgrade::next_step` turns this bind red.
+                        let old = Decided {
+                            actions: Vec::new(),
+                            next: s.clone(),
+                            word: "wait:background".to_string(),
+                            owed: s["owed"] == 1,
+                        };
+                        assert!(
+                            !agrees(&model, s, holds, &old),
+                            "the break's old wait at {s:?} reads as the model's"
+                        );
+                    }
+                }
                 assert!(
                     !(d.owed && after(&d.word, 0) == After::Finished),
                     "{holds:?} at {s:?}: `{}` is the host's last word over a release owed",
@@ -2021,6 +2089,11 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
         }
     }
     assert!(histories > 0, "the second review's history is decided");
+    assert!(
+        voided_at_breaks > 0 && breaks > voided_at_breaks,
+        "a late READY is decided at a break, voided there and (limited) not: \
+         {voided_at_breaks} of {breaks}"
+    );
     // The reducer's seven, the held three (`Void`, and the re-ask and give-up
     // over a READY the agent's work outlived), `Abandon`, and the
     // conversation's three.
@@ -2123,9 +2196,9 @@ fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
 /// EVERY STOP IS STAMPED, AND A RE-ARM IS A NEW ROUND ([`St::fail`],
 /// [`St::rearm`]). The give-up, a stop, a refused signal and a gave-up
 /// round's void each stamp the rest's start; the new round is pending with a
-/// fresh salt past every marker the old one could mint, its markers and
-/// stamp gone, the owner's spent `--now` gone (a skip kept), the release
-/// still owed carried for the new notice to supersede, and why the old one
+/// fresh salt past every marker the old one could mint, its markers, stamp
+/// and saved prompt position gone, the owner's spent `--now` gone (a skip
+/// kept), the release still owed carried for the new notice to supersede, and why the old one
 /// stopped kept until that notice. A state an older build wrote carries no
 /// stamp — no migration: it reads as stopped long ago and is due at once.
 #[test]
@@ -2160,10 +2233,19 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     // THE NEW ROUND.
     let mut skip = st.clone();
     skip.request = Request::Skip("9.9.9".to_string());
+    // The prompt a refused relaunch saved is the stopped round's, never the
+    // new one's to type against.
+    st.prompt = Some(PromptMark {
+        row: 3,
+        col: 9,
+        left: "a, b % ".to_string(),
+        right: None,
+    });
     let why = st.rearm(9_000);
     assert_eq!(why, upgrade::GAVE_UP);
     assert_eq!(st.phase, Phase::Pending);
     assert!(st.marker.is_empty() && st.markers.is_empty());
+    assert_eq!(st.prompt, None, "the stopped round's prompt is forgotten");
     assert!(st.salt > 1_000 + u64::from(upgrade::MAX_ASKS));
     assert_eq!(st.failed_at, 0);
     assert_eq!(
@@ -2197,6 +2279,91 @@ fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
     assert_eq!(old.failed_at, 0);
     assert_eq!(old.failed_for(T0), T0, "stopped long ago");
     assert!(upgrade::retry_due(&old.phase, old.failed_for(T0), false));
+}
+
+/// THE LONGEST SILENCE, through the real record and the real reducer (the
+/// no-stall review of 2026-09-27: `REASK_S + RETRY_S` was claimed as its
+/// bound, but a void begins the rest again). A round's last notice goes out;
+/// its window runs out and it gives up; a late READY comes a second before
+/// its rest runs out and holds the rest where it is, at an idle point and at
+/// a break alike; the agent's own work outlives the answer, and the void
+/// comes `DRAIN_S` after it, beginning the rest again; the new round starts
+/// `RETRY_S` after the void. Five hours today after a first stop, eleven
+/// after one repeated to the cap, as `upgrade::RETRY_S` says — and without
+/// the late READY, two and a half and eight and a half.
+#[test]
+fn the_longest_silence_is_the_window_a_rest_a_drain_and_a_rest() {
+    const H: u64 = 3_600;
+    // The first second in `from..to` at which `hit` holds.
+    let first = |from: u64, to: u64, hit: &dyn Fn(u64) -> bool| (from..to).find(|t| hit(*t));
+    for (prior_stops, with_ready, hours) in [
+        (0, false, 5 * H / 2),
+        (0, true, 5 * H),
+        (upgrade::RETRY_BACKOFF_MAX_SHIFT, false, 17 * H / 2),
+        (upgrade::RETRY_BACKOFF_MAX_SHIFT, true, 11 * H),
+    ] {
+        let case = format!("{prior_stops} stop(s) before, late READY {with_ready}");
+        let last_notice = T0;
+        let mut st = St {
+            to: "9.9.9".to_string(),
+            streak_why: upgrade::GAVE_UP.to_string(),
+            stop_streak: prior_stops,
+            ..St::default()
+        };
+        st.announced(marker(1), last_notice, upgrade::MAX_ASKS);
+        // The give-up: the reducer's, at the first second its window allows.
+        let gave_up_at = first(last_notice, last_notice + H, &|t| {
+            upgrade::next_step(&st.phase, &idle(false), false, t) == Step::GiveUp
+        })
+        .expect("a give-up");
+        assert_eq!(gave_up_at, last_notice + upgrade::REASK_S, "{case}");
+        st.give_up(gave_up_at);
+        let rested =
+            |st: &St, ready: bool, t: u64| upgrade::retry_due(&st.phase, st.failed_for(t), ready);
+        let rest_end = first(gave_up_at, gave_up_at + 12 * H, &|t| rested(&st, false, t))
+            .expect("the rest runs out");
+        let new_round = if with_ready {
+            // A late READY a second before the rest runs out holds it there.
+            let heard_at = rest_end - 1;
+            assert!(!rested(&st, true, heard_at + 7 * 24 * H), "{case}: held");
+            let look = |st: &mut St, t: u64, at_break: bool| {
+                let mut f = Facts {
+                    background: vec!["zsh".to_string()],
+                    background_point: at_break,
+                    ..idle(false)
+                };
+                st.time_ready(true, &mut f, t);
+                st.time_failed(&mut f, t);
+                let step = upgrade::next_step(&st.phase, &f, true, t);
+                if at_break {
+                    upgrade::break_step(step)
+                } else {
+                    step
+                }
+            };
+            let mut voids = Vec::new();
+            for at_break in [false, true] {
+                let mut probe = st.clone();
+                let _ = look(&mut probe, heard_at, at_break);
+                voids.push(
+                    first(heard_at, heard_at + 12 * H, &|t| {
+                        matches!(look(&mut probe.clone(), t, at_break), Step::Void(_))
+                    })
+                    .expect("the answer is voided"),
+                );
+            }
+            assert_eq!(voids, [heard_at + upgrade::DRAIN_S; 2], "{case}");
+            st.void(voids[0]);
+            first(voids[0], voids[0] + 12 * H, &|t| rested(&st, false, t)).expect("a new round")
+        } else {
+            rest_end
+        };
+        assert_eq!(
+            new_round - last_notice + u64::from(with_ready),
+            hours,
+            "{case}"
+        );
+    }
 }
 
 /// THE OWNER'S STALL OF 2026-09-27, THROUGH THE REAL VISIT (tab
@@ -2394,8 +2561,8 @@ fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
 
 /// TIER-1, THE OWNER'S STALL AS A SCHEDULE: the environment as it ran (the
 /// agent's late READY, its own work outliving it, the rest running out) and
-/// the REAL decisions between — the give-up, the void, the release, the new
-/// round, its notice, the restart on its READY — each transition admitted by
+/// the REAL decisions between — the give-up, the void at a break, the release
+/// at the next idle point, the new round, its notice, the restart on its READY — each transition admitted by
 /// the model and every state within `NeverStalls` and `NeverStranded`. The
 /// same schedule under `Terminal = 1` (the reducer as it ran) is refused at
 /// the new round the real code takes, and ends at the quiet word past the
@@ -2447,9 +2614,12 @@ fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
     step(&mut trace, Holds::Person, &["GiveUp"]);
     let next = env(&last(&trace), "AgentReady");
     push(&mut trace, next);
-    // Its own work outlives the READY past the drain: voided, and the agent
-    // released at the same look.
-    step(&mut trace, Holds::Background, &["Void", "Release"]);
+    // Its own work outlives the READY past the drain: voided AT A BREAK of
+    // that work, where the owner's tab took nearly every step (and waited
+    // `background` on the answer for good before the fix) — the release it
+    // owes is an idle point's, typed at the next one.
+    step(&mut trace, Holds::Break, &["Void"]);
+    step(&mut trace, Holds::Nothing, &["Release"]);
     // Resting: the quiet word, not stranded (released), not stalled.
     step(&mut trace, Holds::Nothing, &["Look"]);
     let rested = env(&last(&trace), "Rests");

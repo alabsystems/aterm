@@ -86,4 +86,6 @@ pub use turn::{
     Progress, continuation_suggestion, goal_active, interrupted, said_tail, status_row_progress,
     status_row_stall,
 };
-pub use wall::{Placement, Wall, WallKind, classify_wall, login_restored, memory_wall, wall};
+pub use wall::{
+    ApiCause, Placement, Wall, WallKind, classify_wall, login_restored, memory_wall, wall,
+};

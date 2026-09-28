@@ -2923,6 +2923,17 @@ pub mod fixtures {
     pub use crate::codex::fixtures::TRUST as CODEX_TRUST;
     /// HAND-BUILT: a turn that ended on `API Error: 529 Overloaded`.
     pub const END_529: &str = include_str!("fixtures/hand-built-529-end-of-turn.txt");
+    /// Claude Code 2.1.283's own shape for an API error: a `⏺` message of
+    /// its own, never a `⎿` row (`phase::error_row_notice`). The outage of
+    /// 2026-09-27, wide and narrow (`(ENOTFOUND)` on the second row), a
+    /// reply cut off by sleep, and a 529.
+    pub const API_ERROR_ENOTFOUND: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-enotfound.txt");
+    pub const API_ERROR_ENOTFOUND_80: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-enotfound-80col.txt");
+    pub const API_ERROR_SLEEP: &str =
+        include_str!("fixtures/claude-2.1.283-api-error-sleep-mid-response.txt");
+    pub const API_ERROR_529: &str = include_str!("fixtures/claude-2.1.283-api-error-529.txt");
     /// HAND-BUILT: the same turn ending on the session limit.
     pub const END_SESSION_LIMIT: &str =
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");
@@ -4018,6 +4029,10 @@ mod tests {
             (TRUST_AFTER_RESUMES, "claude-code 2.1.280 · MEASURED"),
             (CODEX_TRUST, "codex 0.156.1 · MEASURED"),
             (END_529, "claude-code (unrecorded) · HAND-BUILT"),
+            (API_ERROR_ENOTFOUND, "claude-code 2.1.283 · SYNTHETIC"),
+            (API_ERROR_ENOTFOUND_80, "claude-code 2.1.283 · SYNTHETIC"),
+            (API_ERROR_SLEEP, "claude-code 2.1.283 · SYNTHETIC"),
+            (API_ERROR_529, "claude-code 2.1.283 · SYNTHETIC"),
             (END_SESSION_LIMIT, "claude-code (unrecorded) · HAND-BUILT"),
             (END_OFFER, "claude-code (unrecorded) · HAND-BUILT"),
             (LOGIN_EXPIRED, "claude-code 2.1.281 · HAND-BUILT 2026-09-27"),

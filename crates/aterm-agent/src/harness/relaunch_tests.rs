@@ -3,6 +3,13 @@
 
 use super::*;
 
+#[test]
+fn a_cold_restore_yields_between_session_checks_but_live_relaunch_keeps_its_wait() {
+    assert_eq!(held_wait(CAUSE_HOST), Duration::from_secs(7));
+    assert!(held_wait(CAUSE_HOST) > ENDED_AT_ONCE);
+    assert_eq!(held_wait(CAUSE_EXIT), HELD_WAIT);
+}
+
 fn words(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_string()).collect()
 }
@@ -207,6 +214,36 @@ fn a_step_is_relaunched_left_not_yet_or_never() {
         "wait:tab-ownership-changed",
     ] {
         assert_eq!(outcome(step), Outcome::NotYet(step.to_string()), "{step}");
+    }
+}
+
+/// DAY SIX, D30 of the messages design: the relaunched agent reads as ENDED
+/// only once every read look for [`ENDED_AT_ONCE`] found its shell holding
+/// the tab, and looks are taken [`SHELL_LOOK`] apart. NEGATIVE CONTROLS: the
+/// agent still starting (anything else holding the tab) starts the count
+/// over; a look that cannot be read is no verdict either way; a look before
+/// [`SHELL_LOOK`] has passed is not taken.
+#[test]
+fn a_shell_that_has_the_tab_back_reads_as_ended_only_after_a_while() {
+    let t0 = Instant::now();
+    let at = |ms: u64| t0 + Duration::from_millis(ms);
+    let mut back = ShellBack::default();
+    assert!(back.due(at(0)));
+    assert!(!back.due(at(400)), "not at the roster's pace");
+    assert!(back.due(at(1_000)));
+    assert!(!back.saw(Some(true), at(0)), "held just now");
+    assert!(!back.saw(None, at(3_000)), "an unread look is no verdict");
+    assert!(!back.saw(Some(false), at(4_000)), "the agent holds it");
+    assert!(!back.saw(Some(true), at(5_000)), "the count started over");
+    assert!(!back.saw(None, at(9_000)));
+    assert!(!back.saw(Some(true), at(9_999)));
+    assert!(
+        back.saw(Some(true), at(10_000)),
+        "held five seconds in a row"
+    );
+    let mut never = ShellBack::default();
+    for s in 0..60 {
+        assert!(!never.saw(None, at(s * 1_000)), "never read, never ended");
     }
 }
 

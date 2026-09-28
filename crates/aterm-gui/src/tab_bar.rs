@@ -8798,7 +8798,7 @@ mod tests {
         );
         // A timeline row is not an identity line and must never be mistaken for one.
         assert_eq!(
-            solo_subtitle("aterm", Some("aterm\n\nstate-change · just now")),
+            solo_subtitle("aterm", Some("aterm\n\nstate changed · just now")),
             None
         );
     }

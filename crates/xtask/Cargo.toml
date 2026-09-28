@@ -7,34 +7,15 @@ version.workspace = true
 edition = "2024"
 license = "Apache-2.0"
 publish = false
-description = "aterm build-graph tasks (TRUST_VACUITY_GATE §2.1/§2.5): harness-manifest + always-run spec-link"
+description = "aterm build-graph tasks: harness-manifest, the merge gate's xtask verbs, perf, verify"
 
 [[bin]]
 name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
-# The anchor graph: aterm-spec (the IR lowering + model registry + proof anchors)
-# and aterm-spec-models (the external ISOLATION .tla). The proof-anchor-bearing
-# crates are linked WITH `spec-anchors` ON so `inventory` collects every
-# `proof_anchor!` (the kani half) into THIS binary — making the L1 proof-name
-# resolution + the lowered `proof` lines an ALWAYS-RUN node independent of
-# aterm-gui's test binary (finding 5). (The in-source path_confine/window_routing
-# `#[cfg(test)]` anchors collect only in aterm-gui's test binary; those remain
-# covered by the gate. This node covers the embedded models, the external ISOLATION
-# specs, and the cross-crate proof anchors — the L1 teeth.)
-aterm-spec = { workspace = true }
-aterm-spec-models = { workspace = true }
-aterm-scrollback = { workspace = true, features = ["spec-anchors"] }
-aterm-grid = { workspace = true, features = ["spec-anchors"] }
-# aterm-search: the streaming-search `#[refines]` anchors (temporal half of the
-# derived StreamingSearch machine) + its kani `proof_anchor!`s, collected into
-# THIS always-run node exactly like the scrollback/grid proof anchors.
-aterm-search = { workspace = true, features = ["spec-anchors"] }
-# The main-loop completeness census (`gate mainloop`) — ONE implementation shared
-# with tools/freeze-safety-gate/build.rs (where it is a build-blocking obligation),
-# so the manual verb and the compile gate cannot diverge. Also provides the shared
-# source-walk helpers (collect_rs_files / is_test_file) every scan gate uses.
+# The shared source walk (`collect_rs_files`) the harness manifest reads the
+# tree with — the same walk the censuses use.
 aterm-census = { workspace = true }
 # THE workspace's one lock-scoped environment helper (`aterm_log::env`), for the
 # single `$CARGO` handoff in driver.rs. A direct edge to the dependency-free leaf
@@ -42,20 +23,13 @@ aterm-census = { workspace = true }
 # the binary has ONE lock, which a per-crate copy would not give (see that
 # module's docs). Nothing here uses aterm-log as a logger.
 aterm-log = { workspace = true }
-# ONE definition of "which directory is THE toolchain", shared with
-# tools/verify.sh's driver. `gate lint` already refuses to re-derive tippy in
-# shell for this reason; re-deriving the toolchain lookup in Rust is the same
-# split brain one layer down, and it is what let the two copies drift into
-# disagreeing about whether a rustup-linked pin counts.
+# ONE definition of "which directory is THE toolchain" (`aterm_verify::Toolchain`),
+# shared with tools/verify.sh's driver, so a verb the gate runs cannot resolve a
+# different toolchain than the gate did.
 aterm-verify = { workspace = true }
-# aterm-forge: the third-party surface policy (`gate forge`). A PATH dep, not a
-# `workspace = true` one — the root manifest's [workspace.dependencies] table has
-# no `aterm-forge` row and that file is not this crate's to edit; the path form
-# resolves the same member and adds no net-new third-party package (forge's own
-# deps — aterm-toml, aterm-census — are already in this graph). Linked for
-# the SAME reason aterm-census is: ONE implementation with TWO consumers, so the
-# `gate forge` verb and the `cargo forge check` verb a human runs by hand read
-# the tree by the same rules and cannot drift apart.
+# aterm-forge: the third-party surface policy (`gate forge`) and the cell list
+# (`gate cells`), one implementation shared with `cargo forge check`. A PATH dep:
+# the root [workspace.dependencies] table has no `aterm-forge` row.
 aterm-forge = { path = "../aterm-forge" }
 # `gate cells` reads cargo's `--message-format=json` stream, because that is the
 # only channel that reports a FRESH unit: a warm re-run prints no `Checking`

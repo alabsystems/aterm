@@ -8,11 +8,11 @@
 
 use super::*;
 
-/// A composed cursor frame may read ribbon witness rows from its already
-/// captured caret-neighbor snapshot, even if the live PTY advances afterward.
-/// A farther row requires a second terminal read and therefore the captured
-/// generation still matching. Tier-1 drives the real composed sampling and
-/// generation guard in `aterm-gui::app_render`.
+/// A composed cursor frame may read any requested ribbon witness row from the
+/// same snapshot as its extracted cells, even if the live PTY advances
+/// afterward. A row first requested after a content-scroll translation may
+/// still require a later terminal read, admitted only while the captured
+/// generation matches. Tier-1 drives both routes in `aterm-gui::app_render`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn composed_witness_generation_model() -> Model {

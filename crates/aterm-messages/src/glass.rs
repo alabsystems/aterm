@@ -38,9 +38,11 @@
 //!    title's elision before they drop (review 2026-09-23), and the slot is
 //!    reserved at ONE width for the row's life so words arriving, changing
 //!    resource or leaving never re-lay a moving row (review round 2). Over
-//!    budget → every capsule takes its SHORT form (a capsule with none, the
-//!    implicit `Details ›`, goes: a lone `›` said nothing the row body does
-//!    not do); still over → the title elides down to [`TITLE_MIN`]; still
+//!    budget → the implicit `Details ›` goes first, where that alone fits
+//!    the row (ruling 305: the row body opens Details, and an authored
+//!    capsule keeps its words); still over → every capsule takes its SHORT
+//!    form (a capsule with none, the implicit `Details ›`, goes: a lone `›`
+//!    said nothing the row body does not do); still over → the title elides down to [`TITLE_MIN`]; still
 //!    over (cols < ~24) → degenerate: `A` goes whole, the title takes what
 //!    is left, the implicit `Details ›` goes, and the capsules stand from
 //!    column 0 for the painter to clip. Rows are always exactly `cols`
@@ -75,7 +77,8 @@
 //!    every extra after it.
 //!
 //! Sacrifice order, therefore, as the row narrows: stats (short, then gone) → excerpt (shaped,
-//! then dropped) → ETA (long, then short) → capsule short forms → title
+//! then dropped) → ETA (long, then short) → the implicit `Details ›` →
+//! capsule short forms → title
 //! elision → the activity words with the load words; on a row with an ETA
 //! the load words go before the short ETA does — where no ETA fits the room
 //! the load slot's cells, which the head paid for, buy the short one, and it
@@ -979,6 +982,28 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     // forms and the elided title fit the head only, and the cells they free
     // never re-buy an excerpt a wider row already gave up.
     let room = budget.saturating_sub(fixed);
+    let mut details_dropped = false;
+    // THE IMPLICIT `Details ›` GOES FIRST (design ruling 305): the row body
+    // opens Details at every width, so the link's cells are spent before an
+    // authored capsule loses its words — at 60 columns `Open aterm.toml`
+    // stayed whole on one config row and read `Edit` on the next, by title
+    // length alone (round 21). Only the plain link: `+N ›` keeps its count
+    // in its short form.
+    if fixed > budget
+        && let Some((last, kept)) = spec.capsules.split_last()
+        && last.action.is_details()
+        && last.short.is_empty()
+    {
+        let caps_kept = capsules_width(kept, false, width);
+        let before_kept = clearance(kept, false);
+        let fixed_kept = 2 + width(&title) + a + ex + before_kept + caps_kept;
+        if fixed_kept <= budget {
+            details_dropped = true;
+            caps = caps_kept;
+            before = before_kept;
+            fixed = fixed_kept;
+        }
+    }
     if fixed > budget {
         short = true;
         caps = capsules_width(&spec.capsules, true, width);
@@ -1007,7 +1032,6 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
         title = elide(full_title, 0);
         fixed = 2 + width(&title) + a + before + caps;
     }
-    let mut details_dropped = false;
     if fixed > budget {
         // Degenerate: the activity's words go whole (pct or elapsed, and the
         // load slot, together — the meter and the track stay: they cost
@@ -1079,14 +1103,34 @@ pub(crate) fn layout_row(
     cols: usize,
     width: &dyn Fn(&str) -> usize,
 ) -> RowLayout {
+    layout_row_with(spec, cols, width, false)
+}
+
+/// [`layout_row`], with the band's time words forced to their short form
+/// where `short_time` (design ruling 305: one row at this width took them
+/// short, so every row does).
+pub(crate) fn layout_row_with(
+    spec: &RowSpec<'_>,
+    cols: usize,
+    width: &dyn Fn(&str) -> usize,
+    short_time: bool,
+) -> RowLayout {
     let fit = fit_fixed(spec, cols, width);
-    let extras = allocate_extras(spec, &fit, width);
+    let extras = allocate_extras(spec, &fit, width, short_time);
     place(spec, cols, width, &fit, extras)
 }
 
 /// Step 2: the extras from the room the fixed head left, in allocation
-/// order (module doc). The meter is not one: it costs nothing.
-fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize) -> Extras {
+/// order (module doc). The meter is not one: it costs nothing. `short_time`:
+/// the band paints its time words short at this width (ruling 305) — a row
+/// that could take the long elapsed or ETA form takes the short one, so
+/// stacked rows read alike, and the cells it saves are not spent.
+fn allocate_extras(
+    spec: &RowSpec<'_>,
+    fit: &Fit,
+    width: &dyn Fn(&str) -> usize,
+    short_time: bool,
+) -> Extras {
     let mut room = fit.room;
     // An extra the row asked for that did not fit STARVES every extra after
     // it: they are sacrificed first as the row narrows, so none of them may
@@ -1098,8 +1142,12 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
     let mut elapsed_w = 0;
     if matches!(fit.activity, Activity::LiveBusy | Activity::LiveLevel) {
         if ELAPSED_W - ELAPSED_SHORT_W <= room {
-            elapsed_w = ELAPSED_W;
-            room -= ELAPSED_W - ELAPSED_SHORT_W;
+            if short_time {
+                elapsed_w = ELAPSED_SHORT_W;
+            } else {
+                elapsed_w = ELAPSED_W;
+                room -= ELAPSED_W - ELAPSED_SHORT_W;
+            }
         } else {
             elapsed_w = ELAPSED_SHORT_W;
             starved = true;
@@ -1120,9 +1168,15 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
     // stays traded at every narrower width (the ETA short: the cells a
     // wider row gave the long one never come back).
     let mut load_slot = reserves_load(spec, fit.activity) && !fit.action_excerpt;
+    // What the slot costs the room: its painted width, save where the band
+    // forces the short form on a row that had room for the long one — that
+    // row pays the LONG width, so the cells the short words save buy no
+    // excerpt, load words or stats (ruling 305(b); the elapsed slot above
+    // leaves its forced cells unspent the same way).
     if spec.eta && fit.activity == Activity::LiveBar {
         if ETA_W < room {
-            eta_w = ETA_W;
+            eta_w = if short_time { ETA_SHORT_W } else { ETA_W };
+            room -= ETA_W - eta_w;
         } else if ETA_SHORT_W < room {
             eta_w = ETA_SHORT_W;
             starved = true;
@@ -1134,9 +1188,7 @@ fn allocate_extras(spec: &RowSpec<'_>, fit: &Fit, width: &dyn Fn(&str) -> usize)
         } else {
             starved = true;
         }
-        if eta_w > 0 {
-            room -= 1 + eta_w;
-        }
+        room -= if eta_w > 0 { 1 + eta_w } else { 0 };
     }
     // b. the excerpt: whole, shaped at or above the floor, else dropped. An
     //    action excerpt has its floor from the fixed head (a starved extra
@@ -1830,7 +1882,7 @@ pub(crate) mod tests {
             (
                 "crash",
                 60,
-                " ⚠ aterm closed unexpectedly last time                 Log  ",
+                " ⚠ aterm closed unexpectedly last time            Open log  ",
             ),
             (
                 "file-access",
@@ -1850,7 +1902,7 @@ pub(crate) mod tests {
             (
                 "file-access",
                 60,
-                " ℹ File access not confirmed            Settings   Not now  ",
+                " ℹ File access not confirmed       Open Settings   Not now  ",
             ),
             (
                 "staged-manual",

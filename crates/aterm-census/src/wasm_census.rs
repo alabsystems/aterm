@@ -13,7 +13,8 @@
 //! WHAT THE SURVEY FOUND (2026-07-14), and what this census therefore is:
 //!
 //! * THE PROCESS IS SINGLE-THREADED — BY TARGET, NOT BY CONVENTION. The web
-//!   renderers build ONLY for `wasm32-unknown-unknown` (`xtask gate web`),
+//!   renderers build ONLY for `wasm32-unknown-unknown` (tools/wasm-bench/run.sh
+//!   and `xtask gate cells-foreign`'s wasm-cpu/wasm-gpu cells),
 //!   with no `+atomics` target feature and no SharedArrayBuffer shared
 //!   memory anywhere in the build configuration. On that target std threads
 //!   do not exist at runtime, so a `std::sync::Mutex` is uncontended by
@@ -78,10 +79,10 @@
 //!   the lock-order obligation is EXTENDED to this process — extension, not
 //!   waiver, is the only repair.
 //!
-//! Consumers (same fan-out as the sibling censuses, so the verb and the gate
-//! cannot diverge): `cargo xtask gate wasmloop`, the fused
-//! `tools/freeze-safety-gate/build.rs` build (obligation 4), and the
-//! `aterm-census` bin (`--wasm`).
+//! Consumers (same fan-out as the sibling censuses, so the runner and the gate
+//! cannot diverge): the fused `tools/freeze-safety-gate/build.rs` build
+//! (obligation 4), and the `aterm-census` bin (`targo --unverified run -p
+//! aterm-census -- --wasm`).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -181,8 +182,9 @@ pub const WASM_THREADING_POSTURE: &str =
     "    THREAD/LOCK POSTURE of the wasm process (why the LOCK-ORDER obligation is
     VACUOUS here — the evidence, re-verified every run by OB-12):
       - TARGET: wasm32-unknown-unknown (the only target these crates ship for;
-        `xtask gate web` builds exactly that), with NO `+atomics` target
-        feature and no SharedArrayBuffer shared memory in any build config.
+        tools/wasm-bench and the wasm cells build exactly that), with NO
+        `+atomics` target feature and no SharedArrayBuffer shared memory in any
+        build config.
         std threads DO NOT EXIST at runtime on this target: there is no second
         thread of execution inside a module instance.
       - Each wasm-bindgen module instance is bound to exactly ONE JS agent
@@ -674,7 +676,8 @@ pub fn run_wasm_census(root: &Path) -> CensusOutcome {
             log,
             "gate wasmloop: FAILED — {failures} obligation violation(s) ({hazard_hits} \
              unregistered synchronous unbounded reach(es)). This census blocks BOTH \
-             `cargo xtask gate wasmloop` and the `cargo build` of tools/freeze-safety-gate."
+             `targo --unverified run -p aterm-census -- --wasm` and the build of \
+             tools/freeze-safety-gate."
         );
         return CensusOutcome { ok: false, log };
     }

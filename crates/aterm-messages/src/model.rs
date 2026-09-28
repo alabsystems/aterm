@@ -250,9 +250,14 @@ impl Glyph {
         '\u{2191}', // ↑
         '\u{23f8}', // ⏸
         '\u{2726}', // ✦
-        '!', '\u{00b7}', // ·
-        '\u{2026}', // …
+        '!', '\u{2026}', // …
+        '\u{2296}', // ⊖ — a removal in flight (ruling 304; the `·` it
+                    // replaced read as a bullet on the glass)
     ];
+    /// The glyph a RETIRED member of the set is read back as: `·`, the
+    /// removal's lead glyph before ruling 304, from a record an older build
+    /// logged or carried.
+    const RETIRED: &'static [(char, char)] = &[('\u{00b7}', '\u{2296}')];
     /// What stands in for a glyph outside the set.
     pub const FALLBACK: Glyph = Glyph('!');
 
@@ -265,7 +270,14 @@ impl Glyph {
     /// The glyph, or [`Glyph::FALLBACK`] when `ch` is outside the set.
     #[must_use]
     pub fn or_fallback(ch: char) -> Self {
-        Self::new(ch).unwrap_or(Self::FALLBACK)
+        Self::new(ch)
+            .or_else(|| {
+                Self::RETIRED
+                    .iter()
+                    .find(|(old, _)| *old == ch)
+                    .map(|(_, now)| Self(*now))
+            })
+            .unwrap_or(Self::FALLBACK)
     }
 
     /// The character.
@@ -489,8 +501,10 @@ impl Intent {
                 // What the press does, not when (round 18, day four, D6: a
                 // bare `Now` beside `Tomorrow` said neither what nor to whom).
                 UpgradeWord::Now => "Upgrade",
-                // A day off, in the eight cells a short form has.
-                UpgradeWord::NotToday => "Tomorrow",
+                // A day off, in the eight cells a short form has — said as
+                // the choice it is (ruling 305: `Tomorrow` alone read as a
+                // noun); the answered record says until when.
+                UpgradeWord::NotToday => "Not now",
                 UpgradeWord::Skip => "Skip",
             },
         }

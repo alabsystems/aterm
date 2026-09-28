@@ -168,6 +168,24 @@ fn caret_text(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
         .and_then(|(_, lines)| lines.into_iter().next())
 }
 
+/// A wall the host's measure of the API's reach answers: an API error
+/// that never reached the API, a reply the connection cut off, or a
+/// certificate or proxy refused ([`aterm_phase::ApiCause`]) — the arms of
+/// the turn-end policy that read [`TurnEndReading::reach`]. The server's
+/// own failure (a status, an overload) is not: a handshake says nothing
+/// of the API's health, and it keeps its ladder whatever the measure.
+fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
+    matches!(
+        kind,
+        aterm_phase::WallKind::ApiError {
+            cause: aterm_phase::ApiCause::Unreachable
+                | aterm_phase::ApiCause::CutOff
+                | aterm_phase::ApiCause::Config,
+            ..
+        }
+    )
+}
+
 /// `rules` as one line of at most [`RULES_CAP`] characters: cut at the last
 /// word that fits, `…` after.
 pub(super) fn capped_rules(line: &str) -> String {
@@ -245,7 +263,11 @@ impl<C: Ctl> Session<'_, C> {
     /// The turn-end reading of `screen`: the reader for the session's
     /// program (as last read), the work since the last point, the wall's
     /// reset, the rules, and how long ago a person typed — a draft that
-    /// changed on any read included ([`Self::person_ago`]).
+    /// changed on any read included ([`Self::person_ago`]). At a wall the
+    /// network answers ([`answered_by_the_network`]) — and there alone — the
+    /// host's measure of the API's reach ([`IdleHost::reach`]), remembered
+    /// as [`Self::reach_seen`]; everywhere else nothing is asked, and it is
+    /// forgotten.
     fn turn_end_reading(
         &mut self,
         screen: &Screen,
@@ -261,6 +283,15 @@ impl<C: Ctl> Session<'_, C> {
             }
             None => None,
         };
+        self.reach_seen = reading
+            .wall
+            .as_ref()
+            .filter(|w| answered_by_the_network(w.kind))
+            .map(|_| {
+                opts.idle_host
+                    .as_ref()
+                    .map_or(Reach::Unknown, |h| h.reach())
+            });
         let r = TurnEndReading::of(
             &reading,
             &screen.rows,
@@ -271,6 +302,7 @@ impl<C: Ctl> Session<'_, C> {
         );
         let host = opts.idle_host.as_ref();
         TurnEndReading {
+            reach: self.reach_seen.unwrap_or_default(),
             person: self.person_ago(Instant::now()),
             // Never while a limit episode stands: the upgrade types nothing
             // at a limit, and the wall is the loop's to wait out
@@ -767,7 +799,7 @@ impl<C: Ctl> Session<'_, C> {
              ({guard}); nothing written"
         ));
         let reason = format!(
-            "not typed: the composer guard matched no row: `{}`",
+            "not typed: aterm could not find the prompt line: `{}`",
             clip(text)
         );
         let attention = escalate::attention_text(self.reader(&point.screen.rows), point, &reason);

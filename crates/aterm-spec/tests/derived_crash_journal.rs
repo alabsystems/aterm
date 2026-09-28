@@ -37,11 +37,13 @@ fn crash_journal_claim_proves_and_catches() {
     for action in [
         "BootFresh",
         "BootFromJournal",
+        "BootSecondChance",
         "Write",
         "Settle",
         "Quit",
         "HandOff",
         "Die",
+        "Crash",
         "Claim",
     ] {
         assert!(
@@ -62,9 +64,12 @@ fn crash_journal_claim_proves_and_catches() {
 
 /// The ends a person meets. A SIGKILL after a write is reopened. A Cmd-Q leaves
 /// nothing to take. The update's hand-off leaves its image behind and it is
-/// taken but not reopened. A launch that reopened a journal and died before its
-/// 90 s is taken and skipped; one that lived past them is reopened. A second
-/// launch finds nothing where the first took the image.
+/// taken but not reopened. A launch that reopened a journal and CRASHED before
+/// its 90 s is taken and skipped; one STOPPED before them (a kill, day five's
+/// D18) is reopened once more as a second chance, and that second chance
+/// stopped again inside its own 90 s is skipped (ruling 285); one that lived
+/// past them is reopened. A second launch finds nothing where the first took
+/// the image.
 #[test]
 fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
     let m = crash_journal_claim_model();
@@ -99,11 +104,34 @@ fn crash_journal_claim_walks_the_ends_the_way_a_person_meets_them() {
         "a running window's journal is never taken"
     );
 
-    let relapsed = walk(&m, &["BootFromJournal", "Write", "Die", "Claim"]);
+    let crashed = walk(&m, &["BootFromJournal", "Write", "Crash", "Claim"]);
     assert_eq!(
-        (relapsed["claims"], relapsed["applied"]),
+        (crashed["claims"], crashed["applied"]),
         (1, 0),
-        "a relapse inside the 90 s is skipped: {relapsed:?}"
+        "a crash inside the 90 s is skipped: {crashed:?}"
+    );
+
+    let stopped = walk(&m, &["BootFromJournal", "Write", "Die", "Claim"]);
+    assert_eq!(
+        (stopped["claims"], stopped["applied"]),
+        (1, 1),
+        "a first stop inside the 90 s comes back once: {stopped:?}"
+    );
+
+    let again = walk(&m, &["BootSecondChance", "Write", "Die", "Claim"]);
+    assert_eq!(
+        (again["claims"], again["applied"]),
+        (1, 0),
+        "the second stop in a row inside the 90 s is skipped: {again:?}"
+    );
+
+    let second_settled = walk(
+        &m,
+        &["BootSecondChance", "Write", "Settle", "Crash", "Claim"],
+    );
+    assert_eq!(
+        second_settled["applied"], 1,
+        "a second chance that lived its 90 s is reopened: {second_settled:?}"
     );
 
     let settled = walk(&m, &["BootFromJournal", "Write", "Settle", "Die", "Claim"]);
@@ -145,11 +173,23 @@ fn crash_journal_claim_the_defects_are_caught_on_every_invariant() {
         "a clean end reopened as a crash: {clean:?}"
     );
 
-    let (looped, _) = interp::bmc(&only(&m, "NoLoop")).expect_err("the probation mark unread");
+    let (crash_looped, _) =
+        interp::bmc(&only(&m, "NoCrashLoop")).expect_err("the probation mark unread");
     assert_eq!(
-        (looped["applied"], looped["image_probation"]),
+        (
+            crash_looped["applied"],
+            crash_looped["image_probation"],
+            crash_looped["crashed"]
+        ),
+        (1, 1, 1),
+        "a crash inside the 90 s reopened again: {crash_looped:?}"
+    );
+
+    let (looped, _) = interp::bmc(&only(&m, "NoLoop")).expect_err("the second-chance mark unread");
+    assert_eq!(
+        (looped["applied"], looped["image_second"]),
         (1, 1),
-        "a relapse inside the 90 s reopened again: {looped:?}"
+        "a second chance stopped inside the 90 s reopened again: {looped:?}"
     );
 
     let (lost, _) = interp::bmc(&only(&m, "NoLoss")).expect_err("the unlink-first writer");

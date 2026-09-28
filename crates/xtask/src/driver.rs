@@ -97,18 +97,6 @@ impl CargoDriver {
         parts.extend(args.iter().map(|s| (*s).to_string()));
         parts.join(" ")
     }
-
-    /// The full argv after the program: `[--unverified] <verb> <args…>`.
-    pub(crate) fn argv(&self, verb: &str, args: &[&str]) -> Vec<String> {
-        let mut out: Vec<String> = self
-            .lane_args(verb)
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        out.push(verb.to_string());
-        out.extend(args.iter().map(|s| (*s).to_string()));
-        out
-    }
 }
 
 /// Does `<program> --version` answer as targo? The same sniff
@@ -176,7 +164,7 @@ fn on_path_under(name: &str, path_env: &OsStr, prefix: &Path) -> Option<PathBuf>
 ///    accepted as the pin. `None` here means it REFUSED what it found (a
 ///    `targo` with no branded `trustc` beside it — see [`pinned_stage2_of`]),
 ///    and a refused directory is skipped, never adopted: the same fail-closed
-///    branch `gate tippy`/`gate fmt` take, so `gate cells` cannot print GREEN
+///    branch `gate lint` takes, so `gate cells` cannot print GREEN
 ///    under a frontend the verify driver would not run. On a
 ///    product-provisioned box this rung IS the store.
 /// 3. `targo` on `path_env` resolving physically under the atpkg `prefix` —
@@ -702,12 +690,12 @@ mod tests {
         // Measured 2026-09-18: `targo --unverified metadata` is refused.
         assert_eq!(d.lane_args("metadata"), &[] as &[&str]);
         assert_eq!(
-            d.argv("metadata", &["--no-deps", "--format-version", "1"]),
-            vec!["metadata", "--no-deps", "--format-version", "1"]
+            d.display("metadata", &["--no-deps", "--format-version", "1"]),
+            "/s/targo metadata --no-deps --format-version 1"
         );
         assert_eq!(
-            d.argv("check", &["--locked"]),
-            vec!["--unverified", "check", "--locked"]
+            d.display("check", &["--locked"]),
+            "/s/targo --unverified check --locked"
         );
         assert_eq!(
             d.display("run", &["--release", "-p", "aterm-bench"]),
@@ -724,7 +712,7 @@ mod tests {
             refused: None,
         };
         assert_eq!(d.lane_args("check"), &[] as &[&str]);
-        assert_eq!(d.argv("test", &["-p", "x"]), vec!["test", "-p", "x"]);
+        assert_eq!(d.display("test", &["-p", "x"]), "cargo test -p x");
         assert_eq!(d.display("metadata", &[]), "cargo metadata");
     }
 

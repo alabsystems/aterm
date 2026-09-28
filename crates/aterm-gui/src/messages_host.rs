@@ -2419,7 +2419,7 @@ impl App {
     /// The staged row is obsolete — its bytes are installed and activating
     /// (`delivered`: it resolves `Ok`, which is true), or the artifact it offered is gone
     /// (withdrawn with no outcome: nothing was installed, so no ✓ may stand
-    /// beside `Update didn't finish`) — so it leaves now rather than standing
+    /// beside `Couldn't finish the update`) — so it leaves now rather than standing
     /// beside the outcome that says so.
     pub(crate) fn retire_staged_update_row(&mut self, delivered: bool) {
         if let Some(id) = self.staged_update_row() {
@@ -6808,7 +6808,7 @@ mod tests {
             vec![(
                 toolchain_words::ALAB_INSTALL_FAILED.to_string(),
                 Hold::Default,
-                Severity::Error
+                Severity::Warn
             )],
             "…and the failure row follows it"
         );

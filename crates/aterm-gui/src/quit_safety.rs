@@ -400,6 +400,122 @@ pub(crate) fn foreground_pgrp(master: i32) -> i32 {
     }
 }
 
+/// The most children [`session_root`] reports: one is enough to say a job is
+/// there, and a handful lets a test clean up after itself.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const ROOT_CHILDREN_MAX: usize = 64;
+
+/// What the process table says about a session's ROOT — the process the PTY
+/// was spawned with, its session leader (crash journal, ruling 292). The
+/// foreground-group test alone misses two cases the quit confirm never had to
+/// see: a program that IS the root (`aterm -e vim`, `exec vim`, a `shell=`
+/// that is not a shell) holds the foreground as the root's own group, and a
+/// background or suspended job (`make &`, a Ctrl-Z'd vim) leaves the
+/// foreground at the shell. Both die with the session when aterm does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionRoot {
+    /// The root's executable name: `p_comm` on macOS, `/proc/<pid>/comm` on
+    /// Linux. A login shell's `-zsh` is argv only; this says `zsh`.
+    pub(crate) comm: String,
+    /// The root's live children (at most 64).
+    pub(crate) children: Vec<i32>,
+}
+
+/// The shells a session root may be and still be "at its prompt" when it has
+/// no child and holds the foreground itself.
+const SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "oksh", "loksh", "pdksh", "yash",
+    "tcsh", "csh", "nu", "xonsh", "elvish", "ion", "pwsh", "rc", "es",
+];
+
+/// Whether `comm` names a shell (a leading login `-` ignored).
+pub(crate) fn is_shell_name(comm: &str) -> bool {
+    let name = comm.trim_start_matches('-');
+    SHELLS.contains(&name)
+}
+
+/// [`SessionRoot`] of `pid`, or `None` when the table cannot answer (gone,
+/// a zombie, a platform without the calls). Two cheap kernel reads on macOS
+/// (`proc_pidinfo`, `proc_listchildpids`), two small `/proc` reads on Linux.
+#[cfg_attr(not(unix), allow(dead_code))] // windows keeps its child walk
+pub(crate) fn session_root(pid: i32) -> Option<SessionRoot> {
+    if pid <= 0 {
+        return None;
+    }
+    platform_session_root(pid)
+}
+
+// libproc's child listing (`<libproc.h>`: `int proc_listchildpids(pid_t
+// ppid, void *buffer, int buffersize)`, answering the number of pids written
+// or -1), in libSystem. Declared here because `crates/aterm-libc` is
+// generated and does not carry it.
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn proc_listchildpids(
+        ppid: libc::pid_t,
+        buffer: *mut libc::c_void,
+        buffersize: libc::c_int,
+    ) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn platform_session_root(pid: i32) -> Option<SessionRoot> {
+    let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `info` points at `size` writable bytes of exactly the structure
+    // PROC_PIDTBSDINFO fills; libproc returns the number of bytes it wrote.
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if read != size {
+        return None;
+    }
+    // SAFETY: the exact-size success above initialized the whole record.
+    let info = unsafe { info.assume_init() };
+    if u32::try_from(pid).ok()? != info.pbi_pid {
+        return None;
+    }
+    let comm: String = info
+        .pbi_comm
+        .iter()
+        .take_while(|c| **c != 0)
+        .map(|c| char::from(c.to_ne_bytes()[0]))
+        .collect();
+    let mut pids = [0 as libc::pid_t; ROOT_CHILDREN_MAX];
+    let bytes = i32::try_from(std::mem::size_of_val(&pids)).ok()?;
+    // SAFETY: `pids` is `bytes` writable bytes of pid_t slots; libproc writes
+    // at most that many and answers how many pids it wrote, or -1.
+    let found = unsafe { proc_listchildpids(pid, pids.as_mut_ptr().cast(), bytes) };
+    let found = usize::try_from(found).ok()?.min(ROOT_CHILDREN_MAX);
+    let children = pids[..found].iter().copied().filter(|p| *p > 0).collect();
+    Some(SessionRoot { comm, children })
+}
+
+#[cfg(target_os = "linux")]
+fn platform_session_root(pid: i32) -> Option<SessionRoot> {
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    let children = std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children")).ok()?;
+    Some(SessionRoot {
+        comm: comm.trim_end().to_string(),
+        children: children
+            .split_whitespace()
+            .filter_map(|p| p.parse().ok())
+            .take(ROOT_CHILDREN_MAX)
+            .collect(),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn platform_session_root(_pid: i32) -> Option<SessionRoot> {
+    None
+}
+
 /// Windows running-job detection: one Toolhelp32 pass over the system process
 /// list, reporting whether `pid` has any live child. Direct kernel32 FFI in the
 /// house tiny-FFI style (see `aterm-pty/src/windows/ffi.rs`); SDK names are kept

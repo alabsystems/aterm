@@ -278,8 +278,12 @@ fn a_529_waits_its_backoff_then_continues_exactly_once() {
         });
     });
     assert_eq!(count(&m, "turn"), 1, "{lines:#?}\n{:#?}", m.requests);
+    // The act quotes the vendor's line (`wall_retry_text`), never the rote
+    // `keep going`.
     assert!(
-        lines.contains(&"CONTINUED seq=102 rule=api-retry@v1 keep going".to_string()),
+        lines.iter().any(|l| l.starts_with(
+            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported \"API Error: 529 Overloaded."
+        )),
         "{lines:#?}"
     );
     let (records, _) = journal_records(&path);
@@ -1244,7 +1248,7 @@ fn the_no_break_space_composer_takes_the_fenced_continuation() {
     assert!(
         m.attention
             .as_deref()
-            .is_some_and(|a| a.contains("not typed: the composer guard matched no row")),
+            .is_some_and(|a| a.contains("not typed: aterm could not find the prompt line")),
         "{:?}",
         m.attention
     );
@@ -1927,4 +1931,275 @@ fn a_codex_session_is_supervised_end_to_end() {
     let _ = watch_lines(&mut m, &opts);
     assert!(m.presses().is_empty(), "{:#?}", m.requests);
     assert_eq!(count(&m, "turn"), 0, "{:#?}", m.requests);
+}
+
+/// A host whose measure of the API's reach is scripted ([`IdleHost::reach`]):
+/// each ask answers the next entry, the last for ever after; every ask is
+/// counted. It takes no step and owns no turn end.
+#[derive(Debug, Default)]
+struct ReachHost {
+    script: std::sync::Mutex<VecDeque<Reach>>,
+    last: std::sync::Mutex<Reach>,
+    asks: std::sync::atomic::AtomicUsize,
+}
+
+impl ReachHost {
+    fn scripted(script: &[Reach]) -> Arc<Self> {
+        Arc::new(Self {
+            script: std::sync::Mutex::new(script.iter().copied().collect()),
+            ..Self::default()
+        })
+    }
+
+    fn asks(&self) -> usize {
+        self.asks.load(Ordering::SeqCst)
+    }
+}
+
+impl IdleHost for ReachHost {
+    fn wants(&self) -> bool {
+        false
+    }
+    fn at_idle(&self) -> Option<HostStep> {
+        None
+    }
+    fn owns_turn_end(&self) -> bool {
+        false
+    }
+    fn reach(&self) -> Reach {
+        self.asks.fetch_add(1, Ordering::SeqCst);
+        let mut last = self.last.lock().unwrap();
+        if let Some(next) = self.script.lock().unwrap().pop_front() {
+            *last = next;
+        }
+        *last
+    }
+}
+
+/// The outage's screen: Claude Code 2.1.283's `⏺ API Error: Can't reach
+/// the API server … (ENOTFOUND)` after the vendor's 3 minutes of retries.
+fn enotfound() -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::API_ERROR_ENOTFOUND)
+}
+
+/// Clocks that keep every rung and the hold an hour off: at the network
+/// wall only the host's measure can move the loop.
+fn far_rungs() -> TurnEndTiming {
+    let hour = Duration::from_secs(3600);
+    TurnEndTiming {
+        net_backoff: vec![hour],
+        down_hold: hour,
+        ..TurnEndTiming::default()
+    }
+}
+
+/// One run of the outage's point under a host scripted `script`: the lines,
+/// the host, the server's record of the run, and the journal's `WAITING`
+/// rows' summaries.
+fn outage_under(script: &[Reach], max_s: u64) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
+    outage_timed(script, max_s, far_rungs())
+}
+
+/// [`outage_under`] with the policy's clocks `timing`.
+fn outage_timed(
+    script: &[Reach],
+    max_s: u64,
+    timing: TurnEndTiming,
+) -> (Vec<String>, Arc<ReachHost>, Mock, Vec<String>) {
+    let host = ReachHost::scripted(script);
+    let tag = timing.net_backoff.first().map_or(0, Duration::as_secs);
+    let (dir, path) = journal_file(&format!("te-outage-{}-{max_s}-{tag}", script.len()));
+    let mut m = Mock::new(
+        true,
+        vec![busy_screen(), enotfound(), busy_screen(), ended(STOP)],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        journal: Some(path.clone()),
+        ..hosted(max_s)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| s.set_turn_end_timing(timing));
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let waiting = records
+        .into_iter()
+        .filter(|r| r.kind == "waiting")
+        .map(|r| r.summary)
+        .collect();
+    (lines, host, m, waiting)
+}
+
+/// The `await`s the loop made before its first `turn` (none: every one).
+fn awaits_before_turn(m: &Mock) -> usize {
+    let end = m
+        .requests
+        .iter()
+        .position(|r| r.starts_with("turn "))
+        .unwrap_or(m.requests.len());
+    m.requests[..end]
+        .iter()
+        .filter(|r| r.starts_with("await "))
+        .count()
+}
+
+/// THE API BACK, WITHIN ONE STEP (the outage of 2026-09-27: the network came
+/// back at 19:15, and a rung may be minutes off). At the outage's point the
+/// host measures the API DOWN — the hold is journaled, nothing typed — and
+/// its measure turns UP while the loop waits: the point is decided again
+/// at the top of the very next step, and continued EXACTLY ONCE under
+/// `api-back@v1`, in words that quote the vendor and say the API is back,
+/// with no rung and no hold waited out. Each further Down answer costs
+/// exactly one step more (the same run with one more Down makes exactly one
+/// more `await` before the `turn`). NEGATIVE CONTROL: a host that stays
+/// DOWN types nothing before the hold — the point is held, and journaled so.
+#[test]
+fn an_up_measure_mid_wait_continues_the_outage_within_one_step() {
+    let t = Instant::now();
+    let down = Reach::Down { since: t };
+    let up = Reach::Up {
+        since: t + Duration::from_secs(1),
+    };
+    let (lines, host, m, waiting) = outage_under(&[down, down, down, up], 30);
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(continued.len(), 1, "{lines:#?}");
+    assert!(
+        continued[0].starts_with(
+            "CONTINUED seq=102 rule=api-back@v1 Claude Code reported \"API Error: Can't reach the \
+             API server"
+        ) && continued[0].contains("the API is reachable again now"),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert_eq!(waiting.len(), 1, "the hold, said once: {waiting:#?}");
+    assert!(waiting[0].contains("the API is unreachable"), "{waiting:?}");
+    // Asked at the point, at the top of each of the three steps, and by the
+    // decision the Up made and the act's record of it — never after the
+    // wall left (the next point, a request for a decision, asks nothing).
+    assert_eq!(host.asks(), 6, "{lines:#?}");
+
+    // One Down more is exactly one step more: the Up acts in its own step.
+    let (_, _, longer, _) = outage_under(&[down, down, down, down, up], 30);
+    assert_eq!(
+        awaits_before_turn(&longer),
+        awaits_before_turn(&m) + 1,
+        "{:#?}\n{:#?}",
+        m.requests,
+        longer.requests
+    );
+
+    // NEGATIVE CONTROL: the host stays Down — nothing typed before the hold.
+    let (lines, host, m, waiting) = outage_under(&[down], 1);
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "{lines:#?}"
+    );
+    assert!(
+        waiting.iter().any(|w| w.contains("the API is unreachable")),
+        "{waiting:#?}"
+    );
+    assert!(host.asks() > 2, "asked at each step while it waited");
+}
+
+/// A DOWN LOST IS BACK ON THE LADDER (the review of 2026-09-27): at the
+/// outage's point the host measures the API DOWN, and the hold (an hour
+/// here) is journaled; while the loop waits, the measure is LOST (a stale
+/// measure, a probe past its budget: `Unknown`). The point is decided again
+/// at the top of that step, as the policy and its model decide on the
+/// measure as it stands — here the unmeasured wall's ladder, whose first
+/// rung is already past — and continued once under `api-retry@v1`, never
+/// held out to the Down's hour. NEGATIVE CONTROL: the same clocks with the
+/// host staying Down type nothing (the hold stands).
+#[test]
+fn a_down_measure_lost_mid_wait_puts_the_outage_back_on_the_ladder() {
+    let t = Instant::now();
+    let down = Reach::Down { since: t };
+    let clocks = || TurnEndTiming {
+        net_backoff: vec![Duration::ZERO],
+        down_hold: Duration::from_secs(3600),
+        ..TurnEndTiming::default()
+    };
+    let (lines, _, m, waiting) = outage_timed(&[down, down, Reach::Unknown], 30, clocks());
+    let continued: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(continued.len(), 1, "{lines:#?}");
+    assert!(
+        continued[0].starts_with(
+            "CONTINUED seq=102 rule=api-retry@v1 Claude Code reported \"API Error: Can't reach \
+             the API server"
+        ) && continued[0].contains("; trying again."),
+        "{lines:#?}"
+    );
+    assert_eq!(count(&m, "turn"), 1, "{:#?}", m.requests);
+    assert_eq!(waiting.len(), 1, "the hold, said once: {waiting:#?}");
+    assert!(waiting[0].contains("the API is unreachable"), "{waiting:?}");
+
+    // NEGATIVE CONTROL: the host stays Down — the hold stands.
+    let (lines, _, m, _) = outage_timed(&[down], 1, clocks());
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}\n{:#?}", m.requests);
+    assert!(
+        !lines.iter().any(|l| l.starts_with("CONTINUED")),
+        "{lines:#?}"
+    );
+}
+
+/// ASKING IS WAITING: an ordinary point — a turn that ended after work, a
+/// request for a decision — never asks the host for the API's reach, so a
+/// host's probe runs only while some loop waits at a network wall. And at a
+/// network wall the owner's policy ESCALATES (`retry_api_errors = false`),
+/// the host is asked once, at the point, and never again: no wait of the
+/// policy's stands, so a measure turning up cannot decide the point again —
+/// and post its ask again (`escalate_point` has no dedupe but the point).
+#[test]
+fn an_ordinary_or_escalated_point_never_asks_for_the_reach_again() {
+    let host = ReachHost::scripted(&[Reach::Up {
+        since: Instant::now(),
+    }]);
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            ended("Fixed the parser; the suite is green."),
+            busy_screen(),
+            ended(STOP),
+        ],
+    );
+    m.turn_releases = Some(1);
+    m.vanish_after = Some(2);
+    let opts = SuperviseOpts {
+        idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    assert!(
+        lines.contains(&"CONTINUED seq=102 rule=continue@v1 keep going".to_string()),
+        "{lines:#?}"
+    );
+    assert_eq!(host.asks(), 0, "an ordinary point asks nothing: {lines:#?}");
+
+    let host = ReachHost::scripted(&[
+        Reach::Down {
+            since: Instant::now(),
+        },
+        Reach::Up {
+            since: Instant::now(),
+        },
+    ]);
+    let mut m = Mock::new(true, vec![busy_screen(), enotfound()]);
+    m.vanish_after = Some(4);
+    let mut off = hosted(30);
+    off.policy.retry_api_errors = false;
+    off.idle_host = Some(Arc::clone(&host) as Arc<dyn IdleHost>);
+    let (lines, _) = watch_lines(&mut m, &off);
+    assert_eq!(count(&m, "turn"), 0, "{lines:#?}");
+    assert_eq!(count(&m, "meta set attention"), 1, "{:#?}", m.requests);
+    assert_eq!(host.asks(), 1, "only at the point: {lines:#?}");
 }

@@ -34,6 +34,9 @@ const COMPATIBILITY_ONLY_KEYS: &[&str] = &[
     "matrix_rain.materialize",
     "matrix_rain.ink_text",
     "matrix_rain.phosphor",
+    // The post-update card it decorated was deleted (759ba0593); the key still
+    // parses so an authored value keeps loading, and it drives nothing.
+    crate::prefs::EDIT_NOTICE_SPARKLE,
 ];
 /// Typed compatibility metadata shared with non-editing inventory surfaces
 /// such as Modified. A retired key may retain schema type information so
@@ -1016,7 +1019,21 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "harness.retry_api_errors",
         "Retry after an API error or an overload",
         ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["supervisor", "529", "overloaded", "retry"],
+        &[
+            "supervisor",
+            "529",
+            "overloaded",
+            "retry",
+            "offline",
+            "network",
+        ],
+        true,
+    ),
+    manual(
+        "harness.probe_api",
+        "Check the API is reachable while a session waits on a network error",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["supervisor", "offline", "network", "reachable", "probe"],
         true,
     ),
     manual(
@@ -1211,9 +1228,9 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     ),
     manual(
         "privacy.notice",
-        "Show the macOS access card",
+        "Suggest Full Disk Access",
         ConfigSchemaKind::Scalar(EditKind::Bool),
-        &["tcc", "full disk access", "card", "notice"],
+        &["tcc", "full disk access", "message", "notice"],
         true,
     ),
     manual(
@@ -1604,8 +1621,8 @@ pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
                      key,
                      label,
                      kind,
+                     seed,
                      placeholder,
-                     ..
                  }| ConfigSchemaEntry {
                     key,
                     label,
@@ -1620,7 +1637,14 @@ pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
                     } else {
                         ConfigSchemaKind::Scalar(kind)
                     },
-                    placeholder,
+                    // A switch has no placeholder channel, so its resolved
+                    // default lives in `seed` (from `Config::default()` here);
+                    // Manual's hover shows it as the default.
+                    placeholder: if placeholder.is_empty() && matches!(kind, EditKind::Bool) {
+                        seed.unwrap_or_default()
+                    } else {
+                        placeholder
+                    },
                     keywords: crate::prefs::keywords_of(key),
                     native_scalar: !crate::prefs::manual_only_key(key),
                     manual_reset_safe: false,
@@ -4459,7 +4483,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         .unwrap_or_default();
     let constraint = match setting.key {
         crate::prefs::EDIT_CHOICE_SOUND => {
-            " · one quiet chime when the in-window supervisor answers Claude Code's question dialog ([harness] answer_questions, or the session's meta set questions); plays for a background tab too, at most once per 2 s · quiets only the chime; the band's ◆ chose flash and the rim pulse stay · subordinate to trail_sounds and trail_sound_volume, silent in serious mode · audio playback is macOS-only"
+            " · a quiet chime when aterm answers a Claude Code question for you, at most once per 2 s · scaled by trail_sound_volume, silent with trail_sounds off or in serious mode · macOS only"
         }
         crate::prefs::EDIT_MINIMUM_CONTRAST => {
             " · translucent backgrounds enforce at least 4.5:1 text contrast"
@@ -4496,10 +4520,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · an invited guest: off until you turn him on · once enabled, typing robi or robot makes him greet you · hidden under reduced motion or serious mode"
         }
         crate::prefs::EDIT_SECURE_KEYBOARD_ENTRY => {
-            " · macOS only: blocks other processes from observing keystrokes (EnableSecureEventInput — the guard iTerm2 offers under this name) · held only while aterm is frontmost, per Apple's TN2150 fairness guidance, so other apps' global hotkeys and clipboard managers are suppressed only then · applied at launch and on every save"
-        }
-        crate::prefs::EDIT_NOTICE_SPARKLE => {
-            " · decorative only: the post-update card wears a hue-cycling badge and a ring of twinkling sparkles · reduced motion keeps the colour and holds it still · no other notice is affected"
+            " · macOS only: while aterm is in front, other apps cannot read your keystrokes, and their global hotkeys pause"
         }
         // Every SYNTH voice shares the one macOS-only output path, so they share
         // one platform caveat. Grown with the Sound menu: these keys are now
@@ -4531,10 +4552,10 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · GPU renderer only; parsed and preserved but inert while the CPU renderer is active"
         }
         crate::prefs::EDIT_CONFIRM_MULTILINE_PASTE => {
-            " · prompts only for unbracketed multiline paste; bracketed paste bypasses the dialog · live on every platform: the macOS sheet, the Windows dialog, and the Linux in-window banner"
+            " · asks before pasting more than one line into a program that does not use bracketed paste"
         }
         crate::prefs::EDIT_OPTION_AS_META => {
-            " · true sends ESC-prefixed Meta on every platform; false forwards OS-composed text when available while non-text Alt chords remain encoded"
+            " · true: Option/Alt acts as Meta in shells and editors · false: it types your keyboard layout's characters (é, ü, …)"
         }
         crate::prefs::EDIT_ALLOW_NOTIFICATIONS => {
             " · desktop delivery is implemented on macOS and Windows; parsed but inert on other platforms"
@@ -4554,7 +4575,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             }
         }
         crate::prefs::EDIT_SEARCH_HISTORY_LINES => {
-            " · 0 searches only the live screen; a bounded index can report partial results for older retained history"
+            " · Find searches only this many of the newest lines; 0 searches only the screen"
         }
         crate::prefs::EDIT_PACKAGES_ENABLED => {
             " · Automatic updates — the one switch for the background package service (the retired auto_update is read as it), read live by the window (off stands it down within seconds, on resumes it); a published public index is picked up within minutes, and a full signed check runs every six hours across every aterm on the machine; explicit package commands and Check & Update Now remain available when the trust-root gate is open"
@@ -7161,12 +7182,12 @@ expect_nonce = "pin"
         assert!(help_for("trail_sounds").contains("audio playback is macOS-only"));
         assert!(help_for("columns").contains("default 80"));
         assert!(help_for("lines").contains("default 24"));
-        assert!(help_for("confirm_multiline_paste").contains("live on every platform"));
+        assert!(help_for("confirm_multiline_paste").contains("more than one line"));
         assert!(
             help_for("allow_notifications")
                 .contains("desktop delivery is implemented on macOS and Windows")
         );
-        assert!(help_for("option_as_meta").contains("ESC-prefixed Meta on every platform"));
+        assert!(help_for("option_as_meta").contains("types your keyboard layout's characters"));
         // The native updater runs on macOS AND Linux (`aterm_update::enabled`): the
         // `[update]` help names both and each platform's own manual lane, never
         // "macOS-only" (2026-09-24 review — the Settings card and the registry already
@@ -8415,7 +8436,8 @@ sty"#;
         }
 
         let help_for = |key: &str| setting_help(config_schema_entry(key).unwrap());
-        assert!(!help_for("cursor_blink").contains(" · default"));
+        // A switch shows its resolved default once, from its seed.
+        assert!(help_for("cursor_blink").contains(" · default true"));
         assert!(!help_for("tab_strip_rows").contains(" · default"));
         assert_eq!(
             help_for("window_theme")
@@ -8467,11 +8489,11 @@ sty"#;
         assert!(help_for(crate::prefs::EDIT_FONT_WEIGHT).contains("provides a wght axis"));
         assert!(
             help_for(crate::prefs::EDIT_SEARCH_HISTORY_LINES)
-                .contains("0 searches only the live screen")
+                .contains("0 searches only the screen")
         );
         assert!(
             help_for(crate::prefs::EDIT_CONFIRM_MULTILINE_PASTE)
-                .contains("bracketed paste bypasses the dialog")
+                .contains("does not use bracketed paste")
         );
     }
 

@@ -439,9 +439,18 @@ fn probe_row(
              {meaning} (docs/RELEASE-PROOF-DISCIPLINE.md).\n  {report}{earlier}\n\
              --- probe stderr ---\n{stderr}"
         ),
+        // EXIT 2 IS THE MACHINE'S TOO (2026-09-26): the probe decided nothing —
+        // no binary, no `sips`, a socket that never bound, a capture that
+        // failed — so the message opens with the gate's COULD NOT RUN sentinel
+        // and the row is recorded as could-not-run, never as a finding. That
+        // costs no vigilance: a launch that exited before binding can be a
+        // crash in the code, and COULD NOT RUN is never green — the MEASURE
+        // tier's receipt then says `measured no`, and a release cut refuses the
+        // tree until a run measures it.
         Some(2) => panic!(
-            "PAINT CONFORMANCE COULD NOT RUN [{shape}]: the probe decided nothing, which is not \
-             a pass.\n  {report}{earlier}\n--- probe stderr ---\n{stderr}"
+            "aterm-gate: COULD NOT RUN — PAINT CONFORMANCE COULD NOT RUN [{shape}]: the probe \
+             decided nothing, which is not a pass.\n  {report}{earlier}\n\
+             --- probe stderr ---\n{stderr}"
         ),
         // EXIT 3, added 2026-09-17: the take RAN and is not evidence — its own
         // instrument disowns it (`evidence=unproved` on the line). Neither a
@@ -454,8 +463,8 @@ fn probe_row(
         //
         // AND IT IS THE MACHINE'S, NOT THE TREE'S (2026-09-23): the message
         // opens with the merge gate's COULD NOT RUN sentinel, so the gate
-        // records this row as could-not-run rather than as a finding. Exit 2
-        // does not: a launch that never answered can be a crash in the code.
+        // records this row as could-not-run rather than as a finding — as it
+        // does exit 2's since 2026-09-26 (above).
         Some(3) => panic!(
             "aterm-gate: COULD NOT RUN — PAINT CONFORMANCE UNPROVED [{shape}]: the take is not \
              evidence about paint — see \

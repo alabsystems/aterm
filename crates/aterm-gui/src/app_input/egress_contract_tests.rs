@@ -125,6 +125,11 @@ fn read_until(fd: i32, want: usize) -> Vec<u8> {
     got
 }
 
+/// Close a fixture's pipe. The sink over `pipe[1]` BORROWS the fd, so call
+/// this only once that sink's ordered writer has nothing admitted
+/// (`ordered_egress_count() == 0`): a queued job keeps the sink — and its
+/// serializer's registry entry, keyed by this fd number — alive after the
+/// close, and the next `pipe()` may be handed the number.
 fn close_pipe(pipe: [i32; 2]) {
     unsafe {
         libc::close(pipe[0]);
@@ -965,9 +970,84 @@ fn a_motion_flood_behind_a_paste_never_refuses_a_key() {
     );
     assert!(receipt.is_queued());
     sink.sever_input();
+    // Drain before closing: every admitted job holds this BORROWED sink, and
+    // closing the pipe under a writer still draining them frees its fd number
+    // to the next fixture while this serializer stays registered — live —
+    // under it (the 2026-09-27 flake; see
+    // `a_sinks_admission_never_reads_an_fd_number_twins_serializer`).
+    assert!(
+        wait_until(Duration::from_secs(5), || sink.ordered_egress_count() == 0),
+        "the sever released the paste, the flood and the key"
+    );
     drop(mirror);
     drop(app);
     drop(sink);
+    close_pipe(pipe);
+}
+
+/// A SINK'S ADMISSION IS ITS OWN, NEVER AN FD-NUMBER TWIN'S (2026-09-27).
+/// The merge contract on ec742fb1f (18 test threads) failed
+/// `the_conpty_route_sends_every_report_through_the_ordered_writer` at its
+/// first `admitted_for_test(&sink) == (0, 0)` with `(225, 306092)`: exactly
+/// what [`a_motion_flood_behind_a_paste_never_refuses_a_key`] leaves admitted
+/// (one paste, the flood up to a paste's job room, one key). That fixture
+/// closed its borrowed pipe while its writer was still draining; each queued
+/// job holds the old sink, so its serializer stayed registered under the fd
+/// number — LIVE, which is why pruning dead sinks could not drop it — and the
+/// next fixture's `pipe()` was handed that number. The registry is keyed by
+/// the number, so the helper read the other sink's budget.
+///
+/// Built here without load: a paste parks on a filled pipe (its sink's
+/// serializer holds one admitted job), and a second sink is built on the
+/// SAME fd number. RED before: the twin reported the parked paste's budget.
+/// Positive control: the owner still reports it.
+#[test]
+fn a_sinks_admission_never_reads_an_fd_number_twins_serializer() {
+    let (app, owner, pipe) = super::typed_kitty_summon_tests::app_with_private_pty();
+    aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking master");
+    owner.note_master_nonblocking(true);
+    fill(pipe[1]);
+    let meter = Arc::new(BulkMeter::new());
+    enqueue(
+        &app,
+        &owner,
+        InputEvent::Paste(
+            "a".repeat(256 * 1024),
+            PasteFraming::Gesture { bracketed: false },
+        ),
+        None,
+        Some(meter.clone()),
+    )
+    .expect("the paste");
+    assert!(
+        wait_until(Duration::from_secs(5), || meter.progress().state
+            == BulkState::Writing),
+        "the paste is parked on the full pipe"
+    );
+    let (jobs, bytes) = paste_order::admitted_for_test(&owner);
+    assert_eq!(
+        jobs, 1,
+        "positive control: the owner's parked paste is admitted"
+    );
+    assert!(bytes >= 256 * 1024);
+
+    let twin = Arc::new(SinkWriter::new(pipe[1]));
+    assert_eq!(twin.master(), owner.master(), "the same registry key");
+    assert_eq!(
+        paste_order::admitted_for_test(&twin),
+        (0, 0),
+        "a sink with no serializer of its own has admitted nothing"
+    );
+
+    owner.sever_input();
+    assert!(
+        wait_until(Duration::from_secs(5), || owner.ordered_egress_count() == 0),
+        "the sever released the parked paste"
+    );
+    assert_eq!(paste_order::admitted_for_test(&owner), (0, 0));
+    drop(twin);
+    drop(app);
+    drop(owner);
     close_pipe(pipe);
 }
 

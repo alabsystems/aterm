@@ -63,7 +63,7 @@
 use crate::anchors::anchor_text;
 use crate::phase::{Phase, leading_spaces};
 use crate::prompt::{Cancel, CancelEffect, Opt, PromptKind, PromptV2, Role, Select};
-use crate::wall::{Placement, Wall, WallKind};
+use crate::wall::{ApiCause, Placement, Wall, WallKind};
 
 /// The agent's and the transcript's own row glyphs, in column 0: an agent
 /// block, an error or interrupt, an approval echo (`✔ You approved codex to
@@ -440,6 +440,7 @@ pub fn wall(rows: &[String]) -> Option<Wall> {
             WallKind::ApiError {
                 code,
                 retryable: code.is_none_or(|c| matches!(c, 408 | 409 | 429) || c >= 500),
+                cause: ApiCause::Server,
             }
         }
     };

@@ -675,7 +675,11 @@ impl Toolchain {
         } else {
             None
         };
-        crate::identity::ToolchainIdentity { files, commit }
+        crate::identity::ToolchainIdentity {
+            files,
+            commit,
+            checkers: None,
+        }
     }
 
     /// PATH for every child: the stage2 directory first, but only when a `targo`

@@ -15,7 +15,8 @@
 //! path or question is named by its OWN first row ([`prompt_box_first_row`],
 //! never a transcript row above it — main's round-25 fix, fed20fadf). Every
 //! part is on one line and cut by terminal cells, a wide character two
-//! ([`cut_cells`]). A limit keeps its own `limited: <message> reset=<when>`.
+//! ([`cut_cells`]). A limit keeps its own `limited: <message>` (the message
+//! names its reset).
 //!
 //! Mail goes only where it can land: `kind=ask` (a box, a question) and
 //! `kind=control` (a limit) are posted only while `status` says

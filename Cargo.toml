@@ -80,7 +80,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.95.0"
+version = "0.96.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -580,6 +580,25 @@ opt-level = "z"
 
 [profile.release.package.aterm-gpu-web]
 opt-level = "z"
+
+# THE MERGE GATE'S OWN BUILD (2026-09-26). `tools/verify.sh` compiles
+# aterm-verify before every invocation — `--help` included — and it did so
+# under [profile.release] above: fat LTO and one codegen unit,
+# the shipping engine's settings, for a std-only orchestrator of child
+# processes. The audit of 2026-09-24 caught two of those builds queued on one
+# target dir at once, one of them for `verify.sh --help`, each at `-C lto -C
+# codegen-units=1`. This profile keeps release's semantics — no
+# debug-assertions, no overflow checks, stripped — and drops what only a
+# shipped binary pays for. Measured 2026-09-26, each from an empty profile
+# dir at load ~100 on 14 cores: 9 s under this profile, 37 s under release.
+# `tools/verify.sh` builds `--profile gate` and runs
+# `target-gate.noindex/gate/aterm-verify`; both halves, and these values, are
+# pinned by crates/aterm-verify/tests/profile_pin.rs.
+[profile.gate]
+inherits = "release"
+lto = false
+codegen-units = 16
+opt-level = 1
 
 # Same codegen as release but keeps symbols, for sampling profilers (sample/samply):
 #   cargo build --profile profiling -p aterm-gui

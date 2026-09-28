@@ -153,6 +153,20 @@ pub struct Row {
     /// met again or not: without it the band row resolved at every re-arm and
     /// a new one was posted a minute later, every [`upgrade::RETRY_S`].
     pub last_stop: String,
+    /// THE SAME STOP IN A ROW (`St::stop_streak`, `St::streak_why`): how many
+    /// rounds in a row stopped for [`Self::streak_why`]. A first stop the
+    /// harness asks again after is the upgrade working (a record); a stop
+    /// that repeats is the person's to see ([`Self::repeating_stop`], ruling
+    /// 283).
+    pub stop_streak: u32,
+    pub streak_why: String,
+    /// A round that GAVE UP holding a late READY its last look heard
+    /// (Claude Code's lane, `St::ready_since`): it acts on the answer — the
+    /// restart, or its void — and starts no new round while it stands
+    /// ([`upgrade::retry_due`]), so no next round is due, however long it has
+    /// rested ([`Self::next_round_in`]; the no-stall review of 2026-09-27:
+    /// `next_round=due` stood over such a round).
+    pub late_ready: bool,
 }
 
 impl Row {
@@ -182,18 +196,26 @@ impl Row {
                 0
             },
             last_stop: st.last_stop.clone(),
+            stop_streak: st.stop_streak,
+            streak_why: st.streak_why.clone(),
+            // A Codex round that gave up hears no late READY (its lane's rule),
+            // whatever READY clock its announced round left behind.
+            late_ready: st.agent == upgrade::Agent::Claude
+                && matches!(&st.phase, Phase::Failed(why) if why == upgrade::GAVE_UP)
+                && st.ready_since != 0,
         };
         row.stalled = row.stall(now);
         row
     }
 
     /// Seconds until this stopped round's next one ([`Self::retry_at`]):
-    /// `Some(0)` when it is due, `None` for a round that has not stopped or
+    /// `Some(0)` when it is due, `None` for a round that has not stopped,
     /// that the owner's word holds (a skip is not re-armed; a deferral is,
-    /// once it runs out).
+    /// once it runs out), or that gave up holding a late READY it acts on
+    /// ([`Self::late_ready`]: no new round starts while the answer stands).
     #[must_use]
     pub fn next_round_in(&self, now: u64) -> Option<u64> {
-        if !matches!(self.phase, Phase::Failed(_)) || self.owner_holds(now) {
+        if !matches!(self.phase, Phase::Failed(_)) || self.owner_holds(now) || self.late_ready {
             return None;
         }
         Some(self.retry_at.saturating_sub(now))
@@ -287,6 +309,13 @@ impl Row {
             Phase::Pending | Phase::Announced { .. } => {
                 if let Some(owner) = self.wait.strip_prefix("terminal:") {
                     Some(format!("held-back:{}", word(owner)))
+                } else if self.repeating_stop() {
+                    // A STOP THAT REPEATS (ruling 283) stays the stall through
+                    // the re-armed round, until it moves (a restart in flight,
+                    // Done) or stops for another reason: the band keeps ONE
+                    // entry for it instead of resolving it at every re-arm and
+                    // posting a new one at the next stop.
+                    Some(format!("failed:{}", word(&self.streak_why)))
                 } else {
                     overdue
                 }
@@ -312,11 +341,36 @@ impl Row {
     #[must_use]
     pub fn stall_words(&self, now: u64) -> Option<String> {
         let stall = self.stall(now)?;
-        let behind = upgrade::span(now.saturating_sub(self.behind_since));
+        // How long, in a person's words (`behind for 8 h`, never `8h28m`),
+        // and only where the start is known (design ruling 308: a start of 0
+        // printed `behind for 20721d4h`, the time since 1970).
+        let behind = behind_words(self.behind_since, now).map(|b| format!("behind for {b}"));
+        let with = |what: &str| match &behind {
+            Some(b) => format!("{b}: {what}"),
+            None => what.to_string(),
+        };
         Some(match stall.as_str() {
+            // A round that gave up and then heard a late READY acts on that
+            // answer ([`Self::late_ready`]): no rest, and no asking again,
+            // while it stands.
+            "overdue" if self.late_ready => {
+                let late = with(
+                    "it agreed to the move after the upgrade stopped asking, and the upgrade acts \
+                     on that answer",
+                );
+                match self.wait_words() {
+                    Some(what) => format!("{late} ({what})"),
+                    None => late,
+                }
+            }
+            // A round that gave up and rests (ruling 283): what happened and
+            // what comes next, never the step's `failed` word.
+            "overdue" if matches!(&self.phase, Phase::Failed(why) if why == upgrade::GAVE_UP) => {
+                with("it has not agreed to the move yet, so the upgrade rests, then asks again")
+            }
             "overdue" => match self.wait_words() {
-                Some(what) => format!("behind for {behind}: {what}"),
-                None => format!("behind for {behind}"),
+                Some(what) => with(what),
+                None => behind.unwrap_or_else(|| "it has not moved yet".to_string()),
             },
             kind => stall_reason(self.agent, kind),
         })
@@ -331,9 +385,46 @@ impl Row {
     /// 18, day four, D5:
     /// it stood as a warn row with a tab mark beside it). The window records
     /// it and marks nothing ([`Self::badge`]).
+    ///
+    /// A ROUND THAT STOPPED AND WILL ASK AGAIN ON ITS OWN is the same (the
+    /// owner, 2026-09-27: "you should NEVER have upgrades stalled"; ruling
+    /// 283): one that gave up — the agent gave no READY it could act on —
+    /// and the FIRST stop of any other reason that is not a refusal (which a
+    /// new round meets again) nor a Codex move whose TUI is gone
+    /// ([`Self::failed_after_exit`]: nothing runs in the tab to ask). Each
+    /// rests until [`Self::retry_at`] and the next round asks again. A stop
+    /// that repeats ([`Self::repeating_stop`]) is no longer the upgrade
+    /// working: a row.
     #[must_use]
     pub fn asks_on_its_own(&self, now: u64) -> bool {
-        matches!(self.phase, Phase::Announced { .. }) && self.remedy(now) == Some(Remedy::Waits)
+        match &self.phase {
+            Phase::Announced { .. } => self.remedy(now) == Some(Remedy::Waits),
+            // A USAGE LIMIT ends by itself, before a notice as after one
+            // (ruling 307): `limited` holds from the transcript's limit row
+            // to its named reset — days, for a weekly limit — and nothing the
+            // owner presses moves it sooner, so it is a record whatever the
+            // phase, never a warn row with a tab mark that the phase alone
+            // flipped.
+            Phase::Pending => self.wait == "limited" && self.remedy(now) == Some(Remedy::Waits),
+            Phase::Failed(why) => {
+                !self.owner_holds(now)
+                    && (why == upgrade::GAVE_UP
+                        || (!refusal(why) && !self.failed_after_exit() && !self.repeating_stop()))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether the latest stop is one that REPEATED — the same reason two
+    /// rounds or more in a row, not a refusal and not a give-up (ruling 283):
+    /// the rest now stretches ([`upgrade::rest_extension`]), and the person
+    /// is shown it.
+    #[must_use]
+    pub fn repeating_stop(&self) -> bool {
+        self.stop_streak >= 2
+            && !self.streak_why.is_empty()
+            && self.streak_why != upgrade::GAVE_UP
+            && !refusal(&self.streak_why)
     }
 
     /// What a Codex wait the owner cannot move by `--now` stands for, in a
@@ -409,16 +500,19 @@ impl Row {
     /// [`Self::retry_at`]: [`Remedy::AskAgain`] is its remedy all the same, so
     /// the words the window offers for it keep `Upgrade now`.
     #[must_use]
+    ///
+    /// Before its rest ends it reads `overdue` once that far behind, as every
+    /// round does, while its step waits `failed` — which `--now` does move:
+    /// until ruling 283 that read [`Remedy::Waits`], and the row said
+    /// `Upgrade now` could not move it and dropped the capsule that does.
     pub fn remedy(&self, now: u64) -> Option<Remedy> {
-        let Some(stall) = self.stall(now) else {
-            return (matches!(&self.phase, Phase::Failed(why) if why == upgrade::GAVE_UP)
-                && !self.owner_holds(now))
-            .then_some(Remedy::AskAgain);
-        };
+        if matches!(&self.phase, Phase::Failed(why) if why == upgrade::GAVE_UP) {
+            return (!self.owner_holds(now)).then_some(Remedy::AskAgain);
+        }
+        let stall = self.stall(now)?;
         Some(match stall.as_str() {
             "overdue" if now_moves_past(&self.wait) => Remedy::Now,
             "overdue" => Remedy::Waits,
-            "gave-up" => Remedy::AskAgain,
             s if s.starts_with("held-back:") => Remedy::InItsPane,
             _ if self.failed_after_exit() => Remedy::ResumeInTab,
             _ => Remedy::ByHand,
@@ -526,6 +620,17 @@ impl Row {
                 self.request.word(),
                 behind,
             ),
+            // A ROUND THAT STOPPED AND ASKS AGAIN ON ITS OWN — resting after
+            // it gave up, or after a first stop (ruling 283) — is pending on
+            // its next round, however far behind (day five, D20: a 7-hour
+            // give-up read `stalled/…/overdue:failed` and a first stop
+            // `stalled/…/failed:signal-refused`, beside a band that said it
+            // retries later; the owner: "you should NEVER have upgrades
+            // stalled"). `--status` keeps the stall word (`stalled=`) and the
+            // stop (`phase=`).
+            _ if matches!(self.phase, Phase::Failed(_)) && self.asks_on_its_own(now) => {
+                ("pending", self.next_round_word(now), behind)
+            }
             // An OVERDUE stall names what it waits on (round 18, day four,
             // D17: two tabs, one mid-turn and one on its own work, both read
             // a bare `overdue`).
@@ -557,8 +662,13 @@ impl Row {
     }
 
     /// `next-round:<span>` until a stopped round's next one, `next-round:due`
-    /// once it is due (the next look re-arms it); `-` for any other row.
+    /// once it is due (the next look re-arms it), `ready` for a round that
+    /// gave up and acts on a late READY instead ([`Self::late_ready`]); `-`
+    /// for any other row.
     fn next_round_word(&self, now: u64) -> String {
+        if self.late_ready {
+            return "ready".to_string();
+        }
         match self.next_round_in(now) {
             Some(0) => "next-round:due".to_string(),
             Some(secs) => format!("next-round:{}", upgrade::span(secs)),
@@ -637,7 +747,9 @@ impl Row {
             ),
             ("done_at", self.done_at),
             // When a stopped round's next one starts (0: not stopped), and
-            // the seconds until then (0: due, or not stopped).
+            // the seconds until then (0: due, or none coming — not stopped,
+            // held by the owner's word, or acting on a late READY; the line's
+            // `next_round=` tells them apart).
             ("retry_at", self.retry_at),
             ("next_round_s", self.next_round_in(now).unwrap_or(0)),
         ] {
@@ -698,22 +810,25 @@ impl Row {
 pub enum Remedy {
     /// `overdue` waiting on nothing, the settling window, the attended-tab
     /// guard, or a turn still running ([`now_moves_past`]): `--now` moves it
-    /// at its next turn end (the settling window waived); `--skip` keeps it
-    /// where it is.
+    /// at its next turn end (the settling window waived) — and one waiting
+    /// behind a full queue of notices (`queued`) has its notice typed once
+    /// more; `--skip` keeps it where it is.
     Now,
     /// `overdue` waiting on what `--now` does NOT waive — the agent's READY
     /// answer, a draft in its composer, a box, a hold, work still running
     /// under it, a background shell or a question waiting on a person:
     /// [`Row::wait`] is named, and `--skip` keeps it where it is.
     Waits,
-    /// `gave-up`: `--now` asks it again — the one stopped kind it re-arms (the
-    /// upgrade giving up, never a refusal).
+    /// A round that gave up ([`upgrade::GAVE_UP`]), resting before it asks
+    /// again: `--now` asks it again at once — the one stopped kind it re-arms
+    /// (the upgrade giving up, never a refusal).
     AskAgain,
     /// `held-back:<owner>`: typing into the tab cannot reach it, so no word
     /// moves it; quit it in its pane and resume it there, or `--skip`.
     InItsPane,
-    /// `refused:*`, `failed:*`: the harness will not restart it; quit it and
-    /// resume it by hand, or `--skip`.
+    /// `refused:*`, `failed:*`: the harness asks it again only after a rest
+    /// ([`Row::retry_at`]); to move it sooner, quit it and resume it by hand,
+    /// or `--skip`.
     ByHand,
     /// A Codex move that stopped AFTER its `/exit` ended the TUI
     /// ([`Row::failed_after_exit`]): nothing runs in the tab to quit, and the
@@ -734,18 +849,25 @@ pub enum Remedy {
 /// waiting on a person; a bare `not-idle`, a status nobody read): `--now`
 /// still asks Claude idle, so nothing ends those but the session itself.
 /// A Codex act that left its text typed and backs off (`left-typed-backoff`)
-/// is tried again at once on `--now`, which lifts the back-off.
+/// is tried again at once on `--now`, which lifts the back-off. A Claude
+/// notice waiting behind a FULL QUEUE of notices the model has not taken
+/// (`queued`, [`upgrade::Facts::queued`]; review of 2026-09-27: the band said
+/// `Upgrade now` could not move it and that it "moves once that ends", of a
+/// limit over by every word) is typed once more on `--now`: the person
+/// asking — never while a limit still stands, which waits `limited`.
 fn now_moves_past(wait: &str) -> bool {
     matches!(
         wait,
-        "" | "settling" | "attended" | "busy" | "not-idle:busy" | "left-typed-backoff"
+        "" | "settling" | "attended" | "busy" | "not-idle:busy" | "left-typed-backoff" | "queued"
     )
 }
 
-/// What a Claude Code wait the owner cannot move by `--now` stands for, in a
-/// person's words ([`Row::wait_words`]): work of the agent's own under it (a
-/// break of its background work, or Claude's own `shell` status at an idle
-/// point). Until 2026-09-26 a Claude row had no words at all. The owner read
+/// What a Claude Code wait stands for, in a person's words
+/// ([`Row::wait_words`]): work of the agent's own under it (a break of its
+/// background work, or Claude's own `shell` status at an idle point), which
+/// `--now` cannot move, and a notice waiting unread behind a full queue
+/// (`queued`), which it can ([`now_moves_past`]). Until 2026-09-26 a Claude
+/// row had no words at all. The owner read
 /// "waiting (background)" beside a promise that the move comes "once that
 /// ends", while two poll loops that could never end held a tab for four days.
 /// The words are SHORT: the band's first line holds 64 characters, so what
@@ -763,15 +885,38 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "not-idle:waiting" => "it asked a question and waits",
         "settling" => "waiting for the tab to settle",
         "attended" => "someone is typing in its tab",
-        "awaiting-ready" | "not-ready" => "waiting for it to answer READY",
+        "awaiting-ready" | "not-ready" => "waiting for it to agree to the move",
         "draft" => "a draft waits in its prompt",
         "box" => "a box on its screen waits for a choice",
         "held" => "its tab is held",
         "limited" => "it is at a usage limit",
+        // Never `notice` (ruling 307): the upgrade's own word for the text it
+        // types, which read as one of the band's rows.
+        "queued" => "it has not read the upgrade's question yet",
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
         w if w.starts_with("not-idle") => "it has not gone idle",
         _ => return None,
+    })
+}
+
+/// How long a session has been behind, in a person's words for a record read
+/// once (design ruling 308): `40 min`, `8 h`, `3 days` — the band's own
+/// elapsed words' units, never the roster's `8h28m`. `None` where the start
+/// is unknown (0, a fixture's or a record's default) or not in the past, or
+/// more than a year back, which no running session has been.
+fn behind_words(since: u64, now: u64) -> Option<String> {
+    const YEAR_S: u64 = 365 * 86_400;
+    let secs = now.checked_sub(since).filter(|_| since > 0)?;
+    if secs == 0 || secs > YEAR_S {
+        return None;
+    }
+    Some(if secs < 3_600 {
+        format!("{} min", (secs / 60).max(1))
+    } else if secs < 48 * 3_600 {
+        format!("{} h", secs / 3_600)
+    } else {
+        format!("{} days", secs / 86_400)
     })
 }
 
@@ -786,10 +931,6 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
         return words.to_string();
     }
     match kind {
-        "gave-up" => format!(
-            "no READY answer it could act on after {} notices",
-            upgrade::MAX_ASKS
-        ),
         "refused:not-a-shell-job" => {
             "it is not its shell's foreground job, so nothing brings it back on the new build"
                 .to_string()
@@ -810,12 +951,41 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
         s if s.starts_with("refused:") => {
             "its launch flags cannot be carried into a resume".to_string()
         }
-        s if s.starts_with("failed:") => format!("the move stopped ({})", &s[7..]),
+        s if s.starts_with("failed:") => stop_words(agent, &s[7..]),
+        // Once, plainly (day five, D23: two lines said it twice, and `no
+        // word moves it` read as jargon); the remedy names the pane.
         s if s.starts_with("held-back:") => format!(
-            "it runs under {}, which typing into the tab does not reach",
+            "it runs inside {}, where the upgrade cannot type to it",
             runs_under(&s[10..])
         ),
         other => other.to_string(),
+    }
+}
+
+/// Why a move stopped, in a person's words (round 19, ruling 283: the band
+/// read `the move stopped (signal-refused)`). Never the raw word — that stays
+/// on `--status` and the `upgrade=` column — and never "restart": the words
+/// say what happened to the agent.
+fn stop_words(agent: upgrade::Agent, why: &str) -> String {
+    let who = match agent {
+        upgrade::Agent::Claude => "Claude",
+        upgrade::Agent::Codex => "Codex",
+    };
+    match why {
+        "signal-refused" => format!("the system refused to stop the old {who}"),
+        "no-resume" => format!("the new {who} never picked the conversation back up"),
+        "stale-exit" => format!("{who} ended and was never started again on the new build"),
+        "shell-gone" => {
+            "the shell it ran in is gone, so there is no prompt to start it at".to_string()
+        }
+        "exited-before-continuing" => format!("the new {who} quit before it carried on"),
+        "relaunch-refused" => {
+            "its prompt refused the line that starts it on the new build".to_string()
+        }
+        "resumed-elsewhere" => {
+            "the conversation was resumed by hand, outside this upgrade".to_string()
+        }
+        _ => "the move stopped before it finished".to_string(),
     }
 }
 
@@ -874,36 +1044,75 @@ fn word(s: &str) -> String {
 /// EVERY UPGRADE RECORD as a [`Row`], sorted by conversation — the tab
 /// `opts` names only, when it names one. Files only: no socket, no lock (each file
 /// is replaced whole by a rename, so a read sees one version or the other).
+/// What cannot be read is left out ([`read_rows`] says whether anything was).
 #[must_use]
 pub fn rows(opts: &Opts) -> Vec<Row> {
     rows_at(opts, now_s())
 }
 
 fn rows_at(opts: &Opts, now: u64) -> Vec<Row> {
-    let Ok(dir) = std::fs::read_dir(state_dir(opts)) else {
-        return Vec::new();
+    read_rows(opts, now).0
+}
+
+/// [`rows_at`], and whether the records were READ WHOLE — `false` for a
+/// state directory there but not listable, a listing that broke off, or a
+/// record listed but not readable, each left out of the rows (review of
+/// 2026-09-27: read as no records, a successor's first look handed the
+/// window no rows, and it withdrew every carried stall row whose tab still
+/// stalled — back as new unread rows at the next look). No directory at all
+/// is whole: nothing was ever recorded. A record removed between the listing
+/// and its read is no record, nor is a directory, and a file that reads but
+/// is no upgrade record (`models.json`, a relaunch's record) is none either.
+fn read_rows(opts: &Opts, now: u64) -> (Vec<Row>, bool) {
+    let dir = match std::fs::read_dir(state_dir(opts)) {
+        Ok(dir) => dir,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), true),
+        Err(_) => return (Vec::new(), false),
     };
-    let mut out: Vec<Row> = dir
-        .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            if path.extension().is_none_or(|x| x != "json") {
-                return None;
+    let mut whole = true;
+    let mut out: Vec<Row> = Vec::new();
+    for entry in dir {
+        let Ok(entry) = entry else {
+            whole = false;
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let Some(session) = path.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                continue;
             }
-            let session = path.file_stem()?.to_string_lossy().into_owned();
-            // The relaunch files its records beside the upgrade's
-            // (`St::cause`): an agent relaunched after an exit, a memory or a
-            // model restart is no upgrade of the tab — the upgrade's own
-            // restart of a conversation with no task is.
-            let st = load(opts, &session).filter(|st| {
-                st.cause.is_empty() || st.cause == super::super::relaunch::CAUSE_UPGRADE_FRESH
-            })?;
-            let ours = opts.only_sid.as_ref().is_none_or(|s| *s == st.tab);
-            ours.then(|| Row::of(&session, &st, now))
-        })
-        .collect();
+            Err(_) => {
+                whole = false;
+                continue;
+            }
+        };
+        // The relaunch files its records beside the upgrade's
+        // (`St::cause`): an agent relaunched after an exit, a memory or a
+        // model restart is no upgrade of the tab — the upgrade's own
+        // restart of a conversation with no task is.
+        let Some(st) = St::from_json(&text).filter(|st| {
+            st.cause.is_empty() || st.cause == super::super::relaunch::CAUSE_UPGRADE_FRESH
+        }) else {
+            continue;
+        };
+        if opts.only_sid.as_ref().is_none_or(|s| *s == st.tab) {
+            out.push(Row::of(&session, &st, now));
+        }
+    }
     out.sort_by(|a, b| a.session.cmp(&b.session));
-    out
+    (out, whole)
 }
 
 /// [`rows`] as `aterm harness upgrade --status` shows them: each one
@@ -1056,6 +1265,28 @@ const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// they check, and [`ask_within`]'s own test proves the wait is waited.
 #[cfg(test)]
 const ASK_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// The prefix of [`ask`]'s refusal of `--now` for a round that STOPPED and
+/// is not the owner's word to re-arm: `stopped:<next round, unix s; 0 at its
+/// next look>:<the CLI's sentence>` — machine words the window reads
+/// ([`refused_stopped`]) and the CLI never prints ([`refusal_sentence`]).
+pub const REFUSED_STOPPED: &str = "stopped:";
+
+/// A `--now` refused because its round stopped ([`REFUSED_STOPPED`]): when
+/// its next round starts (unix seconds, `0` at its next look) and the CLI's
+/// sentence.
+#[must_use]
+pub fn refused_stopped(e: &str) -> Option<(u64, &str)> {
+    let (at, sentence) = e.strip_prefix(REFUSED_STOPPED)?.split_once(':')?;
+    Some((at.parse().ok()?, sentence))
+}
+
+/// What a person at a shell is told for [`ask`]'s refusal: the sentence,
+/// without the machine prefix a window reads.
+#[must_use]
+pub fn refusal_sentence(e: &str) -> &str {
+    refused_stopped(e).map_or(e, |(_, sentence)| sentence)
+}
 
 /// WRITE THE OWNER'S WORD for the upgrade in tab `sid`, under the sweep lock,
 /// with one ledger line (`requested:<word>`). The word is on the TAB: it
@@ -1214,15 +1445,21 @@ fn ask_within(
                 }
                 Phase::Failed(why) => {
                     let row = Row::of(&session, &st, now);
-                    let next = match row.next_round_in(now) {
-                        Some(0) | None => "at its next look".to_string(),
-                        Some(secs) => format!("in {}", upgrade::span(secs)),
+                    let (next, at) = match row.next_round_in(now) {
+                        Some(0) | None => ("at its next look".to_string(), 0),
+                        Some(secs) => (
+                            format!("in {}", upgrade::span(secs)),
+                            now.saturating_add(secs),
+                        ),
                     };
+                    // TYPED for the window (ruling 283): the band words it in
+                    // a person's terms ([`refused_stopped`]); the CLI prints
+                    // the sentence ([`refusal_sentence`]).
                     return Err(format!(
-                        "the upgrade in tab {sid} stopped ({}): `--now` re-arms only one that gave \
-                         up (no READY answer it could act on after its last notice) — this one \
-                         starts a new round on its own {next}; `--skip` keeps it on {}, or quit \
-                         it and resume it by hand",
+                        "{REFUSED_STOPPED}{at}:the upgrade in tab {sid} stopped ({}): `--now` \
+                         re-arms only one that gave up (no READY answer it could act on after its \
+                         last notice) — this one starts a new round on its own {next}; `--skip` \
+                         keeps it on {}, or quit it and resume it by hand",
                         word(why),
                         word(&st.from)
                     ));
@@ -1383,7 +1620,9 @@ impl View {
     /// holders of a set of conversations read by `holders` ([`holders`] in
     /// the host; a script in a test). Only a row [`Row::standing`] is handed
     /// over or marked; session files that cannot be read whole change
-    /// nothing, like a roster that cannot be read.
+    /// nothing, like a roster that cannot be read — and so do upgrade
+    /// records that cannot be read whole ([`read_rows`]): what is handed
+    /// over is a WHOLE LOOK, which the window takes as every tab seen.
     fn refresh_with(
         &mut self,
         opts: &Opts,
@@ -1392,7 +1631,11 @@ impl View {
         holders: &dyn Fn(&BTreeSet<String>) -> Option<Vec<Holder>>,
         summary: &mut dyn FnMut(&[Row]),
     ) -> Option<u64> {
-        let mut mine: Vec<Row> = rows_at(opts, now)
+        let (all, whole) = read_rows(opts, now);
+        if !whole {
+            return None;
+        }
+        let mut mine: Vec<Row> = all
             .into_iter()
             .filter(|r| tab_is_live(tabs, &r.tab))
             .filter(|r| {

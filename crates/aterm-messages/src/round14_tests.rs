@@ -391,15 +391,18 @@ fn a_rows_count_and_percent_agree_and_a_size_has_its_referent() {
 }
 
 /// A CORRECTION CUT KEEPS THE FIX (ruling 261): `windw_padding →
-/// window_padding` whole where it fits, else the correction alone — never
-/// the typo.
+/// window_padding` whole where it fits, else the correction alone behind
+/// its arrow (ruling 306: a bare `window_padding` under `Misspelled
+/// setting` named the right spelling as the wrong one) — never the typo,
+/// and never a clipped key: too narrow for `→ window_padding`, nothing.
 #[test]
 fn a_cut_correction_keeps_the_fix_never_the_typo() {
     use crate::text::shape_detail;
     let excerpt = "windw_padding \u{2192} window_padding";
     assert_eq!(shape_detail(excerpt, 40), excerpt);
-    assert_eq!(shape_detail(excerpt, 29), "window_padding");
-    assert_eq!(shape_detail(excerpt, 14), "window_padding");
+    assert_eq!(shape_detail(excerpt, 29), "\u{2192} window_padding");
+    assert_eq!(shape_detail(excerpt, 16), "\u{2192} window_padding");
+    assert_eq!(shape_detail(excerpt, 15), "");
     assert!(!shape_detail(excerpt, 10).contains("windw"));
 }
 

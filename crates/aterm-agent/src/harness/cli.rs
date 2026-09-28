@@ -382,12 +382,25 @@ answer that work under the agent outlives, is asked again every 30 minutes
 (at a break of the agent's background work too), four notices at most, and
 then that ROUND gives up and names what still runs. NO STOP IS FOR GOOD: a
 round that gave up, was refused, or whose restart stopped rests two hours
-(one round's worth of asking: four notices, 30 minutes apart) and then a NEW
-ROUND starts by itself — new READY markers, its asks reset, `rearmed:<why>` on
-the ledger — whose first notice goes under every gate a first notice does, at
-an idle point or a break (never into a session at its limit). A late READY to
-a round that gave up is still acted on until then; one the agent's own work
-outlives past the drain is void, at a break as at an idle point.
+(one round's worth of asking: four notices, 30 minutes apart; the same stop
+again rests four hours, then eight) and then a NEW ROUND starts by itself —
+new READY markers, its asks reset, `rearmed:<why>` on the ledger — whose
+first notice goes under every gate a first notice does, at an idle point or a
+break (never into a session at its limit). A late READY to a round that gave
+up is still acted on, and no new round starts while it stands; one the
+agent's own work outlives past the drain is void, at a break as at an idle
+point, and the rest begins again from the void. A SESSION AT ITS USAGE LIMIT
+is never asked — its screen showing the limit, or its last
+reply the limit's, until the reset that reply names (30 minutes for one that
+names none) or a `/login` — and a notice a usage limit answered is not asked
+again until the model takes it: nothing is typed behind it and its window
+does not run. Once that limit is over and the screen shows none, the notice
+is typed again as the same ask — straight away until three upgrade notices
+wait untaken in the conversation; from then on it waits `queued` until the
+session goes on, `--now` (one copy more), or a rest after the limit's word
+ran out (one copy more): two hours, doubling with every further copy the
+model has not read, up to a day — so a limit that lasts for days adds one
+copy a day.
 A SESSION IS MOVED ONLY WHILE THE
 AGENT IS ITS SHELL'S FOREGROUND JOB ON A TERMINAL AN ATERM TAB OWNS: an agent
 in a multiplexer pane (tmux, screen, zellij) or on any other pty the tab does
@@ -508,15 +521,17 @@ and to, the phase, `pending_for=`,
 `background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
 for a turn a hand-run sweep found in progress …) with `wait_for=`, the owner's
 `request=`, `next_round=` (for a round that stopped: how long until the new
-round it starts by itself, `due` once it has rested, `-` for any other or one
-the owner's `--skip` holds), and `stalled=` — `-` while the upgrade will move
-on its own, else why it will not: `refused:<why>` (it stays said through the
-new round's first look, which meets it again unless something changed),
-`failed:<why>`, `held-back:<owner>` (a multiplexer pane), or `overdue` (6
-hours behind, whatever it waits on, unless the owner's `--now` came in the
-last 30 minutes). A round that GAVE UP is no stall: it rests until its
-`next_round=`, and its column reads `pending/<to>/next-round:<span>/<age>`.
-The window shows the same per tab as `upgrade=`
+round it starts by itself, `due` once it has rested, `-` for any other, one
+the owner's `--skip` holds, or one that gave up and acts on a late READY —
+no new round starts while that answer stands), and `stalled=` — `-` while
+the upgrade will move on its own, else why it will not: `refused:<why>` (it
+stays said through the new round's first look, which meets it again unless
+something changed), `failed:<why>`, `held-back:<owner>` (a multiplexer pane),
+or `overdue` (6 hours behind, whatever it waits on, unless the owner's `--now`
+came in the last 30 minutes). A round that GAVE UP is no stall: it rests
+until its `next_round=`, and its column reads
+`pending/<to>/next-round:<span>/<age>` — `pending/<to>/ready/<age>` while it
+acts on a late READY instead. The window shows the same per tab as `upgrade=`
 in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages, and marks
 a STALLED tab (`meta attention owner=upgrade`) — never a tab that is merely
 waiting for its turn end.
@@ -2067,7 +2082,11 @@ fn run_upgrade_owner(
             ExitCode::from(atpkg::lock::CONTENDED_EXIT)
         }
         Err(e) => {
-            let _ = writeln!(err, "aterm harness: upgrade {sid}: {e}");
+            let _ = writeln!(
+                err,
+                "aterm harness: upgrade {sid}: {}",
+                super::upgrade_drive::refusal_sentence(&e)
+            );
             ExitCode::from(1)
         }
     }

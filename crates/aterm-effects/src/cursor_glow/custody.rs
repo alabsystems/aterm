@@ -417,11 +417,18 @@ impl PressCredits {
         self.within(now).map(|(t, _, _)| t).min()
     }
 
+    /// The last press still funding a foreign-row park. Once even this
+    /// credit ages out, the park can be retired without waiting for its own
+    /// later ten-second deadline.
+    pub(super) fn newest_unpaid(&self, now: Instant) -> Option<Instant> {
+        self.within(now).map(|(t, _, _)| t).max()
+    }
+
     /// Whether an unpaid press stamped exactly `glyph` within `freshness_s`
-    /// — the key's own echo, read off the glass. Older unspent credits can
-    /// survive a TUI's earlier suppressed echoes for the full in-flight
-    /// patience; as for [`Self::oldest_fresh_glyph`], they are not
-    /// witnesses for this new print. ANY fresh press, not only the oldest:
+    /// — the key's own echo, read off the glass. A caller that passes the
+    /// full in-flight patience must also prove the old content moved with
+    /// the glyph: an older suppressed echo alone proves no new print. ANY
+    /// press in the requested window, not only the oldest:
     /// the glyph a coalesced echo leaves beside its caret is its LAST key's.
     /// A press with no stamped glyph (a host that knows only a cell count)
     /// witnesses nothing.
@@ -974,13 +981,16 @@ pub(super) struct HeldPark {
 }
 
 impl HeldPark {
-    pub(super) fn fresh(&self, now: Instant) -> bool {
-        let seconds = if self.cross_row {
-            IN_FLIGHT_PATIENCE_S
+    pub(super) fn patience(&self) -> Duration {
+        if self.cross_row {
+            Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S)
         } else {
-            CursorGlow::TYPE_HINT_FRESH
-        };
-        now.saturating_duration_since(self.at).as_secs_f32() <= seconds
+            Duration::from_secs_f32(CursorGlow::TYPE_HINT_FRESH)
+        }
+    }
+
+    pub(super) fn fresh(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.at) <= self.patience()
     }
 }
 
@@ -2447,6 +2457,13 @@ impl CursorGlow {
             // not come funds one cell and nothing more; two or more is a
             // BATCH still in flight, judged under the share rule.
             return credits >= usize::from(cc - pc).min(2);
+        }
+        // A composer can move a keyed word from the middle of this row to
+        // the next one after the 250 ms stamp has expired. The exact erased
+        // tail + relocated tail + unpaid glyph proof is this move's echo
+        // shape; a generic cross-row hop still cannot spend the pool.
+        if credits >= 1 && self.carried_key_move == Some(((pr, pc), (cr, cc))) {
+            return true;
         }
         if let Some(cells) = self.fold_shape(pr, pc, cr, cc, geom) {
             return cells >= 1 && credits >= cells;

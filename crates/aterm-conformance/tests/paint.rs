@@ -147,9 +147,14 @@
 //!
 //! THE TESTS LIVE IN `measuring` (2026-09-23). Every row times frames on a live window,
 //! so a busy machine can turn one red without the code changing.
-//! The merge gate runs every test named `measuring::…` ALONE, in its exclusive
-//! `measuring tests` stage, and skips them in the parallel test run
-//! (`aterm_verify::stages::MEASURING_TESTS`); `targo test` by hand still runs them.
+//! The merge gate's test run skips every test named `measuring::…`
+//! (`aterm_verify::stages::MEASURING_TESTS`), and since 2026-09-26 they are the
+//! gate's MEASURE tier (`tools/verify.sh --measure`, `--full`), which runs them
+//! ALONE in its exclusive `measuring tests` stage — the merge contract does
+//! not, and a release cut requires them green for the tree it cuts. A probe
+//! that decides nothing (exit 2, and paint's unproved exit 3) is recorded as
+//! COULD NOT RUN, never as a finding and never as green. `targo test` by hand
+//! still runs them.
 #![cfg(target_os = "macos")]
 
 mod support;

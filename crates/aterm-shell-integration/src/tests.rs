@@ -3234,25 +3234,18 @@ fn test_cmd_prompt_emits_real_osc_133_marks() {
     // `$P` must have expanded to a real directory, not stayed literal.
     assert!(!text.contains("Cwd=$P"), "got {text:?}");
     // And the title is that same directory, in a real ESC-framed OSC 0 — the
-    // bytes conhost turns into the console title ConPTY hands aterm. (Absent
-    // exactly when the runner exported ATERM_DISABLE_PROMPT_TITLES.)
-    let titled = injection
-        .env_add
-        .iter()
-        .any(|(k, v)| k == "PROMPT" && v.contains(CMD_PROMPT_TITLE));
-    if titled {
-        let cwd = text
-            .split_once("\x1b]633;P;Cwd=")
-            .and_then(|(_, rest)| rest.split_once(";id="))
-            .map(|(cwd, _)| cwd)
-            .expect("the cwd mark carries the nonce after the path");
-        assert!(
-            text.contains(&format!("\x1b]0;{cwd}\x1b\\")),
-            "cmd must title the tab with its directory {cwd:?}; got {text:?}"
-        );
-    } else {
-        assert!(!text.contains("\x1b]0;"), "opted out, no title: {text:?}");
-    }
+    // bytes conhost turns into the console title ConPTY hands aterm. Every cmd
+    // prompt carries it: there is no opt-out (a user's own PROMPT title is the
+    // later write and wins), so its absence is a regression, never a choice.
+    let cwd = text
+        .split_once("\x1b]633;P;Cwd=")
+        .and_then(|(_, rest)| rest.split_once(";id="))
+        .map(|(cwd, _)| cwd)
+        .expect("the cwd mark carries the nonce after the path");
+    assert!(
+        text.contains(&format!("\x1b]0;{cwd}\x1b\\")),
+        "cmd must title the tab with its directory {cwd:?}; got {text:?}"
+    );
 }
 
 /// Functional proof on the real thing: the WSL launcher, run through the

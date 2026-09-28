@@ -17694,6 +17694,10 @@ mod composed_cursor_effect_advance_tests {
             &term,
             true,
             v2_owns_frame,
+            (0, 0),
+            &[],
+            None,
+            ComposedWitnessRows::default(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -17712,6 +17716,10 @@ mod composed_cursor_effect_advance_tests {
             &term,
             true,
             v2_owns_frame,
+            (0, 0),
+            &[],
+            None,
+            top.witness_rows,
             top.row_probe,
             top.row_above_probe,
             top.row_below_probe,
@@ -17747,6 +17755,10 @@ mod composed_cursor_effect_advance_tests {
                 &term_lock(&term),
                 true,
                 v2_owns_frame,
+                (0, 0),
+                &[],
+                None,
+                ComposedWitnessRows::default(),
                 Vec::new(),
                 vec!['!'; 12],
                 vec!['!'; 12],
@@ -18117,6 +18129,205 @@ mod composed_cursor_effect_advance_tests {
         }
     }
 
+    /// A scroll makes projection suppress its row probe. Far witness rows
+    /// scanned under that same extraction lock would be discarded; the next
+    /// unchanged scroll snapshot captures them again normally.
+    #[test]
+    fn composed_scroll_skips_far_witness_scan_then_recovers() {
+        for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
+            let (mut app, wid, term, t, win_row, _) = composed_hello(shape);
+            let t = t + Duration::from_millis(90);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .cursor_glow
+                .note_return(t);
+            term_lock(&term).process(b"\r\n");
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+            term_lock(&term).process(b"\x1b[8;1H");
+            let pane_origin = focused_pane_origin(&mut app, wid);
+            let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
+            let mut requested = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+            let n = app.windows[&wid].cursor_glow.ribbon_rows(&mut requested);
+            assert!(
+                requested[..n].contains(&win_row),
+                "fixture asks for a far band"
+            );
+            let previous_scroll = app.windows[&wid].cursor_scroll_state;
+            let stable = focused_composed_cursor_fx_sample(
+                session,
+                &term_lock(&term),
+                true,
+                app.windows[&wid].cursor_glow.v2_owns_frame(),
+                pane_origin,
+                &requested[..n],
+                previous_scroll,
+                ComposedWitnessRows::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            assert!(
+                stable.witness_rows.get(win_row).is_some(),
+                "steady frame captures the far row"
+            );
+
+            term_lock(&term).process(b"\x1b[999;1H\n");
+            let scroll = focused_composed_cursor_fx_sample(
+                session,
+                &term_lock(&term),
+                true,
+                app.windows[&wid].cursor_glow.v2_owns_frame(),
+                pane_origin,
+                &requested[..n],
+                previous_scroll,
+                stable.witness_rows,
+                stable.row_probe,
+                stable.row_above_probe,
+                stable.row_below_probe,
+            );
+            let current_scroll = scroll.content_scroll_state;
+            assert!(
+                !matches!(
+                    cursor_effect_scroll_decision(previous_scroll, current_scroll),
+                    CursorEffectScrollDecision::Baseline | CursorEffectScrollDecision::Unchanged
+                ),
+                "the parser produced a real scroll"
+            );
+            assert_eq!(
+                scroll.witness_rows.active, 0,
+                "no far row is scanned on a scroll frame"
+            );
+            assert!(scroll.witness_rows.get(win_row).is_none());
+            assert!(
+                sync_cursor_effect_scroll(app.windows.get_mut(&wid).unwrap(), current_scroll)
+                    .changed()
+            );
+
+            let next = focused_composed_cursor_fx_sample(
+                session,
+                &term_lock(&term),
+                true,
+                app.windows[&wid].cursor_glow.v2_owns_frame(),
+                pane_origin,
+                &requested[..n],
+                app.windows[&wid].cursor_scroll_state,
+                scroll.witness_rows,
+                scroll.row_probe,
+                scroll.row_above_probe,
+                scroll.row_below_probe,
+            );
+            assert!(
+                next.witness_rows.get(win_row).is_some(),
+                "the next steady frame captures it"
+            );
+        }
+    }
+
+    #[test]
+    fn composed_far_witness_uses_the_extracted_row_after_later_pty_output() {
+        for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
+            let (mut app, wid, term, t, win_row, win_col) = composed_hello(shape);
+            let t = t + Duration::from_millis(90);
+            app.windows
+                .get_mut(&wid)
+                .unwrap()
+                .cursor_glow
+                .note_return(t);
+            term_lock(&term).process(b"\r\n");
+            assert!(
+                app.splice_focused_composed_cursor_effects(wid, ComposedCursorFxClock::Advance(t))
+            );
+            // The retained band is on local row 5; park the caret on row 7,
+            // outside its already-captured caret/neighbor trio.
+            term_lock(&term).process(b"\x1b[8;1H");
+            let (pane_row, pane_col) = focused_pane_origin(&mut app, wid);
+            let plan = app.active_visible_leaf_plan(wid).unwrap();
+            let pane_rows = plan
+                .leaves
+                .iter()
+                .find(|leaf| leaf.focused)
+                .unwrap()
+                .rect
+                .size
+                .height
+                .round() as usize;
+            let session = app.windows[&wid].composed_cursor_effect_session.unwrap();
+            let mut requested = [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+            let n = app.windows[&wid].cursor_glow.ribbon_rows(&mut requested);
+            assert!(
+                requested[..n].contains(&win_row),
+                "fixture asks for the far band"
+            );
+            let sample = focused_composed_cursor_fx_sample(
+                session,
+                &term_lock(&term),
+                true,
+                app.windows[&wid].cursor_glow.v2_owns_frame(),
+                (pane_row, pane_col),
+                &requested[..n],
+                None,
+                ComposedWitnessRows::default(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            assert_eq!(
+                sample.witness_rows.get(win_row).unwrap()[usize::from(win_col) + 10],
+                'd',
+                "far row came from the same extraction hold as the old cells"
+            );
+            let caret_row = sample.cursor.0 + u16::try_from(pane_row).unwrap();
+            assert!(
+                !needs_fresh_witness_read(
+                    &requested[..n],
+                    caret_row,
+                    pane_row,
+                    pane_rows,
+                    sample
+                        .row_above_present
+                        .then_some(sample.row_above_probe.as_slice()),
+                    sample
+                        .row_below_present
+                        .then_some(sample.row_below_probe.as_slice()),
+                    &sample.witness_rows,
+                ),
+                "every in-pane row is already captured; projection owes no second lock"
+            );
+            // The live PTY changes *after* the extracted frame. Sampling it
+            // again here would incorrectly retire the ribbon over old pixels.
+            term_lock(&term).process(b"\x1b7\x1b[6;11HX\x1b8");
+            assert!(!sample.witness_stamp.matches(&term_lock(&term)));
+            let model = aterm_spec::derive::composed_witness_generation_model();
+            let mut state = model.init_state();
+            for action in ["Capture", "Mutate"] {
+                assert!(model.fire(action, &mut state));
+            }
+            assert!(model.action_enabled("ReadCaptured", &state));
+            assert!(!model.action_enabled("ReadFresh", &state));
+            assert!(
+                app.splice_focused_composed_cursor_effects_sampled_with_plan(
+                    wid,
+                    ComposedCursorFxClock::Advance(t + Duration::from_millis(16)),
+                    Some(sample),
+                    &plan,
+                )
+            );
+            assert_eq!(composed_ribbon_retired(&app, wid), 0);
+            assert_eq!(
+                composed_ribbon_row(&app, wid, win_row),
+                (0..11).map(|k| (win_col + k, false)).collect::<Vec<_>>()
+            );
+            composed_idle(&mut app, wid, t + Duration::from_millis(16), 32);
+            assert!(
+                composed_ribbon_retired(&app, wid) > 0,
+                "the next extracted frame sees the real replacement"
+            );
+        }
+    }
+
     #[test]
     fn composed_witness_defers_rows_changed_after_cell_extraction() {
         for shape in [ComposedShape::ThreePane, ComposedShape::Zoomed] {
@@ -18142,6 +18353,10 @@ mod composed_cursor_effect_advance_tests {
                 &term_lock(&term),
                 true,
                 app.windows[&wid].cursor_glow.v2_owns_frame(),
+                (0, 0),
+                &[],
+                None,
+                ComposedWitnessRows::default(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -18200,6 +18415,10 @@ mod composed_cursor_effect_advance_tests {
                 &term_lock(&term),
                 true,
                 app.windows[&wid].cursor_glow.v2_owns_frame(),
+                (0, 0),
+                &[],
+                None,
+                ComposedWitnessRows::default(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -18244,6 +18463,10 @@ mod composed_cursor_effect_advance_tests {
                 &term_lock(&term),
                 true,
                 app.windows[&wid].cursor_glow.v2_owns_frame(),
+                (0, 0),
+                &[],
+                None,
+                ComposedWitnessRows::default(),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),
@@ -22093,8 +22316,9 @@ pub(crate) fn captured_witness_neighbor<'a>(
     None
 }
 
-/// Whether a composed frame must take a SECOND terminal lock for ribbon
-/// witness rows outside the exact caret-and-neighbor capture it already owns.
+/// Whether a composed frame must take a second terminal lock for a row newly
+/// requested after scroll reconciliation. Ordinarily every requested far row
+/// is already in the exact extraction sample and this returns false.
 fn needs_fresh_witness_read(
     rows: &[u16],
     caret_row: u16,
@@ -22102,6 +22326,7 @@ fn needs_fresh_witness_read(
     pane_rows: usize,
     above: Option<&[char]>,
     below: Option<&[char]>,
+    captured: &ComposedWitnessRows,
 ) -> bool {
     rows.iter().any(|&row| {
         row != caret_row
@@ -22109,12 +22334,13 @@ fn needs_fresh_witness_read(
                 .checked_sub(pane_row)
                 .is_some_and(|local| local < pane_rows)
             && captured_witness_neighbor(row, caret_row, above, below).is_none()
+            && captured.get(row).is_none()
     })
 }
 
 #[cfg(test)]
 mod witness_row_capture_tests {
-    use super::{captured_witness_neighbor, needs_fresh_witness_read};
+    use super::{ComposedWitnessRows, captured_witness_neighbor, needs_fresh_witness_read};
 
     #[test]
     fn adjacent_ribbon_rows_reuse_captured_glyphs_without_a_second_grid_read() {
@@ -22149,6 +22375,7 @@ mod witness_row_capture_tests {
                 pane_rows,
                 Some(&above),
                 Some(&below),
+                &ComposedWitnessRows::default(),
             ),
             "the exact captured trio needs no second lock"
         );
@@ -22159,6 +22386,7 @@ mod witness_row_capture_tests {
             pane_rows,
             Some(&above),
             Some(&below),
+            &ComposedWitnessRows::default(),
         ));
         assert!(needs_fresh_witness_read(
             &[12, 13, 14],
@@ -22167,6 +22395,7 @@ mod witness_row_capture_tests {
             pane_rows,
             None,
             Some(&below),
+            &ComposedWitnessRows::default(),
         ));
         assert!(
             !needs_fresh_witness_read(
@@ -22176,6 +22405,7 @@ mod witness_row_capture_tests {
                 pane_rows,
                 Some(&above),
                 Some(&below),
+                &ComposedWitnessRows::default(),
             ),
             "out-of-pane rows need neither a lock nor a witness"
         );
@@ -22684,6 +22914,10 @@ impl ComposedWitnessStamp {
 struct FocusedComposedCursorFxSample {
     session: u64,
     witness_stamp: ComposedWitnessStamp,
+    /// Far ribbon rows read under the same terminal hold as the cells above.
+    /// Kept in window-owned scratch between frames; the later effect splice
+    /// may run after a PTY batch has already changed the live terminal.
+    witness_rows: ComposedWitnessRows,
     terminal_id: u64,
     cursor: (u16, u16),
     cursor_visible: bool,
@@ -22719,6 +22953,65 @@ struct FocusedComposedCursorFxSample {
     /// The glyph at that run's last cell (`Terminal::print_anchor_glyph`),
     /// same hold; a cell's content, so nothing to translate.
     print_anchor_glyph: Option<char>,
+}
+
+#[derive(Default)]
+pub(crate) struct ComposedWitnessRows {
+    slots: Vec<ComposedWitnessRow>,
+    active: usize,
+}
+
+#[derive(Default)]
+struct ComposedWitnessRow {
+    row: u16,
+    cols: Vec<char>,
+}
+
+impl ComposedWitnessRows {
+    fn capture(
+        &mut self,
+        terminal: &Terminal,
+        requested: &[u16],
+        caret_row: u16,
+        pane_row: usize,
+        pane_col: usize,
+    ) {
+        self.active = 0;
+        let grid_rows = usize::from(terminal.grid().rows());
+        let caret_row = pane_row.saturating_add(usize::from(caret_row));
+        for &row in requested {
+            let row_index = usize::from(row);
+            let Some(local) = row_index.checked_sub(pane_row) else {
+                continue;
+            };
+            if local >= grid_rows
+                || row_index == caret_row
+                || caret_row.checked_sub(1) == Some(row_index)
+                || caret_row.checked_add(1) == Some(row_index)
+            {
+                continue;
+            }
+            if self.active == self.slots.len() {
+                self.slots.push(ComposedWitnessRow::default());
+            }
+            let slot = &mut self.slots[self.active];
+            slot.row = row;
+            terminal.row_cols_into(local, &mut slot.cols);
+            if pane_col > 0 {
+                let len = slot.cols.len();
+                slot.cols.resize(len.saturating_add(pane_col), ' ');
+                slot.cols.rotate_right(pane_col);
+            }
+            self.active += 1;
+        }
+    }
+
+    fn get(&self, row: u16) -> Option<&[char]> {
+        self.slots[..self.active]
+            .iter()
+            .find(|slot| slot.row == row)
+            .map(|slot| slot.cols.as_slice())
+    }
 }
 
 /// THE PROGRAM CAT's raw claim for `session`, read under a terminal guard the
@@ -23129,17 +23422,27 @@ mod single_pane_row_probe_cache_tests {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one frame's capture inputs plus the three probe buffers it reuses, moved in and \
+              handed back in the sample"
+)]
 fn focused_composed_cursor_fx_sample(
     session: u64,
     terminal: &Terminal,
     capture_row_probes: bool,
     v2_owns_frame: bool,
+    pane_origin: (usize, usize),
+    requested_witness_rows: &[u16],
+    previous_scroll: Option<ContentScrollState>,
+    mut witness_rows: ComposedWitnessRows,
     mut row_probe: Vec<char>,
     mut row_above_probe: Vec<char>,
     mut row_below_probe: Vec<char>,
 ) -> FocusedComposedCursorFxSample {
     let cursor = terminal.cursor();
     let display_offset = terminal.grid().display_offset();
+    let content_scroll_state = terminal.content_scroll_state();
     let row = usize::from(cursor.row);
     let rows = usize::from(terminal.grid().rows());
     let probe_live = capture_row_probes && display_offset == 0;
@@ -23159,9 +23462,30 @@ fn focused_composed_cursor_fx_sample(
         row_below_probe.clear();
         (false, false)
     };
+    // Projection suppresses its row probe after any scroll translation or
+    // invalidation. Decide from this exact terminal snapshot and the SAME
+    // previous window state as sync_cursor_effect_scroll; rows captured on a
+    // scroll frame would otherwise scan under the terminal lock then be thrown
+    // away without ever reaching the witness.
+    let probe_survives_scroll = matches!(
+        cursor_effect_scroll_decision(previous_scroll, content_scroll_state),
+        CursorEffectScrollDecision::Baseline | CursorEffectScrollDecision::Unchanged
+    );
+    if probe_live && v2_owns_frame && probe_survives_scroll {
+        witness_rows.capture(
+            terminal,
+            requested_witness_rows,
+            cursor.row,
+            pane_origin.0,
+            pane_origin.1,
+        );
+    } else {
+        witness_rows.active = 0;
+    }
     FocusedComposedCursorFxSample {
         session,
         witness_stamp: ComposedWitnessStamp::read(terminal),
+        witness_rows,
         terminal_id: terminal.render_identity(),
         cursor: (cursor.row, cursor.col),
         cursor_visible: terminal.cursor_visible(),
@@ -23176,7 +23500,7 @@ fn focused_composed_cursor_fx_sample(
         default_fg: aterm_render::rgb_to_u32(terminal_blank_cell(terminal).fg),
         alt: terminal.is_alternate_screen(),
         blink_epoch: terminal.repaint_blink_epoch(),
-        content_scroll_state: terminal.content_scroll_state(),
+        content_scroll_state,
         row_probe,
         row_above_probe,
         row_below_probe,
@@ -26159,6 +26483,7 @@ impl App {
                         window.poof_row_buf = sample.row_probe;
                         window.poof_row_above_buf = sample.row_above_probe;
                         window.poof_row_below_buf = sample.row_below_probe;
+                        window.composed_witness_rows = sample.witness_rows;
                         window.composed_cursor_effect_valid = false;
                         window.composed_cursor_effect_session = None;
                     }
@@ -26167,15 +26492,31 @@ impl App {
                 sample
             }
             None => {
-                let (row_probe, row_above_probe, row_below_probe, v2_owns_frame) = {
+                let (
+                    row_probe,
+                    row_above_probe,
+                    row_below_probe,
+                    v2_owns_frame,
+                    requested_witness_rows,
+                    witness_n,
+                    previous_scroll,
+                    witness_rows,
+                ) = {
                     let Some(window) = self.windows.get_mut(&wid) else {
                         return false;
                     };
+                    let mut requested_witness_rows =
+                        [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+                    let witness_n = window.cursor_glow.ribbon_rows(&mut requested_witness_rows);
                     (
                         std::mem::take(&mut window.poof_row_buf),
                         std::mem::take(&mut window.poof_row_above_buf),
                         std::mem::take(&mut window.poof_row_below_buf),
                         window.cursor_glow.v2_owns_frame(),
+                        requested_witness_rows,
+                        witness_n,
+                        window.cursor_scroll_state,
+                        std::mem::take(&mut window.composed_witness_rows),
                     )
                 };
                 let terminal = term_lock(&term);
@@ -26184,6 +26525,10 @@ impl App {
                     &terminal,
                     true,
                     v2_owns_frame,
+                    (row, col),
+                    &requested_witness_rows[..witness_n],
+                    previous_scroll,
+                    witness_rows,
                     row_probe,
                     row_above_probe,
                     row_below_probe,
@@ -26193,6 +26538,7 @@ impl App {
         let FocusedComposedCursorFxSample {
             session: _,
             witness_stamp,
+            witness_rows,
             terminal_id,
             cursor,
             cursor_visible,
@@ -26342,13 +26688,16 @@ impl App {
                     pane_rows,
                     row_above_present.then_some(poof_row_above_buf.as_slice()),
                     row_below_present.then_some(poof_row_below_buf.as_slice()),
+                    &witness_rows,
                 );
                 (wanted, needs_read)
             };
-            // The caret and its flanking rows came from the EXACT extraction
-            // lock, so feed them even if the PTY advanced in the meantime.
-            // Only a farther ribbon row needs a second lock and generation
-            // match; a newer grid may not revoke light over older pixels.
+            // The caret, its flanks and the pre-requested far ribbon rows all
+            // came from the EXACT extraction hold, so feed them even if PTY
+            // output has advanced. A scroll may translate the engine's rows
+            // after capture; only a newly requested row then needs the old
+            // generation-checked fallback read. Newer grid cells may never
+            // revoke light over this frame's older pixels.
             if ribbon_rows[..wanted].iter().any(|&r| r != caret_row) {
                 let terminal = needs_read.then(|| term_lock(&term));
                 let same_generation = terminal
@@ -26383,6 +26732,8 @@ impl App {
                         row_below_present.then_some(poof_row_below_buf.as_slice()),
                     ) {
                         cursor_glow.observe_ribbon_row(r, captured);
+                    } else if let Some(captured) = witness_rows.get(r) {
+                        cursor_glow.observe_ribbon_row(r, captured);
                     } else if same_generation && local < grid_rows {
                         let terminal = terminal.as_ref().expect("far witness owns a lock");
                         cursor_glow.capture_ribbon_row(r, |cols| {
@@ -26396,6 +26747,9 @@ impl App {
                     }
                 }
             }
+        }
+        if let Some(window) = self.windows.get_mut(&wid) {
+            window.composed_witness_rows = witness_rows;
         }
         let effect_cursor = (cursor_visible && display_offset == 0).then_some((
             cursor
@@ -27442,21 +27796,41 @@ impl App {
                             .windows
                             .get(&id)
                             .is_some_and(|window| window.cursor_glow.v2_owns_frame());
-                    let (row_probe, row_above_probe, row_below_probe) = if capture_row_probes {
-                        match self.windows.get_mut(&id) {
-                            Some(window) => (
-                                std::mem::take(&mut window.poof_row_buf),
-                                std::mem::take(&mut window.poof_row_above_buf),
-                                std::mem::take(&mut window.poof_row_below_buf),
-                            ),
-                            None => {
-                                abandoned = true;
-                                break;
-                            }
-                        }
+                    let mut requested_witness_rows =
+                        [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+                    let witness_n = if v2_owns_frame {
+                        self.windows.get(&id).map_or(0, |window| {
+                            window.cursor_glow.ribbon_rows(&mut requested_witness_rows)
+                        })
                     } else {
-                        (Vec::new(), Vec::new(), Vec::new())
+                        0
                     };
+                    let (row_probe, row_above_probe, row_below_probe, witness_rows) =
+                        if capture_row_probes {
+                            match self.windows.get_mut(&id) {
+                                Some(window) => (
+                                    std::mem::take(&mut window.poof_row_buf),
+                                    std::mem::take(&mut window.poof_row_above_buf),
+                                    std::mem::take(&mut window.poof_row_below_buf),
+                                    std::mem::take(&mut window.composed_witness_rows),
+                                ),
+                                None => {
+                                    abandoned = true;
+                                    break;
+                                }
+                            }
+                        } else {
+                            (
+                                Vec::new(),
+                                Vec::new(),
+                                Vec::new(),
+                                ComposedWitnessRows::default(),
+                            )
+                        };
+                    let previous_scroll = self
+                        .windows
+                        .get(&id)
+                        .and_then(|window| window.cursor_scroll_state);
                     let (terminal_title, blank, cursor_color, cursor_fx_sample, ambiguous_cjk) = {
                         terminal.cell_frame_into(&mut cache.staged_input, sub_rows, sub_cols);
                         let blank = terminal_blank_cell(&terminal);
@@ -27467,6 +27841,13 @@ impl App {
                                 &terminal,
                                 capture_row_probes,
                                 v2_owns_frame,
+                                (
+                                    leaf.rect.origin.y.round().max(0.0) as usize,
+                                    leaf.rect.origin.x.round().max(0.0) as usize,
+                                ),
+                                &requested_witness_rows[..witness_n],
+                                previous_scroll,
+                                witness_rows,
                                 row_probe,
                                 row_above_probe,
                                 row_below_probe,
@@ -27690,6 +28071,7 @@ impl App {
                 window.poof_row_buf = sample.row_probe;
                 window.poof_row_above_buf = sample.row_above_probe;
                 window.poof_row_below_buf = sample.row_below_probe;
+                window.composed_witness_rows = sample.witness_rows;
             }
             // This frame composes nothing (the caller drops it), so the only
             // question is what the NEXT frame may reuse. Any leaf that already
@@ -33672,21 +34054,39 @@ impl App {
                     pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, *session),
                     damage_consumed: advance_cursor_fx,
                 };
-                let (row_probe, row_above_probe, row_below_probe) = if advance_cursor_fx {
-                    (
-                        std::mem::take(&mut ws.poof_row_buf),
-                        std::mem::take(&mut ws.poof_row_above_buf),
-                        std::mem::take(&mut ws.poof_row_below_buf),
-                    )
+                let mut requested_witness_rows =
+                    [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+                let witness_n = if advance_cursor_fx {
+                    ws.cursor_glow.ribbon_rows(&mut requested_witness_rows)
                 } else {
-                    (Vec::new(), Vec::new(), Vec::new())
+                    0
                 };
+                let (row_probe, row_above_probe, row_below_probe, witness_rows) =
+                    if advance_cursor_fx {
+                        (
+                            std::mem::take(&mut ws.poof_row_buf),
+                            std::mem::take(&mut ws.poof_row_above_buf),
+                            std::mem::take(&mut ws.poof_row_below_buf),
+                            std::mem::take(&mut ws.composed_witness_rows),
+                        )
+                    } else {
+                        (
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                            ComposedWitnessRows::default(),
+                        )
+                    };
                 let cursor_fx_sample = capture_cursor_fx.then(|| {
                     focused_composed_cursor_fx_sample(
                         *session,
                         &term,
                         advance_cursor_fx,
                         ws.cursor_glow.v2_owns_frame(),
+                        (0, 0),
+                        &requested_witness_rows[..witness_n],
+                        ws.cursor_scroll_state,
+                        witness_rows,
                         row_probe,
                         row_above_probe,
                         row_below_probe,
@@ -33806,19 +34206,34 @@ impl App {
                         ws.poof_row_buf = sample.row_probe;
                         ws.poof_row_above_buf = sample.row_above_probe;
                         ws.poof_row_below_buf = sample.row_below_probe;
+                        ws.composed_witness_rows = sample.witness_rows;
                     }
                     return None;
                 }
             }
-            let (row_probe, row_above_probe, row_below_probe) = if focused && advance_cursor_fx {
-                (
-                    std::mem::take(&mut ws.poof_row_buf),
-                    std::mem::take(&mut ws.poof_row_above_buf),
-                    std::mem::take(&mut ws.poof_row_below_buf),
-                )
+            let mut requested_witness_rows =
+                [0u16; aterm_effects::cursor_glow::CURSOR_WITNESS_ROWS];
+            let witness_n = if focused && advance_cursor_fx {
+                ws.cursor_glow.ribbon_rows(&mut requested_witness_rows)
             } else {
-                (Vec::new(), Vec::new(), Vec::new())
+                0
             };
+            let (row_probe, row_above_probe, row_below_probe, witness_rows) =
+                if focused && advance_cursor_fx {
+                    (
+                        std::mem::take(&mut ws.poof_row_buf),
+                        std::mem::take(&mut ws.poof_row_above_buf),
+                        std::mem::take(&mut ws.poof_row_below_buf),
+                        std::mem::take(&mut ws.composed_witness_rows),
+                    )
+                } else {
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                        ComposedWitnessRows::default(),
+                    )
+                };
             term.cell_frame_into(&mut ws.pane_scratch, pane_rows, pane_cols);
             let content_seq = ws.pane_scratch.content_seq;
             // Preserve an engine-exact pane snapshot for the decoration pass.
@@ -33873,6 +34288,10 @@ impl App {
                         &term,
                         advance_cursor_fx,
                         ws.cursor_glow.v2_owns_frame(),
+                        (row, col),
+                        &requested_witness_rows[..witness_n],
+                        ws.cursor_scroll_state,
+                        witness_rows,
                         row_probe,
                         row_above_probe,
                         row_below_probe,

@@ -10,7 +10,7 @@
 use std::path::PathBuf;
 
 use crate::Ctx;
-use crate::cli::Mode;
+use crate::scope::Scope;
 
 /// A contended resource. Two stages in the same lane are serialised in declared
 /// order; different lanes overlap freely. In practice a lane is a cargo target
@@ -39,20 +39,18 @@ pub enum Lane {
     /// takes to build xtask; `cells-foreign` compiles its cells elsewhere.
     XtaskTarget,
     /// `target-drivers/` — every binary the gate DRIVES rather than tests: the
-    /// smokes' `aterm-gui`/`aterm-ctl`, the redraw harness, the eight objc
-    /// drivers, the `driver builds` stage that pre-compiles all of them,
-    /// (since 2026-09-14) the sealed fabric rung, whose suite boots real
-    /// `aterm-gui`s, and (since 2026-09-16) the atpkg publish tooling, whose
-    /// end-to-end pack suite drives a real `atpkg`. Only stages in this lane
-    /// write its uplifted binaries, so no other stage can relink one under a
-    /// smoke, under the rung or under the pack (in `target/` the test stage
+    /// smokes' `aterm-gui`/`aterm-ctl`, the redraw harness, the objc drivers,
+    /// the `driver builds` stage that pre-compiles them, and the rows whose
+    /// suites drive a binary their own stage builds first — the sealed fabric
+    /// rung (`--full`), the atpkg pack and the live lanes' `aterm`. Only
+    /// stages in this lane write its binaries, so no other stage can relink
+    /// one under a stage that is driving it (in `target/` the test stage
     /// relinked `aterm-gui` with dev features).
     DriverTarget,
-    /// `target/conformance-release/` — the RELEASE `aterm` the live-conformance
-    /// suites JUDGE, and the one lane this gate did not invent: it is the exact
-    /// directory `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin`
-    /// builds into, so [`lane_dir`] must spell it the way that helper spells it
-    /// or the artifact gets built twice instead of primed once.
+    /// `target/conformance-release/` — the RELEASE `aterm` the paint and spin
+    /// suites judge, built here and HANDED to them (`ATERM_PAINT_BIN`). It is
+    /// the directory those suites' own helper builds into when run by hand, so
+    /// a hand run and the gate share one warm artifact.
     ///
     /// It lives UNDER `target/` and is still a lane of its own, because a lane
     /// is a cargo target directory and cargo's build lock is taken per target
@@ -69,17 +67,19 @@ pub enum StageId {
     TestCompile,
     Test,
     Doctests,
-    /// The sealed cross-host rung of the fabric bridge, `--features sealed`. A
-    /// DRIVER-lane stage: its suite boots real `aterm-gui`s (see `plan`).
+    /// `--full` only: the sealed cross-host rung of the fabric bridge,
+    /// `--features sealed`. A DRIVER-lane stage: its suite boots real
+    /// `aterm-gui`s (see `plan`).
     SealedLane,
     Tippy,
     Formatting,
     GrepGuards,
     /// The offline suites over the scripts that build, sign, install and
-    /// publish the app (`stages::DELIVERY_SUITES`). "Release tooling" until
-    /// 2026-09-26, when dev-app's signing identity and cargo pin joined it
-    /// (and, 2026-09-27, the fabric demo's cleanup check).
+    /// publish the app and its toolchain packages (`stages::DELIVERY_SUITES`):
+    /// every one runs on stubs of its own making.
     DeliveryTooling,
+    /// The atpkg end-to-end pack (`stages::ATPKG_DRIVEN_SUITE`), which drives
+    /// the `atpkg` this stage builds first. A DRIVER-lane stage.
     AtpkgTooling,
     TrustContractProbe,
     /// `--full` only: the startup-comparison harness's own test.
@@ -88,10 +88,15 @@ pub enum StageId {
     FreezeGate,
     DriverBuilds,
     /// The RELEASE `aterm` the paint and spin suites judge, built in its own
-    /// lane at t0 so the measuring stage finds it warm.
+    /// lane at t0 so the measuring stage finds it warm. MEASURE tier.
     ConformanceRelease,
-    /// The tests the parallel run skips because they MEASURE the machine
-    /// (`stages::MEASURING_TESTS`), run with nothing else in flight.
+    /// The tests the parallel run skips because their DEADLINES are seconds
+    /// long (`stages::DEADLINE_TESTS`, aterm-update's), run with nothing else
+    /// in flight. LAND tier: they decide correctness.
+    DeadlineTests,
+    /// The tests the parallel run skips because they MEASURE the machine or
+    /// the release artifact (`stages::MEASURING_TESTS`, aterm-conformance's
+    /// paint and spin), run with nothing else in flight. MEASURE tier.
     MeasuringTests,
     ControlSocketSmoke,
     GuiSmoke,
@@ -101,12 +106,7 @@ pub enum StageId {
     ObjcToolbarDrive,
     ObjcWindowDrive,
     ObjcEventDrive,
-    ObjcAlertDrive,
-    ObjcSwizzleDrive,
     ObjcBoundDrive,
-    /// The aterm-gui unit tests that open a WindowServer connection, run here
-    /// and in no parallel test run (`stages::window_server_tests_args`).
-    WindowServerTests,
     /// The foreground handback lane (`stages::FOREGROUND_HANDBACK_SUITE`): a
     /// real shell's job control, in a private headless `aterm` this run built.
     ForegroundHandback,
@@ -124,6 +124,74 @@ pub enum StageId {
     CodexLiveUpgrade,
 }
 
+/// THE TWO TIERS AND THE `--full` EXTRAS (2026-09-26).
+///
+/// * LAND — the merge contract, what a bare `tools/verify.sh` runs: whether the
+///   tree builds, passes its tests, lints, formats, proves its obligations and
+///   drives its binaries. Its verdict is about the change.
+/// * MEASURE — [`MEASURE_TIER`]: the stages that measure the MACHINE or the
+///   RELEASE ARTIFACT rather than decide correctness — frame timings, input
+///   latencies, and the fat-LTO release build the paint and spin matrices
+///   judge. Run by `--measure` and `--full`; a release cut requires a green one
+///   for the tree it cuts.
+/// * FULL — [`FULL_ONLY`]: the sealed fabric rung, the trust-mc / Kani floor,
+///   the cross-cell type-check, the startup comparison and the Codex live
+///   upgrade, `--full`'s own.
+///
+/// WHY THE SPLIT (the 2026-09-26 gate audit, measured on two loaded runs):
+/// the release build took 3351 s and 3525 s beside every push's gate, and the
+/// same load turned correctness verdicts red on timing. The measuring work
+/// still runs — before anything ships — just not as a condition of landing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    Land,
+    Measure,
+    Full,
+}
+
+/// THE MEASURE TIER, DECLARED ONCE. Every stage in it, and no other: the one
+/// list the plan filters on ([`StageId::tier`]), the verdict of a run that did
+/// not run it names ([`tier_titles`]), and a MEASURE receipt's `measured yes`
+/// covers. Adding a stage here moves it out of the merge contract.
+pub const MEASURE_TIER: [StageId; 3] = [
+    StageId::ConformanceRelease,
+    StageId::MeasuringTests,
+    StageId::GuiSmoke,
+];
+
+/// The `--full`-only stages, in their ladder order: the sealed fabric rung,
+/// declared in the driver lane before the first barrier so the test run waits
+/// for it, then the tail — the Codex live upgrade, exclusive, last.
+///
+/// THE SEALED RUNG MOVED HERE ON 2026-09-27. aterm-link's `sealed` is "OFF BY
+/// DEFAULT — so a default build, and every shipped binary, carries no cipher
+/// tree at all" (its `[features]`), so its one test guards a transport no
+/// release carries, while every per-commit test run waited behind it. The
+/// fabric's authorization semantics stay per commit through the plaintext
+/// end-to-end suites.
+pub const FULL_ONLY: [StageId; 5] = [
+    StageId::SealedLane,
+    StageId::KaniFloor,
+    StageId::CrossCells,
+    StageId::StartCompare,
+    StageId::CodexLiveUpgrade,
+];
+
+impl StageId {
+    /// The tier this stage belongs to: [`MEASURE_TIER`], [`FULL_ONLY`], or
+    /// the merge contract's LAND tier.
+    #[must_use]
+    pub fn tier(self) -> Tier {
+        if MEASURE_TIER.contains(&self) {
+            Tier::Measure
+        } else if FULL_ONLY.contains(&self) {
+            Tier::Full
+        } else {
+            Tier::Land
+        }
+    }
+}
+
 /// A stage's identity, its ladder header, and its scheduling constraints.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StageSpec {
@@ -131,10 +199,10 @@ pub struct StageSpec {
     /// The `=== … ===` header, resolved against the scope where it varies.
     pub title: String,
     pub lane: Lane,
-    /// Runs with nothing else in flight. Only the measuring tests and the two
-    /// smokes, and only because they measure frame rates, latencies and
-    /// deadlines: a stage whose verdict depends on how busy the machine is must
-    /// own the machine.
+    /// Runs with nothing else in flight. Only the deadline tests, the
+    /// measuring tests, the two smokes and the Codex live upgrade, and only
+    /// because they judge deadlines, frame rates and latencies: a stage whose
+    /// verdict depends on how busy the machine is must own the machine.
     pub exclusive: bool,
     /// Lanes whose stages must all have FINISHED before this one starts —
     /// apart from stages behind an exclusive barrier declared after it, which
@@ -166,44 +234,74 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
         Lane::LibcOracleTarget => under_root("libc-oracle/target"),
         Lane::XtaskTarget => under_root("target-xtask"),
         Lane::DriverTarget => under_root("target-drivers"),
-        // Spelled as `release_bin` spells it — `root.join("target/conformance-release")`
-        // in `crates/aterm-conformance/tests/support/mod.rs`. A second spelling
-        // of the same artifact is a second BUILD, which is the one thing this
-        // lane exists to prevent.
+        // Spelled as the suites' own helper spells it (`release_bin`,
+        // `root.join("target/conformance-release")` in
+        // `crates/aterm-conformance/tests/support/mod.rs`), so a hand run of
+        // paint or spin and the gate share one warm artifact.
         Lane::ConformanceRelease => under_root("target/conformance-release"),
     }
 }
 
-/// Will this run's measuring stage run a suite that builds the conformance
-/// RELEASE artifact for itself?
-///
-/// Two do — `aterm-conformance`'s `paint` and `spin` — and both reach it through
-/// the same `release_bin` helper, so the question is exactly "does the selection
-/// compile that crate" (atpkg's `untracked_stage`, the third, went with the
-/// untracked lanes on 2026-09-24). Whole-tree always does. A narrowing that selects neither runs
-/// no suite that would ever open the lane, and priming it would be a minutes-long
-/// build for nobody — the same reason the sealed lane is REMOVED rather than
-/// skipped under a scope that has nothing for it.
+/// Does this run measure paint and spin? They are `aterm-conformance`'s, so
+/// the measuring stage — and the release artifact it hands them, and so its
+/// prime — has something to run exactly when the selection compiles that
+/// crate. Whole-tree always does. A narrowing that does not REMOVES all
+/// three rather than skipping them: `--test paint` names no target outside
+/// that crate (cargo refuses it), and a minutes-long release build for
+/// nobody is the opposite of what the prime is for.
 #[must_use]
-fn primes_conformance_release(ctx: &Ctx) -> bool {
-    ctx.scope.includes_crate("aterm-conformance")
+fn measures_paint_and_spin(scope: &Scope) -> bool {
+    scope.includes_crate("aterm-conformance")
 }
 
-/// Build the run's stage list.
+/// Does this run hold the deadline tests? They are `aterm-update`'s lib unit
+/// tests (`stages::DEADLINE_TESTS`), so exactly when the selection compiles
+/// that crate.
+#[must_use]
+fn holds_deadline_tests(scope: &Scope) -> bool {
+    scope.includes_crate("aterm-update")
+}
+
+/// Build the run's stage list: every stage [`declared`] for its scope whose
+/// tier its mode runs ([`crate::cli::Mode::runs`]).
 ///
 /// Two things can remove a stage entirely (as opposed to skipping it):
-///  * `--scope` narrowing away from `aterm-link` drops the sealed fabric lane,
-///    and away from `aterm-conformance` the conformance-release prime
-///    ([`primes_conformance_release`]), because there is nothing for either of
-///    them to run;
-///  * `--fast` drops the four `--full`-only stages.
+///  * a narrowing that does not compile a stage's crate drops it, because
+///    there is nothing for it to run: `aterm-link` for the sealed fabric
+///    lane, `aterm-update` for the deadline tests ([`holds_deadline_tests`]),
+///    `aterm-conformance` for the measuring tests and their release prime
+///    ([`measures_paint_and_spin`]);
+///  * the MODE picks the tiers ([`Tier`]): the default runs the LAND tier and
+///    not the MEASURE tier — and its verdict NAMES every MEASURE stage it left
+///    out ([`tier_titles`]), so the removal is never silent — `--measure` runs
+///    the MEASURE tier alone, and `--full` both plus its own ([`FULL_ONLY`]).
 ///
 /// Nothing else is conditional here. Absent TOOLS produce skips inside a stage,
 /// never a missing stage, because a stage that vanishes is a stage nobody
 /// notices was not run.
 #[must_use]
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
-    let label = ctx.scope.label();
+    declared(&ctx.scope)
+        .into_iter()
+        .filter(|s| ctx.mode.runs(s.id.tier()))
+        .collect()
+}
+
+/// The titles of the `tier` stages `scope` plans, in ladder order — what the
+/// verdict of a run that did not run `tier` names, so a tier a mode leaves out
+/// is never a silent skip.
+#[must_use]
+pub fn tier_titles(scope: &Scope, tier: Tier) -> Vec<String> {
+    declared(scope)
+        .into_iter()
+        .filter(|s| s.id.tier() == tier)
+        .map(|s| s.title)
+        .collect()
+}
+
+/// Every stage of every tier `scope` plans, in the ladder's order.
+fn declared(scope: &Scope) -> Vec<StageSpec> {
+    let label = scope.label();
     let mut v = vec![
         // THE TEST COMPILE, AT t0 (2026-09-27). The test run below waits for the
         // driver lane, and its compile does not need to: a compile is exactly the
@@ -227,9 +325,10 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // `DriverTarget`.
         //
         // NOT FOR TIPPY (2026-09-23) OR THE XTASK LANE (2026-09-27). Both only
-        // compile; the tests that measure the machine run in their own exclusive
-        // stage (`StageId::MeasuringTests`), so the run no longer holds its
-        // start for a compile.
+        // compile; the tests whose verdicts depend on how busy the box is run
+        // in exclusive stages of their own (`StageId::DeadlineTests`, and the
+        // MEASURE tier's `StageId::MeasuringTests`), so the run no longer holds
+        // its start for a compile.
         StageSpec {
             after_lanes: vec![Lane::DriverTarget],
             ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
@@ -269,14 +368,15 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "grep guards and license headers",
         Lane::Pure,
     ));
-    // DELIVERY TOOLING — "release tooling (installer update channel, export
-    // policy, release preflight, after-cut; stubbed)" until 2026-09-26, when
-    // five orphaned suites joined it and two of them made "release" false:
-    // dev-app's signing identity and the cargo pin dev-app shares with the
-    // installer (`stages.rs` section 3.5 has the roster and the reason).
+    // DELIVERY TOOLING — every offline suite over the scripts that take the
+    // app and its toolchain packages to someone's machine, each on stubs of its
+    // own making (`stages.rs` section 3.5 has the roster and the reasons). The
+    // atpkg index and publish producers' ten joined on 2026-09-27 from the
+    // driver lane, where they had sat beside the one suite that drives a real
+    // `atpkg` (the pack, below) and held the test run's start with it.
     v.push(spec(
         StageId::DeliveryTooling,
-        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup; offline)",
+        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup, atpkg index and publish producers; offline)",
         Lane::Pure,
     ));
     v.push(spec(
@@ -321,144 +421,98 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "foreign-cell type-check (xtask gate cells-foreign: the cells no fleet box hosts)",
         Lane::XtaskTarget,
     ));
-    // DRIVER BUILDS (2026-09-13): the smoke, redraw and objc binaries — and,
-    // since 2026-09-26, aterm-gui's library test binary for the window-server
-    // unit tests — compiled at t0 in their own lane. Every driver stage below still runs its
-    // own build argv — a fingerprint no-op after this — so nothing is proven
-    // from this row's binaries that its own stage did not ask cargo for. What
-    // it removes is those compiles running one after another inside the
-    // exclusive tail. Declared here, before the smokes, because a stage after
-    // an exclusive barrier could not start until the barrier finished.
+    // DRIVER BUILDS (2026-09-13): the objc, smoke and redraw binaries and the
+    // live lanes' `aterm`, compiled at t0 in their own lane. Every driver
+    // stage below still runs its own build argv — a fingerprint no-op after
+    // this — so nothing is proven from this row's binaries that its own stage
+    // did not ask cargo for. What it removes is those compiles running one
+    // after another inside the exclusive tail. Declared here, before the
+    // smokes, because a stage after an exclusive barrier could not start until
+    // the barrier finished.
     v.push(spec(
         StageId::DriverBuilds,
-        "driver builds (smoke, redraw and objc binaries, the live lanes' aterm, and the window-server test binary)",
+        "driver builds (objc, smoke and redraw binaries, and the live lanes' aterm)",
         Lane::DriverTarget,
     ));
-    // THE CONFORMANCE RELEASE ARTIFACT (2026-09-22) — the driver-builds row's
-    // twin, one lane over, and for the identical reason: a build the ladder
-    // used to pay for INSIDE a stage that measures, while every other core
-    // idled.
-    //
-    // `crates/aterm-conformance/tests/support/mod.rs`'s `release_bin` builds
-    // `--locked --release -p aterm` into `target/conformance-release` and hands
-    // the binary to the paint and spin suites — which judge the RELEASE
-    // artifact and refuse to run without one. Cargo runs test binaries ONE AT A
-    // TIME, so whichever of the two sorts first pays for
-    // that whole release build inside the test stage's own time, with nothing
-    // else in the gate running. MEASURED on a `--fast` run of 2026-09-22
-    // (`--timings`): `test (--workspace)` was 33 of the run's 36
-    // minutes, and its two slowest suites were `untracked_stage` (424 s, deleted
-    // 2026-09-24) and `paint` (417 s) out of 581.
-    //
-    // This row runs THE SAME argv, in THE SAME directory, from THE SAME cwd —
-    // `stages::conformance_release_cmd` is the one place that argv is written,
-    // and `stages.rs`'s tests pin it against the helper's source. Measured
-    // 2026-09-22 on the owner's Mac: the build is 325.9 s cold and 0.18 s warm
-    // when both invocations carry the same environment. They do NOT today, and
-    // `stages.rs`'s section header says exactly how much of it the suites still
-    // redo and why (cargo's own per-package `CARGO_*` variables, forwarded by
-    // the helper into its nested cargo, which two build scripts track).
-    //
-    // NOT in `after_lanes` of anything, and nothing waits on this lane: the
-    // point is to overlap the test compile, and a waiter would put the cost
-    // back on the critical path it was taken off. Nor is it a MEASUREMENT risk: the
-    // two suites that use this artifact are the measuring stage's, which is
-    // exclusive, so neither of them can start before this row has finished.
-    if primes_conformance_release(ctx) {
+    // THE CONFORMANCE RELEASE ARTIFACT (2026-09-22; the MEASURE tier's since
+    // 2026-09-26) — a fat-LTO, one-codegen-unit `--release -p aterm`, 326 s
+    // cold, built at t0 in its own lane so the exclusive measuring stage that
+    // judges it finds it warm (its own first child is the same build, a
+    // fingerprint check by then). Nothing waits on this lane: the point is to
+    // overlap everything else, and the measuring stage, being exclusive,
+    // cannot start before it has finished anyway.
+    if measures_paint_and_spin(scope) {
         v.push(spec(
             StageId::ConformanceRelease,
             "conformance release artifact (paint/spin build it otherwise)",
             Lane::ConformanceRelease,
         ));
     }
-    // THE SEALED FABRIC RUNG (2026-09-14), a DRIVER-lane stage declared behind
-    // the driver builds. `tests/two_nodes_sealed.rs` is `#![cfg(feature =
-    // "sealed")]`, so the workspace test run compiles the one test covering the
-    // vendored astream-aead to nothing and this row is its only cadence. Its
-    // suite boots real `aterm-gui --headless` processes, which aterm-link cannot
-    // declare (`CARGO_BIN_EXE_` names its own package's binaries only), so the
-    // harness FINDS one — first in the target dir the test binary was built
-    // into — and refuses one older than any source cargo's depfile names.
-    //
-    // It first ran at t0 in a `target-sealed/` of its own, which never builds
-    // `aterm-gui`, so the harness fell through to `target/`'s: still being
-    // relinked by the build stage on a warm gate, absent on a cold one.
-    // MEASURED on a warm gate after a commit that touched an aterm-gui
-    // dependency: the rung ran 2.0–71.4 s, the build 2.0–116.9 s, and 5 of its
-    // 9 tests were refused with "aterm-gui is STALE". The guard was right; the
-    // order was wrong.
-    //
-    // So it runs where the gate's driven `aterm-gui` is built: the suite is
-    // compiled into `target-drivers/`, which makes that binary the harness's
-    // first search; the stage's first child is the smokes' own build argv (a
-    // fingerprint no-op after the row above, a real build if anything moved)
-    // and the suite starts only if it succeeded; and this lane's order keeps
-    // the whole row behind the driver builds, with nothing else writing the
-    // lane's binaries while it runs. Declared BEFORE the smokes' barrier, so
-    // the test run still waits for it and never overlaps it; it waits on no
-    // lanes itself, so `sched::check_after_lanes` still holds.
-    if ctx.scope.includes_sealed_lane() {
+    // THE SEALED FABRIC RUNG (2026-09-14; `--full` only since 2026-09-27, see
+    // [`FULL_ONLY`]). `tests/two_nodes_sealed.rs` is `#![cfg(feature =
+    // "sealed")]`, so the workspace test run compiles it to nothing and this
+    // row is its only cadence. Its suite boots real `aterm-gui --headless`
+    // processes, which its harness FINDS — first in the target dir the test
+    // binary was built into — and refuses when older than their sources. So it
+    // is a DRIVER-lane row: its first child builds that `aterm-gui` into this
+    // lane's dir and its suite starts only if that succeeded (`stages.rs`),
+    // and it is declared before the smokes' barrier, so the test run waits for
+    // it and never relinks the binary under it (`sched.rs` holds every row of
+    // this lane to that).
+    if scope.includes_sealed_lane() {
         v.push(spec(
             StageId::SealedLane,
             "sealed fabric lane (aterm-link --features sealed)",
             Lane::DriverTarget,
         ));
     }
-    // THE ATPKG PUBLISH TOOLING (2026-09-16) — the driver lane's other row, and
-    // it moved here for the reason the rung above did. Its third suite
-    // (`tools/test-atpkg-pack-one-compiler.sh`, section D) PACKS a sysroot
-    // bundle with a real `atpkg`, and on a host that can run that pack (macOS
-    // with cc, codesign and zstd) it treats a missing binary as a GAP in the
-    // run and FAILS, rather than printing PASS over half its checks. It
-    // resolved that binary as `$ATPKG`, else `<root>/target/debug/atpkg`, else
-    // the release one — and a `Lane::Pure` stage starting at t0 can only read
-    // those from a PREVIOUS run.
-    //
-    // MEASURED on 86381efbf (`--timings`): the row ran 2.685 s ->
-    // 112.393 s and FAILED with "section D (the real pack end to end) cannot
-    // run: no atpkg binary", while the workspace build that writes
-    // `target/debug/atpkg` ran 2.685 s -> 805.370 s. Three earlier gates passed
-    // the row only because a STALE `atpkg` from an earlier run sat in the warm
-    // snapshot; on a cold one it could never pass.
-    //
-    // So it is a driver-lane stage: its first child is `targo build -q -p
-    // atpkg` in `target-drivers/`, the pack suite runs only if that built and
-    // is handed `$ATPKG` = the binary it just built (which puts the stale
-    // `<root>/target` fallback out of reach), and this lane's order keeps the
-    // whole row behind the driver builds, with nothing else writing the lane's
-    // binaries while it runs. Declared BEFORE the smokes' barrier, so the test
-    // run still waits for it and never overlaps it; it waits on no lanes
-    // itself, so `sched::check_after_lanes` still holds.
-    //
-    // THE DRIVER LANE rather than one of its own, measured: of the 49 units
-    // `-p atpkg` needs, 48 are units this lane already holds (unit graphs,
-    // 2026-09-16) — 44 of them at an identical feature set, and 4 (`ring`'s
-    // three units and `aterm-types`) at a different one, which cargo keys and
-    // caches separately and therefore never relinks out from under the
-    // `aterm-gui` the smokes drive. A lane of its own would compile all 49
-    // from cold on every gate, which is the second `aterm-gui` mistake
-    // `target-sealed/` made.
+    // THE ATPKG END-TO-END PACK (2026-09-16), the same shape for the same
+    // reason. `tools/test-atpkg-pack-one-compiler.sh` section D PACKS a
+    // sysroot bundle with a real `atpkg`, resolved as `$ATPKG`, else
+    // `<root>/target/debug/atpkg` — which, from a stage at t0, is a PREVIOUS
+    // run's (measured on 86381efbf: FAIL on a cold snapshot; three earlier
+    // gates passed only on a stale binary). So its first child builds `-p
+    // atpkg` into this lane's dir and the suite is handed exactly that. Its
+    // ten stub-only siblings, which drive no real binary, run with the
+    // delivery tooling at t0 (since 2026-09-27).
     v.push(spec(
         StageId::AtpkgTooling,
-        "atpkg publish tooling (index/publish/pack rows; stubbed)",
+        "atpkg end-to-end pack (the atpkg this stage builds)",
         Lane::DriverTarget,
     ));
-    // THE MEASURING TESTS (2026-09-23), the first exclusive stage: the paint
-    // and spin matrices and aterm-update's launchd copy tests, which the test
-    // run skips (`stages::MEASURING_TESTS`). They
-    // judge frame timings and launchd deadlines, so like the smokes below they
-    // run with nothing else in flight: every stage above has finished first,
-    // the conformance-release prime they share included.
-    v.push(exclusive(
-        StageId::MeasuringTests,
-        format!("measuring tests ({label}; run alone)"),
-        Lane::MainTarget,
-    ));
+    // THE DEADLINE TESTS (2026-09-26), the LAND tier's first exclusive stage:
+    // aterm-update's launchd copy tests (`stages::DEADLINE_TESTS`), which the
+    // test run skips. Their deadlines are seconds long, and they are
+    // CORRECTNESS tests — the ty models of the copy's deadline, publication
+    // and reaper, and the real wrapper — so they stay in the merge contract and
+    // run alone.
+    if holds_deadline_tests(scope) {
+        v.push(exclusive(
+            StageId::DeadlineTests,
+            format!("deadline tests ({label}; run alone)"),
+            Lane::MainTarget,
+        ));
+    }
+    // THE MEASURING TESTS (2026-09-23; the MEASURE tier's since 2026-09-26):
+    // the paint and spin matrices, which the test run skips
+    // (`stages::MEASURING_TESTS`). They judge the RELEASE artifact's frame
+    // timings, so like the smokes below they run with nothing else in flight.
+    if measures_paint_and_spin(scope) {
+        v.push(exclusive(
+            StageId::MeasuringTests,
+            format!("measuring tests ({label}; run alone)"),
+            Lane::MainTarget,
+        ));
+    }
     v.push(exclusive(
         StageId::ControlSocketSmoke,
         "control-socket smoke",
         Lane::DriverTarget,
     ));
+    // THE PACING SMOKE, MEASURE tier since 2026-09-26: it gates a real
+    // window's input->present, key->write and present->glass percentiles —
+    // the machine's latencies, which the control-socket smoke above (the
+    // AI-first spine, LAND) does not judge.
     v.push(exclusive(
         StageId::GuiSmoke,
         "gui typing-pacing smoke",
@@ -552,39 +606,12 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "objc event drive (every NSEvent-taking WinitView row and sendEvent:, with a real NSEvent of every type AppKit can deliver)",
         Lane::DriverTarget,
     ));
-    // THE MODAL DRIVER (W13), unconditional like the five above it. W13 ported
-    // `aterm-gui`'s last five `objc2` files, and four of them are one
-    // subsystem — `alert_keys.rs`, `menu::confirm`, the paste sheet and
-    // `app_introspect.rs` — that NONE of the drivers above touches: no
-    // `NSAlert`, no sheet, no completion block, no local event monitor, no
-    // `NSBitmapImageRep`. Its cheaper half, `gui_sent_prototypes.rs`, reads
-    // the encoding of every selector those files send; a census cannot see a
-    // correct send of the wrong selector, a block whose ABI is right and whose
-    // ownership is wrong, or a capture that answers bytes which are not a PNG.
-    // This one presents the real alert, reads the first button's key
-    // equivalent off AppKit, attaches the sheet, drives a keyDown through the
-    // swizzled `-sendEvent:` into the installed monitor, clicks, and reads the
-    // response the copied completion block was handed.
-    v.push(spec(
-        StageId::ObjcAlertDrive,
-        "objc alert drive (the real NSAlert: its buttons and key equivalent, the sheet and its copied completion block, the local key monitor, the menu bar walk and the chrome capture)",
-        Lane::DriverTarget,
-    ));
-    // THE SWIZZLE DRIVER (W12), unconditional for the reason its module
-    // states: NO ENCODING CHECK CAN SEE A SWIZZLE. `SwizzleSite` is what
-    // installs the fork's `-[NSApplication sendEvent:]` override — the row
-    // the containment's stop-outside/contain-inside order lives on — and
-    // `tests/swizzle.rs` can only measure it on classes of its own making.
-    // This one runs it against the live AppKit class: Apple's own encoding
-    // for the row, the IMP's Mach-O image moving from AppKit into this
-    // executable (part A2 of the live-class audit, drawn on the capability
-    // itself), a real `NSEvent` through both halves of the chain, and the
-    // prototype check refusing a wrong prototype.
-    v.push(spec(
-        StageId::ObjcSwizzleDrive,
-        "objc swizzle drive (SwizzleSite against the live -[NSApplication sendEvent:]: Apple's encoding, the IMP's image, a real NSEvent through both halves of the chain, and the refusal)",
-        Lane::DriverTarget,
-    ));
+    // (The modal and swizzle drivers were rows here until 2026-09-27. The
+    // swizzle's one live proof — the IMP's image leaving AppKit — is the
+    // window drive's stage 15, and the event drive sends every NSEvent shape
+    // through the swizzled `sendEvent:`; the modal driver sent every message
+    // as a raw `objc_msgSend`, so it drove AppKit's facts, not aterm's.)
+    //
     // THE CONTAINER DRIVER (W12), unconditional because its obligation has no
     // type-system half. `MainThreadBound<T>` is `Send + Sync` for every `T`
     // on the strength of a `Drop` that reschedules to the main thread, and
@@ -597,23 +624,6 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     v.push(spec(
         StageId::ObjcBoundDrive,
         "objc bound drive (MainThreadBound's main-thread drop against an unsound twin, a declared class's -dealloc, and the needs_drop hang differential)",
-        Lane::DriverTarget,
-    ));
-    // THE WINDOW-SERVER UNIT TESTS (2026-09-26), unconditional like the drivers
-    // above it and in their lane for their reason: these rows open a
-    // WindowServer connection, which is the one thing AGENTS.md's "Concurrent
-    // sessions" rule 5 keeps out of every parallel test run. On 2026-08-17 and
-    // 2026-09-01 a unit test binary doing that from a bloated
-    // `target/debug/deps` held WindowServer's main thread in a synchronous TCC
-    // preflight past its 40 s watchdog, and the watchdog killed every window on
-    // the machine. The rows are `#[ignore]`d in `mod window_server` blocks
-    // (`tools/grep_guard.sh` B9e); `targo test` skips them everywhere and this
-    // stage runs exactly them, from the driver lane's own target dir, after the
-    // smokes' barrier. Never removed by a narrowing: the rows are aterm-gui's,
-    // and a gate a narrowing can drop stops running when someone is in a hurry.
-    v.push(spec(
-        StageId::WindowServerTests,
-        "window-server unit tests (aterm-gui's AppKit rows that open a WindowServer connection, ignored in every parallel test run)",
         Lane::DriverTarget,
     ));
     // THE FOREGROUND HANDBACK (2026-09-26), the last row of the driver lane.
@@ -639,112 +649,112 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "foreground handback (a real shell's job control, driving a private headless aterm built this run)",
         Lane::DriverTarget,
     ));
-    if ctx.mode == Mode::Full {
-        v.push(spec(
-            StageId::KaniFloor,
-            "trust-mc / Kani BMC floor (config-free parser harnesses)",
-            Lane::MainTarget,
-        ));
-        // THE WHOLE MATRIX, COMPILED. Every tier type-checks the host's own
-        // cell (the test and lint lanes) and, since 2026-09-25, the five
-        // cells no fleet box hosts (`ForeignCells` above); forge measures all
-        // eight and compiles none. `xtask gate cells` adds the rest — `mac-x64`,
-        // and `mac-arm`/`linux` where the box is not that host — with a real
-        // compiler per triple. It is `--full`-only because each of those is
-        // native on some box, where that box's own lanes compile it, and its
-        // cross verdict differs from the native one (gate.rs,
-        // `FLEET_HOST_TRIPLES`). (Until 2026-09-25 this comment read "`--fast`
-        // type-checks exactly one of the five targets", true then.)
-        //
-        // WHAT `--fast` DOES NOT SEE, corrected 2026-09-01 because the previous
-        // version of this sentence was FALSE IN BOTH DIRECTIONS. It listed
-        // "every `#[cfg(unix)]`" among the blind spots: macOS IS a unix, so the
-        // mac-arm cell `--fast` runs compiles every `#[cfg(unix)]` block in
-        // every crate it builds, and always did. And it implied `--full` covered
-        // the rest, which was not true either — `ring` and `zstd-sys` bundle C,
-        // their build scripts could not run for the Linux and Windows triples on
-        // this box, and until the `cshim` rows landed in
-        // `tools/cross-cell-gate.tsv` those two cells reached NONE of aterm's
-        // own eighteen compiled crates. A bare `E0308` under
-        // `#[cfg(target_os = "linux")]` in `crates/aterm-gui/src/control.rs`
-        // left `gate cells` GREEN.
-        //
-        // What `--fast` did not see before `ForeignCells`: `#[cfg(windows)]`,
-        // `#[cfg(target_os = "linux")]`, the `unix` arms that exclude Apple,
-        // `#[cfg(target_arch = "wasm32")]`, and every third-party crate that
-        // only appears on a non-native cell. `--fast` now sees the Windows,
-        // wasm32 and ARM-Linux arms through the foreign cells; the x86_64
-        // `linux` cell stays here, and `--full` sees all four of those: measured over the 3,245 platform `cfg` attribute sites under
-        // `crates/`, some cell reaches 2,894 of them, against 2,143 before the
-        // shim rows. Of the 351 left, 232 are in crates no cell's graph carries
-        // at all (`aterm-release`, `atpkg-keys`, `aterm-conformance`,
-        // `aterm-nest`, `aterm-effects-web`, …) and 119 are predicates no cell's
-        // triple can satisfy. Neither `--fast` nor `--full` LINKS or RUNS a
-        // cross artifact.
-        //
-        // `MainTarget`, even though every cell compiles into a target directory
-        // OUTSIDE this repo: the stage reaches the verb through
-        // `targo run -p xtask`, and THAT holds the workspace lock like any other
-        // gate. The lane describes what the stage contends for, not where the
-        // work it launches ends up.
-        v.push(spec(
-            StageId::CrossCells,
-            "cross-cell type-check (every forge cell, each for its own triple)",
-            Lane::MainTarget,
-        ));
-        // THE STARTUP-COMPARISON HARNESS'S OWN TEST (2026-09-27: per commit
-        // until then). It guards the evidence path a publishable startup
-        // comparison takes, which only `--full`-grade work produces.
-        v.push(spec(
-            StageId::StartCompare,
-            "startup comparison scheduler",
-            Lane::Pure,
-        ));
-        // THE CODEX LIVE UPGRADE (2026-09-26) — `--full` only, and run alone.
-        //
-        // `tools/test-codex-live-upgrade.sh` starts the managed store's OLDER
-        // Codex in a private headless `aterm` and watches that aterm's harness
-        // host move it onto the store's CURRENT build. It ran in the per-commit
-        // ladder for one day, beside the foreground handback, and left it because
-        // its verdict is not a function of the tree alone. Two inputs are the
-        // MACHINE's and the VENDOR's:
-        //
-        //  * THE STORE. With no Codex older than `current` in it, the lane cannot
-        //    run (exit 77). atpkg keeps the live build plus one rollback
-        //    (`crates/atpkg/src/gc.rs`), so that is every Mac that installed Codex once,
-        //    installed it fresh, or rolled back to its oldest build — and there
-        //    the per-commit gate could never claim the contract, whatever the
-        //    commit.
-        //  * THE VENDOR. Codex is a default-set, vendor-fetched package that atpkg
-        //    moves forward on its own, and the lane asserts one release's internals
-        //    (0.157's daemon, its `auto-update-version` pin). An unchanged commit
-        //    could go from PASS to FAIL overnight.
-        //
-        // `lib.rs` states the rule this broke: "A contract that measures a
-        // different thing depending on who typed the command is not a contract."
-        // Pinning two Codex builds for the lane to upgrade between was the other
-        // way out, and was not taken: the gate is offline, the pins would be a
-        // vendor download per machine, and a pinned pair stops measuring the
-        // Codex people actually run, which is the lane's whole point.
-        //
-        // So it is in the tier that already holds world-dependent evidence (the
-        // trust-mc floor), where a missing prerequisite is a NAMED SKIP —
-        // counted, printed with the lane's own reason, and
-        // forfeiting that run's contract claim, never a pass — and a FAIL after a
-        // vendor update with an unchanged tree is exactly what the tier is for:
-        // aterm's host (or the lane's release-specific checks) has to catch up
-        // with the Codex people now run. EXCLUSIVE and LAST: it waits on real
-        // idle points and ten-second ledger polls for ~10 minutes (581 s on
-        // 2026-09-26), and in `--full` the tiers above run after the smokes'
-        // barrier, so without exclusivity it would run beside them. Last, so
-        // nothing waits behind it. Its own first child is the handback row's
-        // build (a fingerprint no-op by then).
-        v.push(exclusive(
-            StageId::CodexLiveUpgrade,
-            "Codex live upgrade (the managed store's older Codex moved onto its current one by a private headless aterm; reads this machine's store and the vendor's Codex; run alone)",
-            Lane::DriverTarget,
-        ));
-    }
+    // THE `--full`-ONLY STAGES ([`FULL_ONLY`]).
+    v.push(spec(
+        StageId::KaniFloor,
+        "trust-mc / Kani BMC floor (config-free parser harnesses)",
+        Lane::MainTarget,
+    ));
+    // THE WHOLE MATRIX, COMPILED. Every tier type-checks the host's own
+    // cell (the test and lint lanes) and, since 2026-09-25, the five
+    // cells no fleet box hosts (`ForeignCells` above); forge measures all
+    // eight and compiles none. `xtask gate cells` adds the rest — `mac-x64`,
+    // and `mac-arm`/`linux` where the box is not that host — with a real
+    // compiler per triple. It is `--full`-only because each of those is
+    // native on some box, where that box's own lanes compile it, and its
+    // cross verdict differs from the native one (gate.rs,
+    // `FLEET_HOST_TRIPLES`). (Until 2026-09-25 this comment read "`--fast`
+    // type-checks exactly one of the five targets", true then.)
+    //
+    // WHAT `--fast` DOES NOT SEE, corrected 2026-09-01 because the previous
+    // version of this sentence was FALSE IN BOTH DIRECTIONS. It listed
+    // "every `#[cfg(unix)]`" among the blind spots: macOS IS a unix, so the
+    // mac-arm cell `--fast` runs compiles every `#[cfg(unix)]` block in
+    // every crate it builds, and always did. And it implied `--full` covered
+    // the rest, which was not true either — `ring` and `zstd-sys` bundle C,
+    // their build scripts could not run for the Linux and Windows triples on
+    // this box, and until the `cshim` rows landed in
+    // `tools/cross-cell-gate.tsv` those two cells reached NONE of aterm's
+    // own eighteen compiled crates. A bare `E0308` under
+    // `#[cfg(target_os = "linux")]` in `crates/aterm-gui/src/control.rs`
+    // left `gate cells` GREEN.
+    //
+    // What `--fast` did not see before `ForeignCells`: `#[cfg(windows)]`,
+    // `#[cfg(target_os = "linux")]`, the `unix` arms that exclude Apple,
+    // `#[cfg(target_arch = "wasm32")]`, and every third-party crate that
+    // only appears on a non-native cell. `--fast` now sees the Windows,
+    // wasm32 and ARM-Linux arms through the foreign cells; the x86_64
+    // `linux` cell stays here, and `--full` sees all four of those: measured over the 3,245 platform `cfg` attribute sites under
+    // `crates/`, some cell reaches 2,894 of them, against 2,143 before the
+    // shim rows. Of the 351 left, 232 are in crates no cell's graph carries
+    // at all (`aterm-release`, `atpkg-keys`, `aterm-conformance`,
+    // `aterm-nest`, `aterm-effects-web`, …) and 119 are predicates no cell's
+    // triple can satisfy. Neither `--fast` nor `--full` LINKS or RUNS a
+    // cross artifact.
+    //
+    // `MainTarget`, even though every cell compiles into a target directory
+    // OUTSIDE this repo: the stage reaches the verb through
+    // `targo run -p xtask`, and THAT holds the workspace lock like any other
+    // gate. The lane describes what the stage contends for, not where the
+    // work it launches ends up.
+    v.push(spec(
+        StageId::CrossCells,
+        "cross-cell type-check (every forge cell, each for its own triple)",
+        Lane::MainTarget,
+    ));
+    // THE STARTUP-COMPARISON HARNESS'S OWN TEST (2026-09-27: per commit
+    // until then). It guards the evidence path a publishable startup
+    // comparison takes, which only `--full`-grade work produces.
+    v.push(spec(
+        StageId::StartCompare,
+        "startup comparison scheduler",
+        Lane::Pure,
+    ));
+    // THE CODEX LIVE UPGRADE (2026-09-26) — `--full` only, and run alone.
+    //
+    // `tools/test-codex-live-upgrade.sh` starts the managed store's OLDER
+    // Codex in a private headless `aterm` and watches that aterm's harness
+    // host move it onto the store's CURRENT build. It ran in the per-commit
+    // ladder for one day, beside the foreground handback, and left it because
+    // its verdict is not a function of the tree alone. Two inputs are the
+    // MACHINE's and the VENDOR's:
+    //
+    //  * THE STORE. With no Codex older than `current` in it, the lane cannot
+    //    run (exit 77). atpkg keeps the live build plus one rollback
+    //    (`crates/atpkg/src/gc.rs`), so that is every Mac that installed Codex once,
+    //    installed it fresh, or rolled back to its oldest build — and there
+    //    the per-commit gate could never claim the contract, whatever the
+    //    commit.
+    //  * THE VENDOR. Codex is a default-set, vendor-fetched package that atpkg
+    //    moves forward on its own, and the lane asserts one release's internals
+    //    (0.157's daemon, its `auto-update-version` pin). An unchanged commit
+    //    could go from PASS to FAIL overnight.
+    //
+    // `lib.rs` states the rule this broke: "A contract that measures a
+    // different thing depending on who typed the command is not a contract."
+    // Pinning two Codex builds for the lane to upgrade between was the other
+    // way out, and was not taken: the gate is offline, the pins would be a
+    // vendor download per machine, and a pinned pair stops measuring the
+    // Codex people actually run, which is the lane's whole point.
+    //
+    // So it is in the tier that already holds world-dependent evidence (the
+    // trust-mc floor), where a missing prerequisite is a NAMED SKIP —
+    // counted, printed with the lane's own reason, and
+    // forfeiting that run's contract claim, never a pass — and a FAIL after a
+    // vendor update with an unchanged tree is exactly what the tier is for:
+    // aterm's host (or the lane's release-specific checks) has to catch up
+    // with the Codex people now run. EXCLUSIVE and LAST: it waits on real
+    // idle points and ten-second ledger polls for ~10 minutes (581 s on
+    // 2026-09-26), and in `--full` the tiers above run after the smokes'
+    // barrier, so without exclusivity it would run beside them. Last, so
+    // nothing waits behind it. Its own first child is the handback row's
+    // build (a fingerprint no-op by then).
+    v.push(exclusive(
+        StageId::CodexLiveUpgrade,
+        "Codex live upgrade (the managed store's older Codex moved onto its current one by a private headless aterm; reads this machine's store and the vendor's Codex; run alone)",
+        Lane::DriverTarget,
+    ));
+
     v
 }
 
@@ -772,8 +782,11 @@ fn exclusive(id: StageId, title: impl Into<String>, lane: Lane) -> StageSpec {
 mod tests {
     use super::*;
     use crate::EnvSnapshot;
+    use crate::cli::Mode;
     use crate::scope::Scope;
     use std::path::PathBuf;
+
+    const MODES: [Mode; 3] = [Mode::Fast, Mode::Measure, Mode::Full];
 
     fn ctx(mode: Mode, scope: Scope) -> Ctx {
         Ctx::new(
@@ -807,23 +820,81 @@ mod tests {
                 StageId::Forge,
                 StageId::ForeignCells,
                 StageId::DriverBuilds,
-                StageId::ConformanceRelease,
-                StageId::SealedLane,
                 StageId::AtpkgTooling,
-                StageId::MeasuringTests,
+                StageId::DeadlineTests,
                 StageId::ControlSocketSmoke,
-                StageId::GuiSmoke,
                 StageId::RedrawConformance,
                 StageId::ObjcClassAudit,
                 StageId::ObjcImeDrive,
                 StageId::ObjcToolbarDrive,
                 StageId::ObjcWindowDrive,
                 StageId::ObjcEventDrive,
-                StageId::ObjcAlertDrive,
-                StageId::ObjcSwizzleDrive,
                 StageId::ObjcBoundDrive,
-                StageId::WindowServerTests,
                 StageId::ForegroundHandback,
+            ]
+        );
+    }
+
+    /// THE MEASURE LADDER IS THE MEASURE TIER, IN LADDER ORDER (2026-09-26):
+    /// `--measure` plans exactly [`MEASURE_TIER`] — the release artifact, the
+    /// measuring tests and the pacing smoke — and not one stage of the merge
+    /// contract.
+    #[test]
+    fn the_measure_ladder_is_the_measure_tier_in_ladder_order() {
+        assert_eq!(ids(&ctx(Mode::Measure, Scope::workspace())), MEASURE_TIER);
+        for id in MEASURE_TIER {
+            assert_eq!(id.tier(), Tier::Measure, "{id:?}");
+        }
+        for id in FULL_ONLY {
+            assert_eq!(id.tier(), Tier::Full, "{id:?}");
+        }
+    }
+
+    /// THE MEASURE TIER IS DECLARED ONCE, AND A RUN THAT LEAVES IT OUT NAMES IT
+    /// (2026-09-26). In every mode and scope, a stage is planned iff its tier
+    /// is one the mode runs — nothing else decides it — and [`tier_titles`]
+    /// names exactly the MEASURE stages the same scope would plan, which is
+    /// what the default's verdict lists as `not part of the merge contract`.
+    /// A scope without `aterm-conformance` names no release prime: it would
+    /// not have built one either.
+    #[test]
+    fn a_stage_is_planned_iff_the_mode_runs_its_tier_and_the_left_out_tier_is_named() {
+        for scope in [
+            Scope::workspace(),
+            Scope::crate_only("aterm-grid"),
+            Scope::changed("main", vec!["aterm-conformance".into()], true),
+        ] {
+            let full = plan(&ctx(Mode::Full, scope.clone()));
+            for mode in MODES {
+                let got = ids(&ctx(mode, scope.clone()));
+                let want: Vec<StageId> = full
+                    .iter()
+                    .map(|s| s.id)
+                    .filter(|id| mode.runs(id.tier()))
+                    .collect();
+                assert_eq!(got, want, "{mode:?} / {}", scope.label());
+            }
+            let measured: Vec<String> = full
+                .iter()
+                .filter(|s| s.id.tier() == Tier::Measure)
+                .map(|s| s.title.clone())
+                .collect();
+            assert_eq!(tier_titles(&scope, Tier::Measure), measured);
+            assert_eq!(
+                tier_titles(&scope, Tier::Measure)
+                    .iter()
+                    .any(|t| t.starts_with("conformance release artifact")),
+                scope.includes_crate("aterm-conformance"),
+                "{}",
+                scope.label()
+            );
+        }
+        assert_eq!(
+            tier_titles(&Scope::workspace(), Tier::Measure),
+            [
+                "conformance release artifact (paint/spin build it otherwise)",
+                "measuring tests (--workspace; run alone)",
+                "gui typing-pacing smoke",
             ]
         );
     }
@@ -854,104 +925,6 @@ mod tests {
         }
     }
 
-    /// THE SEALED RUNG IS ORDERED BEHIND THE aterm-gui IT DRIVES (2026-09-14).
-    ///
-    /// Its suite finds `aterm-gui` in the target dir it was built into and
-    /// refuses a stale one. When it ran at t0 in a lane of its own, nothing
-    /// ordered it behind any build of that binary, and a warm gate measured 5 of
-    /// its 9 tests refused "aterm-gui is STALE" while the build stage was still
-    /// linking. It must sit in the lane whose driver builds produce the binary,
-    /// declared after them and before the smokes' barrier (so the test run
-    /// still awaits it), and wait on no lanes itself. `stages.rs` pins that its
-    /// commands build into that same lane's dir, and `sched.rs` model-checks
-    /// that it never starts before the driver builds finish.
-    #[test]
-    fn the_sealed_rung_is_ordered_behind_the_driver_builds_of_the_aterm_gui_it_drives() {
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-link"),
-                Scope::changed("main", vec!["aterm-link".into()], true),
-            ] {
-                let p = plan(&ctx(mode, scope.clone()));
-                let at = |id| p.iter().position(|s| s.id == id);
-                let sealed = at(StageId::SealedLane).expect("the sealed rung is planned");
-                let builds = at(StageId::DriverBuilds).expect("driver builds are planned");
-                let test = at(StageId::Test).expect("test");
-                let barrier = p
-                    .iter()
-                    .position(|s| s.exclusive)
-                    .expect("an exclusive stage");
-                let what = format!("{mode:?} / {}", scope.label());
-                assert_eq!(p[sealed].lane, Lane::DriverTarget, "{what}");
-                assert_eq!(p[builds].lane, p[sealed].lane, "{what}");
-                assert!(
-                    builds < sealed && sealed < barrier,
-                    "{what}: the rung must follow the driver builds and precede the smokes"
-                );
-                assert!(p[sealed].after_lanes.is_empty(), "{what}");
-                assert!(
-                    crate::sched::awaited(&p, test).any(|j| j == sealed),
-                    "{what}: the test run must still wait for the rung"
-                );
-            }
-        }
-    }
-
-    /// THE ATPKG PUBLISH TOOLING IS ORDERED BEHIND THE atpkg IT DRIVES
-    /// (2026-09-16).
-    ///
-    /// Its third suite packs a real sysroot bundle with a real `atpkg`, which
-    /// it resolves as `$ATPKG`, else `<root>/target/debug/atpkg`, else the
-    /// release one — and on a host that can run that pack it FAILS rather than
-    /// skipping when there is none. At t0 in `Lane::Pure` it could only ever
-    /// find a PREVIOUS run's binary: measured on 86381efbf, FAIL at 2.685 s ->
-    /// 112.393 s while the build that writes that path ran to 805.370 s. So it
-    /// must sit in the lane whose dir its own build child writes, declared
-    /// after the driver builds and before the smokes' barrier (so the test run
-    /// still awaits it), waiting on no lanes itself — and it must never again
-    /// be `Lane::Pure`, which is what a t0 start means here. `stages.rs` pins
-    /// the build child and the `$ATPKG` binding; `sched.rs` model-checks that
-    /// it never starts before the driver builds finish.
-    #[test]
-    fn the_atpkg_tooling_is_ordered_behind_the_build_of_the_atpkg_it_drives() {
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("atpkg"),
-                Scope::crate_only("aterm-grid"),
-                Scope::changed("main", vec!["aterm-gui".into()], true),
-                Scope::changed("main", vec![], true),
-            ] {
-                let p = plan(&ctx(mode, scope.clone()));
-                let at = |id| p.iter().position(|s| s.id == id);
-                let what = format!("{mode:?} / {}", scope.label());
-                // A narrowing may not remove it: the suites are whole-tree.
-                let atpkg = at(StageId::AtpkgTooling)
-                    .unwrap_or_else(|| panic!("{what}: the atpkg publish tooling is planned"));
-                let builds = at(StageId::DriverBuilds).expect("driver builds are planned");
-                let test = at(StageId::Test).expect("test");
-                let barrier = p
-                    .iter()
-                    .position(|s| s.exclusive)
-                    .expect("an exclusive stage");
-                assert_eq!(p[atpkg].lane, Lane::DriverTarget, "{what}");
-                assert_eq!(p[builds].lane, p[atpkg].lane, "{what}");
-                assert!(
-                    builds < atpkg && atpkg < barrier,
-                    "{what}: the row must follow the driver builds and precede the smokes"
-                );
-                assert!(p[atpkg].after_lanes.is_empty(), "{what}");
-                assert!(
-                    crate::sched::awaited(&p, test).any(|j| j == atpkg),
-                    "{what}: the test run must wait for it, as it does for every \
-                     non-barrier row of that lane"
-                );
-                crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
-            }
-        }
-    }
-
     /// A GATE NOBODY INVOKES IS NOT A GATE, for the two gate verbs that had no
     /// automatic caller until 2026-09-25. `cells-foreign` is the only automatic compile of the
     /// cells no fleet box hosts, and `forge` the only automatic read of the
@@ -977,38 +950,55 @@ mod tests {
         }
     }
 
+    /// `--full` is BOTH TIERS plus its own ([`FULL_ONLY`]), in ladder order:
+    /// take the MEASURE and FULL stages out of it and it is the default
+    /// ladder; its FULL stages are [`FULL_ONLY`], the Codex live upgrade last;
+    /// and the sealed rung, the one of them declared mid-ladder, sits in the
+    /// driver lane behind the driver builds and before the first barrier, so
+    /// the test run waits for it.
     #[test]
-    fn full_adds_its_opt_in_tiers_at_the_end_and_changes_nothing_else() {
+    fn full_is_both_tiers_plus_its_own_stages() {
         let fast = ids(&ctx(Mode::Fast, Scope::workspace()));
-        let full = ids(&ctx(Mode::Full, Scope::workspace()));
-        assert_eq!(full[..fast.len()], fast[..]);
-        assert_eq!(
-            full[fast.len()..],
-            [
-                StageId::KaniFloor,
-                StageId::CrossCells,
-                StageId::StartCompare,
-                StageId::CodexLiveUpgrade,
-            ]
+        let full = plan(&ctx(Mode::Full, Scope::workspace()));
+        let of = |tier: Tier| -> Vec<StageId> {
+            full.iter()
+                .map(|s| s.id)
+                .filter(|id| id.tier() == tier)
+                .collect()
+        };
+        assert_eq!(of(Tier::Land), fast);
+        assert_eq!(of(Tier::Measure), MEASURE_TIER);
+        assert_eq!(of(Tier::Full), FULL_ONLY);
+        assert_eq!(full.last().map(|s| s.id), Some(StageId::CodexLiveUpgrade));
+        let at = |id| full.iter().position(|s| s.id == id).expect("planned");
+        let (sealed, builds, test) = (
+            at(StageId::SealedLane),
+            at(StageId::DriverBuilds),
+            at(StageId::Test),
         );
+        let barrier = full.iter().position(|s| s.exclusive).expect("a barrier");
+        assert_eq!(full[sealed].lane, Lane::DriverTarget);
+        assert!(builds < sealed && sealed < barrier, "{full:?}");
+        assert!(crate::sched::awaited(&full, test).any(|j| j == sealed));
     }
 
-    /// THE STAGE-SET PROOF across modes and scopes. Two rows follow their
-    /// own crates: the sealed lane is aterm-link's, and the conformance-release
-    /// prime belongs to the crate whose suites build that artifact
-    /// (aterm-conformance).
-    /// Every mode and scope plans EXACTLY the whole-tree ladder of its mode
-    /// minus the lane rows its crates dropped — in the same order, nothing else
-    /// lost. With the literal fast ladder above and `--full`'s four appended
-    /// tiers, that pins every ladder the gate can print.
+    /// THE STAGE-SET PROOF across modes and scopes. Four rows follow their
+    /// own crates: the sealed lane is aterm-link's, the deadline tests are
+    /// aterm-update's, and the measuring tests and their release prime are
+    /// aterm-conformance's. Every mode and scope plans EXACTLY the whole-tree
+    /// ladder of its mode minus the rows its crates dropped — in the same
+    /// order, nothing else lost. With the literal fast ladder above, the
+    /// MEASURE tier and `--full`'s own stages, that pins every ladder the gate
+    /// can print.
     #[test]
     fn a_scope_removes_exactly_the_lanes_whose_crates_it_dropped() {
-        for mode in [Mode::Fast, Mode::Full] {
+        for mode in MODES {
             let whole = ids(&ctx(mode, Scope::workspace()));
             for scope in [
                 Scope::workspace(),
                 Scope::crate_only("aterm-grid"),
-                Scope::crate_only("aterm-search"),
+                Scope::crate_only("aterm-update"),
+                Scope::crate_only("aterm-conformance"),
                 Scope::changed("main", vec!["aterm-gui".into()], true),
                 Scope::changed("main", vec![], true),
             ] {
@@ -1017,7 +1007,10 @@ mod tests {
                     .iter()
                     .filter(|id| match id {
                         StageId::SealedLane => c.scope.includes_sealed_lane(),
-                        StageId::ConformanceRelease => primes_conformance_release(&c),
+                        StageId::DeadlineTests => holds_deadline_tests(&c.scope),
+                        StageId::ConformanceRelease | StageId::MeasuringTests => {
+                            measures_paint_and_spin(&c.scope)
+                        }
                         _ => true,
                     })
                     .copied()
@@ -1030,172 +1023,112 @@ mod tests {
                 );
             }
         }
-        // A scope holding neither crate drops both.
-        let scoped = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
-        assert!(!scoped.contains(&StageId::SealedLane));
-        assert!(!scoped.contains(&StageId::ConformanceRelease));
-        let link_only = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-link")));
-        assert!(link_only.contains(&StageId::SealedLane));
-    }
-
-    /// THE PRIME FOLLOWS THE SUITES THAT WOULD OTHERWISE BUILD IT.
-    ///
-    /// `release_bin` is reached from `aterm-conformance`'s paint and spin suites
-    /// and from nowhere else (grep of the tree, 2026-09-24; atpkg's
-    /// untracked-staging suite was the other caller until then). So the row is
-    /// planned whole-tree, planned whenever a narrowing selects that crate, and
-    /// REMOVED — not skipped — when it does not, because a minutes-long release build for a test
-    /// stage that will never open the directory is the opposite of what this row
-    /// is for.
-    #[test]
-    fn the_conformance_release_prime_follows_the_crates_whose_suites_build_it() {
-        let has = |scope: Scope| {
-            for mode in [Mode::Fast, Mode::Full] {
-                let c = ctx(mode, scope.clone());
-                assert_eq!(
-                    ids(&c).contains(&StageId::ConformanceRelease),
-                    primes_conformance_release(&c),
-                    "{mode:?} / {}",
-                    scope.label()
-                );
-            }
-            ids(&ctx(Mode::Fast, scope)).contains(&StageId::ConformanceRelease)
-        };
-        assert!(has(Scope::workspace()), "--fast and --full both prime it");
-        assert!(has(Scope::crate_only("aterm-conformance")));
-        assert!(
-            !has(Scope::crate_only("atpkg")),
-            "no atpkg suite opens the lane since its untracked-staging suite went"
-        );
-        assert!(has(Scope::changed(
-            "main",
-            vec!["aterm-grid".into(), "aterm-conformance".into()],
-            true
-        )));
-        assert!(!has(Scope::crate_only("aterm-grid")));
-        assert!(!has(Scope::changed("main", vec!["aterm-gui".into()], true)));
-        assert!(
-            !has(Scope::changed("main", vec![], true)),
-            "a selection that compiles nothing runs no suite either"
-        );
-    }
-
-    /// THE PRIME IS SCHEDULED TO OVERLAP, WHICH IS ITS WHOLE POINT.
-    ///
-    /// It must start at t0 (declared before the first exclusive barrier, so no
-    /// barrier can hold it back), own a lane nothing else is in (so no earlier
-    /// stage in it can queue it), wait on no lanes, never be exclusive, and —
-    /// above all — be awaited by NOBODY: a waiter would put the release build
-    /// back on the critical path it was taken off. `target/conformance-release`
-    /// is not `target/`, so the main lane's build never queues on it either.
-    #[test]
-    fn the_conformance_release_prime_overlaps_everything_and_blocks_nobody() {
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [Scope::workspace(), Scope::crate_only("aterm-conformance")] {
-                let p = plan(&ctx(mode, scope.clone()));
-                let what = format!("{mode:?} / {}", scope.label());
-                let prime = p
-                    .iter()
-                    .position(|s| s.id == StageId::ConformanceRelease)
-                    .unwrap_or_else(|| panic!("{what}: the prime is planned"));
-                assert_eq!(p[prime].lane, Lane::ConformanceRelease, "{what}");
-                assert_ne!(p[prime].lane, Lane::MainTarget, "{what}");
-                assert!(!p[prime].exclusive, "{what}");
-                assert!(p[prime].after_lanes.is_empty(), "{what}");
-                // Alone in its lane: nothing serialises in front of it.
-                assert_eq!(
-                    p.iter()
-                        .filter(|s| s.lane == Lane::ConformanceRelease)
-                        .count(),
-                    1,
-                    "{what}"
-                );
-                // Before the first barrier, so it is startable at t0.
-                let barrier = p
-                    .iter()
-                    .position(|s| s.exclusive)
-                    .expect("an exclusive stage");
-                assert!(prime < barrier, "{what}: a barrier would delay it");
-                let nothing_yet = vec![false; p.len()];
-                assert!(
-                    crate::sched::ready(&p, &nothing_yet, &nothing_yet, 0, prime),
-                    "{what}: the prime must be startable with nothing else finished"
-                );
-                // And nobody waits for it.
-                assert!(
-                    p.iter()
-                        .all(|s| !s.after_lanes.contains(&Lane::ConformanceRelease)),
-                    "{what}: a waiter puts the build back on the critical path"
-                );
-                for i in 0..p.len() {
-                    assert!(
-                        !crate::sched::awaited(&p, i).any(|j| j == prime),
-                        "{what}: {:?} awaits the prime",
-                        p[i].id
-                    );
-                }
-                crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
-            }
+        // A scope holding none of the crates drops every one of those rows.
+        let scoped = ids(&ctx(Mode::Full, Scope::crate_only("aterm-grid")));
+        for id in [
+            StageId::SealedLane,
+            StageId::DeadlineTests,
+            StageId::ConformanceRelease,
+            StageId::MeasuringTests,
+        ] {
+            assert!(!scoped.contains(&id), "{id:?}");
         }
+        let link_only = ids(&ctx(Mode::Full, Scope::crate_only("aterm-link")));
+        assert!(link_only.contains(&StageId::SealedLane));
+        let update_only = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-update")));
+        assert!(update_only.contains(&StageId::DeadlineTests));
     }
 
-    /// The measuring stages own the machine because they judge timings; the
-    /// Codex live upgrade (`--full` only) because it waits on a real Codex's
-    /// idle points under deadlines while `--full`'s MainTarget tiers would
-    /// otherwise compile beside it. It is LAST, so nothing waits behind it.
+    /// The deadline and measuring stages and the smokes own the machine because
+    /// they judge deadlines and timings; the Codex live upgrade (`--full` only)
+    /// because it waits on a real Codex's idle points under deadlines while
+    /// `--full`'s MainTarget tiers would otherwise compile beside it. It is
+    /// LAST, so nothing waits behind it.
     #[test]
-    fn only_the_measuring_stages_and_the_codex_live_upgrade_are_exclusive() {
-        let p = plan(&ctx(Mode::Full, Scope::workspace()));
-        let ex: Vec<StageId> = p.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
+    fn only_the_stages_that_judge_deadlines_and_timings_are_exclusive() {
+        let exclusive = |mode| -> Vec<StageId> {
+            plan(&ctx(mode, Scope::workspace()))
+                .iter()
+                .filter(|s| s.exclusive)
+                .map(|s| s.id)
+                .collect()
+        };
         assert_eq!(
-            ex,
+            exclusive(Mode::Full),
             [
+                StageId::DeadlineTests,
                 StageId::MeasuringTests,
                 StageId::ControlSocketSmoke,
                 StageId::GuiSmoke,
                 StageId::CodexLiveUpgrade,
             ]
         );
-        assert_eq!(p.last().map(|s| s.id), Some(StageId::CodexLiveUpgrade));
-        let fast = plan(&ctx(Mode::Fast, Scope::workspace()));
-        let ex: Vec<StageId> = fast.iter().filter(|s| s.exclusive).map(|s| s.id).collect();
         assert_eq!(
-            ex,
-            [
-                StageId::MeasuringTests,
-                StageId::ControlSocketSmoke,
-                StageId::GuiSmoke
-            ]
+            plan(&ctx(Mode::Full, Scope::workspace()))
+                .last()
+                .map(|s| s.id),
+            Some(StageId::CodexLiveUpgrade)
+        );
+        assert_eq!(
+            exclusive(Mode::Fast),
+            [StageId::DeadlineTests, StageId::ControlSocketSmoke]
+        );
+        assert_eq!(
+            exclusive(Mode::Measure),
+            [StageId::MeasuringTests, StageId::GuiSmoke]
         );
     }
 
-    /// THE MEASURING TESTS RUN ALONE, IN EVERY TIER AND SCOPE (2026-09-23).
-    /// The test run skips them, so a plan without this stage would drop them
-    /// silently; and they judge timings, so the stage must be exclusive and
-    /// start only after everything declared before it — the test run and the
-    /// conformance-release prime they use included — has finished.
+    /// THE TESTS THE RUN SKIPS RUN ALONE, EACH IN THE TIER THAT OWNS IT
+    /// (2026-09-26). The test run skips both lists, so a plan without their
+    /// stage would drop them silently: every mode that runs the test run over
+    /// aterm-update runs the deadline tests, as the LAND tier's first barrier,
+    /// after it; every mode that runs the MEASURE tier over aterm-conformance
+    /// runs the measuring tests, exclusive, after the conformance-release
+    /// prime they use — and after the deadline tests when both run.
     #[test]
-    fn the_measuring_tests_run_alone_after_the_test_run_in_every_tier_and_scope() {
-        for mode in [Mode::Fast, Mode::Full] {
+    fn the_skipped_tests_run_alone_in_the_tier_that_owns_them_in_every_scope() {
+        for mode in MODES {
             for scope in [
                 Scope::workspace(),
                 Scope::crate_only("aterm-grid"),
+                Scope::crate_only("aterm-update"),
                 Scope::changed("main", vec!["aterm-conformance".into()], true),
                 Scope::changed("main", vec![], true),
             ] {
                 let p = plan(&ctx(mode, scope.clone()));
                 let what = format!("{mode:?} / {}", scope.label());
                 let at = |id| p.iter().position(|s| s.id == id);
-                let measuring = at(StageId::MeasuringTests)
-                    .unwrap_or_else(|| panic!("{what}: the measuring tests are planned"));
-                assert!(p[measuring].exclusive, "{what}");
-                assert_eq!(p[measuring].lane, Lane::MainTarget, "{what}");
-                assert!(at(StageId::Test).is_some_and(|t| t < measuring), "{what}");
-                if let Some(prime) = at(StageId::ConformanceRelease) {
-                    assert!(prime < measuring, "{what}: the prime must finish first");
-                }
                 let barrier = p.iter().position(|s| s.exclusive).expect("exclusive");
-                assert_eq!(barrier, measuring, "{what}: it is the first barrier");
+                assert_eq!(at(StageId::Test).is_some(), mode.runs(Tier::Land), "{what}");
+                let deadline = at(StageId::DeadlineTests);
+                assert_eq!(
+                    deadline.is_some(),
+                    mode.runs(Tier::Land) && holds_deadline_tests(&scope),
+                    "{what}"
+                );
+                if let Some(deadline) = deadline {
+                    assert!(p[deadline].exclusive, "{what}");
+                    assert_eq!(p[deadline].lane, Lane::MainTarget, "{what}");
+                    assert!(at(StageId::Test).is_some_and(|t| t < deadline), "{what}");
+                    assert_eq!(barrier, deadline, "{what}: the first barrier");
+                }
+                let measuring = at(StageId::MeasuringTests);
+                assert_eq!(
+                    measuring.is_some(),
+                    mode.runs(Tier::Measure) && measures_paint_and_spin(&scope),
+                    "{what}"
+                );
+                if let Some(measuring) = measuring {
+                    assert!(p[measuring].exclusive, "{what}");
+                    assert_eq!(p[measuring].lane, Lane::MainTarget, "{what}");
+                    let prime = at(StageId::ConformanceRelease).expect("the prime");
+                    assert!(prime < measuring, "{what}: the prime must finish first");
+                    match deadline {
+                        Some(deadline) => assert!(deadline < measuring, "{what}"),
+                        None => assert_eq!(barrier, measuring, "{what}: the first barrier"),
+                    }
+                }
             }
         }
     }

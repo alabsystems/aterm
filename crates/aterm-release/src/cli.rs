@@ -49,7 +49,8 @@ USAGE
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
       → tag → ONE publication onto the release channel, made the head last.
         --dry-run          gates + provisional number + full local build into
-                           dist/; zero commits, zero uploads
+                           dist/, notarized by Apple; nothing committed or
+                           published
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
         --abandon vX.Y.Z   withdraw an unpublished cut: its own draft deleted, or
@@ -57,7 +58,9 @@ USAGE
                            release; its origin tag and the local journal deleted
                            (the claim commit stays; a later cut recuts)
         --min-build N      emit an operator apply floor into the manifest
-        --gate             additionally run tools/verify.sh --full inline
+        --gate             additionally run tools/verify.sh --full inline (a
+                           green one is the MEASURE receipt a real cut
+                           requires for the tree it builds)
         --rehearse O/R     full real cut published to the scratch channel O/R,
                            which must be PUBLIC (provisional number, no ledger
                            push, no tag on origin)
@@ -76,12 +79,10 @@ USAGE
                            ATERM_NO_PAINT_SMOKE_ACK=this-cut-may-ship-dark is
                            also set
         --release-credentials <profile.toml>
-                           the ONE signing input: the credentials profile this
-                           cut signs with. Omitted, the machine key provisioned
-                           at ~/.aterm/machine.key is used; a signature-required
-                           cut with neither refuses before it claims. The key
-                           must belong to a machine the master-signed roster
-                           names and has not revoked
+                           the signing profile: a rostered, unrevoked machine
+                           key and its notary credential. A cut without one
+                           refuses before it claims (tools/cut-launch.sh passes
+                           ~/.aterm/release-credentials.toml when it exists)
 
   targo --unverified ship provision --id <machine-id> [--check] [--cert-dir <folder>]
                            ON A BARE MACHINE, RUN tools/bootstrap-publisher.sh

@@ -95,3 +95,78 @@ fn the_dev_profile_builds_line_tables() {
         );
     }
 }
+
+/// 2026-09-26. `tools/verify.sh` compiles the gate before every invocation —
+/// `--help` included — and until this date it did so with
+/// `--release`: fat LTO and one codegen unit, the shipping engine's settings,
+/// for a std-only program that orchestrates child processes. The gate now
+/// builds under its own `[profile.gate]`, which keeps release's semantics
+/// (it inherits them: no debug-assertions, no overflow checks) and drops LTO
+/// and the single codegen unit. Three facts have to hold together, and a
+/// regression in any one is silent — a slower start, or (for the last) a gate
+/// that execs a stale binary from an older profile's directory:
+///  * the profile exists with those values;
+///  * every build of aterm-verify in the shim names it, never `--release`;
+///  * the shim execs the binary from THAT profile's output directory, both
+///    halves read from one variable.
+#[test]
+fn the_gate_builds_itself_under_the_lean_gate_profile_and_runs_what_it_built() {
+    let root = workspace_root();
+    let manifest = root.join("Cargo.toml");
+    let toml = fs::read_to_string(&manifest).expect("read the root Cargo.toml");
+    let gate = |key| table_value(&toml, "profile.gate", key);
+    assert_eq!(
+        (gate("inherits"), gate("lto"), gate("opt-level")),
+        (
+            Some("\"release\"".to_string()),
+            Some("false".to_string()),
+            Some("1".to_string())
+        ),
+        "{}: [profile.gate] must inherit release with lto = false and opt-level = 1",
+        manifest.display()
+    );
+    let units: u32 = gate("codegen-units")
+        .and_then(|v| v.parse().ok())
+        .expect("[profile.gate] sets codegen-units");
+    assert!(
+        units > 1,
+        "[profile.gate] codegen-units = {units}: one unit serializes codegen"
+    );
+
+    let shim = root.join("tools/verify.sh");
+    let text = fs::read_to_string(&shim).expect("read tools/verify.sh");
+    let code: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect();
+    assert!(
+        code.iter().any(|l| l.trim() == "GATE_PROFILE=gate"),
+        "{}: GATE_PROFILE=gate is the one place the profile is named",
+        shim.display()
+    );
+    let builds: Vec<&&str> = code
+        .iter()
+        .filter(|l| l.contains(" build ") && l.contains("-p aterm-verify"))
+        .collect();
+    assert!(
+        !builds.is_empty(),
+        "{}: no gate build found",
+        shim.display()
+    );
+    for b in &builds {
+        assert!(
+            b.contains("--profile \"$GATE_PROFILE\"") && !b.contains("--release"),
+            "{}: the gate build must name the gate profile, never --release: {b}",
+            shim.display()
+        );
+    }
+    let exec = code
+        .iter()
+        .find(|l| l.trim_start().starts_with("exec "))
+        .expect("the shim execs the gate");
+    assert!(
+        exec.contains("\"$GATE_TARGET_DIR/$GATE_PROFILE/aterm-verify\""),
+        "{}: the shim must run what it built: {exec}",
+        shim.display()
+    );
+}

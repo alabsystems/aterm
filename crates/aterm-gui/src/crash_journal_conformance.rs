@@ -64,9 +64,12 @@ pub(crate) struct Rig {
     live: bool,
     clean: bool,
     probation: bool,
+    second: bool,
+    crashed: bool,
     written: bool,
     writes: usize,
     image_probation: bool,
+    image_second: bool,
     claims: i64,
     live_claim: bool,
     applied: bool,
@@ -88,9 +91,12 @@ impl Rig {
             live: true,
             clean: false,
             probation: false,
+            second: false,
+            crashed: false,
             written: false,
             writes: 0,
             image_probation: false,
+            image_second: false,
             claims: 0,
             live_claim: false,
             applied: false,
@@ -104,8 +110,10 @@ impl Rig {
 
     /// The run starts: its crash marker is armed (empty, locked, the installed
     /// app's), before its journal, and named for the start the journal is
-    /// named for (`JournalId::of_this_run`).
-    fn boot(&mut self, probation: bool) {
+    /// named for (`JournalId::of_this_run`). `second`: the journal it
+    /// reopened was a second chance's to give (`Lane::begin_probation`'s
+    /// flag, ruling 285).
+    fn boot(&mut self, probation: bool, second: bool) {
         let armed = markers::arm(
             self.logs.path(),
             self.id.pid,
@@ -120,6 +128,7 @@ impl Rig {
         self.marker = Some((armed.path, Some(lock)));
         self.booted = true;
         self.probation = probation;
+        self.second = second;
     }
 
     /// The writer thread's two calls: arm on the first image, publish.
@@ -134,7 +143,8 @@ impl Rig {
             .expect("armed")
             .publish(
                 &layout(&[(cwd.as_str(), "zsh")]),
-                &JournalHeader::now(self.id.pid, self.probation),
+                &JournalHeader::now(self.id.pid, self.probation)
+                    .with_second_chance(self.probation && self.second),
             )
             .expect("published");
         self.written = true;
@@ -192,11 +202,13 @@ impl Rig {
 
     fn step(&mut self, action: &str) {
         match action {
-            "BootFresh" => self.boot(false),
-            "BootFromJournal" => self.boot(true),
+            "BootFresh" => self.boot(false, false),
+            "BootFromJournal" => self.boot(true, false),
+            "BootSecondChance" => self.boot(true, true),
             "Write" => self.publish(),
             "Settle" => {
                 self.probation = false;
+                self.second = false;
                 if self.written {
                     self.publish();
                 }
@@ -212,6 +224,17 @@ impl Rig {
                 self.end(false);
                 self.lost = self.written && !self.image().exists();
             }
+            // A fatal signal: the handler writes its banner into the run's
+            // own marker (`crash_signal`), then the process goes.
+            "Crash" => {
+                if let Some((path, _)) = self.marker.as_ref() {
+                    std::fs::write(path, b"aterm: fatal signal 11 (SIGSEGV)")
+                        .expect("the live run's marker takes its banner");
+                }
+                self.crashed = true;
+                self.end(false);
+                self.lost = self.written && !self.image().exists();
+            }
             "Claim" => self.claim(),
             other => panic!("no such action {other}"),
         }
@@ -222,15 +245,20 @@ impl Rig {
         let image = self.image().exists();
         if image {
             let text = std::fs::read_to_string(self.image()).expect("a whole image");
-            self.image_probation = crash_journal::decode(&text).expect("decodes").0.probation;
+            let header = crash_journal::decode(&text).expect("decodes").0;
+            self.image_probation = header.probation;
+            self.image_second = header.second_chance;
         }
         let mut s: State = BTreeMap::new();
         s.insert("booted", i64::from(self.booted));
         s.insert("live", i64::from(self.live));
         s.insert("clean", i64::from(self.clean));
         s.insert("probation", i64::from(self.probation));
+        s.insert("second", i64::from(self.second));
+        s.insert("crashed", i64::from(self.crashed));
         s.insert("image", i64::from(image));
         s.insert("image_probation", i64::from(self.image_probation));
+        s.insert("image_second", i64::from(self.image_second));
         // A real publish is one rename: no state has an empty name mid-write.
         s.insert("torn", 0);
         s.insert("written", i64::from(self.written));
@@ -245,12 +273,14 @@ impl Rig {
 const ACTIONS: &[&str] = &[
     "BootFresh",
     "BootFromJournal",
+    "BootSecondChance",
     "Write",
     "FinishWrite",
     "Settle",
     "Quit",
     "HandOff",
     "Die",
+    "Crash",
     "Claim",
 ];
 
@@ -332,9 +362,9 @@ fn replay(
 /// interpreter; each DISTINCT real transition is then validated once on both
 /// tiers.
 ///
-/// The machine has nine actions. `Write`, `Settle`, `Quit` and `Claim` carry
+/// The machine has eleven actions. `Write`, `Settle`, `Quit` and `Claim` carry
 /// real `#[refines]` anchors (`JournalOwner::publish`/`retire`,
-/// `claim_at_boot`). The other five are the process around the journal, which
+/// `claim_at_boot`). The other seven are the process around the journal, which
 /// this runner plays and projects rather than code any journal function runs.
 #[aterm_spec::spec_unmodeled(
     machine = "CrashJournalClaim",
@@ -349,6 +379,21 @@ fn replay(
     reason = "The run's own start after a reopened journal: Lane::begin_probation only sets \
               the header mark the runner writes through JournalOwner::publish; its 90 s \
               clock is crash_journal::tests::the_lane_writes_only_changes_at_the_bounded_rate."
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "BootSecondChance",
+    reason = "The run's own start after the brake let a stopped probation writer's journal \
+              through (ruling 285): Lane::begin_probation's second-chance flag only sets the \
+              header mark the runner writes through JournalOwner::publish \
+              (crash_journal::tests::a_relapse_inside_probation_is_skipped_and_said)."
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "CrashJournalClaim",
+    action = "Crash",
+    reason = "A fatal signal runs no journal code: crash_signal's handler writes its banner \
+              into the run's own marker, which the runner writes, and the kernel releases the \
+              locks as for Die."
 )]
 #[aterm_spec::spec_unmodeled(
     machine = "CrashJournalClaim",
@@ -434,6 +479,8 @@ fn the_real_journal_conforms_to_the_model() {
         vec!["BootFresh", "Write", "Quit"],
         vec!["BootFresh", "Write", "HandOff", "Claim"],
         vec!["BootFromJournal", "Write", "Die", "Claim"],
+        vec!["BootFromJournal", "Write", "Crash", "Claim"],
+        vec!["BootSecondChance", "Write", "Die", "Claim"],
         vec!["BootFromJournal", "Write", "Settle", "Die", "Claim"],
     ] {
         assert!(

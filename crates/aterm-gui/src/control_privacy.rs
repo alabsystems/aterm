@@ -153,7 +153,8 @@ const PENDING_CONSENT_TUPLE: &str = "consent-probe-pending";
 /// the one that also protects the bundled CLI (design §3.3 guardrails 1 and 2).
 #[derive(Clone, Copy)]
 pub(crate) struct ConsentProbes {
-    /// One `open(TCC.db, O_RDONLY)`, fd closed at once, contents never read.
+    /// One `open(TCC.db, O_RDONLY | O_CLOEXEC)`, fd closed at once, contents never
+    /// read.
     fda: fn(ProbeGate) -> FdaProbe,
     /// `responsibility_get_pid_responsible_for_pid`, through `dlsym`. Not a
     /// TCC or `WindowServer` contact, but it is still an OS call made once per

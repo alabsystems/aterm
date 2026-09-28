@@ -199,6 +199,60 @@ pub(crate) fn crash_journal_writable(
     first_present_done && !restore_pending && !handoff_pending
 }
 
+/// What the journal asked the process table about a session's root.
+#[derive(Debug)]
+pub(crate) enum RootAnswer {
+    /// Not asked: a platform whose job test already covers the root's jobs.
+    #[cfg_attr(unix, allow(dead_code))]
+    Unasked,
+    /// Asked: the answer, or `None` when the table could not give one.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Read(Option<crate::quit_safety::SessionRoot>),
+}
+
+/// THE JOURNAL'S TEST FOR ONE LEAF (D16, rulings 282 and 292): whether its
+/// session was running a program that aterm's death would take down, and its
+/// name (`Some("")` when unnamed). `group` is the PTY's foreground group
+/// (`tcgetpgrp`), `root_pid` the session's root, `named` the status sweep's
+/// resolved program and the group it resolved it for. A program ran when:
+///
+/// * the foreground is a JOB (the quit confirm's test) — named when the sweep
+///   resolved that same group;
+/// * the root is not a shell (`aterm -e claude`, `exec vim`, a `shell=` that
+///   is not one) — named when the sweep resolved the root's group to a
+///   non-shell (a name resolved before an `exec` still says the shell);
+/// * the root is a shell with a child: a background or suspended job, which
+///   the shell hangs up when the PTY closes — unnamed;
+/// * the table could not answer — unnamed, because a warning that was not
+///   needed costs less than a loss that was never mentioned.
+///
+/// A shell with no child, holding its own foreground, ran nothing.
+pub(crate) fn leaf_program(
+    group: i32,
+    root_pid: i32,
+    root: &RootAnswer,
+    named: Option<(i32, &str)>,
+) -> Option<String> {
+    let name_for = |pgid: i32| {
+        named
+            .filter(|(at, _)| pgid > 0 && *at == pgid)
+            .map(|(_, name)| name.to_string())
+    };
+    if crate::quit_safety::foreground_is_job(group, root_pid) {
+        return Some(name_for(group).unwrap_or_default());
+    }
+    match root {
+        RootAnswer::Unasked => None,
+        RootAnswer::Read(None) => Some(String::new()),
+        RootAnswer::Read(Some(root)) if !crate::quit_safety::is_shell_name(&root.comm) => Some(
+            name_for(root_pid)
+                .filter(|name| !crate::quit_safety::is_shell_name(name))
+                .unwrap_or_default(),
+        ),
+        RootAnswer::Read(Some(root)) => (!root.children.is_empty()).then(String::new),
+    }
+}
+
 /// Mint recovery authority only from the already-validated typed descriptor.
 /// Its copyable metadata is deliberately never parsed to recover a path/route.
 fn recovery_capability(
@@ -818,13 +872,96 @@ impl App {
         // direction 2026-09-27).
         let mut manifest = self.capture_restore_manifest();
         manifest.fill_agents(&|id| self.hosted_agent(id));
-        let written = self.crash_journal.offer(manifest, now);
+        let programs = self.crash_journal_programs(&manifest);
+        let written = self.crash_journal.offer(manifest, programs, now);
         aterm_log::debug!(
             "crash journal: capture {} {} (images {})",
             self.crash_journal.captures,
             if written { "handed over" } else { "unchanged" },
             self.crash_journal.writes
         );
+    }
+
+    /// THE JOURNAL'S PROGRAMS (D16, rulings 282 and 292): every terminal leaf
+    /// of `manifest` whose session ran a program when aterm died would take it
+    /// down ([`leaf_program`]): a foreground JOB (the quit confirm's own test,
+    /// [`crate::quit_safety`]), a session root that is not a shell (`aterm -e`,
+    /// `exec vim`), or a shell with a child (a background or suspended job) —
+    /// named when the status sweep has resolved that group's program. One
+    /// `tcgetpgrp` and one [`crate::quit_safety::session_root`] read per leaf,
+    /// at most once per journal capture (every 2 s at most, and only after
+    /// activity). A session with no live child (a stub, one whose shell
+    /// exited) is skipped. The layout itself stays exactly the quit's capture,
+    /// so the update worker's layout digest never sees a program come and go.
+    fn crash_journal_programs(
+        &self,
+        manifest: &restore::RestoreManifest,
+    ) -> Vec<crate::crash_journal::LeafProgram> {
+        // Each leaf's session, and whether its restore carries the agent
+        // that session hosts (P6a): that program is the agent (ruling 293).
+        fn leaves(node: &restore::RestoredSplitTree, out: &mut Vec<(u64, bool)>) {
+            match node {
+                restore::RestoredSplitTree::Leaf {
+                    view: restore::RestoredView::Terminal(leaf),
+                } => out.extend(leaf.local_id.map(|id| (id, leaf.agent.is_some()))),
+                restore::RestoredSplitTree::Leaf { .. } => {}
+                restore::RestoredSplitTree::Split { first, second, .. } => {
+                    leaves(first, out);
+                    leaves(second, out);
+                }
+            }
+        }
+        let mut programs = Vec::new();
+        for (window, layout) in manifest.windows.iter().enumerate() {
+            for (tab, restored) in layout.restored_tabs.iter().enumerate() {
+                let mut ids = Vec::new();
+                leaves(&restored.root, &mut ids);
+                for (id, agent) in ids {
+                    let Some(session) = self.pool.get(id) else {
+                        continue;
+                    };
+                    if session.pid <= 0
+                        || session.master < 0
+                        || session
+                            .child_reaped
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        continue;
+                    }
+                    let group = crate::quit_safety::foreground_pgrp(session.master);
+                    #[cfg(unix)]
+                    let root = RootAnswer::Read(crate::quit_safety::session_root(session.pid));
+                    // windows: `foreground_is_job`'s child walk already counts a
+                    // shell's jobs; a program that is the ConPTY root is not seen.
+                    #[cfg(not(unix))]
+                    let root = RootAnswer::Unasked;
+                    let named = {
+                        let timeline = session
+                            .ctx
+                            .timeline
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        let agent = timeline.agent();
+                        agent.program.clone().map(|name| (agent.program_pgid, name))
+                    };
+                    let Some(program) = leaf_program(
+                        group,
+                        session.pid,
+                        &root,
+                        named.as_ref().map(|(pgid, name)| (*pgid, name.as_str())),
+                    ) else {
+                        continue;
+                    };
+                    programs.push(crate::crash_journal::LeafProgram {
+                        window: u32::try_from(window).unwrap_or(u32::MAX),
+                        tab: u32::try_from(tab).unwrap_or(u32::MAX),
+                        program,
+                        agent,
+                    });
+                }
+            }
+        }
+        programs
     }
 
     /// Rebuild the previous quit's layout (one-shot: drains `pending_restore`; a second
@@ -866,6 +1003,16 @@ impl App {
             return;
         }
         if let Some(host) = &self.harness {
+            // Each with where its tab is, for the row that says it did not
+            // come back (ruling 293).
+            let restored = restored
+                .into_iter()
+                .map(|(sid, snap)| crate::harness_host::RestoredAgent {
+                    place: self.upgrade_place(&sid),
+                    sid,
+                    snap,
+                })
+                .collect();
             host.relaunch_restored(restored);
         }
     }
@@ -6283,5 +6430,293 @@ mod tests {
             watch.wait(std::time::Duration::ZERO),
             "the session's `events` watcher was woken for them"
         );
+    }
+}
+
+/// THE JOURNAL'S TEST FOR "A PROGRAM RAN" (D16 review R1–R3, ruling 292),
+/// over the pure decision and over REAL sessions: real processes on real
+/// pseudo-terminals, each the session leader of its own PTY exactly as a
+/// spawned tab's shell is. Every child is this test's own, killed by
+/// `SIGKILL` at the end.
+#[cfg(all(test, unix))]
+mod crash_journal_program_tests {
+    use super::{RootAnswer, leaf_program};
+    use crate::quit_safety::SessionRoot;
+    use crate::{App, WindowId, pane, restore};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::process::CommandExt;
+    use std::time::{Duration, Instant};
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    fn root(comm: &str, children: &[i32]) -> RootAnswer {
+        RootAnswer::Read(Some(SessionRoot {
+            comm: comm.to_string(),
+            children: children.to_vec(),
+        }))
+    }
+
+    /// Every branch of the decision, each with its negative control.
+    #[test]
+    fn a_leaf_ran_a_program_when_its_job_its_root_or_a_child_says_so() {
+        let sh = root("zsh", &[]);
+        // NEGATIVE CONTROL: a shell at its prompt, holding its own foreground,
+        // with no child, ran nothing — and a login shell's `-zsh` is a shell.
+        assert_eq!(leaf_program(100, 100, &sh, Some((100, "zsh"))), None);
+        assert_eq!(leaf_program(100, 100, &root("-zsh", &[]), None), None);
+        // A foreground job, named only for its own group (the quit's test).
+        assert_eq!(
+            leaf_program(200, 100, &sh, Some((200, "vim"))).as_deref(),
+            Some("vim")
+        );
+        assert_eq!(
+            leaf_program(200, 100, &sh, Some((100, "zsh"))).as_deref(),
+            Some("")
+        );
+        // R1: the root is the program (`aterm -e claude`, `exec vim`).
+        assert_eq!(
+            leaf_program(100, 100, &root("2.1.281", &[]), Some((100, "claude"))).as_deref(),
+            Some("claude")
+        );
+        assert_eq!(
+            leaf_program(100, 100, &root("vim", &[]), Some((100, "zsh"))).as_deref(),
+            Some(""),
+            "a name resolved before the exec still says the shell: unnamed"
+        );
+        // R2: a background or suspended job leaves the foreground at the shell.
+        assert_eq!(
+            leaf_program(100, 100, &root("bash", &[4242]), None).as_deref(),
+            Some("")
+        );
+        // The table could not answer: loud, unnamed.
+        assert_eq!(
+            leaf_program(100, 100, &RootAnswer::Read(None), None).as_deref(),
+            Some("")
+        );
+        // A platform whose job test covers the root's jobs is not asked.
+        assert_eq!(leaf_program(100, 100, &RootAnswer::Unasked, None), None);
+    }
+
+    /// `openpty(3)`, retried: several modules open ptys in parallel.
+    fn open_pty_pair() -> (i32, i32) {
+        for _ in 0..20 {
+            let (mut master, mut slave) = (-1i32, -1i32);
+            // SAFETY: openpty(3) into two valid out-slots; no name/termios/winsize.
+            let opened = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            if opened == 0 {
+                return (master, slave);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("openpty failed 20 times");
+    }
+
+    /// `argv` as the session leader of a fresh PTY whose controlling
+    /// terminal it is — a spawned tab's shape. Answers `(master, pid)`.
+    /// Not waited here: the pid stays reserved until the test's `Session`
+    /// drops, whose hang-up and reaper own it, exactly as a spawned tab's.
+    #[allow(clippy::zombie_processes)]
+    fn spawn_leader(argv: &[&str]) -> (i32, i32) {
+        let (master, slave) = open_pty_pair();
+        // SAFETY: `slave` is the open fd openpty just returned; owned here.
+        let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+        let mut cmd = std::process::Command::new(argv[0]);
+        cmd.args(&argv[1..])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("PS1", "$ ")
+            .env("TERM", "dumb")
+            .stdin(slave.try_clone().expect("dup slave"))
+            .stdout(slave.try_clone().expect("dup slave"))
+            .stderr(slave);
+        // SAFETY: `setsid` and `ioctl` are async-signal-safe; the closure
+        // runs in the forked child after its stdio is the slave.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().expect("spawn the session leader");
+        let pid = i32::try_from(child.id()).expect("pid");
+        (master, pid)
+    }
+
+    fn type_line(master: i32, line: &str) {
+        // SAFETY: `master` is this test's open pty master; the buffer is live.
+        let n = unsafe { libc::write(master, line.as_ptr().cast(), line.len()) };
+        assert_eq!(usize::try_from(n).ok(), Some(line.len()), "write(master)");
+    }
+
+    fn wait_for(what: &str, mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + PATIENCE;
+        while !ready() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn children(pid: i32) -> Vec<i32> {
+        crate::quit_safety::session_root(pid).map_or_else(Vec::new, |r| r.children)
+    }
+
+    /// A real session `id` over `(master, pid)`, as a new tab of window 0.
+    fn add_tab(app: &mut App, id: u64, (master, pid): (i32, i32)) {
+        let mut session = crate::stub_session(id);
+        session.master = master;
+        session.pid = pid;
+        App::register_session(&app.store, &session, None);
+        app.pool.insert(session);
+        app.next_session_id = app.next_session_id.max(id + 1);
+        let tree = pane::PaneTree::new(id);
+        let tab = crate::register_terminal_tab(&mut app.tab_ids, &mut app.view_store, &tree)
+            .expect("tab identity");
+        let ws = app.windows.get_mut(&WindowId(0)).expect("window 0");
+        ws.layouts.push(tree);
+        ws.tabs.add();
+        ws.tab_set.push(tab).expect("fresh tab id");
+        app.resync_active_or_window(WindowId(0));
+    }
+
+    fn name_group(app: &App, id: u64, pgid: i32, program: &str) {
+        let session = app.pool.get(id).expect("session");
+        let mut timeline = session
+            .ctx
+            .timeline
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        timeline.note_foreground_group(pgid);
+        timeline.set_program(pgid, Some(program.to_string()));
+    }
+
+    /// Kill everything this test started, by `SIGKILL` (AGENTS.md rule 6).
+    fn kill_all(pids: &[i32], masters: &[i32]) {
+        for pid in pids {
+            // SAFETY: each pid is a process this test started (or its job),
+            // still unreaped by anyone but this test's sessions.
+            unsafe { libc::kill(*pid, libc::SIGKILL) };
+        }
+        for master in masters {
+            // SAFETY: each is this test's own pty master, closed once.
+            unsafe { libc::close(*master) };
+        }
+    }
+
+    /// R3 — the capture over REAL sessions, in its window and tab places
+    /// (the ones `Reopened::lost` counts): tab 0 is a stub with no process
+    /// (skipped), tab 1 a shell at its prompt (NEGATIVE CONTROL: no entry),
+    /// tab 2 a foreground `sleep` (named for its group), tab 3 a `sleep &`
+    /// (R2: unnamed), tab 4 `sleep` as the session root as `aterm -e` runs it
+    /// (R1: named), tab 5 a shell that `exec`ed `sleep` while the sweep's
+    /// name still says the shell (R1: unnamed).
+    #[test]
+    fn the_journal_names_the_tabs_whose_programs_a_death_would_take() {
+        let mut app = App::headless_for_test();
+        let idle = spawn_leader(&["/bin/sh", "-i"]);
+        let fg = spawn_leader(&["/bin/sh", "-i"]);
+        let bg = spawn_leader(&["/bin/sh", "-i"]);
+        let exe = spawn_leader(&["/bin/sleep", "30"]);
+        let exec = spawn_leader(&["/bin/sh", "-i"]);
+        for (id, pair) in [(1, idle), (2, fg), (3, bg), (4, exe), (5, exec)] {
+            add_tab(&mut app, id, pair);
+        }
+        assert!(app.structural_invariants_ok());
+        type_line(fg.0, "/bin/sleep 30\n");
+        type_line(bg.0, "/bin/sleep 30 &\n");
+        type_line(exec.0, "exec /bin/sleep 30\n");
+        let mut fg_group = -1;
+        wait_for("the foreground sleep", || {
+            fg_group = crate::quit_safety::foreground_pgrp(fg.0);
+            fg_group > 0 && fg_group != fg.1
+        });
+        wait_for("the background sleep", || !children(bg.1).is_empty());
+        wait_for("the exec", || {
+            crate::quit_safety::session_root(exec.1).is_some_and(|r| r.comm == "sleep")
+        });
+        name_group(&app, 2, fg_group, "sleep");
+        name_group(&app, 4, exe.1, "sleep");
+        name_group(&app, 5, exec.1, "sh");
+        let bg_jobs = children(bg.1);
+
+        // Ruling 293: tab 2's leaf carries the agent its session hosts (as
+        // the journal's capture fills it), so its entry is marked as that
+        // agent; every other entry is not (the negative control).
+        let mut manifest = app.capture_restore_manifest();
+        let hosted = restore::AgentRestore {
+            pid: u32::try_from(fg_group).unwrap_or(0),
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/".into(),
+            version: None,
+        };
+        manifest.fill_agents(&|id| (id == 2).then(|| hosted.clone()));
+        let programs = app.crash_journal_programs(&manifest);
+        let entry = |tab: u32, program: &str| crate::crash_journal::LeafProgram {
+            window: 0,
+            tab,
+            program: program.to_string(),
+            agent: tab == 2,
+        };
+        assert_eq!(
+            programs,
+            vec![
+                entry(2, "sleep"),
+                entry(3, ""),
+                entry(4, "sleep"),
+                entry(5, "")
+            ],
+            "tabs 0 (no process) and 1 (a shell at its prompt) have none"
+        );
+
+        let mut pids = vec![fg_group, idle.1, fg.1, bg.1, exe.1, exec.1];
+        pids.extend(bg_jobs);
+        kill_all(&pids, &[idle.0, fg.0, bg.0, exe.0, exec.0]);
+    }
+
+    /// R3 — a program starting in a tab marks the journal's lane dirty even
+    /// when nothing else would wake a capture (the status sweep's foreground
+    /// group change). NEGATIVE CONTROL: a sweep that sees the same group
+    /// leaves the lane clean.
+    #[test]
+    fn a_foreground_change_owes_the_journal_a_capture() {
+        let mut app = App::headless_for_test();
+        assert!(app.config.tab_status_or_default(), "the sweep must run");
+        let shell = spawn_leader(&["/bin/sh", "-i"]);
+        add_tab(&mut app, 1, shell);
+        wait_for("the shell's own group", || {
+            crate::quit_safety::foreground_pgrp(shell.0) == shell.1
+        });
+        let t0 = Instant::now();
+        let _ = app.observe_session_statuses(t0);
+        let _ = app.crash_journal.take_dirty();
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(2));
+        assert!(
+            !app.crash_journal.take_dirty(),
+            "NEGATIVE CONTROL: the same foreground owes nothing"
+        );
+        type_line(shell.0, "/bin/sleep 30\n");
+        let mut group = -1;
+        wait_for("the foreground sleep", || {
+            group = crate::quit_safety::foreground_pgrp(shell.0);
+            group > 0 && group != shell.1
+        });
+        let _ = app.observe_session_statuses(t0 + Duration::from_secs(4));
+        assert!(
+            app.crash_journal.take_dirty(),
+            "a program started in the tab: the journal owes a capture"
+        );
+        kill_all(&[group, shell.1], &[shell.0]);
     }
 }

@@ -48,6 +48,7 @@ pub const KEYS: &[&str] = &[
     "continue_per_hour",
     "rules_file",
     "retry_api_errors",
+    "probe_api",
     "resume_limits",
     "model_fallback",
     "compact_on_context_wall",
@@ -139,8 +140,19 @@ pub struct SupervisorConfig {
     pub continue_per_hour: u32,
     /// A file whose text is appended to a continuation (standing rules).
     pub rules_file: Option<PathBuf>,
-    /// Back off and continue after an API error or an overload, however many.
+    /// Answer an API error or an overload, however many, by what it says
+    /// went wrong (`policy::turn_end`'s module header: the network, a reply
+    /// cut off, the server) — never with an ask. Off: each is escalated.
     pub retry_api_errors: bool,
+    /// Let the window's host MEASURE the API's reach while a session waits
+    /// at an API error the network caused — a resolve, a connect and a
+    /// verified TLS handshake to `api.anthropic.com`, no request sent
+    /// (aterm-agent `harness::netwatch`) — so the wait at an unreachable API
+    /// ends within about a minute of it being back (the probe's cadence and
+    /// the loop's wait step), not at the ladder's next rung. Off: nothing is
+    /// probed, the reach is never measured, and such a wall is tried on the
+    /// time ladder alone.
+    pub probe_api: bool,
     /// Continue once a session or weekly usage limit has reset.
     pub resume_limits: bool,
     /// The model the agent is RELAUNCHED on at a model-bucket limit
@@ -208,6 +220,7 @@ impl Default for SupervisorConfig {
             continue_per_hour: 0,
             rules_file: None,
             retry_api_errors: true,
+            probe_api: true,
             resume_limits: true,
             model_fallback: Some("opus".to_string()),
             compact_on_context_wall: true,
@@ -258,6 +271,7 @@ impl SupervisorConfig {
             "dismiss_surveys" => switch!(dismiss_surveys),
             "continue" => switch!(continue_policy),
             "retry_api_errors" => switch!(retry_api_errors),
+            "probe_api" => switch!(probe_api),
             "resume_limits" => switch!(resume_limits),
             "compact_on_context_wall" => switch!(compact_on_context_wall),
             "relaunch" => switch!(relaunch),
@@ -372,6 +386,7 @@ impl SupervisorConfig {
             "continue" => self.continue_policy = false,
             "continue_per_hour" => self.continue_per_hour = 1,
             "retry_api_errors" => self.retry_api_errors = false,
+            "probe_api" => self.probe_api = false,
             "resume_limits" => self.resume_limits = false,
             "model_fallback" => self.model_fallback = None,
             "compact_on_context_wall" => self.compact_on_context_wall = false,
@@ -550,6 +565,7 @@ impl SupervisorConfig {
             && cap(self.continue_per_hour) <= cap(before.continue_per_hour)
             && self.rules_file == before.rules_file
             && no_more(self.retry_api_errors, before.retry_api_errors)
+            && no_more(self.probe_api, before.probe_api)
             && no_more(self.resume_limits, before.resume_limits)
             && (self.model_fallback.is_none() || self.model_fallback == before.model_fallback)
             && no_more(self.compact_on_context_wall, before.compact_on_context_wall)
@@ -563,7 +579,7 @@ impl SupervisorConfig {
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes
     /// back. The destructure names every field, so a field added without a
     /// key here does not build (and `texts_are_the_keys` holds the order).
-    fn texts(&self) -> [(&'static str, String); 18] {
+    fn texts(&self) -> [(&'static str, String); 19] {
         let Self {
             enabled,
             headless,
@@ -577,6 +593,7 @@ impl SupervisorConfig {
             continue_per_hour,
             rules_file,
             retry_api_errors,
+            probe_api,
             resume_limits,
             model_fallback,
             compact_on_context_wall,
@@ -607,6 +624,7 @@ impl SupervisorConfig {
             ("continue_per_hour", continue_per_hour.to_string()),
             ("rules_file", path(rules_file).unwrap_or_default()),
             ("retry_api_errors", retry_api_errors.to_string()),
+            ("probe_api", probe_api.to_string()),
             ("resume_limits", resume_limits.to_string()),
             ("model_fallback", model_fallback.clone().unwrap_or_default()),
             (

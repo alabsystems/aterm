@@ -1703,16 +1703,15 @@ impl CursorGlow {
     /// repaint and HELD the key's move, and `spawn` swallowed every later
     /// move for the park's whole patience: no verdict, no cell.
     ///
-    /// Two observations on the glass, both required, tell the key's own
+    /// Three observations on the glass, all required, tell the key's own
     /// echo from a footer: (1) the source row's TAIL — every column from
-    /// the origin to the end of its old ink — was erased this frame (a
-    /// footer repaint leaves the input row as it was), and (2) the cell
-    /// left of the landing, on the row one below, holds the exact glyph an
-    /// unpaid press stamped within [`Self::TYPE_HINT_FRESH`]
-    /// ([`PressCredits::fresh_glyph`]: a credit a TUI's earlier suppressed
-    /// echo left in the ring is no witness; a host that stamped no glyph
-    /// proves nothing, and the park keeps its custody). Such a move is
-    /// judged at once, as the typed fold it is.
+    /// the origin to the end of its old ink — was erased this frame, (2)
+    /// that exact tail follows the landing glyph on the row below, and (3)
+    /// the landing glyph is an unpaid press's own. A footer can erase the
+    /// source tail and print the SAME glyph as the key, so the moved tail
+    /// is the content-identity proof. With it the exact credit may keep its
+    /// full in-flight patience: a 300 ms Claude Code echo must not be held
+    /// dark merely because the classifier's 250 ms stamp expired.
     pub(super) fn key_pushed_text_down(
         &self,
         (row, col): (u16, u16),
@@ -1736,11 +1735,7 @@ impl CursorGlow {
             return false;
         };
         let glyph = rk::witness::unit_at(&self.row_cur, left);
-        if glyph.is_blank()
-            || !self
-                .type_press_ring
-                .fresh_glyph(now, Self::TYPE_HINT_FRESH, glyph.ch)
-        {
+        if glyph.is_blank() {
             return false;
         }
         let Some(sample) = self.witness_rows[..self.witness_rows_n]
@@ -1750,7 +1745,19 @@ impl CursorGlow {
             return false;
         };
         let old_end = u16::try_from(self.ink_end_in_pane(&self.row_prev)).unwrap_or(u16::MAX);
-        old_end > col && (col..old_end).all(|c| rk::witness::unit_at(&sample.cols, c).is_blank())
+        let Some(old_tail) = self.row_prev.get(usize::from(col)..usize::from(old_end)) else {
+            return false;
+        };
+        let dest_start = usize::from(next_col);
+        let moved_tail = dest_start
+            .checked_add(old_tail.len())
+            .and_then(|end| self.row_cur.get(dest_start..end));
+        old_tail.len() >= 2
+            && moved_tail == Some(old_tail)
+            && (col..old_end).all(|c| rk::witness::unit_at(&sample.cols, c).is_blank())
+            && self
+                .type_press_ring
+                .fresh_glyph(now, IN_FLIGHT_PATIENCE_S, glyph.ch)
     }
 
     /// One past the last glyph of a sampled row inside the focused pane (the
@@ -2409,13 +2416,13 @@ impl CursorGlow {
         // Direct-drive seam (tests call `spawn` without a tick): sparks and
         // thermals are wiped state, so the latch must not survive a spawn.
         self.unsettle();
+        let licensed_row_before = self.last_licensed_row;
         self.last_licensed_row = Some((cr, now));
         self.insert.pending_hop = None;
         // Read BEFORE the classifier spends it: `glyph_echo` below needs to
         // know whether a press was unpaid when the move arrived, and a
         // coalesced echo's spend empties the pool on this very move.
         let unpaid_before = self.typed_credits_within(now) >= 1;
-        let licensed_row_before = self.last_licensed_row;
         let mv = self.classify_move(pr, pc, cr, cc, now, cfg, geom, lane, call);
         // A TYPED RE-ANCHOR LANDING ON A GLYPH NO LIVE PRESS TYPED
         // ([`MoveCtx::landing_foreign`]: zsh's Ctrl-R walking the visible
@@ -2995,10 +3002,14 @@ impl CursorGlow {
         // then non-zero by construction, and the landing sweep at the seam
         // is gated on the same predicate, so a dangling stamp cannot light
         // a keyless hop's landing.
-        // …and only on a KEY's stamp, never on the in-flight pool alone
-        // (the paste harness's flood control): the
-        // landing is v1's law for a hop a press licensed inside the stamp
-        // window (vim's `w`, the box-growth re-anchor, a flushed park).
+        // …and ordinarily only on a KEY's stamp, never on the in-flight
+        // pool alone (the paste harness's flood control): the landing is
+        // v1's law for a hop a press licensed inside the stamp window
+        // (vim's `w`, the box-growth re-anchor, a flushed park). The one
+        // exception is a delayed composer fold whose old source tail is
+        // visibly relocated after the exact unpaid glyph on the next row
+        // (`key_pushed_text_down`). That content identity makes its landing
+        // a cell the key laid even after the stamp's 250 ms has passed.
         // The in-flight licence opens for ANY same-row forward hop while
         // two presses are unpaid (`unpaid_typed_echo` — a batch, judged
         // under the share rule), and the only re-anchors that reach here
@@ -3010,7 +3021,7 @@ impl CursorGlow {
         // no key behind it would spend one of them on its last cell. A hop
         // no stamp licensed and no pool describes is program output: dark.
         let re_anchor_landing = typed_key
-            && !in_flight_licence
+            && (!in_flight_licence || self.carried_key_move == Some(((pr, pc), (cr, cc))))
             && re_anchor
             && !lays_typed_cells
             && self.typed_credits_within(now) >= 1;

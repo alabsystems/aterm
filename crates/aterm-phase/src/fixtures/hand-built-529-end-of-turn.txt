@@ -1,4 +1,4 @@
-# claude-code (unrecorded) · HAND-BUILT by the harness audit census (2026-09-23): the notice text is verbatim from Claude Code transcripts, the rows around it are assembled, not captured · a turn that ended on `API Error: 529 Overloaded`
+# claude-code (unrecorded) · HAND-BUILT by the harness audit census (2026-09-23): the notice text is verbatim from Claude Code transcripts, the rows around it are assembled, not captured · a turn that ended on `API Error: 529 Overloaded` · 2.1.283 draws no API Error under `⎿`: see claude-2.1.283-api-error-529.txt for its shape
 ⏺ Running the division suite again on the lane fix.
 
   Ran 1 shell command

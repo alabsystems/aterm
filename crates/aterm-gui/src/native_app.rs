@@ -5325,7 +5325,7 @@ fn bounded_middle_label_to_width_for_face(
 /// one-line visual strip. Every operational distinction remains visible.
 fn config_visual_help(help: &str) -> String {
     help.replace(
-        "GPU rendering (restart) · gpu · true / false · Applies next launch · ",
+        "GPU rendering (restart) · gpu · true / false · default true · Applies next launch · ",
         "GPU rendering · ",
     )
     .replace("default 1.0 (solid)", "default 1.0")

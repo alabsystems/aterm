@@ -27,10 +27,13 @@
 //!   Enter, and the worker receives EXACTLY ONE continuation, `keep going`;
 //!   the decision it ends on next is escalated (the keyed attention), never
 //!   typed into.
-//! * THE 529: the supervisor waits the (shortened) backoff, then types
-//!   `keep going` through the fenced write (`send if-gen=` on the judged
-//!   read, then a fenced Enter once the composer shows it) — once — and not
-//!   before the backoff has run.
+//! * THE 529: the supervisor waits the (shortened) backoff, then types its
+//!   retry — Claude Code's own line quoted (`Claude Code reported "API
+//!   Error: 529 Overloaded. …". Carry on from where you stopped; …`), never
+//!   the rote `keep going` (the outage of 2026-09-27) — through the fenced
+//!   write (`send if-gen=` on the judged read, then a fenced Enter once the
+//!   composer shows it, wrapped over two rows) — once — and not before the
+//!   backoff has run.
 //! * A LONG CONTINUATION IN A NARROW COMPOSER (lane B2's review, major 4):
 //!   64 columns and a rules file, so `keep going (standing rules: …)` wraps
 //!   over three composer rows, the last holding fewer characters than the
@@ -640,9 +643,10 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     );
 }
 
-/// THE 529, live: nothing before the backoff (1 s here), then ONE `keep
-/// going` through the fenced write, echoed into the worker's composer and
-/// submitted; the decision after it is escalated.
+/// THE 529, live: nothing before the backoff (1 s here), then ONE retry
+/// quoting the vendor's line — never `keep going` — through the fenced
+/// write, echoed into the worker's composer and submitted whole; the
+/// decision after it is escalated.
 #[test]
 fn a_529_end_is_continued_once_after_its_backoff() {
     let Some(inst) = boot("r") else { return };
@@ -664,17 +668,27 @@ fn a_529_end_is_continued_once_after_its_backoff() {
     let continued_after = wall_at.elapsed();
     await_match(&inst, &sid, "I.need.your.decision");
     let out = sup.stop();
-    assert_eq!(
-        submitted,
-        ["SUBMIT:go", "SUBMIT:keep going"],
-        "the loop said:\n{out}"
+    const QUOTED: &str = "Claude Code reported \"API Error: 529 Overloaded. This is a \
+                          server-side issue, usually temporary — try again in a moment.";
+    const CARRY_ON: &str = "Carry on from where you stopped; if the result of your last step \
+                            is missing, check whether it ran before you repeat it.";
+    assert_eq!(submitted.len(), 2, "the loop said:\n{out}");
+    assert_eq!(submitted[0], "SUBMIT:go", "the loop said:\n{out}");
+    assert!(
+        submitted[1].starts_with(&format!("SUBMIT:{QUOTED}")) && submitted[1].ends_with(CARRY_ON),
+        "the vendor's line quoted, whole: {:?}\nthe loop said:\n{out}",
+        submitted[1]
     );
     assert!(
         continued_after >= backoff - Duration::from_millis(100),
         "continued {continued_after:?} after the wall, before its {backoff:?} backoff; the \
          loop said:\n{out}"
     );
-    assert!(out.contains("rule=api-retry@v1 keep going"), "{out}");
+    assert!(
+        out.contains(&format!("rule=api-retry@v1 {QUOTED}")),
+        "{out}"
+    );
+    assert!(!out.contains("rule=api-retry@v1 keep going"), "{out}");
     let all = lines_when(&subs, 3, Duration::from_millis(500));
     assert_eq!(
         all.len(),

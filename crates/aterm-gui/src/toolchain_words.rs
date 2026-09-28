@@ -126,10 +126,11 @@ pub(crate) const PACKAGES_NOT_INSTALLED: &str = "Couldn't install any ALab tools
 
 /// `⇣` — a pass moving bytes.
 const DOWN: char = '\u{21e3}';
-/// `⏸` — a pass that stopped short or was put off.
-const PAUSED: char = '\u{23f8}';
-/// `↻` — a machine setting a pass changed.
-const CHANGED: char = '\u{21bb}';
+/// `ℹ` — a RECORD of the lane at work: a pass put off, a machine setting a
+/// pass changed (design ruling 302: a record wears its outcome's mark; the
+/// `⏸` and `↻` these wore are a moving row's, and in the log they read as
+/// work still under way).
+const NOTED: char = '\u{2139}';
 
 /// The pass name and start stamp that identify one `progress.json` writer,
 /// so a live meter is clamped to its OWN pass's high-water mark and never
@@ -378,12 +379,12 @@ pub(crate) fn announced_stats(detail: &str, size: Option<&str>) -> String {
 /// R30 — the wait ran out (atpkg exit 75): the pass is DEFERRED — the loop
 /// retries on its short backoff, or parks an hour when the holder looks wedged
 /// (never the interval) — and `detail` says which. Routine: an Info RECORD
-/// ("ALab tools update postponed", atpkg's sentence), the ⏸ glyph, never the
+/// ("ALab tools update postponed", atpkg's sentence), the `ℹ` of a record, never the
 /// word "failed" and never a row on glass (2026-09-22). A stand-down that will
 /// not retry is the Packages badge as well (the host's `PkgLockTimedOut {
 /// stands_down }` arm). No key.
 pub(crate) fn deferred(detail: &str) -> Message {
-    whole_record(Severity::Info, PACKAGES_POSTPONED, detail).glyph(glyph(PAUSED))
+    whole_record(Severity::Info, PACKAGES_POSTPONED, detail).glyph(glyph(NOTED))
 }
 
 /// The installed pill's sentence. `frozen_tabs` is `App::frozen_path_tabs`: the
@@ -636,7 +637,11 @@ fn actionable_cause(cause: &str) -> Option<&'static str> {
 /// in flight (the record carries the lane's `phase=done` line).
 pub(crate) fn first_run_short(how: FirstRunShort, cause: &str) -> Message {
     let (severity, title) = match how {
-        FirstRunShort::Failed => (Severity::Error, ALAB_INSTALL_FAILED),
+        // One severity for the family (ruling 309): a first run that failed
+        // left the Mac as it was and the page retries it, as a first run
+        // that installed nothing — a warning both, where the pair read Error
+        // above Warn for the same `Couldn't install … ALab tools`.
+        FirstRunShort::Failed => (Severity::Warn, ALAB_INSTALL_FAILED),
         FirstRunShort::Nothing => (Severity::Warn, PACKAGES_NOT_INSTALLED),
     };
     let msg = Message::new(tags::PACKAGES, severity, title)
@@ -975,8 +980,8 @@ pub(crate) fn managed_current_words_for(
 /// (2026-09-22): the change and its undo are Settings ▸ Security's "This Mac"
 /// card ("Last change: …", `PackagesService::note_machine_change`), the log
 /// and `appstatus`. (The undo-first order the rows kept so the revert was the
-/// next thing read after the pass row went with the rows.) The glyph is `↻`
-/// ("changed"), from the band's closed set. Each item is keyed on its own
+/// next thing read after the pass row went with the rows.) The glyph is a
+/// record's `ℹ` (ruling 302). Each item is keyed on its own
 /// first word.
 pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
     text.split(';')
@@ -992,7 +997,7 @@ pub(crate) fn machine_settings(text: &str) -> Vec<Message> {
                 .to_ascii_lowercase();
             let (title, detail) = machine_setting_words(item);
             record(Severity::Info, title, detail)
-                .glyph(glyph(CHANGED))
+                .glyph(glyph(NOTED))
                 .key(&format!("{KEY_MACHINE_PREFIX}{word}"))
         })
         .collect()
@@ -1488,7 +1493,7 @@ mod tests {
             }
         );
         assert_eq!(packages().label(), "Packages");
-        for ch in [DOWN, PAUSED, CHANGED] {
+        for ch in [DOWN, NOTED] {
             assert!(Glyph::new(ch).is_some(), "{ch:?} is in the closed set");
         }
     }
@@ -1506,7 +1511,12 @@ mod tests {
             "an install, in the lane's noun"
         );
         assert_eq!(failed.title, "Couldn't install ALab tools");
-        assert_eq!(failed.severity, Severity::Error);
+        assert_eq!(failed.severity, Severity::Warn, "ruling 309");
+        assert_eq!(
+            failed.severity,
+            first_run_short(FirstRunShort::Nothing, "x").severity,
+            "one family, one severity"
+        );
         assert_eq!(failed.hold, Hold::Default);
         assert_eq!(failed.key.as_deref(), Some(KEY_PASS));
         assert_eq!(
@@ -1672,7 +1682,7 @@ mod tests {
         );
         assert_eq!(m.title, "ALab tools update postponed");
         assert_eq!(m.severity, Severity::Info);
-        assert_eq!(m.glyph.ch(), PAUSED);
+        assert_eq!(m.glyph.ch(), NOTED, "a record's mark (ruling 302)");
         assert_eq!(m.hold, Hold::LogOnly);
         assert_eq!(m.key, None, "unkeyed");
         assert!(!m.detail[0].contains("failed"), "{}", m.detail[0]);
@@ -2193,7 +2203,7 @@ mod tests {
         assert_eq!(rows[0].severity, Severity::Info);
         assert_eq!(
             rows[0].glyph.ch(),
-            CHANGED,
+            NOTED,
             "from the band's closed set — ⚙ rendered blank headless"
         );
         assert_eq!(rows[0].hold, Hold::LogOnly);
@@ -2771,7 +2781,7 @@ mod tests {
         for m in &rows {
             assert_eq!(m.hold, Hold::LogOnly);
             assert_eq!(m.severity, Severity::Info);
-            assert_eq!(m.glyph.ch(), CHANGED);
+            assert_eq!(m.glyph.ch(), NOTED, "a record's mark (ruling 302)");
         }
         assert!(rows[1].detail.is_empty());
         // The undo record's detail: the pointer first, the revert command last,

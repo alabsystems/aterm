@@ -4770,8 +4770,24 @@ impl App {
             // precise delta ALSO moves the local band by its pixels right now —
             // unless a modal card or a native view claims the pointer, which
             // swallow the whole gesture as they do its whole rows below.
+            //
+            // THE SAME OWNERS THE SEAM CONSULTS. A whole row reaching
+            // `input_to_session` is swallowed while a modal overlay is up
+            // (`overlay_open`) or the tab context menu is
+            // (`tab_menu_input_event`: "a notch scrolls nothing and reports
+            // nothing"). This half answers BEFORE the seam, so it declines for
+            // exactly those owners too — or a two-finger scroll would move the
+            // band (and, across a row, the engine) under a card whose banked
+            // rows move nothing: the device-dependent divergence the seam's
+            // indistinguishability rule forbids. The tab menu is not an
+            // `Overlay` variant, so no `*_claims_pointer` above names it.
+            let seam_owned = self
+                .windows
+                .get(&wid)
+                .is_none_or(|ws| ws.tab_menu.is_some() || ws.overlay_open());
             if let Some(dy_px) = track_px
-                && !(palette
+                && !(seam_owned
+                    || palette
                     || conn_card
                     || session_picker
                     || connection_map

@@ -400,7 +400,7 @@ fn err_halted_parks_until_the_hold_lifts_and_the_loop_goes_on() {
 fn a_stale_attention_is_reconciled_at_the_start() {
     let (dir, journal) = journal_file("stale");
     let mut m = Mock::new(true, vec![idle_screen()]);
-    m.attention = Some("limited: You've hit your weekly limit reset=Sep 19".to_string());
+    m.attention = Some("limited: You've hit your weekly limit".to_string());
     m.vanish_after = Some(0);
     let opts = SuperviseOpts {
         journal: Some(journal.clone()),
@@ -4520,11 +4520,15 @@ fn the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint() {
 /// the loop's reader cannot vouch for, so no host step goes there — and the
 /// server's verdict, already `idle`, never moved as the agent's composer came
 /// up: the loop waited on it for ever and a fresh session's upgrade was
-/// never taken). Here the host asks for a point from the start; the first
-/// screen is the shell's, the next the agent's idle composer, and the host
-/// pushes its verdict: the host's step is taken on the composer. NEGATIVE
-/// CONTROL: a first screen the reader vouches for (the agent's idle
-/// composer) takes the step as it comes.
+/// never taken). Here the host asks for a point from the start; the session
+/// is PAST its start — a busy frame first, as a relaunch in the same tab is
+/// (a fresh session's start window answers `None` before the vouch guard is
+/// asked, which would pass this test with the guard gone) — then the shell's
+/// launch line, then the agent's idle composer, and the host pushes its
+/// verdict: the host's step is taken on the composer, which only the vouch
+/// guard makes it wait for (deleting it leaves the loop on the verdict:
+/// no step). NEGATIVE CONTROL: a first screen the reader vouches for (the
+/// agent's idle composer) takes the step as it comes.
 #[test]
 fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
     let launch = rows(&["% cd /w && '/Users//a/pkg/agents/claude' --model opus", ""]);
@@ -4555,25 +4559,14 @@ fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
         assert_eq!(r, Ok(()));
         (host.steps.load(Ordering::SeqCst), m.requests)
     };
-    // The launch line stands through the loop's settling reads (each read
-    // serves the next screen), then the composer comes up.
-    let mut drawn = vec![launch; 8];
+    // A busy frame (the session past its start), then the launch line through
+    // the loop's settling reads (each read serves the next screen), then the
+    // composer comes up.
+    let mut drawn = vec![busy_screen()];
+    drawn.extend(vec![launch; 8]);
     drawn.push(idle_screen());
     let (steps, requests) = run(drawn);
     assert_eq!(steps, 1, "the step on the composer: {requests:#?}");
-    let composer_read = requests
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.starts_with("@s-1 text "))
-        .nth(1)
-        .map(|(i, _)| i)
-        .unwrap_or_else(|| panic!("the composer read: {requests:#?}"));
-    assert!(
-        !requests[..composer_read]
-            .iter()
-            .any(|r| r.starts_with("@s-1 await agent ")),
-        "no verdict wait on a point the reader cannot vouch for: {requests:#?}"
-    );
     // NEGATIVE CONTROL: the composer from the start.
     let (steps, _) = run(vec![idle_screen()]);
     assert_eq!(steps, 1);

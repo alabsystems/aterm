@@ -73,8 +73,8 @@ mod upgrade_status;
 mod codex;
 pub(super) use upgrade_status::runs_under;
 pub use upgrade_status::{
-    ATTENTION_OWNER, Ask, Remedy, Row, STALLED_AFTER_S, View, ask, ask_for, rows, status_rows,
-    word_marker,
+    ATTENTION_OWNER, Ask, REFUSED_STOPPED, Remedy, Row, STALLED_AFTER_S, View, ask, ask_for,
+    refusal_sentence, refused_stopped, rows, status_rows, word_marker,
 };
 
 /// What one sweep is told.
@@ -413,6 +413,18 @@ pub(super) trait Kernel {
     fn parent(&self, pid: u32) -> Option<u32>;
     /// The program that opened `pid`'s terminal ([`terminal_owner`]).
     fn terminal(&self, pid: u32) -> Option<(u32, String)>;
+    /// Whether `shell` has its terminal back — a job-control shell that
+    /// leads its own process group, and that group is the terminal's
+    /// foreground: its prompt, nothing it started, holds the tab — `None`
+    /// when it cannot be read now (no shell recorded, gone, `ps` could not
+    /// run). The default reads the kernel, as [`Live`] does.
+    fn shell_holds_tab(&self, shell: u32) -> Option<bool> {
+        if shell == 0 {
+            return None;
+        }
+        let (_, pgid, tpgid) = ids(shell)?;
+        Some(pgid == i64::from(shell) && pgid == tpgid)
+    }
     /// The processes of `procs` (`(pid, basename)`, [`background_procs`]
     /// under `agent`), NAMED for the notice ([`upgrade::running_clause`]). The
     /// default names each by what the table says alone, with no age and no
@@ -1569,9 +1581,24 @@ pub(super) struct ModelCtx {
     /// The person's saved default model (`~/.claude/settings.json` `model`):
     /// a choice of theirs, which the list never moves across families.
     default_model: Option<String>,
+    /// The NATIVE build's own view — its baked catalog and every model a
+    /// restart on IT may ask for — for a session that runs the vendor's native
+    /// install rather than the managed twin (`baked`/`offered` above are the
+    /// managed build's). `None` when no native build is installed.
+    native: Option<(Option<Baked>, Vec<String>)>,
 }
 
 impl ModelCtx {
+    /// The catalog and the offer a session is judged by: the native build's
+    /// for a session that runs it (when one is installed), else the managed
+    /// one's.
+    fn view(&self, native: bool) -> (Option<&Baked>, &[String]) {
+        match (&self.native, native) {
+            (Some((baked, offered)), true) => (baked.as_ref(), offered),
+            _ => (self.baked.as_ref(), &self.offered),
+        }
+    }
+
     /// No model half at all (a test's pass, or a list that cannot be read):
     /// nothing is ever due.
     pub(super) fn none() -> ModelCtx {
@@ -1580,6 +1607,7 @@ impl ModelCtx {
             baked: None,
             offered: Vec::new(),
             default_model: None,
+            native: None,
         }
     }
 
@@ -1623,11 +1651,27 @@ impl ModelCtx {
             .map(|t| models::parse_user_settings(&t))
             .unwrap_or_default();
         let offered = models::offered(&list, &label, &ev, baked.as_ref(), user.allowed.as_deref());
+        // The native build is judged by its OWN version and catalog: a model
+        // the managed build offers may be one the native build does not know
+        // yet (or the other way round). Its file is the binary itself — no
+        // twin to read through.
+        let native = targets.native.as_ref().map(|n| {
+            let nb = catalog::baked_cached(&n.exe, &state_dir(opts).join("builds"));
+            let no = models::offered(
+                &list,
+                &n.version.to_string(),
+                &ev,
+                nb.as_ref(),
+                user.allowed.as_deref(),
+            );
+            (nb, no)
+        });
         ModelCtx {
             list,
             baked,
             offered,
             default_model: user.default,
+            native,
         }
     }
 }
@@ -1663,127 +1707,109 @@ struct ModelRead {
     due_for_s: u64,
 }
 
-/// Read what the conversation runs NOW and decide. A model this harness asked
-/// for that now runs is recorded as APPLIED (never asked for again).
+/// Read what the conversation runs NOW and decide, judged as the MANAGED build
+/// (the tests' seam; a visit reads the build first, [`model_read_for`]).
+#[cfg(test)]
 fn model_read(opts: &Opts, sf: &SessionFile, launch: Option<&str>, mctx: &ModelCtx) -> ModelRead {
-    let mut record = load_model_record(opts, &sf.session_id);
-    if mctx.offered.is_empty() && record.set.is_empty() {
-        // Nothing is due: no model can be run and none is pending. Clear the
-        // due clock here too, or a move that comes back later would inherit
-        // this one's start and skip the warm-cache grace.
-        if !record.due_to.is_empty() || record.due_since != 0 {
-            record.due_to.clear();
-            record.due_since = 0;
-            save_model_record(opts, &sf.session_id, &record);
-        }
-        return ModelRead {
-            verdict: ModelVerdict::Keep("no-model-available"),
-            cold: false,
-            due_for_s: 0,
-        };
+    model_read_for(opts, sf, launch, mctx, false)
+}
+
+/// Read what the conversation runs NOW and decide, judged by the build the
+/// session RUNS (`native`: the vendor's native install, [`ModelCtx::view`]).
+/// A model this harness asked for that now runs is recorded as APPLIED (never
+/// asked for again).
+fn model_read_for(
+    opts: &Opts,
+    sf: &SessionFile,
+    launch: Option<&str>,
+    mctx: &ModelCtx,
+    native: bool,
+) -> ModelRead {
+    let before = load_model_record(opts, &sf.session_id);
+    let mut record = before.clone();
+    let tail = std::cell::OnceCell::new();
+    let (read, rows) = model_judge(opts, sf, &mut record, &tail, launch, mctx, native, now_s());
+    model_read_kept(opts, sf, &before, &record, &rows);
+    read
+}
+
+/// A ledger row one read owes — its step, the model, the detail — written
+/// only where the read is kept ([`model_read_kept`]).
+type ModelRow = (&'static str, String, &'static str);
+
+/// Keep one read: its record where it changed, and the rows it owes.
+fn model_read_kept(
+    opts: &Opts,
+    sf: &SessionFile,
+    before: &ModelRecord,
+    record: &ModelRecord,
+    rows: &[ModelRow],
+) {
+    if record != before {
+        save_model_record(opts, &sf.session_id, record);
     }
-    let tail = transcript(&opts.home, &sf.session_id)
-        .map(|p| tail_to_end(&p, TAIL_BYTES).0)
-        .unwrap_or_default();
-    let live = models::live_model_at(
-        &tail,
-        mctx.baked.as_ref(),
-        launch,
-        models::parse_lstart(&sf.proc_start),
-    );
-    let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
-    if !record.set.is_empty()
-        && live
-            .as_ref()
-            .is_some_and(|l| base(&l.id) == base(&record.set))
-        && !record.applied.iter().any(|a| base(a) == base(&record.set))
-    {
-        record.applied.push(record.set.clone());
-        save_model_record(opts, &sf.session_id, &record);
+    for (step, model, detail) in rows {
         let mut r = blank(sf);
-        r.to = format!("model:{}", record.set);
-        ledger(opts, &said(r, "model-verified"), "the conversation runs it");
+        r.to = format!("model:{model}");
+        ledger(opts, &said(r, *step), detail);
     }
-    // Asked for and still not what runs once the relaunch has had its time:
-    // FAILED for this conversation, never asked for again.
-    if !record.set.is_empty()
-        && live
-            .as_ref()
-            .is_none_or(|l| base(&l.id) != base(&record.set))
-        && now_s().saturating_sub(record.set_at) >= models::MODEL_SETTLE_S
-    {
-        let failed = std::mem::take(&mut record.set);
-        record.failed.push(failed.clone());
-        save_model_record(opts, &sf.session_id, &record);
-        let mut r = blank(sf);
-        r.to = format!("model:{failed}");
-        ledger(
-            opts,
-            &said(r, "model-failed"),
-            "asked for on a relaunch and not what runs",
-        );
-    }
-    // A `/model` newer than the last answer is a PERSON's (the harness never
-    // types one): remembered, so the answers that follow do not end its
-    // protection from the list's move across families.
-    if let Some(l) = live.as_ref().filter(|l| l.by_command)
-        && record.human != l.id
-    {
-        record.human.clone_from(&l.id);
-        save_model_record(opts, &sf.session_id, &record);
-    }
-    let verdict = models::model_due(
-        &mctx.list,
-        live.as_ref(),
-        &mctx.offered,
+}
+
+/// One read's JUDGEMENT under one view, on `record` in memory, at `now`:
+/// [`models::model_read_step`] — the early return, the settle step, a
+/// person's `/model`, the rule, the cache and the due clock, in that order,
+/// bound at Tier 1 to the derived `HarnessModelSwitch` — over the view's
+/// catalog and offer and the transcript's tail. It READS (the transcript,
+/// once per `tail`, and only past the early return) and WRITES NOTHING — the
+/// record and the rows it owes are the caller's to keep
+/// ([`model_read_kept`]), so the host's pre-filter can judge under two views
+/// and keep only what both agree on ([`model_wants_a_look`]).
+#[allow(clippy::too_many_arguments)]
+fn model_judge(
+    opts: &Opts,
+    sf: &SessionFile,
+    record: &mut ModelRecord,
+    tail: &std::cell::OnceCell<String>,
+    launch: Option<&str>,
+    mctx: &ModelCtx,
+    native: bool,
+    now: u64,
+) -> (ModelRead, Vec<ModelRow>) {
+    let (baked, offered) = mctx.view(native);
+    let view = models::ModelView {
+        list: &mctx.list,
+        baked,
+        offered,
         launch,
-        mctx.default_model.as_deref(),
-        &record,
-    );
-    let cold = models::last_answer_at(&tail)
-        .is_none_or(|at| now_s().saturating_sub(at) >= models::CACHE_COLD_S);
-    // THE DUE CLOCK: since when THIS move has been due. It restarts when the
-    // target changes (a newer model is a new wait, not the old one's
-    // remainder) and is cleared when the conversation DEFINITELY needs no move
-    // (it runs the target, or the move is not the harness's to make), so a move
-    // that stopped being due and came back never inherits a stale clock.
-    //
-    // `model-unknown` is NOT such a verdict. It means this visit could not read
-    // what the conversation runs — a transcript tail with no answer in it, which
-    // a long tool result can cause for many visits running — and clearing on it
-    // would restart the bound on every such flicker, so an active session's
-    // move might never land: the never-lands shape this clock exists to end
-    // (adversarial review, 2026-09-25). An unknown visit leaves the clock
-    // exactly as it was.
-    let now = now_s();
-    let due_for_s = match &verdict {
-        ModelVerdict::Due { to, .. } => {
-            // A start AHEAD of now (the wall clock stepped back after it was
-            // stamped: a manual date change, a boot before NTP) would read as
-            // 0 s due for the whole skew and postpone the bound by exactly
-            // that much. Restart it instead: the bound then lands on time.
-            if base(&record.due_to) != base(to) || record.due_since == 0 || record.due_since > now {
-                record.due_to.clone_from(to);
-                record.due_since = now;
-                save_model_record(opts, &sf.session_id, &record);
-            }
-            now.saturating_sub(record.due_since)
-        }
-        ModelVerdict::Keep("model-unknown") => 0,
-        ModelVerdict::Keep(_) => {
-            if !record.due_to.is_empty() || record.due_since != 0 {
-                record.due_to.clear();
-                record.due_since = 0;
-                save_model_record(opts, &sf.session_id, &record);
-            }
-            0
-        }
+        default_model: mctx.default_model.as_deref(),
+        started_s: models::parse_lstart(&sf.proc_start),
+        now,
     };
-    ModelRead {
-        verdict,
-        cold,
-        due_for_s,
+    let step = models::model_read_step(record, &view, || {
+        tail.get_or_init(|| {
+            transcript(&opts.home, &sf.session_id)
+                .map(|p| tail_to_end(&p, TAIL_BYTES).0)
+                .unwrap_or_default()
+        })
+        .as_str()
+    });
+    let mut rows = Vec::new();
+    if let Some(model) = step.settled.verified {
+        rows.push(("model-verified", model, "the conversation runs it"));
     }
+    if let Some(model) = step.settled.failed {
+        rows.push((
+            "model-failed",
+            model,
+            "asked for on a relaunch and not what runs",
+        ));
+    }
+    let read = ModelRead {
+        verdict: step.verdict,
+        cold: step.cold,
+        due_for_s: step.due_for_s,
+    };
+    (read, rows)
 }
 
 /// THE MODEL THAT RIDES A RESTART MADE FOR ANOTHER REASON — a relaunch on
@@ -1810,11 +1836,15 @@ pub(super) fn riding_model_in(
     mctx: &ModelCtx,
 ) -> Option<String> {
     let launch = upgrade::launch_model(argv);
-    let mread = model_read(opts, sf, launch.as_deref(), mctx);
-    let ModelVerdict::Due { to, .. } = mread.verdict else {
-        return None;
-    };
-    models::model_moves_now(mread.cold, true, mread.due_for_s).map(|_| to)
+    // A restart is rare: read which build this session runs, so a native
+    // session is judged by the native build's own catalog — off the process,
+    // else (it has exited: the relaunch on exit) the program it ran,
+    // `argv[0]`, which is what that relaunch runs again.
+    let native = exe_of(sf.pid)
+        .or_else(|| argv.first().map(PathBuf::from))
+        .is_some_and(|e| e.starts_with(native_root(&opts.home)));
+    let mread = model_read_for(opts, sf, launch.as_deref(), mctx, native);
+    models::model_to(None, &mread.verdict, mread.cold, true, mread.due_for_s)
 }
 
 /// Remember `model` as the one the relaunch of `session` asks for, BEFORE
@@ -1825,8 +1855,7 @@ pub(super) fn record_asked(opts: &Opts, session: &str, model: &str) {
         return;
     }
     let mut rec = load_model_record(opts, session);
-    rec.set = model.to_string();
-    rec.set_at = now_s();
+    rec.asked(model, now_s());
     save_model_record(opts, session, &rec);
 }
 
@@ -1863,11 +1892,38 @@ fn same_build(
 /// model is due (the launch's own `--model` is not read here — it is in
 /// [`visit_with_claim`]).
 fn model_wants_a_look(opts: &Opts, sf: &SessionFile, mctx: &ModelCtx) -> bool {
-    !mctx.offered.is_empty()
-        && matches!(
-            model_read(opts, sf, None, mctx).verdict,
-            ModelVerdict::Due { .. }
-        )
+    // Which build the session runs is not read here (the pre-filter stays
+    // cheap): a look is wanted when a move is due under EITHER view, and the
+    // visit then judges it by the build it really runs.
+    let views: Vec<bool> = std::iter::once(false)
+        .chain(mctx.native.is_some().then_some(true))
+        .filter(|&native| !mctx.view(native).1.is_empty())
+        .collect();
+    let before = load_model_record(opts, &sf.session_id);
+    let tail = std::cell::OnceCell::new();
+    let now = now_s();
+    let reads: Vec<(ModelRecord, ModelRead, Vec<ModelRow>)> = views
+        .iter()
+        .map(|&native| {
+            let mut judged = before.clone();
+            let (read, rows) = model_judge(opts, sf, &mut judged, &tail, None, mctx, native, now);
+            (judged, read, rows)
+        })
+        .collect();
+    // What the reads did is KEPT only where every view left the record alike
+    // — always, under one view. Under two, a clock stepped under the view
+    // this session does not run would restart the real one on every sweep
+    // (the managed view's `model-current` clearing what the native view's
+    // `Due` started), and an active session's warm wait would never end: the
+    // visit, which reads the build, steps it.
+    if let Some((first, _, rows)) = reads.first()
+        && reads.iter().all(|(judged, _, _)| judged == first)
+    {
+        model_read_kept(opts, sf, &before, first, rows);
+    }
+    reads
+        .iter()
+        .any(|(_, read, _)| matches!(read.verdict, ModelVerdict::Due { .. }))
 }
 
 /// `aterm harness upgrade models`: the list, best first, each model's
@@ -1914,6 +1970,19 @@ pub fn models_report(opts: &Opts) -> String {
         "target (then, for a model nobody chose, up this list): {}",
         models::list_target(&ctx.list, &ctx.offered).unwrap_or("none available")
     );
+    if let (Some(n), Some((_, offered))) = (targets.native.as_ref(), ctx.native.as_ref()) {
+        let _ = writeln!(
+            out,
+            "native Claude Code {} (a session on it is judged by its own catalog): on offer {}; target {}",
+            n.version,
+            if offered.is_empty() {
+                "none".to_string()
+            } else {
+                offered.join(", ")
+            },
+            models::list_target(&ctx.list, offered).unwrap_or("none available")
+        );
+    }
     for (id, source) in models::recommendations(&ev, ctx.baked.as_ref(), &label) {
         let _ = writeln!(out, "  recommended by Claude Code: {id} ({source})");
     }
@@ -2669,8 +2738,8 @@ impl St {
     /// ([`St::fail`]: the round rests [`upgrade::RETRY_S`] from here, then a
     /// new one starts), the release the
     /// agent is owed if it was asked, and the round's markers FORGOTTEN — no
-    /// stopped phase acts on a READY, and the release line says nothing will
-    /// restart the session. Kept, they were the stranding the review of
+    /// stopped phase acts on a READY, and the release line says no restart
+    /// is coming now. Kept, they were the stranding the review of
     /// 2026-09-26 measured: a signal the kernel refused after READY, and a
     /// plan refused at the restart, left the READY standing as the agent's
     /// last word, which held the release (`wait:release:ready`) on every
@@ -2704,8 +2773,12 @@ impl St {
     /// `--now` spent (it hurried the round that stopped; the new one keeps
     /// every wait a person is owed), the stop's stamp cleared and why it
     /// stopped kept as [`St::last_stop`] until the new round's first notice.
-    /// A release still owed stays owed: the new round's first notice
-    /// supersedes it, and a hold of the owner's that waits it types it. A
+    /// The stopped round's saved prompt position ([`St::prompt`]) goes with
+    /// it: a relaunch that was refused left the prompt as it stood then, and
+    /// the new round's relaunch reads the prompt it finds (the no-stall
+    /// review of 2026-09-27). A release still owed stays owed: the new
+    /// round's first notice supersedes it, and a hold of the owner's that
+    /// waits it types it. A
     /// relaunch's record re-armed is the upgrade's own from here. Answers why
     /// the round had stopped, for the ledger (`rearmed:<why>`).
     pub(super) fn rearm(&mut self, now: u64) -> String {
@@ -2717,6 +2790,7 @@ impl St {
         self.forget_markers();
         self.new_round(now);
         self.failed_at = 0;
+        self.prompt = None;
         self.noted.clear();
         self.cause.clear();
         self.hold_since_s = 0;
@@ -2844,7 +2918,7 @@ impl St {
     }
 
     /// The release line was typed: nothing is owed, and the agent was told
-    /// nothing will restart it — so no READY to this round's notices may.
+    /// no restart is coming now — so no READY to this round's notices may.
     fn released(&mut self) {
         self.release.clear();
         self.forget_markers();
@@ -4042,8 +4116,9 @@ pub fn after(step: &str, waits: u32) -> After {
         // 2026-09-27: "you should NEVER have upgrades stalled"): the round
         // rests `upgrade::RETRY_S` and a new one starts, so it is looked at
         // again, climbing to the ten-minute look. (The Codex lane words a
-        // stopped record `wait:failed:<why>` before its reducer, and is looked
-        // at again the same.)
+        // stopped record `wait:failed:<why>` before its reducer while it
+        // rests, and is looked at again the same; rested and held by the
+        // owner's word, it says `wait:skipped`/`wait:deferred`, as here.)
         _ if step == "wait:failed" => later(),
         // A round's own stop, said as it stops (`failed:<why>`,
         // `refused:<what>`): the next look finds it resting, as above.
@@ -4190,9 +4265,11 @@ pub fn owns_turn_ends(step: &str, waits: u32) -> bool {
 /// idle point recomputed the claim ([`owns_turn_ends`]), and a session whose
 /// screen stays busy never reaches one. So the owner's `--skip` or `--defer`,
 /// a person at the tab, aterm's hold, the limit (the loop's to wait out), a
-/// give-up, a void, a release typed or owed (the agent is to go on), and
-/// every stop give them back at once. A wait on the agent's own work keeps
-/// the notice's claim, because the agent was asked to finish up.
+/// full queue of notices the model has not taken (the session's next turn is
+/// what takes them), a give-up, a void, a release typed or owed (the agent
+/// is to go on), and every stop give them back at once. A wait on the
+/// agent's own work keeps the notice's claim, because the agent was asked to
+/// finish up.
 #[must_use]
 pub fn released_at_break(step: &str) -> bool {
     matches!(
@@ -4203,6 +4280,7 @@ pub fn released_at_break(step: &str) -> bool {
             | "wait:attended"
             | "wait:held"
             | "wait:limited"
+            | "wait:queued"
             | "wait:failed"
             | "wait:done"
     ) || [
@@ -4632,7 +4710,7 @@ fn visit_models(
     // whole history, which a warm cache would have spared) but never waits on
     // one without bound: see `models::model_moves_now`, THE MODEL LADDER.
     let launch = upgrade::launch_model(&args.argv);
-    let mread = model_read(opts, sf, launch.as_deref(), mctx);
+    let mread = model_read_for(opts, sf, launch.as_deref(), mctx, running_native);
     // Whether a newer BUILD is due regardless of the model — decided before the
     // model, because a restart already happening is the moment the model rides.
     let build_target = upgrade::choose_target(&running, &targets.for_session(running_native));
@@ -4642,16 +4720,14 @@ fn visit_models(
     let announced_model = prior
         .as_ref()
         .filter(|st| matches!(st.phase, Phase::Announced { .. }) && !st.model_list.is_empty())
-        .map(|st| st.model_list.clone());
-    let model_to = announced_model.or_else(|| match &mread.verdict {
-        ModelVerdict::Due { to, .. }
-            if models::model_moves_now(mread.cold, build_target.is_some(), mread.due_for_s)
-                .is_some() =>
-        {
-            Some(to.clone())
-        }
-        _ => None,
-    });
+        .map(|st| st.model_list.as_str());
+    let model_to = models::model_to(
+        announced_model,
+        &mread.verdict,
+        mread.cold,
+        build_target.is_some(),
+        mread.due_for_s,
+    );
     // A newer build, or — the build current, the model behind — the SAME build
     // again, relaunched with `--model`: a command-line model is session-only,
     // where Claude's own `/model <id>` also rewrites the person's default for
@@ -4743,6 +4819,10 @@ fn visit_models(
     let recent = transcript(&opts.home, &sf.session_id).map(|p| tail_to_end(&p, TAIL_BYTES));
     let tail = recent.as_ref().map(|(text, _)| text.as_str());
     let rearmed = login_facts(opts, &sf.session_id, &mut st, &mut facts, tail, now);
+    // A usage limit the transcript says stands, and a notice queued behind
+    // one: what the screen alone cannot say ([`queue_facts`]).
+    let asked = st.request_for(&tab);
+    let requeued = queue_facts(&mut st, &mut facts, tail, now, &asked);
     let ready = heard(&st, sf, &tab, tail);
     // How long that READY has stood unacted on, held at the limit: what
     // bounds the agent's own background work under it.
@@ -4830,6 +4910,11 @@ fn visit_models(
                 Some(
                     "again: the upgrade had given up on notices that never reached the model, \
                      each answered by the login wall",
+                )
+            } else if requeued {
+                Some(
+                    "again: the notice before it never reached the model, its turn answered by \
+                     a usage limit that is over",
                 )
             } else if facts.undelivered {
                 Some(
@@ -4992,6 +5077,8 @@ fn look(
         // reads the tail ([`visit_models`]).
         login: upgrade::login_wall(upgrade::Agent::Claude, &scr.rows),
         undelivered: false,
+        // The transcript's word, added by the visit ([`queue_facts`]).
+        queued: false,
         ready_s: 0,
         // Stamped by the visit ([`St::time_failed`]).
         failed_s: 0,
@@ -5068,6 +5155,112 @@ fn login_facts(
         f.undelivered,
         upgrade::notices_received(text, &markers),
     )
+}
+
+/// A USAGE LIMIT, AND A NOTICE QUEUED BEHIND ONE, from the transcript's
+/// `tail` (the owner's report of 2026-09-27) — what the screen
+/// alone cannot say:
+///
+/// * the session's last word is Claude Code's limit row, and the reset it
+///   names — or, naming none, [`upgrade::REASK_S`] after it was written — is
+///   still to come ([`upgrade::transcript_limit_until`]; a `/login` that
+///   finished since ends it): the session is at its limit
+///   ([`upgrade::Facts::limited`]) whatever the screen shows, before any
+///   notice too;
+///
+/// and of the conversation's latest upgrade notice — this ask's, for an
+/// announced upgrade; any notice's otherwise (review of 2026-09-27: a
+/// retarget, a new round, 0.93.0's notices, each carry a marker the state no
+/// longer names, and a pending upgrade typed a fresh notice behind one still
+/// queued) — read in ONE scan of the tail ([`upgrade::notice_scan`]):
+///
+/// * its own turn was answered by the limit and the model has not taken it
+///   since ([`upgrade::NoticeFate::Queued`]): while that limit holds by the
+///   transcript's word ([`upgrade::Scan::queued_until`]) the session is at
+///   its limit whatever the screen shows, so nothing is typed behind the
+///   notice and its clock is held ([`upgrade::clock_held`]). Once that word
+///   has run out and the screen shows no limit (a weekly limit continues on
+///   its own only after `/rate-limit-options`, and a limit row may name no
+///   reset at all), this ask's notice never reached the model —
+///   [`upgrade::Facts::undelivered`], typed again as the same ask; answered
+///   `true` — and any notice's leaves a pending upgrade's first notice free
+///   to follow it. But while the conversation already holds more than
+///   [`upgrade::REQUEUE_MAX`] upgrade notices the model has not taken
+///   ([`upgrade::Scan::queued_copies`]: every copy typed again met the limit
+///   once more, the limit's own word that it still stood), the queue is FULL
+///   ([`upgrade::Facts::queued`]): nothing is typed, the clock is held, and
+///   the step waits `queued` — until the model writes a row of its own (a
+///   turn got past the limit and took them all), until the queue has RESTED
+///   ([`upgrade::Scan::rests_until`]: [`upgrade::RETRY_S`] after the limit's
+///   word ran out; review of 2026-09-27 — held with no end, an idle session
+///   whose limit had long ended waited for good), or until the owner's
+///   `--now` comes after the latest notice was typed (`request`, in force
+///   for this tab since `st.request_at`: a person asking, one notice more —
+///   never while the limit stands by the transcript's or the screen's word).
+///   A queue that rested, or the owner's word, lets exactly one more notice
+///   go: typed, it is the latest, and the rest and the word are counted
+///   from it again;
+/// * the model took this ask's notice later ([`upgrade::NoticeFate::Taken`]):
+///   its window opens when the model took it ([`St::hold_clock`]), not when
+///   it was typed.
+///
+/// The derived model `harness_upgrade_limit_queue_model` (aterm-spec) is
+/// bound to this fold, [`upgrade::next_step`], [`upgrade::requested_step`]
+/// and [`upgrade::announce_asks`] over every reachable state
+/// (`upgrade_queued_tests.rs`).
+fn queue_facts(
+    st: &mut St,
+    f: &mut Facts,
+    tail: Option<&str>,
+    now: u64,
+    request: &Request,
+) -> bool {
+    let Some(text) = tail else {
+        return false;
+    };
+    if upgrade::transcript_limit_until(text).is_some_and(|until| until > now) {
+        f.limited = true;
+        st.phase = upgrade::clock_held(&st.phase, f, now);
+    }
+    let ours = matches!(st.phase, Phase::Announced { .. }) && !st.marker.is_empty();
+    let marker = if ours {
+        st.marker.as_str()
+    } else {
+        upgrade::READY_PREFIX
+    };
+    let Some(scan) = upgrade::notice_scan(text, marker) else {
+        return false;
+    };
+    match scan.fate {
+        upgrade::NoticeFate::Queued => {
+            if scan.queued_until().is_some_and(|until| until > now) {
+                f.limited = true;
+                st.phase = upgrade::clock_held(&st.phase, f, now);
+                return false;
+            }
+            if f.limited {
+                return false;
+            }
+            let owner_asked = *request == Request::Now
+                && scan.typed_at.is_some_and(|typed| st.request_at > typed);
+            if scan.queued_copies() > upgrade::REQUEUE_MAX
+                && !owner_asked
+                && scan.rests_until().is_none_or(|rested| now < rested)
+            {
+                f.queued = true;
+                st.phase = upgrade::clock_held(&st.phase, f, now);
+            }
+            if ours {
+                f.undelivered = true;
+            }
+            ours
+        }
+        upgrade::NoticeFate::Taken(Some(at)) if ours => {
+            let _ = st.hold_clock(at.min(now));
+            false
+        }
+        _ => false,
+    }
 }
 
 /// THE RELEASE, typed if it may be now ([`upgrade::gate_release`]): ONE line
@@ -5180,7 +5373,7 @@ fn owed_word(r: Report, why: &str) -> Report {
 /// target it was asked for is gone (rolled back, uninstalled). Any OTHER
 /// process holding the conversation — resumed by hand after the upgrade
 /// stopped, in this tab or any other, often on the new build — is not this
-/// upgrade's to tell that nothing will restart it (the review of
+/// upgrade's to tell that no restart is coming (the review of
 /// 2026-09-26): the release is dropped ([`release_void`]), and so it is once
 /// the agent took up direction given after its last answer to the upgrade.
 /// Else one look, and the release if it may be typed.
@@ -5232,8 +5425,8 @@ fn release_visit(
 /// `tab`, if it is not: `other-process` — the process the notice reached no
 /// longer holds the conversation in its tab ([`St::notice_belongs_to`]); a
 /// person resumed it by hand, and the line would reach an agent that was
-/// never asked, perhaps on the new build where "nothing will restart this
-/// session" is false — or `directed`: someone spoke to the agent after its
+/// never asked, perhaps on the new build, about a restart it was never told
+/// of — or `directed`: someone spoke to the agent after its
 /// last answer to the upgrade and it took that up
 /// ([`upgrade::directed_since_ready`] over the transcript's `tail`, after a
 /// READY to any marker this round typed, [`St::asked`]), and the line would
@@ -5807,8 +6000,7 @@ fn restart(
         // failed).
         if !st.model_list.is_empty() {
             let mut rec = load_model_record(opts, &sf.session_id);
-            rec.set.clone_from(&st.model_list);
-            rec.set_at = now_s();
+            rec.asked(&st.model_list, now_s());
             save_model_record(opts, &sf.session_id, &rec);
         }
         match terminate(c, tab, pid, grace) {

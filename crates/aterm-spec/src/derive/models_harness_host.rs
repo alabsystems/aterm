@@ -10,6 +10,36 @@
 
 use super::Model;
 
+/// Two restored tabs in the host's one retry queue. A's first step waits;
+/// B still gets its first step before A can retry, even when A's due time
+/// passes during its own call. `Buggy=1` is the former nested retry loop,
+/// which ran A's second step before B's first. Tier-1 drives the real host's
+/// restored worker with these outcomes and validates each observed action.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_restored_first_attempt_model() -> Model {
+    crate::ty_model! {
+        HarnessRestoredFirstAttempt {
+            const Buggy = 0;
+            var a_first = 0;
+            var b_first = 0;
+            var a_retry = 0;
+
+            action FirstA when (a_first == 0) {
+                a_first = 1;
+            }
+            action FirstB when (a_first == 1 && b_first == 0) {
+                b_first = 1;
+            }
+            action RetryA when (a_first == 1 && a_retry == 0 && (b_first == 1 || Buggy == 1)) {
+                a_retry = 1;
+            }
+
+            invariant FirstAttemptsBeforeRetry: a_retry == 0 || b_first == 1;
+        }
+    }
+}
+
 /// `aterm-gui`'s `harness_host` runs one worker per Claude session. For ONE
 /// session: `wanted` is the session's published program being `claude` (and
 /// the policy active); `cur` a worker running under the current policy;

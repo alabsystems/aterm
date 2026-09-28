@@ -1076,55 +1076,84 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
     })
 }
 
-/// How many rows the vendor's `⏺` error row may take, its wrapped text
-/// included ([`error_row_notice`]): the notices it draws are one sentence
-/// and a remedy, and a longer `⏺` block is the worker's own words.
+/// How many rows a `<notice> · <remedy>` error row may take, its wrapped
+/// text included ([`error_row_notice`]): those notices are one sentence and a
+/// remedy, and a longer `⏺` block is the worker's own words. An `API Error`
+/// may run longer: the vendor's own messages do (a 529 wraps to three rows at
+/// 80 columns, and a message runs to 1000 characters before the expand hint).
 const ERROR_ROWS: usize = 3;
 
-/// THE VENDOR'S ERROR ROW the last turn ended on. Claude Code 2.1.281 draws
-/// an `isApiErrorMessage` row its message renderer has no case of its own
-/// for (`du`, read from the binary on 2026-09-27) as its `⏺` bullet in column
-/// 0 — the `error:` one, in the warning colour, which a row of text cannot
-/// tell from the worker's own — then the text, wrapped under column 2: `⏺
-/// Login expired · Please run /login` (the incident of 2026-09-27: every turn
-/// for nine hours ended on that row, and every one read idle with no wall),
-/// `⏺ API Error: …`. `Not logged in · …`, `OAuth token revoked · …` and a
-/// full context have cases of their own and are drawn under the `⎿` gutter,
-/// which [`notice`] reads after this.
+/// What the vendor adds under a message past 1000 characters.
+const EXPAND_HINT: &str = "(ctrl+o to expand)";
+
+/// THE VENDOR'S ERROR ROW the last turn ended on. Claude Code draws an
+/// `isApiErrorMessage` row its message renderer has no case of its own for
+/// (2.1.281's `du`, 2.1.283's `lu()`, both read from the binary on
+/// 2026-09-27) as its `⏺` bullet in column 0 — the `error:` one, in the
+/// warning colour, which a row of text cannot tell from the worker's own —
+/// then the text, wrapped ten columns short of the width onto rows under
+/// column 2. Two incidents of 2026-09-27 ended every turn on one: `⏺ Login
+/// expired · Please run /login` for nine hours (tab s-b5cf2faabac5ce5127bd),
+/// and `⏺ API Error: Can't reach the API server — check your internet or DNS
+/// (ENOTFOUND)` through an hour's outage, typed `keep going` into sixteen
+/// times; every one read idle with no wall. In 2.1.283 every `API Error: …`
+/// is drawn so — a 529, a 5xx, a rate limit, every connection and mid-stream
+/// failure. `Not logged in · …`, `OAuth token revoked · …`, `Request timed
+/// out` and a full context have cases of their own and are drawn under the
+/// `⎿` gutter, which [`notice`] reads after this.
 ///
 /// A worker's message is drawn the same way, so the row must be the vendor's
-/// in its words as well as its place: the LAST thing said, at most
-/// [`ERROR_ROWS`] rows (the `⏺` row and the rows indented two columns under
-/// it, nothing else), no tool call, and the vendor's own shape — a notice and
-/// its remedy joined by ` · ` or ` ∙ `, or `API Error` at its head — whose
-/// head the table ([`classify`]) names. The worker's `⏺ Not logged in to gh,
-/// so nothing was pushed.` has no remedy joined on and is not one; a message
-/// that opens with a wall's words, a `·` and more is read as the wall — the
-/// one copy this cannot tell from the vendor's row.
+/// in its words as well as its place: the LAST thing said, ONE paragraph (the
+/// `⏺` row and the rows indented two columns under it, no `⎿` row, nothing
+/// else), no tool call, and the vendor's own shape — `API Error` at its head,
+/// case and all, or a notice and its remedy joined by ` · ` or ` ∙ ` in at
+/// most [`ERROR_ROWS`] rows — whose text the table ([`classify`]) names. The
+/// worker's `⏺ Not logged in to gh, so nothing was pushed.` has no remedy
+/// joined on, and its `⏺ The server was overloaded, so I retried` no vendor
+/// head: neither is one. The copies this cannot tell from the vendor's row: a
+/// message that opens with a wall's words, a `·` and more, and a one-paragraph
+/// reply that itself opens `API Error`. The whole message is classified, its
+/// rows joined — under ~100 columns the words that decide it (`(ENOTFOUND)`,
+/// `mid-response`) wrap onto the second row — and a wrapped row that opens
+/// with `·` or `*`, which reads as a status row and so can end the last thing
+/// said above it, is its own too. The vendor's [`EXPAND_HINT`] is dropped.
 fn error_row_notice(
     rows: &[String],
     last: usize,
     classify: &dyn Fn(&str) -> Option<WallKind>,
 ) -> Option<Wall> {
-    let open = (last.saturating_sub(ERROR_ROWS - 1)..=last)
-        .rev()
-        .find(|&i| rows[i].starts_with(['⏺', '●']))?;
     let wrapped = |row: &String| {
         row.strip_prefix("  ")
             .is_some_and(|t| t.starts_with(|c: char| !c.is_whitespace() && c != '⎿'))
     };
-    if is_tool_call(&rows[open]) || !rows[open + 1..=last].iter().all(wrapped) {
+    let mut open = last;
+    while !rows[open].starts_with(['⏺', '●']) {
+        if !wrapped(&rows[open]) {
+            return None;
+        }
+        open = open.checked_sub(1)?;
+    }
+    if is_tool_call(&rows[open]) {
         return None;
+    }
+    let mut end = last;
+    while rows.get(end + 1).is_some_and(wrapped) {
+        end += 1;
     }
     let head = rows[open]
         .strip_prefix(['⏺', '●'])
         .map(str::trim)
         .filter(|t| !t.is_empty())?;
-    let text = std::iter::once(head)
-        .chain(rows[open + 1..=last].iter().map(|r| r.trim()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    if !(text.contains(" · ") || text.contains(" ∙ ") || text.starts_with("API Error")) {
+    let mut parts: Vec<&str> = std::iter::once(head)
+        .chain(rows[open + 1..=end].iter().map(|r| r.trim()))
+        .collect();
+    if let Some(tail) = parts.last_mut() {
+        *tail = tail.strip_suffix(EXPAND_HINT).unwrap_or(tail).trim_end();
+    }
+    parts.retain(|p| !p.is_empty());
+    let text = parts.join(" ");
+    let remedy = end - open < ERROR_ROWS && (text.contains(" · ") || text.contains(" ∙ "));
+    if !(head.starts_with("API Error") || remedy) {
         return None;
     }
     let kind = classify(&text)?;
@@ -3446,6 +3475,26 @@ mod tests {
             worker_phase(&api),
             Phase::Limited {
                 message: "API Error: Rate limit reached for requests".to_string(),
+                reset: None,
+            }
+        );
+        // Claude Code 2.1.283's own 429 is a message of its own, its status
+        // in parentheses: the same limit (`error_row_notice`).
+        let own = screen(
+            &[
+                "⏺ Running the suite again.",
+                "",
+                "⏺ API Error: Request rejected (429) · this may be a temporary capacity issue.",
+                "",
+            ],
+            tail,
+        );
+        assert_eq!(
+            worker_phase(&own),
+            Phase::Limited {
+                message: "API Error: Request rejected (429) · this may be a temporary capacity \
+                          issue."
+                    .to_string(),
                 reset: None,
             }
         );

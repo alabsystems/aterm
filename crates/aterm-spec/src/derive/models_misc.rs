@@ -3072,9 +3072,12 @@ pub fn native_update_overlap_handoff_model() -> Model {
                 commit = 1;
                 parent_exited = 1;
             }
-            // Shipping deliberately never `try_wait`s after ProofReady. A child
-            // that exits before Commit is observed only when the real atomic
-            // Commit-pipe write fails (normally EPIPE), then this transition
+            // Shipping never reaps (`try_wait`) after ProofReady. A child that
+            // exits before Commit is seen by the worker's NON-REAPING liveness
+            // probe, which rejects through `WorkerWinsRejectArbiter` like any
+            // other worker reject; once the main thread's Commit has won the
+            // arbiter instead, the exit is observed only when the real atomic
+            // Commit-pipe write fails (normally EPIPE), and this transition
             // transfers the arbiter to rollback without granting authority.
             action CommitWriteFails when (
                 protocol == 0 && phase == 3 && child_live == 1 &&

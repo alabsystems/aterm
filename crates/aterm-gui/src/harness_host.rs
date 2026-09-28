@@ -152,6 +152,14 @@
 //!   ended at that idle point and relaunched on its conversation
 //!   ([`aterm_agent::harness::relaunch::restart_here`]), the loop running on
 //!   over the new process and carrying it on at its next idle point.
+//! * THE API'S REACH (`[harness] probe_api`; the outage of 2026-09-27). Where
+//!   the loop waits at an API error the network caused, it asks its worker
+//!   what the host MEASURES of the agent's route ([`IdleHost::reach`]): a
+//!   Claude Code on the default route is measured by the instance's one
+//!   probe ([`crate::harness_netprobe`], shared by every session, running
+//!   only while one asks), any other route is not ([`Acts::route`], read
+//!   once per agent process), and the policy continues an unreachable wall
+//!   as soon as the API is measured back.
 //!
 //! **The owner sees the upgrade** (gap audit 2026-09-24): the host thread
 //! keeps the window's view of its tabs' upgrades
@@ -172,15 +180,19 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::netwatch::Route;
 use aterm_agent::harness::relaunch::{
     self, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say, Snapshot,
 };
 use aterm_agent::harness::upgrade_drive::{self, After, Behind, Due};
 use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
+use aterm_agent::supervise::policy::turn_end::Reach;
 use aterm_agent::supervise::{
     Ctl, CtlReply, Endpoint, HostStep, IdleHost, Interrupter, RelayCtl, Session, SuperviseOpts,
     SupervisorConfig,
 };
+
+use crate::harness_netprobe::NetProbe;
 
 use aterm_phase::Program;
 
@@ -188,15 +200,16 @@ use crate::session_store::{SessionState, Store};
 
 /// `cfg` with every key the engine does not read at its default: what the
 /// host runs under and compares, so an edit that changes nothing the engine
-/// reads restarts nothing. Those are the two `[harness]` keys the HOST reads
-/// and the loop does not: `upgrade` and `relaunch` — read from the same
-/// parse before they are masked ([`Switches`], live in every worker), so the
-/// table has one parser.
+/// reads restarts nothing. Those are the three `[harness]` keys the HOST
+/// reads and the loop does not: `upgrade`, `relaunch` and `probe_api` — read
+/// from the same parse before they are masked ([`Switches`], live in every
+/// worker), so the table has one parser.
 pub(crate) fn effective(cfg: &SupervisorConfig) -> SupervisorConfig {
     let d = SupervisorConfig::default();
     SupervisorConfig {
         upgrade: d.upgrade,
         relaunch: d.relaunch,
+        probe_api: d.probe_api,
         ..cfg.clone()
     }
 }
@@ -208,6 +221,7 @@ pub(crate) fn effective(cfg: &SupervisorConfig) -> SupervisorConfig {
 pub(crate) struct Switches {
     upgrade: AtomicBool,
     relaunch: AtomicBool,
+    probe_api: AtomicBool,
 }
 
 impl Switches {
@@ -216,6 +230,12 @@ impl Switches {
             .store(cfg.enabled && cfg.upgrade, Ordering::SeqCst);
         self.relaunch
             .store(cfg.enabled && cfg.relaunch, Ordering::SeqCst);
+        self.probe_api
+            .store(cfg.enabled && cfg.probe_api, Ordering::SeqCst);
+    }
+
+    fn probe_api(&self) -> bool {
+        self.probe_api.load(Ordering::SeqCst)
     }
 
     fn upgrade(&self) -> bool {
@@ -244,13 +264,58 @@ const HOST_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// panics by it).
 pub(crate) const THREAD_PREFIX: &str = "aterm-harness-";
 
-/// A restored tab's relaunch ([`HostHandle::relaunch_restored`]) is tried at
-/// most this many times — a shell that is still starting says `NotYet` —
+/// A restored tab's relaunch ([`HostHandle::relaunch_restored`]) is usually
+/// tried at most this many times — a shell that is still starting says `NotYet` —
 /// pausing [`RESTORED_FIRST_PAUSE`] first, doubling up to
-/// [`RESTORED_MAX_PAUSE`]: about two minutes in all.
+/// [`RESTORED_MAX_PAUSE`]. An already typed relaunch still waiting for its
+/// conversation is watched until the in-flight record's stale horizon.
 const RESTORED_TRIES: u32 = 8;
 const RESTORED_FIRST_PAUSE: Duration = Duration::from_secs(1);
 const RESTORED_MAX_PAUSE: Duration = Duration::from_secs(30);
+/// Whether a restored tab's relaunch step that came to `outcome` (its word
+/// `step`) is tried again ([`HostHandle::relaunch_restored`]): only a step
+/// that was not possible YET — the shell still starting, the relaunch still
+/// coming up, another actor on the lock. A relaunch that was typed and did
+/// not take (`failed:`: the agent ended as it started, never picked its
+/// conversation up, or its prompt refused the line) is not: another try
+/// types the same line into the tab again (day six, D30: three times, the
+/// row 14 minutes late), and the row says what to type instead.
+fn restored_again(step: &str, outcome: &Outcome) -> bool {
+    matches!(outcome, Outcome::NotYet(_) | Outcome::Busy) && !step.starts_with("failed:")
+}
+
+/// The usual retry budget is eight steps. `wait:resume` means the line was
+/// already typed and its process may still register its conversation: a
+/// shorter per-step lock hold must not make that process appear lost before
+/// the in-flight record itself becomes stale.
+fn restored_retry(step: &str, outcome: &Outcome, tried: u32, waiting: Duration) -> bool {
+    restored_again(step, outcome)
+        && (tried < RESTORED_TRIES
+            || (step == "wait:resume" && waiting < Duration::from_secs(relaunch::STALE_S)))
+}
+
+/// One agent a cold restore hands the host ([`HostHandle::relaunch_restored`]):
+/// its new tab's sid, the snapshot naming that tab, its new shell and what the
+/// layout carried of the agent, and where the tab is in the person's words
+/// (`in tab 2`, `App::upgrade_place`) for the row that says it did not come
+/// back.
+pub(crate) struct RestoredAgent {
+    pub(crate) sid: String,
+    pub(crate) snap: Snapshot,
+    pub(crate) place: String,
+}
+
+/// One cold-restore relaunch's next eligible step. A slow tab must not make
+/// every other restored tab wait through its own growing retry pauses.
+struct RestoredAttempt {
+    agent: RestoredAgent,
+    order: usize,
+    due: Instant,
+    pause: Duration,
+    tried: u32,
+    resume_wait_since: Option<Instant>,
+}
+
 /// The keyed-attention owner this host writes (`meta set attention
 /// owner=supervisor …`): the engine's own, one constant.
 pub(crate) use aterm_agent::supervise::ATTENTION_OWNER;
@@ -295,6 +360,13 @@ static UPGRADE_ACTS: AtomicU64 = AtomicU64::new(0);
 fn note_upgrade_act() {
     UPGRADE_ACTS.fetch_add(1, Ordering::SeqCst);
     ring();
+}
+
+/// The window learned the owner's view is stale — a press refused because
+/// the round it was offered for has since stopped (day five, D22): the view
+/// is looked at again at the host's next wake, as after a worker's step.
+pub(crate) fn look_at_upgrades_soon() {
+    note_upgrade_act();
 }
 
 /// Wake the host: something it decides from moved (the roster, a program, a
@@ -619,6 +691,9 @@ type RestoredFn = dyn Fn(&str, &Snapshot, bool) -> String + Send + Sync;
 /// stands it down.
 type ViewFn = dyn Fn(bool) -> Option<u64> + Send + Sync;
 type RestartFn = dyn Fn(&str, u32, &Restart) -> String + Send + Sync;
+/// An agent's route to its API, read now from its pid, argv and directory
+/// ([`Acts::route`]).
+type RouteFn = dyn Fn(u32, &[String], &str) -> Route + Send + Sync;
 /// Whether the conversation a tab's agent holds has a task
 /// ([`upgrade_drive::tasked`], the tab's supervisor's own turns none), read
 /// on from where the worker's last read of it ended: `(sid, session, memo)`.
@@ -707,6 +782,11 @@ pub(crate) struct Acts {
     /// The live upgrade's clocks held through the loop's limit episode
     /// ([`upgrade_drive::hold_clock`], [`WorkerIdle::limited`]).
     pub(crate) hold: Arc<HoldFn>,
+    /// The route a Claude Code agent's API requests take, read-only from
+    /// its exec environment and every settings source Claude Code reads for
+    /// it ([`crate::harness_netprobe::route_of_agent`]): only the default
+    /// route is measured ([`WorkerIdle::reach`]).
+    pub(crate) route: Arc<RouteFn>,
 }
 
 /// Stop one worker: its flag, then its connection's cut. A stop is never an
@@ -738,7 +818,7 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
 /// The badge a session whose supervisor keeps failing carries while it
 /// waits to restart it: information, never an "off" — the restart is
 /// coming, and the badge is cleared as it starts.
-fn failing_badge(why: &str, restarts: usize, pause: Duration) -> String {
+fn failing_badge(why: &str, pause: Duration) -> String {
     let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ");
     // The whole badge within the server's keyed-attention cap (200 bytes).
     let mut end = why.len().min(80);
@@ -746,7 +826,7 @@ fn failing_badge(why: &str, restarts: usize, pause: Duration) -> String {
         end -= 1;
     }
     format!(
-        "supervisor keeps failing ({restarts} restarts this hour); restarting in {} min; last: {}",
+        "supervisor keeps failing; restarting in {} min; last: {}",
         pause.as_secs().div_ceil(60),
         &why[..end]
     )
@@ -843,7 +923,7 @@ fn worker_main(mut job: WorkerJob, hooks: &Hooks) -> WorkerExit {
                 job.sid,
                 pause.as_secs(),
             );
-            (hooks.badge)(&job.sid, Some(&failing_badge(&why, failed, pause)));
+            (hooks.badge)(&job.sid, Some(&failing_badge(&why, pause)));
             badged = true;
         } else {
             aterm_log::warn!(
@@ -1196,6 +1276,14 @@ pub(crate) struct WorkerIdle {
     /// applied to the upgrade's clocks ([`Acts::hold`]: another sweep held
     /// the lock) — applied before the next step.
     clock_hold: Mutex<Option<u64>>,
+    /// The instance's one API reach probe ([`NetProbe`]).
+    net: Arc<NetProbe>,
+    /// The agent's route as last read, by its pid, kernel start and working
+    /// directory: read once per agent process ([`Acts::route`]), and again
+    /// when the directory it was read with changes — a snapshot taken before
+    /// the agent's cwd was known reads its route custom, and the relaunch's
+    /// `follow` filling the cwd in later must be read, not the cached custom.
+    route: Mutex<Option<(u32, String, String, Route)>>,
 }
 
 impl std::fmt::Debug for WorkerIdle {
@@ -1419,6 +1507,60 @@ impl IdleHost for WorkerIdle {
     /// remedy's (U1).
     fn stalled(&self, held: bool) {
         self.stalled.store(held, Ordering::SeqCst);
+    }
+
+    /// WHAT THE HOST MEASURES OF THE AGENT'S ROUTE TO ITS API (the loop
+    /// asks only while it waits at a wall the network answers): a Claude
+    /// Code on the default route asks the instance's one probe
+    /// ([`NetProbe::ask`], its lease renewed); any other route — a base URL,
+    /// a cloud provider, a unix socket, a proxy, a settings source that
+    /// could not be read — any other agent, an agent not snapshotted yet,
+    /// and `[harness] probe_api = false` (read live) are measured by
+    /// nothing: [`Reach::Unknown`], the time ladder — and so is an agent
+    /// whose working directory is not known yet (its project settings are
+    /// unseen). The route is read once per agent process (its pid and kernel
+    /// start) and directory — again when the directory is filled in —
+    /// outside every lock.
+    fn reach(&self) -> Reach {
+        if self.agent != Program::Claude || !self.switches.probe_api() {
+            return Reach::Unknown;
+        }
+        let agent = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .map(|s| (s.pid, s.start.clone(), s.argv.clone(), s.cwd.clone()));
+        let Some((pid, start, argv, cwd)) = agent else {
+            return Reach::Unknown;
+        };
+        let cached = self
+            .route
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .filter(|(p, s, c, _)| *p == pid && *s == start && *c == cwd)
+            .map(|(_, _, _, route)| route.clone());
+        let route = match cached {
+            Some(route) => route,
+            None => {
+                let route = (self.hooks.acts.route)(pid, &argv, &cwd);
+                if let Route::Custom(why) = &route {
+                    aterm_log::info!(
+                        "harness @{}: the API's reach is not measured for pid {pid}: {why}",
+                        self.sid
+                    );
+                }
+                *self.route.lock().unwrap_or_else(PoisonError::into_inner) =
+                    Some((pid, start, cwd, route.clone()));
+                route
+            }
+        };
+        match route {
+            Route::Default => self.net.ask(&self.sid),
+            Route::Custom(_) => Reach::Unknown,
+        }
     }
 
     /// A TURN RAN since the loop's last point ([`IdleHost::turn_ran`]): the
@@ -1729,11 +1871,10 @@ fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say) {
         OnExit::Held => {
             "the session is held (a halt, a lease or a driver's turn): the exit is theirs"
         }
-        // No configuration took this away: the relaunch is not built for
-        // this agent yet (the philosophy review of 2026-09-25: it was worded
-        // as a limit). What it printed is the way back.
+        // No configuration took this away: aterm relaunches Claude Code
+        // alone, so it is never worded as a limit. The way back is the fact.
         OnExit::Limited if job.agent != Program::Claude => {
-            "relaunch not built for this agent yet (no [harness] limit); use its resume line"
+            "`codex resume` in this tab takes its conversation back"
         }
         OnExit::Limited => "[harness] relaunch = false",
         OnExit::Relaunch => "",
@@ -1746,7 +1887,10 @@ fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say) {
 }
 
 /// Say a relaunch's word on the session's attention (`why`: the step, or the
-/// limit, that said it).
+/// limit, that said it). A step word (`refused:shell-gone`, `wait:resume`) is
+/// the log's; the attention says the state and what a person can do — for a
+/// relaunch that keeps failing, the cause when it is one only a person clears
+/// ([`failing_text`]).
 fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str) {
     let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut end = why.len().min(80);
@@ -1754,20 +1898,40 @@ fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str) {
         end -= 1;
     }
     let why = &why[..end];
-    let text = match said {
+    let (text, step) = match said {
         Say::Nothing => return,
         Say::Clear => {
             (hooks.badge)(sid, None);
             return;
         }
-        Say::Cannot => format!("the agent exited and cannot be relaunched: {why}"),
-        Say::Failing => {
-            format!("the agent exited and its relaunch keeps failing (still retrying): {why}")
-        }
-        Say::Limited => format!("the agent exited and is not relaunched: {why}"),
+        Say::Cannot => (
+            "the agent exited and cannot be relaunched; resume it by hand".to_string(),
+            why,
+        ),
+        Say::Failing => (failing_text(why), why),
+        Say::Limited => (format!("the agent exited and is not relaunched: {why}"), ""),
     };
-    aterm_log::warn!("harness @{sid}: {text}");
+    if step.is_empty() {
+        aterm_log::warn!("harness @{sid}: {text}");
+    } else {
+        aterm_log::warn!("harness @{sid}: {text} ({step})");
+    }
     (hooks.badge)(sid, Some(&text));
+}
+
+/// The badge of a relaunch that keeps failing after `step`: with the cause
+/// when it is one only a person clears — a hold or a hand on the tab
+/// (`wait:held`), a foreground job keeping the shell from its prompt
+/// (`wait:shell-prompt`), the conversation open in another tab. Any other
+/// step the retry gets past on its own, and it stays in the log.
+fn failing_text(step: &str) -> String {
+    let cause = match step {
+        "wait:held" => "the session is held",
+        "wait:shell-prompt" => "the shell prompt is not back",
+        "wait:conversation-in-other-tab" => "the conversation is open in another tab",
+        _ => return "the agent exited and its relaunch keeps failing (still trying)".to_string(),
+    };
+    format!("the agent exited and its relaunch keeps failing (still trying: {cause})")
 }
 
 struct Worker {
@@ -1882,6 +2046,9 @@ struct Shared {
     /// Host threads started again after one ended in a panic
     /// ([`HOST_RESTARTS`] at most).
     host_restarts: AtomicU64,
+    /// The instance's one API reach probe, shared by every worker's
+    /// [`WorkerIdle::reach`]; stopped at the host's shutdown.
+    net: Arc<NetProbe>,
 }
 
 /// How many times a host thread that ended in a panic is started again (by
@@ -1942,6 +2109,7 @@ impl HostHandle {
                 wake: std::sync::OnceLock::new(),
                 host_done: AtomicBool::new(false),
                 host_restarts: AtomicU64::new(0),
+                net: NetProbe::new(),
             }),
             thread: Arc::default(),
             hooks,
@@ -2042,14 +2210,27 @@ impl HostHandle {
     /// each `(sid, snapshot)` naming its new tab and shell and what the
     /// layout carried of its agent.
     /// Each is relaunched there on its conversation
-    /// ([`relaunch::after_host_ended`]) on a thread of its own — never this
-    /// caller's, the event loop — while `[harness] relaunch` allows it: a
-    /// step that is not yet possible (the shell still starting) is tried
-    /// again on a growing pause, [`RESTORED_TRIES`] times at most; a
-    /// relaunch, a launch that ends there, and one that cannot be made are
-    /// journaled, never retried. A headless instance relaunches nothing.
-    pub(crate) fn relaunch_restored(&self, restored: Vec<(String, Snapshot)>) {
-        if restored.is_empty() || self.shared.headless || !self.shared.switches.relaunch() {
+    /// ([`relaunch::after_host_ended`]) on one background worker — never this
+    /// caller's, the event loop — while `[harness] relaunch` allows it: each
+    /// tab gets a first attempt before another tab's retry pause, and a
+    /// step that is not yet possible is tried again on a growing pause,
+    /// [`RESTORED_TRIES`] times normally, with no pause after the last.
+    /// An already typed relaunch waiting for its conversation can be checked
+    /// until its in-flight stale horizon; a relaunch, a launch that ends there, one that
+    /// cannot be made and one typed that did not take ([`restored_again`])
+    /// are journaled, never retried. A headless instance relaunches nothing.
+    ///
+    /// The reopened layout's row told the person each agent the relaunch
+    /// brings back resumes its conversation ([`Self::relaunches_restored`],
+    /// ruling 293). One of those that did not come back — a shell gone, a tab
+    /// never ready, the old agent still running, an agent that started and
+    /// did not pick its conversation up — is said ONCE, in one row
+    /// for them all once every tab is tried
+    /// ([`crate::message_reporters::restored_agents_not_resumed`]); one that
+    /// row already counted as lost (no conversation, a one-shot run) is not
+    /// said twice.
+    pub(crate) fn relaunch_restored(&self, restored: Vec<RestoredAgent>) {
+        if restored.is_empty() || !self.relaunches_restored() {
             return;
         }
         let act = Arc::clone(&self.hooks.acts.relaunch_restored);
@@ -2058,26 +2239,92 @@ impl HostHandle {
             .name(format!("{THREAD_PREFIX}restored"))
             .spawn(move || {
                 crate::qos::set_self(crate::qos::Role::Background);
-                for (sid, snap) in restored {
-                    let mut pause = RESTORED_FIRST_PAUSE;
-                    for _ in 0..RESTORED_TRIES {
-                        if !switches.relaunch() {
-                            return;
-                        }
-                        let step = act(&sid, &snap, switches.upgrade());
-                        match relaunch::outcome(&step) {
-                            Outcome::NotYet(_) | Outcome::Busy => {
-                                std::thread::sleep(pause);
-                                pause = (pause * 2).min(RESTORED_MAX_PAUSE);
-                            }
-                            _ => break,
-                        }
+                let mut missed = Vec::new();
+                let now = Instant::now();
+                let mut pending: VecDeque<_> = restored
+                    .into_iter()
+                    .enumerate()
+                    .map(|(order, agent)| RestoredAttempt {
+                        agent,
+                        order,
+                        due: now,
+                        pause: RESTORED_FIRST_PAUSE,
+                        tried: 0,
+                        resume_wait_since: None,
+                    })
+                    .collect();
+                while !pending.is_empty() && switches.relaunch() {
+                    // The earliest due tab runs first. Initial attempts all
+                    // precede any retry, even when the first step took a
+                    // while. The one worker still takes only one upgrade
+                    // lock at a time; no new actor can race a relaunch.
+                    let (at, due) = pending
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, attempt)| attempt.due)
+                        .map(|(at, attempt)| (at, attempt.due))
+                        .expect("pending was not empty");
+                    let now = Instant::now();
+                    if due > now {
+                        std::thread::sleep(due - now);
+                        continue;
                     }
+                    let mut attempt = pending.remove(at).expect("due attempt exists");
+                    let RestoredAgent { sid, snap, place } = &attempt.agent;
+                    let step = act(sid, snap, switches.upgrade());
+                    let last = relaunch::outcome(&step);
+                    attempt.tried += 1;
+                    let now = Instant::now();
+                    if step == "wait:resume" {
+                        attempt.resume_wait_since.get_or_insert(now);
+                    }
+                    let waiting = attempt
+                        .resume_wait_since
+                        .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+                    if restored_retry(&step, &last, attempt.tried, waiting) {
+                        attempt.due = now + attempt.pause;
+                        attempt.pause = (attempt.pause * 2).min(RESTORED_MAX_PAUSE);
+                        pending.push_back(attempt);
+                        continue;
+                    }
+                    if last != Outcome::Relaunched
+                        && crate::restore::agent_resumes(snap.session.as_deref(), &snap.argv)
+                    {
+                        aterm_log::warn!(
+                            "harness @{sid}: the agent aterm hosted {place} was not relaunched \
+                             after aterm ended: {last:?}"
+                        );
+                        missed.push((attempt.order, place.clone(), last));
+                    }
+                }
+                if !missed.is_empty() {
+                    // Attempts finish in due order; the one notice still
+                    // names missed tabs in the layout's original order.
+                    missed.sort_by_key(|(order, _, _)| *order);
+                    let missed = missed
+                        .into_iter()
+                        .map(|(_, place, outcome)| (place, outcome))
+                        .collect::<Vec<_>>();
+                    let log = crate::logging::log_dir().map(|dir| dir.join("aterm.log"));
+                    crate::message_inbox::queue_message(
+                        crate::message_reporters::restored_agents_not_resumed(
+                            &missed,
+                            log.as_deref(),
+                        ),
+                    );
                 }
             });
         if let Err(e) = spawned {
             aterm_log::warn!("harness: the restored tabs' agents could not be relaunched: {e}");
         }
+    }
+
+    /// Whether the agents a cold restore hands this host are relaunched
+    /// ([`Self::relaunch_restored`]): not in a headless instance, and while
+    /// `[harness]` is on with `relaunch` allowed. The reopened layout's row
+    /// reads it to say an agent resumes rather than was lost (ruling 293).
+    pub(crate) fn relaunches_restored(&self) -> bool {
+        !self.shared.headless && self.shared.switches.relaunch()
     }
 
     /// A reloaded `[harness]` policy: workers restart under it, or all stop
@@ -2141,6 +2388,7 @@ impl HostHandle {
     /// [`HOST_JOIN_TIMEOUT`] the thread is left to the process exit.
     pub(crate) fn shutdown_and_join(&self) {
         self.shared.lock().shutting_down = true;
+        self.shared.net.stop();
         ring();
         if let Some(wake) = self.shared.wake.get() {
             wake.pull();
@@ -2634,6 +2882,8 @@ fn start_workers(
             tasked: Mutex::default(),
             note: Arc::clone(&note),
             clock_hold: Mutex::default(),
+            net: Arc::clone(&shared.net),
+            route: Mutex::default(),
         });
         let job = WorkerJob {
             sid: sid.clone(),
@@ -3033,6 +3283,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         hold: Arc::new(move |sid, until| {
             o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
         }),
+        route: Arc::new(crate::harness_netprobe::route_of_agent),
     }
 }
 
@@ -3552,6 +3803,7 @@ mod tests {
                 restart: Arc::new(|_, _, _| "refused:inert".to_string()),
                 tasked: Arc::new(|_, _, _| None),
                 hold: Arc::new(|_, _| true),
+                route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
             }
         }
     }
@@ -3617,25 +3869,295 @@ mod tests {
                 "adopted".to_string()
             });
             let host = HostHandle::start(cfg, headless, false, h);
-            host.relaunch_restored(vec![
-                ("s-a".to_string(), snap("s-a")),
-                ("s-b".to_string(), snap("s-b")),
-            ]);
+            host.relaunch_restored(
+                ["s-a", "s-b"]
+                    .map(|sid| RestoredAgent {
+                        sid: sid.to_string(),
+                        snap: snap(sid),
+                        place: "in tab 1".to_string(),
+                    })
+                    .into(),
+            );
             (host, seen)
         };
-        let (_host, seen) = run(on(), false);
+        let (host, seen) = run(on(), false);
+        assert!(
+            host.relaunches_restored(),
+            "the reopened row reads the same gate"
+        );
         until("both relaunched", || seen.lock().unwrap().len() == 2);
         std::thread::sleep(Duration::from_millis(50));
         assert_eq!(*seen.lock().unwrap(), ["s-a", "s-b"], "once each");
 
         let mut limited = on();
         limited.set("relaunch", "false").unwrap();
-        let (_host, seen) = run(limited, false);
+        let (host, seen) = run(limited, false);
+        assert!(!host.relaunches_restored());
         std::thread::sleep(Duration::from_millis(100));
         assert!(seen.lock().unwrap().is_empty(), "relaunch = false");
-        let (_host, seen) = run(on(), true);
+        let (host, seen) = run(on(), true);
+        assert!(!host.relaunches_restored());
         std::thread::sleep(Duration::from_millis(100));
         assert!(seen.lock().unwrap().is_empty(), "headless");
+        let (host, _) = run(off(), false);
+        assert!(!host.relaunches_restored(), "[harness] off");
+    }
+
+    /// A tab whose relaunched agent still has not registered its conversation
+    /// cannot consume its retry pause before another tab's first relaunch.
+    /// Its own in-flight step is still retried later; neither is typed twice
+    /// after it succeeds.
+    #[test]
+    fn a_waiting_restored_tab_does_not_delay_another_tabs_first_step() {
+        let world = Arc::new(World::default());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+        let first = Arc::new(AtomicUsize::new(0));
+        let mut h = hooks(&world, parking_body(&world));
+        let (calls, tries) = (Arc::clone(&seen), Arc::clone(&first));
+        h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+            calls.lock().unwrap().push(sid.to_string());
+            if sid == "s-a" && tries.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_millis(50));
+                "wait:resume"
+            } else {
+                "adopted"
+            }
+            .to_string()
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        let snap = |sid: &str| Snapshot {
+            tab: sid.to_string(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".to_string(),
+            shell: 4343,
+            program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".to_string()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".to_string()),
+            cwd: "/".to_string(),
+            version: None,
+        };
+        host.relaunch_restored(
+            ["s-a", "s-b"]
+                .map(|sid| RestoredAgent {
+                    sid: sid.to_string(),
+                    snap: snap(sid),
+                    place: "in tab 1".to_string(),
+                })
+                .into(),
+        );
+        until("both first steps", || seen.lock().unwrap().len() >= 2);
+        assert_eq!(seen.lock().unwrap()[..2], ["s-a", "s-b"]);
+        until("the waiting tab retried", || {
+            seen.lock().unwrap().len() == 3
+        });
+        assert_eq!(*seen.lock().unwrap(), ["s-a", "s-b", "s-a"]);
+
+        // Tier-1: map the real worker's call order onto the model's actions.
+        // The former nested loop enables RetryA immediately after FirstA;
+        // this worker chose FirstB instead.
+        let model = aterm_spec::derive::harness_restored_first_attempt_model();
+        let mut state = model.init_state();
+        let mut first_a = false;
+        for sid in seen.lock().unwrap().iter() {
+            let action = match sid.as_str() {
+                "s-a" if !first_a => {
+                    first_a = true;
+                    "FirstA"
+                }
+                "s-a" => "RetryA",
+                "s-b" => "FirstB",
+                _ => panic!("unexpected restored tab {sid}"),
+            };
+            assert!(model.fire(action, &mut state), "{action}: {state:?}");
+            if action == "FirstA" {
+                assert!(!model.action_enabled("RetryA", &state));
+                let buggy = aterm_spec::interp::with_buggy(&model, 1);
+                assert!(buggy.action_enabled("RetryA", &state));
+            }
+        }
+    }
+
+    /// Shorter host steps must not exhaust the old in-flight window after
+    /// eight fast `wait:resume` reads. Other waits retain the bounded budget,
+    /// and a typed failure never retries.
+    #[test]
+    fn a_restored_in_flight_relaunch_stays_eligible_until_stale() {
+        let waiting = Outcome::NotYet("wait:resume".to_string());
+        assert!(restored_retry(
+            "wait:resume",
+            &waiting,
+            RESTORED_TRIES,
+            Duration::from_secs(relaunch::STALE_S - 1)
+        ));
+        assert!(!restored_retry(
+            "wait:resume",
+            &waiting,
+            RESTORED_TRIES,
+            Duration::from_secs(relaunch::STALE_S)
+        ));
+        assert!(!restored_retry(
+            "wait:shell-prompt",
+            &Outcome::NotYet("wait:shell-prompt".to_string()),
+            RESTORED_TRIES,
+            Duration::ZERO
+        ));
+        assert!(!restored_retry(
+            "failed:no-resume",
+            &Outcome::NotYet("failed:no-resume".to_string()),
+            1,
+            Duration::ZERO
+        ));
+    }
+
+    /// RULING 293: an agent the reopened row said resumes and that did not
+    /// come back is said ONCE, in one row, once every restored tab is tried:
+    /// here tab 2's shell was gone (`refused:shell-gone`). NEGATIVE CONTROLS
+    /// in the same pass: tab 1's relaunch landed (`adopted`) and tab 3's agent
+    /// had no conversation (the reopened row already counted it lost), so
+    /// neither is in the row.
+    #[test]
+    fn a_restored_agent_that_did_not_come_back_is_said_once() {
+        let _lane = crate::message_inbox::lane_test_guard();
+        let _ = crate::message_inbox::take_queued();
+        let snap = |tab: &str, session: Option<&str>| Snapshot {
+            tab: tab.to_string(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".to_string(),
+            shell: 4343,
+            program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".to_string()],
+            session: session.map(str::to_string),
+            cwd: "/".to_string(),
+            version: None,
+        };
+        let world = Arc::new(World::default());
+        let tried: Arc<Mutex<Vec<String>>> = Arc::default();
+        let mut h = hooks(&world, parking_body(&world));
+        let t = Arc::clone(&tried);
+        h.acts.relaunch_restored = Arc::new(move |sid, _, _| {
+            t.lock().unwrap().push(sid.to_string());
+            if sid == "s-a" {
+                "adopted"
+            } else {
+                "refused:shell-gone"
+            }
+            .to_string()
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        let conversation = Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c");
+        host.relaunch_restored(
+            [
+                ("s-a", conversation, 1),
+                ("s-b", conversation, 2),
+                ("s-c", None, 3),
+            ]
+            .map(|(sid, session, tab)| RestoredAgent {
+                sid: sid.to_string(),
+                snap: snap(sid, session),
+                place: format!("in tab {tab}"),
+            })
+            .into(),
+        );
+        until("all three tried", || tried.lock().unwrap().len() == 3);
+        let ours = || {
+            crate::message_inbox::take_queued()
+                .into_iter()
+                .filter(|m| {
+                    m.message.key.as_deref() == Some(crate::message_reporters::KEY_RESTORED_AGENTS)
+                })
+                .collect::<Vec<_>>()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rows = Vec::new();
+        while rows.is_empty() && Instant::now() < deadline {
+            rows.extend(ours());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        rows.extend(ours());
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0].message;
+        assert_eq!(row.title, "Couldn't resume Claude in tab 2");
+        assert!(
+            row.detail
+                .iter()
+                .all(|l| !l.contains("tab 1") && !l.contains("tab 3")),
+            "{:?}",
+            row.detail
+        );
+    }
+
+    /// DAY SIX, D30: a restored tab's relaunch that was TYPED AND DID NOT
+    /// TAKE (`failed:no-resume`: the agent started and ended without its
+    /// conversation) is tried once — another try types the same line into the
+    /// tab again — and said at once, its reason true (D31) and the remedy in
+    /// the plain sentence (D32). NEGATIVE CONTROLS: a step not possible yet
+    /// (`wait:shell-prompt`) is tried again, up to [`RESTORED_TRIES`]; so is
+    /// another actor on the lock; a landed relaunch is not.
+    #[test]
+    fn a_restored_relaunch_typed_that_did_not_take_is_tried_once_and_said_at_once() {
+        assert!(!restored_again(
+            "failed:no-resume",
+            &relaunch::outcome("failed:no-resume")
+        ));
+        assert!(!restored_again(
+            "failed:relaunch:ERR-busy",
+            &relaunch::outcome("failed:relaunch:ERR-busy")
+        ));
+        for again in ["wait:shell-prompt", "wait:resume", "busy:another-sweep"] {
+            assert!(restored_again(again, &relaunch::outcome(again)), "{again}");
+        }
+        assert!(!restored_again("adopted", &relaunch::outcome("adopted")));
+
+        let _lane = crate::message_inbox::lane_test_guard();
+        let _ = crate::message_inbox::take_queued();
+        let world = Arc::new(World::default());
+        let tried = Arc::new(AtomicUsize::new(0));
+        let mut h = hooks(&world, parking_body(&world));
+        let t = Arc::clone(&tried);
+        h.acts.relaunch_restored = Arc::new(move |_, _, _| {
+            t.fetch_add(1, Ordering::SeqCst);
+            "failed:no-resume".to_string()
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        let started = Instant::now();
+        host.relaunch_restored(vec![RestoredAgent {
+            sid: "s-a".to_string(),
+            snap: Snapshot {
+                tab: "s-a".to_string(),
+                pid: 4242,
+                start: "Sat Sep 27 01:02:03 2026".to_string(),
+                shell: 4343,
+                program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+                argv: vec!["/opt/claude/bin/claude".to_string()],
+                session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".to_string()),
+                cwd: "/".to_string(),
+                version: None,
+            },
+            place: "in tab 1".to_string(),
+        }]);
+        let mut rows = Vec::new();
+        while rows.is_empty() && started.elapsed() < Duration::from_secs(10) {
+            rows.extend(crate::message_inbox::take_queued().into_iter().filter(|m| {
+                m.message.key.as_deref() == Some(crate::message_reporters::KEY_RESTORED_AGENTS)
+            }));
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            started.elapsed() < RESTORED_FIRST_PAUSE,
+            "said without a pause: {:?}",
+            started.elapsed()
+        );
+        std::thread::sleep(RESTORED_FIRST_PAUSE + Duration::from_millis(200));
+        assert_eq!(tried.load(Ordering::SeqCst), 1, "never typed again");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let row = &rows[0].message;
+        assert_eq!(row.title, "Couldn't resume Claude in tab 1");
+        assert_eq!(
+            row.detail[0],
+            "Claude started in the tab but did not pick its conversation up after aterm \
+             stopped: type claude --resume there to pick it up again"
+        );
     }
 
     #[test]
@@ -3867,9 +4389,8 @@ mod tests {
 
     /// The relaunch on exit is built for Claude Code: another supervised
     /// agent that leaves its tab unasked is not relaunched — said once on its
-    /// attention as a capability not built yet (never as a `[harness]` limit,
-    /// the philosophy review of 2026-09-25) — and nothing of a relaunch is
-    /// read for it. The UPGRADE is built for Codex too — the Codex branch of
+    /// attention with the way back (never as a `[harness]` limit) — and
+    /// nothing of a relaunch is read for it. The UPGRADE is built for Codex too — the Codex branch of
     /// the same step — so a Codex with one due is parked for its idle point,
     /// and one with none is not. NEGATIVE CONTROL: the same exit of a Claude
     /// Code is relaunched.
@@ -3919,11 +4440,12 @@ mod tests {
         assert!(!other.park.load(Ordering::SeqCst), "not written for it");
         on_agent_left(&codex, &hooks);
         assert!(a.relaunched.lock().unwrap().is_empty());
-        // Not relaunched, and said — as a capability not built yet, never as
-        // a [harness] limit.
+        // Not relaunched, and said — with the way back, never as a
+        // [harness] limit.
         let badges = a.badges.lock().unwrap().clone();
         assert!(
-            matches!(&badges[..], [Some(b)] if b.contains("not built for this agent yet (no [harness] limit)")),
+            matches!(&badges[..], [Some(b)] if b.contains("`codex resume` in this tab")
+                && !b.contains("[harness]")),
             "{badges:?}"
         );
         let claude = job(Program::Claude);
@@ -4078,12 +4600,11 @@ mod tests {
         let raised: Vec<&str> = badges.iter().filter_map(|(_, t)| t.as_deref()).collect();
         assert!(!raised.is_empty(), "{badges:?}");
         assert!(
-            raised
-                .iter()
-                .all(|t| t.starts_with("supervisor keeps failing (")
-                    && t.contains("restarting in")
+            raised.iter().all(
+                |t| t.starts_with("supervisor keeps failing; restarting in ")
                     && t.contains("boom in the loop")
-                    && t.len() <= 200),
+                    && t.len() <= 200
+            ),
             "{raised:?}"
         );
         assert!(
@@ -4830,6 +5351,7 @@ mod tests {
                         *a14.tasked.lock().unwrap()
                     }),
                     hold: Arc::new(|_, _| true),
+                    route: Arc::new(|_, _, _| Route::Custom("inert".to_string())),
                 },
                 backoff: Arc::new(quick_backoff),
                 // Every pause is recorded as named. The relaunch's back-off
@@ -4899,6 +5421,8 @@ mod tests {
             tasked: Mutex::default(),
             note: Arc::default(),
             clock_hold: Mutex::default(),
+            net: NetProbe::new(),
+            route: Mutex::default(),
         };
         let taken = || std::mem::take(&mut *log.lock().unwrap());
         let idle = host(Program::Claude);
@@ -4939,6 +5463,136 @@ mod tests {
         other.limited(true);
         assert!(taken().is_empty());
         assert!(other.clock_hold.lock().unwrap().is_none());
+    }
+
+    /// THE API'S REACH, AS THE WORKER ANSWERS ITS LOOP: a Claude Code on the
+    /// default route asks the instance's probe (here one whose resolver
+    /// fails at once: Down, the run's start kept across asks), its route read
+    /// ONCE per agent process; a custom route, another agent, an agent not
+    /// snapshotted yet and `[harness] probe_api = false` ask nothing and read
+    /// Unknown. NEGATIVE CONTROL: a new agent process (another pid), and the
+    /// same one with its directory filled in, read their route again.
+    #[test]
+    fn a_worker_measures_the_default_route_only_and_reads_it_once_per_agent() {
+        use crate::harness_netprobe::Probe;
+        struct Nx(AtomicU64);
+        impl Probe for Nx {
+            fn resolve(&self, _: &str, _: u16) -> std::io::Result<Vec<std::net::SocketAddr>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+            fn connect(
+                &self,
+                _: std::net::SocketAddr,
+                _: Duration,
+            ) -> std::io::Result<std::net::TcpStream> {
+                unreachable!()
+            }
+            fn handshake(
+                &self,
+                _: std::net::TcpStream,
+                _: &str,
+                _: aterm_http::Deadline,
+            ) -> std::io::Result<()> {
+                unreachable!()
+            }
+        }
+        let routes = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let custom = Arc::new(AtomicBool::new(false));
+        let (r1, c1) = (Arc::clone(&routes), Arc::clone(&custom));
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        hooks.acts = Acts {
+            route: Arc::new(move |pid, _, _| {
+                r1.lock().unwrap().push(pid);
+                if c1.load(Ordering::SeqCst) {
+                    Route::Custom("ANTHROPIC_BASE_URL in the agent's environment".to_string())
+                } else {
+                    Route::Default
+                }
+            }),
+            ..Acts::inert()
+        };
+        let probe = Arc::new(Nx(AtomicU64::new(0)));
+        let net = NetProbe::with(Arc::clone(&probe) as Arc<dyn Probe>, Duration::from_secs(2));
+        let switches = Arc::new(Switches::default());
+        switches.set(&on());
+        let snapshot = |pid: u32| Snapshot {
+            tab: "s-net".to_string(),
+            pid,
+            start: "Sun Sep 27 18:00:00 2026".to_string(),
+            shell: 1,
+            program: std::path::PathBuf::from("/usr/local/bin/claude"),
+            argv: vec!["claude".to_string()],
+            session: None,
+            cwd: "/tmp".to_string(),
+            version: None,
+        };
+        let host = |agent: Program| WorkerIdle {
+            sid: "s-net".to_string(),
+            agent,
+            grace: 0,
+            park: Arc::default(),
+            look_at: Arc::default(),
+            acting: Arc::default(),
+            stalled: Arc::default(),
+            switches: Arc::clone(&switches),
+            kept: Arc::default(),
+            hooks: hooks.clone(),
+            run: Mutex::default(),
+            owns: AtomicBool::new(false),
+            background_at: Mutex::default(),
+            clock_hold: Mutex::default(),
+            tasked: Mutex::default(),
+            note: Arc::default(),
+            net: Arc::clone(&net),
+            route: Mutex::default(),
+        };
+        let idle = host(Program::Claude);
+        assert_eq!(idle.reach(), Reach::Unknown, "no agent snapshotted yet");
+        assert!(routes.lock().unwrap().is_empty());
+        idle.kept.lock().unwrap().snapshot = Some(snapshot(4242));
+        let asked = Instant::now();
+        let mut seen = idle.reach();
+        while !matches!(seen, Reach::Down { .. }) && asked.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(5));
+            seen = idle.reach();
+        }
+        assert!(matches!(seen, Reach::Down { .. }), "{seen:?}");
+        assert_eq!(idle.reach(), seen, "the run's start stands");
+        assert_eq!(*routes.lock().unwrap(), [4242], "read once per agent");
+        // A new agent process: its route read again — custom, never measured.
+        custom.store(true, Ordering::SeqCst);
+        idle.kept.lock().unwrap().snapshot = Some(snapshot(4343));
+        let probes = probe.0.load(Ordering::SeqCst);
+        assert_eq!(idle.reach(), Reach::Unknown);
+        assert_eq!(*routes.lock().unwrap(), [4242, 4343]);
+        // The same process with its directory filled in later (a snapshot
+        // taken before its cwd was read, `follow` completing it): read again,
+        // once — a route read blind must not stand for the process's life.
+        let mut placed = snapshot(4343);
+        placed.cwd = "/private/tmp".to_string();
+        idle.kept.lock().unwrap().snapshot = Some(placed);
+        assert_eq!(idle.reach(), Reach::Unknown);
+        assert_eq!(idle.reach(), Reach::Unknown);
+        assert_eq!(*routes.lock().unwrap(), [4242, 4343, 4343]);
+        // `probe_api = false`, another agent: nothing read, nothing asked.
+        let mut off = on();
+        off.probe_api = false;
+        switches.set(&off);
+        custom.store(false, Ordering::SeqCst);
+        idle.kept.lock().unwrap().snapshot = Some(snapshot(4444));
+        assert_eq!(idle.reach(), Reach::Unknown);
+        switches.set(&on());
+        let codex = host(Program::Codex);
+        codex.kept.lock().unwrap().snapshot = Some(snapshot(4545));
+        assert_eq!(codex.reach(), Reach::Unknown);
+        assert_eq!(*routes.lock().unwrap(), [4242, 4343, 4343]);
+        std::thread::sleep(Duration::from_millis(30));
+        assert_eq!(probe.0.load(Ordering::SeqCst), probes, "no probe for them");
+        net.stop();
     }
 
     /// THE UPGRADE IS A STEP OF THE WORKER, TAKEN IN ITS LOOP: an activation
@@ -5705,6 +6359,7 @@ mod tests {
             "wait:attended",
             "wait:held",
             "wait:limited",
+            "wait:queued",
             "failed:signal-refused",
             "refused:--bogus",
             "held-back:terminal:tmux",
@@ -6215,6 +6870,30 @@ mod tests {
         host.shutdown_and_join();
     }
 
+    /// A relaunch that keeps failing names on its badge a cause only a person
+    /// clears; any other step stays in the log.
+    #[test]
+    fn a_failing_relaunch_badge_names_the_cause_only_a_person_clears() {
+        for (step, cause) in [
+            ("wait:held", "the session is held"),
+            ("wait:shell-prompt", "the shell prompt is not back"),
+            (
+                "wait:conversation-in-other-tab",
+                "the conversation is open in another tab",
+            ),
+        ] {
+            assert_eq!(
+                failing_text(step),
+                format!("the agent exited and its relaunch keeps failing (still trying: {cause})")
+            );
+        }
+        // NEGATIVE CONTROL: a step the retry gets past alone stays in the log.
+        assert_eq!(
+            failing_text("wait:resume"),
+            "the agent exited and its relaunch keeps failing (still trying)"
+        );
+    }
+
     /// A relaunch that keeps failing is tried again on the growing back-off,
     /// said on the session's attention once it has missed three in a row,
     /// and the word is cleared when it lands; one that can never be made is
@@ -6255,9 +6934,9 @@ mod tests {
         {
             let badges = a.badges.lock().unwrap();
             assert!(
-                badges[0]
-                    .as_deref()
-                    .is_some_and(|b| b.contains("keeps failing") && b.contains("wait:resume")),
+                badges[0].as_deref().is_some_and(
+                    |b| b.contains("keeps failing (still trying)") && !b.contains("wait:")
+                ),
                 "{badges:?}"
             );
             assert_eq!(badges[1], None, "cleared when it landed");
@@ -6272,7 +6951,8 @@ mod tests {
         assert!(
             a.badges.lock().unwrap()[2]
                 .as_deref()
-                .is_some_and(|b| b.contains("cannot be relaunched")),
+                .is_some_and(|b| b.contains("cannot be relaunched; resume it by hand")
+                    && !b.contains("refused:")),
         );
         // The launch's own end: one try, nothing said.
         attach_again();
@@ -6778,6 +7458,8 @@ mod tests {
                 tasked: Mutex::default(),
                 note: job.note,
                 clock_hold: Mutex::default(),
+                net: NetProbe::new(),
+                route: Mutex::default(),
             }
         }
 

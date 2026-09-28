@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use aterm_verify::cli::Mode;
 use aterm_verify::ladder::{Report, Tally, tally};
-use aterm_verify::plan::{Lane, StageId, StageSpec};
+use aterm_verify::plan::{Lane, StageId, StageSpec, Tier};
 use aterm_verify::verdict::{MERGE_CONTRACT_SENTENCE, verdict};
 use aterm_verify::{Ctx, EnvSnapshot, Scope, exit, mktemp_dir, plan, sched, stages};
 
@@ -73,13 +73,13 @@ impl FakeRepo {
         for name in aterm_verify::stages::LIVE_ATERM_SUITES {
             me.script(&format!("tools/{name}"), "exit 0");
         }
-        // DERIVED FROM THE ROSTER, never re-typed. This list was a hand-written copy of
-        // `ATPKG_SUITES` and the two drifted the moment the roster grew: adding a suite
-        // made every fixture here report `missing or not executable` for it, which reads
-        // as a broken change rather than as an un-updated fixture (2026-09-17).
-        for name in aterm_verify::stages::ATPKG_SUITES {
-            me.script(&format!("tools/{name}"), "exit 0");
-        }
+        // …and the atpkg end-to-end pack, by its stage's own name. (A hand-written
+        // copy of a roster drifted the moment the roster grew: every fixture here
+        // reported the new suite `missing or not executable`, 2026-09-17.)
+        me.script(
+            &format!("tools/{}", aterm_verify::stages::ATPKG_DRIVEN_SUITE),
+            "exit 0",
+        );
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
         me.script("libc-oracle/run.sh", "exit 0");
@@ -216,11 +216,11 @@ exit 0"#
         // the ambient environment — and two fixtures here pin that value to a
         // lane's own cap (`test "$CARGO_BUILD_JOBS" = 8 || exit 71`). Measured
         // 2026-09-16: the merge gate itself exports `CARGO_BUILD_JOBS=4` on a
-        // 4-core Mac, so inside that run the driver lane capped 8 to 4 and both
-        // `sealed_lane_prepares_its_gui_before_testing_and_preserves_both_failures`
-        // and `atpkg_tooling_builds_the_atpkg_its_pack_suite_drives_and_never_takes_a_stale_one`
-        // failed at exit 71 — their stubs never reaching the build arm, so the
-        // trace was missing rows and the driven binary missing entirely. The
+        // 4-core Mac, so inside that run the driver lane capped 8 to 4 and the
+        // driven-binary fixtures (today's
+        // `every_driven_suite_drives_the_binary_its_stage_just_built`) failed
+        // at exit 71 — their stubs never reaching the build arm, so the trace
+        // was missing rows and the driven binary missing entirely. The
         // stages were right and the fixture was reading the shell. `None` is
         // the pin because these tests assert the CAPS; the ceiling itself is
         // measured by `a_callers_job_count_caps_the_side_lane_child_it_reaches`,
@@ -479,7 +479,7 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     for driven in [
         "targo test --workspace --no-run (trustdoc)",
         "targo test --doc --workspace (trustdoc)",
-        "targo test --workspace --tests (trustdoc) -- measuring:: launchd_copy_tests::",
+        "targo test --workspace --lib (trustdoc) -- launchd_copy_tests::",
         "gate lint --fmt-only",
         "gate forge",
         "freeze-safety-gate (6 obligations)",
@@ -496,10 +496,12 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     );
     // The test run's second child never starts after a failed compile — as
     // the single child ran no test after one — and the ladder says so without
-    // calling it a skip.
+    // calling it a skip: a COULD NOT RUN row, counted (2026-09-27, third
+    // review: a compile red main's receipt excuses must not excuse the tests
+    // it kept from running).
     assert!(
         ladder.contains(
-            "  not run: targo test --workspace --tests (trustdoc) — the compile above failed"
+            "  FAIL  targo test --workspace --tests (trustdoc) — not run: the compile above failed"
         ),
         "{ladder}"
     );
@@ -509,103 +511,21 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
             .any(|(_, l)| *l == "targo test --workspace --tests (trustdoc)"),
         "{ladder}"
     );
-    // Likewise the sealed rung: its aterm-gui build fails, so its suite never
+    // Likewise the atpkg pack: its atpkg build fails, so its suite never
     // starts against whatever binary an earlier build left behind.
     assert!(
         labels_with(&ladder, "FAIL")
             .iter()
-            .any(|l| l
-                == "targo build -p aterm-gui -p aterm-ctl (the aterm-gui the sealed rung drives)"),
+            .any(|l| l == stages::ATPKG_BUILD_LABEL),
         "{ladder}"
     );
     assert!(
-        ladder.contains(
-            "  not run: targo test -p aterm-link --features sealed --test two_nodes_sealed — the aterm-gui build above failed"
-        ),
+        ladder.contains(&format!(
+            "  FAIL  {} — not run: the atpkg build above failed",
+            stages::ATPKG_DRIVEN_SUITE
+        )),
         "{ladder}"
     );
-}
-
-/// THE SEALED RUNG NEVER DRIVES AN aterm-gui IT DID NOT JUST SEE BUILT
-/// (2026-09-14), end to end over the real scheduler and stage runner.
-///
-/// `two_nodes_sealed` finds `aterm-gui` in the target dir it was compiled into
-/// and refuses one older than its sources. At 28508563a it was spawned at t0 in
-/// `target-sealed/`, which no stage ever built `aterm-gui` into, while the
-/// build stage was still linking the binary its harness fell through to — 5 of
-/// 9 tests refused STALE on a warm gate. The recording driver here shows the
-/// order cargo is actually asked for: the suite is spawned only in the driver
-/// lane's dir, only after the driver builds' children and the rung's own
-/// `aterm-gui` build in that same dir — and never at all when that build fails.
-#[test]
-fn the_sealed_rung_never_runs_before_a_fresh_aterm_gui_is_built_in_its_dir() {
-    for gui_build_exit in [0, 1] {
-        let repo = FakeRepo::new();
-        let record = repo.scratch.join("argv.txt");
-        repo.with_stage2(&format!(
-            "printf '%s %s\\n' \"$CARGO_TARGET_DIR\" \"$*\" >> '{}'\n\
-             case \"$*\" in *'-p aterm-gui -p aterm-ctl'*) exit {gui_build_exit} ;; esac\n\
-             exit 0",
-            record.display()
-        ));
-        let (ladder, _) = repo.run(Mode::Fast, Scope::workspace());
-        let lines: Vec<String> = fs::read_to_string(&record)
-            .expect("the driver was invoked")
-            .lines()
-            .map(str::to_string)
-            .collect();
-        let suite = "--features sealed --test two_nodes_sealed";
-        let drivers = repo.root.join("target-drivers").display().to_string();
-        if gui_build_exit != 0 {
-            assert!(
-                !lines.iter().any(|l| l.contains(suite)),
-                "the suite ran after its aterm-gui build failed:\n{}",
-                lines.join("\n")
-            );
-            assert!(
-                ladder.contains("  not run: targo test -p aterm-link --features sealed"),
-                "{ladder}"
-            );
-            continue;
-        }
-        let at = lines
-            .iter()
-            .position(|l| l.contains(suite))
-            .expect("the suite was spawned");
-        assert!(
-            lines[at].starts_with(&format!("{drivers} ")),
-            "the suite must be compiled into the driver lane's dir: {}",
-            lines[at]
-        );
-        // The driver lane is serialised, so its lines are in the order it ran.
-        let before: Vec<&String> = lines[..at]
-            .iter()
-            .filter(|l| l.starts_with(&format!("{drivers} ")))
-            .collect();
-        assert!(
-            before
-                .last()
-                .is_some_and(|l| l.contains("build -q -p aterm-gui -p aterm-ctl")),
-            "the rung's own aterm-gui build must be the lane's last command before the suite: {before:?}"
-        );
-        assert!(
-            before
-                .iter()
-                .any(|l| l.contains("--bin aterm-redraw-conformance"))
-                && before
-                    .iter()
-                    .filter(|l| l.contains("-p aterm-gui -p aterm-ctl"))
-                    .count()
-                    >= 2,
-            "the driver builds must have run before the rung: {before:?}"
-        );
-        assert!(
-            labels_with(&ladder, "ok")
-                .iter()
-                .any(|l| l == "targo test -p aterm-link --features sealed --test two_nodes_sealed"),
-            "{ladder}"
-        );
-    }
 }
 
 #[test]
@@ -637,8 +557,15 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
             "- scoped to -p aterm-grid: the rest of the workspace was not built or tested"
         )
     );
-    // and the skips are named beside it
-    assert!(ladder.contains("      - gui smoke (--skip-gui-smoke)"));
+    // The pacing smoke is the MEASURE tier's (2026-09-26): this run did not
+    // plan it, so it is no skip — the verdict names it as not part of the
+    // contract instead.
+    assert!(!ladder.contains("gui smoke (--skip-gui-smoke)"), "{ladder}");
+    assert!(
+        ladder.contains("MEASURE tier: not part of the merge contract")
+            && ladder.contains("      - gui typing-pacing smoke\n"),
+        "{ladder}"
+    );
 }
 
 /// Every driven stage reads its driver's EXIT CODE, and nothing that decided
@@ -739,21 +666,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
                 undecided: &[(2, "NOT RUN")],
                 findings: &[(Finding::Exit(3), "ABORTED"), (Finding::Signal, "ABORTED")],
             },
-            // The three the objc2 exit added read exactly as the window drive.
-            Row {
-                id: StageId::ObjcAlertDrive,
-                label: "objc alert drive",
-                stub: format!("examples/{}", stages::OBJC_ALERT_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
-            },
-            Row {
-                id: StageId::ObjcSwizzleDrive,
-                label: "objc swizzle drive",
-                stub: format!("examples/{}", stages::OBJC_SWIZZLE_DRIVE_EXAMPLE),
-                undecided: &[(2, "NOT RUN")],
-                findings: &[],
-            },
+            // The one the objc2 exit added reads exactly as the window drive.
             Row {
                 id: StageId::ObjcBoundDrive,
                 label: "objc bound drive",
@@ -952,91 +865,180 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
 }
 
-/// The sealed stage on its own: it prepares the `aterm-gui` its suite drives in
-/// the suite's own target dir (the driver lane's) before the suite starts,
-/// never lets a GUI in the shared `target/` stand in for it, and counts a
-/// failed build and a failed suite each as the gate failure it is.
+/// A DRIVEN SUITE DRIVES THE BINARY ITS STAGE JUST BUILT — one law, end to end,
+/// for every row whose suite drives a binary its own stage builds (in place of
+/// a test per row since 2026-09-27): the sealed rung (`--full`), the atpkg
+/// end-to-end pack, and the foreground handback. Over a fixture whose driver
+/// writes a FRESH binary into the lane's dir, with a STALE one in
+/// `<root>/target/debug` — each suite's own fallback — and each suite
+/// resolving its binary as its harness or script does:
+///  * the build runs first, in the driver lane's dir at that lane's job cap
+///    (the stand-in driver refuses anything else);
+///  * the suite drives the fresh binary and never the stale one;
+///  * a failed build runs no suite, and the ladder says `not run:` — no skip;
+///  * a failed build and a failed suite each count once.
+///
+/// Each row's NEGATIVE CONTROL is its suite run the way it ran before its row
+/// existed — alone, handed nothing — which drives the stale binary. Off macOS
+/// the handback is one named skip that builds nothing (its lane has been
+/// measured nowhere else).
 #[test]
-fn sealed_lane_prepares_its_gui_before_testing_and_preserves_both_failures() {
-    for (build_exit, test_exit) in [(0, 0), (19, 0), (0, 23)] {
-        let repo = FakeRepo::new();
-        let trace = repo.scratch.join("sealed-order");
-        let target = repo.root.join("target-drivers");
-        repo.with_stage2(&format!(
-            r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
+fn every_driven_suite_drives_the_binary_its_stage_just_built() {
+    struct Row {
+        id: StageId,
+        mode: Mode,
+        /// The build child's argv, as the stand-in driver sees it.
+        build: &'static str,
+        /// What that build writes under the lane's `debug/`, and the suite's
+        /// own fallback under `<root>/target/debug/`.
+        bin: &'static str,
+        /// The suite, as its `not run:` line names it.
+        suite: &'static str,
+    }
+    let rows = [
+        Row {
+            id: StageId::SealedLane,
+            mode: Mode::Full,
+            build: "--unverified build -q -p aterm-gui -p aterm-ctl",
+            bin: "aterm-gui",
+            suite: "targo test -p aterm-link --features sealed --test two_nodes_sealed",
+        },
+        Row {
+            id: StageId::AtpkgTooling,
+            mode: Mode::Fast,
+            build: "--unverified build -q -p atpkg",
+            bin: "atpkg",
+            suite: stages::ATPKG_DRIVEN_SUITE,
+        },
+        Row {
+            id: StageId::ForegroundHandback,
+            mode: Mode::Fast,
+            build: "--unverified build -q -p aterm --bin aterm",
+            bin: "aterm",
+            suite: stages::FOREGROUND_HANDBACK_SUITE,
+        },
+    ];
+    for row in rows {
+        for (build_exit, suite_exit) in [(0, 0), (19, 0), (0, 23)] {
+            let what = format!("{:?} ({build_exit}, {suite_exit})", row.id);
+            let repo = FakeRepo::new();
+            let trace = repo.scratch.join("driven-order");
+            let target = repo.root.join("target-drivers");
+            // FakeRepo seeds a driven `aterm` for the whole-ladder tests: what
+            // this stage drives must be what its OWN build left.
+            fs::remove_file(target.join("debug/aterm")).expect("unseed the driven aterm");
+            let root = sh_quote(&repo.root.display().to_string());
+            let tr = sh_quote(&trace.display().to_string());
+            let bin = row.bin;
+            repo.with_stage2(&format!(
+                r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
 test "$CARGO_BUILD_JOBS" = 8 || exit 71
 case "$*" in
-  '--unverified build -q -p aterm-gui -p aterm-ctl')
-    echo build >> {trace}
+  '{build}')
+    echo build >> {tr}
     test {build_exit} = 0 || exit {build_exit}
     mkdir -p "$CARGO_TARGET_DIR/debug"
-    echo fresh-sealed-gui > "$CARGO_TARGET_DIR/debug/aterm-gui"
+    printf '#!/bin/sh\necho fresh\n' > "$CARGO_TARGET_DIR/debug/{bin}"
+    chmod 755 "$CARGO_TARGET_DIR/debug/{bin}"
     ;;
   '--unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast')
-    test -f "$CARGO_TARGET_DIR/debug/aterm-gui" || exit 72
-    test "$(cat "$CARGO_TARGET_DIR/debug/aterm-gui")" = fresh-sealed-gui || exit 73
-    echo test >> {trace}
-    exit {test_exit}
+    bin="$CARGO_TARGET_DIR/debug/aterm-gui"
+    [ -x "$bin" ] || bin={root}/target/debug/aterm-gui
+    echo "suite $("$bin")" >> {tr}
+    exit {suite_exit}
     ;;
   *) exit 74 ;;
 esac
 "#,
-            target = sh_quote(&target.display().to_string()),
-            trace = sh_quote(&trace.display().to_string()),
-        ));
-        // A shared-target artifact must not satisfy the local prerequisite.
-        fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
-        fs::write(
-            repo.root.join("target/debug/aterm-gui"),
-            b"stale-shared-gui",
-        )
-        .expect("stale shared GUI");
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::SealedLane)
-            .expect("sealed stage");
+                target = sh_quote(&target.display().to_string()),
+                build = row.build,
+            ));
+            // The suites' own resolution: `$ATPKG`, else the checkout's
+            // `target/debug/atpkg`; `--binary`, else its `target/debug/aterm`.
+            repo.script(
+                &format!("tools/{}", stages::ATPKG_DRIVEN_SUITE),
+                &format!(
+                    "bin=\"$ATPKG\"\n[ -n \"$bin\" ] || bin={root}/target/debug/atpkg\n\
+                     echo \"suite $(\"$bin\")\" >> {tr}\nexit {suite_exit}"
+                ),
+            );
+            repo.script(
+                &format!("tools/{}", stages::FOREGROUND_HANDBACK_SUITE),
+                &format!(
+                    "BIN={root}/target/debug/aterm\n\
+                     while [ $# -gt 0 ]; do case $1 in --binary) BIN=$2; shift 2 ;; *) exit 2 ;; esac; done\n\
+                     echo \"suite $(\"$BIN\")\" >> {tr}\nexit {suite_exit}"
+                ),
+            );
+            fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
+            repo.script(&format!("target/debug/{bin}"), "echo stale");
 
-        // The old test-only stage really fails against this fixture, even
-        // though the shared target contains a GUI. This is the negative control.
-        let old = std::process::Command::new(repo.stage2.join("targo"))
-            .args(stages::sealed_lane_args())
-            .env("CARGO_TARGET_DIR", &target)
-            .env("CARGO_BUILD_JOBS", "8")
-            .current_dir(&repo.root)
-            .output()
-            .expect("old test-only invocation");
-        assert_eq!(old.status.code(), Some(72));
-        assert!(!trace.exists(), "an unprepared test must not run");
-
-        let report = stages::run_stage(&ctx, &spec);
-        let measured = fs::read_to_string(&trace).expect("stage invoked the driver");
-        assert_eq!(
-            measured,
-            if build_exit == 0 {
-                "build\ntest\n"
+            // The negative control: the suite alone, handed nothing.
+            let mut control = if row.id == StageId::SealedLane {
+                let mut c = std::process::Command::new(repo.stage2.join("targo"));
+                c.args(stages::sealed_lane_args())
+                    .env("CARGO_TARGET_DIR", &target)
+                    .env("CARGO_BUILD_JOBS", "8");
+                c
             } else {
-                "build\n"
-            },
-            "{}",
-            report.render()
-        );
-        let result = tally(std::slice::from_ref(&report));
-        assert_eq!(result.could_not_run.len(), 0);
-        assert_eq!(
-            result.gate_failures.len(),
-            usize::from(build_exit != 0 || test_exit != 0),
-            "{}",
-            report.render()
-        );
-        assert_eq!(
-            report.render().contains(
-                "  not run: targo test -p aterm-link --features sealed --test two_nodes_sealed — the aterm-gui build above failed"
-            ),
-            build_exit != 0,
-            "{}",
-            report.render()
-        );
+                std::process::Command::new(repo.root.join("tools").join(row.suite))
+            };
+            let old = control
+                .current_dir(&repo.root)
+                .env_remove("ATPKG")
+                .output()
+                .expect("the suite as it ran before its row");
+            assert_eq!(old.status.code(), Some(suite_exit), "{what}: {old:?}");
+            assert_eq!(
+                fs::read_to_string(&trace).expect("the control ran"),
+                "suite stale\n",
+                "{what}: the control must demonstrate the stale fallback"
+            );
+            fs::write(&trace, "").expect("reset the trace");
+
+            let ctx = repo.ctx(row.mode, Scope::workspace());
+            let spec = plan::plan(&ctx)
+                .into_iter()
+                .find(|s| s.id == row.id)
+                .unwrap_or_else(|| panic!("{what}: the stage is planned"));
+            let report = stages::run_stage(&ctx, &spec);
+            let rendered = report.render();
+            let measured = fs::read_to_string(&trace).expect("the trace");
+            let result = tally(std::slice::from_ref(&report));
+            if row.id == StageId::ForegroundHandback && !cfg!(target_os = "macos") {
+                assert_eq!(measured, "", "{what}: {rendered}");
+                assert_eq!(result.skipped(), 1, "{what}: {rendered}");
+                assert!(!result.failed(), "{what}: {rendered}");
+                continue;
+            }
+            assert_eq!(
+                measured,
+                if build_exit == 0 {
+                    "build\nsuite fresh\n"
+                } else {
+                    "build\n"
+                },
+                "{what}: {rendered}"
+            );
+            // The suite a failed build kept from running decided nothing, and
+            // the tally hears it: a COULD NOT RUN row of its own (2026-09-27,
+            // third review).
+            assert_eq!(
+                result.could_not_run.len(),
+                usize::from(build_exit != 0),
+                "{what}: {rendered}"
+            );
+            assert_eq!(
+                result.gate_failures.len(),
+                usize::from(build_exit != 0 || suite_exit != 0),
+                "{what}: {rendered}"
+            );
+            assert_eq!(
+                rendered.contains(&format!("  FAIL  {} — not run: ", row.suite)),
+                build_exit != 0,
+                "{what}: {rendered}"
+            );
+        }
     }
 }
 
@@ -1051,8 +1053,9 @@ esac
 /// failing at exit 71 (see the `cargo_build_jobs` pin in `ctx_with`).
 #[test]
 fn a_callers_job_count_caps_the_side_lane_child_it_reaches() {
-    // 2 is below the driver lane's cap of 8, so the child must see 2; the two
-    // stage fixtures above pin the uncapped 8 through the same code path.
+    // 2 is below the driver lane's cap of 8, so the child must see 2; the
+    // driven-binary law above pins the uncapped 8 through the same code path.
+    // The sealed rung is `--full`'s.
     for (caller, want) in [("2", "2"), ("16", "8"), ("", "8"), ("none", "8")] {
         let repo = FakeRepo::new();
         let trace = repo.scratch.join("jobs-seen");
@@ -1074,7 +1077,7 @@ esac
             target = sh_quote(&target.display().to_string()),
             trace = sh_quote(&trace.display().to_string()),
         ));
-        let ctx = repo.ctx_with(Mode::Fast, Scope::workspace(), |env| {
+        let ctx = repo.ctx_with(Mode::Full, Scope::workspace(), |env| {
             env.cargo_build_jobs = (caller != "none").then(|| caller.into());
         });
         let spec = plan::plan(&ctx)
@@ -1093,301 +1096,6 @@ esac
             "caller {caller:?}: {}",
             report.render()
         );
-    }
-}
-
-/// THE ATPKG PUBLISH TOOLING, on its own: it builds the `atpkg` its end-to-end
-/// pack suite drives, in the lane's own dir, before that suite starts; it hands
-/// the suite that binary through `$ATPKG` so the script's own
-/// `<root>/target/debug/atpkg` fallback cannot answer with a previous run's;
-/// the two self-contained suites are handed no `ATPKG` and run either way; and
-/// a failed build and a failed suite each count as the gate failure they are.
-///
-/// The NEGATIVE CONTROL is the shape this stage had until 2026-09-16: the pack
-/// suite alone, with no `$ATPKG` — against this fixture it "passes", by packing
-/// with the stale binary lying in `<root>/target/debug`.
-#[test]
-fn atpkg_tooling_builds_the_atpkg_its_pack_suite_drives_and_never_takes_a_stale_one() {
-    for (build_exit, suite_exit) in [(0, 0), (19, 0), (0, 23)] {
-        let repo = FakeRepo::new();
-        let trace = repo.scratch.join("atpkg-order");
-        let target = repo.root.join("target-drivers");
-        repo.with_stage2(&format!(
-            r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
-test "$CARGO_BUILD_JOBS" = 8 || exit 71
-case "$*" in
-  '--unverified build -q -p atpkg')
-    echo build >> {trace}
-    test {build_exit} = 0 || exit {build_exit}
-    mkdir -p "$CARGO_TARGET_DIR/debug"
-    printf '#!/bin/sh\necho fresh-atpkg\n' > "$CARGO_TARGET_DIR/debug/atpkg"
-    chmod 755 "$CARGO_TARGET_DIR/debug/atpkg"
-    ;;
-  *) exit 74 ;;
-esac
-"#,
-            target = sh_quote(&target.display().to_string()),
-            trace = sh_quote(&trace.display().to_string()),
-        ));
-        // The stale binary the script's own fallback finds: a previous run's,
-        // or — under a `--scope` narrowing — one this run never rebuilt.
-        fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
-        repo.script("target/debug/atpkg", "echo stale-atpkg");
-        // The pack suite, resolving its binary exactly as
-        // `tools/test-atpkg-pack-one-compiler.sh` section D does.
-        repo.script(
-            "tools/test-atpkg-pack-one-compiler.sh",
-            &format!(
-                r#"bin="$ATPKG"
-if [ -z "$bin" ]; then
-  for c in {root}/target/debug/atpkg {root}/target/release/atpkg; do
-    if [ -x "$c" ]; then bin="$c"; break; fi
-  done
-fi
-if [ -z "$bin" ] || [ ! -x "$bin" ]; then
-  echo "section D (the real pack end to end) cannot run: no atpkg binary" >&2
-  exit 1
-fi
-echo "pack $("$bin")" >> {trace}
-exit {suite_exit}
-"#,
-                root = sh_quote(&repo.root.display().to_string()),
-                trace = sh_quote(&trace.display().to_string()),
-            ),
-        );
-        // The two self-contained suites: they must be handed NO `$ATPKG`, or
-        // the cases that measure a producer script without one stop measuring it.
-        for name in [
-            "test-atpkg-vendor-tooling.sh",
-            "test-atpkg-mirror-extras.sh",
-        ] {
-            repo.script(
-                &format!("tools/{name}"),
-                &format!(
-                    "[ -z \"$ATPKG\" ] || exit 66\necho {name} >> {trace}\nexit 0",
-                    trace = sh_quote(&trace.display().to_string()),
-                ),
-            );
-        }
-
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::AtpkgTooling)
-            .expect("atpkg publish tooling stage");
-
-        // The negative control: the pre-2026-09-16 shape, which took the stale
-        // binary and reported a pass.
-        let old =
-            std::process::Command::new(repo.root.join("tools/test-atpkg-pack-one-compiler.sh"))
-                .current_dir(&repo.root)
-                .env_remove("ATPKG")
-                .output()
-                .expect("old pure-stage invocation");
-        // It ran — reaching the suite's own verdict, whatever that is — which
-        // is the point: nothing stopped it packing with a binary no stage of
-        // this run built.
-        assert_eq!(old.status.code(), Some(suite_exit), "{old:?}");
-        assert_eq!(
-            fs::read_to_string(&trace).expect("the control packed"),
-            "pack stale-atpkg\n",
-            "the control must demonstrate the stale fallback"
-        );
-        fs::write(&trace, "").expect("reset the trace");
-
-        let report = stages::run_stage(&ctx, &spec);
-        let measured = fs::read_to_string(&trace).expect("the stage ran its children");
-        assert_eq!(
-            measured,
-            if build_exit == 0 {
-                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-mirror-extras.sh\npack fresh-atpkg\n"
-            } else {
-                "build\ntest-atpkg-vendor-tooling.sh\ntest-atpkg-mirror-extras.sh\n"
-            },
-            "{}",
-            report.render()
-        );
-        assert!(
-            !measured.contains("stale-atpkg"),
-            "the stage drove the stale binary: {}",
-            report.render()
-        );
-
-        let result = tally(std::slice::from_ref(&report));
-        assert_eq!(result.could_not_run.len(), 0, "{}", report.render());
-        assert_eq!(
-            result.gate_failures.len(),
-            usize::from(build_exit != 0 || suite_exit != 0),
-            "{}",
-            report.render()
-        );
-        assert_eq!(
-            report.render().contains(
-                "  not run: test-atpkg-pack-one-compiler.sh — the atpkg build above failed"
-            ),
-            build_exit != 0,
-            "{}",
-            report.render()
-        );
-    }
-}
-
-/// A repo whose stage2 builds the live lanes' `aterm` into the driver lane (or
-/// exits `build_exit`), with a STALE `aterm` in `<root>/target/debug` — the
-/// lanes' own default — and each lane stubbed to resolve its binary exactly as
-/// its script does, append `<lane> <what the binary printed>` to the trace, and
-/// exit as told. FakeRepo seeds a driven `aterm` for the whole-ladder tests;
-/// this one is removed, so what the stage drives is what its OWN build left.
-fn live_lane_repo(build_exit: i32, handback_exit: i32) -> (FakeRepo, PathBuf) {
-    let repo = FakeRepo::new();
-    let trace = repo.scratch.join("live-order");
-    let target = repo.root.join("target-drivers");
-    fs::remove_file(target.join("debug/aterm")).expect("unseed the driven aterm");
-    repo.with_stage2(&format!(
-        r#"test "$CARGO_TARGET_DIR" = {target} || exit 70
-test "$CARGO_BUILD_JOBS" = 8 || exit 71
-case "$*" in
-  '--unverified build -q -p aterm --bin aterm')
-    echo build >> {trace}
-    test {build_exit} = 0 || exit {build_exit}
-    mkdir -p "$CARGO_TARGET_DIR/debug"
-    printf '#!/bin/sh\necho fresh-aterm\n' > "$CARGO_TARGET_DIR/debug/aterm"
-    chmod 755 "$CARGO_TARGET_DIR/debug/aterm"
-    ;;
-  *) exit 74 ;;
-esac
-"#,
-        target = sh_quote(&target.display().to_string()),
-        trace = sh_quote(&trace.display().to_string()),
-    ));
-    fs::create_dir_all(repo.root.join("target/debug")).expect("shared target");
-    repo.script("target/debug/aterm", "echo stale-aterm");
-    let root = sh_quote(&repo.root.display().to_string());
-    let tr = sh_quote(&trace.display().to_string());
-    // tools/test-foreground-handback.sh's resolution: `--binary`, else the
-    // checkout's target/debug/aterm; `2` when there is none.
-    repo.script(
-        "tools/test-foreground-handback.sh",
-        &format!(
-            r#"BIN={root}/target/debug/aterm
-while [ $# -gt 0 ]; do case $1 in --binary) BIN=$2; shift 2 ;; *) exit 2 ;; esac; done
-[ -x "$BIN" ] || {{ echo "no aterm binary at $BIN" >&2; exit 2; }}
-echo "handback $("$BIN")" >> {tr}
-exit {handback_exit}
-"#
-        ),
-    );
-    // tools/test-codex-live-upgrade.sh's: the first argument, else the
-    // checkout's target/debug/aterm; `77` (SKIP) when there is none.
-    repo.script(
-        "tools/test-codex-live-upgrade.sh",
-        &format!(
-            r#"A=${{1:-{root}/target/debug/aterm}}
-[ -x "$A" ] || {{ echo "SKIP: no aterm at $A"; exit 77; }}
-echo "codex $("$A")" >> {tr}
-exit 0
-"#
-        ),
-    );
-    (repo, trace)
-}
-
-/// The lanes as a person ran them before 2026-09-26 — by hand, no argument —
-/// which is each stage's NEGATIVE CONTROL: with a stale binary in
-/// `<root>/target/debug` the lane drives THAT, and with none it answers its
-/// not-run code; neither says anything about this tree.
-fn live_lane_by_hand(repo: &FakeRepo, trace: &Path, suite: &str, lane: &str, not_run: i32) {
-    fs::write(trace, "").expect("reset the trace");
-    std::process::Command::new(repo.root.join(suite))
-        .current_dir(&repo.root)
-        .output()
-        .expect("the lane as run by hand");
-    assert_eq!(
-        fs::read_to_string(trace).expect("the control ran"),
-        format!("{lane} stale-aterm\n"),
-        "the control must demonstrate the stale fallback"
-    );
-    fs::remove_file(repo.root.join("target/debug/aterm")).expect("rm stale");
-    let bare = std::process::Command::new(repo.root.join(suite))
-        .current_dir(&repo.root)
-        .output()
-        .expect("the lane with no binary at all");
-    assert_eq!(bare.status.code(), Some(not_run), "{bare:?}");
-    repo.script("target/debug/aterm", "echo stale-aterm");
-    fs::write(trace, "").expect("reset the trace");
-}
-
-/// THE FOREGROUND HANDBACK, on its own: the stage builds the `aterm` the lane
-/// drives, in the driver lane's dir, before the lane starts; it hands the lane
-/// that binary as `--binary <path>`, so the lane's own `<root>/target/debug/aterm`
-/// default cannot answer; a failed build runs nothing; and the lane's not-run
-/// code, `2`, is COULD NOT RUN with the lane's reason, never a pass. Off macOS,
-/// where the lane has never been measured and its bash row pins macOS's
-/// `/bin/bash` 3.2, the stage is ONE named skip and builds nothing.
-#[test]
-fn the_foreground_handback_drives_the_aterm_its_stage_built_and_never_reads_not_run_as_a_pass() {
-    for (build_exit, handback_exit) in [(0, 0), (19, 0), (0, 1), (0, 2)] {
-        let (repo, trace) = live_lane_repo(build_exit, handback_exit);
-        live_lane_by_hand(
-            &repo,
-            &trace,
-            "tools/test-foreground-handback.sh",
-            "handback",
-            2,
-        );
-
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::ForegroundHandback)
-            .expect("the foreground handback is planned");
-        let report = stages::run_stage(&ctx, &spec);
-        let what = format!("({build_exit}, {handback_exit})\n{}", report.render());
-        let measured = fs::read_to_string(&trace).expect("the stage ran its children");
-        let runs = cfg!(target_os = "macos");
-        let want = match (runs, build_exit) {
-            (false, _) => "",
-            (true, 0) => "build\nhandback fresh-aterm\n",
-            (true, _) => "build\n",
-        };
-        assert_eq!(measured, want, "{what}");
-
-        let result = tally(std::slice::from_ref(&report));
-        assert_eq!(
-            result.gate_failures.len(),
-            usize::from(runs && (build_exit != 0 || handback_exit == 1)),
-            "{what}"
-        );
-        assert_eq!(
-            result.could_not_run.len(),
-            usize::from(runs && build_exit == 0 && handback_exit == 2),
-            "{what}"
-        );
-        assert_eq!(result.skipped(), usize::from(!runs), "{what}");
-        let rendered = report.render();
-        if !runs {
-            assert!(
-                rendered.contains(&format!(
-                    "  skip  test-foreground-handback.sh (macOS only: {})",
-                    stages::live_aterm_macos_only(stages::FOREGROUND_HANDBACK_SUITE)
-                )),
-                "{what}"
-            );
-        }
-        assert_eq!(
-            rendered
-                .contains("  not run: test-foreground-handback.sh — the aterm build above failed"),
-            runs && build_exit != 0,
-            "{what}"
-        );
-        if runs && build_exit == 0 && handback_exit == 2 {
-            assert!(
-                rendered.contains("test-foreground-handback.sh: NOT RUN — "),
-                "{what}"
-            );
-        }
-        // The Codex lane is `--full`'s: the per-commit stage never starts it.
-        assert!(!measured.contains("codex"), "{what}");
     }
 }
 
@@ -1537,4 +1245,1165 @@ esac
                 .to_string()
         )
     );
+}
+
+/// THE TIERS, END TO END (2026-09-26). The default run — the merge contract
+/// — plans no MEASURE stage, spawns no release build and no `measuring::`
+/// child, runs the deadline tests alone, and still NAMES every MEASURE stage
+/// in its verdict: leaving a
+/// tier out is said, never skipped silently. `--measure` plans exactly the
+/// MEASURE tier and nothing of the contract; this fixture skips the pacing
+/// smoke (no window), so the run is green, claims nothing, and says it did
+/// not measure the tree and why.
+#[test]
+fn the_default_names_the_measure_tier_it_leaves_out_and_measure_runs_it_alone() {
+    let repo = FakeRepo::new();
+    repo.with_stage2("echo \"argv: $*\"\nexit 0");
+    let titles = plan::tier_titles(&Scope::workspace(), Tier::Measure);
+    assert_eq!(titles.len(), 3, "{titles:?}");
+
+    let (fast, _) = repo.run(Mode::Fast, Scope::workspace());
+    for title in &titles {
+        assert!(!headers(&fast).contains(title), "the default ran {title}");
+        assert!(
+            fast.contains(&format!("      - {title}\n")),
+            "the default must name {title}:\n{fast}"
+        );
+    }
+    assert!(fast.contains("MEASURE tier: not part of the merge contract"));
+    assert!(
+        !fast.contains("--release"),
+        "the merge contract builds no release artifact:\n{fast}"
+    );
+    // The test run's child carries the recording runner before its libtest
+    // separator (2026-09-26); the stand-in driver runs no runner, so it is the
+    // whole test run here.
+    assert!(fast.contains(
+        "argv: --unverified test --workspace --no-fail-fast --tests --config \
+         target.'cfg(all())'.runner=["
+    ));
+    assert!(fast.contains("\"] -- --skip measuring:: --skip launchd_copy_tests::"));
+    assert!(fast.contains(
+        "argv: --unverified test --workspace --no-fail-fast --lib -- launchd_copy_tests::"
+    ));
+    assert!(
+        !fast.contains("-- measuring::"),
+        "no measuring child in the contract:\n{fast}"
+    );
+    assert!(
+        !fast.contains("test-start-compare.sh"),
+        "the startup comparison is --full's:\n{fast}"
+    );
+    assert!(
+        !fast.contains("verify: MEASURE tier —"),
+        "a run that measured nothing says nothing about measuring:\n{fast}"
+    );
+
+    let (measure, code) = repo.run(Mode::Measure, Scope::workspace());
+    let mut want = titles.clone();
+    want.push("verdict".to_string());
+    assert_eq!(headers(&measure), want, "{measure}");
+    for argv in [
+        "argv: --unverified build --locked --release -p aterm",
+        "argv: --unverified test --workspace --no-fail-fast --test paint --test spin -- measuring::",
+    ] {
+        assert!(measure.contains(argv), "missing {argv:?}:\n{measure}");
+    }
+    assert!(
+        !measure.contains("argv: --unverified test --workspace --no-fail-fast --no-run"),
+        "no test compile of the merge contract: {measure}"
+    );
+    assert!(!measure.contains("launchd_copy_tests"), "{measure}");
+    assert_eq!(code, exit::PASS, "{measure}");
+    assert!(measure.contains(
+        "verify: MEASURE tier — NOT MEASURED: `gui typing-pacing smoke` skipped: gui smoke \
+         (--skip-gui-smoke)"
+    ));
+    assert!(measure.contains("VERIFY: PASS (mode=measure scope=workspace, 1 skipped) —"));
+    assert!(!measure.contains(MERGE_CONTRACT_SENTENCE));
+    assert!(
+        !measure.contains("MEASURE tier: not part of the merge contract"),
+        "it ran the tier:\n{measure}"
+    );
+}
+
+/// A PROBE THAT DECIDED NOTHING IS COULD NOT RUN, NOT A FINDING (2026-09-26).
+/// The paint matrix's exit 2 — no binary, a socket that never bound — now
+/// opens its panic with the gate's sentinel, as its exit 3 has since
+/// 2026-09-23, so a measuring child whose every failure says so is a COULD NOT
+/// RUN row: the run exits 3, not 1, and it did not measure the tree. The
+/// negative control is the same log in the words exit 2 used before, without
+/// the sentinel: a FAIL, exit 1.
+#[test]
+fn a_paint_probe_that_decided_nothing_is_a_could_not_run_row() {
+    let log = |message: &str| {
+        format!(
+            "     Running tests/paint.rs (target/debug/deps/paint-abc)\n\nrunning 2 tests\n\
+             test measuring::scan_self_test ... ok\n\
+             test measuring::main_screen_prompt_typing_paints_trail_ink ... FAILED\n\n\
+             failures:\n\n---- measuring::main_screen_prompt_typing_paints_trail_ink stdout ----\n\n\
+             thread 'measuring::main_screen_prompt_typing_paints_trail_ink' panicked at \
+             crates/aterm-conformance/tests/paint/measuring.rs:425:14:\n{message}\n\
+             note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n\n\n\
+             failures:\n    measuring::main_screen_prompt_typing_paints_trail_ink\n\n\
+             test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; \
+             finished in 0.01s\n\nerror: test failed, to rerun pass `-p aterm-conformance --test paint`\n"
+        )
+    };
+    let decided_nothing = "PAINT CONFORMANCE COULD NOT RUN [prompt]: the probe decided nothing, \
+                           which is not a pass.\n  PAINT-COULD-NOT-RUN control socket never \
+                           appeared within 60s (launch alive but starved?)";
+    for (sentinel, code, word) in [
+        (true, exit::COULD_NOT_RUN, "could not run"),
+        (false, exit::FAILED, "FAILED"),
+    ] {
+        let repo = FakeRepo::new();
+        let message = if sentinel {
+            format!(
+                "{} — {decided_nothing}",
+                aterm_verify::libtest::COULD_NOT_RUN_SENTINEL
+            )
+        } else {
+            decided_nothing.to_string()
+        };
+        let out = repo.scratch.join("paint.log");
+        fs::write(&out, log(&message)).expect("write");
+        repo.with_stage2(&format!(
+            "case \"$*\" in\n  *'-- measuring::'*) cat '{}'; exit 101 ;;\nesac\nexit 0",
+            out.display()
+        ));
+        let (ladder, got) = repo.run(Mode::Measure, Scope::workspace());
+        assert_eq!(got, code, "sentinel={sentinel}:\n{ladder}");
+        let labels = labels_with(&ladder, "FAIL");
+        assert!(
+            labels.iter().any(|l| l.starts_with(
+                "targo test --workspace --test paint --test spin (trustdoc) -- measuring::"
+            ) && (l.contains("could not run") == sentinel)),
+            "sentinel={sentinel}: {labels:?}"
+        );
+        assert!(
+            ladder.contains(&format!(
+                "verify: MEASURE tier — NOT MEASURED: `measuring tests (--workspace; run alone)` {word}"
+            )),
+            "sentinel={sentinel}:\n{ladder}"
+        );
+    }
+}
+
+/// THE DIFFERENTIAL CLAIM, END TO END (2026-09-26): the REAL plan, scheduler,
+/// tally and verdict, as `a_whole_green_run_is_the_only_thing_that_claims_the_contract`
+/// drives them, with one stage red the way a real child makes it red (the
+/// lint stage's `Report::fail_checker_child` fingerprints what it printed).
+/// Judged against a main whose receipt lists exactly that failure — the
+/// findings the tally itemized, written back the way a receipt lists them —
+/// the run claims the contract and names the red as inherited, exit 0. The
+/// same stage printing another error — or the same lint at another line
+/// (2026-09-27, second review: a line is the message) — is a different
+/// failure: NEW, exit 1. The same lint in a LIBRARY is never main's
+/// (2026-09-27, fourth review): it left every crate built on that library
+/// unlinted, and the output is the same whatever a branch did to them. And
+/// the same red with no base at all is the absolute rule's FAIL.
+#[test]
+fn a_run_whose_every_red_main_already_has_claims_the_contract_against_main() {
+    use aterm_verify::differential::{Against, BaseReds};
+    use aterm_verify::receipt::Failure;
+    use aterm_verify::verdict::verdict_against;
+
+    let repo = FakeRepo::new();
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let specs = plan::plan(&ctx);
+    let lint = |said: String| {
+        move |s: &StageSpec| {
+            let mut r = Report::new(s.title.clone());
+            if s.title.starts_with("tippy") {
+                let run = aterm_verify::exec::Run {
+                    ok: false,
+                    output: said.clone(),
+                    code: Some(101),
+                    spawn_error: None,
+                };
+                r.fail_checker_child(
+                    &run,
+                    "tippy --workspace -D warnings",
+                    aterm_verify::differential::lint_reached_every_unit,
+                );
+            } else {
+                r.pass("did the thing");
+            }
+            r
+        }
+    };
+    // A lint in an integration test: a unit nothing else is built on.
+    let said = |msg: &str, at: &str| {
+        format!(
+            "error: {msg}\n  --> crates/a/tests/{at}\nerror: could not compile `a` (test \"probe\") \
+             due to 1 previous error\n"
+        )
+    };
+    let main_says = said("this call to `clone` can be replaced", "probe.rs:12:5");
+    let on_main = tally(&sched::run_stages(
+        &specs,
+        lint(main_says.clone()),
+        |_, _| {},
+    ));
+    let now = 2_000_000_000;
+    let main = Against::Base(BaseReds {
+        commit: "9".repeat(40),
+        source: "receipt 999999999".to_string(),
+        failures: on_main
+            .all_findings()
+            .map(|f| Failure {
+                id: f.id.clone(),
+                hash: f.hash.clone(),
+                since: "9".repeat(40),
+                since_when: now - 3600,
+            })
+            .collect(),
+        now,
+    });
+
+    // The same lint at another line is another failure.
+    let t = tally(&sched::run_stages(
+        &specs,
+        lint(said(
+            "this call to `clone` can be replaced",
+            "probe.rs:40:9",
+        )),
+        |_, _| {},
+    ));
+    let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &main);
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+
+    // The branch: the same lint, the same way.
+    let t = tally(&sched::run_stages(
+        &specs,
+        lint(main_says.clone()),
+        |_, _| {},
+    ));
+    let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &main);
+    assert!(v.claims_merge_contract, "{}", v.text);
+    assert_eq!(v.exit, exit::PASS);
+    assert!(v.text.contains(MERGE_CONTRACT_SENTENCE));
+    assert!(
+        v.text
+            .contains("0 new, 1 inherited (red on main since 999999999)"),
+        "{}",
+        v.text
+    );
+    assert!(
+        v.text
+            .contains("      - tippy --workspace -D warnings (red on main since 999999999, 1 h)"),
+        "{}",
+        v.text
+    );
+
+    // Another error from the same stage: a different failure.
+    let t = tally(&sched::run_stages(
+        &specs,
+        lint(said("unused import", "x.rs:3:1")),
+        |_, _| {},
+    ));
+    let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &main);
+    assert!(!v.claims_merge_contract);
+    assert_eq!(v.exit, exit::FAILED);
+    assert!(
+        v.text.contains(
+            "      - tippy --workspace -D warnings — red on main too, but failing differently"
+        ),
+        "{}",
+        v.text
+    );
+
+    // The same lint in a library: never main's, however the same it reads.
+    let in_lib = "error: this call to `clone` can be replaced\n  --> crates/a/src/lib.rs:12:5\n\
+                  error: could not compile `a` (lib) due to 1 previous error\n"
+        .to_string();
+    let lib_red = tally(&sched::run_stages(&specs, lint(in_lib.clone()), |_, _| {}));
+    let main_lib = Against::Base(BaseReds {
+        commit: "9".repeat(40),
+        source: "receipt 999999999".to_string(),
+        failures: lib_red
+            .all_findings()
+            .map(|f| Failure {
+                id: f.id.clone(),
+                hash: f.hash.clone(),
+                since: "9".repeat(40),
+                since_when: now - 3600,
+            })
+            .collect(),
+        now,
+    });
+    let t = tally(&sched::run_stages(&specs, lint(in_lib), |_, _| {}));
+    let v = verdict_against(Mode::Fast, &Scope::workspace(), &t, &main_lib);
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+    assert!(
+        v.text.contains("every unit that needs it went unlinted"),
+        "{}",
+        v.text
+    );
+
+    // No base: the absolute rule.
+    let v = verdict(Mode::Fast, &Scope::workspace(), &on_main);
+    assert!(!v.claims_merge_contract);
+    assert_eq!(v.exit, exit::FAILED);
+}
+
+/// AN EXCUSED COMPILE RED NEVER EXCUSES THE TESTS IT KEPT FROM RUNNING
+/// (2026-09-27, third review). The test stage runs no test after its compile
+/// fails, and said so in a raw `not run:` line the tally never heard: the
+/// compile's FAIL was "the decision". Against main's receipt that FAIL was
+/// INHERITED when main's compile broke the same way — and then nothing at all
+/// stood for the test run: a branch could break any test, and the run claimed
+/// the merge contract. Now the run the compile prevented is a COULD NOT RUN
+/// row, naming why. And the compile red itself is main's no longer
+/// (2026-09-27, fourth review): a build stops at the first crate that fails,
+/// so its output is the same whatever a branch broke in the crates behind
+/// it — NEW, never inherited, exit 1.
+#[test]
+fn an_excused_compile_red_never_excuses_the_tests_it_kept_from_running() {
+    use aterm_verify::differential::{Against, BaseReds};
+    use aterm_verify::receipt::Failure;
+    use aterm_verify::verdict::verdict_against;
+
+    let repo = FakeRepo::new();
+    repo.with_stage2(
+        "case \"$*\" in *--no-run*) echo 'error[E0425]: cannot find value `gone` in this scope' \
+         >&2; echo '  --> crates/x/tests/probe.rs:3:13' >&2; exit 101 ;; esac\nexit 0",
+    );
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let run = || tally(std::slice::from_ref(&stages::run_stage(&ctx, &spec)));
+    let on_main = run();
+    assert_eq!(
+        on_main.gate_failures,
+        ["targo test --workspace --no-run (trustdoc)"],
+        "{on_main:?}"
+    );
+    let now = 2_000_000_000;
+    let main = Against::Base(BaseReds {
+        commit: "9".repeat(40),
+        source: "receipt 999999999".to_string(),
+        failures: on_main
+            .all_findings()
+            .map(|f| Failure {
+                id: f.id.clone(),
+                hash: f.hash.clone(),
+                since: "9".repeat(40),
+                since_when: now - 3600,
+            })
+            .collect(),
+        now,
+    });
+    let branch = run();
+    let v = verdict_against(Mode::Fast, &Scope::workspace(), &branch, &main);
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+    assert!(
+        v.text.contains(
+            "targo test --workspace --no-run (trustdoc) — never inherited: nothing shows it \
+             ran to its end"
+        ),
+        "a build red is never main's: {}",
+        v.text
+    );
+    assert!(
+        v.text.contains(
+            "targo test --workspace --tests (trustdoc) — not run: the compile above failed"
+        ),
+        "{}",
+        v.text
+    );
+}
+
+/// A compile red, as a stub driver prints one: the build of whatever it names
+/// fails, every other invocation passes.
+const COMPILE_RED: &str = "echo 'error[E0425]: cannot find value `gone` in this scope' >&2; \
+     echo '  --> crates/aterm-gui/src/bin/rot.rs:3:13' >&2; exit 101";
+
+/// One stage of the merge contract, run alone, tallied.
+fn stage_tally(ctx: &aterm_verify::Ctx, id: StageId) -> Tally {
+    let spec = plan::plan(ctx)
+        .into_iter()
+        .find(|s| s.id == id)
+        .unwrap_or_else(|| panic!("{id:?} is planned in the merge contract"));
+    tally(std::slice::from_ref(&stages::run_stage(ctx, &spec)))
+}
+
+/// Main's reds, as a baseline an hour old lists `on_main`'s findings.
+fn mains_reds(on_main: &Tally) -> aterm_verify::differential::Against {
+    let now = 2_000_000_000;
+    aterm_verify::differential::Against::Base(aterm_verify::differential::BaseReds {
+        commit: "9".repeat(40),
+        source: "receipt 999999999".to_string(),
+        failures: on_main
+            .all_findings()
+            .map(|f| aterm_verify::receipt::Failure {
+                id: f.id.clone(),
+                hash: f.hash.clone(),
+                since: "9".repeat(40),
+                since_when: now - 3600,
+            })
+            .collect(),
+        now,
+    })
+}
+
+/// P1, P3 (2026-09-27, fourth review): AN EXCUSED BUILD RED NEVER EXCUSES THE
+/// DRIVE IT KEPT FROM RUNNING. The third review's `not run` rows covered four
+/// sites; the redraw harness and the eight objc drivers still ended at their
+/// build's FAIL. Main's driver build red (a rotted example — nothing else
+/// builds `--example` targets), and the branch breaks what the driver checks
+/// (the stub driver exits 1 now): the build red was INHERITED, the harness ran
+/// on neither side, and the run printed `VERIFY: PASS … 1 inherited — merge
+/// contract satisfied`, exit 0 (the review's probes, on the real stages). Now
+/// the build's row is never inherited (a build stops at its first failure),
+/// and the drive it kept from running is a COULD NOT RUN row of its own.
+#[test]
+fn an_excused_build_red_never_excuses_the_drive_it_kept_from_running() {
+    use aterm_verify::verdict::verdict_against;
+
+    let repo = FakeRepo::new();
+    let mut cases = vec![(
+        StageId::RedrawConformance,
+        stages::REDRAW_CONFORMANCE_BIN.to_string(),
+        stages::REDRAW_CONFORMANCE_BIN,
+    )];
+    if cfg!(target_os = "macos") {
+        cases.push((
+            StageId::ObjcWindowDrive,
+            format!("examples/{}", stages::OBJC_WINDOW_DRIVE_EXAMPLE),
+            stages::OBJC_WINDOW_DRIVE_EXAMPLE,
+        ));
+    }
+    for (id, driven, named) in cases {
+        repo.with_stage2(&format!(
+            "case \"$*\" in *{named}*) {COMPILE_RED} ;; esac\nexit 0"
+        ));
+        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+        repo.driver_stub(&driven, 0);
+        let on_main = stage_tally(&ctx, id);
+        assert_eq!(on_main.gate_failures.len(), 1, "{id:?}: {on_main:?}");
+        // The branch breaks the driver's subject: it would exit 1 if it ran.
+        repo.driver_stub(&driven, 1);
+        let branch = stage_tally(&ctx, id);
+        let v = verdict_against(
+            Mode::Fast,
+            &Scope::workspace(),
+            &branch,
+            &mains_reds(&on_main),
+        );
+        assert!(!v.claims_merge_contract, "{id:?}:\n{}", v.text);
+        assert_eq!(v.exit, exit::FAILED, "{id:?}:\n{}", v.text);
+        assert!(
+            branch
+                .could_not_run
+                .iter()
+                .any(|c| c.contains("— not run: the build above failed")),
+            "{id:?}: the drive the build kept from running names itself: {branch:?}"
+        );
+    }
+}
+
+/// P2 (2026-09-27, fourth review): the control-socket smoke behind a smoke
+/// build red main already has. It escaped the review's probe only because its
+/// build writes to the smoke's log, so the row printed nothing and was opaque
+/// by accident; now the smoke it kept from running says so.
+#[test]
+fn an_excused_smoke_build_red_never_excuses_the_smoke() {
+    use aterm_verify::verdict::verdict_against;
+
+    let repo = FakeRepo::new();
+    repo.with_stage2(&format!(
+        "case \"$*\" in *aterm-gui*aterm-ctl*) {COMPILE_RED} ;; esac\nexit 0"
+    ));
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let on_main = stage_tally(&ctx, StageId::ControlSocketSmoke);
+    assert_eq!(on_main.gate_failures.len(), 1, "{on_main:?}");
+    let branch = stage_tally(&ctx, StageId::ControlSocketSmoke);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &branch,
+        &mains_reds(&on_main),
+    );
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert!(
+        branch
+            .could_not_run
+            .iter()
+            .any(|c| c.contains("smoke: the smoke's checks — not run: the build above failed")),
+        "{branch:?}"
+    );
+}
+
+/// P5 (2026-09-27, fourth review): A SUITE THAT STOPS AT ITS FIRST FAILURE.
+/// The `tools/test-*.sh` suites end at their first failing check (`fail() {
+/// echo …; exit 1; }`), so their output is the same wherever they stopped.
+/// Main fails check 1; the branch fails check 1 AND breaks check 2, which the
+/// suite never reaches: the row was INHERITED and the run claimed the merge
+/// contract, exit 0. Now a row whose check is not known to run to its end is
+/// never inherited.
+#[test]
+fn an_excused_suite_red_never_excuses_the_checks_after_it() {
+    use aterm_verify::verdict::verdict_against;
+
+    let repo = FakeRepo::new();
+    repo.with_stage2("exit 0");
+    let suite = |check2_breaks: bool| {
+        repo.script(
+            &format!("tools/{}", stages::DELIVERY_SUITES[0]),
+            &format!(
+                "fail() {{ echo \"FAIL: $*\" >&2; exit 1; }}\n\
+                 fail 'check 1: the channel pin names no build'\n\
+                 {} && fail 'check 2: the installer runs unsigned code'\n\
+                 echo PASS",
+                if check2_breaks { "true" } else { "false" }
+            ),
+        );
+    };
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    suite(false);
+    let on_main = stage_tally(&ctx, StageId::DeliveryTooling);
+    assert_eq!(on_main.gate_failures.len(), 1, "{on_main:?}");
+    suite(true);
+    let branch = stage_tally(&ctx, StageId::DeliveryTooling);
+    let v = verdict_against(
+        Mode::Fast,
+        &Scope::workspace(),
+        &branch,
+        &mains_reds(&on_main),
+    );
+    assert!(!v.claims_merge_contract, "{}", v.text);
+    assert_eq!(v.exit, exit::FAILED, "{}", v.text);
+    assert!(
+        v.text.contains(&format!(
+            "{} — never inherited: nothing shows it ran to its end",
+            stages::DELIVERY_SUITES[0]
+        )),
+        "{}",
+        v.text
+    );
+}
+
+/// EVERY STAGE THAT DRIVES WHAT A BUILD LEAVES NAMES WHAT A FAILED BUILD KEPT
+/// FROM RUNNING (2026-09-27, fourth review) — the guard for the class the
+/// third review fixed at four sites and the fourth found at nine more. Every
+/// stage of the merge contract is run with a driver whose every `build` and
+/// `--no-run` fails. Every finding any of them reports is never inherited (a
+/// build stops at its first failure), and every stage with a finding stands a
+/// COULD NOT RUN row for what the build kept from running — but the stages
+/// whose only children ARE builds: the test compile, the driver builds and the
+/// L0 gate (whose build is its check). A new stage that drives a built
+/// artifact fails here until it says what a failed build kept from running.
+#[test]
+fn every_stage_names_what_a_failed_build_kept_from_running() {
+    const BUILDS_ONLY: [StageId; 3] = [
+        StageId::TestCompile,
+        StageId::DriverBuilds,
+        StageId::FreezeGate,
+    ];
+    let repo = FakeRepo::new();
+    repo.with_stage2(&format!(
+        "case \"$*\" in *build*|*--no-run*) {COMPILE_RED} ;; esac\nexit 0"
+    ));
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    let mut drove = Vec::new();
+    for spec in plan::plan(&ctx) {
+        let t = tally(std::slice::from_ref(&stages::run_stage(&ctx, &spec)));
+        for f in t.all_findings() {
+            assert!(
+                f.opaque.is_some(),
+                "{:?}: a finding behind a failed build is never main's: {f:?}",
+                spec.id
+            );
+        }
+        if t.gate_failures.is_empty() || BUILDS_ONLY.contains(&spec.id) {
+            continue;
+        }
+        assert!(
+            !t.could_not_run.is_empty(),
+            "{:?} drives what a failed build left and names nothing it kept from running: {t:?}",
+            spec.id
+        );
+        drove.push(spec.id);
+    }
+    // The guard reached the stages it is about.
+    for id in [
+        StageId::Test,
+        StageId::AtpkgTooling,
+        StageId::ControlSocketSmoke,
+        StageId::RedrawConformance,
+    ] {
+        assert!(drove.contains(&id), "{id:?} not reached: {drove:?}");
+    }
+    if cfg!(target_os = "macos") {
+        for id in [
+            StageId::ObjcClassAudit,
+            StageId::ObjcImeDrive,
+            StageId::ObjcToolbarDrive,
+            StageId::ObjcWindowDrive,
+            StageId::ObjcEventDrive,
+            StageId::ObjcBoundDrive,
+            StageId::ForegroundHandback,
+        ] {
+            assert!(drove.contains(&id), "{id:?} not reached: {drove:?}");
+        }
+    }
+}
+
+/// A stand-in `targo` that does what cargo does with a runner (2026-09-26): for
+/// the compile it writes `bins` as test executables and reports each in a JSON
+/// `compiler-artifact` line; for `--tests` it prints each binary's `Running`
+/// header and, when the argv carries the recording runner, executes the runner
+/// with the binary's argv from the binary's package directory with
+/// `CARGO_PKG_NAME` set — or, with no runner (the serial child), runs the
+/// binary itself and prints cargo's re-run line after a failure. `extra` is
+/// shell run first for `--tests`, so a test can bend the recording pass.
+/// `bins` are `(package, target flag, name)`; each binary's body is
+/// `bodies(name)`.
+fn with_recording_cargo(repo: &FakeRepo, bins: &[(&str, &str, &str)], extra: &str) {
+    let deps = repo.root.join("target/debug/deps");
+    fs::create_dir_all(&deps).expect("mkdir");
+    let mut compile = String::new();
+    let mut record = String::new();
+    let mut serial = String::new();
+    for (pkg, flag, name) in bins {
+        let exe = deps.join(format!("{name}-1"));
+        let (kind, tname) = match flag.split_once(' ') {
+            Some((k, n)) => (k.trim_start_matches("--"), n),
+            None => ("lib", *name),
+        };
+        compile.push_str(&format!(
+            "printf '%s\\n' '{{\"reason\":\"compiler-artifact\",\"target\":{{\"kind\":[\"{kind}\"],\
+             \"name\":\"{tname}\"}},\"profile\":{{\"test\":true}},\"executable\":\"{}\"}}'\n",
+            exe.display()
+        ));
+        let src = if kind == "test" {
+            format!("tests/{tname}.rs")
+        } else {
+            "unittests src/lib.rs".to_string()
+        };
+        let header = format!("     Running {src} (target/debug/deps/{name}-1)");
+        fs::create_dir_all(repo.root.join("crates").join(pkg)).expect("mkdir");
+        record.push_str(&format!(
+            "echo '{header}' >&2\n(cd '{root}/crates/{pkg}' && CARGO_PKG_NAME={pkg} \"$runner\" \
+             \"$flag\" \"$dir\" '{exe}' $targs) || {{ echo \"Caused by:\"; echo \"  process \
+             didn't exit successfully: \\`$runner $flag $dir {exe}\\` (exit status: 1)\"; \
+             status=101; }}\n",
+            root = repo.root.display(),
+            exe = exe.display()
+        ));
+        serial.push_str(&format!(
+            "echo '{header}' >&2\n(cd '{root}/crates/{pkg}' && CARGO_PKG_NAME={pkg} '{exe}' \
+             $targs) || {{ echo 'error: test failed, to rerun pass `-p {pkg} {flag}`'; \
+             status=101; }}\n",
+            root = repo.root.display(),
+            exe = exe.display()
+        ));
+    }
+    repo.with_stage2(&format!(
+        r#"status=0
+cfg=""; prev=""; seen=0; targs=""
+for a in "$@"; do
+  if [ "$seen" = 1 ]; then targs="$targs $a"; fi
+  [ "$a" = "--" ] && seen=1
+  [ "$prev" = "--config" ] && cfg="$a"
+  prev="$a"
+done
+case "$*" in
+  *--no-run*)
+    echo '   Compiling fixture v0.1.0' >&2
+{compile}    exit 0 ;;
+  *--tests*)
+{extra}
+    if [ -n "$cfg" ]; then
+      arr=${{cfg#*=\[\"}}; arr=${{arr%\"\]}}
+      runner=${{arr%%\",\"*}}; rest=${{arr#*\",\"}}
+      flag=${{rest%%\",\"*}}; dir=${{rest#*\",\"}}
+{record}    else
+{serial}    fi
+    exit $status ;;
+esac
+exit 0"#
+    ));
+}
+
+/// THE TEST BINARIES, SEVERAL AT A TIME, END TO END (2026-09-26), through the
+/// real recorder (`aterm-verify --record-test-binary`, the binary this package
+/// builds) and a stand-in cargo that runs it the way cargo runs a runner.
+///
+/// Pinned: the world-harness binary ran FIRST and ALONE with the whole thread
+/// count, though it prints in its declared place; the shared binaries ran two
+/// at a time (the first two meet: each waits for the other to have started)
+/// with half the threads each; every binary ran in its own package directory
+/// with the environment cargo gave its runner; the compile's JSON is gone from
+/// the ladder; and the one failed test is itemized under cargo's own re-run
+/// spec, from the combined log's shape.
+#[test]
+fn the_test_binaries_run_as_cargo_recorded_them_two_at_a_time_and_the_world_alone() {
+    let repo = FakeRepo::new();
+    let marks = repo.scratch.join("marks");
+    fs::create_dir_all(marks.join("running")).expect("mkdir");
+    let bins = [
+        ("fixture", "--lib", "a"),
+        ("aterm-link", "--test world", "world"),
+        ("fixture", "--test b", "b"),
+        ("fixture", "--test c", "c"),
+    ];
+    with_recording_cargo(&repo, &bins, "");
+    let deps = repo.root.join("target/debug/deps");
+    let m = marks.display();
+    let libtest_ok = |n: &str| {
+        format!(
+            "printf '\\nrunning 1 test\\ntest {n}::fine ... ok\\n\\ntest result: ok. 1 passed; 0 \
+             failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'"
+        )
+    };
+    let meet = |me: &str, other: &str| {
+        format!(
+            "touch '{m}/started-{me}'; i=0\n\
+             until [ -e '{m}/started-{other}' ]; do i=$((i+1)); [ $i -gt 600 ] && {{ echo \
+             '{me}: {other} never ran beside me'; exit 1; }}; sleep 0.05; done"
+        )
+    };
+    let body = |name: &str, rest: &str| {
+        format!(
+            "#!/bin/sh\necho \"{name}: cwd=$(pwd -P) pkg=$CARGO_PKG_NAME threads=$RUST_TEST_THREADS \
+             args=$*\"\ntouch '{m}/running/{name}'\n{rest}\nrm -f '{m}/running/{name}'\n"
+        )
+    };
+    let write = |name: &str, text: String| {
+        let p = deps.join(format!("{name}-1"));
+        fs::write(&p, text).expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    };
+    write(
+        "a",
+        body("a", &format!("{}\n{}", meet("a", "b"), libtest_ok("a"))),
+    );
+    write(
+        "b",
+        body(
+            "b",
+            &format!(
+                "{}\nprintf '\\nrunning 2 tests\\ntest t::fine ... ok\\ntest t::broke ... \
+                 FAILED\\n\\nfailures:\\n\\n---- t::broke stdout ----\\n\\nthread '\"'\"'t::broke'\"'\"' \
+                 panicked at src/b.rs:3:5:\\nassertion failed: broke\\n\\nfailures:\\n    \
+                 t::broke\\n\\ntest result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 \
+                 filtered out; finished in 0.30s\\n\\n'\nrm -f '{m}/running/b'\nexit 101",
+                meet("b", "a")
+            ),
+        ),
+    );
+    write("c", body("c", &libtest_ok("c")));
+    write(
+        "world",
+        body(
+            "world",
+            &format!(
+                "for k in 1 2 3; do n=$(ls '{m}/running' | grep -vx world | wc -l | tr -d ' '); \
+                 [ \"$n\" = 0 ] || {{ echo \"world: $n binaries beside me\"; exit 1; }}; sleep \
+                 0.1; done\necho 'world: alone'\n{}",
+                libtest_ok("world")
+            ),
+        ),
+    );
+
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_jobs = 2;
+    ctx.test_threads = Some(6);
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+
+    assert_eq!(
+        decisions(&block),
+        [
+            ("ok", "targo test --workspace --no-run (trustdoc)"),
+            ("FAIL", "targo test --workspace --tests (trustdoc)"),
+        ],
+        "{block}"
+    );
+    assert!(block.contains("   Compiling fixture v0.1.0"), "{block}");
+    assert!(
+        !block.contains("{\"reason\""),
+        "the JSON leaves the ladder:\n{block}"
+    );
+    assert!(
+        block.contains(
+            "  test binaries: 4 — cargo recorded each one's argv, directory and environment \
+             (a runner in its place) and the gate ran them: 1 alone first \
+             (RUST_TEST_THREADS=6: -p aterm-link --test world), then 3 shared, 2 at a time \
+             (RUST_TEST_THREADS=3 each)"
+        ),
+        "{block}"
+    );
+    let at = |needle: &str| {
+        block
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in:\n{block}"))
+    };
+    assert!(
+        at("Running unittests src/lib.rs (target/debug/deps/a-1)")
+            < at("Running tests/world.rs (target/debug/deps/world-1)")
+            && at("Running tests/world.rs") < at("Running tests/b.rs")
+            && at("Running tests/b.rs") < at("Running tests/c.rs"),
+        "printed in cargo's order, whatever order they ran in:\n{block}"
+    );
+    assert!(block.contains("world: alone"), "{block}");
+    for (name, pkg, threads) in [
+        ("a", "fixture", 3),
+        ("b", "fixture", 3),
+        ("c", "fixture", 3),
+        ("world", "aterm-link", 6),
+    ] {
+        let want = format!(
+            "{name}: cwd={} pkg={pkg} threads={threads} args=--skip measuring:: --skip \
+             launchd_copy_tests::",
+            fs::canonicalize(repo.root.join("crates").join(pkg))
+                .expect("canonical")
+                .display()
+        );
+        assert!(block.contains(&want), "missing {want:?} in:\n{block}");
+    }
+    assert!(!block.contains("never ran beside me"), "{block}");
+    assert!(
+        block.contains("error: test failed, to rerun pass `-p fixture --test b`\n"),
+        "{block}"
+    );
+    let t = tally(std::slice::from_ref(&report));
+    assert_eq!(
+        t.gate_failures,
+        ["targo test --workspace --tests (trustdoc)"]
+    );
+    assert_eq!(
+        t.findings_of(0)
+            .iter()
+            .map(|f| f.id.as_str())
+            .collect::<Vec<_>>(),
+        ["-p fixture --test b -- t::broke"],
+        "{block}"
+    );
+    assert!(t.could_not_run.is_empty(), "{t:?}");
+}
+
+/// NEVER LESS THAN CARGO (2026-09-26): a recording that does not add up runs
+/// the serial `--tests` child instead, and says why — cargo announcing a
+/// binary the recorder never saw, or the recorder failing — and a pass in
+/// which the recorder never ran (a runner the caller's config names outranks
+/// ours) is judged as the serial run it was. In every case the tests RAN and
+/// the one failure is decided exactly once.
+#[test]
+fn a_recording_that_does_not_add_up_falls_back_to_cargos_serial_run() {
+    let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
+    let cases = [
+        (
+            "echo '     Running tests/ghost.rs (target/debug/deps/ghost-1)' >&2",
+            "run by cargo, one at a time — the recording did not add up: cargo announced 3 \
+             test binaries and the recorder saw 2",
+        ),
+        (
+            "if [ -n \"$cfg\" ]; then cfg=$(printf '%s' \"$cfg\" | sed 's#\",\"/#\",\"/nonexistent/#'); fi",
+            "run by cargo, one at a time — the recording pass failed:",
+        ),
+        (
+            "cfg=''",
+            "run by cargo, one at a time — the recording runner was not used",
+        ),
+    ];
+    for (extra, why) in cases {
+        let repo = FakeRepo::new();
+        with_recording_cargo(&repo, &bins, extra);
+        let deps = repo.root.join("target/debug/deps");
+        for (name, code, verdict) in [("b", 101, "FAILED"), ("c", 0, "ok")] {
+            let p = deps.join(format!("{name}-1"));
+            let failed = if code == 0 {
+                String::new()
+            } else {
+                "\\nfailures:\\n\\n---- t::x stdout ----\\n\\nthread '\"'\"'t::x'\"'\"' panicked at \
+                 src/x.rs:1:1:\\nno\\n\\nfailures:\\n    t::x\\n"
+                    .to_string()
+            };
+            let (passed, nfailed) = if code == 0 { (1, 0) } else { (0, 1) };
+            fs::write(
+                &p,
+                format!(
+                    "#!/bin/sh\necho RAN-{name}\nprintf '\\nrunning 1 test\\ntest t::x ... \
+                     {verdict}\\n{failed}\\ntest result: {}. {passed} passed; {nfailed} failed; 0 \
+                     ignored; 0 measured; 0 filtered out; finished in 0.01s\\n\\n'\nexit {code}\n",
+                    if code == 0 { "ok" } else { "FAILED" }
+                ),
+            )
+            .expect("write");
+            fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let mut ctx = repo.ctx(Mode::Fast, Scope::workspace());
+        ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+        let spec = plan::plan(&ctx)
+            .into_iter()
+            .find(|s| s.id == StageId::Test)
+            .expect("the test stage");
+        let report = stages::run_stage(&ctx, &spec);
+        let block = report.render();
+        assert!(block.contains(why), "{extra}: missing {why:?} in:\n{block}");
+        assert!(
+            block.contains("RAN-b") && block.contains("RAN-c"),
+            "{block}"
+        );
+        let t = tally(std::slice::from_ref(&report));
+        assert_eq!(
+            t.gate_failures,
+            ["targo test --workspace --tests (trustdoc)"],
+            "{extra}:\n{block}"
+        );
+        assert_eq!(
+            t.findings_of(0)
+                .iter()
+                .map(|f| f.id.as_str())
+                .collect::<Vec<_>>(),
+            ["-p fixture --test b -- t::x"],
+            "{extra}:\n{block}"
+        );
+    }
+}
+
+/// A RUNNER THAT RUNS NO TEST IS NO PASS (2026-09-27, third review). A runner
+/// for the host named in a cargo config or the environment
+/// (`CARGO_TARGET_<TRIPLE>_RUNNER`) outranks the gate's `cfg(all())` recording
+/// runner, so the recording pass is judged as the serial run it was — or, when
+/// it printed no result, the serial child runs, through the same runner. One
+/// that runs nothing exits 0 for every binary: the row was `ok`, and the merge
+/// contract claimed, with no test run. Here the stand-in cargo's runner is
+/// outranked (`cfg=''`) and each binary "runs" as such a runner would: it
+/// prints nothing and exits 0. The row is COULD NOT RUN, and says why.
+#[test]
+fn a_runner_that_ran_no_test_is_could_not_run_never_ok() {
+    let repo = FakeRepo::new();
+    let bins = [("fixture", "--test b", "b"), ("fixture", "--test c", "c")];
+    with_recording_cargo(&repo, &bins, "cfg=''");
+    let deps = repo.root.join("target/debug/deps");
+    for name in ["b", "c"] {
+        let p = deps.join(format!("{name}-1"));
+        fs::write(&p, "#!/bin/sh\nexit 0\n").expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+    assert!(
+        !decisions(&block).contains(&("ok", "targo test --workspace --tests (trustdoc)")),
+        "a run of no test passed:\n{block}"
+    );
+    let t = tally(std::slice::from_ref(&report));
+    assert!(t.gate_failures.is_empty(), "{t:?}");
+    assert_eq!(t.could_not_run.len(), 1, "{block}");
+    assert!(
+        t.could_not_run[0].starts_with("targo test --workspace --tests (trustdoc) — could not run")
+            && t.could_not_run[0].contains("CARGO_TARGET_<TRIPLE>_RUNNER"),
+        "{t:?}"
+    );
+}
+
+/// A HUNG BINARY IS NAMED BY ITS OWN CEILING (2026-09-27): each binary the gate
+/// runs is a stage child of its own, so the wall-clock ceiling ends the one that
+/// hung — its TIMEOUT block names THAT binary (from the `Running` header the
+/// gate wrote at the head of its log) and the test libtest said was still
+/// running, with the `--exact` line to re-run it alone — while the binaries
+/// beside it finish and print in cargo's order, and the row is one FAIL.
+#[test]
+fn a_hung_test_binary_is_named_by_its_own_timeout_and_the_rest_still_run() {
+    let repo = FakeRepo::new();
+    let bins = [
+        ("fixture", "--test fine", "fine"),
+        ("fixture", "--test hang", "hang"),
+        ("fixture", "--test after", "after"),
+    ];
+    with_recording_cargo(&repo, &bins, "");
+    let deps = repo.root.join("target/debug/deps");
+    let ok = |n: &str| {
+        format!(
+            "#!/bin/sh\necho RAN-{n}\nprintf '\\nrunning 1 test\\ntest {n}::fine ... ok\\n\\ntest \
+             result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in \
+             0.01s\\n\\n'\n"
+        )
+    };
+    for (name, body) in [
+        ("fine", ok("fine")),
+        (
+            "hang",
+            "#!/bin/sh\nprintf '\\nrunning 2 tests\\ntest h::quick ... ok\\ntest h::wedged has been \
+             running for over 60 seconds\\n'\nexec sleep 600\n"
+                .to_string(),
+        ),
+        ("after", ok("after")),
+    ] {
+        let p = deps.join(format!("{name}-1"));
+        fs::write(&p, body).expect("write");
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace());
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    ctx.test_jobs = 2;
+    // Generous for every child that finishes (a shell script each, on a loaded
+    // machine); only the wedged binary ever reaches it.
+    ctx.child_ceiling = Some(std::time::Duration::from_secs(20));
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let report = stages::run_stage(&ctx, &spec);
+    let block = report.render();
+
+    assert_eq!(
+        decisions(&block),
+        [
+            ("ok", "targo test --workspace --no-run (trustdoc)"),
+            ("FAIL", "targo test --workspace --tests (trustdoc)"),
+        ],
+        "{block}"
+    );
+    assert!(
+        block.contains(
+            "  test binary: tests/hang.rs (target/debug/deps/hang-1) — it never printed its \
+             `test result:` line\n"
+        ),
+        "the TIMEOUT names the binary that hung, not the last one started:\n{block}"
+    );
+    assert!(block.contains("h::wedged"), "{block}");
+    assert!(
+        block
+            .contains("    re-run alone: target/debug/deps/hang-1 --exact h::wedged --nocapture\n"),
+        "{block}"
+    );
+    assert!(
+        !block.contains("test binary: tests/after.rs"),
+        "a binary that finished is never the one named:\n{block}"
+    );
+    let at = |needle: &str| {
+        block
+            .find(needle)
+            .unwrap_or_else(|| panic!("no {needle:?} in:\n{block}"))
+    };
+    assert!(
+        at("RAN-fine") < at("Running tests/hang.rs")
+            && at("Running tests/hang.rs") < at("RAN-after"),
+        "the binaries beside the hung one ran and print in cargo's order:\n{block}"
+    );
+    assert!(
+        block.contains("error: test failed, to rerun pass `-p fixture --test hang`\n"),
+        "{block}"
+    );
+    let t = tally(std::slice::from_ref(&report));
+    assert_eq!(
+        t.gate_failures,
+        ["targo test --workspace --tests (trustdoc)"],
+        "{block}"
+    );
+}
+
+/// MEASURING THE TEST RUN ON THIS TREE (2026-09-26) — opt-in and never part of
+/// any gate run: the REAL test stage (compile, record, run) over the crates
+/// `ATERM_VERIFY_MEASURE_CRATES` names (comma-separated), `--test-jobs` =
+/// `ATERM_VERIFY_MEASURE_JOBS` (default the gate's), with the load at both
+/// ends. `ATERM_VERIFY_MEASURE_SERIAL=1` runs the serial child it replaced
+/// instead — cargo's own `--tests` run, the same argv and environment — as the
+/// baseline. Both print the run's findings, and `ATERM_VERIFY_MEASURE_LOG`
+/// names a file for the stage's whole block:
+///
+/// ```text
+/// ATERM_VERIFY_MEASURE_CRATES=atpkg,aterm-update ATERM_VERIFY_MEASURE_JOBS=2 \
+///   targo --unverified test -p aterm-verify --test gate_contract -- --ignored \
+///   measure_the_test_run_on_this_tree --nocapture
+/// ```
+#[test]
+#[ignore = "measures this machine: run by hand with ATERM_VERIFY_MEASURE_CRATES"]
+fn measure_the_test_run_on_this_tree() {
+    let crates: Vec<String> = std::env::var("ATERM_VERIFY_MEASURE_CRATES")
+        .expect("ATERM_VERIFY_MEASURE_CRATES names the crates to measure")
+        .split(',')
+        .map(|c| c.trim().to_string())
+        .filter(|c| !c.is_empty())
+        .collect();
+    let root = fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .expect("the repository root");
+    let scratch = mktemp_dir("atv-measure").expect("mktemp");
+    let mut ctx = Ctx::new(
+        root,
+        Mode::Fast,
+        Scope::changed("HEAD", crates, true),
+        EnvSnapshot::capture(),
+        scratch.clone(),
+    )
+    .with_pinned_child_facts(None);
+    ctx.test_recorder = Some(PathBuf::from(env!("CARGO_BIN_EXE_aterm-verify")));
+    if let Some(jobs) = std::env::var("ATERM_VERIFY_MEASURE_JOBS")
+        .ok()
+        .and_then(|j| j.parse().ok())
+    {
+        ctx.test_jobs = jobs;
+    }
+    let spec = plan::plan(&ctx)
+        .into_iter()
+        .find(|s| s.id == StageId::Test)
+        .expect("the test stage");
+    let serial = std::env::var_os("ATERM_VERIFY_MEASURE_SERIAL").is_some();
+    let load_start = aterm_verify::exec::load_average();
+    let started = std::time::Instant::now();
+    let report = if serial {
+        let cmd = aterm_verify::exec::Cmd::new(&ctx.tools.targo)
+            .args(stages::test_run_args(&ctx.scope))
+            .env("RUSTDOC", ctx.tools.trustdoc.as_os_str());
+        let run = aterm_verify::exec::run(&cmd, ctx.exec_env());
+        let mut r = Report::new(spec.title.clone());
+        r.decide_test_child(&run, "targo test --tests (serial, as before 2026-09-26)");
+        r
+    } else {
+        stages::run_stage(&ctx, &spec)
+    };
+    let took = started.elapsed();
+    let block = report.render();
+    if let Some(log) = std::env::var_os("ATERM_VERIFY_MEASURE_LOG") {
+        fs::write(&log, &block).expect("the stage's block");
+    }
+    let summary: Vec<&str> = block
+        .lines()
+        .filter(|l| {
+            l.starts_with("  ok ")
+                || l.starts_with("  FAIL")
+                || l.starts_with("  skip")
+                || l.starts_with("  test binaries:")
+        })
+        .collect();
+    let findings: Vec<String> = tally(std::slice::from_ref(&report))
+        .all_findings()
+        .map(|f| format!("  finding: {}", f.id))
+        .collect();
+    println!(
+        "measured: test {} {:.1}s (load {:?} -> {:?})\n{}\n{}",
+        if serial {
+            "run, serial".to_string()
+        } else {
+            format!("stage, --test-jobs {}", ctx.test_jobs)
+        },
+        took.as_secs_f64(),
+        load_start,
+        aterm_verify::exec::load_average(),
+        summary.join("\n"),
+        findings.join("\n")
+    );
+    fs::remove_dir_all(&scratch).ok();
 }

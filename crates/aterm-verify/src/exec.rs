@@ -21,7 +21,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +52,21 @@ pub struct Cmd {
     /// Spawn under UTILITY QoS rather than the gate's inherited tier — see
     /// [`Cmd::demoted`] for which children may, and why the rest may not.
     pub demoted: bool,
+    /// The directory the child starts in, in place of [`ExecEnv::cwd`] — a
+    /// test binary replayed from cargo's own invocation starts where cargo
+    /// started it, in its package's root ([`Cmd::replayed`]).
+    pub cwd: Option<PathBuf>,
+    /// [`Cmd::envs`] is the child's WHOLE environment: nothing is inherited, and
+    /// [`ExecEnv`]'s PATH, removals and additions are not applied, because the
+    /// environment was recorded from a child that already had them
+    /// ([`Cmd::replayed`]).
+    pub exact_env: bool,
+    /// Text written at the head of the child's captured log before it starts
+    /// ([`Capture::Emit`] only), so a ceiling kill's diagnostic — which reads
+    /// that log — sees it too: cargo's `Running <target> (<path>)` header for a
+    /// test binary the gate runs itself, which is how the TIMEOUT block names
+    /// the binary and the test still running ([`crate::libtest::note`]).
+    pub preamble: Option<String>,
     /// When the gate must end this child early — its ceiling fired, or the
     /// gate itself was interrupted — send its group `SIGTERM` first and give it
     /// this long to exit before the `SIGKILL`. `None` (the default): `SIGKILL`
@@ -68,8 +83,36 @@ impl Cmd {
             envs: Vec::new(),
             capture: Capture::Emit,
             demoted: false,
+            cwd: None,
+            exact_env: false,
+            preamble: None,
             term_grace: None,
         }
+    }
+
+    /// A child replayed from a recorded invocation: `argv[0]` with the rest of
+    /// `argv`, started in `cwd` with exactly `env` and nothing inherited — the
+    /// process cargo itself would have started ([`crate::testrun`]).
+    #[must_use]
+    pub fn replayed(
+        argv: &[OsString],
+        cwd: impl Into<PathBuf>,
+        env: Vec<(OsString, OsString)>,
+    ) -> Self {
+        let mut c = Self::new(argv.first().cloned().unwrap_or_default());
+        c.args = argv.iter().skip(1).cloned().collect();
+        c.envs = env;
+        c.exact_env = true;
+        c.cwd = Some(cwd.into());
+        c
+    }
+
+    /// Write `text` at the head of the captured log before the child starts
+    /// ([`Cmd::preamble`]).
+    #[must_use]
+    pub fn preamble(mut self, text: impl Into<String>) -> Self {
+        self.preamble = Some(text.into());
+        self
     }
 
     #[must_use]
@@ -206,6 +249,35 @@ pub struct ExecEnv<'a> {
     /// 55 GB and run the volume to `No space left on device`
     /// ([`crate::Ctx::with_pinned_child_facts`]).
     pub add_env: &'a [(OsString, OsString)],
+}
+
+/// THE ONE-MINUTE LOAD AVERAGE (2026-09-26): `/proc/loadavg` where it exists,
+/// else `sysctl -n vm.loadavg` (macOS prints `{ 1.23 2.34 3.45 }`). Read at
+/// each stage's start and end for its `time` line, its receipt `load` line and
+/// the verdict's under-load label ([`crate::ladder::StageLoad`]); `None` when
+/// neither answers, and then the line simply carries no load.
+#[must_use]
+pub fn load_average() -> Option<f64> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
+        let out = Command::new("/usr/sbin/sysctl")
+            .args(["-n", "vm.loadavg"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    })?;
+    parse_load_average(&text)
+}
+
+/// The first number in a load-average line, braces and all.
+#[must_use]
+pub fn parse_load_average(text: &str) -> Option<f64> {
+    text.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
+        .find(|t| !t.is_empty())
+        .and_then(|t| t.parse().ok())
 }
 
 /// What a child did.
@@ -434,12 +506,17 @@ pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
-    c.current_dir(env.cwd).env("PATH", env.path);
-    for k in env.remove_env {
-        c.env_remove(k);
-    }
-    for (k, v) in env.add_env {
-        c.env(k, v);
+    c.current_dir(cmd.cwd.as_deref().unwrap_or(env.cwd));
+    if cmd.exact_env {
+        c.env_clear();
+    } else {
+        c.env("PATH", env.path);
+        for k in env.remove_env {
+            c.env_remove(k);
+        }
+        for (k, v) in env.add_env {
+            c.env(k, v);
+        }
     }
     for (k, v) in &cmd.envs {
         c.env(k, v);
@@ -465,10 +542,15 @@ pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
             let log = env
                 .scratch
                 .join(format!("stage.{}.{seq}.log", std::process::id()));
-            let file = match File::create(&log) {
+            let mut file = match File::create(&log) {
                 Ok(f) => f,
                 Err(e) => return spawn_failure(cmd, &e.to_string()),
             };
+            if let Some(text) = &cmd.preamble
+                && let Err(e) = file.write_all(text.as_bytes())
+            {
+                return spawn_failure(cmd, &e.to_string());
+            }
             let file2 = match file.try_clone() {
                 Ok(f) => f,
                 Err(e) => return spawn_failure(cmd, &e.to_string()),
@@ -529,8 +611,9 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
 /// the child is actually given (its own [`Cmd::envs`] override included).
 fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
     let program = cmd.program.as_path();
+    let cwd = cmd.cwd.as_deref().unwrap_or(env.cwd);
     if program.components().count() > 1 {
-        return crate::is_executable_file(&env.cwd.join(program));
+        return crate::is_executable_file(&cwd.join(program));
     }
     let path = cmd
         .envs
@@ -538,7 +621,7 @@ fn resolves(cmd: &Cmd, env: ExecEnv<'_>) -> bool {
         .rev()
         .find(|(k, _)| k == "PATH")
         .map_or(env.path, |(_, v)| v.as_os_str());
-    std::env::split_paths(path).any(|d| crate::is_executable_file(&env.cwd.join(d).join(program)))
+    std::env::split_paths(path).any(|d| crate::is_executable_file(&cwd.join(d).join(program)))
 }
 
 /// Spawn and wait, under `ceiling`. Returns a [`Run`] whose `output` is EMPTY
@@ -1286,6 +1369,96 @@ mod tests {
             env_in(&tmp),
         );
         assert_eq!(r.trimmed_output(), "x/usr/bin:/bin");
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE LOAD READER (2026-09-26): the first number of either spelling —
+    /// macOS's braced `sysctl -n vm.loadavg` and Linux's `/proc/loadavg` —
+    /// and nothing from a line that holds no number.
+    #[test]
+    fn the_load_reader_takes_the_one_minute_figure_of_either_spelling() {
+        assert_eq!(parse_load_average("{ 74.82 58.31 32.86 }\n"), Some(74.82));
+        assert_eq!(parse_load_average("1.50 0.90 0.40 2/613 4242\n"), Some(1.5));
+        assert_eq!(parse_load_average(""), None);
+        assert_eq!(parse_load_average("{ }"), None);
+        assert_eq!(parse_load_average("{ busy 1.0 }"), None);
+    }
+
+    /// A REPLAYED CHILD IS THE PROCESS CARGO WOULD HAVE STARTED (2026-09-26):
+    /// its own directory, exactly the recorded environment — nothing the gate
+    /// inherited, and none of the gate's PATH, removals or additions, which the
+    /// recorded environment already reflects — and a preamble at the head of its
+    /// log, above its own bytes.
+    #[test]
+    fn a_replayed_child_starts_where_and_as_it_was_recorded() {
+        let tmp = crate::mktemp_dir("atv-replay").expect("mktemp");
+        let pkg = tmp.join("pkg");
+        std::fs::create_dir_all(&pkg).expect("mkdir");
+        std::fs::write(pkg.join("marker"), b"in-pkg").expect("write");
+        let added = [(OsString::from("GATE_ADDED"), OsString::from("gate"))];
+        let env = ExecEnv {
+            add_env: &added,
+            ..env_in(&tmp)
+        };
+        let cmd = Cmd::replayed(
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "cat marker; printf ' %s %s %s' \"${RECORDED-unset}\" \"${GATE_ADDED-unset}\" \
+                     \"${HOME-unset}\"",
+                ),
+            ],
+            &pkg,
+            vec![
+                (OsString::from("RECORDED"), OsString::from("yes")),
+                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            ],
+        )
+        .preamble("     Running tests/x.rs (target/debug/deps/x-1)\n");
+        let r = run(&cmd, env);
+        assert!(r.ok, "{}", r.output);
+        assert_eq!(
+            r.trimmed_output(),
+            "     Running tests/x.rs (target/debug/deps/x-1)\nin-pkg yes unset unset",
+            "the preamble first, then the child — in its own directory, with only what \
+             was recorded"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE PREAMBLE IS WHAT A CEILING KILL READS: a test binary the gate runs
+    /// itself carries cargo's `Running` header only because the gate wrote it,
+    /// and the TIMEOUT block names the binary and its re-run line from it.
+    #[test]
+    fn a_timed_out_replayed_binary_is_named_from_its_preamble() {
+        let tmp = crate::mktemp_dir("atv-replay-hang").expect("mktemp");
+        let script = "printf '\\nrunning 1 test\\n\
+                      test a::hang has been running for over 60 seconds\\n'; exec sleep 600";
+        let cmd = Cmd::replayed(
+            &[
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+            ],
+            &tmp,
+            vec![(OsString::from("PATH"), OsString::from("/usr/bin:/bin"))],
+        )
+        .preamble("     Running unittests src/lib.rs (target/debug/deps/x-abc)\n");
+        let r = run(&cmd, ceiled(&tmp, Some(Duration::from_millis(300))));
+        assert!(!r.ok);
+        let out = r.trimmed_output();
+        assert!(
+            out.contains(
+                "  test binary: unittests src/lib.rs (target/debug/deps/x-abc) — it never \
+                 printed its `test result:` line\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("    re-run alone: target/debug/deps/x-abc --exact a::hang --nocapture\n"),
+            "{out}"
+        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 

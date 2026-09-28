@@ -967,14 +967,35 @@ fn next_cut_line(
     }
 }
 
+/// What a cut from this tree must be given to sign, read off the committed pins: the
+/// paper master (the roster) and the Apple Team ID (notarization).
+fn signing_requirement() -> &'static str {
+    let roster = aterm_update_core::pins::roster_tier_armed();
+    let notary = !aterm_update_core::pins::APPLE_TEAM_ID.is_empty();
+    match (roster, notary) {
+        (true, true) => {
+            "a cut needs --release-credentials <profile.toml>: a rostered machine key and a \
+             notary credential"
+        }
+        // With no flag, the machine key at ~/.aterm/machine.key signs
+        // (`sign::ReleaseCredentials::resolve`); only a notary credential needs the profile.
+        (true, false) => {
+            "a cut needs a rostered machine key (--release-credentials <profile.toml>, or \
+             ~/.aterm/machine.key)"
+        }
+        (false, true) => {
+            "a cut needs --release-credentials <profile.toml> with a notary credential; update \
+             signing is optional (no paper master pinned)"
+        }
+        (false, false) => "update signing is optional (no paper master pinned)",
+    }
+}
+
 pub fn run_status(repo: &Path) -> Result<()> {
     let slug = publish::workspace_channel_slug(repo)?;
     let _cred = publish::ChannelCred::enter();
     println!("aterm-release · status ({slug})");
-    step(
-        "signing",
-        "Tier REPO channel: gh auth + SHA-256 + monotonic build number · update signing is optional (a configured key signs; no key is required to cut)",
-    );
+    step("signing", signing_requirement());
 
     let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read Cargo.toml: {e}")))?;
@@ -1747,10 +1768,7 @@ pub fn run_abandon(repo: &Path, version: &str) -> Result<()> {
         }
         fs::remove_file(&journal_path)
             .map_err(|e| Error::new(format!("delete {}: {e}", journal_path.display())))?;
-        step(
-            "",
-            "owner + unique publisher fence atomically released; local journal deleted",
-        );
+        step("", "release lock freed; journal deleted");
         step(
             "",
             &format!(

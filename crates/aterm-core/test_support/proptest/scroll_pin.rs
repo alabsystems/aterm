@@ -14,7 +14,17 @@
 use crate::terminal::TerminalBuilder;
 use proptest::prelude::*;
 
+/// This module's checked-in seed corpus. See `seed_corpus` in
+/// `src/tests/proptest/mod.rs` for why the path is spelled out rather than left
+/// to proptest's default derivation.
+const SEEDS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/proptest-regressions/tests/proptest/scroll_pin.txt"
+);
+
 proptest! {
+    #![proptest_config(super::seed_corpus(SEEDS))]
+
     /// SCR-1: live output while scrolled back preserves the absolute top row and
     /// advances display_offset by the lines that entered scrollback (big ring => no
     /// eviction within these bounds, so the advance is exact).

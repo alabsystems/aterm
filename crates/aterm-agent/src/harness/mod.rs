@@ -60,6 +60,11 @@
 //!   exit use: an agent that no longer runs started again in its own tab, on
 //!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
 //!   the host's per-session back-off.
+//! * [`netwatch`] — THE API'S REACH, pure: which route an agent takes, what
+//!   one probe of the default route may conclude, and the one instance's
+//!   measure and schedule while a supervised session waits at a wall the
+//!   network answers (the window's host carries it out: aterm-gui
+//!   `harness_netprobe`).
 //!
 //! # What was deleted, 2026-09-23
 //!
@@ -76,7 +81,7 @@
 //! and it duplicated the engine in [`crate::supervise`], which is the one
 //! supervisor now. Design §0.4 is the record.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; TEN bounded
+//! STATUS (docs/README.md honesty ratchet): unit-tested; THIRTEEN bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
 //! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
 //! in its tests), `harness_upgrade_notice_owner_model` ([`upgrade_drive`]'s
@@ -104,11 +109,27 @@
 //! `harness_model_ladder_model` (WHEN a due model move is taken —
 //! [`upgrade_models::model_moves_now`] over every reachable state, in
 //! `aterm-agent/tests/conformance_upgrade_models/ladder.rs`),
+//! `harness_model_switch_model` (the model rule, ladder, announcement and
+//! settle step: one visit's whole read, [`upgrade_models::model_read_step`],
+//! then [`upgrade_models::model_to`], and a relaunch's
+//! [`upgrade_models::ModelRecord::asked`] and
+//! [`upgrade_models::live_model_at`], over every reachable state, in
+//! `aterm-agent/tests/conformance_upgrade_models/switch.rs`),
 //! `harness_login_wall_model` (nothing of the upgrade's typed at the login
 //! wall, no give-up spent on a notice it answered, no continuation into a
 //! login the supervisor saw gone, the owner told first: in
 //! `aterm-agent/tests/conformance_login_wall.rs`, over the real readers,
-//! reducer and turn-end decider on every reachable state), and
+//! reducer and turn-end decider on every reachable state),
+//! `harness_upgrade_limit_queue_model` (no ask typed behind a notice a usage
+//! limit answered and the model has not taken, such a notice typed again
+//! straight away at most [`upgrade::REQUEUE_MAX`] times and past that once per
+//! rest — a rest that grows with every copy the model has not read, so a limit
+//! that lasts for days adds at most [`upgrade::QUEUE_REST_DOUBLINGS`] copies
+//! after a rest shorter than a day — no give-up before [`upgrade::MAX_ASKS`] asks the model took, and
+//! never quiet while an ask it could read is owed — a full queue included:
+//! [`upgrade_drive`]'s tests, over the real readers, `queue_facts`, clock and
+//! reducer, with and without the owner's `--now`, on every reachable state),
+//! and
 //! `harness_codex_daemon_update_model` ([`upgrade_codex::daemon_step`] over
 //! every reachable state, in [`upgrade_codex`]'s tests). The Codex branch
 //! has run end to end against a REAL Codex (0.157.0 → 0.157.1, a private
@@ -139,6 +160,7 @@ pub mod cli;
 pub mod disk;
 pub mod footer;
 pub mod lights;
+pub mod netwatch;
 pub mod relaunch;
 pub mod source;
 pub mod upgrade;

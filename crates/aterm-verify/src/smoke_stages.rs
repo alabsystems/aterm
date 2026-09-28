@@ -10,7 +10,9 @@
 //!    so it cannot touch a real instance, and it tears itself down on every exit
 //!    path. Every gate run proves the socket still answers.
 //!
-//! 5b) GUI TYPING-PACING SMOKE (macOS desktop only). Headless never PRESENTS, so
+//! 5b) GUI TYPING-PACING SMOKE (macOS desktop only; the MEASURE tier's since
+//!    2026-09-26 — `--measure` and `--full` run it, the merge contract does
+//!    not, and a release cut requires it green). Headless never PRESENTS, so
 //!    only a real window can measure pacing. The 2026-07-05 incident build
 //!    presented at ~5/s with 190-530 ms input→present; a healthy build does 30+/s
 //!    under 15 ms. Skips automatically without a WindowServer session (CI/SSH), or
@@ -52,8 +54,9 @@
 //!    purity: the driver writes lane diagnostics to stderr, and these round trips
 //!    capture stderr to catch real errors — through `run` that banner lands in the
 //!    reply and every `OK`-prefix match fails.
-//!  * These stages are the run's only EXCLUSIVE ones (see `crate::sched`): they
-//!    decide on frame counts and latencies, so they must own the machine.
+//!  * These stages are EXCLUSIVE (see `crate::sched`), as are the deadline and
+//!    measuring tests: they decide on frame counts and latencies, so they must
+//!    own the machine.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -401,7 +404,8 @@ impl Sandbox {
         if let Some(mut child) = self.child.take() {
             let (ok, _) = retire_smoke_child(&mut child);
             if !ok {
-                r.fail("smoke: child cleanup/reap failed");
+                // After every check: it hides none.
+                r.fail_and_continue("smoke: child cleanup/reap failed");
             }
         }
         self.lifeline.take();
@@ -480,6 +484,15 @@ fn bring_up(
             format!("{tag}: targo build -p aterm-gui -p aterm-ctl failed"),
         );
         r.raw(smoke_log_tail(log_label, &sb.gui_log));
+        // What the build kept from running is decided by nothing (2026-09-27,
+        // fourth review): a smoke build red main had stood for the smoke.
+        if built.environment_failure().is_none() {
+            crate::stages::not_run_behind(
+                r,
+                &format!("{tag}: the smoke's checks"),
+                "the build above failed, so there is no fresh aterm-gui to launch",
+            );
+        }
         return Ready::Stopped;
     }
     // The driver lane's dir: that is where the build above put them.
@@ -635,7 +648,10 @@ fn headless_round_trips(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path)
     if glob_match(pattern::OK, &got) {
         r.pass(format!("smoke: aterm-ctl cursor -> {got}"));
     } else {
-        r.fail(format!("smoke: aterm-ctl cursor -> {}", or_no_reply(&got)));
+        // The burst below still runs: this row hides nothing. Every other
+        // `r.fail` here ends its smoke, so it is never inherited
+        // ([`Report::fail`]).
+        r.fail_and_continue(format!("smoke: aterm-ctl cursor -> {}", or_no_reply(&got)));
     }
 
     // Driven-typing pacing counters (the 2026-07-05 incident class). Headless
@@ -694,7 +710,8 @@ fn headless_round_trips(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path)
             "smoke: typing burst pacing counters clean ({accepted}/{BURST_KEYS} keys accepted)"
         ));
     } else {
-        r.fail(format!(
+        // The smoke's last check: it hides none.
+        r.fail_and_continue(format!(
             "smoke: wake heals during a plain typing burst -> {got}"
         ));
     }
@@ -807,11 +824,11 @@ fn effect_lane_burst(
     let percentiles = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
     match effect_lane_verdict(lane, &summary) {
         Ok(line) => r.pass(line),
-        Err(bad) => r.fail(bad),
+        Err(bad) => r.fail_and_continue(bad),
     }
     match hardware_key_verdict(posted, &percentiles) {
         Ok(line) => r.pass(format!("[{name}] {line}")),
-        Err(bad) => r.fail(format!("[{name}] {bad}")),
+        Err(bad) => r.fail_and_continue(format!("[{name}] {bad}")),
     }
     Some(lane_latency(&summary, &percentiles))
 }
@@ -933,7 +950,8 @@ fn gui_measurements(ctx: &Ctx, r: &mut Report, sb: &mut Sandbox, ctl_bin: &Path)
             "gui smoke: frames={frames} max_input_present={maxin}ms, no sync timeouts"
         ));
     } else {
-        r.fail(format!(
+        // The hardware slices below still run: this row hides nothing.
+        r.fail_and_continue(format!(
             "gui smoke: sync timeout-releases during plain typing [{got}]"
         ));
     }
@@ -986,7 +1004,7 @@ fn hardware_key_slices(ctx: &Ctx, r: &mut Report, sb: &Sandbox, ctl_bin: &Path, 
     let got = ctl(ctx, sb, ctl_bin, &["metrics", "percentiles"]);
     match hardware_key_verdict(posted, &got) {
         Ok(line) => r.pass(line),
-        Err(bad) => r.fail(bad),
+        Err(bad) => r.fail_and_continue(bad),
     }
 }
 

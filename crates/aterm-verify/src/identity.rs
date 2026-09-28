@@ -20,9 +20,11 @@
 //!    whether it is staged or not, and in the caller's checkout or a snapshot
 //!    synced from it ([`crate::snapshot`] compares exactly these values).
 //!  * [`ToolchainIdentity`] — `(dev, ino, len, mtime)` of `targo`, `trustc`,
-//!    `trustdoc` and `tippy`, plus `trustc -vV`'s commit hash. A re-seal or an
-//!    atpkg update mid-run swaps the compiler under the run the same way a pull
-//!    swaps the source.
+//!    `trustdoc` and `tippy`, plus `trustc -vV`'s commit hash, and (since
+//!    2026-09-26) the spec checkers the tests run — `ty`, `trust-ir`, `ay`,
+//!    each as the file it resolves to ([`crate::checkers`]). A re-seal or an
+//!    atpkg update mid-run swaps the compiler or a checker under the run the
+//!    same way a pull swaps the source.
 //!
 //! A [`Tripwire`] holds both. The ladder re-checks it before every stage that
 //! touches a target dir and once more before the verdict; a mismatch makes the
@@ -807,17 +809,22 @@ impl FileStamp {
     }
 }
 
-/// The compiler a run uses. Built by [`crate::Toolchain::identity`].
+/// The compiler a run uses, and the checkers its tests run. Built by
+/// [`crate::Toolchain::identity`]; [`crate::run`] adds the checkers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolchainIdentity {
     /// Each tool's path and its stamp (`None` = absent at capture).
     pub files: Vec<(PathBuf, Option<FileStamp>)>,
     /// `commit-hash:` from `trustc -vV`, when trustc answered.
     pub commit: Option<String>,
+    /// `ty`, `trust-ir` and `ay` as the tests find them — `None` where they
+    /// were not resolved (the lane stamps need only the compiler).
+    pub checkers: Option<crate::checkers::Checkers>,
 }
 
 impl ToolchainIdentity {
-    /// The first tool whose stamp changed since capture, in words.
+    /// Every tool whose stamp changed since capture, and every checker that
+    /// moved ([`crate::checkers::Checkers::moved`]), in words.
     ///
     /// Re-stats only. A file whose `(dev, ino, len, mtime)` are all unchanged
     /// has not been rewritten or replaced, so asking `trustc -vV` again would
@@ -838,6 +845,11 @@ impl ToolchainIdentity {
                     format!("{} {word}", path.display())
                 })
             })
+            .chain(
+                self.checkers
+                    .as_ref()
+                    .and_then(crate::checkers::Checkers::moved),
+            )
             .collect();
         (!moved.is_empty()).then(|| moved.join("; "))
     }
@@ -1123,6 +1135,7 @@ mod tests {
                 .map(|p| (p.clone(), FileStamp::of(p)))
                 .collect(),
             commit: None,
+            checkers: None,
         };
         assert_eq!(id.moved(), None);
         // A replacement by rename is a new inode even at the same length.

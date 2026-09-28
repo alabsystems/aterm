@@ -14654,14 +14654,15 @@ mod output_streak_cfg_tests {
                    answer_questions = false\nanswer_text = \"ask me\"\n\
                    dismiss_surveys = false\ncontinue = false\ncontinue_text = \"go\"\n\
                    continue_per_hour = 2\nrules_file = \"/r\"\nretry_api_errors = false\n\
-                   resume_limits = false\nmodel_fallback = \"\"\n\
+                   probe_api = false\nresume_limits = false\nmodel_fallback = \"\"\n\
                    compact_on_context_wall = false\nrelaunch = false\nupgrade = false\n\
                    human_grace_s = 600\n";
         assert_eq!(
             super::HarnessPolicy::read(all).words(),
             "Automatic \u{b7} limited: headless: off \u{b7} approve: none \
              \u{b7} answer_questions: off \u{b7} dismiss_surveys: off \u{b7} continue: off \
-             \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} resume_limits: off \
+             \u{b7} continue_per_hour: 2 \u{b7} retry_api_errors: off \u{b7} probe_api: off \
+             \u{b7} resume_limits: off \
              \u{b7} model_fallback: off \u{b7} compact_on_context_wall: off \u{b7} relaunch: off \
              \u{b7} upgrade: off \u{b7} human_grace_s: 600 \
              \u{b7} yours: answer_text, continue_text, rules_file"

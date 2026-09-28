@@ -1669,6 +1669,10 @@ fn with_journal_lock<T>(
             .map_err(|error| format!("protect journal lock {}: {error}", lock_path.display()))?;
     }
     take_journal_lock(&lock, path, patience.budget())?;
+    // Released by `LOCK_UN` on every exit, not by the close: a shell forked while
+    // this runs would otherwise keep the lock until its exec, and the event loop's
+    // next take has 25 ms (the product fd-hygiene sweep of 2026-09-27).
+    let _held = crate::native_document_host::HeldAdvisoryLock::adopt(lock);
     operation()
 }
 
@@ -1700,6 +1704,12 @@ fn with_journal_lock<T>(
 ///     pipe's EOF, which IS this window): p50 2.99 ms, p99 6.0 ms, max 12.7 ms
 ///     over n=5000 at ordinary load; p50 4.5 ms, p99 206 ms, MAX 523 ms over
 ///     n=20000 under deliberately pathological load (loadavg 118 on 18 cores).
+///     This lock and the sibling save lock are now released through `LOCK_UN`
+///     (`native_document_host::HeldAdvisoryLock`), which frees the description
+///     the child copied at the holder's release rather than at the child's exec
+///     (the product fd-hygiene sweep of 2026-09-27). The budgets are kept for the
+///     genuine peers: mechanism 2, and an older aterm sharing the journal that
+///     still releases by the close.
 ///  2. A PEER'S DEVICE-BARRIER HOLD — a legitimate holder inside the locked
 ///     section, which spans `sync_all` on the temporary (`atomic_replace_locked`,
 ///     :1255) and `sync_directory` on the parent (:1271). Both are `F_FULLFSYNC`
@@ -2353,6 +2363,70 @@ mod tests {
             "budget must actually be spent, got {elapsed:?}"
         );
         drop(held);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// A second descriptor onto the open file description behind the one
+    /// descriptor this process holds on `path` — what a child forked at this
+    /// instant would hold until it execs. Found by identity, because the
+    /// description under test is private to the call that opened it.
+    #[cfg(unix)]
+    fn copy_of_the_open_description_of(path: &Path) -> File {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+        fn identity(fd: libc::c_int) -> Option<(libc::dev_t, libc::ino_t)> {
+            // SAFETY: `fstat` only writes the out-parameter, which lives for the
+            // call; a closed slot fails with EBADF and is skipped.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            (unsafe { libc::fstat(fd, &raw mut stat) } == 0).then_some((stat.st_dev, stat.st_ino))
+        }
+
+        let wanted = {
+            let probe = File::open(path).expect("open the lock to learn its identity");
+            identity(probe.as_raw_fd()).expect("fstat the lock")
+        };
+        for fd in 0..(1 << 16) {
+            if identity(fd) == Some(wanted) {
+                // SAFETY: `fd` is the live lock descriptor its owner is still
+                // holding on this thread's stack; the copy is a fresh descriptor
+                // this call owns.
+                let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+                assert!(
+                    copy >= 0,
+                    "dup the lock: {}",
+                    std::io::Error::last_os_error()
+                );
+                return unsafe { File::from_raw_fd(copy) };
+            }
+        }
+        panic!("no open descriptor refers to {}", path.display());
+    }
+
+    /// The journal lock is FREE the instant the locked operation returns, even
+    /// while a copy of its description lives. The copy stands in for a shell
+    /// another thread forked mid-append: a forked child holds every descriptor
+    /// until it execs, and a lock released by the close alone lives on in that
+    /// copy — so the event loop's 25 ms take after a worker append refused an
+    /// open, and the worker waited out a lock nobody held (the product
+    /// fd-hygiene sweep of 2026-09-27).
+    #[cfg(unix)]
+    #[test]
+    fn a_released_journal_lock_is_free_while_a_forked_copy_of_it_lives() {
+        let root = test_root("forked-copy");
+        let path = root.join("draft.atdj");
+        let lock_path = journal_lock_path(&path).unwrap();
+
+        let forked_copy = with_journal_lock(&path, JournalLockPatience::Worker, || {
+            Ok(copy_of_the_open_description_of(&lock_path))
+        })
+        .unwrap();
+
+        let next = open_journal_lock(&lock_path).unwrap();
+        assert!(
+            next.try_lock().is_ok(),
+            "the lock outlived its operation on the forked copy of its description"
+        );
+        drop(forked_copy);
         let _ = fs::remove_dir_all(root);
     }
 

@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Wall-clock THROUGHPUT baseline for `gate perf` (PERF-WALLCLOCK-BASELINE lane).
+//! `xtask perf` — the perf lanes, each against its committed baseline in
+//! `tools/golden/`, and the same-box trend ledger ([`run`] is the verb). Below,
+//! the wall-clock THROUGHPUT lane (PERF-WALLCLOCK-BASELINE) first.
 //!
 //! aterm is a NO-CI, MULTI-MACHINE repo: m3 and m7 are different-speed boxes that
 //! share one committed `tools/golden/perf-baseline.json`, and a gate run may land
@@ -126,7 +128,7 @@ pub(crate) fn parse_report(json: &str) -> Option<PerfReport> {
 /// the live gate uses [`PASS_RATIO`] (the source of truth), not this echoed copy.
 pub(crate) fn baseline_json(r: &PerfReport, ratio: f64) -> String {
     format!(
-        "{{\n  \"_comment\": \"aterm wall-clock throughput baseline (PERF-WALLCLOCK-BASELINE). Median-of-N MB/s of Terminal::process over a deterministic ~32 MiB mixed VT workload. Re-record with `cargo run -p xtask -- gate perf --record`. The gate fails only if measured median < median_mbps * pass_ratio; pass_ratio is generous to tolerate multi-machine/throttle variance.\",\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
+        "{{\n  \"_comment\": \"aterm wall-clock throughput baseline (PERF-WALLCLOCK-BASELINE). Median-of-N MB/s of Terminal::process over a deterministic ~32 MiB mixed VT workload. Re-record with `targo --unverified run -p xtask -- perf --record`. The gate fails only if measured median < median_mbps * pass_ratio; pass_ratio is generous to tolerate multi-machine/throttle variance.\",\n  \"median_mbps\": {:.3},\n  \"min_mbps\": {:.3},\n  \"max_mbps\": {:.3},\n  \"workload_bytes\": {},\n  \"n\": {},\n  \"warmup\": {},\n  \"pass_ratio\": {:.3}\n}}\n",
         r.median_mbps, r.min_mbps, r.max_mbps, r.workload_bytes, r.n, r.warmup, ratio,
     )
 }
@@ -224,8 +226,8 @@ pub(crate) fn pathological_baseline_json(medians: &[(&str, f64)], ratio: f64) ->
     let mut s = String::from(
         "{\n  \"_comment\": \"aterm PATHOLOGICAL-BENCH baseline: per-corpus median MB/s of \
          Terminal::process under hostile input (yes-flood / escape-storm / style-churn / \
-         long-escapes / wide-unicode). Re-record with cargo run -p xtask -- \
-         gate perf --record. Each corpus fails independently iff measured < recorded * pass_ratio.\",\n",
+         long-escapes / wide-unicode). Re-record with targo --unverified run -p xtask -- \
+         perf --record. Each corpus fails independently iff measured < recorded * pass_ratio.\",\n",
     );
     for (name, med) in medians {
         s.push_str(&format!("  \"{name}_median_mbps\": {med:.3},\n"));
@@ -408,7 +410,7 @@ pub(crate) fn scroll_baseline_json(medians: &[(&str, f64)], ratio: f64) -> Strin
         "{\n  \"_comment\": \"aterm ARENA-SCROLL baseline: scrollback-scrub read-path rates \
          (rows materialized/sec for wheel-scrub + page-sweep, jumps/sec for jump-to-top) over a \
          100k+-line tiered-scrollback fill. All BIGGER-IS-BETTER. Re-record with \
-         cargo run -p xtask -- gate perf --record. Each phase fails independently iff \
+         targo --unverified run -p xtask -- perf --record. Each phase fails independently iff \
          measured < recorded * pass_ratio.\",\n",
     );
     for (name, key) in SCROLL_PHASES {
@@ -582,7 +584,7 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
 /// There is deliberately no environment spelling. Recording is a WRITE SIDE
 /// EFFECT ON A GATE: it replaces the performance floors with whatever this run
 /// happened to measure, so a `ATERM_PERF_RECORD=1` left in a shell profile made
-/// every later `gate perf` pass by re-recording the floor it was supposed to
+/// every later `xtask perf` pass by re-recording the floor it was supposed to
 /// enforce — silently, and for as long as the export lived. That is the same
 /// shape as `ATERM_SKIP_CHANNEL_VERSION_GATE`, which this repo deleted for
 /// exactly this reason (aterm-release `gates.rs`, docs/RELEASING.md): a gate's
@@ -592,20 +594,18 @@ fn compare_scroll_against_baseline(path: &Path, medians: &[(&'static str, f64)])
 pub(crate) fn record_requested() -> bool {
     // BUG (fixed), two of them:
     //   1. this scanned the WHOLE process argv with no subcommand scoping, so
-    //      `xtask gate all --record` — or any argv that merely carried the word
-    //      — rewrote every committed baseline from that run's own numbers and
-    //      reported the roster green. Recording is now scoped to the one verb
-    //      the baselines themselves document: `xtask gate perf --record`
-    //      (argv[1]/argv[2], per main.rs's dispatch).
+    //      any argv that merely carried the word rewrote every committed
+    //      baseline from that run's own numbers. Recording is scoped to the one
+    //      verb the baselines document: `xtask perf --record` (argv[1], per
+    //      main.rs's dispatch).
     //   2. every lane's record branch writes and returns `true` WITHOUT
     //      comparing anything, and the verb then printed "GREEN — ... within
     //      bounds". A recording run enforces NO floor, so say so through the
     //      existing honesty channel: the verdict prints it under NOT MEASURED.
     let args: Vec<String> = std::env::args().collect();
-    let on = args.get(1).map(String::as_str) == Some("gate")
-        && args.get(2).map(String::as_str) == Some("perf")
+    let on = args.get(1).map(String::as_str) == Some("perf")
         && args
-            .get(3..)
+            .get(2..)
             .unwrap_or_default()
             .iter()
             .any(|a| a == "--record");
@@ -766,7 +766,7 @@ pub(crate) const SEARCH_LANE: FloorLane = FloorLane {
               retained-index lines-per-MiB on the trigram-diverse (rotating), repetitive-log \
               (replog), and hyperlink-heavy (linkheavy, Wave-4A P7) corpora, plus the \
               incremental index_scrollback_line primitive. All BIGGER-IS-BETTER. Re-record \
-              with cargo run -p xtask -- gate perf --record.",
+              with targo --unverified run -p xtask -- perf --record.",
 };
 
 pub(crate) const RESTORE_LANE: FloorLane = FloorLane {
@@ -776,7 +776,7 @@ pub(crate) const RESTORE_LANE: FloorLane = FloorLane {
     baseline_file: "perf-baseline-restore.json",
     comment: "aterm RESTORE-BENCH baseline (E0): serialize->fresh-engine replay rate over a \
               10k-line SGR-mixed snapshot (the product's cold-restore path). BIGGER-IS-BETTER. \
-              Re-record with cargo run -p xtask -- gate perf --record.",
+              Re-record with targo --unverified run -p xtask -- perf --record.",
 };
 
 pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
@@ -788,7 +788,7 @@ pub(crate) const RESIZE_LANE: FloorLane = FloorLane {
               the 50k cap and offload+pump+reattach cycles/s over a 110k-line tiered fill. \
               BIGGER-IS-BETTER; the 42s-freeze-class ABSOLUTE fences live in the gate code \
               (RESIZE_RING_WORST_CAP_MS / RESIZE_TIERED_SYNC_WORST_CAP_MS), not this file. \
-              Re-record with cargo run -p xtask -- gate perf --record.",
+              Re-record with targo --unverified run -p xtask -- perf --record.",
 };
 
 pub(crate) const WASM_LANE: FloorLane = FloorLane {
@@ -813,7 +813,7 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
     comment: "aterm WASM-BENCH baseline (E0): the SHIPPED wasm modules (CPU aterm-wasm + GPU \
               aterm-gpu-web) driven under node by tools/wasm-bench — ingest, scroll/typing \
               present, uniform-flood / scrolled-stream / styled-scrub present, search \
-              build/query, restore, GPU wasm-side frame build. All BIGGER-IS-BETTER. Re-record with cargo run -p xtask -- gate perf \
+              build/query, restore, GPU wasm-side frame build. All BIGGER-IS-BETTER. Re-record with targo --unverified run -p xtask -- perf \
               --record (needs node + a wasm32-capable stable toolchain).",
 };
 
@@ -839,12 +839,12 @@ pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
 /// Decided 2026-09-25 (docs/DESIGN-host-boundary-2026-08-30.md §9 decision 5,
 /// §8.4): the pre-pet baseline module is 3,792,917 B and the ceiling is +25% of
 /// it. Unlike the ratio floors this needs no committed baseline and no same-box
-/// history: it holds on a fresh checkout. When it trips, `gate perf` fails and
+/// history: it holds on a fresh checkout. When it trips, `xtask perf` fails and
 /// its verdict names the growth; raising the number or shrinking the module is
-/// the owner's call, never an automatic re-record. Nothing runs `gate perf`
+/// the owner's call, never an automatic re-record. Nothing runs `xtask perf`
 /// automatically (the merge-contract ladder does not include it), so a commit
-/// that crosses the ceiling is caught only when someone runs `gate perf` or
-/// `gate all` — the design doc's decision 5 says so too.
+/// that crosses the ceiling is caught only when someone runs `xtask perf` — the
+/// design doc's decision 5 says so too.
 pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 4_741_146.0;
 
 /// Parse a lane's flat JSON into `(key, value)` pairs. `None` if ANY gated key
@@ -1260,12 +1260,9 @@ pub(crate) const WASM_BINDGEN_PIN: &str = "0.2.108";
 // baseline, a seed run with no same-box history. Each lane already says so on its
 // own line; this is how the VERDICT line gets to say it too.
 //
-// `gate perf`'s verdict used to assert that all ten floors held whenever `ok` was
-// true, and eight of the ten lanes return `true` without measuring anything. That
-// is the same untruth `gate web` told until 2026-08-31, in the gate that IS in
-// ALL_ROSTER — so it was the last word `gate all` printed about performance.
-// (The tidier shape is gate.rs's three-valued `LaneVerdict`, which the lint lanes
-// already use; this channel buys the honesty without re-signing ten lanes.)
+// The verdict used to assert that every floor held whenever `ok` was true, while
+// most lanes return `true` without measuring anything when a prerequisite or a
+// baseline is missing. A verdict may not claim more than the lanes did.
 thread_local! {
     static UNMEASURED: std::cell::RefCell<Vec<String>> =
         const { std::cell::RefCell::new(Vec::new()) };
@@ -1436,7 +1433,7 @@ pub(crate) fn wasm_module_fence(json: &str) -> bool {
 // ---------------------------------------------------------------------------
 // SAME-BOX TREND LEDGER (E0, audit §5.6): the multi-machine floors must stay
 // generous (0.45), so a genuine same-box 2x regression passes them. This
-// ledger closes that: every green `gate perf` run appends its medians (keyed
+// ledger closes that: every green `xtask perf` run appends its medians (keyed
 // by hostname) to a committed TSV, and each metric must clear
 // [`TREND_RATIO`] x the BEST of that box's last [`TREND_WINDOW`] entries —
 // tight enough to catch a real 2x, wide enough for same-box run-to-run
@@ -2036,7 +2033,7 @@ pub(crate) fn trend_rows(date: &str, sha: &str, me: &MachineId, samples: &[Trend
 }
 
 const TREND_HEADER: &str = "# aterm same-box perf trend ledger (E0, audit 5.6). Appended by every \
-GREEN `gate perf` run;\n# each metric must clear TREND_RATIO x the best of this box's last \
+GREEN `xtask perf` run;\n# each metric must clear TREND_RATIO x the best of this box's last \
 TREND_WINDOW entries\n# (xtask/src/perf.rs; *_worst_ms metrics are INVERTED — bounded by \
 best-MIN / TREND_RATIO).\n# The BOX column is a name from tools/golden/perf-boxes.tsv, which is \
 also where a\n# pre-W-1 hostname is claimed as the box it was measured on. NEVER edit a box name \
@@ -2166,6 +2163,50 @@ pub(crate) fn gate_trend(samples: &[TrendSample], lanes_ok: bool) -> bool {
         }
     }
     trend_ok
+}
+
+/// The `xtask perf` verb: every measuring lane (each runs even after one fails,
+/// so one report shows every regression), then the same-box trend lane, told
+/// whether the measuring lanes held. The two allocation gates (`aterm-core`'s
+/// `mem_budget` and `perf_scaling` integration tests) are not here: the
+/// workspace test stage runs them on every tier.
+pub(crate) fn run() -> bool {
+    eprintln!("=== xtask perf ===");
+    let lanes: [fn(&mut Vec<TrendSample>) -> bool; 7] = [
+        gate_throughput,
+        gate_pathological,
+        gate_scroll_scrub,
+        gate_search,
+        gate_restore,
+        gate_resize,
+        gate_wasm,
+    ];
+    let mut trend: Vec<TrendSample> = Vec::new();
+    let mut ok = true;
+    for lane in lanes {
+        ok &= lane(&mut trend);
+    }
+    ok &= gate_trend(&trend, ok);
+    let unmeasured = take_unmeasured();
+    if !ok {
+        eprintln!(
+            "xtask perf: FAILED — a lane floor (throughput / pathological / scroll-scrub / search \
+             / restore / resize / wasm), a resize absolute fence, or the same-box trend ledger."
+        );
+    } else if unmeasured.is_empty() {
+        eprintln!(
+            "xtask perf: GREEN — throughput, pathological, scroll-scrub, search, restore, resize \
+             (incl. absolute fences), wasm and the same-box trend all within bounds."
+        );
+    } else {
+        eprintln!(
+            "xtask perf: GREEN — every lane that MEASURED was within bounds. NOT MEASURED this \
+             pass ({}): {}. Those floors were not evaluated.",
+            unmeasured.len(),
+            unmeasured.join(", ")
+        );
+    }
+    ok
 }
 
 #[cfg(test)]
@@ -2942,7 +2983,7 @@ mod tests {
     // over two small committed TSVs — microseconds — so they ride `cargo test`
     // and therefore `tools/verify.sh` at no marginal cost, which is the
     // only way anything about the perf ledger can be in the merge contract at
-    // all (the MEASURING half of `gate perf` cannot: see the module docs on
+    // all (the MEASURING half of `xtask perf` cannot: see the module docs on
     // `gate_trend`, and the notes in docs/PERF-REGRESSION-DEFENCE.md).
     //
     // Between them they would have caught W-1 the day it happened.
@@ -3084,7 +3125,7 @@ mod tests {
         assert!(
             mine > 0,
             "{} names this machine `{}` ({}), but not one of the {} committed ledger rows \
-             resolves to it — the trend guard is DEAD on this box and every `gate perf` \
+             resolves to it — the trend guard is DEAD on this box and every `xtask perf` \
              run will print SKIP as though it were a fresh machine. That is precisely the \
              state a hostname rename left this ledger in.",
             boxes_path().display(),

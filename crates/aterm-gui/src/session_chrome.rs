@@ -87,8 +87,9 @@ pub(crate) struct SessionChromeInput {
     /// command with nowhere to go and the row greys out instead of accepting a
     /// click that only reaches a log line.
     pub can_rename: bool,
-    /// The recent timeline tail, NEWEST-FIRST, already capped to
-    /// [`TIMELINE_TAIL`] by the caller (the composer re-caps defensively).
+    /// The recent timeline tail, NEWEST-FIRST, already cut to the rows it
+    /// shows and capped to [`TIMELINE_TAIL`] by the caller ([`timeline_tail`];
+    /// the composer re-applies both defensively).
     pub timeline: Vec<TimelineNote>,
     /// This session's live SESSION CONNECTIONS (design §2.3/§4), one fact per
     /// peer, gathered by the caller from the in-process edge tables (the
@@ -174,8 +175,9 @@ pub(crate) struct ConnectionFact {
     pub live: bool,
 }
 
-/// One timeline event as the chrome shows it: the kind token plus its age at
-/// compose time. The payload is deliberately NOT shown — hover chrome is a
+/// One timeline event as the chrome shows it: the kind token (printed in a
+/// person's words, [`event_words`]) plus its age at compose time. The payload
+/// is deliberately NOT shown — hover chrome is a
 /// pulse ("what happened lately"), the `timeline` verb is the detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TimelineNote {
@@ -528,10 +530,60 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
     let timeline: Vec<String> = input
         .timeline
         .iter()
+        .filter(|n| timeline_row_shown(n.kind))
         .take(TIMELINE_TAIL)
-        .map(|n| format!("{} · {}", n.kind, relative_age(n.age_ms)))
+        .map(|n| format!("{} · {}", event_words(n.kind), relative_age(n.age_ms)))
         .collect();
     (identity, timeline)
+}
+
+/// Whether a timeline event earns a row in the tab's hover chrome. An agent's
+/// verdict moves, a person's own typing and the bus's own traffic (a fetch, a
+/// topic, a read receipt, a delivery receipt) say nothing without their
+/// payload, which this surface never shows (the `timeline` verb does), and on
+/// an agent's or a fabric session's tab they would fill the tail.
+pub(crate) fn timeline_row_shown(kind: &str) -> bool {
+    !matches!(
+        kind,
+        "agent-change" | "human" | "fetch" | "topic" | "inbox-seen" | "post-landed"
+    )
+}
+
+/// The rows the hover chrome shows, from a NEWEST-FIRST walk of the
+/// session's `(kind, t_ms)` events: the newest [`TIMELINE_TAIL`] that earn a
+/// row ([`timeline_row_shown`]), aged against `now_ms`. The cut runs before
+/// the cap, so the rows left out never crowd out older ones that say
+/// something.
+pub(crate) fn timeline_tail(
+    newest_first: impl Iterator<Item = (&'static str, u64)>,
+    now_ms: u64,
+) -> Vec<TimelineNote> {
+    newest_first
+        .filter(|(kind, _)| timeline_row_shown(kind))
+        .take(TIMELINE_TAIL)
+        .map(|(kind, t_ms)| TimelineNote {
+            kind,
+            age_ms: now_ms.saturating_sub(t_ms),
+        })
+        .collect()
+}
+
+/// A timeline event kind in a person's words (`cwd-change` → `changed
+/// directory`). A kind with no entry here is printed as recorded.
+fn event_words(kind: &str) -> &str {
+    match kind {
+        "spawned" => "started",
+        "cwd-change" => "changed directory",
+        "meta-change" => "details changed",
+        "title-change" => "renamed",
+        "state-change" => "state changed",
+        "modes-restored" => "terminal modes restored",
+        "hold" => "hold changed",
+        "inbox" => "mail arrived",
+        "post" => "mail sent",
+        "in-doubt" => "input unconfirmed",
+        other => other,
+    }
 }
 
 /// Compose the hover TOOLTIP for one terminal tab, or `None` when the session
@@ -1041,15 +1093,52 @@ mod tests {
         let tip = compose_tooltip(&input).unwrap();
         let events = tip
             .lines()
-            .filter(|l| l.starts_with("state-change"))
+            .filter(|l| l.starts_with("state changed"))
             .count();
         assert_eq!(events, 0, "the tooltip is no log: {tip:?}");
         let menu = compose_tab_menu(&input);
         let headers = menu
             .iter()
-            .filter(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("state-change")))
+            .filter(|e| matches!(e, TabMenuEntry::Header(h) if h.starts_with("state changed")))
             .count();
         assert_eq!(headers, TIMELINE_TAIL);
+    }
+
+    /// An agent's verdict moves, a person's own typing and the bus's own
+    /// traffic are no rows: without their payload they say nothing. The cut
+    /// runs BEFORE the cap ([`timeline_tail`]), so a burst of them never
+    /// hides the older rows that say something.
+    #[test]
+    fn timeline_tail_leaves_out_agent_moves_and_typing() {
+        let newest_first = [
+            ("agent-change", 90),
+            ("human", 90),
+            ("fetch", 90),
+            ("topic", 90),
+            ("inbox-seen", 90),
+            ("post-landed", 90),
+            ("agent-change", 90),
+            ("inbox", 90),
+            ("cwd-change", 90),
+        ];
+        let tail = timeline_tail(newest_first.into_iter(), 100);
+        let kinds: Vec<&str> = tail.iter().map(|n| n.kind).collect();
+        assert_eq!(kinds, ["inbox", "cwd-change"]);
+        assert!(tail.iter().all(|n| n.age_ms == 10));
+        let mut input = full_input();
+        input.timeline = ["agent-change", "human", "agent-change", "cwd-change"]
+            .into_iter()
+            .map(|kind| TimelineNote { kind, age_ms: 0 })
+            .collect();
+        let menu = compose_tab_menu(&input);
+        let rows: Vec<&str> = menu
+            .iter()
+            .filter_map(|e| match e {
+                TabMenuEntry::Header(h) if h.ends_with("just now") => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows, ["changed directory \u{b7} just now"]);
     }
 
     /// The age buckets are coarse and monotone: sub-10s reads "just now", then
@@ -1096,9 +1185,9 @@ mod tests {
         // it. Same facts, sorted per surface.
         let mut tip_sorted = tip_lines.clone();
         tip_sorted.extend([
-            "meta-change · just now",
-            "cwd-change · 2m ago",
-            "spawned · 2h ago",
+            "details changed · just now",
+            "changed directory · 2m ago",
+            "started · 2h ago",
         ]);
         tip_sorted.sort_unstable();
         let mut menu_sorted = menu_headers.clone();

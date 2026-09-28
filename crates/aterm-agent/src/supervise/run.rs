@@ -104,7 +104,7 @@ use super::phase::{
 };
 use super::policy::approval::{FooterMode, footer_mode};
 use super::policy::turn_end::{
-    ModelSwitch, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
+    ModelSwitch, Reach, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming,
 };
 use super::prompt::{
     Prompt, PromptKind, PromptV2, parse_prompt, prompt_box_first_row, prompt_box_span,
@@ -460,6 +460,22 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// own rule. The default ignores it.
     fn limited(&self, open: bool) {
         let _ = open;
+    }
+    /// WHAT THIS HOST MEASURES OF THE AGENT'S ROUTE TO ITS API
+    /// ([`Reach`]; the outage of 2026-09-27): `Down` only on a definite
+    /// failure, `Up` only on a completed verified handshake, and `since` the
+    /// START of the measure's run — so the same measure read twice is the
+    /// same value, and only a new run is an edge. The loop asks ONLY at a wall
+    /// that never reached the API, was cut off, or refused a certificate or
+    /// proxy ([`Session::reach_seen`]) — at the point, and at the top of
+    /// each step of its wait there — and never at an ordinary point: ASKING
+    /// IS WAITING, the host measuring only while some loop asks within its
+    /// lease, so an ask anywhere else would keep its probe running for
+    /// nothing. The default measures nothing: [`Reach::Unknown`], the time
+    /// ladder (`drive watch`, and every host that cannot reproduce the
+    /// agent's route).
+    fn reach(&self) -> Reach {
+        Reach::Unknown
     }
 }
 
@@ -1730,6 +1746,14 @@ pub struct Session<'a, C: Ctl> {
     /// typed, "finish sign-in in the browser"): cleared once the worker
     /// works again.
     turn_end_badge: bool,
+    /// What the host measured of the API's reach at the point on the
+    /// screen, when that point is a wall the network answers — an API error
+    /// that never reached the API, was cut off, or refused a certificate or
+    /// proxy ([`Self::turn_end_reading`]) — and `None` at every other point.
+    /// While it is `Some` (and a wait of the policy's stands), the wait asks
+    /// the host again at the top of each step, and a new measure decides the
+    /// point again at once ([`Self::reach_edge`]).
+    reach_seen: Option<Reach>,
     /// The stall `status input=stalled|stopped` reported and this loop holds
     /// on ([`stall`]): nothing is pressed, typed or escalated until it lifts.
     stalled: Option<stall::WorkerStall>,
@@ -1868,6 +1892,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             supervisor_name: None,
             attention_ours: None,
             turn_end_badge: false,
+            reach_seen: None,
             stalled: None,
             stall_host: None,
             stall_suspect: false,
@@ -3428,9 +3453,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             pause.as_secs()
         ));
         if tries == SURVEY_BADGE_AT && review.unattended() {
-            let why = format!(
-                "the session survey did not take its guarded 0 ({tries} tries); still trying"
-            );
+            let why = format!("the session survey did not close ({tries} tries); still trying");
             self.escalate_point(turn, allow, Some(&why), review)?;
         }
         Ok(())
@@ -3803,11 +3826,8 @@ impl<C: Ctl> Session<'_, C> {
                 // Opened on a wall the policy acted on at once, and waiting
                 // on it now (the wall again after the act): escalated now.
                 if !handled && !raised {
-                    let text = format!(
-                        "{ATTENTION_PREFIX} {} reset={}",
-                        one_line(message),
-                        reset.as_deref().unwrap_or("-")
-                    );
+                    // The notice names its own reset; the journal keeps it apart.
+                    let text = format!("{ATTENTION_PREFIX} {}", one_line(message));
                     self.escalate(point.screen.seq, &text, None, "control", review)?;
                     if let Some(ep) = self.limit.as_mut() {
                         ep.raised = true;
@@ -3844,11 +3864,7 @@ impl<C: Ctl> Session<'_, C> {
         if handled {
             review.note(&format!("LIMITED seq={seq} handled: {}", clip(message)));
         } else {
-            let text = format!(
-                "{ATTENTION_PREFIX} {} reset={}",
-                one_line(message),
-                reset_text
-            );
+            let text = format!("{ATTENTION_PREFIX} {}", one_line(message));
             self.escalate(seq, &text, retry.as_ref().map(|r| r.seq), "control", review)?;
         }
         self.limit = Some(Episode {
@@ -3987,6 +4003,17 @@ impl<C: Ctl> Session<'_, C> {
                 self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }
+            // THE API BACK: at a network wall, the host's measure turning
+            // up decides the point again now, within this step — never the
+            // ladder's next rung (the outage of 2026-09-27 ended at 19:15,
+            // and a rung may be minutes off). Any other new measure decides
+            // it again too: a Down lost to Unknown is back on the ladder,
+            // not held to the Down's hold. Asked at the TOP of the step, so
+            // a step that latched on a screen tick skips nothing.
+            if self.reach_edge(opts) {
+                self.turn_end_now(&seen, opts, allow, review)?;
+                return Ok(None);
+            }
             // A look owed at the point still showing (a survey's `0` to try
             // again): the wait ends there, and the loop looks again.
             if self.look_at.is_some_and(|at| Instant::now() >= at) {
@@ -4049,6 +4076,45 @@ impl<C: Ctl> Session<'_, C> {
             self.turn_end_now(&seen, opts, allow, review)?;
             return Ok(None);
         }
+    }
+
+    /// A NEW MEASURE from the host at a network wall: the loop's cue to
+    /// decide the point again at once ([`Self::wait_for_next`]). An `Up`
+    /// continues it within the step; a `Down` lost to `Unknown` (a stale
+    /// measure, a probe past its budget) puts it back on the ladder the
+    /// policy gives an unmeasured wall, where it had been held to the
+    /// Down's hold (the review of 2026-09-27: the policy and its model
+    /// decide on the measure as it stands, and the loop decided again only
+    /// on an `Up`); a `Down` newly measured moves the wait out to the hold
+    /// (the act at the ladder's due would have been decided again there
+    /// anyway, and waited). So the loop decides at every change that can
+    /// move what the policy says — the ticks of its due and the measure's
+    /// every new run — as `SupervisorNetworkWall` assumes. The host is asked
+    /// ONLY while the point is a wall the network answers
+    /// ([`Self::reach_seen`]) AND a wait of the policy's stands
+    /// ([`Self::turn_end_due`]) — so an ordinary point, an escalated one
+    /// (nothing stands: [`Self::escalate_point`] has no dedupe but the
+    /// point, and a decision made again here would post its ask again) and
+    /// one whose act is out ask nothing, and the host's probe parks. A
+    /// measure the loop has seen ([`IdleHost::reach`]: `since` is its run's
+    /// start) is no edge; it is remembered before the point is decided, so
+    /// a decision that reads nothing new asks nothing twice.
+    fn reach_edge(&mut self, opts: &SuperviseOpts) -> bool {
+        let Some(seen) = self.reach_seen else {
+            return false;
+        };
+        if self.turn_end_due.is_none() {
+            return false;
+        }
+        let Some(host) = opts.idle_host.as_ref() else {
+            return false;
+        };
+        let now = host.reach();
+        if now == seen {
+            return false;
+        }
+        self.reach_seen = Some(now);
+        true
     }
 
     /// The words an `await agent` on `seen` waits for — every verdict but
@@ -6303,7 +6369,7 @@ mod tests {
         let lines = read_notes(&dir, &notes);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
-            lines[0].contains("handed to the manager (the guarded press matched no row)"),
+            lines[0].contains("handed to the manager (aterm could not find the box's row)"),
             "{lines:?}"
         );
     }
@@ -8005,7 +8071,7 @@ mod tests {
             m.requests
                 .iter()
                 .any(|r| r.starts_with("meta set attention owner=supervisor")
-                    && r.contains("did not take its guarded 0")),
+                    && r.contains("the session survey did not close")),
             "badged from the second failure: {:#?}",
             m.requests
         );
@@ -11171,7 +11237,7 @@ mod tests {
             ]
         );
         assert_eq!(code, 1);
-        let text = format!("limited: {WEEKLY_TEXT} reset={WEEKLY_RESET}");
+        let text = format!("limited: {WEEKLY_TEXT}");
         assert_eq!(
             m.requests
                 .iter()

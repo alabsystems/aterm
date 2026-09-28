@@ -418,6 +418,19 @@ impl Shape {
                     .min(self.bar(px, py, bottom - dh, bottom))
             }
             BandIcon::Dot => self.p_disc(px, py, 0.0, (t * 0.85).max(1.0)),
+            BandIcon::Remove => {
+                // `ℹ`'s disc, a pixel over the capital height, with a bar cut
+                // across its middle on whole rows (ruling 304): a removal
+                // reads as a mark of the same family as the badges, where the
+                // `·` it replaced read as a bullet. The cut is the stem's
+                // weight and a half, so a bold row cuts a heavier bar.
+                let (r, cyr) = self.ring_frame();
+                let disc = (px - self.cx).hypot(py - cyr) - r;
+                let bh = (t * 1.5).round().max(2.0);
+                let y0 = (cyr - bh * 0.5).round();
+                let hw = (r * 0.6).max(t);
+                disc.max(-rect(px, py, self.cx - hw, y0, self.cx + hw, y0 + bh))
+            }
             BandIcon::More => {
                 let r = (t * 0.6).max(0.8);
                 let y = self.bot.round() - r;
@@ -697,7 +710,7 @@ mod tests {
                 let tall = y1 - y0;
                 match icon {
                     BandIcon::Dot | BandIcon::More => {}
-                    BandIcon::Info | BandIcon::Update => {
+                    BandIcon::Info | BandIcon::Update | BandIcon::Remove => {
                         assert!((cap + 1..=cap + 3).contains(&tall), "{at}: {tall} vs {cap}");
                     }
                     BandIcon::Warn => {
@@ -767,7 +780,7 @@ mod tests {
                     // stem under that leaves them as they are.
                     BandIcon::Pause => assert!(ink(&heavy) >= ink(&regular), "{icon:?}"),
                     // A badge's mark is CUT OUT at the stem: a bold mark cuts more.
-                    BandIcon::Info | BandIcon::Warn => {
+                    BandIcon::Info | BandIcon::Warn | BandIcon::Remove => {
                         assert!(ink(&heavy) < ink(&regular), "{icon:?}: a heavier cut");
                     }
                     _ => assert!(ink(&heavy) > ink(&regular), "{icon:?}: bold is heavier"),

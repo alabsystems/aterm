@@ -31,8 +31,8 @@ use crate::animate::{
 };
 use crate::carry::{CarriedMessage, Carry};
 use crate::glass::{
-    CapsuleSpec, Fnv, Links, Presentation, RowKind, RowLayout, RowSpec, finish_title, layout_row,
-    outranks, overflow_spec, overflow_words, rank,
+    CapsuleRole, CapsuleSpec, Fnv, Links, Presentation, RowKind, RowLayout, RowSpec, finish_title,
+    layout_row, layout_row_with, outranks, overflow_spec, overflow_words, rank,
 };
 use crate::log::{FinalWords, LogLine, LogRecord, MessageLog, Retired};
 use crate::model::{
@@ -1671,7 +1671,8 @@ impl MessageCenter {
         links: Links,
     ) -> Presentation {
         let plus = self.plus_hidden();
-        let mut rows = Vec::with_capacity(usize::from(self.committed_rows));
+        let mut inputs = Vec::with_capacity(usize::from(self.committed_rows));
+        let mut echo_words = Vec::with_capacity(inputs.capacity());
         for v in self.visual() {
             let (kind, msg, indicator, load, load_slot, finished) =
                 match v {
@@ -1720,17 +1721,24 @@ impl MessageCenter {
                         )
                     }
                 };
-            let mut row = message_layout(
+            inputs.push(RowIn {
                 kind,
                 msg,
-                indicator,
-                (load, load_slot),
-                plus,
-                links,
-                cols,
-                width,
-                home,
-            );
+                ind: indicator,
+                load: (load, load_slot),
+            });
+            echo_words.push(finished);
+        }
+        let lay = LayIn {
+            plus,
+            links,
+            cols,
+            width,
+            home,
+        };
+        let laid = lay_band(&inputs, &lay);
+        let mut rows = Vec::with_capacity(laid.len());
+        for (mut row, finished) in laid.into_iter().zip(echo_words) {
             match finished {
                 Some(Some(words)) => {
                     finish_title(&mut row, &words, cols, width);
@@ -2467,23 +2475,102 @@ struct Indicator {
     moving: bool,
 }
 
-/// One message's row: the excerpt only when the row paints it, its
-/// authored capsules and its link, and the indicator it moves with.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the presentation's per-row inputs, each read once here"
-)]
-fn message_layout(
+/// One visual row's inputs to the width law ([`MessageCenter::presentation`]).
+struct RowIn<'m> {
     kind: RowKind,
-    msg: &Message,
+    msg: &'m Message,
     ind: Indicator,
-    (load, load_slot): (Option<Load>, Loads),
+    /// The load said, and the loads the slot is reserved for.
+    load: (Option<Load>, Loads),
+}
+
+/// What every row of the band is laid out under.
+struct LayIn<'a> {
     plus: usize,
     links: Links,
     cols: usize,
-    width: &dyn Fn(&str) -> usize,
-    home: Option<&str>,
-) -> RowLayout {
+    width: &'a dyn Fn(&str) -> usize,
+    home: Option<&'a str>,
+}
+
+/// What the band says ONE way at this width (design ruling 305): the labels
+/// some row had to paint short, and whether some row's time words went
+/// short.
+#[derive(Default)]
+struct BandForms {
+    labels: Vec<&'static str>,
+    short_time: bool,
+}
+
+impl BandForms {
+    /// Read off a first layout of every row.
+    fn of(laid: &[RowLayout]) -> Self {
+        Self {
+            labels: laid
+                .iter()
+                .flat_map(|row| row.capsules.iter())
+                .filter(|c| c.role != CapsuleRole::Details && !c.full_label.is_empty())
+                .filter(|c| c.text != c.full_label)
+                .map(|c| c.full_label)
+                .collect(),
+            short_time: laid.iter().any(|row| {
+                (row.eta.is_some() && row.eta_short) || (row.elapsed.is_some() && row.elapsed_short)
+            }),
+        }
+    }
+
+    /// Whether `row` says something another way than these forms do.
+    fn differs(&self, row: &RowLayout) -> bool {
+        let long_label = row.capsules.iter().any(|c| {
+            c.role != CapsuleRole::Details
+                && c.text == c.full_label
+                && self.labels.contains(&c.full_label)
+        });
+        let long_time = self.short_time
+            && ((row.eta.is_some() && !row.eta_short)
+                || (row.elapsed.is_some() && !row.elapsed_short));
+        long_label || long_time
+    }
+}
+
+/// ONE WORDING PER WIDTH ACROSS THE BAND (design ruling 305): every row laid
+/// out on its own, then each row that says a label or its time words
+/// another way than a row that had to shorten them laid out again with the
+/// short forms — rows stacked at one width read `Not now` and `10s left`
+/// alike, never `Not today` above `Not now`, or `10 s left` above `15s
+/// left`, by title length alone.
+fn lay_band(inputs: &[RowIn<'_>], lay: &LayIn<'_>) -> Vec<RowLayout> {
+    let own = BandForms::default();
+    let mut laid: Vec<RowLayout> = inputs
+        .iter()
+        .map(|i| message_layout(i, lay, &own))
+        .collect();
+    let forms = BandForms::of(&laid);
+    for (row, input) in laid.iter_mut().zip(inputs) {
+        if forms.differs(row) {
+            *row = message_layout(input, lay, &forms);
+        }
+    }
+    laid
+}
+
+/// One message's row: the excerpt only when the row paints it, its
+/// authored capsules and its link, and the indicator it moves with — in the
+/// band's `forms` at this width.
+fn message_layout(row: &RowIn<'_>, lay: &LayIn<'_>, forms: &BandForms) -> RowLayout {
+    let RowIn {
+        kind,
+        msg,
+        ind,
+        load: (load, load_slot),
+    } = *row;
+    let LayIn {
+        plus,
+        links,
+        cols,
+        width,
+        home,
+    } = *lay;
     let detail0 = msg
         .detail
         .first()
@@ -2495,7 +2582,12 @@ fn message_layout(
         .iter()
         .enumerate()
         .map(|(i, it)| {
-            let spec = CapsuleSpec::authored(it, u8::try_from(i).unwrap_or(u8::MAX));
+            let mut spec = CapsuleSpec::authored(it, u8::try_from(i).unwrap_or(u8::MAX));
+            // A label another row at this width paints short is painted
+            // short here too (ruling 305).
+            if forms.labels.contains(&spec.full_label) && !spec.short.is_empty() {
+                spec.long.clone_from(&spec.short);
+            }
             // An echo is not pressable (a flash of well under a second can
             // not be clicked): every capsule keeps its cells and draws
             // nothing (rulings 235 and 244).
@@ -2525,7 +2617,7 @@ fn message_layout(
         load_slot: if ind.moving { load_slot } else { Loads::NONE },
         capsules,
     };
-    let mut layout = layout_row(&spec, cols, width);
+    let mut layout = layout_row_with(&spec, cols, width, forms.short_time);
     if matches!(kind, RowKind::Echo(_)) {
         // An echo is the indicator ending, not a reading: the stats were
         // frozen at the last read before the resolve ("198 MB / 200 MB"

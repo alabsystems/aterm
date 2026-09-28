@@ -1467,6 +1467,17 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let next_check = aterm_update::next_check_at().map_or_else(String::new, |stamp| {
         format!(" next_check={}", pct_encode(&stamp))
     });
+    // THE CHECK LOOP ITSELF, beside its ledger (plan P2-1). `stale_check=` above
+    // reads the last check that reached the channel, four hours out; these read
+    // this process's live heartbeat: `checker_stalled=<secs>:<phase>` the moment
+    // the loop has gone quiet past its phase's budget, `checker_respawns=` once
+    // the watchdog has replaced it, `checker_deferred=` while another aterm has
+    // held the checker lock through consecutive cycles. Each is absent in the
+    // healthy state, so a healthy line stays byte-identical.
+    let checker = crate::update_checker_watch::checker_status_tokens(
+        aterm_update::checker_watch::checker_snapshot(),
+        aterm_update::checker_watch::now_secs(),
+    );
     // commit= is the RUNNING binary's source commit (compile-time stamp);
     // staged_commit= is the staged build's (from its release manifest). Together a
     // controller can bind both sides of an update to exact repo commits. The two use
@@ -1480,7 +1491,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let mut out = format!(
         "OK enabled={} current_build={} commit={} staged_build={} staged_version={} \
          staged_commit={} staged_is_same_commit={} relaunch_ready={} apply_posture={} failing={} \
-         failing_applies={} persistent={}{stale_check}{checked_at}{next_check} \
+         failing_applies={} persistent={}{stale_check}{checked_at}{next_check}{checker} \
          outcome={:?}\n",
         st.enabled,
         st.current_build,
@@ -11060,6 +11071,16 @@ fn typing_momentum_reading(
 #[cfg(test)]
 mod tests {
 
+    /// HOW LONG A TEST WAITS FOR SOMETHING THAT MUST HAPPEN (2026-09-26): a
+    /// reader thread's reply, a worker releasing its lane, a proxy handshake.
+    /// A hang detector, never a latency budget: a passing test waits only as
+    /// long as the event takes. The 2-5 s bounds these waits carried went red
+    /// when the merge contract ran them beside other builds at load 50-100
+    /// (the push-gate audit, 2026-09-24). The quarantine reaper's waits have
+    /// their own bound for the same reason (`REAPER_PATIENCE`), and the grace
+    /// intervals themselves stay as the tests set them.
+    const EVENTUALLY: std::time::Duration = std::time::Duration::from_secs(60);
+
     /// A pid alive on every host and never this process: 1 (init/launchd) on
     /// Unix; on Windows pid 1 is not a process at all and 4 (System) is the
     /// one every boot has — `identity_claim::tests::LIVE_FOREIGN_PID` carries
@@ -15126,7 +15147,7 @@ mod tests {
             let second = read_authenticated_request_line(&mut reader);
             let _ = tx.send((first, prefetched, second));
         });
-        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let result = rx.recv_timeout(EVENTUALLY);
         // Release even a broken implementation's blocked wait before failing.
         let _ = client.shutdown(std::net::Shutdown::Both);
         let Ok((first, prefetched, second)) = result else {
@@ -15160,7 +15181,7 @@ mod tests {
         client
             .shutdown(std::net::Shutdown::Write)
             .expect("peer write-half close");
-        let result = rx.recv_timeout(std::time::Duration::from_secs(2));
+        let result = rx.recv_timeout(EVENTUALLY);
         let _ = client.shutdown(std::net::Shutdown::Both);
         let Ok((tail, eof)) = result else {
             panic!("peer EOF did not release the authenticated reader");
@@ -15285,7 +15306,7 @@ mod tests {
             client.read_exact(&mut reply).expect("read reply");
             assert_eq!(reply, [b'!']);
             served_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
+                .recv_timeout(EVENTUALLY)
                 .expect("worker released the lane");
         }
 
@@ -16617,7 +16638,7 @@ mod tests {
             after
         };
 
-        let handshake = handshake_rx.recv_timeout(Duration::from_secs(5));
+        let handshake = handshake_rx.recv_timeout(EVENTUALLY);
         let Ok(handshake) = handshake else {
             // Hang up so the parked server can finish on its own, then report
             // the wedge in the model's terms (without joining a thread that may

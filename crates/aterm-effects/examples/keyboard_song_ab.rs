@@ -702,7 +702,7 @@ const SCRIPT_PROSE: &str =
 
 /// THE FIXED SCRIPTS. `shift-space`, `prose-lower` and `password` are not text constants
 /// and are built in [`script_scenario`].
-const SCRIPTS: [Script; 4] = [
+const SCRIPTS: [Script; 5] = [
     Script {
         name: "prose",
         text: SCRIPT_PROSE,
@@ -719,6 +719,13 @@ const SCRIPTS: [Script; 4] = [
     Script {
         name: "digits",
         text: "0123456789 2026 42 3.14159 10,000 v0.88.0",
+    },
+    // Round two of the punctuation phrasing (2026-09-27): a quotation that
+    // lifts and comes home, an aside said sotto voce inside it, a question
+    // whose Return lands on the G — then a full stop's Return on the C.
+    Script {
+        name: "phrasing",
+        text: "She said \"wait (not yet) please?\"\nok.\n",
     },
 ];
 

@@ -1199,6 +1199,262 @@ pub fn model_due(
     }
 }
 
+/// What one visit's read of the live model did to a conversation's
+/// [`ModelRecord`] ([`ModelRecord::settle`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Settled {
+    /// The model this harness asked for runs: recorded APPLIED (the caller
+    /// says `model-verified`).
+    pub verified: Option<String>,
+    /// The model this harness asked for is still not what runs
+    /// [`MODEL_SETTLE_S`] after it was asked for: recorded FAILED and the ask
+    /// cleared (the caller says `model-failed`).
+    pub failed: Option<String>,
+    /// The record changed (either of the above, or a `/model` remembered):
+    /// the caller saves it.
+    pub changed: bool,
+}
+
+impl ModelRecord {
+    /// THE SETTLE STEP, taken on every visit that reads what the
+    /// conversation runs (`live`, `None` when it could not be read) at `now`
+    /// (Unix seconds), before [`model_due`] is asked:
+    ///
+    /// * a model this harness asked for ([`ModelRecord::set`]) that now runs
+    ///   is recorded APPLIED, never asked for again;
+    /// * one still not what runs (an unreadable live model counts as not
+    ///   running) [`MODEL_SETTLE_S`] after it was asked for, and never
+    ///   recorded applied, is recorded FAILED for this conversation, never
+    ///   asked for again, and the ask is cleared;
+    /// * an ask once APPLIED stands: it RAN, so a conversation that runs
+    ///   something else later (a person's `/model`) is not a relaunch that
+    ///   failed, and the ask stays this harness's own — its `--model` on the
+    ///   process is never then read as a person's choice (skeptic review of
+    ///   `HarnessModelSwitch`, 2026-09-27: it was recorded FAILED, and
+    ///   ledgered `model-failed`, after its own `model-verified`);
+    /// * a `/model` newer than the last answer is a PERSON's (the harness
+    ///   never types one): remembered ([`ModelRecord::human`]), so the
+    ///   answers that follow do not end its protection.
+    pub fn settle(&mut self, live: Option<&LiveModel>, now: u64) -> Settled {
+        let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
+        let mut out = Settled::default();
+        let applied = |rec: &ModelRecord| rec.applied.iter().any(|a| base(a) == base(&rec.set));
+        if !self.set.is_empty()
+            && live.is_some_and(|l| base(&l.id) == base(&self.set))
+            && !applied(self)
+        {
+            self.applied.push(self.set.clone());
+            out.verified = Some(self.set.clone());
+            out.changed = true;
+        }
+        if !self.set.is_empty()
+            && live.is_none_or(|l| base(&l.id) != base(&self.set))
+            && now.saturating_sub(self.set_at) >= MODEL_SETTLE_S
+            && !applied(self)
+        {
+            let failed = std::mem::take(&mut self.set);
+            self.failed.push(failed.clone());
+            out.failed = Some(failed);
+            out.changed = true;
+        }
+        if let Some(l) = live.filter(|l| l.by_command)
+            && self.human != l.id
+        {
+            self.human.clone_from(&l.id);
+            out.changed = true;
+        }
+        out
+    }
+
+    /// THE DUE CLOCK, stepped by `verdict` at `now`: since when THIS move has
+    /// been due ([`ModelRecord::due_to`], [`ModelRecord::due_since`]). It
+    /// restarts when the target changes (a newer model is a new wait, not the
+    /// old one's remainder) and is cleared when the conversation DEFINITELY
+    /// needs no move (it runs the target, or the move is not the harness's to
+    /// make), so a move that stopped being due and came back never inherits a
+    /// stale clock.
+    ///
+    /// `model-unknown` is NOT such a verdict. It means this visit could not
+    /// read what the conversation runs — a transcript tail with no answer in
+    /// it, which a long tool result can cause for many visits running — and
+    /// clearing on it would restart the bound on every such flicker, so an
+    /// active session's move might never land: the never-lands shape this
+    /// clock exists to end (adversarial review, 2026-09-25). An unknown visit
+    /// leaves the clock exactly as it was.
+    ///
+    /// A start AHEAD of `now` (the wall clock stepped back after it was
+    /// stamped: a manual date change, a boot before NTP) would read as 0 s due
+    /// for the whole skew and postpone the bound by exactly that much: it is
+    /// restarted instead, so the bound lands on time.
+    ///
+    /// Returns the seconds the current move has been due (0 when none is) —
+    /// what [`model_moves_now`] bounds — and whether the record changed.
+    pub fn due_clock(&mut self, verdict: &ModelVerdict, now: u64) -> (u64, bool) {
+        let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
+        match verdict {
+            ModelVerdict::Due { to, .. } => {
+                let restart =
+                    base(&self.due_to) != base(to) || self.due_since == 0 || self.due_since > now;
+                if restart {
+                    self.due_to.clone_from(to);
+                    self.due_since = now;
+                }
+                (now.saturating_sub(self.due_since), restart)
+            }
+            ModelVerdict::Keep("model-unknown") => (0, false),
+            ModelVerdict::Keep(_) => {
+                let clear = !self.due_to.is_empty() || self.due_since != 0;
+                if clear {
+                    self.due_to.clear();
+                    self.due_since = 0;
+                }
+                (0, clear)
+            }
+        }
+    }
+
+    /// Remember `model` as the one a relaunch of this conversation asks for,
+    /// at `now` — written BEFORE the relaunch's one act, so it is never asked
+    /// for twice (a model then not taken is recorded as failed,
+    /// [`ModelRecord::settle`]).
+    pub fn asked(&mut self, model: &str, now: u64) {
+        model.clone_into(&mut self.set);
+        self.set_at = now;
+    }
+}
+
+/// What ONE VISIT reads a conversation's model against
+/// ([`model_read_step`]): the list, the catalog and the offer of the build the
+/// session runs (the managed build's, or the native build's for a session
+/// that runs it), the launch's own `--model`, the person's saved default,
+/// when the process started (`procStart`, Unix seconds), and the wall clock.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelView<'a> {
+    /// The priority list.
+    pub list: &'a Priority,
+    /// The build's baked catalog (a `/model` display is read through it).
+    pub baked: Option<&'a Baked>,
+    /// Every model a restart on that build may ask for ([`offered`]).
+    pub offered: &'a [String],
+    /// The launch's own `--model`.
+    pub launch: Option<&'a str>,
+    /// The person's saved default (`~/.claude/settings.json` `model`).
+    pub default_model: Option<&'a str>,
+    /// When the process started ([`live_model_at`]).
+    pub started_s: Option<u64>,
+    /// The wall clock, Unix seconds.
+    pub now: u64,
+}
+
+/// What one visit's read decided ([`model_read_step`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelReadStep {
+    /// THE MODEL RULE's verdict ([`model_due`]).
+    pub verdict: ModelVerdict,
+    /// The conversation's prompt cache is cold (no answer for
+    /// [`CACHE_COLD_S`]).
+    pub cold: bool,
+    /// Seconds the CURRENT due move has been due (0 when none is) — the clock
+    /// [`MODEL_WARM_MAX_S`] bounds ([`ModelRecord::due_clock`]).
+    pub due_for_s: u64,
+    /// What THE SETTLE STEP recorded ([`ModelRecord::settle`]): the caller
+    /// ledgers `model-verified` / `model-failed`.
+    pub settled: Settled,
+    /// The record changed (the settle step, or the clock): the caller saves
+    /// it.
+    pub changed: bool,
+}
+
+/// ONE VISIT'S READ of a conversation's model, over its record (changed in
+/// place) and against `view`, in the one order the harness takes it:
+///
+/// * no model can be run and none is pending (nothing on `view.offered`, no
+///   ask in the record): `no-model-available`, the due clock cleared as that
+///   verdict clears it (a move that comes back later must not inherit this
+///   one's start and skip the warm-cache grace) — the transcript is not read;
+/// * else the transcript's tail (`tail`, read only now) says what the
+///   conversation runs ([`live_model_at`]); THE SETTLE STEP
+///   ([`ModelRecord::settle`]) records what the harness asked for; THE MODEL
+///   RULE ([`model_due`]) judges the SETTLED record; the cache is cold when no
+///   answer came for [`CACHE_COLD_S`] ([`last_answer_at`]); and THE DUE CLOCK
+///   ([`ModelRecord::due_clock`]) is stepped by the verdict.
+///
+/// The whole of `upgrade_drive::model_read_for` but its I/O (loading and
+/// saving the record, reading the transcript, the ledger rows), so the
+/// derived model `HarnessModelSwitch` binds the read itself at Tier 1.
+pub fn model_read_step<S: AsRef<str>>(
+    record: &mut ModelRecord,
+    view: &ModelView<'_>,
+    tail: impl FnOnce() -> S,
+) -> ModelReadStep {
+    if view.offered.is_empty() && record.set.is_empty() {
+        let verdict = ModelVerdict::Keep("no-model-available");
+        let (_, changed) = record.due_clock(&verdict, view.now);
+        return ModelReadStep {
+            verdict,
+            cold: false,
+            due_for_s: 0,
+            settled: Settled::default(),
+            changed,
+        };
+    }
+    let tail = tail();
+    let tail = tail.as_ref();
+    let live = live_model_at(tail, view.baked, view.launch, view.started_s);
+    let settled = record.settle(live.as_ref(), view.now);
+    let verdict = model_due(
+        view.list,
+        live.as_ref(),
+        view.offered,
+        view.launch,
+        view.default_model,
+        record,
+    );
+    let cold = last_answer_at(tail).is_none_or(|at| view.now.saturating_sub(at) >= CACHE_COLD_S);
+    let (due_for_s, clocked) = record.due_clock(&verdict, view.now);
+    let changed = settled.changed || clocked;
+    ModelReadStep {
+        verdict,
+        cold,
+        due_for_s,
+        settled,
+        changed,
+    }
+}
+
+/// THE MODEL A RESTART OF THIS CONVERSATION ASKS FOR (`--model` on its
+/// relaunch), or `None` for none:
+///
+/// * an ANNOUNCED model (`announced`: the upgrade already told the agent it
+///   is moving to it) rides the upgrade's own state whatever this visit
+///   decides: the READY answer warms the cache again, and a decision re-taken
+///   then would drop the model half-way;
+/// * else a DUE move ([`model_due`]) when THE MODEL LADDER
+///   ([`model_moves_now`]) takes it now — `build_restart` when the restart
+///   happens regardless (a newer build is due, or it is a restart made for
+///   another reason);
+/// * else none.
+#[must_use]
+pub fn model_to(
+    announced: Option<&str>,
+    verdict: &ModelVerdict,
+    cold: bool,
+    build_restart: bool,
+    due_for_s: u64,
+) -> Option<String> {
+    if let Some(model) = announced {
+        return Some(model.to_string());
+    }
+    match verdict {
+        ModelVerdict::Due { to, .. }
+            if model_moves_now(cold, build_restart, due_for_s).is_some() =>
+        {
+            Some(to.clone())
+        }
+        _ => None,
+    }
+}
+
 /// WHY a relaunch asks for `to` over `before` (the model the conversation ran),
 /// read back from the two ids — which the rule makes exact: [`model_due`]
 /// crosses families only by the list's step, so the same family is the first
@@ -2157,6 +2413,52 @@ mod tests {
             got.applied.is_empty() && got.set.is_empty() && got.due_to.is_empty(),
             "{got:?}"
         );
+    }
+
+    /// AN ASK THAT RAN STANDS (skeptic review of `HarnessModelSwitch`,
+    /// 2026-09-27), on the pure settle step. The harness asks for
+    /// `claude-opus-5-5`, the relaunch runs it, and the settle step records it
+    /// APPLIED. A person then types `/model claude-fable-5-1`, and a visit
+    /// comes after `MODEL_SETTLE_S`. Before the fix the failed arm did not look
+    /// at `applied`: the ask that ran was recorded FAILED too (a false
+    /// `model-failed` after its own `model-verified`) and cleared. NEGATIVE
+    /// CONTROL: an ask that never ran is still recorded failed.
+    #[test]
+    fn the_settle_step_never_fails_an_ask_that_ran() {
+        let asked_at = 1_000_000;
+        let mut rec = ModelRecord::default();
+        rec.asked("claude-opus-5-5", asked_at);
+        let ran = LiveModel {
+            id: "claude-opus-5-5".into(),
+            by_command: false,
+        };
+        let verified = rec.settle(Some(&ran), asked_at + 20);
+        assert_eq!(verified.verified.as_deref(), Some("claude-opus-5-5"));
+        let moved = LiveModel {
+            id: "claude-fable-5-1".into(),
+            by_command: true,
+        };
+        let later = rec.settle(Some(&moved), asked_at + MODEL_SETTLE_S + 1);
+        assert_eq!(later.failed, None, "an ask that ran was recorded failed");
+        assert!(rec.failed.is_empty(), "{rec:?}");
+        assert_eq!(
+            rec.set, "claude-opus-5-5",
+            "the ask stays the harness's own"
+        );
+        assert_eq!(
+            rec.human, "claude-fable-5-1",
+            "the person's choice remembered"
+        );
+
+        let mut never = ModelRecord::default();
+        never.asked("claude-opus-5-5", asked_at);
+        let other = LiveModel {
+            id: "claude-opus-5".into(),
+            by_command: false,
+        };
+        let failed = never.settle(Some(&other), asked_at + MODEL_SETTLE_S);
+        assert_eq!(failed.failed.as_deref(), Some("claude-opus-5-5"));
+        assert!(never.set.is_empty() && never.failed == ["claude-opus-5-5"]);
     }
 
     /// A record an OLDER harness wrote has no due clock. It must parse, with

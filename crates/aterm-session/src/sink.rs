@@ -207,12 +207,15 @@ pub fn bulk_stop_cut(bytes: &[u8], off: usize) -> (usize, usize) {
     {
         keep_to = keep_to.saturating_add(1);
     }
-    let bracketed = len >= PASTE_OPEN.len() + PASTE_CLOSE.len()
+    // Checked forms of what the guard already implies (`len` covers both
+    // markers, so neither saturates): the same answer, with no arithmetic a
+    // reader — or the verifier — has to connect back to the guard.
+    let bracketed = len >= PASTE_OPEN.len().saturating_add(PASTE_CLOSE.len())
         && bytes.starts_with(PASTE_OPEN)
         && bytes.ends_with(PASTE_CLOSE);
     let tail_from = if bracketed {
         keep_to = keep_to.max(PASTE_OPEN.len());
-        len - PASTE_CLOSE.len()
+        len.saturating_sub(PASTE_CLOSE.len())
     } else {
         len
     };
@@ -1518,7 +1521,13 @@ impl SinkWriter {
                 epoch.checked_add(1)
             })
             .ok()
-            .map(|previous| (InputEpoch(previous), InputEpoch(previous + 1)))
+            // The update above succeeded only because `previous + 1` fits;
+            // re-deriving it checked states that instead of assuming it.
+            .and_then(|previous| {
+                previous
+                    .checked_add(1)
+                    .map(|reserved| (InputEpoch(previous), InputEpoch(reserved)))
+            })
     }
 
     /// Try to hand one bounded frame to the kernel **now**, without parking and

@@ -39,8 +39,8 @@
 //!
 //! ONE implementation, TWO consumers (so the verb and the gate cannot diverge):
 //!
-//!   * `cargo xtask gate lazyinit` (crates/xtask/src/gate.rs) — the standalone
-//!     verb, part of `gate all`.
+//!   * the `aterm-census` bin (`targo --unverified run -p aterm-census --
+//!     --lazy-init`, src/main.rs) — the standalone runner.
 //!   * `tools/freeze-safety-gate/build.rs` — the same `cargo build` that runs
 //!     the temporal proof gate and the other four censuses; any violation
 //!     fails the compile.

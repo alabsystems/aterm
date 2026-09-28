@@ -7,6 +7,14 @@
 use crate::sixel::{SIXEL_MAX_DIMENSION, SixelDecoder};
 use proptest::prelude::*;
 
+/// This module's checked-in seed corpus. See `seed_corpus` in
+/// `src/tests/proptest/mod.rs` for why the path is spelled out rather than left
+/// to proptest's default derivation.
+const SEEDS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/proptest-regressions/tests/proptest/sixel.txt"
+);
+
 fn sixel_protocol_byte() -> impl Strategy<Value = u8> {
     prop_oneof![
         Just(b'"'),        // raster attributes
@@ -27,7 +35,7 @@ fn sixel_stream_strategy() -> impl Strategy<Value = Vec<u8>> {
 // Sixel decoder tests: 128 cases is sufficient for crash-safety and
 // dimension-bound checking on structured protocol byte streams.
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(128))]
+    #![proptest_config(ProptestConfig { cases: 128, ..super::seed_corpus(SEEDS) })]
 
     /// Arbitrary byte sequences through the decoder must never panic.
     #[test]

@@ -543,6 +543,15 @@ enum BatchSample {
     Stale,
 }
 
+/// A failed batch is not a reason to ask the same occupied GUI event loop once
+/// per session. Only an older endpoint that explicitly lacks the verb needs
+/// the single-status path for the whole roster.
+enum StatusBatch {
+    Rows(BTreeMap<u64, BatchSample>),
+    Legacy,
+    Unavailable,
+}
+
 /// Parse the status fields the bridge consumes from one batched row.
 /// A malformed batch row is retried through the old per-session verb rather
 /// than silently becoming `hold=0 detail=- agent=-`.
@@ -1005,6 +1014,10 @@ pub struct Bridge {
     fault: Fault,
     /// The verb connection to aterm (fd 3, or the observer socket).
     ctl: Ctl,
+    /// The push connection to aterm (fd 4), adopted in [`Bridge::new`] beside
+    /// `ctl` and taken by [`Bridge::run`] for the event reader. `None` for a
+    /// hand-started observer, which inherits nothing.
+    push: Option<Ctl>,
     /// The publisher/commit connection. `None` while the broker is unreachable —
     /// and that is the whole of "the broker is down" as far as this process is
     /// concerned: holds stay, posts stay queued, nothing is lifted.
@@ -1265,10 +1278,21 @@ impl Bridge {
             .map(|p| read_cap_file(p))
             .collect::<io::Result<Vec<_>>>()?
             .concat();
-        let (mut ctl, attachment) = match (&cfg.sock, &cfg.token) {
-            (Some(sock), Some(token)) => (Ctl::connect(sock, token)?, Attachment::Observer),
+        // BOTH INHERITED NUMBERS ARE ADOPTED HERE, TOGETHER. The push lane used
+        // to wait for `run`, leaving fd 4 unflagged — the launcher's `dup2`
+        // clears `FD_CLOEXEC` so it survives the exec — until then, and for the
+        // whole life of a bridge the probe below turned observer, which never
+        // adopted it at all. A forked child holds every descriptor until it
+        // execs, and an unflagged one survives the exec, so any spawn in that
+        // window (`hostname`'s `uname -n` publishes the node row) would inherit
+        // the lane and keep aterm's end from reading EOF, which is the
+        // fail-closed halt. [`Ctl::adopt`] moves each onto a close-on-exec copy
+        // (the product fd-hygiene sweep of 2026-09-27).
+        let (mut ctl, push, attachment) = match (&cfg.sock, &cfg.token) {
+            (Some(sock), Some(token)) => (Ctl::connect(sock, token)?, None, Attachment::Observer),
             _ => (
                 Ctl::adopt(aterm_uds::spawnfd::BRIDGE_VERB_FD)?,
+                Some(Ctl::adopt(aterm_uds::spawnfd::BRIDGE_PUSH_FD)?),
                 Attachment::Inherited,
             ),
         };
@@ -1315,6 +1339,7 @@ impl Bridge {
             attachment,
             fault,
             ctl,
+            push,
             conn: None,
             locals: BTreeMap::new(),
             epochs: BTreeMap::new(),
@@ -3771,17 +3796,24 @@ impl Bridge {
             .iter()
             .map(|(local, sid)| (*local, sid.clone()))
             .collect();
-        let mut batch = (!locals.is_empty())
-            .then(|| self.batch_status_samples())
-            .flatten();
+        if locals.is_empty() {
+            return;
+        }
+        let mut batch = self.batch_status_samples();
         // Apply the whole snapshot before a session's broadcast replay can
         // consume several broker pages. That keeps a later tab's hold verdict
         // close to the instant the main thread observed it.
         for (local, sid) in &locals {
-            let sample = match batch.as_mut().and_then(|rows| rows.remove(local)) {
-                Some(BatchSample::Ready(sample)) => Some(sample),
-                Some(BatchSample::Stale) => None,
-                None => self.status_sample(sid),
+            let sample = match &mut batch {
+                StatusBatch::Rows(rows) => match rows.remove(local) {
+                    Some(BatchSample::Ready(sample)) => Some(sample),
+                    Some(BatchSample::Stale) => None,
+                    // Only this row was absent or malformed; the other batch
+                    // answers remain useful, and this one can be retried alone.
+                    None => self.status_sample(sid),
+                },
+                StatusBatch::Legacy => self.status_sample(sid),
+                StatusBatch::Unavailable => None,
             };
             self.observe_local_control(sid, sample);
         }
@@ -4398,23 +4430,35 @@ impl Bridge {
     }
 
     /// Read all hosted sessions' status fields in one Lines-framed reply.
-    /// `None` means the batch was unavailable, so each session takes the old
-    /// single-status path. A malformed row is retried alone; a row that names a
-    /// different sid or nonce is never projected onto this roster's session.
-    fn batch_status_samples(&mut self) -> Option<BTreeMap<u64, BatchSample>> {
+    /// A transient refusal or timeout leaves every previous sample standing
+    /// until the next roster tick. Retrying every session through the same
+    /// occupied event loop multiplied one timeout by the roster size. Only an
+    /// explicit unknown verb identifies an older endpoint needing singles.
+    /// A malformed row is retried alone; a row naming another incarnation is
+    /// never projected onto this roster's session.
+    fn batch_status_samples(&mut self) -> StatusBatch {
         // Keep the fault's old meaning: while it is armed, EVERY status read
         // fails and no batch response may accidentally bypass the test seam.
         if self.fault == Fault::FailStatusWhileMarked
             && self.state.root().join("fail-status").exists()
         {
-            return None;
+            return StatusBatch::Unavailable;
         }
-        let reply = self.ctl_request("sessions status").ok()?;
+        let Ok(reply) = self.ctl_request("sessions status") else {
+            return StatusBatch::Unavailable;
+        };
         if !reply.ok() {
-            return None;
+            return if reply.header().starts_with("ERR unknown verb") {
+                StatusBatch::Legacy
+            } else {
+                StatusBatch::Unavailable
+            };
         }
-        Some(parse_batch_rows(
-            reply.rows().iter().map(String::as_str),
+        let Reply::Lines { rows, .. } = reply else {
+            return StatusBatch::Unavailable;
+        };
+        StatusBatch::Rows(parse_batch_rows(
+            rows.iter().map(String::as_str),
             &self.locals,
             &self.epochs,
         ))
@@ -5548,16 +5592,20 @@ impl Bridge {
     ///
     /// # Errors
     ///
-    /// Only a failure to set the push lane up: everything after that is handled
-    /// in the loop, because a bridge that exits on a broker hiccup is a bridge
-    /// that lifts the fleet halt by dying.
+    /// None any more: setting the push lane up was the one failure, and it is
+    /// adopted in [`Bridge::new`] now. Everything is handled in the loop,
+    /// because a bridge that exits on a broker hiccup is a bridge that lifts the
+    /// fleet halt by dying.
     pub fn run(mut self) -> io::Result<()> {
         // The push lane: `subscribe @* events,sessions` on the SECOND inherited
         // descriptor. It is a separate connection because a `subscribe` holds its
-        // stream forever, and the verb connection must stay answerable.
+        // stream forever, and the verb connection must stay answerable. Adopted
+        // in [`Bridge::new`]; a bridge the probe made an observer keeps holding
+        // it, unread, exactly as it held the bare number before.
         if self.attachment == Attachment::Inherited {
-            let push = Ctl::adopt(aterm_uds::spawnfd::BRIDGE_PUSH_FD)?;
-            spawn_event_reader(push, self.mailbox.clone());
+            if let Some(push) = self.push.take() {
+                spawn_event_reader(push, self.mailbox.clone());
+            }
         }
         let _ = self.refresh_sessions();
         // Restored deadlines are already in the table: no `note_deadline`
@@ -6700,6 +6748,104 @@ mod tests {
         assert!(parse_batch_rows(old.into_iter(), &locals, &epochs).is_empty());
     }
 
+    /// Drive the bridge's real control lane for both failed-batch meanings.
+    /// A transient GUI timeout must not fan out into more waits on that same
+    /// event loop; an old endpoint's explicit unknown verb still needs singles.
+    #[cfg(unix)]
+    #[test]
+    fn status_batch_failure_fans_out_only_for_legacy_endpoint() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        for (batch_reply, legacy) in [
+            (
+                "ERR main thread did not answer within the placement deadline\n",
+                false,
+            ),
+            ("ERR unknown verb (try: help)\n", true),
+        ] {
+            let scratch = std::env::temp_dir().join(format!(
+                "al-status-batch-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&scratch).unwrap();
+            let socket = scratch.join("ctl.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let responder = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "AUTH test\n");
+                line.clear();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "outbox\n");
+                stream.write_all(b"OK 0\n").unwrap();
+
+                let mut requests = Vec::new();
+                loop {
+                    line.clear();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    requests.push(line.trim_end().to_string());
+                    if line == "sessions status\n" {
+                        stream.write_all(batch_reply.as_bytes()).unwrap();
+                    } else if line.starts_with('@') && line.ends_with(" status\n") {
+                        stream
+                            .write_all(b"OK hold=0 detail=new agent=idle\n")
+                            .unwrap();
+                    } else {
+                        panic!("unexpected control request: {line}");
+                    }
+                }
+                requests
+            });
+
+            let mut bridge = Bridge::new(Config {
+                fleet: "test".into(),
+                broker: String::new(),
+                transport: Transport::Unix,
+                cap_files: Vec::new(),
+                state_dir: scratch.join("state").to_string_lossy().into_owned(),
+                accept_from: Vec::new(),
+                sock: Some(socket.to_string_lossy().into_owned()),
+                token: Some("test".into()),
+                presence: Mode::Meta,
+                receipts: true,
+            })
+            .unwrap();
+            // The socket test supplies the inherited bridge's requests but no
+            // broker. Pending admission suppresses unrelated meta/publish work.
+            bridge.attachment = Attachment::Inherited;
+            for (local, sid) in [(1, "s-one"), (2, "s-two"), (3, "s-three")] {
+                bridge.locals.insert(local, sid.to_string());
+                bridge.epochs.insert(sid.to_string(), "nonce".to_string());
+                bridge.pending_admit.insert(sid.to_string());
+                let fields = &mut bridge.presence.entry(sid.to_string()).or_default().fields;
+                fields.set_detail(Some("old"));
+                fields.set_agent(Some("prompt"));
+            }
+            bridge.sample_local_control();
+            for sid in ["s-one", "s-two", "s-three"] {
+                let fields = &bridge.presence[sid].fields;
+                assert_eq!(fields.detail, if legacy { "new" } else { "old" });
+                assert_eq!(fields.phase, if legacy { "idle" } else { "prompt" });
+            }
+            drop(bridge);
+            let requests = responder.join().unwrap();
+            let mut expected = vec!["sessions status".to_string()];
+            if legacy {
+                expected.extend(["s-one", "s-two", "s-three"].map(|sid| format!("@{sid} status")));
+            }
+            assert_eq!(requests, expected);
+            std::fs::remove_dir_all(scratch).unwrap();
+        }
+    }
+
     #[test]
     fn busy_local_events_cannot_accelerate_a_failed_broker_retry() {
         // Tier-1: drive the real mailbox and reconnect wait, then project the
@@ -7604,6 +7750,123 @@ mod tests {
             vec!["ctl.rs".to_string()],
             "aterm-link's unsafe surface is exactly one adopt in ctl.rs (§11.2 \
              wants even that in the aterm-uds cordon); found {breaches:?}"
+        );
+    }
+
+    /// NOTHING THE BRIDGE SPAWNS INHERITS EITHER aterm LANE.
+    ///
+    /// Both lanes arrive at fds 3 and 4 with `FD_CLOEXEC` cleared — the
+    /// launcher's `dup2` has to, or they would not survive the exec. A forked
+    /// child holds every descriptor until it execs, and an unflagged one
+    /// survives the exec, so `Ctl::adopt` wrapping the number as it found it,
+    /// and `run` adopting fd 4 only later, let `hostname`'s `uname -n` inherit
+    /// both: bridge-scope authority in a stranger, and aterm's near ends reading
+    /// no EOF — no fail-closed halt — until that child exited.
+    ///
+    /// Driven for real: this test binary re-runs itself as the bridge, the two
+    /// far ends placed by the launcher's own `spawn_with_two_fds`. That half
+    /// builds the bridge through `Bridge::new` (this half answers its `outbox`
+    /// probe), spawns a `cat` that lives until this half lets it go, and exits.
+    /// Both near ends must then read EOF at once, with the `cat` provably still
+    /// alive (the product fd-hygiene sweep of 2026-09-27).
+    #[test]
+    fn a_child_the_bridge_spawns_inherits_neither_aterm_lane() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::net::UnixStream;
+        const CHILD: &str = "ATERM_LINK_TEST_INHERITED_BRIDGE";
+        if let Some(state_dir) = std::env::var_os(CHILD) {
+            // THE BRIDGE HALF, on the inherited numbers.
+            let _bridge = Bridge::new(Config {
+                fleet: "f".to_string(),
+                broker: String::new(),
+                transport: Transport::Unix,
+                cap_files: Vec::new(),
+                state_dir: state_dir.to_string_lossy().into_owned(),
+                accept_from: Vec::new(),
+                sock: None,
+                token: None,
+                presence: Mode::default(),
+                receipts: true,
+            })
+            .expect("a bridge on the inherited lanes");
+            // `cat` reads this process's stdin: a pipe the other half holds.
+            let _cat = std::process::Command::new("/bin/cat")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn cat");
+            // Dies the way a killed bridge does: the kernel closes what it held.
+            std::process::exit(0);
+        }
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "al-inherit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        let (near_verb, far_verb) = UnixStream::pair().expect("socketpair");
+        let (near_push, far_push) = UnixStream::pair().expect("socketpair");
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("this binary"));
+        cmd.args([
+            "--exact",
+            "bridge::tests::a_child_the_bridge_spawns_inherits_neither_aterm_lane",
+            "--test-threads",
+            "1",
+        ])
+        .env(CHILD, &state_dir)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null());
+        let mut child = aterm_uds::spawnfd::spawn_with_two_fds(
+            cmd,
+            std::os::fd::OwnedFd::from(far_verb),
+            std::os::fd::OwnedFd::from(far_push),
+        )
+        .expect("spawn the bridge half");
+        let mut hold_cat = child.stdin.take().expect("a piped stdin");
+
+        // The one request `Bridge::new` makes of its verb lane. Every read
+        // bound is set while its socket is still connected: Darwin refuses
+        // `SO_RCVTIMEO` (EINVAL) on one whose peer is gone, and the bridge half
+        // cannot finish (and exit) before the reply below.
+        near_push
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        near_verb
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut verb = std::io::BufReader::new(near_verb.try_clone().unwrap());
+        let mut line = String::new();
+        verb.read_line(&mut line).expect("the outbox probe");
+        assert_eq!(line, "outbox\n", "the bridge half never reached its probe");
+        near_verb
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        (&near_verb).write_all(b"OK 0\n").unwrap();
+        let status = child.wait().expect("reap the bridge half");
+        assert!(status.success(), "the bridge half failed: {status:?}");
+
+        let mut byte = [0u8; 1];
+        let verb_read = verb.read(&mut byte);
+        let push_read = (&near_push).read(&mut byte);
+        // NOT VACUOUS: `cat` is alive (a write to its pipe finds a reader), so
+        // the EOFs below are not its exit.
+        let cat_alive = hold_cat
+            .write_all(b"alive\n")
+            .and_then(|()| hold_cat.flush());
+        drop(hold_cat);
+        let _ = std::fs::remove_dir_all(&state_dir);
+        assert!(
+            cat_alive.is_ok(),
+            "the grandchild must outlive the checks: {cat_alive:?}"
+        );
+        assert!(
+            matches!(verb_read, Ok(0)),
+            "the verb lane (fd 3) reached the bridge's child; read {verb_read:?}"
+        );
+        assert!(
+            matches!(push_read, Ok(0)),
+            "the push lane (fd 4) reached the bridge's child; read {push_read:?}"
         );
     }
 

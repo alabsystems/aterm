@@ -194,6 +194,109 @@ fn a_held_park_is_a_wake_source() {
     assert!(!glow.is_active(), "idle → inactive after the flush");
 }
 
+/// A foreign-row park holds an unpaid press for ten seconds, not the
+/// same-row park's quarter second. RED with the old shared timer: after
+/// 250 ms the cross-row park is still fresh but every deadline is only
+/// `ARM_MIN` (1 ms) away, keeping an idle window in a thousand-wake-per-
+/// second loop until the park's real expiry.
+#[test]
+fn a_cross_row_park_sleeps_until_its_own_expiry() {
+    let g = Geom {
+        rows: 3,
+        cols: 40,
+        ..wide_geom()
+    };
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let frame = ms(16);
+    let t0 = Instant::now();
+    for cross_row in [false, true] {
+        let mut glow = CursorGlow::default();
+        let mut out = Vec::new();
+        glow.tick(Some((1, 20)), t0, &c, g, &mut out);
+        glow.type_press_ring.bank(t0, 1, Some('x'));
+        glow.held_park = Some(HeldPark {
+            row: 1,
+            landing_row: if cross_row { 2 } else { 1 },
+            cross_row,
+            origin: 20,
+            landing: 5,
+            at: t0,
+            cfg: c,
+            geom: g,
+            landing_glyph: false,
+            landing_cell: None,
+            content_followed: false,
+        });
+        let patience = if cross_row {
+            Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S)
+        } else {
+            Duration::from_secs_f32(CursorGlow::TYPE_HINT_FRESH)
+        };
+        let expiry = t0 + patience + rk::ARM_MIN;
+        assert_eq!(
+            glow.next_change_deadline(t0, frame),
+            Some(expiry),
+            "the park arms its own expiry ({cross_row})"
+        );
+        if cross_row {
+            let after_same_row_window = t0 + ms(300);
+            assert!(glow.held_park.unwrap().fresh(after_same_row_window));
+            assert_eq!(
+                glow.next_change_deadline(after_same_row_window, frame),
+                Some(expiry),
+                "a live cross-row park must not re-arm at 1 ms"
+            );
+            glow.tick(Some((1, 20)), after_same_row_window, &c, g, &mut out);
+            assert!(glow.held_park.is_some(), "still in custody after 250 ms");
+            assert_eq!(
+                glow.next_change_deadline(after_same_row_window, frame),
+                Some(expiry)
+            );
+        }
+        glow.tick(Some((1, 20)), expiry, &c, g, &mut out);
+        assert!(glow.held_park.is_none(), "park expired on its deadline");
+    }
+}
+
+/// The park's ten-second clock starts at the foreign repaint, but its last
+/// funding credit may already be nine seconds old. Wake when that credit
+/// expires and retire the park; sleeping for the full park window would
+/// hold a stale foreign-row custody for nine extra seconds.
+#[test]
+fn a_cross_row_park_wakes_at_its_last_credits_expiry() {
+    let g = Geom {
+        rows: 3,
+        cols: 40,
+        ..wide_geom()
+    };
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let frame = ms(16);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    let park_at = t0 + ms(9000);
+    glow.tick(Some((1, 20)), park_at, &c, g, &mut out);
+    glow.type_press_ring.bank(t0, 1, Some('x'));
+    glow.held_park = Some(HeldPark {
+        row: 1,
+        landing_row: 2,
+        cross_row: true,
+        origin: 20,
+        landing: 5,
+        at: park_at,
+        cfg: c,
+        geom: g,
+        landing_glyph: false,
+        landing_cell: None,
+        content_followed: false,
+    });
+    let due = t0 + Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S) + rk::ARM_MIN;
+    assert!(glow.held_park.unwrap().fresh(due));
+    assert_eq!(glow.next_change_deadline(park_at, frame), Some(due));
+    glow.tick(Some((1, 20)), due, &c, g, &mut out);
+    assert!(glow.held_park.is_none(), "the final credit expired");
+}
+
 /// The tick's degenerate-geometry guard covers rows and columns beside
 /// `cw`/`ch`, in lockstep with the v2 engage gate. RED without it: on a
 /// 0-row or 0-column grid the effects box is empty and the first settling
@@ -2161,6 +2264,52 @@ fn a_soft_wrapped_re_anchor_is_witnessed_at_the_origin_it_lays() {
         }
         assert_eq!(glow.typed_credits_within(echo), 0, "{label}");
     }
+}
+
+/// A rejected visible hop must not claim the row that a later hidden-caret
+/// echo uses to identify the hand. The landing classifier rejects zle's
+/// foreign glyph after the tentative row is written; restoring the value
+/// sampled after that write instead of before it leaves the wrong row in
+/// `last_licensed_row` even though the verdict is `program-row`.
+#[test]
+fn a_foreign_landing_restores_the_prior_licensed_hand_row() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut glow = CursorGlow::default();
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    let mut before: Vec<char> = "> ".chars().collect();
+    before.resize(17, 'x');
+    before.push(' ');
+    glow.observe_row(3, 17, &before, t0);
+    glow.observe_neighbor_rows(Some(&[]), Some(&[]));
+    glow.tick(Some((3, 17)), t0, &c, g, &mut out);
+
+    // The input row was established by an earlier licensed echo. Its clock
+    // remains fresh through this foreign move and the next hidden frame.
+    glow.last_licensed_row = Some((3, t0));
+    let key = t0 + ms(100);
+    glow.note_typed_expected(key, 1, false, rk::TypedClass::Glyph, 'a');
+    let echo = key + ms(8);
+    let mut after = before;
+    after[17] = '_'; // zle's foreign caret glyph, not the typed `a`.
+    glow.observe_row(4, 2, &[' ', ' '], echo);
+    glow.observe_neighbor_rows(Some(&after), Some(&[]));
+    glow.tick(Some((4, 2)), echo, &c, g, &mut out);
+
+    assert_eq!(
+        last_row(&glow).map(|row| row.0),
+        Some(CursorGlow::DECLINE_PROGRAM_ROW),
+        "precondition: the visible hop really was rejected"
+    );
+    assert_eq!(glow.last_licensed_row, Some((3, t0)));
+    let hidden = echo + ms(8);
+    glow.tick(None, hidden, &c, g, &mut out);
+    assert_eq!(
+        glow.hand_row(hidden),
+        Some(3),
+        "a hidden-caret echo still belongs to the prior licensed input row"
+    );
 }
 
 /// **A LIFTED WORD LAYS NO LANDING, SO THE LANDING GATE STANDS DOWN**

@@ -11,7 +11,7 @@ use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 use super::*;
 
 /// A deterministic xorshift, so a failing step names a reproducible state.
-fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+pub(super) fn xorshift(seed: u64) -> impl FnMut() -> u64 {
     let mut state = seed;
     move || {
         state ^= state << 13;
@@ -31,7 +31,7 @@ fn xorshift(seed: u64) -> impl FnMut() -> u64 {
 /// band's one-row toggle between entering 1049 and the capture — plus every
 /// sequence the old walk drove (DECSC/DECRC on both screens, 1047/1049, DECSTBM,
 /// DECLRMM+DECSLRM, origin mode, TBC/HTS, RIS).
-fn hostile_walk_step(t: &mut Terminal, next: &mut impl FnMut() -> u64) {
+pub(super) fn hostile_walk_step(t: &mut Terminal, next: &mut impl FnMut() -> u64) {
     let roll = next();
     let a = u16::try_from((roll >> 8) % 120).expect("< 120") + 1;
     let b = u16::try_from((roll >> 24) % 400).expect("< 400") + 1;
@@ -205,6 +205,61 @@ fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
     bytes
 }
 
+/// What the StrippedLinks rung must be (plan P2-4): `carried` is `exact` — the
+/// engine's own carry at the same scrollback depth — with the hyperlinks of
+/// the line records over the record cap dropped and NOTHING else changed:
+/// every scalar, every other line byte for byte, and on the stripped lines the
+/// text, attributes, underline colours and wrap flag. Returns how many lines
+/// lost their links.
+pub(super) fn assert_only_over_cap_links_dropped(
+    at: &str,
+    exact: &TerminalCheckpoint,
+    carried: &TerminalCheckpoint,
+) -> usize {
+    let mut scalars = exact.clone();
+    scalars.grid.clone_from(&carried.grid);
+    scalars.alt_grid.clone_from(&carried.alt_grid);
+    assert_eq!(&scalars, carried, "{at}: every scalar is exact");
+    let cap = line_record_cap(exact.cols);
+    let mut stripped = 0;
+    for (which, source, wire) in [
+        ("main", Some(&exact.grid), Some(&carried.grid)),
+        (
+            "inactive",
+            exact.alt_grid.as_ref(),
+            carried.alt_grid.as_ref(),
+        ),
+    ] {
+        let (Some(source), Some(wire)) = (source, wire) else {
+            assert_eq!(
+                source.is_some(),
+                wire.is_some(),
+                "{at}: {which} grid present in both"
+            );
+            continue;
+        };
+        let source = aterm_core::scrollback::deserialize_lines(source);
+        let wire = aterm_core::scrollback::deserialize_lines(wire);
+        assert_eq!(source.len(), wire.len(), "{at}: {which} record count");
+        for (record, (mut line, carried_line)) in source.into_iter().zip(&wire).enumerate() {
+            if line.serialize().len() > cap && line.has_hyperlinks() {
+                assert!(
+                    !carried_line.has_hyperlinks(),
+                    "{at}: {which} record {record} is over the cap and keeps its links"
+                );
+                line.clear_hyperlinks();
+                stripped += 1;
+            }
+            assert_eq!(
+                line.serialize(),
+                carried_line.serialize(),
+                "{at}: {which} record {record} is exact but for links over the cap"
+            );
+        }
+    }
+    stripped
+}
+
 /// EVERY REACHABLE ENGINE STATE IS ADMITTED BY THE WIRE — now over the hostile
 /// grammar ([`hostile_walk_step`]) and with NO state skipped (the 2026-09-22/23
 /// update audit, plan P0-4d). The old walk drove only cursor and mode
@@ -219,13 +274,25 @@ fn link_dense(n: usize, url_len: usize) -> Vec<u8> {
 /// may need the Sanitized rung — one that did would be the 2026-09-22 class,
 /// a producer/predicate disagreement), and a Full carry of a Ground engine is
 /// byte-identical to the pre-ladder `checkpoint_carry`, so healthy handoffs
-/// are unchanged. The only Repaint the grammar can reach is a link-dense line
-/// past the record cap (plan P2-4 would strip its links instead).
+/// are unchanged.
+///
+/// A link-dense line past the record cap used to be the one Repaint the
+/// grammar reached — 588 of these 3000 states, a blank tab each, and 16 more
+/// lost their whole scrollback to one in it (VisibleOnly). Plan P2-4 carries
+/// them at the StrippedLinks rung instead: the screen and scrollback exact but
+/// for the links of the over-cap lines, which is asserted state by state.
+/// Measured 2026-09-24 with it in: rungs [full 2396, visible-only 0,
+/// stripped-links 604, sanitized 0, repaint 0], 993 lines losing their links.
+/// The bound on Repaint is therefore ZERO: the walk is deterministic, so any
+/// blank carry at all is a new cause, and names its step. RED before P2-4: no
+/// state reaches StrippedLinks, and 588 are carried blank.
 #[test]
 fn every_reachable_engine_state_is_admitted_by_the_wire() {
     let mut next = xorshift(0x9E37_79B9_7F4A_7C15);
     let mut t = Terminal::new(24, 80);
-    let mut rungs = [0_u32; 4];
+    let mut rungs = [0_u32; 5];
+    let mut stripped_lines = 0_usize;
+    let mut first_repaint = None;
     let mut mid_sequence = 0_u32;
     for step in 0..3000_u32 {
         hostile_walk_step(&mut t, &mut next);
@@ -250,13 +317,8 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
             CarryRung::Sanitized,
             "{at}: an honest engine broke a meta bound"
         );
-        if rung == CarryRung::Repaint {
-            assert!(
-                cause
-                    .as_deref()
-                    .is_some_and(|cause| cause.contains("is not canonical")),
-                "{at}: only a line past the record cap may cost the screen"
-            );
+        if rung == CarryRung::Repaint && first_repaint.is_none() {
+            first_repaint = Some(at.clone());
         }
         if t.parser_is_ground() {
             if rung == CarryRung::Full {
@@ -270,13 +332,31 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
         } else {
             mid_sequence += 1;
         }
+        if rung == CarryRung::StrippedLinks {
+            let exact = t
+                .checkpoint_carry_abandoning_partial(checkpoint.history_lines as usize)
+                .0;
+            let lines = assert_only_over_cap_links_dropped(&at, &exact, &checkpoint);
+            assert!(lines > 0, "{at}: the rung names a line that lost its links");
+            stripped_lines += lines;
+        }
         assert_wire_admits(&at, &checkpoint);
         rungs[rung as usize] += 1;
     }
+    eprintln!(
+        "hostile walk: rungs [full, visible-only, stripped-links, sanitized, repaint] = \
+         {rungs:?}; {stripped_lines} line(s) lost their links; {mid_sequence} mid-sequence"
+    );
     assert!(
-        mid_sequence > 0 && rungs[CarryRung::Repaint as usize] > 0,
+        mid_sequence > 0 && rungs[CarryRung::StrippedLinks as usize] > 0,
         "the walk must reach the states it was widened for: {mid_sequence} mid-sequence, \
          rungs {rungs:?}"
+    );
+    assert_eq!(
+        rungs[CarryRung::Repaint as usize],
+        0,
+        "a link-dense line must cost its links, not the screen: rungs {rungs:?}, the first \
+         {first_repaint:?}"
     );
     assert!(
         rungs[CarryRung::Full as usize] > 2000,
@@ -291,12 +371,14 @@ fn every_reachable_engine_state_is_admitted_by_the_wire() {
 /// a ZWJ emoji on the saved primary under 1049, (iii) a title left
 /// unterminated (`printf '\e]0;x'`), (iv) a full-screen 5K and a maximized 6K
 /// window, (v) a DECSC on the last row, then 1049, then the message band's
-/// one-row shrink — and (vi) a link-dense line past the record cap still does.
-/// Each is now carried at a named rung, committed by `screen_digest`, adopted
-/// exactly by the consumer, and the whole pool settles.
+/// one-row shrink — and (vi) a link-dense line past the record cap, which
+/// until plan P2-4 was still carried blank. Each is now carried at a named
+/// rung, committed by `screen_digest`, adopted exactly by the consumer, and the
+/// whole pool settles; (vi) keeps its screen and loses only that line's links
+/// (RED before P2-4: it was carried at the Repaint rung).
 #[test]
 fn producer_is_total_over_hostile_and_large_desks() {
-    use CarryRung::{Full, Repaint, Sanitized};
+    use CarryRung::{Full, Repaint, Sanitized, StrippedLinks};
 
     let mut desks: Vec<(&str, Terminal, CarryRung)> = Vec::new();
 
@@ -361,7 +443,11 @@ fn producer_is_total_over_hostile_and_large_desks() {
 
     let mut links = Terminal::new(24, 80);
     links.process(&link_dense(8, 8192));
-    desks.push(("(vi) a link-dense line past the record cap", links, Repaint));
+    desks.push((
+        "(vi) a link-dense line past the record cap",
+        links,
+        StrippedLinks,
+    ));
 
     let mut pool = Vec::new();
     let mut cells = 0_u64;
@@ -393,6 +479,16 @@ fn producer_is_total_over_hostile_and_large_desks() {
                 let blank = Terminal::new(24, 80).checkpoint_carry(0).expect("Ground");
                 assert_eq!(checkpoint.grid, blank.grid, "{at}: the screen is blank");
             }
+            StrippedLinks => {
+                let exact = terminal
+                    .checkpoint_carry(checkpoint.history_lines as usize)
+                    .expect("Ground");
+                assert_eq!(
+                    assert_only_over_cap_links_dropped(&at, &exact, &checkpoint),
+                    1,
+                    "{at}: the one link-dense line lost its links"
+                );
+            }
             _ => {}
         }
         pool.push(WireCarry {
@@ -419,6 +515,277 @@ fn producer_is_total_over_hostile_and_large_desks() {
         .map(|carry| (carry.local_id, carry.checkpoint))
         .collect();
     assert_eq!(screen_digest(&screens), Ok(digest));
+}
+
+/// THE STRIP DECODES NO MORE SCROLLBACK THAN THE CAPTURE PRICED (the review of
+/// plan P2-4). The link-stripping rung decodes a whole grid blob, re-serializes
+/// every record and then the grid, inside the frozen window, and the capture
+/// prices a carried scrollback by its dimensions, not its bytes. Here every line
+/// is one-cell links with 8 KiB URLs, so the carry at a 40-line depth is
+/// megabytes past that price — terminal output alone makes one. RED before the
+/// bound: the strip decoded the whole depth and carried it (StrippedLinks, 40
+/// history lines), work the capture's deadline, checked only between sessions,
+/// never saw. Now that depth goes on to the screen without scrollback, as it did
+/// before links could be stripped, and that screen's links are stripped.
+#[test]
+fn a_scrollback_past_what_the_capture_priced_is_never_decoded_to_strip_its_links() {
+    const DEPTH: u32 = 40;
+    let mut dense = Terminal::new(24, 80);
+    for _ in 0..(DEPTH + 24) {
+        dense.process(&link_dense(16, 8192));
+        dense.process(b"\r\n");
+    }
+    let exact = dense.checkpoint_carry(DEPTH as usize).expect("Ground");
+    assert_eq!(
+        exact.history_lines, DEPTH,
+        "PRECONDITION: the depth is there"
+    );
+    let priced = checkpoint_capture_budget_bytes(24, 80, DEPTH).expect("a real geometry");
+    assert!(
+        wire_bytes(&exact) > priced,
+        "PRECONDITION: the carried depth ({} bytes) is past the {priced} priced",
+        wire_bytes(&exact)
+    );
+    let visible = dense.checkpoint_carry(0).expect("Ground");
+    assert!(
+        wire_bytes(&visible) <= MAX_LINK_STRIP_BYTES,
+        "the visible 24x80 control still fits the absolute strip-work bound"
+    );
+    let (checkpoint, rung, cause) = carry_for_wire(&dense, 3, DEPTH, &mut 0, WireCaps::current());
+    let cause = cause.expect("a rung below Full names its cause");
+    assert_eq!(
+        (rung, checkpoint.history_lines),
+        (CarryRung::StrippedLinks, 0),
+        "the depth was dropped, not decoded; the screen kept its text: {cause}"
+    );
+    assert!(
+        cause.contains("not decoded to strip links"),
+        "the cause says why the scrollback went: {cause}"
+    );
+    assert_wire_admits("dense", &checkpoint);
+    // The transform refuses that depth too, whoever asks (the self-check's lower).
+    let mut probe = exact.clone();
+    assert_eq!(strip_over_cap_links(&mut probe), None);
+    assert_eq!(probe, exact, "and changes nothing");
+}
+
+/// A visible screen is mandatory to project, but its serialized OSC 8 URLs
+/// need not fit the geometry-based price. The strip would decode and
+/// re-serialize this whole blob while readers are parked, despite the grid
+/// already being over the wire's byte cap. The absolute work bound makes it
+/// take Repaint without that second pass. The 3 MiB 24x80 control above still
+/// keeps its text at StrippedLinks.
+#[test]
+fn a_visible_grid_past_the_strip_work_bound_repaints_without_decoding_links() {
+    let mut dense = Terminal::new(24, 80);
+    for row in 0..24 {
+        dense.process(&link_dense(32, 8192));
+        if row < 23 {
+            dense.process(b"\r\n");
+        }
+    }
+    let exact = dense.checkpoint_carry(0).expect("Ground");
+    assert_eq!(exact.history_lines, 0);
+    assert!(
+        wire_bytes(&exact) > MAX_LINK_STRIP_BYTES,
+        "PRECONDITION: dense visible grid exceeds the strip-work bound"
+    );
+    assert!(
+        checkpoint_shape_refusal(3, &exact).is_some(),
+        "PRECONDITION: the exact grid is refused by the wire"
+    );
+    let mut probe = exact.clone();
+    assert_eq!(strip_over_cap_links(&mut probe), None);
+    assert_eq!(probe, exact, "the large grid was never transformed");
+
+    let (checkpoint, rung, cause) = carry_for_wire(&dense, 3, 0, &mut 0, WireCaps::current());
+    assert_eq!(rung, CarryRung::Repaint, "{cause:?}");
+    assert!(
+        cause.is_some_and(|why| why.contains("not decoded to strip links")),
+        "the refusal names the bounded work"
+    );
+    assert_wire_admits("large visible grid", &checkpoint);
+}
+
+/// A LINK-DENSE LINE COSTS ITS LINKS, NOT THE SCREEN OR THE SCROLLBACK (the
+/// 2026-09-22/23 update audit, plan P2-4). An OSC 8 URL may be 8 KiB and a row
+/// of one-cell links carries each URL once per span, so eight such links in an
+/// 80-column pane make a 65 KiB line record against the wire's 57 KiB cap.
+/// Wherever that line is — on screen under a scrollback, only in the
+/// scrollback, or on the saved primary under an alternate-screen app — the
+/// carry drops the links of that one line and keeps everything else, at the
+/// full scrollback depth; and a ROLLBACK successor, whose consumer is v0.91.0's
+/// vintage, decodes the stripped carry too (its line decoder, transcribed, and
+/// its per-grid cap). A row of links under the cap keeps them.
+///
+/// RED before P2-4: the on-screen and saved-primary lines were carried at the
+/// Repaint rung (a blank screen), and the scrollback-only line at VisibleOnly
+/// (the whole scrollback dropped — and, through the capture's history latch,
+/// every later session's).
+#[test]
+fn a_link_dense_line_costs_its_links_not_the_screen_or_the_scrollback() {
+    use super::tests::v0_91_consumer_decodes;
+
+    let scroll = |t: &mut Terminal| {
+        for line in 0..60 {
+            t.process(format!("\x1b[3{}mline {line}\x1b[0m\r\n", line % 8).as_bytes());
+        }
+    };
+    let mut on_screen = Terminal::new(24, 80);
+    scroll(&mut on_screen);
+    on_screen.process(&link_dense(8, 8192));
+    on_screen.process(b"\r\nprompt % ");
+    let mut in_scrollback = Terminal::new(24, 80);
+    in_scrollback.process(&link_dense(8, 8192));
+    scroll(&mut in_scrollback);
+    let mut saved_primary = Terminal::new(24, 80);
+    scroll(&mut saved_primary);
+    saved_primary.process(&link_dense(8, 8192));
+    saved_primary.process(b"\x1b[?1049h\x1b[Hvim");
+
+    let cap = line_record_cap(80);
+    assert_eq!(cap, 57_344, "PRECONDITION: the finding's arithmetic");
+    for (what, terminal) in [
+        ("on screen", &on_screen),
+        ("in the scrollback", &in_scrollback),
+        ("on the saved primary", &saved_primary),
+    ] {
+        let exact = terminal
+            .checkpoint_carry(MAX_HANDOFF_HISTORY_LINES as usize)
+            .expect("Ground");
+        assert!(
+            checkpoint_shape_refusal(0, &exact).is_some(),
+            "PRECONDITION {what}: the exact carry is refused"
+        );
+        for (caps, legacy) in [(WireCaps::current(), false), (WireCaps::legacy(), true)] {
+            let at = format!("{what}, legacy={legacy}");
+            let mut cells = 0;
+            let (checkpoint, rung, cause) =
+                carry_for_wire(terminal, 5, MAX_HANDOFF_HISTORY_LINES, &mut cells, caps);
+            assert_eq!(rung, CarryRung::StrippedLinks, "{at}: {cause:?}");
+            assert!(!rung.needs_repaint() && rung.keeps_control_carry(), "{at}");
+            let cause = cause.expect("a rung below Full names its cause");
+            assert!(
+                cause.contains(&format!(
+                    "1 line(s) over the {cap}-byte line-record cap lost their links"
+                )),
+                "{at}: the cause counts the lines: {cause}"
+            );
+            assert!(
+                exact.history_lines > 0 || what == "on the saved primary",
+                "PRECONDITION {at}: there is scrollback to keep"
+            );
+            assert_eq!(
+                checkpoint.history_lines, exact.history_lines,
+                "{at}: the whole scrollback crossed"
+            );
+            assert_eq!(
+                assert_only_over_cap_links_dropped(&at, &exact, &checkpoint),
+                1,
+                "{at}: exactly the link-dense line lost its links"
+            );
+            assert_eq!(
+                checkpoint.alt_grid != exact.alt_grid,
+                what == "on the saved primary",
+                "{at}: the saved primary is the grid that changed"
+            );
+            assert!(
+                cells >= wire_cells(&checkpoint),
+                "{at}: the aggregate is charged for what it carries"
+            );
+            assert_wire_admits(&at, &checkpoint);
+            if legacy {
+                assert!(
+                    v0_91_consumer_decodes(&checkpoint),
+                    "{at}: the older successor's line decoder reads it"
+                );
+                assert!(
+                    caps.admit(
+                        &mut 0,
+                        checkpoint.rows,
+                        checkpoint.cols,
+                        checkpoint.history_lines,
+                        checkpoint.alt_grid.is_some()
+                    )
+                    .is_ok(),
+                    "{at}: the older successor's caps admit it"
+                );
+            }
+        }
+    }
+
+    // Links under the cap are carried, exactly.
+    let mut few = Terminal::new(24, 80);
+    few.process(&link_dense(2, 8192));
+    let (checkpoint, rung, cause) = carry_for_wire(
+        &few,
+        6,
+        MAX_HANDOFF_HISTORY_LINES,
+        &mut 0,
+        WireCaps::current(),
+    );
+    assert_eq!(rung, CarryRung::Full, "{cause:?}");
+    assert!(
+        aterm_core::scrollback::deserialize_lines(&checkpoint.grid)
+            .iter()
+            .any(|line| line.hyperlink_count() == 2),
+        "a row of links under the cap keeps them"
+    );
+}
+
+/// THE SELF-CHECK STRIPS A BLAMED LINK-DENSE CARRY RATHER THAN BLANK IT (plan
+/// P2-4). The self-check is the net for a producer bug the ladder did not see,
+/// so it lowers along the ladder's own rungs: a carry that reached it exact
+/// but non-canonical because of a link-dense line (here the engine's own
+/// pre-ladder carry, pushed straight into the pool) is carried with that
+/// line's links dropped, the others are untouched, and the pool commits. A
+/// carry still refused after the strip goes on to Repaint as before.
+///
+/// RED before P2-4: the blamed session was carried at the Repaint rung.
+#[test]
+fn the_self_check_strips_a_blamed_link_dense_carry_rather_than_blank_it() {
+    let mut links = Terminal::new(24, 80);
+    links.process(b"prompt % cat links.txt\r\n");
+    links.process(&link_dense(8, 8192));
+    let exact = links.checkpoint_carry(0).expect("Ground");
+    let mut healthy = Terminal::new(24, 80);
+    healthy.process(b"prompt % ");
+    let healthy = healthy.checkpoint_carry(0).expect("Ground");
+    let mut pool = vec![
+        WireCarry {
+            local_id: 0,
+            checkpoint: healthy.clone(),
+            rung: CarryRung::Full,
+        },
+        WireCarry {
+            local_id: 1,
+            checkpoint: exact.clone(),
+            rung: CarryRung::Full,
+        },
+    ];
+    let digest = settle_wire_carries(&mut pool, WireCaps::current()).expect("the pool commits");
+    assert_eq!(pool[1].rung, CarryRung::StrippedLinks, "the blamed session");
+    assert_eq!(
+        assert_only_over_cap_links_dropped("self-check", &exact, &pool[1].checkpoint),
+        1
+    );
+    assert_eq!(pool[0].rung, CarryRung::Full);
+    assert_eq!(pool[0].checkpoint, healthy, "the other is untouched");
+    let screens: Vec<(u64, TerminalCheckpoint)> = pool
+        .iter()
+        .map(|carry| (carry.local_id, carry.checkpoint.clone()))
+        .collect();
+    assert_eq!(screen_digest(&screens), Ok(digest));
+
+    // Stripping cannot help a blob that is not the engine's own: Repaint.
+    let mut pool = vec![WireCarry {
+        local_id: 1,
+        checkpoint: exact,
+        rung: CarryRung::Full,
+    }];
+    pool[0].checkpoint.grid.extend_from_slice(&[0xff]);
+    settle_wire_carries(&mut pool, WireCaps::current()).expect("the pool commits");
+    assert_eq!(pool[0].rung, CarryRung::Repaint);
 }
 
 /// A ROLLBACK hands to an older consumer whose per-grid cap is the frozen
@@ -716,6 +1083,12 @@ fn dropping_carried_history_equals_the_engines_visible_only_carry() {
 /// only that one — the successor adopts it flagged for a redraw and without a
 /// control carry, adopts every other session exactly, and the adoption proof
 /// still equals the parent's, because the flag rides no digest.
+///
+/// And a link-dense screen carried at the StrippedLinks rung (plan P2-4)
+/// crosses as it is, UNMARKED: this build's consumer, unchanged, adopts it
+/// exactly and the proof holds, because the stripped carry is inside every cap
+/// the consumer already enforces. RED before P2-4: that session was the blank
+/// one, carried at the Repaint rung.
 #[test]
 #[cfg(unix)]
 fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
@@ -744,8 +1117,10 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     mid_title.process(b"% \x1b]0;x");
     let mut links = Terminal::new(24, 80);
     links.process(&link_dense(8, 8192));
+    let mut vim = Terminal::new(24, 80);
+    vim.process(b"\x1b[?1049h\x1b[2;5Hediting");
     let mut cells = 0;
-    let carried: Vec<(TerminalCheckpoint, CarryRung, Option<String>)> =
+    let mut carried: Vec<(TerminalCheckpoint, CarryRung, Option<String>)> =
         [&healthy, &mid_title, &links]
             .into_iter()
             .enumerate()
@@ -759,10 +1134,24 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
                 )
             })
             .collect();
+    // A session the capture's own decode-authority budget carried blank.
+    carried.push(repaint_carry_for_wire(
+        &vim,
+        3,
+        &mut cells,
+        WireCaps::current(),
+        "the test".to_string(),
+    ));
     assert_eq!(
         carried.iter().map(|(_, rung, _)| *rung).collect::<Vec<_>>(),
-        [CarryRung::Full, CarryRung::Full, CarryRung::Repaint]
+        [
+            CarryRung::Full,
+            CarryRung::Full,
+            CarryRung::StrippedLinks,
+            CarryRung::Repaint
+        ]
     );
+    let stripped = carried[2].0.clone();
     let repaint: Vec<u64> = carried
         .iter()
         .enumerate()
@@ -790,7 +1179,7 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     for record in &published.sessions {
         assert_eq!(
             record.screen.as_ref().map(|screen| screen.repaint),
-            Some(record.local_id == 2),
+            Some(record.local_id == 3),
             "session {}: only the blank carry is marked",
             record.local_id
         );
@@ -807,13 +1196,13 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
         )),
     );
     let incoming = take_incoming_as(ReceiverShape::Current);
-    assert_eq!(incoming.adopted.len(), 3, "every session adopts");
+    assert_eq!(incoming.adopted.len(), 4, "every session adopts");
     assert_eq!(incoming.screen_digest, Some(staged.screen_digest));
     for adopted in &incoming.adopted {
         let checkpoint = adopted.checkpoint.as_ref().expect("a screen to adopt onto");
         assert_eq!(
             adopted.repaint,
-            adopted.local_id == 2,
+            adopted.local_id == 3,
             "session {}: only the blank carry pulses a redraw",
             adopted.local_id
         );
@@ -824,6 +1213,18 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
             adopted.local_id
         );
         if adopted.local_id == 2 {
+            assert_eq!(
+                checkpoint, &stripped,
+                "the link-stripped screen is adopted exactly, every scalar with it"
+            );
+            assert!(
+                aterm_core::scrollback::deserialize_lines(&checkpoint.grid)
+                    .iter()
+                    .any(|line| line.as_bytes().starts_with(b"L L L")),
+                "the link-dense line's text crossed"
+            );
+        }
+        if adopted.local_id == 3 {
             assert!(
                 adopted.control.is_none(),
                 "a repainted session carries no control"
@@ -842,7 +1243,7 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     }
     let ((proof, ready, adopted), _) =
         child_proof_from(incoming).expect("the child adopts and proves");
-    assert_eq!(adopted.len(), 3);
+    assert_eq!(adopted.len(), 4);
     assert_eq!(
         proof, staged.expected,
         "THE HANDOFF COMPLETES: the child's proof equals the parent's expectation"
@@ -1001,7 +1402,7 @@ fn every_blank_fallback_keeps_the_shells_mark_authority() {
     let meta = CheckpointMeta::from_checkpoint(&source);
 
     let mut spent = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
-    let producer = repaint_carry(&source, &mut spent, WireCaps::current());
+    let producer = repaint_carry(&meta, &mut spent, WireCaps::current());
     let mut spent = MAX_HANDOFF_AGGREGATE_GRID_CELLS;
     let IncomingScreen::Degraded {
         checkpoint: Some(consumer),
@@ -1052,5 +1453,169 @@ fn every_blank_fallback_keeps_the_shells_mark_authority() {
         blind.shell_integration_posture(),
         ShellIntegrationPosture::Degraded,
         "fail-closed, and `status` says the loss"
+    );
+}
+
+/// A SUCCESSOR'S CARRY CEILING ONLY EVER LOWERS THE RUNG (the 2026-09-22/23
+/// update audit, plan P0-5). Over a shell with scrollback, a screen with a
+/// link-dense line, a full-screen program and a parser mid-title, each ceiling a
+/// signed handoff policy can set gives the carry that producer could have made
+/// without it:
+///
+/// * `full` is [`carry_for_wire`] exactly;
+/// * `visible` is the ladder at depth 0 — no scrollback, and a rung no higher
+///   than VisibleOnly, whatever the ladder's own lower rung was;
+/// * `repaint` is [`repaint_carry_for_wire`]'s blank screen for every session;
+///
+/// and every one of them is committed by this build's own `screen_digest` and
+/// adopted exactly by its consumer, so a policy reaches nothing either side
+/// checks. RED without the clamp (measured by making `carry_for_wire_within`
+/// ignore its ceiling): the `visible` carry of the shell keeps its 256 lines,
+/// and the `repaint` carries are exact screens.
+#[test]
+fn a_policy_ceiling_only_ever_lowers_the_carry() {
+    use aterm_update_core::handoff_policy::CarryCeiling;
+    let mut shell = Terminal::new(24, 80);
+    for line in 0..400 {
+        shell.process(format!("\x1b[38;5;{}m{line:>4}\x1b[0m built\r\n", line % 256).as_bytes());
+    }
+    shell.process(b"% ");
+    let mut links = Terminal::new(24, 80);
+    links.process(&link_dense(8, 8192));
+    let mut vim = Terminal::new(24, 80);
+    vim.process(b"% vim\r\n\x1b[?1049h\x1b[2;5Hediting");
+    let mut mid_title = Terminal::new(24, 80);
+    mid_title.process(b"% \x1b]0;x");
+    for (label, terminal) in [
+        ("shell", &shell),
+        ("links", &links),
+        ("vim", &vim),
+        ("mid-title", &mid_title),
+    ] {
+        let caps = WireCaps::current();
+        let own = carry_for_wire(terminal, 0, MAX_HANDOFF_HISTORY_LINES, &mut 0, caps);
+        let own_visible = carry_for_wire(terminal, 0, 0, &mut 0, caps);
+        let blank = repaint_carry_for_wire(terminal, 0, &mut 0, caps, String::new());
+        for ceiling in [
+            CarryCeiling::Full,
+            CarryCeiling::Visible,
+            CarryCeiling::Repaint,
+        ] {
+            let at = format!("{label} under a {} ceiling", ceiling.as_str());
+            let (checkpoint, rung, _) = carry_for_wire_within(
+                terminal,
+                0,
+                MAX_HANDOFF_HISTORY_LINES,
+                &mut 0,
+                caps,
+                ceiling,
+            );
+            assert!(
+                rung >= own.1,
+                "{at}: {rung} is above the ladder's own {}",
+                own.1
+            );
+            match ceiling {
+                CarryCeiling::Full => {
+                    assert_eq!(
+                        (&checkpoint, rung),
+                        (&own.0, own.1),
+                        "{at}: the ladder as it ships"
+                    );
+                }
+                CarryCeiling::Visible => {
+                    assert_eq!(checkpoint.history_lines, 0, "{at}: no scrollback");
+                    assert_eq!(
+                        checkpoint, own_visible.0,
+                        "{at}: the ladder's depth-0 carry"
+                    );
+                    assert_eq!(rung, own_visible.1.max(CarryRung::VisibleOnly), "{at}");
+                }
+                CarryCeiling::Repaint => {
+                    assert_eq!((&checkpoint, rung), (&blank.0, CarryRung::Repaint), "{at}");
+                    assert!(rung.needs_repaint() && !rung.keeps_control_carry(), "{at}");
+                }
+            }
+            assert_wire_admits(&at, &checkpoint);
+        }
+    }
+    assert!(
+        carry_for_wire(
+            &shell,
+            0,
+            MAX_HANDOFF_HISTORY_LINES,
+            &mut 0,
+            WireCaps::current()
+        )
+        .0
+        .history_lines
+            > 0,
+        "PRECONDITION: the shell's own carry holds scrollback for `visible` to drop"
+    );
+}
+
+/// A `carry = "repaint"` POLICY NEVER PROJECTS A SESSION'S GRIDS (the review of
+/// the signed handoff policy, plan P0-5). The policy is the escape hatch a
+/// successor seals for a capture path that is slow or panics, and projecting a
+/// live session's grids for the wire is that path, so the rung the policy forces
+/// must not take it: with that projection made to fail (aterm-core's
+/// `checkpoint.carry_projection` fault point), every session below still carries
+/// — blank, and identical to its Repaint carry with nothing armed. RED before the
+/// fix: the rung took the whole visible carry only to read its scalars, so the
+/// injected failure fired in every session, whatever it held.
+#[test]
+fn a_repaint_ceiling_never_projects_a_grid() {
+    use aterm_update_core::handoff_policy::CarryCeiling;
+    let mut shell = Terminal::new(24, 80);
+    for line in 0..400 {
+        shell.process(format!("{line:>4} built\r\n").as_bytes());
+    }
+    let mut links = Terminal::new(24, 80);
+    links.process(&link_dense(8, 8192));
+    let mut vim = Terminal::new(24, 80);
+    vim.process(b"% vim\r\n\x1b[?1049h\x1b[2;5Hediting");
+    let mut mid_title = Terminal::new(24, 80);
+    mid_title.process(b"% \x1b]0;x");
+    let caps = WireCaps::current();
+    for (label, terminal) in [
+        ("shell", &shell),
+        ("links", &links),
+        ("vim", &vim),
+        ("mid-title", &mid_title),
+    ] {
+        let unarmed = carry_for_wire_within(
+            terminal,
+            0,
+            MAX_HANDOFF_HISTORY_LINES,
+            &mut 0,
+            caps,
+            CarryCeiling::Repaint,
+        );
+        let armed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aterm_core::fault::with_armed("checkpoint.carry_projection", || {
+                carry_for_wire_within(
+                    terminal,
+                    0,
+                    MAX_HANDOFF_HISTORY_LINES,
+                    &mut 0,
+                    caps,
+                    CarryCeiling::Repaint,
+                )
+            })
+        }))
+        .unwrap_or_else(|_| panic!("{label}: the repaint rung projected the session's grids"));
+        assert_eq!(armed.1, CarryRung::Repaint, "{label}");
+        assert_eq!(armed.0, unarmed.0, "{label}: the same blank carry");
+        assert_wire_admits(label, &armed.0);
+    }
+    // CONTROL: the fault point is live, and the Full ceiling does project.
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            aterm_core::fault::with_armed("checkpoint.carry_projection", || {
+                carry_for_wire_within(&shell, 0, 0, &mut 0, caps, CarryCeiling::Full)
+            })
+        }))
+        .is_err(),
+        "the fault point must fire where a carry is projected, or the test proves nothing"
     );
 }

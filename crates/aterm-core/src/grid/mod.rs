@@ -106,8 +106,6 @@ mod tests;
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{Damage, DamagedRowIterator, LineDamageBounds, RowDamageBounds};
 pub use extra::{CellCoord, CellExtra, CellExtras, KittyPlaceholderData, UniformExtras};
-// `crate::grid::PAGE_SIZE` is a flat re-export; in-crate code reaches it via
-// `grid::page::PAGE_SIZE`.
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
 pub use style::{Color, ColorType, ExtendedStyle, Style, StyleAttrs, StyleId, StyleTable};

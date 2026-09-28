@@ -38,6 +38,9 @@
 
 pub mod cdn;
 pub mod codesign;
+/// The successor's signed handoff policy (plan P0-5): the release cutter seals it into
+/// the bundle, the outgoing build reads it from the verified candidate.
+pub mod handoff_policy;
 pub mod linux;
 pub mod manifest;
 pub mod pins;

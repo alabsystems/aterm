@@ -38053,10 +38053,14 @@ mod ribbon_beam_tests {
         }
     }
 
-    /// Changing the walk must not change a full mark's pixels. The fractional
-    /// endpoints give the lower-anchored partition a one-pixel last slab;
-    /// stepping backward from the upper endpoint would shift the other slabs
-    /// and their screen-anchored dither, failing this exact multiset check.
+    /// The capped retry must not change a full mark's pixels. It walks a
+    /// reversed segment head-first over the SAME lower-anchored slabs; the
+    /// fractional endpoints give that partition a one-pixel last slab, so a
+    /// head-first walk that stepped backward from the upper endpoint instead
+    /// would shift the other slabs and their screen-anchored dither, failing
+    /// this exact multiset check. An uncapped public call never takes the
+    /// retry, so the head-first walk is driven directly, and its order is
+    /// checked first so the comparison is never two lower-to-upper walks.
     #[test]
     fn a_reversed_walk_keeps_the_uncapped_slab_partition_bit_identical() {
         let clip = BeamClip::grid(4_320, 3_360, 56);
@@ -38065,8 +38069,92 @@ mod ribbon_beam_tests {
             vert(91.5, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
         ];
         let descending = [ascending[1], ascending[0]];
-        let beams: [(&str, Beam); 2] = [("x-major", ribbon_beam), ("y-major", ribbon_beam_v)];
-        for (name, beam) in beams {
+        type Ordered = fn(
+            &mut Vec<GlowQuad>,
+            BeamClip,
+            &[RibbonVertex],
+            f32,
+            usize,
+            usize,
+            GlowBlend,
+            bool,
+        ) -> bool;
+        let beams: [(&str, Beam, Ordered, Major); 2] = [
+            ("x-major", ribbon_beam, super::ribbon_beam_ordered, |q| q.x),
+            (
+                "y-major",
+                ribbon_beam_v,
+                super::ribbon_beam_v_ordered,
+                |q| q.y,
+            ),
+        ];
+        for (name, beam, ordered, major) in beams {
+            let mut forward = Vec::new();
+            let mut head_first = Vec::new();
+            assert!(beam(
+                &mut forward,
+                clip,
+                &ascending,
+                1.0,
+                10,
+                10_240,
+                GlowBlend::Over,
+            ));
+            assert!(ordered(
+                &mut head_first,
+                clip,
+                &descending,
+                1.0,
+                10,
+                10_240,
+                GlowBlend::Over,
+                true,
+            ));
+            assert!(
+                forward.len() > 100,
+                "fixture must paint a real mark ({name})"
+            );
+            assert!(
+                head_first.windows(2).all(|w| major(&w[0]) >= major(&w[1]))
+                    && major(&head_first[0]) > major(&head_first[head_first.len() - 1]),
+                "the retry did not walk the reversed segment head-first ({name})"
+            );
+            let key = |q: &GlowQuad| {
+                (
+                    q.row, q.x, q.y, q.w, q.h, q.color, q.alpha, q.color2, q.alpha2,
+                )
+            };
+            forward.sort_unstable_by_key(key);
+            head_first.sort_unstable_by_key(key);
+            assert_eq!(
+                forward, head_first,
+                "the head-first retry moved pixels ({name})"
+            );
+        }
+    }
+
+    /// **AN UNCAPPED WALK KEEPS ITS QUAD ORDER, NOT ONLY ITS PIXELS.** The
+    /// multiset check above cannot see emission order, and order is part of
+    /// the contract: `aterm-effects`' `licensed_typed_parity` goldens fold
+    /// the quad stream IN ORDER (each quad's Debug string, one after
+    /// another), so an uncapped call that walked a reversed segment
+    /// head-first would paint the very same pixels and still move those
+    /// goldens. Head-first belongs to the capped retry alone: an uncapped
+    /// reversed segment emits the very quads, in the very order, of its
+    /// ascending twin, and both walk lower to upper.
+    #[test]
+    fn an_uncapped_reversed_walk_keeps_the_historical_quad_order() {
+        let clip = BeamClip::grid(4_320, 3_360, 56);
+        let ascending = [
+            vert(60.5, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+            vert(91.5, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+        ];
+        let descending = [ascending[1], ascending[0]];
+        let beams: [(&str, Beam, Major); 2] = [
+            ("x-major", ribbon_beam, |q| q.x),
+            ("y-major", ribbon_beam_v, |q| q.y),
+        ];
+        for (name, beam, major) in beams {
             let mut forward = Vec::new();
             let mut reverse = Vec::new();
             assert!(beam(
@@ -38091,14 +38179,14 @@ mod ribbon_beam_tests {
                 forward.len() > 100,
                 "fixture must paint a real mark ({name})"
             );
-            let key = |q: &GlowQuad| {
-                (
-                    q.row, q.x, q.y, q.w, q.h, q.color, q.alpha, q.color2, q.alpha2,
-                )
-            };
-            forward.sort_unstable_by_key(key);
-            reverse.sort_unstable_by_key(key);
-            assert_eq!(forward, reverse, "uncapped pixels moved ({name})");
+            assert!(
+                reverse.windows(2).all(|w| major(&w[0]) <= major(&w[1])),
+                "an uncapped reversed segment was not walked lower to upper ({name})"
+            );
+            assert_eq!(
+                reverse, forward,
+                "an uncapped reversed segment changed its quad order ({name})"
+            );
         }
     }
 

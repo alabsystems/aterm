@@ -47,6 +47,19 @@
 //! target is the one shape where `dup2` succeeds and the child still execs with
 //! that number CLOSED. [`spawn_with_two_fds`] therefore moves every source OFF
 //! both target numbers before it places either one.
+//!
+//! ## And the opposite job: inherit NOTHING but stdio
+//!
+//! A forked child holds every descriptor its parent held until it execs, and an
+//! unflagged one survives the exec. The GUI holds descriptors nobody in aterm
+//! opened — MEASURED 2026-09-27, Metal's shader-cache files open read-write at
+//! fds 8, 10, 11 and 17, opened by the GPU driver without close-on-exec — so
+//! any child it starts with a plain `Command` carries them for its whole life.
+//! [`inherited_fd_ceiling`] and [`mark_inherited_close_on_exec`] are the strip
+//! aterm-pty's shell child has run since `a3840f1c1`, lifted here so a
+//! `Command` whose descendants outlive the GUI can run it from `pre_exec` (the
+//! product fd-hygiene sweep of 2026-09-27). The same async-signal-safety
+//! argument holds: the loop calls `fcntl(2)` and nothing else.
 
 #![cfg(unix)]
 
@@ -164,20 +177,123 @@ pub fn spawn_with_two_fds(
     cmd.spawn()
 }
 
-// The whole FFI surface of this module, in one block. `fcntl(2)`, `dup2(2)` and
-// `close(2)` are POSIX and identically shaped on every Unix aterm builds for;
-// `fcntl` is variadic by declaration, which is not cosmetic — on arm64 Darwin a
-// variadic argument is passed differently from a fixed one, so declaring it
-// non-variadic would be an ABI mismatch rather than a tidier signature.
+/// How far a child's inheritance strip must reach: this process's soft
+/// `RLIMIT_NOFILE`, which is the most descriptors it can have open (a number
+/// above it could only exist if the limit was LOWERED after it was opened, and
+/// no product path lowers it), capped at 65 536 so a limit raised to
+/// "unlimited" cannot turn one spawn into millions of `fcntl`s. MEASURED
+/// 2026-09-27 on aterm-pty's copy of this loop: 256 numbers ~0.1 ms — launchd's
+/// soft limit for a Dock-launched app — 10 240 ~2 ms, the cap ~15 ms.
+///
+/// READ IT BEFORE THE SPAWN, never inside `pre_exec`: `getrlimit` is not on
+/// POSIX's async-signal-safe list, and the number is the parent's to decide.
+/// An unreadable limit answers the cap, so the strip errs toward reaching too
+/// far rather than stopping short.
+#[must_use]
+pub fn inherited_fd_ceiling() -> RawFd {
+    const CAP: u64 = 1 << 16;
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    {
+        let mut limit = Rlimit { cur: 0, max: 0 };
+        // SAFETY: `limit` is a live `struct rlimit` of the platform's layout
+        // (two 64-bit `rlim_t` on every 64-bit Unix aterm builds for), which
+        // `getrlimit` fills and does not retain.
+        let soft = if unsafe { getrlimit(RLIMIT_NOFILE, &mut limit) } == 0 {
+            limit.cur.min(CAP)
+        } else {
+            CAP
+        };
+        RawFd::try_from(soft).unwrap_or(RawFd::MAX)
+    }
+    // A 32-bit `rlim_t` would not match `Rlimit`, and another Unix numbers the
+    // resource differently (7 is RLIMIT_NPROC on the BSDs); the cap is the safe
+    // answer wherever the ABI below is not known to hold.
+    #[cfg(not(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    )))]
+    {
+        RawFd::try_from(CAP).unwrap_or(RawFd::MAX)
+    }
+}
+
+/// MARK EVERY DESCRIPTOR ABOVE STDIO CLOSE-ON-EXEC, from 3 up to (not
+/// including) `ceiling` — call it from `pre_exec` with a ceiling
+/// [`inherited_fd_ceiling`] read before the spawn.
+///
+/// A forked child holds every descriptor its parent held until it execs, and an
+/// unflagged one survives the exec into the program and everything IT starts.
+/// Marking rather than closing is deliberate: `std`'s own exec-error pipe is
+/// already close-on-exec and must stay open until the exec, and 0/1/2 (the
+/// child's stdio, already `dup2`ed into place by `std` before any `pre_exec`
+/// closure runs) are below the range. macOS has no `closefrom`, so it is one
+/// `fcntl(F_SETFD)` per number; a number that is not open answers `EBADF` and
+/// costs nothing.
+///
+/// ASYNC-SIGNAL-SAFE by construction: `fcntl(2)` and integer arithmetic only —
+/// no allocation, no lock, no `static`, no error formatting. That is the whole
+/// obligation `pre_exec` places on it. Called in the PARENT it would be memory
+/// safe but wrong: it would strip descriptors the parent means to pass on.
+pub fn mark_inherited_close_on_exec(ceiling: RawFd) {
+    let mut fd: RawFd = 3;
+    while fd < ceiling {
+        // SAFETY: `F_SETFD` takes an int and touches no memory; an unused
+        // number is a harmless `EBADF`.
+        unsafe {
+            fcntl(fd, F_SETFD, FD_CLOEXEC);
+        }
+        fd += 1;
+    }
+}
+
+// The whole FFI surface of this module, in one block. `fcntl(2)`, `dup2(2)`,
+// `close(2)` and `getrlimit(2)` are POSIX and identically shaped on every Unix
+// aterm builds for; `fcntl` is variadic by declaration, which is not cosmetic —
+// on arm64 Darwin a variadic argument is passed differently from a fixed one, so
+// declaring it non-variadic would be an ABI mismatch rather than a tidier
+// signature.
 unsafe extern "C" {
     fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
     fn dup2(old: RawFd, new: RawFd) -> RawFd;
     fn close(fd: RawFd) -> i32;
+    #[cfg(all(
+        target_pointer_width = "64",
+        any(target_vendor = "apple", target_os = "linux")
+    ))]
+    fn getrlimit(resource: i32, limit: *mut Rlimit) -> i32;
 }
+
+/// `struct rlimit`: the soft and hard limit, each an `rlim_t` — 64 bits on
+/// Darwin and on every 64-bit Linux.
+#[cfg(all(
+    target_pointer_width = "64",
+    any(target_vendor = "apple", target_os = "linux")
+))]
+#[repr(C)]
+struct Rlimit {
+    cur: u64,
+    max: u64,
+}
+
+/// The descriptor-count resource: 8 on Darwin, 7 on Linux. The per-platform
+/// number is the ABI; `inherited_fd_ceiling_is_the_soft_open_file_limit` pins
+/// it against the shell's own `ulimit -n`.
+#[cfg(all(target_pointer_width = "64", target_vendor = "apple"))]
+const RLIMIT_NOFILE: i32 = 8;
+#[cfg(all(target_pointer_width = "64", target_os = "linux"))]
+const RLIMIT_NOFILE: i32 = 7;
 
 /// `fcntl(2)`'s "duplicate to the lowest free descriptor at or above the third
 /// argument". POSIX-defined and 0 on every supported Unix, so it is not per-ABI.
 const F_DUPFD: i32 = 0;
+
+/// `fcntl(2)`'s descriptor-flag setter and its one flag. Same numbers on every
+/// supported Unix, as in [`crate::fdpass`].
+const F_SETFD: i32 = 2;
+const FD_CLOEXEC: i32 = 1;
 
 #[cfg(test)]
 mod tests {
@@ -220,11 +336,9 @@ mod tests {
     /// carry the verdict back.
     const STAGE_ENV: &str = "ATERM_UDS_SPAWNFD_STAGE";
 
-    /// `fcntl(2)`'s descriptor-flag getter/setter and the one flag there is.
-    /// Same numbers on every supported Unix, as in [`crate::fdpass`].
+    /// `fcntl(2)`'s descriptor-flag getter (the setter and the flag are the
+    /// module's). Same number on every supported Unix, as in [`crate::fdpass`].
     const F_GETFD: i32 = 1;
-    const F_SETFD: i32 = 2;
-    const FD_CLOEXEC: i32 = 1;
 
     /// `F_GETFD` on `fd`, or `-1` when the number is not open.
     fn flags(fd: RawFd) -> i32 {
@@ -379,5 +493,116 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // The inheritance strip
+    // -----------------------------------------------------------------------
+
+    /// A descriptor WITHOUT close-on-exec at `floor` or above: the stand-in for
+    /// a file a framework opened in the GUI (Metal's shader cache, measured
+    /// 2026-09-27). `F_DUPFD` clears the flag on the copy. The floor keeps the
+    /// number clear of the ones a shell takes for itself while it runs `-c`.
+    fn unflagged_at_or_above(floor: RawFd) -> OwnedFd {
+        use std::os::fd::FromRawFd;
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        // SAFETY: `file` is live for the call; `F_DUPFD` returns a fresh
+        // descriptor or -1 and touches no memory.
+        let fd = unsafe { fcntl(file.as_raw_fd(), F_DUPFD, floor) };
+        assert!(
+            fd >= floor,
+            "F_DUPFD at {floor}: {}",
+            io::Error::last_os_error()
+        );
+        assert_eq!(
+            flags(fd) & FD_CLOEXEC,
+            0,
+            "PRECONDITION: the stand-in must be inheritable, or the strip has nothing to strip"
+        );
+        // SAFETY: `fd` was just created here and nothing else owns it.
+        unsafe { OwnedFd::from_raw_fd(fd) }
+    }
+
+    /// What a `/bin/sh` child finds open: its stdout (the detector's own
+    /// positive control) and `fd`. `strip` runs the strip from `pre_exec`, with
+    /// the ceiling read before the spawn — the shape a caller uses.
+    fn child_finds(fd: RawFd, strip: bool) -> String {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "[ -e /dev/fd/1 ] && printf 'stdout '; [ -e /dev/fd/{fd} ] && printf 'held '; \
+                 printf end"
+            ))
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if strip {
+            let ceiling = inherited_fd_ceiling();
+            // SAFETY: the closure runs between fork and exec and calls only
+            // `mark_inherited_close_on_exec`, which is async-signal-safe; the
+            // ceiling it reads is a plain integer captured before the fork.
+            unsafe {
+                cmd.pre_exec(move || {
+                    mark_inherited_close_on_exec(ceiling);
+                    Ok(())
+                });
+            }
+        }
+        let out = cmd.output().expect("run /bin/sh");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// **A STRIPPED CHILD INHERITS NOTHING ABOVE STDIO.** A descriptor the
+    /// parent holds without close-on-exec rides a plain `Command` into the
+    /// child (the control, in the same run), and does not ride one that runs
+    /// the strip — while the child's stdio still arrives.
+    #[test]
+    fn a_stripped_child_inherits_nothing_above_stdio() {
+        let held = unflagged_at_or_above(64);
+        let fd = held.as_raw_fd();
+        assert!(
+            inherited_fd_ceiling() > fd,
+            "the ceiling must reach every descriptor this process can hold open"
+        );
+        let plain = child_finds(fd, false);
+        let stripped = child_finds(fd, true);
+        drop(held);
+        assert_eq!(
+            plain, "stdout held end",
+            "control: an unflagged descriptor must reach a plain child, or this test \
+             cannot tell a strip from a detector that sees nothing"
+        );
+        assert_eq!(
+            stripped, "stdout end",
+            "the strip must keep fd {fd} out of the child and leave its stdio alone"
+        );
+    }
+
+    /// The ceiling IS the soft open-file limit, capped: pinned against the
+    /// shell's own `ulimit -n`, which a child inherits unchanged. This is the
+    /// check on the per-platform `RLIMIT_NOFILE` number and the `struct rlimit`
+    /// layout — the wrong resource number reads some other limit.
+    #[test]
+    fn inherited_fd_ceiling_is_the_soft_open_file_limit() {
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("ulimit -n")
+            .output()
+            .expect("run ulimit");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let text = text.trim();
+        let cap: u64 = 1 << 16;
+        let soft = if text == "unlimited" {
+            cap
+        } else {
+            text.parse::<u64>()
+                .unwrap_or_else(|e| panic!("`ulimit -n` answered {text:?}: {e}"))
+                .min(cap)
+        };
+        assert_eq!(
+            u64::try_from(inherited_fd_ceiling()).expect("a non-negative ceiling"),
+            soft,
+            "the ceiling must be the soft RLIMIT_NOFILE (`ulimit -n` = {text})"
+        );
     }
 }

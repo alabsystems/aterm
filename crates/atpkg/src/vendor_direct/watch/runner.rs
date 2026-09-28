@@ -715,16 +715,17 @@ impl Runner {
         Ok(HostHandle { stop, thread })
     }
 
-    /// ONE SLICE, the window's park slice alone: park (no wait while a head is due and
-    /// nothing is in flight), read `[packages]`, follow the pass in flight — no head is
-    /// asked meanwhile, as none is while the window's lane runs a pass, though a round the
-    /// pass interrupted is harvested as its answers land — or start the next
-    /// one a moved head queued, else the watch's own [`HeadWatch::slice`] over the slice's
+    /// ONE LOOK: park until the next useful admission (or one window-sized slice
+    /// while seated), read `[packages]`, follow the pass in flight — no head is asked
+    /// meanwhile, as none is while the window's lane runs a pass, though a round the
+    /// pass interrupted is harvested as its answers land — or start the next one a
+    /// moved head queued, else the watch's own [`HeadWatch::slice`] over the park's
     /// two clocks.
     pub fn step(&mut self) {
         let wall_before = self.clock.wall();
         let mono_before = self.clock.mono();
         let idle = self.following.is_none() && self.queue.is_empty();
+        let admission_wait = self.admit_after.saturating_sub(mono_before);
         // A refused claim or a round started moves every head off due, so a zero wait is
         // one look, never a spin.
         let wait = if self.on
@@ -734,6 +735,22 @@ impl Runner {
             && self.watch.due(wall_before)
         {
             Duration::ZERO
+        } else if self.on
+            && idle
+            && !admission_wait.is_zero()
+            && !self.watch.has_pending()
+            && self.index.pending.is_none()
+            && self.index.ready == 0
+        {
+            // A second session denied the seat cannot ask any vendor, inspect a held
+            // flip, or launch a signed index pass before `admit_after`: every path
+            // re-admits through that same claim. Its per-five-second config stat
+            // used to wake every denied session for no work. Sleep to the claim's
+            // existing deadline (at most a minute), then re-read the live gate
+            // BEFORE admitting or asking a head. A seated session, an in-flight
+            // worker, or an enabled session with no denial keeps the five-second
+            // config response; `HostHandle::stop` still unparks this wait.
+            admission_wait.min(CADENCE)
         } else {
             SLICE
         };
@@ -1144,6 +1161,8 @@ mod tests {
         wall_ms: Arc<AtomicU64>,
         mono_ms: Arc<AtomicU64>,
         nap_ms: Arc<AtomicU64>,
+        last_park_ms: Arc<AtomicU64>,
+        parks: Arc<AtomicU64>,
     }
 
     impl Time {
@@ -1181,6 +1200,10 @@ mod tests {
         /// A head in flight is waited for on the real clock — its worker's completion
         /// unparks this thread; the bound is only a backstop — then the slice passes.
         fn park(&mut self, watch: &mut HeadWatch, slice: Duration) {
+            self.0
+                .last_park_ms
+                .store(u64::try_from(slice.as_millis()).unwrap(), Ordering::SeqCst);
+            self.0.parks.fetch_add(1, Ordering::SeqCst);
             if watch.has_pending() {
                 watch.park_for_hint(Duration::from_secs(30));
             }
@@ -1458,17 +1481,29 @@ mod tests {
         let passes = Passes::default();
         let mut first = session(&l, &time, &vendors, "first", &passes, &on());
         let mut second = session(&l, &time, &vendors, "second", &passes, &on());
-        // Both park on the one clock, so each pair of steps is up to two slices.
+        // Give the first session the seat before the second asks. The fake
+        // clocks share one wall clock, so stepping the denied host's minute
+        // park alongside the seated host would skip the latter's scheduled
+        // five-second looks. Check the seated GET cadence on its own clock;
+        // the denied host still proves the claim excludes its GET below.
+        first.step();
+        second.step();
+        assert_eq!(vendors.count("second"), 0, "the other stood by");
         let start = time.wall();
         while time.wall() < start + Duration::from_secs(5 * 60) {
             first.step();
-            second.step();
         }
         assert!(
             (5..=6).contains(&vendors.count("first")),
-            "the seat holder asked each minute"
+            "the seat holder asked each minute: {} GETs over {:?}",
+            vendors.count("first"),
+            time.wall().duration_since(start).unwrap()
         );
+        // Re-admit while the first still owns the seat, so the second's next
+        // deadline is a full minute away when the first disappears.
+        second.step();
         assert_eq!(vendors.count("second"), 0, "the other stood by");
+        assert_eq!(second.admit_after - second.clock.mono(), CADENCE);
         assert!(
             second.watch.session_admission_attempts() <= 6,
             "a second tab tries the seat at most once a minute, not every slice: {}",
@@ -1484,6 +1519,57 @@ mod tests {
             second.step();
         }
         assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// A denied session cannot do update work before its next admission. It
+    /// therefore needs one park, not twelve config stats and wakeups, during
+    /// that minute. A changed live gate is read on the admission wake BEFORE
+    /// any claim or GET; while the gate is off, five-second looks resume so
+    /// turning it back on is still observed promptly.
+    #[test]
+    fn a_denied_idle_session_parks_to_admission_and_reads_the_gate_first() {
+        let l = layout("denied-idle-park");
+        install(&l, "claude", "2.1.280");
+        let time = Time::default();
+        let vendors = Vendors::new("2.1.280");
+        let passes = Passes::default();
+        let mut first = session(&l, &time, &vendors, "first", &passes, &on());
+        for _ in 0..3 {
+            first.step();
+        }
+        assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
+
+        let gate = on();
+        let gate_reads = Arc::new(AtomicU64::new(0));
+        let mut second = session(&l, &time, &vendors, "second", &passes, &gate);
+        let watched_gate = Arc::clone(&gate);
+        let watched_reads = Arc::clone(&gate_reads);
+        second.settings = Box::new(move || {
+            watched_reads.fetch_add(1, Ordering::SeqCst);
+            Gate {
+                on: watched_gate.load(Ordering::SeqCst),
+                exclude: vec![String::from("codex")],
+            }
+        });
+        second.step();
+        assert_eq!(second.admit_after - second.clock.mono(), CADENCE);
+        let reads_before = gate_reads.load(Ordering::SeqCst);
+        let parks_before = time.parks.load(Ordering::SeqCst);
+        gate.store(false, Ordering::SeqCst);
+        second.step();
+        assert_eq!(time.last_park_ms.load(Ordering::SeqCst), 60_000);
+        assert_eq!(time.parks.load(Ordering::SeqCst), parks_before + 1);
+        assert_eq!(gate_reads.load(Ordering::SeqCst), reads_before + 1);
+        assert!(!second.on);
+        assert_eq!(vendors.count("second"), 0);
+        assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
+
+        gate.store(true, Ordering::SeqCst);
+        second.step();
+        assert_eq!(time.last_park_ms.load(Ordering::SeqCst), 5_000);
+        assert!(second.on);
+        assert_eq!(vendors.count("second"), 0);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1598,7 +1684,12 @@ mod tests {
         assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
         gate.store(false, Ordering::SeqCst);
         let asked = vendors.count("session");
-        for _ in 0..(5 * 60 / SLICE.as_secs()) {
+        runner.step();
+        assert!(
+            time.last_park_ms.load(Ordering::SeqCst) <= 5_000,
+            "a seated session still observes a live config edit within one slice"
+        );
+        for _ in 1..(5 * 60 / SLICE.as_secs()) {
             runner.step();
         }
         assert_eq!(vendors.count("session"), asked);
@@ -1645,6 +1736,68 @@ mod tests {
         assert_eq!(watcher(&l), Watcher::Session(Some(std::process::id())));
         handle.stop();
         assert_eq!(watcher(&l), Watcher::Nobody);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The stop signal uses `thread::unpark`, so even a denied session's
+    /// minute-long admission park must end immediately on process shutdown.
+    #[test]
+    fn stop_unparks_a_denied_minute_wait() {
+        struct NotifyingClock {
+            origin: Instant,
+            parked: std::sync::mpsc::Sender<Duration>,
+        }
+
+        impl Clock for NotifyingClock {
+            fn wall(&self) -> SystemTime {
+                SystemTime::now()
+            }
+
+            fn mono(&self) -> Duration {
+                self.origin.elapsed()
+            }
+
+            fn park(&mut self, watch: &mut HeadWatch, wait: Duration) {
+                if wait >= CADENCE - SLICE {
+                    self.parked.send(wait).unwrap();
+                }
+                watch.park_for_hint(wait);
+            }
+        }
+
+        let l = layout("stop-denied-park");
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let get: Arc<ConcurrentVendorGetFn<'static>> =
+            Arc::new(|_, _, _, _| panic!("a denied session must not ask a vendor"));
+        let mut runner = Runner::new(
+            l.clone(),
+            (
+                HeadWatch::hosted(&[String::from("codex")], Host::Session),
+                get,
+            ),
+            Box::new(NotifyingClock {
+                origin: Instant::now(),
+                parked: parked_tx,
+            }),
+            Box::new(|| Gate {
+                on: true,
+                exclude: vec![String::from("codex")],
+            }),
+            Box::new(Passes::default()),
+            Box::new(|_: &str| {}),
+        );
+        runner.admit_after = CADENCE;
+        let handle = runner.spawn().unwrap();
+        assert!(
+            parked_rx.recv_timeout(Duration::from_secs(2)).unwrap() >= CADENCE - SLICE,
+            "the denied runner entered its long park"
+        );
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            handle.stop();
+            stopped_tx.send(()).unwrap();
+        });
+        stopped_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

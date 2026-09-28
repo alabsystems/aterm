@@ -182,6 +182,27 @@ pub(crate) struct AgentRestore {
     pub version: Option<String>,
 }
 
+impl AgentRestore {
+    /// Whether the relaunch after aterm ended brings this agent back on its
+    /// conversation ([`agent_resumes`]).
+    pub(crate) fn resumes(&self) -> bool {
+        agent_resumes(self.session.as_deref(), &self.argv)
+    }
+}
+
+/// Whether an agent aterm hosted when it ended — its conversation `session`
+/// and its argv, as the live layout carried them — is one the relaunch in
+/// its reopened tab brings back (P6a, ruling 293): it names a conversation,
+/// and it is no one-shot run (`-p`, `--version`), whose end is the one it was
+/// launched for. `aterm_agent::harness::relaunch::after_host_ended` refuses
+/// exactly these two (`ended:no-conversation`, `ended:one-shot`) before it
+/// looks at the tab; what it finds there (a shell gone, a tab never ready)
+/// is said when it happens ([`crate::message_reporters::restored_agents_not_resumed`]).
+pub(crate) fn agent_resumes(session: Option<&str>, argv: &[String]) -> bool {
+    use aterm_agent::harness::upgrade::{is_session_id, one_shot};
+    session.is_some_and(is_session_id) && !one_shot(argv)
+}
+
 impl TerminalLeafRestore {
     /// The six USER fields this leaf carries, as the values of the
     /// [`SessionMeta`](crate::session_timeline::SessionMeta) they were captured

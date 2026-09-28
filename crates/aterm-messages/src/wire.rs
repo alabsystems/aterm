@@ -17,7 +17,7 @@ use std::collections::VecDeque;
 use crate::center::{Live, MessageCenter, Outcome, PostOutcome};
 use crate::log::{LogRecord, MessageLog, Retired};
 use crate::model::{
-    ActionIndex, Amount, Hold, Intent, Load, Message, MessageId, Meter, Origin, Restatement,
+    ActionIndex, Amount, Glyph, Hold, Intent, Load, Message, MessageId, Meter, Origin, Restatement,
     Severity, Tag, Unit, WallStamp, tags,
 };
 use crate::text::{clip, glass_title_fault};
@@ -755,11 +755,14 @@ impl ProgressRequest {
 
     /// A NEW row (design ruling 165): Info, `Origin::Wire`, keyed,
     /// `Hold::Live { STALE_WIRE }`, revealed only after [`PROGRESS_GRACE`]
-    /// (a job done inside it never flashes), with its meter; no actions.
+    /// (a job done inside it never flashes), with its meter; no actions. It
+    /// wears the working mark `↻` (design ruling 304): Info's `ℹ` made a
+    /// script's meter read as an FYI beside aterm's own moving rows.
     #[must_use]
     pub(crate) fn into_message(self) -> Message {
         let meter = self.meter();
         Message::new(self.tag, Severity::Info, self.title)
+            .glyph(Glyph::or_fallback('\u{21bb}'))
             .key(&self.key)
             .origin(Origin::Wire)
             .hold(Hold::Live {

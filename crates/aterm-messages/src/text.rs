@@ -170,12 +170,21 @@ pub fn shape_detail(detail: &str, cap: usize) -> String {
     }
     // A CORRECTION — `windw_padding → window_padding` — cut is the right
     // side alone (design ruling 261): the fix is what the person types, and
-    // a cut that kept the typo kept the one word that is wrong.
+    // a cut that kept the typo kept the one word that is wrong. Its ARROW
+    // stays (ruling 306: `Misspelled setting · window_padding` named the
+    // right spelling as the misspelled one), and a fix too long for the cap
+    // with it is not cut — a clipped key is a key that is not there — but
+    // dropped whole.
     if let Some((_, fix)) = clean.split_once(" \u{2192} ")
         && !fix.contains(" \u{2192} ")
         && !fix.trim().is_empty()
     {
-        return truncate(fix.trim(), cap);
+        let arrowed = format!("\u{2192} {}", fix.trim());
+        return if char_width(&arrowed) <= cap {
+            arrowed
+        } else {
+            String::new()
+        };
     }
     if clean.contains('`') && clean.contains(PIECE_SEP) {
         let pieces: Vec<&str> = clean.split(PIECE_SEP).collect();

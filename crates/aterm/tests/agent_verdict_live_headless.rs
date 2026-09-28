@@ -845,6 +845,23 @@ fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
 /// Type the launch of `script` as `claude` (`exec -a`), its go-file `go` and
 /// quit-file `quit`.
 fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path) {
+    // THE SHELL FIRST. A line typed before bash has drawn its prompt is echoed
+    // twice: once raw by the tty in canonical mode, then again when readline
+    // starts and redisplays the pending input after its prompt. The merge
+    // contract measured it on 2026-09-27 under a loaded machine: the relaunch
+    // test counted three launch lines for two launches and failed. Every launch
+    // waits for a prompt row (`$ ` at the end, the default PS1) — the same wait a
+    // person makes before typing.
+    ctl_ok(
+        inst,
+        &[
+            &format!("@{sid}"),
+            "await",
+            "match",
+            r"[$#]\s*$",
+            "timeout=15000",
+        ],
+    );
     type_line(
         inst,
         sid,

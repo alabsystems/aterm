@@ -215,19 +215,6 @@ pub unsafe fn send_id_rect(recv: Id, sel: Sel, a: CGRect) -> Id {
     }
 }
 
-/// `-(id)sel:(NSInteger)a` — `-[NSMenu itemAtIndex:]` and friends.
-///
-/// # Safety
-/// See the module note, including the ownership paragraph.
-#[must_use]
-pub unsafe fn send_id_isize(recv: Id, sel: Sel, a: isize) -> Id {
-    // SAFETY: the caller pins the prototype; this is the cast for it.
-    unsafe {
-        let f: unsafe extern "C-unwind" fn(Id, Sel, isize) -> Id = msg();
-        f(recv, sel, a)
-    }
-}
-
 /// `-(BOOL)sel`.
 ///
 /// # Safety
@@ -467,8 +454,7 @@ pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect 
 }
 
 /// `-(id)sel:(NSUInteger)a` — `-[NSWindow standardWindowButton:]`, whose
-/// argument is an `NSWindowButton` (an `NSUInteger` enum, NOT the signed one
-/// [`send_id_isize`] takes).
+/// argument is an `NSWindowButton`: an `NSUInteger` enum, NOT an `NSInteger`.
 ///
 /// # Safety
 /// See the module note, including the ownership paragraph.

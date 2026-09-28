@@ -497,24 +497,26 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
     let mut line = row.to_line();
     line.push('\n');
     for _ in 0..4 {
-        let mut file = std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
-        let locked = lock_briefly(&file);
+        // Bound after `file`, so it drops first on every exit — the `continue`, the
+        // `?` and the return all release the lock before the descriptor closes.
+        let lock = lock_briefly(&file);
         // A trim that renamed a new file over the path between our open and our lock
         // left us holding the retired inode: go round and open the path again.
         let same_inode = match (file.metadata(), std::fs::symlink_metadata(path)) {
             (Ok(ours), Ok(now)) => ours.ino() == now.ino() && ours.dev() == now.dev(),
             _ => false,
         };
-        if locked && !same_inode {
+        if lock.is_some() && !same_inode {
             continue;
         }
-        file.write_all(line.as_bytes())?;
-        if locked && file.metadata().is_ok_and(|m| m.len() > TRIM_AT_BYTES) {
+        (&file).write_all(line.as_bytes())?;
+        if lock.is_some() && file.metadata().is_ok_and(|m| m.len() > TRIM_AT_BYTES) {
             trim_locked(path);
         }
         return Ok(());
@@ -524,19 +526,38 @@ pub fn append_row(path: &Path, row: &Row) -> std::io::Result<()> {
     ))
 }
 
-/// `flock(LOCK_EX)` without waiting, retried every 20 ms for about a second.
+/// `flock(LOCK_EX)` without waiting, retried every 20 ms for about a second: the
+/// held lock, or `None` when it stayed taken.
 #[cfg(unix)]
-fn lock_briefly(file: &std::fs::File) -> bool {
+fn lock_briefly(file: &std::fs::File) -> Option<LedgerLock<'_>> {
     use std::os::unix::io::AsRawFd as _;
     for _ in 0..50 {
-        // SAFETY: `file` owns a live descriptor for the call; LOCK_NB never waits,
-        // and the lock is released when the descriptor closes.
+        // SAFETY: `file` owns a live descriptor for the call; LOCK_NB never waits.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return true;
+            return Some(LedgerLock(file));
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    false
+    None
+}
+
+/// A held [`lock_briefly`], released by `LOCK_UN` when it drops rather than by the
+/// close alone (the product fd-hygiene sweep of 2026-09-27). An `flock` lives on the
+/// open file description, and the census appends while the GUI forks shells: a
+/// forked child holds every descriptor until it execs, and `O_CLOEXEC` closes its
+/// copy at the exec, never at the fork (up to ~523 ms under load). Released by the
+/// close alone, the lock lived on in that copy, a rival append ran out of tries, and
+/// its row went unchecked into an inode a trim had just retired. `LOCK_UN` strips the
+/// lock from the description itself, every inherited copy included (pinned by
+/// `a_released_ledger_lock_is_free_while_a_copy_of_its_descriptor_lives`).
+#[cfg(unix)]
+struct LedgerLock<'a>(&'a std::fs::File);
+
+#[cfg(unix)]
+impl Drop for LedgerLock<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
 }
 
 /// Rewrite the ledger at `path` with its newest [`KEEP_ROWS`] rows, by a `0600`
@@ -909,6 +930,41 @@ mod tests {
             assert!(n < 10_000, "the ledger never trimmed");
         }
         assert!(std::fs::metadata(&path).expect("meta").len() <= TRIM_AT_BYTES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ledger lock is free for a second open file description the instant its
+    /// guard drops, even while a copy of the first description lives — the copy a
+    /// child another thread is forking holds until it execs (the product fd-hygiene
+    /// sweep of 2026-09-27). `try_clone` is `dup`: the same description, as a fork's
+    /// copy is.
+    #[cfg(unix)]
+    #[test]
+    fn a_released_ledger_lock_is_free_while_a_copy_of_its_descriptor_lives() {
+        let dir = scratch("lock-copy");
+        let path = ledger_path(&dir);
+        let open = || {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .create(true)
+                .open(&path)
+                .expect("open the ledger")
+        };
+        let file = open();
+        let held = lock_briefly(&file).expect("a free ledger locks");
+        assert!(
+            open().try_lock().is_err(),
+            "a held ledger lock refuses a second description"
+        );
+        let childs_copy = file.try_clone().expect("dup the ledger's descriptor");
+        // Released by `LOCK_UN` (the guard's drop), then closed, while the copy lives.
+        drop(held);
+        drop(file);
+        assert!(
+            open().try_lock().is_ok(),
+            "a released ledger lock must be free while a copy of its descriptor lives"
+        );
+        drop(childs_copy);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

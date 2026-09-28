@@ -127,6 +127,9 @@ mod cadence_bounds;
 mod check_lane;
 #[cfg(target_os = "macos")]
 mod check_receipt;
+/// The background check loop's heartbeat and the pure judgement of it that the
+/// window's watchdog, `aterm ctl update status` and the tests share (plan P2-1).
+pub mod checker_watch;
 /// The 2026-09-14 multi-process coordination audit's failing tests (checker gate
 /// vs. the apply lane's ledger writes, a future-dated stamp, cross-build streak
 /// expiry). Kept in their own file so the audit's laws read as one document.
@@ -175,6 +178,10 @@ mod verify;
 // Check-channel audit (2026-09-14): failing tests for the cross-process checker gate.
 #[cfg(all(test, target_os = "macos"))]
 mod check_channel_audit_tests;
+// The checker's supervision (plan P2-1): the real loop, driven to each way it used
+// to stall silently.
+#[cfg(all(test, target_os = "macos"))]
+mod checker_supervision_tests;
 // Not macOS-only: every platform names the copy of aterm it is running (S12 of
 // `docs/DESIGN-which-copy-runs-2026-08-27.md`); only the other-copy probe is `.app`-shaped.
 pub mod which_copy;
@@ -489,13 +496,17 @@ pub fn refusal_needs_person(_reason: &str) -> bool {
 /// `install::preverify_staged_handoff_candidate` for the exact obligations, and
 /// `install::preverify_installed_rollback_source` for why the second half is
 /// not optional.
+///
+/// `Ok` carries what the candidate's HANDOFF POLICY file held
+/// ([`aterm_update_core::handoff_policy`], plan P0-5), read from the verified
+/// stage after every check passed and never on a refusal.
 #[cfg(target_os = "macos")]
 pub fn preverify_staged_for_handoff(
     current_build: u64,
     current_commit: Option<&str>,
     expected_build: Option<u64>,
     expected_commit: Option<&str>,
-) -> Result<(), String> {
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
     install::preverify_staged_handoff_candidate(
         current_build,
         current_commit,
@@ -504,17 +515,18 @@ pub fn preverify_staged_for_handoff(
     )
 }
 
-/// Non-macOS: there is no `.app` bundle, so there is nothing to pre-verify and
-/// nothing this could refuse. The only overlap lane reachable off macOS is the
-/// same-binary `ATERM_DEBUG_SEAMLESS_REEXEC` QA path, which skips pre-verify.
+/// Non-macOS: there is no `.app` bundle, so there is nothing to pre-verify,
+/// nothing this could refuse and no policy to read. The only overlap lane
+/// reachable off macOS is the same-binary `ATERM_DEBUG_SEAMLESS_REEXEC` QA path,
+/// which skips pre-verify.
 #[cfg(not(target_os = "macos"))]
 pub fn preverify_staged_for_handoff(
     _current_build: u64,
     _current_commit: Option<&str>,
     _expected_build: Option<u64>,
     _expected_commit: Option<&str>,
-) -> Result<(), String> {
-    Ok(())
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+    Ok(aterm_update_core::handoff_policy::PolicyRead::Absent)
 }
 
 /// Record that a staged build FAILED to become the running build, so the failure
@@ -945,27 +957,92 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
 /// a bundle swapped again between the observation and the handoff is caught before
 /// the terminal is touched. Runs on the handoff worker (codesign is not free), never
 /// the event loop.
+///
+/// `Ok` carries what that bundle's HANDOFF POLICY file held
+/// ([`aterm_update_core::handoff_policy`], plan P0-5), read only once every check
+/// above has passed.
 #[cfg(target_os = "macos")]
 pub fn preverify_installed_for_handoff(
     current_build: u64,
     expected_build: u64,
     expected_commit: &str,
-) -> Result<(), String> {
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
     let installed = bundle::resolve_layout()
         .ok_or_else(|| "no installed bundle at this executable's path".to_string())?;
-    let (build, commit) = install::verified_bundle_identity_at(&installed.app_root)?;
+    preverify_installed_locked(
+        paths::Staging::resolve().as_ref(),
+        &installed.app_root,
+        current_build,
+        expected_build,
+        expected_commit,
+        &aterm_update_core::handoff_policy::read_from_bundle,
+    )
+}
+
+/// [`preverify_installed_at`] UNDER THE APPLY LOCK of `staging` (bounded, as the
+/// staged lane's check is), with the operator floor read under it.
+///
+/// A sibling aterm's staged swap renames a new bundle onto this very path while
+/// it holds that lock. Unlocked, the swap could land between the codesign check
+/// and the policy read, and the policy of the bundle that replaced the verified
+/// one was then cached under the verified one's identity and followed by this
+/// park — so "the policy is read from the bytes the signature check verified"
+/// held for a staged candidate and not for an activation. Under the lock a swap
+/// happens wholly before the check or wholly after the read. (A bundle dragged
+/// over the app by hand takes no lock; the swap-time gate is what catches that.)
+/// No staging root, no sibling can be swapping: nothing to take.
+#[cfg(target_os = "macos")]
+fn preverify_installed_locked(
+    staging: Option<&paths::Staging>,
+    app_root: &std::path::Path,
+    current_build: u64,
+    expected_build: u64,
+    expected_commit: &str,
+    read_policy: &dyn Fn(&std::path::Path) -> aterm_update_core::handoff_policy::PolicyRead,
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+    let _lock = staging
+        .map(|staging| {
+            aterm_update_core::FileLock::acquire_within(
+                &staging.apply_lock,
+                install::APPLY_LOCK_WAIT,
+            )
+        })
+        .transpose()
+        .map_err(|error| format!("pre-verify lock: {error}"))?;
+    let floor = staging.map_or(0, |staging| {
+        manifest::Floor::read(&staging.floor()).min_build
+    });
+    preverify_installed_at(
+        app_root,
+        floor,
+        current_build,
+        expected_build,
+        expected_commit,
+        read_policy,
+    )
+}
+
+/// The checks of [`preverify_installed_for_handoff`] against the bundle at
+/// `app_root` and the operator floor `floor_min_build`, with the policy reader
+/// injected so a test can prove a refused bundle's policy is never read.
+#[cfg(target_os = "macos")]
+fn preverify_installed_at(
+    app_root: &std::path::Path,
+    floor_min_build: u64,
+    current_build: u64,
+    expected_build: u64,
+    expected_commit: &str,
+    read_policy: &dyn Fn(&std::path::Path) -> aterm_update_core::handoff_policy::PolicyRead,
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
+    let (build, commit) = install::verified_bundle_identity_at(app_root)?;
     // The operator apply floor (a yank) gates an ACTIVATION exactly as it gates a
     // staged swap (`install.rs`): a yanked build found under our own path is still a
     // yanked build (2026-08-19 review).
-    if let Some(staging) = paths::Staging::resolve() {
-        let floor = manifest::Floor::read(&staging.floor());
-        if build < floor.min_build {
-            return Err(format!(
-                "installed bundle build {build} is below the operator apply floor {} (yanked); \
-                 not activating it",
-                floor.min_build
-            ));
-        }
+    if build < floor_min_build {
+        return Err(format!(
+            "installed bundle build {build} is below the operator apply floor \
+             {floor_min_build} (yanked); not activating it"
+        ));
     }
     if build != expected_build {
         return Err(format!(
@@ -982,7 +1059,9 @@ pub fn preverify_installed_for_handoff(
             "installed bundle build {build} is not newer than the running build {current_build}"
         ));
     }
-    Ok(())
+    // Every refusal returned above: the policy is read from a bundle that passed
+    // its codesign policy and IS the authorized successor, or not at all.
+    Ok(read_policy(app_root))
 }
 
 /// THIS PROCESS IS A HANDOFF CANDIDATE THAT HAS NOT TAKEN OVER YET. Set by the GUI
@@ -1104,7 +1183,7 @@ pub fn preverify_installed_for_handoff(
     _current_build: u64,
     _expected_build: u64,
     _expected_commit: &str,
-) -> Result<(), String> {
+) -> Result<aterm_update_core::handoff_policy::PolicyRead, String> {
     Err("installed-bundle activation is macOS-only".to_string())
 }
 
@@ -1829,6 +1908,14 @@ pub struct LinuxUpdateStatus {
 
 /// The same single background checker, sampling its source before each cycle so
 /// configuration reloads take effect without restarting the process.
+///
+/// SUPERVISED SINCE THE 2026-09-22/23 UPDATE AUDIT (plan P2-1). The thread stamps
+/// [`checker_watch::WATCH`] as it goes, each cycle runs under `catch_unwind` (a
+/// panic is a logged cycle, not the end of updating for the life of the
+/// process), the machine-wide `checker.lock` is taken with a bound
+/// ([`checker_watch::CHECKER_LOCK_WAIT`]) and a cycle that cannot get it DEFERS,
+/// and the arguments are kept so the window's watchdog can start a replacement
+/// under a new generation ([`respawn_stalled_checker`]) when the stamp goes stale.
 #[cfg(target_os = "macos")]
 pub fn spawn_background_check_with_source(
     current_build: u64,
@@ -1853,438 +1940,880 @@ pub fn spawn_background_check_with_source(
     if bundle::resolve().is_none() {
         return;
     }
-    std::thread::Builder::new()
+    let args = std::sync::Arc::new(CheckerArgs {
+        current_build,
+        source_provider,
+        health_hook: std::sync::Mutex::new(notify),
+        staged_hook: std::sync::Mutex::new(on_staged),
+        settings_retry: SETTINGS_RETRY,
+        staging: std::sync::Arc::new(paths::Staging::resolve),
+        checker_lock_wait: checker_watch::CHECKER_LOCK_WAIT,
+        pause: None,
+    });
+    let generation = checker_watch::WATCH.register(
+        cadence::Cadence::new(std::time::Duration::from_secs(cadence::INTERVAL_SECS))
+            .max_wait()
+            .as_secs(),
+    );
+    // Kept for a replacement, which runs on the FIRST spawn's arguments. Nothing
+    // spawns twice in one process; if something did, its `register` would take the
+    // next generation and so retire the first thread — still one checker.
+    let _ = CHECKER_ARGS.set(std::sync::Arc::clone(&args));
+    spawn_checker_thread(generation, args);
+}
+
+/// How long the check loop pauses after the host did not answer its settings query
+/// (the query itself is bounded by the host — the window's is 2 s).
+#[cfg(target_os = "macos")]
+const SETTINGS_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Every how many consecutive settings misses the loop says so again (~7 s each:
+/// the 2 s query plus [`SETTINGS_RETRY`], so about every seven minutes).
+#[cfg(target_os = "macos")]
+const SETTINGS_MISS_LOG_EVERY: u64 = 60;
+
+/// Every how many consecutive `checker.lock` deferrals the loop says so again
+/// (one per cycle: about an hour at the ten-minute interval).
+#[cfg(target_os = "macos")]
+const CHECKER_DEFERRAL_LOG_EVERY: u64 = 6;
+
+/// Every how many consecutive cycles that found this process's own check lane busy
+/// the loop says so again.
+#[cfg(target_os = "macos")]
+const LANE_BUSY_LOG_EVERY: u64 = 6;
+
+/// What the check loop runs on, shared by the thread and any replacement for it.
+///
+/// The two GUI hooks are `Send` but not `Sync` (their public types say so), and a
+/// replacement may call them while the thread it replaced still holds a reference,
+/// so each sits behind a mutex; a call only posts an event-loop message.
+#[cfg(target_os = "macos")]
+struct CheckerArgs {
+    current_build: u64,
+    source_provider: SourceProvider,
+    health_hook: std::sync::Mutex<Option<HealthNotify>>,
+    staged_hook: std::sync::Mutex<Option<StagedNotify>>,
+    /// The pause after an unanswered settings query ([`SETTINGS_RETRY`]; a test
+    /// passes zero).
+    settings_retry: std::time::Duration,
+    /// Where the loop's OWN reads of the staging root go — the checker lock, the
+    /// dedup receipt, the health ledger: [`paths::Staging::resolve`] in the
+    /// shipping loop, a scratch root in a test (the check itself resolves its own).
+    staging: std::sync::Arc<dyn Fn() -> Option<paths::Staging> + Send + Sync>,
+    /// How long a cycle waits for `checker.lock` before it defers
+    /// ([`checker_watch::CHECKER_LOCK_WAIT`]; a test passes a short one).
+    checker_lock_wait: std::time::Duration,
+    /// Every wait between cycles: `None` is the cadence's own (jittered, backed
+    /// off, wake-aware — the shipping loop); a test passes a fixed pause.
+    pause: Option<std::time::Duration>,
+}
+
+#[cfg(target_os = "macos")]
+impl CheckerArgs {
+    fn has_health_hook(&self) -> bool {
+        self.health_hook.lock().is_ok_and(|hook| hook.is_some())
+    }
+
+    fn send_health(&self, title: String, body: String) {
+        if let Ok(hook) = self.health_hook.lock()
+            && let Some(cb) = hook.as_ref()
+        {
+            cb(title, body);
+        }
+    }
+
+    fn has_staged_hook(&self) -> bool {
+        self.staged_hook.lock().is_ok_and(|hook| hook.is_some())
+    }
+
+    fn send_staged(&self, build: u64, version: String) {
+        if let Ok(hook) = self.staged_hook.lock()
+            && let Some(cb) = hook.as_ref()
+        {
+            cb(build, version);
+        }
+    }
+}
+
+/// The arguments the process's checker was started with — what
+/// [`respawn_stalled_checker`] starts a replacement on.
+#[cfg(target_os = "macos")]
+static CHECKER_ARGS: std::sync::OnceLock<std::sync::Arc<CheckerArgs>> = std::sync::OnceLock::new();
+
+/// Start one checker thread under `generation`. The handle is dropped on purpose —
+/// nothing joins a loop that never ends — and the heartbeat, not the handle, is
+/// how its life is watched: a thread that could not even be created leaves its
+/// `Starting` stamp to go stale, and the watchdog tries again.
+#[cfg(target_os = "macos")]
+fn spawn_checker_thread(generation: u64, args: std::sync::Arc<CheckerArgs>) {
+    let spawned = std::thread::Builder::new()
         .name("aterm-update".into())
         .spawn(move || {
-            // One cadence (`cadence::INTERVAL_SECS`, no knob). Cost honesty: a check
-            // spends ZERO metered requests — one HEAD of the evergreen
-            // github.com/…/releases/latest/download/aterm-appcast.toml, whose 302
-            // names the newest tag, and tag-specific GETs on the same unmetered host
-            // only when that tag moved. The interval is a courtesy to the download
-            // host and a bound on staleness; the in-session lane applies what it
-            // stages (see the module docs' delivery model).
-            //
-            // This is the BASE interval only. The wait actually taken is jittered and
-            // backs off while checks fail, and returns early when the Mac turns out to
-            // have been asleep — see `cadence`, which owns all three policies.
-            let interval = cadence::INTERVAL_SECS;
-            let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
-            let mut failures = cadence::FailureLog::default();
-            // Once per strand (`unreadable::StrandNotice`): announced once, then it
-            // lives in `status.toml`; a readable check re-arms it.
-            let mut strand_notice = unreadable::StrandNotice::default();
-            // Per-process dedup, seeded from the clock at thread start so history
-            // never re-notifies on every launch: the persistent-failure notice
-            // requires the streak's latest failure to postdate this thread (RFC3339
-            // strings compare chronologically), so a stale streak from a build that
-            // isn't even checking any more (e.g. no token) stays quiet.
-            // KEYED on the class that was announced (see `HealthAnnouncer`), not a
-            // bare bool. As a bool the latch swallowed every class after the first
-            // for the life of the process: a machine whose downloads broke
-            // (announced) and whose apply lane then stranded it heard about the
-            // download only. The two notices name different lanes and ask for
-            // different fixes, so dropping the second is losing a message, not
-            // deduping one.
-            let mut announcer = HealthAnnouncer::new(install::now_rfc3339());
-            // The ledger's verdict, spoken to the GUI. Called on EVERY cycle — the
-            // skip path included (2026-09-14): the ledger is shared, so a cycle a
-            // sibling checked for us carries exactly the same evidence.
-            //
-            // AND THE MACHINE'S STATE BESIDE THE STREAKS (2026-09-22/23 update
-            // audit, plan P1-1(b)): which newer build is waiting here — the staged
-            // marker, or a bundle already installed under this older image — is
-            // noted in the ledger's pending clock every cycle, and a build that has
-            // waited past `PENDING_UPDATE_OVERDUE_SECS` is announced with its
-            // typed cause, whatever the failure streaks say.
-            let speak_health = |announcer: &mut HealthAnnouncer| {
-                if let (Some(cb), Some(staging)) = (notify.as_ref(), paths::Staging::resolve()) {
-                    let staged =
-                        manifest::Ready::read_publishable(&staging).map(|ready| ready.build_number);
-                    let installed = bundle::resolve()
-                        .and_then(|installed| verify::bundle_build_number(&installed.app_root).ok())
-                        .filter(|build| *build > current_build);
-                    let h = health::Health::note_pending_update(
-                        &staging.health(),
-                        current_build,
-                        staged.max(installed),
-                    );
-                    let now = install::now_rfc3339();
-                    if let Some((title, body)) = announcer.tick(&h, &now, current_build) {
-                        cb(title, body);
-                    }
-                    if let Some((title, body)) =
-                        announcer.tick_overdue(&h, &now, current_build, automatic_apply_on())
-                    {
-                        cb(title, body);
-                    }
-                }
-            };
-            // The installed bundle we last told the GUI about (by build). Announced
-            // once per build, re-announced when the bundle moves again. And the last
-            // (build, error) we could NOT verify, so a permanently unverifiable bundle
-            // is logged once, not every cycle.
-            let mut announced_installed: Option<u64> = None;
-            let mut unverifiable_installed: Option<(u64, String)> = None;
-            // The newest staged build this process has told `on_staged` about, so a
-            // stage a SIBLING process published is announced once per build from the
-            // skip path (see `announce_sibling_stage`).
-            let mut announced_stage: Option<u64> = None;
-            // AN UNCOMMITTED CANDIDATE CHECKS NOTHING (2026-09-19): a handoff
-            // successor holds this thread until the outgoing process has
-            // committed to it — a check from a process the parent may still
-            // reject is a wasted request at best, and at worst the stage it
-            // finds is read by two processes with two opinions of it.
-            if wait_while_uncommitted_handoff_candidate(UNCOMMITTED_CANDIDATE_HOLD_BOUND) {
-                debug("the first update check waited for the handoff to commit");
+            let CheckerExit::Superseded { phase } =
+                run_checker(&checker_watch::WATCH, generation, &args);
+            let live = checker_watch::WATCH
+                .snapshot()
+                .map_or(0, |beat| beat.generation);
+            warn(&format!(
+                "update checker generation {generation} came back from {} after generation \
+                 {live} replaced it; it exits without checking",
+                phase.as_str()
+            ));
+        });
+    if let Err(error) = spawned {
+        warn(&format!(
+            "could not start the update checker thread (generation {generation}): {error}; \
+             a window's watchdog tries again when its stamp goes stale"
+        ));
+    }
+}
+
+/// Replace a STALLED checker (the window's watchdog, plan P2-1): retire
+/// `stalled_generation` and start a thread under the next one. `Some(new
+/// generation)` when a replacement was started; `None` when there is nothing to
+/// replace (no checker in this process, or `stalled_generation` is no longer the
+/// live one — a second look at the same stall starts nothing) or the replacement
+/// budget ([`checker_watch::MAX_RESPAWNS`]) is spent.
+///
+/// The stalled thread cannot be killed; it is told. Every stamp it makes from here
+/// on is refused, and it reads that as its cue to exit wherever it wakes — so a
+/// replacement never leaves two checkers running.
+#[cfg(target_os = "macos")]
+pub fn respawn_stalled_checker(stalled_generation: u64) -> Option<u64> {
+    let args = std::sync::Arc::clone(CHECKER_ARGS.get()?);
+    let next = checker_watch::WATCH.supersede(stalled_generation)?;
+    warn(&format!(
+        "update checker generation {stalled_generation} stopped stamping its heartbeat; \
+         starting generation {next} in its place"
+    ));
+    spawn_checker_thread(next, args);
+    Some(next)
+}
+
+/// Linux supervises its own enrolled checker; other platforms run none.
+#[cfg(not(target_os = "macos"))]
+pub fn respawn_stalled_checker(_stalled_generation: u64) -> Option<u64> {
+    None
+}
+
+/// Why a checker thread returned. The loop has no other way out: a cycle that
+/// fails, finds nothing, defers or panics is followed by the next one.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckerExit {
+    /// A replacement took over; this thread was last in `phase`.
+    Superseded { phase: checker_watch::CheckerPhase },
+}
+
+/// How one cycle of [`run_checker`] ended.
+#[cfg(target_os = "macos")]
+enum Cycle {
+    /// Go round again.
+    Next,
+    /// This generation was replaced while the cycle was in the named phase.
+    Superseded(checker_watch::CheckerPhase),
+}
+
+/// What one cycle got when it asked for the machine-wide `checker.lock`.
+#[cfg(target_os = "macos")]
+enum CheckerGate {
+    /// This cycle is the machine's checker until the guard drops.
+    Held(aterm_update_core::FileLock),
+    /// Another process held it past the bound: record a deferral and wait for the
+    /// next cycle. Its check covers this interval, and if it is stopped or hung,
+    /// waiting on it forever is what stalled this loop for 4.6 days.
+    Deferred,
+    /// The lock itself failed (not contention): the gate is a cost device, never a
+    /// correctness one, so the cycle proceeds ungated, as it always has.
+    Unavailable,
+}
+
+/// Ask for the machine-wide checker lock at `path`, waiting at most `wait`.
+#[cfg(target_os = "macos")]
+fn checker_gate(path: &std::path::Path, wait: std::time::Duration) -> CheckerGate {
+    match aterm_update_core::FileLock::acquire_within(path, wait) {
+        Ok(lock) => CheckerGate::Held(lock),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => CheckerGate::Deferred,
+        Err(_) => CheckerGate::Unavailable,
+    }
+}
+
+/// The text of a caught panic's payload, for its log line.
+#[cfg(target_os = "macos")]
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a non-text panic payload".to_string())
+}
+
+/// THE CHECK LOOP, under `generation` of `watch`. Returns only when a replacement
+/// has taken over.
+#[cfg(target_os = "macos")]
+fn run_checker(
+    watch: &checker_watch::CheckerWatch,
+    generation: u64,
+    args: &CheckerArgs,
+) -> CheckerExit {
+    use checker_watch::{CheckerPhase, Streak, StreakLog};
+    let current_build = args.current_build;
+    if !watch.beat(generation, CheckerPhase::Starting) {
+        return CheckerExit::Superseded {
+            phase: CheckerPhase::Starting,
+        };
+    }
+    // One cadence (`cadence::INTERVAL_SECS`, no knob). Cost honesty: a check
+    // spends ZERO metered requests — one HEAD of the evergreen
+    // github.com/…/releases/latest/download/aterm-appcast.toml, whose 302
+    // names the newest tag, and tag-specific GETs on the same unmetered host
+    // only when that tag moved. The interval is a courtesy to the download
+    // host and a bound on staleness; the in-session lane applies what it
+    // stages (see the module docs' delivery model).
+    //
+    // This is the BASE interval only. The wait actually taken is jittered and
+    // backs off while checks fail, and returns early when the Mac turns out to
+    // have been asleep — see `cadence`, which owns all three policies.
+    let interval = cadence::INTERVAL_SECS;
+    let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
+    let mut failures = cadence::FailureLog::default();
+    // Once per strand (`unreadable::StrandNotice`): announced once, then it
+    // lives in `status.toml`; a readable check re-arms it.
+    let mut strand_notice = unreadable::StrandNotice::default();
+    // Per-process dedup, seeded from the clock at thread start so history
+    // never re-notifies on every launch: the persistent-failure notice
+    // requires the streak's latest failure to postdate this thread (RFC3339
+    // strings compare chronologically), so a stale streak from a build that
+    // isn't even checking any more (e.g. no token) stays quiet.
+    // KEYED on the class that was announced (see `HealthAnnouncer`), not a
+    // bare bool. As a bool the latch swallowed every class after the first
+    // for the life of the process: a machine whose downloads broke
+    // (announced) and whose apply lane then stranded it heard about the
+    // download only. The two notices name different lanes and ask for
+    // different fixes, so dropping the second is losing a message, not
+    // deduping one.
+    let mut announcer = HealthAnnouncer::new(install::now_rfc3339());
+    // The ledger's verdict, spoken to the GUI. Called on EVERY cycle — the
+    // skip path included (2026-09-14): the ledger is shared, so a cycle a
+    // sibling checked for us carries exactly the same evidence.
+    //
+    // AND THE MACHINE'S STATE BESIDE THE STREAKS (2026-09-22/23 update
+    // audit, plan P1-1(b)): which newer build is waiting here — the staged
+    // marker, or a bundle already installed under this older image — is
+    // noted in the ledger's pending clock every cycle, and a build that has
+    // waited past `PENDING_UPDATE_OVERDUE_SECS` is announced with its
+    // typed cause, whatever the failure streaks say.
+    let speak_health = |announcer: &mut HealthAnnouncer| {
+        if args.has_health_hook()
+            && let Some(staging) = (args.staging)()
+        {
+            let staged =
+                manifest::Ready::read_publishable(&staging).map(|ready| ready.build_number);
+            let installed = bundle::resolve()
+                .and_then(|installed| verify::bundle_build_number(&installed.app_root).ok())
+                .filter(|build| *build > current_build);
+            let h = health::Health::note_pending_update(
+                &staging.health(),
+                current_build,
+                staged.max(installed),
+            );
+            let now = install::now_rfc3339();
+            if let Some((title, body)) = announcer.tick(&h, &now, current_build) {
+                args.send_health(title, body);
             }
-            loop {
-                let Some(source) = source_provider() else {
-                    // A failed bounded config query is not permission to use a
-                    // stale channel. Retry the provider without holding any lane.
-                    std::thread::sleep(std::time::Duration::from_secs(5));
-                    continue;
+            if let Some((title, body)) =
+                announcer.tick_overdue(&h, &now, current_build, automatic_apply_on())
+            {
+                args.send_health(title, body);
+            }
+        }
+    };
+    // The installed bundle we last told the GUI about (by build). Announced
+    // once per build, re-announced when the bundle moves again. And the last
+    // (build, error) we could NOT verify, so a permanently unverifiable bundle
+    // is logged once, not every cycle.
+    let mut announced_installed: Option<u64> = None;
+    let mut unverifiable_installed: Option<(u64, String)> = None;
+    // The newest staged build this process has told `on_staged` about, so a
+    // stage a SIBLING process published is announced once per build from the
+    // skip path (see `announce_sibling_stage`).
+    let mut announced_stage: Option<u64> = None;
+    // AN UNCOMMITTED CANDIDATE CHECKS NOTHING (2026-09-19): a handoff
+    // successor holds this thread until the outgoing process has
+    // committed to it — a check from a process the parent may still
+    // reject is a wasted request at best, and at worst the stage it
+    // finds is read by two processes with two opinions of it.
+    if wait_while_uncommitted_handoff_candidate(UNCOMMITTED_CANDIDATE_HOLD_BOUND) {
+        debug("the first update check waited for the handoff to commit");
+    }
+    // The last phase this generation stamped successfully — the one it names when a
+    // refused stamp tells it that it has been replaced.
+    let last = std::cell::Cell::new(CheckerPhase::Starting);
+    let stamp = |phase: CheckerPhase| -> bool {
+        let live = watch.beat(generation, phase);
+        if live {
+            last.set(phase);
+        }
+        live
+    };
+    // Every wait between cycles: the cadence's own, or a test's fixed pause.
+    let wait = |schedule: &cadence::Cadence| -> cadence::Waited {
+        match args.pause {
+            Some(pause) => {
+                std::thread::sleep(pause);
+                cadence::Waited::Elapsed
+            }
+            None => cadence::wait(schedule).1,
+        }
+    };
+    // THE REPEATS THAT USED TO BE SILENT OR SAID EVERY CYCLE (plan P2-1): an
+    // unanswered settings query slept five seconds and looped with no line at all,
+    // forever; a held `checker.lock` parked the thread; a busy lane was said once
+    // per cycle. Each now speaks when it starts, every Nth repeat, and when it ends.
+    let mut settings_misses = StreakLog::new(SETTINGS_MISS_LOG_EVERY);
+    let mut deferrals = StreakLog::new(CHECKER_DEFERRAL_LOG_EVERY);
+    let mut lane_busy = StreakLog::new(LANE_BUSY_LOG_EVERY);
+    loop {
+        if !stamp(CheckerPhase::Settings) {
+            return CheckerExit::Superseded { phase: last.get() };
+        }
+        // ONE CYCLE, UNWIND-ISOLATED. A panic anywhere in a cycle — the host's
+        // settings hook, a ledger parse, a helper — used to unwind out of the
+        // thread's closure and end automatic updating for the life of the
+        // process, with the `JoinHandle` dropped so nothing ever knew. Now it is
+        // one logged cycle: the lane mutex it poisoned recovers on the next take
+        // (`check_lane::Lane::try_lock`), the schedule backs off as for any
+        // failure, and the loop goes round again.
+        let cycle = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Cycle {
+            let settings = (args.source_provider)();
+            // The query answered (or gave up): a recovery is said before anything
+            // else, so the line lands even when this generation is about to learn
+            // it was replaced.
+            if settings.is_some()
+                && let Some(misses) = settings_misses.clear()
+            {
+                watch.set_settings_misses(generation, 0);
+                log(&format!(
+                    "update checks resumed: the settings query answered after {misses} \
+                     unanswered attempt(s)"
+                ));
+            }
+            if !watch.is_current(generation) {
+                return Cycle::Superseded(CheckerPhase::Settings);
+            }
+            let Some(source) = settings else {
+                // A failed bounded config query is not permission to use a
+                // stale channel. Retry the provider without holding any lane.
+                //
+                // AND SAY SO (plan P2-1). This branch used to sleep and loop with
+                // no line at all, so a window whose main thread stopped answering
+                // stopped every update check with nothing in the log to say why.
+                // The first miss is news, a streak is restated every
+                // `SETTINGS_MISS_LOG_EVERY` misses (at WARN: by then it is not a
+                // busy moment), and the answer that ends it is said above.
+                match settings_misses.note() {
+                    Streak::Began => log(&format!(
+                        "update checks paused: the settings query went unanswered; asking \
+                         again every {} s, and no check runs until it answers",
+                        args.settings_retry.as_secs()
+                    )),
+                    Streak::Continues(misses) => warn(&format!(
+                        "update checks still paused: the settings query has gone unanswered \
+                         {misses} times in a row; no check runs until it answers"
+                    )),
+                    Streak::Quiet => {}
+                }
+                watch.set_settings_misses(generation, settings_misses.consecutive());
+                if !stamp(CheckerPhase::Settings) {
+                    return Cycle::Superseded(last.get());
+                }
+                std::thread::sleep(args.settings_retry);
+                return Cycle::Next;
+            };
+            if !stamp(CheckerPhase::BundleProbe) {
+                return Cycle::Superseded(last.get());
+            }
+            // THE BUNDLE UNDER OUR OWN EXECUTABLE MAY HAVE MOVED ON WITHOUT A STAGE.
+            // The release cutter rewrites the bundle it was launched from, a user
+            // drags a new `.app` over the running one, a sibling process swaps
+            // it — none of that writes `ready.toml`, so `on_staged` above never
+            // fires and, before 2026-08-18, the running process learned about the
+            // newer bundle only at startup or when a stage happened to land. A
+            // plist read per cycle, and — only when it says newer — the same
+            // codesign policy the GUI's facts worker applies, is what makes the
+            // activation lane fire on its own instead of waiting for a coincidence.
+            // A DEV-MARKED bundle is skipped outright (`bundle::resolve` is the
+            // dev-mark-aware resolver): it can never pass the shipped tier, so
+            // verifying it every cycle would only spawn codesign forever.
+            if args.has_staged_hook()
+                && let Some(installed) = bundle::resolve()
+                && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
+                && installed_build > current_build
+                // A build below the operator apply floor (a yank) is not an update
+                // wherever it sits; announcing it would stage something every
+                // handoff then refuses.
+                && (args.staging)().is_none_or(|s| {
+                    installed_build >= manifest::Floor::read(&s.floor()).min_build
+                })
+                && announced_installed != Some(installed_build)
+            {
+                // The version is a plist read, so it names the bundle whether or
+                // not it verifies; read only when a line is about to say it.
+                let version = || {
+                    verify::bundle_short_version(&installed.app_root)
+                        .unwrap_or_else(|_| format!("build {installed_build}"))
                 };
-                // THE BUNDLE UNDER OUR OWN EXECUTABLE MAY HAVE MOVED ON WITHOUT A STAGE.
-                // The release cutter rewrites the bundle it was launched from, a user
-                // drags a new `.app` over the running one, a sibling process swaps
-                // it — none of that writes `ready.toml`, so `on_staged` above never
-                // fires and, before 2026-08-18, the running process learned about the
-                // newer bundle only at startup or when a stage happened to land. A
-                // plist read per cycle, and — only when it says newer — the same
-                // codesign policy the GUI's facts worker applies, is what makes the
-                // activation lane fire on its own instead of waiting for a coincidence.
-                // A DEV-MARKED bundle is skipped outright (`bundle::resolve` is the
-                // dev-mark-aware resolver): it can never pass the shipped tier, so
-                // verifying it every cycle would only spawn codesign forever.
-                if let Some(cb) = on_staged.as_ref()
-                    && let Some(installed) = bundle::resolve()
-                    && let Ok(installed_build) = verify::bundle_build_number(&installed.app_root)
-                    && installed_build > current_build
-                    // A build below the operator apply floor (a yank) is not an update
-                    // wherever it sits; announcing it would stage something every
-                    // handoff then refuses.
-                    && paths::Staging::resolve().is_none_or(|s| {
-                        installed_build >= manifest::Floor::read(&s.floor()).min_build
-                    })
-                    && announced_installed != Some(installed_build)
-                {
-                    // The version is a plist read, so it names the bundle whether or
-                    // not it verifies; read only when a line is about to say it.
-                    let version = || {
-                        verify::bundle_short_version(&installed.app_root)
-                            .unwrap_or_else(|_| format!("build {installed_build}"))
-                    };
-                    // ANNOUNCE ONLY WHAT THE GUI CAN IMPORT. The plist is written
-                    // first and signed/notarized minutes later (the cutter lays the
-                    // bundle out in place; Gatekeeper refuses it until the ticket is
-                    // stapled), and the GUI's facts worker imports nothing it cannot
-                    // verify — so an announcement latched on plist evidence alone
-                    // landed inside that window, the import failed silently, and
-                    // nothing ever re-announced the same build (2026-08-19 audit).
-                    // Verify HERE, on this thread, before latching: an unverifiable
-                    // newer bundle is retried next cycle, not remembered.
-                    match verify::verify_bundle_policy(&installed.app_root, effective_team_id()) {
-                        Ok(()) => {
-                            announced_installed = Some(installed_build);
-                            let version = version();
-                            // "switches to it" only when the host lands it by itself:
-                            // with `auto_apply = false`, unsaved work, or a handoff this
-                            // process cannot run, the build waits for a person.
-                            log(&if automatic_apply_on() {
-                                format!(
-                                    "update {version} is installed; aterm switches to it in place"
-                                )
-                            } else {
-                                format!("update {version} is installed")
-                            });
-                            cb(installed_build, version);
-                        }
-                        Err(error) => {
-                            // Once per (build, reason): the notarize window is minutes,
-                            // a broken seal is forever, and neither deserves a log line
-                            // per cycle.
-                            let key = (installed_build, error.clone());
-                            if unverifiable_installed.as_ref() != Some(&key) {
-                                log(&format!(
-                                    "update {} is installed but does not verify ({error}); \
-                                     re-checking each cycle",
-                                    version()
-                                ));
-                                unverifiable_installed = Some(key);
-                            }
+                // ANNOUNCE ONLY WHAT THE GUI CAN IMPORT. The plist is written
+                // first and signed/notarized minutes later (the cutter lays the
+                // bundle out in place; Gatekeeper refuses it until the ticket is
+                // stapled), and the GUI's facts worker imports nothing it cannot
+                // verify — so an announcement latched on plist evidence alone
+                // landed inside that window, the import failed silently, and
+                // nothing ever re-announced the same build (2026-08-19 audit).
+                // Verify HERE, on this thread, before latching: an unverifiable
+                // newer bundle is retried next cycle, not remembered.
+                match verify::verify_bundle_policy(&installed.app_root, effective_team_id()) {
+                    Ok(()) => {
+                        announced_installed = Some(installed_build);
+                        let version = version();
+                        // "switches to it" only when the host lands it by itself:
+                        // with `auto_apply = false`, unsaved work, or a handoff this
+                        // process cannot run, the build waits for a person.
+                        log(&if automatic_apply_on() {
+                            format!("update {version} is installed; aterm switches to it in place")
+                        } else {
+                            format!("update {version} is installed")
+                        });
+                        args.send_staged(installed_build, version);
+                    }
+                    Err(error) => {
+                        // Once per (build, reason): the notarize window is minutes,
+                        // a broken seal is forever, and neither deserves a log line
+                        // per cycle.
+                        let key = (installed_build, error.clone());
+                        if unverifiable_installed.as_ref() != Some(&key) {
+                            log(&format!(
+                                "update {} is installed but does not verify ({error}); \
+                                 re-checking each cycle",
+                                version()
+                            ));
+                            unverifiable_installed = Some(key);
                         }
                     }
                 }
-                match check_lane().try_lock() {
-                    Some(mut lane) => {
-                        // CROSS-PROCESS DEDUP. The lane mutex above is process-local
-                        // (the module docs say so), and since the one-binary era every
-                        // terminal SESSION runs this same loop — round-11 found that
-                        // sessions used to run NONE of it, so terminal-only Macs never
-                        // updated at all. N aterm processes must cost the shared
-                        // GitHub budget ~one check per interval, not N: the flock
-                        // serializes checkers machine-wide (the holder is bounded by
-                        // the network timeouts), and the ledger re-read under it turns
-                        // "another process just completed this interval's check" into
-                        // a quiet skip. The freshness window is 70% of the base —
-                        // strictly below the jittered minimum wait (80%), so a
-                        // process cannot mistake its OWN previous healthy stamp for
-                        // another checker's and starve itself. A DEFERRED stamp's
-                        // window is wider than this process's own next wait, so the
-                        // deferring process points its timer at that window's end
-                        // itself (`Cadence::deferred`, the rate-limited arm below)
-                        // rather than waking inside it to skip its own note.
-                        let checker_staging = paths::Staging::resolve();
-                        let _checker_gate = checker_staging.as_ref().and_then(|s| {
-                            aterm_update_core::FileLock::acquire(
-                                &s.status.with_file_name("checker.lock"),
-                            )
-                            .ok()
-                        });
-                        let now_unix = unix_now_secs();
-                        if let Some((reason, window_expiry)) =
-                            checker_staging.as_ref().and_then(|s| {
-                                checker_skip_for(
-                                    s,
-                                    current_build,
-                                    &source,
-                                    schedule.base(),
-                                    now_unix,
-                                )
-                            })
+            }
+            match check_lane().try_lock() {
+                Some(mut lane) => {
+                    // A retired generation that woke here leaves without marking
+                    // the lane as its own.
+                    if !watch.is_current(generation) {
+                        return Cycle::Superseded(last.get());
+                    }
+                    // Marked held for exactly as long as the lane is: a stall from
+                    // here on keeps the lane from any replacement, and the watchdog
+                    // and the status line must be able to say so (`hold_lane`).
+                    let lane_mark = watch.hold_lane(generation);
+                    if let Some(cycles) = lane_busy.clear() {
+                        debug(&format!(
+                            "the update check lane is free again after {cycles} busy cycle(s)"
+                        ));
+                    }
+                    // CROSS-PROCESS DEDUP. The lane mutex above is process-local
+                    // (the module docs say so), and since the one-binary era every
+                    // terminal SESSION runs this same loop — round-11 found that
+                    // sessions used to run NONE of it, so terminal-only Macs never
+                    // updated at all. N aterm processes must cost the shared
+                    // GitHub budget ~one check per interval, not N: the flock
+                    // serializes checkers machine-wide (the holder is bounded by
+                    // the network timeouts), and the ledger re-read under it turns
+                    // "another process just completed this interval's check" into
+                    // a quiet skip. The freshness window is 70% of the base —
+                    // strictly below the jittered minimum wait (80%), so a
+                    // process cannot mistake its OWN previous healthy stamp for
+                    // another checker's and starve itself. A DEFERRED stamp's
+                    // window is wider than this process's own next wait, so the
+                    // deferring process points its timer at that window's end
+                    // itself (`Cadence::deferred`, the rate-limited arm below)
+                    // rather than waking inside it to skip its own note.
+                    //
+                    // BOUNDED (plan P2-1). This was a blocking `flock` taken while
+                    // holding the lane above, so one stopped or hung sibling — the
+                    // reproduction is a SIGSTOP to any aterm process mid-check —
+                    // parked this thread, and every manual check queued behind the
+                    // lane, until that sibling was continued or killed: the
+                    // machine's likeliest route into the 4.6-day silence. A cycle
+                    // that waits out `CHECKER_LOCK_WAIT` now records a typed
+                    // deferral and takes the ordinary wait: whoever holds the lock
+                    // is checking for this machine, and if it never finishes, this
+                    // process says so every few cycles instead of nothing, ever.
+                    let checker_staging = (args.staging)();
+                    if !stamp(CheckerPhase::LockWait) {
+                        return Cycle::Superseded(last.get());
+                    }
+                    let gate = checker_staging.as_ref().map(|s| {
+                        checker_gate(
+                            &s.status.with_file_name("checker.lock"),
+                            args.checker_lock_wait,
+                        )
+                    });
+                    if !watch.is_current(generation) {
+                        return Cycle::Superseded(CheckerPhase::LockWait);
+                    }
+                    let _checker_gate = match gate {
+                        Some(CheckerGate::Deferred) => {
+                            match deferrals.note() {
+                                Streak::Began => log(&format!(
+                                    "update check deferred: another aterm process has held the \
+                                     checker lock for more than {} s — it is checking for this \
+                                     machine; this process waits for its next cycle",
+                                    args.checker_lock_wait.as_secs()
+                                )),
+                                Streak::Continues(cycles) => warn(&format!(
+                                    "update check deferred {cycles} cycles in a row: another \
+                                     aterm process has held the checker lock through each of \
+                                     them (a stopped or hung aterm holds it until it is \
+                                     continued or quit)"
+                                )),
+                                Streak::Quiet => {}
+                            }
+                            watch.set_deferrals(generation, deferrals.consecutive());
+                            if !stamp(CheckerPhase::Waiting) {
+                                return Cycle::Superseded(last.get());
+                            }
+                            // The same release-then-wait as a dedup skip: neither the
+                            // lane nor a flock is held across the sleep, so a manual
+                            // check in this process runs at once.
+                            check_lane::after_skip((), (lane, lane_mark), interval, || {
+                                speak_health(&mut announcer);
+                                if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
+                                    schedule.woke();
+                                }
+                            });
+                            return Cycle::Next;
+                        }
+                        Some(CheckerGate::Held(lock)) => Some(lock),
+                        Some(CheckerGate::Unavailable) | None => None,
+                    };
+                    // Past the gate, by either road: a deferral streak is over.
+                    if let Some(cycles) = deferrals.clear() {
+                        watch.set_deferrals(generation, 0);
+                        log(&format!(
+                            "update checks resumed: this cycle got past the checker lock after \
+                             {cycles} deferred cycle(s)"
+                        ));
+                    }
+                    let now_unix = unix_now_secs();
+                    if let Some((reason, window_expiry)) = checker_staging.as_ref().and_then(|s| {
+                        checker_skip_for(s, current_build, &source, schedule.base(), now_unix)
+                    }) {
+                        log(&reason);
+                        // A sibling's completed check is this machine checking.
+                        watch.note_check(generation);
+                        // The ledger is read only when there is a window to tell.
+                        if let Ok(hook) = args.staged_hook.lock()
+                            && let Some(hook) = hook.as_ref()
                         {
-                            log(&reason);
                             announce_sibling_stage(
                                 &mut announced_stage,
                                 current_build,
                                 status(current_build).as_ref(),
-                                on_staged.as_ref(),
+                                Some(hook),
                             );
-                            // Point the timer at the WINDOW'S END (scattered), not at the
-                            // next tick of the base (2026-09-14): a fresh process used to
-                            // re-read and re-log the same skip every tick for the whole
-                            // window.
-                            let until = skip_timer_target(window_expiry, cadence::entropy_byte());
-                            schedule.hold_until(
-                                std::time::Instant::now()
-                                    + std::time::Duration::from_secs(
-                                        until.saturating_sub(now_unix),
-                                    ),
-                            );
-                            // Release the flock AND local lane BEFORE sleeping: the
-                            // former blocks sibling processes, the latter blocks
-                            // this process's manual checks — then take the same jittered wait the loop tail
-                            // takes (a bare `continue` would skip the tail's sleep
-                            // and spin hot). The wake subtleties (settle window,
-                            // still-failing suppression) only matter ahead of a
-                            // network check, which this cycle deliberately isn't.
-                            check_lane::after_skip(_checker_gate, lane, interval, || {
-                                speak_health(&mut announcer);
-                                let (_delay, waited) = cadence::wait(&schedule);
-                                if matches!(waited, cadence::Waited::Woke(_)) {
-                                    schedule.woke();
-                                }
-                            });
-                            continue;
                         }
-                        // Stamped BEFORE the check so the ledger can be asked, after
-                        // it, whether THIS check recorded a failure (see the `Ok(None)`
-                        // arm). RFC3339 strings compare chronologically.
-                        let check_started = install::now_rfc3339();
-                        let result = github::check_and_stage(current_build, &source);
-                        check_lane().complete(&mut lane, current_build, &source);
-                        match result {
-                            Ok(Some(v)) => {
+                        // Point the timer at the WINDOW'S END (scattered), not at the
+                        // next tick of the base (2026-09-14): a fresh process used to
+                        // re-read and re-log the same skip every tick for the whole
+                        // window.
+                        let until = skip_timer_target(window_expiry, cadence::entropy_byte());
+                        schedule.hold_until(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(until.saturating_sub(now_unix)),
+                        );
+                        // Release the flock AND local lane BEFORE sleeping: the
+                        // former blocks sibling processes, the latter blocks
+                        // this process's manual checks — then take the same jittered wait the loop tail
+                        // takes (a bare `continue` would skip the tail's sleep
+                        // and spin hot). The wake subtleties (settle window,
+                        // still-failing suppression) only matter ahead of a
+                        // network check, which this cycle deliberately isn't.
+                        if !stamp(CheckerPhase::Waiting) {
+                            return Cycle::Superseded(last.get());
+                        }
+                        check_lane::after_skip(_checker_gate, (lane, lane_mark), interval, || {
+                            speak_health(&mut announcer);
+                            if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
+                                schedule.woke();
+                            }
+                        });
+                        return Cycle::Next;
+                    }
+                    // Stamped BEFORE the check so the ledger can be asked, after
+                    // it, whether THIS check recorded a failure (see the `Ok(None)`
+                    // arm). RFC3339 strings compare chronologically.
+                    let check_started = install::now_rfc3339();
+                    if !stamp(CheckerPhase::Checking) {
+                        return Cycle::Superseded(last.get());
+                    }
+                    let result = github::check_and_stage(current_build, &source);
+                    check_lane().complete(&mut lane, current_build, &source);
+                    // A check that outlived its generation has already written what
+                    // it found to the ledger and `status.toml`; its replacement's
+                    // next cycle reads them and announces anything staged, so the
+                    // stale thread reports nothing and leaves.
+                    if !watch.is_current(generation) {
+                        return Cycle::Superseded(CheckerPhase::Checking);
+                    }
+                    watch.note_check(generation);
+                    match result {
+                        Ok(Some(v)) => {
+                            emit(failures.success());
+                            after_healthy_check(&mut schedule);
+                            // "is staged", not "was staged just now": the check also
+                            // answers `Some` for a build that was already published and
+                            // is only waiting to be applied (its re-download may be
+                            // backed off — a stage backoff never gates an apply).
+                            //
+                            // SAY WHAT THE LEDGER KNOWS ABOUT THIS BUILD (2026-09-14).
+                            // "the GUI applies it in place; the next launch is the
+                            // fallback" was logged twenty times across ~10 h while the
+                            // apply lane had failed that very build six times and stood
+                            // down, and on an unsigned install the promised fallback
+                            // refuses for the same reason. The stand-down itself lives
+                            // only in GUI memory; the failure count and its reason are
+                            // the ledger's, so those are what the line carries.
+                            let staged_build = status(current_build).and_then(|s| s.staged_build);
+                            let lane = apply_lane_report(current_build).filter(|r| {
+                                staged_build.is_some_and(|b| b == r.last_failure_target_build)
+                                    && r.failures_for_target > 0
+                            });
+                            match lane {
+                                Some(r) if refusal_needs_person(&r.last_failure) => {
+                                    log(&format!(
+                                        "update {v} is staged but cannot be installed on \
+                                         this copy ({}× refused: {}); run `aterm ctl update \
+                                         status`",
+                                        r.failures_for_target, r.last_failure
+                                    ));
+                                }
+                                Some(r) => {
+                                    log(&format!(
+                                        "update {v} is staged; installing it failed {}× \
+                                         ({}); the next launch is the fallback",
+                                        r.failures_for_target, r.last_failure
+                                    ));
+                                }
+                                None => {
+                                    log(&format!("update {v} is staged"));
+                                }
+                            }
+                            // RFC Rung 2: surface the staged build to the GUI so it can arm
+                            // the in-session apply lane and show the update-ready nudge
+                            // (Version menu ⬆️ / tab-strip ↻). The staged build number comes
+                            // from the ready marker (status reads it, no I/O).
+                            if args.has_staged_hook()
+                                && let Some(b) = status(current_build).and_then(|s| s.staged_build)
+                            {
+                                announced_stage = Some(b);
+                                args.send_staged(b, v);
+                            }
+                        }
+                        Ok(None) if unreadable::is_stranded() => {
+                            // Not a success: GitHub answered that this machine
+                            // cannot read the channel at all. Back off; the backoff
+                            // clears on the first readable check, so a channel
+                            // repaired mid-session is noticed within one backoff
+                            // ceiling at worst — `max(MAX_BACKOFF,
+                            // MAX_BACKOFF_INTERVALS × base)`.
+                            schedule.failed();
+                        }
+                        Ok(None) if github::rate_limited() => {
+                            // The download host asked us to slow down. That is a
+                            // CADENCE problem, not a broken updater: lengthen the
+                            // wait (the entire remedy) but emit no failure line and
+                            // no ledger entry, so a 429 never accrues the streak
+                            // that fires "your update pipeline is likely broken".
+                            //
+                            // …and wake no earlier than the machine-wide window the
+                            // deferral just stamped (2026-09-24, measured: the
+                            // ladder's first rung, 24–36 min then, woke this very
+                            // process inside its own 42-minute window at 20:27:06,
+                            // and it logged the shared ledger's deferral — its own
+                            // — and slept to the window's end anyway). Read from the
+                            // same staging root the dedup gate above read, and
+                            // still under the checker lock this cycle holds.
+                            let now_unix = unix_now_secs();
+                            let now = std::time::Instant::now();
+                            let window_end = checker_staging
+                                .as_ref()
+                                .and_then(|s| {
+                                    checker_skip_for(
+                                        s,
+                                        current_build,
+                                        &source,
+                                        schedule.base(),
+                                        now_unix,
+                                    )
+                                })
+                                .map(|(_, expiry)| {
+                                    let until = skip_timer_target(expiry, cadence::entropy_byte());
+                                    now + std::time::Duration::from_secs(
+                                        until.saturating_sub(now_unix),
+                                    )
+                                });
+                            schedule.deferred(window_end, now, cadence::entropy_byte());
+                        }
+                        Ok(None) => {
+                            // A completed check that found nothing to do is a
+                            // SUCCESS: the network and the token both worked.
+                            //
+                            // Unless it wrote a FAILURE to the ledger on its way
+                            // here. The manifest dead-end — an authoritative
+                            // release that cannot be trusted — records its class
+                            // and then returns `Ok(None)`, so it used to land in
+                            // this arm and be counted as a success: no failure
+                            // line, and `schedule.succeeded(…)` kept the cadence at
+                            // full speed. That is why the 2026-07-25 machine
+                            // reached 597 failures instead of backing off — ~13h
+                            // at an un-backed-off 75s cadence is ~624 checks.
+                            // Ask the ledger rather than trusting the return
+                            // value: a check that recorded a failure is not a
+                            // success, whatever it returned.
+                            let recorded_failure = (args.staging)().is_some_and(|s| {
+                                health::Health::read(&s.health()).last_failure_at.as_str()
+                                    >= check_started.as_str()
+                            });
+                            if recorded_failure {
+                                emit(Some(failures.failure(
+                                    "no usable release this check — run \
+                                     `aterm ctl update status` for the reason",
+                                )));
+                                schedule.failed();
+                            } else {
                                 emit(failures.success());
                                 after_healthy_check(&mut schedule);
-                                // "is staged", not "was staged just now": the check also
-                                // answers `Some` for a build that was already published and
-                                // is only waiting to be applied (its re-download may be
-                                // backed off — a stage backoff never gates an apply).
-                                //
-                                // SAY WHAT THE LEDGER KNOWS ABOUT THIS BUILD (2026-09-14).
-                                // "the GUI applies it in place; the next launch is the
-                                // fallback" was logged twenty times across ~10 h while the
-                                // apply lane had failed that very build six times and stood
-                                // down, and on an unsigned install the promised fallback
-                                // refuses for the same reason. The stand-down itself lives
-                                // only in GUI memory; the failure count and its reason are
-                                // the ledger's, so those are what the line carries.
-                                let staged_build =
-                                    status(current_build).and_then(|s| s.staged_build);
-                                let lane = apply_lane_report(current_build).filter(|r| {
-                                    staged_build.is_some_and(|b| b == r.last_failure_target_build)
-                                        && r.failures_for_target > 0
-                                });
-                                match lane {
-                                    Some(r) if refusal_needs_person(&r.last_failure) => {
-                                        log(&format!(
-                                            "update {v} is staged but cannot be installed on \
-                                             this copy ({}× refused: {}); run `aterm ctl update \
-                                             status`",
-                                            r.failures_for_target, r.last_failure
-                                        ));
-                                    }
-                                    Some(r) => {
-                                        log(&format!(
-                                            "update {v} is staged; installing it failed {}× \
-                                             ({}); the next launch is the fallback",
-                                            r.failures_for_target, r.last_failure
-                                        ));
-                                    }
-                                    None => {
-                                        log(&format!("update {v} is staged"));
-                                    }
-                                }
-                                // RFC Rung 2: surface the staged build to the GUI so it can arm
-                                // the in-session apply lane and show the update-ready nudge
-                                // (Version menu ⬆️ / tab-strip ↻). The staged build number comes
-                                // from the ready marker (status reads it, no I/O).
-                                if let Some(cb) = on_staged.as_ref()
-                                    && let Some(b) =
-                                        status(current_build).and_then(|s| s.staged_build)
-                                {
-                                    announced_stage = Some(b);
-                                    cb(b, v);
-                                }
-                            }
-                            Ok(None) if unreadable::is_stranded() => {
-                                // Not a success: GitHub answered that this machine
-                                // cannot read the channel at all. Back off; the backoff
-                                // clears on the first readable check, so a channel
-                                // repaired mid-session is noticed within one backoff
-                                // ceiling at worst — `max(MAX_BACKOFF,
-                                // MAX_BACKOFF_INTERVALS × base)`.
-                                schedule.failed();
-                            }
-                            Ok(None) if github::rate_limited() => {
-                                // The download host asked us to slow down. That is a
-                                // CADENCE problem, not a broken updater: lengthen the
-                                // wait (the entire remedy) but emit no failure line and
-                                // no ledger entry, so a 429 never accrues the streak
-                                // that fires "your update pipeline is likely broken".
-                                //
-                                // …and wake no earlier than the machine-wide window the
-                                // deferral just stamped (2026-09-24, measured: the
-                                // ladder's first rung, 24–36 min then, woke this very
-                                // process inside its own 42-minute window at 20:27:06,
-                                // and it logged the shared ledger's deferral — its own
-                                // — and slept to the window's end anyway).
-                                let now_unix = unix_now_secs();
-                                let now = std::time::Instant::now();
-                                let window_end = checker_staging
-                                    .as_ref()
-                                    .and_then(|s| {
-                                        checker_skip_for(
-                                            s,
-                                            current_build,
-                                            &source,
-                                            schedule.base(),
-                                            now_unix,
-                                        )
-                                    })
-                                    .map(|(_, expiry)| {
-                                        let until =
-                                            skip_timer_target(expiry, cadence::entropy_byte());
-                                        now + std::time::Duration::from_secs(
-                                            until.saturating_sub(now_unix),
-                                        )
-                                    });
-                                schedule.deferred(window_end, now, cadence::entropy_byte());
-                            }
-                            Ok(None) => {
-                                // A completed check that found nothing to do is a
-                                // SUCCESS: the network and the token both worked.
-                                //
-                                // Unless it wrote a FAILURE to the ledger on its way
-                                // here. The manifest dead-end — an authoritative
-                                // release that cannot be trusted — records its class
-                                // and then returns `Ok(None)`, so it used to land in
-                                // this arm and be counted as a success: no failure
-                                // line, and `schedule.succeeded(…)` kept the cadence at
-                                // full speed. That is why the 2026-07-25 machine
-                                // reached 597 failures instead of backing off — ~13h
-                                // at an un-backed-off 75s cadence is ~624 checks.
-                                // Ask the ledger rather than trusting the return
-                                // value: a check that recorded a failure is not a
-                                // success, whatever it returned.
-                                let recorded_failure = paths::Staging::resolve().is_some_and(|s| {
-                                    health::Health::read(&s.health()).last_failure_at.as_str()
-                                        >= check_started.as_str()
-                                });
-                                if recorded_failure {
-                                    emit(Some(failures.failure(
-                                        "no usable release this check — run \
-                                         `aterm ctl update status` for the reason",
-                                    )));
-                                    schedule.failed();
-                                } else {
-                                    emit(failures.success());
-                                    after_healthy_check(&mut schedule);
-                                }
-                            }
-                            // A network that could not be reached at all — the first
-                            // check after a cold boot, or on a Wi-Fi still joining —
-                            // is retried within seconds on the cadence's short rungs,
-                            // and said at INFO while those run: it is expected, and a
-                            // WARN there buried the warnings that matter (2026-09-23).
-                            Err(e)
-                                if paths::Staging::resolve().is_some_and(|s| {
-                                    unreachable_before_the_channel(
-                                        &e,
-                                        &health::Health::read(&s.health()),
-                                        &check_started,
-                                    )
-                                }) =>
-                            {
-                                schedule.failed_offline();
-                                emit(Some(
-                                    failures.failure_expected(&e, schedule.retrying_offline()),
-                                ));
-                            }
-                            Err(e) => {
-                                emit(Some(failures.failure(&e)));
-                                schedule.failed();
                             }
                         }
-                    }
-                    None => {
-                        debug("update check already running; this cycle skips it");
+                        // A network that could not be reached at all — the first
+                        // check after a cold boot, or on a Wi-Fi still joining —
+                        // is retried within seconds on the cadence's short rungs,
+                        // and said at INFO while those run: it is expected, and a
+                        // WARN there buried the warnings that matter (2026-09-23).
+                        Err(e)
+                            if (args.staging)().is_some_and(|s| {
+                                unreachable_before_the_channel(
+                                    &e,
+                                    &health::Health::read(&s.health()),
+                                    &check_started,
+                                )
+                            }) =>
+                        {
+                            schedule.failed_offline();
+                            emit(Some(
+                                failures.failure_expected(&e, schedule.retrying_offline()),
+                            ));
+                        }
+                        Err(e) => {
+                            emit(Some(failures.failure(&e)));
+                            schedule.failed();
+                        }
                     }
                 }
-                // A machine that cannot READ its release channel can never update, and
-                // nothing else in the updater will ever report a failure for it (this
-                // is deliberately not a health-ledger failure — a configuration state
-                // is not a transient fault). Raise it on the SAME channel the
-                // broken-pipeline notice uses, once per strand, so the user actually
-                // learns that this Mac is stranded.
-                if strand_notice.due(unreadable::is_stranded())
-                    && let Some(cb) = notify.as_ref()
-                {
-                    let (title, body) = unreadable::notification();
-                    cb(title, body);
-                }
-                speak_health(&mut announcer);
-                // Jittered, backed-off, wake-aware wait. A detected wake returns early
-                // and clears the backoff — the outage the backoff was about belonged
-                // to a network this Mac is no longer on — then lets the network
-                // associate before the next check, instead of burning a guaranteed
-                // DNS failure the moment the lid opens.
-                let (_delay, waited) = cadence::wait(&schedule);
-                if matches!(waited, cadence::Waited::Woke(_)) {
-                    log(&format!(
-                        "woke from sleep; checking for updates in {}s",
-                        cadence::WAKE_SETTLE.as_secs()
-                    ));
-                    schedule.woke();
-                    // Suppress the "still failing" carry-over too: a pre-sleep DNS
-                    // failure is not evidence about the post-wake network.
-                    failures = cadence::FailureLog::default();
-                    std::thread::sleep(cadence::WAKE_SETTLE);
+                None => {
+                    // Said when it starts and every few cycles, not every cycle: a
+                    // manual check overlapping one tick is one line, and a lane
+                    // held by the stalled checker a replacement took over from
+                    // (`respawn_stalled_checker`) is a streak, not a flood.
+                    //
+                    // AND NAMED WHEN IT IS THAT STALL. A generation the watchdog
+                    // retired while it was in its lock wait or its check still
+                    // holds the lane, and this replacement can never take it: no
+                    // check runs in this process until it lets go. That is a WARN
+                    // from the first cycle, and the status line keeps the stall up
+                    // (`checker_watch::standing_stall`) — it used to read healthy.
+                    let blocked = watch
+                        .snapshot()
+                        .filter(|beat| beat.generation == generation)
+                        .and_then(|beat| beat.blocked_by());
+                    match (lane_busy.note(), blocked) {
+                        (Streak::Began, None) => {
+                            debug("update check already running; this cycle skips it");
+                        }
+                        (Streak::Began, Some(holder)) => warn(&format!(
+                            "update checks cannot run: checker generation {} stopped \
+                             answering while {} and still holds this process's check lane; \
+                             they resume when it lets go",
+                            holder.generation,
+                            holder.phase.as_str()
+                        )),
+                        (Streak::Continues(cycles), None) => warn(&format!(
+                            "the update check lane has been busy for {cycles} cycles in a \
+                             row (a long manual check, or a stalled checker still holding it)"
+                        )),
+                        (Streak::Continues(cycles), Some(holder)) => warn(&format!(
+                            "update checks still cannot run after {cycles} cycles: checker \
+                             generation {} still holds this process's check lane, {} s after \
+                             its last stamp (in {})",
+                            holder.generation,
+                            checker_watch::now_secs().saturating_sub(holder.at_secs),
+                            holder.phase.as_str()
+                        )),
+                        (Streak::Quiet, _) => {}
+                    }
                 }
             }
-        })
-        .ok();
+            // A machine that cannot READ its release channel can never update, and
+            // nothing else in the updater will ever report a failure for it (this
+            // is deliberately not a health-ledger failure — a configuration state
+            // is not a transient fault). Raise it on the SAME channel the
+            // broken-pipeline notice uses, once per strand, so the user actually
+            // learns that this Mac is stranded.
+            if strand_notice.due(unreadable::is_stranded()) && args.has_health_hook() {
+                let (title, body) = unreadable::notification();
+                args.send_health(title, body);
+            }
+            speak_health(&mut announcer);
+            // The heartbeat is judged against the schedule's longest wait. Restated
+            // every cycle, from the schedule itself, so a ceiling that moves can
+            // never leave the watchdog judging a wait it no longer knows.
+            watch.set_max_interval(generation, schedule.max_wait().as_secs());
+            if !stamp(CheckerPhase::Waiting) {
+                return Cycle::Superseded(last.get());
+            }
+            // Jittered, backed-off, wake-aware wait. A detected wake returns early
+            // and clears the backoff — the outage the backoff was about belonged
+            // to a network this Mac is no longer on — then lets the network
+            // associate before the next check, instead of burning a guaranteed
+            // DNS failure the moment the lid opens.
+            if matches!(wait(&schedule), cadence::Waited::Woke(_)) {
+                log(&format!(
+                    "woke from sleep; checking for updates in {}s",
+                    cadence::WAKE_SETTLE.as_secs()
+                ));
+                schedule.woke();
+                // Suppress the "still failing" carry-over too: a pre-sleep DNS
+                // failure is not evidence about the post-wake network.
+                failures = cadence::FailureLog::default();
+                std::thread::sleep(cadence::WAKE_SETTLE);
+            }
+            Cycle::Next
+        }));
+        match cycle {
+            Ok(Cycle::Next) => {}
+            Ok(Cycle::Superseded(phase)) => return CheckerExit::Superseded { phase },
+            Err(payload) => {
+                warn(&format!(
+                    "an update check cycle panicked ({}); the checker carries on after a \
+                     backed-off wait",
+                    panic_text(payload.as_ref())
+                ));
+                schedule.failed();
+                if !stamp(CheckerPhase::Waiting) {
+                    return CheckerExit::Superseded { phase: last.get() };
+                }
+                let _ = wait(&schedule);
+            }
+        }
+    }
 }
 
 /// A SIBLING'S STAGE IS THIS PROCESS'S NEWS TOO (audit AU-5). A skipping cycle never
@@ -3372,6 +3901,21 @@ pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
 /// ([`enabled`], not [`automatic`]); on an uninstalled copy it just reports state.
 #[cfg(target_os = "macos")]
 pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
+    // NOT QUEUED BEHIND A STUCK CHECK (plan P2-1, round three). A checker
+    // generation the window's watchdog retired while it was inside its check still
+    // holds the lane, and `run_or_join` would wait on it with no bound — the button
+    // spinning for as long as the stall lasts. Say so at once instead.
+    if enabled()
+        && let Some(why) = manual_check_blocked(&checker_watch::WATCH)
+    {
+        warn(&why);
+        return status(current_build)
+            .map(|mut status| {
+                status.outcome.clone_from(&why);
+                status
+            })
+            .unwrap_or_else(|| UpdateStatus::empty(true, current_build, why));
+    }
     if enabled() {
         check_lane().run_or_join(current_build, source, || {
             if let Err(error) = github::check_and_stage(current_build, source) {
@@ -3390,6 +3934,20 @@ pub fn check_now(current_build: u64, source: &Source) -> UpdateStatus {
             },
         )
     })
+}
+
+/// Why a manual check cannot run right now, or `None` when it can: a retired
+/// checker generation of `watch` still holds this process's check lane
+/// ([`checker_watch::CheckerBeat::blocked_by`]), and a check would only queue
+/// behind it.
+#[cfg(target_os = "macos")]
+fn manual_check_blocked(watch: &checker_watch::CheckerWatch) -> Option<String> {
+    let holder = watch.snapshot()?.blocked_by()?;
+    Some(format!(
+        "update check could not run: an earlier update check stopped answering while {} and \
+         still holds this process's check lane",
+        holder.phase.as_str()
+    ))
 }
 
 /// Stub where nothing updates (Linux checks through [`check_now_with_settings`]'s own

@@ -617,6 +617,10 @@ pub struct CursorGlow {
     /// Recomputed on every tick; never carried as permission into another
     /// observed frame.
     park_source_intact: Option<(u16, u16)>,
+    /// The source tail proved this tick's cross-row caret move belongs to
+    /// the unpaid glyph. Captured before the witness samples are taken and
+    /// cleared immediately after the visible move is judged.
+    carried_key_move: Option<((u16, u16), (u16, u16))>,
     /// Original per-column prefix, plus one lookahead for a wide unit.
     /// One bounded resident buffer, populated only for a cross-row park.
     park_source_cells: Vec<char>,
@@ -2030,17 +2034,29 @@ impl CursorGlow {
             None
         };
         // A held park schedules the tick that judges it: the flush in `tick`
-        // is strict (`> TYPE_HINT_FRESH`), so the arm lands one `ARM_MIN`
-        // past the window rather than exactly on it (a wake exactly at
-        // `p.at + 0.25 s` would not flush and cost a re-arm), and never
-        // earlier than `now + ARM_MIN` (a busy re-arm is not a next change).
+        // is strict (`> p.patience()`), so the arm lands one `ARM_MIN` past
+        // the park's OWN window rather than exactly on it. A same-row park
+        // lives for 0.25 s; a proved foreign-row park keeps custody of an
+        // in-flight press for 10 s. Scheduling the latter at 0.25 s leaves
+        // it fresh and re-arms a 1 ms timer on every tick for the remaining
+        // 9.75 s. The last unpaid press may expire sooner than the park if
+        // it was already in flight when the foreign repaint arrived; that
+        // expiry also ends custody. Never arm earlier than `now + ARM_MIN`.
         // v2-gated: the park is v2's state and the Classic branch returns
         // before the flush, so an ungated arm on a park stranded by a style
         // switch would spin. Without this arm a deadline-driven host sleeps
         // with the park held and its verdict comes at the next event, judged
         // at the park's frozen clock.
         let park_due = self.held_park.filter(|_| self.v2.engaged()).map(|p| {
-            (p.at + Duration::from_secs_f32(Self::TYPE_HINT_FRESH) + rk::ARM_MIN)
+            let park_expiry = p.at + p.patience() + rk::ARM_MIN;
+            let credit_expiry = p.cross_row.then(|| {
+                self.type_press_ring
+                    .newest_unpaid(now)
+                    .map_or(now, |at| at + Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S))
+                    + rk::ARM_MIN
+            });
+            park_expiry
+                .min(credit_expiry.unwrap_or(park_expiry))
                 .max(now + rk::ARM_MIN)
         });
         [v1_due, v2_due, park_due].into_iter().flatten().min()
@@ -2066,6 +2082,7 @@ impl CursorGlow {
     fn clear_transient_state(&mut self) {
         self.recent_typed_run = None;
         self.park_source_intact = None;
+        self.carried_key_move = None;
         // A held park is judged before the teardown takes its stamp and
         // its pool: today's verdict, then the wipe.
         self.flush_held_park();
@@ -2293,11 +2310,24 @@ impl CursorGlow {
         self.momentum_pulse = None;
         // The witness's samples are THIS frame's and no other's: taken here,
         // so a tick that returns dark below cannot leave them for the next.
-        self.park_source_intact = self.last.filter(|&(row, col)| {
-            cur.is_some_and(|(next, _)| next != row)
-                && self.park_source_unchanged(row, col)
-                && !self.key_pushed_text_down((row, col), cur, now)
+        let park_source = self.last.filter(|&(row, col)| {
+            cur.is_some_and(|(next, _)| next != row) && self.park_source_unchanged(row, col)
         });
+        self.carried_key_move = if matches!(cfg.style, GlowStyle::RainbowKitty)
+            && cfg.enabled
+            && cfg.intensity > 0.0
+            && geom.cw != 0
+            && geom.ch != 0
+            && geom.rows != 0
+            && geom.cols != 0
+        {
+            park_source
+                .zip(cur)
+                .filter(|&(from, to)| self.key_pushed_text_down(from, Some(to), now))
+        } else {
+            None
+        };
+        self.park_source_intact = park_source.filter(|_| self.carried_key_move.is_none());
         self.park_source_confirmed = false;
         if let Some(p) = self.held_park.filter(|p| p.cross_row)
             && let Some(sample) = self.witness_rows[..self.witness_rows_n]
@@ -2682,6 +2712,7 @@ impl CursorGlow {
             .last
             .or_else(|| self.hidden_bridge_source(cur, now, cfg, geom));
         self.judge_observed_caret(spawn_from, cur, now, cfg, geom);
+        self.carried_key_move = None;
         // The hidden/parked-caret echo lane: when the DEC cursor cannot
         // witness the keystroke's echo (hidden across frames, or parked on a
         // different row), the host-fed print anchor is the mutation site of

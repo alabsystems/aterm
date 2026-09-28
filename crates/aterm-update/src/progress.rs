@@ -95,6 +95,14 @@ pub(crate) fn report(p: Progress) {
     if let Progress::Downloading { .. } = &p {
         DOWNLOAD_BEGAN.store(true, Ordering::Relaxed);
     }
+    // A check that is moving bytes is alive (plan P2-1): a container on a slow link
+    // can take hours inside one check, and without this stamp the watchdog would
+    // judge that honest download against a budget sized for everything else a
+    // check does. Only a check in flight is re-stamped (`beat_progress`), so a
+    // manual check's download never vouches for a checker that is stuck elsewhere.
+    if matches!(p, Progress::Downloading { .. } | Progress::Verifying { .. }) {
+        crate::checker_watch::WATCH.beat_progress();
+    }
     if let Some(cb) = OBSERVER.get() {
         cb(p);
     }

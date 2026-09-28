@@ -413,7 +413,7 @@ pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Repo
 /// typing at that prompt, or it may be gone with its tab: an exit that old
 /// is never relaunched from this record, a relaunch that old never waited
 /// for again.
-pub(super) const STALE_S: u64 = 300;
+pub const STALE_S: u64 = 300;
 
 /// Why a relaunch in flight whose agent is gone must stop instead of acting
 /// on the tab, `(word, ledger detail)`, or `None` while it may still act.
@@ -1132,7 +1132,10 @@ fn await_held(
     let fresh = starts_afresh(&st.cause);
     let mut new: Option<SessionFile> = None;
     let mut roster = SessionRosterCache::default();
-    wait_until(Duration::from_secs(90), || {
+    let mut back = ShellBack::default();
+    let mut ended = false;
+    let look_back = ends_at_once(&st.cause);
+    wait_until(held_wait(&st.cause), || {
         hand.keep(c);
         new = roster.files(&home, Instant::now()).and_then(|files| {
             files
@@ -1146,7 +1149,11 @@ fn await_held(
                 })
                 .cloned()
         });
-        new.is_some()
+        let now = Instant::now();
+        if look_back && new.is_none() && back.due(now) {
+            ended = back.saw(k.shell_holds_tab(shell), now);
+        }
+        new.is_some() || ended
     });
     // The new process holds the conversation: the harness's hand stays on the
     // tab until it is up and idle — and, where this step types the
@@ -1186,6 +1193,24 @@ fn await_held(
             r
         }
         Some(sf) => carry_on(opts, r, st, c, session, &sf),
+        // The relaunched agent ended as it started (Claude's `No conversation
+        // found`, a crash at start): its shell has had the tab back for
+        // [`ENDED_AT_ONCE`] and nothing registered the conversation — read
+        // for a restored tab's relaunch only ([`ends_at_once`]). Said now
+        // (day six, D30: the wait went on 90 s at a time for five minutes,
+        // the harness's hand on the tab throughout), with the stale
+        // relaunch's word and stop — what it printed is on the tab.
+        None if ended => {
+            st.stop("no-resume", now_s());
+            let r = said(r, "failed:no-resume");
+            ledger(
+                opts,
+                &r,
+                "the relaunched agent ended without registering the conversation: its shell \
+                 has the tab back",
+            );
+            r
+        }
         None => {
             if let upgrade::Phase::Relaunched { at_s } = st.phase
                 && now_s().saturating_sub(at_s) > STALE_S
@@ -1200,6 +1225,106 @@ fn await_held(
                 return r;
             }
             said(r, "wait:resume")
+        }
+    }
+}
+
+/// How long one [`await_held`] step waits for the relaunched process to
+/// register its conversation; a later step waits again, until [`STALE_S`].
+const HELD_WAIT: Duration = Duration::from_secs(90);
+/// A cold restore has other tabs to relaunch. A foreground agent that never
+/// registers its conversation must release the one sweep lock soon enough for
+/// their first steps; the same in-flight record is checked on a later retry.
+/// This still lets [`ShellBack`] observe [`ENDED_AT_ONCE`] before the step
+/// ends, so a launch that returned to its shell is reported immediately.
+const RESTORED_HELD_WAIT: Duration = Duration::from_secs(7);
+
+#[cfg(test)]
+thread_local! {
+    /// A test's shorter [`HELD_WAIT`], for this thread only ([`held_wait`]):
+    /// a step that must NOT end early is waited out in seconds.
+    pub(super) static HELD_WAIT_IN_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// [`HELD_WAIT`] for a live relaunch, [`RESTORED_HELD_WAIT`] for a cold
+/// restore, or a test's shorter one ([`HELD_WAIT_IN_TEST`]).
+fn held_wait(cause: &str) -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = HELD_WAIT_IN_TEST.with(std::cell::Cell::get) {
+        return wait;
+    }
+    if ends_at_once(cause) {
+        RESTORED_HELD_WAIT
+    } else {
+        HELD_WAIT
+    }
+}
+
+/// Whether [`await_held`] reads a relaunched agent as ENDED once its shell
+/// has held the tab for [`ENDED_AT_ONCE`] ([`ShellBack`]): only a restored
+/// tab's relaunch, after aterm itself ended ([`CAUSE_HOST`]), whose host
+/// tries it once and says a failure at once (ruling 296 of the messages
+/// design, as amended in review). NOT the live relaunch on exit, nor the
+/// upgrade: the live loop reads `failed:no-resume` as not yet
+/// ([`outcome`]) and each retry after its back-off types the relaunch line
+/// into the tab afresh, so an early verdict there retyped a refusing agent
+/// at about +7 s, +23 s and +90 s where this wait retypes it only past
+/// [`STALE_S`] — a change to P6's cadence that is its owner's call.
+pub(super) fn ends_at_once(cause: &str) -> bool {
+    cause == CAUSE_HOST
+}
+
+/// How long the shell a relaunch line was typed at may hold its terminal
+/// again, with nothing registered, before the relaunched agent is read as
+/// ended ([`ShellBack`]). The shell hands the terminal to what it starts as
+/// it starts it, so a prompt that holds it this long started nothing that
+/// still runs.
+pub(super) const ENDED_AT_ONCE: Duration = Duration::from_secs(5);
+
+/// How often [`await_held`] asks whether the shell has the tab back: a `ps`
+/// each time, so not at the roster's pace.
+const SHELL_LOOK: Duration = Duration::from_secs(1);
+
+/// THE RELAUNCHED AGENT ENDED AS IT STARTED (day six, D30): read from the
+/// shell the relaunch line was typed at, which has held its terminal again
+/// for [`ENDED_AT_ONCE`] in a row. A look that finds anything else holding
+/// it — the agent still starting, a program a person started — starts the
+/// count over; a look that cannot be read is no verdict and leaves it as it
+/// is.
+#[derive(Debug, Default)]
+pub(super) struct ShellBack {
+    /// Since when every read look found the shell holding its terminal.
+    since: Option<Instant>,
+    /// The last look, for [`SHELL_LOOK`].
+    looked: Option<Instant>,
+}
+
+impl ShellBack {
+    /// Whether a look is due at `now` ([`SHELL_LOOK`] since the last).
+    pub(super) fn due(&mut self, now: Instant) -> bool {
+        let due = self
+            .looked
+            .is_none_or(|at| now.saturating_duration_since(at) >= SHELL_LOOK);
+        if due {
+            self.looked = Some(now);
+        }
+        due
+    }
+
+    /// One look at `now` ([`Kernel::shell_holds_tab`]): whether the shell
+    /// has now held its terminal for [`ENDED_AT_ONCE`].
+    pub(super) fn saw(&mut self, holds: Option<bool>, now: Instant) -> bool {
+        match holds {
+            Some(true) => {
+                let since = *self.since.get_or_insert(now);
+                now.saturating_duration_since(since) >= ENDED_AT_ONCE
+            }
+            Some(false) => {
+                self.since = None;
+                false
+            }
+            None => false,
         }
     }
 }
@@ -1557,11 +1682,15 @@ pub(super) const CAUSE_MODEL: &str = "model:";
 pub(super) const CAUSE_MODEL_BACK: &str = "model-back:";
 
 /// Whether a record of `cause` is a relaunch's — its continuation says why
-/// it was relaunched ([`resumed_prompt`]) — rather than the upgrade's.
+/// it was relaunched ([`resumed_prompt`]) — rather than the upgrade's. A
+/// relaunch after aterm itself ended ([`CAUSE_HOST`]) is one (ruling 293 of
+/// the messages design: left out, its continuation told the agent it had
+/// been upgraded, from and to the same version).
 fn relaunch_cause(cause: &str) -> bool {
     cause == CAUSE_EXIT
         || cause == CAUSE_MEMORY
         || cause == CAUSE_STALL
+        || cause == CAUSE_HOST
         || cause.starts_with(CAUSE_MODEL)
         || cause.starts_with(CAUSE_MODEL_BACK)
 }

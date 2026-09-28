@@ -177,6 +177,7 @@ fn reading(
         upgrading: false,
         taskless,
         person: (st["person"] == 1).then_some(JUST_TYPED),
+        reach: Default::default(),
         login_back: false,
     }
 }

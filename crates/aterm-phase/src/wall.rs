@@ -33,6 +33,20 @@
 //! whose first row is its limit notice — reads as this worker's wall too.
 //! A finished Bash call's `⎿` block once its echo is gone is not measured.
 //!
+//! **Claude Code 2.1.283 draws an API error as a message of its own** — the
+//! `⏺` in column 0, the text from column 2 (its `lu()`), never under `⎿` —
+//! so a turn that ended on `API Error: Can't reach the API server — check
+//! your internet or DNS (ENOTFOUND)` or on a 529 left no gutter row, no wall
+//! was read, and the supervisor continued it at once, sixteen times in the
+//! outage of 2026-09-27 (and `⏺ Login expired · Please run /login`, drawn
+//! the same way, ended every turn for nine hours the same day). That `⏺` row
+//! is a place of its own ([`Placement::ErrorRow`], `phase::error_row_notice`),
+//! read only when it is the last thing said, one paragraph, and in the
+//! vendor's own shape — `API Error` at its head, or a notice and its remedy
+//! joined by ` · ` — never any last `⏺` row, whose prose names a wall in its
+//! first four words as often as not. What an API error says went wrong on
+//! the way is its [`ApiCause`].
+//!
 //! **Not every `… limit reached` is a wall.** The binary's full set (2.1.280,
 //! read with `rg -a 'limit reached'`) includes a subagent quota (`Concurrent
 //! subagent limit reached. You can run 5 subagents at once. Do not retry.`),
@@ -74,11 +88,16 @@ pub enum WallKind {
     Auth,
     /// Any other `API Error: …` the turn ended on. `code` is the HTTP status
     /// when the notice prints one; `retryable` is the vendor's own rule — 408,
-    /// 409, 429 and every 5xx retry, and a notice with no status retries when
-    /// it names a server or connection failure (`Server error mid-response`,
-    /// `Request timed out`). `API Error: Rate limit reached for requests` is
-    /// `code: Some(429)`: that is the status the vendor maps to `rate_limit`.
-    ApiError { code: Option<u16>, retryable: bool },
+    /// 409, 429 and every 5xx retry, and a notice with no status retries
+    /// unless it names a TLS or proxy refusal. `cause` says what went wrong
+    /// on the way ([`ApiCause`]), which decides what answers it. `API Error:
+    /// Rate limit reached for requests` is `code: Some(429)`: that is the
+    /// status the vendor maps to `rate_limit`.
+    ApiError {
+        code: Option<u16>,
+        retryable: bool,
+        cause: ApiCause,
+    },
     /// The service is overloaded (`API Error: 529 Overloaded. This is a
     /// server-side issue, usually temporary — try again in a moment.`,
     /// `Repeated 529 Overloaded errors`, `Opus is experiencing high load`).
@@ -91,6 +110,34 @@ pub enum WallKind {
     /// ([`memory_wall`]), and the reader keeps it under a hard busy, where it
     /// drops every other wall. Never waited out, retried or typed at.
     Memory,
+}
+
+/// What an API error says went wrong on the way, named by what answers it
+/// — Claude Code 2.1.283's connection catalog (its `Kne`, and the stream's
+/// own endings), read from the binary on 2026-09-27, the day an outage of an
+/// hour turned every hosted session's turn into `API Error: Can't reach the
+/// API server — check your internet or DNS (ENOTFOUND)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiCause {
+    /// The API answered with a failure: a status (5xx, 4xx), or words the
+    /// catalog does not name. Time answers it.
+    Server,
+    /// The API was never reached: the name did not resolve, no route, the
+    /// connection refused, dropped or timed out, no response, the computer
+    /// asleep. The network coming back answers it.
+    Unreachable,
+    /// The reply was cut off mid-stream, or before it began (`… The response
+    /// above may be incomplete.`, `… Try again.`). Trying again answers it.
+    CutOff,
+    /// The connection's TLS, certificate or proxy tunnel was refused. The
+    /// vendor does not retry it (`retryable` is false: its own rule), and
+    /// what fixes it for good is usually a person's (a CA bundle, a proxy's
+    /// credentials) — but a captive portal or an intercepting proxy can
+    /// clear by itself, so a supervisor tries it again on its network ladder
+    /// and does not ask (aterm-agent's turn-end policy). A handshake that
+    /// another client verified is no evidence it has cleared: the agent
+    /// verifies against its own trust store.
+    Config,
 }
 
 impl WallKind {
@@ -278,7 +325,9 @@ pub fn classify_wall(text: &str) -> Option<WallKind> {
         Some(Tag::Context) => Some(WallKind::Context),
         Some(Tag::Auth) => Some(WallKind::Auth),
         Some(Tag::Overloaded) => Some(WallKind::Overloaded),
-        None if api => Some(api_error(head)),
+        // The exact `Request timed out` is drawn under `⎿` with no prefix:
+        // the whole row, never a tool's line that begins so.
+        None if api || lower.trim() == "request timed out" => api_error(head, &lower),
         None => None,
     }
 }
@@ -315,36 +364,155 @@ fn opens_with(words: &str, phrase: &str) -> bool {
     })
 }
 
-/// `api error: <status>? <words>` → the code it prints (a 529 is
-/// [`WallKind::Overloaded`] before this is asked) and whether the vendor
-/// retries it.
-fn api_error(head: &str) -> WallKind {
-    let rest = head["api error".len()..].trim_start_matches([':', ' ']);
+/// `api error: <status>? <words>` → the wall it is: the code it prints (a
+/// 529 is [`WallKind::Overloaded`] before this is asked; 2.1.283's `Request
+/// rejected (429)` prints it in parentheses), a full context (`The model has
+/// reached its context window limit.`), or what it says went wrong
+/// ([`ApiCause`]) and whether the vendor retries it. The status is read from
+/// the notice's `head`; everything else from the WHOLE notice, `full`
+/// (lowercased): `Unable to connect to API. Check your internet connection`
+/// says what it is after its first sentence, and a wrapped message after
+/// its first row. The tables are asked in order — a certificate or proxy
+/// refusal, then a reply cut off, then a network never reached — so `Server
+/// error mid-response` is cut off and `Connection refused — a firewall or
+/// proxy may be blocking it` is unreachable (a bare `proxy` names no
+/// refusal). `None` for an API error with no status that none of them names
+/// (a safeguards refusal, a model that is not found, an effort it does not
+/// take): no wall, so the ordinary policy answers it, as it did before
+/// 2.1.283 drew one where it could be read.
+fn api_error(head: &str, full: &str) -> Option<WallKind> {
+    let rest = head
+        .strip_prefix("api error")
+        .unwrap_or(head)
+        .trim_start_matches([':', ' ']);
     let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
     let code = if digits.len() == 3 {
         digits.parse::<u16>().ok()
     } else if rest.starts_with("rate limit") {
         Some(429)
     } else {
-        None
+        status_in_parens(rest)
     };
     if code == Some(529) {
-        return WallKind::Overloaded;
+        return Some(WallKind::Overloaded);
     }
-    let retryable = match code {
-        Some(c) => matches!(c, 408 | 409 | 429) || c >= 500,
-        None => [
-            "server error",
-            "timed out",
-            "stopped arriving",
-            "mid-response",
-            "connection",
-        ]
-        .iter()
-        .any(|k| rest.contains(k)),
+    if full.contains("context window limit") {
+        return Some(WallKind::Context);
+    }
+    let names = |words: &[&str]| words.iter().any(|w| full.contains(w));
+    let cause = if code.is_some() {
+        ApiCause::Server
+    } else if names(CONFIG_WORDS) {
+        ApiCause::Config
+    } else if names(CUT_OFF_WORDS) {
+        ApiCause::CutOff
+    } else if names(UNREACHABLE_WORDS) {
+        ApiCause::Unreachable
+    } else if full.contains("server error") {
+        ApiCause::Server
+    } else {
+        return None;
     };
-    WallKind::ApiError { code, retryable }
+    let retryable = match (cause, code) {
+        (ApiCause::Config, _) => false,
+        (ApiCause::Unreachable | ApiCause::CutOff, _) => true,
+        (ApiCause::Server, Some(c)) => matches!(c, 408 | 409 | 429) || c >= 500,
+        (ApiCause::Server, None) => true,
+    };
+    Some(WallKind::ApiError {
+        code,
+        retryable,
+        cause,
+    })
 }
+
+/// A 4xx or 5xx status printed in parentheses (`request rejected (429)`).
+fn status_in_parens(rest: &str) -> Option<u16> {
+    rest.match_indices('(').find_map(|(at, _)| {
+        let inner = rest.get(at + 1..at + 5)?;
+        let code = inner.strip_suffix(')')?.parse::<u16>().ok()?;
+        (400..600).contains(&code).then_some(code)
+    })
+}
+
+/// A certificate or proxy-tunnel refusal: `Unable to connect to API: SSL
+/// certificate verification failed` (… has expired, … has been revoked, …
+/// hostname mismatch, … is not yet valid), `Self-signed certificate
+/// detected`, `(<code>). The certificate comes from an authority Claude Code
+/// doesn't trust …`, `Couldn't connect through your proxy
+/// (ERR_PROXY_TUNNEL)`, and Node's certificate codes. Not a bare `SSL error
+/// (<code>)`: 2.1.283 names a handshake that timed out or a record that
+/// broke so (`ERR_TLS_HANDSHAKE_TIMEOUT`, `ERR_SSL_WRONG_VERSION_NUMBER`),
+/// and those pass with the network — it reads unreachable, by its `unable
+/// to connect`.
+const CONFIG_WORDS: &[&str] = &[
+    "certificate",
+    "self-signed",
+    "self_signed",
+    "err_proxy_tunnel",
+    "through your proxy",
+    "unable_to_verify",
+    "unable_to_get_issuer",
+    "cert_",
+];
+
+/// A reply cut off mid-stream or before it began: `The response stopped
+/// arriving.`, `Server error mid-response.`, `The response stream was
+/// malformed.`, `Part of the response never arrived.`, `Your computer went
+/// to sleep mid-response.`, `Connection lost mid-response.` (each `… The
+/// response above may be incomplete.`), `The response stalled before a
+/// response was produced. Try again.` and its kin.
+///
+/// So is a reply past its output token maximum (`Claude's response exceeded
+/// the N output token maximum.`) and one whose image was dropped (`… in the
+/// conversation could not be processed and was removed.`).
+const CUT_OFF_WORDS: &[&str] = &[
+    "mid-response",
+    "output token maximum",
+    "could not be processed and was removed",
+    "may be incomplete",
+    "stopped arriving",
+    "never arrived",
+    "malformed",
+    "stalled",
+    "before a response was produced",
+];
+
+/// A network never reached: `Can't reach the API server — check your
+/// internet or DNS (ENOTFOUND)`, `No internet route — check your connection
+/// or VPN (ENETUNREACH)`, `Unable to connect to API. Check your internet
+/// connection`, `Unable to connect to API (<code>)`, `Connection refused — a
+/// firewall or proxy may be blocking it`, `Connection dropped (ECONNRESET)`,
+/// `Request timed out. Check your internet connection and proxy settings`,
+/// `No response from API`, `Connection lost while your computer was
+/// asleep`, `Connection closed before the response finished`.
+const UNREACHABLE_WORDS: &[&str] = &[
+    "can't reach",
+    "no internet route",
+    "unable to connect",
+    "connection refused",
+    "connection dropped",
+    "connection lost",
+    "connection closed",
+    "timed out",
+    "no response from api",
+    "asleep",
+    "enotfound",
+    "eai_again",
+    "econnrefused",
+    "econnreset",
+    "etimedout",
+    "enetunreach",
+    "enetdown",
+    "ehostunreach",
+    "ehostdown",
+    "epipe",
+    "econnaborted",
+    "failedtoopensocket",
+    "und_err_socket",
+    "err_socket_closed",
+    "connectionclosed",
+];
 
 /// The wall the worker's last turn ended on, if any: Claude Code's
 /// critical-memory banner first ([`memory_wall`]), then [`classify_wall`]
@@ -611,6 +779,7 @@ mod tests {
                 Some(WallKind::ApiError {
                     code: Some(429),
                     retryable: true,
+                    cause: ApiCause::Server,
                 }),
             ),
             (
@@ -618,6 +787,7 @@ mod tests {
                 Some(WallKind::ApiError {
                     code: Some(500),
                     retryable: true,
+                    cause: ApiCause::Server,
                 }),
             ),
             (
@@ -625,6 +795,7 @@ mod tests {
                 Some(WallKind::ApiError {
                     code: Some(400),
                     retryable: false,
+                    cause: ApiCause::Server,
                 }),
             ),
             (
@@ -632,6 +803,7 @@ mod tests {
                 Some(WallKind::ApiError {
                     code: None,
                     retryable: true,
+                    cause: ApiCause::CutOff,
                 }),
             ),
         ];
@@ -669,8 +841,8 @@ mod tests {
 
     use crate::phase::{Phase, limit_notice, worker_phase};
     use crate::prompt::fixtures::{
-        END_529, END_OFFER, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows,
-        screen,
+        API_ERROR_529, API_ERROR_ENOTFOUND, API_ERROR_ENOTFOUND_80, API_ERROR_SLEEP, END_529,
+        END_OFFER, END_SESSION_LIMIT, IDLE_AFTER_LIMIT_AND_MODEL_SWITCH, composer, rows, screen,
     };
 
     fn framed(body: &[&str], footer: &str) -> Vec<String> {
@@ -1241,7 +1413,8 @@ mod tests {
         assert!(
             WallKind::ApiError {
                 code: Some(429),
-                retryable: true
+                retryable: true,
+                cause: ApiCause::Server,
             }
             .reads_limited()
         );
@@ -1253,9 +1426,310 @@ mod tests {
         assert!(
             !WallKind::ApiError {
                 code: Some(500),
-                retryable: true
+                retryable: true,
+                cause: ApiCause::Server,
             }
             .reads_limited()
         );
+    }
+
+    const ENOTFOUND: &str =
+        "API Error: Can't reach the API server — check your internet or DNS (ENOTFOUND)";
+    const UNREACHABLE: WallKind = WallKind::ApiError {
+        code: None,
+        retryable: true,
+        cause: ApiCause::Unreachable,
+    };
+
+    /// THE OUTAGE OF 2026-09-27: Claude Code 2.1.283 draws `API Error: …` as
+    /// a `⏺` message of its own, and the supervisor, which read walls only in
+    /// the footer, a banner and the `⎿` gutter, typed `keep going` into it
+    /// sixteen times. It is a wall — at 144 columns, at 80 where
+    /// `(ENOTFOUND)` wraps onto the second row, without a done row, with the
+    /// `●` off macOS, and under the vendor's expand hint — and the message is
+    /// the whole of it, joined.
+    #[test]
+    fn a_283_api_error_message_row_is_a_wall_at_every_width() {
+        for (name, r) in [
+            ("144", screen(API_ERROR_ENOTFOUND)),
+            ("80", screen(API_ERROR_ENOTFOUND_80)),
+        ] {
+            assert_eq!(worker_phase(&r), Phase::Idle, "{name}");
+            let w = wall(&r).unwrap_or_else(|| panic!("{name}: the wall"));
+            assert_eq!(w.kind, UNREACHABLE, "{name}");
+            assert_eq!(w.placement, Placement::ErrorRow, "{name}");
+            assert_eq!(w.message, ENOTFOUND, "{name}");
+            assert!(r[w.row].starts_with("⏺ API Error"), "{name}");
+        }
+        let variants = [
+            framed(&["⏺ Working.", "", &format!("⏺ {ENOTFOUND}"), ""], FOOTER),
+            framed(&["● Working.", "", &format!("● {ENOTFOUND}"), ""], FOOTER),
+            framed(
+                &[
+                    "⏺ Working.",
+                    "",
+                    &format!("⏺ {ENOTFOUND}"),
+                    "  (ctrl+o to expand)",
+                    "",
+                ],
+                FOOTER,
+            ),
+        ];
+        for r in &variants {
+            let w = wall(r).expect("the wall");
+            assert_eq!((w.kind, w.message.as_str()), (UNREACHABLE, ENOTFOUND));
+        }
+    }
+
+    /// The same shape carries every other API error: a 529 (its URL wrapped
+    /// onto the second row) is an overload, and a reply the Mac's sleep cut
+    /// off is cut off.
+    #[test]
+    fn the_283_529_and_sleep_rows_read_their_kinds() {
+        let w = wall(&screen(API_ERROR_529)).expect("the 529");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::Overloaded, Placement::ErrorRow)
+        );
+        assert_eq!(w.message, API_529);
+        let w = wall(&screen(API_ERROR_SLEEP)).expect("the sleep");
+        assert_eq!(
+            w.kind,
+            WallKind::ApiError {
+                code: None,
+                retryable: true,
+                cause: ApiCause::CutOff,
+            }
+        );
+    }
+
+    /// NEGATIVE CONTROLS for the message row. The table names a wall within
+    /// a notice's first four words, so a worker's prose that opens so would
+    /// read as one if any last `⏺` row were offered: the literal vendor
+    /// prefix is required. And the error is history once anything is said
+    /// under it — a person's `keep going`, the worker's next words, a tool
+    /// call — or when it is not the whole paragraph, not in column 0, or a
+    /// person's own row. A `⎿` notice under it is still read, by the
+    /// gutter; `Request was aborted.` is still no wall.
+    #[test]
+    fn the_workers_prose_and_history_are_not_a_message_wall() {
+        let error = format!("⏺ {ENOTFOUND}");
+        let none: Vec<(&str, Vec<String>)> = vec![
+            (
+                "overloaded prose",
+                framed(
+                    &["⏺ The server was overloaded, so I retried the push.", ""],
+                    FOOTER,
+                ),
+            ),
+            (
+                "high load prose",
+                framed(
+                    &["⏺ Fixed the high load path in the scheduler.", ""],
+                    FOOTER,
+                ),
+            ),
+            (
+                "login prose",
+                framed(&["⏺ Please run /login when you are back.", ""], FOOTER),
+            ),
+            (
+                "context prose",
+                framed(
+                    &["⏺ Context limit reached in the fixture was the bug.", ""],
+                    FOOTER,
+                ),
+            ),
+            (
+                "lowercase",
+                framed(&["⏺ api error: can't reach the api server", ""], FOOTER),
+            ),
+            ("user row", framed(&[&format!("❯ {ENOTFOUND}"), ""], FOOTER)),
+            (
+                "indented",
+                framed(
+                    &["⏺ Bash(cat log)", &format!("  ⏺ {ENOTFOUND}"), ""],
+                    FOOTER,
+                ),
+            ),
+            (
+                "keep going after it",
+                framed(&[&error, "", "❯ keep going", ""], FOOTER),
+            ),
+            (
+                "later words",
+                framed(&[&error, "", "⏺ Back online; carrying on.", ""], FOOTER),
+            ),
+            (
+                "a tool call after it",
+                framed(
+                    &[&error, "", "⏺ Bash(git status)", "  ⎿  clean", ""],
+                    FOOTER,
+                ),
+            ),
+            (
+                "two paragraphs",
+                framed(
+                    &[
+                        "⏺ API Error: 529 Overloaded is what CI hit last night.",
+                        "",
+                        "  I re-ran it and it passed.",
+                        "",
+                    ],
+                    FOOTER,
+                ),
+            ),
+            (
+                "aborted",
+                framed(&["⏺ API Error: Request was aborted.", ""], FOOTER),
+            ),
+        ];
+        for (name, r) in none {
+            assert_eq!(wall(&r), None, "{name}");
+        }
+        let under = framed(
+            &[
+                &error,
+                "  ⎿  Context limit reached · /compact or /clear to continue",
+                "",
+            ],
+            FOOTER,
+        );
+        let w = wall(&under).expect("the gutter's notice");
+        assert_eq!(
+            (w.kind, w.placement),
+            (WallKind::Context, Placement::Gutter)
+        );
+    }
+
+    /// Claude Code 2.1.283's whole connection catalog, each text as it
+    /// follows `API Error: `, lands on its cause: a network never reached, a
+    /// reply cut off, a TLS or proxy refusal (never retried) — with the
+    /// traps: a refused connection that NAMES a proxy, and a timeout that
+    /// names proxy settings, are unreachable; `Unable to connect to API.
+    /// Check your internet connection` says so only after its first
+    /// sentence. A status keeps its server cause.
+    #[test]
+    fn every_api_error_family_of_the_283_catalog_classifies() {
+        let unreachable = [
+            "Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+            "Can't reach the API server — check your internet or DNS (EAI_AGAIN)",
+            "Can't reach the API server — check your internet or DNS (FailedToOpenSocket)",
+            "No internet route — check your connection or VPN (ENETUNREACH)",
+            "No internet route — check your connection or VPN (EHOSTDOWN)",
+            "Unable to connect to API. Check your internet connection",
+            "Unable to connect to API (ECONNABORTED)",
+            "Connection refused — a firewall or proxy may be blocking it (ECONNREFUSED)",
+            "Connection dropped (ECONNRESET)",
+            "Connection dropped (UND_ERR_SOCKET)",
+            "Request timed out. Check your internet connection and proxy settings",
+            "No response from API",
+            "Connection lost while your computer was asleep",
+            "Connection closed before the response finished",
+            "Unable to connect to API: SSL error (ERR_TLS_HANDSHAKE_TIMEOUT)",
+            "Unable to connect to API: SSL error (ERR_SSL_WRONG_VERSION_NUMBER)",
+        ];
+        let cut_off = [
+            "The response stopped arriving. The response above may be incomplete.",
+            "Server error mid-response. The response above may be incomplete.",
+            "The response stream was malformed. The response above may be incomplete.",
+            "Part of the response never arrived. The response above may be incomplete.",
+            "Your computer went to sleep mid-response. The response above may be incomplete.",
+            "Connection lost mid-response. The response above may be incomplete.",
+            "The response stalled before a response was produced. Try again.",
+            "The response stream was malformed and no response was produced. Try again.",
+            "Part of the response never arrived and no response was produced. Try again.",
+            "Your computer went to sleep before a response was produced. Try again.",
+            "Connection lost before a response was produced. Try again.",
+            "Claude's response exceeded the 32000 output token maximum. To configure this behavior, set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable.",
+            "An image in the conversation could not be processed and was removed. Re-read the file with a different approach if you still need it.",
+        ];
+        let config = [
+            "Unable to connect to API: SSL certificate verification failed",
+            "Unable to connect to API: SSL certificate has expired",
+            "Unable to connect to API: SSL certificate has been revoked",
+            "Unable to connect to API: SSL certificate hostname mismatch",
+            "Unable to connect to API: SSL certificate is not yet valid",
+            "Unable to connect to API: Self-signed certificate detected",
+            "Unable to connect to API (SELF_SIGNED_CERT_IN_CHAIN). The certificate comes from an authority Claude Code doesn't trust",
+            "Couldn't connect through your proxy (ERR_PROXY_TUNNEL) — the proxy refused the tunnel: check its credentials and that it allows this host",
+        ];
+        for (texts, cause, retryable) in [
+            (&unreachable[..], ApiCause::Unreachable, true),
+            (&cut_off[..], ApiCause::CutOff, true),
+            (&config[..], ApiCause::Config, false),
+        ] {
+            for text in texts {
+                let text = format!("API Error: {text}");
+                assert_eq!(
+                    classify_wall(&text),
+                    Some(WallKind::ApiError {
+                        code: None,
+                        retryable,
+                        cause,
+                    }),
+                    "{text}"
+                );
+            }
+        }
+        assert_eq!(
+            classify_wall("API Error: 503 Service unavailable. Connection refused upstream"),
+            Some(WallKind::ApiError {
+                code: Some(503),
+                retryable: true,
+                cause: ApiCause::Server,
+            }),
+            "a status is the server's, whatever words follow"
+        );
+        assert_eq!(
+            classify_wall(
+                "API Error: Request rejected (429) · this may be a temporary capacity issue."
+            ),
+            Some(WallKind::ApiError {
+                code: Some(429),
+                retryable: true,
+                cause: ApiCause::Server,
+            }),
+            "2.1.283's own 429"
+        );
+        assert_eq!(
+            classify_wall("API Error: The model has reached its context window limit."),
+            Some(WallKind::Context)
+        );
+        // What the catalog does not name is no wall: the ordinary policy's.
+        for text in [
+            "API Error: Claude Opus 5.5 can't help with this. Start a new session to continue.",
+            "API Error (claude-x-1): The model claude-x-1 is not available. Run /model to pick another.",
+            "API Error: Effort 'max' isn't available for this model.",
+        ] {
+            assert_eq!(classify_wall(text), None, "{text}");
+        }
+    }
+
+    /// The one connection failure 2.1.283 draws under `⎿` with no prefix,
+    /// `Request timed out`, is unreachable there — and a tool's output that
+    /// says it is no wall.
+    #[test]
+    fn request_timed_out_under_the_gutter_is_unreachable() {
+        let r = framed(
+            &["⏺ Checking the suite.", "  ⎿  Request timed out", ""],
+            FOOTER,
+        );
+        let w = wall(&r).expect("the wall");
+        assert_eq!((w.kind, w.placement), (UNREACHABLE, Placement::Gutter));
+        let tool = framed(
+            &["⏺ Bash(curl -m1 x)", "  ⎿  Request timed out", ""],
+            FOOTER,
+        );
+        assert_eq!(wall(&tool), None);
+        let longer = framed(
+            &[
+                "⏺ Checking the suite.",
+                "  ⎿  Request timed out. Retrying the fetch.",
+                "",
+            ],
+            FOOTER,
+        );
+        assert_eq!(wall(&longer), None, "only the whole row");
     }
 }

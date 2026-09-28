@@ -494,8 +494,8 @@ fn parse_dcs_body(major_tok: &str, rest: &str) -> Result<SequenceSelector, Selec
 }
 
 fn split_major(tok: &str) -> (&str, Option<&str>) {
-    match tok.find(';') {
-        Some(idx) => (&tok[..idx], Some(&tok[idx + 1..])),
+    match tok.split_once(';') {
+        Some((major, rest)) => (major, Some(rest)),
         None => (tok, None),
     }
 }

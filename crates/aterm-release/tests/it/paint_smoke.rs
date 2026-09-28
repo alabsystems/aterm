@@ -374,7 +374,7 @@ fn a_line_that_says_nothing_about_its_own_standing_is_not_evidence() {
         let why = publish::paint_take_is_evidence(line)
             .expect_err("a take that does not stand behind itself may not satisfy the gate");
         assert!(
-            why.contains("ProcessType=Interactive"),
+            why.contains("`tools/cut-launch.sh"),
             "every refusal names the remedy: {why}"
         );
     }
@@ -414,7 +414,7 @@ fn an_unproven_take_refuses_the_cut_and_names_the_remedy() {
         "an unproven take is not a claim that the artifact is dark: {msg}"
     );
     assert!(
-        msg.contains("ProcessType=Interactive") && msg.contains("interactive shell"),
+        msg.contains(publish::PAINT_EVIDENCE_REMEDY) && msg.contains("`tools/cut-launch.sh"),
         "the refusal must name the remedy, or it will be switched off: {msg}"
     );
     assert!(

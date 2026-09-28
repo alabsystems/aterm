@@ -516,9 +516,14 @@ impl Floor {
     ) -> Result<(), String> {
         let lock_path = path.with_extension("toml.lock");
         // `_lock`, never `_`: the guard must live until this function returns, since
-        // it covers the whole read/max/write transaction.
-        let _lock = aterm_update_core::FileLock::acquire(&lock_path)
-            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        // it covers the whole read/max/write transaction. BOUNDED (plan P2-1): the
+        // checker thread ratchets here after a stage, and a holder stopped mid-write
+        // parked it for good; a timeout is the bump's ordinary, reported failure.
+        let _lock = aterm_update_core::FileLock::acquire_within(
+            &lock_path,
+            crate::install::BACKGROUND_LOCK_WAIT,
+        )
+        .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
         let cur = Self::read(path);
         let next = Self {
             min_build: cur.min_build.max(seen_min_build),

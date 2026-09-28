@@ -47,6 +47,9 @@ const HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 /// The CEILING on the child-exit poll interval (see [`HELPER_POLL_MIN`]).
 const HELPER_POLL: Duration = Duration::from_millis(25);
 
+/// How long a timed-out helper is given to be reaped after its SIGKILL.
+const HELPER_REAP: Duration = Duration::from_millis(250);
+
 /// The first child-exit poll interval, doubled up to [`HELPER_POLL`].
 ///
 /// A fixed 25 ms tick made every helper cost `25ms * ceil(runtime / 25ms)` with a
@@ -378,6 +381,43 @@ fn timed_out(what: &str, bound_by_budget: bool) -> String {
 }
 
 fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output, String> {
+    output_until(cmd, what, || {
+        let (deadline, bound_by_budget) = helper_deadline();
+        (deadline, timed_out(what, bound_by_budget))
+    })
+}
+
+/// [`output_bounded`] with an explicit `limit` instead of the helper timeout and
+/// the apply budget: for a helper on the CHECK thread whose legitimate run is
+/// longer than a verification helper's, but must still end — `hdiutil attach`
+/// verifies a whole image's checksums; `hdiutil detach -force` of a wedged mount
+/// can wait on the disk arbitration daemon indefinitely. A timeout is an `Err`
+/// and the child is killed and reaped. Same output caveat as [`output_bounded`]:
+/// for helpers that print a few lines at most.
+pub(crate) fn output_within(
+    cmd: &mut Command,
+    what: &str,
+    limit: Duration,
+) -> Result<std::process::Output, String> {
+    output_until(cmd, what, || {
+        (
+            Instant::now() + limit,
+            format!(
+                "{what} did not finish within {}s; treating as a failure",
+                limit.as_secs()
+            ),
+        )
+    })
+}
+
+/// Spawn `cmd` and collect its output, killing and reaping it at the deadline
+/// `bound` names once the child is running; `bound` also gives the timeout's
+/// error text.
+fn output_until(
+    cmd: &mut Command,
+    what: &str,
+    bound: impl FnOnce() -> (Instant, String),
+) -> Result<std::process::Output, String> {
     use std::process::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -385,18 +425,20 @@ fn output_bounded(cmd: &mut Command, what: &str) -> Result<std::process::Output,
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn {what}: {e}"))?;
-    let (deadline, bound_by_budget) = helper_deadline();
+    let (deadline, timeout) = bound();
     let mut poll = HELPER_POLL_MIN;
     loop {
         match child.try_wait() {
             Ok(Some(_)) => break,
             Ok(None) => {
                 if Instant::now() >= deadline {
-                    // Reap it so the timed-out helper cannot linger as a zombie
-                    // holding the bundle open across the swap.
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(timed_out(what, bound_by_budget));
+                    // Kill it and reap it, within a short reserve: a helper still
+                    // wedged in the kernel past SIGKILL is left to exit on its own
+                    // rather than parking this thread on it, which is the whole
+                    // point of the bound. A timeout is a rejection either way, so
+                    // nothing is swapped past a helper that may still hold a file.
+                    let _ = stop_helper_before(&mut child, Instant::now() + HELPER_REAP);
+                    return Err(timeout);
                 }
                 // Clamp the sleep to the remaining budget so the 30s ceiling
                 // stays exact, then back off toward the steady-state tick.
@@ -655,6 +697,35 @@ mod tests {
             waited < Duration::from_secs(5),
             "waited {waited:?}, so the budget did not bind"
         );
+    }
+
+    /// A CHECK-THREAD HELPER ENDS AT ITS OWN LIMIT (plan P2-1, round three). The
+    /// check's `hdiutil` attach and detaches ran with `.output()` — no bound at all
+    /// — on the update checker's thread, inside a check holding the process's check
+    /// lane and the machine-wide `checker.lock`, so one that never returned parked
+    /// the checker for good. They now run through `output_within`: a child past its
+    /// limit is killed, reaped within a short reserve, and reported, promptly; one
+    /// that finishes is collected as before.
+    #[cfg(unix)]
+    #[test]
+    fn a_check_helper_past_its_limit_is_killed_and_reported_promptly() {
+        let started = Instant::now();
+        let error = output_within(
+            Command::new("/bin/sleep").arg("30"),
+            "sleep",
+            Duration::from_millis(300),
+        )
+        .expect_err("a helper past its limit is a failure");
+        let waited = started.elapsed();
+        assert!(error.contains("sleep did not finish within"), "{error}");
+        assert!(waited < Duration::from_secs(5), "waited {waited:?}");
+        let out = output_within(
+            Command::new("/bin/echo").arg("hi"),
+            "echo",
+            Duration::from_secs(10),
+        )
+        .expect("a helper inside its limit runs");
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
     }
 
     /// Outside an apply there is no budget, and the per-helper ceiling stands

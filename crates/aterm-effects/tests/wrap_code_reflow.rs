@@ -1018,6 +1018,31 @@ fn the_first_key_that_pushes_a_glued_word_down_is_judged_not_parked() {
     );
 }
 
+/// The same recorded composer fold with a delayed first echo. A key may
+/// remain unpaid for ten seconds, but the exact-glyph witness used to
+/// distinguish this fold from a foreign footer currently expires at 250 ms.
+/// At 300 ms the fold is held as a cross-row park and every later key can
+/// disappear behind its custody even though the source tail moved with the
+/// key's glyph.
+#[test]
+fn a_delayed_first_key_still_carries_the_glued_word_down() {
+    let mut cc = painted(ROW1_EXACT);
+    cc.echo_ms = 300;
+    let from = cc.insert_before_chip(&TYPED[..1], 110);
+    assert!(
+        cc.h.judged((16, 56), (17, 3)),
+        "the 300 ms fold was held rather than judged: {:?}",
+        cc.h.glow.admission_log().collect::<Vec<_>>()
+    );
+    let faults = cc.faults(from);
+    assert!(
+        faults.dark.is_empty(),
+        "{}; verdicts {:?}",
+        faults.summary(),
+        cc.h.glow.admission_log().collect::<Vec<_>>()
+    );
+}
+
 /// NEGATIVE CONTROL: a footer that happens to show the pressed key's own
 /// glyph, with the input row untouched, is still a footer. The park keeps
 /// custody of the press: the row below never lights, and the key's real
@@ -1059,6 +1084,18 @@ fn an_erased_tail_under_a_foreign_footer_glyph_keeps_the_parks_custody() {
         "the key's own echo went dark: r16 |{}|",
         map(&last.lit[0])
     );
+}
+
+/// A program footer can print the SAME glyph as the unpaid key while erasing
+/// the input row's tail. Those two observations alone do not prove that the
+/// typed word moved: the old tail must also follow the landing glyph.
+#[test]
+fn an_erased_tail_under_a_same_glyph_footer_keeps_the_parks_custody() {
+    let (cc, col) = footer_before_the_echo('x', true);
+    let footer = cc.shots.iter().filter(|s| s.lit[1].contains(&true)).count();
+    assert_eq!(footer, 0, "the footer spent the key");
+    let last = cc.shots.last().expect("a frame");
+    assert!(last.lit[0][col], "the key's echo went dark");
 }
 
 // ---------------------------------------------------------------------------

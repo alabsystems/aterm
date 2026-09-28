@@ -25,8 +25,9 @@
 //! HISTORICAL tree (e.g. a worktree of the pre-a69a6bb3 commit that shipped
 //! the 42 s whole-Mac freeze) without needing the census crate to exist there:
 //! today's walker, yesterday's sources. The build-blocking consumer is
-//! tools/freeze-safety-gate/build.rs; the manual verbs are `xtask gate
-//! mainloop|lockorder|wasmloop|scope|lazyinit`.
+//! tools/freeze-safety-gate/build.rs; this bin is the manual runner (the
+//! `xtask gate mainloop|lockorder|wasmloop|scope|lazyinit` verbs were retired
+//! in gate decruft wave 2, 2026-09-27).
 
 use std::path::PathBuf;
 use std::process::ExitCode;

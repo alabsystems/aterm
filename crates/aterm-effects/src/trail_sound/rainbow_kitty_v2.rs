@@ -1761,6 +1761,48 @@ fn cadence_target(mark: u8, from: i32, last_cadence: i32) -> i32 {
     }
 }
 
+/// **THE ASIDE IS SOTTO VOCE** (round two, 2026-09-27; owner, 2026-09-20:
+/// *"I want musical phrasing to organically feel like it comes from
+/// punctuation choice"*). While a bracket `( [ {` is open, every key inside
+/// it — letters, digits, marks, a nested bracket — is struck −2 dB (this) under
+/// a darker roof ([`ASIDE_ROOF_MUL`]): a parenthesis is said more quietly.
+/// The PITCH is not the aside's: no degree, no gravity, moves for it. The
+/// opening bracket itself and the close that ends the aside are outside it
+/// and sound as they always did. Exactly ×1.0 outside an aside, so every key
+/// of plain typing evaluates the operands it always did.
+const ASIDE_GAIN: f32 = 0.794_328_2;
+/// …and its roof, ×0.8 of the key's own: the note is further away, not
+/// muffled. Every roof is at most [`ROOF_MAX_HZ`] (7500), so the aside's is at
+/// most 6000 Hz — a real filter, under the one-pole's 7639 Hz bypass.
+const ASIDE_ROOF_MUL: f32 = 0.8;
+/// THE ASIDE EXPIRES after this many typed keys inside it, so a code block —
+/// whose `{` is often closed a screen later, or never on this line — never
+/// stays quiet for ever. Typed keys only: a Space is the word's, not the
+/// aside's, and is never sotto voce.
+const ASIDE_MAX_KEYS: u8 = 32;
+/// How deep the bracket counter goes. Sotto voce is ONE level, whatever the
+/// depth (it does not stack); the counter only keeps `f(g(x))` from ending
+/// the aside at its first `)`. Capped so a run of `((((((` cannot bank closes
+/// that a later line would then spend.
+const ASIDE_DEPTH_MAX: u8 = 4;
+
+/// [`TypedPlan::quote`]'s values (round two, 2026-09-27): what a QUOTE did.
+/// `QUOTE_NONE` is every other key AND the apostrophe (`don't`, `it's`) —
+/// a quote mid-word with no quotation open, which is unchanged from before
+/// the quotation existed.
+const QUOTE_NONE: u8 = 0;
+/// **A QUOTATION OPENS** — a quote at a word head (after a Space, an Enter, a
+/// line feed or the session's start) or straight after an OPEN, with no
+/// quotation open. Its note snaps UP to the nearest tone of the live chord
+/// at or above the degree the line derived, and it keeps the quote's ×2
+/// sparkle and second wink ([`QUOTE_GLINT_MUL`]): the voice lifts to quote.
+const QUOTE_OPENS: u8 = 1;
+/// **A QUOTATION CLOSES** — any quote while one is open. Its note steers back
+/// toward the degree the quotation opened on, by at most
+/// [`WORD_LEAP_MAX_DEG`] (`)`'s return, for a quote), and it is PLAIN: one
+/// ×1 sparkle, the every-key one, and no second wink.
+const QUOTE_CLOSES: u8 = 2;
+
 /// **A NUMBER IS A WOOD BAR** — the kalimba colour on the lattice. The
 /// letter's tine is sine + octave + the 2.760 strike; the digit's keeps the
 /// sine and replaces the other two with the ODD HARMONICS, 3f and 5f, which
@@ -2753,6 +2795,16 @@ const CAD_RESOLUTION_LOW_DEG: i32 = 0;
 const CAD_RESOLUTION_HIGH_DEG: i32 = 5;
 /// The verse degree at or below which the resolution takes the low C.
 const CAD_RESOLUTION_SPLIT: i8 = 2;
+/// **A QUESTION'S RETURN STAYS OPEN** (round two, 2026-09-27; owner,
+/// 2026-09-20: *"I want musical phrasing to organically feel like it comes
+/// from punctuation choice"*). When the line's last mark is a `?`
+/// ([`MelodyV2::pending_mark`], so `is it?⏎` and `is it? ⏎` alike; `??` is
+/// void and resolves as ever), the Enter's resolution lands this many degrees
+/// over the C it would have taken — the G, a just fifth up, in the same
+/// register: the question is answered on the dominant, not at home. Only the
+/// resolution's degree (and the room that answers it) moves: the pickup, the
+/// bell and the tonic dyad are the Return's as ever.
+const CAD_QUESTION_LIFT_DEG: i32 = 3;
 /// The tonic dyad, C4 + G4 — home, in the bass, −3 dB.
 const CAD_DYAD_LEVEL: f32 = 0.707_945_8;
 /// The faraway ICE BELL (§11). Sine C6 with a light inharmonic FM colour: its
@@ -2965,6 +3017,15 @@ struct Undo {
     token_marked: bool,
     paren_deg: i8,
     last_cadence_deg: i8,
+    /// ROUND TWO'S STATE (2026-09-27): the aside's depth and its key count
+    /// ([`ASIDE_GAIN`]). Un-typing a bracket re-opens or re-closes the aside
+    /// it opened or closed, so both ride the frame.
+    aside_depth: u8,
+    aside_keys: u8,
+    /// …and the quotation's: the degree it opened on (−1 for none) and
+    /// whether the last typed key was an OPEN (a quote there opens one).
+    quote_deg: i8,
+    after_open: bool,
 }
 
 /// **THE MELODY ENGINE** (§10) — `Copy`, alloc-free, deterministic, and driven
@@ -3040,6 +3101,23 @@ pub struct MelodyV2 {
     /// The degree the last `.` or `!` cadenced on, −1 for none — the
     /// anti-drone's memory ([`cadence_target`]).
     last_cadence_deg: i8,
+    /// **THE ASIDE** (round two, 2026-09-27; [`ASIDE_GAIN`]): how many
+    /// brackets are open, capped at [`ASIDE_DEPTH_MAX`], and how many typed
+    /// keys have sounded inside the aside ([`ASIDE_MAX_KEYS`]). Sotto voce at
+    /// depth ≥ 1, one level whatever the depth. Closed by a CLOSE that brings
+    /// the depth to 0, by an Enter, a line feed, a kill, a phrase rest, or
+    /// the 32nd key.
+    aside_depth: u8,
+    aside_keys: u8,
+    /// **THE QUOTATION** (round two, 2026-09-27; [`QUOTE_OPENS`]): the degree
+    /// the open quote sounded, −1 when no quotation is open — where the
+    /// closing quote steers back toward. Cleared with the phrase
+    /// ([`MelodyV2::end_phrase`]).
+    quote_deg: i8,
+    /// WAS THE LAST TYPED KEY AN OPEN (`( [ {`)? A quote there is at the head
+    /// of what the bracket opened — `("hi")` — so it opens a quotation as a
+    /// word head's does.
+    after_open: bool,
     /// THE AUTO-REPEAT DETECTOR'S STATE: the previous raw gap and how many
     /// gaps of the live machine-regular run have agreed. Deliberately NOT on
     /// the undo frame — it describes the hand on the key, not the text, and a
@@ -3205,6 +3283,10 @@ impl MelodyV2 {
             token_marked: false,
             paren_deg: -1,
             last_cadence_deg: -1,
+            aside_depth: 0,
+            aside_keys: 0,
+            quote_deg: -1,
+            after_open: false,
             motif: [0; MOTIF_LEN],
             motif_len: 0,
             motif_play: 0,
@@ -3255,6 +3337,10 @@ impl MelodyV2 {
                 token_marked: false,
                 paren_deg: -1,
                 last_cadence_deg: -1,
+                aside_depth: 0,
+                aside_keys: 0,
+                quote_deg: -1,
+                after_open: false,
             }; UNDO_N],
             undo_len: 0,
             lead: None,
@@ -3387,6 +3473,10 @@ impl MelodyV2 {
             token_marked: self.token_marked,
             paren_deg: self.paren_deg,
             last_cadence_deg: self.last_cadence_deg,
+            aside_depth: self.aside_depth,
+            aside_keys: self.aside_keys,
+            quote_deg: self.quote_deg,
+            after_open: self.after_open,
         }
     }
 
@@ -3426,6 +3516,10 @@ impl MelodyV2 {
         self.token_marked = f.token_marked;
         self.paren_deg = f.paren_deg;
         self.last_cadence_deg = f.last_cadence_deg;
+        self.aside_depth = f.aside_depth;
+        self.aside_keys = f.aside_keys;
+        self.quote_deg = f.quote_deg;
+        self.after_open = f.after_open;
     }
 
     /// Is `deg` a chord tone of the live chord (§10.3)?
@@ -3490,6 +3584,30 @@ impl MelodyV2 {
         self.last_mark = MARK_NONE;
         self.token_marked = false;
         self.paren_deg = -1;
+        self.close_aside();
+        self.quote_deg = -1;
+        self.after_open = false;
+    }
+
+    /// THE ASIDE ENDS (round two, 2026-09-27; [`ASIDE_GAIN`]) — every open
+    /// bracket at once. A line boundary and a phrase rest take it; so does
+    /// the [`ASIDE_MAX_KEYS`]-th key inside it.
+    fn close_aside(&mut self) {
+        self.aside_depth = 0;
+        self.aside_keys = 0;
+    }
+
+    /// IS AN ASIDE OPEN (test / introspection hook)? True between an opening
+    /// bracket and whatever closes it ([`ASIDE_GAIN`]).
+    #[must_use]
+    pub fn in_aside(&self) -> bool {
+        self.aside_depth > 0
+    }
+
+    /// IS A QUOTATION OPEN (test / introspection hook)? ([`QUOTE_OPENS`].)
+    #[must_use]
+    pub fn in_quote(&self) -> bool {
+        self.quote_deg >= 0
     }
 
     /// **THE MARK THE NEXT SPACE WILL CONFIRM** (test / introspection hook):
@@ -3571,6 +3689,16 @@ struct TypedPlan {
     /// sentence (a tine that rings, and breathes) from the dot inside
     /// `foo.bar` (a pluck, and no air). False on every letter and digit.
     steered: bool,
+    /// THIS KEY IS INSIDE AN ASIDE (round two, 2026-09-27; [`ASIDE_GAIN`]):
+    /// an aside was open before it and is still open after it — so neither
+    /// the bracket that opens the outermost aside nor the close that ends it,
+    /// and never a key of plain typing. It changes a level and a roof, never
+    /// the degree.
+    sotto: bool,
+    /// WHAT A QUOTE DID (round two, 2026-09-27): [`QUOTE_OPENS`],
+    /// [`QUOTE_CLOSES`], or [`QUOTE_NONE`] — every other key, and the
+    /// apostrophe.
+    quote: u8,
 }
 
 /// WHICH OF §3.3's ADDITIONS THIS SYNTH VOICES — the timbre ladder's stops
@@ -3676,6 +3804,9 @@ impl MelodyV2 {
             self.run_stride = 0;
             self.run_len = 0;
             self.relatch_motif();
+            // …and a rest ends the aside (round two, 2026-09-27): the key that
+            // breaks the silence is spoken aloud again.
+            self.close_aside();
         }
 
         // THE WORD HEAD, decided BEFORE `word_pos` moves: this key is the
@@ -3877,6 +4008,11 @@ impl MelodyV2 {
         let decimal =
             class == STOP && (DIGIT_RANK0..DIGIT_RANK0 + 10).contains(&i32::from(rank_before));
         let mut steered = false;
+        // **THE QUOTATION** (round two, 2026-09-27; [`QUOTE_OPENS`]). Read
+        // before this key overwrites `after_open`: a quote straight after an
+        // OPEN is at the head of what the bracket opened.
+        let quote_head = word_head || self.after_open;
+        let mut quote = QUOTE_NONE;
         if doubled {
             // No override.
         } else if class == DASH {
@@ -3889,6 +4025,27 @@ impl MelodyV2 {
                 deg = from + (to - from).clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG);
             }
             self.paren_deg = -1;
+        } else if class == QUOTE && self.quote_deg >= 0 {
+            // A quotation CLOSES, toward the degree it opened on — `)`'s
+            // return, bounded the same way.
+            let to = i32::from(self.quote_deg);
+            deg = from + (to - from).clamp(-WORD_LEAP_MAX_DEG, WORD_LEAP_MAX_DEG);
+            self.quote_deg = -1;
+            quote = QUOTE_CLOSES;
+        } else if class == QUOTE && quote_head {
+            // A quotation OPENS: up to the nearest chord tone at or above the
+            // derived degree — held to A2's in-word bound when it is not a
+            // word head (`("`), and standing where no tone is in reach.
+            let top = if word_head {
+                TUNE_DEG_HI
+            } else {
+                (from + WORD_LEAP_MAX_DEG).min(TUNE_DEG_HI)
+            };
+            if let Some(up) = (deg..=top).find(|c| self.deg_is_lit(*c)) {
+                deg = up;
+            }
+            self.quote_deg = deg as i8;
+            quote = QUOTE_OPENS;
         } else if mark != MARK_NONE && !self.token_marked && !decimal {
             deg = cadence_target(mark, from, i32::from(self.last_cadence_deg));
             if matches!(mark, MARK_PERIOD | MARK_BANG) {
@@ -3900,7 +4057,40 @@ impl MelodyV2 {
         if class == OPEN {
             self.paren_deg = deg as i8;
         }
-        self.last_mark = if doubled { mark | MARK_DOUBLED } else { mark };
+        // **A CLOSING QUOTE CARRIES THE MARK BEFORE IT** (round two,
+        // 2026-09-27): `"Why?"` asks and `"Stop."` closes — the quote that
+        // ends a quotation does not end what its last mark said, so the next
+        // Space confirms it and the next Return reads it
+        // ([`CAD_QUESTION_LIFT_DEG`]). Every other key writes its own.
+        self.last_mark = if quote == QUOTE_CLOSES {
+            self.last_mark
+        } else if doubled {
+            mark | MARK_DOUBLED
+        } else {
+            mark
+        };
+        // **THE ASIDE** (round two, 2026-09-27; [`ASIDE_GAIN`]). A LEVEL, not
+        // a note: it is decided here because it is a function of the text,
+        // and read nowhere above — `deg` is final. An OPEN deepens it (to
+        // [`ASIDE_DEPTH_MAX`]), a CLOSE shallows it, and the key is sotto voce
+        // when the aside is open on both sides of it. The keys inside are
+        // counted, and the [`ASIDE_MAX_KEYS`]-th ends it.
+        let aside_before = self.aside_depth;
+        if class == OPEN {
+            self.aside_depth = (self.aside_depth + 1).min(ASIDE_DEPTH_MAX);
+        } else if class == CLOSE {
+            self.aside_depth = self.aside_depth.saturating_sub(1);
+        }
+        let sotto = aside_before > 0 && self.aside_depth > 0;
+        self.after_open = class == OPEN;
+        if self.aside_depth == 0 {
+            self.aside_keys = 0;
+        } else if sotto {
+            self.aside_keys = self.aside_keys.saturating_add(1);
+            if self.aside_keys >= ASIDE_MAX_KEYS {
+                self.close_aside();
+            }
+        }
         // THE RUN IS BOOKED ON WHAT WILL SOUND — after the reflection, after
         // the snap, after the lift, after the mark — because that is the
         // stride the ear counts and the only one [`MELODY_RUN_MAX`] can be a
@@ -3982,8 +4172,13 @@ impl MelodyV2 {
         // the cadence, not a doubled letter — the word head's common-tone
         // precedent, for the same reason. It is a step, and `repeat` damps
         // the old lead under it.
+        //
+        // **NOR IS A QUOTATION'S OPEN OR CLOSE** (round two, 2026-09-27): `("`
+        // shares the bracket's degree as often as not, and the quote that
+        // comes home may land where the line stands — each is a gesture of
+        // the text, not a doubled letter. The apostrophe keeps the old law.
         let repeat = deg == from && !first;
-        let touch = if repeat && !word_head && !steered {
+        let touch = if repeat && !word_head && !steered && quote == QUOTE_NONE {
             self.restrike = self.restrike.saturating_add(1);
             Touch::ReStrike
         } else {
@@ -4096,6 +4291,8 @@ impl MelodyV2 {
             answer_head,
             opens_shift,
             steered,
+            sotto,
+            quote,
         }
     }
 
@@ -4367,9 +4564,14 @@ impl MelodyV2 {
     /// or not). That mark WAS the cadence, so the Return behind it is a
     /// codetta — [`TrailSynth::v2_enter`] drops the pickup — and `.`⏎ is one
     /// arrival home, not two.
-    fn on_enter(&mut self, at: u32) -> (bool, bool) {
+    ///
+    /// **AND WHETHER IT ASKED** (round two, 2026-09-27): `asked` is true when
+    /// the last mark was a `?` — [`CAD_QUESTION_LIFT_DEG`] lands the
+    /// resolution on the G.
+    fn on_enter(&mut self, at: u32) -> (bool, bool, bool) {
         let full = self.keys_since_enter >= ENTER_PICKUP_MIN_KEYS;
         let closed = matches!(self.pending_mark(), MARK_PERIOD | MARK_BANG);
+        let asked = self.pending_mark() == MARK_QMARK;
         self.end_phrase();
         self.chord = CHORD_AFTER_ENTER;
         self.walk = self.nearest_lit_within(MELODY_CENTRE_DEG, MELODY_CENTRE_DEG) as i8;
@@ -4387,7 +4589,7 @@ impl MelodyV2 {
         self.undo_len = 0;
         self.space_run = false;
         self.keys_since_enter = 0;
-        (full, closed)
+        (full, closed, asked)
     }
 
     /// Is this line feed the ECHO of the keyed Return just admitted (§10.4,
@@ -5754,6 +5956,11 @@ impl TrailSynth {
         // expression.
         let class = meta.glyph_class;
         let plan = self.v2.on_typed(at, meta.rank, sing, ev.shifted, class);
+        #[cfg(test)]
+        let plan = TypedPlan {
+            sotto: plan.sotto && !self.aside_off,
+            ..plan
+        };
         let stops = self.v2.stops;
         // …and a FELT key (auto-repeat, a sing-along re-strike) is the felt
         // mallet whatever its glyph: the class shaping is skipped and the
@@ -5793,6 +6000,16 @@ impl TrailSynth {
         // all with the stop out — `hue_arc(0) == 0`, so `plain` is exact.
         let arc = if stops.hue { hue_arc(ev.hue) } else { 0.0 };
         let roof = roof_hz(cps, lit_roof, ev.heat, arc, plan.touch);
+        // THE ASIDE'S DARKER ROOF ([`ASIDE_ROOF_MUL`]), on every voice this
+        // key builds from it; `roof` itself, to the bit, outside an aside.
+        let roof = if plan.sotto {
+            roof * ASIDE_ROOF_MUL
+        } else {
+            roof
+        };
+        // …and its −2 dB ([`ASIDE_GAIN`]), on every voice the key spawns.
+        // Exactly ×1.0 outside an aside.
+        let aside_gain = if plan.sotto { ASIDE_GAIN } else { 1.0 };
         // THE LINE'S OWN DEGREE — what the walk derived, in the song's key —
         // IS THE DEGREE EVERY KEY STRIKES, whatever its spelling.
         //
@@ -5875,7 +6092,8 @@ impl TrailSynth {
         // mark carries [`MARK_SHIFT_GAIN`], because half of code's punctuation
         // is shifted and none of it is a capital.
         let phrase_gain = if pause_mark { PAUSE_MARK_GAIN } else { 1.0 };
-        let gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel * hammer.gain * phrase_gain;
+        let gain =
+            ev.gain * KEY_TINE_TRIM * plan.level * g * vel * hammer.gain * phrase_gain * aside_gain;
         // THE CLASS RESHAPES THE ONE TINE (§10.4) — one key, one TUNE voice,
         // whatever the glyph. A DIGIT is the wood bar ([`wood`]) on a blip's
         // τ ([`DIGIT_TAU_MUL`]); a PLUCKED mark ([`pluck_class`]) is the
@@ -5950,7 +6168,8 @@ impl TrailSynth {
         } else {
             (hue_air(0.25), 0.0)
         };
-        let bloom_gain = ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air;
+        let bloom_gain =
+            ev.gain * KEY_TINE_TRIM * plan.level * g * vel * BLOOM_LEVEL * air * aside_gain;
         if blooms {
             let mut halo = bloom(deg, roof, tau);
             // EVERY VOICE A SHIFTED KEY SPAWNS IS UNDER A REAL FILTER (the
@@ -5995,7 +6214,7 @@ impl TrailSynth {
                     ev,
                     deg,
                     0,
-                    GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g,
+                    GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g * aside_gain,
                     vel,
                     KEY_GLINT_DELAY_S,
                 );
@@ -6008,24 +6227,27 @@ impl TrailSynth {
                 // bang or a quote winks a SECOND time, at its own distance
                 // ([`BANG_GLINT2_DELAY_S`], [`QUOTE_GLINT2_DELAY_S`]), the
                 // rotation advancing twice.
-                let mul = hammer.glint_mul;
+                // …and a CLOSING quote is plain ([`QUOTE_CLOSES`]): the
+                // every-key ×1, one wink. `hammer.glint_mul` everywhere else.
+                let closes_quote = classed && plan.quote == QUOTE_CLOSES;
+                let mul = if closes_quote { 1.0 } else { hammer.glint_mul };
                 self.v2_glint_at(
                     ev,
                     0,
-                    GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g,
+                    GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g * aside_gain,
                     vel,
                     KEY_GLINT_DELAY_S,
                 );
                 let second = match class {
                     BANG if classed => Some(BANG_GLINT2_DELAY_S),
-                    QUOTE if classed => Some(QUOTE_GLINT2_DELAY_S),
+                    QUOTE if classed && !closes_quote => Some(QUOTE_GLINT2_DELAY_S),
                     _ => None,
                 };
                 if let Some(delay) = second {
                     self.v2_glint_at(
                         ev,
                         0,
-                        GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g,
+                        GLINT_LEVEL * KEY_GLINT_LEVEL_MUL * mul * g * aside_gain,
                         vel,
                         delay,
                     );
@@ -6127,7 +6349,7 @@ impl TrailSynth {
             let level = if class == STOP { 1.0 } else { PAUSE_BREATH_MUL };
             self.v2_spawn_decoration(
                 breath(STOP_BREATH_DELAY_S),
-                ev.gain * KEY_TINE_TRIM * BREATH_LEVEL * g * level,
+                ev.gain * KEY_TINE_TRIM * BREATH_LEVEL * g * level * aside_gain,
                 pan,
             );
         }
@@ -6372,7 +6594,7 @@ impl TrailSynth {
                 let pan = self.v2_pan(ev.pan);
                 self.v2_spawn(
                     answer,
-                    ev.gain * KEY_TINE_TRIM * ANSWER_LEVEL * g * vel,
+                    ev.gain * KEY_TINE_TRIM * ANSWER_LEVEL * g * vel * aside_gain,
                     pan,
                 );
             }
@@ -6742,7 +6964,7 @@ impl TrailSynth {
         self.v2.graft = None;
         self.v2.prev_class = LETTER;
         self.v2_hand_back_key(at);
-        let (full, closed) = self.v2.on_enter(at);
+        let (full, closed, asked) = self.v2.on_enter(at);
         // §10.4 reads `walk` AFTER the phrase has been cadenced, so the
         // resolution answers the note the theme was heading for and not the
         // note the last keystroke happened to leave behind.
@@ -6754,20 +6976,26 @@ impl TrailSynth {
         let arc = if stops.hue { hue_arc(ev.hue) } else { 0.0 };
         let roof = roof_hz(1.0 / ioi_s, true, ev.heat, arc, Touch::Step);
         let key = i32::from(self.song_key);
+        // THE RESOLUTION'S DEGREE. Low or high C, so the cadence always
+        // resolves onto home rather than leaping away from it — and behind a
+        // `?` the G over that C ([`CAD_QUESTION_LIFT_DEG`]; round two,
+        // 2026-09-27): a question's line ends open.
+        let resolution = if walk <= CAD_RESOLUTION_SPLIT {
+            CAD_RESOLUTION_LOW_DEG
+        } else {
+            CAD_RESOLUTION_HIGH_DEG
+        };
+        let resolution = if asked {
+            resolution + CAD_QUESTION_LIFT_DEG
+        } else {
+            resolution
+        };
         // THE ROOM ANSWERS THE LINE'S END (§3.3 item 4): two bloom taps
         // behind the note the cadence resolves onto — the resolution at
         // `t` when the cadence is earned, home where it is a bare dyad —
         // at the bloom's own level for this hue. A line ends, and the air
         // it ends in is heard once.
-        let home = if full {
-            if walk <= CAD_RESOLUTION_SPLIT {
-                CAD_RESOLUTION_LOW_DEG
-            } else {
-                CAD_RESOLUTION_HIGH_DEG
-            }
-        } else {
-            i32::from(walk)
-        };
+        let home = if full { resolution } else { i32::from(walk) };
         if stops.room {
             let air = if stops.hue {
                 hue_air(ev.hue)
@@ -6806,15 +7034,9 @@ impl TrailSynth {
                 self.v2_spawn(pickup, ev.gain * KEY_TINE_TRIM * CAD_PICKUP_LEVEL, ev.pan);
             }
 
-            // THE RESOLUTION, at t = T. Low or high C, so the cadence always
-            // resolves onto home rather than leaping away from it.
-            let deg = if walk <= CAD_RESOLUTION_SPLIT {
-                CAD_RESOLUTION_LOW_DEG
-            } else {
-                CAD_RESOLUTION_HIGH_DEG
-            };
+            // THE RESOLUTION, at t = T, on the degree decided above.
             let mut res = tine(
-                penta(TINE_BASE_HZ, deg + key),
+                penta(TINE_BASE_HZ, resolution + key),
                 Touch::Step,
                 tau,
                 roof,
@@ -12279,6 +12501,377 @@ for it up front.\n\
         }
     }
 
+    /// THE STRIKE ONE TYPED KEY SPAWNS — its TUNE voice, through the shipping
+    /// seam ([`push_ch`]).
+    fn strike_of(s: &mut TrailSynth, ch: char, at: u32) -> Voice {
+        let mark = s.born_seq;
+        push_ch(s, SoundKind::Typed, at, ch);
+        tune_voices(&since(s, mark))[0]
+    }
+
+    /// `prefix` typed, then `ch` struck on the engine AND on its twin with
+    /// the aside closed by hand → (level ratio, roof ratio, same pitch). The
+    /// twin shares every draw, so the ratio is the aside's and nothing else.
+    fn aside_vs_twin(prefix: &str, ch: char) -> (f32, f32, bool) {
+        let mut s = synth();
+        let mut at = 1_000;
+        let _ = type_phrase(&mut s, prefix, &mut at, 150, false);
+        let mut t = s.clone();
+        t.v2.close_aside();
+        let a = strike_of(&mut s, ch, at);
+        let b = strike_of(&mut t, ch, at);
+        (
+            (a.gl + a.gr) / (b.gl + b.gr),
+            a.lp_cut / b.lp_cut,
+            a.p[0].f0 == b.p[0].f0,
+        )
+    }
+
+    /// **AN ASIDE IS SOTTO VOCE, AND IT ENDS** (round two, 2026-09-27;
+    /// [`ASIDE_GAIN`], [`ASIDE_ROOF_MUL`], [`ASIDE_MAX_KEYS`]).
+    ///
+    /// Inside `( [ {` — a letter, a digit, a mark, a nested bracket, a close
+    /// that leaves an outer aside open — the key's strike is −2 dB and its
+    /// roof ×0.8 against a TWIN of the same engine whose aside was closed by
+    /// hand, on the SAME pitch. The opening bracket and the close that ends
+    /// the aside are outside it (ratio exactly 1). The aside ends at the
+    /// outer close, an Enter, a line feed, a kill, a phrase rest and the
+    /// 32nd key inside it; a Backspace over any of those puts it back.
+    ///
+    /// NEGATIVE CONTROL: with `sotto` forced false in `on_typed` every inside
+    /// ratio reads 1.0 and the first assertion fails; with the rest's
+    /// `close_aside` removed the rest key reads −2 dB; with the aside off the
+    /// undo frame the Backspace assertions fail (all three verified by hand,
+    /// 2026-09-27).
+    #[test]
+    fn an_aside_is_sotto_voce_and_ends_where_it_should() {
+        const DB: f32 = -2.0;
+        for (prefix, ch) in [
+            ("so (ab", 'c'),
+            ("so (ab", '7'),
+            ("so (ab", ','),
+            ("x [y", 'z'),
+            ("x {y", 'z'),
+            ("f(g", '('),
+            ("f(g(x", ')'),
+        ] {
+            let (lvl, roof, pitch) = aside_vs_twin(prefix, ch);
+            let db = 20.0 * lvl.log10();
+            assert!(
+                (db - DB).abs() < 0.01,
+                "{prefix:?} + `{ch}`: inside the aside the key is {db:+.3} dB re its twin"
+            );
+            assert!(
+                (roof - ASIDE_ROOF_MUL).abs() < 1e-5,
+                "{prefix:?} + `{ch}`: the aside's roof is ×{roof:.4}"
+            );
+            assert!(pitch, "{prefix:?} + `{ch}`: the aside moved the pitch");
+        }
+        for (prefix, ch) in [
+            ("so", '('),
+            ("so (ab", ')'),
+            ("f(g(x)", ')'),
+            ("so (ab)", 'c'),
+            ("so ab", 'c'),
+        ] {
+            let (lvl, roof, pitch) = aside_vs_twin(prefix, ch);
+            assert!(
+                lvl == 1.0 && roof == 1.0 && pitch,
+                "{prefix:?} + `{ch}` is outside the aside and was touched: ×{lvl} level, \
+                 ×{roof} roof"
+            );
+        }
+        // Every roof inside an aside is a real filter.
+        let mut s = synth();
+        let mut at = 1_000;
+        let _ = type_phrase(&mut s, "(", &mut at, 150, false);
+        for ch in "abcdefghijklmnopqrstuvwxyzAB!?".chars() {
+            let v = strike_of(&mut s, ch, at);
+            at += 100;
+            assert!(v.lp_cut < 7639.0, "`{ch}` in an aside: roof {}", v.lp_cut);
+            let _ = render_mono(&mut s, 2);
+        }
+
+        // -- WHERE IT ENDS -------------------------------------------------
+        let open = |text: &str| {
+            let mut s = synth();
+            let mut at = 1_000;
+            let _ = type_phrase(&mut s, text, &mut at, 150, false);
+            assert!(s.v2.in_aside(), "fixture: {text:?} opens an aside");
+            (s, at)
+        };
+        let (s, _) = open("f(g(x)");
+        assert!(s.v2.in_aside(), "an inner close ended the outer aside");
+        for (what, kind) in [
+            ("an Enter", SoundKind::Enter { cells: 5 }),
+            ("a line feed", SoundKind::Jump),
+            ("a kill", SoundKind::Kill),
+        ] {
+            let (mut s, at) = open("so (ab");
+            push(&mut s, kind, at, 0.0, false);
+            assert!(!s.v2.in_aside(), "{what} left the aside open");
+        }
+        // A phrase rest: the key that breaks the silence is spoken aloud.
+        let (mut s, at) = open("so (ab");
+        let mut t = s.clone();
+        t.v2.close_aside();
+        let a = strike_of(&mut s, 'c', at + 1_500);
+        let b = strike_of(&mut t, 'c', at + 1_500);
+        assert!(!s.v2.in_aside(), "a rest left the aside open");
+        assert_eq!(
+            (a.gl, a.lp_cut),
+            (b.gl, b.lp_cut),
+            "the key after a rest is still sotto voce"
+        );
+        // The 32nd key inside ends it, and is itself the last quiet one.
+        let (mut s, mut at) = open("(");
+        for k in 1..=u32::from(ASIDE_MAX_KEYS) {
+            assert!(s.v2.in_aside(), "the aside ended early, before key {k}");
+            let _ = type_phrase(&mut s, "a", &mut at, 150, false);
+        }
+        assert!(!s.v2.in_aside(), "32 keys in, the aside is still open");
+        // …and a Backspace over that 32nd key re-opens it, count and all;
+        // retyped, it expires again.
+        push(&mut s, SoundKind::Backspace, at, 0.0, false);
+        at += 150;
+        assert!(
+            s.v2.in_aside(),
+            "a Backspace over the expiry did not re-open it"
+        );
+        assert_eq!(s.v2.aside_keys, ASIDE_MAX_KEYS - 1);
+        let _ = type_phrase(&mut s, "a", &mut at, 150, false);
+        assert!(
+            !s.v2.in_aside(),
+            "retyped, the 32nd key did not end the aside"
+        );
+
+        // -- BACKSPACE ACROSS THE BRACKETS ------------------------------------
+        let (mut s, at) = open("so (ab");
+        let _ = type_phrase(&mut s, ")", &mut at.clone(), 150, false);
+        assert!(!s.v2.in_aside(), "fixture: `)` closes");
+        push(&mut s, SoundKind::Backspace, at + 150, 0.0, false);
+        assert!(
+            s.v2.in_aside(),
+            "un-typing the `)` did not re-open the aside"
+        );
+        assert_eq!(s.v2.aside_keys, 2, "…with its two keys");
+        for _ in 0..3 {
+            push(&mut s, SoundKind::Backspace, at + 300, 0.0, false);
+        }
+        assert!(!s.v2.in_aside(), "un-typing the `(` left the aside open");
+    }
+
+    /// **A QUOTATION LIFTS AND COMES HOME; AN APOSTROPHE IS NEITHER** (round
+    /// two, 2026-09-27; [`QUOTE_OPENS`], [`QUOTE_CLOSES`]).
+    ///
+    /// Every quote of a small corpus × 3 seeds × two rates, against a TWIN:
+    /// the same melody copied just before the key and handed the same rank as
+    /// a MATH key (a class no rule steers), whose degree is the one the line
+    /// DERIVED. A quote at a word head or behind an OPEN with no quotation
+    /// open OPENS one — a chord tone at or above the derived degree — and
+    /// sparkles twice; a quote while one is open CLOSES it — the open's
+    /// degree, reached by at most [`WORD_LEAP_MAX_DEG`] — with ONE sparkle; a
+    /// quote mid-word with none open is an APOSTROPHE: the derived degree and
+    /// two sparkles, as before this rule. An Enter ends the quotation, and a
+    /// Backspace over either quote puts it back exactly.
+    ///
+    /// NEGATIVE CONTROL: with the two QUOTE arms of `on_typed` switched off
+    /// every quote plays its derived degree and the open/close assertions
+    /// fail (verified by hand, 2026-09-27).
+    #[test]
+    fn a_quotation_lifts_and_comes_home_and_an_apostrophe_is_neither() {
+        const TEXTS: [&str; 4] = [
+            "she said \"wait for me\" and left",
+            "it's 'fine' he said, don't go",
+            "call (\"hi\") then \"so\" ok",
+            "say `ls` or 'no' now",
+        ];
+        let glints = |v: &[Voice]| v.iter().filter(|v| v.lane == LANE_GLINT).count();
+        let (mut opens, mut lifted, mut closes, mut apostrophes) = (0, 0, 0, 0);
+        for seed in [SEED, 0x5EED_1234, 0xCAFE_F00D] {
+            for period in [250u32, 100] {
+                for text in TEXTS {
+                    let mut s = TrailSynth::new(SR, seed);
+                    let mut at = 1_000u32;
+                    let mut open_deg: Option<i32> = None;
+                    for ch in text.chars() {
+                        let class = crate::trail_sound::typed_glyph_class(Some(ch));
+                        if class != QUOTE {
+                            let _ = type_phrase(&mut s, &ch.to_string(), &mut at, period, false);
+                            continue;
+                        }
+                        let rank = crate::trail_sound::typed_glyph_rank(Some(ch));
+                        let from = i32::from(s.v2.walk());
+                        let head = s.v2.word_pos() == 0 || s.v2.after_open;
+                        let derived = {
+                            let mut twin = s.v2;
+                            twin.on_typed(at, rank, false, false, MATH).deg
+                        };
+                        let mark = s.born_seq;
+                        push_ch(&mut s, SoundKind::Typed, at, ch);
+                        let born = since(&s, mark);
+                        at += period;
+                        let _ = render_mono(&mut s, 4);
+                        let deg = i32::from(s.v2.walk());
+                        match open_deg {
+                            Some(q) => {
+                                let want = from + (q - from).clamp(-4, 4);
+                                assert_eq!(deg, want, "{text:?}: the close did not come home");
+                                assert_eq!(glints(&born), 1, "{text:?}: the close sparkles");
+                                assert!(!s.v2.in_quote(), "{text:?}: the close left it open");
+                                open_deg = None;
+                                closes += 1;
+                            }
+                            None if head => {
+                                assert!(
+                                    deg >= derived && s.v2.deg_is_lit(deg),
+                                    "{text:?}: the open quote is on {deg}, derived {derived}"
+                                );
+                                assert_eq!(glints(&born), 2, "{text:?}: the open winks twice");
+                                assert!(s.v2.in_quote(), "{text:?}: the open did not open");
+                                open_deg = Some(deg);
+                                opens += 1;
+                                lifted += usize::from(deg > derived);
+                            }
+                            None => {
+                                assert_eq!(deg, derived, "{text:?}: the apostrophe was steered");
+                                assert_eq!(glints(&born), 2, "{text:?}: the apostrophe's winks");
+                                assert!(!s.v2.in_quote(), "{text:?}: an apostrophe opened");
+                                apostrophes += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "quotes: {opens} opened ({lifted} lifted off the derived degree), {closes} closed, \
+             {apostrophes} apostrophes"
+        );
+        assert_eq!(
+            (opens, closes, apostrophes),
+            (36, 36, 12),
+            "fixture: the corpus"
+        );
+        assert!(lifted > 0, "fixture: no open quote ever had to move up");
+
+        // -- AN ENTER ENDS IT; A BACKSPACE PUTS IT BACK ------------------------
+        let mut s = synth();
+        let mut at = 1_000;
+        let _ = type_phrase(&mut s, "say \"hi", &mut at, 150, false);
+        assert!(s.v2.in_quote(), "fixture: the quotation is open");
+        let open = s.v2.frame();
+        let _ = type_phrase(&mut s, "\"", &mut at, 150, false);
+        assert!(!s.v2.in_quote());
+        push(&mut s, SoundKind::Backspace, at, 0.0, false);
+        at += 150;
+        assert_eq!(s.v2.frame(), open, "un-typing the close did not re-open it");
+        for _ in 0..3 {
+            push(&mut s, SoundKind::Backspace, at, 0.0, false);
+            at += 150;
+        }
+        assert!(!s.v2.in_quote(), "un-typing the open left it open");
+        let _ = type_phrase(&mut s, "\"hi\n", &mut at, 150, false);
+        assert!(!s.v2.in_quote(), "an Enter left the quotation open");
+    }
+
+    /// **A QUESTION'S RETURN LANDS ON THE G** (round two, 2026-09-27;
+    /// [`CAD_QUESTION_LIFT_DEG`]). A line whose last mark is a `?` — a Space
+    /// behind it or not, or a closing quote (which carries the mark before
+    /// it) — resolves its Enter on the G a just fifth over the C
+    /// every other Return lands on, from every bar of the chord loop; `.`,
+    /// `!`, a letter, `,` and the void `??` keep their C to the bit, and the
+    /// pickup, the bell and the tonic dyad are the same voices either way.
+    ///
+    /// NEGATIVE CONTROL: with `asked` forced false in `on_enter` every `?`
+    /// line lands on the C and the first assertion fails; with the closing
+    /// quote writing its own `MARK_NONE`, `he said "is it so?"` does (both
+    /// verified by hand, 2026-09-27).
+    #[test]
+    fn a_question_s_return_lands_on_the_g() {
+        // → (the resolution's f0, every OTHER voice the Return spawned).
+        let enter = |text: &str, words: usize| -> (f32, Vec<(u8, f32)>) {
+            let mut s = synth();
+            let mut at = 1_000;
+            for _ in 0..words {
+                let _ = type_phrase(&mut s, "ab ", &mut at, 150, false);
+            }
+            let _ = type_phrase(&mut s, text, &mut at, 150, false);
+            let mark = s.born_seq;
+            push(&mut s, SoundKind::Enter { cells: 30 }, at, 0.0, false);
+            let born = since(&s, mark);
+            let res: Vec<_> = tune_voices(&born)
+                .into_iter()
+                .filter(|v| v.delay > 0.0)
+                .collect();
+            assert_eq!(res.len(), 1, "{text:?}: one resolution");
+            let rest = born
+                .iter()
+                .filter(|v| !(v.lane == LANE_TUNE && v.delay > 0.0))
+                .map(|v| (v.lane, v.p[0].f0))
+                .collect();
+            (res[0].p[0].f0, rest)
+        };
+        let n = CHORD_LOOP.len();
+        let mut landed = Vec::new();
+        for words in 0..n {
+            let (home, voices) = enter("so it goes.", words);
+            for text in ["is it so?", "is it so? ", "he said \"is it so?\""] {
+                let (f, v) = enter(text, words);
+                let g = [CAD_RESOLUTION_LOW_DEG, CAD_RESOLUTION_HIGH_DEG]
+                    .map(|d| penta(TINE_BASE_HZ, d + CAD_QUESTION_LIFT_DEG));
+                assert!(
+                    g.contains(&f),
+                    "{text:?} after {words} words: the Return landed on {f:.1} Hz, not a G"
+                );
+                assert!(
+                    (f / home - 1.5).abs() < 1e-4,
+                    "{text:?}: the G is not the fifth over the C the full stop took"
+                );
+                // Everything else the Return spawned is the full stop's —
+                // but for the pickup, which a `.` withholds (its codetta),
+                // and the room's taps, which answer the G.
+                let mut rest = v.clone();
+                rest.retain(|x| !voices.contains(x));
+                assert_eq!(
+                    rest.len(),
+                    1 + AIR_TAP_DELAY_S.len(),
+                    "{text:?}: more than the pickup and the room differ: {rest:?}"
+                );
+                assert!(
+                    rest.iter()
+                        .any(|x| x.0 == LANE_TUNE && x.1 == penta(TINE_BASE_HZ, CAD_PICKUP_DEG)),
+                    "{text:?}: the pickup is not among them"
+                );
+                landed.push(f);
+            }
+            for text in [
+                "so it goes.",
+                "wow it goes!",
+                "so it goes",
+                "so it goes,",
+                "is it so??",
+            ] {
+                let (f, _) = enter(text, words);
+                assert_eq!(
+                    f, home,
+                    "{text:?} after {words} words: a Return with no question moved"
+                );
+                assert!(
+                    [CAD_RESOLUTION_LOW_DEG, CAD_RESOLUTION_HIGH_DEG]
+                        .map(|d| penta(TINE_BASE_HZ, d))
+                        .contains(&f),
+                    "{text:?}: the Return is not on a C"
+                );
+            }
+        }
+        println!("?⏎ lands on {:?} Hz", {
+            let mut l = landed.clone();
+            l.dedup();
+            l
+        });
+    }
+
     /// **A LINE OF CODE IS NO LOUDER THAN PROSE** (the 2026-09-20 design's C1:
     /// code-script RMS minus lowercase-prose RMS ≤ **+1.5 dB**; pinned
     /// 2026-09-21 by the WI-6 review, which measured +1.77 dB at 10 cps on
@@ -12296,6 +12889,15 @@ for it up front.\n\
     /// level over every shifted mark the 10 cps take reads +1.76 dB, OVER
     /// the limit. So this pin sees [`TING_DUCK_MARK`], which is what put C1
     /// back, and would have seen the bell arrive.
+    ///
+    /// **ROUND TWO (2026-09-27): THE ASIDE MADE CODE QUIETER** ([`ASIDE_GAIN`]
+    /// — `x[0], &y`, `42`, `a != b` and the whole `{ … }` block are asides).
+    /// MEASURED that day: **+0.01 / +1.01 dB** at 6 / 10 cps, and the bell
+    /// unducked over the aside reads +1.45 dB — inside C1, so the duck alone
+    /// no longer decides this pin. The limit is NOT widened; the control is
+    /// taken in the world it was measured in — the bell unducked AND the aside
+    /// off (`aside_off`) — where it still reads over the limit, so the pin
+    /// still sees a bell arriving on a line with no brackets in it.
     #[test]
     fn a_line_of_code_is_no_louder_than_prose() {
         const CODE: &str = "let v = self.v2.walk(x[0], &y) + foo::bar(42); // ok\n\
@@ -12312,6 +12914,7 @@ for it up front.\n\
         let take = |text: &str, cps: f32, unducked: bool| -> f64 {
             let mut s = synth();
             s.ting_unducked = unducked;
+            s.aside_off = unducked;
             // (press time ms, the glyph; `\0` is the bare Shift).
             let mut cues: Vec<(u32, char)> = Vec::new();
             let (mut t, mut in_run) = (500.0f32, false);
@@ -12374,7 +12977,7 @@ for it up front.\n\
             );
         }
         let loud = over(10.0, true);
-        println!("C1 at 10 cps, the bell unducked: {loud:+.2} dB");
+        println!("C1 at 10 cps, the bell unducked and the aside off: {loud:+.2} dB");
         assert!(
             loud > C1_MAX_DB,
             "negative control: with the bell at full level over every shifted mark the code \

@@ -50,8 +50,8 @@ pub struct CutOptions {
     /// here: the loaded material lives in `CutCtx`, and only the derived public
     /// identity is ever journaled.
     pub release_credentials: Option<PathBuf>,
-    /// Gates + provisional n + full local build into dist/ — zero commits,
-    /// zero network mutations (the one network touch is the gates' fetch).
+    /// Gates + provisional n + full local build into dist/, notarized by Apple;
+    /// nothing committed or published.
     pub dry_run: bool,
     /// Re-enter the journaled cut at its first incomplete step.
     pub resume: bool,
@@ -1828,8 +1828,10 @@ pub fn preflight_release_lease(git: &dyn GitRunner) -> Result<()> {
     ensure_no_publisher_fence(git)?;
     if let Some(owner) = release_lease_owner(git)? {
         return Err(Error::new(format!(
-            "release lease {RELEASE_LEASE_REF} is already owned by {owner}; resume/abandon \
-             that exact journal before claiming another build"
+            "the release lock is held by claim {owner}; nothing was claimed. On the machine \
+             that cut it: `{CUT_COMMAND} --resume` or `--abandon vX.Y.Z`; from another machine, \
+             once that cut is stopped: `{}`",
+            fence_recover_command(None, &owner)
         )));
     }
     Ok(())
@@ -4068,16 +4070,21 @@ pub fn resume_provenance_gate(journal: &Journal, gate: impl FnOnce() -> Result<(
 
 /// The fresh cut's provenance gate over the toolchain THIS cutter resolves
 /// ([`gates::trust_stage2_bin`] — the same resolution `buildplan` performs) and its own
-/// binary: the production `gate` of [`resume_provenance_gate`].
-pub fn toolchain_provenance_gate() -> Result<()> {
-    toolchain_provenance_gate_with(atpkg::provenance::heal)
+/// binary: the production `gate` of [`resume_provenance_gate`], whose refusal names
+/// `rerun` ([`gates::Rerun::resume`] there: a fresh cut is refused while one is
+/// journaled).
+pub fn toolchain_provenance_gate(rerun: &gates::Rerun) -> Result<()> {
+    toolchain_provenance_gate_with(atpkg::provenance::heal, rerun)
 }
 
 /// [`toolchain_provenance_gate`] with the toolchain heal explicit
 /// ([`gates::provenance_gate_with`]).
-pub fn toolchain_provenance_gate_with(heal: atpkg::provenance::Healer) -> Result<()> {
+pub fn toolchain_provenance_gate_with(
+    heal: atpkg::provenance::Healer,
+    rerun: &gates::Rerun,
+) -> Result<()> {
     let trustc = gates::trust_stage2_bin()?.join("trustc");
-    gates::provenance_gate_with(&trustc, heal)
+    gates::provenance_gate_with(&trustc, heal, rerun)
 }
 
 const MAX_SMALL_RELEASE_ASSET_BYTES: u64 = 256 * 1024;
@@ -7009,7 +7016,7 @@ pub fn run_recover_lost(
     ledger::check_version_shape(version)?;
     if !valid_lease_owner(owner) {
         return Err(Error::new(
-            "recover requires the full 40- or 64-hex claim commit printed by the lease",
+            "recover needs the full 40- or 64-hex claim commit (the cut's `lock` line prints it)",
         ));
     }
     let owner = owner.to_ascii_lowercase();
@@ -7230,10 +7237,7 @@ fn recover_under_fence(
     assert_publisher_session(&git, &lease, fence)?;
     delete_owned_release_tag(&git, &tag, owner, &lease, fence)?;
     release_completed_publisher_session(&git, owner, fence)?;
-    step(
-        "recover",
-        "unpublished cut safely withdrawn · exact owner lease released",
-    );
+    step("recover", "unpublished cut withdrawn · release lock freed");
     Ok(())
 }
 
@@ -7769,33 +7773,12 @@ pub fn signature_transcript_line(signing_key: Option<&str>, machine_id: Option<&
     }
 }
 
-/// The transcript's statement of what this cut builds and how far it is from a
-/// gate (see [`gates::place_published`] and [`gates::receipt_report`]): the
-/// published commit and how far main has moved past it, and how many commits the
-/// built commit sits above the newest one a gate receipt vouches for. Pure, so the
-/// wording is a test.
-pub fn ungated_range_lines(
-    published: Option<&gates::PublishedCheckout>,
-    receipts: &gates::ReceiptReport,
-) -> Vec<String> {
-    // A dry run or rehearsal said what it builds on its `source` line
-    // ([`rehearsal_source_line`]); only a real cut has a published build to state.
-    let mut lines: Vec<String> = published
-        .map(|checkout| {
-            format!(
-                "published source: building {} — the commit `pub publish` recorded (verified \
-                 {}); main is {} commit(s) past it, none of which ships in this cut",
-                checkout
-                    .source
-                    .commit
-                    .get(..9)
-                    .unwrap_or(&checkout.source.commit),
-                checkout.source.verified_at,
-                checkout.main_ahead
-            )
-        })
-        .into_iter()
-        .collect();
+/// The transcript's statement of how far the built commit is from a gate (see
+/// [`gates::receipt_report`]): how many commits it sits above the newest one a gate
+/// receipt vouches for. What it builds — the published commit, and how far main has
+/// moved past it — is the `source` line's, said once. Pure, so the wording is a test.
+pub fn ungated_range_lines(receipts: &gates::ReceiptReport) -> Vec<String> {
+    let mut lines = Vec::new();
     let named = |items: &[String]| {
         let mut text = items.iter().take(8).cloned().collect::<Vec<_>>().join("; ");
         if items.len() > 8 {
@@ -7803,13 +7786,22 @@ pub fn ungated_range_lines(
         }
         text
     };
+    // A commit gated BY ITS TREE says whose run vouched: the receipt is about the
+    // bytes, and the few gates that read history ran on that other commit.
+    let by_tree = receipts
+        .gated_by_tree
+        .as_deref()
+        .map(|run| {
+            format!(", by its tree — the passing receipt is {run}'s, a commit with the same bytes")
+        })
+        .unwrap_or_default();
     lines.push(match &receipts.newest_gated {
         Some((sha, subject)) if receipts.ungated.is_empty() => {
-            format!("gate receipts: HEAD itself is gated ({sha} {subject})")
+            format!("gate receipts: HEAD itself is gated ({sha} {subject}){by_tree}")
         }
         Some((sha, subject)) => format!(
             "gate receipts: {} UNGATED commit(s) since the newest receipted commit {sha} \
-             ({subject}): {}",
+             ({subject}){by_tree}: {}",
             receipts.ungated.len(),
             named(&receipts.ungated)
         ),
@@ -7820,13 +7812,28 @@ pub fn ungated_range_lines(
             receipts.ungated.len()
         ),
     });
+    // Gated WITH main's reds (the gate's differential verdict): they are main's to
+    // fix, and a cut from here ships them, so they are named.
+    if let Some((sha, _)) = &receipts.newest_gated
+        && !receipts.inherited.is_empty()
+    {
+        lines.push(format!(
+            "gate receipts: {sha} passed the merge contract with {} red(s) inherited from \
+             main — red there with the same failure, so not that change's, and still red: {}",
+            receipts.inherited.len(),
+            named(&receipts.inherited)
+        ));
+    }
     if let Some(verdict) = receipts.head_verdict.as_deref()
         && verdict != "PASS"
     {
-        lines.push(format!(
-            "WARNING: HEAD's own gate receipt says {verdict} — the merge contract ran on this \
-             exact tree and did not pass (read <git common dir>/aterm-verify/receipts/ before trusting it)"
-        ));
+        lines.push(match &receipts.head_receipt {
+            Some(path) => format!(
+                "WARNING: HEAD's own gate receipt says {verdict}: {}",
+                path.display()
+            ),
+            None => format!("WARNING: HEAD's own gate receipt says {verdict}"),
+        });
     }
     lines
 }
@@ -8271,12 +8278,23 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // anything reads a step of it.
     let existing = JournalHeader::read(&journal_path)?;
     if opts.resume {
-        let header = existing.ok_or_else(|| {
-            Error::new(format!(
-                "nothing to resume — no dist/cut-state.toml. A wedged cut from another \
-                 machine is recovered by a plain `{CUT_COMMAND}` (remote-derived recut)."
-            ))
-        })?;
+        let Some(header) = existing else {
+            // The journal is this checkout's; the lock is the channel's. A cut journaled
+            // elsewhere — another checkout, another machine — holds the lock, and the
+            // recover command needs its exact claim, which the lock names.
+            let lock = match release_lease_owner(&operator) {
+                Ok(Some(owner)) => format!(
+                    "the release lock is held by claim {owner}; once that cut is stopped: `{}`",
+                    fence_recover_command(None, &owner)
+                ),
+                Ok(None) => "no release lock is held".to_string(),
+                Err(error) => format!("the release lock could not be read: {error}"),
+            };
+            return Err(Error::new(format!(
+                "nothing to resume: no cut is journaled in this checkout (dist/cut-state.toml); \
+                 {lock}"
+            )));
+        };
         if kind != CutKind::Real {
             return Err(Error::new(
                 "--resume applies to a real cut only (dry-run/rehearse are never journaled)"
@@ -8452,7 +8470,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         CutKind::DryRun => " [dry-run]",
         CutKind::Rehearse => " [rehearse]",
     };
-    println!("aterm-release · cut v{version} (workspace {full}, {head8}){flavor}");
+    println!("aterm-release · cut v{version} ({head8}){flavor}");
 
     // ---- gates (spec §6; <5s, before anything is committed) ---------------
     let gate_opts = gates::GateOpts {
@@ -8470,6 +8488,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         allow_stale_cutter: matches!(kind, CutKind::DryRun),
         paint_smoke: !opts.no_paint_smoke,
         published: published.clone(),
+        rerun: gates::Rerun::of(kind, opts.rehearse.as_deref()),
     };
     let gr = gates::run_all(&git, &tree, repo, &gate_opts)?;
     step(
@@ -8503,6 +8522,25 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     step(
         "",
+        &match &gr.handoff_fixtures {
+            Some(f) => format!(
+                "handoff fixtures of v{} checked in: {} desks, {} pinned",
+                f.release,
+                f.desks.len(),
+                f.pinned.len()
+            ),
+            None => "handoff fixtures: the ledger records no earlier release".to_string(),
+        },
+    );
+    step(
+        "",
+        &format!(
+            "handoff policy sealed into the bundle: {}",
+            gr.handoff_policy
+        ),
+    );
+    step(
+        "",
         &format!(
             "Cargo.lock exact/offline · trustc ok ({}) · no com.apple.provenance on \
              trustc/targo/the cutter, probe write untagged · {} · disk ok ({} GiB free)",
@@ -8517,9 +8555,12 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     step(
         "",
-        &match gr.channel_version.as_deref() {
-            Some(v) => format!("public channel source agrees: carries {v}"),
-            None => "public channel source version: not checked (no channel/manifest)".to_string(),
+        &match (gr.channel_version.as_deref(), gate_opts.offline) {
+            (Some(v), _) => format!("public channel source agrees: carries {v}"),
+            (None, true) => {
+                "public channel: not compared (this run publishes nothing there)".to_string()
+            }
+            (None, false) => "public channel: no source version to compare".to_string(),
         },
     );
     step(
@@ -8529,7 +8570,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             gr.processes_checked
         ),
     );
-    for line in ungated_range_lines(gr.published.as_ref(), &gr.receipts) {
+    for line in ungated_range_lines(&gr.receipts) {
         step("", &line);
     }
     // THE L0 OBLIGATIONS ARE MANDATORY. Unlike the deep gate below this is one
@@ -8545,17 +8586,25 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     if opts.gate {
         run_gate_script(&tree)?;
     }
+    // NOTHING SHIPS UNMEASURED (2026-09-26): the merge contract no longer runs
+    // the gate's MEASURE tier, so a real cut requires a MEASURE receipt saying
+    // `measured yes` for the tree it builds, taken with the compiler it builds
+    // with (2026-09-27) and with no build environment of its caller's (third
+    // review, the same day) — after the optional deep gate, whose `--full` files
+    // one — and refuses pre-claim without one. A dry run or rehearsal states
+    // the answer.
+    step("gate", &gates::measure_gate(&git, kind == CutKind::Real)?);
 
     if kind == CutKind::Real {
         preflight_release_lease(&git)?;
-        step("lease", "remote release lease is free (pre-claim)");
+        step("lock", "release lock is free");
     }
     if kind != CutKind::DryRun {
         // Prove the channel is public and writable BEFORE the ledger claim — with the
         // credential `publish` will use (the release-org token on a real cut, `gh auth`
         // on a rehearsal's own scratch channel). Failing at `publish` would burn a
         // build number, and no amount of `--resume` fixes a missing permission grant.
-        preflight_channel_target(&publish_slug)?;
+        preflight_channel_target(&publish_slug, kind, false)?;
         step(
             "channel",
             &format!("release channel {publish_slug} is public and writable (pre-claim)"),
@@ -8660,9 +8709,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         step(
             "roster",
             &format!(
-                "machine {} authorized by the paper-master roster (roster_seq {} · \
-                 channel head {}) (pre-claim)",
-                who.machine_id,
+                "roster generation {} (channel head {})",
                 who.roster_seq,
                 newest_roster_seq.map_or_else(|| "none".to_string(), |seq| seq.to_string())
             ),
@@ -8931,7 +8978,9 @@ fn resume_cut(
     // resume from a tracked shell that still has `build` to do would tag every object
     // file and die at the proof snapshot with the build number already burned, which
     // is the fresh cut's incident with the claim's protection removed.
-    resume_provenance_gate(&journal, toolchain_provenance_gate)?;
+    resume_provenance_gate(&journal, || {
+        toolchain_provenance_gate(&gates::Rerun::resume())
+    })?;
 
     // Steps that (re)bake artifact bytes additionally require the recovered
     // signing key. The claim-commit/clean-tree proof above applies to every
@@ -9141,10 +9190,15 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
                     step(
                         "DONE",
                         &format!(
-                            "dry-run: v{} (build {}) built + self-checked in dist/ — \
-                             nothing committed, nothing uploaded.  [{}]",
+                            "dry-run: v{} (build {}) built{} and self-checked in dist/ — \
+                             nothing committed or published.  [{}]",
                             ctx.version,
                             ctx.build,
+                            if ctx.apple.identity().is_some() {
+                                ", notarized"
+                            } else {
+                                ""
+                            },
                             fmt_elapsed(t0)
                         ),
                     );
@@ -9329,8 +9383,7 @@ fn step_lock(ctx: &mut CutCtx) -> Result<()> {
     step(
         "lock",
         &format!(
-            "{} owned by claim {} · live build {} checked under lease",
-            RELEASE_LEASE_REF,
+            "release lock held by claim {} · newest live build {}",
             ctx.commit,
             newest.map_or_else(|| "none".to_string(), |build| build.to_string())
         ),
@@ -9360,13 +9413,8 @@ fn step_unlock(ctx: &mut CutCtx) -> Result<()> {
     step(
         "unlock",
         match outcome {
-            LeaseRelease::Released => "exact-owner remote lease released",
-            LeaseRelease::AlreadyAbsent => {
-                "remote lease already absent (prior CAS delete converged)"
-            }
-            LeaseRelease::AlreadySuperseded => {
-                "prior CAS delete converged; successor lease left untouched"
-            }
+            LeaseRelease::Released | LeaseRelease::AlreadyAbsent => "release lock freed",
+            LeaseRelease::AlreadySuperseded => "release lock freed; the next cut already holds it",
         },
     );
     Ok(())
@@ -9608,6 +9656,8 @@ fn run_freeze_safety_gate(repo: &Path) -> Result<()> {
 }
 
 /// Opt-in deep gate: `tools/verify.sh --full`, streamed (spec decisions 15/22).
+/// Its receipt is also a MEASURE receipt, so a green one satisfies
+/// [`gates::measure_gate`], which runs right after it.
 fn run_gate_script(repo: &Path) -> Result<()> {
     step("gate", "tools/verify.sh --full (opt-in deep gate)");
     let status = Command::new(repo.join("tools/verify.sh"))
@@ -9683,6 +9733,24 @@ pub struct PackagedCut {
     pub zip: dmg::Packaged,
 }
 
+/// The line said BEFORE the two notarization waits: how long Apple usually takes, when
+/// this cut gives up, and — on a real cut, the only journaled kind — that a stopped cut
+/// continues with `--resume` (a dead same-host fence is reclaimed by the resume).
+#[must_use]
+pub fn notarize_notice(kind: CutKind) -> String {
+    let mut line = format!(
+        "notarizing with Apple (the app, then the DMG): usually 2-10 min each, at most {} min \
+         each",
+        sign::NOTARY_SUBMIT_TIMEOUT.as_secs() / 60
+    );
+    if kind == CutKind::Real {
+        line.push_str(&format!(
+            "\nif it stops, `{CUT_COMMAND} --resume` continues this cut"
+        ));
+    }
+    line
+}
+
 /// Notarize the bundle, build both containers around it (the DMG, then the
 /// zip), notarize the DMG, and return the digests that go on record in the
 /// manifest.
@@ -9716,29 +9784,8 @@ pub fn notarize_and_package(
     tools: &dyn sign::AppleTools,
     pack: &dyn Packager,
 ) -> Result<PackagedCut> {
-    // Said BEFORE the two notarization waits, and said HERE rather than in `sign.rs`,
-    // which references nothing else in the crate — the transcript grid's `step` included.
-    //
-    // The crate teaches, in the ONE other place it mentions interrupting — the
-    // certificate wait, "Ctrl-C is safe, nothing is lost and this step resumes" — that a
-    // long silent wait may be interrupted. This is the other kind, and every fact below
-    // already lived in `run_streamed`'s doc and in `NOTARY_SUBMIT_TIMEOUT` without ever
-    // being printed.
-    if tier.identity().is_some() {
-        step(
-            "notarize",
-            &format!(
-                "Apple decides how long this takes, not us: usually 2-10 min, and this cut \
-                 gives up after {} min.\n\
-                 ⚠ do NOT Ctrl-C — unlike the certificate wait, this cut is holding a \
-                 release lease, a publisher fence and a burned build number, and abandoning \
-                 it here is recoverable only through an explicit killed-machine takeover \
-                 (`{SHIP_COMMAND} recover`).\n\
-                 notarytool streams its own progress below.",
-                sign::NOTARY_SUBMIT_TIMEOUT.as_secs() / 60
-            ),
-        );
-    }
+    // The wait is announced by the caller ([`notarize_notice`]), which knows whether
+    // this run is a journaled cut that `--resume` continues.
     // THE BUNDLE IS NOTARIZED FIRST, before either container exists.
     let notarized_app = sign::notarize_app(app, tier, tools).map_err(Error::new)?;
     if notarized_app {
@@ -9904,6 +9951,9 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // load-bearing and none of it is observable from a green cut. See
     // `notarize_and_package`; its ordering and its fail-closed propagation are
     // proved offline in tests/it/apple_tier.rs.
+    if ctx.apple.identity().is_some() {
+        step("notarize", &notarize_notice(ctx.kind));
+    }
     let PackagedCut {
         dmg: dout,
         dmg_sha256: dmg_sha,
@@ -10248,10 +10298,12 @@ pub const PAINT_EXIT_UNPROVED: i32 = 3;
 /// switched off. MEASURED 2026-09-12: the sampler's worst tick reads 5.0 ms
 /// from an interactive shell or a `ProcessType=Interactive` LaunchAgent, and
 /// 75 ms under `launchctl submit` — whose QoS the launched SUBJECT inherits.
-pub const PAINT_EVIDENCE_REMEDY: &str = "re-run the cut from an interactive shell, or from a \
-     LaunchAgent with ProcessType=Interactive — a `launchctl submit` job runs this whole family \
-     at QoS utility and the bundle it launches inherits it. Repeating the take under the same \
-     tier cannot help: N starved takes are N takes of zero evidence";
+/// `tools/cut-launch.sh` is that LaunchAgent, and the one the runbook documents. The
+/// words hold whether or not this cut already runs under it: a real cut's
+/// `--resume` re-enters at the self-check and takes the smoke again, under the
+/// launcher either way.
+pub const PAINT_EVIDENCE_REMEDY: &str = "retake it under `tools/cut-launch.sh` (a real cut: \
+     `tools/cut-launch.sh --resume`)";
 
 /// Why a paint smoke did not hand back a green take — and the two arms are
 /// NOT the same claim about the artifact.
@@ -11146,7 +11198,11 @@ fn step_tag(ctx: &mut CutCtx) -> Result<()> {
 /// the channel" at `publish` would burn a build number and hold the lease until an
 /// OWNER-level permission grant — which is not something a resume can fix. Failing
 /// here costs nothing.
-pub fn preflight_channel_target(slug: &str) -> Result<()> {
+///
+/// `kind` and `claimed` decide only the refusal's words: a rehearsal's scratch
+/// channel is written with `gh auth`, not the release token, and never claims; a real
+/// cut says whether a build number was claimed yet, and so what comes after the fix.
+pub fn preflight_channel_target(slug: &str, kind: CutKind, claimed: bool) -> Result<()> {
     let endpoint = format!("repos/{slug}");
     let out = gh_retry(&[
         "api",
@@ -11169,27 +11225,36 @@ pub fn preflight_channel_target(slug: &str) -> Result<()> {
             "release channel {slug} returned a malformed repository row {row:?}"
         )));
     };
+    let then = match (kind, claimed) {
+        (CutKind::Real, false) => "; nothing was claimed".to_string(),
+        (CutKind::Real, true) => format!(", then `{CUT_COMMAND} --resume`"),
+        _ => String::new(),
+    };
     if push != "true" {
-        return Err(Error::new(format!(
-            "the authenticated account has no push permission on the release channel {slug}, \
-             so `{CUT_COMMAND}` cannot publish there and the fleet would never see this \
-             release. This is an OWNER action, not a resume: grant the release account write \
-             access to {slug} (the release-org token is {}). Refusing before the ledger claim \
-             so no build number is burned.",
-            channel_token_path().map_or_else(
-                || "~/.secrets/gh_access_token_alabsystems".to_string(),
-                |path| path.display().to_string()
-            ),
-        )));
+        let token_path = channel_token_path().map_or_else(
+            || "~/.secrets/gh_access_token_alabsystems".to_string(),
+            |path| path.display().to_string(),
+        );
+        return Err(Error::new(if kind == CutKind::Real {
+            // With no token loaded, `gh` ran as the plain `gh auth` account
+            // ([`active_channel_token`]): the token was never asked.
+            if channel_token().is_some() {
+                format!(
+                    "the release token ({token_path}) cannot write {slug}: grant it write access{then}"
+                )
+            } else {
+                format!(
+                    "no release token in {token_path}, and gh auth cannot write {slug}: put the \
+                     release-org token there{then}"
+                )
+            }
+        } else {
+            format!("gh auth cannot push to the scratch channel {slug}")
+        }));
     }
     if private == "true" {
         return Err(Error::new(format!(
-            "the release channel {slug} is PRIVATE. Every installed copy reads its channel with \
-             no credential, so a private one is a channel no install can ever read — the \
-             silent never-updates failure. Make {slug} public, or point `{table} {key}` at a \
-             public repository.",
-            table = channel::CHANNEL_TABLE,
-            key = channel::CHANNEL_KEY,
+            "{slug} is private, so no install can read it: make it public{then}"
         )));
     }
     Ok(())
@@ -11245,7 +11310,7 @@ fn step_publish(ctx: &mut CutCtx) -> Result<()> {
     // Every call below talks to the channel and nothing else — the asset bytes come
     // from `dist/` — under the release-org credential `run_pipeline` holds for a real
     // cut. A rehearsal's scratch channel is the operator's own, written with `gh auth`.
-    preflight_channel_target(&slug)?;
+    preflight_channel_target(&slug, ctx.kind, true)?;
     if ctx.kind == CutKind::Rehearse {
         // A release's tag is minted on the repository's default branch, so the scratch
         // channel needs this tree first. Force-push: its history is disposable.
@@ -11269,11 +11334,7 @@ fn step_publish(ctx: &mut CutCtx) -> Result<()> {
     })?;
     step(
         "publish",
-        &format!(
-            "v{} (build {}) is live on {slug} and owns its `latest` pointer — every install \
-             updates from here, no token required",
-            ctx.version, ctx.build
-        ),
+        &format!("v{} (build {}) published on {slug}", ctx.version, ctx.build),
     );
     Ok(())
 }
@@ -13939,51 +14000,85 @@ mod ungated_range_statement_tests {
                 .map(|i| format!("{i:09x} commit {i}"))
                 .collect(),
             scanned: ungated + 1,
+            head_receipt: verdict.map(|_| PathBuf::from("/repo/.git/aterm-verify/receipts/head")),
             head_verdict: verdict.map(str::to_string),
+            gated_by_tree: None,
+            inherited: Vec::new(),
         }
     }
 
     #[test]
     fn the_transcript_states_the_ungated_count_and_names_the_newest_commits() {
-        let published = gates::PublishedCheckout {
-            source: gates::PublishedSource {
-                commit: "48c26b0b7fad3e9f338b0110cd7f71cb424c50f7".to_string(),
-                verified_at: "2026-09-22T23:37:28+00:00".to_string(),
-            },
-            tree: PathBuf::from("/Users//me/aterm-cut.noindex"),
-            moved: true,
-            main_ahead: 109,
-        };
-        let lines = ungated_range_lines(Some(&published), &report(136, None));
-        assert!(lines[0].contains("building 48c26b0b7"), "{lines:?}");
+        // What the cut builds is the `source` line's; these lines state receipts only.
+        let lines = ungated_range_lines(&report(136, None));
         assert!(
-            lines[0].contains("main is 109 commit(s) past it, none of which ships"),
+            lines[0].contains("136 UNGATED commit(s) since the newest receipted commit 3b1f0c2aa"),
             "{lines:?}"
         );
-        assert!(
-            lines[1].contains("136 UNGATED commit(s) since the newest receipted commit 3b1f0c2aa"),
-            "{lines:?}"
-        );
-        assert!(lines[1].contains("… and 128 more"), "{lines:?}");
-        assert_eq!(lines.len(), 2, "no HEAD receipt, no warning: {lines:?}");
+        assert!(lines[0].contains("… and 128 more"), "{lines:?}");
+        assert_eq!(lines.len(), 1, "no HEAD receipt, no warning: {lines:?}");
 
-        // A dry run states its source on its own `source` line, not here.
-        let gated_head = ungated_range_lines(None, &report(0, Some("PASS")));
+        let gated_head = ungated_range_lines(&report(0, Some("PASS")));
         assert!(
             gated_head[0].contains("HEAD itself is gated"),
             "{gated_head:?}"
         );
         assert_eq!(gated_head.len(), 1);
 
-        // A FAIL receipt at HEAD is said out loud (stated, not refused).
-        let failed = ungated_range_lines(None, &report(1, Some("FAIL")));
-        assert!(
-            failed
-                .last()
-                .unwrap()
-                .starts_with("WARNING: HEAD's own gate receipt says FAIL"),
+        // A FAIL receipt at HEAD is said out loud (stated, not refused), with the file.
+        let failed = ungated_range_lines(&report(1, Some("FAIL")));
+        assert_eq!(
+            failed.last().unwrap(),
+            "WARNING: HEAD's own gate receipt says FAIL: /repo/.git/aterm-verify/receipts/head",
             "{failed:?}"
         );
+    }
+
+    /// A commit gated by its TREE names the commit whose run vouched for those
+    /// bytes, whether it is HEAD or the newest gated commit below an ungated range;
+    /// one gated by its own receipt says nothing extra.
+    #[test]
+    fn a_commit_gated_by_its_tree_names_the_run_that_vouched() {
+        let by_tree = |ungated| gates::ReceiptReport {
+            gated_by_tree: Some("7f00ba1d2".to_string()),
+            ..report(ungated, Some("PASS"))
+        };
+        let head = ungated_range_lines(&by_tree(0));
+        assert_eq!(
+            head[0],
+            "gate receipts: HEAD itself is gated (3b1f0c2aa fix: the last gated slice), by its \
+             tree — the passing receipt is 7f00ba1d2's, a commit with the same bytes"
+        );
+        let below = ungated_range_lines(&by_tree(2));
+        assert!(
+            below[0].contains(
+                "since the newest receipted commit 3b1f0c2aa (fix: the last gated slice), by its \
+                 tree — the passing receipt is 7f00ba1d2's, a commit with the same bytes: "
+            ),
+            "{below:?}"
+        );
+        let own = ungated_range_lines(&report(0, Some("PASS")));
+        assert!(!own[0].contains("by its tree"), "{own:?}");
+    }
+
+    /// A commit gated WITH main's reds — the gate's differential verdict — has
+    /// them named on the transcript, since a cut from there ships them; a commit
+    /// gated clean adds no line.
+    #[test]
+    fn a_commit_gated_with_inherited_reds_has_them_named() {
+        let with_reds = gates::ReceiptReport {
+            inherited: vec!["tippy lint".to_string(), "-p x --lib -- flaky".to_string()],
+            ..report(0, Some("PASS"))
+        };
+        let lines = ungated_range_lines(&with_reds);
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert_eq!(
+            lines[1],
+            "gate receipts: 3b1f0c2aa passed the merge contract with 2 red(s) inherited from \
+             main — red there with the same failure, so not that change's, and still red: \
+             tippy lint; -p x --lib -- flaky"
+        );
+        assert_eq!(ungated_range_lines(&report(0, Some("PASS"))).len(), 1);
     }
 }
 
@@ -14020,6 +14115,23 @@ mod remedy_tests {
         }
         assert_eq!(CUT_COMMAND, "tools/cut-launch.sh");
         assert_eq!(SHIP_COMMAND, "targo --unverified ship");
+    }
+
+    /// Only a real cut is journaled, so only a real cut is told `--resume` continues it;
+    /// a dry run or rehearsal holds no lease and burns no number.
+    #[test]
+    fn the_notarize_wait_offers_resume_only_to_a_journaled_cut() {
+        let real = notarize_notice(CutKind::Real);
+        assert!(real.starts_with("notarizing with Apple"), "{real}");
+        assert!(
+            real.contains("`tools/cut-launch.sh --resume` continues this cut"),
+            "{real}"
+        );
+        for kind in [CutKind::DryRun, CutKind::Rehearse] {
+            let line = notarize_notice(kind);
+            assert!(!line.contains("--resume"), "{kind:?}: {line}");
+            assert!(!line.contains("lease"), "{kind:?}: {line}");
+        }
     }
 
     #[test]

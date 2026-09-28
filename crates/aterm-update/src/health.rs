@@ -61,6 +61,11 @@ use aterm_update_core::FileLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+/// How long a ledger write waits for `health.toml.lock` before proceeding unlocked
+/// (plan P2-1). Every legitimate holder is one read→mutate→write; five seconds is
+/// hundreds of them, and past it the holder is stopped or wedged.
+const HEALTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Consecutive `pipeline` failures at which the state is called PERSISTENT: the
 /// status wording stops saying "deferred" and the GUI raises a notification.
 /// (Re-exported from the crate root so cross-platform status consumers share the
@@ -910,8 +915,14 @@ impl Health {
     /// write of the ledger. `None` on failure: the caller then proceeds unlocked —
     /// health is observability, never a gate, so a missed lock must never drop the
     /// update. Held for the lifetime of the returned guard (i.e. the record_* call).
+    ///
+    /// BOUNDED (plan P2-1): the check loop records here every cycle, and a blocking
+    /// `flock` against a holder that was stopped mid-write parked it forever — for a
+    /// lock whose own contract is that missing it must never drop the update. Every
+    /// real holder is one read→mutate→write, milliseconds long; a holder past
+    /// [`HEALTH_LOCK_WAIT`] is wedged, and the unlocked fallback above applies.
     fn lock(path: &Path) -> Option<FileLock> {
-        FileLock::acquire(&path.with_extension("toml.lock")).ok()
+        FileLock::acquire_within(&path.with_extension("toml.lock"), HEALTH_LOCK_WAIT).ok()
     }
 
     /// Best-effort atomic write (temp + rename), mirroring `status::record`.

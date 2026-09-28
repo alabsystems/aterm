@@ -39,13 +39,13 @@ use aterm_spec::derive::{
     fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
     flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
     gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    harness_model_ladder_model, harness_model_priority_model, hdr_present_gate_model,
-    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
-    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
-    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
-    kitty_flush_worker_model, kitty_pin_merge_model, kitty_sidecar_durability_model,
-    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
-    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    harness_model_ladder_model, harness_model_priority_model, harness_model_switch_model,
+    hdr_present_gate_model, hdr_reconfigure_retag_model, hyperlink_scheme_cap_model,
+    idle_deadline_model, ignition_reservation_lifecycle_model, ignition_reservation_rekey_model,
+    inject_floor_model, input_release_pairing_model, kernel_model, key_injectivity_model,
+    kitty_collectibles_model, kitty_flush_worker_model, kitty_pin_merge_model,
+    kitty_sidecar_durability_model, kitty_sing_detector_model, layout_coordinate_reset_model,
+    ligature_gate_model, manual_config_completion_model, manual_config_diagnostics_lane_model,
     manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
     motion_policy_model, native_async_delivery_model, native_capture_source_model,
     native_close_plan_model, native_config_observation_handoff_model,
@@ -12345,6 +12345,324 @@ fn derived_harness_model_priority_proves_and_catches_every_writer_and_reader_law
     assert!(!buggy.check_invariant("ReaderPicksTheFirstAvailable", &head));
 
     assert_proves_and_catches(&model);
+}
+
+/// Every `(DefaultFable, PersonFlag, Build)` configuration of
+/// `HarnessModelSwitch`: the person's standing settings default and launch
+/// flag (none, an id, a family alias), and whether a newer build is due all
+/// along.
+const MODEL_SWITCH_CONFIGS: [(i64, i64, i64); 12] = [
+    (0, 0, 0),
+    (1, 0, 0),
+    (0, 1, 0),
+    (1, 1, 0),
+    (0, 2, 0),
+    (1, 2, 0),
+    (0, 0, 1),
+    (1, 0, 1),
+    (0, 1, 1),
+    (1, 1, 1),
+    (0, 2, 1),
+    (1, 2, 1),
+];
+
+/// Each `HarnessModelSwitch` mutant and the law it is checked against alone.
+const MODEL_SWITCH_MUTANTS: [(&str, &str); 9] = [
+    ("JudgeMovesOffList", "UpTheListOnly"),
+    (
+        "JudgeForgetsTheRememberedChoice",
+        "PersonsChoiceStaysInFamily",
+    ),
+    ("JudgeRetriesAFailedModel", "NeverOntoAppliedOrFailed"),
+    ("JudgeReadsAStaleAnnouncement", "NeverOntoAppliedOrFailed"),
+    ("LadderWaitsForCold", "MovesExactlyWhenTheLadderSays"),
+    ("LadderRetakenAfterReady", "AnnouncedModelRides"),
+    ("SettleNeverFails", "SettleRecordsWhatRan"),
+    ("SettleNeverVerifies", "SettleRecordsWhatRan"),
+    ("SettleFailsAnAskThatRan", "AppliedAskStands"),
+];
+
+/// THE MODEL SWITCH: the live upgrade's model rule (`model_due`), ladder
+/// (`model_moves_now`), announcement (`model_to`) and settle step
+/// (`ModelRecord::settle`, the due clock, the ask) as one conversation's
+/// lifecycle. Every law is the only law some mutant step breaks, in every
+/// configuration of the person's standing choices; each mutant, alone
+/// against its own law alone, is proven clean at `Buggy = 0` and caught at
+/// `Buggy = 1` by the interpreter and by `ty` wherever it is installed
+/// (`JudgeReadsAStaleAnnouncement` pins the DECISION half of
+/// `NeverOntoAppliedOrFailed`: its verdict is right, so the law's verdict
+/// half alone would not see it). Under a person's launch ALIAS
+/// (`PersonFlag = 2`) the rule keeps everything (`model-alias`), so no
+/// mutant's defect can show there: those configurations are proven at
+/// `Buggy = 0` and shown to move nothing, ever. Tier-1: aterm-agent's
+/// `conformance_upgrade_models/switch.rs`.
+#[test]
+fn derived_harness_model_switch_proves_and_catches_every_law() {
+    let model = harness_model_switch_model();
+    for (default_fable, person_flag, build) in MODEL_SWITCH_CONFIGS {
+        let m = aterm_spec::interp::with_consts(
+            &model,
+            &[
+                ("DefaultFable", default_fable),
+                ("PersonFlag", person_flag),
+                ("Build", build),
+            ],
+        );
+        if person_flag == 2 {
+            let healthy = aterm_spec::interp::with_buggy(&m, 0);
+            let states = aterm_spec::interp::bmc(&healthy).expect("every law holds at Buggy=0");
+            let key = |st: &aterm_spec::interp::State| -> Vec<(&'static str, i64)> {
+                st.iter().map(|(k, v)| (*k, *v)).collect()
+            };
+            let mut seen = std::collections::BTreeSet::new();
+            let mut queue = std::collections::VecDeque::from([healthy.init_state()]);
+            while let Some(st) = queue.pop_front() {
+                if !seen.insert(key(&st)) {
+                    continue;
+                }
+                assert!(
+                    st["due"] == 0 && st["mto"] == 0 && st["set"] == 0 && st["flag"] == 0,
+                    "a person's launch alias was moved: {st:?}"
+                );
+                for action in &healthy.actions {
+                    queue.extend(healthy.successors(action.name, &st));
+                }
+            }
+            eprintln!(
+                "HarnessModelSwitch DefaultFable={default_fable} PersonFlag=2 (alias) \
+                 Build={build}: {states} states, every law proven (Buggy=0), nothing ever \
+                 due, asked for or moved"
+            );
+            continue;
+        }
+        assert_operator_model_shape(&m, |_| false);
+        assert_every_invariant_breaks_first(&m, &[]);
+        let states = aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&m, 0))
+            .expect("every law holds at Buggy=0");
+        eprintln!(
+            "HarnessModelSwitch DefaultFable={default_fable} PersonFlag={person_flag} \
+             Build={build}: {states} states, every law proven (Buggy=0) and the only law \
+             some mutant step breaks (Buggy=1)"
+        );
+        assert_proves_and_catches(&m);
+    }
+
+    // Each mutant alone against its own law alone: the interpreter's
+    // counterexample printed, and `ty` (where installed) proves the healthy
+    // arm and catches the mutant.
+    let mutants: Vec<&str> = MODEL_SWITCH_MUTANTS.iter().map(|(a, _)| *a).collect();
+    for (mutant, law) in MODEL_SWITCH_MUTANTS {
+        let mut single = model.clone();
+        single
+            .actions
+            .retain(|a| !mutants.contains(&a.name) || a.name == mutant);
+        single.invariants.retain(|inv| inv.name == law);
+        let (state, broken) = aterm_spec::interp::bmc(&aterm_spec::interp::with_buggy(&single, 1))
+            .expect_err("the mutant alone must break its law");
+        assert_eq!(broken, law);
+        eprintln!("HarnessModelSwitch: `{mutant}` is caught by `{law}` at {state:?}");
+        assert_proves_and_catches(&single);
+    }
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+
+    // The ordinary move, Opus 5 -> Opus 5.5: due on a cold cache, announced,
+    // the READY answer warms the cache and the model still rides, the relaunch
+    // runs it and the next visit records it applied — and nothing more is due.
+    let mut s = model.init_state();
+    fire_all(&model, &mut s, &["GoCold", "Visit"]);
+    assert_eq!(
+        (s["due"], s["mto"]),
+        (1, 1),
+        "due, and the cold cache takes it"
+    );
+    fire_all(&model, &mut s, &["Announce", "Answer", "Visit"]);
+    assert_eq!(
+        (s["cold"], s["ann"], s["mto"]),
+        (0, 1, 1),
+        "warm again, still rides"
+    );
+    fire_all(&model, &mut s, &["Relaunch", "Visit"]);
+    assert_eq!((s["live"], s["set"], s["ap"], s["due"]), (1, 1, 1, 0));
+
+    // THE LADDER on a warm cache: the move waits, then lands when the warm
+    // wait is over.
+    let mut warm = model.init_state();
+    fire_all(&model, &mut warm, &["Visit"]);
+    assert_eq!((warm["due"], warm["mto"]), (1, 0), "warm: it waits");
+    fire_all(&model, &mut warm, &["WarmWaitElapses", "Visit"]);
+    assert_eq!(warm["mto"], 1, "the warm wait is over: it moves");
+    let mut incident = warm.clone();
+    fire_all(&buggy, &mut incident, &["LadderWaitsForCold"]);
+    assert!(!buggy.check_invariant("MovesExactlyWhenTheLadderSays", &incident));
+
+    // SETTLE: asked for, and Claude Code runs another — recorded failed after
+    // MODEL_SETTLE_S, and never due again.
+    let mut other = model.init_state();
+    fire_all(
+        &model,
+        &mut other,
+        &[
+            "GoCold",
+            "Visit",
+            "Announce",
+            "Visit",
+            "RelaunchRunsOther",
+            "Visit",
+        ],
+    );
+    assert_eq!(
+        (other["set"], other["fl"]),
+        (1, 0),
+        "pending until it settles"
+    );
+    fire_all(&model, &mut other, &["SettleElapses", "Visit"]);
+    assert_eq!((other["set"], other["fl"], other["due"]), (0, 1, 0));
+    let mut never = other.clone();
+    never.insert("set", 1);
+    never.insert("sage", 1);
+    never.insert("fl", 0);
+    never.insert("tgt", 3);
+    never.insert("fresh", 0);
+    fire_all(&buggy, &mut never, &["SettleNeverFails"]);
+    assert!(!buggy.check_invariant("SettleRecordsWhatRan", &never));
+
+    // AN ASK THAT RAN STANDS: applied, then a person moves off it, and the
+    // settle window passes — never recorded failed, the ask still the
+    // harness's own. The settle step before 2026-09-27 failed it.
+    let mut ran = model.init_state();
+    fire_all(
+        &model,
+        &mut ran,
+        &["GoCold", "Visit", "Announce", "Visit", "Relaunch", "Visit"],
+    );
+    assert_eq!((ran["set"], ran["ap"]), (1, 1), "the ask ran");
+    fire_all(
+        &model,
+        &mut ran,
+        &["PersonTypesModel", "Answer", "SettleElapses", "Visit"],
+    );
+    assert_eq!(
+        (ran["live"], ran["set"], ran["ap"], ran["fl"], ran["due"]),
+        (2, 1, 1, 0, 0)
+    );
+    let mut failed_it = ran.clone();
+    failed_it.insert("fresh", 0);
+    fire_all(&buggy, &mut failed_it, &["SettleFailsAnAskThatRan"]);
+    assert!(!buggy.check_invariant("AppliedAskStands", &failed_it));
+
+    // A person's answered `/model claude-fable-5-1`, remembered by the visit
+    // that saw it, holds Fable against a cross-family move; the rule before
+    // 18090b6ae forgot it at the answer.
+    let mut fable = model.init_state();
+    fire_all(
+        &model,
+        &mut fable,
+        &["PersonTypesModel", "Visit", "Answer", "Visit"],
+    );
+    assert_eq!((fable["live"], fable["hum"], fable["due"]), (2, 1, 0));
+    let mut forgot = fable.clone();
+    forgot.insert("fresh", 0);
+    fire_all(&buggy, &mut forgot, &["JudgeForgetsTheRememberedChoice"]);
+    assert!(!buggy.check_invariant("PersonsChoiceStaysInFamily", &forgot));
+
+    // STICKINESS: announced, then the target moves away — the announced
+    // model still rides; the decision re-taken drops it.
+    let mut sticky = model.init_state();
+    fire_all(
+        &model,
+        &mut sticky,
+        &["GoCold", "Visit", "Announce", "Retarget", "Visit"],
+    );
+    assert_eq!((sticky["tgt"], sticky["due"], sticky["mto"]), (3, 0, 1));
+    let mut retaken = sticky.clone();
+    retaken.insert("fresh", 0);
+    fire_all(&buggy, &mut retaken, &["LadderRetakenAfterReady"]);
+    assert!(!buggy.check_invariant("AnnouncedModelRides", &retaken));
+}
+
+/// OPEN — THE RIDE'S EXEMPTION IS A GAP IN THE CODE (skeptic review of
+/// `HarnessModelSwitch`, 2026-09-27). `UpTheListOnly`,
+/// `PersonsChoiceStaysInFamily` and `NeverOntoAppliedOrFailed` hold for the
+/// rule's verdict and for every visit's decision EXCEPT while an announced
+/// model rides: `upgrade_drive::visit_models` carries the upgrade's
+/// `model_list` whatever the visit decides, and a gave-up upgrade's late READY
+/// restarts with that `model_list` too (`restart` asks `st.model_list`). So
+/// the HEALTHY model reaches, in every configuration, a relaunch about to ask
+/// for `claude-opus-5-5`:
+///
+/// * (a) after it was recorded FAILED — both from a standing notice and from
+///   a gave-up one (the latter where a newer build gives the late READY a
+///   restart to make);
+/// * (b) over a person's `/model claude-fable-5-1` typed after the notice,
+///   across families;
+/// * (c) off a model the list does not name (a person's `/model
+///   claude-sonnet-5`).
+///
+/// This test pins each as reachable. A fix re-takes those three laws inside
+/// the ride as well (the ride's model then gives way to a verdict of
+/// `model-failed-before`, `model-chosen-by-hand` or `model-off-list`), and
+/// flips this test into their proof.
+#[test]
+fn derived_harness_model_switch_open_ride_gaps_are_reachable() {
+    for (default_fable, person_flag, build) in MODEL_SWITCH_CONFIGS {
+        let m = aterm_spec::interp::with_buggy(
+            &aterm_spec::interp::with_consts(
+                &harness_model_switch_model(),
+                &[
+                    ("DefaultFable", default_fable),
+                    ("PersonFlag", person_flag),
+                    ("Build", build),
+                ],
+            ),
+            0,
+        );
+        let key = |st: &aterm_spec::interp::State| -> Vec<(&'static str, i64)> {
+            st.iter().map(|(k, v)| (*k, *v)).collect()
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        let mut queue = std::collections::VecDeque::from([m.init_state()]);
+        let mut found = std::collections::BTreeSet::new();
+        while let Some(st) = queue.pop_front() {
+            if !seen.insert(key(&st)) {
+                continue;
+            }
+            let rides = st["fresh"] == 1 && st["phase"] == 1 && st["ann"] == 1 && st["mto"] == 1;
+            let relaunches = !m.successors("Relaunch", &st).is_empty();
+            if rides && relaunches && st["fl"] == 1 {
+                found.insert("(a) a ride asks for a model recorded failed");
+            }
+            if st["fresh"] == 1 && st["phase"] == 2 && st["ann"] == 1 && st["fl"] == 1 && relaunches
+            {
+                found.insert("(a) a late READY after a give-up asks for a model recorded failed");
+            }
+            if rides && relaunches && st["live"] == 2 && st["cmd"] == 1 {
+                found.insert("(b) a ride moves a person's /model across families");
+            }
+            if rides && relaunches && st["live"] == 4 {
+                found.insert("(c) a ride moves a model the list does not name");
+            }
+            for action in &m.actions {
+                queue.extend(m.successors(action.name, &st));
+            }
+        }
+        // A person's launch alias keeps everything: nothing is ever
+        // announced with a model, so no ride exists to carry one.
+        let want = if person_flag == 2 {
+            0
+        } else if build == 1 {
+            4
+        } else {
+            3
+        };
+        assert_eq!(
+            found.len(),
+            want,
+            "DefaultFable={default_fable} PersonFlag={person_flag} Build={build}: {found:?} — \
+             a gap no longer reachable is a FIX: turn this test into the laws' proof inside \
+             the ride"
+        );
+    }
 }
 
 /// Fire `actions` in order on `model` from `state`, each of which must be

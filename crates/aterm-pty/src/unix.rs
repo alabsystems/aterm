@@ -3007,30 +3007,50 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
 /// never turn into input latency. Returns `None` on failure — the caller then degrades to a plain
 /// un-cancellable [`read`], no worse than before. The owner unblocks a reader parked
 /// in [`read_or_wake`] by writing the write end via [`wake`] (MEM-L2).
+///
+/// On Linux both flags are set BY THE CALL (`pipe2`), so no instant exists at which
+/// a `Command::spawn` on another thread could inherit an unflagged end (the product
+/// fd-hygiene sweep of 2026-09-27). Darwin has no `pipe2`, and the window-free
+/// carrier it does have — the exec-status channel's unlinked `O_CLOEXEC` fifo —
+/// costs filesystem work (tens of ms on a busy volume) on the event loop's reader
+/// attach, which a handoff pays once per adopted session: a visible stall is worse
+/// than what the window costs here, because the wake is a byte and a stray copy of
+/// either end blocks nothing. So Darwin keeps `pipe(2)` + `fcntl`.
 pub fn make_wake_pipe() -> Option<(i32, i32)> {
-    let mut fds = [0i32; 2];
-    // SAFETY: `fds` is a valid 2-int out-array for pipe(2).
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        return None;
+    #[cfg(target_os = "linux")]
+    {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-int out-array; `pipe2` applies both flags to
+        // both descriptors as it creates them.
+        (unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0)
+            .then_some((fds[0], fds[1]))
     }
-    let (rd, wr) = (fds[0], fds[1]);
-    // SAFETY: rd/wr are freshly-created pipe fds; these fcntls only read/set flags.
-    let configured = unsafe {
-        let rd_flags = libc::fcntl(rd, libc::F_GETFL);
-        let wr_flags = libc::fcntl(wr, libc::F_GETFL);
-        libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-            && libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-            && rd_flags >= 0
-            && wr_flags >= 0
-            && libc::fcntl(rd, libc::F_SETFL, rd_flags | libc::O_NONBLOCK) != -1
-            && libc::fcntl(wr, libc::F_SETFL, wr_flags | libc::O_NONBLOCK) != -1
-    };
-    if !configured {
-        close_fd(rd);
-        close_fd(wr);
-        return None;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut fds = [0i32; 2];
+        // SAFETY: `fds` is a valid 2-int out-array for pipe(2).
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        let (rd, wr) = (fds[0], fds[1]);
+        // SAFETY: rd/wr are freshly-created pipe fds; these fcntls only read/set flags.
+        let configured = unsafe {
+            let rd_flags = libc::fcntl(rd, libc::F_GETFL);
+            let wr_flags = libc::fcntl(wr, libc::F_GETFL);
+            libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
+                && libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
+                && rd_flags >= 0
+                && wr_flags >= 0
+                && libc::fcntl(rd, libc::F_SETFL, rd_flags | libc::O_NONBLOCK) != -1
+                && libc::fcntl(wr, libc::F_SETFL, wr_flags | libc::O_NONBLOCK) != -1
+        };
+        if !configured {
+            close_fd(rd);
+            close_fd(wr);
+            return None;
+        }
+        Some((rd, wr))
     }
-    Some((rd, wr))
 }
 
 /// Outcome of [`read_or_wake`].
@@ -3922,15 +3942,31 @@ mod tests {
         eprintln!("P05 busy-parser hot gather: best of nine held {best_held:?}");
     }
 
-    /// P05 — the hold a CONTINUOUS stream (refills every ~100 µs for longer
-    /// than any budget) imposes on an echo byte: ≤ the 1 ms hot budget with a
-    /// keystroke pending, the 3 ms flood budget otherwise. Red before the fix:
-    /// both arms held ≥ 3 ms. Margins are 2-3x each way so a loaded machine
-    /// cannot invert them.
+    /// P05 — the hold a CONTINUOUS stream (a refill waiting at every dry gap,
+    /// for longer than any budget) imposes on an echo byte: the 1 ms hot budget
+    /// with a keystroke pending, the 3 ms flood budget otherwise. Red before the
+    /// fix: both arms held ≥ 3 ms.
+    ///
+    /// THE STREAM COMES FROM THE PARK SEAM, NOT FROM A THREAD. A writer thread
+    /// yielding one byte per turn made "continuous" a claim about the scheduler:
+    /// descheduled for longer than the 1 ms bridge poll, it ended the cold
+    /// gather on "burst over" — correct behaviour for a stream that really
+    /// paused — and on 2026-09-27 a gate sharing the machine with a solver farm
+    /// did that in all fifteen cold runs (best 1.375 ms against the 1.5 ms
+    /// floor). The hot arm read the same thread's gaps: most of its passing
+    /// runs ended on a 50 µs idle wait that saw no refill, 100-400 µs in,
+    /// before the hot budget was ever consulted. So each gather writes one
+    /// byte from `at_gap`, immediately before it parks: the refill is in the
+    /// pipe whenever the gather looks, the park returns `Refill` on every gap,
+    /// and the ONLY way either arm can end is the budget check.
     #[test]
     fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
         use std::sync::atomic::AtomicUsize;
-        fn hold(interactive_pending: fn() -> bool) -> std::time::Duration {
+        use std::time::Duration;
+        const BUF: usize = 65_536;
+        /// One gather over a stream that never pauses: (wall held, bytes
+        /// gathered, dry gaps parked at, 1 ms bridge polls taken).
+        fn gather(interactive_pending: fn() -> bool) -> (Duration, usize, u32, u32) {
             let mut m = [0i32; 2];
             // SAFETY: valid 2-int out-array for pipe(2).
             assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
@@ -3942,37 +3978,14 @@ mod tests {
                 unsafe { libc::write(wr, chunk.as_ptr().cast(), chunk.len()) },
                 chunk.len() as isize
             );
-            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let writer = {
-                let stop = stop.clone();
-                std::thread::spawn(move || {
-                    // ONE byte per iteration: the gather loop ends the moment its
-                    // 64 KiB buffer is full, and 64-byte writes at yield cadence
-                    // filled it in ~0.7 ms on an idle machine — the COLD control
-                    // then ended on "buffer full" well inside the hot budget and
-                    // proved nothing. A byte per yield cannot reach 64 KiB inside
-                    // the 3 ms `BATCH_BUDGET` on any machine, so the cold arm ends
-                    // on its budget, which is the property.
-                    let small = [b'x'; 1];
-                    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        // SAFETY: bounded write to this test's live pipe end.
-                        unsafe {
-                            libc::write(wr, small.as_ptr().cast(), small.len());
-                        }
-                        // Tightest cadence a non-realtime thread can hold: a
-                        // sleep(100 µs) stretched past the 1 ms bridge poll under
-                        // a parallel test load and ended the COLD gather early.
-                        std::thread::yield_now();
-                    }
-                    close_fd(wr);
-                })
-            };
             let busy = AtomicUsize::new(1); // a parser mid-batch: the flood shape
-            let mut buf = [0u8; 65_536];
+            let mut buf = [0u8; BUF];
             let n = read(rd, &mut buf[..1024]);
             assert!(n > 0);
+            let mut gaps = 0u32;
+            let polls_before = super::BRIDGE_POLLS.with(std::cell::Cell::get);
             let t0 = std::time::Instant::now();
-            let _ = drain_more_nonblocking_with_idle_wait(
+            let filled = drain_more_nonblocking_with_idle_wait_after_gap(
                 rd,
                 &mut buf,
                 n as usize,
@@ -3980,71 +3993,90 @@ mod tests {
                 Some(&busy),
                 interactive_pending,
                 IDLE_POLL_DEFAULT_US,
+                |_| {
+                    gaps += 1;
+                    // SAFETY: a one-byte write to this test's live pipe end; the
+                    // gather drains it, so the 64 KiB pipe never fills.
+                    assert_eq!(unsafe { libc::write(wr, b"x".as_ptr().cast(), 1) }, 1);
+                    false
+                },
             );
             let held = t0.elapsed();
-            stop.store(true, std::sync::atomic::Ordering::Relaxed);
-            writer.join().expect("writer");
+            let polls = super::BRIDGE_POLLS.with(std::cell::Cell::get) - polls_before;
+            close_fd(wr);
             close_fd(rd);
+            (held, filled, gaps, polls)
+        }
+        /// The clockless half, true on every run: the stream was bridged at
+        /// every gap and the gather did not stop on a full buffer. With the
+        /// writer open, a byte always queued before the park and the buffer not
+        /// full, the gather's remaining exits are EOF, a hard error and a signal
+        /// interrupting a park (none of which this test can produce) and the
+        /// budget, so the hold below is a reading of the budget and not of the
+        /// machine.
+        fn bridged(
+            arm: &str,
+            (held, filled, gaps, polls): (Duration, usize, u32, u32),
+            hot: bool,
+        ) -> Duration {
+            assert!(
+                filled < BUF,
+                "{arm}: ended on a full buffer, which proves nothing"
+            );
+            assert!(gaps >= 1, "{arm}: the stream was never bridged");
+            // Hot bridges with the µs idle wait, flood with the 1 ms bridge poll;
+            // each gap is followed by exactly one park of its arm's kind.
+            let expected = if hot { 0 } else { gaps };
+            assert_eq!(
+                polls, expected,
+                "{arm}: {gaps} gaps took {polls} bridge polls"
+            );
             held
         }
-        // Scheduling noise under a parallel suite can stretch or cut either arm,
-        // so each is judged from the direction that falsifies it: the hot arm by
-        // its SHORTEST hold (the old code's hot arm cannot beat ~3 ms however
-        // many times it is run), the cold control by its LONGEST (a writer
-        // descheduled past the bridge poll cuts one run short; it cannot make a
-        // run hold past the budget).
-        //
-        // THE HOT ARM RUNS UNTIL IT CLEARS ITS CEILING, up to fifteen times and
-        // 10 ms apart. It took the shortest of five back-to-back runs, which all
-        // land in the same few milliseconds and so in the same bad scheduling
-        // window (the load-sensitive test audit of 2026-09-27); the old code's
-        // hot arm never clears the ceiling however often it runs.
-        //
-        // THE CONTROL RUNS UNTIL IT CLEARS ITS FLOOR, up to fifteen times. It
-        // took the longest of three, and on 2026-09-23 two full gates sharing
-        // one machine descheduled the writer in all three (held 1.47 ms, then
-        // 1.18 ms in isolation — one run in five). A cold arm that ENDED at the
-        // hot budget — the regression this control exists for — never clears
-        // the floor however often it runs, so stopping at the first run that
-        // does keeps the falsifier and drops the flake.
-        const COLD_FLOOR: std::time::Duration = std::time::Duration::from_micros(1500);
-        const HOT_CEILING: std::time::Duration = std::time::Duration::from_micros(2200);
-        let shortest_until_ceiling = |f: fn() -> bool| {
-            let mut shortest = std::time::Duration::MAX;
-            for _ in 0..15 {
-                shortest = shortest.min(hold(f));
-                if shortest < HOT_CEILING {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+        // THE HOT ARM, a cap from both sides. From below it is exact: a gather
+        // that bridges every refill cannot end before `HOT_BATCH_BUDGET` — what
+        // makes the ceiling below a reading of the cap, where the thread-fed
+        // version's 100 µs early exits read the writer. From above, the old code
+        // bridged a hot gather to the 3 ms `BATCH_BUDGET` on EVERY run (nothing
+        // else can end it now), so any ceiling under 3 ms catches it on every
+        // run; 2.2 ms leaves the correct arm (1 ms plus one gap) 1.2 ms of
+        // preemption, and it runs until it clears the ceiling — up to fifteen
+        // times, 10 ms apart, so one bad scheduling window cannot cover them all.
+        const HOT_CEILING: Duration = Duration::from_micros(2200);
+        let mut hot = Duration::MAX;
+        for _ in 0..15 {
+            let held = bridged("hot", gather(always_hot), true);
+            assert!(
+                held >= HOT_BATCH_BUDGET,
+                "a hot gather over an unbroken stream ended at {held:?}, before its \
+                 {HOT_BATCH_BUDGET:?} budget"
+            );
+            hot = hot.min(held);
+            if hot < HOT_CEILING {
+                break;
             }
-            shortest
-        };
-        let longest_until_floor = |f: fn() -> bool| {
-            let mut longest = std::time::Duration::ZERO;
-            for _ in 0..15 {
-                longest = longest.max(hold(f));
-                if longest >= COLD_FLOOR {
-                    break;
-                }
-            }
-            longest
-        };
-        let hot = shortest_until_ceiling(always_hot);
-        let cold = longest_until_floor(never_hot);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // THE CONTROL: the flood-shaped gather holds the same stream to its 3 ms
+        // `BATCH_BUDGET`. Exact from below for the same reason — the only exit
+        // left is `start.elapsed() >= BATCH_BUDGET`, and `t0` precedes `start` —
+        // so the floor IS that budget and no load can fail it. The regression it
+        // exists for, a cold arm cut at the 1 ms hot budget, reads ~1 ms and has
+        // to be stretched 2 ms by preemption to pass; judging the SHORTEST of
+        // three makes that happen three times running.
+        const COLD_FLOOR: Duration = Duration::from_millis(3); // = BATCH_BUDGET
+        let cold = (0..3)
+            .map(|_| bridged("cold", gather(never_hot), false))
+            .min()
+            .expect("three runs");
         eprintln!("P05 continuous-stream gather hold: hot={hot:?} cold={cold:?}");
         assert!(
             hot < HOT_CEILING,
             "hot gather must close near HOT_BATCH_BUDGET, held {hot:?} at best of fifteen"
         );
-        // The CONTROL: the flood-shaped gather still holds a continuous stream
-        // well past the hot budget (its bridge poll continues the batch on every
-        // refill) and ends on the 3 ms `BATCH_BUDGET`; the floor is set at the
-        // discriminating value, not the nominal one, so a late budget check
-        // under load cannot fail it.
         assert!(
             cold >= COLD_FLOOR,
-            "cold gather keeps holding past the hot budget, held {cold:?} at best of fifteen"
+            "cold gather keeps holding to BATCH_BUDGET, held {cold:?} at the shortest of three"
         );
     }
 

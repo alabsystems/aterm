@@ -678,22 +678,31 @@ yet enabled workspace-wide, so "compiled by a verifying compiler" is not
 stock Rust and carries the embedded exhaustive checker, the conformance,
 property, and fuzz tests, the CPU/GPU parity suites, and the differential oracle
 against `alacritty_terminal` (the `ay` bundles stay internal). These prove or
-test named, bounded contracts — not the whole emulator, renderer, or OS. Run
-`cargo run -q -p xtask -- gate counts` for the live inventory; totals are
-computed from source, never maintained in prose. Every gate is a local command —
-`tools/verify.sh` is the merge contract and runs the L0 temporal-safety
-gate as one of its unconditional stages, the release cutter re-runs those six
-obligations itself before it claims a build number, the full ladder runs by
+test named, bounded contracts — not the whole emulator, renderer, or OS.
+Every gate is a local command — `tools/verify.sh` is the merge contract and
+runs the L0 temporal-safety gate as one of its unconditional stages, the
+release cutter re-runs those six obligations itself before it claims a build
+number, the full ladder runs by
 hand, and there is no hosted CI and no git hook — by the owner's decision,
 every gate runs inline in the tool being run. `tools/verify.sh` writes a receipt
 for a clean tree — into the repository's git common dir, which every worktree
-shares — naming the commit it verified and what that run discharged, never
-letting a weaker run's replace a whole-tree one; a narrowed run (`--changed`,
+shares, filed under the commit and under its tree — naming the commit it
+verified, the compiler and spec checkers it ran, what failed, the machine's load
+around each stage and what that run discharged, never letting a weaker run's
+replace a whole-tree one. A run is
+judged against main's receipt for its base: a red main already has, failing the
+same way, is named as inherited rather than blocking (for up to 24 h), and
+`tools/verify.sh --baseline` records and publishes main's own. A narrowed run (`--changed`,
 `--scope`) vouches for nothing, because other crates' tests read files no
-dependency edge names. The release cutter reads those receipts itself and states
-in the cut's transcript how many commits the built commit sits above the newest
-one a whole-tree pass vouches for. So L0 is enforced by the merge contract and
-again, unconditionally, at the release cut.
+dependency edge names. The work that measures the machine or the release
+artifact rather than correctness — the release build and the paint and spin
+matrices that judge it, the typing-pacing smoke — is a separate MEASURE tier
+(`tools/verify.sh --measure`), not part of the merge contract. The release
+cutter reads those receipts itself: it states in the cut's transcript how many
+commits the built commit sits above the newest one a whole-tree pass vouches
+for, and refuses to claim a build number unless a MEASURE run measured the
+tree it builds. So L0 is enforced by the merge contract and again,
+unconditionally, at the release cut.
 
 aterm makes no aggregate performance claim. The reproducible cross-engine
 measurements are engine-only and in-process — throughput via

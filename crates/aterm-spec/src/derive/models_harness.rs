@@ -482,8 +482,11 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// `failed` of 2026-09-27 (`Terminal`). Tier-1 in
 /// aterm-agent's `harness::upgrade_drive` tests drives the real reducer,
 /// gates, record transitions, transcript readers and the host's reading of
-/// each step's word over every reachable state, and replays the incident,
-/// the pre-fix trace as the caught negative control.
+/// each step's word over every reachable state — and a gave-up round's late
+/// READY at a BREAK of the agent's own work too, which this model has none
+/// of: the real code must `Void` there exactly where the model voids, so the
+/// break's old `wait:background` is caught — and replays the incident, the
+/// pre-fix trace as the caught negative control.
 ///
 /// ONE STATED EXCEPTION, outside the model: an agent found to be no job of a
 /// job-control shell is refused and owed no release
@@ -965,6 +968,339 @@ pub fn harness_login_wall_model() -> Model {
     }
 }
 
+/// THE NOTICE QUEUED BEHIND A USAGE LIMIT (`aterm_agent::harness::upgrade`:
+/// `notice_scan`, `queued_until`, `queued_copies`, `Scan::rests_until`,
+/// `queue_rest`, `transcript_limit_until`, `next_step`, `requested_step`,
+/// `announce_asks`, `clock_held`; the driver's `queue_facts`). The incident it
+/// is written for (the owner's report of 2026-09-27, tab
+/// `s-c543f4e0edd3439e5791`, Claude Code 2.1.280): the session stood at its
+/// weekly limit; the upgrade typed four notices half an hour apart — each
+/// answered within two seconds by Claude Code's `You've hit your weekly limit`
+/// row, and each read as ASKED, the limit's banner no longer on the screen —
+/// gave up on them (`no READY answer after 4 notices`), and when the session
+/// went on all four reached the agent at once.
+///
+/// The account: `limited` (it stands at its usage limit — no reader sees
+/// this directly). What the upgrade reads of it: `shown` (the screen shows the
+/// limit; a person's Esc or a recogniser that misses it clears the screen
+/// while the limit stands), `held` (the transcript's word that the limit
+/// holds: the limit row that last answered the latest notice — or, with
+/// nothing queued, the session's last row — its named reset ahead or, naming
+/// none, written less than `REASK_S` ago). The conversation: `untaken`
+/// (notices in it the model has not taken, each answered by the limit; they
+/// reach the model together, with the next turn that gets past the limit),
+/// counted to `RetypeMax + 1 + Daily`, which stands for that many OR MORE —
+/// a queue is FULL past `RetypeMax`, and its rest has grown to a day at the
+/// top; `took` (the asks the model took). The upgrade: `phase` 0 pending, 1
+/// announced, 2 gave up; `asks` counted to `MaxAsks`; `window` (the latest
+/// ask's re-ask window has run out); `rested` (a full queue has rested since
+/// the transcript's word on its latest notice ran out: 1, a rest shorter than
+/// a day; 2, a day). Five ghosts: `stacked`, a fresh ask typed while a notice
+/// waited untaken; `burst`, a notice typed into a full queue before it
+/// rested; `hurried`, the notices typed into a full queue, the limit still
+/// standing, without a day's rest before them (saturating at `Daily + 1`);
+/// `spent`, a give-up before `MaxAsks` asks the model took; `stuck`, the
+/// upgrade's quiet word where it still owed the agent an ask it could read.
+///
+/// `Retype` is the same ask typed again: its latest copy was queued and the
+/// limit is over by the transcript's word and the screen's (a named reset
+/// passed, a `/login` finished, `REASK_S` since a row naming none) — which,
+/// for a row naming no reset, it is every half hour however long the limit
+/// really stands. So it is BOUNDED: straight away only while at most
+/// `RetypeMax` (the real `REQUEUE_MAX`) notices wait untaken; into a full
+/// queue only once it has RESTED (`Rests`, the passing of the real
+/// `queue_rest`) — one copy per rest, never the half-hourly pile — and the
+/// rest GROWS with every copy unread (the owner, 2026-09-27: a limit that
+/// names no reset and lasts for days still added a copy every two and a half
+/// hours, about ten a day): shorter than a day for the first `Daily` (the
+/// real `QUEUE_REST_DOUBLINGS`: two, four, eight, sixteen hours), a day for
+/// every one after. `NowAsks` is the owner's `Upgrade now` on a full queue:
+/// one copy more, the person asking — never while the limit shows on the
+/// screen or holds by the transcript's word. `GoesOn` is a turn someone else
+/// began getting past the limit. `Look` is the upgrade's QUIET WORD at a
+/// point where the limit is over by every word, DERIVED FROM ITS OWN GUARDS:
+/// enabled exactly where none of `Announce`, `Retype`, `GiveUp`, `Elapse`
+/// and `Rests` is, which the Tier-0 test checks state by state. One round is
+/// modelled: a stopped round's rest and new round (main's "no stop is for
+/// good") are `HarnessUpgradeNeverStrands`', and so are the READY and the
+/// restart. A notice an EARLIER round, target or build left queued (its
+/// marker no longer the state's) is read by the real code as this queue is —
+/// held while its limit holds by the transcript's word, and counted toward
+/// the same bound and rest — which a new round's first notice then joins;
+/// that crossing of rounds is not modelled.
+///
+/// Properties: `NeverTwoAsksUntaken` — no ask is typed behind a notice the
+/// model has not taken (the copies of ONE ask are the retype's, bounded by
+/// the next); `CopiesBounded` — at most `RetypeMax + 1` notices wait untaken
+/// before a rest, and past that one more per rest (`burst`);
+/// `CopiesPerDayBounded` — however long the limit stands, at most `Daily`
+/// notices go into a full queue without a day's rest before them (`hurried`),
+/// so a limit that lasts for days adds `1 + RetypeMax + Daily` notices at the
+/// most before its rests reach a day, and then one a day, never one every
+/// rest of the first; `NoGiveUpUntaken` — a give-up only after `MaxAsks` asks
+/// the model took; `NeverStranded` — once the limit is over by every word,
+/// the upgrade is never quiet while it owes the agent a readable ask:
+/// announced, it always has a next act of its own (a notice, a copy, its
+/// window, its give-up, a full queue's rest — no waiting on anyone's turn),
+/// and a round never gives up before the model took `MaxAsks` (it would never
+/// ask again). ONE KNOB PER DEFECT, each caught on its own: `CountRetype` (a
+/// notice typed again spends an ask, and at the bound is given up on:
+/// `NoGiveUpUntaken`), `Unbounded` (a queued notice is typed again every time
+/// its limit is over by the transcript's word, full queue or not — this
+/// branch before the bound: `CopiesBounded`), `NoBound` (a queued notice
+/// holds the upgrade until the model takes it, whatever the transcript says
+/// — the first fix before its review, which left an idle session waiting for
+/// a person: `NeverStranded`), `ForGood` (a full queue waits for the model
+/// with no rest — b77f7c28e before its review: an idle session whose limit
+/// had long ended waited for good, and the owner was told it "moves once that
+/// ends": `NeverStranded`), `Flat` (every rest of a full queue as long as the
+/// first, whatever it holds unread — d5cc7f01c, a copy every two and a half
+/// hours for as long as the limit stands: `CopiesPerDayBounded`). `Buggy = 1`
+/// is a COMPOSITE of two builds, so that the ratchet, which walks `Buggy = 1`
+/// alone, sees every invariant caught: the owner's build (0.93.0, and main's
+/// gate that 0.94.0 shipped) — the limit read off the screen alone, a notice
+/// the limit answered read as asked and its window run from its typing: four
+/// notices stacked behind the limit, a give-up on asks the model never had,
+/// and nothing left to ask it once the limit ended — PLUS d5cc7f01c's flat
+/// rest, a full queue retyped after every rest as short as the first. The
+/// owner's build never did the second part (it had no queue to rest, and
+/// gave up after four), so `CopiesPerDayBounded` is not its defect: the walk
+/// of the owner's report as it ran breaks the other four, and `Flat` is the
+/// knob that stands for the flat rest on its own. Tier-0 in aterm-spec's
+/// `derived_harness_upgrade_limit_queue`; Tier-1 in aterm-agent's
+/// `harness::upgrade_drive` tests (`upgrade_queued_tests.rs`), over the real
+/// screen reader, transcript readers, `queue_facts`, clock, reducer (with and
+/// without the owner's `--now`), ask count and rest on every reachable state
+/// and several transcripts each.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_limit_queue_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeLimitQueue {
+            const Buggy = 0;
+            const CountRetype = 0;
+            const Unbounded = 0;
+            const NoBound = 0;
+            const ForGood = 0;
+            const Flat = 0;
+            const MaxAsks = 4;
+            const RetypeMax = 2;
+            const Daily = 4;
+            var limited = 0;
+            var shown = 0;
+            var held = 0;
+            var phase = 0;
+            var asks = 0;
+            var window = 0;
+            var untaken = 0;
+            var took = 0;
+            var rested = 0;
+            var stacked = 0;
+            var burst = 0;
+            var hurried = 0;
+            var spent = 0;
+            var stuck = 0;
+
+            // The account and the session, as they please. The agent's own
+            // turn meets the limit: the screen shows it, and its row holds the
+            // transcript's word — until the reset it names or, naming none,
+            // for `REASK_S`; an announced upgrade's clock is held from here.
+            action LimitHits when (limited == 0 && untaken == 0 && phase <= 1) {
+                limited = 1;
+                shown = 1;
+                held = 1;
+                window = 0;
+            }
+            action LimitEnds when (limited == 1) {
+                limited = 0;
+            }
+            // The transcript's word runs out: the named reset passes, a
+            // `/login` finishes, or `REASK_S` since a row naming none —
+            // whether or not the limit really ended.
+            action BoundPasses when (held == 1) {
+                held = 0;
+            }
+            // The banner leaves the screen: a person's Esc, a recogniser that
+            // misses it — whether or not the limit really ended.
+            action Clear when (shown == 1) {
+                shown = 0;
+            }
+            // A turn someone else began gets past the limit (Claude Code's own
+            // at the reset, a person's, a peer's): the model writes a row,
+            // taking every notice waiting at once — one ask it had — and the
+            // latest ask's window opens then (`Buggy`: it ran from the typing).
+            action GoesOn when (limited == 0 && untaken > 0) {
+                untaken = 0;
+                took = took + 1;
+                shown = 0;
+                held = 0;
+                rested = 0;
+                hurried = 0;
+                window = if Buggy == 1 { window } else { 0 };
+            }
+            // The owner's `Upgrade now` on a FULL queue: one copy more — the
+            // person asking — never where the screen shows the limit or the
+            // transcript's word holds it. Its own turn: read, or queued, one
+            // more unread (the next rest the longer for it).
+            action NowAsks when (
+                Buggy == 0 && phase == 1 && untaken > RetypeMax && shown == 0 && held == 0
+            ) {
+                window = 0;
+                took = if limited == 0 { took + 1 } else { took };
+                untaken = if limited == 1 {
+                    if untaken > RetypeMax + Daily { untaken } else { untaken + 1 }
+                } else { 0 };
+                hurried = if limited == 1 { hurried } else { 0 };
+                shown = limited;
+                held = limited;
+                rested = 0;
+            }
+
+            // The upgrade. It reads a limit where the screen shows one or the
+            // transcript's word holds, and a FULL queue — more than
+            // `RetypeMax` notices untaken — until it has rested (`Unbounded`:
+            // never full; `NoBound`: any queue holds; `Buggy`: the screen
+            // alone). A FRESH ASK: the first notice, or the next once the
+            // window of one the model took has run out — never behind a notice
+            // waiting untaken (`Buggy`: a queued notice read as asked). Its own
+            // turn: read by the model, or, the account at its limit, answered
+            // by the limit and queued.
+            action Announce when (
+                shown == 0 &&
+                (Buggy == 1 ||
+                    (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                        (untaken == 0 || NoBound == 0))) &&
+                (untaken == 0 || Buggy == 1) &&
+                (phase == 0 || (phase == 1 && window == 1 && asks <= MaxAsks - 1))
+            ) {
+                stacked = if untaken > 0 { 1 } else { stacked };
+                burst = if untaken > RetypeMax && rested == 0 { 1 } else { burst };
+                hurried = if (limited == 1 && untaken > RetypeMax && rested <= 1) {
+                    if hurried > Daily { hurried } else { hurried + 1 }
+                } else if (limited == 1) { hurried } else { 0 };
+                phase = 1;
+                asks = asks + 1;
+                window = 0;
+                took = if limited == 0 { took + 1 } else { took };
+                untaken = if limited == 1 {
+                    if untaken > RetypeMax + Daily { untaken } else { untaken + 1 }
+                } else { 0 };
+                shown = limited;
+                held = limited;
+                rested = 0;
+            }
+            // THE SAME ASK AGAIN: its latest copy was the limit's, and that
+            // limit is over by the transcript's word and the screen's —
+            // straight away while the queue has room, into a full one only
+            // once it has rested (`Unbounded`: no bound; `ForGood`: a full
+            // queue never; `CountRetype`: it spends an ask; `Buggy`: only
+            // into a full queue that rested, the rest d5cc7f01c gave it).
+            action Retype when (
+                phase == 1 && untaken > 0 && shown == 0 && held == 0 &&
+                (Buggy == 0 || (untaken > RetypeMax && rested > 0)) &&
+                (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                NoBound == 0 &&
+                (CountRetype == 0 || asks <= MaxAsks - 1)
+            ) {
+                burst = if untaken > RetypeMax && rested == 0 { 1 } else { burst };
+                hurried = if (limited == 1 && untaken > RetypeMax && rested <= 1) {
+                    if hurried > Daily { hurried } else { hurried + 1 }
+                } else if (limited == 1) { hurried } else { 0 };
+                asks = if CountRetype == 1 { asks + 1 } else { asks };
+                window = 0;
+                took = if limited == 0 { took + 1 } else { took };
+                untaken = if limited == 1 {
+                    if untaken > RetypeMax + Daily { untaken } else { untaken + 1 }
+                } else { 0 };
+                shown = limited;
+                held = limited;
+                rested = 0;
+            }
+            // A FULL queue rests after the transcript's word on its latest
+            // notice ran out: shorter than a day while it holds at most
+            // `RetypeMax + Daily` notices unread, a day once it holds more
+            // (`Flat`, `Buggy`: every rest the first one's).
+            action Rests when (phase == 1 && untaken > RetypeMax && held == 0 && rested == 0) {
+                rested = if (Flat == 0 && Buggy == 0 && untaken > RetypeMax + Daily) { 2 } else { 1 };
+            }
+            // The re-ask window runs only where the upgrade reads no limit
+            // and no full queue.
+            action Elapse when (
+                phase == 1 && window == 0 && shown == 0 &&
+                (Buggy == 1 ||
+                    (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                        (untaken == 0 || NoBound == 0)))
+            ) {
+                window = 1;
+            }
+            // Its asks spent and the last one's window run out, nothing
+            // waiting untaken: it gives up (`CountRetype`: a queued notice's
+            // re-type at the bound is the give-up).
+            action GiveUp when (
+                phase == 1 && asks == MaxAsks && shown == 0 &&
+                (Buggy == 1 ||
+                    (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                        (untaken == 0 || NoBound == 0))) &&
+                ((window == 1 && (untaken == 0 || Buggy == 1)) ||
+                    (CountRetype == 1 && Buggy == 0 && untaken > 0))
+            ) {
+                phase = 2;
+                spent = if took <= MaxAsks - 1 { 1 } else { spent };
+            }
+            // THE QUIET WORD where the limit is over by every word — the
+            // account's, the screen's, the transcript's: nothing the upgrade
+            // would do by itself now, its own guards negated. A strand where
+            // it still owes the agent an ask it could read: an announced
+            // round with nothing of its own left to do (only someone else's
+            // turn would move it), or a round given up before `MaxAsks` the
+            // model took.
+            action Look when (
+                phase > 0 && limited == 0 && shown == 0 && held == 0 && stuck == 0 &&
+                (if (
+                    shown == 0 &&
+                    (Buggy == 1 ||
+                        (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                            (untaken == 0 || NoBound == 0))) &&
+                    (untaken == 0 || Buggy == 1) &&
+                    (phase == 0 || (phase == 1 && window == 1 && asks <= MaxAsks - 1))
+                ) { 1 } else { 0 }) +
+                (if (
+                    phase == 1 && untaken > 0 && shown == 0 && held == 0 &&
+                    (Buggy == 0 || (untaken > RetypeMax && rested > 0)) &&
+                    (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                    NoBound == 0 &&
+                    (CountRetype == 0 || asks <= MaxAsks - 1)
+                ) { 1 } else { 0 }) +
+                (if (
+                    phase == 1 && untaken > RetypeMax && held == 0 && rested == 0
+                ) { 1 } else { 0 }) +
+                (if (
+                    phase == 1 && window == 0 && shown == 0 &&
+                    (Buggy == 1 ||
+                        (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                            (untaken == 0 || NoBound == 0)))
+                ) { 1 } else { 0 }) +
+                (if (
+                    phase == 1 && asks == MaxAsks && shown == 0 &&
+                    (Buggy == 1 ||
+                        (held == 0 && (untaken <= RetypeMax || (rested > 0 && ForGood == 0) || Unbounded == 1) &&
+                            (untaken == 0 || NoBound == 0))) &&
+                    ((window == 1 && (untaken == 0 || Buggy == 1)) ||
+                        (CountRetype == 1 && Buggy == 0 && untaken > 0))
+                ) { 1 } else { 0 }) == 0
+            ) {
+                stuck = if (phase == 1 || (phase == 2 && took <= MaxAsks - 1)) { 1 } else { 0 };
+            }
+
+            invariant NeverTwoAsksUntaken: stacked == 0;
+            invariant CopiesBounded: burst == 0;
+            invariant CopiesPerDayBounded: hurried <= Daily;
+            invariant NoGiveUpUntaken: spent == 0;
+            invariant NeverStranded: stuck == 0;
+        }
+    }
+}
+
 /// THE MODEL PRIORITY LIST (`harness::upgrade_models`): a WRITER/READER
 /// pair, the shape of `NativeUpdateFailedMarkSuppression`. The writers are
 /// `Priority::admit` — the automatic insertion of a model Claude Code
@@ -1386,6 +1722,513 @@ pub fn harness_model_ladder_model() -> Model {
             }
 
             invariant NeverPastTheBound: clock <= Warm;
+        }
+    }
+}
+
+/// THE MODEL SWITCH (`harness::upgrade_models` + `harness::upgrade_drive`):
+/// which model a conversation is moved to, when, and what the harness
+/// remembers of it — the rule, the ladder, the announcement and the settle
+/// step as ONE lifecycle for one conversation.
+///
+/// THE RULE it transcribes is `model_due` as it stands since the owner's
+/// decision of 2026-09-27, *"SAME FAMILY FIRST, THEN THE PRIORITY LIST"*,
+/// over the build's offer (`upgrade_models::offered`). On this projection its
+/// moves are the ones the list-only rule of 2026-09-24 made — Opus 5 moves to
+/// Opus 5.5 by its own family's step, whoever chose it; Fable crosses to Opus
+/// 5.5 by the list's step, only when nobody chose it; nothing moves down,
+/// sideways, or off a model the list does not name — with ONE exception the
+/// model states on its own: a person's launch ALIAS (`PersonFlag = 2`), which
+/// the family-first rule keeps verbatim (`model-alias`) before it reads what
+/// runs, so nothing is ever due under it and even an unread visit clears the
+/// due clock (the list-only rule read it as a person's choice, and still
+/// moved within its family). A family the list does not name moving by the
+/// build's own word (Sonnet to a newer Sonnet) is outside the projection.
+///
+/// WHAT IS BOUND, AND WHAT IS ONLY TRANSCRIBED. The Tier-1 file
+/// (`aterm-agent`'s `conformance_upgrade_models/switch.rs`) drives these real
+/// functions over EVERY reachable state and projects what they produce back
+/// onto the model:
+///
+/// * `Visit` — `upgrade_models::model_read_step`, which
+///   `upgrade_drive::model_judge` (the one read the drive's visit, the host's
+///   pre-filter and a riding restart all take) wraps in its I/O: its early
+///   return when no
+///   model can be run and none is pending, then what the transcript says runs
+///   (`live_model_at`), THE SETTLE STEP (`ModelRecord::settle`), THE MODEL
+///   RULE (`model_due`) over the settled record, the cache's coldness
+///   (`last_answer_at` against `CACHE_COLD_S`) and THE DUE CLOCK
+///   (`ModelRecord::due_clock`), in that order; then `model_to`, with THE
+///   MODEL LADDER (`model_moves_now`) inside it.
+/// * `Relaunch`, `RelaunchRunsOther`, `Refused`, `Ride` — the ask recorded
+///   before the one act (`ModelRecord::asked`) and what the new process then
+///   runs (`live_model_at`: its launch flag until it answers).
+///
+/// TRANSCRIBED, not driven (a change there passes the bind): `model_judge`'s
+/// and `model_read_kept`'s I/O (loading and saving the record, reading the
+/// transcript, the ledger rows); the offer itself (`upgrade_models::offered`
+/// over the build's catalog, the list and `availableModels`); `visit_models`' derivation of the announced model (the upgrade's
+/// `model_list` while `Phase::Announced`) and of `build_restart` (a newer
+/// build is due); the cheap pre-filter `model_wants_a_look`; `Announce`
+/// (`St::for_target` and the notice carrying `model_to` as `model_list`);
+/// `GiveUp` (`St::give_up`); `restart`'s ask of `st.model_list` and the
+/// relaunch line (`relaunch::with_model`); `Refused`'s `St::unsent`; and
+/// which view (managed or native) `visit_models` and `riding_model_in` judge
+/// the session by, and the pre-filter's keep rule over two views — the model
+/// has one view.
+///
+/// The projection. Models are the seed list (`upgrade_models::SEED`) plus one
+/// it does not name: `live` is `1` = `claude-opus-5-5` (rank 1, Opus), `2` =
+/// `claude-fable-5-1` (rank 2, Fable), `3` = `claude-opus-5` (rank 3, Opus),
+/// `4` = `claude-sonnet-5` (off the list), `0` = unread (`model-unknown`);
+/// `cmd` = it is a `/model` result newer than the last answer
+/// (`LiveModel::by_command`). The offer `tgt` is `1` (every seed model
+/// available: `offered` = `[claude-opus-5-5, claude-fable-5-1,
+/// claude-opus-5]`), `3` (only `claude-opus-5`: every move would be DOWN) or
+/// `0` (nothing offered), so the only model ever due, announced or asked for
+/// is `claude-opus-5-5`, and the
+/// record's `set`/`ap`/`fl`/`due` are that model's ask, applied, failed and
+/// due-clock bits; `sage` = `MODEL_SETTLE_S` has passed since `set_at`,
+/// `dover` = `MODEL_WARM_MAX_S` since `due_since`, `cold` = no answer for
+/// `CACHE_COLD_S`. `hum` = the remembered `/model` (`ModelRecord::human`) is
+/// `claude-fable-5-1` — the only memory that can protect anything here, as
+/// the only live model outside the target's family that the rule may move.
+/// `flag` = the process was relaunched by this harness with `--model
+/// claude-opus-5-5`; `PersonFlag` = before that it was launched with a
+/// person's own `--model`: `1` an id (`claude-fable-5-1` in the model), `2` a
+/// family ALIAS (`fable`, `opus`: `model-alias`, see above); `DefaultFable` =
+/// the settings' default is Fable, `Build` = a newer build is due all along. `phase` = the
+/// upgrade is `0` not announced, `1` announced (`Phase::Announced`), `2` gave
+/// up (`Phase::Failed(GAVE_UP)`: it stops asking, and a late READY still
+/// restarts it — with the `model_list` the notice carried, `ann`); `ann` =
+/// the notice carried the model. `fresh`/`mto` = the state is the one a visit
+/// just left, and that visit's `model_to`: the laws are about THAT decision,
+/// read against the inputs it was made on.
+///
+/// Laws, one invariant each, and `Buggy = 1` arms at least one mutant per law
+/// (two for `SettleRecordsWhatRan` and for `NeverOntoAppliedOrFailed`) — each
+/// an action whose healthy branch changes nothing, firing once from a state
+/// where the defect shows, after which nothing else moves (so the `Buggy = 1`
+/// space stays the healthy one plus the forged states). The first three are
+/// stated over BOTH the rule's verdict (`due`) and the visit's decision
+/// (`mto`), and the decision is EXEMPT while an announced model rides (`phase
+/// == 1 && ann == 1`, `AnnouncedModelRides`):
+///
+/// * `UpTheListOnly` — the verdict, and a decision outside a ride, go only UP
+///   the list: never down, never sideways, never off a model the list does not
+///   name. Mutant `JudgeMovesOffList`: an off-list model's missing rank read
+///   as below everything (`rank(..).unwrap_or(usize::MAX)`), which moves a
+///   person's own pick.
+/// * `PersonsChoiceStaysInFamily` — a person's choice (a launch `--model` not
+///   the harness's, a `/model`, now or remembered, the settings' default by
+///   family) is moved, by the verdict or by a decision outside a ride, only
+///   within its family. Mutant `JudgeForgetsTheRememberedChoice`: the rule
+///   before `18090b6ae`, which read a person's choice only off the launch flag
+///   and a `/model` newer than the last answer — so an answered `/model
+///   claude-fable-5-1` was moved to Opus.
+/// * `NeverOntoAppliedOrFailed` — neither the verdict nor a decision outside a
+///   ride is ever onto a model already applied to the conversation, or after
+///   it failed. Mutants `JudgeRetriesAFailedModel` (the verdict: the failed
+///   record not read, so a model the relaunch did not take is asked for again
+///   every time it is due — a restart loop) and `JudgeReadsAStaleAnnouncement`
+///   (the decision: a gave-up upgrade's `model_list` read as if still
+///   announced, which carries a model recorded FAILED).
+/// * `MovesExactlyWhenTheLadderSays` — a due move is taken exactly when THE
+///   MODEL LADDER says (a cold cache, a restart happening anyway, or the warm
+///   wait over). Mutant `LadderWaitsForCold`: the rule before `2d4656f32`,
+///   which moved only on a cold cache, so an active session never moved (the
+///   2026-09-25 incident: a restart onto 2.1.283 kept `claude-opus-5`).
+/// * `AnnouncedModelRides` — once announced, the model is the one the
+///   relaunch asks for, even after the READY answer re-warms the cache.
+///   Mutant `LadderRetakenAfterReady`: the decision re-taken at every visit,
+///   as before `4f4c00777`, which drops the model half-way.
+/// * `SettleRecordsWhatRan` — an ask that runs is recorded applied, and one
+///   never applied and still not what runs after `MODEL_SETTLE_S` is recorded
+///   failed and cleared. Mutants `SettleNeverFails` (the ask stays pending, so
+///   the same model is asked for again) and `SettleNeverVerifies` (never
+///   applied, so a person who moves off it by hand is moved back).
+/// * `AppliedAskStands` — an ask once applied is never recorded failed: it
+///   ran. Mutant `SettleFailsAnAskThatRan`: the settle step before
+///   2026-09-27, whose failed arm did not read `applied`, so a person's later
+///   `/model` turned a verified ask into a `model-failed` one and the
+///   harness's own `--model` then read as a person's.
+///
+/// OPEN — the ride's exemption is a gap in the CODE, not a convenience of the
+/// model: an announced model rides whatever this visit decides, and a
+/// gave-up upgrade's late READY relaunches with the `model_list` its notice
+/// carried, so the relaunch asks for `claude-opus-5-5` (a) after it was
+/// recorded FAILED, (b) over a person's `/model claude-fable-5-1` typed after
+/// the notice (across families), and (c) off a model the list does not name.
+/// `aterm-spec`'s `derived_harness_model_switch_open_ride_gaps_are_reachable`
+/// pins each as reachable here; a fix re-takes those three laws inside the
+/// ride too, and flips that test.
+///
+/// What this does NOT cover is listed in the Tier-1 file's header; the
+/// largest omissions are a second family member above the person's (the
+/// target is always Opus), a person's own relaunch, the owner's `--now`
+/// re-arming a gave-up upgrade, a restart made for another reason while an
+/// upgrade is announced, and clock skew.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_model_switch_model() -> Model {
+    crate::ty_model! {
+        HarnessModelSwitch {
+            const Buggy = 0;
+            const DefaultFable = 0;
+            const PersonFlag = 0;
+            const Build = 0;
+
+            var live = 3;
+            var cmd = 0;
+            var flag = 0;
+            var cold = 0;
+            var tgt = 1;
+            var set = 0;
+            var sage = 0;
+            var ap = 0;
+            var fl = 0;
+            var hum = 0;
+            var due = 0;
+            var dover = 0;
+            var phase = 0;
+            var ann = 0;
+            var fresh = 0;
+            var mto = 0;
+            var forged = 0;
+
+            // -- the world: every step ends the visit's freshness -----------
+
+            // The conversation answers: the cache is warm, and a `/model`
+            // before it is no longer newer than the last answer.
+            action Answer when (forged == 0) {
+                cold = 0;
+                cmd = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            action GoCold when (forged == 0 && cold == 0) {
+                cold = 1;
+                fresh = 0;
+                mto = 0;
+            }
+            // Availability moves the target: Opus 5.5, only Opus 5, none.
+            action Retarget when (forged == 0) {
+                tgt = if tgt == 1 { 3 } else if tgt == 3 { 0 } else { 1 };
+                fresh = 0;
+                mto = 0;
+            }
+            // A person's `/model`: Fable, or a model the list does not name.
+            action PersonTypesModel when (forged == 0) {
+                live = if live == 2 { 4 } else { 2 };
+                cmd = 1;
+                fresh = 0;
+                mto = 0;
+            }
+            // The tail holds no answer (a long tool result): unread.
+            action LoseSight when (forged == 0 && live > 0) {
+                live = 0;
+                cmd = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            action SettleElapses when (forged == 0 && set == 1 && sage == 0) {
+                sage = 1;
+                fresh = 0;
+                mto = 0;
+            }
+            action WarmWaitElapses when (forged == 0 && due == 1 && dover == 0) {
+                dover = 1;
+                fresh = 0;
+                mto = 0;
+            }
+
+            // -- the harness -------------------------------------------------
+
+            // `model_read_step` + `model_to`, as one visit. The settle step's
+            // failed arm fires only on an ask never applied.
+            action Visit when (forged == 0) {
+                ap = if set == 1 && live == 1 { 1 } else { ap };
+                fl = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 1 } else { fl };
+                set = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 0 } else { set };
+                sage = if set == 1 && (live <= 0 || live > 1) && sage == 1 && ap == 0 { 0 } else { sage };
+                hum = if (tgt > 0 || set == 1) && cmd == 1 {
+                    if live == 2 { 1 } else { 0 }
+                } else {
+                    hum
+                };
+                due = if (if tgt == 1 && ap == 0 && fl == 0 && (set == 0 || sage == 0) &&
+                    (flag == 1 || PersonFlag <= 1) {
+                    if live == 3 {
+                        1
+                    } else if live == 2 {
+                        if (flag == 0 && PersonFlag == 1) || (flag == 1 && set == 0) ||
+                            cmd == 1 || hum == 1 || DefaultFable == 1 { 0 } else { 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }) == 1 {
+                    1
+                } else if tgt > 0 && live <= 0 && (flag == 1 || PersonFlag <= 1) {
+                    due
+                } else {
+                    0
+                };
+                dover = if (if tgt == 1 && ap == 0 && fl == 0 && (set == 0 || sage == 0) &&
+                    (flag == 1 || PersonFlag <= 1) {
+                    if live == 3 {
+                        1
+                    } else if live == 2 {
+                        if (flag == 0 && PersonFlag == 1) || (flag == 1 && set == 0) ||
+                            cmd == 1 || hum == 1 || DefaultFable == 1 { 0 } else { 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }) == 1 {
+                    if due == 1 { dover } else { 0 }
+                } else if tgt > 0 && live <= 0 && (flag == 1 || PersonFlag <= 1) {
+                    dover
+                } else {
+                    0
+                };
+                mto = if phase == 1 && ann == 1 {
+                    1
+                } else if (if tgt == 1 && ap == 0 && fl == 0 && (set == 0 || sage == 0) &&
+                    (flag == 1 || PersonFlag <= 1) {
+                    if live == 3 {
+                        1
+                    } else if live == 2 {
+                        if (flag == 0 && PersonFlag == 1) || (flag == 1 && set == 0) ||
+                            cmd == 1 || hum == 1 || DefaultFable == 1 { 0 } else { 1 }
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                }) == 1 && (cold == 1 || Build == 1 || (due == 1 && dover == 1)) {
+                    1
+                } else {
+                    0
+                };
+                fresh = 1;
+            }
+            // The notice, carrying that visit's `model_to`: a restart with
+            // nothing to carry is a build's; a build-only notice is
+            // retargeted when a model becomes due. A gave-up upgrade is not
+            // announced again (`St::for_target` reuses a FAILED state for the
+            // build, whatever model would ride).
+            action Announce when (
+                forged == 0 && fresh == 1 &&
+                ((phase == 0 && (mto == 1 || Build == 1)) || (phase == 1 && ann == 0 && mto == 1))
+            ) {
+                phase = 1;
+                ann = mto;
+                fresh = 0;
+                mto = 0;
+            }
+            // READY — to a standing notice, or a late one after the upgrade
+            // gave up: the ask recorded, the agent ended, the relaunch runs
+            // what its line asks — the notice's model, else the launch flag it
+            // kept, else what the transcript last named. There is a restart
+            // to make only while a build is due or this visit moves the model.
+            action Relaunch when (forged == 0 && fresh == 1 && phase > 0 && (Build == 1 || mto == 1)) {
+                set = if ann == 1 { 1 } else { set };
+                sage = if ann == 1 { 0 } else { sage };
+                flag = if ann == 1 { 1 } else { flag };
+                live = if ann == 1 || flag == 1 { 1 } else if PersonFlag == 1 { 2 } else { live };
+                cmd = if ann == 1 || flag == 1 || PersonFlag == 1 { 0 } else { cmd };
+                phase = 0;
+                ann = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            // The relaunch asked for the model, and Claude Code runs another.
+            action RelaunchRunsOther when (
+                forged == 0 && fresh == 1 && phase > 0 && ann == 1 && (Build == 1 || mto == 1)
+            ) {
+                set = 1;
+                sage = 0;
+                flag = 1;
+                live = 3;
+                cmd = 0;
+                phase = 0;
+                ann = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            // The ask recorded, the signal refused: nothing relaunched, the
+            // phase as it was (`St::unsent`).
+            action Refused when (
+                forged == 0 && fresh == 1 && phase > 0 && ann == 1 && (Build == 1 || mto == 1)
+            ) {
+                set = 1;
+                sage = 0;
+                fresh = 0;
+                mto = 0;
+            }
+            // No READY the restart could act on: the upgrade stops asking. It
+            // keeps the notice's `model_list`, and a late READY still restarts.
+            action GiveUp when (forged == 0 && phase == 1) {
+                phase = 2;
+                fresh = 0;
+                mto = 0;
+            }
+            // A restart made for another reason carries the due model.
+            action Ride when (forged == 0 && fresh == 1 && phase == 0 && due == 1 && live > 0) {
+                set = 1;
+                sage = 0;
+                flag = 1;
+                live = 1;
+                cmd = 0;
+                fresh = 0;
+                mto = 0;
+            }
+
+            // -- the defects; every healthy branch changes nothing ----------
+
+            action JudgeMovesOffList when (
+                forged == 0 && tgt == 1 && live == 4 && cmd == 0 && sage == 0 &&
+                ap == 0 && fl == 0 && phase == 0 &&
+                ((flag == 0 && PersonFlag == 0) || (flag == 1 && set == 1))
+            ) {
+                due = if Buggy == 1 { 1 } else { due };
+                mto = if Buggy == 1 {
+                    if cold == 1 || Build == 1 || (due == 1 && dover == 1) { 1 } else { 0 }
+                } else {
+                    mto
+                };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            action JudgeForgetsTheRememberedChoice when (
+                forged == 0 && tgt == 1 && live == 2 && cmd == 0 && sage == 0 &&
+                ap == 0 && fl == 0 && phase == 0 &&
+                ((flag == 0 && PersonFlag == 0) || (flag == 1 && set == 1)) &&
+                (hum == 1 || DefaultFable == 1)
+            ) {
+                due = if Buggy == 1 { 1 } else { due };
+                mto = if Buggy == 1 {
+                    if cold == 1 || Build == 1 || (due == 1 && dover == 1) { 1 } else { 0 }
+                } else {
+                    mto
+                };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            action JudgeRetriesAFailedModel when (
+                forged == 0 && tgt == 1 && live == 3 && cmd == 0 && sage == 0 &&
+                ap == 0 && fl == 1 && phase == 0
+            ) {
+                due = if Buggy == 1 { 1 } else { due };
+                mto = if Buggy == 1 {
+                    if cold == 1 || Build == 1 || (due == 1 && dover == 1) { 1 } else { 0 }
+                } else {
+                    mto
+                };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // The decision, not the verdict: the verdict is right (nothing is
+            // due — the model failed), and a gave-up upgrade's `model_list` is
+            // carried as if the notice still stood.
+            action JudgeReadsAStaleAnnouncement when (
+                forged == 0 && phase == 2 && ann == 1 && fl == 1 && due == 0 && live > 0
+            ) {
+                mto = if Buggy == 1 { 1 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            action LadderWaitsForCold when (
+                forged == 0 && tgt == 1 && live == 3 && cmd == 0 && sage == 0 &&
+                ap == 0 && fl == 0 && phase == 0 && cold == 0 &&
+                (Build == 1 || (due == 1 && dover == 1))
+            ) {
+                due = if Buggy == 1 { 1 } else { due };
+                mto = if Buggy == 1 { 0 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // Re-taken where the fresh decision would not carry the model: the
+            // READY answer warmed the cache (and nothing else says move), or
+            // the target moved away since the notice.
+            action LadderRetakenAfterReady when (
+                forged == 0 && live == 3 && cmd == 0 && sage == 0 && phase == 1 && ann == 1 && (
+                    (tgt == 1 && ap == 0 && fl == 0 && cold == 0 && Build == 0 &&
+                        (due == 0 || dover == 0)) ||
+                    (tgt == 3 && due == 0)
+                )
+            ) {
+                due = if Buggy == 1 && tgt == 1 { 1 } else { due };
+                mto = if Buggy == 1 { 0 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            action SettleNeverFails when (
+                forged == 0 && set == 1 && sage == 1 && live > 1 && ap == 0 && tgt == 3 &&
+                cmd == 0 && due == 0 && phase == 0
+            ) {
+                mto = if Buggy == 1 { 0 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            action SettleNeverVerifies when (
+                forged == 0 && set == 1 && live == 1 && ap == 0 && tgt == 3 &&
+                cmd == 0 && due == 0 && phase == 0
+            ) {
+                mto = if Buggy == 1 { 0 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+            // The failed arm without its `applied` test: an ask that ran, and
+            // a person has since moved off, recorded failed and cleared.
+            action SettleFailsAnAskThatRan when (
+                forged == 0 && set == 1 && sage == 1 && ap == 1 && fl == 0 && live > 1 &&
+                due == 0 && phase == 0
+            ) {
+                set = if Buggy == 1 { 0 } else { set };
+                sage = if Buggy == 1 { 0 } else { sage };
+                fl = if Buggy == 1 { 1 } else { fl };
+                mto = if Buggy == 1 { 0 } else { mto };
+                fresh = if Buggy == 1 { 1 } else { fresh };
+                forged = if Buggy == 1 { 1 } else { forged };
+            }
+
+            // A visit's verdict is DUE exactly when it leaves the clock running
+            // on a model it could read (`model-unknown` leaves the clock as it
+            // was): `fresh == 1 && due == 1 && live > 0`. Its decision is
+            // `mto`, exempt from the first three laws only while an announced
+            // model rides (`phase == 1 && ann == 1`: OPEN, see above).
+
+            // Up the list only: the move is onto the target, a listed model
+            // ranked above the live one, and the live one is on the list.
+            invariant UpTheListOnly:
+                fresh == 0 || (tgt == 1 && live > 1 && live <= 3) ||
+                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+            // A person's choice moves only within its family (the target's is
+            // Opus: `1` and `3`).
+            invariant PersonsChoiceStaysInFamily:
+                fresh == 0 || live == 1 || live == 3 ||
+                (if (flag == 0 && PersonFlag > 0) || (flag == 1 && set == 0) || cmd == 1 ||
+                    (live == 2 && (hum == 1 || DefaultFable == 1)) { 0 } else { 1 }) == 1 ||
+                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+            invariant NeverOntoAppliedOrFailed:
+                fresh == 0 || (ap == 0 && fl == 0) ||
+                ((due == 0 || live <= 0) && (mto == 0 || (phase == 1 && ann == 1)));
+            // Outside an announcement, the visit's `model_to` is the due move
+            // exactly when the ladder takes it.
+            invariant MovesExactlyWhenTheLadderSays:
+                fresh == 0 || (phase == 1 && ann == 1) ||
+                mto == (if due == 1 && live > 0 && (cold == 1 || Build == 1 || dover == 1) { 1 } else { 0 });
+            invariant AnnouncedModelRides:
+                fresh == 0 || phase <= 0 || phase > 1 || ann == 0 || mto == 1;
+            invariant SettleRecordsWhatRan:
+                fresh == 0 || set == 0 || (live == 1 && ap == 1) ||
+                ((live <= 0 || live > 1) && (ap == 1 || sage == 0));
+            invariant AppliedAskStands:
+                ap == 0 || set == 1;
         }
     }
 }

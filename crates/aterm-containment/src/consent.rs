@@ -1090,20 +1090,25 @@ fn codesign_report(root: &Path) -> Option<String> {
             "--verbose=2".as_ref(),
             root.as_os_str(),
         ],
+        CODESIGN_CEILING,
     )?;
     Some(format!("{out}\n{err}"))
 }
 
-/// Run one of Apple's tools with stdin closed, within [`CODESIGN_CEILING`]:
-/// whether it succeeded, then its stdout and its stderr — each read on its own
-/// thread, so output larger than a pipe's buffer cannot wedge the tool. `None`
-/// when it cannot run or does not finish, and when either stream is over
-/// [`TOOL_OUTPUT_MAX_BYTES`] or is not UTF-8: a report read in part is not
-/// read. Gated native-only first, as the wasm census reads gates: its
-/// reader threads are never part of the wasm module.
+/// Run one of Apple's tools with stdin closed, within `ceiling` (for
+/// `codesign`, [`CODESIGN_CEILING`]): whether it succeeded, then its stdout and
+/// its stderr — each read on its own thread, so output larger than a pipe's
+/// buffer cannot wedge the tool. `None` when it cannot run or does not finish,
+/// and when either stream is over [`TOOL_OUTPUT_MAX_BYTES`] or is not UTF-8: a
+/// report read in part is not read. Gated native-only first, as the wasm census
+/// reads gates: its reader threads are never part of the wasm module.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(target_os = "macos")]
-fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String, String)> {
+fn run_bounded(
+    program: &str,
+    args: &[&std::ffi::OsStr],
+    ceiling: std::time::Duration,
+) -> Option<(bool, String, String)> {
     use std::io::Read as _;
     use std::process::{Command, Stdio};
     fn drain(
@@ -1142,7 +1147,7 @@ fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String
     };
     // wasm-clock-guard: allow — `run_bounded` is `#[cfg(target_os = "macos")]`
     // (it runs Apple's tools), so neither clock read below reaches wasm.
-    let deadline = std::time::Instant::now() + CODESIGN_CEILING;
+    let deadline = std::time::Instant::now() + ceiling;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1157,6 +1162,22 @@ fn run_bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String
             }
         }
     };
+    // The ceiling bounds the readers too, not only the exit (the product
+    // fd-hygiene sweep of 2026-09-27). A reader ends at EOF, and EOF needs every
+    // copy of its pipe's write end closed. A copy can outlive the tool: a
+    // grandchild it left in the background, or a stranger another thread spawned
+    // inside std's non-atomic `pipe()`-then-`FIOCLEX` on macOS — an unflagged
+    // descriptor survives that child's exec, and an update successor lives for
+    // the login session. Joined without a bound, that wedged the census, the
+    // Trash's worker or the privacy verb for as long as the stranger lived. A
+    // reader left unjoined is detached, and ends when the last copy closes.
+    while !(out.is_finished() && err.is_finished()) {
+        // wasm-clock-guard: allow — the same macOS-only function.
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
     let out = out.join().ok()??;
     let err = err.join().ok()??;
     Some((status.success(), out, err))
@@ -2887,23 +2908,39 @@ mod imp {
 
     /// The ONE probe syscall: open, close, never read.
     pub(super) fn open_probe(db: &Path) -> ProbeOutcome {
+        match probe_descriptor(db) {
+            Ok(fd) => {
+                // Closed at once; the contents are never read.
+                drop(fd);
+                ProbeOutcome::Ok
+            }
+            Err(errno) => ProbeOutcome::Errno(errno),
+        }
+    }
+
+    /// The probe's `open`, close-on-exec from its creation (the product
+    /// fd-hygiene sweep of 2026-09-27). The GUI probes while other threads
+    /// spawn, and a child spawned between this open and its close keeps every
+    /// descriptor that is not flagged: an unflagged one survives the exec, so
+    /// the child would hold a handle on `TCC.db` it never passed TCC for — and,
+    /// flag still clear, hand it on to every child of its own. `O_CLOEXEC` is
+    /// applied atomically by `open(2)`, so no spawn can see it unflagged.
+    pub(super) fn probe_descriptor(db: &Path) -> Result<std::os::fd::OwnedFd, i32> {
+        use std::os::fd::FromRawFd as _;
         let Ok(path) = CString::new(db.as_os_str().as_bytes()) else {
             // Unreachable: the caller already rejected interior NULs. Report
             // an errno rather than panicking in a probe.
-            return ProbeOutcome::Errno(libc::EINVAL);
+            return Err(libc::EINVAL);
         };
         // SAFETY: `path` is a valid NUL-terminated C string that outlives the
-        // call; `O_RDONLY` takes no third argument.
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY) };
+        // call; `O_RDONLY | O_CLOEXEC` takes no third argument.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
-            return ProbeOutcome::Errno(errno());
+            return Err(errno());
         }
-        // SAFETY: `fd` is a descriptor this call just created and no longer
-        // uses. The contents are never read.
-        unsafe {
-            libc::close(fd);
-        }
-        ProbeOutcome::Ok
+        // SAFETY: `fd` is a descriptor this call just created, owned by nothing
+        // else; the `OwnedFd` closes it exactly once.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
     }
 
     /// `errno` for the immediately preceding call.
@@ -4217,7 +4254,13 @@ mod tests {
     #[test]
     fn a_tool_report_read_in_part_is_no_report() {
         let bytes = |count: u64| format!("head -c {count} /dev/zero");
-        let sh = |script: &str| run_bounded("/bin/sh", &["-c".as_ref(), script.as_ref()]);
+        let sh = |script: &str| {
+            run_bounded(
+                "/bin/sh",
+                &["-c".as_ref(), script.as_ref()],
+                CODESIGN_CEILING,
+            )
+        };
         assert_eq!(sh(&bytes(TOOL_OUTPUT_MAX_BYTES + 1)), None);
         assert_eq!(sh("printf '\\377'"), None);
         let whole = sh(&bytes(TOOL_OUTPUT_MAX_BYTES)).expect("a report at the cap");
@@ -4225,6 +4268,76 @@ mod tests {
         assert_eq!(
             u64::try_from(whole.1.len()).ok(),
             Some(TOOL_OUTPUT_MAX_BYTES)
+        );
+    }
+
+    /// The ceiling bounds the whole run, not only the tool's exit (the product
+    /// fd-hygiene sweep of 2026-09-27): a grandchild the tool left holding its
+    /// stdout and stderr keeps both readers short of EOF after the tool is gone,
+    /// the shape a stranger that inherited a write end takes too. The run gives
+    /// up at its ceiling rather than waiting the holder out.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_pipe_held_open_past_the_tool_cannot_outlast_the_ceiling() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-run-bounded-hold-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("holder.pid");
+        let script = format!("sleep 20 & echo $! > '{}'", pid_file.display());
+        let started = std::time::Instant::now();
+        let ran = run_bounded(
+            "/bin/sh",
+            &["-c".as_ref(), script.as_ref()],
+            std::time::Duration::from_secs(2),
+        );
+        let took = started.elapsed();
+        let holder = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok());
+        if let Some(pid) = holder {
+            // SAFETY: kill(2) of the background `sleep` this test started.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            holder.is_some(),
+            "the tool ran to its end and left a holder"
+        );
+        assert_eq!(ran, None, "a stream still open at the ceiling is no report");
+        assert!(
+            took < std::time::Duration::from_secs(10),
+            "the run outlasted its ceiling waiting on the holder: {took:?}"
+        );
+    }
+
+    /// The FDA probe's descriptor is close-on-exec from its open (the product
+    /// fd-hygiene sweep of 2026-09-27): a child another thread spawns between the
+    /// probe's open and its close must not carry a handle on `TCC.db` past its
+    /// exec.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_fda_probe_descriptor_is_close_on_exec_from_its_open() {
+        use std::os::fd::AsRawFd as _;
+        let path = std::env::temp_dir().join(format!("aterm-fda-probe-{}", std::process::id()));
+        std::fs::write(&path, b"").unwrap();
+        let fd = imp::probe_descriptor(&path).expect("the probe opens a readable file");
+        // SAFETY: F_GETFD only reads the flags of the descriptor `fd` owns.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+        drop(fd);
+        assert_eq!(imp::open_probe(&path), ProbeOutcome::Ok);
+        let _ = std::fs::remove_file(&path);
+        assert!(flags >= 0, "F_GETFD failed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the probe's descriptor must not survive a concurrent spawn's exec"
+        );
+        assert_eq!(
+            imp::open_probe(&path),
+            ProbeOutcome::Errno(libc::ENOENT),
+            "a missing file is its errno"
         );
     }
 

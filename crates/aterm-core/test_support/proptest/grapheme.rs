@@ -8,9 +8,19 @@
 
 use proptest::prelude::*;
 
+/// This module's checked-in seed corpus. See `seed_corpus` in
+/// `src/tests/proptest/mod.rs` for why the path is spelled out rather than left
+/// to proptest's default derivation.
+const SEEDS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/proptest-regressions/tests/proptest/grapheme.txt"
+);
+
 // ============== Grapheme Property Tests (#1931) ==============
 
 proptest! {
+    #![proptest_config(super::seed_corpus(SEEDS))]
+
     /// Grapheme display width is always 0, 1, or 2.
     ///
     /// Property: For any single grapheme, display width is bounded [0, 2].

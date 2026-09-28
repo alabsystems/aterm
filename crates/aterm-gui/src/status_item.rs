@@ -260,6 +260,12 @@ pub(crate) struct Escalation {
     pub label: String,
     /// The notification body: `<tab title>: <what>`.
     pub body: String,
+    /// A fact about the MACHINE, not the tab: an agent that cannot reach
+    /// its API ([`crate::presence::API_UNREACHABLE`]). Every tab on the
+    /// same network meets it at once, so the herald notifies it once for
+    /// all of them while any tab still shows it ([`Herald::note`]); each
+    /// tab keeps its menu row.
+    pub shared: bool,
 }
 
 /// Byte budget for the tab title inside a row or a notification.
@@ -323,19 +329,19 @@ fn text_key(s: &str) -> u64 {
 fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
     match fact.word {
         "prompt" => {
-            // `bash:not-read-only` names the box's kind before the colon.
-            let kind = fact
-                .detail
-                .as_deref()
-                .and_then(|d| d.split(':').next())
-                .filter(|k| !k.is_empty())
-                .unwrap_or("approval");
-            let what = match fact.subject.as_deref().filter(|s| !s.is_empty()) {
-                Some(subject) => format!("{kind} {subject}"),
-                None if kind == "approval" => kind.to_string(),
-                None => format!("{kind} approval"),
+            // `bash:not-read-only` names the box's kind before the colon, in
+            // the band's words; the question tool's box is a question.
+            let kind = crate::presence::prompt_kind_words(fact.detail.as_deref());
+            let escalation = if kind == Some("question") {
+                EscalationKind::Question
+            } else {
+                EscalationKind::Prompt
             };
-            Some((EscalationKind::Prompt, what))
+            let what = match fact.subject.as_deref().filter(|s| !s.is_empty()) {
+                Some(subject) => format!("{} {subject}", kind.unwrap_or("approval")),
+                None => crate::presence::prompt_band_word(fact.detail.as_deref()),
+            };
+            Some((escalation, what))
         }
         "question" => Some((EscalationKind::Question, "question".to_string())),
         // The server's own stall word: the row normally comes from
@@ -354,6 +360,13 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
                 aterm_phase::resume_hint(aterm_phase::Program::Claude).unwrap_or("resume it")
             ),
         )),
+        // An API error the network caused says its cause (the verdict's
+        // host-side subject, `presence::api_cause_words`): `can't reach the
+        // API`, never a bare `API error`.
+        "wall:api-error" if fact.subject.as_deref().is_some_and(|s| !s.is_empty()) => Some((
+            EscalationKind::Wall,
+            fact.subject.clone().unwrap_or_default(),
+        )),
         word => {
             // `wall:usage-session` → `usage-session`, the kind aterm-phase
             // names, said in a person's words; a reset time rides it.
@@ -369,9 +382,10 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
     }
 }
 
-/// A wall kind (`aterm_phase::WallKind::name`) in the words the menu row and
-/// the notification say; a kind this build does not know stays as it came.
-fn wall_words(kind: &str) -> &str {
+/// A wall kind (`aterm_phase::WallKind::name`) in the words the menu row,
+/// the notification and the band say; a kind this build does not know stays
+/// as it came.
+pub(crate) fn wall_words(kind: &str) -> &str {
     match kind {
         "usage-session" => "session usage limit",
         "usage-weekly" => "weekly usage limit",
@@ -381,6 +395,7 @@ fn wall_words(kind: &str) -> &str {
         "auth" => "logged out",
         "api-error" => "API error",
         "overloaded" => "service overloaded",
+        "memory" => "memory critical",
         other => other,
     }
 }
@@ -456,6 +471,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: stall.key,
             label: format!("⚠ {body}"),
             body,
+            shared: false,
         });
     }
     if let Some(message) = row
@@ -476,6 +492,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: text_key(message),
             label,
             body: body_for(&what),
+            shared: false,
         });
     }
     if let Some(fact) = &row.agent
@@ -498,6 +515,8 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: fact.rev,
             label: format!("⚠ {body}"),
             body,
+            shared: fact.word == "wall:api-error"
+                && fact.subject.as_deref() == Some(crate::presence::API_UNREACHABLE),
         });
     }
     let stripped = stripped_title(&row.title);
@@ -509,6 +528,7 @@ pub(crate) fn escalation(row: &SessionRow) -> Option<Escalation> {
             key: text_key(&text),
             body: fold_clip(&text, ROW_WHAT_MAX),
             label: text,
+            shared: false,
         });
     }
     None
@@ -586,6 +606,9 @@ pub(crate) enum HeraldQuiet {
     /// [`NOTIFY_SESSION_FLOOR`] or [`NOTIFY_BURST`] held it back: it is OWED,
     /// and posted (coalesced) when the limit allows ([`Herald::due`]).
     Limited,
+    /// A machine's fact ([`Escalation::shared`]) another tab already shows:
+    /// told once for every tab that meets it.
+    Shared,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -601,6 +624,18 @@ struct HeraldSlot {
     /// coalesced notice once the limit allows, and dropped when the
     /// escalation clears or the human looks.
     owed: u32,
+    /// What is shown is a machine's fact ([`Escalation::shared`]).
+    shared: bool,
+    /// The machine's fact shown here has been TOLD: this tab posted it, the
+    /// human was looking at this tab when it arrived, or it was quieted as
+    /// [`HeraldQuiet::Shared`] because another tab had told it. Only a told
+    /// fact quiets another tab — a notice the limit merely held back
+    /// ([`HeraldQuiet::Limited`]) is owed, not told, and must not spend the
+    /// other tabs' notices (review, 2026-09-27: a first tab held back by
+    /// [`NOTIFY_BURST`] then quieted every later tab, and was itself quieted
+    /// when re-heralded, so the outage was never told at all). Cleared with
+    /// what is shown.
+    told: bool,
 }
 
 /// THE ESCALATION HERALD: per session, folds the current [`escalation`] into
@@ -645,6 +680,14 @@ impl Herald {
             // session's late refresh must not re-grow the map).
             return HeraldOutcome::default();
         }
+        // Another tab already shows the same machine's fact AND it has been
+        // told (read before this tab's slot is taken). A tab that only OWES
+        // its notice does not count: it has told nobody yet.
+        let shared_elsewhere = current.is_some_and(|e| e.shared)
+            && self
+                .slots
+                .iter()
+                .any(|(other, s)| *other != session && s.shared && s.shown.is_some() && s.told);
         let slot = self.slots.entry(session).or_default();
         let ident = current.map(|e| (e.kind, e.key));
         let label = current.map(|e| e.label.clone());
@@ -660,11 +703,14 @@ impl Herald {
         let Some(esc) = current else {
             slot.shown = None;
             slot.owed = 0;
+            slot.shared = false;
+            slot.told = false;
             return HeraldOutcome {
                 row_moved,
                 notice: None,
             };
         };
+        slot.shared = esc.shared;
         if slot.shown == ident {
             if slot.owed == 0 {
                 return quiet(self, HeraldQuiet::Same);
@@ -672,6 +718,16 @@ impl Herald {
         } else {
             slot.shown = ident;
             slot.owed += 1;
+            slot.told = false;
+        }
+        // A MACHINE'S FACT another tab has already told (the outage of
+        // 2026-09-27: every tab met `Can't reach the API server` at once):
+        // told once for all of them, while any still shows it — each tab
+        // keeps its row. A new outage, after every tab cleared, is told again.
+        if shared_elsewhere {
+            slot.owed = 0;
+            slot.told = true;
+            return quiet(self, HeraldQuiet::Shared);
         }
         // A notice is wanted for what is shown now (a transition, or one the
         // limit held back earlier).
@@ -680,7 +736,10 @@ impl Herald {
             return quiet(self, HeraldQuiet::Silent);
         }
         if looking {
+            // The human sees it on this tab: for a machine's fact, that is
+            // the fact told for every tab.
             slot.owed = 0;
+            slot.told = true;
             return quiet(self, HeraldQuiet::Looking);
         }
         let notified_at = slot.notified_at;
@@ -699,6 +758,7 @@ impl Herald {
         };
         let more = slot.owed.saturating_sub(1);
         slot.owed = 0;
+        slot.told = true;
         slot.notified_at = Some(now);
         self.recent.push_back(now);
         let body = if more == 0 {
@@ -2031,6 +2091,175 @@ mod tests {
         assert_ne!(text_key(&first.label), text_key(&later.label));
     }
 
+    /// AN OUTAGE IS TOLD ONCE, NOT PER TAB (the outage of 2026-09-27: every
+    /// tab met `Can't reach the API server` at once). Each unsupervised tab's
+    /// row says the cause (`can't reach the API`, the verdict's host-side
+    /// subject, never a bare `API error`), but the notification is posted for
+    /// the first tab alone while any tab still shows it; once every tab has
+    /// cleared, the next outage is told again. NEGATIVE CONTROLS: the server's
+    /// own failure on two tabs is two tab facts (two notices, the session
+    /// floor and burst aside), and a reply cut off is a tab's fact too.
+    #[test]
+    fn an_api_outage_is_one_notice_for_every_tab() {
+        let api = |id: u64, rev: u64, subject: Option<&str>| SessionRow {
+            id,
+            title: format!("tab {id}"),
+            agent: Some(AgentFact {
+                word: "wall:api-error",
+                detail: None,
+                rev,
+                subject: subject.map(str::to_string),
+            }),
+            ..SessionRow::default()
+        };
+        let unreachable = |id, rev| api(id, rev, Some(crate::presence::API_UNREACHABLE));
+        let first = escalation(&unreachable(1, 3)).expect("a row");
+        assert_eq!(first.kind, EscalationKind::Wall);
+        assert!(first.shared);
+        assert!(
+            first.label.ends_with("tab 1: can't reach the API"),
+            "{}",
+            first.label
+        );
+        let now = std::time::Instant::now();
+        let mut h = Herald::default();
+        assert!(h.note(1, Some(&first), false, now).notice.is_some());
+        for id in 2..=5 {
+            let tab = escalation(&unreachable(id, 7)).expect("a row");
+            let out = h.note(id, Some(&tab), false, now + NOTIFY_BURST_WINDOW * 2);
+            assert!(out.row_moved, "each tab keeps its row");
+            assert!(out.notice.is_none(), "tab {id}");
+            assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+        }
+        assert_eq!(
+            h.due(now + NOTIFY_BURST_WINDOW * 3).0,
+            Vec::<u64>::new(),
+            "nothing owed"
+        );
+        // Every tab clears; the next outage is told again.
+        for id in 1..=5 {
+            let _ = h.note(id, None, false, now + NOTIFY_BURST_WINDOW * 4);
+        }
+        let again = escalation(&unreachable(3, 9)).expect("a row");
+        assert!(
+            h.note(3, Some(&again), false, now + NOTIFY_BURST_WINDOW * 5)
+                .notice
+                .is_some()
+        );
+
+        // The controls: the server's failure and a cut-off are each a tab's.
+        let server = escalation(&api(6, 1, None)).expect("a row");
+        assert!(!server.shared);
+        assert!(
+            server.label.ends_with("tab 6: API error"),
+            "{}",
+            server.label
+        );
+        let cut = escalation(&api(7, 1, Some(crate::presence::API_CUT_OFF))).expect("a row");
+        assert!(!cut.shared);
+        assert!(cut.label.ends_with("tab 7: reply cut off"), "{}", cut.label);
+        let mut h = Herald::default();
+        let later = now + NOTIFY_BURST_WINDOW * 2;
+        assert!(h.note(6, Some(&server), false, later).notice.is_some());
+        assert!(h.note(7, Some(&cut), false, later).notice.is_some());
+    }
+
+    /// Review (2026-09-27): only a TOLD outage quiets the other tabs. A first
+    /// tab the limit held back owes its notice; a later tab meeting the same
+    /// outage must not be quieted by it (or the re-heralded first tab by the
+    /// later one), or the outage is told to nobody.
+    #[test]
+    fn an_outage_the_limit_held_back_is_still_told_once() {
+        let unreachable = |id: u64, rev: u64| SessionRow {
+            id,
+            title: format!("tab {id}"),
+            agent: Some(AgentFact {
+                word: "wall:api-error",
+                detail: None,
+                rev,
+                subject: Some(crate::presence::API_UNREACHABLE.to_string()),
+            }),
+            ..SessionRow::default()
+        };
+        let other = |id: u64| SessionRow {
+            id,
+            title: format!("tab {id}"),
+            agent: Some(AgentFact {
+                word: "wall:api-error",
+                detail: None,
+                rev: 1,
+                subject: None,
+            }),
+            ..SessionRow::default()
+        };
+        // Fill the instance's burst with three other sessions' notices.
+        let fill = |h: &mut Herald, now| {
+            for id in 100..100 + NOTIFY_BURST as u64 {
+                let e = escalation(&other(id)).expect("a row");
+                assert!(h.note(id, Some(&e), false, now).notice.is_some());
+            }
+        };
+        let now = std::time::Instant::now();
+        let later = now + NOTIFY_BURST_WINDOW;
+
+        // Both tabs meet it while the burst is full: both OWE, neither quiets
+        // the other.
+        let mut h = Herald::default();
+        fill(&mut h, now);
+        let one = escalation(&unreachable(1, 3)).expect("a row");
+        let two = escalation(&unreachable(2, 5)).expect("a row");
+        assert!(h.note(1, Some(&one), false, now).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Limited));
+        assert!(h.note(2, Some(&two), false, now).notice.is_none());
+        assert_eq!(
+            h.last_quiet(),
+            Some(HeraldQuiet::Limited),
+            "an owed notice has told nobody: it must not quiet tab 2"
+        );
+        // The App's timer re-heralds each due session: ONE notice in all.
+        let (due, _) = h.due(later);
+        assert_eq!(due, vec![1, 2]);
+        let posted: Vec<u64> = due
+            .iter()
+            .filter_map(|&id| {
+                let e = if id == 1 { &one } else { &two };
+                h.note(id, Some(e), false, later).notice.map(|n| n.session)
+            })
+            .collect();
+        assert_eq!(posted, vec![1], "told exactly once");
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+        assert_eq!(h.due(later + NOTIFY_BURST_WINDOW).0, Vec::<u64>::new());
+        // A third tab meeting it after the teller cleared is still quieted:
+        // tab 2 was told through tab 1.
+        let _ = h.note(1, None, false, later);
+        let three = escalation(&unreachable(3, 8)).expect("a row");
+        assert!(h.note(3, Some(&three), false, later).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+
+        // The owing first tab CLEARS before its notice is due: the later tab
+        // still showing the outage owes, and tells it.
+        let mut h = Herald::default();
+        fill(&mut h, now);
+        assert!(h.note(1, Some(&one), false, now).notice.is_none());
+        assert!(h.note(2, Some(&two), false, now).notice.is_none());
+        let _ = h.note(1, None, false, now);
+        let (due, _) = h.due(later);
+        assert_eq!(due, vec![2]);
+        let told = h.note(2, Some(&two), false, later).notice.expect("told");
+        assert!(
+            told.body.ends_with("tab 2: can't reach the API"),
+            "{told:?}"
+        );
+
+        // A tab the human was LOOKING at saw the fact: that is it told, and a
+        // later tab is quieted (the negative control of the owed case above).
+        let mut h = Herald::default();
+        assert!(h.note(1, Some(&one), true, now).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Looking));
+        assert!(h.note(2, Some(&two), false, now).notice.is_none());
+        assert_eq!(h.last_quiet(), Some(HeraldQuiet::Shared));
+    }
+
     #[test]
     fn row_text_is_one_clipped_line() {
         assert_eq!(fold_clip("rm -rf\n  build\t/x", 64), "rm -rf build /x");
@@ -2065,6 +2294,41 @@ mod tests {
         assert_eq!(
             escalation(&bare).unwrap().label,
             "\u{26a0} t: bash approval"
+        );
+    }
+
+    /// The menu bar and the presence band say a box and a wall in one set of
+    /// words: the question tool's box is a question (it approves nothing), a
+    /// box of no named kind is an approval, and an overload is the service's.
+    #[test]
+    fn presence_band_and_menu_bar_say_a_box_and_a_wall_alike() {
+        let mut bare = agent_row(1, "t", "prompt", 1);
+        bare.agent.as_mut().unwrap().subject = None;
+        for (detail, kind, label) in [
+            ("question", EscalationKind::Question, "question"),
+            ("other", EscalationKind::Prompt, "approval"),
+            ("plan-exit", EscalationKind::Prompt, "plan approval"),
+        ] {
+            bare.agent.as_mut().unwrap().detail = Some(detail.into());
+            let esc = escalation(&bare).unwrap();
+            assert_eq!(esc.kind, kind, "{detail}");
+            assert_eq!(esc.label, format!("\u{26a0} t: {label}"), "{detail}");
+            assert_eq!(
+                crate::presence::prompt_band_word(Some(detail)),
+                label,
+                "{detail}"
+            );
+        }
+        let overloaded = crate::presence::AgentPhase::Wall {
+            kind: aterm_phase::WallKind::Overloaded,
+            reset: None,
+            until: None,
+        };
+        assert_eq!(
+            escalation(&agent_row(2, "w", "wall:overloaded", 1))
+                .unwrap()
+                .label,
+            format!("\u{26a0} w: {}", overloaded.band_word())
         );
     }
 

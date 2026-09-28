@@ -672,10 +672,13 @@ pub(crate) fn report_next_after_cut(r: &atpkg_keys::provision::Report) -> Vec<St
 pub(crate) const SHIP: &str = crate::publish::SHIP_COMMAND;
 
 /// The one line an operator copies off a READY TO CUT transcript. It RUNS as printed:
-/// the profile path is the real one the audit resolved, never a `<profile>` placeholder.
+/// the profile path is the real one the audit resolved, never a `<profile>` placeholder,
+/// and it goes through the launcher, because a dry run meets the same provenance gate
+/// and paint smoke a real cut does.
 fn cut_dry_run_next(profile_path: &Path) -> String {
     format!(
-        "{SHIP} cut --dry-run --release-credentials {}",
+        "{} --dry-run --release-credentials {}",
+        crate::publish::CUT_COMMAND,
         profile_path.display()
     )
 }
@@ -2733,7 +2736,7 @@ mod tests {
         let next = cut_dry_run_next(Path::new("/tmp/x/release.toml"));
         assert_eq!(
             next,
-            "targo --unverified ship cut --dry-run --release-credentials /tmp/x/release.toml"
+            "tools/cut-launch.sh --dry-run --release-credentials /tmp/x/release.toml"
         );
         assert!(!next.starts_with("cargo "), "{next}");
         assert!(!SHIP.contains("cargo"), "{SHIP}");

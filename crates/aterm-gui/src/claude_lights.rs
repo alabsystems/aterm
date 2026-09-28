@@ -394,10 +394,10 @@ impl WindowLights {
                     Refusal::InputPending => "wait for queued input",
                 },
                 (_, Some(p)) if p.light == light => "switching\u{2026}",
-                _ => match state {
-                    LightState::On => "on",
-                    LightState::Off => "off",
-                    LightState::Unknown => "not on screen right now",
+                _ => match (light, state) {
+                    (_, LightState::On) => "on",
+                    (_, LightState::Off) => "off",
+                    (_, LightState::Unknown) => "not on screen right now",
                 },
             };
             let cells = |text: String| -> Vec<RenderCell> {

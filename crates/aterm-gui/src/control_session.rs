@@ -154,15 +154,22 @@ pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
     out
 }
 
+/// The batch must fail well inside the bridge's two-second roster cadence.
+const BRIDGE_STATUS_HOP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// `sessions status`: a Lines-framed roster of the status fields the Fabric
 /// bridge consumes, including the server's agent verdict. One wake replaces one
 /// wake per hosted session on each bridge roster round. The bridge validates
 /// every row's sid and launch nonce against its own preceding `sessions bridge`
 /// read. A busy timeline writer makes only that row's agent field
 /// `agent_deferred=1`; the bridge keeps its last verdict, and the GUI's event
-/// loop does not wait for that writer.
+/// loop does not wait for that writer. If the event loop itself cannot answer
+/// promptly, the bridge retains its prior samples and retries at its next
+/// roster tick.
 pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
-    match super::control_media::call_main(proxy, |reply| Wake::ReadSessionStatuses { reply }) {
+    match super::control_media::call_main_within(proxy, BRIDGE_STATUS_HOP_TIMEOUT, |reply| {
+        Wake::ReadSessionStatuses { reply }
+    }) {
         Ok(rows) => rows,
         Err(e) => format!("ERR {e}\n"),
     }

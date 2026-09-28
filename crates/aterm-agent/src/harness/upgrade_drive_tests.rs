@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::relaunch::{
-    AtPrompt, CAUSE_HOST, CONTINUE_FENCE_TRIES, EXIT_LOOK, EXIT_SETTLE, ExitRecord, MODEL_WAIT,
-    RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart, STALE_S, Snapshot, after_exit,
-    after_host_ended, await_new, carry_on_with_tab_probe, continuation_session, exit_record,
-    line_for, look_at_exit, owed, relaunch_by_parent, restart_from, resume, resumed_prompt,
-    shell_dialect, type_relaunch_line,
+    AtPrompt, CAUSE_EXIT, CAUSE_HOST, CONTINUE_FENCE_TRIES, ENDED_AT_ONCE, EXIT_LOOK, EXIT_SETTLE,
+    ExitRecord, HELD_WAIT_IN_TEST, MODEL_WAIT, RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart,
+    STALE_S, Snapshot, after_exit, after_host_ended, await_new, carry_on_with_tab_probe,
+    continuation_session, exit_record, line_for, look_at_exit, owed, relaunch_by_parent,
+    restart_from, resume, resumed_prompt, shell_dialect, type_relaunch_line,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -2784,10 +2784,11 @@ fn the_hand_is_kept_through_every_wait_under_it() {
     let _ = std::fs::remove_dir_all(&dir);
     // Every wait of the relaunch under the hand keeps it — Claude Code's and
     // Codex's.
-    for (src, waits) in [
+    for (src, waits, for_new) in [
         (
             include_str!("relaunch.rs"),
             ["wait_exit(", "let prompt_back = wait_until("],
+            "wait_until(held_wait(&st.cause), || {",
         ),
         (
             include_str!("upgrade_codex_drive.rs"),
@@ -2795,6 +2796,7 @@ fn the_hand_is_kept_through_every_wait_under_it() {
                 "wait_until(EXIT_WAIT,",
                 "wait_until(Duration::from_secs(15), || k.shell_has_terminal",
             ],
+            "wait_until(Duration::from_secs(90), || {",
         ),
     ] {
         let body_of = |head: &str| -> &str {
@@ -2808,9 +2810,7 @@ fn the_hand_is_kept_through_every_wait_under_it() {
             assert!(held[at..].contains("hand.keep(c);"), "{wait}");
         }
         let awaited = body_of("\nfn await_held(\n");
-        let wait = awaited
-            .find("wait_until(Duration::from_secs(90), || {")
-            .expect("the wait for the new process");
+        let wait = awaited.find(for_new).expect("the wait for the new process");
         let closure = &awaited[wait..];
         let closure = &closure[..closure.find("});").expect("its end")];
         assert!(closure.contains("hand.keep(c);"), "{closure}");
@@ -5207,6 +5207,233 @@ fn a_restart_says_the_model_before_and_confirms_the_one_after() {
     );
 }
 
+/// RULING 293 of the messages design: a relaunch after aterm itself ended
+/// (`CAUSE_HOST`, P6a) types the relaunch's own words once its agent holds
+/// its conversation again. It typed the upgrade's (`Upgraded: this session
+/// was restarted on Claude Code …`), which is false for an agent nobody
+/// upgraded. NEGATIVE CONTROL: the upgrade's own record (no cause) still
+/// types the upgrade's words, through the same carry-on.
+#[cfg(unix)]
+#[test]
+fn a_relaunch_after_aterm_ended_types_why_it_was_relaunched() {
+    let before = [user_row("work"), turn_by("claude-opus-5-5", "Working.")];
+    let after = [turn_by("claude-opus-5-5", "Resumed.")];
+    let typed = |cause: &str, name: &str| {
+        let rig = Rig::new(name, &before);
+        rig.append(&after);
+        let mut st = St {
+            cause: cause.to_string(),
+            ..rig.st.clone()
+        };
+        let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+        assert_eq!(r.step, "continued", "{r:?}");
+        rig.typed()
+    };
+    let host = typed(CAUSE_HOST, "host-ended-words");
+    assert_eq!(host.len(), 1, "{host:?}");
+    assert!(
+        host[0].contains("Relaunched: aterm ended while this session ran"),
+        "{host:?}"
+    );
+    assert!(!host[0].contains("Upgraded"), "{host:?}");
+    let upgrade = typed("", "upgrade-words");
+    assert_eq!(upgrade.len(), 1, "{upgrade:?}");
+    assert!(upgrade[0].contains("Upgraded: "), "{upgrade:?}");
+}
+
+/// A [`Kernel`] whose one scripted answer is whether the relaunch's shell has
+/// its terminal back; nothing else about any process can be read.
+#[cfg(unix)]
+struct ShellHolds(Option<bool>);
+
+#[cfg(unix)]
+impl Kernel for ShellHolds {
+    fn job(&self, _: u32) -> Option<(Job, u32)> {
+        None
+    }
+
+    fn parent(&self, _: u32) -> Option<u32> {
+        None
+    }
+
+    fn terminal(&self, _: u32) -> Option<(u32, String)> {
+        None
+    }
+
+    fn shell_holds_tab(&self, _: u32) -> Option<bool> {
+        self.0
+    }
+}
+
+/// DAY SIX, D30 of the messages design: a relaunched agent that ENDED AS IT
+/// STARTED — Claude's `No conversation found`, a crash at start — leaves its
+/// shell holding the tab again at once, and is said at once: `failed:no-resume`,
+/// stopped, one ledger line, in seconds. It was waited on 90 s at a time for
+/// five minutes, the harness's hand on the tab throughout, and the restored
+/// tab's row came 14 minutes after the launch. (NEGATIVE CONTROLS, where no
+/// 90 s wait is paid: `relaunch::tests::a_shell_that_has_the_tab_back_reads_as_ended_only_after_a_while`.)
+#[cfg(unix)]
+#[test]
+fn a_relaunch_that_ended_as_it_started_is_said_at_once() {
+    let dir = scratch("ended-at-once");
+    let (sock, _asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        hand_back: true,
+        background: false,
+        ..drive(&dir)
+    };
+    let mut st = St {
+        phase: Phase::Relaunched { at_s: now_s() },
+        pid: dead_pid(),
+        shell: std::process::id(),
+        tab: TAB.to_string(),
+        to: "9.9.9".to_string(),
+        source: "same".to_string(),
+        cause: CAUSE_HOST.to_string(),
+        ..St::default()
+    };
+    save(&opts, SESSION, &st);
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let r = Report {
+        pid: st.pid,
+        tab: TAB.to_string(),
+        session: SESSION.to_string(),
+        from: "9.9.9".to_string(),
+        to: "9.9.9(same)".to_string(),
+        step: String::new(),
+    };
+    let started = Instant::now();
+    let r = await_new(&opts, r, &mut st, &mut c, SESSION, &ShellHolds(Some(true)));
+    let took = started.elapsed();
+    assert_eq!(r.step, "failed:no-resume", "{r:?}");
+    assert!(took < Duration::from_secs(20), "said in {took:?}");
+    assert!(
+        took >= ENDED_AT_ONCE,
+        "not before the shell held it a while: {took:?}"
+    );
+    assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
+    assert_eq!(ledger_lines(&opts), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One [`await_new`] step over a relaunch of `cause` in flight since just
+/// now, its shell's hold on the tab read as `holds` ([`ShellHolds`]), and
+/// the wait for the relaunched process cut to `wait` (a step that must not
+/// end early is waited out): the step, the record after it, its ledger rows.
+#[cfg(unix)]
+fn held_step(name: &str, cause: &str, holds: Option<bool>, wait: Duration) -> (Report, St, usize) {
+    let dir = scratch(name);
+    let (sock, _asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        only_sid: Some(TAB.to_string()),
+        hand_back: true,
+        background: false,
+        ..drive(&dir)
+    };
+    let mut st = St {
+        phase: Phase::Relaunched { at_s: now_s() },
+        pid: dead_pid(),
+        shell: std::process::id(),
+        tab: TAB.to_string(),
+        to: "9.9.9".to_string(),
+        source: "same".to_string(),
+        cause: cause.to_string(),
+        ..St::default()
+    };
+    save(&opts, SESSION, &st);
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let r = Report {
+        pid: st.pid,
+        tab: TAB.to_string(),
+        session: SESSION.to_string(),
+        from: "9.9.9".to_string(),
+        to: "9.9.9(same)".to_string(),
+        step: String::new(),
+    };
+    HELD_WAIT_IN_TEST.with(|w| w.set(Some(wait)));
+    let r = await_new(&opts, r, &mut st, &mut c, SESSION, &ShellHolds(holds));
+    HELD_WAIT_IN_TEST.with(|w| w.set(None));
+    let rows = ledger_lines(&opts);
+    let _ = std::fs::remove_dir_all(&dir);
+    (r, st, rows)
+}
+
+/// A wait long enough that a shell read as holding the tab throughout would
+/// have been read as ENDED ([`ENDED_AT_ONCE`] and two looks more).
+#[cfg(unix)]
+const PAST_ENDED: Duration = Duration::from_secs(ENDED_AT_ONCE.as_secs() + 2);
+
+/// NEGATIVE CONTROLS of D30's early verdict, through the step itself (review
+/// of day six, R2): a restored tab's relaunched agent that is still starting
+/// — something other than its shell holds the tab — or whose shell cannot be
+/// read is WAITED ON past [`ENDED_AT_ONCE`]: `wait:resume`, the record still
+/// in flight, nothing stopped and nothing ledgered. Wired to a verdict that
+/// ignores the kernel's answer, both would fail as `failed:no-resume`.
+#[cfg(unix)]
+#[test]
+fn a_restored_relaunch_still_starting_or_unread_is_waited_on_not_failed() {
+    for (holds, name) in [(Some(false), "held-starting"), (None, "held-unread")] {
+        let (r, st, rows) = held_step(name, CAUSE_HOST, holds, PAST_ENDED);
+        assert_eq!(r.step, "wait:resume", "{holds:?}: {r:?}");
+        assert!(
+            matches!(st.phase, Phase::Relaunched { .. }),
+            "{holds:?}: {st:?}"
+        );
+        assert_eq!(rows, 0, "{holds:?}");
+    }
+}
+
+/// RULING 296 AS AMENDED (review of day six, R1): the early verdict is a
+/// restored tab's relaunch's alone. The LIVE relaunch on exit
+/// ([`CAUSE_EXIT`]) keeps main's wait even with its shell holding the tab
+/// throughout: its loop retries `failed:no-resume` after its back-off by
+/// typing the relaunch line afresh, so an early verdict there retyped a
+/// refusing agent within seconds. NEGATIVE CONTROL: the same step as a
+/// restored tab's is said as ended.
+#[cfg(unix)]
+#[test]
+fn a_live_relaunch_on_exit_keeps_its_wait_when_its_shell_has_the_tab() {
+    let (r, st, rows) = held_step("held-live", CAUSE_EXIT, Some(true), PAST_ENDED);
+    assert_eq!(r.step, "wait:resume", "{r:?}");
+    assert!(matches!(st.phase, Phase::Relaunched { .. }), "{st:?}");
+    assert_eq!(rows, 0);
+    let (r, st, rows) = held_step("held-restored", CAUSE_HOST, Some(true), PAST_ENDED);
+    assert_eq!(r.step, "failed:no-resume", "{r:?}");
+    assert_eq!(st.phase, Phase::Failed("no-resume".to_string()));
+    assert_eq!(rows, 1);
+}
+
+/// THE KERNEL'S OWN ANSWER ([`Kernel::shell_holds_tab`]'s default, which
+/// [`Live`] uses) on real processes: a shell that leads its own session on a
+/// terminal and is its foreground holds the tab; a job in a group of its
+/// own that is not the terminal's foreground, or a process in another's
+/// group, does not; no shell recorded (pid 0) or a gone one cannot be read.
+#[cfg(unix)]
+#[test]
+fn the_kernel_reads_whether_a_shell_has_its_tab_back() {
+    use std::os::unix::process::CommandExt as _;
+    let mut zsh = tty_zsh();
+    let mut own = parked().process_group(0).spawn().expect("spawn");
+    let mut plain = parked().spawn().expect("spawn");
+    wait_exec(own.id());
+    wait_exec(plain.id());
+    let got = [
+        Live.shell_holds_tab(zsh.id()),
+        Live.shell_holds_tab(own.id()),
+        Live.shell_holds_tab(plain.id()),
+    ];
+    for c in [&mut zsh, &mut own, &mut plain] {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    assert_eq!(got, [Some(true), Some(false), Some(false)]);
+    assert_eq!(Live.shell_holds_tab(0), None);
+    assert_eq!(Live.shell_holds_tab(dead_pid()), None);
+}
+
 /// UNCONFIRMED: a resumed session that has not answered by the first sweep
 /// past the bound is said to be, and it is the one outcome whose step says so.
 /// The turns BEFORE the mark name a model: read from the start, they would have
@@ -5624,6 +5851,7 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        native: None,
     };
     // Precondition, so the pass below is about THIS path: the move is due,
     // the cache is warm, and the ladder takes it because a build restarts.
@@ -5698,6 +5926,7 @@ fn a_due_model_rides_a_restart_made_for_another_reason() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        native: None,
     };
     assert_eq!(
         riding_model_in(&opts, &sf, &argv, &due).as_deref(),
@@ -5736,6 +5965,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         baked: None,
         offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
+        native: None,
     };
     std::fs::write(&path, &answered).expect("transcript");
     assert!(matches!(
@@ -5793,6 +6023,225 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
         cleared.due_to.is_empty() && cleared.due_since == 0,
         "the early return left a stale clock: {cleared:?}"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// AN ASK THAT RAN STANDS (skeptic review of the `HarnessModelSwitch` model,
+/// 2026-09-27). The harness asked for `claude-opus-5-5`, the relaunch ran it,
+/// and a visit recorded it APPLIED. The conversation now runs another model (a
+/// person moved off it), and a visit comes after `MODEL_SETTLE_S`. The failed
+/// arm did not look at `applied`: the ask that ran was recorded FAILED too — a
+/// false `model-failed` after its own `model-verified` — which bars the model
+/// from this conversation for good. NEGATIVE CONTROL: an ask that never ran is
+/// still recorded failed.
+#[test]
+fn an_ask_that_ran_is_never_recorded_failed_when_a_person_moves_off_it() {
+    let dir = scratch("ask-ran-stands");
+    let opts = drive(&dir);
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    let now = i64::try_from(now_s()).expect("now");
+    let proj = opts.home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    let answered = format!(
+        "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"claude-fable-5-1\"}}}}\n",
+        crate::harness::usage::rfc3339_utc(now)
+    );
+    std::fs::write(proj.join(format!("{SESSION}.jsonl")), &answered).expect("transcript");
+    let mctx = ModelCtx {
+        list: Priority::seed(0),
+        baked: None,
+        offered: vec!["claude-opus-5-5".to_string()],
+        default_model: None,
+        native: None,
+    };
+    let asked = |applied: bool| {
+        let mut rec = ModelRecord {
+            set: "claude-opus-5-5".to_string(),
+            set_at: now_s() - 2 * models::MODEL_SETTLE_S,
+            ..ModelRecord::default()
+        };
+        if applied {
+            rec.applied.push(rec.set.clone());
+        }
+        save_model_record(&opts, SESSION, &rec);
+    };
+
+    asked(true);
+    let _ = model_read(&opts, &sf, None, &mctx);
+    let rec = load_model_record(&opts, SESSION);
+    assert!(
+        rec.failed.is_empty(),
+        "an ask that ran was recorded failed: {rec:?}"
+    );
+    assert_eq!(
+        rec.set, "claude-opus-5-5",
+        "the ask stays the harness's own"
+    );
+
+    // NEGATIVE CONTROL: the same ask, never run, settles as failed.
+    asked(false);
+    let _ = model_read(&opts, &sf, None, &mctx);
+    let rec = load_model_record(&opts, SESSION);
+    assert_eq!(rec.failed, ["claude-opus-5-5"], "{rec:?}");
+    assert!(rec.set.is_empty(), "{rec:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The transcript of a conversation whose last answer, on `model`, came
+/// `ago_s` seconds ago.
+fn answered_on(opts: &Opts, model: &str, ago_s: i64) {
+    let at = i64::try_from(now_s()).expect("now") - ago_s;
+    let proj = opts.home.join(".claude/projects/-work");
+    std::fs::create_dir_all(&proj).expect("projects");
+    std::fs::write(
+        proj.join(format!("{SESSION}.jsonl")),
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"{}\",\"message\":{{\"model\":\"{model}\"}}}}\n",
+            crate::harness::usage::rfc3339_utc(at)
+        ),
+    )
+    .expect("transcript");
+}
+
+/// A session that runs the NATIVE build is judged by the native build's own
+/// catalog and offer, not the managed one's (design record §2, OPEN since
+/// 2026-09-24): the same conversation on `claude-opus-5` is due for Opus 5.5
+/// (its own family's newest) under the managed view, and — the native build
+/// not offering Opus 5.5 yet — for the list's Fable 5.1 under the native one.
+/// With no native build installed, a native session falls back to the managed
+/// view rather than to nothing.
+#[test]
+fn a_native_session_is_judged_by_the_native_builds_own_offer() {
+    let dir = scratch("native-view");
+    let opts = drive(&dir);
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    answered_on(&opts, "claude-opus-5", 7200);
+    let mctx = ModelCtx {
+        list: Priority::seed(0),
+        baked: None,
+        offered: vec!["claude-opus-5-5".to_string()],
+        default_model: None,
+        native: Some((None, vec!["claude-fable-5-1".to_string()])),
+    };
+    let due_to = |native: bool, ctx: &ModelCtx| match model_read_for(&opts, &sf, None, ctx, native)
+        .verdict
+    {
+        ModelVerdict::Due { to, .. } => Some(to),
+        ModelVerdict::Keep(_) => None,
+    };
+    assert_eq!(due_to(false, &mctx).as_deref(), Some("claude-opus-5-5"));
+    assert_eq!(due_to(true, &mctx).as_deref(), Some("claude-fable-5-1"));
+    let no_native = ModelCtx {
+        native: None,
+        ..mctx
+    };
+    assert_eq!(due_to(true, &no_native).as_deref(), Some("claude-opus-5-5"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE PRE-FILTER NEVER RESTARTS A NATIVE SESSION'S WARM WAIT (skeptic review,
+/// 2026-09-27). A native session on `claude-opus-5`, warm: the managed build
+/// offers only `claude-opus-5` (the session runs it), the native build offers
+/// `claude-opus-5-5` (due), and the move has been due for 50 minutes. Every
+/// sweep runs the host's pre-filter before the visit. Were the pre-filter to
+/// WRITE what it read under both views, the managed `model-current` would
+/// clear the due clock and the native `Due` restart it, so the visit would
+/// read ~0 s due on every sweep and `warm-wait-over` never fire. NEGATIVE
+/// CONTROL: where the views agree the pre-filter's settle step is still kept —
+/// the ask that runs is recorded applied.
+#[test]
+fn the_pre_filter_never_restarts_a_native_sessions_warm_wait() {
+    let dir = scratch("prefilter-views");
+    let opts = drive(&dir);
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    answered_on(&opts, "claude-opus-5", 0);
+    let mctx = ModelCtx {
+        list: Priority::seed(0),
+        baked: None,
+        offered: vec!["claude-opus-5".to_string()],
+        default_model: None,
+        native: Some((None, vec!["claude-opus-5-5".to_string()])),
+    };
+    let first = model_read_for(&opts, &sf, None, &mctx, true);
+    assert!(
+        matches!(&first.verdict, ModelVerdict::Due { to, .. } if to == "claude-opus-5-5"),
+        "the native view must see the move due: {:?}",
+        first.verdict
+    );
+    let mut rec = load_model_record(&opts, SESSION);
+    rec.due_since = now_s() - 3000;
+    save_model_record(&opts, SESSION, &rec);
+    for sweep in 0..3 {
+        assert!(model_wants_a_look(&opts, &sf, &mctx), "sweep {sweep}");
+        let read = model_read_for(&opts, &sf, None, &mctx, true);
+        assert!(
+            read.due_for_s >= 3000,
+            "sweep {sweep}: the pre-filter restarted the warm wait ({} s due)",
+            read.due_for_s
+        );
+    }
+    let mut over = load_model_record(&opts, SESSION);
+    over.due_since = now_s() - models::MODEL_WARM_MAX_S;
+    save_model_record(&opts, SESSION, &over);
+    assert!(model_wants_a_look(&opts, &sf, &mctx));
+    let read = model_read_for(&opts, &sf, None, &mctx, true);
+    assert_eq!(
+        models::model_moves_now(read.cold, false, read.due_for_s),
+        Some("warm-wait-over"),
+        "the warm wait must end for an active native session"
+    );
+
+    // NEGATIVE CONTROL: the views agree, and the pre-filter keeps its settle.
+    let agree = ModelCtx {
+        offered: vec!["claude-opus-5-5".to_string()],
+        ..mctx
+    };
+    record_asked(&opts, SESSION, "claude-opus-5-5");
+    answered_on(&opts, "claude-opus-5-5", 0);
+    assert!(!model_wants_a_look(&opts, &sf, &agree), "nothing due");
+    assert_eq!(
+        load_model_record(&opts, SESSION).applied,
+        ["claude-opus-5-5"],
+        "the pre-filter's settle step was not kept where the views agree"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A CRASHED NATIVE SESSION'S RIDING MODEL IS THE NATIVE BUILD'S (skeptic
+/// review, 2026-09-27). On the relaunch-on-exit path the session file's pid
+/// has exited, so `exe_of` reads nothing; the view is then the program the
+/// crash ran (`argv[0]`), which that relaunch runs again. Read off the dead pid
+/// alone it would be the MANAGED view: here that offers only the model the
+/// session already runs, so nothing would ride, while the native build the
+/// relaunch runs offers `claude-opus-5-5`. NEGATIVE CONTROL: a managed program
+/// on the same dead pid is judged by the managed view.
+#[test]
+fn a_crashed_native_sessions_riding_model_is_the_native_builds() {
+    let dir = scratch("riding-native");
+    let opts = drive(&dir);
+    // The crash's own record, read while it lived; its pid since exited.
+    let mut sf = register(&opts.home, std::process::id(), SESSION);
+    let mut child = Command::new("true").spawn().expect("spawn");
+    sf.pid = child.id();
+    child.wait().expect("reap");
+    assert_eq!(exe_of(sf.pid), None, "the pid must be gone for this test");
+    answered_on(&opts, "claude-opus-5", 0);
+    let mctx = ModelCtx {
+        list: Priority::seed(0),
+        baked: None,
+        offered: vec!["claude-opus-5".to_string()],
+        default_model: None,
+        native: Some((None, vec!["claude-opus-5-5".to_string()])),
+    };
+    let native = native_root(&opts.home).join("2.1.283");
+    let argv = vec![native.to_string_lossy().into_owned()];
+    assert_eq!(
+        riding_model_in(&opts, &sf, &argv, &mctx).as_deref(),
+        Some("claude-opus-5-5"),
+        "a crashed native session was judged by the managed view"
+    );
+    let managed = vec!["/opt/aterm/pkg/agents/claude".to_string()];
+    assert_eq!(riding_model_in(&opts, &sf, &managed, &mctx), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -1204,6 +1204,16 @@ fn own_process_group(cmd: &mut Command) {
 /// verb's own exit. Past `limit` the sweep stops WAITING and says so — the
 /// verb is left to finish on its own (a thread reaps it), never killed: a
 /// kill mid-copy is the one way to leave the daemon's package half laid.
+///
+/// NOTHING BUT STDIO IS INHERITED. The verb (re)starts the daemon as its own
+/// descendant, a process that lives for days, and a forked child holds every
+/// descriptor its parent held until it execs; an unflagged one survives the
+/// exec into the verb and on into the daemon. In the GUI that is Metal's
+/// shader-cache files, open read-write without close-on-exec (measured
+/// 2026-09-27), and anything caught between another thread's `pipe` and its
+/// `fcntl`. So the child marks every number above stdio close-on-exec before
+/// it execs — the strip aterm-pty's shell child runs — with the ceiling read
+/// here, before the fork (the product fd-hygiene sweep of 2026-09-27).
 fn update_daemon(exe: &Path, env: &[String], limit: Duration) -> Result<Version, String> {
     let mut cmd = Command::new(exe);
     cmd.args(["app-server", "daemon", "update", "--from-cli", "--yes"])
@@ -1212,6 +1222,20 @@ fn update_daemon(exe: &Path, env: &[String], limit: Duration) -> Result<Version,
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
     own_process_group(&mut cmd);
+    #[cfg(unix)]
+    {
+        let ceiling = aterm_uds::spawnfd::inherited_fd_ceiling();
+        // SAFETY: the closure runs in the forked child before `exec` and calls
+        // only `mark_inherited_close_on_exec` — `fcntl(F_SETFD)` over plain
+        // integers, async-signal-safe, no allocation, no lock. The ceiling it
+        // reads was captured here, in the parent, before the fork.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
+                aterm_uds::spawnfd::mark_inherited_close_on_exec(ceiling);
+                Ok(())
+            });
+        }
+    }
     for kv in env {
         if let Some((k, v)) = kv.split_once('=')
             && !k.is_empty()
@@ -1664,17 +1688,18 @@ pub(super) fn visit(
     // owner, 2026-09-27). Until `RETRY_S` has passed since it stopped it
     // waits `failed:<why>` — looked at again, never read by the reducer; a
     // Codex round that gave up hears no late READY (the lane's own rule).
-    // Past it — unless the owner's skip or a deferral holds it — the round is
-    // re-armed here, and the next look types its first notice under every
-    // gate ([`super::rearm`]).
+    // Past it the round is re-armed here, and the next look types its first
+    // notice under every gate ([`super::rearm`]) — unless the owner's word
+    // holds it, which it then waits on, worded as the Claude lane words it:
+    // `wait:skipped`, the host's last word until a newer build or the owner's
+    // next word, or `wait:deferred`, looked at again until it runs out.
     if let Phase::Failed(why) = &st.phase {
-        let due = if upgrade::retry_due(&st.phase, st.failed_for(now), false) {
-            Step::Rearm
-        } else {
-            Step::Wait("failed")
-        };
-        if upgrade::rearm_held(&st.request_for(&tui.tab), due, &st.to, now) != Step::Rearm {
+        if !upgrade::retry_due(&st.phase, st.failed_for(now), false) {
             return said(r, format!("wait:failed:{why}"));
+        }
+        let step = upgrade::rearm_held(&st.request_for(&tui.tab), Step::Rearm, &st.to, now);
+        if let Step::Wait(held) = step {
+            return said(r, format!("wait:{held}"));
         }
         let r = super::rearm(opts, r, &mut st, now);
         save(opts, &session, &st);
@@ -1790,6 +1815,9 @@ pub(super) fn visit(
         // Codex writes to its rollout at the wall is not measured).
         login: upgrade::login_wall(Agent::Codex, &scr.rows),
         undelivered: false,
+        // Claude Code's transcript alone says a queue of its notices is
+        // full; a Codex rollout's is not read for it.
+        queued: false,
         // Stamped below, once the READY is read ([`St::time_ready`]).
         ready_s: 0,
         // A stopped round never reaches here (re-armed or waiting, above).

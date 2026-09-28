@@ -90,9 +90,13 @@ with a journal beside it (`<sid>.journal.jsonl`):
   screen, no turn); `answer_text`
   (decide yourself, prefer reversible steps, keep going) when the worker asks a question
   or for a decision, and only "take the option that deletes, overwrites and force-pushes
-  nothing" when it names an irreversible act; a continuation after an API error or
-  an overload, for ever (1, 5, 15, 30, then every 60 min), and after a usage or spend
-  limit's reset (never buying anything); on a model-bucket limit a relaunch on the
+  nothing" when it names an irreversible act; after an API error, a try that quotes
+  Claude Code's own error line instead of `keep going` (never an ask): a network never
+  reached, or a certificate or proxy refused, 1, 2, 5, then every 5 min (in a window,
+  within about a minute of the API measured reachable again, and nothing for up to 15
+  min while it is measured down), a reply cut off at once, the server's own failure or
+  an overload for ever (1, 5, 15, 30, then every 60 min); a continuation after a usage
+  or spend limit's reset (never buying anything); on a model-bucket limit a relaunch on the
   fallback model (`--model opus`, session-only — never `/model`, which saves the default
   for every new session) and back at its reset (a bucket asking consent to go on on
   credits is continued first); `/compact` on a full context; `/login` on a lost login.

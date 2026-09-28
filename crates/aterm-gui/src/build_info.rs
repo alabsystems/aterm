@@ -267,7 +267,7 @@ pub(crate) fn about_fields() -> Vec<(&'static str, String)> {
         ),
         ("author", AUTHOR_ATTRIBUTION.to_string()),
         ("company", COMPANY.to_string()),
-        // The byline's live link and the native route's `Project` row / "Open
+        // The byline's live link and the native route's `Website` row / "Open
         // Project Site" button — where aterm comes from (owner, 2026-09-14).
         ("site", SITE.to_string()),
         ("version", version_display().to_string()),

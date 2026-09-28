@@ -71,6 +71,7 @@ mod channel_latest;
 mod claim_landing_model;
 mod cut_handoff;
 mod durable_post_intent_model;
+mod handoff_policy_bundle;
 mod journal_prefix_model;
 mod ledger_race;
 mod machine_roster;

@@ -516,10 +516,39 @@ impl Terminal {
         &self,
         max_history: usize,
     ) -> (TerminalCheckpoint, Option<&'static str>) {
+        // A FAULT POINT for this projection failing (a const `false` outside
+        // tests): it is the one a seamless capture takes of a LIVE session's
+        // grids, and so the producer path a successor's `carry = "repaint"`
+        // handoff policy is sealed to route around — a test proves the Repaint
+        // rung never reaches it.
+        assert!(
+            !crate::fault::triggered("checkpoint.carry_projection"),
+            "fault injected: the carry projection failed"
+        );
         let mut carry = self.project_bounded(max_history, 0, true);
         carry.shell_integration_nonce = self.carried_shell_integration_nonce();
         carry.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
         (carry, self.partial_sequence_state())
+    }
+
+    /// The SCALAR half of [`Self::checkpoint_carry_abandoning_partial`]`(0)` —
+    /// exactly the [`CheckpointMeta`] of that carry — WITHOUT projecting either
+    /// grid.
+    ///
+    /// For the seamless capture's Repaint rung (`aterm-gui`'s
+    /// `seamless::repaint_carry_for_wire`), which carries a blank canonical screen
+    /// and reads nothing of the grids but their geometry and cursors. Taking the
+    /// full carry there serialized the visible and the inactive grid inside the
+    /// frozen window only to throw both away — and ran the very grid code a
+    /// successor's `carry = "repaint"` handoff policy is sent to route around when
+    /// a release finds it slow or panicking.
+    #[cfg(feature = "serde")]
+    #[must_use]
+    pub fn carry_meta_abandoning_partial(&self) -> CheckpointMeta {
+        let mut scalars = self.project(0, 0, true, false);
+        scalars.shell_integration_nonce = self.carried_shell_integration_nonce();
+        scalars.shell_integration_rev = self.shell_integration_rev().map(str::to_owned);
+        CheckpointMeta::from_checkpoint(&scalars)
     }
 
     /// The authorized shell-integration nonce as the two seamless-handoff
@@ -605,19 +634,39 @@ impl Terminal {
         inactive_max_history: usize,
         parser_ground: bool,
     ) -> TerminalCheckpoint {
+        self.project(max_history, inactive_max_history, parser_ground, true)
+    }
+
+    /// [`Self::project_bounded`], or — `grids == false` — its scalars alone: both
+    /// grid blobs left EMPTY (the inactive one present exactly when the engine has
+    /// an inactive grid) and `history_lines` 0, as a visible-only projection
+    /// records it. Such a checkpoint is never a carry; it exists only to be read
+    /// by [`CheckpointMeta::from_checkpoint`], which ignores the blobs
+    /// ([`Self::carry_meta_abandoning_partial`]).
+    fn project(
+        &self,
+        max_history: usize,
+        inactive_max_history: usize,
+        parser_ground: bool,
+        grids: bool,
+    ) -> TerminalCheckpoint {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
-        let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
-        // How many of those records are history, as the consumer must be told.
-        // Derived from the produced vector rather than from `max_history` so it is
-        // exact when the ring holds fewer lines than the bound allows.
-        let history_lines = u32::try_from(
-            grid_lines
-                .len()
-                .saturating_sub(usize::from(self.grid.rows())),
-        )
-        .unwrap_or(u32::MAX);
-        let grid_bytes = serialize_lines(&grid_lines);
+        let (grid_bytes, history_lines) = if grids {
+            let grid_lines = self.grid.checkpoint_lines_bounded(max_history);
+            // How many of those records are history, as the consumer must be told.
+            // Derived from the produced vector rather than from `max_history` so it
+            // is exact when the ring holds fewer lines than the bound allows.
+            let history_lines = u32::try_from(
+                grid_lines
+                    .len()
+                    .saturating_sub(usize::from(self.grid.rows())),
+            )
+            .unwrap_or(u32::MAX);
+            (serialize_lines(&grid_lines), history_lines)
+        } else {
+            (Vec::new(), 0)
+        };
         let cursor = GridCursorRepr::capture(&self.grid);
 
         // The oldest line of the PRIMARY lineage this projection carries, which
@@ -651,9 +700,11 @@ impl Terminal {
                 // to 0 while a full in-memory checkpoint leaves it at the active
                 // grid's bound. The old code shared ONE bound between the two
                 // grids, which is precisely the conflation this fixes.
-                Some(serialize_lines(
-                    &inactive.checkpoint_lines_bounded(inactive_max_history),
-                )),
+                Some(if grids {
+                    serialize_lines(&inactive.checkpoint_lines_bounded(inactive_max_history))
+                } else {
+                    Vec::new()
+                }),
                 Some(GridCursorRepr::capture(inactive)),
             ),
             None => (None, None),
@@ -1145,6 +1196,38 @@ fn restore_grid(rows: u16, cols: u16, bytes: &[u8], cursor: &GridCursorRepr, is_
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// THE REPAINT RUNG'S SCALARS, WITHOUT THE GRIDS: `carry_meta_abandoning_partial`
+    /// is exactly the meta of the visible-only carry, for every state that moves a
+    /// scalar — scrollback, the alternate screen (an inactive grid), a parser left
+    /// mid-sequence, shell marks — and it never takes the carry projection (the
+    /// fault point below would fail it), where the carry itself does.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn the_carry_meta_is_the_visible_carrys_meta_and_projects_no_grid() {
+        let mut alt = build_rich_terminal(6, 24);
+        alt.process(b"\x1b[?1049hon the alt screen\x1b]8;;https://example.com\x07link\x1b]8;;\x07");
+        let mut partial = build_rich_terminal(6, 24);
+        partial.process(b"\x1b]0;an unterminated title");
+        for (label, terminal) in [
+            ("plain", Terminal::new(4, 20)),
+            ("rich", build_rich_terminal(6, 24)),
+            ("alt screen", alt),
+            ("mid-sequence", partial),
+        ] {
+            let (carry, _) = terminal.checkpoint_carry_abandoning_partial(0);
+            let meta = crate::fault::with_armed("checkpoint.carry_projection", || {
+                terminal.carry_meta_abandoning_partial()
+            });
+            assert_eq!(meta, CheckpointMeta::from_checkpoint(&carry), "{label}");
+            let projected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::fault::with_armed("checkpoint.carry_projection", || {
+                    terminal.checkpoint_carry_abandoning_partial(0)
+                })
+            }));
+            assert!(projected.is_err(), "{label}: the carry does take it");
+        }
+    }
 
     /// Drive a fresh terminal with a byte stream that exercises EVERY captured
     /// field, leaving the parser in Ground state.

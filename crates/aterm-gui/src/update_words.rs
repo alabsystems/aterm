@@ -73,13 +73,23 @@ pub(crate) const KEY_OUTCOME: &str = "update.outcome";
 /// The check-health warning's key (R38).
 pub(crate) const KEY_HEALTH: &str = "update.health";
 
-/// The glyph of an update in progress — the flow row's from the first byte
-/// to the switch. `↻` is "working", `✓` is "done", `⚠` is "needs you".
+/// The glyph of the flow row while it CHECKS what arrived — `↻` is
+/// "working"; the phases that move a build in wear [`MOVING_IN`] (design
+/// ruling 304: the mark says the activity, one table for every reporter).
 const FLOW_GLYPH: char = '\u{21bb}';
-/// `✓` — the ready row and the landing's record.
+/// `⇣` — a build moving in: downloading, installing, finishing, and the
+/// ready build that waits for `Install now` (ruling 303: one mark for "a
+/// build is here, press to install it", where `✓` read as done and a still
+/// `↻` as a stalled spinner).
+const MOVING_IN: char = '\u{21e3}';
+/// `✓` — the landing's record, and the ready build the lane installs by
+/// itself (a record).
 const READY: char = '\u{2713}';
 /// `⚠` — an outcome the person acts on.
 const NEEDS_YOU: char = '\u{26a0}';
+/// `ℹ` — a record of the lane working (ruling 302: a record wears its
+/// outcome's mark, never the working `↻` of a row still moving).
+const NOTED: char = '\u{2139}';
 
 /// How a STAGED build will be applied — what the staged row's detail line may
 /// promise. Computed by the App (`App::apply_posture_for`), which is the only
@@ -235,8 +245,13 @@ pub(crate) fn flow_title(verb: &str, version: &str) -> String {
 /// The flow row: its phase title, the working glyph, `phase` behind
 /// `Details ›`, a meter (a fill, or busy), `hold`, the progress key.
 fn flow(title: String, phase: &str, meter: Meter, hold: Hold) -> Message {
+    let mark = if phase == CHECKING {
+        FLOW_GLYPH
+    } else {
+        MOVING_IN
+    };
     row(Severity::Info, title)
-        .glyph(glyph(FLOW_GLYPH))
+        .glyph(glyph(mark))
         .line(phase)
         .no_excerpt()
         .meter(meter)
@@ -338,7 +353,7 @@ pub(crate) fn staged_detail_lines(posture: Option<ApplyPosture>) -> Vec<String> 
 /// amended 2026-09-24 by the owner's silent path, §5.3(d)):
 ///
 /// * a press installs it ([`staged_is_decision`]): the READY row, `aterm vX is
-///   ready`, Info with `✓`, how it installs behind `Details ›`, the
+///   ready`, Info with `⇣` (ruling 303), how it installs behind `Details ›`, the
 ///   `Install now` capsule, held [`HOLD_STAGED_MANUAL`] — raised once per
 ///   build and posture by the host (ruling 119);
 /// * anything else — the automatic lane that lands it within a minute, a
@@ -353,7 +368,7 @@ pub(crate) fn staged(version: &str, build: u64, posture: Option<ApplyPosture>) -
     let title = staged_title(version);
     match apply_capsule_for(posture, build) {
         Some(install) => row(Severity::Info, title)
-            .glyph(glyph(READY))
+            .glyph(glyph(MOVING_IN))
             .lines(staged_detail_lines(posture))
             .no_excerpt()
             .action(install)
@@ -470,7 +485,7 @@ pub(crate) fn download_failed(flow_version: &str, detail: &str) -> Message {
         format!("Couldn't download aterm v{v}")
     };
     row(Severity::Warn, title)
-        .glyph(glyph(FLOW_GLYPH))
+        .glyph(glyph(NEEDS_YOU))
         .line(DOWNLOAD_FAILED)
         .sentence(detail)
         .hold(Hold::LogOnly)
@@ -481,7 +496,7 @@ pub(crate) fn download_failed(flow_version: &str, detail: &str) -> Message {
 /// sentence ("Update download postponed").
 pub(crate) fn download_postponed(detail: &str) -> Message {
     row(Severity::Info, "Update download postponed")
-        .glyph(glyph(FLOW_GLYPH))
+        .glyph(glyph(NOTED))
         .sentence(detail)
         .hold(Hold::LogOnly)
 }
@@ -687,7 +702,7 @@ pub(crate) fn switch_started(target: Option<&str>, running: &str) -> Message {
         |version| flow_title("Installing", version),
     );
     row(Severity::Info, title)
-        .glyph(glyph(FLOW_GLYPH))
+        .glyph(glyph(NOTED))
         .line(format!("from {}", aterm_v(running)))
         .hold(Hold::LogOnly)
 }
@@ -711,7 +726,7 @@ pub(crate) fn switch_stopped(
             format!("you were typing, so {running} kept running; it {TRIES_AGAIN}"),
         ),
         (Some(version), false) => (
-            format!("{} was not installed", aterm_v(version)),
+            format!("Couldn't install {}", aterm_v(version)),
             format!("{running} kept running: {why}"),
         ),
         (None, true) => (
@@ -719,7 +734,7 @@ pub(crate) fn switch_stopped(
             format!("you were typing, so aterm kept running; it {TRIES_AGAIN}"),
         ),
         (None, false) => (
-            "aterm was not reloaded".to_string(),
+            "Couldn't reload aterm".to_string(),
             format!("aterm kept running: {why}"),
         ),
     };
@@ -731,7 +746,7 @@ pub(crate) fn switch_stopped(
         },
         title,
     )
-    .glyph(glyph(if routine { FLOW_GLYPH } else { NEEDS_YOU }))
+    .glyph(glyph(if routine { NOTED } else { NEEDS_YOU }))
     .sentence(detail)
     .hold(Hold::LogOnly)
 }
@@ -742,9 +757,10 @@ pub(crate) fn switch_stopped(
 /// glass is the flow row's echo, never a second row. A warning keeps the
 /// `Software Update` capsule for the page's re-offer. The whole sentence is
 /// kept (design ruling 64).
-pub(crate) fn outcome(glyph_ch: char, title: &str, detail: &str, severity: Severity) -> Message {
+pub(crate) fn outcome(title: &str, detail: &str, severity: Severity) -> Message {
+    // A record wears its outcome's mark (ruling 302).
     let msg = row(severity, sanitize_for_tty(title, 80))
-        .glyph(glyph(glyph_ch))
+        .glyph(severity.default_glyph())
         .sentence(detail)
         .hold(Hold::LogOnly)
         .key(KEY_OUTCOME);
@@ -758,13 +774,15 @@ pub(crate) fn outcome(glyph_ch: char, title: &str, detail: &str, severity: Sever
 /// R37 — the lane STOPPED and only a press moves the build (ruling 143): a
 /// DECISION row, `Install now` (`Intent::ApplyUpdate`) as its capsule — the
 /// Version menu's own affordance, on the glass — main's words for the title
-/// ("Couldn't install aterm vX", "Update didn't install", "Update
+/// ("Couldn't install aterm vX", "Couldn't install the update", "Update
 /// installed"). Where else the press lives rides behind `Details ›` on
 /// every tone — the capsule already says it (ruling 77; ruling 161). Warn
 /// where an attempt failed (`⚠`); Info where the build is on disk and waits
-/// for a press — main's ruling-68 row, `↻ Update installed`: the WORKING
-/// glyph, since a done-mark beside `Install now` read as finished while
-/// asking to install (review 2026-09-24). The tone's hold.
+/// for a press — main's ruling-68 row: the staged decision's `⇣` (ruling
+/// 303), since a done-mark beside `Install now` read as finished while asking
+/// to install (review 2026-09-24), and the still `↻` that replaced it read as
+/// a stalled spinner beside the same words with `✓` (round 21). The tone's
+/// hold.
 pub(crate) fn needs_install(title: &str, detail: &str, severity: Severity, build: u64) -> Message {
     needs_install_because(title, None, detail, severity, build)
 }
@@ -784,7 +802,7 @@ pub(crate) fn needs_install_because(
     build: u64,
 ) -> Message {
     if detail.contains(TRIES_AGAIN) {
-        return outcome(FLOW_GLYPH, title, detail, Severity::Info);
+        return outcome(title, detail, Severity::Info);
     }
     let msg = row(severity, sanitize_for_tty(title, 80));
     let msg = match cause {
@@ -796,7 +814,7 @@ pub(crate) fn needs_install_because(
     if severity >= Severity::Warn {
         msg.glyph(glyph(NEEDS_YOU))
     } else {
-        msg.glyph(glyph(FLOW_GLYPH))
+        msg.glyph(glyph(MOVING_IN))
             .hold(Hold::For(HOLD_STAGED_MANUAL))
     }
 }
@@ -823,7 +841,7 @@ pub(crate) fn short_cause(message: &str) -> Option<&'static str> {
 }
 
 /// R37 — an attempt that FAILED and that nothing retries, a FAILURE row
-/// (ruling 143, main's "Update didn't finish"): Warn, `⚠`, the warning's
+/// (ruling 143, main's "Couldn't finish the update"): Warn, `⚠`, the warning's
 /// hold, the `Software Update` capsule — the page that says what happened;
 /// a mechanism's account rides behind `Details ›`. A blocker the person can
 /// clear (`actionable`) is the other way round: its words are painted, and
@@ -863,6 +881,62 @@ pub(crate) fn health_warning(title: &str, body: &str) -> Message {
         .action(software_update())
         .hold(Hold::Default)
         .key(KEY_HEALTH)
+}
+
+/// The title of the warning the window's watchdog raises when the update check
+/// stops answering (`crate::update_checker_watch`, plan P2-1).
+///
+/// ITS OWN, not the ledger's "can't check for updates"
+/// (`aterm_update::health_failing_title`). Every health title is latched once per
+/// launch (`App::note_update_health`), and the stall warning used to borrow that
+/// one: nothing but a download or a ledger heal ever cleared the latch, a
+/// replacement checker's ordinary checks produce neither, and a real network or
+/// manifest failure hours later was then "already said this launch" — a log line,
+/// no row, no banner. Its own title is healed by what it is about: a completed
+/// check ([`crate::update_checker_watch`]).
+pub(crate) const CHECKER_STALLED_TITLE: &str = "aterm's update check stopped";
+
+/// THE UPDATE CHECK STOPPED ANSWERING (the 2026-09-22/23 update audit, plan
+/// P2-1): the body of the warning the window's watchdog raises
+/// (`crate::update_checker_watch`) under [`CHECKER_STALLED_TITLE`].
+///
+/// Whose words, and why these: the loop's heartbeat went `for_secs` of RUNNING
+/// time without a stamp while it was in `phase`
+/// (`aterm_update::checker_watch::CheckerPhase::as_str`), which the sentence says
+/// in a person's terms; whether aterm could start a fresh check in its place
+/// (`replaced`); and whether the stuck one still holds the lane every check runs
+/// through (`holds_lane`: it stalled in its lock wait or inside its check), in
+/// which case the fresh one cannot check until it lets go — and the sentence must
+/// not say the remedy has already happened. It asks nothing of the person (an
+/// update never asks for a restart, grep_guard B12): it says what aterm did and
+/// where the details are.
+pub(crate) fn checker_stalled_body(
+    for_secs: u64,
+    phase: &str,
+    replaced: bool,
+    holds_lane: bool,
+) -> String {
+    let doing = match phase {
+        "starting" => "starting",
+        "settings" => "reading its settings",
+        "bundle-probe" => "reading the installed app",
+        "lock-wait" => "waiting for another aterm's check to finish",
+        "checking" => "checking for a new version",
+        "waiting" => "waiting between checks",
+        _ => "running",
+    };
+    let minutes = for_secs.div_ceil(60).max(1);
+    let then = match (replaced, holds_lane) {
+        (true, false) => "aterm started a fresh one in its place",
+        (true, true) => {
+            "aterm started a fresh one, which cannot check until the stuck one finishes"
+        }
+        (false, _) => "aterm could not start a fresh one",
+    };
+    format!(
+        "the update check stopped answering {minutes} min ago while {doing}; {then}. Run \
+         `aterm ctl update status` for details."
+    )
 }
 
 /// THE WARNING HEALED, on record — once per announced episode: what it had
@@ -1335,10 +1409,10 @@ mod tests {
             landed("0.48.0", 7, 2, Some(Duration::from_secs(42))),
             switch_started(Some("0.48.0"), "0.47.0"),
             switch_stopped(Some("0.48.0"), "0.47.0", false, "child died"),
-            outcome('\u{21bb}', "Update installed", "x", Severity::Info),
+            outcome("Update installed", "x", Severity::Info),
             needs_install("Update installed", "x", Severity::Info, 7),
             needs_install("Couldn't install aterm v0.48.0", "x", Severity::Warn, 7),
-            failed("Update didn't finish", "", false),
+            failed("Couldn't finish the update", "", false),
             health_warning("aterm can't install updates", "3 checks"),
             health_recovered("aterm can't install updates", "since Sep 14"),
             scrollback_lost(12_345, 3),
@@ -1363,7 +1437,7 @@ mod tests {
             }
         );
         assert_eq!(software_update().label(), "Software Update");
-        for ch in [FLOW_GLYPH, NEEDS_YOU] {
+        for ch in [FLOW_GLYPH, NEEDS_YOU, MOVING_IN, NOTED, READY] {
             assert!(Glyph::new(ch).is_some(), "{ch:?} is in the closed set");
         }
     }
@@ -1386,7 +1460,8 @@ mod tests {
             "",
         );
         assert_eq!(m.title, "Downloading aterm v0.48.0");
-        assert_eq!(m.glyph.ch(), FLOW_GLYPH);
+        // The mark says the activity (ruling 304): a build moving in.
+        assert_eq!(m.glyph.ch(), MOVING_IN);
         assert_eq!(m.severity, Severity::Info);
         assert_eq!(m.detail, vec![DOWNLOADING]);
         assert!(
@@ -1433,6 +1508,7 @@ mod tests {
             "",
         );
         assert_eq!(m.title, "Checking aterm v0.48.0");
+        assert_eq!(m.glyph.ch(), FLOW_GLYPH, "checking is the working mark");
         assert_eq!(m.detail, vec![CHECKING]);
         assert!(busy(&m), "checking has no fraction: the row moves");
         assert!(!m.excerpt);
@@ -1523,13 +1599,8 @@ mod tests {
             switch_started(Some("0.91.0"), "0.90.0"),
             switch_stopped(Some("0.91.0"), "0.90.0", true, "x"),
             switch_stopped(Some("0.91.0"), "0.90.0", false, "x"),
-            outcome(
-                '\u{21bb}',
-                "Couldn't install aterm v0.91.0",
-                "x",
-                Severity::Info,
-            ),
-            outcome('\u{26a0}', "Update waits", "x", Severity::Warn),
+            outcome("Couldn't install aterm v0.91.0", "x", Severity::Info),
+            outcome("Update waits", "x", Severity::Warn),
             needs_install(
                 "Couldn't install aterm v0.91.0",
                 INSTALL_FROM_MENU,
@@ -1548,7 +1619,7 @@ mod tests {
                 Severity::Warn,
                 7,
             ),
-            failed("Update didn't finish", "", false),
+            failed("Couldn't finish the update", "", false),
             failed(
                 crate::app_update_screen::UPDATE_WAITS_FOR_YOU,
                 crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
@@ -1636,7 +1707,7 @@ mod tests {
             let m = staged("0.67.0", 7, Some(posture));
             if staged_is_decision(Some(posture)) {
                 assert_eq!(m.title, "aterm v0.67.0 is ready", "{posture:?}");
-                assert_eq!(m.glyph.ch(), '\u{2713}');
+                assert_eq!(m.glyph.ch(), MOVING_IN, "a build to install (ruling 303)");
                 assert_eq!(m.severity, Severity::Info, "a decision, not a confirmation");
                 assert_eq!(m.hold, Hold::For(HOLD_STAGED_MANUAL));
                 assert!(!m.excerpt, "the capsule is the press");
@@ -2033,7 +2104,7 @@ mod tests {
         );
         assert_eq!(waiting.severity, Severity::Info);
         let not = switch_stopped(Some("0.79.0"), "0.78.0", false, "the proof timed out");
-        assert_eq!(not.title, "aterm v0.79.0 was not installed");
+        assert_eq!(not.title, "Couldn't install aterm v0.79.0", "ruling 309");
         assert_eq!(
             not.detail.join(" "),
             "aterm v0.78.0 kept running: the proof timed out"
@@ -2045,7 +2116,7 @@ mod tests {
         );
         assert_eq!(
             switch_stopped(None, "0.78.0", false, "x").title,
-            "aterm was not reloaded"
+            "Couldn't reload aterm"
         );
         for m in [s, waiting, not] {
             let words = std::iter::once(m.title.clone())
@@ -2104,7 +2175,6 @@ mod tests {
     #[test]
     fn an_outcome_is_a_record_unless_the_person_acts_on_it() {
         let retry = outcome(
-            '\u{21bb}',
             "Couldn't install aterm v9.9.9",
             "will try again by itself",
             Severity::Info,
@@ -2112,7 +2182,7 @@ mod tests {
         assert_eq!(retry.hold, Hold::LogOnly, "a self-retry is a record");
         assert!(retry.actions.is_empty());
         assert_eq!(retry.key.as_deref(), Some(KEY_OUTCOME));
-        let warn = outcome('\u{26a0}', "Update waits", "x", Severity::Warn);
+        let warn = outcome("Update waits", "x", Severity::Warn);
         assert_eq!(warn.hold, Hold::LogOnly);
         assert_eq!(warn.actions, vec![software_update()], "the page's re-offer");
         let stopped = needs_install(
@@ -2134,16 +2204,21 @@ mod tests {
         );
         assert_eq!(installed.hold, Hold::For(HOLD_STAGED_MANUAL));
         assert_eq!(installed.actions, vec![Intent::ApplyUpdate { build: 7 }]);
-        // Main's ruling-68 row: the working glyph — never a done-mark
-        // beside `Install now` — and the menu's words behind Details, since
-        // the capsule beside it is that press (ruling 161).
-        assert_eq!(installed.glyph.ch(), FLOW_GLYPH);
+        // Main's ruling-68 row: never a done-mark beside `Install now`, nor
+        // a still `↻` that read as a stalled spinner — the mark of a build
+        // moving in, the staged decision's too (ruling 303) — and the menu's
+        // words behind Details, since the capsule beside it is that press
+        // (ruling 161).
+        assert_eq!(installed.glyph.ch(), MOVING_IN);
+        let ready = staged("9.9.9", 7, Some(ApplyPosture::ManualByConfig));
+        assert_eq!(installed.title, ready.title, "one sentence…");
+        assert_eq!(installed.glyph, ready.glyph, "…one mark");
         assert!(!installed.excerpt, "the capsule is the press");
         assert_eq!(
             installed.detail,
             [crate::app_update_screen::UPDATE_INSTALLED_DETAIL]
         );
-        let bare = failed("Update didn't finish", "", false);
+        let bare = failed("Couldn't finish the update", "", false);
         assert!(bare.detail.is_empty(), "the capsules are the press");
         assert_eq!(bare.hold, Hold::Default);
         assert_eq!(bare.severity, Severity::Warn);
@@ -2311,6 +2386,15 @@ mod tests {
         ] {
             surfaces.push(("admission refusal", block.message(facts)));
         }
+        // The watchdog's warning when the check loop stops answering, in every
+        // arm of its sentence.
+        surfaces.push(("checker stall title", CHECKER_STALLED_TITLE.to_string()));
+        for (replaced, holds_lane) in [(true, false), (true, true), (false, false)] {
+            surfaces.push((
+                "checker stall",
+                checker_stalled_body(3_000, "checking", replaced, holds_lane),
+            ));
+        }
         for blocker in [
             crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
             crate::App::RESTORE_IN_FLIGHT_BLOCKS_APPLY,
@@ -2344,7 +2428,7 @@ mod tests {
             ("Couldn't install aterm v9.9.9", INSTALL_FROM_MENU),
             ("Couldn't install aterm v9.9.9", TRIES_AGAIN),
             ("Couldn't download aterm v9.9.9", DOWNLOAD_FAILED),
-            ("Update didn't finish", ""),
+            ("Couldn't finish the update", ""),
         ] {
             surfaces.push(("outcome row", format!("{title} — {detail}")));
         }

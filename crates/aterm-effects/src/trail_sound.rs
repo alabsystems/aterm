@@ -3538,6 +3538,13 @@ pub struct TrailSynth {
     /// nothing, so the two takes differ by the ting's level and nothing else.
     #[cfg(test)]
     pub(crate) ting_unducked: bool,
+    /// TEST-ONLY: strike every key inside an aside at full voice
+    /// (`rainbow_kitty_v2`'s `ASIDE_GAIN` / `ASIDE_ROOF_MUL`, round two,
+    /// 2026-09-27) — the world before the aside, which the loudness pins'
+    /// negative controls were measured in. The melody's state is untouched
+    /// and nothing is drawn differently: only the level and the roof.
+    #[cfg(test)]
+    pub(crate) aside_off: bool,
     inv_sr: f32,
     rng: u32,
     voices: [Voice; MAX_VOICES],
@@ -4021,6 +4028,8 @@ impl TrailSynth {
             hammer_unlocked: false,
             #[cfg(test)]
             ting_unducked: false,
+            #[cfg(test)]
+            aside_off: false,
             inv_sr: 1.0 / sample_rate.max(8_000.0),
             rng: seed | 1,
             voices: [Voice::default(); MAX_VOICES],

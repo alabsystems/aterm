@@ -142,6 +142,19 @@ impl Scope {
         }
     }
 
+    /// The receipt's `scope` value: `workspace`, `crate:<name>`, or
+    /// `changed:<base>` — the ref the diff was taken against, as the run named
+    /// it (until 2026-09-26 a bare `changed`, which left a reader no way to
+    /// say what a change-scoped run was scoped against).
+    #[must_use]
+    pub fn receipt_word(&self) -> String {
+        match self {
+            Self::Workspace => "workspace".to_string(),
+            Self::Crate(c) => format!("crate:{c}"),
+            Self::Changed(c) => format!("changed:{}", c.base),
+        }
+    }
+
     /// Why this run proved less than the merge contract, in the verdict's words.
     /// `None` for — and only for — the whole-tree run.
     #[must_use]
@@ -272,6 +285,24 @@ mod tests {
             assert!(s.narrowing().is_some(), "{s:?} narrows but does not say so");
         }
         assert_eq!(Scope::workspace().narrowing(), None);
+    }
+
+    /// The receipt names what a narrowed run was narrowed to: the crate, or
+    /// the base a change-scoped run diffed against (never a bare `changed`,
+    /// which left a reader nothing to check the cone against).
+    #[test]
+    fn the_receipt_word_names_the_crate_or_the_base_a_run_was_narrowed_to() {
+        assert_eq!(Scope::workspace().receipt_word(), "workspace");
+        assert_eq!(
+            Scope::crate_only("aterm-grid").receipt_word(),
+            "crate:aterm-grid"
+        );
+        assert_eq!(changed(&["aterm-grid"]).receipt_word(), "changed:main");
+        assert_eq!(
+            Scope::changed("origin/main", Vec::new(), false).receipt_word(),
+            "changed:origin/main",
+            "an empty selection still names its base"
+        );
     }
 
     #[test]

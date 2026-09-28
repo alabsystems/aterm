@@ -419,6 +419,8 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.280",
     ),
     lit("wall.login", "Please run /login", "2.1.280"),
+    // The vendor's API-error message row opens with it (`phase::error_row_notice`).
+    lit("wall.api_error", "API Error", "2.1.283"),
     lit("wall.goal_paused", "Goal paused", "2.1.280"),
     // Claude Code's critical-memory banner, right-aligned on its own row
     // between the spinner and the composer's top rule (`<anchor> (140.4GB) —
