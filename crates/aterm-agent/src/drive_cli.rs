@@ -112,6 +112,21 @@ fn parse(argv: Vec<std::ffi::OsString>) -> Result<Opts, String> {
             _ => {
                 cmd.push(a);
                 cmd.extend(it.by_ref());
+                // A VERB FOLLOWED BY `-h`/`--help` ASKS FOR HELP, for every verb.
+                // Only the leading position used to catch it: after a verb word
+                // the loop takes the rest verbatim, so `prompt --help` TYPED
+                // "--help" into the ACTIVE tab and pressed Enter (measured
+                // 2026-09-27 — the active tab was a peer's Claude Code, busy, so
+                // the prompt-ready wait kept it out; an idle one takes it as a
+                // user turn), `read --help` printed that tab's screen, and nine
+                // verbs answered `unknown option '--help'` at exit 1 while telling
+                // the reader to run `aterm drive --help`. Probing help is the
+                // first thing an agent does with a verb; it may never act. Only
+                // an argument that IS the flag counts: `prompt 'what does --help
+                // show'` is one argument and is still text.
+                if matches!(cmd.get(1).map(String::as_str), Some("-h" | "--help")) {
+                    cmd = vec!["help".to_string()];
+                }
                 break;
             }
         }
@@ -1961,6 +1976,65 @@ mod tests {
         if std::env::var("ATERM_DRIVE_READY").is_err() {
             assert_eq!(resolve_ready(None), dflt);
         }
+    }
+
+    /// `<verb> --help` is a request for help and never an action. `prompt --help`
+    /// used to type "--help" into the active tab and press Enter; `read --help`
+    /// dumped that tab's screen; the other verbs refused the flag at exit 1. Every
+    /// verb, both spellings, lands on the side-effect-free `help` path — and a
+    /// prompt that merely MENTIONS the flag is still the text to send.
+    #[test]
+    fn a_verb_followed_by_help_asks_for_help_and_never_acts() {
+        let os = |v: &[&str]| -> Vec<std::ffi::OsString> {
+            v.iter().map(std::ffi::OsString::from).collect()
+        };
+        let verbs = [
+            "prompt",
+            "read",
+            "await",
+            "shot",
+            "classify",
+            "phase",
+            "answer",
+            "await-turn",
+            "supervise",
+            "watch",
+            "task",
+            "report",
+            "ledger",
+        ];
+        for verb in verbs {
+            for flag in ["--help", "-h"] {
+                let o = parse(os(&[verb, flag])).expect("parses");
+                assert_eq!(
+                    o.cmd,
+                    vec!["help".to_string()],
+                    "`{verb} {flag}` must ask for help"
+                );
+                // Trailing words after the flag change nothing: it is still help.
+                let o = parse(os(&[verb, flag, "more"])).expect("parses");
+                assert_eq!(o.cmd, vec!["help".to_string()], "`{verb} {flag} more`");
+            }
+        }
+        // Global options before the verb still apply, and do not reopen the hole.
+        let o = parse(os(&["--idle", "900", "prompt", "--help"])).expect("parses");
+        assert_eq!(o.cmd, vec!["help".to_string()]);
+        // A prompt that mentions the flag inside its text is text, not a request.
+        let o = parse(os(&["prompt", "what does --help show"])).expect("parses");
+        assert_eq!(
+            o.cmd,
+            vec!["prompt".to_string(), "what does --help show".to_string()]
+        );
+        // The flag later in the text is also text: only the first argument counts.
+        let o = parse(os(&["prompt", "explain", "--help"])).expect("parses");
+        assert_eq!(o.cmd[0], "prompt");
+        // And the help path returns the usage without reaching for any aterm.
+        let o = parse(os(&["prompt", "--help"])).expect("parses");
+        let text = match run(&o) {
+            Ok(r) => r.text,
+            Err(e) => panic!("help must not fail: {e}"),
+        };
+        assert!(text.contains("aterm-drive"), "{text}");
     }
 
     /// `--ready` takes its value verbatim, including an empty string, and a

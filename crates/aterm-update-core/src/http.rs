@@ -52,42 +52,18 @@
 use std::path::Path;
 use std::process::Command;
 
-/// A classified GitHub API failure. [`api_get`] flattens this to the historical
-/// `String`; [`api_get_classified`] hands it over intact so a caller can tell
-/// "you need a credential" from "slow down" from "the network is down" — a
-/// distinction the token-optional updater has to make on EVERY check, since the
-/// same 404 means "private repo, no token" and "repo does not exist".
-///
-/// [`std::fmt::Display`] reproduces the historical message for each arm verbatim, so
-/// no log line, status string, or test wording changes with the classification.
+/// A classified transport failure. The web lane ([`head_no_redirect`]) reports what the
+/// wire said or that it could not be read; the vendor lane ([`vendor_get`],
+/// [`vendor_content_length`], [`vendor_download_to`]) adds its own verdicts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HttpError {
     /// curl itself failed (exit != 0): DNS, TLS, timeout, or a refused spawn.
     Transport(String),
-    /// HTTP 429, or a 403 whose body names a (primary or secondary) rate limit.
-    /// TRANSIENT: the credential — or the lack of one — is not the problem.
-    RateLimited {
-        code: u16,
-        url: String,
-        /// Whether the request carried a token. Anonymous rate limits are ordinary
-        /// (~60/hour per IP) and need different advice than an authenticated one.
-        authenticated: bool,
-    },
-    /// HTTP 401, or a 403 that is NOT a rate limit: the credential is missing,
-    /// expired, revoked, or lacks access.
-    Unauthorized { code: u16 },
-    /// HTTP 404. GitHub deliberately returns this both for a private repo the caller
-    /// cannot see AND for a repo that does not exist — the two are indistinguishable
-    /// over the API, so the classification stops here and the caller must say so.
-    NotFound { url: String },
-    /// Any other non-2xx status.
-    Status { code: u16, url: String },
     /// The `-w`-appended status trailer was not a number: a proxy/portal mangled the
-    /// response. Carries the whole historical message.
+    /// response. Carries the whole message.
     Malformed(String),
     /// A status the vendor lane ([`vendor_get`], [`vendor_content_length`],
-    /// [`vendor_download_to`]) does not accept. Unclassified on purpose: these hosts are
-    /// not GitHub's API, so the rate-limit and token wording above would be false for them.
+    /// [`vendor_download_to`]) does not accept.
     VendorStatus { code: u16, url: String },
     /// A vendor-lane verdict about the request or the document, returned on the first
     /// attempt: a URL, cap or ETag refused before spawning, a response over its cap, or a
@@ -101,43 +77,6 @@ impl std::fmt::Display for HttpError {
         match self {
             Self::Transport(message) | Self::Malformed(message) | Self::VendorRefused(message) => {
                 f.write_str(message)
-            }
-            Self::RateLimited {
-                code,
-                url,
-                authenticated: true,
-            } => write!(
-                f,
-                "GitHub rate limit hit (HTTP {code}) for {url}; transient (the token is \
-                 valid) — backing off, will retry on the next check"
-            ),
-            // The authenticated wording ("the token is valid") would be a lie for a
-            // credential-less API caller (atpkg's index listing when no pointer
-            // resolves — the app updater never calls the API without a token), where
-            // the ~60/hour per-IP budget is the whole story, including for several
-            // machines behind one NAT.
-            Self::RateLimited {
-                code,
-                url,
-                authenticated: false,
-            } => write!(
-                f,
-                "GitHub rate limit hit (HTTP {code}) for {url}; the unauthenticated API \
-                 allows ~60 requests/hour per IP address — backing off, will retry on the \
-                 next check"
-            ),
-            Self::Unauthorized { code } => write!(
-                f,
-                "GitHub auth failed (HTTP {code}): the update token is missing required \
-                 access, expired, or was revoked — rotate it (see docs/RELEASING.md)"
-            ),
-            Self::NotFound { url } => write!(
-                f,
-                "GitHub returned HTTP 404 for {url} (repo/releases not found, or the token \
-                 lacks access to this private repo)"
-            ),
-            Self::Status { code, url } => {
-                write!(f, "GitHub API returned HTTP {code} for {url}")
             }
             Self::VendorStatus { code, url } => {
                 write!(f, "the vendor host answered HTTP {code} for {url}")
@@ -295,7 +234,7 @@ fn curl_command(args: &[&str], url: &str, authenticated: bool) -> Command {
 /// marker directly before it, AFTER every option including the auth channel (callers
 /// must NOT put `--` in `args` — that is the v0.5.10 auto-update-bricking
 /// regression). Returns the completed process output.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn curl_fetch(
     args: &[&str],
@@ -327,154 +266,28 @@ fn curl_fetch(
         .map_err(|e| format!("curl wait: {e}"))
 }
 
-/// [`api_get_classified`], flattened to the historical `String` error. Every message
-/// is byte-identical to what this function produced before the classification split
-/// (see [`HttpError`]'s `Display`), so existing callers, logs and status text are
-/// unchanged.
-pub fn api_get(url: &str, token: Option<&str>) -> Result<Vec<u8>, String> {
-    api_get_classified(url, token).map_err(|e| e.to_string())
-}
-
 /// How many times a request whose BODY is captured from curl's stdout is attempted,
-/// in-process. Matches the budget curl's own `--retry 2` used to spend here (one try
-/// plus two retries), so the worst-case wall time is unchanged in magnitude.
+/// in-process. Matches the budget curl's own `--retry 2` would spend (one try plus two
+/// retries), so the worst-case wall time is the same in magnitude.
+///
+/// The retry is the SUBPROCESS, never curl's `--retry`, on every stdout-captured lane.
+/// curl truncates only a FILE sink between attempts (a pipe has no filename to
+/// `ftruncate`), so a curl-level retry CONCATENATES the failed attempt's bytes in front
+/// of the good ones while `-w` writes the status trailer exactly once — a blip curl had
+/// recovered from then reads as a malformed answer (reproduced against curl 8.7.1). A
+/// fresh pipe per attempt means no failed attempt's bytes can survive.
 const CURL_ATTEMPTS: u32 = 3;
 
 /// Whether an HTTP status is worth another in-process attempt: the transient
 /// server-side set curl itself calls retryable (`man curl`, `--retry`).
 ///
-/// 429 — and the rate-limited 403 — are deliberately ABSENT. Classification here is
-/// code-only, so a retry buys nothing but a second request against a budget that is
-/// already exhausted, and hammering GitHub's secondary limit without honouring
-/// `Retry-After` is strictly worse than the back-off-and-retry-on-the-next-cycle this
-/// layer already documents. Everything else (2xx, 401/403/404, a mangled trailer) is a
-/// verdict rather than a blip and is returned on the first attempt.
-fn transient_api_status(code: &str) -> bool {
+/// 429 is deliberately ABSENT. Classification here is code-only, so a retry buys nothing
+/// but a second request against a throttle that is already refusing, without honouring
+/// `Retry-After` — strictly worse than the back-off-and-retry-on-the-next-cycle every
+/// caller already does. Everything else (2xx, 403/404, a mangled trailer) is a verdict
+/// rather than a blip and is returned on the first attempt.
+fn transient_status(code: &str) -> bool {
     matches!(code, "408" | "500" | "502" | "503" | "504")
-}
-
-/// The fixed option list for [`api_get_classified`], extracted so the flag set itself
-/// is assertable in a unit test.
-///
-/// It carries NO `--retry`, and that omission is load-bearing. The body is captured
-/// from curl's STDOUT, and curl truncates only a FILE sink between attempts (a pipe has
-/// no filename to `ftruncate`), so a curl-level retry CONCATENATES the failed attempt's
-/// error document in front of the good one while `-w` writes the status trailer exactly
-/// once — the result parses as a healthy 200 whose JSON then fails with "trailing
-/// characters", i.e. a blip curl HAD recovered from is reported as a broken publisher.
-/// Reproduced against curl 8.7.1. [`api_get_classified`] retries the whole subprocess
-/// instead: a fresh pipe per attempt, so no failed attempt's bytes can survive.
-fn api_get_args() -> [&'static str; 11] {
-    [
-        "-sS",
-        "--max-time",
-        "30",
-        // Bound the buffered-in-memory API response. GitHub API JSON (a releases
-        // list / a manifest) is small; 16 MiB is generous headroom while stopping
-        // a rogue/oversized response from being read whole into memory, matching
-        // the caps download_bytes/download_to already carry.
-        "--max-filesize",
-        "16777216",
-        "-H",
-        "Accept: application/vnd.github+json",
-        "-H",
-        "X-GitHub-Api-Version: 2022-11-28",
-        "-w",
-        "\n%{http_code}",
-    ]
-}
-
-/// GET a GitHub API JSON resource, returning the raw body bytes. Distinguishes an
-/// authentication failure (401/403 — expired/revoked/insufficient token, or no token
-/// against a private repo) from a rate limit and from a transient error, so the
-/// caller can act on the difference instead of collapsing it into one string. We
-/// append the HTTP status via `-w` and DON'T pass `-f` (we want the code even on 4xx).
-///
-/// A transport failure or a transient server status is retried up to three times HERE
-/// rather than by curl, because each attempt must start from a fresh pipe: curl
-/// truncates only a FILE sink between retries, so a curl-level retry CONCATENATES the
-/// failed attempt's error document in front of the good body under one `-w` status
-/// trailer, and the whole thing then fails JSON parsing as a "broken publisher".
-/// See `api_get_args`.
-// Skip: response-text handling — from_utf8_lossy over curl output (display/
-// classification only; the byte-exact BODY is returned untouched as Vec<u8>)
-// and the trailing-status split arithmetic, whose bounds ride the lossy
-// Cow (unmodeled). Every malformed shape returns Err (fail-closed).
-// Audited (update-atpkg); droppable with the byte-exact contract lane.
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn api_get_classified(url: &str, token: Option<&str>) -> Result<Vec<u8>, HttpError> {
-    let args = api_get_args();
-    // Bounded: `last` is true on attempt `CURL_ATTEMPTS`, and every branch returns there.
-    let mut attempt: u32 = 0;
-    loop {
-        attempt += 1;
-        if attempt > 1 {
-            // curl's own inter-retry backoff, preserved: 1 s, then 2 s.
-            std::thread::sleep(std::time::Duration::from_secs(1 << (attempt - 2)));
-        }
-        let last = attempt >= CURL_ATTEMPTS;
-        // The token is passed in unchanged on every attempt — never re-read or
-        // re-validated per attempt, so a rotation mid-loop cannot split the lanes.
-        let out = curl_fetch(&args, url, token).map_err(HttpError::Transport)?;
-        if !out.status.success() {
-            if !last {
-                continue;
-            }
-            // Transport-level failure (curl exit != 0): DNS, TLS, timeout, etc.
-            return Err(HttpError::Transport(format!(
-                "curl GET {} failed ({}): {}",
-                url,
-                out.status,
-                String::from_utf8_lossy(&out.stderr).trim()
-            )));
-        }
-        // Split the trailing "\n<http_code>" we appended via -w.
-        let stdout = out.stdout;
-        let text = String::from_utf8_lossy(&stdout);
-        let (body, code) = match text.rfind('\n') {
-            Some(i) => (&text[..i], text[i + 1..].trim()),
-            None => ("", text.trim()),
-        };
-        if code.starts_with('2') {
-            return Ok(body.as_bytes().to_vec());
-        }
-        if !last && transient_api_status(code) {
-            // Discard this attempt's bytes ENTIRELY — that discarding is the whole
-            // point of retrying out here instead of inside curl.
-            continue;
-        }
-        // GitHub signals rate limiting with 429, or a 403 whose body mentions a
-        // (primary or secondary) rate limit. That is TRANSIENT — the credential (or its
-        // absence) is not the problem — so it must not be reported as an auth failure
-        // ("rotate the token"), and retrying it here would only spend a budget that is
-        // already gone; we surface it as back-off-and-retry-next-cycle (F11).
-        let rate_limited =
-            code == "429" || (code == "403" && body.to_ascii_lowercase().contains("rate limit"));
-        let Ok(numeric) = code.parse::<u16>() else {
-            // A non-numeric trailer means something mangled the response (captive
-            // portal / proxy). Fail closed with the historical wording.
-            return Err(HttpError::Malformed(format!(
-                "GitHub API returned HTTP {code} for {url}"
-            )));
-        };
-        if rate_limited {
-            return Err(HttpError::RateLimited {
-                code: numeric,
-                url: url.to_string(),
-                authenticated: token.is_some(),
-            });
-        }
-        return match numeric {
-            401 | 403 => Err(HttpError::Unauthorized { code: numeric }),
-            404 => Err(HttpError::NotFound {
-                url: url.to_string(),
-            }),
-            other => Err(HttpError::Status {
-                code: other,
-                url: url.to_string(),
-            }),
-        };
-    }
 }
 
 /// What a redirect-refusing HEAD came back with: the status the web host answered
@@ -500,8 +313,8 @@ pub struct HeadAnswer {
 /// report it (with `-L` absent curl would not follow anyway — the flag pins the intent
 /// against a later "helpful" `-L`); the headers land on stdout, followed by the `-w`
 /// status trailer, so no file sink is needed. No `-f`: a 404 is an answer this lane
-/// reads, not a failure. No `--retry`: the stdout capture is retried per process like
-/// the API lane's (a concatenated hop would be parsed as one).
+/// reads, not a failure. No `--retry`: the stdout capture is retried per process (see
+/// [`CURL_ATTEMPTS`]; a concatenated hop would be parsed as one).
 fn head_args() -> [&'static str; 8] {
     head_args_with_timeout("30")
 }
@@ -525,9 +338,9 @@ fn head_args_with_timeout(timeout_secs: &'static str) -> [&'static str; 8] {
 /// `…/releases/latest/download/<name>`, whose 302 names the newest published release's
 /// tag. No credential is ever attached (the argument is not even accepted — `github.com`
 /// reads no `Authorization` header and must never be shown one), the scheme must be
-/// `https`, and a transport failure or a transient 5xx is retried in-process exactly as
-/// [`api_get_classified`] retries, for the same fresh-pipe reason.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+/// `https`, and a transport failure or a transient 5xx is retried in-process — a fresh
+/// pipe per attempt ([`CURL_ATTEMPTS`]).
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn head_no_redirect(url: &str) -> Result<HeadAnswer, HttpError> {
     head_no_redirect_with(url, &head_args(), CURL_ATTEMPTS)
@@ -542,8 +355,11 @@ pub fn head_no_redirect_quick(url: &str) -> Result<HeadAnswer, HttpError> {
     head_no_redirect_with(url, &head_args_with_timeout("5"), 1)
 }
 
-// Skip: this is the original head_no_redirect body, moved here so a short hint
-// and the normal update request share the same audited response parser.
+// Skip: response-text handling — from_utf8_lossy over curl output (classification
+// only) and the trailing-status split arithmetic, whose bounds ride the lossy Cow
+// (unmodeled). Every malformed shape returns Err (fail-closed). Shared by the normal
+// request and the short hint so both use one audited response parser; every other
+// `Skip: … display-lossy Err-path class` note in this module names this one.
 #[cfg_attr(trust_verify, trust::skip)]
 fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<HeadAnswer, HttpError> {
     require_https_url(url).map_err(HttpError::Transport)?;
@@ -571,7 +387,7 @@ fn head_no_redirect_with(url: &str, args: &[&str], attempts: u32) -> Result<Head
             Some(i) => (&text[..i], text[i + 1..].trim()),
             None => ("", text.trim()),
         };
-        if !last && transient_api_status(code) {
+        if !last && transient_status(code) {
             continue;
         }
         let Ok(numeric) = code.parse::<u16>() else {
@@ -625,12 +441,12 @@ fn require_https_url(url: &str) -> Result<(), String> {
 /// The option list for [`download_bytes`], extracted so the flag set is assertable in
 /// a unit test.
 ///
-/// Like [`api_get_args`] it carries NO `--retry`: these bytes are captured from curl's
-/// stdout, which curl does not truncate between attempts. `-f` makes the concatenation
-/// window much narrower than the API lane's (a 5xx writes zero body bytes before the
-/// retry fires), but a `--max-time` that expires after partial bytes still lands two
-/// attempts' fragments in one buffer — and the buffer is exactly what the Ed25519
-/// check reads. [`download_bytes`] retries the subprocess instead.
+/// It carries NO `--retry`: these bytes are captured from curl's stdout, which curl
+/// does not truncate between attempts ([`CURL_ATTEMPTS`]). `-f` narrows the
+/// concatenation window (a 5xx writes zero body bytes before the retry fires), but a
+/// `--max-time` that expires after partial bytes still lands two attempts' fragments in
+/// one buffer — and the buffer is exactly what the Ed25519 check reads.
+/// [`download_bytes`] retries the subprocess instead.
 ///
 /// Refuse to pair a credential with any host but `api.github.com` — STRUCTURALLY, at
 /// the one place every asset download passes through, rather than by each caller's
@@ -683,7 +499,7 @@ fn download_bytes_args(cap: &str) -> [&str; 9] {
 /// returned buffer always holds exactly ONE attempt's bytes — the Ed25519 check reads
 /// that buffer, and curl does not truncate a pipe between its own retries. See
 /// `download_bytes_args`.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_bytes(
     asset_url: &str,
@@ -693,8 +509,7 @@ pub fn download_bytes(
     require_https_url(asset_url)?;
     refuse_credential_off_api(asset_url, token)?;
     let cap = max_filesize.to_string();
-    // Bounded exactly as `api_get_classified`'s loop is: the final attempt returns on
-    // both arms.
+    // Bounded: the final attempt returns on both arms.
     let mut attempt: u32 = 0;
     loop {
         attempt += 1;
@@ -841,7 +656,7 @@ fn download_max_time_secs(max_filesize: u64) -> u64 {
 /// This is the ONE lane that keeps curl's own `--retry`: the sink is a file (`-o`), and
 /// curl DOES truncate a file sink between attempts (verified), so no failed attempt's
 /// bytes can survive into `dest` the way they survive on a pipe — see
-/// [`api_get_args`].
+/// [`CURL_ATTEMPTS`].
 fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a str; 19] {
     [
         // `-s` matters as much as `-S` here, and its absence was load-bearing: without
@@ -900,7 +715,7 @@ fn download_to_args<'a>(cap: &'a str, max_time: &'a str, dest: &'a str) -> [&'a 
 /// CALLER owns, and this lane's caller (the app-container download, 26–29 MB, whose
 /// scratch dir is swept wholesale before every attempt by design) neither has one nor
 /// has much to gain. The 630 MB toolchain artifact does, and uses the resumable form.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to(
     asset_url: &str,
@@ -1124,7 +939,7 @@ fn download_resume_args_https_only<'a>(
 /// ([`keep_partial_after_failure`]). Without that, a private release repo (which answers
 /// 404 on the derived URL shape) had the API lane's progress deleted by the next pass's
 /// doomed probe, and resume never took hold for it.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable(
     asset_url: &str,
@@ -1144,7 +959,7 @@ pub fn download_to_resumable(
 /// credential must not be presented to it. The transport ENFORCES that
 /// (`refuse_credential_off_api`): a credential paired with any non-API host is refused
 /// before curl is spawned.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn download_to_resumable_https_only(
     asset_url: &str,
@@ -1172,7 +987,7 @@ enum ResumeLane {
 /// [`vendor_download_to`]; `lane` selects the argv, the child and the verdicts. Every
 /// error but a vendor-direct verdict is [`HttpError::Transport`], whose text is the
 /// historical message.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn download_to_resumable_with(
     asset_url: &str,
@@ -1473,7 +1288,7 @@ fn vendor_get_step(
             run.stdout.trim()
         ))));
     };
-    if !last && transient_api_status(&code.to_string()) {
+    if !last && transient_status(&code.to_string()) {
         return Step::Retry;
     }
     let etag = etag_header(headers);
@@ -1510,7 +1325,7 @@ fn vendor_head_step(run: &CurlRun<'_>, last: bool, url: &str) -> Step<u64> {
         Some(i) => (&run.stdout[..i], run.stdout[i + 1..].trim()),
         None => ("", run.stdout.trim()),
     };
-    if !last && transient_api_status(code) {
+    if !last && transient_status(code) {
         return Step::Retry;
     }
     let Ok(code) = code.parse::<u16>() else {
@@ -1654,7 +1469,7 @@ fn vendor_command(args: &[&str], url: &str) -> Command {
 }
 
 /// Spawn [`vendor_command`] with no stdin and wait for it.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn vendor_fetch(args: &[&str], url: &str) -> Result<std::process::Output, String> {
     use std::process::Stdio;
@@ -1679,7 +1494,7 @@ fn vendor_backoff(attempt: u32) {
 struct VendorScratch(std::path::PathBuf);
 
 impl VendorScratch {
-    // Skip: same audited display-lossy Err-path class as `api_get`.
+    // Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn new() -> Result<Self, String> {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -1776,7 +1591,7 @@ pub fn vendor_get_hint(
 }
 
 /// [`vendor_get`] under `bounds`.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 fn vendor_get_within(
     url: &str,
@@ -1851,7 +1666,7 @@ fn vendor_get_within(
 /// 200; [`HttpError::Malformed`] for a final hop with no single positive numeric
 /// `Content-Length`; [`HttpError::Transport`] only when the network failed all three
 /// attempts.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
     require_https_url(url).map_err(HttpError::VendorRefused)?;
@@ -1886,7 +1701,7 @@ pub fn vendor_content_length(url: &str) -> Result<u64, HttpError> {
 /// payload over its cap, or a [`vendor_curl_refusal`]; [`HttpError::VendorStatus`] for a
 /// status no retry changes (anything but 408, 429 and 5xx); [`HttpError::Transport`] for
 /// everything else, the network included.
-// Skip: same audited display-lossy Err-path class as `api_get`.
+// Skip: same audited display-lossy Err-path class as `head_no_redirect_with`.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn vendor_download_to(url: &str, dest: &Path, cap: u64) -> Result<(), HttpError> {
     require_https_url(url).map_err(HttpError::VendorRefused)?;
@@ -2006,11 +1821,11 @@ mod tests {
 
     use super::{
         CURL_ATTEMPTS, HINT_BOUNDS, HttpError, LANE_BOUNDS, RELEASE_ASSET_DOWNLOAD_BOUND,
-        api_get_args, curl_argv, curl_bin, curl_fetch, curl_prepared, download_bytes_args,
+        curl_argv, curl_bin, curl_fetch, curl_prepared, download_bytes_args,
         download_max_time_secs, download_resume_args, download_resume_args_https_only,
         download_to_args, download_to_resumable, download_to_resumable_https_only, head_args,
         keep_partial, keep_partial_after_failure, location_header, part_path, range_refused,
-        resume_plan, token_config_safe, transient_api_status, vendor_get_args,
+        resume_plan, token_config_safe, transient_status, vendor_get_args,
     };
     use std::process::Command;
 
@@ -2199,51 +2014,26 @@ mod tests {
             .collect()
     }
 
-    /// Each classified arm names its status and URL, a rate limit says so, and the
-    /// ANONYMOUS rate limit never claims a token is involved ("the token is valid" would
-    /// be a lie there). `Transport` passes curl's own text through untouched.
+    /// `Transport`, `Malformed` and `VendorRefused` pass their text through untouched;
+    /// a vendor status names its code and URL.
     #[test]
-    fn classified_errors_name_their_status_and_the_anonymous_limit_names_no_token() {
-        let url = "https://api.github.com/repos/o/r/releases";
-        let rate_limited = |code, authenticated| {
-            HttpError::RateLimited {
-                code,
-                url: url.into(),
-                authenticated,
-            }
-            .to_string()
-        };
-        let authed = rate_limited(403, true);
-        assert!(
-            authed.contains("rate limit") && authed.contains("(HTTP 403)") && authed.contains(url),
-            "{authed}"
-        );
-        let anon = rate_limited(429, false);
-        assert!(
-            anon.contains("rate limit")
-                && anon.contains("~60 requests/hour per IP")
-                && !anon.contains("the token is valid"),
-            "an anonymous rate limit must not claim a token is involved: {anon}"
-        );
-        let unauthorized = HttpError::Unauthorized { code: 401 }.to_string();
-        assert!(unauthorized.contains("(HTTP 401)"), "{unauthorized}");
-        let not_found = HttpError::NotFound { url: url.into() }.to_string();
-        assert!(
-            not_found.contains("HTTP 404") && not_found.contains(url),
-            "{not_found}"
-        );
-        let status = HttpError::Status {
-            code: 500,
-            url: url.into(),
-        }
-        .to_string();
-        assert!(
-            status.contains("HTTP 500") && status.contains(url),
-            "{status}"
-        );
+    fn errors_render_their_own_words() {
         assert_eq!(
             HttpError::Transport("curl GET x failed (exit 6): dns".into()).to_string(),
             "curl GET x failed (exit 6): dns"
+        );
+        assert_eq!(
+            HttpError::Malformed("mangled".into()).to_string(),
+            "mangled"
+        );
+        let status = HttpError::VendorStatus {
+            code: 500,
+            url: "https://vendor.example/x".into(),
+        }
+        .to_string();
+        assert!(
+            status.contains("HTTP 500") && status.contains("https://vendor.example/x"),
+            "{status}"
         );
     }
 
@@ -2400,17 +2190,17 @@ mod tests {
     }
 
     /// Only the FILE-sink lane may use curl's own `--retry`. On a pipe curl cannot
-    /// truncate what a failed attempt already wrote, so a retried API GET returns the
-    /// error document CONCATENATED in front of the good body under a single `-w`
-    /// status trailer — a 200 whose JSON then fails with "trailing characters",
-    /// blaming the publisher for a blip curl had recovered from. Those two lanes retry
-    /// the subprocess instead; `download_to` writes to `-o`, which curl DOES truncate.
+    /// truncate what a failed attempt already wrote, so a retried capture returns the
+    /// failed attempt's bytes CONCATENATED in front of the good ones under a single
+    /// `-w` status trailer — a blip curl had recovered from, read as a malformed
+    /// answer. Those lanes retry the subprocess instead; `download_to` writes to `-o`,
+    /// which curl DOES truncate.
     #[test]
     fn only_the_file_sink_lane_uses_curls_own_retry() {
         assert!(
-            !api_get_args().contains(&"--retry"),
-            "a stdout-captured GET must not let curl retry: {:?}",
-            api_get_args()
+            !head_args().contains(&"--retry"),
+            "a stdout-captured HEAD must not let curl retry: {:?}",
+            head_args()
         );
         let cap = "16777216";
         assert!(
@@ -2431,11 +2221,11 @@ mod tests {
     #[test]
     fn only_transient_server_statuses_are_retried_in_process() {
         for code in ["408", "500", "502", "503", "504"] {
-            assert!(transient_api_status(code), "{code} is transient");
+            assert!(transient_status(code), "{code} is transient");
         }
         for code in ["200", "204", "301", "401", "403", "404", "429", "418", ""] {
             assert!(
-                !transient_api_status(code),
+                !transient_status(code),
                 "{code} is a verdict, not a blip — retrying it is wrong"
             );
         }
@@ -2445,8 +2235,7 @@ mod tests {
     #[test]
     fn only_the_vendor_lane_asks_conditionally() {
         let cap = "1024";
-        let lanes: [Vec<&str>; 5] = [
-            api_get_args().to_vec(),
+        let lanes: [Vec<&str>; 4] = [
             head_args().to_vec(),
             download_bytes_args(cap).to_vec(),
             download_to_args(cap, "600", "/tmp/x").to_vec(),

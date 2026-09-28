@@ -357,6 +357,44 @@ impl CtlStream {
         Ok((accepted?, connector))
     }
 
+    /// The connected peer's pid as afunix recorded it at `connect`
+    /// (`SIO_AF_UNIX_GETPEERPID`) — identity the peer cannot assert for itself.
+    ///
+    /// # Errors
+    /// Whatever `WSAIoctl` reports (a Windows build whose afunix lacks the
+    /// ioctl answers `WSAEINVAL`/`WSAEOPNOTSUPP`), and `InvalidData` for a
+    /// short answer or a zero pid.
+    pub fn peer_pid(&self) -> io::Result<u32> {
+        let mut pid: u32 = 0;
+        let mut returned: u32 = 0;
+        // SAFETY: `raw` is this stream's live socket; the output buffer is a
+        // `u32` we own, sized by `cbOutBuffer`; no input buffer, synchronous
+        // (null overlapped and completion routine).
+        let rc = unsafe {
+            ffi::WSAIoctl(
+                self.0.raw,
+                ffi::SIO_AF_UNIX_GETPEERPID,
+                std::ptr::null_mut(),
+                0,
+                (&raw mut pid).cast(),
+                std::mem::size_of::<u32>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if rc == ffi::SOCKET_ERROR {
+            return Err(last_wsa_error());
+        }
+        if returned as usize != std::mem::size_of::<u32>() || pid == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SIO_AF_UNIX_GETPEERPID answered no pid",
+            ));
+        }
+        Ok(pid)
+    }
+
     /// A handle sharing THIS socket (Arc clone — infallible; kept fallible
     /// for signature parity with `UnixStream::try_clone`). Same observable
     /// semantics as a Unix dup at every control-channel call site: clones

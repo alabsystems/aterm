@@ -67,7 +67,7 @@ use crate::cursor_glow::Geom;
 // origin (0,0) — every unit test's geometry — and displaced by exactly
 // (origin_x, origin_y) in a real window: the halo floated in the chrome head
 // band, 84 px above and 24 px left of the caret (capture, 2026-09-08). The
-// Fire arm in `cursor_glow.rs` documents the same trap.
+// Fire arm in `cursor_glow/spawn.rs` documents the same trap.
 use crate::effect_util::push_fx_rect as push_rect;
 
 /// What one printable key adds, from wherever the decayed value is.

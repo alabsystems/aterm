@@ -301,6 +301,21 @@ impl DeferredLine {
         total
     }
 
+    /// What staging this line costs, fixed for as long as it is staged: its
+    /// slot in the buffer's spine, its cell body's CAPACITY (a recycled body
+    /// can be larger than the row it now holds) and its extras. The lazily
+    /// materialized `cached` line is left out on purpose — it appears only when
+    /// something reads the row, and a figure that moved under `&self` could
+    /// not be kept as a running sum.
+    pub(crate) fn staged_bytes(&self) -> usize {
+        let mut total =
+            std::mem::size_of::<Self>() + self.cells.capacity() * std::mem::size_of::<Cell>();
+        if let Some(extras) = self.extras.as_deref() {
+            total += std::mem::size_of::<ScrolledRowExtras>() + extras.image_bytes();
+        }
+        total
+    }
+
     /// Convert into an owned [`Line`], consuming the deferred line AND its cell
     /// body. Test-only: every production consumption site goes through
     /// [`into_line_recycled`](Self::into_line_recycled) so the body comes back to
@@ -493,6 +508,134 @@ pub(crate) struct LazyBuffer {
     /// return the body, and the pool's bytes fold into
     /// [`memory_used`](Self::memory_used) automatically.
     pool: CellPool,
+    /// The hole the flood path has cut at the FRONT of `lines`, if one is open
+    /// (see [`FloodCut`]). Logically the buffer's oldest row: `len`, `get_line`
+    /// and both drains present it as one marker line ahead of `lines`.
+    cut: Option<FloodCut>,
+    /// Running sum of [`DeferredLine::staged_bytes`] over `lines`: what the
+    /// staged rows ACTUALLY hold, kept O(1) so the flood path can weigh the
+    /// backlog against the store's memory headroom on every scrolled row.
+    ///
+    /// WHY a measured sum and not `rows × cols`: a staged row copies only the
+    /// row's OCCUPIED cells (`Row::len`), so a flood of short lines costs a
+    /// fraction of the width. Charging the full width capped a 120k-line burst
+    /// of `seq`-sized lines at 200 columns to ~42k rows while the grid used
+    /// under 22 MB of its 100 MB budget (review of 2026-09-27, measured on the
+    /// real engine): the depth loss the budget exists to prevent, only moved
+    /// to wide windows.
+    staged_bytes: usize,
+    /// Rows staged since the last bounded drain opportunity took the count
+    /// ([`take_arrivals`](Self::take_arrivals)): the stream's rate as the
+    /// host's drain sees it, which is what `Grid::trickle_lazy_bounded`
+    /// decides on. Arrivals, not drops: a cut that opened late in an interval
+    /// has dropped only a few rows by the next opportunity while the stream is
+    /// still delivering thousands.
+    arrivals_since_drain: u64,
+}
+
+/// A hole at the front of the staged lines — the lines the flood path dropped
+/// from the buffer's oldest end ([`LazyBuffer::shed_oldest`],
+/// [`LazyBuffer::drop_oldest`]) — remembered so it is shown as ONE marker row
+/// in their place instead of closing up silently.
+///
+/// WHY it lives INSIDE the buffer rather than as a count on the grid: every
+/// reader of staged history already walks this buffer — `get_line` (which
+/// `Grid::try_get_history_line` reaches WITHOUT draining first), `len`, and
+/// the two drains that the compression worker, the reflow re-attach and the
+/// offload paths all consume through. A slot here is seen by all of them by
+/// construction; a count kept beside the buffer would have to be taught to
+/// each reader, and the audit that found the 91k-line silent hole (2026-09-22:
+/// 120k lines printed into a 100k scrollback, 28.5k kept, no indication
+/// anywhere) is exactly what one forgotten reader looks like.
+///
+/// WHY a count and not a pre-built line: the flood path drops once per
+/// scrolled row while the reader holds the term lock, so moving the cut must
+/// cost an integer store. The marker line is built on first READ and thrown
+/// away whenever the count moves, so a cut nobody looks at mid-flood never
+/// builds one.
+#[derive(Debug, Default)]
+struct FloodCut {
+    /// Lines missing here that the configured line limit would still hold —
+    /// what the marker says. Moves while the cut is open: it grows as the
+    /// flood drops rows the limit would keep, and shrinks when the limit's
+    /// window slides past the hole's oldest rows (they would be gone by now
+    /// anyway, so naming them would be a lie). A drain that reaches the front
+    /// closes the cut, and a later drop opens a NEW cut behind the promoted
+    /// lines — so each marker names the hole that sits before the lines after
+    /// it.
+    dropped: u64,
+    /// The largest `dropped` this cut has reached: the grid's loss counter
+    /// grows by each new peak, so a count that shrinks and grows back is not
+    /// counted twice.
+    peak: u64,
+    /// The marker line for `dropped`, built lazily; reset by [`Self::set`].
+    line: OnceCell<Line>,
+}
+
+impl FloodCut {
+    /// The marker line for the current count.
+    fn line(&self) -> &Line {
+        self.line.get_or_init(|| flood_marker_line(self.dropped))
+    }
+
+    /// The marker line, owned — for a drain that promotes the cut into the store.
+    fn into_line(self) -> Line {
+        let dropped = self.dropped;
+        self.line
+            .into_inner()
+            .unwrap_or_else(|| flood_marker_line(dropped))
+    }
+
+    /// Make the marker name `dropped` lines (any built marker line is then
+    /// stale). Returns how far that raised the cut's PEAK — the lines to add
+    /// to the grid's loss counter.
+    fn set(&mut self, dropped: u64) -> u64 {
+        if dropped != self.dropped {
+            self.dropped = dropped;
+            self.line = OnceCell::new();
+        }
+        let raised = dropped.saturating_sub(self.peak);
+        self.peak = self.peak.max(dropped);
+        raised
+    }
+}
+
+/// The text every flood marker row starts with — a reader that needs to tell
+/// the marker from content (tests, a driver scanning `line` output) matches on
+/// this, not on the wording after the count.
+pub(crate) const FLOOD_MARKER_PREFIX: &str = "— aterm dropped ";
+
+/// The ONE row that stands in for `dropped` lines lost at a flood cut.
+///
+/// The state, then the one thing the user can do about it (the house rule
+/// for user-facing lines, with no mechanism talk): the lines are gone from
+/// here, output came too fast to keep, and a file is the way to keep all of
+/// a stream that large. Rendered DIM: the grid has no system-row style, and
+/// dim is the one attribute every theme paints as "not the program's
+/// output". Kept within 80 columns for any count up to seven digits, so it is
+/// one row at the default width; the count comes first, so a narrower window
+/// that clips the row still shows it. Otherwise ordinary text, deliberately:
+/// `search`, `copy` and `line` find it like any other history row, so an agent
+/// that searched for the missing lines and found nothing can search for
+/// `aterm dropped` and learn why. The count is the whole point — a marker with
+/// a wrong count would be a second lie on top of the hole — so it is only ever
+/// built from the cut's own counter.
+pub(crate) fn flood_marker_line(dropped: u64) -> Line {
+    let noun = if dropped == 1 { "line" } else { "lines" };
+    let text = format!(
+        "{FLOOD_MARKER_PREFIX}{dropped} {noun} here: output too fast to keep; save it to a file —"
+    );
+    let attrs = CellAttrs::new(
+        CellAttrs::DEFAULT.fg,
+        CellAttrs::DEFAULT.bg,
+        CellFlags::DIM.bits(),
+    );
+    let mut rle = Rle::new();
+    rle.extend_with(
+        attrs,
+        u32::try_from(text.chars().count()).unwrap_or(u32::MAX),
+    );
+    Line::with_hyperlinks_owned(text, rle, Vec::new())
 }
 
 /// Maximum number of deferred lines before automatic drain to tiered scrollback.
@@ -600,6 +743,9 @@ impl LazyBuffer {
         Self {
             lines: VecDeque::new(),
             pool: CellPool::default(),
+            cut: None,
+            staged_bytes: 0,
+            arrivals_since_drain: 0,
         }
     }
 
@@ -608,7 +754,22 @@ impl LazyBuffer {
     /// body always comes from the pool.
     #[cfg(test)]
     pub(crate) fn push(&mut self, deferred: DeferredLine) {
+        self.stage(deferred);
+    }
+
+    /// The one place a line joins `lines`, so neither running count can miss
+    /// one.
+    #[inline]
+    fn stage(&mut self, deferred: DeferredLine) {
+        self.staged_bytes += deferred.staged_bytes();
+        self.arrivals_since_drain = self.arrivals_since_drain.saturating_add(1);
         self.lines.push_back(deferred);
+    }
+
+    /// Rows staged since the previous call (see the `arrivals_since_drain`
+    /// field), resetting the count: called once per bounded drain opportunity.
+    pub(crate) fn take_arrivals(&mut self) -> u64 {
+        std::mem::take(&mut self.arrivals_since_drain)
     }
 
     /// Snapshot `row` into a POOLED cell body and stage it.
@@ -619,8 +780,7 @@ impl LazyBuffer {
     #[inline]
     pub(crate) fn push_row(&mut self, row: &Row, extras: ScrolledRowExtras) {
         let scratch = self.pool.take();
-        self.lines
-            .push_back(DeferredLine::new(row, extras, scratch));
+        self.stage(DeferredLine::new(row, extras, scratch));
     }
 
     /// [`push_row`](Self::push_row) for a caller that already owns the extras in
@@ -630,22 +790,80 @@ impl LazyBuffer {
     #[inline]
     pub(crate) fn push_row_boxed(&mut self, row: &Row, extras: Option<Box<ScrolledRowExtras>>) {
         let scratch = self.pool.take();
-        self.lines
-            .push_back(DeferredLine::new_boxed(row, extras, scratch));
+        self.stage(DeferredLine::new_boxed(row, extras, scratch));
     }
 
-    /// Number of pending deferred lines.
+    /// Number of pending lines: the staged rows plus the flood marker row when
+    /// a cut is open (it is a real history row to every reader, so it counts
+    /// like one — `scrollback_lines()` and the drains agree on it).
     #[inline]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.lines.len()
+        self.lines.len() + usize::from(self.cut.is_some())
     }
 
-    /// Whether the buffer is empty.
+    /// Whether the buffer is empty — no staged rows AND no open cut (a lone
+    /// marker is still a row a drain must promote).
     #[inline]
     #[must_use]
     pub(crate) fn is_empty(&self) -> bool {
-        self.lines.is_empty()
+        self.lines.is_empty() && self.cut.is_none()
+    }
+
+    /// Lines the open flood cut's marker names — `0` when no cut is open.
+    #[inline]
+    #[must_use]
+    pub(crate) fn cut_dropped(&self) -> u64 {
+        self.cut.as_ref().map_or(0, |cut| cut.dropped)
+    }
+
+    /// Staged CONTENT rows — [`len`](Self::len) without the marker row.
+    #[inline]
+    #[must_use]
+    pub(crate) fn staged_rows(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// How many of the OLDEST staged rows must go for the rest to fit in
+    /// `budget` bytes (measured as the `staged_bytes` field sums them), never
+    /// taking the buffer below `keep` rows (the marker counts as one, as in
+    /// [`len`](Self::len)).
+    ///
+    /// O(1) while the backlog fits; otherwise one step per row returned, and
+    /// each of those rows is then dropped — so the flood path's per-newline
+    /// cost stays amortized O(1) however the row sizes vary.
+    #[must_use]
+    pub(crate) fn front_rows_over(&self, budget: usize, keep: usize) -> usize {
+        let mut excess = self.staged_bytes.saturating_sub(budget);
+        let removable = self.len().saturating_sub(keep).min(self.lines.len());
+        let mut n = 0;
+        while excess > 0 && n < removable {
+            excess = excess.saturating_sub(self.lines[n].staged_bytes());
+            n += 1;
+        }
+        n
+    }
+
+    /// The running staged-byte sum (see the field). Test-only: pins that the
+    /// sum always equals a fresh walk, whichever path removed the rows.
+    #[cfg(test)]
+    pub(crate) fn staged_bytes(&self) -> usize {
+        debug_assert_eq!(
+            self.staged_bytes,
+            self.lines
+                .iter()
+                .map(DeferredLine::staged_bytes)
+                .sum::<usize>(),
+            "the running staged-byte sum drifted from the rows it sums"
+        );
+        self.staged_bytes
+    }
+
+    /// Whether a flood cut is open at the front (see [`FloodCut`]).
+    #[inline]
+    #[must_use]
+    pub(crate) fn cut_open(&self) -> bool {
+        self.cut.is_some()
     }
 
     /// Whether the buffer has exceeded the drain threshold.
@@ -659,13 +877,23 @@ impl LazyBuffer {
     ///
     /// Returns an iterator of Lines in oldest-to-newest order.
     pub(crate) fn drain_all(&mut self) -> impl Iterator<Item = Line> + '_ {
+        // An open cut is the OLDEST row: it goes first, so the store receives
+        // the marker exactly where the hole is — after whatever it already
+        // holds, before the first surviving staged line. Taking it closes the
+        // cut; a later drop opens a new one behind these promoted lines.
+        let marker = self.cut.take().map(FloodCut::into_line);
+        // Every staged row leaves, consumed or not: `VecDeque::Drain` removes
+        // the whole range when it is dropped.
+        self.staged_bytes = 0;
         // Disjoint field borrows: the drain owns `lines`, the recycling owns
         // `pool`. Each materialized line hands its cell body back for the next
         // scroll-off to fill.
         let pool = &mut self.pool;
-        self.lines
-            .drain(..)
-            .map(move |deferred| deferred.into_line_recycled(&mut *pool))
+        marker.into_iter().chain(
+            self.lines
+                .drain(..)
+                .map(move |deferred| deferred.into_line_recycled(&mut *pool)),
+        )
     }
 
     /// Drain up to `n` of the OLDEST pending lines (front of the buffer),
@@ -677,21 +905,41 @@ impl LazyBuffer {
     /// whole ~1000-line compression spike inline on its PTY-drain critical path.
     /// `n` is clamped to the buffer length, so front-to-`n` is always valid.
     pub(crate) fn drain_front(&mut self, n: usize) -> impl Iterator<Item = Line> + '_ {
-        let n = n.min(self.lines.len());
+        let n = n.min(self.len());
+        // The marker is the oldest row, so a batch that takes anything takes
+        // it first and it counts against `n` like the row it is (see
+        // `drain_all` for why it must lead).
+        let marker = if n > 0 {
+            self.cut.take().map(FloodCut::into_line)
+        } else {
+            None
+        };
+        let n = n - usize::from(marker.is_some());
+        // Weighed before the drain: the range leaves whether or not the
+        // iterator is consumed, and it is O(n) like the drain itself.
+        let leaving: usize = self.lines.range(..n).map(DeferredLine::staged_bytes).sum();
+        self.staged_bytes -= leaving;
         // The steady-state consumption site under flood: the worker's bounded
         // batch is exactly where the reader's per-newline bodies come back.
         let pool = &mut self.pool;
-        self.lines
-            .drain(..n)
-            .map(move |deferred| deferred.into_line_recycled(&mut *pool))
+        marker.into_iter().chain(
+            self.lines
+                .drain(..n)
+                .map(move |deferred| deferred.into_line_recycled(&mut *pool)),
+        )
     }
 
-    /// Get a line by index within the lazy buffer (0 = oldest).
+    /// Get a line by index within the lazy buffer (0 = oldest — the flood
+    /// marker when a cut is open, the oldest staged row otherwise).
     ///
     /// Triggers materialization via `OnceCell` on first access.
     #[must_use]
     pub(crate) fn get_line(&self, idx: usize) -> Option<&Line> {
-        self.lines.get(idx).map(DeferredLine::to_line)
+        match &self.cut {
+            Some(cut) if idx == 0 => Some(cut.line()),
+            Some(_) => self.lines.get(idx - 1).map(DeferredLine::to_line),
+            None => self.lines.get(idx).map(DeferredLine::to_line),
+        }
     }
 
     /// Clear all pending lines, and release the recycling pool with them.
@@ -703,7 +951,11 @@ impl LazyBuffer {
     /// free on the next drain.
     pub(crate) fn clear(&mut self) {
         self.lines.clear();
+        self.staged_bytes = 0;
         self.pool.clear();
+        // The hole is part of the history being invalidated: a marker for
+        // lines the user just erased would be a hole in nothing.
+        self.cut = None;
     }
 
     /// Drop the recycled cell bodies without touching the staged lines.
@@ -725,9 +977,68 @@ impl LazyBuffer {
     }
 
     /// Drop the `n` oldest deferred lines (front of the buffer) without
-    /// materializing them. Bounds the buffer while the tiered store is detached
-    /// for a reflow and cannot absorb it (audit #4).
-    pub(crate) fn drop_oldest(&mut self, n: usize) {
+    /// materializing them, as a LOSS: the hole they leave is opened (or
+    /// widened) as the buffer's flood cut, so every reader sees one marker row
+    /// naming exactly how many lines are missing there. Bounds the buffer
+    /// while the tiered store is detached for a reflow and cannot absorb it
+    /// (audit #4), where there is no telling which rows the limit would keep.
+    ///
+    /// Returns the lines to add to the grid's loss counter (every line dropped
+    /// here, unless the cut had shrunk below its peak), so the counter and the
+    /// markers stay one account.
+    pub(crate) fn drop_oldest(&mut self, n: usize) -> u64 {
+        let n = self.discard_front(n) as u64;
+        if n == 0 {
+            return 0;
+        }
+        let cut = self.cut.get_or_insert_with(FloodCut::default);
+        let dropped = cut.dropped.saturating_add(n);
+        cut.set(dropped)
+    }
+
+    /// The flood path's drop: discard the `n` oldest staged rows (never the
+    /// marker) and make the cut name `hole` lines — the missing lines the
+    /// configured limit would still hold, as `Grid::drop_flood_overflow`
+    /// works them out. `0` means the top of history has moved past any hole:
+    /// an open marker goes, as the store's own trim evicts a promoted one, and
+    /// the loss it named stays in the grid's counter. Otherwise a cut opens if
+    /// none is open. Returns the lines to add to the loss counter (see
+    /// [`FloodCut::set`]).
+    pub(crate) fn shed_oldest(&mut self, n: usize, hole: u64) -> u64 {
+        self.discard_front(n);
+        if hole == 0 {
+            self.cut = None;
+            return 0;
+        }
+        self.cut.get_or_insert_with(FloodCut::default).set(hole)
+    }
+
+    /// Hand back the deque spine a flood grew. `VecDeque::drain` never shrinks
+    /// the allocation, so a burst that staged ~90k rows would otherwise keep
+    /// ~90k × `size_of::<DeferredLine>()` (~10 MB) of empty spine for the life
+    /// of the session — a footprint, where the staging cap promises only a
+    /// peak. Shrinks only past 4× the larger of the live length and the drain
+    /// threshold, and then to 2× it, so the steady inline drain (~1000 rows
+    /// every ~1000 rows) never reallocates and a long post-flood drain gives
+    /// the memory back in a handful of geometric steps. Call it after a
+    /// drain's iterator has been consumed.
+    pub(crate) fn release_spine_slack(&mut self) {
+        let floor = self.lines.len().max(DRAIN_THRESHOLD);
+        if self.lines.capacity() > floor.saturating_mul(4) {
+            self.lines.shrink_to(floor.saturating_mul(2));
+        }
+    }
+
+    /// The deque spine's capacity, in rows. Test-only: pins that a drained
+    /// flood backlog does not keep its peak allocation.
+    #[cfg(test)]
+    pub(crate) fn spine_capacity(&self) -> usize {
+        self.lines.capacity()
+    }
+
+    /// The shared body of the two drops: discard up to `n` front rows, never
+    /// the cut. Returns how many were discarded.
+    fn discard_front(&mut self, n: usize) -> usize {
         let n = n.min(self.lines.len());
         // Recycle even here: this is the FLOOD path (the compression worker fell
         // behind), i.e. exactly when the reader is allocating a body per newline
@@ -735,8 +1046,11 @@ impl LazyBuffer {
         // leave the pool dry precisely when it is needed most.
         let pool = &mut self.pool;
         for mut deferred in self.lines.drain(..n) {
+            // Weighed before the body is taken: its capacity is part of it.
+            self.staged_bytes -= deferred.staged_bytes();
             pool.put(std::mem::take(&mut deferred.cells));
         }
+        n
     }
 
     /// Estimated bytes held by the staged (not yet drained) lines: the
@@ -754,6 +1068,10 @@ impl LazyBuffer {
         // POOL_MAX_CELLS) — same reason the staged lines are counted: memory the
         // ring byte watermark must be able to see.
         total += self.pool.memory_used();
+        // An open cut is a counter plus, once read, one short line.
+        if let Some(cut) = &self.cut {
+            total += std::mem::size_of::<FloodCut>() + cut.line.get().map_or(0, Line::memory_used);
+        }
         total
     }
 }

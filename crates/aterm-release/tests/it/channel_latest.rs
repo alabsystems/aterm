@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CUT OWNS `latest` — proved against a fake GitHub.
+//! THE CUT PUBLISHES ONCE, AND OWNS `latest` — proved against a fake GitHub.
 //!
 //! `pub publish` creates aterm's vX.Y.0 release on the public channel first, as a
-//! SOURCE release, and the cut's `mirror` step ADOPTS it and puts the app on it.
+//! SOURCE release, and the cut's `publish` step ADOPTS it and puts the app on it — the
+//! one release object of the version (since 2026-09-26 there is no second, private
+//! one, flipped and verified first and then mirrored here).
 //! Every credential-less updater finds the channel head with one request,
 //! `releases/latest/download/aterm-appcast.toml`, so whichever release GitHub calls
 //! `latest` IS the channel head. Until 2026-09-23 two things were wrong at once:
@@ -16,22 +18,23 @@
 //!   BECAUSE of that steal.
 //!
 //! The engine now creates the source release as a prerelease (never `latest`), and
-//! [`mirror::publish_on_channel`] sends one guarded head PATCH ([`mirror::HEAD_PATCH`]:
+//! [`channel::publish_on_channel`] sends one guarded head PATCH ([`channel::HEAD_PATCH`]:
 //! `draft=false`, `prerelease=false`, `make_latest=true`) on every path, after the
-//! appcast pair is up. The fake below models the three GitHub rules that decide
+//! appcast pair is up and the release's exact asset set is proved. The fake below
+//! models the three GitHub rules that decide
 //! `latest` — a newly published full release takes it, a prerelease never can,
 //! `make_latest=true` on a full release takes it — applies exactly the PATCH fields
 //! the cutter's own table sends, and records every moment at which `latest` named a
 //! release a client could not install from. The pointer verdict is the cutter's own
 //! gate, [`publish::prove_pointer_serves`], fed from the fake.
 
-use crate::{ledger, manifest_out, mirror, publish, verify};
+use crate::{channel, ledger, manifest_out, publish};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use channel::{ChannelRelease, HeadPatchValue};
 use ledger::{Error, Result};
-use mirror::{ChannelRelease, HeadPatchValue, UnclaimedChannelRelease};
 use publish::PointerProbe;
 
 const OWNER: &str = "alabsystems";
@@ -42,6 +45,8 @@ const TAG: &str = "v0.91.0";
 const VERSION: &str = "0.91.0";
 const PREVIOUS_BUILD: u64 = 1_789_000_000;
 const BUILD: u64 = 1_789_100_000;
+/// The machine-roster generation this cut's signed appcast carries.
+const CARRIED_ROSTER: u64 = 7;
 
 fn download_url(tag: &str, name: &str) -> String {
     aterm_update_core::cdn::release_download_url(OWNER, REPO, tag, name)
@@ -52,7 +57,7 @@ fn download_url(tag: &str, name: &str) -> String {
 /// the web-lane client demands.
 fn appcast(version: &str, build: u64) -> Vec<u8> {
     let tag = format!("v{version}");
-    let dmg = mirror::dmg_asset_name(version);
+    let dmg = channel::dmg_asset_name(version);
     format!(
         "schema = 1\nversion = \"{version}\"\nbuild_number = {build}\n\
          dmg = \"{dmg}\"\nsha256 = \"{}\"\nurl = \"{}\"\n",
@@ -67,6 +72,8 @@ struct Release {
     tag: String,
     draft: bool,
     prerelease: bool,
+    /// `DELETE /releases/{id}` — only a negative control ever sets it.
+    deleted: bool,
     assets: BTreeMap<String, Vec<u8>>,
 }
 
@@ -79,7 +86,7 @@ struct FakeGithub {
     /// The pre-fix adopt path: the cutter sends no head PATCH at all.
     drop_head_patch: bool,
     /// The head PATCH body, when a test replaces the cutter's own
-    /// [`mirror::HEAD_PATCH`] (a negative control).
+    /// [`channel::HEAD_PATCH`] (a negative control).
     head_fields: Option<Vec<(&'static str, HeadPatchValue)>>,
     /// Every time the cut bound its channel release.
     binds: usize,
@@ -89,21 +96,61 @@ struct FakeGithub {
     head_patches: Vec<(bool, bool)>,
     /// Every moment `latest` named a release a client cannot install from.
     exposures: Vec<String>,
+    /// The journal's bound release, as a resume reads it back (`bind` records it).
+    journal_release: Option<usize>,
+    /// The machine-roster generation the fleet has observed on the channel.
+    roster_seq: u64,
+    /// GitHub's `releases/latest` cache: while set, the pointer still names this release
+    /// whatever `latest` is (v0.93.0: five minutes after the PATCH landed).
+    stale_pointer: Option<usize>,
+    /// NEGATIVE CONTROL: a resume that does not ask whether its head PATCH landed — the
+    /// sequence before 2026-09-26.
+    forget_head: bool,
 }
 
 impl FakeGithub {
     /// The channel as it stands when a release is cut: the previous app release is
     /// complete and holds `latest`.
     fn with_previous_release() -> Self {
-        let mut github = Self::default();
+        let mut github = Self {
+            roster_seq: CARRIED_ROSTER,
+            ..Self::default()
+        };
         github.app_release("0.90.0", PREVIOUS_BUILD);
         github
+    }
+
+    /// `atpkg-keys join`: the fleet's roster moves to the next generation, and the join
+    /// re-dresses the channel head with the new pair — no lease, no re-signed manifest.
+    fn roster_join(&mut self) {
+        self.roster_seq += 1;
+        let bytes = format!("roster generation {}", self.roster_seq).into_bytes();
+        if let Some(head) = self.latest {
+            for name in [
+                aterm_update_core::roster::ROSTER_ASSET,
+                aterm_update_core::roster::ROSTER_SIG_ASSET,
+            ] {
+                if let Some(asset) = self.releases[head].assets.get_mut(name) {
+                    asset.clone_from(&bytes);
+                }
+            }
+        }
+    }
+
+    /// Is this release the channel's PUBLISHED app release — what only a head PATCH makes
+    /// of an adopted prerelease or a draft (`verify::ReleaseState::Published`)?
+    fn published(&self, id: usize) -> bool {
+        let release = &self.releases[id];
+        !release.draft
+            && !release.prerelease
+            && !release.deleted
+            && release.assets.contains_key(manifest_out::MANIFEST_ASSET)
     }
 
     /// A complete app release, published as a full release — so it takes `latest`.
     fn app_release(&mut self, version: &str, build: u64) -> usize {
         let mut assets = BTreeMap::new();
-        for name in mirror::required_asset_names(version, true, true) {
+        for name in channel::required_asset_names(version, true, true) {
             let bytes = if name == manifest_out::MANIFEST_ASSET {
                 appcast(version, build)
             } else {
@@ -115,6 +162,7 @@ impl FakeGithub {
             tag: format!("v{version}"),
             draft: false,
             prerelease: false,
+            deleted: false,
             assets,
         });
         let id = self.releases.len() - 1;
@@ -130,6 +178,7 @@ impl FakeGithub {
             tag: tag.into(),
             draft,
             prerelease,
+            deleted: false,
             assets: assets
                 .iter()
                 .map(|name| ((*name).to_string(), name.as_bytes().to_vec()))
@@ -161,13 +210,13 @@ impl FakeGithub {
     }
 
     /// `PATCH /releases/{id}` with exactly the fields the cutter sends — its own
-    /// [`mirror::HEAD_PATCH`] unless a test replaced it. GitHub's rule: `make_latest=true`
+    /// [`channel::HEAD_PATCH`] unless a test replaced it. GitHub's rule: `make_latest=true`
     /// makes a FULL release `latest`, and moves nothing for a draft or a prerelease.
     fn head_patch(&mut self, id: usize) {
         let fields = self
             .head_fields
             .clone()
-            .unwrap_or_else(|| mirror::HEAD_PATCH.to_vec());
+            .unwrap_or_else(|| channel::HEAD_PATCH.to_vec());
         let release = &mut self.releases[id];
         self.head_patches.push((
             release.assets.contains_key(manifest_out::MANIFEST_ASSET),
@@ -208,7 +257,7 @@ impl FakeGithub {
     /// What `releases/latest/download/aterm-appcast.toml` answers a stranger, read the
     /// way the deployed client reads it (a tag outside its grammar is not an app).
     fn pointer(&self) -> PointerProbe {
-        match self.latest {
+        match self.stale_pointer.or(self.latest) {
             Some(id) => {
                 let tag = self.releases[id].tag.clone();
                 if !aterm_update_core::pointer::canonical_app_tag(&tag) {
@@ -227,7 +276,7 @@ impl FakeGithub {
     fn get(&self, url: &str) -> Option<Vec<u8>> {
         self.releases
             .iter()
-            .filter(|release| !release.draft)
+            .filter(|release| !release.draft && !release.deleted)
             .flat_map(|release| {
                 release
                     .assets
@@ -252,17 +301,45 @@ struct FakeChannel<'a> {
     github: &'a mut FakeGithub,
     id: usize,
     local_appcast: Vec<u8>,
+    /// This cut's `dist/`, as `artifacts` hands it over.
+    files: Vec<PathBuf>,
     bound: bool,
 }
 
 impl<'a> FakeChannel<'a> {
-    fn new(github: &'a mut FakeGithub, id: usize, local_appcast: Vec<u8>) -> Self {
+    fn new(
+        github: &'a mut FakeGithub,
+        id: usize,
+        local_appcast: Vec<u8>,
+        files: Vec<PathBuf>,
+    ) -> Self {
         Self {
             github,
             id,
             local_appcast,
+            files,
             bound: false,
         }
+    }
+
+    /// The head half of the ratchet, decided by the cutter's own function over what the
+    /// fake serves a stranger.
+    fn head_half(&self) -> Result<()> {
+        let github = &*self.github;
+        publish::prove_channel_head_is_older(
+            SLUG,
+            TAG,
+            BUILD,
+            &mut || Ok(github.pointer()),
+            &mut |url| Ok(github.get(url)),
+        )
+    }
+
+    /// The roster half, decided by the cutter's own floor: this cut's generation against
+    /// the one the fleet has observed. (The lineage-fork half reads signed roster
+    /// documents; `machine_roster.rs` owns its proofs.)
+    fn roster_half(&self) -> Result<()> {
+        publish::roster_floor_covered(Some(CARRIED_ROSTER), Some(self.github.roster_seq))
     }
 
     fn bound(&self) -> Result<()> {
@@ -275,8 +352,21 @@ impl<'a> FakeChannel<'a> {
 }
 
 impl ChannelRelease for FakeChannel<'_> {
+    fn head_made(&mut self) -> Result<bool> {
+        if self.github.forget_head || self.github.journal_release != Some(self.id) {
+            return Ok(false);
+        }
+        self.bound = self.github.published(self.id);
+        Ok(self.bound)
+    }
+
+    fn artifacts(&mut self) -> Result<Vec<PathBuf>> {
+        Ok(self.files.clone())
+    }
+
     fn bind(&mut self) -> Result<()> {
         self.github.binds += 1;
+        self.github.journal_release = Some(self.id);
         self.bound = true;
         Ok(())
     }
@@ -313,21 +403,16 @@ impl ChannelRelease for FakeChannel<'_> {
             .keys()
             .cloned()
             .collect();
-        mirror::validate_mirror_asset_set_with_linux(&names, VERSION, true, true, &[])
+        channel::validate_channel_asset_set(&names, VERSION, true, true, &[])
+    }
+
+    fn ratchet_head(&mut self) -> Result<()> {
+        self.head_half()
     }
 
     fn ratchet(&mut self) -> Result<()> {
-        // The head half of the ratchet, decided by the cutter's own function over what
-        // the fake serves a stranger. (The roster half reads a signed roster document;
-        // `machine_roster.rs` owns its proofs.)
-        let github = &*self.github;
-        publish::prove_channel_head_is_older(
-            SLUG,
-            TAG,
-            BUILD,
-            &mut || Ok(github.pointer()),
-            &mut |url| Ok(github.get(url)),
-        )
+        self.head_half()?;
+        self.roster_half()
     }
 
     fn make_head(&mut self) -> Result<()> {
@@ -358,7 +443,7 @@ fn dist() -> (tempdir::Dir, Vec<PathBuf>, Vec<u8>) {
     let dir = tempdir::Dir::new();
     let local_appcast = appcast(VERSION, BUILD);
     let mut files = Vec::new();
-    for name in mirror::required_asset_names(VERSION, true, true) {
+    for name in channel::required_asset_names(VERSION, true, true) {
         let path = dir.path().join(&name);
         let bytes = if name == manifest_out::MANIFEST_ASSET {
             local_appcast.clone()
@@ -435,8 +520,8 @@ fn the_adopted_source_release_takes_latest_only_after_its_appcast_pair() {
     );
 
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files)
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel)
         .expect("the pointer gate passes once the cut owns latest");
 
     let uploads = &github.uploads;
@@ -476,8 +561,8 @@ fn a_pointer_github_recomputes_slowly_is_waited_for_within_its_own_bound() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone());
-    mirror::publish_on_channel(&mut channel, files).expect("the cut owns latest");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files);
+    channel::publish_on_channel(&mut channel).expect("the cut owns latest");
     let stale = || PointerProbe::Tag {
         tag: PREVIOUS.to_string(),
         location: download_url(PREVIOUS, manifest_out::MANIFEST_ASSET),
@@ -535,9 +620,8 @@ fn without_the_head_patch_the_pointer_gate_refuses() {
     github.drop_head_patch = true;
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    let err =
-        mirror::publish_on_channel(&mut channel, files).expect_err("no PATCH, no latest, no pass");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    let err = channel::publish_on_channel(&mut channel).expect_err("no PATCH, no latest, no pass");
     let msg = err.to_string();
     assert!(
         msg.contains(&format!("names {PREVIOUS}, not {TAG}")),
@@ -563,8 +647,8 @@ fn a_full_source_release_steals_latest_before_the_cut_and_the_cut_still_converge
         "the old engine's steal is exactly one exposure, at creation"
     );
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files).expect("the cut converges either way");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("the cut converges either way");
     assert_eq!(github.latest, Some(id));
 }
 
@@ -576,11 +660,11 @@ fn a_head_patch_before_the_appcast_pair_exposes_an_empty_head() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files.clone());
     channel.bind().unwrap();
     for file in files
         .iter()
-        .filter(|f| mirror::channel_upload_rank(f.file_name().unwrap().to_str().unwrap()) == 0)
+        .filter(|f| channel::channel_upload_rank(f.file_name().unwrap().to_str().unwrap()) == 0)
     {
         channel.upload(file).unwrap();
     }
@@ -605,8 +689,8 @@ fn a_draft_this_cut_created_becomes_latest_through_the_same_patch() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.create(TAG, true, false, &[]);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files).expect("draft path");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("draft path");
     assert_eq!(github.head_patches, vec![(true, true)]);
     assert!(!github.releases[id].draft);
     assert_eq!(github.latest, Some(id));
@@ -616,20 +700,23 @@ fn a_draft_this_cut_created_becomes_latest_through_the_same_patch() {
 /// The rank table itself: everything, then the signature, then the appcast.
 #[test]
 fn the_upload_rank_puts_the_appcast_pair_last_signature_first() {
-    assert_eq!(mirror::channel_upload_rank("aterm-0.91.0-mac.zip"), 0);
+    assert_eq!(channel::channel_upload_rank("aterm-0.91.0-mac.zip"), 0);
     assert_eq!(
-        mirror::channel_upload_rank(aterm_update_core::roster::ROSTER_ASSET),
+        channel::channel_upload_rank(aterm_update_core::roster::ROSTER_ASSET),
         0
     );
     assert_eq!(
-        mirror::channel_upload_rank(manifest_out::MANIFEST_SIG_ASSET),
+        channel::channel_upload_rank(manifest_out::MANIFEST_SIG_ASSET),
         1
     );
-    assert_eq!(mirror::channel_upload_rank(manifest_out::MANIFEST_ASSET), 2);
+    assert_eq!(
+        channel::channel_upload_rank(manifest_out::MANIFEST_ASSET),
+        2
+    );
 }
 
 /// A cut OWNS `latest`, so it must never take it from a NEWER release: `make_latest`
-/// obeys no version order, and a stale journal resumed at `mirror` after a newer
+/// obeys no version order, and a stale journal resumed at `publish` after a newer
 /// release shipped would hand the fleet an older build. Refused at the first ratchet —
 /// before a single upload, and with no PATCH.
 #[test]
@@ -638,9 +725,9 @@ fn a_newer_release_holding_latest_is_never_displaced() {
     let id = github.source_release(true);
     let newer = github.app_release("0.92.0", BUILD + 1);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    let err = mirror::publish_on_channel(&mut channel, files)
-        .expect_err("a newer head is never displaced");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    let err =
+        channel::publish_on_channel(&mut channel).expect_err("a newer head is never displaced");
     assert!(
         err.to_string()
             .contains("v0.92.0 holds alabsystems/aterm's `latest`"),
@@ -702,23 +789,101 @@ fn the_head_ratchet_orders_by_tag_and_by_build() {
     decide(&stranded_newer).expect_err("a newer tag is refused whatever it carries");
 }
 
-/// A resume after the head PATCH landed (the journal mark did not): the pointer already
-/// names this cut, every asset is already up, and the whole sequence converges again
-/// without re-uploading a byte — the PATCH re-sent is a no-op.
+/// A cut whose first pass fails after its head PATCH: the pointer gate's bound runs out
+/// while GitHub's `releases/latest` cache still names the previous release (v0.93.0).
+/// Returns the release's asset bytes as the PATCH left them.
+fn first_pass_fails_at_the_pointer_gate(
+    github: &mut FakeGithub,
+    id: usize,
+    files: &[PathBuf],
+    local_appcast: &[u8],
+) -> BTreeMap<String, Vec<u8>> {
+    github.stale_pointer = github.latest;
+    let mut channel = FakeChannel::new(github, id, local_appcast.to_vec(), files.to_vec());
+    let err = channel::publish_on_channel(&mut channel).expect_err("the cache outlasts the gate");
+    assert!(
+        err.to_string()
+            .contains(&format!("names {PREVIOUS}, not {TAG}")),
+        "{err}"
+    );
+    assert_eq!(github.head_patches, vec![(true, true)], "the PATCH landed");
+    assert_eq!(github.latest, Some(id));
+    github.stale_pointer = None;
+    github.releases[id].assets.clone()
+}
+
+/// A HEAD THE CUT MADE IS FINISHED, NEVER REFUSED. The first pass's PATCH landed and its
+/// pointer gate ran out; a roster join since re-dressed the head with generation N+1,
+/// and this cut's signed appcast carries N. The resume sees its head is made: no roster
+/// floor read to refuse it, no upload to roll the join's roster back — only the PATCH,
+/// re-sent (idempotent), and the read side — and it passes.
 #[test]
-fn a_resume_after_the_head_patch_converges_idempotently() {
+fn a_resume_after_the_head_patch_uploads_nothing_and_reads_no_roster_floor() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone());
-    mirror::publish_on_channel(&mut channel, files.clone()).expect("first pass");
-    let uploaded_once = github.releases[id].assets.clone();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files).expect("the resume converges");
-    assert_eq!(github.releases[id].assets, uploaded_once);
-    assert_eq!(github.head_patches, vec![(true, true), (true, true)]);
+    first_pass_fails_at_the_pointer_gate(&mut github, id, &files, &local_appcast);
+    github.roster_join();
+    let redressed = github.releases[id].assets.clone();
+    let uploads = github.uploads.len();
+
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("the resume finishes the head it made");
+    assert_eq!(github.uploads.len(), uploads, "nothing uploaded");
+    assert_eq!(
+        github.releases[id].assets, redressed,
+        "the join's roster stands"
+    );
+    assert_eq!(
+        github.head_patches,
+        vec![(true, true); 2],
+        "the PATCH re-sent, the pair up"
+    );
     assert_eq!(github.latest, Some(id));
     assert!(github.exposures.is_empty(), "{:?}", github.exposures);
+}
+
+/// WHY THE RESUME RE-SENDS THE PATCH. GitHub hands `latest` to every release published as
+/// a full release — an `atpkg-index-<n>` cut too — so one that lands between this cut's
+/// PATCH and its resume holds the pointer, and a resume that only read would fail its
+/// pointer gate forever. The head half of the ratchet lets the cut take a non-app head,
+/// the re-sent PATCH takes `latest` back, and the gate passes.
+#[test]
+fn a_release_that_took_latest_since_the_patch_is_taken_back_by_the_resume() {
+    let mut github = FakeGithub::with_previous_release();
+    let id = github.source_release(true);
+    let (_dir, files, local_appcast) = dist();
+    first_pass_fails_at_the_pointer_gate(&mut github, id, &files, &local_appcast);
+    let index = github.create("atpkg-index-31", false, false, &["index.toml"]);
+    assert_eq!(github.latest, Some(index), "a full release takes `latest`");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("the resume takes `latest` back");
+    assert_eq!(github.latest, Some(id));
+    assert_eq!(github.head_patches.len(), 2);
+}
+
+/// NEGATIVE CONTROL — the resume before 2026-09-26, which re-entered the write half over
+/// a head it made: the floors read again refuse a release the fleet already runs, and
+/// with `--abandon` refusing a published release nothing could release the lease.
+#[test]
+fn a_resume_that_forgets_its_head_is_refused_by_the_join_since() {
+    let mut github = FakeGithub::with_previous_release();
+    let id = github.source_release(true);
+    let (_dir, files, local_appcast) = dist();
+    first_pass_fails_at_the_pointer_gate(&mut github, id, &files, &local_appcast);
+    github.roster_join();
+    github.forget_head = true;
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    let err = channel::publish_on_channel(&mut channel).expect_err("the floors refuse the head");
+    assert!(
+        err.to_string()
+            .contains("this machine's roster is older than the channel's"),
+        "{err}"
+    );
+    assert!(
+        github.published(id),
+        "…a release that IS the published head"
+    );
 }
 
 /// A non-app release holding `latest` (an `atpkg-index-<n>` cut published as a full
@@ -733,7 +898,7 @@ fn a_non_app_release_holding_latest_is_taken_over() {
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
     {
-        let channel = FakeChannel::new(&mut github, id, local_appcast.clone());
+        let channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files.clone());
         let github = &*channel.github;
         let err = publish::prove_pointer_serves(
             SLUG,
@@ -746,8 +911,8 @@ fn a_non_app_release_holding_latest_is_taken_over() {
         .expect_err("the gate never calls a non-app head this cut");
         assert!(err.to_string().contains("not an app release"), "{err}");
     }
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files).expect("no app head to protect");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("no app head to protect");
     assert_eq!(github.latest, Some(id));
 }
 
@@ -760,7 +925,7 @@ fn a_non_app_release_holding_latest_is_taken_over() {
 #[test]
 fn the_live_head_patch_sends_exactly_the_table() {
     assert_eq!(
-        mirror::head_patch_argv("repos/alabsystems/aterm/releases/7"),
+        channel::head_patch_argv("repos/alabsystems/aterm/releases/7"),
         [
             "api",
             "--method",
@@ -783,20 +948,20 @@ fn the_live_head_patch_sends_exactly_the_table() {
 /// field exists for the adopt path, which is the path every aterm cut takes.
 #[test]
 fn without_prerelease_false_the_adopted_release_never_becomes_latest() {
-    let without_prerelease: Vec<_> = mirror::HEAD_PATCH
+    let without_prerelease: Vec<_> = channel::HEAD_PATCH
         .iter()
         .copied()
         .filter(|(name, _)| *name != "prerelease")
         .collect();
-    assert_eq!(without_prerelease.len(), mirror::HEAD_PATCH.len() - 1);
+    assert_eq!(without_prerelease.len(), channel::HEAD_PATCH.len() - 1);
 
     let mut github = FakeGithub::with_previous_release();
     github.head_fields = Some(without_prerelease.clone());
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone());
-    let err = mirror::publish_on_channel(&mut channel, files.clone())
-        .expect_err("a prerelease cannot be made latest");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast.clone(), files.clone());
+    let err =
+        channel::publish_on_channel(&mut channel).expect_err("a prerelease cannot be made latest");
     assert!(
         err.to_string()
             .contains(&format!("names {PREVIOUS}, not {TAG}")),
@@ -809,8 +974,8 @@ fn without_prerelease_false_the_adopted_release_never_becomes_latest() {
     let mut github = FakeGithub::with_previous_release();
     github.head_fields = Some(without_prerelease);
     let id = github.create(TAG, true, false, &[]);
-    let mut channel = FakeChannel::new(&mut github, id, local_appcast);
-    mirror::publish_on_channel(&mut channel, files).expect("a draft needs no prerelease=false");
+    let mut channel = FakeChannel::new(&mut github, id, local_appcast, files);
+    channel::publish_on_channel(&mut channel).expect("a draft needs no prerelease=false");
     assert_eq!(github.latest, Some(id));
 }
 
@@ -834,7 +999,7 @@ fn the_tree_that_declares_binary_cut_follows_flips_the_prerelease() {
         "publish/config.sh declares the opt-in exactly once, as the engine parses it"
     );
     assert!(
-        mirror::HEAD_PATCH.contains(&("prerelease", HeadPatchValue::Bool(false))),
+        channel::HEAD_PATCH.contains(&("prerelease", HeadPatchValue::Bool(false))),
         "a tree that opts in must flip the prerelease it is given"
     );
     // The matcher is not vacuous: a config without the line declares nothing, and
@@ -853,21 +1018,21 @@ fn the_tree_that_declares_binary_cut_follows_flips_the_prerelease() {
 // Adopting a release the journal holds no intent for
 // ---------------------------------------------------------------------------
 
-/// The classifier's table. POSITIVE rows: the source release (with or without its
-/// roster pair, or still empty), and this cut's own release — complete, or partial as a
-/// dead machine left it — alongside the source shapes. NEGATIVE rows, each a foreign
-/// release that must never be adopted: a name no cut publishes (another version's DMG, a
-/// retired container), one mismatched app asset among matching ones, and a source
-/// release carrying one binary that is not this cut's.
+/// The adoption table. A release under this cut's tag that the journal holds no intent
+/// for is adopted ONLY as the engine's source release — with or without its roster pair,
+/// or still empty. NEGATIVE rows, each another cut's release that must never be adopted:
+/// a complete app release under this tag (every name this cut publishes, which no
+/// journal of this cut claims), a partial one, another version's DMG, and a retired
+/// container. Refused by name, before a byte is fetched.
 #[test]
-fn an_unclaimed_release_is_adopted_only_as_the_source_release_or_by_its_bytes() {
-    let elected = mirror::required_asset_names(VERSION, true, true);
+fn an_unclaimed_release_is_adopted_only_as_the_source_release() {
+    let elected = channel::required_asset_names(VERSION, true, true);
     let source_pair = ["SHA256SUMS", "SHA256SUMS.sig"];
     let roster_pair = [
         aterm_update_core::roster::ROSTER_ASSET,
         aterm_update_core::roster::ROSTER_SIG_ASSET,
     ];
-    let dmg = mirror::dmg_asset_name(VERSION);
+    let dmg = channel::dmg_asset_name(VERSION);
     let names = |parts: &[&[&str]]| -> Vec<String> {
         parts
             .iter()
@@ -875,142 +1040,55 @@ fn an_unclaimed_release_is_adopted_only_as_the_source_release_or_by_its_bytes() 
             .collect()
     };
     let elected_refs: Vec<&str> = elected.iter().map(String::as_str).collect();
-    let app_only: Vec<&str> = elected_refs
-        .iter()
-        .copied()
-        .filter(|name| !roster_pair.contains(name))
-        .collect();
-    // (label, release assets, app assets whose bytes are NOT this cut's, verdict)
-    type Want = std::result::Result<UnclaimedChannelRelease, &'static str>;
-    let rows: Vec<(&str, Vec<String>, Vec<&str>, Want)> = vec![
+    // (label, release assets, `None` to adopt or the asset the refusal names)
+    let rows: Vec<(&str, Vec<String>, Option<&str>)> = vec![
         (
             "the source release",
             names(&[&source_pair, &roster_pair]),
-            vec![],
-            Ok(UnclaimedChannelRelease::Source),
+            None,
         ),
         (
             "a source release without its roster pair yet",
             names(&[&source_pair]),
-            vec![],
-            Ok(UnclaimedChannelRelease::Source),
+            None,
         ),
+        ("a source release with nothing on it yet", vec![], None),
         (
-            "a source release with nothing on it yet",
-            vec![],
-            vec![],
-            Ok(UnclaimedChannelRelease::Source),
-        ),
-        (
-            "this cut's complete release beside the source pair",
+            "NEGATIVE: a complete app release no journal of this cut claims",
             names(&[&source_pair, &elected_refs]),
-            vec![],
-            Ok(UnclaimedChannelRelease::Own),
+            Some("aterm-0.91.0-mac.zip"),
         ),
         (
-            "this cut's partial release, as a dead machine left it",
+            "NEGATIVE: a partial one, as a dead cut left it",
             names(&[&source_pair, &roster_pair, &[dmg.as_str()]]),
-            vec![],
-            Ok(UnclaimedChannelRelease::Own),
+            Some("aterm-0.91.0.dmg"),
         ),
         (
             "NEGATIVE: another version's DMG",
             names(&[&source_pair, &["aterm-0.90.0.dmg"]]),
-            vec![],
-            Err("it carries aterm-0.90.0.dmg, which this cut does not publish"),
+            Some("aterm-0.90.0.dmg"),
         ),
         (
-            "NEGATIVE: a retired container beside this cut's own set",
-            names(&[&source_pair, &elected_refs, &["aterm-offline.dmg"]]),
-            vec![],
-            Err("it carries aterm-offline.dmg, which this cut does not publish"),
-        ),
-        (
-            "NEGATIVE: one mismatched app asset among this cut's",
-            names(&[&source_pair, &app_only]),
-            vec![manifest_out::MANIFEST_ASSET],
-            Err("aterm-appcast.toml is not this cut's artifact"),
-        ),
-        (
-            "NEGATIVE: the source release plus one binary that is not this cut's",
-            names(&[&source_pair, &roster_pair, &[dmg.as_str()]]),
-            vec![dmg.as_str()],
-            Err("is not this cut's artifact"),
+            "NEGATIVE: a retired container",
+            names(&[&source_pair, &["aterm-offline.dmg"]]),
+            Some("aterm-offline.dmg"),
         ),
     ];
-    for (label, assets, foreign_bytes, want) in rows {
-        let mut asked = Vec::new();
-        let verdict = mirror::classify_unclaimed_channel_release(&assets, &elected, |name| {
-            asked.push(name.to_string());
-            if foreign_bytes.contains(&name) {
-                Err("sha256 differs".to_string())
-            } else {
-                Ok(())
-            }
-        });
-        match (want, &verdict) {
-            (Ok(want), got) => assert_eq!(got, &want, "{label}"),
-            (Err(needle), UnclaimedChannelRelease::Foreign(why)) => {
-                assert!(why.contains(needle), "{label}: {why}");
-            }
-            (Err(_), got) => panic!("{label}: a foreign release was classified {got:?}"),
-        }
-        match verdict {
-            // A source release costs no download, and a foreign NAME is refused before
-            // any byte is fetched.
-            UnclaimedChannelRelease::Source => assert!(asked.is_empty(), "{label}: {asked:?}"),
-            UnclaimedChannelRelease::Foreign(ref why) if why.contains("does not publish") => {
-                assert!(asked.is_empty(), "{label}: {asked:?}");
-            }
-            // Never a roster or attestation asset: those are not this cut's to prove.
-            _ => assert!(
-                asked
-                    .iter()
-                    .all(|name| !roster_pair.contains(&name.as_str())
-                        && !source_pair.contains(&name.as_str())),
-                "{label}: {asked:?}"
+    for (label, assets, refused) in rows {
+        match (channel::unclaimed_is_source_release(&assets), refused) {
+            (Ok(()), None) => {}
+            (Err(why), Some(app)) => assert_eq!(
+                why,
+                format!("carries {app}, which the engine's source release never does"),
+                "{label}"
             ),
+            (verdict, want) => panic!("{label}: {verdict:?}, wanted a refusal naming {want:?}"),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// --retire-unmirrored and the release its journal names
-// ---------------------------------------------------------------------------
-
-/// Retire's decision over the channel release its journal names. A cut refused at the
-/// first ratchet names none (proved above: the floors run before the bind); one refused
-/// later names either the draft it created — deleted — or the shared-tag release it
-/// adopted, which is VISIBLE and left alone: before 2026-09-23 retire refused it as
-/// "LIVE", and the documented exit was dead for exactly the refusal it exists for.
-/// NEGATIVE rows: an ID that now names another tag, draft or visible, is never touched.
-#[test]
-fn retire_deletes_its_own_draft_leaves_the_adopted_release_and_touches_nothing_else() {
-    let object = |tag: &str, draft: bool| publish::ReleaseObjectIdentity {
-        id: 7,
-        tag: tag.to_string(),
-        draft,
-        target_commitish: "main".to_string(),
-    };
-    use verify::RetireChannelRelease::{DeleteDraft, Gone, LeaveAdopted};
-    assert_eq!(verify::retire_channel_disposition(None, TAG), Ok(Gone));
-    assert_eq!(
-        verify::retire_channel_disposition(Some(&object(TAG, true)), TAG),
-        Ok(DeleteDraft)
-    );
-    assert_eq!(
-        verify::retire_channel_disposition(Some(&object(TAG, false)), TAG),
-        Ok(LeaveAdopted)
-    );
-    for draft in [true, false] {
-        let err = verify::retire_channel_disposition(Some(&object(PREVIOUS, draft)), TAG)
-            .expect_err("another tag's object is never touched");
-        assert!(err.contains(&format!("under tag \"{PREVIOUS}\"")), "{err}");
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Tier-1: the real sequence, stepped through the derived `ReleaseChannelHead`
+// Tier-1: the real sequence, stepped through the derived `ReleasePublishOnce`
 // ---------------------------------------------------------------------------
 
 /// [`FakeChannel`] with every call the real sequence makes stepped through the derived
@@ -1023,20 +1101,37 @@ struct ModelBound<'g> {
     state: aterm_spec::interp::State,
     actions: Vec<&'static str>,
     newer: Option<usize>,
+    /// The environment's roster join, taken right after this model action.
+    join_after: Option<&'static str>,
 }
 
 impl ModelBound<'_> {
-    fn project(&self) -> [(&'static str, i64); 4] {
+    fn project(&self) -> [(&'static str, i64); 7] {
         let github = &*self.inner.github;
-        let ours = &github.releases[self.inner.id];
         let latest = match github.latest {
             Some(i) if i == self.inner.id => 1,
             Some(i) if Some(i) == self.newer => 2,
             _ => 0,
         };
+        let joined = i64::from(github.roster_seq > CARRIED_ROSTER);
+        let bound = i64::from(github.journal_release == Some(self.inner.id));
+        let Some(ours) = github.releases.get(self.inner.id).filter(|r| !r.deleted) else {
+            return [
+                ("latest", latest),
+                ("joined", joined),
+                ("bound", bound),
+                ("source", 0),
+                ("prerelease", 0),
+                ("sig_up", 0),
+                ("toml_up", 0),
+            ];
+        };
         let has = |name: &str| i64::from(ours.assets.contains_key(name));
         [
             ("latest", latest),
+            ("joined", joined),
+            ("bound", bound),
+            ("source", 1),
             ("prerelease", i64::from(ours.prerelease)),
             ("sig_up", has(manifest_out::MANIFEST_SIG_ASSET)),
             ("toml_up", has(manifest_out::MANIFEST_ASSET)),
@@ -1078,11 +1173,47 @@ impl ModelBound<'_> {
             return Err(Error::new(format!("Tier-1: {action} not admitted: {why}")));
         }
         self.actions.push(action);
-        self.agree(action)
+        self.agree(action)?;
+        if self.join_after == Some(action) {
+            self.join_after = None;
+            self.join()?;
+        }
+        Ok(())
+    }
+
+    /// The environment's `RosterJoin`, on the fake and the model together.
+    fn join(&mut self) -> Result<()> {
+        self.inner.github.roster_join();
+        self.step("RosterJoin")
+    }
+
+    /// A new process resuming the journal: nothing is bound in memory, the model's state
+    /// (and the fake's journal) carry over.
+    fn restart(&mut self) {
+        self.inner.bound = false;
     }
 }
 
 impl ChannelRelease for ModelBound<'_> {
+    fn head_made(&mut self) -> Result<bool> {
+        let made = self.inner.head_made()?;
+        // The real predicate against the model's history, both ways: the resume finishes
+        // exactly the heads the cut made.
+        if made != (self.state["headed"] == 1) {
+            return Err(Error::new(format!(
+                "Tier-1: head_made answered {made}, but the model has headed={}",
+                self.state["headed"]
+            )));
+        }
+        self.agree("head_made")?;
+        Ok(made)
+    }
+
+    fn artifacts(&mut self) -> Result<Vec<PathBuf>> {
+        self.agree("artifacts")?;
+        self.inner.artifacts()
+    }
+
     fn bind(&mut self) -> Result<()> {
         self.inner.bind()?;
         self.step("Bind")
@@ -1099,27 +1230,46 @@ impl ChannelRelease for ModelBound<'_> {
 
     fn prove_assets(&mut self) -> Result<()> {
         self.inner.prove_assets()?;
-        self.agree("prove_assets")
+        self.step("ProveAssets")
+    }
+
+    fn ratchet_head(&mut self) -> Result<()> {
+        // The head half alone reads, and moves nothing the model tracks.
+        if let Err(refused) = self.inner.head_half() {
+            self.step("RefuseNewer")?;
+            return Err(refused);
+        }
+        self.agree("ratchet_head")
     }
 
     fn ratchet(&mut self) -> Result<()> {
-        match self.inner.ratchet() {
-            Ok(()) => self.step("Ratchet"),
-            Err(refused) => {
-                self.step("RefuseNewer")?;
-                Err(refused)
-            }
+        // The real ratchet's two halves, each refusal stepped as the model's own.
+        if let Err(refused) = self.inner.head_half() {
+            self.step("RefuseNewer")?;
+            return Err(refused);
         }
+        if let Err(refused) = self.inner.roster_half() {
+            self.step("RefuseFloor")?;
+            return Err(refused);
+        }
+        self.step("Ratchet")
     }
 
     fn make_head(&mut self) -> Result<()> {
         self.inner.make_head()?;
-        self.step("MakeHead")
+        // One PATCH, two model actions: the head PATCH, or — over a head this cut
+        // already made (`head_made` agreed with the model's `headed`) — its re-send.
+        if self.state["headed"] == 1 {
+            self.step("ReassertHead")
+        } else {
+            self.step("MakeHead")
+        }
     }
 
     fn prove_head(&mut self) -> Result<()> {
         self.agree("prove_head")?;
-        self.inner.prove_head()
+        self.inner.prove_head()?;
+        self.step("ProveHead")
     }
 }
 
@@ -1130,8 +1280,9 @@ fn model_bound<'g>(
     id: usize,
     newer: Option<usize>,
     local_appcast: Vec<u8>,
+    files: Vec<PathBuf>,
 ) -> ModelBound<'g> {
-    let model = aterm_spec::derive::release_channel_head_model();
+    let model = aterm_spec::derive::release_publish_once_model();
     let mut state = model.init_state();
     let mut environment = vec!["PublishSource"];
     if newer.is_some() {
@@ -1142,11 +1293,12 @@ fn model_bound<'g>(
         assert!(model.fire(action, &mut state), "{action}");
     }
     let bound = ModelBound {
-        inner: FakeChannel::new(github, id, local_appcast),
+        inner: FakeChannel::new(github, id, local_appcast, files),
         model,
         state,
         actions: Vec::new(),
         newer,
+        join_after: None,
     };
     bound
         .agree("binding")
@@ -1155,16 +1307,17 @@ fn model_bound<'g>(
 }
 
 /// TIER-1. The real `publish_on_channel`, against the fake, conforms to the derived
-/// model step for step: the ratchet, the bind, the signature, the appcast, the ratchet
-/// again, the head PATCH — every one enabled where it was taken, and the fake's
-/// `latest`, prerelease flag and appcast pair equal to the model's after each.
+/// model step for step: the ratchet, the bind, the signature, the appcast, the proof,
+/// the ratchet again, the head PATCH, the stranger's view — every one enabled where it
+/// was taken, and the fake's `latest`, prerelease flag, release, journal, roster and
+/// appcast pair equal to the model's after each.
 #[test]
 fn the_real_sequence_conforms_to_the_derived_head_model() {
     let mut github = FakeGithub::with_previous_release();
     let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut bound = model_bound(&mut github, id, None, local_appcast);
-    mirror::publish_on_channel(&mut bound, files).expect("conforms");
+    let mut bound = model_bound(&mut github, id, None, local_appcast, files);
+    channel::publish_on_channel(&mut bound).expect("conforms");
     assert_eq!(
         bound.actions,
         [
@@ -1172,11 +1325,13 @@ fn the_real_sequence_conforms_to_the_derived_head_model() {
             "Bind",
             "UploadSig",
             "UploadToml",
+            "ProveAssets",
             "Ratchet",
-            "MakeHead"
+            "MakeHead",
+            "ProveHead"
         ]
     );
-    assert_eq!(bound.state["phase"], 3);
+    assert_eq!(bound.state["phase"], 6);
 }
 
 /// TIER-1, the refusal: a newer release holding `latest` is the model's
@@ -1187,12 +1342,120 @@ fn a_newer_head_conforms_as_the_models_refusal() {
     let id = github.source_release(true);
     let newer = github.app_release("0.92.0", BUILD + 1);
     let (_dir, files, local_appcast) = dist();
-    let mut bound = model_bound(&mut github, id, Some(newer), local_appcast);
-    mirror::publish_on_channel(&mut bound, files).expect_err("refused");
+    let mut bound = model_bound(&mut github, id, Some(newer), local_appcast, files);
+    channel::publish_on_channel(&mut bound).expect_err("refused");
     assert_eq!(bound.actions, ["RefuseNewer"]);
     assert_eq!(bound.state["phase"], 4);
     assert_eq!(bound.state["bound"], 0);
     assert_eq!(github.binds, 0, "the refused cut bound nothing");
+}
+
+/// TIER-1, THE RESUME AFTER THE HEAD. The first pass is the model's up to `MakeHead`;
+/// its pointer gate runs out (no model step: the cut stops, the journal stays at
+/// `publish`); an `atpkg-index` full release takes `latest` (`OtherTakesLatest`) and a
+/// join re-dresses the channel (`RosterJoin` in phase 3); and the resume — a new process,
+/// the model's state carried over — answers `head_made` exactly as the model's `headed`
+/// does, and takes `ReassertHead` and `ProveHead` alone. NEGATIVE CONTROL: the resume
+/// that forgets its head disagrees with the model at the first question it asks.
+#[test]
+fn a_resume_after_the_head_conforms_as_the_models_proof_alone() {
+    for forget_head in [false, true] {
+        let mut github = FakeGithub::with_previous_release();
+        let id = github.source_release(true);
+        let (_dir, files, local_appcast) = dist();
+        github.stale_pointer = github.latest;
+        let mut bound = model_bound(&mut github, id, None, local_appcast, files);
+        channel::publish_on_channel(&mut bound).expect_err("the pointer gate runs out");
+        assert_eq!(bound.actions.last(), Some(&"MakeHead"));
+        assert_eq!(bound.state["phase"], 3);
+        bound.inner.github.stale_pointer = None;
+        bound
+            .inner
+            .github
+            .create("atpkg-index-31", false, false, &["index.toml"]);
+        bound
+            .step("OtherTakesLatest")
+            .expect("a full release after the PATCH takes `latest`, in the model too");
+        bound
+            .join()
+            .expect("a join after the PATCH is the model's too");
+        bound.inner.github.forget_head = forget_head;
+        bound.restart();
+        let resumed = channel::publish_on_channel(&mut bound);
+        if forget_head {
+            let err = resumed.expect_err("the forgotten head is not the model's");
+            assert!(
+                err.to_string()
+                    .contains("head_made answered false, but the model has headed=1"),
+                "{err}"
+            );
+            continue;
+        }
+        resumed.expect("the resume conforms");
+        assert_eq!(
+            bound.actions[bound.actions.len() - 4..],
+            [
+                "OtherTakesLatest",
+                "RosterJoin",
+                "ReassertHead",
+                "ProveHead"
+            ]
+        );
+        assert_eq!(bound.state["phase"], 6);
+        assert_eq!(bound.inner.github.latest, Some(id));
+    }
+}
+
+/// TIER-1, THE SECOND FLOOR READ. A join lands while the cut uploads (after the
+/// signature, before the appcast); the read after the proof is the model's
+/// `RefuseFloor`, from a release carrying every upload but not yet the head. The
+/// `--abandon` that follows withdraws exactly those uploads — the real
+/// `channel::withdrawable_assets` over the fake's upload log — and conforms to the
+/// model's `Abandon` from the refusal, the engine's release left as it made it.
+#[test]
+fn a_join_during_the_uploads_is_refused_by_the_second_read_and_withdrawn() {
+    let mut github = FakeGithub::with_previous_release();
+    let id = github.source_release(true);
+    let (_dir, files, local_appcast) = dist();
+    let mut bound = model_bound(&mut github, id, None, local_appcast, files);
+    bound.join_after = Some("UploadSig");
+    let err = channel::publish_on_channel(&mut bound).expect_err("the second read refuses");
+    assert!(
+        err.to_string()
+            .contains("this machine's roster is older than the channel's"),
+        "{err}"
+    );
+    assert_eq!(
+        bound.actions,
+        [
+            "Ratchet",
+            "Bind",
+            "UploadSig",
+            "RosterJoin",
+            "UploadToml",
+            "ProveAssets",
+            "RefuseFloor"
+        ]
+    );
+    assert!(bound.inner.github.head_patches.is_empty(), "never the head");
+    assert_eq!(
+        bound.inner.github.latest,
+        Some(0),
+        "the previous release keeps it"
+    );
+
+    let uploaded = bound.inner.github.uploads.clone();
+    let release = &mut bound.inner.github.releases[id];
+    let names: Vec<String> = release.assets.keys().cloned().collect();
+    for name in channel::withdrawable_assets(&names, VERSION, Some(&uploaded)).unwrap() {
+        release.assets.remove(&name);
+    }
+    bound.inner.github.journal_release = None;
+    bound
+        .step("Abandon")
+        .expect("the withdrawal after a refusal conforms to the model's abandon");
+    assert_eq!(bound.state["phase"], 5);
+    assert!(bound.inner.github.releases[id].prerelease);
 }
 
 /// NEGATIVE CONTROLS: the binding catches what it exists to catch.
@@ -1200,14 +1463,27 @@ fn a_newer_head_conforms_as_the_models_refusal() {
 ///   adoption and bound the release first) takes a `Bind` the model disables;
 /// * the upload order the sequence would have without its rank sort (alphabetical:
 ///   the appcast before its signature) takes an `UploadToml` the model disables;
+/// * a head PATCH over bytes nothing proved — what the origin's verify stood in front
+///   of while a cut published twice — takes a `MakeHead` the model disables;
+/// * a head PATCH on the floor read BEFORE the uploads, a join having landed since,
+///   takes a `MakeHead` the model disables;
 /// * the adopt path before 2026-09-23 (no head PATCH reaching GitHub) leaves the fake's
 ///   `latest` where the model says the head PATCH moved it.
 #[test]
 fn the_tier1_binding_refuses_the_pre_fix_orders() {
-    let mut github = FakeGithub::with_previous_release();
-    let id = github.source_release(true);
     let (_dir, files, local_appcast) = dist();
-    let mut bound = model_bound(&mut github, id, None, local_appcast.clone());
+    let ranked = {
+        let mut ranked = files.clone();
+        ranked.sort_by_key(|file| {
+            channel::channel_upload_rank(file.file_name().unwrap().to_str().unwrap())
+        });
+        ranked
+    };
+    let fresh = |github: &mut FakeGithub| github.source_release(true);
+
+    let mut github = FakeGithub::with_previous_release();
+    let id = fresh(&mut github);
+    let mut bound = model_bound(&mut github, id, None, local_appcast.clone(), files.clone());
     let err = bound.bind().expect_err("the bind before the ratchet");
     assert!(
         err.to_string()
@@ -1216,8 +1492,8 @@ fn the_tier1_binding_refuses_the_pre_fix_orders() {
     );
 
     let mut github = FakeGithub::with_previous_release();
-    let id = github.source_release(true);
-    let mut bound = model_bound(&mut github, id, None, local_appcast.clone());
+    let id = fresh(&mut github);
+    let mut bound = model_bound(&mut github, id, None, local_appcast.clone(), files.clone());
     bound.ratchet().unwrap();
     bound.bind().unwrap();
     let err = files
@@ -1231,14 +1507,117 @@ fn the_tier1_binding_refuses_the_pre_fix_orders() {
     );
 
     let mut github = FakeGithub::with_previous_release();
+    let id = fresh(&mut github);
+    let mut bound = model_bound(&mut github, id, None, local_appcast.clone(), files.clone());
+    bound.ratchet().unwrap();
+    bound.bind().unwrap();
+    for file in &ranked {
+        bound.upload(file).unwrap();
+    }
+    bound.ratchet().unwrap();
+    let err = bound
+        .make_head()
+        .expect_err("a head PATCH over unproved bytes");
+    assert!(
+        err.to_string()
+            .contains("took MakeHead, which the model does not enable"),
+        "{err}"
+    );
+
+    let mut github = FakeGithub::with_previous_release();
+    let id = fresh(&mut github);
+    let mut bound = model_bound(&mut github, id, None, local_appcast.clone(), files.clone());
+    bound.join_after = Some("UploadSig");
+    bound.ratchet().unwrap();
+    bound.bind().unwrap();
+    for file in &ranked {
+        bound.upload(file).unwrap();
+    }
+    bound.prove_assets().unwrap();
+    let err = bound
+        .make_head()
+        .expect_err("a head PATCH on the floor read before the join");
+    assert!(
+        err.to_string()
+            .contains("took MakeHead, which the model does not enable"),
+        "{err}"
+    );
+
+    let mut github = FakeGithub::with_previous_release();
     github.drop_head_patch = true;
-    let id = github.source_release(true);
-    let (_dir, files, local_appcast) = dist();
-    let mut bound = model_bound(&mut github, id, None, local_appcast);
-    let err = mirror::publish_on_channel(&mut bound, files).expect_err("no PATCH");
+    let id = fresh(&mut github);
+    let mut bound = model_bound(&mut github, id, None, local_appcast, files);
+    let err = channel::publish_on_channel(&mut bound).expect_err("no PATCH");
     assert!(
         err.to_string()
             .contains("after MakeHead, the fake GitHub has latest=0 but the model has 1"),
         "{err}"
     );
+}
+
+/// TIER-1, the abandon. A cut that never made its release the head withdraws exactly
+/// what it uploaded — the real `channel::withdrawable_assets` over its journal's upload
+/// intents — and the fake then projects onto the model's `Abandon`: the engine's release
+/// is still there, still a prerelease, and carries none of the cut's app assets (the
+/// source shapes stay). NEGATIVE CONTROL: deleting the release instead — what abandon
+/// did to the private origin's draft while a cut published twice — leaves the fake with
+/// no release where the model keeps the engine's.
+#[test]
+fn an_abandon_withdraws_the_cuts_assets_and_leaves_the_source_release() {
+    for delete_instead in [false, true] {
+        let mut github = FakeGithub::with_previous_release();
+        let id = github.source_release(true);
+        let (_dir, files, local_appcast) = dist();
+        let mut bound = model_bound(&mut github, id, None, local_appcast, files.clone());
+        bound.ratchet().unwrap();
+        bound.bind().unwrap();
+        let mut ranked = files;
+        ranked.sort_by_key(|file| {
+            channel::channel_upload_rank(file.file_name().unwrap().to_str().unwrap())
+        });
+        // The cut dies with everything up but the appcast.
+        for file in ranked
+            .iter()
+            .filter(|file| !file.ends_with(manifest_out::MANIFEST_ASSET))
+        {
+            bound.upload(file).unwrap();
+        }
+        let uploaded = bound.inner.github.uploads.clone();
+        bound.inner.github.journal_release = None;
+        let release = &mut bound.inner.github.releases[id];
+        if delete_instead {
+            release.deleted = true;
+        } else {
+            let names: Vec<String> = release.assets.keys().cloned().collect();
+            for name in channel::withdrawable_assets(&names, VERSION, Some(&uploaded)).unwrap() {
+                release.assets.remove(&name);
+            }
+        }
+        let outcome = bound.step("Abandon");
+        if delete_instead {
+            let err = outcome.expect_err("a deleted release is not the model's abandon");
+            assert!(
+                err.to_string()
+                    .contains("the fake GitHub has source=0 but the model has 1"),
+                "{err}"
+            );
+            continue;
+        }
+        outcome.expect("the withdrawal conforms to the model's abandon");
+        let release = &bound.inner.github.releases[id];
+        assert!(release.prerelease && !release.draft);
+        let mut left: Vec<&str> = release.assets.keys().map(String::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(
+            left,
+            [
+                "SHA256SUMS",
+                "SHA256SUMS.sig",
+                aterm_update_core::roster::ROSTER_ASSET,
+                aterm_update_core::roster::ROSTER_SIG_ASSET,
+            ],
+            "exactly the engine's source shapes remain"
+        );
+        assert_eq!(bound.state["source"], 1);
+    }
 }

@@ -54,11 +54,21 @@
 //! held, claim or no claim. Adoption requires BOTH gates; a handoff keeps the id
 //! unconditionally, since a transfer is not a second holder.
 //!
-//! Residual, and stated rather than papered over: between a predecessor's exit and
-//! its successor publishing its own graph entry, neither gate answers, so a launch
-//! landing in exactly that window can still adopt. Closing it needs the claim fd to
-//! ride the handoff, which is a change to a proof-carrying protocol and not one to
-//! make as a side effect of this fix.
+//! ## The third gate: the handoff window
+//!
+//! A handoff is not one step. The predecessor EXITS (its lock dies with it), and only
+//! then does the successor bind and publish its own graph entry — so between the two,
+//! neither gate above answered, and a launch landing in exactly that window adopted
+//! the id. Closed (2026-09-25) without touching the proof-carrying fd protocol: at
+//! Commit, before `_exit`, the predecessor writes `claims/<sid>.successor` naming the
+//! attested successor pid for each carried id ([`mark_successor`]), and
+//! [`claim_for_adoption`] treats a marker that names a LIVE process other than us as
+//! held. Once its entries are published the successor takes each transferred claim —
+//! the predecessor is gone, so the lock is free — and retires its markers
+//! ([`settle_transferred`]). A stale marker can only name a dead pid (ignored) or a
+//! live unrelated one (a safe refusal: the launch mints a fresh identity). The
+//! derived model is `SessionIdClaim` (`PredecessorExits` / `SuccessorPublishes`, with
+//! `Unmarked = 1` the pre-fix exit that duplicates).
 
 use std::path::{Path, PathBuf};
 
@@ -80,6 +90,9 @@ pub(crate) struct Claim {
         expect(dead_code, reason = "held for its close: the open handle is the claim")
     )]
     file: std::fs::File,
+    /// The id this claim holds — so [`settle_transferred`] can tell an id it already
+    /// holds from one it still has to take.
+    sid: String,
 }
 
 /// The drop releases the claim at once: `LOCK_UN`, not the close — a child another
@@ -200,7 +213,117 @@ pub(crate) fn claim_in(dir: &Path, sid: &SessionId) -> ClaimOutcome {
     // conclude anything from this pid: it is whatever process last won, which
     // after a crash is a process that no longer exists.
     let _ = write_pid(&file);
-    ClaimOutcome::Held(Claim { file })
+    ClaimOutcome::Held(Claim {
+        file,
+        sid: sid.as_str().to_string(),
+    })
+}
+
+/// The successor marker beside a claim file: `claims/<sid>.successor`.
+fn successor_marker_path(dir: &Path, sid: &SessionId) -> Option<PathBuf> {
+    claim_path(dir, sid).map(|claim| claim.with_file_name(format!("{}.successor", sid.as_str())))
+}
+
+/// The pid a successor marker names for `sid`, whatever its liveness.
+fn marked_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
+    let text = std::fs::read_to_string(successor_marker_path(dir, sid)?).ok()?;
+    text.strip_prefix("pid ")?.trim().parse().ok()
+}
+
+/// The LIVE successor a handoff marker names for `sid` — a live process other than
+/// this one that the predecessor handed the id to at Commit. See the module header's
+/// third gate. Pid liveness, as for [`live_holder_in`]: a recycled pid reads as live
+/// and costs a fresh identity, never a duplicate.
+pub(crate) fn live_successor_in(dir: &Path, sid: &SessionId) -> Option<u32> {
+    let pid = marked_successor_in(dir, sid)?;
+    (pid != std::process::id() && crate::control_auth::pid_alive(pid)).then_some(pid)
+}
+
+/// PREDECESSOR, at Commit, before `_exit`: name `successor` as the process about to
+/// answer to each of `sids`, so a launch landing between this process's exit and the
+/// successor's publish is refused. Written tmp-then-rename, so a reader sees a whole
+/// marker or none; failures are silent (the other two gates still stand, and the
+/// Commit must not wait on a filesystem).
+#[cfg(unix)]
+pub(crate) fn mark_successor_in(dir: &Path, sids: &[SessionId], successor: u32) {
+    if crate::control_auth::ensure_private_dir(&dir.join(CLAIMS_DIR)).is_err() {
+        return;
+    }
+    for sid in sids {
+        let Some(marker) = successor_marker_path(dir, sid) else {
+            continue;
+        };
+        let tmp = marker.with_file_name(format!(
+            ".{}.successor.{}.tmp",
+            sid.as_str(),
+            std::process::id()
+        ));
+        if std::fs::write(&tmp, format!("pid {successor}\n")).is_ok()
+            && std::fs::rename(&tmp, &marker).is_err()
+        {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+}
+
+/// [`mark_successor_in`] on the rendezvous directory.
+#[cfg(unix)]
+pub(crate) fn mark_successor(sids: &[SessionId], successor: u32) {
+    if let Some(dir) = rendezvous_dir() {
+        mark_successor_in(&dir, sids, successor);
+    }
+}
+
+/// PREDECESSOR, when a Commit FAILED and it keeps its sessions: withdraw the markers
+/// it wrote for `successor` (only those — a marker a later handoff wrote is not ours).
+#[cfg(unix)]
+pub(crate) fn withdraw_successor_markers(sids: &[SessionId], successor: u32) {
+    let Some(dir) = rendezvous_dir() else {
+        return;
+    };
+    for sid in sids {
+        if marked_successor_in(&dir, sid) == Some(successor)
+            && let Some(marker) = successor_marker_path(&dir, sid)
+        {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+}
+
+/// SUCCESSOR, once its own graph entries are published: take the claim on each
+/// transferred id it does not hold yet (the predecessor has exited, so its lock is
+/// free), and retire every marker that names `me`. Idempotent and cheap: it touches
+/// only `sids`, which in production are the ids this process ADOPTED.
+pub(crate) fn settle_transferred_in(dir: &Path, sids: &[SessionId], me: u32) {
+    for sid in sids {
+        let held = HELD
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|claim| claim.sid == sid.as_str());
+        if !held && let ClaimOutcome::Held(claim) = claim_in(dir, sid) {
+            hold(claim);
+        }
+        if marked_successor_in(dir, sid) == Some(me)
+            && let Some(marker) = successor_marker_path(dir, sid)
+        {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+}
+
+/// [`settle_transferred_in`] for every id this process adopted, on the rendezvous
+/// directory, as this process.
+pub(crate) fn settle_transferred() {
+    let Some(dir) = rendezvous_dir() else {
+        return;
+    };
+    let sids: Vec<SessionId> = {
+        let guard = ADOPTED.read();
+        let adopted = guard.unwrap_or_else(|p| p.into_inner());
+        adopted.iter().map(|s| SessionId::new(s.clone())).collect()
+    };
+    settle_transferred_in(&dir, &sids, std::process::id());
 }
 
 /// Whether a session id is already served by a LIVE instance other than this one,
@@ -261,6 +384,12 @@ pub(crate) fn rendezvous_test_guard() -> std::sync::MutexGuard<'static, ()> {
 /// is `None` by construction and costs one lock read and a short string compare —
 /// no `stat`, no `read`, no `kill`. Only an id that arrived from outside pays the
 /// two syscalls, and only on a request that names it.
+///
+/// Measured 2026-09-15 (debug lane, M-series macOS, five rounds of 20 000): a
+/// minted id costs 45–64 ns; an adopted id ~1.2 µs with no discovery entry,
+/// ~10.4–11.3 µs for our own entry, ~11.7–12.7 µs to refuse a live foreign one —
+/// against a 4.8–5.7 µs floor for one request+reply over a unix socket. So the
+/// gate, not the probe's own cost, is what keeps this off the hot path.
 pub(crate) fn live_holder(sid: &SessionId) -> Option<u32> {
     if !adopted_here(sid) {
         return None;
@@ -278,6 +407,14 @@ pub(crate) fn claim_for_adoption(dir: &Path, sid: &SessionId) -> bool {
     if let Some(pid) = live_holder_in(dir, sid) {
         crate::logging::stderr_line!(
             "aterm: session id {} is already served by a live instance (pid {pid}); \
+             minting a fresh identity for this one",
+            sid.as_str()
+        );
+        return false;
+    }
+    if let Some(pid) = live_successor_in(dir, sid) {
+        crate::logging::stderr_line!(
+            "aterm: session id {} is being handed to a live update successor (pid {pid}); \
              minting a fresh identity for this one",
             sid.as_str()
         );
@@ -314,9 +451,9 @@ pub(crate) fn claim_for_adoption(dir: &Path, sid: &SessionId) -> bool {
 /// Never a refusal: the successor keeps the handed-off id whatever this answers —
 /// ids must survive an update or every edge, discovery entry and saved address
 /// breaks. During an OVERLAP handoff the predecessor is still alive and still
-/// holds the claim, so failing to take it is the normal case, not a fault; what
-/// the successor publishes for the id is its own `graph/<sid>` entry, and
-/// [`live_holder_in`] reads that.
+/// holds the claim, so failing to take it is the normal case, not a fault; the
+/// successor takes it later, once the predecessor has exited and its own entries
+/// are published ([`settle_transferred`]).
 pub(crate) fn hold_transferred(sid: &SessionId) {
     // Registered whatever the claim answers: the successor IS answering to an id
     // it did not mint, which is exactly what the dispatch probe must know.
@@ -400,88 +537,6 @@ fn write_pid(file: &std::fs::File) -> std::io::Result<()> {
     use std::io::Write as _;
     let mut f = file;
     f.write_all(format!("pid {}\n", std::process::id()).as_bytes())
-}
-
-#[cfg(test)]
-mod measure {
-    use super::*;
-    use aterm_session::{LaunchNonce, SessionId};
-    use std::time::Instant;
-
-    /// WHAT THE DISPATCH PROBE COSTS — a measurement harness, never a gate
-    /// (`#[ignore]`d: a wall-clock assertion in the suite is a flake, and this
-    /// answers a question, it does not defend an invariant). Four arms
-    /// interleaved over five rounds, the last of them the hot path.
-    ///
-    /// `targo --unverified test -p aterm-gui --lib -- --ignored --nocapture probe_cost`
-    ///
-    /// Measured 2026-09-15, debug lane, M-series macOS, five rounds of 20 000:
-    ///
-    /// * minted id (the register miss — every ordinary `@<sid>`): **45–64 ns**
-    /// * adopted id, no discovery entry: ~1.2 µs (one failed `open`)
-    /// * adopted id, our own entry: ~10.4–11.3 µs
-    /// * adopted id, a live foreign entry (the refusal): ~11.7–12.7 µs
-    ///
-    /// For scale, measured the same way in an OPTIMIZED standalone lane: reading
-    /// a graph entry is 10.6–15.2 µs and `kill(pid, 0)` under 1 µs, against a
-    /// 4.8–5.7 µs floor for one request+reply over a unix socket with no auth,
-    /// no parse and no verb body. So the full probe is ~2× the transport floor
-    /// and the gated one is ~1% of it — which is why the register gate, not the
-    /// probe's own cost, is what keeps this off the hot path.
-    #[test]
-    #[ignore]
-    fn probe_cost() {
-        const N: u32 = 20_000;
-        let d = aterm_tempfile::tempdir().expect("dir");
-        let present = SessionId::generate();
-        let absent = SessionId::generate();
-        let mine = SessionId::generate();
-        crate::proxy::write_graph_entry(
-            d.path(),
-            &mine,
-            "/nonexistent/aterm.sock",
-            &LaunchNonce::generate(),
-        );
-        std::fs::write(
-            d.path().join("graph").join(present.as_str()),
-            "sock /nonexistent/aterm.sock\nnonce ab\npid 1\n",
-        )
-        .expect("plant");
-
-        let mut rows = [(0u128, 0u128, 0u128, 0u128); 5];
-        for round in &mut rows {
-            let t = Instant::now();
-            for _ in 0..N {
-                std::hint::black_box(live_holder_in(d.path(), &present));
-            }
-            round.0 = t.elapsed().as_nanos() / u128::from(N);
-
-            let t = Instant::now();
-            for _ in 0..N {
-                std::hint::black_box(live_holder_in(d.path(), &absent));
-            }
-            round.1 = t.elapsed().as_nanos() / u128::from(N);
-
-            let t = Instant::now();
-            for _ in 0..N {
-                std::hint::black_box(live_holder_in(d.path(), &mine));
-            }
-            round.2 = t.elapsed().as_nanos() / u128::from(N);
-
-            let t = Instant::now();
-            for _ in 0..N {
-                std::hint::black_box(live_holder(&present));
-            }
-            round.3 = t.elapsed().as_nanos() / u128::from(N);
-        }
-        for (i, r) in rows.iter().enumerate() {
-            println!(
-                "round {i}: foreign-live {} ns | absent {} ns | self {} ns | \
-                 minted-id (register miss, the hot path) {} ns",
-                r.0, r.1, r.2, r.3
-            );
-        }
-    }
 }
 
 #[cfg(test)]
@@ -645,8 +700,12 @@ mod tests {
         )
         .expect("plant the successor's entry");
         assert!(
-            mh.fire("Handover", &mut st),
-            "the model admits the handover"
+            mh.fire("PredecessorExits", &mut st),
+            "the model admits the predecessor's exit"
+        );
+        assert!(
+            mh.fire("SuccessorPublishes", &mut st),
+            "…and the successor's publish"
         );
         assert_eq!(
             st.get("lock"),
@@ -675,6 +734,115 @@ mod tests {
         );
         assert_eq!(st.get("holders"), Some(&1));
         assert!(mh.check_invariant("AtMostOneHolder", &st));
+    }
+
+    /// **TIER-1 BINDING FOR THE HANDOFF WINDOW** — `SessionIdClaim`'s
+    /// `PredecessorExits` / `SuccessorPublishes`, driven through the REAL
+    /// `claim_for_adoption`, `mark_successor_in` and `settle_transferred_in`.
+    ///
+    /// The window: the predecessor has exited (its flock is gone, its graph entry
+    /// names a dead pid) and the successor has not published yet. Only the marker
+    /// the predecessor wrote at Commit can refuse a launch there — and the NEGATIVE
+    /// CONTROL removes it and watches the real code adopt the id a second time,
+    /// exactly as the model's `Unmarked = 1` arm does.
+    #[cfg(unix)]
+    #[test]
+    fn the_handoff_window_is_held_by_the_successor_marker() {
+        let _guard = rendezvous_test_guard();
+        let d = dir();
+        let base = aterm_spec::derive::session_id_claim_model();
+        let marked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1)]);
+        let unmarked = aterm_spec::interp::with_consts(&base, &[("Handoff", 1), ("Unmarked", 1)]);
+        // The SUCCESSOR is another live process: a stand-in that is never us.
+        let mut successor = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the successor stand-in");
+        let succ = successor.id();
+        let dead_predecessor_entry = |sid: &SessionId| {
+            std::fs::create_dir_all(d.path().join("graph")).expect("graph dir");
+            std::fs::write(
+                d.path().join("graph").join(sid.as_str()),
+                "sock /nonexistent/aterm.sock\nnonce ab\npid 2147483646\n",
+            )
+            .expect("the dead predecessor's entry");
+        };
+
+        for (model, write_marker) in [(&marked, true), (&unmarked, false)] {
+            let sid = SessionId::generate();
+            let mut st = model.init_state();
+            // The predecessor adopts the id.
+            assert!(model.fire("Launch", &mut st));
+            assert!(claim_for_adoption(d.path(), &sid), "the predecessor adopts");
+            // Commit: name the successor (or, the pre-fix exit, do not), then exit.
+            if write_marker {
+                mark_successor_in(d.path(), std::slice::from_ref(&sid), succ);
+            }
+            release_claims_for_test();
+            dead_predecessor_entry(&sid);
+            assert!(model.fire("PredecessorExits", &mut st));
+            assert_eq!(
+                (st.get("lock"), st.get("entry")),
+                (Some(&0), Some(&0)),
+                "the window: no lock, no live entry"
+            );
+            // A launch lands in the window.
+            assert!(model.fire("Launch", &mut st));
+            let adopted = claim_for_adoption(d.path(), &sid);
+            assert_eq!(
+                i64::from(adopted) + 1,
+                st["holders"],
+                "the real launch and the model agree on the holder count \
+                 (marker written: {write_marker})"
+            );
+            if write_marker {
+                assert!(!adopted, "the marker refuses the window launch");
+                assert!(model.check_invariant("AtMostOneHolder", &st));
+            } else {
+                assert!(
+                    adopted,
+                    "NEGATIVE CONTROL: with no marker the real code adopts a second time"
+                );
+                assert!(!model.check_invariant("AtMostOneHolder", &st));
+                release_claims_for_test();
+                continue;
+            }
+            // The successor publishes its entry, takes the free claim, and retires
+            // the marker that names it.
+            std::fs::write(
+                d.path().join("graph").join(sid.as_str()),
+                format!("sock /nonexistent/aterm.sock\nnonce ab\npid {succ}\n"),
+            )
+            .expect("the successor's entry");
+            settle_transferred_in(d.path(), std::slice::from_ref(&sid), succ);
+            assert_eq!(
+                marked_successor_in(d.path(), &sid),
+                None,
+                "the successor retires its marker"
+            );
+            assert!(model.fire("SuccessorPublishes", &mut st));
+            assert!(model.fire("Launch", &mut st));
+            assert!(
+                !claim_for_adoption(d.path(), &sid),
+                "after the publish, the live entry (and the taken claim) refuse"
+            );
+            assert_eq!(st["holders"], 1);
+            release_claims_for_test();
+        }
+
+        // A STALE marker is harmless in the adoption direction: one naming a dead pid
+        // does not block a relaunch, and one naming US is not a rival.
+        let sid = SessionId::generate();
+        mark_successor_in(d.path(), std::slice::from_ref(&sid), 2_147_483_646);
+        assert_eq!(live_successor_in(d.path(), &sid), None);
+        mark_successor_in(d.path(), std::slice::from_ref(&sid), std::process::id());
+        assert_eq!(live_successor_in(d.path(), &sid), None);
+        assert!(claim_for_adoption(d.path(), &sid));
+        release_claims_for_test();
+
+        let _ = successor.kill();
+        let _ = successor.wait();
     }
 
     /// Two ADOPTIONS of one premint in the same process-second: the first takes the

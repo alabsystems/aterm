@@ -345,6 +345,15 @@ pub struct Terminal {
     /// `RowMatches` watcher no longer allocates one full-screen `Vec` plus one
     /// `String` per visible row on every processed batch.
     pub(super) row_text_scratch: Vec<Option<String>>,
+    /// Persistent row mask for the damage-scoped refill
+    /// ([`cell_frame_damage_scoped_into`](Self::cell_frame_damage_scoped_into)):
+    /// one bit per viewport row, `rows.div_ceil(64)` words. The scoped arm
+    /// copies the tracker's row bits (or SCR-2's exposed strip) here BEFORE the
+    /// fill, because the fill needs `&mut self`; it is `mem::take`n for the
+    /// fill and put back, so an echo frame reuses the capacity instead of
+    /// allocating a fresh `Vec<u64>` on every refill (typing-to-pixels audit P2).
+    /// EPHEMERAL render scratch: never checkpointed, never VT state.
+    pub(super) refill_mask_scratch: Vec<u64>,
     /// The alt-screen scroll-off archive and its `process_at` hook state: the
     /// rows a fullscreen app scrolled off the top of the alternate screen, which
     /// has no scrollback. In memory and observation-only (like `watchers`): never
@@ -588,6 +597,12 @@ pub struct Terminal {
     /// [`Terminal::damage_epoch`]: never reset (monotonic across RIS), never
     /// checkpointed, never gates bytes.
     pub(super) repaint_blink_epoch: u64,
+    /// The foreground handback's ASSERTED evidence: each
+    /// [`program_evidence`](super::program_evidence) bit whose setter the
+    /// dispatcher parsed since the host last took it
+    /// ([`Terminal::take_evidence_asserted`]). Never checkpointed, never
+    /// gates bytes.
+    pub(super) evidence_asserted: u16,
     /// Read-only host projection of content-coordinate motion.
     ///
     /// Updated once at the terminal post-processing boundary from the grid's

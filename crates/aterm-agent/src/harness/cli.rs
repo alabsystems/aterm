@@ -130,15 +130,15 @@ pub const DISK_LEDGER_MAX_BYTES: u64 = 1024 * 1024;
 /// `ledger disk`.
 pub const DISK_LEDGER_KEEP_ROWS: usize = 1024;
 
-/// The durable config's home: aterm.toml. MIRRORS `aterm-gui`'s `config_path`
-/// (XDG first, then `$HOME/.config/aterm/aterm.toml`), so `disk` reads the
-/// same `[disk]` table the window's Settings page writes.
+/// The durable config's home: aterm.toml — [`aterm_types::dirs::aterm_config_path`],
+/// the rule `aterm-gui`'s `config_path` delegates to, so `disk` reads the same
+/// `[disk]` table the window's Settings page writes. This was a hand copy of
+/// the Unix arms (XDG, then `$HOME/.config`), so on Windows it read
+/// `$HOME\.config\aterm\aterm.toml`, or nothing, while the window wrote
+/// `%APPDATA%\aterm\aterm.toml` (review, 2026-09-27).
 #[must_use]
 pub fn default_config_path() -> Option<PathBuf> {
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
-        return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
+    aterm_types::dirs::aterm_config_path()
 }
 
 /// Every raw value text assigned to `[<table>] <key>` in `text`, in file
@@ -292,7 +292,8 @@ USAGE:
     aterm harness ledger upgrade [<n>] [--json]  the live upgrade's ledger: every act, and the owner's word
     aterm harness upgrade [<sid>] [--dry-run] [--json]
                                                  move live Claude Code sessions onto a newer build
-                                                 and the priority list's best available model, and
+                                                 and the newest model of their own family (else
+                                                 up the model priority list), and
                                                  live Codex sessions (their daemon first) onto the
                                                  managed Codex
     aterm harness upgrade [<sid>] --status [--json]
@@ -301,7 +302,8 @@ USAGE:
                                                  the owner's word on one tab's upgrade
     aterm harness upgrade models [set <id>,<id>,...]
                                                  the model priority list: show it (availability,
-                                                 target, Claude Code's recommendations) or set it
+                                                 what is on offer, the target, Claude Code's
+                                                 recommendations) or set it
 
 `hook`, `statusline`, `install` and `uninstall` are RETIRED: aterm installs nothing into
 an agent. `install`/`uninstall` refuse (exit 2); `hook` and `statusline` do nothing and
@@ -347,7 +349,10 @@ a package build the live one supersedes. Removal needs BOTH `disk.apply = true` 
 aterm.toml AND an explicit `--apply <class>`; a refusal is written to the disk journal as
 a denial row rather than dropped. Nothing under the transcripts root is removable under
 any flag. Build directories are the ones you NAME on the line. The journal is cut back to
-its newest 1024 rows once it passes 1 MiB.
+its newest 1024 rows once it passes 1 MiB. One removal needs no verb: every 6 h the window
+looks at free space, and below `disk.auto_free_gib` (10 GiB; 0 or a negative value turns
+it off) it removes the stale build directories in its agents' working directories on that
+volume by itself — that class only, each with its witness journalled here.
 
 `ledger` prints the newest rows of the approval ledger the supervisor keeps for one
 session (<aterm state>/drive/<sid>.jsonl: every box its approval policy decided —
@@ -361,16 +366,29 @@ footer shows Claude Code's own `Update installed` notice — that install's
 current version; never an older one. Each sweep moves each session one step: when the
 agent is idle, its composer empty, no approval box up and nobody typing into the tab
 (`[harness] human_grace_s`), it TYPES a notice
-asking the agent to reach a stopping point — let its background tasks finish,
-never cancel them — and answer with a one-time READY marker. Only after that
+asking the agent to reach a stopping point — let its background tasks finish
+while they make progress, never cancel them, but stop any wait of its own that
+can never end — naming the shells still running under the agent (up to five, by
+pid and age, and what each of the agent's own runs), and to answer with a
+one-time READY marker. Only after that
 answer is in the transcript, with no shell still running under the agent and
 nobody holding the tab, does it send SIGTERM (never a harder signal), wait for
 the shell prompt, type a relaunch line — the atpkg hook sourced first so the
 shell's PATH is healed, then the same launch flags with `--resume <session>` —
 and, once the new process holds the conversation, type one line telling the
 agent to carry on. A launch it cannot resume (`--print`, `--worktree`, an
-unknown flag) is refused, not guessed; an unanswered notice is asked again
-every 30 minutes, four times at most. A SESSION IS MOVED ONLY WHILE THE
+unknown flag) is refused, not guessed; an unanswered notice, or a READY
+answer that work under the agent outlives, is asked again every 30 minutes
+(at a break of the agent's background work too), four notices at most, and
+then that ROUND gives up and names what still runs. NO STOP IS FOR GOOD: a
+round that gave up, was refused, or whose restart stopped rests two hours
+(one round's worth of asking: four notices, 30 minutes apart) and then a NEW
+ROUND starts by itself — new READY markers, its asks reset, `rearmed:<why>` on
+the ledger — whose first notice goes under every gate a first notice does, at
+an idle point or a break (never into a session at its limit). A late READY to
+a round that gave up is still acted on until then; one the agent's own work
+outlives past the drain is void, at a break as at an idle point.
+A SESSION IS MOVED ONLY WHILE THE
 AGENT IS ITS SHELL'S FOREGROUND JOB ON A TERMINAL AN ATERM TAB OWNS: an agent
 in a multiplexer pane (tmux, screen, zellij) or on any other pty the tab does
 not own (`script`, ssh) is held back — said once in the ledger, then waited
@@ -391,17 +409,21 @@ apart. It hands the relaunched agent straight back to its supervisor, which type
 the carry-on at its first idle point. It also RELAUNCHES an agent that crashed
 (its session record left behind, read as the exit is seen — a graceful exit is
 someone's), on its conversation (`[harness] relaunch`).
-THE MODEL goes with it: a session behind the priority list's best model available
-on the managed build (`aterm harness upgrade models`) is moved onto it on the
+THE MODEL goes with it: a session behind the newest model of its OWN family that
+the managed build offers (`aterm harness upgrade models`) is moved onto it on the
 relaunch line (`--model`, session-only — never `/model`, which also saves the
-person's default), riding a build restart when there is one, else by itself once
-its prompt cache is cold, or at most an hour after the move came due. A turn that
-ended with the agent's own background work in flight (Claude's `Waiting for N
-dynamic workflow`, a shell it left running, a Codex background terminal) is a
-NATURAL BREAK: once it has stood 20 s the window types the notice there — it
-interrupts the agent's orchestration once — and the restart still waits for an
-idle point with nothing running under the agent (a re-ask waits for one too), so
-running work is never ended.
+person's default) — Opus 5 -> Opus 5.5 first; only with nothing newer of its
+family, up the priority list for a model nobody chose; never down, a launch
+alias like `opus` kept as it is — riding a build restart when there is one, else
+by itself once its prompt cache is cold, or at most an hour after the move came
+due. A turn that ended with the agent's own background work in flight (Claude's
+`Waiting for N dynamic workflow`, a shell it left running, a Codex background
+terminal) is a NATURAL BREAK: once it has stood 20 s the window types the notice
+there, and again only after a whole 30 minutes with that work still running,
+four notices at most before the round gives up (and two hours later a new round
+asks again, there too). The restart still waits for an idle point with nothing
+running under the agent, so running work is never ended; a READY answer a
+person held past the drain is void at a break as at an idle point.
 A HAND-RUN sweep obeys `[harness] enabled` too: with it off it prints `step=refused:bypassed`, types and signals nothing
 and exits 1 (a `--dry-run` says so on stderr, still prints its plan, and
 exits 0); naming the verb is the consent `[harness] upgrade` would give.
@@ -459,7 +481,9 @@ what the daemon waits on (`wait:daemon-first:<why>`). An EMBEDDED session
 it by the `thread-writer-locks/<id>.lock` it holds) gets Claude's protocol —
 the notice, its READY answer in the rollout, nothing running under it, a
 background terminal included (`wait:background-terminal`: it would end with
-the TUI) — then the same `/exit`, the relaunch through the one relaunch line
+the TUI; one that outlives the READY a whole re-ask window is asked about
+again, and past the last ask the upgrade gives up, as Claude's) — then the
+same `/exit`, the relaunch through the one relaunch line
 Claude Code's restart types, and a carry-on line (the window hands the new
 TUI back to its supervisor, which types it at its next idle point). NO
 SIGNAL IS EVER SENT TO CODEX: SIGTERM leaves its tab in the alternate screen
@@ -483,11 +507,16 @@ and to, the phase, `pending_for=`,
 `wait=` (what the last step waited on: `settling`, `awaiting-ready`,
 `background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
 for a turn a hand-run sweep found in progress …) with `wait_for=`, the owner's
-`request=`, and `stalled=` — `-` while the upgrade will move on its own, else
-why it will not: `gave-up` (no READY answer after the last notice),
-`refused:<why>`, `failed:<why>`, `held-back:<owner>` (a multiplexer pane), or
-`overdue` (6 hours behind, whatever it waits on, unless the owner's `--now`
-came in the last 30 minutes). The window shows the same per tab as `upgrade=`
+`request=`, `next_round=` (for a round that stopped: how long until the new
+round it starts by itself, `due` once it has rested, `-` for any other or one
+the owner's `--skip` holds), and `stalled=` — `-` while the upgrade will move
+on its own, else why it will not: `refused:<why>` (it stays said through the
+new round's first look, which meets it again unless something changed),
+`failed:<why>`, `held-back:<owner>` (a multiplexer pane), or `overdue` (6
+hours behind, whatever it waits on, unless the owner's `--now` came in the
+last 30 minutes). A round that GAVE UP is no stall: it rests until its
+`next_round=`, and its column reads `pending/<to>/next-round:<span>/<age>`.
+The window shows the same per tab as `upgrade=`
 in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages, and marks
 a STALLED tab (`meta attention owner=upgrade`) — never a tab that is merely
 waiting for its turn end.
@@ -509,10 +538,14 @@ marker no earlier answer carries. An upgrade the owner holds (`--defer`,
 `--skip`) owns none of its session's turn ends: the tab's supervisor goes on
 continuing the worker as if none were pending, and a notice already typed is
 ended — the hold's end brings a fresh notice and needs a fresh READY. ONE
-PLACE `--now` adds an act: an upgrade that GAVE UP (no READY answer after the
-last notice) is re-armed, so the notice is typed again and, after its READY
-answer, the agent is restarted. An upgrade that was REFUSED or FAILED is not
-re-armed — `--now` exits 1 and names why; what stopped it still holds. `--now`
+PLACE `--now` adds an act: an upgrade that GAVE UP (no READY answer it could act
+on after the last notice) is re-armed AT ONCE rather than at its next round,
+so the notice is typed again and, after its READY answer, the agent is
+restarted. An upgrade that was REFUSED or FAILED is not
+re-armed by the word — `--now` exits 1, names why and when its next round
+starts by itself. `--skip` holds a stopped round too: it is not re-armed
+while the skip of its build stands, and a `--defer` holds it until it runs
+out. `--now`
 cannot reach an agent HELD BACK in a multiplexer pane either (typing into the
 tab does not reach it; stderr says so). `--defer` holds it until the time runs
 out; `--skip` holds it on the running build until a newer target than this
@@ -1343,14 +1376,22 @@ fn disk_roots(env: &Env, targets: &[PathBuf]) -> disk::Roots {
     }
 }
 
-/// The `[disk]` knobs, all three, read from `aterm.toml` through
-/// [`toml_bool`] and [`toml_int`]. A value of the wrong type — and a NEGATIVE stale window,
-/// which would make every directory a candidate at once — falls back to the
-/// shipped default rather than to a guess.
+/// The `[disk]` knobs ([`disk::KEYS`]), read from `aterm.toml` through
+/// [`toml_bool`] and [`toml_int`]. A value of the wrong type falls back to the
+/// shipped default rather than to a guess, and so does a NEGATIVE warning
+/// threshold or stale window (a negative window would make every directory a
+/// candidate at once). A negative `auto_free_gib` reads as `0`, OFF: a floor
+/// below zero is never crossed, and the default would leave the removal on for
+/// a person who wrote `-1` to stop it ([`disk::Config::negative_reading`]).
 fn disk_config(env: &Env) -> disk::Config {
-    let text = env
-        .config
-        .as_ref()
+    disk_config_at(env.config.as_deref())
+}
+
+/// The `[disk]` knobs of the `aterm.toml` at `path` (every knob at its
+/// default when there is none): what the verb reads, and the host's tick.
+#[must_use]
+pub fn disk_config_at(path: Option<&Path>) -> disk::Config {
+    let text = path
         .and_then(|p| std::fs::read_to_string(p).ok())
         .unwrap_or_default();
     let d = disk::Config::default();
@@ -1362,6 +1403,127 @@ fn disk_config(env: &Env) -> disk::Config {
         target_stale_days: toml_int(&text, "disk", "target_stale_days")
             .filter(|v| *v >= 0)
             .unwrap_or(d.target_stale_days),
+        auto_free_gib: toml_int(&text, "disk", "auto_free_gib")
+            .map_or(d.auto_free_gib, |v| u64::try_from(v).unwrap_or(0)),
+    }
+}
+
+/// What one tick of the host's disk watch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiskTick {
+    /// Free space is at or above the automatic floor, or unknown: nothing was
+    /// scanned, journalled or removed.
+    Plenty,
+    /// Below the floor: the report was journalled and the automatic grant
+    /// applied ([`disk::apply_auto`]).
+    Reclaimed(disk::Applied),
+}
+
+/// What one look of the window's disk watch is about: every path and figure is
+/// the host's ([`disk_tick`]).
+#[derive(Debug, Clone, Copy)]
+pub struct DiskLook<'a> {
+    /// The harness state directory; the ledger is `<state>/disk.jsonl`.
+    pub state: &'a Path,
+    /// The volume the free figure is about.
+    pub volume: &'a Path,
+    /// Its free bytes, measured by the host (the statvfs edge lives in
+    /// `atpkg`); `None` fails OPEN.
+    pub free: Option<u64>,
+    /// The build directories the host found where its agents work. Only the
+    /// ones on [`Self::volume`]'s volume are looked at ([`on_volume`]).
+    pub targets: &'a [PathBuf],
+    /// Where transcripts live: nothing under it is ever removable.
+    pub transcripts: Option<&'a Path>,
+    /// Unix seconds.
+    pub now: i64,
+}
+
+/// ONE TICK of the window's disk watch (design §5.5's 6 h timer, hosted by
+/// `aterm-gui`'s harness host): below the automatic floor
+/// ([`disk::Config::below_auto_floor`], `[disk] auto_free_gib`), survey the
+/// look's targets, journal the report into `<state>/disk.jsonl`, and remove
+/// what [`disk::auto_plan`] grants, a removal row (with its witness) or a
+/// denial row for each. At or above the floor it reads nothing but the config.
+/// A target on ANOTHER volume than the one measured is not looked at: removing
+/// it would free nothing where space ran short ([`on_volume`]).
+#[must_use]
+pub fn disk_tick(
+    look: &DiskLook<'_>,
+    config: disk::Config,
+    remove: &mut dyn FnMut(&Path) -> io::Result<()>,
+) -> DiskTick {
+    let DiskLook {
+        state,
+        volume,
+        free,
+        targets,
+        transcripts,
+        now,
+    } = *look;
+    if !config.below_auto_floor(free) {
+        return DiskTick::Plenty;
+    }
+    let roots = disk::Roots {
+        volume: Some(volume.to_path_buf()),
+        targets: on_volume(volume, targets, &volume_id),
+        transcripts: transcripts.map(Path::to_path_buf),
+        ..disk::Roots::default()
+    };
+    let survey = disk::scan(&roots, now, disk::Trigger::Tick, config, free);
+    let rep = disk::report(&survey, config);
+    let done =
+        disk::apply_auto(&rep, survey.transcripts_root.as_deref(), remove).unwrap_or_default();
+    let path = state.join(DISK_LEDGER);
+    let mut sink = io::sink();
+    if std::fs::create_dir_all(state).is_ok() {
+        let _ = bound_ledger(&path, DISK_LEDGER_MAX_BYTES, DISK_LEDGER_KEEP_ROWS);
+        let mut journal = Journal::open(Some(&path), None, &mut sink);
+        journal.append_raw(&disk::report_row(now, "", &rep), &mut sink);
+        for row in &done.removed {
+            journal.append_raw(&disk::removal_row(now, "", row), &mut sink);
+        }
+        for refusal in &done.denials {
+            journal.append_raw(&disk::denial_row(now, "", refusal), &mut sink);
+        }
+    }
+    DiskTick::Reclaimed(done)
+}
+
+/// The `targets` on the same volume as `volume`, by `id_of` (a device id): the
+/// free figure the tick acts on is that volume's, and a build directory on an
+/// external disk or a second APFS volume frees nothing there. A path whose
+/// volume cannot be read is left out, and so is every target when the
+/// measured volume's own id cannot be: nothing is removed on a fact nobody
+/// read.
+fn on_volume<V: PartialEq>(
+    volume: &Path,
+    targets: &[PathBuf],
+    id_of: &dyn Fn(&Path) -> Option<V>,
+) -> Vec<PathBuf> {
+    let Some(measured) = id_of(volume) else {
+        return Vec::new();
+    };
+    targets
+        .iter()
+        .filter(|t| id_of(t).is_some_and(|id| id == measured))
+        .cloned()
+        .collect()
+}
+
+/// A path's volume: its device id (`st_dev`).
+#[cfg(unix)]
+fn volume_id(path: &Path) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path).ok().map(|m| m.dev())
+}
+
+/// A path's volume where there is no `st_dev`: its drive or share prefix.
+#[cfg(not(unix))]
+fn volume_id(path: &Path) -> Option<std::ffi::OsString> {
+    match path.components().next()? {
+        std::path::Component::Prefix(prefix) => Some(prefix.as_os_str().to_os_string()),
+        _ => None,
     }
 }
 
@@ -1707,6 +1869,7 @@ fn run_upgrade_models(
         human_grace_s: 0,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     match set {
         Some(list) => match super::upgrade_drive::set_models(&opts, list) {
@@ -1775,6 +1938,7 @@ fn upgrade_opts(
         human_grace_s: policy.human_grace_s,
         hand_back: false,
         background: false,
+        aterm_state: env.aterm_state.clone(),
     })
 }
 
@@ -2035,7 +2199,14 @@ fn upgrade_line_with(
 ) {
     let ages = recorded.map(|(row, now)| {
         (
-            now.saturating_sub(row.behind_since),
+            // A FINISHED upgrade is history: the session caught up, so it is
+            // not behind, whatever its old record's clock says. `--status`
+            // already reads the clock only for a Pending or Announced row; the
+            // dry-run line read it for every row, so a session reported
+            // `step=current` beside `pending_for=1d19h` — the age of an
+            // upgrade that had landed that long ago (seen 2026-09-27).
+            (!matches!(row.phase, super::upgrade::Phase::Done))
+                .then(|| now.saturating_sub(row.behind_since)),
             (!row.wait.is_empty()).then(|| now.saturating_sub(row.wait_since)),
         )
     });
@@ -2045,7 +2216,7 @@ fn upgrade_line_with(
                 out,
                 "{} pending_for={} wait_for={}",
                 r.line(),
-                super::upgrade::span(behind),
+                behind.map_or_else(|| "-".to_string(), super::upgrade::span),
                 wait.map_or_else(|| "-".to_string(), super::upgrade::span)
             ),
             None => writeln!(out, "{}", r.line()),
@@ -2066,7 +2237,10 @@ fn upgrade_line_with(
         o.insert(k.to_owned(), Value::from(v.clone()));
     }
     if let Some((behind, wait)) = ages {
-        o.insert("pending_for_s".to_owned(), Value::from(behind));
+        o.insert(
+            "pending_for_s".to_owned(),
+            behind.map_or(Value::Null, Value::from),
+        );
         o.insert(
             "wait_for_s".to_owned(),
             wait.map_or(Value::Null, Value::from),

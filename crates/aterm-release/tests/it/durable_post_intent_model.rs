@@ -27,11 +27,8 @@ fn journal() -> Journal {
         signature_pubkey: None,
         signature_machine_id: None,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         done: Vec::new(),
     }
 }
@@ -70,16 +67,8 @@ fn context(root: &Path, with_journal: bool) -> CutCtx {
         attribution: None,
         roster: None,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        // No public update channel in this fixture: the model covers the
-        // PRIVATE side's one-shot POST intents, and the mirror's twin set must
-        // start empty so a converged private upload cannot be mistaken for
-        // authority on the channel.
-        mirror_slug: None,
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
         no_paint_smoke: false,
         lease: None,
@@ -124,9 +113,9 @@ fn real_guard_and_fsynced_journal_refine_one_shot_model() {
         "PersistCreateIntent",
         "durable create intent persisted before POST permit",
     );
-    let permit = ctx.persist_draft_create_intent().unwrap();
+    let permit = ctx.persist_release_intent().unwrap();
     let loaded = Journal::load(&ctx.journal_path).unwrap().unwrap();
-    assert!(loaded.draft_create_issued);
+    assert!(loaded.release_intent);
     assert!(ctx.journal_path.parent().unwrap().is_dir());
     drop(permit);
 
@@ -140,11 +129,11 @@ fn real_guard_and_fsynced_journal_refine_one_shot_model() {
         "resume retains durable intent",
     );
     assert_eq!(
-        publish::durable_post_decision(loaded.draft_create_issued, false),
+        publish::durable_post_decision(loaded.release_intent, false),
         DurablePostDecision::AwaitVisibility
     );
     assert!(!model.action_enabled("IssueCreatePost", &state));
-    assert!(ctx.persist_draft_create_intent().is_err());
+    assert!(ctx.persist_release_intent().is_err());
 
     ctx.release_id = Some(55);
     let persisted = ctx.journal.as_mut().unwrap();
@@ -158,7 +147,7 @@ fn real_guard_and_fsynced_journal_refine_one_shot_model() {
 
     // A real publication context without a journal cannot mint authority.
     let mut unjournaled = context(&root, false);
-    assert!(unjournaled.persist_draft_create_intent().is_err());
+    assert!(unjournaled.persist_release_intent().is_err());
     assert!(
         unjournaled
             .persist_upload_intent("aterm-0.55.0.dmg")
@@ -320,9 +309,14 @@ fn recovery_state(model: &Model, knowledge: Option<bool>, visible: bool, bound: 
     state
 }
 
-/// The shipping delete authority for one row: `delete_owned_draft_release`
-/// deletes only when `draft_cleanup_decision` says so AND the draft it found
+/// The delete authority for one row as the private draft leg held it — a
+/// helper retired with that leg by the publish-once decruft (fd6dd6377):
+/// delete only when `draft_cleanup_decision` says so AND the draft found
 /// passes `validate_release_object_capability` against the claim's commit.
+/// Its successor, `publish::withdraw_unpublished_release`, makes the same
+/// `draft_cleanup_decision` but binds the draft by its asset names
+/// (`channel::binds_to_version`), so this row pins the decision function and
+/// the capability check, not the successor's binding.
 fn real_deletes(knowledge: Option<bool>, visible: bool, bound: bool) -> bool {
     let draft = publish::ReleaseObjectIdentity {
         id: 7,

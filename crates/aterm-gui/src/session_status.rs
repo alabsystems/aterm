@@ -89,12 +89,21 @@ fn unresolved_program_recheck(attempts: u8) -> Duration {
     }
 }
 
-/// FNV-1a 64 over the classified rows, `\n`-joined: the live-zone hash the
-/// agent verdict is re-derived on (a changed content seq over an unchanged
-/// zone — a ticking clock elsewhere — costs a hash, not a classification).
-fn zone_hash(rows: &[String]) -> u64 {
+/// FNV-1a 64 over the classified rows, `\n`-joined, and the cursor's row on
+/// the screen: the live-zone hash the agent verdict is re-derived on (a
+/// changed content seq over an unchanged zone — a ticking clock elsewhere —
+/// costs a hash, not a classification). The cursor is in it because Claude
+/// Code's `idle` is the prompt box that HOLDS the cursor
+/// ([`crate::presence::Cursor`]): the cursor stepping into the box drawn a
+/// frame earlier changes the verdict and nothing else.
+fn zone_hash(rows: &[String], cursor: crate::presence::Cursor) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-    for row in rows {
+    let cursor = format!("{cursor:?}");
+    for row in rows
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(cursor.as_str()))
+    {
         for b in row.bytes().chain(std::iter::once(b'\n')) {
             h ^= u64::from(b);
             h = h.wrapping_mul(0x0000_0100_0000_01b3);
@@ -111,6 +120,10 @@ struct AgentWatch {
     /// the bare content seq: a screen switch can land the new grid on the old
     /// grid's seq, and that screen must still be read.
     seq_seen: Option<crate::control::ScreenGen>,
+    /// The terminal's cursor the live zone was last read with: its moving
+    /// alone is a reason to read again (the content seq does not move with
+    /// it, and Claude Code's `idle` is the prompt box that holds it).
+    cursor_seen: Option<crate::presence::Cursor>,
     /// [`zone_hash`] of the rows last classified.
     zone_hash: Option<u64>,
     /// When the classifier last ran — the [`AGENT_MIN_INTERVAL`] floor.
@@ -123,6 +136,14 @@ struct AgentWatch {
     /// drawn just after a look, with nothing printed after it — is read
     /// within one interval rather than at the status FSM's next deadline.
     followup: bool,
+    /// The latest output wake for this session ([`StatusObserver::note_output`]).
+    /// A follow-up is owed only once the output has been QUIET for one
+    /// observation interval: while it keeps arriving, each output wake's own
+    /// sweep looks whenever the session is due, so a timer at the observation
+    /// floor would only duplicate those looks — a 4 Hz poll for as long as a
+    /// program repaints without moving the grid (the spin gate's claude row:
+    /// 39 timer wakes in 10 s where a quiet loop takes 5).
+    output_at: Option<Instant>,
     /// The foreground group last seen (`-1` when unknowable).
     pgid: i32,
     /// When a program resolution was last requested for this session.
@@ -664,11 +685,14 @@ impl StatusFsm {
             let conflict =
                 matches!(shell, ShellEvidence::Executing) && evidence.foreground_job == Some(false);
             return match shell {
+                // The movement reason is the foreground-job arm's own: output
+                // that mutates nothing reads `output_activity`, so the record
+                // says which clock keeps `Running` alive.
                 ShellEvidence::Executing => Candidate {
                     phase: if moved { Phase::Running } else { Phase::Quiet },
                     confidence: Confidence::Strong,
                     reasons: if moved {
-                        vec![Reason::ShellBlock, Reason::ContentActivity]
+                        vec![Reason::ShellBlock, self.movement_reason(evidence, now)]
                     } else {
                         vec![Reason::ShellBlock, Reason::Stall]
                     },
@@ -915,6 +939,48 @@ fn env_split_string(flag: &str) -> Option<Option<&str>> {
     Some((!attached.is_empty()).then_some(attached))
 }
 
+/// The program a word in a program slot names: its BASENAME, less the
+/// executable extension a Windows launcher spells out.
+///
+/// The basename is what follows the last `/` (or `\`, save one that escapes a
+/// space: `my\ tool`), and only up to its first whitespace: a word may hold a
+/// quoted or escaped space, and a program's name is never published with one —
+/// `"/opt/My App/My App"` is `My`, and no reading of a line that
+/// [`shell_words`] got wrong can carry an argument out behind the name.
+///
+/// `less.exe`, `cmd.exe` and `build.cmd` are the programs `less`, `cmd` and
+/// `build` — the same name the same tool answers on every other host, and the
+/// name an agent compares against — so the four extensions Windows resolves
+/// for a bare command (`PATHEXT`'s `.exe`/`.com`/`.bat`/`.cmd`) are dropped,
+/// case-insensitively because the filesystem that resolved them is (measured
+/// 2026-09-22: a Windows launcher's `"C:\Program Files\Git\usr\bin\less.exe"
+/// README.md` read `Program` under a whitespace split). ONLY those: a dotted
+/// program name such as `python3.11` is a name, not a path with an extension,
+/// and a general `file_stem` would cut it to `python3`.
+fn basename(word: &str) -> Option<&str> {
+    const EXE_EXTENSIONS: [&str; 4] = [".exe", ".com", ".bat", ".cmd"];
+    let mut from = 0;
+    let mut chars = word.char_indices().peekable();
+    while let Some((at, c)) = chars.next() {
+        let escapes_space = c == '\\' && chars.peek().is_some_and(|(_, n)| n.is_whitespace());
+        if c == '/' || (c == '\\' && !escapes_space) {
+            from = at + c.len_utf8();
+        }
+    }
+    let name = word[from..]
+        .split_whitespace()
+        .next()
+        .map(|name| name.trim_end_matches('\\').trim_matches(WORD_TRIM))
+        .filter(|name| !name.is_empty())?;
+    let stem = EXE_EXTENSIONS.iter().find_map(|ext| {
+        let cut = name.len().checked_sub(ext.len()).filter(|cut| *cut > 0)?;
+        name.get(cut..)
+            .filter(|tail| tail.eq_ignore_ascii_case(ext))
+            .map(|_| &name[..cut])
+    });
+    Some(stem.unwrap_or(name))
+}
+
 /// `FOO=1` in front of a program: environment, not the program.
 fn is_assignment(word: &str) -> bool {
     word.split_once('=').is_some_and(|(name, _)| {
@@ -934,7 +1000,9 @@ fn leading_word(segment: &str) -> Option<&str> {
         .filter(|w| !is_assignment(w) && (*w == "{" || w.chars().any(char::is_alphanumeric)))
         .peekable();
     let first = words.next()?;
-    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    // The same basename the program slot is read by ([`basename`]), so a
+    // Windows launcher's `C:\…\env.exe` is the wrapper `env` here too.
+    let base = basename(first).unwrap_or(first);
     if !WRAPPERS.contains(&base) {
         return Some(first);
     }
@@ -962,7 +1030,7 @@ fn leading_word(segment: &str) -> Option<&str> {
 /// `detail=Application` for every session the upgrade moved onto the managed
 /// store). Each word is a borrowed slice of `segment` with its quotes and
 /// backslashes still in it — nothing is copied: [`command_detail`]'s `clean`
-/// trims the quotes off a word's ends, and its `basename` takes the program's
+/// trims the quotes off a word's ends, and [`basename`] takes the program's
 /// name from after the last `/`, past any quoted or escaped space in a
 /// directory.
 ///
@@ -1061,7 +1129,10 @@ fn word_end(segment: &str, start: usize, escape_in_single: bool) -> usize {
 /// still reads a name from the program's word, never text from an argument.
 /// `env -S '<program> <args>'` (and `--split-string`) hands env one string it
 /// splits itself, so the program — and a subcommand from the closed list — is
-/// read from that string's words ([`env_split_string`]).
+/// read from that string's words ([`env_split_string`]). The program's name
+/// drops a Windows executable extension ([`basename`]), so a launcher's
+/// `"C:\Program Files\Git\usr\bin\less.exe" README.md` reads `less` —
+/// measured 2026-09-22 reading `Program` under a whitespace split.
 ///
 /// A COMPOUND command line names the program of the segment that is RUNNING,
 /// not the word the line happens to open with — measured: `cd ~/ay && claude`
@@ -1151,26 +1222,9 @@ pub(crate) fn command_detail(cmdline: &str) -> Option<String> {
     // looked at, the wrapper included: a shell that reports `/usr/bin/env
     // FOO=1 codex` names the same wrapper as `env FOO=1 codex`, and comparing
     // the full path would leave the `env` in place as the "program". The
-    // basename is what follows the last `/` (or `\`, save one that escapes a
-    // space: `my\ tool`), and only up to its first whitespace: a word may hold
-    // a quoted or escaped space, and a program's name is never published with
-    // one — `"/opt/My App/My App"` is `My`, and no reading of a line that
-    // [`shell_words`] got wrong can carry an argument out behind the name.
-    fn basename(word: &str) -> Option<&str> {
-        let mut from = 0;
-        let mut chars = word.char_indices().peekable();
-        while let Some((at, c)) = chars.next() {
-            let escapes_space = c == '\\' && chars.peek().is_some_and(|(_, n)| n.is_whitespace());
-            if c == '/' || (c == '\\' && !escapes_space) {
-                from = at + c.len_utf8();
-            }
-        }
-        word[from..]
-            .split_whitespace()
-            .next()
-            .map(|name| name.trim_end_matches('\\').trim_matches(WORD_TRIM))
-            .filter(|name| !name.is_empty())
-    }
+    // module-level [`basename`] says what a basename is here — up to its first
+    // whitespace, less a Windows executable extension — and [`leading_word`]
+    // reads the wrapper slot by the same one.
     let mut program_word = words.next()?;
     // `env -S '<program> <args>'`: the one string env splits ([`env_split_string`]).
     let mut split: Option<String> = None;
@@ -1693,6 +1747,11 @@ pub(crate) struct StatusObserver {
     /// brand-new session may be waiting for its first classification and the
     /// gate must open regardless of the deadlines. See `SessionPool::insert_epoch`.
     swept_pool_epoch: u64,
+    /// Pooled sessions the last full sweep reached but could NOT classify —
+    /// their terminal `try_lock` lost to the PTY reader — so they still have no
+    /// slot. Every output wake retries exactly these (not the pool) until each
+    /// is classified. See [`StatusObserver::note_swept`].
+    unclassified: Vec<u64>,
     /// THE SERVER'S AGENT VERDICT, per session ([`AgentWatch`]).
     agents: std::collections::HashMap<u64, AgentWatch>,
     /// Monotonic across every session and every [`Self::clear`]: the sequence
@@ -1714,7 +1773,14 @@ pub(crate) struct StatusObserver {
     /// When each Claude Code session's footer facts were last asked for, so a
     /// sweep at the classification rate asks at most every
     /// [`crate::claude_footer::RECHECK`].
-    footer_asked: std::collections::HashMap<u64, Instant>,
+    footer_asked: std::collections::HashMap<u64, FooterAsk>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FooterAsk {
+    at: Instant,
+    pgid: i32,
+    stopped: bool,
 }
 
 #[derive(Debug)]
@@ -1745,6 +1811,7 @@ impl StatusObserver {
             // No slots yet: the gate is open until the first sweep records one.
             next_due_any: None,
             swept_pool_epoch: 0,
+            unclassified: Vec::new(),
             agents: std::collections::HashMap::new(),
             agent_seq: 0,
             agent_cleared_at: 0,
@@ -1766,14 +1833,70 @@ impl StatusObserver {
         now: Instant,
     ) {
         if program != Some("claude") || pgid <= 0 {
+            // A held pane can outlive Claude with no valid foreground group;
+            // it will not be retired, and the program resolver cannot name a
+            // replacement to stop. Use the group we last asked for, or the
+            // timeline's still-named Claude group if only the program worker
+            // made the first request. Mark the stop so an idle sweep does not
+            // send another message every observation interval.
+            let prior = self.footer_asked.get(&session).copied();
+            if prior.is_some_and(|ask| ask.stopped)
+                || (prior.is_none() && !(pgid <= 0 && program == Some("claude")))
+            {
+                return;
+            }
+            let current = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            // The sampled program was read before the resolver's answer. Hold
+            // this leaf lock through the stop send: if a newer Claude answer
+            // already landed, keep it; if it lands next, its request follows
+            // this stop in channel order.
+            if pgid > 0
+                && current.agent().program_pgid == pgid
+                && current.agent().program.as_deref() == Some("claude")
+            {
+                return;
+            }
+            let old = prior.map(|ask| ask.pgid).or_else(|| {
+                (pgid <= 0 && program == Some("claude")).then_some(current.agent().program_pgid)
+            });
+            if let Some(old) = old.filter(|old| *old > 0) {
+                self.footer_asked.insert(
+                    session,
+                    FooterAsk {
+                        at: now,
+                        pgid: old,
+                        stopped: true,
+                    },
+                );
+                crate::claude_footer::stop(session, old);
+            }
             return;
         }
-        let due = self.footer_asked.get(&session).is_none_or(|asked| {
-            now.saturating_duration_since(*asked) >= crate::claude_footer::RECHECK
+        let due = self.footer_asked.get(&session).is_none_or(|ask| {
+            ask.stopped
+                || ask.pgid != pgid
+                || now.saturating_duration_since(ask.at) >= crate::claude_footer::RECHECK
         });
         if due {
-            self.footer_asked.insert(session, now);
-            crate::claude_footer::request(session, timeline, pgid);
+            // The sampled program can become stale while this sweep runs. A
+            // worker may have named a different program and stopped its watch
+            // already; hold the leaf lock through this send so that stale
+            // sample cannot restart the stopped watch after that transition.
+            let current = timeline.lock().unwrap_or_else(|p| p.into_inner());
+            if current.agent().program_pgid != pgid
+                || current.agent().program.as_deref() != Some("claude")
+            {
+                return;
+            }
+            self.footer_asked.insert(
+                session,
+                FooterAsk {
+                    at: now,
+                    pgid,
+                    stopped: false,
+                },
+            );
+            crate::claude_footer::request_footer(session, timeline, pgid);
         }
     }
 
@@ -1810,29 +1933,47 @@ impl StatusObserver {
         self.next_due_any.is_none_or(|due| now >= due)
     }
 
-    /// A sweep just walked the whole pool: make `next_due_any` EXACT again, and
-    /// bank `pool_epoch` IF the sweep left every pooled session with a slot.
-    /// O(slots), on the classification path only — which is 4/s at the default
-    /// interval, not the burst rate the gate spares.
+    /// A sweep just walked the whole pool: make `next_due_any` EXACT again,
+    /// bank `pool_epoch`, and record the pooled sessions the sweep left
+    /// slot-less. O(slots), on the classification path only — which is 4/s at
+    /// the default interval, not the burst rate the gate spares.
     ///
-    /// `None` MEANS "DO NOT BANK", and that is the load-bearing case. A sweep
-    /// can leave a session unclassified: the classify path takes the session's
-    /// terminal with `try_lock` and SKIPS the session when the PTY reader holds
-    /// it — which, under exactly the output flood this gate exists to survive,
-    /// is not rare. A session skipped that way still has no slot, so `due()`
-    /// would report it due and the whole-pool scan WOULD classify it, while
-    /// `next_due_any` (a min over slots that do not include it) would not. If
-    /// this banked the epoch anyway, the gate would close over a session it has
-    /// never seen and that session's first status could wait out another
-    /// session's whole interval. Leaving the epoch stale keeps the gate open
-    /// until the newcomer really is classified, which costs one scan per wake
-    /// in a rare case and makes the gate EXACTLY equivalent to the scan it
-    /// replaces — the only property that makes it safe to ship.
-    pub(crate) fn note_swept(&mut self, pool_epoch: Option<u64>) {
-        if let Some(epoch) = pool_epoch {
-            self.swept_pool_epoch = epoch;
-        }
+    /// `unclassified` is the load-bearing part. A sweep can leave a session
+    /// unclassified: the classify path takes the session's terminal with
+    /// `try_lock` and SKIPS the session when the PTY reader holds it — which,
+    /// under exactly the output flood this gate exists to survive, is not
+    /// rare. A session skipped that way still has no slot, so `due()` would
+    /// report it due and the whole-pool scan WOULD classify it on the next
+    /// wake, while `next_due_any` (a min over slots that do not include it)
+    /// would not. Banking the epoch with nothing else would close the gate
+    /// over a session it has never seen. Recording the id keeps the gate open
+    /// for exactly that session — the next wake retries IT, not the pool —
+    /// until it is classified, which keeps the gate EXACTLY equivalent to the
+    /// scan it replaces, the only property that makes it safe to ship. (This
+    /// used to leave the epoch un-banked instead, which re-walked the whole
+    /// pool on every wake while the newcomer stayed contended.)
+    pub(crate) fn note_swept(&mut self, pool_epoch: u64, unclassified: Vec<u64>) {
+        self.swept_pool_epoch = pool_epoch;
+        self.unclassified = unclassified;
         self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
+    }
+
+    /// Whether a sweep left a pooled session slot-less (see
+    /// [`StatusObserver::note_swept`]) — the one reason the gate opens while
+    /// every known deadline is in the future and no session is new.
+    pub(crate) fn has_unclassified(&self) -> bool {
+        !self.unclassified.is_empty()
+    }
+
+    /// Hand the unclassified ids to a retry pass (which puts back the ones it
+    /// still could not classify with [`Self::restore_unclassified`]).
+    pub(crate) fn take_unclassified(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.unclassified)
+    }
+
+    /// See [`Self::take_unclassified`].
+    pub(crate) fn restore_unclassified(&mut self, ids: Vec<u64>) {
+        self.unclassified = ids;
     }
 
     /// Whether this observer holds a slot for `session` — i.e. whether it has
@@ -1884,9 +2025,9 @@ impl StatusObserver {
         };
         let due = now + self.min_interval;
         slot.next_due = due;
-        // What the refused look would have read is owed at the next due
-        // instant — the PTY reader holding the lock is output arriving.
-        self.note_output(session);
+        // What the refused look would have read is owed one interval on —
+        // the PTY reader holding the lock is output arriving.
+        self.note_output(session, now);
         // Same LOWER-bound fold as `observe`; `note_swept` restores exactness.
         self.next_due_any = Some(self.next_due_any.map_or(due, |min| min.min(due)));
     }
@@ -1968,16 +2109,25 @@ impl StatusObserver {
     }
 
     pub(crate) fn next_wake(&self) -> Option<Instant> {
-        // THE AGENT FOLLOW-UP: a session whose content moved at its last look
-        // is looked at once more at its next due instant, so the frame an
-        // agent drew last (an approval box, then silence) is read within one
-        // interval. It re-arms only while the content keeps moving.
+        // THE AGENT FOLLOW-UP: a session whose content moved at its last look,
+        // or whose output landed between looks, is looked at once more, so the
+        // frame an agent drew last (an approval box, then silence) is read
+        // within one interval of it. The look waits for the output to pause
+        // (`output_at + min_interval`, never before the slot's next due
+        // instant): output still arriving brings its own due looks, and a
+        // timer that fires between them is a poll.
         let agent_wake = self
             .agents
             .iter()
             .filter_map(|(id, w)| {
                 let slot = self.sessions.get(id)?;
-                let followup = w.followup.then_some(slot.next_due);
+                let followup = w.followup.then(|| {
+                    w.output_at.map_or(slot.next_due, |at| {
+                        at.checked_add(self.min_interval)
+                            .unwrap_or(at)
+                            .max(slot.next_due)
+                    })
+                });
                 // A missing argv[0] can be transient (a group just exec'd).
                 // An unchanged screen cannot cause another request itself,
                 // so this deadline is the only route to a retry. The slot's
@@ -2052,24 +2202,27 @@ impl StatusObserver {
         }
     }
 
-    /// OUTPUT ARRIVED for `session` (the output wake, before its sweep): its
-    /// agent verdict owes a look at the next due instant. A sweep that looks
-    /// now answers for itself (its look sets the follow-up from what it
-    /// read); one that cannot — the session not due yet, the whole sweep
-    /// gated, the terminal contended — leaves this armed, so the FINAL frame
-    /// of a burst that landed between looks is read within one interval,
-    /// never at whatever unrelated deadline comes next (a box answered and a
-    /// static busy screen drawn read `agent=prompt` for seconds; an exited
-    /// agent's shell prompt left `program=claude` standing). No poll: one
-    /// deadline, armed by the output itself.
-    pub(crate) fn note_output(&mut self, session: u64) {
+    /// OUTPUT ARRIVED for `session` at `now` (the output wake, before its
+    /// sweep): its agent verdict owes a look once the output pauses. A sweep
+    /// that looks now answers for itself (its look sets the follow-up from
+    /// what it read); one that cannot — the session not due yet, the whole
+    /// sweep gated, the terminal contended — leaves this armed, so the FINAL
+    /// frame of a burst that landed between looks is read within one interval
+    /// of it, never at whatever unrelated deadline comes next (a box answered
+    /// and a static busy screen drawn read `agent=prompt` for seconds; an
+    /// exited agent's shell prompt left `program=claude` standing). No poll:
+    /// one deadline, armed by the output itself and pushed on by each further
+    /// burst, so it fires only after the last one ([`Self::next_wake`]).
+    pub(crate) fn note_output(&mut self, session: u64, now: Instant) {
         if let Some(w) = self.agents.get_mut(&session) {
             w.followup = true;
+            w.output_at = Some(now);
         }
     }
 
     /// Whether this observation should read the live zone (the caller holds
-    /// the terminal guard): the screen generation moved since the last read, or the
+    /// the terminal guard): the screen generation or the terminal's `cursor`
+    /// moved since the last read, or the
     /// published program is not the one the zone was last judged under — and
     /// the [`AGENT_MIN_INTERVAL`] floor allows it. A read the floor defers
     /// arms a follow-up instead.
@@ -2077,6 +2230,7 @@ impl StatusObserver {
         &mut self,
         session: u64,
         generation: crate::control::ScreenGen,
+        cursor: crate::presence::Cursor,
         program: &Option<String>,
         now: Instant,
     ) -> bool {
@@ -2084,7 +2238,9 @@ impl StatusObserver {
             pgid: -1,
             ..AgentWatch::default()
         });
-        let moved = w.seq_seen != Some(generation) || w.program_seen.as_ref() != Some(program);
+        let moved = w.seq_seen != Some(generation)
+            || w.cursor_seen != Some(cursor)
+            || w.program_seen.as_ref() != Some(program);
         if !moved {
             return false;
         }
@@ -2099,7 +2255,8 @@ impl StatusObserver {
 
     /// One observation's agent step, after the terminal guard is released:
     /// `rows` is the live zone when [`Self::agent_zone_wanted`] asked for it
-    /// (under the same `program`), `pgid` the foreground group, `resolving`
+    /// (under the same `program`), `cursor` the terminal's cursor read under
+    /// the same guard, `pgid` the foreground group, `resolving`
     /// whether a program resolution was just requested for it. Classifies
     /// through [`crate::presence::agent_verdict`] only when the zone's hash
     /// or the program changed.
@@ -2113,6 +2270,7 @@ impl StatusObserver {
         session: u64,
         generation: crate::control::ScreenGen,
         rows: Option<Vec<String>>,
+        cursor: crate::presence::Cursor,
         program: Option<String>,
         pgid: i32,
         resolving: bool,
@@ -2146,7 +2304,7 @@ impl StatusObserver {
             }
         }
         let program_moved = w.program_seen.as_ref() != Some(&program);
-        let screen_moved = w.seq_seen != Some(generation);
+        let screen_moved = w.seq_seen != Some(generation) || w.cursor_seen != Some(cursor);
         if let Some(name) = program.as_deref() {
             // A later exec in this SAME group can make the next lookup miss.
             // Once this name is known, that is a fresh retry episode.
@@ -2196,10 +2354,12 @@ impl StatusObserver {
         };
         let moved = screen_moved;
         w.seq_seen = Some(generation);
+        w.cursor_seen = Some(cursor);
         w.followup = moved || resolving;
         // The zone the verdict reads ([`crate::presence::live_zone`]): a box
-        // drawn above the last rows of a mostly blank pane moves it.
-        let hash = zone_hash(crate::presence::live_zone(&rows));
+        // drawn above the last rows of a mostly blank pane moves it, and so
+        // does the cursor's row.
+        let hash = zone_hash(crate::presence::live_zone(&rows), cursor);
         if w.zone_hash == Some(hash) && !program_moved {
             return AgentStep::default();
         }
@@ -2216,6 +2376,7 @@ impl StatusObserver {
             pending,
             known,
             &rows,
+            cursor,
             now,
         );
         if let crate::presence::AgentVerdict::Agent {
@@ -2340,6 +2501,7 @@ impl StatusObserver {
         self.agents.remove(&session);
         let _ = self.inputs.forget(session);
         self.programs.retire(session);
+        crate::claude_footer::stop_session(session);
         self.footer_asked.remove(&session);
         if self.sessions.remove(&session).is_some() {
             // The removed slot may have BEEN the minimum, and a stale-early
@@ -2391,6 +2553,7 @@ impl StatusObserver {
         let had = !self.sessions.is_empty();
         self.sessions.clear();
         self.programs.clear_pending();
+        self.footer_asked.clear();
         // The agent readings describe the same stopped subsystem: retire them
         // (presence folds the post-clear sequence as "no reading").
         self.agents.clear();
@@ -2399,6 +2562,7 @@ impl StatusObserver {
         // No slots ⇒ no known deadline ⇒ the gate is open again, which is what
         // a re-enabled subsystem needs (every session is unclassified).
         self.next_due_any = None;
+        self.unclassified.clear();
         had
     }
 }
@@ -2437,17 +2601,40 @@ impl crate::App {
         // it cannot — a brand-new session has no slot, `due()` reports an
         // unknown id as due immediately, and gating on deadlines alone would
         // make a fresh tab wait a whole interval for its first classification.
+        //
+        // The third term is the newcomer a sweep reached but could not
+        // classify, because the PTY reader held its terminal: it still has no
+        // slot, so the deadlines cannot speak for it, and it is owed a retry on
+        // the very next wake. Those ids are RECORDED at the end of every full
+        // sweep (`StatusObserver::note_swept`), so the retry visits just them —
+        // it used to keep the pool epoch un-banked instead, which re-walked
+        // EVERY session on every output wake for as long as one newcomer's
+        // lock stayed contended (a flooding background tab): O(sessions) of
+        // UI-thread time between redraw admission and the frame it admitted.
         let pool_epoch = self.pool.insert_epoch();
-        let gated = pool_epoch == self.session_status.swept_pool_epoch()
+        let retry_only = pool_epoch == self.session_status.swept_pool_epoch()
             && !self.session_status.any_due(now);
-        if gated {
+        if retry_only && !self.session_status.has_unclassified() {
             return Vec::new();
         }
+        let retry = if retry_only {
+            self.session_status.take_unclassified()
+        } else {
+            Vec::new()
+        };
+        let pool = &self.pool;
+        let sessions: Box<dyn Iterator<Item = &crate::Session> + '_> = if retry_only {
+            Box::new(retry.iter().filter_map(|id| pool.get(*id)))
+        } else {
+            Box::new(pool.iter())
+        };
         let mut changed = Vec::new();
         // The sweep never changes pool membership: borrow each due session
         // directly instead of collecting ids, looking them up again, and
         // cloning its terminal Arc on every observation interval.
-        for session in self.pool.iter() {
+        for session in sessions {
+            #[cfg(test)]
+            crate::work_counts::status_probe();
             let id = session.id;
             if !self.session_status.due(id, now) {
                 continue;
@@ -2506,9 +2693,15 @@ impl crate::App {
             // `status hash=` hashes ([`crate::control::screen_text`]): its hash
             // and generation are the verdict's stamp (`agent_gen=`/`agent_fp=`),
             // and its last rows are the zone classified.
+            // The terminal's cursor, under this SAME guard as the rows: Claude
+            // Code's `idle` is the prompt box that holds it (`presence::Cursor`),
+            // and its moving alone is a reason to read the zone again. Its row
+            // is the grid's, the rows' own (`visible_row` reads the live rows
+            // whatever the scroll position).
+            let cursor = crate::presence::Cursor::At(Some(usize::from(guard.cursor().row)));
             let read = self
                 .session_status
-                .agent_zone_wanted(id, generation, &program, now)
+                .agent_zone_wanted(id, generation, cursor, &program, now)
                 .then(|| {
                     // The whole screen: the verdict reads its live zone (the
                     // last CLASSIFY_ROWS of the content, `presence::live_zone`),
@@ -2601,13 +2794,21 @@ impl crate::App {
             } else {
                 -1
             };
-            let group_changed = pgid > 0
-                && session
-                    .ctx
-                    .timeline
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .note_foreground_group(pgid);
+            let previous_group = (pgid > 0)
+                .then(|| {
+                    let mut timeline = session
+                        .ctx
+                        .timeline
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let previous = timeline.agent().program_pgid;
+                    timeline.note_foreground_group(pgid).then_some(previous)
+                })
+                .flatten();
+            let group_changed = previous_group.is_some();
+            if let Some(previous) = previous_group {
+                crate::claude_footer::stop(id, previous);
+            }
             let resolve = pgid > 0
                 && self.session_status.program_due(
                     id,
@@ -2652,13 +2853,17 @@ impl crate::App {
             self.session_status.request_footer_if_due(
                 id,
                 &session.ctx.timeline,
-                program.as_deref(),
+                if group_changed {
+                    None
+                } else {
+                    program.as_deref()
+                },
                 pgid,
                 now,
             );
             let step = self
                 .session_status
-                .agent_observe(id, generation, zone, program, pgid, resolve, now);
+                .agent_observe(id, generation, zone, cursor, program, pgid, resolve, now);
             let moved = match (step.publish, stamp) {
                 (Some((word, detail, subject, reader)), Some(stamp)) => session
                     .ctx
@@ -2689,23 +2894,31 @@ impl crate::App {
                 changed.push(id);
             }
         }
+        if retry_only {
+            // A newcomer retry: keep the ones still live and still slot-less.
+            let still: Vec<u64> = retry
+                .into_iter()
+                .filter(|id| self.pool.get(*id).is_some() && !self.session_status.knows(*id))
+                .collect();
+            self.session_status.restore_unclassified(still);
+            return changed;
+        }
         // This pass walked the whole pool, so the gate's bound can be made
         // exact. O(slots), once per sweep — and a sweep only happens when
         // something WAS due, i.e. at the classification rate (~4/s at the
         // default interval), never at the burst rate.
         //
-        // The EPOCH is banked only if every pooled session now has a slot. A
-        // `try_lock` that lost to the PTY reader leaves a session unclassified
-        // and slot-less, and the scan this gate replaces would have retried it
-        // on the very next wake; banking the epoch over it would instead defer
-        // its first status by another session's interval. See
-        // `StatusObserver::note_swept`.
-        let fully_classified = self
+        // A `try_lock` that lost to the PTY reader leaves a session
+        // unclassified and slot-less, and the scan this gate replaces would
+        // have retried it on the very next wake. Its id is recorded, so the
+        // gate retries exactly those; see `StatusObserver::note_swept`.
+        let unclassified: Vec<u64> = self
             .pool
             .iter()
-            .all(|session| self.session_status.knows(session.id));
-        self.session_status
-            .note_swept(fully_classified.then_some(pool_epoch));
+            .map(|session| session.id)
+            .filter(|id| !self.session_status.knows(*id))
+            .collect();
+        self.session_status.note_swept(pool_epoch, unclassified);
         changed
     }
 
@@ -2790,8 +3003,13 @@ impl crate::App {
             // the foreground group the sweep keeps current): with the sweep
             // off, forget them, or the next Claude in a tab would be painted
             // with the last one's model and branch (`crate::claude_footer`).
+            // Cancel the program resolver before sending footer stops, so an
+            // in-flight Claude identification cannot enqueue a watch after
+            // this sweep has stopped it.
+            let cleared = self.session_status.clear();
             let mut footers = false;
             for session in self.pool.iter() {
+                crate::claude_footer::stop_session(session.id);
                 footers |= session
                     .ctx
                     .timeline
@@ -2799,7 +3017,7 @@ impl crate::App {
                     .unwrap_or_else(|p| p.into_inner())
                     .clear_claude_footer();
             }
-            self.session_status.clear() || footers
+            cleared || footers
         };
         // The badge switch changes no POLICY — it only decides whether a record
         // reaches chrome — so `reconfigure` cannot see it move. Track it here or
@@ -2914,7 +3132,9 @@ impl crate::App {
     /// This is a pure read. There is no cursor or batch-owned state: the point
     /// is one event-loop wake for the roster. It deliberately avoids `status`'s
     /// subject, full-screen hash and consent projection: doing those N times
-    /// in one event-loop turn would trade N wakes for a long typing stall.
+    /// in one event-loop turn would trade N wakes for a long typing stall. A
+    /// background timeline writer must not hold this main-thread read either:
+    /// the batch marks only its agent field deferred until the next round.
     pub(crate) fn session_statuses_record(&self) -> String {
         let snapshot = self
             .store
@@ -2975,16 +3195,22 @@ impl crate::App {
             ),
         };
         let detail = detail.map_or_else(|| "-".to_string(), aterm_control::wire::pct_encode);
-        let agent = pooled
-            .ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent()
-            .word;
-        Some(format!(
-            "sid={session} revision={revision} hold={hold} detail={detail} agent={agent}"
-        ))
+        let agent = match pooled.ctx.timeline.try_lock() {
+            Ok(timeline) => Some(timeline.agent().word),
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner().agent().word),
+            // The bridge still receives hold/detail now. The explicit marker
+            // makes it keep the last published agent verdict; an older bridge
+            // instead retries the full per-session status read.
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        Some(match agent {
+            Some(word) => format!(
+                "sid={session} revision={revision} hold={hold} detail={detail} agent={word}"
+            ),
+            None => format!(
+                "sid={session} revision={revision} hold={hold} detail={detail} agent_deferred=1"
+            ),
+        })
     }
 
     /// Project one session's SUBJECT + STATUS onto the `status` verb's reply
@@ -3409,6 +3635,9 @@ mod idle_cost_tests {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use crate::session_timeline::SessionTimeline;
 
     /// `seq=<n|-> hash=<hex16|->`, last on the record and in that order — the
     /// pair a stamped report opens with, and the one
@@ -3438,6 +3667,31 @@ mod tests {
             quiet_after: QUIET,
             dwell: DWELL,
         }
+    }
+
+    #[test]
+    fn stale_claude_sample_cannot_restart_a_stopped_footer_watch() {
+        let now = Instant::now();
+        let mut observer = StatusObserver::new(policy(), Duration::from_millis(50));
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        {
+            let mut current = timeline.lock().unwrap();
+            current.note_foreground_group(42);
+            current.set_program(42, Some("claude".into()));
+            current.set_program(42, Some("zsh".into()));
+        }
+        // The UI sampled Claude before the worker published zsh and sent its
+        // stop. A later request from that stale sample would revive the watch.
+        observer.request_footer_if_due(7, &timeline, Some("claude"), 42, now);
+        assert!(!observer.footer_asked.contains_key(&7));
+
+        {
+            let mut current = timeline.lock().unwrap();
+            current.note_foreground_group(43);
+            current.set_program(43, Some("claude".into()));
+        }
+        observer.request_footer_if_due(7, &timeline, Some("claude"), 42, now);
+        assert!(!observer.footer_asked.contains_key(&7));
     }
 
     fn blank(seq: u64) -> ActivitySample {
@@ -3653,6 +3907,40 @@ mod tests {
         assert_eq!(fsm.status().phase, Phase::Unknown);
         assert_eq!(fsm.status().confidence, Confidence::Unknown);
         assert_eq!(fsm.status().reasons, vec![Reason::NoEvidence]);
+    }
+
+    /// THE `Executing` ARM NAMES THE CLOCK THAT IS ALIVE
+    /// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 21). On a
+    /// shell-integrated session, output that mutates nothing must read
+    /// `output_activity` — the same `movement_reason` the foreground-job arm
+    /// uses — or `ctl status` cannot say whether the movement clock has gone
+    /// stale (the in-band witness the spin gate's fixture relies on). RED
+    /// before: the arm hardcoded `ContentActivity` whenever anything moved.
+    #[test]
+    fn executing_names_output_only_movement_as_output_activity() {
+        let t0 = Instant::now();
+        let mut fsm = StatusFsm::new(policy(), t0);
+        let mut ev = evidence(blank(1));
+        ev.shell = Some(ShellEvidence::Executing);
+        ev.activity.last_output = Some(t0);
+        let t1 = settle(&mut fsm, &ev, t0);
+        assert_eq!(fsm.status().phase, Phase::Running);
+        assert_eq!(
+            fsm.status().reasons,
+            vec![Reason::ShellBlock, Reason::OutputActivity],
+            "bytes arrived and the grid never moved"
+        );
+
+        // Control: the grid moves, and the record says so.
+        ev.activity.content_seq = 2;
+        ev.activity.last_output = Some(t1);
+        settle(&mut fsm, &ev, t1 + Duration::from_millis(10));
+        assert_eq!(fsm.status().phase, Phase::Running);
+        assert_eq!(
+            fsm.status().reasons,
+            vec![Reason::ShellBlock, Reason::ContentActivity],
+            "a moved grid is content activity"
+        );
     }
 
     #[test]
@@ -4382,6 +4670,55 @@ mod tests {
         drop(guard);
     }
 
+    #[test]
+    fn fabric_batch_does_not_wait_for_a_background_timeline_writer() {
+        use std::sync::mpsc;
+
+        let app = crate::App::headless_for_test();
+        let timeline = app.pool.get(0).expect("session").ctx.timeline.clone();
+        {
+            let mut guard = timeline.lock().unwrap();
+            guard.publish_agent(
+                "prompt",
+                None,
+                None,
+                Some(aterm_phase::Program::Claude),
+                crate::session_timeline::AgentStamp {
+                    generation: crate::control::ScreenGen { epoch: 1, seq: 1 },
+                    fp: 1,
+                },
+            );
+        }
+        let (held_tx, held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _guard = timeline.lock().unwrap();
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_millis(750));
+        });
+        held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        let start = Instant::now();
+        let batch = app.session_statuses_record();
+        let elapsed = start.elapsed();
+        // On the old blocking path the writer's timeout releases the lock
+        // first; still report the elapsed-time failure rather than a send error.
+        let _ = release_tx.send(());
+        worker.join().unwrap();
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "a Fabric roster read held the main thread for {elapsed:?}"
+        );
+        assert!(batch.contains("agent_deferred=1"), "{batch}");
+        assert!(
+            !batch.contains("agent=-"),
+            "a busy writer is not no agent: {batch}"
+        );
+
+        let settled = app.session_statuses_record();
+        assert!(settled.contains("agent=prompt"), "{settled}");
+    }
+
     /// IDENTITY (session identities, phase 1): the record carries the agent
     /// identity the session was spawned under — the word the `sessions`
     /// roster carries, from the same spawn-time field — `-` for the human's
@@ -4584,27 +4921,34 @@ mod tests {
             "no cwd reported, so no token: {record}"
         );
 
-        // The protected roots are RESOLVED DATA from the consent module — this
-        // file writes no protected-folder literal of its own (rule B13).
-        let roots = aterm_containment::consent::protected_roots(&[]);
-        let Some(root) = roots.first() else {
-            return; // no $HOME resolved: nothing to assert against
-        };
-        let cwd = root.join("aterm-consent-proof");
+        // The conjunction half is Unix-only: the OSC 7 fed below is
+        // `file://localhost<cwd>` with a `/`-rooted cwd, and on Windows a
+        // protected root is `C:\Users\…` — how the Windows integration spells
+        // OSC 7 is a separate question this fixture cannot ask.
+        #[cfg(unix)]
         {
-            let term = app.pool.get(0).expect("session 0").term.clone();
-            let mut t = crate::term_lock(&term);
-            t.process(format!("\x1b]7;file://localhost{}\x07", cwd.display()).as_bytes());
+            // The protected roots are RESOLVED DATA from the consent module —
+            // this file writes no protected-folder literal of its own (rule B13).
+            let roots = aterm_containment::consent::protected_roots(&[]);
+            let Some(root) = roots.first() else {
+                return; // no $HOME resolved: nothing to assert against
+            };
+            let cwd = root.join("aterm-consent-proof");
+            {
+                let term = app.pool.get(0).expect("session 0").term.clone();
+                let mut t = crate::term_lock(&term);
+                t.process(format!("\x1b]7;file://localhost{}\x07", cwd.display()).as_bytes());
+            }
+            let record = app.session_status_record(0).expect("live session");
+            assert!(
+                record.contains(",consent_at_risk "),
+                "a protected cwd with an uncovered fs_consent arms the token: {record}"
+            );
+            assert!(
+                record.contains(" fs_consent=unknown "),
+                "and the token never upgrades the verdict it rides on: {record}"
+            );
         }
-        let record = app.session_status_record(0).expect("live session");
-        assert!(
-            record.contains(",consent_at_risk "),
-            "a protected cwd with an uncovered fs_consent arms the token: {record}"
-        );
-        assert!(
-            record.contains(" fs_consent=unknown "),
-            "and the token never upgrades the verdict it rides on: {record}"
-        );
     }
 
     /// The Subject ladder under contention. A pin is answered from the LEAF lock
@@ -5045,7 +5389,7 @@ mod tests {
         // exact minimum (`note_skipped` only folds a lower bound, exactly as
         // `observe` does). Mirrored here so the O(1) gate is asserted in the
         // state production actually leaves it in.
-        observer.note_swept(None);
+        observer.note_swept(observer.swept_pool_epoch(), Vec::new());
         let wake = observer.next_wake().expect("the slot still owes a wake");
         assert!(
             wake >= now + interval,
@@ -5113,6 +5457,35 @@ mod tests {
             ("ssh me@host", Some("ssh")),
             ("/usr/local/bin/python3 secret.py", Some("python3")),
             ("./run.sh --token abc", Some("run.sh")),
+            // Quoting is honoured: a quoted path with a space is ONE word,
+            // and a Windows launcher's `.exe` names the same program the bare
+            // name does everywhere else (measured 2026-09-22: `Program`).
+            (
+                "\"C:\\Program Files\\Git\\usr\\bin\\less.exe\" README.md",
+                Some("less"),
+            ),
+            // The audit's own line: pwsh's call operator (a glyph, skipped as
+            // a prompt's is), then a SINGLE-quoted path with a space — and the
+            // 8.3 short spelling of the same path, which never had a space.
+            (
+                "& 'C:\\Program Files\\Git\\usr\\bin\\less.exe' C:\\Windows\\win.ini",
+                Some("less"),
+            ),
+            (
+                "& C:\\PROGRA~1\\Git\\usr\\bin\\less.exe C:\\Windows\\win.ini",
+                Some("less"),
+            ),
+            ("'/opt/my tools/claude' --resume", Some("claude")),
+            ("C:\\Windows\\System32\\cmd.exe /c dir", Some("cmd")),
+            ("C:\\tools\\build.CMD release", Some("build")),
+            // An escaped space is part of the WORD, but a program's name is
+            // never published with whitespace: it ends at the first one.
+            ("my\\ tool --flag", Some("my")),
+            ("\"git\" status", Some("git status")),
+            // Only the executable extensions Windows resolves are dropped: a
+            // dotted program NAME is not a path with an extension.
+            ("python3.11 -m http.server", Some("python3.11")),
+            ("/usr/bin/a.out", Some("a.out")),
             ("FOO=1 cmd --secret", Some("cmd")),
             ("FOO=1 BAR=two targo test", Some("targo test")),
             ("sudo -u root targo --unverified test", Some("targo test")),
@@ -5676,6 +6049,7 @@ mod agent_verdict_tests {
         PROGRAM_NAME_CONFIRM, PROGRAM_NAMED_RECHECK_FLOOR, PROGRAM_RECHECK, SessionSlot, StatusFsm,
         StatusObserver, StatusPolicy,
     };
+    use crate::presence::Cursor;
     use crate::{App, WindowId};
 
     /// The background resolver can answer after the usual one-interval
@@ -5703,6 +6077,7 @@ mod agent_verdict_tests {
             id,
             generation,
             Some(vec!["Claude Code composer".into()]),
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             false,
@@ -5713,6 +6088,7 @@ mod agent_verdict_tests {
             id,
             generation,
             None,
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             false,
@@ -5723,11 +6099,18 @@ mod agent_verdict_tests {
         observer.note_program_answered(id);
         observer.note_program_answered(id);
         assert_eq!(observer.next_wake(), Some(t0 + floor * 2));
-        assert!(observer.agent_zone_wanted(id, generation, &Some("codex".into()), t0 + floor * 2,));
+        assert!(observer.agent_zone_wanted(
+            id,
+            generation,
+            Cursor::Unknown,
+            &Some("codex".into()),
+            t0 + floor * 2,
+        ));
         observer.agent_observe(
             id,
             generation,
             Some(vec!["Codex prompt".into()]),
+            Cursor::Unknown,
             Some("codex".into()),
             pgid,
             false,
@@ -5999,27 +6382,46 @@ mod agent_verdict_tests {
         let mut obs =
             super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
         let t0 = Instant::now();
-        assert!(obs.agent_zone_wanted(1, g(1), &None, t0));
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0));
         let rows = vec!["$ ls".to_string()];
-        let _ = obs.agent_observe(1, g(1), Some(rows), None, -1, false, t0);
-        assert!(!obs.agent_zone_wanted(1, g(1), &None, t0), "nothing moved");
+        let _ = obs.agent_observe(1, g(1), Some(rows), Cursor::Unknown, None, -1, false, t0);
+        assert!(
+            !obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0),
+            "nothing moved"
+        );
         let t1 = t0 + Duration::from_millis(100);
         assert!(
-            !obs.agent_zone_wanted(1, g(2), &None, t1),
+            !obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, t1),
             "a read 100 ms after the last is deferred"
         );
-        let _ = obs.agent_observe(1, g(2), None, None, -1, false, t1);
+        let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, t1);
         assert!(obs.agents[&1].followup, "and a follow-up is armed");
-        assert!(obs.agent_zone_wanted(1, g(2), &None, t0 + super::AGENT_MIN_INTERVAL));
+        assert!(obs.agent_zone_wanted(
+            1,
+            g(2),
+            Cursor::Unknown,
+            &None,
+            t0 + super::AGENT_MIN_INTERVAL
+        ));
         // A resolution in flight keeps the follow-up armed over an unmoved
         // screen, so its answer is read one interval later.
         let t2 = t0 + super::AGENT_MIN_INTERVAL;
-        let _ = obs.agent_observe(1, g(2), Some(vec!["$ ls".into()]), None, 7, true, t2);
+        let _ = obs.agent_observe(
+            1,
+            g(2),
+            Some(vec!["$ ls".into()]),
+            Cursor::Unknown,
+            None,
+            7,
+            true,
+            t2,
+        );
         assert!(obs.agents[&1].followup);
         assert!(
             obs.agent_zone_wanted(
                 1,
                 g(2),
+                Cursor::Unknown,
                 &Some("sleep".into()),
                 t2 + super::AGENT_MIN_INTERVAL
             ),
@@ -6032,12 +6434,13 @@ mod agent_verdict_tests {
     /// `agent=prompt` after the host had cleared its badge; an exited agent's
     /// prompt left `program=claude` standing). A look that saw nothing move
     /// arms no follow-up, and output inside the interval runs no look: the
-    /// output wake's [`super::StatusObserver::note_output`] owes the session a look
-    /// at its next due instant — and so does a look the terminal lock
-    /// refused ([`super::StatusObserver::note_skipped`]). NEGATIVE CONTROL: before
-    /// the burst nothing is owed that soon.
+    /// output wake's [`super::StatusObserver::note_output`] owes the session a
+    /// look one interval after the burst (never before its next due instant)
+    /// — and so does a look the terminal lock refused
+    /// ([`super::StatusObserver::note_skipped`]). NEGATIVE CONTROL: before the
+    /// burst nothing is owed that soon.
     #[test]
-    fn output_between_looks_is_owed_a_look_at_the_next_due_instant() {
+    fn output_between_looks_is_owed_a_look_within_one_interval_of_it() {
         let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
         let interval = Duration::from_millis(250);
         let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
@@ -6056,29 +6459,37 @@ mod agent_verdict_tests {
         let rows = vec!["$ ls".to_string()];
         let t0 = Instant::now();
         let _ = obs.observe(1, &ev, t0);
-        assert!(obs.agent_zone_wanted(1, g(1), &None, t0));
-        let _ = obs.agent_observe(1, g(1), Some(rows), None, -1, false, t0);
+        assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t0));
+        let _ = obs.agent_observe(1, g(1), Some(rows), Cursor::Unknown, None, -1, false, t0);
         // A look at the same screen: nothing moved, nothing owed by it.
         let t1 = t0 + interval;
         let _ = obs.observe(1, &ev, t1);
-        assert!(!obs.agent_zone_wanted(1, g(1), &None, t1));
-        let _ = obs.agent_observe(1, g(1), None, None, -1, false, t1);
+        assert!(!obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &None, t1));
+        let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, t1);
         let due = obs.sessions[&1].next_due;
         assert!(
             obs.next_wake().is_none_or(|w| w > due),
             "NEGATIVE CONTROL: nothing owes a look at {due:?} yet"
         );
-        // A burst lands 10 ms later: not due, so no look — but one is owed.
-        obs.note_output(1);
-        assert_eq!(obs.next_wake(), Some(due), "a look at the next due instant");
+        // A burst lands 10 ms later: not due, so no look — but one is owed,
+        // one interval after it.
+        let burst = t1 + Duration::from_millis(10);
+        obs.note_output(1, burst);
+        let owed = burst + interval;
+        assert!(
+            owed >= due,
+            "fixture: the burst's interval ends past the floor"
+        );
+        assert_eq!(obs.next_wake(), Some(owed), "a look once the burst paused");
         // That look reads the new frame, and owes nothing more once it holds.
-        let t2 = due;
+        let t2 = owed;
         let _ = obs.observe(1, &ev, t2);
-        assert!(obs.agent_zone_wanted(1, g(2), &None, t2));
+        assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &None, t2));
         let _ = obs.agent_observe(
             1,
             g(2),
             Some(vec!["$ ls".into(), "x".into()]),
+            Cursor::Unknown,
             None,
             -1,
             false,
@@ -6086,12 +6497,345 @@ mod agent_verdict_tests {
         );
         let t3 = t2 + interval;
         let _ = obs.observe(1, &ev, t3);
-        let _ = obs.agent_observe(1, g(2), None, None, -1, false, t3);
+        let _ = obs.agent_observe(1, g(2), None, Cursor::Unknown, None, -1, false, t3);
         let due = obs.sessions[&1].next_due;
         assert!(obs.next_wake().is_none_or(|w| w > due), "settled again");
         // A look the lock refused owes the next one as well.
         obs.note_skipped(1, t3);
         assert_eq!(obs.next_wake(), Some(obs.sessions[&1].next_due));
+    }
+
+    /// OUTPUT THAT KEEPS ARRIVING IS NOT A POLL (the spin gate's claude row,
+    /// `tools/spin-conformance/spin_probe.sh`, after 2026-09-24's owed look
+    /// landed: 39 timer wakes in 10 s against a quiet loop's 5). A program
+    /// that repaints without moving the grid ~6x/s — a Claude Code spinner —
+    /// wakes the loop by its own output, and each output wake's sweep looks
+    /// whenever the session is due; an owed look pinned to the slot's next due
+    /// instant fired between those wakes, 4x/s, forever. The owed look waits
+    /// for the output to PAUSE: every burst pushes it one interval on, so no
+    /// timer precedes the next burst, and the last burst is still read within
+    /// one interval of it. RED before: the owed wake was the next due instant.
+    #[test]
+    fn output_that_keeps_arriving_owes_no_look_before_it_pauses() {
+        let g = |seq| crate::control::ScreenGen { epoch: 0, seq };
+        let interval = Duration::from_millis(250);
+        let gap = Duration::from_millis(167);
+        let mut obs = super::StatusObserver::new(super::StatusPolicy::default(), interval);
+        let ev = super::Evidence {
+            pin: None,
+            shell: None,
+            lifecycle: None,
+            foreground_job: None,
+            activity: super::ActivitySample {
+                alt_screen: false,
+                content_seq: 1,
+                last_input: None,
+                last_output: None,
+            },
+        };
+        // Settle first: the status FSM's first sample serves a dwell, and the
+        // first look (a screen never read) owes its own follow-up. Past both,
+        // the only deadline left to judge is the one output owes.
+        let start = Instant::now();
+        let _ = obs.observe(1, &ev, start);
+        let _ = obs.agent_observe(
+            1,
+            g(1),
+            Some(vec!["* Thinking".into()]),
+            Cursor::Unknown,
+            None,
+            -1,
+            false,
+            start,
+        );
+        let t0 = start + Duration::from_secs(5);
+        let _ = obs.observe(1, &ev, t0);
+        let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, t0);
+        assert_eq!(
+            obs.next_wake(),
+            None,
+            "fixture: a settled, unmoved session owes nothing"
+        );
+        // Twelve output wakes ~6/s over an unmoved screen, in the output
+        // wake's order: `note_output`, then the sweep, which looks only when
+        // the session is due (the rate gate) and answers for the burst.
+        let mut at = t0;
+        let mut looks = 0;
+        for _ in 0..12 {
+            at += gap;
+            obs.note_output(1, at);
+            if obs.sessions[&1].next_due <= at {
+                let _ = obs.observe(1, &ev, at);
+                let _ = obs.agent_observe(1, g(1), None, Cursor::Unknown, None, -1, false, at);
+                looks += 1;
+            }
+            let next_burst = at + gap;
+            assert!(
+                obs.next_wake().is_none_or(|w| w > next_burst),
+                "no timer fires before the next burst: {:?} vs {next_burst:?}",
+                obs.next_wake()
+            );
+        }
+        assert!(
+            looks >= 5,
+            "fixture: the output wakes' own sweeps looked ({looks})"
+        );
+        // The LAST burst lands between looks, and the output pauses: it is
+        // read within one interval of it.
+        let last = at + gap;
+        obs.note_output(1, last);
+        assert!(
+            obs.sessions[&1].next_due > last,
+            "fixture: not due at the burst"
+        );
+        assert_eq!(obs.next_wake(), Some(last + interval));
+    }
+
+    /// THE CHANGE GATE HASHES THE ZONE THE VERDICT READS (the review of
+    /// 2026-09-26): the sweep re-derives the verdict only when its zone's
+    /// hash moved, and that hash covered the grid's last 40 rows. Claude
+    /// Code's inline renderer draws the REPL at the top of a tall pane, so a
+    /// turn that ends ABOVE those rows — the spinner row over the prompt box
+    /// replaced, every row from the box down unchanged — moved no hash, and
+    /// the verdict stayed `busy`. The gate hashes the live zone
+    /// (`presence::live_zone`): the idle REPL is classified and published.
+    /// NEGATIVE CONTROL: the same screen again under a new generation moves
+    /// no hash, and nothing is re-derived.
+    #[test]
+    fn a_change_above_the_last_40_rows_of_an_inline_repl_is_classified() {
+        use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, screen};
+        let ready = screen(INLINE_REPL_READY);
+        assert_eq!(ready.len(), 50);
+        let top = ready
+            .iter()
+            .position(|r| r.starts_with('─'))
+            .expect("the top rule");
+        let mut busy = ready.clone();
+        busy[top - 1] = "✶ Deliberating… (3s · thinking)".to_string();
+        assert!(top - 1 < ready.len() - 40, "above the grid's last 40 rows");
+        assert_eq!(busy[ready.len() - 40..], ready[ready.len() - 40..]);
+        let claude = Some("claude".to_string());
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let t0 = Instant::now();
+        let mut look = |seq: u64, rows: &[String], after: u64| {
+            let at = t0 + Duration::from_secs(after);
+            let generation = crate::control::ScreenGen { epoch: 0, seq };
+            assert!(obs.agent_zone_wanted(1, generation, Cursor::Unknown, &claude, at));
+            obs.agent_observe(
+                1,
+                generation,
+                Some(rows.to_vec()),
+                Cursor::Unknown,
+                claude.clone(),
+                100,
+                false,
+                at,
+            )
+            .publish
+            .map(|p| p.0)
+        };
+        assert_eq!(look(1, &busy, 0), Some("busy"));
+        assert_eq!(look(2, &ready, 1), Some("idle"), "the turn's end");
+        assert_eq!(look(3, &ready, 2), None, "the control: nothing moved");
+    }
+
+    /// THE CURSOR MOVING ALONE IS READ (2026-09-27): Claude Code's `idle` is
+    /// the prompt box that holds the terminal's cursor, and the cursor moves
+    /// without the content seq — a frame drawn whole, then the cursor stepped
+    /// into its box. The gate reads the zone again when the cursor moved
+    /// under an unchanged generation, and publishes `idle` once it is in the
+    /// box. NEGATIVE CONTROL: the same generation and cursor again read
+    /// nothing.
+    #[test]
+    fn a_cursor_that_steps_into_the_box_is_read() {
+        use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, cursor, screen};
+        let ready = screen(INLINE_REPL_READY);
+        let (caret, _) = cursor(INLINE_REPL_READY).expect("measured");
+        let claude = Some("claude".to_string());
+        let mut obs =
+            super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
+        let t0 = Instant::now();
+        let generation = crate::control::ScreenGen { epoch: 0, seq: 7 };
+        let mut look = |cursor: Cursor, after: u64| {
+            let at = t0 + Duration::from_secs(after);
+            obs.agent_zone_wanted(1, generation, cursor, &claude, at)
+                .then(|| {
+                    obs.agent_observe(
+                        1,
+                        generation,
+                        Some(ready.clone()),
+                        cursor,
+                        claude.clone(),
+                        100,
+                        false,
+                        at,
+                    )
+                    .publish
+                    .map(|p| p.0)
+                })
+                .flatten()
+        };
+        let under = Cursor::At(Some(caret + 3));
+        let in_box = Cursor::At(Some(caret));
+        assert_eq!(look(under, 0), Some("unknown"), "the cursor under the box");
+        assert_eq!(look(in_box, 1), Some("idle"), "the cursor stepped in");
+        assert_eq!(look(in_box, 2), None, "the control: nothing moved");
+    }
+
+    /// Tier-1 for `ClaudeIdleAtComposer` (the live e2e's NEW-1, 2026-09-26,
+    /// and its review's same-tab relaunch): over EVERY reachable state of the
+    /// model, the shipping observer — one `agent_observe` of the screen the
+    /// state names, under `program=claude`, with the terminal CURSOR measured
+    /// on it — publishes the verdict the model's `Look` publishes there:
+    /// `prompt` for the trust dialog, `idle` only for the NEW REPL drawn
+    /// whole, neither for the shell's rows (before the dialog, after its
+    /// press, or with no dialog) nor for the half-drawn REPL — in a new tab,
+    /// and with the previous run's prompt box on the screen above the new
+    /// launch line (`stale`). So `await agent idle` answers exactly where the
+    /// model's `Type` is enabled, and the model proves a prompt typed there
+    /// is never lost. The screens are the frames Claude Code 2.1.283 drew
+    /// (aterm-phase's fixtures, each with its measured cursor; the one dialog
+    /// with none measured is 2.1.280's, read with the cursor on none of its
+    /// rows), each model screen looked at through EVERY measured frame of it:
+    /// the fullscreen renderer (`LAUNCH_*`, `SHELL_MODE*`: `!` typed, the
+    /// caret `!`, the REPL up and taking keys), the inline one in a new tab
+    /// (`INLINE_*`: on the main grid under the launch line, 150x50, blank
+    /// rows below — its whole REPL above the grid's last 40 rows), and the
+    /// inline one relaunched in the same tab (`INLINE_RELAUNCH_*`). NEGATIVE
+    /// CONTROLS: the reader before 2026-09-26 (`Buggy=1`) publishes idle on
+    /// the shell's rows and the half-drawn REPL, the reader of 2026-09-26
+    /// (`Buggy=2`, the box by its frame alone) on the relaunch's shell rows
+    /// under the previous run's box — and the real observer disagrees with
+    /// each there, and only there. RED: read by its frame alone (the cursor
+    /// not given, the rule this branch had), every frame publishes what
+    /// `Buggy=2` publishes: `idle` on that old box.
+    #[test]
+    fn claude_is_published_idle_exactly_where_the_model_types() {
+        use aterm_phase::prompt::fixtures::{
+            INLINE_RELAUNCH_BEFORE_REPL, INLINE_RELAUNCH_REPL_HALF_DRAWN,
+            INLINE_RELAUNCH_REPL_READY, INLINE_RELAUNCH_TRUST, INLINE_REPL_HALF_DRAWN,
+            INLINE_REPL_READY, INLINE_TRUST, LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN,
+            LAUNCH_REPL_READY, SHELL_MODE, SHELL_MODE_DRAFT, TRUST, cursor, screen,
+        };
+        let model = aterm_spec::derive::claude_idle_at_composer_model();
+        let old = aterm_spec::interp::with_buggy(&model, 1);
+        let framed = aterm_spec::interp::with_buggy(&model, 2);
+        // `screens[stale][screen]`: every measured frame of each.
+        let screens: [[Vec<&str>; 4]; 2] = [
+            [
+                vec![LAUNCH_BEFORE_REPL],
+                vec![TRUST, INLINE_TRUST],
+                vec![LAUNCH_REPL_HALF_DRAWN, INLINE_REPL_HALF_DRAWN],
+                vec![
+                    LAUNCH_REPL_READY,
+                    SHELL_MODE,
+                    SHELL_MODE_DRAFT,
+                    INLINE_REPL_READY,
+                ],
+            ],
+            [
+                vec![INLINE_RELAUNCH_BEFORE_REPL],
+                vec![INLINE_RELAUNCH_TRUST],
+                vec![INLINE_RELAUNCH_REPL_HALF_DRAWN],
+                vec![INLINE_RELAUNCH_REPL_READY],
+            ],
+        ];
+        let project = |word: &str| match word {
+            "idle" => 1,
+            "prompt" => 2,
+            _ => 0,
+        };
+        let claude = Some("claude".to_string());
+        let publish = |text: &str, cursor: Cursor| {
+            let mut obs = super::StatusObserver::new(
+                super::StatusPolicy::default(),
+                Duration::from_millis(50),
+            );
+            let t0 = Instant::now();
+            let generation = crate::control::ScreenGen { epoch: 0, seq: 1 };
+            assert!(obs.agent_zone_wanted(1, generation, cursor, &claude, t0));
+            let step = obs.agent_observe(
+                1,
+                generation,
+                Some(screen(text)),
+                cursor,
+                claude.clone(),
+                100,
+                false,
+                t0,
+            );
+            step.publish.expect("the zone was classified").0
+        };
+        let measured = |text: &str| Cursor::At(cursor(text).map(|(row, _)| row));
+        // Every reachable state, breadth first.
+        let mut seen = vec![model.init_state()];
+        let mut next = 0;
+        let mut looked = std::collections::BTreeSet::new();
+        let mut disagreed = [
+            std::collections::BTreeSet::new(),
+            std::collections::BTreeSet::new(),
+        ];
+        while next < seen.len() {
+            let state = seen[next].clone();
+            next += 1;
+            if model.action_enabled("Look", &state) {
+                let at = usize::try_from(state["screen"]).expect("a screen");
+                let stale = usize::try_from(state["stale"]).expect("stale");
+                let modeled = model.successors("Look", &state).remove(0);
+                for (frame, text) in screens[stale][at].iter().enumerate() {
+                    let word = publish(text, measured(text));
+                    assert_eq!(
+                        project(word),
+                        modeled["published"],
+                        "stale {stale} screen {at} frame {frame}: the observer published `{word}`"
+                    );
+                    assert_eq!(
+                        model.action_enabled("Type", &modeled),
+                        word == "idle",
+                        "stale {stale} screen {at} frame {frame}"
+                    );
+                    looked.insert((stale, at, frame));
+                    for (bug, buggy) in [&old, &framed].into_iter().enumerate() {
+                        let theirs = buggy.successors("Look", &state).remove(0)["published"];
+                        if theirs != project(word) {
+                            assert_eq!(theirs, 1, "Buggy={}: it said idle", bug + 1);
+                            disagreed[bug].insert((stale, at));
+                        }
+                    }
+                    // RED: the frame alone, the cursor not given.
+                    let by_frame = publish(text, Cursor::Unknown);
+                    let theirs = framed.successors("Look", &state).remove(0)["published"];
+                    assert_eq!(
+                        project(by_frame),
+                        theirs,
+                        "stale {stale} screen {at} frame {frame}: the frame rule is Buggy=2"
+                    );
+                }
+            }
+            for action in &model.actions {
+                for s in model.successors(action.name, &state) {
+                    if !seen.contains(&s) {
+                        seen.push(s);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            looked.len(),
+            screens.iter().flatten().map(Vec::len).sum::<usize>(),
+            "every frame of every screen was looked at: {looked:?}"
+        );
+        assert_eq!(
+            disagreed[0].iter().copied().collect::<Vec<_>>(),
+            [(0, 0), (0, 2), (1, 0), (1, 2)],
+            "NEGATIVE CONTROL: the old reader, refuted before the REPL"
+        );
+        assert_eq!(
+            disagreed[1].iter().copied().collect::<Vec<_>>(),
+            [(1, 0)],
+            "NEGATIVE CONTROL: the box by its frame alone, refuted on the relaunch"
+        );
     }
 
     /// THE DEPARTED AGENT'S LAST FRAME (2026-09-24): the look that first sees
@@ -6116,20 +6860,29 @@ mod agent_verdict_tests {
                 Duration::from_millis(50),
             );
             let t0 = Instant::now();
-            assert!(obs.agent_zone_wanted(1, g(1), &claude, t0));
-            let step =
-                obs.agent_observe(1, g(1), Some(frame.clone()), claude.clone(), 100, true, t0);
+            assert!(obs.agent_zone_wanted(1, g(1), Cursor::Unknown, &claude, t0));
+            let step = obs.agent_observe(
+                1,
+                g(1),
+                Some(frame.clone()),
+                Cursor::Unknown,
+                claude.clone(),
+                100,
+                true,
+                t0,
+            );
             assert_eq!(
                 reader(&step).and_then(|(_, r)| r),
                 Some(aterm_phase::Program::Claude),
                 "the agent, named"
             );
             let t1 = t0 + super::AGENT_MIN_INTERVAL;
-            assert!(obs.agent_zone_wanted(1, g(2), &claude, t1));
+            assert!(obs.agent_zone_wanted(1, g(2), Cursor::Unknown, &claude, t1));
             let step = obs.agent_observe(
                 1,
                 g(2),
                 Some(exited.clone()),
+                Cursor::Unknown,
                 claude.clone(),
                 group_after,
                 true,
@@ -6160,7 +6913,9 @@ mod agent_verdict_tests {
     /// slept on it. The gate hashes [`crate::presence::live_zone`], the rows
     /// the verdict reads: the dialog is classified and published a trust
     /// prompt. NEGATIVE CONTROL: the dialog read again, nothing in the zone
-    /// moved, is not classified again.
+    /// moved, is not classified again. The cursor is where Claude Code parks
+    /// it: the idle prompt box's caret row, then the dialog's focused option
+    /// (the measured row 17).
     #[test]
     fn a_dialog_above_a_blank_foot_passes_the_classifier_gate() {
         use aterm_phase::prompt::fixtures::{TRUST_FRESH_PANE, composer, rows, screen};
@@ -6176,14 +6931,26 @@ mod agent_verdict_tests {
         let mut obs =
             super::StatusObserver::new(super::StatusPolicy::default(), Duration::from_millis(50));
         let t0 = Instant::now();
-        let step = obs.agent_observe(1, g(1), Some(idle), claude.clone(), 100, false, t0);
+        let caret = Cursor::At(idle.iter().position(|r| r.starts_with('❯')));
+        let focus = Cursor::At(trust.iter().position(|r| r == " ❯ No, exit"));
+        assert_eq!(focus, Cursor::At(Some(17)), "the measured cursor");
+        let step = obs.agent_observe(1, g(1), Some(idle), caret, claude.clone(), 100, false, t0);
         assert_eq!(word(&step), Some(("idle", None)));
         let t1 = t0 + super::AGENT_MIN_INTERVAL;
-        let step = obs.agent_observe(1, g(2), Some(trust.clone()), claude.clone(), 100, false, t1);
+        let step = obs.agent_observe(
+            1,
+            g(2),
+            Some(trust.clone()),
+            focus,
+            claude.clone(),
+            100,
+            false,
+            t1,
+        );
         assert!(step.reading_changed, "{:?}", word(&step));
         assert_eq!(word(&step), Some(("prompt", Some("trust".to_string()))));
         let t2 = t1 + super::AGENT_MIN_INTERVAL;
-        let step = obs.agent_observe(1, g(3), Some(trust), claude, 100, false, t2);
+        let step = obs.agent_observe(1, g(3), Some(trust), focus, claude, 100, false, t2);
         assert_eq!(word(&step), None, "the zone did not move");
     }
 
@@ -6349,6 +7116,7 @@ mod agent_verdict_tests {
             id,
             generation,
             Some(vec!["Claude Code approval box".into()]),
+            Cursor::Unknown,
             None,
             pgid,
             true,
@@ -6359,7 +7127,16 @@ mod agent_verdict_tests {
         // The one follow-up read sees the same frame. Its flag clears, but
         // the unresolved name keeps an independently bounded deadline.
         observer.sessions.get_mut(&id).unwrap().next_due = t0 + floor * 2;
-        observer.agent_observe(id, generation, None, None, pgid, false, t0 + floor);
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            Cursor::Unknown,
+            None,
+            pgid,
+            false,
+            t0 + floor,
+        );
         assert_eq!(observer.next_wake(), Some(t0 + Duration::from_millis(250)));
         assert!(!observer.program_due(
             id,
@@ -6390,10 +7167,28 @@ mod agent_verdict_tests {
         // miss waits five seconds. Each resolution's single follow-up is
         // charged to the ordinary observation floor.
         observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor;
-        observer.agent_observe(id, generation, None, None, pgid, true, first_retry);
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            Cursor::Unknown,
+            None,
+            pgid,
+            true,
+            first_retry,
+        );
         assert_eq!(observer.next_wake(), Some(first_retry + floor));
         observer.sessions.get_mut(&id).unwrap().next_due = first_retry + floor * 2;
-        observer.agent_observe(id, generation, None, None, pgid, false, first_retry + floor);
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            Cursor::Unknown,
+            None,
+            pgid,
+            false,
+            first_retry + floor,
+        );
         let second_retry = first_retry + Duration::from_secs(1);
         assert_eq!(observer.next_wake(), Some(second_retry));
         assert!(!observer.program_due(
@@ -6413,12 +7208,22 @@ mod agent_verdict_tests {
         assert!(model.fire("Retry", &mut modeled));
         assert_eq!(observer.agents[&id].resolve_attempts, 3);
         observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor;
-        observer.agent_observe(id, generation, None, None, pgid, true, second_retry);
+        observer.agent_observe(
+            id,
+            generation,
+            None,
+            Cursor::Unknown,
+            None,
+            pgid,
+            true,
+            second_retry,
+        );
         observer.sessions.get_mut(&id).unwrap().next_due = second_retry + floor * 2;
         observer.agent_observe(
             id,
             generation,
             None,
+            Cursor::Unknown,
             None,
             pgid,
             false,
@@ -6439,6 +7244,7 @@ mod agent_verdict_tests {
             id,
             generation,
             Some(vec!["Claude Code approval box".into()]),
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             false,
@@ -6473,6 +7279,7 @@ mod agent_verdict_tests {
             id,
             newer,
             Some(vec!["still named".into()]),
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             true,
@@ -6482,6 +7289,7 @@ mod agent_verdict_tests {
             id,
             newer,
             Some(vec!["unnamed".into()]),
+            Cursor::Unknown,
             None,
             pgid,
             false,
@@ -6492,7 +7300,16 @@ mod agent_verdict_tests {
             observer.next_wake(),
             Some(exec_at + Duration::from_millis(250))
         );
-        observer.agent_observe(id, newer, None, None, -1, false, exec_at + floor);
+        observer.agent_observe(
+            id,
+            newer,
+            None,
+            Cursor::Unknown,
+            None,
+            -1,
+            false,
+            exec_at + floor,
+        );
         assert_eq!(observer.next_wake(), None);
         observer.retire(id);
         assert_eq!(observer.next_wake(), None);
@@ -6530,6 +7347,7 @@ mod agent_verdict_tests {
             id,
             first,
             Some(vec!["launching".into()]),
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             true,
@@ -6546,6 +7364,7 @@ mod agent_verdict_tests {
             id,
             first,
             Some(vec!["sh launching Claude".into()]),
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             false,
@@ -6573,6 +7392,7 @@ mod agent_verdict_tests {
             id,
             first,
             None,
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             true,
@@ -6583,6 +7403,7 @@ mod agent_verdict_tests {
             id,
             first,
             None,
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             false,
@@ -6600,6 +7421,7 @@ mod agent_verdict_tests {
             id,
             later,
             Some(vec!["Claude Code approval box".into()]),
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             false,
@@ -6618,6 +7440,7 @@ mod agent_verdict_tests {
             id,
             later,
             None,
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             false,
@@ -6645,6 +7468,7 @@ mod agent_verdict_tests {
             id,
             later,
             None,
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             true,
@@ -6656,6 +7480,7 @@ mod agent_verdict_tests {
             id,
             later,
             Some(vec!["Claude Code approval box".into()]),
+            Cursor::Unknown,
             Some("claude".into()),
             pgid,
             false,
@@ -6676,6 +7501,7 @@ mod agent_verdict_tests {
             id,
             third,
             Some(vec!["sh again".into()]),
+            Cursor::Unknown,
             Some("sh".into()),
             pgid,
             false,
@@ -6688,6 +7514,7 @@ mod agent_verdict_tests {
             id,
             third,
             Some(vec!["prompt".into()]),
+            Cursor::Unknown,
             None,
             -1,
             false,

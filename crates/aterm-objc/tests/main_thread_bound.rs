@@ -18,8 +18,9 @@
 //!
 //! The half that CANNOT be held here — that the destructor really does run on
 //! the main thread, and what happens to a container that omits the reschedule —
-//! is in `examples/objc_bound_drive.rs`, which owns a `fn main` and can drive a
-//! run loop. That is the same division as [`aterm_objc::run_on_main`] itself.
+//! is in `tests/main_thread_bound_drive.rs`, a `harness = false` test that owns
+//! `fn main` and can drive a run loop. That is the same division as
+//! [`aterm_objc::run_on_main`] itself.
 
 #![cfg(target_os = "macos")]
 

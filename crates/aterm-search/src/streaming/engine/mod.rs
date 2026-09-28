@@ -36,7 +36,6 @@ pub struct StreamingSearch {
     /// Current search pattern.
     pattern: String,
     /// Compiled regex (if filter mode is Regex).
-    #[cfg(feature = "regex")]
     compiled_regex: Option<aterm_regex::Regex>,
     /// Search results (bounded by max_results).
     results: Vec<StreamingMatch>,
@@ -70,7 +69,6 @@ impl StreamingSearch {
             state: SearchState::Idle,
             filter_mode: FilterMode::Literal,
             pattern: String::new(),
-            #[cfg(feature = "regex")]
             compiled_regex: None,
             results: Vec::new(),
             current_index: 0,
@@ -230,10 +228,7 @@ impl StreamingSearch {
         self.scan_progress = -1;
         self.total_matches = results.len();
 
-        #[cfg(feature = "regex")]
-        {
-            self.compiled_regex = None;
-        }
+        self.compiled_regex = None;
 
         for &(row, start_col, end_col) in results {
             self.record_seen_position((row, start_col));

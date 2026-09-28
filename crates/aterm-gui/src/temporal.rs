@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aterm_buffer::{BlobId, Event, EventLog, KeyframeId, Op, Seq, Ticks};
-use aterm_core::terminal::{HostBindings, Terminal, TerminalCheckpoint};
+use aterm_core::grid::ResizePolicy;
+use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 /// Default byte budget for retained blob payloads + warm-tier events. A flood
 /// cannot balloon RAM past this; an idle session costs nothing.
@@ -112,6 +113,14 @@ pub(crate) struct TemporalRecorder {
     bytes_since_keyframe: usize,
     /// The monotonic epoch this recorder's tick timeline is relative to.
     epoch: Instant,
+    /// The seam policy the live engine resizes with (`pty_resize_policy` of
+    /// the session's master), which every recorded `Resize` replays under.
+    /// The spine's `Op::Resize` carries only the geometry, and the policy is a
+    /// fact of the session's backend rather than of any one resize, so it is
+    /// held once here. Replaying a ConPTY session's resizes as Native would
+    /// reveal history that the recorded conhost repaint then paints over: the
+    /// replayed engine would lose lines the live one kept.
+    resize_policy: ResizePolicy,
 }
 
 impl TemporalRecorder {
@@ -136,7 +145,14 @@ impl TemporalRecorder {
             dropped_events: 0,
             bytes_since_keyframe: 0,
             epoch: Instant::now(), // CLOCK-EXEMPT: recorder timeline epoch, not engine state
+            resize_policy: ResizePolicy::Native,
         }
+    }
+
+    /// Replay every recorded resize under `policy` — the one the live engine
+    /// resizes with. Set by the reader attach from the session's PTY backend.
+    pub(crate) fn set_resize_policy(&mut self, policy: ResizePolicy) {
+        self.resize_policy = policy;
     }
 
     /// The current tick on this recorder's timeline (micros since the epoch).
@@ -253,8 +269,8 @@ impl TemporalRecorder {
     /// survives budget eviction (R19). Replaying to the LATEST tick yields the
     /// current state (NOT a past state stamped `now()`), seeded from the newest
     /// keyframe + its still-live forward chain — so the new keyframe is faithful.
-    /// `HostBindings::none()` reconstructs a fully-inspectable buffer whose grid
-    /// matches the source (host callbacks are not checkpointed anyway). Interval
+    /// The replayed terminal is a fully-inspectable buffer whose grid matches the
+    /// source (host callbacks are not checkpointed anyway). Interval
     /// floors at 64 KiB so a pathologically tiny budget never thrashes (and cannot
     /// retain a keyframe, so it honestly still degrades to `None`).
     fn maybe_rekeyframe(&mut self) {
@@ -262,7 +278,7 @@ impl TemporalRecorder {
         if self.bytes_since_keyframe < interval {
             return;
         }
-        match self.replay_at(HostBindings::none(), None) {
+        match self.replay_at(None) {
             Some(mut live) => {
                 // GUARD: only checkpoint a parser-GROUND engine. A recorded RawIn burst
                 // is an arbitrary PTY read, so the burst that crossed the re-keyframe
@@ -443,24 +459,25 @@ impl TemporalRecorder {
     /// recorded instant) — the read half of the hydratable spine (B.9). Seeds a
     /// fresh headless [`Terminal`] from the nearest retained keyframe with
     /// `ts <= at`, then folds the recorded `RawIn`/`Resize` events forward in seq
-    /// order through `process`/`resize`; `Reply` is NOT re-emitted (the design's
+    /// order through `process`/`resize_with_policy` (under the session's seam
+    /// policy, [`Self::set_resize_policy`]); `Reply` is NOT re-emitted (the design's
     /// contract) and intermediate keyframes are skipped (already seeded from base).
     ///
     /// Returns `None` when the target is unreachable under bounded retention: the
     /// base keyframe aged out, or a needed input blob was evicted. Degrades to
     /// `None` — never a panic or an out-of-bounds read (the B.8.2 lossy-but-honest
-    /// contract). `host` rebinds host effects (B.3.2); this increment's
-    /// [`HostBindings`] is empty, so a null set reconstructs a fully-inspectable
-    /// buffer whose grid matches the source.
+    /// contract). The replayed terminal carries no host effects (no callbacks,
+    /// default auth), which is what a scrub needs: a fully-inspectable buffer
+    /// whose grid matches the source.
     #[must_use]
-    pub(crate) fn replay_at(&self, host: HostBindings, at: Option<Ticks>) -> Option<Terminal> {
+    pub(crate) fn replay_at(&self, at: Option<Ticks>) -> Option<Terminal> {
         let at = at.unwrap_or_else(|| self.latest_tick());
         // Base keyframe: O(MAX_KEYFRAMES) over the retained deque (which carries
         // each keyframe's own spine coordinates) instead of a full walk of the
         // spine looking for the last `Op::Keyframe` — see `base_keyframe` for
         // why the two pick the same entry.
         let base = self.base_keyframe(at)?;
-        let mut term = Terminal::from_checkpoint(&base.checkpoint, host);
+        let mut term = Terminal::from_checkpoint(&base.checkpoint);
         // Fold every live event AFTER the seed with ts <= at, in seq order.
         //
         // TWO SCANS DELETED. The seek (`live_after`) starts at the base instead
@@ -476,7 +493,9 @@ impl TemporalRecorder {
             }
             match ev.op {
                 Op::RawIn(id) => term.process(self.blob_bytes(id)?),
-                Op::Resize { rows, cols } => term.resize(rows, cols),
+                Op::Resize { rows, cols } => {
+                    term.resize_with_policy(rows, cols, self.resize_policy)
+                }
                 _ => {}
             }
         }
@@ -649,23 +668,23 @@ mod tests {
                 .iter()
                 .find(|kf| kf.id == base_kid)
                 .map(|kf| &kf.checkpoint)?;
-            let mut term = Terminal::from_checkpoint(cp, HostBindings::none());
+            let mut term = Terminal::from_checkpoint(cp);
             for ev in r.log.live() {
                 if ev.seq <= base_seq || ev.ts > at {
                     continue;
                 }
                 match ev.op {
                     Op::RawIn(id) => term.process(r.blob_bytes(id)?),
-                    Op::Resize { rows, cols } => term.resize(rows, cols),
+                    Op::Resize { rows, cols } => {
+                        term.resize_with_policy(rows, cols, r.resize_policy);
+                    }
                     _ => {}
                 }
             }
             Some(screen_of(&term))
         };
-        let observed = |at: Ticks| -> Option<Vec<String>> {
-            r.replay_at(HostBindings::none(), Some(at))
-                .map(|t| screen_of(&t))
-        };
+        let observed =
+            |at: Ticks| -> Option<Vec<String>> { r.replay_at(Some(at)).map(|t| screen_of(&t)) };
 
         let latest = r.latest_tick();
         let mut probes: Vec<Ticks> =
@@ -686,8 +705,7 @@ mod tests {
         );
         // And the default target (`None`) still lands on the latest instant.
         assert_eq!(
-            r.replay_at(HostBindings::none(), None)
-                .map(|t| screen_of(&t)),
+            r.replay_at(None).map(|t| screen_of(&t)),
             reference(latest),
             "the default replay target must still be the latest recorded instant"
         );
@@ -766,7 +784,7 @@ mod tests {
         r.record_raw_in(b"seed\r\n");
 
         let term = r
-            .replay_at(HostBindings::none(), None)
+            .replay_at(None)
             .expect("base keyframe retained -> replay reconstructs");
         let row0 = term.get_line_text(0, None).unwrap_or_default();
         assert!(row0.starts_with("seed"), "replayed row 0 = {row0:?}");
@@ -790,7 +808,7 @@ mod tests {
         // THEN widen to 20 columns (recorded AFTER the write — the spine order).
         r.record_resize(4, 20);
 
-        let term = r.replay_at(HostBindings::none(), None).expect("replay");
+        let term = r.replay_at(None).expect("replay");
         assert_eq!(term.cols(), 20, "the resize is applied");
         // X sits at col 9 (clamped at the OLD 10-col width), proving the write replayed
         // BEFORE the resize. If the resize had jumped ahead (the bug), the width would
@@ -801,6 +819,67 @@ mod tests {
             Some(9),
             "X at the pre-resize column: row0={row0:?}"
         );
+    }
+
+    /// A ConPTY session's recorded resizes replay under ITS seam policy. The
+    /// live engine keeps all 7 history lines across a 6→10 grow and the
+    /// conhost repaint recorded after it; the replay must rebuild that engine,
+    /// not the one a Native grow leaves once the same repaint lands (the 4
+    /// revealed lines painted over, 3 left in history).
+    #[test]
+    fn replay_resizes_under_the_sessions_seam_policy() {
+        let mut live = Terminal::new(6, 20);
+        let mut r = TemporalRecorder::new();
+        r.set_resize_policy(ResizePolicy::ConPty);
+        r.record_keyframe(live.checkpoint());
+        let lines: Vec<u8> = (0..12)
+            .flat_map(|i| format!("L{i:02}\r\n").into_bytes())
+            .collect();
+        live.process(&lines);
+        r.record_raw_in(&lines);
+
+        let screen = screen_of(&live);
+        live.resize_with_policy(10, 20, ResizePolicy::ConPty);
+        r.record_resize(10, 20);
+        // conhost's repaint: the pre-grow viewport from row 0, the grown rows
+        // blank, the cursor back on its row.
+        let mut repaint = b"\x1b[H".to_vec();
+        for (i, row) in screen.iter().enumerate() {
+            if i > 0 {
+                repaint.extend_from_slice(b"\r\n");
+            }
+            repaint.extend_from_slice(row.trim_end().as_bytes());
+            repaint.extend_from_slice(b"\x1b[K");
+        }
+        repaint.extend_from_slice(&b"\r\n\x1b[K".repeat(4));
+        repaint.extend_from_slice(b"\x1b[6;1H");
+        live.process(&repaint);
+        r.record_raw_in(&repaint);
+
+        let history = |t: &Terminal| -> Vec<String> {
+            (0..t.grid().scrollback_lines())
+                .map(|i| {
+                    t.grid()
+                        .get_history_line(i)
+                        .map(|l| l.to_string())
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        assert_eq!(live.grid().scrollback_lines(), 7, "precondition");
+        let replayed = r.replay_at(None).expect("replay");
+        assert_eq!(
+            history(&replayed),
+            history(&live),
+            "the history the live engine kept"
+        );
+        assert_eq!(screen_of(&replayed), screen_of(&live));
+
+        // Teeth: the same spine replayed as Native is the engine the live one
+        // is not.
+        r.set_resize_policy(ResizePolicy::Native);
+        let native = r.replay_at(None).expect("replay");
+        assert_eq!(native.grid().scrollback_lines(), 3);
     }
 
     #[test]
@@ -843,7 +922,7 @@ mod tests {
         // Replay to the LATEST instant reconstructs the recent screen (the window
         // survived eviction because re-keyframing minted fresh, bounded bases).
         let term = r
-            .replay_at(HostBindings::none(), None)
+            .replay_at(None)
             .expect("re-keyframing keeps the latest instant reachable past the budget");
         let mut found = false;
         for row in 0..i32::from(term.rows()) {
@@ -880,6 +959,6 @@ mod tests {
         for _ in 0..64 {
             r.record_raw_in(&[b'x'; 64]);
         }
-        assert!(r.replay_at(HostBindings::none(), None).is_none());
+        assert!(r.replay_at(None).is_none());
     }
 }

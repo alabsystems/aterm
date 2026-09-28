@@ -11,7 +11,8 @@
 //! effects; addressing and spans ship with the slice that has a consumer) so
 //! the freeze (§4, M1) lands piece by verified piece rather than as a big bang.
 //!
-//! Invariant proven here AND model-checked by the DERIVED kernel-family twins in
+//! Invariant TESTED here (unit tests + the Tier-1 conformance below) and
+//! model-checked by the DERIVED kernel-family twins in
 //! `aterm-spec::derive` (Kernel/Subscribe/Snapshot/Transact/Ring — exhaustively
 //! `ty check`ed in `aterm-spec/tests/derived_ring_ty.rs`; they cover the spine,
 //! poll, snapshot isolation, transact OCC, and ring eviction). The hand-written
@@ -20,10 +21,21 @@
 //! the event log is a **gap-free, strictly-monotonic spine** — every `apply`
 //! yields exactly one new `Seq`, and `seq == log.len()` always (§4.3 clause 1).
 //!
-//! STATUS: per §0.1 — designed-for-verification; the Trust contracts and the
-//! `aterm-buffer` TLA+ ledger (§6.2) are not yet green. This is tested, not proven.
+//! STATUS: the kernel invariants are model-checked (the derived twins, by the
+//! in-process interpreter and by `ty`) and Tier-1-bound to THIS code by
+//! `tests/conformance_*.rs`, which drive the real `Surface`/`EventLog` and check
+//! each transition against the model. What is not proven is the code itself:
+//! the crate carries no Trust source contracts, and in-compilation verification
+//! is off workspace-wide (`.cargo/config.toml`). The `InvariantClosure` ledger
+//! an earlier plan named for this crate was never built and is superseded by
+//! `aterm-spec`'s `InvariantAnchor` / `spec_xref_closure` gate
+//! (docs/REARCH-PLAN.md, A-2).
 
-#![forbid(unsafe_code)]
+// Production code is `forbid(unsafe_code)`. The unit-test build relaxes that to
+// `deny` for one reason: its capability helpers call the `unsafe` launcher mint
+// (`aterm_cap::Authority::root_authority`), each under an explicit `allow`.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 use std::sync::Arc;
 
@@ -83,17 +95,28 @@ pub enum OriginTag {
     System,
 }
 
-/// Capability witnesses — passed BY REFERENCE (§4.3 clause 6, §5.4). TODAY
-/// THEY ARE PLACEHOLDERS WITH NO TEETH: public unit structs any caller can
-/// construct, which the verbs ignore, so a missing cap is NOT yet unreachable.
-/// `aterm-cap`'s sealed mint has landed (§5.4); wiring these to
-/// `aterm_cap::Cap<E>` is the step `docs/design/P1_KERNEL_MIGRATION.md` §1b
-/// still owes. The signatures are already cap-by-reference, so that swap is
-/// non-breaking.
-#[derive(Clone, Copy, Debug)]
-pub struct ReadCap;
-#[derive(Clone, Copy, Debug)]
-pub struct WriteCap;
+/// Effect marker: reading a [`Surface`] (`read_text`, `snapshot`, `subscribe`).
+pub enum BufferRead {}
+/// Effect marker: mutating a [`Surface`] (`apply`, `transact`).
+pub enum BufferWrite {}
+
+/// Capability witnesses, passed BY REFERENCE (§4.3 clause 6, §5.4). They are
+/// `aterm_cap` capabilities, so the only way to hold one is to be granted it by
+/// an [`aterm_cap::Authority`], and the only mint for that is the
+/// feature-sealed `Authority::root_authority` in the two launcher binaries. A
+/// verb called without the matching cap does not compile, and neither does a
+/// forged one:
+///
+/// ```compile_fail,E0423
+/// // The witnesses used to be public unit structs anyone could write down.
+/// let _forged = aterm_buffer::WriteCap;
+/// ```
+///
+/// The tier a cap was granted at is not consulted: buffer edits are
+/// reversible, buffer-only effects, so holding the cap is the whole gate.
+pub type ReadCap = aterm_cap::Cap<BufferRead>;
+/// See [`ReadCap`].
+pub type WriteCap = aterm_cap::Cap<BufferWrite>;
 
 /// A half-open line range `[start, end)` for reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -295,8 +318,10 @@ impl EventLog {
 }
 
 /// A Surface: the addressing root holding committed lines + the event-log spine
-/// (§3.1). First slice models a line as text; the cell/style model integrates
-/// `aterm-grid` in the next slice.
+/// (§3.1). It is a text-line model, and it is the native editor's document
+/// spine (`aterm-gui`'s `document_store.rs`: one `Document` owns one
+/// `Surface`). Terminal cells live in `aterm-grid`; the cap-gated one-door
+/// kernel over them is REARCH-PLAN A-2 (parked).
 #[derive(Clone, Debug)]
 pub struct Surface {
     /// Immutable snapshot spine. [`Arc::make_mut`] clones this ordered vector
@@ -531,6 +556,23 @@ impl Snapshot {
 mod tests {
     use super::*;
 
+    #[allow(unsafe_code, reason = "the test build is its own trusted launcher")]
+    fn authority() -> aterm_cap::Authority {
+        // SAFETY: a test process that processes no untrusted input is its own
+        // trusted launcher, which is the whole of `root_authority`'s contract.
+        // The mint is nameable here only through the dev-dependency edge's
+        // `launcher-mint`.
+        unsafe { aterm_cap::Authority::root_authority() }
+    }
+
+    fn read_cap() -> ReadCap {
+        authority().grant(aterm_cap::Tier::Trusted)
+    }
+
+    fn write_cap() -> WriteCap {
+        authority().grant(aterm_cap::Tier::Trusted)
+    }
+
     /// THE kernel invariant (§4.3 clause 1), the executable twin of
     /// `Kernel.tla`'s `SeqIsLen` + `Monotonic`: every apply bumps seq by exactly
     /// one, the spine is gap-free, and seq == total events appended.
@@ -541,7 +583,7 @@ mod tests {
         let mut prev = 0u64;
         for i in 0..1000 {
             let before = s.seq().0;
-            s.apply(&WriteCap, Edit::AppendLine(format!("line {i}")));
+            s.apply(&write_cap(), Edit::AppendLine(format!("line {i}")));
             let now = s.seq().0;
             assert_eq!(now, before + 1, "each apply yields exactly one Seq");
             assert!(now > prev, "seq is strictly monotonic");
@@ -555,10 +597,10 @@ mod tests {
     #[test]
     fn apply_read_round_trips() {
         let mut s = Surface::new();
-        s.apply(&WriteCap, Edit::AppendLine("hello".into()));
-        s.apply(&WriteCap, Edit::AppendLine("world".into()));
+        s.apply(&write_cap(), Edit::AppendLine("hello".into()));
+        s.apply(&write_cap(), Edit::AppendLine("world".into()));
         let got = s.read_text(
-            &ReadCap,
+            &read_cap(),
             Range {
                 start: LineId(0),
                 end: LineId(2),
@@ -572,13 +614,13 @@ mod tests {
     #[test]
     fn snapshot_is_isolated_from_later_writes() {
         let mut s = Surface::new();
-        s.apply(&WriteCap, Edit::AppendLine("frozen".into()));
-        let snap = s.snapshot(&ReadCap);
-        s.apply(&WriteCap, Edit::AppendLine("after".into()));
+        s.apply(&write_cap(), Edit::AppendLine("frozen".into()));
+        let snap = s.snapshot(&read_cap());
+        s.apply(&write_cap(), Edit::AppendLine("after".into()));
         // The snapshot sees the frozen world; the live surface moved on.
         let snap_text = snap
             .read_text(
-                &ReadCap,
+                &read_cap(),
                 Range {
                     start: LineId(0),
                     end: LineId(9),
@@ -587,7 +629,7 @@ mod tests {
             .text;
         let live_text = s
             .read_text(
-                &ReadCap,
+                &read_cap(),
                 Range {
                     start: LineId(0),
                     end: LineId(9),
@@ -605,17 +647,17 @@ mod tests {
         let original = String::from("frozen allocation");
         let original_ptr = original.as_ptr();
         let original_capacity = original.capacity();
-        s.apply(&WriteCap, Edit::AppendLine(original));
+        s.apply(&write_cap(), Edit::AppendLine(original));
         assert_eq!(s.lines[0].1.as_ptr(), original_ptr);
         assert_eq!(s.lines[0].1.capacity(), original_capacity);
 
-        let snap = s.snapshot(&ReadCap);
+        let snap = s.snapshot(&read_cap());
         assert!(Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
 
         let replacement = String::from("live replacement allocation");
         let replacement_ptr = replacement.as_ptr();
         let replacement_capacity = replacement.capacity();
-        s.apply(&WriteCap, Edit::SetLine(LineId(0), replacement));
+        s.apply(&write_cap(), Edit::SetLine(LineId(0), replacement));
         assert_eq!(s.lines[0].1.as_ptr(), replacement_ptr);
         assert_eq!(s.lines[0].1.capacity(), replacement_capacity);
         assert!(!Arc::ptr_eq(&s.lines[0].1, &snap.surface.lines[0].1));
@@ -628,15 +670,15 @@ mod tests {
     #[test]
     fn snapshot_shares_the_line_and_log_spines_until_a_line_write() {
         let mut live = Surface::new();
-        live.apply(&WriteCap, Edit::AppendLine("frozen".into()));
-        let snap = live.snapshot(&ReadCap);
+        live.apply(&write_cap(), Edit::AppendLine("frozen".into()));
+        let snap = live.snapshot(&read_cap());
         let fork = snap.surface.clone();
         for candidate in [&snap.surface, &fork] {
             assert!(Arc::ptr_eq(&live.lines, &candidate.lines));
             assert!(Arc::ptr_eq(&live.log, &candidate.log));
         }
 
-        live.apply(&WriteCap, Edit::SetLine(LineId(0), "live".into()));
+        live.apply(&write_cap(), Edit::SetLine(LineId(0), "live".into()));
         assert!(!Arc::ptr_eq(&live.lines, &snap.surface.lines));
         assert!(!Arc::ptr_eq(&live.log, &snap.surface.log));
         assert!(Arc::ptr_eq(&snap.surface.lines, &fork.lines));
@@ -651,15 +693,15 @@ mod tests {
     #[test]
     fn absent_line_edits_append_an_event_without_detaching_the_line_spine() {
         let mut source = Surface::new();
-        source.apply(&WriteCap, Edit::AppendLine("line".into()));
-        let snap = source.snapshot(&ReadCap);
+        source.apply(&write_cap(), Edit::AppendLine("line".into()));
+        let snap = source.snapshot(&read_cap());
 
         for edit in [
             Edit::SetLine(LineId(99), "absent".into()),
             Edit::ClearLine(LineId(99)),
         ] {
             let mut fork = snap.surface.clone();
-            fork.apply(&WriteCap, edit);
+            fork.apply(&write_cap(), edit);
             assert!(
                 Arc::ptr_eq(&fork.lines, &snap.surface.lines),
                 "an absent line edit must not copy the shared line spine"
@@ -677,16 +719,16 @@ mod tests {
     #[test]
     fn equal_line_edits_advance_the_log_without_detaching_the_line_spine() {
         let mut source = Surface::new();
-        source.apply(&WriteCap, Edit::AppendLine("same".into()));
-        source.apply(&WriteCap, Edit::AppendLine(String::new()));
-        let snap = source.snapshot(&ReadCap);
+        source.apply(&write_cap(), Edit::AppendLine("same".into()));
+        source.apply(&write_cap(), Edit::AppendLine(String::new()));
+        let snap = source.snapshot(&read_cap());
 
         for edit in [
             Edit::SetLine(LineId(0), "same".into()),
             Edit::ClearLine(LineId(1)),
         ] {
             let mut fork = snap.surface.clone();
-            fork.apply(&WriteCap, edit);
+            fork.apply(&write_cap(), edit);
             assert!(Arc::ptr_eq(&fork.lines, &snap.surface.lines));
             assert!(!Arc::ptr_eq(&fork.log, &snap.surface.log));
             assert_eq!(fork.seq().0, snap.at.0 + 1);
@@ -705,7 +747,7 @@ mod tests {
             } else {
                 "prefix"
             };
-            s.apply(&WriteCap, Edit::AppendLine(text.into()));
+            s.apply(&write_cap(), Edit::AppendLine(text.into()));
         }
         let tail = Range {
             start: LineId((LINES - 1) as u64),
@@ -713,7 +755,7 @@ mod tests {
         };
 
         let _ = take_line_id_comparisons();
-        assert_eq!(s.read_text(&ReadCap, tail).text, "tail needle\n");
+        assert_eq!(s.read_text(&read_cap(), tail).text, "tail needle\n");
         let read_comparisons = take_line_id_comparisons();
         assert!(read_comparisons > 0, "read must reach the lower bound");
         assert!(
@@ -722,7 +764,7 @@ mod tests {
         );
 
         s.apply(
-            &WriteCap,
+            &write_cap(),
             Edit::SetLine(LineId((LINES - 1) as u64), "updated".into()),
         );
         let lookup_comparisons = take_line_id_comparisons();
@@ -734,7 +776,7 @@ mod tests {
 
         assert!(
             s.read_text(
-                &ReadCap,
+                &read_cap(),
                 Range {
                     start: LineId(12),
                     end: LineId(3),
@@ -749,9 +791,9 @@ mod tests {
     #[test]
     fn subscribe_pulls_new_events_then_drains() {
         let mut s = Surface::new();
-        let cur = s.subscribe(&ReadCap); // positioned at head (seq 0)
-        s.apply(&WriteCap, Edit::AppendLine("a".into()));
-        s.apply(&WriteCap, Edit::AppendLine("b".into()));
+        let cur = s.subscribe(&read_cap()); // positioned at head (seq 0)
+        s.apply(&write_cap(), Edit::AppendLine("a".into()));
+        s.apply(&write_cap(), Edit::AppendLine("b".into()));
         let (upd, cur) = s.poll(cur);
         match upd {
             SubUpdate::Events(ev) => {
@@ -769,10 +811,10 @@ mod tests {
     #[test]
     fn slow_subscriber_gets_a_gap_and_never_blocks() {
         let mut s = Surface::new();
-        let cur = s.subscribe(&ReadCap); // at seq 0
+        let cur = s.subscribe(&read_cap()); // at seq 0
         // overflow the bounded ring so the oldest live event is past the cursor
         for i in 0..(MAX_LOG_EVENTS + 8) {
-            s.apply(&WriteCap, Edit::AppendLine(format!("{i}")));
+            s.apply(&write_cap(), Edit::AppendLine(format!("{i}")));
         }
         let (upd, _cur) = s.poll(cur);
         assert!(
@@ -871,19 +913,19 @@ mod tests {
     #[test]
     fn transact_is_atomic_and_cc_guarded() {
         let mut s = Surface::new();
-        s.apply(&WriteCap, Edit::AppendLine("base".into()));
-        let snap = s.snapshot(&ReadCap); // base = Seq(1)
+        s.apply(&write_cap(), Edit::AppendLine("base".into()));
+        let snap = s.snapshot(&read_cap()); // base = Seq(1)
 
         // up-to-date base: the whole group lands atomically
         let out = s.transact(
-            &WriteCap,
+            &write_cap(),
             snap.at,
             vec![Edit::AppendLine("a".into()), Edit::AppendLine("b".into())],
         );
         assert_eq!(out, TxnOutcome::Committed(Seq(3)));
         assert_eq!(
             s.read_text(
-                &ReadCap,
+                &read_cap(),
                 Range {
                     start: LineId(0),
                     end: LineId(9)
@@ -894,7 +936,7 @@ mod tests {
         );
 
         // stale base: optimistic CC conflicts and applies NOTHING
-        let out2 = s.transact(&WriteCap, snap.at, vec![Edit::AppendLine("z".into())]);
+        let out2 = s.transact(&write_cap(), snap.at, vec![Edit::AppendLine("z".into())]);
         assert_eq!(out2, TxnOutcome::Conflict);
         assert_eq!(s.seq(), Seq(3), "conflict left the surface untouched");
     }

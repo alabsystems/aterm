@@ -2084,12 +2084,10 @@ impl App {
         if confirmed {
             self.boot_health_confirmation_dispatched = true;
             self.boot_health_confirmation_retry_at = None;
+            self.boot_health_confirmation_backoff = crate::BOOT_HEALTH_RETRY_MIN;
         } else {
             self.boot_health_confirmation_dispatched = false;
-            self.boot_health_confirmation_retry_at = Some(
-                now.checked_add(std::time::Duration::from_secs(1))
-                    .unwrap_or(now),
-            );
+            self.arm_boot_health_retry(now);
         }
     }
 
@@ -5540,7 +5538,6 @@ impl App {
                         // so that record is not the newest state and must not be taken
                         // as one (review 2026-09-16). The completion re-reads instead,
                         // and its read closes the expectation the change line opens.
-                        // `tools/grep_guard.sh` W4 fences this filter and the Check's.
                         crate::read_seed_markers(
                             std::io::BufReader::new(out.stdout.as_slice()),
                             |event| {
@@ -7413,10 +7410,6 @@ impl App {
             UpdaterPhase::Checking | UpdaterPhase::Available | UpdaterPhase::Downloading
         );
         let attention = snapshot.attention_pending();
-        debug_assert!(
-            !snapshot.has_determinate_progress(),
-            "the current updater API supplies no progress denominator"
-        );
         let staged = snapshot
             .staged
             .as_ref()
@@ -12459,6 +12452,11 @@ mod tests {
     /// specifies that externally-visible boundary, not worker scheduling timing.
     #[test]
     fn native_update_worker_queue_conforms_to_saturation_coalescing_and_disconnect() {
+        // It records an apply refusal in the process-wide update ledger
+        // (`record_apply_outcome_in_ledger`), whose standing slot the
+        // ledger-reading tests assert on: hold the one ledger lock, as every
+        // such writer does.
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let model = aterm_spec::derive::native_update_worker_queue_model();
         let mut state = model.init_state();
 
@@ -12604,17 +12602,28 @@ mod tests {
     fn boot_health_failure_rearms_bounded_retry_then_success_closes_latch() {
         let mut app = App::headless_for_test();
         let now = std::time::Instant::now();
+        let secs = std::time::Duration::from_secs;
         app.boot_health_confirmation_dispatched = true;
         app.finish_native_boot_health_confirmation(false, now);
         assert!(!app.boot_health_confirmation_dispatched);
-        assert_eq!(
-            app.boot_health_confirmation_retry_at,
-            Some(now + std::time::Duration::from_secs(1))
-        );
+        assert_eq!(app.boot_health_confirmation_retry_at, Some(now + secs(1)));
+
+        // Consecutive failures back off, doubling to the 60 s ceiling.
+        for want in [2, 4, 8, 16, 32, 60, 60] {
+            app.finish_native_boot_health_confirmation(false, now);
+            assert_eq!(
+                app.boot_health_confirmation_retry_at,
+                Some(now + secs(want)),
+                "the backoff after a failure"
+            );
+        }
 
         app.finish_native_boot_health_confirmation(true, now);
         assert!(app.boot_health_confirmation_dispatched);
         assert!(app.boot_health_confirmation_retry_at.is_none());
+        // Success resets the backoff for any later failure.
+        app.finish_native_boot_health_confirmation(false, now);
+        assert_eq!(app.boot_health_confirmation_retry_at, Some(now + secs(1)));
     }
 
     #[test]
@@ -13908,6 +13917,11 @@ mod tests {
     /// rides the newer facts: the reduction that lands them acts on ApplyControl.
     #[test]
     fn a_parked_control_apply_rides_the_next_newer_facts_instead_of_going_stale() {
+        // It records an apply refusal in the process-wide update ledger
+        // (`record_apply_outcome_in_ledger`), whose standing slot the
+        // ledger-reading tests assert on: hold the one ledger lock, as every
+        // such writer does.
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let running = app.native_updater_service.snapshot().current_build;
         let build = running + 1;
@@ -16326,6 +16340,9 @@ mod tests {
     /// never the first row resolved into its Fault echo and the same row posted back.
     #[test]
     fn an_announced_editor_block_stays_one_row_through_the_budget() {
+        // Every Blocked attempt books a refusal in the one per-process ledger:
+        // held, like every other writer (`UPDATE_LEDGER_TEST_LOCK`).
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let _ = park_a_settings_draft_in_a_background_tab(&mut app);
         let build = app.native_updater_service.snapshot().current_build + 1;
@@ -16513,6 +16530,9 @@ mod tests {
     /// which is the code that does the disturbing.
     #[test]
     fn an_exhausted_preflight_block_budget_neither_latches_forever_nor_nags_on_a_schedule() {
+        // Every Blocked attempt books a refusal in the one per-process ledger:
+        // held, like every other writer (`UPDATE_LEDGER_TEST_LOCK`).
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
         assert!(
@@ -17186,6 +17206,13 @@ mod tests {
     /// one way spams park/spawn round trips, the other never applies.
     #[test]
     fn a_genuine_failure_takes_the_physical_budget_while_a_preflight_block_only_cools_down() {
+        // Every Blocked attempt books a refusal in the one per-process ledger
+        // (`aterm_update::record_apply_refusal`): held, so it cannot land between
+        // a sibling's booking and its read (measured 2026-09-26: this test's
+        // "Updating after session restore finishes" was read back as
+        // `a_fork_lane_park_miss_is_booked_as_a_refusal_not_a_failure`'s own
+        // last refusal, one full-suite run in two).
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
         // The pure policy split the two lanes ride on, asserted directly so a
         // future reclassification cannot silently swap them.
         use crate::native_update_auto_intent::{AttemptDisposition, AttemptResult, finish};

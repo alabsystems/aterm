@@ -417,7 +417,11 @@ pub(crate) fn build_key_input(
         return Some((key, mods, base_layout));
     }
     let key = aterm_winit_keymap::map_logical_key(&ev.key_without_modifiers())?;
-    Some((key, mods, base_layout))
+    Some((
+        aterm_winit_keymap::sided_modifier(key, ev.location),
+        mods,
+        base_layout,
+    ))
 }
 
 /// Fallback for [`build_key_input`] on platforms WITHOUT
@@ -451,6 +455,13 @@ pub(crate) fn build_key_input(
         mods,
         layout_shift_state,
     )
+    .map(|(key, mods, base)| {
+        (
+            aterm_winit_keymap::sided_modifier(key, ev.location),
+            mods,
+            base,
+        )
+    })
 }
 
 /// The layout-BASE key of a press, for the Ctrl+Alt rescue in
@@ -970,14 +981,6 @@ mod tests {
         if let Some(on) = hid_lock_state::caps_lock() {
             assert_eq!(on, locks.contains(Modifiers::CAPS_LOCK));
         }
-    }
-
-    /// The headless/test source is inert on every platform: this is what keeps a
-    /// unit test's encoded bytes machine-independent, and what keeps a test
-    /// binary off every platform lock-key path (2026-08-17).
-    #[test]
-    fn no_lock_modifiers_is_empty() {
-        assert!(no_lock_modifiers().is_empty());
     }
 
     /// winit ModifiersState → engine Modifiers carries Super/Cmd through

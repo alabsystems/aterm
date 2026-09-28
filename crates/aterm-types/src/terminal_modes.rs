@@ -156,6 +156,19 @@ pub struct TerminalModes {
     /// effect on encoding, mirroring how other tracked-but-minimal modes are
     /// handled. Default `false` (reset).
     pub mode_1045: bool,
+    /// ConPTY win32-input-mode (DEC private mode 9001, microsoft/terminal spec
+    /// #4999). conhost sets it at every ConPTY start (`CSI ? 9001 h`) to ask the
+    /// hosting terminal for INPUT_RECORD-faithful key reports. Folded into the
+    /// keyboard encoding as `KeyboardMode::WIN32_INPUT`, where an Enter chord
+    /// (Shift/Ctrl, with or without Alt) becomes a win32 key-record pair —
+    /// the only way conhost can learn a modifier legacy VT cannot spell.
+    /// Everything else stays legacy VT; conhost accepts the mixed stream.
+    /// Reported by DECRQM, carried by XTSAVE/XTRESTORE, cleared by RIS like
+    /// every other negotiated mode. Never reaches an application: it is a
+    /// negotiation with the console host, not a kitty flag. Default `false`;
+    /// a Unix PTY never sets it, so Unix encoding is byte-identical.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub win32_input_mode: bool,
     /// DEC private mode 2048: in-band size reports. When set, the terminal emits
     /// `CSI 48 ; rows ; cols ; pixH ; pixW t` on enable and on every resize, so
     /// apps (neovim 0.10+) learn the geometry without an ioctl. Off by default.

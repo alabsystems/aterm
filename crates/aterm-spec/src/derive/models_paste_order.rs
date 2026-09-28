@@ -53,8 +53,11 @@ pub fn claude_light_admission_model() -> Model {
 }
 
 /// Ordered input owns both payload bytes and jobs until completion or failed
-/// submission. Paste leaves a byte/job allowance for ordinary input. Zero-byte
-/// jobs exercise the independent job bound. `Buggy=1` ignores admission bounds.
+/// submission. Paste leaves a byte/job allowance for ordinary input — and so
+/// does a report the UI thread encoded and queued, which the real admission
+/// (aterm-gui's `paste_order::Budget::claim`) takes through the same `paste`
+/// arm, so `AdmitPaste` is its action too. Zero-byte jobs exercise the
+/// independent job bound. `Buggy=1` ignores admission bounds.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ordered_input_admission_model() -> Model {

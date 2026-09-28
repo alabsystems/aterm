@@ -63,9 +63,9 @@ impl Lcg {
         self.next_u32() % n
     }
 
-    fn pick<'a, T>(&mut self, xs: &'a [T]) -> &'a T {
+    fn pick<T: Copy>(&mut self, xs: &[T]) -> T {
         let i = self.below(xs.len() as u32) as usize;
-        &xs[i]
+        xs[i]
     }
 }
 

@@ -683,7 +683,7 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
     }
 
     // -- [OB-16] the mirror -----------------------------------------------------
-    // TODO(mirror-gate-wiring) DISCHARGED. The mirror is not load-bearing yet:
+    // The mirror is not load-bearing yet:
     // no default is flipped and the directory is not in this tree. That is
     // exactly why the obligation is worth carrying NOW — it is the state in
     // which the fragment can drift from the lock with nothing to notice, and
@@ -730,8 +730,8 @@ fn report_over(root: &Path, cells: &[Cell]) -> Verdict {
          which record no features at all, and the verify report says how many rows it could \
          anchor; it does NOT prove any build actually USED a mirror, because nothing here \
          flips a default; it does NOT verify a bundle (`cargo forge mirror check-bundle`) or \
-         any signature — signing and delivery are the owner's ceremony, \
-         TODO(mirror-delivery-atpkg); and it runs no cargo and no network, so upstream yank \
+         any signature — delivery is deferred and will ride a signed atpkg pkg manifest \
+         outside this crate; and it runs no cargo and no network, so upstream yank \
          status is outside it entirely."
     );
 

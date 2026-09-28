@@ -2,16 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Policy-engine bridge helper for capability-module `try_mint` paths (#7994).
+//! Policy-engine bridge helper for the capability-module mint paths (#7994).
 //!
 //! # Why this module exists
 //!
-//! Phase 2 of the OSC / escape-sequence security hardening effort
-//! (`designs/2026-04-19-osc-policy-engine.md` §2.2, §6.3) adds a single
-//! [`PolicyEngine`] to [`super::Terminal`] that evaluates every
-//! policy-bearing dispatch against an operator-provided rule set. During
-//! the **Release N** deprecation window (§6.2) the engine and the legacy
-//! `TerminalModes::allow_*` booleans must co-exist:
+//! The OSC / escape-sequence policy adds a single [`PolicyEngine`] to
+//! [`super::Terminal`] that evaluates every policy-bearing dispatch against a
+//! rule set. The engine and the legacy `TerminalModes::allow_*` booleans
+//! co-exist:
 //!
 //! * When the operator's policy has an explicit rule for a sequence, the
 //!   engine's response is authoritative.

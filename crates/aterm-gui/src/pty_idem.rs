@@ -107,13 +107,8 @@ use crate::SessionCtx;
 
 /// The verbs that accept `id=<key>` — §11.2's set, exactly. Every one of them can
 /// put bytes on the PTY and no other verb may claim a mark, so a mark can only
-/// ever be consumed by something that CAN type.
-///
-/// It can still be consumed by something that DIDN'T: `send` with an empty tail
-/// answers `OK` and types nothing, so a claim settles `Applied` with no bytes
-/// moved. That is bounded to the caller's own [`Realm`] and no longer reaches the
-/// bridge's marks, which is the property that matters; within one realm it stays
-/// true and is stated rather than papered over.
+/// ever be consumed by something that CAN type — and, through
+/// [`empty_payload_refusal`], only by an attempt that carries bytes to type.
 pub(crate) const KEYED_VERBS: &[&str] = &["send", "key", "feed-bin", "turn"];
 
 /// THE NAMESPACE A MARK LIVES IN — the authority half of the key, and the half
@@ -254,6 +249,11 @@ pub(crate) struct Key {
 /// stated in exactly one place.
 const USAGE: &str = "ERR usage: id=<epoch>:<producer>:<seq>\n";
 
+/// The answer to a well-formed key minted for another launch of the session:
+/// the head drivers key on, and where the live epoch is read.
+pub(crate) const EPOCH_REFUSAL: &str =
+    "ERR epoch: id= is from another launch; use this session's nonce= from sessions\n";
+
 /// Parse `<epoch>:<producer>:<seq>` and check the epoch against the live
 /// session's launch nonce.
 ///
@@ -281,7 +281,7 @@ pub(crate) fn parse_key(value: &str, live: LaunchNonce) -> Result<Key, String> {
         return Err(USAGE.to_string());
     }
     if !epoch.ct_eq(&live) {
-        return Err("ERR epoch\n".to_string());
+        return Err(EPOCH_REFUSAL.to_string());
     }
     Ok(Key { producer, seq })
 }
@@ -613,6 +613,16 @@ fn dup_reply(verb: &str) -> String {
     }
 }
 
+/// A KEYED attempt that carries no payload (`send id=<k>` with an empty tail,
+/// `feed-bin 0 id=<k>`) would answer `OK` with nothing typed and settle its claim
+/// `Applied` — consuming a sequence no byte ever moved under. Refuse it as a usage
+/// error BEFORE [`guarded`], so the mark stays unclaimed and a retry with the real
+/// payload is still a first attempt. An unkeyed empty write keeps its old `OK`.
+pub(crate) fn empty_payload_refusal(key: Option<&str>, payload_is_empty: bool) -> Option<String> {
+    (key.is_some() && payload_is_empty)
+        .then(|| "ERR usage: id= needs a non-empty payload\n".to_string())
+}
+
 /// Run `attempt` under the session's mark for `key`, or answer for it.
 ///
 /// `key` is the RAW `id=` value (`None` when the caller passed none, in which
@@ -691,6 +701,19 @@ fn record_in_doubt(ctx: &SessionCtx, key: Key, reply: &str) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Only a KEYED attempt with nothing to type is refused; an unkeyed empty
+    /// write and a keyed non-empty one both pass through to the claim.
+    #[test]
+    fn only_a_keyed_empty_payload_is_refused_before_the_claim() {
+        assert_eq!(
+            empty_payload_refusal(Some("1:2:3"), true).as_deref(),
+            Some("ERR usage: id= needs a non-empty payload\n")
+        );
+        assert_eq!(empty_payload_refusal(Some("1:2:3"), false), None);
+        assert_eq!(empty_payload_refusal(None, true), None);
+        assert_eq!(empty_payload_refusal(None, false), None);
+    }
 
     /// `turn`'s help states WHO takes the idempotency key, and the statement is
     /// bound to [`KEYED_VERBS`] — because the previous wording, "the key, which
@@ -875,7 +898,7 @@ mod tests {
         let dead = nonce();
         assert_eq!(
             parse_key(&format!("{}:7:1", dead.to_hex()), live).unwrap_err(),
-            "ERR epoch\n"
+            EPOCH_REFUSAL
         );
         for bad in [
             String::from("nope"),

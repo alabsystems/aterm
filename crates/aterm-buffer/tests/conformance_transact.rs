@@ -18,9 +18,11 @@
 //! safety directly: a conflicted transaction applies nothing. Pure Rust + real
 //! code, so it always runs.
 
-use aterm_buffer::{Edit, Surface, TxnOutcome, WriteCap};
+use aterm_buffer::{Edit, Surface, TxnOutcome};
+mod support;
 use aterm_spec::derive::transact_model;
 use std::collections::BTreeMap;
+use support::write_cap;
 
 /// Project the optimistic-CC state the model reasons about, for a txn attempting
 /// to commit (`active = 1`) against base version `tbase`, with no loss yet.
@@ -53,7 +55,7 @@ fn real_transact_clean_commit_matches_model() {
         "model: abort disabled when there is no conflict"
     );
 
-    let outcome = s.transact(&WriteCap, base, vec![Edit::AppendLine("x".into())]);
+    let outcome = s.transact(&write_cap(), base, vec![Edit::AppendLine("x".into())]);
     assert!(
         matches!(outcome, TxnOutcome::Committed(_)),
         "real transact must commit when base == head"
@@ -66,7 +68,7 @@ fn real_transact_conflict_aborts_no_lost_update() {
     let mut s = Surface::new();
     let base = s.seq(); // txn reads the head at base
     // A concurrent write advances the head past `base`.
-    s.apply(&WriteCap, Edit::AppendLine("concurrent".into()));
+    s.apply(&write_cap(), Edit::AppendLine("concurrent".into()));
     let st = attempting(s.seq().0, base.0); // seq > tbase
 
     assert!(
@@ -79,7 +81,7 @@ fn real_transact_conflict_aborts_no_lost_update() {
     );
 
     let head_before = s.seq().0;
-    let outcome = s.transact(&WriteCap, base, vec![Edit::AppendLine("txn".into())]);
+    let outcome = s.transact(&write_cap(), base, vec![Edit::AppendLine("txn".into())]);
     assert!(
         matches!(outcome, TxnOutcome::Conflict),
         "real transact must CONFLICT under a concurrent write, not commit against a stale base"

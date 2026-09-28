@@ -45,10 +45,10 @@
 //! Platform split: the portable decisions live here; the filesystem/peer
 //! primitives are per-platform sibling modules (`control_auth_unix.rs` — the
 //! shipping POSIX code, moved verbatim — and `control_auth_win.rs`, whose
-//! honestly-reduced posture — no peer-uid gate, but a `%LOCALAPPDATA%` directory
-//! whose owner is VERIFIED and DACL hardened to owner-only
-//! (`verify_owner_and_harden`), token still mandatory — is documented there and
-//! disclosed at startup).
+//! posture — a peer-USER gate where provable (afunix's peer pid + a token-user
+//! compare), a control directory whose owner is VERIFIED and DACL hardened to
+//! owner-only (`verify_owner_and_harden`), token still mandatory — is
+//! documented there and disclosed at startup).
 
 use std::path::{Path, PathBuf};
 
@@ -3381,6 +3381,150 @@ pub(crate) fn sweep_stale_instances(dir: &Path) {
     }
 }
 
+/// [`control_socket::STALE_SOCK_MIN_AGE_SECS`] — the day a zero-length socket
+/// file must have sat untouched before the launch sweep probes it — as the
+/// `Duration` the filesystem half works in.
+#[cfg(any(windows, test))]
+const STALE_SOCK_MIN_AGE: std::time::Duration =
+    std::time::Duration::from_secs(control_socket::STALE_SOCK_MIN_AGE_SECS);
+
+/// What one directory's launch sweep did, for its one log line.
+#[cfg(any(windows, test))]
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SockSweep {
+    /// Stale files removed, in listing order.
+    pub removed: Vec<String>,
+    /// Stale files the OS would not let go of (`remove_file` failed), named so
+    /// the log says what is still there; the next launch simply retries.
+    pub failed: Vec<String>,
+}
+
+/// Remove the zero-length `*.sock` files in `dir` at least `min_age` old that
+/// nothing listens on — [`control_socket::stale_socket_files`] decides; this
+/// does the listing, the probing and the unlinking. `None` when `dir` cannot
+/// be listed (absent is the normal state of a legacy directory).
+///
+/// The facts come from the directory LISTING, not from a `stat` of each
+/// entry: on Windows `DirEntry::metadata` is the `FindNextFile` record, and
+/// that matters because opening ANOTHER process's live socket file fails
+/// there (`ERROR_CANT_ACCESS_FILE`, 1920 — the reparse point cannot be opened
+/// cross-process, the same fact `CtlStream::connect`'s NotFound normalization
+/// works around), so a sweep that stat'ed would have had to guess at exactly
+/// the files it must not touch. An entry whose facts cannot be read is kept.
+///
+/// The listener probe is [`socket_is_live`], the FAIL-SAFE one: only a
+/// connection-refused or not-found means "nobody"; any other error keeps the
+/// file. In `%LOCALAPPDATA%\aterm` on a OneDrive-managed profile that other
+/// error is `WSAEINVAL` for every socket file there, live or dead (the reason
+/// the socket directory moved), so in that directory the dead-pid rule does
+/// the work and a recycled-pid leftover waits for a launch at which its pid
+/// is dead again.
+///
+/// `keep_alias_target`: whether the socket the `latest` alias ([`SOCK_FILE`])
+/// names is exempt, as [`sweep_stale_instances`] exempts it — true for the
+/// directory instances bind in, where the alias moves on at the next bind.
+/// False for a legacy directory: nothing binds there any more, so nothing
+/// will ever repoint an alias a pre-move build left, and honouring it would
+/// keep the one socket it names for good.
+#[cfg(any(windows, test))]
+pub(crate) fn sweep_stale_socket_files(
+    dir: &Path,
+    min_age: std::time::Duration,
+    keep_alias_target: bool,
+) -> Option<SockSweep> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let aliased = keep_alias_target
+        .then(|| aterm_uds::latest::target_name(&dir.join(SOCK_FILE)))
+        .flatten()
+        .and_then(|target| target.into_string().ok());
+    let now = std::time::SystemTime::now();
+    let facts: Vec<(String, u64, u64)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            let meta = e.metadata().ok()?;
+            // A last-write time in the future reads as age 0: kept, never guessed.
+            let age_secs = meta
+                .modified()
+                .ok()
+                .and_then(|m| now.duration_since(m).ok())
+                .map_or(0, |d| d.as_secs());
+            Some((name, meta.len(), age_secs))
+        })
+        .collect();
+    let listing: Vec<control_socket::SockFileFacts<'_>> = facts
+        .iter()
+        .map(|(name, len, age_secs)| control_socket::SockFileFacts {
+            name: name.as_str(),
+            len: *len,
+            age_secs: *age_secs,
+        })
+        .collect();
+    let listening = |name: &str| socket_is_live(&dir.join(name).to_string_lossy());
+    let mut report = SockSweep::default();
+    for stale in control_socket::stale_socket_files(
+        &listing,
+        min_age.as_secs(),
+        aliased.as_deref(),
+        &imp::pid_alive,
+        &listening,
+    ) {
+        if std::fs::remove_file(dir.join(&stale)).is_ok() {
+            report.removed.push(stale);
+        } else {
+            report.failed.push(stale);
+        }
+    }
+    Some(report)
+}
+
+/// The launch sweep: [`sweep_stale_socket_files`] over the current socket
+/// directory AND every directory an earlier build bound in
+/// ([`imp::legacy_socket_dirs`]), one log line per directory swept — INFO
+/// naming what went (and what would not go), DEBUG when nothing was stale, so
+/// a routine launch adds no line at the default level. Runs beside
+/// [`sweep_stale_instances`] at bind time, before this instance's own socket
+/// exists, and covers what that rule cannot: a leftover whose pid the OS has
+/// recycled, a socket whose name carries no pid, and the legacy directory.
+///
+/// Windows only. The legacy directory is a Windows artifact, and the Unix
+/// sweep stays exactly the dead-pid rule it has always been.
+#[cfg(windows)]
+pub(crate) fn sweep_stale_socket_files_at_launch(sock_dir: &Path) {
+    // (directory, whether instances bind there — see `keep_alias_target`).
+    let mut dirs = vec![(sock_dir.to_path_buf(), true)];
+    for legacy in imp::legacy_socket_dirs() {
+        if !dirs.iter().any(|(dir, _)| *dir == legacy) {
+            dirs.push((legacy, false));
+        }
+    }
+    for (dir, keep_alias_target) in dirs {
+        let Some(report) = sweep_stale_socket_files(&dir, STALE_SOCK_MIN_AGE, keep_alias_target)
+        else {
+            continue;
+        };
+        if report.removed.is_empty() && report.failed.is_empty() {
+            aterm_log::debug!(
+                "control socket sweep: {}: no stale socket file",
+                dir.display()
+            );
+            continue;
+        }
+        let failed = if report.failed.is_empty() {
+            String::new()
+        } else {
+            format!("; could not remove: {}", report.failed.join(", "))
+        };
+        aterm_log::info!(
+            "control socket sweep: {}: removed {} zero-length socket file(s) older than a day \
+             with no listener: {}{failed}",
+            dir.display(),
+            report.removed.len(),
+            report.removed.join(", ")
+        );
+    }
+}
+
 /// Graceful-exit cleanup OFF UNIX: remove this instance's socket + token by
 /// path, and the `latest` alias ONLY while it still points at our socket (a
 /// newer instance may have repointed it). Crash exits are covered by
@@ -4732,15 +4876,18 @@ mod tests {
         assert_eq!(peer_check(&a), Ok(()));
     }
 
-    /// Windows has no peer-cred primitive at all: the gate passes every
-    /// same-machine peer (the mandatory token + dir ACL are the gates — the
-    /// reduction the startup notice discloses). "None ⇒ refuse" here would
-    /// refuse EVERY connection.
+    /// Windows: a same-process pair is the same user, so the pid gate
+    /// (`SIO_AF_UNIX_GETPEERPID` + token-user compare) passes it — and where
+    /// the ioctl exists it names THIS process, the negative control that the
+    /// pid is the peer's and not a stand-in.
     #[test]
     #[cfg(windows)]
-    fn peer_check_passes_on_windows() {
+    fn peer_check_passes_a_same_user_peer_on_windows() {
         let (a, _b) = CtlStream::pair().expect("socketpair");
         assert_eq!(peer_check(&a), Ok(()));
+        if let Ok(pid) = aterm_uds::fdpass::peer_pid(&a) {
+            assert_eq!(pid, std::process::id());
+        }
     }
 
     /// A minimal stand-in for the server's `serve` auth preamble, run over a
@@ -4869,6 +5016,132 @@ mod tests {
         assert!(!dir.join(control_socket::instance_sock_name(dead)).exists());
         assert!(!dir.join(control_socket::instance_token_name(dead)).exists());
         assert!(dir.join(control_socket::instance_sock_name(us)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The launch sweep against a real directory. With the day margin only the
+    /// dead pid's zero-byte file goes: everything younger — including two real
+    /// socket files — is left unprobed, and a token, a file with bytes in it
+    /// and the `latest` alias are never candidates. With no margin the dropped
+    /// listener's leftover goes once the kernel has torn it down, and the bound
+    /// listener survives every pass. The socket the alias names is kept only
+    /// where a bind will move the alias on.
+    #[test]
+    fn launch_sweep_removes_only_aged_empty_socks_nobody_listens_on() {
+        use std::time::{Duration, SystemTime};
+        let dir = std::env::temp_dir().join(format!("aterm-socksweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        ensure_private_dir(&dir).unwrap();
+        // A certainly-dead pid: a reaped child cannot be signalled any more.
+        #[cfg(unix)]
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0")
+            .spawn()
+            .unwrap();
+        #[cfg(windows)]
+        let mut child = std::process::Command::new("cmd")
+            .args(["/c", "exit"])
+            .spawn()
+            .unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        // `try_exists`, not `exists`: on Windows a bound socket file is a
+        // reparse point `metadata` cannot open (1920), which `exists` reads as
+        // absent; `try_exists` reports it present.
+        let present = |p: &Path| p.try_exists().unwrap_or(false);
+
+        let two_days_ago =
+            SystemTime::now() - Duration::from_secs(2 * control_socket::STALE_SOCK_MIN_AGE_SECS);
+        let plant = |name: &str, body: &[u8], when: Option<SystemTime>| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            if let Some(when) = when {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+            }
+        };
+        let dead_sock = control_socket::instance_sock_name(dead);
+        let dead_token = control_socket::instance_token_name(dead);
+        plant(&dead_sock, b"", Some(two_days_ago)); // stale on the name alone
+        plant(&dead_token, b"tok", Some(two_days_ago)); // not a .sock
+        plant("young.sock", b"", None); // younger than the margin
+        plant("pointer.sock", b"aterm-1.sock", Some(two_days_ago)); // bytes in it
+        plant(control_socket::LATEST_SOCK_FILE, b"", Some(two_days_ago)); // the alias, by name
+        // Two REAL socket files, judged on liveness alone below (a same-process
+        // `set_modified` cannot open their reparse points on Windows, so they
+        // stay young and the zero-margin pass is what probes them).
+        let live_path = dir.join("live.sock");
+        let live = aterm_uds::CtlListener::bind(&live_path).expect("bind live");
+        let orphan_path = dir.join("orphan.sock");
+        let orphan = aterm_uds::CtlListener::bind(&orphan_path).expect("bind orphan");
+        drop(orphan); // file remains, nobody listens
+
+        let report = sweep_stale_socket_files(&dir, STALE_SOCK_MIN_AGE, true).expect("dir listed");
+        assert_eq!(report.removed, vec![dead_sock.clone()]);
+        assert!(report.failed.is_empty());
+        assert!(!present(&dir.join(&dead_sock)));
+        assert!(present(&dir.join(&dead_token)));
+        assert!(present(&dir.join("young.sock")));
+        assert!(present(&dir.join("pointer.sock")));
+        assert!(present(&dir.join(control_socket::LATEST_SOCK_FILE)));
+        assert!(
+            present(&live_path) && present(&orphan_path),
+            "younger than the margin: neither real socket is probed or touched"
+        );
+
+        // No margin: the orphan goes once the kernel has torn its listener down
+        // (asynchronous — poll, bounded, as `socket_is_live`'s own test does).
+        // Each pass dials `live.sock` once and the test listener never accepts,
+        // so the cap keeps the probes well inside its backlog.
+        let mut orphan_gone = false;
+        for _ in 0..40 {
+            let report = sweep_stale_socket_files(&dir, Duration::ZERO, true).expect("dir listed");
+            assert!(
+                !report.removed.iter().any(|n| n == "live.sock"),
+                "a live listener is never swept"
+            );
+            if report.removed.iter().any(|n| n == "orphan.sock") {
+                orphan_gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(
+            orphan_gone,
+            "a dropped listener's leftover must go once stale"
+        );
+        assert!(!present(&orphan_path));
+        assert!(present(&live_path));
+        assert!(
+            socket_is_live(&live_path.to_string_lossy()),
+            "still answering"
+        );
+        // Never candidates, at any margin.
+        assert!(present(&dir.join(&dead_token)));
+        assert!(present(&dir.join("pointer.sock")));
+        assert!(present(&dir.join(control_socket::LATEST_SOCK_FILE)));
+
+        // The socket the `latest` alias names, dead and a day old: kept where
+        // instances bind (the alias moves on at the next bind, and the
+        // dead-pid sweep keeps it too), swept in a legacy directory, where no
+        // bind will ever repoint that alias.
+        plant(&dead_sock, b"", Some(two_days_ago));
+        std::fs::remove_file(dir.join(control_socket::LATEST_SOCK_FILE)).unwrap();
+        publish_latest_link(&dir.join(SOCK_FILE), &dead_sock);
+        let report = sweep_stale_socket_files(&dir, STALE_SOCK_MIN_AGE, true).expect("dir listed");
+        assert!(report.removed.is_empty(), "{report:?}");
+        assert!(present(&dir.join(&dead_sock)));
+        let report = sweep_stale_socket_files(&dir, STALE_SOCK_MIN_AGE, false).expect("dir listed");
+        assert_eq!(report.removed, vec![dead_sock.clone()]);
+        assert!(!present(&dir.join(&dead_sock)));
+
+        // An absent directory is `None`, not an empty report.
+        assert!(sweep_stale_socket_files(&dir.join("absent"), Duration::ZERO, true).is_none());
+        drop(live);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

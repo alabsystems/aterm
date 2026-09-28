@@ -57,8 +57,8 @@ impl Lcg {
         self.next() % bound.max(1)
     }
 
-    fn pick<'a, T>(&mut self, options: &'a [T]) -> &'a T {
-        &options[self.below(options.len() as u32) as usize]
+    fn pick<T: Copy>(&mut self, options: &[T]) -> T {
+        options[self.below(options.len() as u32) as usize]
     }
 
     /// One CHARACTER out of an alphabet, so the alphabet can hold multi-byte

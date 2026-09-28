@@ -94,3 +94,69 @@ fn resize_reflow_keeps_engine_invariants() {
         }
     }
 }
+
+/// The same schedule under the ConPTY seam policy (the one a Windows session
+/// resizes with), plus the policy's own law on the way: a rows-only GROW
+/// appends blank rows at the bottom and reveals nothing, so it never changes
+/// the history depth — the native grow would have handed history back to the
+/// screen, where conhost's repaint overwrites it — and it moves the counter
+/// with the rows it appends, so no absolute key moves and nothing renumbers.
+///
+/// Fewer iterations than the native schedule, for a measured reason: with no
+/// reveal, history ACCUMULATES here (hundreds to ~3,200 lines, against a
+/// native run whose every grow hands the history back — measured at 0 lines
+/// throughout), so each width change also rewraps history, the path this
+/// schedule exists to reach. 30,000 iterations took 66 s in a debug build.
+#[test]
+fn resize_reflow_keeps_engine_invariants_under_the_conpty_policy() {
+    use aterm_core::grid::ResizePolicy;
+    let mut s: u64 = 0xD1CE_F00D_1234_5678;
+    let mut term = Terminal::new(24, 80);
+    for it in 0..6_000u32 {
+        emit_content(&mut s, &mut term);
+        if next(&mut s) & 1 == 0 {
+            let r = 1 + (next(&mut s) % 50) as u16;
+            // A third of the resizes keep the width: window-height drags are
+            // the common ConPTY resize, and a random width almost never
+            // repeats.
+            let c = if next(&mut s).is_multiple_of(3) {
+                term.cols()
+            } else {
+                1 + (next(&mut s) % 200) as u16
+            };
+            let rows_only_grow = c == term.cols() && r > term.rows();
+            let history = term.grid().scrollback_lines();
+            let keys = (
+                term.grid().oldest_absolute_row(),
+                term.grid().visible_to_absolute(0),
+                term.grid().history_renumber_epoch(),
+            );
+            term.resize_with_policy(r, c, ResizePolicy::ConPty);
+            check_invariants(&term, it, r, c);
+            if rows_only_grow {
+                assert_eq!(
+                    term.grid().scrollback_lines(),
+                    history,
+                    "iter {it}: a ConPTY rows-only grow revealed history"
+                );
+                assert_eq!(
+                    (
+                        term.grid().oldest_absolute_row(),
+                        term.grid().visible_to_absolute(0),
+                        term.grid().history_renumber_epoch(),
+                    ),
+                    keys,
+                    "iter {it}: a ConPTY rows-only grow moved an absolute key"
+                );
+            }
+        }
+    }
+    let (rows, cols) = (term.rows(), term.cols());
+    for row in 0..rows {
+        for col in 0..cols {
+            if let Some(cell) = term.grid().cell(row, col) {
+                let _ = cell.char();
+            }
+        }
+    }
+}

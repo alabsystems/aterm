@@ -204,7 +204,6 @@ const SPACE_GUARDS: &[(&str, &[&str])] = &[
     ("ReleasePublisherFence", &["FenceStateBounds"]),
     ("ReleaseHistoricalRecovery", &["HistoricalRecoveryBounds"]),
     ("ReleaseYankSuccessorFirst", &["YankStateBounds"]),
-    ("ReleaseChannelSingleHead", &["ArchiveStateBounds"]),
     ("NativeUpdateAdmission", &["AttemptsBounded"]),
     (
         "NativeUpdateAutoIntent",

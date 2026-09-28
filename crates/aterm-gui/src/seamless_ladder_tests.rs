@@ -6,7 +6,7 @@
 //! a carry this build's own predicates admit, at the highest rung they allow —
 //! and the consumer in the same build decodes it exactly.
 
-use aterm_core::terminal::{HostBindings, Terminal, TerminalCheckpoint};
+use aterm_core::terminal::{Terminal, TerminalCheckpoint};
 
 use super::*;
 
@@ -316,7 +316,7 @@ fn producer_is_total_over_hostile_and_large_desks() {
     source.process(b"prompt % ls\r\nfile\r\nprompt % ");
     let mut held = source.checkpoint_carry(0).expect("Ground");
     held.current_working_directory = Some("/tmp/a\0b".to_string());
-    let held = Terminal::from_checkpoint(&held, HostBindings::none());
+    let held = Terminal::from_checkpoint(&held);
     // What the Sanitized rung must equal: that engine's own exact carry, with
     // only the directory dropped.
     let mut held_exact = held.checkpoint_carry(0).expect("Ground");

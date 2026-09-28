@@ -103,8 +103,8 @@
 //! that file and a verifier outside this tool reaches the same number. It is
 //! printed only on a PASS: a digest that is only sometimes `shasum` is worse
 //! than none, and a bundle that failed is one whose byte count is in dispute.
-//! Signing is the owner's ceremony (see `TODO(mirror-delivery-atpkg)`); this
-//! module produces the number and stops.
+//! This module produces the number and stops: delivery rides atpkg's signed
+//! pkg manifest, which pins this sha256 (see [`crate::mirror`], "Delivery").
 //!
 //! # The verification chain
 //!
@@ -167,8 +167,8 @@
 //! delivery target does not compare the lock DIGEST (a mirror for another lock
 //! is still extractable) and does require the lock's EDGES.
 //!
-//! What closes the rest is a signature over `bundle-sha256`, which is the
-//! owner's ceremony (`TODO(mirror-delivery-atpkg)`); nothing here signs or
+//! What closes the rest is a signature over `bundle-sha256` — the signed atpkg
+//! pkg manifest that pins it, outside this crate; nothing here signs or
 //! verifies one, and the verdict names it as the missing link rather than
 //! implying the chain is whole without it.
 //!
@@ -1089,9 +1089,10 @@ pub fn bundle(
     };
     let _ = writeln!(
         log,
-        "  UNSIGNED. `bundle-sha256` is the number a release signature covers, and it is the \
-         only thing that can prove this file is the one that came off this machine; signing \
-         and index upload are the owner's ceremony (TODO(mirror-delivery-atpkg))."
+        "  UNSIGNED. `bundle-sha256` is the number a signed atpkg pkg manifest (rostered \
+         machine key) would pin once delivery ships (deferred; none exists today), and that \
+         signature would be the only thing that can prove this file is the one that came off \
+         this machine; nothing in this tool signs or uploads it."
     );
     let _ = writeln!(log, "  PASS");
     Ok((Outcome { ok: true, log }, st))
@@ -1588,10 +1589,11 @@ pub fn check_bundle(
              them and they agree again. A bundle can be internally perfect and still not be \
              the one the owner emitted. The anchors that reach outside it are cargo's own \
              sparse-index cache (counted above; absent on a delivery target), `Cargo.lock`'s \
-             resolved dependency edges (counted above; a lock records NO features), and the \
-             owner's signature over `bundle-sha256` — the only \
-             one left on a machine with neither cache nor network, and deliberately outside \
-             this tool (TODO(mirror-delivery-atpkg))."
+             resolved dependency edges (counted above; a lock records NO features), and a \
+             signed atpkg pkg manifest pinning `bundle-sha256` once delivery ships — the only \
+             one that would be left on a machine with neither cache nor network, deliberately \
+             outside this tool. Delivery is deferred and none exists today, so on such a \
+             machine nothing outside this file anchors a row's `features` now."
         );
     }
     for problem in &problems {
@@ -2463,6 +2465,11 @@ mod tests {
         let second_path = fx.0.join("second.bundle");
         let (outcome, st) = bundle(&fx.root(), &fx.mirror(), &second_path, &unanchored()).unwrap();
         assert!(outcome.ok, "{}", outcome.log);
+        assert!(
+            outcome.log.contains("UNSIGNED") && outcome.log.contains("none exists today"),
+            "the bundle never reads as covered by a signature that does not exist: {}",
+            outcome.log
+        );
         let second = std::fs::read(&second_path).unwrap();
         assert_eq!(first, second, "two bundles of one mirror must be identical");
         assert_eq!(st.packages, PKGS.len());
@@ -3007,7 +3014,7 @@ mod tests {
         );
     }
 
-    /// F3. `bundle-sha256` is the number a release signature would cover, so
+    /// F3. `bundle-sha256` is the number a signed pkg manifest would pin, so
     /// it must be `shasum -a 256` of the file and nothing else. It used to be
     /// rebuilt from PARSED fields, so two different files printed one digest
     /// and a verifier running `shasum` would have rejected the artifact the
@@ -3299,6 +3306,10 @@ mod tests {
             "{}",
             blind.log
         );
+        // The outside signature is named as what WOULD anchor the rows, never
+        // as an anchor that exists (2026-09-27: delivery is deferred).
+        assert!(blind.log.contains("none exists today"), "{}", blind.log);
+        assert!(!blind.log.contains("manifest that pins"), "{}", blind.log);
 
         // With one: refused by name, and `unbundle` writes nothing.
         let anchor = mirror::RowAnchor::open(&fx.cargo_home());

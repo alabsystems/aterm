@@ -34,21 +34,31 @@ fn no_false_negatives_symbolic() {
     }
 }
 
-/// Index length is consistent with indexed lines.
-// TODO(#7932): tautology — strengthen or delete — T1: constructor round-trip field == any-binding
+/// `len()` is a high-water mark, not a counter: it is one past the highest
+/// line ever indexed, and re-indexing a line leaves it unchanged. The range
+/// queries use it as their bound, so both halves matter.
 #[kani::proof]
 #[kani::unwind(10)] // "test line" → 7 trigrams, bloom K=7; needs max(8, 8)=8, +2 margin
-fn index_length_consistent() {
+fn index_length_is_a_high_water_mark() {
     let mut index = SearchIndex::new();
 
-    let count: usize = kani::any();
-    kani::assume(count <= 5);
+    let a: usize = kani::any();
+    let b: usize = kani::any();
+    kani::assume(a <= 4 && b <= 4);
 
-    for i in 0..count {
-        index.index_line(i, "test line");
-    }
+    index.index_line(a, "test line");
+    index.index_line(b, "test line");
+    kani::assert(
+        index.len() == a.max(b) + 1,
+        "len is one past the highest line",
+    );
 
-    kani::assert(index.len() == count, "index length mismatch");
+    // Re-index the first line: the high-water mark does not move.
+    index.index_line(a, "test line");
+    kani::assert(
+        index.len() == a.max(b) + 1,
+        "re-indexing leaves len unchanged",
+    );
 }
 
 /// CRITICAL: Empty query must return empty results and terminate.

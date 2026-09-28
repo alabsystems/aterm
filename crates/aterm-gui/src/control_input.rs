@@ -548,6 +548,24 @@ pub(crate) struct LeadingInputOptions {
 ///
 /// Returns the options and the remaining tail. With no leading option the tail
 /// is `rest` byte for byte (leading whitespace included — `send` bodies are raw).
+/// The App lane's `unread=ok` (round 18, day four, D9): `hwkey`, `pointer`
+/// and `invoke` take it as their FIRST token, lifting the unread-input gate
+/// for that one gesture — the way a person's own key reaches the window's
+/// paste queue, whose refusal row says what the gate would have. `ok` is the
+/// only value; any other token, or none, leaves the line as it was (the arm
+/// refuses what it cannot parse). Returns whether it was given and the rest.
+pub(crate) fn take_app_unread_ok<'a>(verb: &str, rest: &'a str) -> (bool, &'a str) {
+    if !matches!(verb, "hwkey" | "pointer" | "invoke") {
+        return (false, rest);
+    }
+    let trimmed = rest.trim_start();
+    match trimmed.split_once(char::is_whitespace) {
+        Some(("unread=ok", tail)) => (true, tail.trim_start()),
+        None if trimmed == "unread=ok" => (true, ""),
+        _ => (false, rest),
+    }
+}
+
 pub(crate) fn take_leading_options(verb: &str, rest: &str) -> (LeadingInputOptions, String) {
     let keyed = crate::pty_idem::is_keyed_verb(verb);
     let guarded = is_guarded_verb(verb);
@@ -1071,6 +1089,18 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
 /// Claude Code this way; an older server answers the `pid=` form with
 /// `ERR unknown signal`, having sent nothing).
 ///
+/// `quiet=<s>` makes the signal wait for the tab to be LEFT ALONE, in the
+/// same decision: it is refused `ERR busy person human_ms=<ms>` when a person
+/// gave the session input within `s` seconds (`human_ms`, the stamp `status`
+/// reads), and `ERR busy input-unread bytes=<n>` while input someone wrote is
+/// queued unread — a first prompt on its way, which a `term` would drop and the
+/// shell after it run — and nothing is sent or discarded. The live upgrade's
+/// restart signals so (`quiet=` its `human_grace_s`): its last look and the
+/// signal were two requests, and a keystroke between them was ended with the
+/// agent (ND1 of the live re-test of 2026-09-26, the review of its fix). An
+/// older server answers `ERR bad signal argument: quiet=…`, having sent
+/// nothing.
+///
 /// `term`, `kill`, `hup` and `quit`, in either form, first DISCARD the input
 /// a raw-mode (or stopped) program left unread and say so (`discarded=<n>`):
 /// the shell that takes the tty back would otherwise run it
@@ -1083,9 +1113,17 @@ pub(crate) fn feed_bytes(rest: &str) -> Result<Vec<u8>, &'static str> {
 /// POSIX-only: on Windows (no process groups / killpg for a ConPTY) the verb
 /// stays in the table but honestly replies
 /// `ERR signal unsupported on this platform`.
+///
+/// `human_ms` is the session's person stamp at the request (milliseconds since
+/// a person last gave it input; `None`: never), read by the caller.
 #[cfg(unix)]
-pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
-    let (sig, pid) = match parse_signal(rest) {
+pub(crate) fn cmd_signal(
+    master: i32,
+    rest: &str,
+    sink: &SinkWriter,
+    human_ms: Option<u64>,
+) -> String {
+    let (sig, pid, quiet) = match parse_signal(rest) {
         Ok(v) => v,
         Err(e) => return e,
     };
@@ -1097,6 +1135,14 @@ pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
         && pid != pgrp
     {
         return format!("ERR pid {pid} is not the foreground process group ({pgrp})\n");
+    }
+    if let Some(grace_s) = quiet {
+        if let Some(ms) = human_ms.filter(|ms| *ms < u64::from(grace_s).saturating_mul(1000)) {
+            return format!("ERR busy person human_ms={ms}\n");
+        }
+        if let Some(unread) = sink.input_backlog().map(|b| b.unread()).filter(|n| *n > 0) {
+            return format!("ERR busy input-unread bytes={unread}\n");
+        }
     }
     // A signal that ENDS the program first drops the input it left unread,
     // so the shell that inherits the tty never runs it
@@ -1128,9 +1174,10 @@ pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
     reply
 }
 
-/// PURE parser for `signal <name> [pid=<n>]` → (signal number, exact pid).
+/// PURE parser for `signal <name> [pid=<n>] [quiet=<s>]` → (signal number,
+/// exact pid, quiet seconds).
 #[cfg(unix)]
-pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>), String> {
+pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>, Option<u32>), String> {
     let mut words = rest.split_whitespace();
     let name = words.next().unwrap_or("");
     let sig = match name {
@@ -1146,13 +1193,21 @@ pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>), String> {
         _ => return Err(format!("ERR unknown signal: {}\n", rest.trim())),
     };
     let mut pid = None;
+    let mut quiet = None;
     for w in words {
+        if let Some(s) = w.strip_prefix("quiet=") {
+            match s.parse::<u32>() {
+                Ok(s) if quiet.is_none() => quiet = Some(s),
+                _ => return Err(format!("ERR bad signal argument: {w}\n")),
+            }
+            continue;
+        }
         match w.strip_prefix("pid=").map(str::parse::<i32>) {
             Some(Ok(n)) if n > 1 && pid.is_none() => pid = Some(n),
             _ => return Err(format!("ERR bad signal argument: {w}\n")),
         }
     }
-    Ok((sig, pid))
+    Ok((sig, pid, quiet))
 }
 
 /// Windows arm of the `signal` verb: kept in the verb table so the surface is
@@ -1160,8 +1215,13 @@ pub(crate) fn parse_signal(rest: &str) -> Result<(i32, Option<i32>), String> {
 /// honest error (callers wanting Ctrl-C semantics can `feed 03`, which the
 /// ConPTY host cooks into a console Ctrl-C for the foreground app).
 #[cfg(windows)]
-pub(crate) fn cmd_signal(master: i32, rest: &str, sink: &SinkWriter) -> String {
-    let _ = (master, rest, sink);
+pub(crate) fn cmd_signal(
+    master: i32,
+    rest: &str,
+    sink: &SinkWriter,
+    human_ms: Option<u64>,
+) -> String {
+    let _ = (master, rest, sink, human_ms);
     "ERR signal unsupported on this platform\n".to_string()
 }
 
@@ -1556,9 +1616,38 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
     rest.parse::<usize>().ok().map(TabAction::Select)
 }
 
+/// The refusal `tab <N>` / `tab close <N>` / `tab move <from> <to>` answer for
+/// an index no tab holds. PURE (the main-thread arm `App::apply_tab_cmd_in`
+/// formats through it), so the wording is pinned without an event loop.
+///
+/// It names the BASE. The wire's `<N>` is 0-based (the documented contract, and
+/// what `inspect app/v1 tabs` prints as `index=`), while the strip paints
+/// 1-based ordinals — so `no tab at index 3: this window has 3` read as a
+/// contradiction to anyone who had just counted three chips (measured, audit
+/// 2026-09-22). The reply now says which numbers WOULD have been accepted
+/// (`indexes 0..2`), the one sentence that resolves it for a reader who does
+/// not already know the base.
+#[must_use]
+pub(crate) fn no_such_tab(index: usize, count: usize) -> String {
+    match count {
+        0 => format!("no tab at index {index}: this window has no tabs"),
+        1 => format!("no tab at index {index}: this window has 1 tab, index 0"),
+        n => format!(
+            "no tab at index {index}: this window has {n} tabs, indexes 0..{}",
+            n - 1
+        ),
+    }
+}
+
 /// `tab new | <N> | next | prev | close [N] | move <from> <to>` -> DRIVE the FRONT window's tabs and reply
 /// `OK <active_index> <tab_count>` when the action HAPPENED, or `ERR <why>` when
-/// it did not — an index no tab holds, or a host that declined the close.
+/// it did not — an index no tab holds, a host that declined the close, or a
+/// `close` refused by a running foreground job, the `close` verb's guard: `ERR
+/// close refused (a running job armed the last-tab confirm)` for the window's
+/// last tab (the `close` verb's exact words), `ERR close refused (a running
+/// job in that tab)` for a tab among several (`App::tab_cmd_front` runs the
+/// same `WireRefuseBusy` policy; a `--headless` instance never confirms, so it
+/// never answers either).
 ///
 /// MAIN-THREAD HOP (mirrors [`cmd_chrome`]): mutating `App` (its tabs) may ONLY
 /// happen on the event loop, but this runs on a background control thread. So we
@@ -1567,11 +1656,16 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
 /// action via the SAME command paths the keyboard/menu use (`open_tab` / `switch_tab`
 /// / `cycle_tab`), and sends back the resulting `(active, count)`. `new` reuses the
 /// new-tab path; the native toolbar segments then re-track via `App::sync_window`.
-pub(crate) fn cmd_tab(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+/// `by` is the caller, the exit ledger's `by=` for a session `close` retires.
+pub(crate) fn cmd_tab(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    by: crate::session_store::ExitActor,
+) -> String {
     let Some(action) = parse_tab(rest) else {
         return "ERR usage: tab <new|N|next|prev|close [N]|move <from> <to>>\n".to_string();
     };
-    match super::control_media::call_main(proxy, |reply| Wake::TabCmd { action, reply }) {
+    match super::control_media::call_main(proxy, |reply| Wake::TabCmd { action, by, reply }) {
         Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
         // A REFUSED action says so, in the same vocabulary the aimed twin
         // (`cmd_tab_aimed`) and the sibling `@<sid> close` verb already use.
@@ -1924,6 +2018,34 @@ pub(crate) fn parse_resize_px(rest: &str) -> Option<Result<InputEvent, String>> 
     Some(Ok(InputEvent::ResizeWindowPx { width, height }))
 }
 
+/// The one refusal the px form has that the cell form does not: it names a
+/// WINDOW, and the only window a driven px resize reaches is the front one
+/// ([`crate::App`]'s `input_resize_window_px` follows `frontmost_window`, the
+/// same rule as `apply_grid_resize`). A session that is not the focused pane
+/// of the front window's active tab therefore has no honest px target: a
+/// sibling pane shares the window (resizing it would be the same request,
+/// aimed by the wrong name), a background tab or another window is not the
+/// window that would move, and the cell form is the one that reaches a
+/// background session's engine + PTY. Measured 2026-09-22: `@<sid> resize px
+/// 1400 900` on any such target answered `ERR bad args` — the CELL parser's
+/// verdict on the word `px` — with nothing in `help resize` saying why. The
+/// refusal names the FRONT window too: the focused pane of another window's
+/// active tab is refused by the same rule, and "the active tab" alone reads as
+/// a contradiction to the agent driving that window.
+pub(crate) const RESIZE_PX_FRONT_ONLY: &str =
+    "ERR resize px: only the focused pane of the front window's active tab\n";
+
+/// The reply a cross-session `resize` gives when `rest` is the px form and
+/// the target is NOT the focused pane of the front window's active tab —
+/// `None` when `rest` is the cell form, which the background arm goes on to
+/// apply. Any px
+/// spelling is refused by TARGET before its arguments are read: the form is
+/// unavailable here, so a malformed one is not told a different thing than a
+/// well-formed one.
+pub(crate) fn cross_resize_px_refusal(rest: &str) -> Option<String> {
+    parse_resize_px(rest).map(|_| RESIZE_PX_FRONT_ONLY.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1931,11 +2053,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn signal_parses_the_bare_form_and_the_exact_pid_form() {
-        assert_eq!(parse_signal("int"), Ok((libc::SIGINT, None)));
-        assert_eq!(parse_signal(" term "), Ok((libc::SIGTERM, None)));
+        assert_eq!(parse_signal("int"), Ok((libc::SIGINT, None, None)));
+        assert_eq!(parse_signal(" term "), Ok((libc::SIGTERM, None, None)));
         assert_eq!(
             parse_signal("int pid=52489"),
-            Ok((libc::SIGINT, Some(52489)))
+            Ok((libc::SIGINT, Some(52489), None))
+        );
+        assert_eq!(
+            parse_signal("term pid=52489 quiet=120"),
+            Ok((libc::SIGTERM, Some(52489), Some(120)))
+        );
+        assert_eq!(
+            parse_signal("term quiet=0"),
+            Ok((libc::SIGTERM, None, Some(0)))
         );
         // What an OLDER server answers for the pid= form, having sent
         // nothing — the harness's fallback detector — stays the answer for
@@ -1952,9 +2082,74 @@ mod tests {
             "int pid=-3",
             "int 5",
             "int pid=5 pid=6",
+            "term quiet=",
+            "term quiet=-1",
+            "term quiet=5 quiet=6",
         ] {
             assert!(parse_signal(bad).is_err(), "{bad}");
         }
+    }
+
+    /// The px form on a target that is not the focused pane of the active tab
+    /// is refused BY NAME, and the cell form is untouched. Before 2026-09-22
+    /// the background arm handed `px …` to the cell parser, whose `ERR bad
+    /// args` said nothing about the target — and `help resize` said nothing
+    /// about the restriction at all.
+    #[test]
+    fn a_cross_session_px_resize_is_refused_by_name_and_the_cell_form_is_not() {
+        for px in [
+            "px 1400 900",
+            "  px  1400   900  ",
+            "px 1400",
+            "px wide tall",
+        ] {
+            assert_eq!(
+                cross_resize_px_refusal(px).as_deref(),
+                Some(RESIZE_PX_FRONT_ONLY),
+                "{px:?}: every px spelling is refused by target, before its arguments"
+            );
+        }
+        assert_ne!(
+            RESIZE_PX_FRONT_ONLY, "ERR bad args\n",
+            "the refusal names the target rule, not the cell parser's verdict"
+        );
+        assert!(RESIZE_PX_FRONT_ONLY.ends_with('\n') && RESIZE_PX_FRONT_ONLY.starts_with("ERR "));
+        for cell in ["24 80", "x y", ""] {
+            assert_eq!(
+                cross_resize_px_refusal(cell),
+                None,
+                "{cell:?}: the cell form keeps its own parser and its own replies"
+            );
+        }
+    }
+
+    /// THE REFUSAL NAMES THE BASE. `tab 3` on a three-tab window used to answer
+    /// `no tab at index 3: this window has 3` — self-contradictory to anyone
+    /// who counted three chips, because the strip's ordinals are 1-based and
+    /// the wire's index is 0-based (audit 2026-09-22). The reply now spells
+    /// the indexes that WOULD be accepted, and the count is grammatical.
+    #[test]
+    fn an_index_no_tab_holds_is_refused_with_the_accepted_range() {
+        assert_eq!(
+            no_such_tab(3, 3),
+            "no tab at index 3: this window has 3 tabs, indexes 0..2"
+        );
+        assert_eq!(
+            no_such_tab(7, 2),
+            "no tab at index 7: this window has 2 tabs, indexes 0..1"
+        );
+        assert_eq!(
+            no_such_tab(1, 1),
+            "no tab at index 1: this window has 1 tab, index 0"
+        );
+        assert_eq!(
+            no_such_tab(0, 0),
+            "no tab at index 0: this window has no tabs"
+        );
+        // The grammar `parse_tab` accepts is the base the message speaks:
+        // `tab 0` is the first tab, so the wire never reads `indexes 1..`.
+        assert_eq!(parse_tab("0"), Some(TabAction::Select(0)));
+        assert_eq!(parse_tab("close 2"), Some(TabAction::Close(Some(2))));
     }
 
     /// GATE (lane-license, deliverable 2): the control fence exempts exactly
@@ -2089,13 +2284,13 @@ mod tests {
     fn signal_cont_is_a_known_signal() {
         for name in ["cont", "sigcont"] {
             assert_eq!(
-                cmd_signal(-1, name, &SinkWriter::new(-1)),
+                cmd_signal(-1, name, &SinkWriter::new(-1), None),
                 "ERR no foreground process group\n",
                 "{name}"
             );
         }
         assert_eq!(
-            cmd_signal(-1, "continue", &SinkWriter::new(-1)),
+            cmd_signal(-1, "continue", &SinkWriter::new(-1), None),
             "ERR unknown signal: continue\n"
         );
     }
@@ -2337,8 +2532,43 @@ mod tests {
         let pgrp = unsafe { libc::tcgetpgrp(master) };
         assert!(pgrp > 0, "a foreground job");
         let reply = match remedy {
-            Remedy::Verb => Some(cmd_signal(master, "term", &sink)),
-            Remedy::VerbPid => Some(cmd_signal(master, &format!("term pid={pgrp}"), &sink)),
+            Remedy::Verb => Some(cmd_signal(master, "term", &sink, None)),
+            Remedy::VerbPid => {
+                // `quiet=` (the live upgrade's restart): refused while input
+                // someone wrote sits unread, and while a person's keystroke
+                // is inside the grace — nothing sent, nothing dropped. A
+                // stamp past the grace holds nothing of its own.
+                let unread = sink.input_backlog().expect("measured").unread();
+                assert_eq!(
+                    cmd_signal(master, &format!("term pid={pgrp} quiet=0"), &sink, None),
+                    format!("ERR busy input-unread bytes={unread}\n")
+                );
+                assert_eq!(
+                    cmd_signal(
+                        master,
+                        &format!("term pid={pgrp} quiet=120"),
+                        &sink,
+                        Some(5_000)
+                    ),
+                    "ERR busy person human_ms=5000\n"
+                );
+                assert_eq!(
+                    cmd_signal(
+                        master,
+                        &format!("term pid={pgrp} quiet=1"),
+                        &sink,
+                        Some(5_000)
+                    ),
+                    format!("ERR busy input-unread bytes={unread}\n"),
+                    "a person past the grace is no hold; the unread input still is"
+                );
+                assert_eq!(
+                    sink.input_backlog().expect("measured").unread(),
+                    unread,
+                    "nothing dropped"
+                );
+                Some(cmd_signal(master, &format!("term pid={pgrp}"), &sink, None))
+            }
             Remedy::BareKillpg => {
                 // SAFETY: `pgrp` is this test's own job.
                 assert_eq!(unsafe { libc::killpg(pgrp, libc::SIGTERM) }, 0);
@@ -2357,6 +2587,36 @@ mod tests {
         drawer.join().expect("the drawer");
         aterm_pty::close_fd(master);
         (ran, reply)
+    }
+
+    /// The App lane's `unread=ok` (round 18, D9): a LEADING token on `hwkey`,
+    /// `pointer` and `invoke` only, `ok` its only value; anything else leaves
+    /// the line untouched for the arm to parse.
+    #[test]
+    fn the_app_lane_takes_a_leading_unread_ok_on_its_gesture_verbs() {
+        use super::take_app_unread_ok;
+        assert_eq!(
+            take_app_unread_ok("invoke", "unread=ok Paste"),
+            (true, "Paste")
+        );
+        assert_eq!(
+            take_app_unread_ok("hwkey", " unread=ok v mods=cmd"),
+            (true, "v mods=cmd")
+        );
+        assert_eq!(take_app_unread_ok("invoke", "Paste"), (false, "Paste"));
+        // Not leading, another value, another verb: the line is untouched.
+        assert_eq!(
+            take_app_unread_ok("invoke", "Paste unread=ok"),
+            (false, "Paste unread=ok")
+        );
+        assert_eq!(
+            take_app_unread_ok("hwkey", "unread=yes v"),
+            (false, "unread=yes v")
+        );
+        assert_eq!(
+            take_app_unread_ok("tab", "unread=ok close"),
+            (false, "unread=ok close")
+        );
     }
 
     /// `unread=ok` (2026-09-24) is the one override of the unread-input gate:

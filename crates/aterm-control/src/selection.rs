@@ -31,7 +31,8 @@ const NO_SESSION: &str = "ERR no such session\n";
 /// blocks `cmd_blocks` reports (oldest-first, optional last-N), one JSON object
 /// per block with the absolute rows, exit code, state, cwd and commandline. An
 /// absent optional row is JSON `null`; the cwd/commandline are JSON strings (not
-/// percent-encoded — JSON carries spaces natively). `"cmdcol"` (after `"cmd"`,
+/// percent-encoded — JSON carries spaces natively), the cwd in the host's native
+/// form ([`SessionHost::native_cwd`]). `"cmdcol"` (after `"cmd"`,
 /// `null` with it) is the COLUMN the shell's `133;B` marked its input to start
 /// at: where the prompt ended on the `cmd` row, so a reader can tell the prompt
 /// from what was typed after it (the live agent upgrade's relaunch line is
@@ -66,7 +67,10 @@ pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String 
                 opt_row(b.command_start_col.map(u64::from)),
                 opt_row(b.output_start_row),
                 opt_row(b.end_row),
-                json_str_field("cwd", b.working_directory.as_deref().unwrap_or("")),
+                json_str_field(
+                    "cwd",
+                    &host.native_cwd(b.working_directory.as_deref().unwrap_or("")),
+                ),
                 json_str_field("cmdline", b.commandline.as_deref().unwrap_or("")),
             ));
         }
@@ -95,7 +99,8 @@ pub fn cmd_blocks_json(host: &impl SessionHost, sid: u64, rest: &str) -> String 
 /// Header `OK <shown>\n`, then one line per block: `block <id> <state>
 /// exit=<code|-> prompt=<row> cmd=<row|-> out=<row|-> end=<row|-> cwd=<pct>
 /// cmdline=<pct>`. `state` is prompt|entering|executing|complete; cwd/cmdline
-/// are percent-encoded (single tokens even with spaces). Needs a shell emitting
+/// are percent-encoded (single tokens even with spaces), and the cwd is the
+/// host's native path ([`SessionHost::native_cwd`]). Needs a shell emitting
 /// OSC 133 (see the `shell_integration` injection); empty otherwise.
 pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
     use aterm_core::terminal::BlockState;
@@ -137,7 +142,10 @@ pub fn cmd_blocks(host: &impl SessionHost, sid: u64, rest: &str) -> String {
                 opt_row(b.output_start_row),
                 opt_row(b.end_row),
             );
-            pct_encode_into(&mut out, b.working_directory.as_deref().unwrap_or(""));
+            pct_encode_into(
+                &mut out,
+                &host.native_cwd(b.working_directory.as_deref().unwrap_or("")),
+            );
             out.push_str(" cmdline=");
             pct_encode_into(&mut out, b.commandline.as_deref().unwrap_or(""));
             out.push('\n');

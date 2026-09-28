@@ -8,12 +8,11 @@
 use crate::{ledger, manifest_out, publish, verify};
 
 use aterm_spec::derive::{
-    Model, release_channel_floor_model, release_channel_single_head_model,
-    release_published_identity_model, release_yank_successor_first_model,
+    Model, release_channel_floor_model, release_published_identity_model,
+    release_yank_successor_first_model,
 };
 use ledger::{GitRunner, RunOut};
-use ring::signature::{Ed25519KeyPair, KeyPair as _};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::VecDeque;
 use std::sync::Mutex;
 
 fn numeric(floor: Option<u64>) -> i64 {
@@ -113,120 +112,6 @@ fn command_ok() -> RunOut {
         stdout: Vec::new(),
         stderr: Vec::new(),
     }
-}
-
-#[derive(Debug)]
-struct IdentityArchiveRemote {
-    releases: Vec<publish::AppcastRelease>,
-    renames: Vec<publish::AppcastRename>,
-    replace_object_mutant: bool,
-    delete_object_mutant: bool,
-    next_replacement_id: u64,
-}
-
-impl IdentityArchiveRemote {
-    fn new(releases: Vec<publish::AppcastRelease>) -> Self {
-        Self {
-            releases,
-            renames: Vec::new(),
-            replace_object_mutant: false,
-            delete_object_mutant: false,
-            next_replacement_id: 10_000,
-        }
-    }
-
-    fn ids(&self) -> BTreeSet<u64> {
-        self.releases
-            .iter()
-            .flat_map(|release| release.assets.iter().map(|asset| asset.id))
-            .collect()
-    }
-}
-
-impl publish::AppcastArchiveRemote for IdentityArchiveRemote {
-    fn list_releases(&mut self) -> ledger::Result<Vec<publish::AppcastRelease>> {
-        Ok(self.releases.clone())
-    }
-
-    fn rename_asset(&mut self, rename: &publish::AppcastRename) -> ledger::Result<()> {
-        self.renames.push(rename.clone());
-        let release = self
-            .releases
-            .iter_mut()
-            .find(|release| !release.draft && release.tag == rename.tag)
-            .ok_or_else(|| ledger::Error::new("archive fixture release missing"))?;
-        let index = release
-            .assets
-            .iter()
-            .position(|asset| asset.id == rename.id)
-            .ok_or_else(|| ledger::Error::new("archive fixture asset missing"))?;
-        if release.assets[index].name != rename.from {
-            return Err(ledger::Error::new("archive fixture source name drifted"));
-        }
-        if self.delete_object_mutant {
-            release.assets.remove(index);
-        } else if self.replace_object_mutant {
-            release.assets.remove(index);
-            release.assets.push(publish::AppcastAsset {
-                id: self.next_replacement_id,
-                name: rename.to.clone(),
-            });
-            self.next_replacement_id += 1;
-        } else {
-            release.assets[index].name.clone_from(&rename.to);
-        }
-        Ok(())
-    }
-}
-
-fn archive_release(tag: &str, manifest_id: u64, signature_id: u64) -> publish::AppcastRelease {
-    publish::AppcastRelease {
-        release_id: manifest_id,
-        tag: tag.to_string(),
-        draft: false,
-        target_commitish: "a".repeat(40),
-        assets: vec![
-            publish::AppcastAsset {
-                id: manifest_id,
-                name: manifest_out::MANIFEST_ASSET.to_string(),
-            },
-            publish::AppcastAsset {
-                id: signature_id,
-                name: manifest_out::MANIFEST_SIG_ASSET.to_string(),
-            },
-        ],
-    }
-}
-
-fn release_manifest(version: &str, build: u64, commit: &str, dmg: &str) -> Vec<u8> {
-    format!(
-        "schema = 1\nversion = \"{version}\"\nbuild_number = {build}\ncommit = \"{commit}\"\n\
-         dmg = \"{dmg}\"\nsha256 = \"{}\"\n",
-        "0".repeat(64)
-    )
-    .into_bytes()
-}
-
-fn assert_live_identity_refusal(model: &Model, label: &str, rejected: bool) {
-    assert!(rejected, "real identity validator accepted {label}");
-    let mut observed = model.init_state();
-    assert!(model.fire("Flip", &mut observed));
-    assert!(model.fire("ObserveLiveIdentityMismatch", &mut observed));
-    let refused = model.successors("AbortLiveIdentityMismatch", &observed)[0].clone();
-    assert_eq!(refused["owner"], 1);
-    assert_eq!(refused["guard_attached"], 1);
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        model,
-        &[],
-        &observed,
-        &refused,
-        Some("AbortLiveIdentityMismatch"),
-        label,
-    );
-    assert!(admitted, "model rejected real identity refusal: {why}");
-    let exited = model.successors("ExitAfterRefusal", &refused)[0].clone();
-    assert_eq!(exited["owner"], 1);
-    assert_eq!(exited["guard_attached"], 0);
 }
 
 /// Exhaustively bind the real carry-forward resolver to the model over the whole
@@ -341,7 +226,7 @@ fn effective_min_build_conforms_to_release_channel_floor_model() {
 
 /// Bind the non-vacuous crash/resume transition to the real atomic Journal
 /// save/load path. Runtime state is deliberately cleared before resume; the loaded
-/// persisted floor is what reconstructs it, and the journal resumes at `archive`.
+/// persisted floor is what reconstructs it, and the journal resumes at `publish`.
 #[test]
 fn journal_round_trip_restores_frozen_floor_for_resume() {
     let model = release_channel_floor_model();
@@ -371,14 +256,11 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         signature_pubkey: None,
         signature_machine_id: None,
         release_id: Some(55),
-        draft_create_issued: true,
+        release_intent: true,
         upload_intents: Vec::new(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         done: publish::STEPS
             .iter()
-            .take_while(|step| **step != "archive")
+            .take_while(|step| **step != "publish")
             .map(|step| (*step).to_string())
             .collect(),
     };
@@ -387,7 +269,7 @@ fn journal_round_trip_restores_frozen_floor_for_resume() {
         .expect("load release journal")
         .expect("journal exists");
     assert_eq!(loaded, journal);
-    assert_eq!(loaded.first_incomplete(), Some("archive"));
+    assert_eq!(loaded.first_incomplete(), Some("publish"));
 
     let resumed = model.successors("ResumeFrozen", &crashed)[0].clone();
     assert_eq!(resumed["phase"], 1);
@@ -578,7 +460,7 @@ fn release_lease_seams_conform_through_final_unlock() {
     assert_eq!(published["phase"], 3);
     assert_eq!(
         published["lease_owned"], 1,
-        "flip must retain the remote owner"
+        "the head PATCH must retain the remote owner"
     );
     let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
         &model,
@@ -590,8 +472,7 @@ fn release_lease_seams_conform_through_final_unlock() {
     );
     assert!(admitted, "model rejected lease-retaining visibility: {why}");
 
-    let archived = model.successors("ArchiveAfterPublish", &published)[0].clone();
-    let verified = model.successors("VerifyRelease", &archived)[0].clone();
+    let verified = model.successors("ProveHead", &published)[0].clone();
     assert_eq!(verified["lease_owned"], 1);
 
     // Exact-CAS deletion observes our owner, succeeds, then confirms absence.
@@ -601,7 +482,7 @@ fn release_lease_seams_conform_through_final_unlock() {
         publish::LeaseRelease::Released
     );
     let unlocked = model.successors("Unlock", &verified)[0].clone();
-    assert_eq!(unlocked["phase"], 8);
+    assert_eq!(unlocked["phase"], 7);
     assert_eq!(unlocked["lease_owned"], 0);
     let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
         &model,
@@ -612,214 +493,27 @@ fn release_lease_seams_conform_through_final_unlock() {
         "release final exact-CAS unlock",
     );
     assert!(admitted, "model rejected real final unlock: {why}");
-    assert!(model.check_invariant("CompletionRequiresPostPublishSteps", &unlocked));
+    assert!(model.check_invariant("CompletionRequiresProvedHead", &unlocked));
 
     // NEGATIVE CONTROL: the model's early-unlock mutant is unreachable in the
     // healthy lifecycle and violates both completion and bypass invariants.
-    let early = buggy.successors("UnlockBeforeVerification", &published)[0].clone();
+    let early = buggy.successors("UnlockBeforeHeadProof", &published)[0].clone();
     let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
         &model,
         &[],
         &published,
         &early,
-        Some("UnlockBeforeVerification"),
+        Some("UnlockBeforeHeadProof"),
         "release early-unlock negative control",
     );
     assert!(!admitted, "healthy model admitted early unlock: {why}");
-    assert!(!buggy.check_invariant("CompletionRequiresPostPublishSteps", &early));
+    assert!(!buggy.check_invariant("CompletionRequiresProvedHead", &early));
     assert!(!buggy.check_invariant("UnlockCannotBeBypassed", &early));
 }
 
-/// Tier-1 binds the complete live authority seam: version/build/commit/DMG,
-/// byte equality, signature policy/key, signature bytes, and cryptographic
-/// validity. Only exact identity enters archive; every concrete mismatch maps to
-/// the same refusal abstraction while retaining the persistent lease.
-#[test]
-fn live_release_identity_conforms_to_single_head_archive_guard() {
-    let model = release_channel_single_head_model();
-    let commit = "a".repeat(40);
-    let expected = publish::ExpectedReleaseIdentity {
-        version: "0.2.0",
-        build: 2,
-        commit: &commit,
-    };
-    let manifest = release_manifest("0.2.0", 2, &commit, "aterm-0.2.0.dmg");
-
-    let real = publish::validate_live_release_identity(
-        expected,
-        &manifest,
-        None,
-        Some(&manifest),
-        None,
-        false,
-        None,
-    );
-    assert!(real.is_ok());
-    let mut before = model.init_state();
-    assert!(model.fire("Flip", &mut before));
-    let after = model.successors("BeginArchive", &before)[0].clone();
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &before,
-        &after,
-        Some("BeginArchive"),
-        "archive exact unsigned live identity",
-    );
-    assert!(admitted, "model rejected exact live identity: {why}");
-
-    for (label, bad) in [
-        (
-            "archive rejects wrong version",
-            release_manifest("0.3.0", 2, &commit, "aterm-0.2.0.dmg"),
-        ),
-        (
-            "archive rejects wrong build",
-            release_manifest("0.2.0", 3, &commit, "aterm-0.2.0.dmg"),
-        ),
-        (
-            "archive rejects wrong commit",
-            release_manifest("0.2.0", 2, &"b".repeat(40), "aterm-0.2.0.dmg"),
-        ),
-        (
-            "archive rejects wrong DMG",
-            release_manifest("0.2.0", 2, &commit, "other.dmg"),
-        ),
-    ] {
-        assert_live_identity_refusal(
-            &model,
-            label,
-            publish::validate_live_release_identity(expected, &bad, None, None, None, false, None)
-                .is_err(),
-        );
-    }
-    assert_live_identity_refusal(
-        &model,
-        "archive rejects local/live manifest byte drift",
-        publish::validate_live_release_identity(
-            expected,
-            &manifest,
-            None,
-            Some(b"different manifest bytes"),
-            None,
-            false,
-            None,
-        )
-        .is_err(),
-    );
-    assert_live_identity_refusal(
-        &model,
-        "archive rejects malformed manifest bytes",
-        publish::validate_live_release_identity(
-            expected,
-            b"not a manifest",
-            None,
-            None,
-            None,
-            false,
-            None,
-        )
-        .is_err(),
-    );
-    assert_live_identity_refusal(
-        &model,
-        "unsigned journal rejects unexpected live signature",
-        publish::validate_live_release_identity(
-            expected,
-            &manifest,
-            Some(&[0_u8; 64]),
-            Some(&manifest),
-            None,
-            false,
-            None,
-        )
-        .is_err(),
-    );
-
-    let keypair = Ed25519KeyPair::from_seed_unchecked(&[42_u8; 32]).unwrap();
-    let pubkey = aterm_codec::base64::encode(keypair.public_key().as_ref()).expect("32-byte key");
-    let signature = keypair.sign(&manifest).as_ref().to_vec();
-    let bad_signature = [0_u8; 64];
-    assert!(
-        publish::validate_live_release_identity(
-            expected,
-            &manifest,
-            Some(&signature),
-            Some(&manifest),
-            Some(&signature),
-            true,
-            Some(&pubkey),
-        )
-        .is_ok()
-    );
-    let mut signed_before = model.init_state();
-    assert!(model.fire("ConfigureSignatures", &mut signed_before));
-    assert!(model.fire("Flip", &mut signed_before));
-    let signed_after = model.successors("BeginArchive", &signed_before)[0].clone();
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &signed_before,
-        &signed_after,
-        Some("BeginArchive"),
-        "archive exact signed live identity",
-    );
-    assert!(admitted, "model rejected exact signed identity: {why}");
-
-    for (label, live_signature, local_signature, key) in [
-        (
-            "signed archive rejects missing live signature",
-            None,
-            Some(signature.as_slice()),
-            Some(pubkey.as_str()),
-        ),
-        (
-            "signed archive rejects missing key identity",
-            Some(signature.as_slice()),
-            Some(signature.as_slice()),
-            None,
-        ),
-        (
-            "signed archive rejects local/live signature drift",
-            Some(signature.as_slice()),
-            Some(bad_signature.as_slice()),
-            Some(pubkey.as_str()),
-        ),
-        (
-            "signed archive rejects invalid signature",
-            Some(bad_signature.as_slice()),
-            Some(bad_signature.as_slice()),
-            Some(pubkey.as_str()),
-        ),
-    ] {
-        assert_live_identity_refusal(
-            &model,
-            label,
-            publish::validate_live_release_identity(
-                expected,
-                &manifest,
-                live_signature,
-                Some(&manifest),
-                local_signature,
-                true,
-                key,
-            )
-            .is_err(),
-        );
-    }
-
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut invalid = model.init_state();
-    assert!(model.fire("Flip", &mut invalid));
-    assert!(model.fire("ObserveLiveIdentityMismatch", &mut invalid));
-    let bypassed = buggy.successors("BeginArchiveInvalidLiveIdentity", &invalid)[0].clone();
-    assert!(!model.action_enabled("BeginArchiveInvalidLiveIdentity", &invalid));
-    assert!(!buggy.check_invariant("ArchiveUsesValidatedLiveIdentity", &bypassed));
-    assert!(!buggy.check_invariant("LiveIdentityGuardCannotBeBypassed", &bypassed));
-}
-
 /// Tier-1 binds the model's symbolic-target distinction to the real immutable
-/// release snapshot and exact historical tag resolver. The old
+/// release snapshot and the exact origin-tag resolver `ship verify` and a yank's
+/// successor proof bind the published head through. The old
 /// target-equals-manifest mutant is retained as an explicit negative control.
 #[test]
 fn published_identity_snapshot_and_tag_resolution_refine_model() {
@@ -850,8 +544,7 @@ fn published_identity_snapshot_and_tag_resolution_refine_model() {
             .into_bytes(),
         stderr: Vec::new(),
     }]);
-    publish::assert_remote_historical_tag_commits(&git, &[("v0.25", manifest_commit.as_str())])
-        .unwrap();
+    publish::assert_remote_annotated_tag_commit(&git, "v0.25", &manifest_commit).unwrap();
     let accepted = tier1_step(
         &model,
         &model.init_state(),
@@ -877,11 +570,7 @@ fn published_identity_snapshot_and_tag_resolution_refine_model() {
         stderr: Vec::new(),
     }]);
     assert!(
-        publish::assert_remote_historical_tag_commits(
-            &wrong_git,
-            &[("v0.25", manifest_commit.as_str())]
-        )
-        .is_err()
+        publish::assert_remote_annotated_tag_commit(&wrong_git, "v0.25", &manifest_commit).is_err()
     );
     let tag_drifted = tier1_step(
         &model,
@@ -1005,83 +694,4 @@ fn yank_successor_decision_refines_successor_first_model() {
     let mut mismatched = successor;
     mismatched.version = "0.56.0".into();
     assert!(verify::yank_successor_covers(&bad, &mismatched).is_err());
-}
-
-/// Tier-1 binds the real archive executor—not only its scalar plan—to the
-/// model's identity-preserving rename transitions. The negative remote keeps
-/// the same names/counts but swaps object IDs, which production must reject.
-#[test]
-fn archive_executor_refines_identity_preserving_single_head_transitions() {
-    let model = release_channel_single_head_model();
-    let releases = vec![
-        archive_release("v0.2.0", 1, 2),
-        archive_release("v0.1.0", 11, 12),
-        archive_release("v0.0.0", 21, 22),
-    ];
-    let mut remote = IdentityArchiveRemote::new(releases.clone());
-    let ids_before = remote.ids();
-    assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.2.0", false).unwrap(),
-        4
-    );
-    assert_eq!(remote.ids(), ids_before, "metadata PATCH must preserve IDs");
-
-    let mut state = model.init_state();
-    assert!(model.fire("ConfigureSignatures", &mut state));
-    assert!(model.fire("Flip", &mut state));
-    assert!(model.fire("BeginArchive", &mut state));
-    for (index, rename) in remote.renames.iter().enumerate() {
-        let action = if rename.from == manifest_out::MANIFEST_ASSET {
-            "RenameHistoricalManifest"
-        } else {
-            assert_eq!(rename.from, manifest_out::MANIFEST_SIG_ASSET);
-            "RenameHistoricalSignature"
-        };
-        let before = state.clone();
-        let after = model.successors(action, &before)[0].clone();
-        let label = format!("archive same-ID PATCH {} for {}", rename.id, rename.tag);
-        let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-            &model,
-            &[],
-            &before,
-            &after,
-            Some(action),
-            &label,
-        );
-        assert!(admitted, "real archive PATCH {index} rejected: {why}");
-        state = after;
-    }
-    assert!(model.fire("FinalizeArchived", &mut state));
-    assert!(model.check_invariant("HistoricalManifestIdentityPreserved", &state));
-    assert!(model.check_invariant("HistoricalSignatureIdentityPreserved", &state));
-    assert!(model.check_invariant("StableHasSingleExactHead", &state));
-
-    let mut replacement = IdentityArchiveRemote::new(releases.clone());
-    replacement.replace_object_mutant = true;
-    let error = publish::converge_appcast_archive(&mut replacement, "v0.2.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("vanished instead of being metadata-renamed"),
-        "delete+recreate mutant escaped identity proof: {error}"
-    );
-
-    // Archive by plain deletion: the object is gone and nothing replaces it.
-    // Production refuses it by the same re-list, and the model's deletion mutant
-    // is what the count law exists to catch.
-    let mut deletion = IdentityArchiveRemote::new(releases);
-    deletion.delete_object_mutant = true;
-    let error = publish::converge_appcast_archive(&mut deletion, "v0.2.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains("vanished instead of being metadata-renamed"),
-        "archive-by-deletion escaped identity proof: {error}"
-    );
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-    let mut archiving = model.init_state();
-    assert!(model.fire("Flip", &mut archiving));
-    assert!(model.fire("BeginArchive", &mut archiving));
-    let deleted = buggy.successors("ArchiveByDeletingHistoricalManifest", &archiving)[0].clone();
-    assert!(!buggy.check_invariant("HistoricalManifestNeverDeleted", &deleted));
 }

@@ -463,8 +463,9 @@ fn read_incr(inner: &Inner, property: Atom) -> Option<String> {
     // Bounded just under the caller's 1000 ms `get` timeout: the serve thread sends
     // the result back through that channel, so finishing earlier lets even a failed
     // transfer report cleanly. Local INCR transfers (the realistic case) complete in
-    // well under this; a fully async paste that lifts the UI-thread wait is the
-    // documented follow-up (audit finding on the 1 s clipboard block).
+    // well under this. The UI thread never waits on it: every GUI caller of a
+    // foreign-owner read runs on a paste worker (`paste_clipboard_into`,
+    // `paste_primary_into`, `search_paste_in`) that posts a `Wake` when done.
     let deadline = Instant::now() + Duration::from_millis(900);
     let mut buf: Vec<u8> = Vec::new();
     while Instant::now() < deadline {

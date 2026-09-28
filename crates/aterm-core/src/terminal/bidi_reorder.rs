@@ -5,7 +5,7 @@
 //! BiDi visual-reordering bridge (feature `bidi`).
 //!
 //! Wires the engine's BiDi configuration ([`BiDiMode`] + [`ParagraphDirection`])
-//! to the UAX #9 implicit reordering in the `aterm-bidi` crate. Compiled ONLY
+//! to the UAX #9 reordering in the `aterm-bidi` crate. Compiled ONLY
 //! when the off-by-default `bidi` feature is enabled; with the feature off this
 //! module is absent and the engine build is byte-identical (the no-op posture in
 //! `bidi_stubs.rs` is unaffected).
@@ -74,6 +74,51 @@ impl Terminal {
             &chars,
             &wide,
         )
+    }
+
+    /// Visible row `row` in DISPLAY order, for an introspection read: the row's
+    /// text laid out as the frame paints it, and the visual→logical column map
+    /// the renderer applies ([`Self::bidi_visual_order_cells`] over the same cell
+    /// scalars and wide-continuation flags): `map[v] == l` means the logical
+    /// column `l` is drawn at visual column `v`. A wide glyph's continuation cell
+    /// contributes no text (the `get_line_text` rule), and trailing blanks are
+    /// dropped from the text; the map always covers every column. The identity
+    /// when BiDi is off or the row is pure left-to-right. `None` for a row off
+    /// the screen.
+    #[must_use]
+    pub fn row_display_order(&self, row: u16) -> Option<(String, Vec<usize>)> {
+        if row >= self.grid.rows() {
+            return None;
+        }
+        let cols = self.grid.cols();
+        let continuation: Vec<bool> = (0..cols)
+            .map(|c| self.grid.is_wide_continuation_at_screen(row, c))
+            .collect();
+        // One scalar per cell for the class lookup: a cluster's first scalar
+        // decides its direction, a blank cell is a space.
+        let chars: Vec<char> = (0..cols)
+            .map(|c| {
+                let mut one = String::new();
+                super::content::push_cell_text(&self.grid, row, c, &mut one);
+                one.chars().next().unwrap_or(' ')
+            })
+            .collect();
+        let map = compute_visual_order_cells(
+            self.modes.bidi_mode,
+            self.modes.bidi_direction,
+            self.modes.bidi_autodetection,
+            &chars,
+            &continuation,
+        );
+        let mut text = String::with_capacity(usize::from(cols));
+        for &l in &map {
+            if let Ok(col) = u16::try_from(l) {
+                super::content::push_cell_text(&self.grid, row, col, &mut text);
+            }
+        }
+        let end = text.trim_end().len();
+        text.truncate(end);
+        Some((text, map))
     }
 
     /// Reorder each row of a render snapshot into BiDi VISUAL order, in place.
@@ -162,20 +207,20 @@ impl Terminal {
                 continue;
             }
             let base = base_direction_from_classes(dir, autodetect, &scratch.classes);
+            // Bracket properties only for the rows that reorder (N0 pairs them).
+            scratch.brackets.clear();
+            scratch
+                .brackets
+                .extend(frame.cells[r].iter().map(|c| aterm_bidi::bracket_of(c.ch)));
             // Resolve the visual→logical CELL permutation into `scratch.cell_order`,
-            // reusing the inner UAX #9 working buffers (logical/lead_cell/has_cont/
-            // types/levels/char_order) — no per-row heap allocation after warmup.
-            // Output is byte-identical to `reorder_cells_with_classes`.
+            // reusing the UAX #9 working memory — no per-row heap allocation after
+            // warmup. Output is byte-identical to `reorder_cells_with_classes`.
             aterm_bidi::reorder_cells_with_classes_into(
                 &scratch.classes,
+                &scratch.brackets,
                 &scratch.wide,
                 base,
-                &mut scratch.logical,
-                &mut scratch.lead_cell,
-                &mut scratch.has_cont,
-                &mut scratch.types,
-                &mut scratch.levels,
-                &mut scratch.char_order,
+                &mut scratch.bidi,
                 &mut scratch.cell_order,
             );
             // Identity (e.g. RTL-capable chars that still resolve LTR): skip.
@@ -274,7 +319,11 @@ pub fn compute_visual_order_cells(
         return (0..cell_chars.len()).collect();
     }
     let base = base_direction_from_classes(dir, autodetect, &classes);
-    aterm_bidi::reorder_cells_with_classes(&classes, is_wide_continuation, base)
+    let brackets: Vec<aterm_bidi::Bracket> = cell_chars
+        .iter()
+        .map(|&c| aterm_bidi::bracket_of(c))
+        .collect();
+    aterm_bidi::reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
 }
 
 /// Map the engine's [`ParagraphDirection`] onto an `aterm-bidi` `BaseDirection`.
@@ -605,6 +654,43 @@ mod tests {
             ),
             vec![1, 2, 0]
         );
+    }
+
+    /// The introspection read's display order IS the renderer's: the map
+    /// `row_display_order` returns equals `bidi_visual_order_cells` over the
+    /// same row's render cells, and the text is the cells laid out in that
+    /// order — a Hebrew run reads right to left, a wide glyph stays whole, and
+    /// an LTR row is the identity with its logical text.
+    #[test]
+    fn row_display_order_is_the_renderers_permutation() {
+        let mut t = Terminal::new(2, 10);
+        t.process("x \u{05D0}\u{05D1} \u{4E2D}y".as_bytes());
+        let (text, map) = t.row_display_order(0).expect("on screen");
+        // `render_row` stops at the row's last written cell; the map covers
+        // every column, and the blank tail past it stays in place.
+        let painted = t.bidi_visual_order_cells(&t.render_row(0));
+        assert_eq!(map[..painted.len()], painted[..]);
+        assert!(
+            map[painted.len()..]
+                .iter()
+                .copied()
+                .eq(painted.len()..map.len())
+        );
+        assert_ne!(map, (0..map.len()).collect::<Vec<_>>(), "the RTL run moved");
+        assert!(
+            text.contains("\u{05D1}\u{05D0}"),
+            "BET before ALEF on screen: {text:?}"
+        );
+        assert!(
+            text.contains('\u{4E2D}'),
+            "the wide glyph is whole: {text:?}"
+        );
+        let mut ltr = Terminal::new(2, 10);
+        ltr.process(b"hello");
+        let (text, map) = ltr.row_display_order(0).expect("on screen");
+        assert_eq!(text, "hello");
+        assert_eq!(map, (0..10).collect::<Vec<_>>());
+        assert!(ltr.row_display_order(2).is_none(), "off the screen");
     }
 
     #[test]

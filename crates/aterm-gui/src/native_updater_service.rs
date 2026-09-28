@@ -362,14 +362,6 @@ impl UpdaterSnapshot {
         self.attention_revision.is_some()
             && self.attention_revision != self.acknowledged_attention_revision
     }
-
-    /// No determinate progress is invented: today's `aterm_update::check_now` API does
-    /// not provide a byte denominator, so the native route must render an indeterminate
-    /// busy state while this is true.
-    #[must_use]
-    pub(crate) fn has_determinate_progress(&self) -> bool {
-        false
-    }
 }
 
 /// Decision returned when a view asks the process service to check.
@@ -1972,7 +1964,6 @@ mod tests {
             snapshot.staged.as_ref().map(|staged| staged.generation),
             Some(ticket.generation)
         );
-        assert!(!snapshot.has_determinate_progress());
         assert!(snapshot.attention_pending());
     }
 

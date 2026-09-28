@@ -57,7 +57,8 @@ use crate::store::Layout;
 /// A held advisory lock on an open file, released by `LOCK_UN` when dropped rather than by
 /// the close: a child another thread is spawning holds a copy of every descriptor until it
 /// execs, and a lock released only by the close stays held for that long (measured
-/// 2026-09-17; `aterm-verify/tests/release_then_probe.rs`).
+/// 2026-09-17 by a probe since deleted with aterm-verify's test pruning;
+/// `a_dropped_store_lock_is_free_while_a_copy_of_its_descriptor_lives` below pins it).
 pub(crate) struct Flock(File);
 
 impl Flock {

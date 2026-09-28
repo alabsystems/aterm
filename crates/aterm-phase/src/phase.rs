@@ -319,8 +319,9 @@ const BACKGROUND_RULES: &[&str] = &[
 /// started (`✻ Waiting for 1 dynamic workflow to finish`, `wait_bg.out`).
 /// `Some(the rule)`, `None` for a live turn (`wait_bg2.out`: a spinner over
 /// the same workflow's progress line), an idle screen, or one with no frame.
-/// A natural break for a host's word that interrupts the orchestration once
-/// (the live upgrade's notice); never one where anything may be ended.
+/// A natural break for a host's word that interrupts the orchestration (the
+/// live upgrade's notice, and its re-ask after half an hour); never one where
+/// anything may be ended.
 ///
 /// Nor one where a turn has just BEGUN: a message submitted under the status
 /// row is drawn there (`❯ …`) a frame before the spinner of the turn it
@@ -527,6 +528,58 @@ pub(crate) fn composer_frame(rows: &[String]) -> Option<Frame> {
 /// box covers the screen, and the whole-screen rules apply.
 pub fn has_composer_frame(rows: &[String]) -> bool {
     composer_frame(rows).is_some()
+}
+
+/// Claude Code's prompt box in SHELL MODE: `!` typed into the empty box
+/// turns its caret from `❯` into `!`, between the same two rules (measured on
+/// 2.1.283, 2026-09-26, every printable key typed alone into the empty box:
+/// `!` is the one that changes the caret — `!\u{a0}Try "…"` under the
+/// placeholder, `!\u{a0}ls` with a command typed — the `SHELL_MODE*`
+/// fixtures). It is the REPL, drawn and taking keys, so its `idle` is
+/// evidence ([`crate::ClaudeReader`]'s `phase_authoritative`); it is NOT
+/// [`composer_frame`], whose `❯` caret row is where the draft, the footer,
+/// the lights and the turn-end policy read a prompt.
+pub(crate) fn has_shell_mode_frame(rows: &[String]) -> bool {
+    (1..rows.len()).rev().any(|i| {
+        let caret = rows[i]
+            .strip_prefix('!')
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{a0}']));
+        caret && is_rule(&rows[i - 1]) && rows[i + 1..].iter().any(|r| is_rule(r))
+    })
+}
+
+/// Whether row `row` of `rows` is INSIDE one of Claude Code's prompt boxes,
+/// from its top rule down to its bottom rule: the `❯` composer, or shell
+/// mode's `!` box ([`has_shell_mode_frame`]), its caret in column 0 right
+/// under the top rule. The box the row is in is the nearest one that starts
+/// at or above it; a box with no bottom rule yet holds nothing.
+///
+/// This is where Claude Code keeps the TERMINAL'S CURSOR while its REPL takes
+/// keys, so the box that holds the cursor is the REPL that is running.
+/// Measured on 2.1.283 (2026-09-27, `subscribe … screen,cursor` of a private
+/// headless aterm at 150x50, the fullscreen and the inline renderer, a new
+/// tab and the same tab): from the first frame that draws the box whole the
+/// cursor sits on its caret row — at column 2 at rest, after a draft's last
+/// character (on the draft's second row when it wraps), in shell mode, with
+/// the `/` and `@` menus and the shortcuts open, after one Ctrl-C. It is
+/// never in a box an EARLIER run left on the screen: the inline renderer
+/// relaunched in the same tab draws under the new launch line, and until its
+/// REPL is up the cursor sits under that line, on the rows its folder-trust
+/// dialog took, or on the row the new bottom rule is drawn on — below the
+/// old box (all 19 frames of three relaunches).
+#[must_use]
+pub fn prompt_box_holds(rows: &[String], row: usize) -> bool {
+    let caret_row = |r: &str| {
+        r.starts_with('❯')
+            || r.strip_prefix('!')
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([' ', '\u{a0}']))
+    };
+    let last = row.saturating_add(1).min(rows.len().saturating_sub(1));
+    (1..=last)
+        .rev()
+        .find(|&i| caret_row(&rows[i]) && is_rule(&rows[i - 1]))
+        .and_then(|caret| (caret + 1..rows.len()).find(|&i| is_rule(&rows[i])))
+        .is_some_and(|bottom| row <= bottom)
 }
 
 /// The index of the composer's BOTTOM rule, when the frame is on the screen —
@@ -976,10 +1029,11 @@ pub fn limit_notice(rows: &[String]) -> Option<(String, Option<String>)> {
 }
 
 /// The notice the worker's last turn ended on, placed as [`limit_notice`]
-/// places it — the footer, a banner under the last thing said, the `⎿` block
-/// of the last message — and named by `classify`. Shared by
-/// [`limit_notice`] (the usage kinds) and [`crate::wall::wall`] (every
-/// kind), so the two can never disagree about WHERE a wall is.
+/// places it — the footer, a banner under the last thing said, the vendor's
+/// `⏺` error row ([`error_row_notice`]), the `⎿` block of the last message —
+/// and named by `classify`. Shared by [`limit_notice`] (the usage kinds) and
+/// [`crate::wall::wall`] (every kind), so the two can never disagree about
+/// WHERE a wall is.
 ///
 /// A `⎿` block counts as the VENDOR's row except in the two forms this
 /// recognises as output: the `⏺` row it hangs from is a tool call written
@@ -999,6 +1053,9 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
         }
     }
     let last = last_said_index(rows)?;
+    if let Some(found) = error_row_notice(rows, last, classify) {
+        return Some(found);
+    }
     let open = gutter_open(rows, last)?;
     let head = rows[open].trim_start().trim_start_matches('⎿').trim();
     if head.starts_with("$ ") || owner_is_tool_call(rows, open) {
@@ -1016,6 +1073,67 @@ pub(crate) fn notice(rows: &[String], classify: &dyn Fn(&str) -> Option<WallKind
         reset,
         row: open,
         placement: Placement::Gutter,
+    })
+}
+
+/// How many rows the vendor's `⏺` error row may take, its wrapped text
+/// included ([`error_row_notice`]): the notices it draws are one sentence
+/// and a remedy, and a longer `⏺` block is the worker's own words.
+const ERROR_ROWS: usize = 3;
+
+/// THE VENDOR'S ERROR ROW the last turn ended on. Claude Code 2.1.281 draws
+/// an `isApiErrorMessage` row its message renderer has no case of its own
+/// for (`du`, read from the binary on 2026-09-27) as its `⏺` bullet in column
+/// 0 — the `error:` one, in the warning colour, which a row of text cannot
+/// tell from the worker's own — then the text, wrapped under column 2: `⏺
+/// Login expired · Please run /login` (the incident of 2026-09-27: every turn
+/// for nine hours ended on that row, and every one read idle with no wall),
+/// `⏺ API Error: …`. `Not logged in · …`, `OAuth token revoked · …` and a
+/// full context have cases of their own and are drawn under the `⎿` gutter,
+/// which [`notice`] reads after this.
+///
+/// A worker's message is drawn the same way, so the row must be the vendor's
+/// in its words as well as its place: the LAST thing said, at most
+/// [`ERROR_ROWS`] rows (the `⏺` row and the rows indented two columns under
+/// it, nothing else), no tool call, and the vendor's own shape — a notice and
+/// its remedy joined by ` · ` or ` ∙ `, or `API Error` at its head — whose
+/// head the table ([`classify`]) names. The worker's `⏺ Not logged in to gh,
+/// so nothing was pushed.` has no remedy joined on and is not one; a message
+/// that opens with a wall's words, a `·` and more is read as the wall — the
+/// one copy this cannot tell from the vendor's row.
+fn error_row_notice(
+    rows: &[String],
+    last: usize,
+    classify: &dyn Fn(&str) -> Option<WallKind>,
+) -> Option<Wall> {
+    let open = (last.saturating_sub(ERROR_ROWS - 1)..=last)
+        .rev()
+        .find(|&i| rows[i].starts_with(['⏺', '●']))?;
+    let wrapped = |row: &String| {
+        row.strip_prefix("  ")
+            .is_some_and(|t| t.starts_with(|c: char| !c.is_whitespace() && c != '⎿'))
+    };
+    if is_tool_call(&rows[open]) || !rows[open + 1..=last].iter().all(wrapped) {
+        return None;
+    }
+    let head = rows[open]
+        .strip_prefix(['⏺', '●'])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())?;
+    let text = std::iter::once(head)
+        .chain(rows[open + 1..=last].iter().map(|r| r.trim()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if !(text.contains(" · ") || text.contains(" ∙ ") || text.starts_with("API Error")) {
+        return None;
+    }
+    let kind = classify(&text)?;
+    Some(Wall {
+        kind,
+        reset: reset_of(&text),
+        message: text,
+        row: open,
+        placement: Placement::ErrorRow,
     })
 }
 

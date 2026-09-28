@@ -1421,6 +1421,27 @@ pub fn spawn_shell_with_pid(
     )
 }
 
+/// The descriptor numbers a spawned child strips of inheritance: every number
+/// below this process's soft RLIMIT_NOFILE, which is the most it can have open
+/// (a number above it could only exist if the limit was LOWERED after it was
+/// opened, and no product path lowers it; the child's own resource sandbox
+/// runs after this is read). Capped so a limit raised to "unlimited"
+/// cannot turn one spawn into millions of `fcntl`s. MEASURED 2026-09-27 (an upper
+/// bound, timed through Python's ctypes): 256 numbers ~0.1 ms — launchd's soft
+/// limit for a Dock-launched app — 10,240 ~2 ms, the 65,536 cap ~15 ms, which
+/// only a GUI started from a shell with a raised limit reaches.
+fn inherited_fd_ceiling() -> libc::c_int {
+    const CAP: libc::rlim_t = 1 << 16;
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is a live, initialised rlimit that getrlimit fills.
+    let read = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0;
+    let soft = if read { limit.rlim_cur.min(CAP) } else { CAP };
+    libc::c_int::try_from(soft).unwrap_or(libc::c_int::MAX)
+}
+
 /// [`spawn_shell_with_pid`], filling the winsize PIXEL fields from the host's cell
 /// metrics. Identical spawn/sandbox/exec behavior.
 ///
@@ -1706,6 +1727,9 @@ pub fn spawn_shell_with_pid_cell_px(
     // comment on `open_exec_status_channel` for the defect, the measurements, and
     // the carriers that were tried and rejected.
     let (status_rd, status_wr, status_carrier) = open_exec_status_channel()?;
+    // How far the child's inheritance strip (step 3b) reaches, read HERE: the
+    // child's resource sandbox may lower RLIMIT_NOFILE before that step runs.
+    let fd_ceiling = inherited_fd_ceiling();
 
     // The child's FIRST winsize, pixel fields included: a tool that reads
     // TIOCGWINSZ before anything resizes the window must still learn the pixel
@@ -1888,6 +1912,32 @@ pub fn spawn_shell_with_pid_cell_px(
         unsafe {
             if master > libc::STDERR_FILENO {
                 libc::close(master);
+            }
+        }
+        // (3b) NOTHING ELSE IS INHERITED. The shell must start with its stdio
+        //     and nothing more, but `fork` copied every descriptor this process
+        //     held, and the ones opened WITHOUT close-on-exec would survive
+        //     `execve` into the shell and every program it ever runs. This
+        //     crate opens all of its own close-on-exec; the frameworks the GUI
+        //     loads do not — MEASURED 2026-09-27: a login shell aterm spawned
+        //     held Metal's shader-cache files (`com.apple.metal/…/
+        //     libraries.data`, `functions.list`, …) open READ-WRITE on fds 8,
+        //     10, 11 and 17, inherited from the GUI's GPU driver, for its whole
+        //     life, and so did everything it started. macOS has no `closefrom`,
+        //     so every number up to the parent's RLIMIT_NOFILE is marked
+        //     close-on-exec: `fcntl(F_SETFD)` is async-signal-safe, a number
+        //     that is not open answers EBADF and costs nothing, and MARKING
+        //     rather than closing leaves `status_wr` (already close-on-exec)
+        //     open for the failure byte below while `execve` closes it as
+        //     before. Stdio (0/1/2) is below the range: `login_tty`'s `dup2`s
+        //     are what the shell must keep.
+        // SAFETY: `fcntl(F_SETFD)` is async-signal-safe; it takes an int and
+        // touches no memory, and an unused number is a harmless EBADF.
+        unsafe {
+            let mut fd = libc::STDERR_FILENO + 1;
+            while fd < fd_ceiling {
+                libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                fd += 1;
             }
         }
         // (4) exec. `execve` (not `execvp`) takes the pre-built `envp` and does no
@@ -5897,11 +5947,17 @@ mod tests {
     fn a_stranger_holding_the_write_end_cannot_block_the_status_wait_forever() {
         const BUDGET: std::time::Duration = std::time::Duration::from_millis(400);
 
-        // CONTROL first: same protocol, no stranger. A verdict must arrive.
+        // CONTROL first: same protocol, no stranger. A verdict must arrive. It
+        // gets the shipping `EXEC_STATUS_BUDGET`, not the stranger arm's 400 ms:
+        // the EOF arrives only once every copy of the write end is closed, and a
+        // fork elsewhere in this binary (the spawn tests, the 300-fork loop)
+        // holds one until it execs — longer than 400 ms on a loaded machine (the
+        // fd-copy sweep of 2026-09-27). The wait returns the instant EOF lands,
+        // so a correct run still costs nothing.
         let (crd, cwr) = racy_status_pipe();
         // SAFETY: the only write end; closing it is the "child exec'd" signal.
         unsafe { libc::close(cwr) };
-        let control = wait_for_exec_status(crd, BUDGET);
+        let control = wait_for_exec_status(crd, EXEC_STATUS_BUDGET);
         // SAFETY: the read end this test owns.
         unsafe { libc::close(crd) };
 
@@ -6357,9 +6413,11 @@ mod tests {
                 ch.filter = libc::EVFILT_READ;
                 ch.flags = libc::EV_ADD | libc::EV_ENABLE;
                 let mut ev: libc::kevent = std::mem::zeroed();
+                // Split: a whole-second timeout in `tv_nsec` alone is out of
+                // range, and the call answers EINVAL — read as "not ready".
                 let ts = libc::timespec {
-                    tv_sec: 0,
-                    tv_nsec: ms * 1_000_000,
+                    tv_sec: ms / 1000,
+                    tv_nsec: (ms % 1000) * 1_000_000,
                 };
                 let n = libc::kevent(kq, &ch, 1, &mut ev, 1, &ts);
                 libc::close(kq);
@@ -6373,20 +6431,30 @@ mod tests {
             unsafe {
                 let mut set: libc::fd_set = std::mem::zeroed();
                 libc::FD_SET(fd, &mut set);
+                // Split, as in `kqueue_ready`: `tv_usec` holds under a second.
                 let mut tv = libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: ms * 1000,
+                    tv_sec: libc::time_t::from(ms / 1000),
+                    tv_usec: (ms % 1000) * 1000,
                 };
                 libc::select(fd + 1, &mut set, ptr::null_mut(), ptr::null_mut(), &mut tv) > 0
             }
         }
 
         // A fifo at EOF: the real carrier, with its write end closed.
+        //
+        // Every probe EXPECTED to report ready waits 10 s, not 200 ms (the fd-copy
+        // sweep of 2026-09-27): EOF arrives only once every copy of the write end
+        // is closed, and a fork elsewhere in this binary holds one until it execs
+        // — past 200 ms on a loaded machine. A ready descriptor answers at once,
+        // so a correct run costs nothing; the probes expected NOT to report keep
+        // 200 ms, since a late EOF only keeps them false.
         let (frd, fwr) = open_exec_status_fifo().expect("the exec-status fifo must open");
         // SAFETY: the only write end; closing it puts the read end at EOF.
         unsafe { libc::close(fwr) };
         let fifo = (
-            selects_ready(frd, 200),
+            // `select` first, and it establishes the EOF: once an EOF has been
+            // READ on a Darwin fifo, select stops reporting it (below).
+            selects_ready(frd, 10_000),
             polls_ready(frd, 200),
             kqueue_ready(frd, 200),
         );
@@ -6430,8 +6498,11 @@ mod tests {
         let (prd, pwr) = racy_status_pipe();
         // SAFETY: the only write end; closing it puts the read end at EOF.
         unsafe { libc::close(pwr) };
+        // All three are expected ready: `select` waits the 10 s for the EOF to
+        // land, and a pipe at EOF is level-triggered, so the other two answer at
+        // once after it.
         let pipe = (
-            selects_ready(prd, 200),
+            selects_ready(prd, 10_000),
             polls_ready(prd, 200),
             kqueue_ready(prd, 200),
         );
@@ -6487,6 +6558,92 @@ mod tests {
              `wait_readable_briefly`'s comments rather than deleting this test \
              (poll, kqueue) = {:?}",
             (fifo.1, fifo.2)
+        );
+    }
+
+    /// A spawned child inherits its stdio and NOTHING else (step 3b). A pipe end
+    /// is parked on a number from 100 up WITHOUT close-on-exec — the state the GUI's Metal
+    /// driver leaves its shader-cache files in, measured leaking into a login
+    /// shell on 2026-09-27 — and the child reports whether that number is open.
+    /// POSITIVE CONTROLS: the same probe sees its own stdout (fd 1), so "closed"
+    /// is a reading, not a broken probe; and the parked number is asserted inheritable in
+    /// the parent before the spawn, so the test is about the child's strip and
+    /// not about a descriptor that was never going to cross the `execve`.
+    #[test]
+    fn a_spawned_child_inherits_its_stdio_and_no_other_descriptor() {
+        use std::time::Duration;
+        // SAFETY: single-threaded test, trusted-launcher contract trivially holds.
+        let authority = unsafe { aterm_cap::Authority::root_authority() };
+        let spawn_cap = authority.grant::<aterm_cap::effects::Spawn>(aterm_cap::Tier::Trusted);
+        let sandbox_cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
+        let (rd, wr) = racy_status_pipe();
+        // F_DUPFD takes the lowest FREE number from 100 up, so no sibling test's
+        // descriptor is disturbed, and its copy carries NO close-on-exec flag —
+        // which is the point.
+        // SAFETY: `fcntl(F_DUPFD)` on a descriptor this test owns.
+        let parked = unsafe { libc::fcntl(rd, libc::F_DUPFD, 100) };
+        assert!(parked >= 100, "park a copy of the pipe: {parked}");
+        // SAFETY: F_GETFD reads the flag word of a descriptor this test owns.
+        let flags = unsafe { libc::fcntl(parked, libc::F_GETFD) };
+        assert_eq!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "PRECONDITION: fd {parked} is inheritable in the parent"
+        );
+        let script = format!(
+            "o=closed; {{ : >&{parked}; }} 2>/dev/null && o=open; \
+             s=closed; {{ : >&1; }} 2>/dev/null && s=open; \
+             printf 'PROBE parked=%s stdout=%s\\n' \"$o\" \"$s\"; exec sleep 30"
+        );
+        let exec: Vec<String> = vec!["/bin/sh".into(), "-c".into(), script];
+        let sh = spawn_shell_with_pid_cell_px(
+            24,
+            80,
+            &spawn_cap,
+            &sandbox_cap,
+            &[],
+            None, // shell_override
+            None, // shell_args
+            None, // argv_override
+            Some(&exec),
+            None, // cwd
+            None, // sandbox_wrap
+            aterm_sandbox::Limits::inherit(),
+            None, // cell_px
+        )
+        .expect("the probe command must spawn");
+        // SAFETY: closing this test's own descriptors; the child has its copies
+        // (or, as asserted below, does not).
+        unsafe {
+            libc::close(parked);
+            libc::close(rd);
+            libc::close(wr);
+        }
+
+        set_nonblocking(sh.master, true).expect("nonblocking master");
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < deadline && !seen.ends_with(b"\n") {
+            let mut buf = [0u8; 256];
+            let n = read(sh.master, &mut buf);
+            if n > 0 {
+                seen.extend_from_slice(&buf[..n as usize]);
+            } else {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        hangup(sh.pid);
+        // SAFETY: closing the master this test owns.
+        unsafe { libc::close(sh.master) };
+        reap(sh.pid);
+        let seen = String::from_utf8_lossy(&seen).into_owned();
+        assert!(
+            seen.contains("stdout=open"),
+            "POSITIVE CONTROL: the probe must see its own stdout: {seen:?}"
+        );
+        assert!(
+            seen.contains("parked=closed"),
+            "the child inherited fd {parked}, a descriptor it was never given: {seen:?}"
         );
     }
 

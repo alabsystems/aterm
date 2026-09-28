@@ -2928,6 +2928,11 @@ pub mod fixtures {
         include_str!("fixtures/hand-built-session-limit-end-of-turn.txt");
     /// HAND-BUILT: the same turn ending on an offer.
     pub const END_OFFER: &str = include_str!("fixtures/hand-built-offer-end-of-turn.txt");
+    /// HAND-BUILT from the 2.1.281 render code and the owner's report
+    /// (2026-09-27): the supervisor's `continue` answered by the login wall,
+    /// Claude Code's synthetic `authentication_failed` row drawn as
+    /// `⏺ Login expired · Please run /login` in column 0.
+    pub const LOGIN_EXPIRED: &str = include_str!("fixtures/claude-2.1.281-login-expired.txt");
     /// Measured 2026-09-21 (version unrecorded): `◎ /goal active (3h)` over
     /// the frame and the dim suggestion `❯ keep going`, cursor at column 2.
     pub const GOAL_ACTIVE_SUGGESTION: &str =
@@ -3165,6 +3170,88 @@ pub mod fixtures {
     /// ` Session paused` (Gpe(), numbered: `Switch to <fallback>` / `Edit
     /// prompt and retry with <model>`).
     pub const SESSION_PAUSED: &str = include_str!("fixtures/claude-2.1.282-session-paused.txt");
+
+    /// Claude Code 2.1.283's LAUNCH, measured 2026-09-26 from every frame a
+    /// private headless aterm pushed (`subscribe … screen,events,ts`): the
+    /// MAIN grid between the launch and the REPL — the shell's own rows. In a
+    /// new folder it is the frame right after the folder-trust dialog was
+    /// pressed (the dialog erased, the REPL still to come up on the
+    /// alternate screen 300-510 ms later); in a trusted one, the rows from
+    /// the launch on. Read `idle` by name, the server published `agent=idle`
+    /// from it, and a draft typed then was lost.
+    pub const LAUNCH_BEFORE_REPL: &str =
+        include_str!("fixtures/claude-2.1.283-launch-before-repl.txt");
+    /// The same launch's FIRST alternate-screen frame: the banner, the
+    /// composer's top rule and caret row, its bottom rule and footer not
+    /// drawn yet.
+    pub const LAUNCH_REPL_HALF_DRAWN: &str =
+        include_str!("fixtures/claude-2.1.283-launch-repl-half-drawn.txt");
+    /// The REPL drawn whole, 47 ms later: the composer between its two
+    /// rules, the mode footer under them — where a draft typed at once
+    /// landed, every time.
+    pub const LAUNCH_REPL_READY: &str =
+        include_str!("fixtures/claude-2.1.283-launch-repl-ready.txt");
+    /// The same REPL in SHELL MODE (2.1.283, measured 2026-09-26): `!` typed
+    /// into the empty prompt box turns its caret into `!` — the placeholder
+    /// and both rules kept, `! for shell mode` under them. Of every printable
+    /// key typed alone into the empty box, `!` is the one that changes the
+    /// caret. The REPL is up and taking keys: `idle`, as before 2026-09-26.
+    pub const SHELL_MODE: &str = include_str!("fixtures/claude-2.1.283-shell-mode.txt");
+    /// Shell mode with a command typed and not run (`!`, then `ls`).
+    pub const SHELL_MODE_DRAFT: &str = include_str!("fixtures/claude-2.1.283-shell-mode-draft.txt");
+
+    /// The same launch under Claude Code 2.1.283's INLINE renderer (its
+    /// classic main-screen one: `CLAUDE_CODE_NO_FLICKER=0`, `tui =
+    /// "default"`, or fullscreen turned off after failed starts), measured
+    /// 2026-09-26 on a 150x50 pane: the folder-trust dialog on the MAIN grid,
+    /// under the launch line, the rows below it blank.
+    pub const INLINE_TRUST: &str = include_str!("fixtures/claude-2.1.283-inline-trust.txt");
+    /// The inline REPL's first frame after the dialog was pressed: the
+    /// banner, the composer's top rule and caret row under the launch line,
+    /// its bottom rule begun (`──`), the footer not drawn.
+    pub const INLINE_REPL_HALF_DRAWN: &str =
+        include_str!("fixtures/claude-2.1.283-inline-repl-half-drawn.txt");
+    /// The inline REPL drawn whole AT THE TOP of the 50-row pane — its
+    /// prompt box on rows 8-11 — and 38 blank rows below it: the grid's last
+    /// 40 rows hold its bottom rule and footer, not its caret.
+    pub const INLINE_REPL_READY: &str =
+        include_str!("fixtures/claude-2.1.283-inline-repl-ready.txt");
+
+    /// The inline renderer RELAUNCHED IN THE SAME TAB (2.1.283, the review of
+    /// 2026-09-26 and a repeat on 2026-09-27, 150x50): the previous run
+    /// exited with two Ctrl-C and left its prompt box on the main grid (its
+    /// footer `Press Ctrl-C again to exit`); then `cd` into a new folder and
+    /// the launch line. This is the frame the server published `agent=idle`
+    /// from once the folder-trust dialog was pressed and erased: the OLD box
+    /// whole above the new launch line, the rows under it blank, the cursor
+    /// under that line. A draft typed on `await agent idle` was lost 3 of 3.
+    pub const INLINE_RELAUNCH_BEFORE_REPL: &str =
+        include_str!("fixtures/claude-2.1.283-inline-relaunch-before-repl.txt");
+    /// The same relaunch's folder-trust dialog, under the new launch line.
+    pub const INLINE_RELAUNCH_TRUST: &str =
+        include_str!("fixtures/claude-2.1.283-inline-relaunch-trust.txt");
+    /// The new REPL's first frame: its composer's top rule and caret row
+    /// under the new launch line, its bottom rule begun, the old box above.
+    pub const INLINE_RELAUNCH_REPL_HALF_DRAWN: &str =
+        include_str!("fixtures/claude-2.1.283-inline-relaunch-repl-half-drawn.txt");
+    /// The new REPL drawn whole under the new launch line, the old box above
+    /// it and the cursor in the new one — 3 s after the draft typed on the
+    /// early `idle` was sent, and the draft is nowhere on it.
+    pub const INLINE_RELAUNCH_REPL_READY: &str =
+        include_str!("fixtures/claude-2.1.283-inline-relaunch-repl-ready.txt");
+
+    /// Where the terminal's CURSOR was on a fixture's screen, `(row, col)`:
+    /// its provenance line's `cursor=<row>,<col>`, for the fixtures whose
+    /// cursor was measured (the 2.1.283 launch and relaunch frames); `None`
+    /// for the others.
+    #[must_use]
+    pub fn cursor(text: &str) -> Option<(usize, usize)> {
+        let head = text.strip_prefix("# ")?.lines().next()?;
+        let (_, at) = head.split_once(" cursor=")?;
+        let (row, rest) = at.split_once(',')?;
+        let col: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        Some((row.parse().ok()?, col.parse().ok()?))
+    }
 
     /// A fixture's rows, its provenance line dropped.
     #[must_use]
@@ -3933,6 +4020,7 @@ mod tests {
             (END_529, "claude-code (unrecorded) · HAND-BUILT"),
             (END_SESSION_LIMIT, "claude-code (unrecorded) · HAND-BUILT"),
             (END_OFFER, "claude-code (unrecorded) · HAND-BUILT"),
+            (LOGIN_EXPIRED, "claude-code 2.1.281 · HAND-BUILT 2026-09-27"),
             (
                 GOAL_ACTIVE_SUGGESTION,
                 "claude-code (version unrecorded) · MEASURED",

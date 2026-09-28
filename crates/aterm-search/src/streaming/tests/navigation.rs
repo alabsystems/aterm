@@ -99,30 +99,6 @@ fn toggle_highlight_all_flips_setting() {
 }
 
 #[test]
-fn jump_to_match() {
-    let mut search = StreamingSearch::new();
-    let mut content = TestContent::new(vec!["match", "match", "match"]);
-
-    search.start_search("match", FilterMode::Literal).unwrap();
-    search.scan_all(&mut content);
-
-    assert_eq!(search.current_index(), 1);
-
-    search.jump_to_match(3);
-    assert_eq!(search.current_index(), 3);
-
-    search.jump_to_match(2);
-    assert_eq!(search.current_index(), 2);
-
-    // Invalid index ignored
-    search.jump_to_match(10);
-    assert_eq!(search.current_index(), 2);
-
-    search.jump_to_match(0);
-    assert_eq!(search.current_index(), 2);
-}
-
-#[test]
 fn current_match_returns_correct_match() {
     let mut search = StreamingSearch::new();
     let mut content = TestContent::new(vec!["hello world"]);

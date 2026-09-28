@@ -21,6 +21,12 @@ pub(crate) struct MarkdownDocument {
     /// content range, making source navigation stable across reflow and theme
     /// changes without retaining an HTML tree.
     pub(crate) inline_runs: Vec<MarkdownInlineRun>,
+    /// Styled spans of each PROSE block's display text (heading, paragraph, list
+    /// item, quote), keyed by block index: disjoint byte ranges in that block's
+    /// `text`, in order, produced by the same lowering pass that produced the
+    /// text ([`lower_inline_text_styled`]) — so a span can never land on the
+    /// wrong occurrence of a repeated word. Paint-only; see [`Self::block_styles`].
+    block_styles: std::collections::BTreeMap<usize, Vec<(Range<usize>, InlineStyle)>>,
     anchors: std::collections::BTreeMap<String, usize>,
     /// Exact UTF-8 byte length of the canonical source used to build this
     /// projection. Reader selection remains source-addressed even though block
@@ -319,6 +325,7 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
     let mut links = Vec::new();
     let mut images = Vec::new();
     let mut inline_runs = Vec::new();
+    let mut block_styles = std::collections::BTreeMap::new();
     let mut anchors = std::collections::BTreeMap::new();
     let mut heading_ids = std::collections::BTreeMap::<String, usize>::new();
     let mut i = 0usize;
@@ -360,7 +367,10 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
         }
 
         if let Some((level, text)) = heading(trimmed) {
-            let text = lower_inline_text(text);
+            let (text, styles) = lower_inline_text_styled(text);
+            if !styles.is_empty() {
+                block_styles.insert(blocks.len(), styles);
+            }
             let base = slug(&text);
             let count = heading_ids.entry(base.clone()).or_insert(0);
             let id = if *count == 0 {
@@ -444,10 +454,14 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
                 &mut images,
                 &mut inline_runs,
             );
+            let (text, styles) = lower_inline_text_styled(text);
+            if !styles.is_empty() {
+                block_styles.insert(blocks.len(), styles);
+            }
             blocks.push(MarkdownBlock::ListItem {
                 depth,
                 ordinal,
-                text: lower_inline_text(text),
+                text,
                 source: line.start..line.end,
             });
             i += 1;
@@ -478,8 +492,12 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
                 end = candidate.end;
                 i += 1;
             }
+            let (text, styles) = lower_inline_text_styled(&quote);
+            if !styles.is_empty() {
+                block_styles.insert(blocks.len(), styles);
+            }
             blocks.push(MarkdownBlock::Quote {
-                text: lower_inline_text(&quote),
+                text,
                 source: start..end,
             });
             continue;
@@ -521,8 +539,12 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
             );
             i += 1;
         }
+        let (text, styles) = lower_inline_text_styled(&paragraph);
+        if !styles.is_empty() {
+            block_styles.insert(blocks.len(), styles);
+        }
         blocks.push(MarkdownBlock::Paragraph {
-            text: lower_inline_text(&paragraph),
+            text,
             source: start..end,
         });
     }
@@ -533,6 +555,7 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
         links,
         images,
         inline_runs,
+        block_styles,
         anchors,
         source_len: source.len(),
         source_line_starts: std::iter::once(0)
@@ -611,6 +634,57 @@ pub(crate) fn semantic_projection(document: &MarkdownDocument) -> MarkdownSemant
     MarkdownSemanticProjection {
         text: out,
         source_map,
+    }
+}
+
+/// How one span of a block's DISPLAY text is styled — the flattened union of the
+/// inline runs that cover it (a `***strong emphasis***` span is both).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct InlineStyle {
+    pub(crate) strong: bool,
+    pub(crate) emphasis: bool,
+    pub(crate) strike: bool,
+    pub(crate) code: bool,
+    pub(crate) link: bool,
+}
+
+impl InlineStyle {
+    fn is_plain(self) -> bool {
+        self == Self::default()
+    }
+
+    fn merged(self, other: Self) -> Self {
+        Self {
+            strong: self.strong || other.strong,
+            emphasis: self.emphasis || other.emphasis,
+            strike: self.strike || other.strike,
+            code: self.code || other.code,
+            link: self.link || other.link,
+        }
+    }
+}
+
+impl MarkdownDocument {
+    /// The styled spans of block `index`'s display text, clipped to its first
+    /// `len` bytes — the part of the painter's bounded copy that is the block's
+    /// own text (`native_app::bounded_markdown_block_paint`), never the `…` a cut
+    /// appends — empty for a block with no inline markup and for code, tables and
+    /// rules.
+    pub(crate) fn block_styles(
+        &self,
+        index: usize,
+        len: usize,
+    ) -> Vec<(Range<usize>, InlineStyle)> {
+        self.block_styles
+            .get(&index)
+            .map(|spans| {
+                spans
+                    .iter()
+                    .filter(|(span, _)| span.start < len)
+                    .map(|(span, style)| (span.start..span.end.min(len), *style))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -1312,23 +1386,104 @@ fn is_backslash_escaped(bytes: &[u8], index: usize) -> bool {
 }
 
 /// Lower inline Markdown into the authored reader text without changing the
-/// canonical source. This intentionally produces one flat presentation run—the
-/// native renderer does not yet carry styled inline spans—but it removes syntax
-/// that should never be visible in a reading surface. Every scanner is linear
+/// canonical source. This produces the one flat reading text (what semantics,
+/// accessibility and copy read); the painter styles spans of it that
+/// [`lower_inline_text_styled`] records as it lowers. It removes syntax that should never be
+/// visible in a reading surface. Every scanner is linear
 /// within its recursion level and nesting is capped, so malformed input remains
 /// bounded and round-trips literally instead of triggering backtracking.
 fn lower_inline_text(source: &str) -> String {
     normalize_display_whitespace(&lower_inline_segment(source, 0))
 }
 
+/// [`lower_inline_text`] plus the STYLED spans of the text it returns — the
+/// ranges each recognized construct (strong, emphasis, strikethrough, inline
+/// code, link) emitted, recorded by the same pass that emits them, then carried
+/// through the whitespace normalization and flattened into disjoint, merged,
+/// ordered spans.
+pub(crate) fn lower_inline_text_styled(source: &str) -> (String, Vec<(Range<usize>, InlineStyle)>) {
+    let mut raw = String::with_capacity(source.len());
+    let mut spans = Vec::new();
+    lower_segment_into(source, 0, InlineStyle::default(), &mut raw, &mut spans);
+    // Normalize exactly as `normalize_display_whitespace`, keeping a map from
+    // every raw byte offset (and the end) to its normalized offset.
+    let mut text = String::with_capacity(raw.len());
+    let mut map = Vec::with_capacity(raw.len() + 1);
+    let mut pending_space = false;
+    for character in raw.chars() {
+        let at = text.len() + usize::from(pending_space && !character.is_whitespace());
+        for _ in 0..character.len_utf8() {
+            map.push(at);
+        }
+        if character.is_whitespace() {
+            pending_space = !text.is_empty();
+        } else {
+            if pending_space {
+                text.push(' ');
+                pending_space = false;
+            }
+            text.push(character);
+        }
+    }
+    map.push(text.len());
+    let spans: Vec<(Range<usize>, InlineStyle)> = spans
+        .into_iter()
+        .map(|(span, style): (Range<usize>, InlineStyle)| (map[span.start]..map[span.end], style))
+        .filter(|(span, _)| span.start < span.end)
+        .collect();
+    let mut cuts: Vec<usize> = spans.iter().flat_map(|(s, _)| [s.start, s.end]).collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut flat: Vec<(Range<usize>, InlineStyle)> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (start, end) = (pair[0], pair[1]);
+        let style = spans
+            .iter()
+            .filter(|(span, _)| span.start <= start && end <= span.end)
+            .fold(InlineStyle::default(), |style, (_, s)| style.merged(*s));
+        if style.is_plain() || text[start..end].trim().is_empty() && !style.code {
+            continue;
+        }
+        match flat.last_mut() {
+            Some((prev, prev_style)) if prev.end == start && *prev_style == style => {
+                prev.end = end;
+            }
+            _ => flat.push((start..end, style)),
+        }
+    }
+    (text, flat)
+}
+
 const MAX_INLINE_NESTING: usize = 32;
 
 fn lower_inline_segment(source: &str, depth: usize) -> String {
+    let mut out = String::with_capacity(source.len());
+    lower_segment_into(
+        source,
+        depth,
+        InlineStyle::default(),
+        &mut out,
+        &mut Vec::new(),
+    );
+    out
+}
+
+/// The lowering pass, appending to `out`. Each recognized construct records the
+/// range of `out` it emitted with its style merged over the enclosing `style`
+/// (nested constructs record their own, stronger spans); `lower_inline_text`
+/// discards them, `lower_inline_text_styled` keeps them.
+fn lower_segment_into(
+    source: &str,
+    depth: usize,
+    style: InlineStyle,
+    out: &mut String,
+    spans: &mut Vec<(Range<usize>, InlineStyle)>,
+) {
     if depth >= MAX_INLINE_NESTING {
-        return source.to_string();
+        out.push_str(source);
+        return;
     }
     let bytes = source.as_bytes();
-    let mut out = String::with_capacity(source.len());
     let mut index = 0usize;
     while index < bytes.len() {
         // Backslash escapes are opaque authored punctuation, not formatting.
@@ -1363,7 +1518,15 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
                     code.remove(0);
                     code.pop();
                 }
+                let start = out.len();
                 out.push_str(&code);
+                spans.push((
+                    start..out.len(),
+                    style.merged(InlineStyle {
+                        code: true,
+                        ..InlineStyle::default()
+                    }),
+                ));
                 index = close + ticks;
                 continue;
             }
@@ -1383,10 +1546,26 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
             && let Some(destination_close) =
                 find_balanced_close(source, label_close + 1, b'(', b')')
         {
-            out.push_str(&lower_inline_segment(
+            // An image's alt text reads as plain text; a link's label is styled.
+            let inner = if image {
+                style
+            } else {
+                style.merged(InlineStyle {
+                    link: true,
+                    ..InlineStyle::default()
+                })
+            };
+            let start = out.len();
+            lower_segment_into(
                 &source[label_open + 1..label_close],
                 depth + 1,
-            ));
+                inner,
+                out,
+                spans,
+            );
+            if !image {
+                spans.push((start..out.len(), inner));
+            }
             index = destination_close + 1;
             continue;
         }
@@ -1405,10 +1584,28 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
                 && delimiter_can_open(bytes, index, marker, run)
                 && let Some(close) = find_emphasis_close(bytes, index + run, marker, run)
             {
-                out.push_str(&lower_inline_segment(
-                    &source[index + run..close],
-                    depth + 1,
-                ));
+                let own = if marker == b'~' {
+                    InlineStyle {
+                        strike: true,
+                        ..InlineStyle::default()
+                    }
+                } else if run >= 2 {
+                    InlineStyle {
+                        strong: true,
+                        // `***x***` is strong AND emphasis.
+                        emphasis: run == 3,
+                        ..InlineStyle::default()
+                    }
+                } else {
+                    InlineStyle {
+                        emphasis: true,
+                        ..InlineStyle::default()
+                    }
+                };
+                let inner = style.merged(own);
+                let start = out.len();
+                lower_segment_into(&source[index + run..close], depth + 1, inner, out, spans);
+                spans.push((start..out.len(), inner));
                 index = close + run;
                 continue;
             }
@@ -1425,7 +1622,15 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
             let close = index + 1 + relative;
             let inside = &source[index + 1..close];
             if is_autolink(inside) {
+                let start = out.len();
                 out.push_str(inside);
+                spans.push((
+                    start..out.len(),
+                    style.merged(InlineStyle {
+                        link: true,
+                        ..InlineStyle::default()
+                    }),
+                ));
                 index = close + 1;
                 continue;
             }
@@ -1456,7 +1661,6 @@ fn lower_inline_segment(source: &str, depth: usize) -> String {
         out.push(character);
         index += character.len_utf8();
     }
-    out
 }
 
 fn normalize_display_whitespace(source: &str) -> String {
@@ -1925,6 +2129,87 @@ mod tests {
         assert_eq!(
             &"[**site**](https://example.com) ![*alt*](pic.png)"[document.links[0].source.clone()],
             "[**site**](https://example.com)"
+        );
+    }
+
+    /// The PAINT styling of a block, recorded by the lowering pass that produced
+    /// its text: nested constructs merged (`**a *b* c**`'s `b` is strong AND
+    /// emphasis; `***both***` is both), a repeated word styled where it was
+    /// authored (not at its first occurrence), and the plain text between
+    /// constructs left unstyled.
+    #[test]
+    fn inline_styles_locate_nested_and_repeated_runs_in_the_display_text() {
+        let source =
+            "foo **foo** *em* ***both*** `code` ~~gone~~ [site](https://x.example) **a *b* c**";
+        let document = parse(source);
+        let block = &document.blocks[0];
+        let MarkdownBlock::Paragraph { text, .. } = block else {
+            panic!("one paragraph: {block:?}");
+        };
+        assert_eq!(text, "foo foo em both code gone site a b c");
+        let styles = document.block_styles(0, text.len());
+        let styled: Vec<(&str, InlineStyle)> = styles
+            .iter()
+            .map(|(span, style)| (&text[span.clone()], *style))
+            .collect();
+        let strong = InlineStyle {
+            strong: true,
+            ..InlineStyle::default()
+        };
+        let emphasis = InlineStyle {
+            emphasis: true,
+            ..InlineStyle::default()
+        };
+        assert_eq!(
+            styled,
+            vec![
+                ("foo", strong),
+                ("em", emphasis),
+                (
+                    "both",
+                    InlineStyle {
+                        strong: true,
+                        emphasis: true,
+                        ..InlineStyle::default()
+                    }
+                ),
+                (
+                    "code",
+                    InlineStyle {
+                        code: true,
+                        ..InlineStyle::default()
+                    }
+                ),
+                (
+                    "gone",
+                    InlineStyle {
+                        strike: true,
+                        ..InlineStyle::default()
+                    }
+                ),
+                (
+                    "site",
+                    InlineStyle {
+                        link: true,
+                        ..InlineStyle::default()
+                    }
+                ),
+                ("a ", strong),
+                (
+                    "b",
+                    InlineStyle {
+                        strong: true,
+                        emphasis: true,
+                        ..InlineStyle::default()
+                    }
+                ),
+                (" c", strong),
+            ]
+        );
+        assert_eq!(
+            styles[0].0,
+            4..7,
+            "the STRONG foo is the second one, where it was authored"
         );
     }
 

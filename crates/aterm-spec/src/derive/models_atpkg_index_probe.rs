@@ -55,6 +55,52 @@ pub fn atpkg_index_probe_completion_cadence_model() -> Model {
     }
 }
 
+/// A host arriving before another host's shared stamp expires must schedule
+/// its next local look at that expiry. Starting a fresh thirty-second local
+/// interval at the suppressed look can leave every host idle for another
+/// interval after the shared stamp is ready. `Buggy=1` replays that extra wait;
+/// Tier-1 binds the returned remaining duration to both host schedulers.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn atpkg_index_shared_handoff_model() -> Model {
+    crate::ty_model! {
+        AtpkgIndexSharedHandoff {
+            const Buggy = 0;
+            const Interval = 6;
+            // Five-second ticks since the prior host completed a HEAD pair.
+            var stamp_age = 0;
+            // 0 no stamp, 1 shared stamp live, 2 second host waiting,
+            // 3 shared stamp expired and second host checked.
+            var phase = 0;
+            var local_wait = 0;
+            var requests = 0;
+            var missed = 0;
+
+            action Stamp when (phase == 0) {
+                phase = 1;
+            }
+            action TickBeforeHandoff when (phase == 1 && stamp_age <= Interval - 2) {
+                stamp_age = stamp_age + 1;
+            }
+            action Handoff when (phase == 1 && stamp_age > 0 && stamp_age <= Interval - 1) {
+                phase = 2;
+                local_wait = if Buggy == 1 { Interval } else { Interval - stamp_age };
+            }
+            action TickAfterHandoff when (phase == 2 && stamp_age <= Interval - 1) {
+                stamp_age = stamp_age + 1;
+                local_wait = if local_wait > 0 { local_wait - 1 } else { 0 };
+            }
+            action AtExpiry when (phase == 2 && stamp_age == Interval) {
+                phase = 3;
+                requests = if local_wait == 0 { 1 } else { 0 };
+                missed = if local_wait == 0 { 0 } else { 1 };
+            }
+
+            invariant NoSecondLocalCooldown: missed == 0;
+        }
+    }
+}
+
 /// The GUI package lane owns at most one asynchronous index probe across park
 /// slices. A positive HEAD may be offered while the probe's other HEAD is still
 /// out; its final answer cannot offer that same build twice. A

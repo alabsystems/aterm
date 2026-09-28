@@ -19,6 +19,8 @@ use std::collections::BTreeMap;
 use aterm_spec::derive::Model;
 use aterm_spec::verify;
 
+#[path = "conformance_upgrade_models/ladder.rs"]
+mod ladder;
 #[path = "conformance_upgrade_models/priority.rs"]
 mod priority;
 

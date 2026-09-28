@@ -91,8 +91,8 @@ fn main() -> ExitCode {
                  spec-link         lower the anchor graph + run `trust-ir spec-link --require-manifest`\n\
                  gate <check>      local enforcement gate (NO CI): all|{roster}|nonvacuity,\n\
                                    plus the ones `all` leaves out: {opt_in}\n\
-                                   `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt +\n\
-                                   guards; --no-fmt drops the formatter lane and\n\
+                                   `gate lint [--no-fmt|--fmt-only]` — tippy + trustfmt;\n\
+                                   --no-fmt drops the formatter lane and\n\
                                    --fmt-only keeps only it (both passes, no compiler,\n\
                                    seconds), nothing else narrowed either way\n\
                                    see docs/EXCEED_GHOSTTY_PLAN.md\n\

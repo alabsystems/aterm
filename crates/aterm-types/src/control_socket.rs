@@ -312,6 +312,79 @@ pub fn stale_instance_files(names: &[&str], pid_alive: &dyn Fn(u32) -> bool) -> 
         .collect()
 }
 
+/// One entry of a socket-directory listing as the launch sweep sees it: its
+/// name, its byte length, and how long ago it was last written. The host
+/// reads the directory and passes these in; [`stale_socket_files`] decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SockFileFacts<'a> {
+    /// The bare filename (`aterm-4242.sock`, `private.sock`, `images`, …).
+    pub name: &'a str,
+    /// Byte length. A bound AF_UNIX socket file is ZERO bytes on every
+    /// platform (on Windows it is a zero-byte reparse point), so anything with
+    /// bytes in it — the Windows `latest` pointer file, a token — is not a
+    /// socket leftover and is never touched.
+    pub len: u64,
+    /// Seconds since the file was last written; `0` when the clock cannot say.
+    pub age_secs: u64,
+}
+
+/// How long a zero-length socket file must have sat untouched before the
+/// launch sweep will even probe it: one day. A younger file may belong to an
+/// instance between its `bind` and its first `accept` — a window measured in
+/// milliseconds — and the day-long margin makes that race unreachable rather
+/// than merely unlikely.
+pub const STALE_SOCK_MIN_AGE_SECS: u64 = 24 * 60 * 60;
+
+/// From a socket-directory listing, the zero-length `*.sock` files at least
+/// `min_age_secs` old that NOTHING listens on — leftovers of instances that
+/// were killed (`Stop-Process`, SIGKILL) or that bound in a directory no
+/// current build uses — safe to remove. The complement of
+/// [`stale_instance_files`]: that rule needs a pid in the name and trusts it,
+/// which misses a leftover whose pid the OS has since recycled and every
+/// socket whose name carries no pid at all.
+///
+/// A file is stale when ALL of these hold, checked in this order:
+/// 1. it is named `*.sock`, is not the `latest` alias ([`LATEST_SOCK_FILE`],
+///    which is a symlink or pointer file, never a socket), and is not the
+///    socket that alias names (`aliased`) — the exemption the host's dead-pid
+///    sweep (the one applying [`stale_instance_files`]) makes too: the alias's
+///    target goes at the sweep after the alias moves on, never while it still
+///    names it;
+/// 2. it is zero bytes long (see [`SockFileFacts::len`]);
+/// 3. it is at least `min_age_secs` old;
+/// 4. nothing listens on it: a pid in its name is dead (`pid_alive` says so —
+///    a dead owner cannot be listening, so the socket is not probed), or
+///    `listening` reports no listener behind the file. A live listener is
+///    NEVER swept, whatever the file's name or age says.
+///
+/// `listening` is only consulted when the name gives no verdict, so a
+/// long-running instance's socket is probed once per launch of a sibling and
+/// a dead instance's is not probed at all.
+#[must_use]
+pub fn stale_socket_files(
+    files: &[SockFileFacts<'_>],
+    min_age_secs: u64,
+    aliased: Option<&str>,
+    pid_alive: &dyn Fn(u32) -> bool,
+    listening: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    files
+        .iter()
+        .filter(|f| {
+            f.name.ends_with(".sock")
+                && f.name != LATEST_SOCK_FILE
+                && Some(f.name) != aliased
+                && f.len == 0
+                && f.age_secs >= min_age_secs
+                && match instance_pid(f.name) {
+                    Some(pid) if !pid_alive(pid) => true,
+                    _ => !listening(f.name),
+                }
+        })
+        .map(|f| f.name.to_string())
+        .collect()
+}
+
 /// Whether a `latest` symlink target (relative or absolute) designates the
 /// instance socket of `pid` — i.e. the link belongs to that instance and may
 /// be removed on its exit.
@@ -592,6 +665,162 @@ mod tests {
         assert_eq!(stale, vec!["aterm-100.sock", "aterm-100.token"]);
         // All pids alive: nothing to sweep.
         assert!(stale_instance_files(&names, &|_| true).is_empty());
+    }
+
+    /// A listing entry a day-plus old, as the launch sweep sees it.
+    fn aged(name: &str, len: u64) -> SockFileFacts<'_> {
+        SockFileFacts {
+            name,
+            len,
+            age_secs: STALE_SOCK_MIN_AGE_SECS + 1,
+        }
+    }
+
+    /// A probe that records which files it was asked about, so a test can
+    /// prove a verdict was reached WITHOUT dialling (dead pid, young file).
+    fn recording_probe(
+        answer: bool,
+    ) -> (
+        std::rc::Rc<std::cell::RefCell<Vec<String>>>,
+        impl Fn(&str) -> bool,
+    ) {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let seen = asked.clone();
+        (asked, move |name: &str| {
+            seen.borrow_mut().push(name.to_string());
+            answer
+        })
+    }
+
+    /// The Stop-Process / SIGKILL case: a zero-byte `aterm-<pid>.sock` whose
+    /// pid is dead is stale on the name alone — the socket is never dialled.
+    #[test]
+    fn aged_empty_sock_of_a_dead_pid_is_stale_without_a_probe() {
+        let files = [aged("aterm-100.sock", 0), aged("aterm-200.sock", 0)];
+        let (asked, probe) = recording_probe(true);
+        let stale = stale_socket_files(
+            &files,
+            STALE_SOCK_MIN_AGE_SECS,
+            None,
+            &|pid| pid == 200,
+            &probe,
+        );
+        assert_eq!(stale, vec!["aterm-100.sock"]);
+        // Only the live pid's socket was worth a dial; the dead one was not.
+        assert_eq!(*asked.borrow(), vec!["aterm-200.sock"]);
+    }
+
+    /// The recycled-pid case (Windows hands a killed instance's pid to the
+    /// next process almost immediately): the pid reads alive, so only the
+    /// probe can tell — and a file nothing listens on is stale.
+    #[test]
+    fn aged_empty_sock_nobody_listens_on_is_stale_even_when_its_pid_is_alive() {
+        let files = [aged("aterm-100.sock", 0)];
+        let stale =
+            stale_socket_files(&files, STALE_SOCK_MIN_AGE_SECS, None, &|_| true, &|_| false);
+        assert_eq!(stale, vec!["aterm-100.sock"]);
+    }
+
+    /// The one inviolable rule: a socket with a live listener is never swept,
+    /// however old the file is and whatever its name says about its pid.
+    #[test]
+    fn a_live_listener_is_never_stale() {
+        let files = [aged("aterm-100.sock", 0), aged("private.sock", 0)];
+        assert!(
+            stale_socket_files(&files, STALE_SOCK_MIN_AGE_SECS, None, &|_| true, &|_| true)
+                .is_empty()
+        );
+        // A dead pid in the name still wins over the probe (a dead owner cannot
+        // be the one listening), but a nameless socket that answers is kept.
+        let stale =
+            stale_socket_files(&files, STALE_SOCK_MIN_AGE_SECS, None, &|_| false, &|_| true);
+        assert_eq!(stale, vec!["aterm-100.sock"]);
+    }
+
+    /// A file younger than the margin is left alone unprobed: it may be an
+    /// instance between `bind` and `accept`.
+    #[test]
+    fn young_socks_are_left_alone_and_not_probed() {
+        let young = SockFileFacts {
+            name: "aterm-100.sock",
+            len: 0,
+            age_secs: STALE_SOCK_MIN_AGE_SECS - 1,
+        };
+        let (asked, probe) = recording_probe(false);
+        assert!(
+            stale_socket_files(&[young], STALE_SOCK_MIN_AGE_SECS, None, &|_| false, &probe)
+                .is_empty()
+        );
+        assert!(asked.borrow().is_empty(), "a young file is not dialled");
+        // Exactly at the margin counts as old enough.
+        let at_margin = SockFileFacts {
+            age_secs: STALE_SOCK_MIN_AGE_SECS,
+            ..young
+        };
+        assert_eq!(
+            stale_socket_files(
+                &[at_margin],
+                STALE_SOCK_MIN_AGE_SECS,
+                None,
+                &|_| false,
+                &probe
+            ),
+            vec!["aterm-100.sock"]
+        );
+    }
+
+    /// Everything that is not a zero-length `*.sock` is ignored: the `latest`
+    /// alias by NAME (even a zero-byte one), files with bytes in them (the
+    /// Windows pointer file, tokens), and non-socket names.
+    #[test]
+    fn only_zero_length_sock_files_other_than_the_latest_alias_are_candidates() {
+        let files = [
+            aged(LATEST_SOCK_FILE, 16), // the Windows pointer file
+            aged(LATEST_SOCK_FILE, 0),  // a symlink lstat'ed at 0 would still be skipped by name
+            aged("aterm-100.token", 0),
+            aged("aterm-100.sock.tmp", 0),
+            aged("images", 0),
+            aged("private.sock", 5), // bytes in it: not a socket
+            aged("private.sock", 0), // the one genuine candidate
+        ];
+        let (asked, probe) = recording_probe(false);
+        let stale = stale_socket_files(&files, STALE_SOCK_MIN_AGE_SECS, None, &|_| false, &probe);
+        assert_eq!(stale, vec!["private.sock"]);
+        assert_eq!(*asked.borrow(), vec!["private.sock"]);
+    }
+
+    /// The socket the `latest` alias names is kept, dead pid and all, and is
+    /// not even probed: it goes at the sweep after the alias moves on, the
+    /// rule the host's dead-pid sweep keeps too. Its neighbour, as dead and
+    /// as old, goes.
+    #[test]
+    fn the_socket_the_alias_names_is_kept_until_the_alias_moves_on() {
+        let files = [aged("aterm-100.sock", 0), aged("aterm-200.sock", 0)];
+        let (asked, probe) = recording_probe(false);
+        let stale = stale_socket_files(
+            &files,
+            STALE_SOCK_MIN_AGE_SECS,
+            Some("aterm-100.sock"),
+            &|_| false,
+            &probe,
+        );
+        assert_eq!(stale, vec!["aterm-200.sock"]);
+        assert!(asked.borrow().is_empty(), "neither needed a dial");
+        // The alias moved on: the same listing now yields both.
+        let stale = stale_socket_files(
+            &files,
+            STALE_SOCK_MIN_AGE_SECS,
+            Some("aterm-300.sock"),
+            &|_| false,
+            &probe,
+        );
+        assert_eq!(stale, vec!["aterm-100.sock", "aterm-200.sock"]);
+    }
+
+    /// The margin is one day, and the constant is what the hosts pass.
+    #[test]
+    fn the_stale_margin_is_one_day() {
+        assert_eq!(STALE_SOCK_MIN_AGE_SECS, 86_400);
     }
 
     #[test]

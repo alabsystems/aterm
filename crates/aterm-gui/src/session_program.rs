@@ -537,6 +537,15 @@ struct PendingJobs {
 }
 
 impl PendingJobs {
+    fn current(&self, job: &Job, incarnation: u64) -> bool {
+        self.by_session.get(&job.session).is_some_and(|slot| {
+            slot.incarnation == incarnation
+                && slot.latest.as_ref().is_some_and(|latest| {
+                    latest.pgid == job.pgid && Arc::ptr_eq(&latest.timeline, &job.timeline)
+                })
+        })
+    }
+
     /// Replace a session's latest request. Only a new session needs a channel
     /// token: a queued worker reads the replacement, and an in-flight worker
     /// requeues once after its current lookup finishes.
@@ -831,17 +840,29 @@ fn run_worker(
             continue;
         };
         let facts = lookup(job.pgid, job.shell);
-        let (changed, became_claude) = publish_if_current(&pending, &job, incarnation, facts);
-        // The timeline and queue locks are both released before a callback or
-        // footer request can post more work to the GUI.
+        let (changed, became_claude, left_claude) =
+            publish_if_current(&pending, &job, incarnation, facts);
+        // The timeline and queue locks are released before a callback can
+        // post more work to the GUI. The footer send below briefly re-takes
+        // the queue lock to order it against retirement.
         if changed && let Some(wake) = &completion {
             wake(job.session);
+        }
+        if left_claude {
+            crate::claude_footer::stop(job.session, job.pgid);
         }
         // The status sweep already refreshes a still-named Claude footer at
         // its own bounded cadence. Only the transition INTO Claude needs this
         // worker's immediate request.
         if became_claude {
-            crate::claude_footer::request(job.session, &job.timeline, job.pgid);
+            // Serialize this send with `retire`/`clear_pending`: if they win,
+            // this request is stale and suppressed; if this wins, their stop
+            // follows it on the footer channel. A request sent after a
+            // retiring stop would otherwise keep a dead tab's watch alive.
+            let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
+            if pending.current(&job, incarnation) {
+                crate::claude_footer::request_footer(job.session, &job.timeline, job.pgid);
+            }
         }
         let changed_while_running = pending
             .lock()
@@ -859,29 +880,24 @@ fn publish_if_current(
     job: &Job,
     incarnation: u64,
     facts: LeaderFacts,
-) -> (bool, bool) {
+) -> (bool, bool, bool) {
     // Lock order is pending -> timeline. The sole UI callers of `request`,
     // `retire`, and `clear_pending` release any timeline guard first, and
     // `set_program` only rings the harness's leaf bell. This short nested
     // section makes cancellation and a same-PGID re-enable linearize before
     // or after the name write, never between its check and write.
     let pending = pending.lock().unwrap_or_else(|p| p.into_inner());
-    let current = pending.by_session.get(&job.session).is_some_and(|slot| {
-        slot.incarnation == incarnation
-            && slot.latest.as_ref().is_some_and(|latest| {
-                latest.pgid == job.pgid && Arc::ptr_eq(&latest.timeline, &job.timeline)
-            })
-    });
-    if !current {
-        return (false, false);
+    if !pending.current(job, incarnation) {
+        return (false, false, false);
     }
     let mut timeline = job.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    let was_claude = timeline.agent().program.as_deref() == Some("claude");
     let changed = timeline.set_program(job.pgid, facts.program);
     // The copy and the PATH verdict ride the same answer, under the same
     // currency check: a departed group's read never reaches the timeline.
     timeline.set_leader(job.pgid, facts.copy, facts.path);
     let became_claude = changed && timeline.agent().program.as_deref() == Some("claude");
-    (changed, became_claude)
+    (changed, became_claude, changed && was_claude)
 }
 
 #[cfg(test)]

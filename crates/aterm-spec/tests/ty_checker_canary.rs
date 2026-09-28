@@ -12,15 +12,16 @@
 //!
 //! On 2026-08-06 `spec_xref_closure` went red with a dead-action tier
 //! disagreement. The root cause was a driver that had not armed reduction off —
-//! fixed — but underneath it was something the fix only routes around: the `ty`
-//! that `find_trust_bin` selects on this machine has an **unsound partial-order
+//! fixed — but underneath it was something the fix only routed around: the `ty`
+//! that `find_trust_bin` selected then had an **unsound partial-order
 //! reduction**. Given `RainbowJumpBurstLifecycle` at `Buggy = 1`, where
-//! `NoLostFadePayload` is violated three steps from `Init`, it collapses the
-//! 128-state space to one, prints `Model checking complete: No errors found
-//! (exhaustive).` under a `Soundness mode: Sound` banner, and exits 0.
+//! `NoLostFadePayload` is violated three steps from `Init`, it collapsed the
+//! 128-state space to one, printed `Model checking complete: No errors found
+//! (exhaustive).` under a `Soundness mode: Sound` banner, and exited 0.
 //!
-//! Two fix commits have now routed around that binary without ever naming it.
-//! This names it.
+//! The atpkg store's `ty 0.13.0` finds the violation unarmed (a 3-state
+//! counterexample; measured 2026-09-25), so this canary passes silently today.
+//! It stays as the regression detector for the next `ty` that does not.
 //!
 //! ## Why a NOTICE and not a failure
 //!

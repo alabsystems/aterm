@@ -8,10 +8,32 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "aterm — THE one binary: the transparent terminal session, the GPU window, and every verb (ctl/pkg/fleet/drive/help), behind a single name."
+# Two `[[bin]]` targets below, so `cargo run -p aterm` must be told which one it
+# means — without this it refuses on every platform ("could not determine which
+# binary to run", measured 2026-09-27), and CONTRIBUTING.md's build-from-source
+# check is exactly that command.
+default-run = "aterm"
 
 [[bin]]
 name = "aterm"
 path = "src/main.rs"
+
+# The WINDOWED image of the same front door, for Windows: the PE subsystem is a
+# per-file header field the shell keys on (it waits for a console-subsystem
+# child and not for a GUI one), so `aterm.exe` above is CONSOLE subsystem and
+# this second file object — `src/windowed.rs`, which `#[path]`-includes
+# `src/main.rs` and adds only `windows_subsystem = "windows"` — is what the Start
+# Menu, the Explorer verb and a pinned tile launch without a console flash.
+# `apps/aterm-win/build.ps1` ships it renamed to `aterm-gui.exe` (crate
+# `aterm-gui` already owns the bin name `aterm-gui`, so the target cannot be
+# called that). A `[[bin]]` cannot be made target-conditional, so on macOS and
+# Linux it still builds — as a std-only stub that says to run `aterm` and exits
+# 2, never a second link of the whole front door (with `lto = true` that would
+# double the slowest step of every release build) — and it is on no bundle or
+# release list there.
+[[bin]]
+name = "aterm-windowed"
+path = "src/windowed.rs"
 
 [dependencies]
 # The four faces of the one command, all libraries:
@@ -93,7 +115,6 @@ sealed = ["aterm-link/sealed"]
 # shipped binary reads none of them (owner, 2026-09-22: "NOT ENV VARS those are for
 # development").
 dev-seams = [
-    "aterm-cli/dev-seams",
     "aterm-gui/dev-seams",
     "aterm-link/dev-seams",
     "aterm-update/dev-seams",
@@ -105,6 +126,9 @@ dev-seams = [
 # regression it pins (`aterm ship` reaching the session parser) is invisible
 # with piped stdio, because piped stdio takes the WINDOW route instead.
 libc = { workspace = true }
+# The reply-grammar lane reads each verb's framing from the one verb table
+# (`control_verbs::framing_of`), so it cannot drift from what the server promises.
+aterm-types = { workspace = true }
 # Every live-headless test arms its instance with a lifeline
 # (`tests/support/launch_isolation.rs::lifeline`), so a killed test run takes its
 # instances with it. aterm-uds is a dependency-free leaf the binary links already.

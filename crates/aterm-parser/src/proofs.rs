@@ -889,14 +889,17 @@ fn csi_simd_byte_classification_exhaustive() {
 // (`tests/batch.rs`) confirms it on concrete inputs.
 //
 // These harnesses ENCODE that equivalence + the cap invariant as `#[kani::proof]`
-// obligations for trust-mc. NOTE: like much of the existing parser suite, they
-// currently come back INCONCLUSIVE on this trust-mc revision — the SIMD-heavy
-// `advance_fast` body uses constructs the model checker does not yet model
-// soundly (it reports "unsupported construct" fallbacks + an ay solver timeout).
-// That is a trust-mc modelling gap (an active workstream), NOT an aterm defect.
-// The harnesses are kept so they discharge automatically as trust-mc coverage
-// grows; the property is operationally guaranteed today by the adversarial review
-// + the concrete parity tests.
+// obligations for trust-mc. Both carry `#[kani::unwind(11)]`, so they are
+// config-required and the gate's `--config-free` floor
+// (`scripts/verify-kani-proofs.sh`) SKIPS them; they run only when invoked
+// explicitly. Last measured 2026-09-25 with the atpkg store's trust-mc (build
+// 20065), run without `--config-free`: `osc_fast_path_matches_byte_by_byte`
+// is INCONCLUSIVE and `osc_data_respects_cap_invariant` was killed by the
+// script's 16 GB RSS guard — trust-mc cannot yet model the SIMD `advance_fast`
+// body (needed from $HOME/trust: SIMD/NEON intrinsic modelling). Neither is an
+// aterm defect. The property is guaranteed today by the concrete parity
+// battery in `tests/batch.rs`; the harnesses stay so they discharge when
+// trust-mc can model the body.
 // ----------------------------------------------------------------------------
 
 /// `advance_fast` (bulk OSC copy) is observably identical to byte-by-byte
@@ -986,13 +989,15 @@ fn arbitrary_state() -> State {
 /// harnesses would rely on (replacing the body's ~18 un-modellable sub-calls
 /// with this contract).
 ///
-/// STATUS: the contract's verification condition currently solves to `unknown`
-/// in the bounded model checker — the full per-byte state machine encodes a
-/// large combined datatype + array + bitvector formula (the `Parser` struct, its
-/// `ArrayVec`/`Vec` fields with `Array` carriers, and closure environments) that
-/// exceeds the ay solver's present completeness. Reported as a solver gap (the
-/// `verify-kani-proofs` gate treats INCONCLUSIVE as non-fatal), not an aterm
-/// defect: the contract itself is the genuine TLA+ invariant.
+/// STATUS (re-measured 2026-09-25, managed trust-mc 20065 + ay 8256): the
+/// harness completes (~136 s, no OOM) with all 18 checks SUCCESS and is then
+/// DEMOTED to FAILURE by one unsupported construct — the `Call` to
+/// [`Parser::process_byte_dispatch`], which the BMC inliner declines. Taking
+/// that body instead (a probe calling it directly, 2026-09-26) meets 17
+/// unsupported constructs — the `TRANSITIONS` constant, sub-slice ranges,
+/// `Iterator::position`/`all` over the OSC closures — so the gap is trust-mc
+/// modelling, not an aterm defect: the contract itself is the genuine TLA+
+/// invariant (docs/design/MODULAR_VERIFICATION_PROCESS_BYTE_INNER.md).
 ///
 /// The receiver's scalar fields are havoc'd to an arbitrary invariant-satisfying
 /// configuration; the collection fields start empty (`kani_stub`), so this
@@ -1036,7 +1041,13 @@ fn process_byte_inner_preserves_invariant() {
 /// 14 succeed, the invariant is inductive under `process_byte_inner`, which is
 /// the mathematical content a `stub_verified` modular proof relies on.
 ///
-/// STATUS / known blocker (root-caused 2026-06-19 via full ay-pipeline
+/// STATUS 2026-09-26 (managed trust-mc 20065 + ay 8256): no longer OOMs —
+/// `pbpi_csi_ignore` finishes in ~170 s at 1.6 GB peak with 21/21 checks
+/// SUCCESS and is demoted by the same unmodelled `process_byte_dispatch` call
+/// as the contract harness above. The 2026-06-19 root cause below is the
+/// record of what the encoding work since then changed.
+///
+/// Known blocker as of 2026-06-19 (root-caused via full ay-pipeline
 /// instrumentation): each per-state VC bit-blasts to ~495 K clauses / ~179 K
 /// bv-vars; ALL encoding phases finish in <90 s / <1 GB, and the OOM is the SAT
 /// SOLVE proving UNSAT (a valid state's invariant holds → exhaustive search).

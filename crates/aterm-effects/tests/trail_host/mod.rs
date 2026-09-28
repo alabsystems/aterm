@@ -11,7 +11,7 @@
 //! A real `aterm_core::terminal::Terminal` driven byte for byte; each frame
 //! (`Core::frame`) is the GUI's: SYNC-1 withholding when asked, the
 //! content-scroll seam first (a scroll or band move is applied to the engine
-//! and the frame samples NOTHING, as `app_render.rs` does), then LOCK A — the
+//! and the frame samples NOTHING, as `app_render.rs` does), then the frame hold — the
 //! caret row's probe, which is also its witness sample, and every row
 //! `CursorGlow::ribbon_rows` names into the GUI's `CURSOR_WITNESS_ROWS`
 //! slots, read AFTER the last `process` — then the tick. What differs between the families is an explicit [`Opts`]; the
@@ -209,7 +209,7 @@ pub struct Opts {
     pub pane_columns: bool,
 }
 
-/// The implementer's LOCK-A-only host (no scroll seam; every named row read).
+/// The implementer's frame-hold-only host (no scroll seam; every named row read).
 pub const LOCK_A: Opts = Opts {
     scroll_seam: false,
     alt_rebaseline: false,
@@ -318,7 +318,7 @@ impl Core {
         }
     }
 
-    /// ONE FRAME: (SYNC-1), the content-scroll seam, LOCK A's samples (the
+    /// ONE FRAME: (SYNC-1), the content-scroll seam, the frame hold's samples (the
     /// caret row's probe and the rows the witness names), the tick.
     pub fn frame(&mut self) {
         if self.o.honour_sync && self.term.sync_open_dirty() {
@@ -539,7 +539,7 @@ impl Pace {
 pub const PACES: [Pace; 4] = [Pace::Flat(16), Pace::Flat(8), Pace::Paced, Pace::Pet];
 
 /// A 24×80 (or any) [`Core`] with the scroll seam, the alt-screen
-/// re-baseline and LOCK A (the caret row not re-read), framed by a
+/// re-baseline and the frame hold (the caret row not re-read), framed by a
 /// [`Pace`]; SYNC-1 when `honour_sync`.
 pub struct PacedHost {
     pub c: Core,

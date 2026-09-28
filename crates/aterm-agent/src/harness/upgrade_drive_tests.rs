@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::relaunch::{
-    AtPrompt, CONTINUE_FENCE_TRIES, EXIT_LOOK, EXIT_SETTLE, ExitRecord, MODEL_WAIT,
-    RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart, STALE_S, Snapshot, after_exit, await_new,
-    carry_on_with_tab_probe, continuation_session, exit_record, line_for, look_at_exit, owed,
-    relaunch_by_parent, restart_from, resume, shell_dialect, type_relaunch_line,
+    AtPrompt, CAUSE_HOST, CONTINUE_FENCE_TRIES, EXIT_LOOK, EXIT_SETTLE, ExitRecord, MODEL_WAIT,
+    RELAUNCH_FENCE_TRIES, RelaunchLineError, Restart, STALE_S, Snapshot, after_exit,
+    after_host_ended, await_new, carry_on_with_tab_probe, continuation_session, exit_record,
+    line_for, look_at_exit, owed, relaunch_by_parent, restart_from, resume, resumed_prompt,
+    shell_dialect, type_relaunch_line,
 };
 use super::super::upgrade::Dialect;
 use super::*;
@@ -77,6 +78,40 @@ fn a_tab_is_held_by_a_halt_a_hand_a_person_or_an_unreadable_status() {
     );
 }
 
+/// ND1 OF THE LIVE RE-TEST OF 2026-09-26: the harness's OWN hand on a tab
+/// whose agent it restarts ([`Hand`]: `hand=lease:aterm-harness@<this
+/// pid>`) holds nothing against itself — its last looks, the relaunch line
+/// and its supervisor loops read on — while ANOTHER holder's lease, a named
+/// driver's turn, and INPUT its program has not read yet (a first prompt on
+/// its way, which a signal would drop; a shell's queued lines) hold the tab.
+/// NEGATIVE CONTROLS: another process's harness hand is someone else's, and
+/// `input=clear`/`-` holds nothing.
+#[test]
+fn the_harness_own_hand_holds_nothing_against_it_and_unread_input_holds_the_tab() {
+    let ours = STATUS.replace("hand=-", &format!("hand=lease:{}", hand_name()));
+    assert!(our_hand(&format!("lease:{}", hand_name())));
+    assert!(!held_by_status(&ours, 120), "{ours}");
+    assert!(!crate::harness::relaunch::driver_hand(&ours));
+    assert!(!crate::harness::relaunch::held_by_someone(&ours));
+    for theirs in [
+        "hand=lease:orchestrator".to_string(),
+        "hand=lease:aterm-harness@1".to_string(),
+        "hand=turn:7:manager".to_string(),
+    ] {
+        let line = STATUS.replace("hand=-", &theirs);
+        assert!(held_by_status(&line, 120), "{line}");
+        assert!(crate::harness::relaunch::driver_hand(&line), "{line}");
+    }
+    for input in ["pending", "typeahead", "stalled", "stopped"] {
+        let line = STATUS.replace("hand=-", &format!("hand=- input={input}"));
+        assert!(held_by_status(&line, 0), "{line}");
+    }
+    for input in ["clear", "-"] {
+        let line = STATUS.replace("hand=-", &format!("hand=- input={input}"));
+        assert!(!held_by_status(&line, 0), "{line}");
+    }
+}
+
 #[test]
 fn who_roster_exposes_a_unique_foreground_group_without_a_window_hop() {
     let body = "0 s-a driving=- watchers=0 turns=0 alive nonce=0123456789abcdef0123456789abcdef fgpgid=101\n\
@@ -126,21 +161,98 @@ fn codex_due_answers_do_not_scan_claude_sessions() {
         sid: "s-codex".to_string(),
         fgpgid: Some(4_000_002),
     }];
-    let check = |answer: Option<bool>| {
+    let check = |answer: Option<Due>| {
         SESSION_FILE_SCANS.with(|count| count.set(0));
         let due = due_after_codex(&opts, &tabs, answer);
         (due, SESSION_FILE_SCANS.with(std::cell::Cell::get))
     };
     assert_eq!(
-        check(Some(false)),
-        (false, 0),
+        check(Some(Due::No)),
+        (Due::No, 0),
         "current Codex is conclusive"
     );
-    assert_eq!(check(Some(true)), (true, 0), "old Codex is conclusive");
+    assert_eq!(
+        check(Some(Due::Yes)),
+        (Due::Yes, 0),
+        "old Codex is conclusive"
+    );
     assert_eq!(
         check(None),
-        (false, 1),
+        (Due::No, 1),
         "unknown or Claude foreground still reads Claude's roster"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A BUILD THAT DID NOT ANSWER DECIDES NOTHING (the 2026-09-27 review:
+/// nothing held that `due` says so — reverting its arm to a plain `No` left
+/// every test green). The tab's Claude Code runs 1.0.0, and the managed
+/// twin's `--version` timed out: the version cache ([`cached_version_with`],
+/// the product's own) holds it unanswered until its back-off, [`Targets`]
+/// carries that, and the look is [`UNREAD_VERSION`] — the host looks again
+/// on its unread ladder — never "not due". Asked again before the back-off,
+/// it says the same and probes nothing. NEGATIVE CONTROLS: once the build
+/// answers, it decides — `No` for a session on it, `Yes` for one behind it;
+/// and a record of ANOTHER tab's agent is no record of this one's
+/// ([`UNREAD_RECORD`]), whatever the cache holds.
+#[test]
+fn a_build_whose_version_timed_out_is_unread_never_not_due() {
+    let dir = scratch("due-unanswered");
+    let mut opts = drive(&dir);
+    opts.only_sid = Some(TAB.to_string());
+    let twin = dir.join("agents/claude");
+    std::fs::create_dir_all(dir.join("agents")).expect("agents");
+    std::fs::write(&twin, "#!/bin/sh\necho 1.0.0\n").expect("the twin");
+    let probes = std::cell::Cell::new(0);
+    let look = |files: &[SessionFile], group: i64, now: Instant, answer: Probed| {
+        due_among(
+            &opts,
+            files,
+            &the_tab(),
+            || {
+                Targets::read_with(Some(twin.clone()), &opts.home, |exe| {
+                    cached_version_with(exe, now, |_| {
+                        probes.set(probes.get() + 1);
+                        answer.clone()
+                    })
+                })
+            },
+            |_| Some(atpkg::caller_shell::ProcArgs::default()),
+            |_| Some(group),
+            |_| Some((10, group, group)),
+        )
+    };
+    let on_it = [record("1.0.0")];
+    let t0 = Instant::now();
+    assert_eq!(
+        look(&on_it, 101, t0, Probed::TimedOut),
+        Due::Unread(UNREAD_VERSION),
+        "a build that did not answer decides nothing"
+    );
+    assert_eq!(probes.get(), 1);
+    let before = t0 + VERSION_RETRY_FIRST - Duration::from_secs(1);
+    assert_eq!(
+        look(&on_it, 101, before, Probed::TimedOut),
+        Due::Unread(UNREAD_VERSION),
+        "before the back-off: the same"
+    );
+    assert_eq!(probes.get(), 1, "and no probe before it");
+    assert_eq!(
+        look(&on_it, 202, before, Probed::TimedOut),
+        Due::Unread(UNREAD_RECORD),
+        "another tab's agent's record is none of this tab's"
+    );
+    let answers = Probed::Version(Version::parse("1.0.0").expect("v"));
+    assert_eq!(
+        look(&on_it, 101, t0 + VERSION_RETRY_FIRST, answers.clone()),
+        Due::No,
+        "answered at the back-off, and the session is on it"
+    );
+    assert_eq!(probes.get(), 2, "asked again at the back-off");
+    assert_eq!(
+        look(&[record("0.9.0")], 101, t0 + VERSION_RETRY_FIRST, answers),
+        Due::Yes,
+        "answered, and the session is behind it"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -327,6 +439,81 @@ fn the_agents_own_keep_awake_does_not_hold_the_restart() {
     assert_eq!(gate, upgrade::Gate::Wait("background"));
 }
 
+/// THE PROCESSES THE NOTICE NAMES (2026-09-26): two background poll loops,
+/// under a Claude Code the upgrade could not move for four days, as `ps`
+/// printed them. The notice quotes the `eval` payload and drops the Bash
+/// tool's boilerplate. Their pids come from the same walk as the gate's.
+#[test]
+fn the_notice_names_what_runs_under_the_agent_by_its_command() {
+    let measured = "/bin/zsh -c source /Users//u/.claude/shell-snapshots/snapshot-zsh-1790024225604-061jsy.sh \
+        2>/dev/null || true && setopt NO_EXTENDED_GLOB NO_BARE_GLOB_QUAL 2>/dev/null || true && { \
+        \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true \
+        && eval 'D=/tmp/wf; until [ \"$(python3 -c \"\\012import json\\012print(sum(1 for l in \
+        open('\"'\"'$D/journal.jsonl'\"'\"')))\")\" -ge 6 ]; do sleep 15; done; echo \"CLIPPY_PHASE_DONE\"' \
+        < /dev/null && pwd -P >| /tmp/claude-f730-cwd";
+    let head = command_head(measured);
+    assert!(head.starts_with("D=/tmp/wf; until ["), "{head}");
+    assert!(head.contains("-ge 6 ]; do sleep 15; done"), "{head}");
+    assert!(
+        head.contains("open('$D/journal.jsonl')"),
+        "the quoting undone: {head}"
+    );
+    assert!(
+        !head.contains("shell-snapshots") && !head.contains("pwd -P"),
+        "{head}"
+    );
+    assert!(!head.contains("\\012"), "{head}");
+    // A command line that is not the Bash tool's is its own head.
+    assert_eq!(
+        command_head("/opt/bin/watcher --poll 5"),
+        "/opt/bin/watcher --poll 5"
+    );
+
+    for (etime, secs) in [
+        ("00:07", 7),
+        ("12:34", 754),
+        ("04:10:51", 15_051),
+        ("05-04:10:51", 5 * 86_400 + 15_051),
+    ] {
+        assert_eq!(parse_etime(etime), Some(secs), "{etime}");
+    }
+    assert_eq!(parse_etime("soon"), None);
+    assert_eq!(parse_etime("1:2:3:4"), None);
+
+    // The walk the gate reads, with pids: the agent's own keep-awake is not
+    // named, the loops and whatever they run under them are.
+    let t = vec![
+        (74315, 74252, "claude".to_string()),
+        (82096, 74315, "caffeinate".to_string()),
+        (63492, 74315, "zsh".to_string()),
+        (68290, 63492, "sleep".to_string()),
+        (64036, 74315, "zsh".to_string()),
+    ];
+    let mut procs = background_procs(74315, &t);
+    procs.sort_unstable();
+    assert_eq!(
+        procs,
+        vec![(63492, "zsh".to_string()), (64036, "zsh".to_string())]
+    );
+    assert_eq!(background(74315, &t).len(), 2);
+}
+
+/// THE RESTART'S LAST LOOK FAILS CLOSED (audit of 2026-09-26). A process
+/// table `ps` could not give is empty, and over an empty table the walk
+/// answers "nothing runs". That let the one irreversible act pass on no
+/// evidence. An empty table now reads as work.
+#[test]
+fn an_unreadable_process_table_is_never_read_as_nothing_running() {
+    assert_eq!(
+        background_or_unreadable(4163, &[]),
+        vec![UNREADABLE_TABLE.to_string()]
+    );
+    assert!(background_or_unreadable(4163, &[(1, 0, "launchd".to_string())]).is_empty());
+    // The live table is never empty: it holds this very process.
+    assert!(!table().is_empty());
+    assert!(!live_background(std::process::id()).contains(&UNREADABLE_TABLE.to_string()));
+}
+
 #[test]
 fn a_sweep_never_signals_its_own_ancestry() {
     let t = table();
@@ -377,11 +564,14 @@ fn host_filters_foreign_groups_before_expensive_process_reads() {
         |_| Some((10, 101, 101)),
     );
     assert_eq!(found.len(), 1);
-    assert_eq!(found[0].0.pid, 1);
-    assert_eq!(found[0].2.tab, "s-mine");
+    let (sf, _, claim) = found[0].as_ref().expect("claimed");
+    assert_eq!(sf.pid, 1);
+    assert_eq!(claim.tab, "s-mine");
     assert_eq!(args_read, [1]);
     assert_eq!(groups_read, [1, 2]);
 
+    // The tab's foreground moved between the roster and the ids: nothing
+    // owns the tab, and nothing was read to decide on — the step's wait.
     let found = host_candidates(
         &files[..1],
         &ours,
@@ -390,7 +580,13 @@ fn host_filters_foreign_groups_before_expensive_process_reads() {
         |_| Some(101),
         |_| Some((10, 101, 202)),
     );
-    assert!(found.is_empty(), "a background job does not own the tab");
+    let [Err(wait)] = found.as_slice() else {
+        panic!("a background job does not own the tab: {found:?}");
+    };
+    assert_eq!(
+        (wait.pid, wait.tab.as_str(), wait.step.as_str()),
+        (1, "s-mine", "wait:no-process")
+    );
     let found = host_candidates(
         &files[..1],
         &ours,
@@ -434,6 +630,7 @@ fn current_claude_skips_process_inspection_but_new_and_in_flight_do_not() {
     let mut targets = Targets {
         managed: Some(target("2.1.281", Source::Managed)),
         native: Some(target("2.1.280", Source::Native)),
+        unanswered: false,
     };
     let ours = [LiveTab {
         sid: "s-mine".to_string(),
@@ -463,7 +660,10 @@ fn current_claude_skips_process_inspection_but_new_and_in_flight_do_not() {
         |_| Some(101),
         |_| Some((10, 101, 101)),
     );
-    assert_eq!(newer.len(), 1, "new build keeps the ownership path");
+    assert!(
+        matches!(newer.as_slice(), [Ok(_)]),
+        "new build keeps the ownership path"
+    );
 
     targets.native = None;
     let restarting = St {
@@ -473,6 +673,60 @@ fn current_claude_skips_process_inspection_but_new_and_in_flight_do_not() {
     assert!(needs_upgrade_inspection(&file, &targets, Some(&restarting)));
     file.version = "unknown".to_string();
     assert!(needs_upgrade_inspection(&file, &targets, None));
+}
+
+/// A SESSION FILE ITS DEAD OWNER LEFT BEHIND HOLDS NOTHING: the restart it
+/// names is still the orphan pass's to carry on. Skipping on the file alone
+/// stranded it — `visit` acts on live processes only (`wait:stale-file`).
+/// Control: the same file with a LIVE owner is `visit`'s, and skipped here.
+#[test]
+fn a_dead_owners_leftover_session_file_does_not_strand_the_restart() {
+    let dir = std::env::temp_dir().join(format!("aterm-upgrade-leftover-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = Opts {
+        home: dir.join("home"),
+        state: dir.join("state"),
+        sock: None,
+        only_sid: None,
+        dry_run: true,
+        human_grace_s: 120,
+        hand_back: false,
+        background: false,
+        aterm_state: None,
+    };
+    let mut child = Command::new("true").spawn().expect("spawn");
+    let dead = child.id();
+    child.wait().expect("reap");
+    let session = "03396a15-856e-4f1b-8174-ae9a3e4b36a0";
+    let st = St {
+        phase: Phase::Exiting { at_s: now_s() },
+        pid: dead,
+        shell: std::process::id(),
+        tab: "s-b5cf2faabac5ce5127bd".to_string(),
+        to: "2.1.281".to_string(),
+        source: "native".to_string(),
+        ..St::default()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    std::fs::write(state_path(&opts, session), st.to_json()).expect("write");
+    let file = |pid: u32, start: &str| {
+        upgrade::parse_session_file(&format!(
+            r#"{{"pid":{pid},"sessionId":"{session}","cwd":"/","version":"2.1.280","status":"idle","statusUpdatedAt":1,"procStart":"{start}","kind":"interactive","entrypoint":"cli"}}"#
+        ))
+        .expect("a session file")
+    };
+    let steps = |files: &[SessionFile]| {
+        orphans(&opts, files, None)
+            .into_iter()
+            .map(|r| r.step)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(steps(&[file(dead, "gone")]), ["would-resume:exiting"]);
+    // CONTROL: this test's own live process holding the conversation.
+    let me = std::process::id();
+    let start = kernel_start(me).expect("our own start");
+    assert!(steps(&[file(me, &start)]).is_empty(), "`visit` has it");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
@@ -494,6 +748,7 @@ fn a_restart_left_between_exit_and_relaunch_is_resumed_by_the_next_sweep() {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let session = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
     // Signalled a moment ago, and the shell it ran under still there.
@@ -547,6 +802,7 @@ fn a_second_sweeper_does_nothing_while_the_first_holds_the_lock() {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let first = sweep_lock(&opts).expect("free").expect("a real run locks");
     let got = sweep(&opts);
@@ -580,6 +836,7 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let session = "03396a15-856e-4f1b-8174-ae9a3e4b369f";
     let exe = Path::new("/Users/_me/Library/Application Support/aterm/pkg/agents/claude");
@@ -637,6 +894,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         &mut st,
         planned(&launch(&["--append-system-prompt", &prompt])),
         100,
+        1,
+        None,
         &mut send,
     );
     assert_eq!(got.step, "refused:line");
@@ -665,6 +924,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         &mut st,
         planned(&launch(&["--brand-new-flag"])),
         100,
+        1,
+        None,
         &mut send,
     );
     assert_eq!(got.step, "refused:unknown-flag --brand-new-flag");
@@ -681,6 +942,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         &mut st,
         Err(NoPlan::Wait("shell-dialect")),
         100,
+        1,
+        None,
         &mut send,
     );
     assert_eq!(got.step, "wait:shell-dialect");
@@ -698,6 +961,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         &mut st,
         planned(&launch(&["--append-system-prompt", &prompt])),
         100,
+        1,
+        None,
         &mut send,
     );
     assert_eq!(got.step, "would-refuse:line");
@@ -713,6 +978,8 @@ fn a_launch_that_cannot_be_carried_is_refused_before_the_agent_is_asked_to_wind_
         &mut st,
         planned(&launch(&["--model", "opus"])),
         100,
+        1,
+        None,
         &mut send,
     );
     assert_eq!(got.step, "announced:1");
@@ -739,7 +1006,8 @@ fn a_drain_a_person_holds_past_its_bound_voids_the_answer_and_asks_again() {
     let opts = drive(&dir);
     let marker = "ATERM-UPGRADE-READY-0badf00d";
     let tail = format!(
-        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
+        r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
     );
     let mut st = St {
         phase: Phase::Announced { at_s: 100, asks: 1 },
@@ -876,6 +1144,7 @@ fn a_dropped_sweep_lock_is_free_while_a_copy_of_its_descriptor_lives() {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let holder = sweep_lock(&opts).expect("free").expect("a real run locks");
     assert_eq!(
@@ -938,6 +1207,12 @@ const TAB: &str = "s-feedfacefeedfacefeed";
 
 /// A conversation id the stand-in agents hold.
 const SESSION: &str = "0badf00d-1111-2222-3333-444455556666";
+
+/// A person's prompt: what makes the conversation a transcript below stands
+/// for one WITH A TASK (D1 of the live E2E of 2026-09-26: a record of the
+/// harness's own turns alone is restarted afresh, never announced to, and is
+/// carried on with nothing).
+const ASKED: &str = r#"{"type":"user","message":{"role":"user","content":"fix the bug"}}"#;
 
 /// The stand-in agent's argv: THIS test binary, running only [`park_when_asked`].
 const PARK: [&str; 2] = ["harness::upgrade_drive::tests::park_when_asked", "--exact"];
@@ -1054,7 +1329,10 @@ fn ready_from_tab_a_never_announces_or_terminates_tab_b() {
     std::fs::create_dir_all(&project).expect("project");
     std::fs::write(
         project.join(format!("{SESSION}.jsonl")),
-        format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{marker}"}}]}}}}"#),
+        format!(
+            r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{marker}"}}]}}}}"#
+        ),
     )
     .expect("READY transcript");
     assert!(upgrade::transcript_has_ready(
@@ -1177,7 +1455,10 @@ fn malformed_or_unreadable_sibling_vetoes_a_valid_owner() {
     std::fs::create_dir_all(&project).expect("project");
     std::fs::write(
         project.join(format!("{SESSION}.jsonl")),
-        format!(r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{marker}"}}]}}}}"#),
+        format!(
+            r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{marker}"}}]}}}}"#
+        ),
     )
     .expect("READY transcript");
     let st = St {
@@ -1261,6 +1542,7 @@ fn newer() -> Targets {
             source: Source::Managed,
         }),
         native: None,
+        unanswered: false,
     }
 }
 
@@ -1276,6 +1558,7 @@ fn drive(dir: &Path) -> Opts {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     }
 }
 
@@ -1302,7 +1585,8 @@ fn a_ready_answer_is_read_when_the_tail_window_starts_inside_a_character() {
     let path = dir.join("t.jsonl");
     let marker = "ATERM-UPGRADE-READY-0badf00d";
     let ready = format!(
-        r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
+        r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
     ) + "\n";
     // An earlier turn whose `é` straddles the first byte of a 256-byte window.
     let mut body = String::from(r#"{"type":"user","message":"é"#);
@@ -1891,6 +2175,20 @@ struct Answers {
     /// The `rekey shell=<pid>` reply (a `rekey withdraw` is answered
     /// `OK rekey withdrawn`).
     rekey: &'static str,
+    /// How long the stand-in agent answers a submitted turn: a `turn` that
+    /// settles on a quiet longer than a keystroke's (`idle=` above 1 ms)
+    /// returns only once that answer is over, as the server's does.
+    answer: Duration,
+    /// The `lease acquire …` reply; a `lease release` is answered `OK lease
+    /// released` after an acquire this granted, `OK lease none` otherwise.
+    lease: &'static str,
+    /// The `status` reply from the SECOND read after a `lease acquire` on:
+    /// what a person's keystroke, or a prompt someone sent, makes it between
+    /// a restart's first look (under the hand) and its last.
+    after_first_look: Option<&'static str>,
+    /// The `signal` reply, sending nothing (empty: the stand-in agent named
+    /// by `pid=` is sent SIGTERM, then `OK`).
+    signal: &'static str,
 }
 
 #[cfg(unix)]
@@ -1905,6 +2203,10 @@ impl Default for Answers {
             blocks: "ERR unscripted",
             line: "ERR unscripted",
             rekey: "ERR unscripted",
+            answer: Duration::ZERO,
+            lease: "ERR unscripted",
+            after_first_look: None,
+            signal: "",
         }
     }
 }
@@ -1956,6 +2258,8 @@ fn instance_for(
     std::thread::spawn(move || {
         let mut turn_replies = answers.turn.clone();
         let mut texts = 0;
+        // Status reads since a `lease acquire` (`None`: none acquired yet).
+        let mut looks: Option<usize> = None;
         for conn in listener.incoming() {
             let Ok(conn) = conn else { break };
             let Ok(mut out) = conn.try_clone() else {
@@ -1983,10 +2287,19 @@ fn instance_for(
                         }
                     }
                     "cell" => "OK %20 d0d0d0 111318 none".to_string(),
-                    "status" => std::fs::read_to_string(&status_file).map_or_else(
-                        |_| "OK schema=1 hold=0 hand=-".to_string(),
-                        |s| s.trim().to_string(),
-                    ),
+                    "status" => {
+                        let look = looks.as_mut().map(|n| {
+                            *n += 1;
+                            *n
+                        });
+                        match answers.after_first_look {
+                            Some(later) if look.is_some_and(|n| n >= 2) => later.to_string(),
+                            _ => std::fs::read_to_string(&status_file).map_or_else(
+                                |_| "OK schema=1 hold=0 hand=-".to_string(),
+                                |s| s.trim().to_string(),
+                            ),
+                        }
+                    }
                     "help" => answers.help.to_string(),
                     "blocks" => answers.blocks.to_string(),
                     "line" => answers.line.to_string(),
@@ -1994,7 +2307,26 @@ fn instance_for(
                         "OK rekey withdrawn".to_string()
                     }
                     "rekey" => answers.rekey.to_string(),
+                    "lease" if line.contains(" lease release ") => {
+                        if answers.lease.starts_with("OK lease acquired") {
+                            "OK lease released".to_string()
+                        } else {
+                            "OK lease none".to_string()
+                        }
+                    }
+                    "lease" => {
+                        looks.get_or_insert(0);
+                        answers.lease.to_string()
+                    }
                     "turn" => {
+                        let settles_on_quiet = line
+                            .split_whitespace()
+                            .find_map(|w| w.strip_prefix("idle="))
+                            .and_then(|ms| ms.parse::<u64>().ok())
+                            .is_none_or(|ms| ms > 1);
+                        if settles_on_quiet {
+                            std::thread::sleep(answers.answer);
+                        }
                         let next = turn_replies.first().copied().unwrap_or("OK status=done");
                         if turn_replies.len() > 1 {
                             turn_replies.remove(0);
@@ -2005,6 +2337,7 @@ fn instance_for(
                     // `signal term pid=<n>` as the server answers it: that
                     // process is sent SIGTERM (the stand-in has no foreground
                     // group to check it against), then `OK`.
+                    "signal" if !answers.signal.is_empty() => answers.signal.to_string(),
                     "signal" => match line
                         .split_whitespace()
                         .find_map(|w| w.strip_prefix("pid="))
@@ -2302,6 +2635,192 @@ fn relaunch_rechecks_shell_tab_after_the_session_scan() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// ND1: THE RELAUNCH LINE IS TYPED UNDER THE HARNESS'S HAND, never let go
+/// for it (the review of the first cut: it gave the hand back for the line
+/// and took it again, and a retrying orchestrator's `turn` could win either
+/// gap — into the bare shell before the line, into the booting agent after
+/// it). The hand is the server's HARD lease ([`Hand`]: `lease acquire …
+/// hard`), which refuses every other connection's writes and lets its own
+/// connection's through, its `turn` included: between the hand taken and
+/// the line typed nothing is released or re-taken — for bash's raw `send`
+/// and zsh's fenced `turn` alike. A turn refused `ERR busy …` (a hand that
+/// could not be taken, or lapsed) is a WAIT, never the refusal that fails a
+/// relaunch whose agent is already gone. NEGATIVE CONTROL: from a server
+/// that takes no hard lease (an older aterm), the hand holds nothing and is
+/// given back by nothing.
+#[cfg(unix)]
+#[test]
+fn the_relaunch_line_is_typed_under_the_hand_never_let_go() {
+    let run = |name: &str, lease: &'static str, turn: &'static str, shell: u32| {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                lease,
+                turn: vec![turn],
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            ..drive(&dir)
+        };
+        std::fs::create_dir_all(opts.home.join(".claude/sessions")).expect("empty roster");
+        let mut c = connect(&opts, TAB).expect("control connection");
+        let mut hand = Hand::take(&mut c, TAB).expect("nobody else's");
+        let typed = type_relaunch_line(
+            &opts,
+            &mut c,
+            shell,
+            TAB,
+            SESSION,
+            "claude --resume",
+            None,
+            &mut None,
+            |_, _, _| true,
+        );
+        hand.give_back(&mut c);
+        drop(c);
+        let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(dir);
+        (typed, asked)
+    };
+    let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
+    let mut bash = stand_in_shell();
+    for (name, shell, typing) in [
+        ("line-zsh", std::process::id(), " turn "),
+        ("line-bash", bash.id(), " send "),
+    ] {
+        let (typed, asked) = run(name, held, "OK status=done", shell);
+        assert_eq!(typed, Ok(()), "{name}: {asked:#?}");
+        assert!(
+            asked[0].contains(" lease acquire ") && asked[0].ends_with(" hard"),
+            "{name}: the hard hold first: {asked:#?}"
+        );
+        let line = asked
+            .iter()
+            .position(|l| l.contains(typing))
+            .unwrap_or_else(|| panic!("{name}: the line: {asked:#?}"));
+        assert!(
+            !asked[1..=line].iter().any(|l| l.contains(" lease ")),
+            "{name}: never let go for the line: {asked:#?}"
+        );
+        assert!(
+            asked.last().is_some_and(|l| l.contains(" lease release ")),
+            "{name}: given back at the end: {asked:#?}"
+        );
+    }
+    let _ = bash.kill();
+    let _ = bash.wait();
+    // A turn refused busy: a wait, not a failed relaunch.
+    let (typed, _) = run(
+        "line-busy",
+        held,
+        "ERR busy lease=orchestrator",
+        std::process::id(),
+    );
+    assert_eq!(typed, Err(RelaunchLineError::Wait("held")));
+    // NEGATIVE CONTROL: an older server, no hard lease — nothing to give back.
+    let (typed, asked) = run(
+        "line-no-hand",
+        "ERR lease acquire: unknown arg 'hard' (ttl=<ms> holder=<name>)",
+        "OK status=done",
+        std::process::id(),
+    );
+    assert_eq!(typed, Ok(()), "{asked:#?}");
+    assert!(
+        !asked.iter().any(|l| l.contains(" lease release ")),
+        "{asked:#?}"
+    );
+}
+
+/// ND1: THE HAND OUTLASTS EVERY WAIT UNDER IT (the review of the first cut:
+/// taken once, with a 60 s life, it lapsed silently under a slow `--resume` —
+/// the new process may take 90 s to register, its first idle 15 s more).
+/// Each wait under it keeps it ([`Hand::keep`]): renewed once [`HAND_RENEW`]
+/// has passed since it was last taken, and not before; a hand that holds
+/// nothing is never renewed; and the relaunch keeps it through its waits —
+/// the exit, the shell's prompt, the new process, its first idle.
+#[cfg(unix)]
+#[test]
+fn the_hand_is_kept_through_every_wait_under_it() {
+    let dir = scratch("hand-kept");
+    let (sock, asked) = instance_with(
+        &dir,
+        Answers {
+            lease: "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1",
+            ..Answers::default()
+        },
+    );
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let acquires = || {
+        asked
+            .lock()
+            .map(|a| a.iter().filter(|l| l.contains(" lease acquire ")).count())
+            .unwrap_or_default()
+    };
+    let mut hand = Hand::take(&mut c, TAB).expect("taken");
+    assert_eq!(acquires(), 1);
+    hand.keep(&mut c);
+    assert_eq!(acquires(), 1, "fresh: not renewed");
+    hand.renewed = Instant::now().checked_sub(HAND_RENEW).expect("clock");
+    hand.keep(&mut c);
+    assert_eq!(acquires(), 2, "due: renewed");
+    assert!(hand.held);
+    hand.keep(&mut c);
+    assert_eq!(acquires(), 2, "renewed just now");
+    let mut unheld = Hand {
+        tab: TAB.to_string(),
+        held: false,
+        renewed: Instant::now().checked_sub(HAND_RENEW).expect("clock"),
+    };
+    unheld.keep(&mut c);
+    assert_eq!(acquires(), 2, "a hand that holds nothing is never renewed");
+    drop(c);
+    let _ = std::fs::remove_dir_all(&dir);
+    // Every wait of the relaunch under the hand keeps it — Claude Code's and
+    // Codex's.
+    for (src, waits) in [
+        (
+            include_str!("relaunch.rs"),
+            ["wait_exit(", "let prompt_back = wait_until("],
+        ),
+        (
+            include_str!("upgrade_codex_drive.rs"),
+            [
+                "wait_until(EXIT_WAIT,",
+                "wait_until(Duration::from_secs(15), || k.shell_has_terminal",
+            ],
+        ),
+    ] {
+        let body_of = |head: &str| -> &str {
+            let at = src.find(head).unwrap_or_else(|| panic!("{head}"));
+            let body = &src[at..];
+            &body[..body.find("\n}\n").unwrap_or(body.len())]
+        };
+        let held = body_of("\nfn relaunch_held(\n");
+        for wait in waits {
+            let at = held.find(wait).unwrap_or_else(|| panic!("{wait}"));
+            assert!(held[at..].contains("hand.keep(c);"), "{wait}");
+        }
+        let awaited = body_of("\nfn await_held(\n");
+        let wait = awaited
+            .find("wait_until(Duration::from_secs(90), || {")
+            .expect("the wait for the new process");
+        let closure = &awaited[wait..];
+        let closure = &closure[..closure.find("});").expect("its end")];
+        assert!(closure.contains("hand.keep(c);"), "{closure}");
+        assert!(awaited.contains("first_idle(c, hand,"), "{awaited}");
+    }
+    let src = include_str!("relaunch.rs");
+    let first = &src[src.find("fn first_idle(").expect("first_idle")..];
+    assert!(first[..first.find("\n}\n").expect("its end")].contains("hand.keep(c);"));
+}
+
 /// THE LAST LOOK BEFORE THE RELAUNCH LINE is a `status` read at the moment
 /// it is typed, after every wait before it: a person who typed at the
 /// returned prompt within the grace, a halt and anyone's hand each hold the
@@ -2469,7 +2988,8 @@ fn every_look_at_the_job_stands_between_a_ctrl_z_and_the_act() {
     std::fs::write(
         project.join(format!("{SESSION}.jsonl")),
         format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
+            r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
         ) + "\n",
     )
     .expect("transcript");
@@ -2877,18 +3397,25 @@ fn after_a_step_the_host_parks_waits_longer_stops_or_says_it_is_broken() {
     assert_eq!(after("drain-expired:box", 0), After::NextIdle);
     assert_eq!(after("released:gave-up", 0), After::Later(LATER[0]));
     assert_eq!(after("wait:release:limited", 2), After::Later(LATER[2]));
-    // A stopped upgrade with nothing owed says `wait:failed` — its last word
-    // (an owed release reads `wait:release:<why>`, and a Codex record's stop
-    // `wait:failed:<why>`, both looked at again).
-    assert_eq!(after("wait:failed:unanswered", 0), After::Later(LATER[0]));
-    for last in [
-        "current",
-        "done",
-        "done:no-continue",
+    // A stopped round says so as it stops (`failed:<why>`, `refused:<what>`)
+    // and, resting with nothing owed, `wait:failed` (an owed release reads
+    // `wait:release:<why>`, and a Codex record's stop `wait:failed:<why>`) —
+    // NONE a last word (the owner, 2026-09-27: "you should NEVER have
+    // upgrades stalled"): a new round starts once it has rested
+    // `upgrade::RETRY_S`, so each is looked at again, up to the ten-minute
+    // look; so is the new round's `rearmed:<why>`, whose first notice the
+    // next look types.
+    for resting in [
+        "wait:failed:unanswered",
         "refused:not-a-shell-job",
         "failed:no-resume",
         "wait:failed",
+        "rearmed:unanswered",
     ] {
+        assert_eq!(after(resting, 0), After::Later(LATER[0]), "{resting}");
+        assert_eq!(after(resting, 9), After::Later(LATER[3]), "{resting}");
+    }
+    for last in ["current", "done", "done:no-continue", "wait:skipped"] {
         assert_eq!(after(last, 0), After::Finished, "{last}");
     }
     assert!(
@@ -2896,6 +3423,56 @@ fn after_a_step_the_host_parks_waits_longer_stops_or_says_it_is_broken() {
         "the first look waits out the settle a new idle point needs"
     );
     assert!(LATER.windows(2).all(|w| w[0] < w[1]), "each pause longer");
+}
+
+/// WHETHER A STEP MOVED THE SESSION (review of 2026-09-26), AND WHETHER IT
+/// TYPED A TURN (N1 of the live E2E of 2026-09-26): a step that typed into
+/// the agent or ended it leaves no point for the loop to decide again — the
+/// typed carry-on was followed by the old point decided at once, while the
+/// agent began its answer — and one that TYPED a turn (a notice, a carry-on)
+/// is awaited as the harness's own, whose answer is no work of the worker's.
+/// NEGATIVE CONTROLS: a step that ended the agent typed no turn into it; and
+/// every word that typed nothing and ended nothing — a carry-on's model read
+/// later (`done`, `done:model-unconfirmed`) and a daemon-mode Codex carried
+/// on with nothing typed (`done`) among them — leaves the point standing.
+#[test]
+fn a_step_that_typed_or_ended_the_agent_moved_the_session() {
+    for turn in ["announced:1", "announced:3", "continued"] {
+        assert!(moved(turn) && typed(turn), "{turn}");
+    }
+    for ended in [
+        "terminated",
+        "relaunched",
+        "adopted",
+        "done:fresh",
+        "exit-typed",
+        "exited",
+        "done:unconfirmed",
+    ] {
+        assert!(moved(ended) && !typed(ended), "{ended}");
+    }
+    for left in [
+        "current",
+        "done",
+        "done:model-unconfirmed",
+        "wait:model",
+        "wait:settling",
+        "wait:awaiting-ready",
+        "wait:fresh",
+        "skip:not-selected",
+        "busy:another-sweep",
+        "would-announce",
+        "would-restart:fresh",
+        "held-back:terminal:tmux",
+        "gave-up",
+        "failed:no-resume",
+        "refused:not-a-shell-job",
+        "done:taskless",
+        "done:no-continue",
+        "left-typed-cleared",
+    ] {
+        assert!(!moved(left) && !typed(left), "{left}");
+    }
 }
 
 /// THE UPGRADE OWNS A SESSION'S TURN ENDS BY ITS OWN STEP'S WORD
@@ -2993,14 +3570,21 @@ fn the_release_is_the_next_act_only_where_nothing_else_is() {
 }
 
 /// [`due`] parks a session only when it has an upgrade to take — a restart
-/// of THIS tab in flight is one — and anything unreadable is not. NEGATIVE
-/// CONTROLS: another tab's restart, and a socket that answers nothing.
+/// of THIS tab in flight is one — and says what it could not read rather
+/// than "not due" (the live re-test of 155c72a28: a look whose socket did
+/// not answer let the upgrade go for good). NEGATIVE CONTROLS: another
+/// tab's restart, and a finished one, are not `Yes` — with no socket to read
+/// the tab by, they are `Unread(no-socket)`, never `No`.
 #[test]
 fn due_is_this_tabs_upgrade_or_restart_and_nothing_unread() {
     let dir = scratch("due");
     let mut opts = drive(&dir);
     opts.only_sid = Some(TAB.to_string());
-    assert!(!due(&opts), "no socket, no roster: not due");
+    assert_eq!(
+        due(&opts),
+        Due::Unread(UNREAD_SOCKET),
+        "no socket, no roster: nothing read, nothing decided"
+    );
     let other = St {
         phase: Phase::Exiting { at_s: now_s() },
         pid: dead_pid(),
@@ -3010,13 +3594,17 @@ fn due_is_this_tabs_upgrade_or_restart_and_nothing_unread() {
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
     std::fs::write(state_path(&opts, SESSION), other.to_json()).expect("write");
-    assert!(!due(&opts), "another tab's restart is not this tab's");
+    assert_eq!(
+        due(&opts),
+        Due::Unread(UNREAD_SOCKET),
+        "another tab's restart is not this tab's"
+    );
     let ours = St {
         tab: TAB.to_string(),
         ..other
     };
     std::fs::write(state_path(&opts, SESSION), ours.to_json()).expect("write");
-    assert!(due(&opts), "this tab's restart in flight is due");
+    assert_eq!(due(&opts), Due::Yes, "this tab's restart in flight is due");
     // Done, its carry-on typed and its model still owed: due until read.
     let owed = St {
         phase: Phase::Done,
@@ -3024,13 +3612,17 @@ fn due_is_this_tabs_upgrade_or_restart_and_nothing_unread() {
         ..ours.clone()
     };
     std::fs::write(state_path(&opts, SESSION), owed.to_json()).expect("write");
-    assert!(due(&opts), "a model still to be read is due");
+    assert_eq!(due(&opts), Due::Yes, "a model still to be read is due");
     let settled = St {
         confirm_by: 0,
         ..owed
     };
     std::fs::write(state_path(&opts, SESSION), settled.to_json()).expect("write");
-    assert!(!due(&opts), "a finished restart is not");
+    assert_eq!(
+        due(&opts),
+        Due::Unread(UNREAD_SOCKET),
+        "a finished restart is not due: what decides is the roster"
+    );
     std::fs::write(state_path(&opts, SESSION), ours.to_json()).expect("write");
     assert_eq!(
         step(&Opts {
@@ -3041,6 +3633,542 @@ fn due_is_this_tabs_upgrade_or_restart_and_nothing_unread() {
         "wait:tab-not-live",
         "a tab the instance does not list is not stepped"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// One Claude Code record of the tab's agent, `pid` 101, on `version`.
+fn record(version: &str) -> SessionFile {
+    SessionFile {
+        pid: 101,
+        session_id: SESSION.to_string(),
+        cwd: "/tmp".to_string(),
+        version: version.to_string(),
+        status: "idle".to_string(),
+        status_updated_at_ms: 0,
+        proc_start: "start".to_string(),
+        kind: "interactive".to_string(),
+        entrypoint: "cli".to_string(),
+    }
+}
+
+/// The instance's one tab, [`TAB`], its foreground group 101.
+fn the_tab() -> [LiveTab; 1] {
+    [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(101),
+    }]
+}
+
+/// A TAB WHOSE AGENT'S RECORD IS NOT THERE DECIDES NOTHING ([`due_among`]):
+/// Claude Code writes `sessions/<pid>.json` a moment after it starts, so a
+/// look at a launch before then reads [`UNREAD_RECORD`] — never "not due"
+/// (N3 of the live re-test of 155c72a28: the record 1.2 s after the attach
+/// that asked, and nothing asked again before the first idle point). Once
+/// the record leads the tab it decides: behind is `Yes`, current is `No`.
+/// NEGATIVE CONTROL: a record leading ANOTHER tab is no record of this one.
+#[test]
+fn a_tab_whose_agent_has_no_record_yet_is_unread_never_not_due() {
+    let dir = scratch("due-record");
+    let mut opts = drive(&dir);
+    opts.only_sid = Some(TAB.to_string());
+    let tabs = the_tab();
+    let among = |files: &[SessionFile], group: i64| {
+        due_among(
+            &opts,
+            files,
+            &tabs,
+            || Targets::read(&opts.home),
+            |_| Some(atpkg::caller_shell::ProcArgs::default()),
+            |_| Some(group),
+            |_| Some((10, group, group)),
+        )
+    };
+    assert_eq!(
+        among(&[], 101),
+        Due::Unread(UNREAD_RECORD),
+        "not written yet"
+    );
+    assert_eq!(
+        among(&[record("1.0.0")], 202),
+        Due::Unread(UNREAD_RECORD),
+        "another tab's agent's record is none of this tab's"
+    );
+    // Newer than any build it could move to: a current session.
+    assert_eq!(
+        among(&[record("999.0.0")], 101),
+        Due::No,
+        "read, and current"
+    );
+    // A version nobody can compare takes the full path, as a behind one does.
+    assert_eq!(
+        among(&[record("unknown")], 101),
+        Due::Yes,
+        "read, and behind"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A RECORD IS READ ONLY WHERE IT DECIDES (the review of the silent-drop
+/// fix): a record whose agent leads the tab and is behind, but whose PROCESS
+/// could not be read whole — its ids (a `ps` that could not spawn: under
+/// fork pressure), its argv, or the tab's foreground caught moving between
+/// the roster and the ids — decided nothing, and the look is
+/// [`UNREAD_PROCESS`]. It was counted as read before its process was, and
+/// read "not due": a READY'd session was let go without a word. NEGATIVE
+/// CONTROLS: every read whole is `Yes`; a readable environment naming
+/// another tab is read — none of this tab's — and `No`; a current record
+/// needs no process read at all.
+#[test]
+fn a_record_whose_process_could_not_be_read_is_unread_never_not_due() {
+    let dir = scratch("due-process");
+    let mut opts = drive(&dir);
+    opts.only_sid = Some(TAB.to_string());
+    let tabs = the_tab();
+    let args = |tab: Option<&str>| {
+        Some(atpkg::caller_shell::ProcArgs {
+            env: tab
+                .map(|t| vec![format!("ATERM_PARENT_SESSION_ID={t}")])
+                .unwrap_or_default(),
+            ..atpkg::caller_shell::ProcArgs::default()
+        })
+    };
+    // A version nobody can compare takes the full path, as a behind one does.
+    let behind = [record("unknown")];
+    let look = |files: &[SessionFile],
+                read_args: Option<atpkg::caller_shell::ProcArgs>,
+                read_ids: Option<(u32, i64, i64)>| {
+        due_among(
+            &opts,
+            files,
+            &tabs,
+            || Targets::read(&opts.home),
+            |_| read_args.clone(),
+            |_| Some(101),
+            |_| read_ids,
+        )
+    };
+    let whole = Some((10, 101, 101));
+    assert_eq!(look(&behind, args(None), whole), Due::Yes, "read whole");
+    assert_eq!(
+        look(&behind, args(None), None),
+        Due::Unread(UNREAD_PROCESS),
+        "the ids unread: a `ps` that could not spawn"
+    );
+    assert_eq!(
+        look(&behind, None, whole),
+        Due::Unread(UNREAD_PROCESS),
+        "the argv unread"
+    );
+    assert_eq!(
+        look(&behind, args(None), Some((10, 101, 202))),
+        Due::Unread(UNREAD_PROCESS),
+        "the tab's foreground caught moving"
+    );
+    assert_eq!(
+        look(&behind, args(None), Some((10, 303, 101))),
+        Due::Unread(UNREAD_PROCESS),
+        "the process caught leaving its group"
+    );
+    // NEGATIVE CONTROLS.
+    assert_eq!(
+        look(&behind, args(Some("s-another")), whole),
+        Due::No,
+        "another tab's by its environment: read, and none of this tab's"
+    );
+    assert_eq!(
+        look(&behind, args(Some(TAB)), whole),
+        Due::Yes,
+        "its own tab by its environment"
+    );
+    assert_eq!(
+        look(&[record("999.0.0")], None, None),
+        Due::No,
+        "a current record decides with no process read"
+    );
+    // The step's own pass says the same wait for it, on the tab.
+    let seen = host_candidates(
+        &behind,
+        &tabs,
+        |_, _| true,
+        |_| args(None),
+        |_| Some(101),
+        |_| None,
+    );
+    let [Err(wait)] = seen.as_slice() else {
+        panic!("{seen:?}");
+    };
+    assert_eq!(
+        (wait.tab.as_str(), wait.session.as_str(), wait.step.as_str()),
+        (TAB, SESSION, "wait:no-process")
+    );
+    assert_eq!(
+        after(&wait.step, 0),
+        After::Later(LATER[0]),
+        "looked at again"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A LAUNCH'S RECORD IS WAITED ON FOR ITS LAUNCH, NOT FOR GOOD ([`no_record`],
+/// the review of the silent-drop fix): no record of the tab's agent is a wait
+/// ([`UNREAD_RECORD`]) while the agent — the tab's foreground group's leader —
+/// is younger than [`RECORD_WINDOW_S`], and nothing to take once it is older:
+/// a Claude Code that keeps its records elsewhere (`CLAUDE_CONFIG_DIR`), or
+/// whose session is no interactive CLI one, never writes one this look can
+/// find, and read as a wait for good it was looked at again at every turn end,
+/// for good. A leader whose start cannot be read is a process not read while
+/// it lives, and nothing once it is gone; a tab the instance no longer has is
+/// nothing. And a machine with no `.claude/sessions` at all holds no records —
+/// the same window decides — while one whose records cannot be read whole is
+/// unread.
+#[test]
+fn a_launch_is_waited_on_for_its_record_only_within_its_window() {
+    let tabs = the_tab();
+    let now = 1_000_000;
+    let at = |age: u64| move |pid: u32| (pid == 101).then_some(now - age);
+    let lives = |_| true;
+    assert_eq!(
+        no_record(&tabs, TAB, at(1), lives, now),
+        Due::Unread(UNREAD_RECORD),
+        "a launch a second old"
+    );
+    assert_eq!(
+        no_record(&tabs, TAB, at(RECORD_WINDOW_S - 1), lives, now),
+        Due::Unread(UNREAD_RECORD)
+    );
+    assert_eq!(
+        no_record(&tabs, TAB, at(RECORD_WINDOW_S), lives, now),
+        Due::No,
+        "past its launch: no record will come"
+    );
+    assert_eq!(
+        no_record(&tabs, TAB, |_| None, lives, now),
+        Due::Unread(UNREAD_PROCESS),
+        "a live leader whose start could not be read"
+    );
+    assert_eq!(
+        no_record(&tabs, TAB, |_| None, |_| false, now),
+        Due::No,
+        "a leader gone from its group: no launch to wait on"
+    );
+    let unknown = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: None,
+    }];
+    assert_eq!(
+        no_record(&unknown, TAB, at(1), lives, now),
+        Due::Unread(UNREAD_PROCESS),
+        "a foreground group the kernel did not name"
+    );
+    assert_eq!(
+        no_record(&[], TAB, at(1), lives, now),
+        Due::No,
+        "a tab gone"
+    );
+    // The records themselves.
+    let dir = scratch("records");
+    assert_eq!(claude_records(&dir), Some(Vec::new()), "none kept here");
+    std::fs::create_dir_all(dir.join(".claude/sessions")).expect("sessions");
+    std::fs::write(dir.join(".claude/sessions/101.json"), "{\"pid\": 1").expect("half");
+    assert_eq!(claude_records(&dir), None, "caught half-written: unread");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Tier-1 of `HarnessUpgradeLook`, ITS CLASSIFIER HALF (the review of the
+/// silent-drop fix: the host's bind — aterm-gui's
+/// `the_real_look_conforms_to_the_upgrade_look_model` — fakes `due` from the
+/// model's `readable` bit, so it binds the host's reaction to a verdict, not
+/// the reads the bit stands for). Here the real [`due_among`] and
+/// [`no_record`] are driven over EVERY combination of what a look reads of
+/// one tab — its agent's record there or not, behind or current, its group,
+/// its ids and its argv each read or not, the foreground caught moving, its
+/// environment naming no tab, its own or another, the agent a second old or
+/// past [`RECORD_WINDOW_S`] — and each verdict is taken as the model's
+/// action (`Yes` is `Look`, `No` is `NotDue`, `Unread` is `Unread`) at the
+/// state the combination projects to, a look owed: `due` an upgrade the step
+/// could take (where nothing says, the worst case: one it could), `readable`
+/// every read the verdict needed answered. The model must enable each.
+/// NEGATIVE CONTROL: the classifier of 8538c65b5 — the record counted as read
+/// before its process was — answers `No` where a process read failed:
+/// `NotDue` where the model forbids it (`NeverDropped`'s cause).
+#[test]
+fn the_real_classifier_conforms_to_the_upgrade_look_model() {
+    let model = aterm_spec::derive::harness_upgrade_look_model();
+    let dir = scratch("look-bind");
+    let mut opts = drive(&dir);
+    opts.only_sid = Some(TAB.to_string());
+    let tabs = the_tab();
+    let now = 1_000_000;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Ids {
+        Whole,
+        Unread,
+        Moved,
+    }
+    let at = |due: bool, readable: bool| {
+        let mut state = model.init_state();
+        state.insert("due", i64::from(due));
+        state.insert("readable", i64::from(readable));
+        state.insert("looks", 1);
+        state.insert("done", 0);
+        state
+    };
+    let action = |due: Due| match due {
+        Due::Yes => "Look",
+        Due::No => "NotDue",
+        Due::Unread(_) => "Unread",
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut looks = 0;
+    for present in [false, true] {
+        for behind in [false, true] {
+            for group in [false, true] {
+                for ids in [Ids::Whole, Ids::Unread, Ids::Moved] {
+                    for argv in [false, true] {
+                        for env in [None, Some(TAB), Some("s-another")] {
+                            for old in [false, true] {
+                                let files = if present {
+                                    vec![record(if behind { "unknown" } else { "999.0.0" })]
+                                } else {
+                                    Vec::new()
+                                };
+                                let args = argv.then(|| atpkg::caller_shell::ProcArgs {
+                                    env: env
+                                        .map(|t| vec![format!("ATERM_PARENT_SESSION_ID={t}")])
+                                        .unwrap_or_default(),
+                                    ..atpkg::caller_shell::ProcArgs::default()
+                                });
+                                let verdict = match due_among(
+                                    &opts,
+                                    &files,
+                                    &tabs,
+                                    || Targets::read(&opts.home),
+                                    |_| args.clone(),
+                                    |_| group.then_some(101),
+                                    |_| match ids {
+                                        Ids::Whole => Some((10, 101, 101)),
+                                        Ids::Unread => None,
+                                        Ids::Moved => Some((10, 101, 202)),
+                                    },
+                                ) {
+                                    Due::Unread(UNREAD_RECORD) => no_record(
+                                        &tabs,
+                                        TAB,
+                                        |_| Some(now - if old { RECORD_WINDOW_S } else { 1 }),
+                                        |_| true,
+                                        now,
+                                    ),
+                                    due => due,
+                                };
+                                // The projection: what the look could read.
+                                let leads = present && group;
+                                let process = ids == Ids::Whole && argv;
+                                let (due, readable) = if !leads {
+                                    // No record of the tab's agent: final
+                                    // past its launch, unknown before.
+                                    (!old, old)
+                                } else if !behind {
+                                    (false, true)
+                                } else if process && env == Some("s-another") {
+                                    // Read whole: another tab's agent.
+                                    (false, true)
+                                } else {
+                                    (true, process)
+                                };
+                                let name = action(verdict);
+                                assert!(
+                                    model.action_enabled(name, &at(due, readable)),
+                                    "{name} at due={due} readable={readable}: present={present} \
+                                     behind={behind} group={group} ids={ids:?} argv={argv} \
+                                     env={env:?} old={old} -> {verdict:?}"
+                                );
+                                seen.insert(name);
+                                looks += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(looks, 288);
+    assert_eq!(
+        seen.into_iter().collect::<Vec<_>>(),
+        ["Look", "NotDue", "Unread"],
+        "every verdict reached"
+    );
+    // NEGATIVE CONTROL: 8538c65b5's count — a record read once its group
+    // led the tab, before its process was — made a behind record whose ids
+    // did not read `No`.
+    let counted_early = |process: bool| if process { Due::Yes } else { Due::No };
+    assert_eq!(
+        due_among(
+            &opts,
+            &[record("unknown")],
+            &tabs,
+            || Targets::read(&opts.home),
+            |_| Some(atpkg::caller_shell::ProcArgs::default()),
+            |_| Some(101),
+            |_| None,
+        ),
+        Due::Unread(UNREAD_PROCESS),
+        "the real classifier"
+    );
+    assert!(!model.action_enabled(action(counted_early(false)), &at(true, false)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// N3 OF THE LIVE RE-TEST OF 2026-09-26: A SESSION IS BEHIND FROM ITS
+/// WORKER'S ATTACH ([`note_behind`]). Its state is minted `Pending` there —
+/// the target, the tab, its age from now — and the first step, at the first
+/// idle point after a busy first turn, reuses it and keeps that age (the
+/// re-test's column read `-` for 2m36s, and "behind" counted from the step).
+/// NEGATIVE CONTROLS: a state already there is left as it is, and a session
+/// on the newest build gets none.
+#[test]
+fn a_session_behind_is_minted_pending_at_attach_and_its_step_keeps_the_age() {
+    let dir = scratch("behind");
+    let opts = drive(&dir);
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    assert!(mint_behind(&opts, &sf, TAB, &newer(), false, now_s()));
+    let st = load(&opts, SESSION).expect("minted");
+    assert_eq!(
+        (st.phase.clone(), st.to.as_str(), st.tab.as_str()),
+        (Phase::Pending, "9.9.9", TAB)
+    );
+    assert!(now_s().saturating_sub(st.behind_since()) <= 1, "{st:?}");
+    assert!(
+        !mint_behind(&opts, &sf, TAB, &newer(), false, now_s()),
+        "left as it is"
+    );
+    // The first step, later: the same upgrade, its age the attach's.
+    let attached = St {
+        pending_since: now_s() - 150,
+        ..st
+    };
+    save(&opts, SESSION, &attached);
+    let running = Version::parse("1.0.0").expect("version");
+    let target = newer().managed.expect("target");
+    let stepped = St::for_target(load(&opts, SESSION), &running, &target, None, now_s());
+    assert_eq!(stepped.pending_since, attached.pending_since);
+    // NEGATIVE CONTROL: nothing newer to move to.
+    let current = Targets {
+        managed: Some(Candidate {
+            version: running.clone(),
+            ..target
+        }),
+        native: None,
+        unanswered: false,
+    };
+    let _ = std::fs::remove_file(state_path(&opts, SESSION));
+    assert!(!mint_behind(&opts, &sf, TAB, &current, false, now_s()));
+    assert!(load(&opts, SESSION).is_none());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// N3 AS THE RE-TEST OF 155c72a28 FOUND IT: A FRESH LAUNCH IS BEHIND FROM
+/// ITS WORKER'S ATTACH, though the note can only be made once Claude Code has
+/// written its record (1.2 s later there). The host asks again until it can
+/// be read, with the second it first saw the session: the state is minted
+/// with its age from THEN ([`mint_behind`]'s `since`), not from the ask that
+/// finally read it. And a look that cannot read the session notes nothing
+/// and says why ([`Behind::Unread`]), never "nothing to note". NEGATIVE
+/// CONTROL: a `since` in the future never makes a session younger than now.
+#[test]
+fn a_launch_noted_once_its_record_is_there_is_behind_from_the_attach() {
+    let dir = scratch("behind-since");
+    let mut opts = drive(&dir);
+    opts.only_sid = Some(TAB.to_string());
+    assert_eq!(
+        note_behind(&opts, now_s()),
+        Behind::Unread(UNREAD_SOCKET),
+        "no socket: nothing read, nothing noted"
+    );
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    let attached = now_s() - 90;
+    assert!(mint_behind(&opts, &sf, TAB, &newer(), false, attached));
+    let st = load(&opts, SESSION).expect("minted");
+    assert_eq!(
+        (st.phase.clone(), st.pending_since),
+        (Phase::Pending, attached),
+        "behind from the attach"
+    );
+    // The first step, later, keeps it.
+    let running = Version::parse("1.0.0").expect("version");
+    let target = newer().managed.expect("target");
+    let stepped = St::for_target(load(&opts, SESSION), &running, &target, None, now_s());
+    assert_eq!(stepped.pending_since, attached);
+    // NEGATIVE CONTROL.
+    let _ = std::fs::remove_file(state_path(&opts, SESSION));
+    assert!(mint_behind(&opts, &sf, TAB, &newer(), false, now_s() + 600));
+    let st = load(&opts, SESSION).expect("minted");
+    assert!(st.pending_since <= now_s(), "{st:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// N3, A SESSION UPGRADED BEFORE (the review of the N3 fix): the state an
+/// EARLIER upgrade left — done, or failed on another build — no longer
+/// says where the session stands once a newer build lands: it is minted
+/// behind anew ([`behind_anew`]), its age from now, as the step would mint
+/// it — not left to the first step, whose `for_target` started the age at
+/// the step. NEGATIVE CONTROLS: a state still in flight, a carry-on whose
+/// model is still waited for, a failure on this very build (final for it),
+/// and a pending one (the step's, its age kept) are left as they are.
+#[test]
+fn a_session_upgraded_before_is_behind_anew_when_a_newer_build_lands() {
+    let dir = scratch("behind-anew");
+    let opts = drive(&dir);
+    let sf = register(&opts.home, std::process::id(), SESSION);
+    let earlier = |phase: Phase, to: &str| St {
+        phase,
+        from: "0.9.0".to_string(),
+        to: to.to_string(),
+        tab: TAB.to_string(),
+        pending_since: now_s() - 3_600,
+        done_at: now_s() - 1_800,
+        ..St::default()
+    };
+    for prior in [
+        earlier(Phase::Done, "1.0.0"),
+        earlier(Phase::Failed("no-resume".to_string()), "1.0.0"),
+    ] {
+        save(&opts, SESSION, &prior);
+        assert!(
+            mint_behind(&opts, &sf, TAB, &newer(), false, now_s()),
+            "{prior:?}"
+        );
+        let st = load(&opts, SESSION).expect("minted");
+        assert_eq!(
+            (st.phase.clone(), st.to.as_str()),
+            (Phase::Pending, "9.9.9")
+        );
+        assert!(now_s().saturating_sub(st.behind_since()) <= 1, "{st:?}");
+    }
+    for prior in [
+        earlier(Phase::Exiting { at_s: now_s() }, "9.9.9"),
+        St {
+            confirm_by: now_s() + 60,
+            ..earlier(Phase::Done, "1.0.0")
+        },
+        earlier(Phase::Failed("no-resume".to_string()), "9.9.9"),
+        earlier(Phase::Pending, "9.9.9"),
+    ] {
+        save(&opts, SESSION, &prior);
+        assert!(
+            !mint_behind(&opts, &sf, TAB, &newer(), false, now_s()),
+            "{prior:?}"
+        );
+        let st = load(&opts, SESSION).expect("kept");
+        assert_eq!(
+            (&st.phase, &st.to, st.pending_since, st.confirm_by),
+            (
+                &prior.phase,
+                &prior.to,
+                prior.pending_since,
+                prior.confirm_by
+            )
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -3380,6 +4508,52 @@ fn a_crash_read_at_its_exit_is_relaunched_whatever_removes_its_record_later() {
         ..a.snap.clone()
     };
     assert_eq!(look_at_exit(&a.opts.home, &reused).record, None);
+}
+
+/// THE AGENT OF A TAB ATERM'S OWN CRASH TOOK (2026-09-27): aterm ended while
+/// it ran, its shell's hangup reached it, and it removed its own record as
+/// it went — which reads as a graceful exit, someone's decision. It was
+/// nobody's: the next launch reopened its tab, and `after_host_ended`
+/// relaunches it there on its conversation. A relaunch the crashed run had
+/// in flight for its OLD tab (that tab is gone) is closed, not waited on.
+/// NEGATIVE CONTROLS: the same removed record through `after_exit` (the
+/// agent's own exit) is left as graceful; and the continuation says why.
+#[test]
+fn an_agent_whose_host_ended_is_relaunched_in_its_reopened_tab() {
+    let a = DeadAgent::new("host-ended");
+    assert_eq!(a.attempt(&ExitRecord::Removed), "ended:graceful-exit");
+    let r = after_host_ended(&a.opts, &a.snap, true);
+    assert_eq!(r.step, "would-relaunch");
+    assert_eq!(r.session, SESSION);
+    // The crashed run's own relaunch, in flight for a tab that is gone.
+    let old = St {
+        tab: "s-0000000000000000dead".to_string(),
+        pid: a.snap.pid,
+        phase: super::super::upgrade::Phase::Exiting { at_s: now_s() },
+        ..St::default()
+    };
+    save(
+        &Opts {
+            dry_run: false,
+            ..a.opts.clone()
+        },
+        SESSION,
+        &old,
+    );
+    assert_eq!(
+        after_exit(&a.opts, &a.snap, &ExitRecord::Removed, true, true).step,
+        "wait:conversation-in-other-tab",
+        "a relaunch on exit waits for the tab its record names"
+    );
+    assert_eq!(
+        after_host_ended(&a.opts, &a.snap, true).step,
+        "would-relaunch"
+    );
+    assert!(
+        resumed_prompt("2.1.283", CAUSE_HOST).contains("aterm ended while this session ran"),
+        "{}",
+        resumed_prompt("2.1.283", CAUSE_HOST)
+    );
 }
 
 /// Tier-1 of `HarnessExitRecord` (aterm-spec): EVERY path of the model, from
@@ -3957,22 +5131,28 @@ fn carried_on(name: &str, before: &[String], after: &[String], wait: Duration) -
     let rig = Rig::new(name, before);
     rig.append(after);
     let mut st = rig.st.clone();
-    let report = rig.carry_on_from(&mut st, wait);
+    // The step that types says only that it typed; the model its answer
+    // names is the next step's to read ([`confirmations`]).
+    let typed = rig.carry_on_from(&mut st, wait);
+    assert_eq!(typed.step, "continued", "{typed:?}");
+    let mut said = confirmations(&rig.opts);
+    assert_eq!(said.len(), 1, "{said:?}");
+    let report = said.remove(0);
     let detail = rig.details(&report.step);
     assert_eq!(detail.len(), 1, "the outcome is recorded once: {detail:?}");
     Carried {
         typed: rig.typed(),
         report,
         detail: detail[0].clone(),
-        st,
+        st: load(&rig.opts, SESSION).expect("state"),
     }
 }
 
 /// THE MODEL, BEFORE AND AFTER: the continuation names the model the agent's
 /// READY answer ran, and the resumed session's first answer — past the
 /// restart's mark, Claude's own `<synthetic>` row skipped (measured just after
-/// a 2026-09-23 restart) — is the model after. A change is words only: the
-/// step is `done`.
+/// a 2026-09-23 restart) — is the model after, read by the step after the one
+/// that typed the continuation. A change is words only: the step is `done`.
 #[cfg(unix)]
 #[test]
 fn a_restart_says_the_model_before_and_confirms_the_one_after() {
@@ -4079,12 +5259,16 @@ fn a_resumed_session_that_has_not_answered_is_unconfirmed() {
 }
 
 /// A restart an older aterm began took no mark: nothing past it can be told to
-/// be the resumed session's, so the model is unconfirmed at once — never read
-/// from the start of the conversation, and never left pending.
+/// be the resumed session's, so the model is unconfirmed at the first read
+/// after the continuation — never read from the start of the conversation,
+/// and never left pending past it.
 #[cfg(unix)]
 #[test]
 fn a_restart_without_a_mark_is_unconfirmed_at_once() {
-    let before = [turn_by("claude-opus-5-5", "ATERM-UPGRADE-READY-0badf00d")];
+    let before = [
+        ASKED.to_string(),
+        turn_by("claude-opus-5-5", "ATERM-UPGRADE-READY-0badf00d"),
+    ];
     let rig = Rig::new("model-no-mark", &before);
     rig.append(&[turn_by("claude-opus-5-5", "Resumed.")]);
     let mut st = St {
@@ -4092,8 +5276,13 @@ fn a_restart_without_a_mark_is_unconfirmed_at_once() {
         ..rig.st.clone()
     };
     let r = rig.carry_on_from(&mut st, MODEL_WAIT);
-    assert_eq!(r.step, "done:model-unconfirmed");
-    assert!(!st.confirming());
+    assert_eq!(r.step, "continued");
+    let said = confirmations(&rig.opts);
+    assert_eq!(
+        said.iter().map(|r| r.step.as_str()).collect::<Vec<_>>(),
+        ["done:model-unconfirmed"]
+    );
+    assert!(!load(&rig.opts, SESSION).expect("state").confirming());
     assert_eq!(rig.typed().len(), 1);
 }
 
@@ -4129,6 +5318,7 @@ fn a_restart_records_the_model_its_ready_answer_ran_and_where_that_read_ended() 
     std::fs::create_dir_all(&project).expect("project");
     let path = project.join(format!("{SESSION}.jsonl"));
     let body = [
+        ASKED.to_string(),
         turn_by("claude-fable-5-1", "Earlier."),
         turn_by("claude-opus-5-5", &format!("Saved.\\n{marker}")),
         r#"{"type":"assistant","message":{"model":"<synthetic>","content":[{"type":"text","text":"No response requested."}]}}"#.to_string(),
@@ -4340,7 +5530,10 @@ fn a_kept_model_flag_is_the_reason_a_launch_with_one_changed_model() {
         ..rig.st.clone()
     };
     let r = rig.carry_on_from(&mut st, MODEL_WAIT);
-    assert_eq!(r.step, "done", "{r:?}");
+    assert_eq!(r.step, "continued", "{r:?}");
+    let said = confirmations(&rig.opts);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].step, "done", "{said:?}");
     assert_eq!(
         rig.details("done"),
         [
@@ -4397,9 +5590,9 @@ fn a_new_upgrade_waits_for_the_last_restarts_model() {
 /// because it steps with [`ModelCtx::none`] and so never carries a model.
 ///
 /// A WARM conversation (answered moments ago) on `claude-opus-5`, a newer build
-/// installed, and `claude-opus-5-5` the list's target: THE MODEL LADDER sends
-/// the model along with the build restart (`build-restart`), so `model_to` is
-/// non-empty on every pass. The agent is a launcher script's child, which the
+/// installed, and `claude-opus-5-5` the newest Opus on offer: THE MODEL LADDER
+/// sends the model along with the build restart (`build-restart`), so
+/// `model_to` is non-empty on every pass. The agent is a launcher script's child, which the
 /// upgrade must refuse — once. Before the fix the reuse guard compared the
 /// Failed state's empty `model_list` with that non-empty `model_to`, re-minted
 /// a fresh state each pass, and said the same refusal (and ledgered it) every
@@ -4429,7 +5622,7 @@ fn a_refusal_with_a_model_due_is_said_once_not_every_pass() {
     let mctx = ModelCtx {
         list: Priority::seed(0),
         baked: None,
-        target: Some("claude-opus-5-5".to_string()),
+        offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
     };
     // Precondition, so the pass below is about THIS path: the move is due,
@@ -4503,7 +5696,7 @@ fn a_due_model_rides_a_restart_made_for_another_reason() {
     let due = ModelCtx {
         list: Priority::seed(0),
         baked: None,
-        target: Some("claude-opus-5-5".to_string()),
+        offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
     };
     assert_eq!(
@@ -4541,7 +5734,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
     let mctx = ModelCtx {
         list: Priority::seed(0),
         baked: None,
-        target: Some("claude-opus-5-5".to_string()),
+        offered: vec!["claude-opus-5-5".to_string()],
         default_model: None,
     };
     std::fs::write(&path, &answered).expect("transcript");
@@ -4591,7 +5784,7 @@ fn the_due_clock_survives_an_unknown_read_and_clears_when_nothing_is_due() {
 
     // Nothing can run and nothing is pending: THAT clears it.
     let none = ModelCtx {
-        target: None,
+        offered: Vec::new(),
         ..mctx
     };
     let _ = model_read(&opts, &sf, None, &none);
@@ -4941,7 +6134,9 @@ fn the_notice_is_fenced_on_the_generation_it_was_judged_on() {
     let typed = h.typed();
     assert_eq!(typed.len(), 1);
     assert!(
-        typed[0].contains(" turn if-gen=4.77 yield=0.2 idle=1500 timeout=30000 [aterm harness]"),
+        typed[0].contains(&format!(
+            " turn if-gen=4.77 yield=0.2 {TURN_WAIT} [aterm harness]"
+        )),
         "{typed:?}"
     );
     drop(h);
@@ -5094,6 +6289,17 @@ fn a_version_probe_is_bounded_whole() {
     let ours = |l: &str| l.contains("sleep 98765") || l.contains("sleep 12.98765");
     let answer = script("answer", "echo '2.1.282 (Claude Code)'");
     let silent = script("silent", "exit 3");
+    // The FIRST exec of a script this test process just wrote can take
+    // seconds on macOS before its first instruction runs (measured 2026-09-26
+    // on the owner's M5 Max: 6.6 s for `answer`'s first probe, 5.8 ms for the
+    // next exec — the system's check of a new file from a new binary), which
+    // pushed `answer` past its 10 s bound under load. That is not the probe's
+    // time: run the two scripts that end once, unbounded, so the bounded
+    // probes below time the probe. (`hang` and `lingers` are expected to
+    // time out anyway.)
+    for warm in [&answer, &silent] {
+        let _ = std::process::Command::new(warm).output();
+    }
     for (name, exe) in [("hang", &hang), ("lingers", &lingers)] {
         let started = Instant::now();
         assert_eq!(
@@ -5143,8 +6349,9 @@ fn a_version_probe_is_bounded_whole() {
 /// one — is remembered while the file is unchanged, but a TIMEOUT is not a
 /// verdict on the build (the 2026-09-24 review: one slow probe on a loaded
 /// machine and that build was never probed again, so never upgraded to). It
-/// is asked again on a back-off that doubles, and a changed file is asked at
-/// once. Driven on an injected clock.
+/// is asked again on a back-off that doubles — unanswered until then, which
+/// a look reads as nothing decided ([`UNREAD_VERSION`]) — and a changed file
+/// is asked at once. Driven on an injected clock.
 #[test]
 fn a_timed_out_version_probe_is_retried_on_a_back_off() {
     let dir = scratch("version-cache");
@@ -5156,20 +6363,24 @@ fn a_timed_out_version_probe_is_retried_on_a_back_off() {
         probes.set(probes.get() + 1);
         Probed::TimedOut
     };
-    assert_eq!(cached_version_with(&slow, t0, timed_out), None);
-    assert_eq!(probes.get(), 1);
     let first = t0 + VERSION_RETRY_FIRST;
+    assert_eq!(cached_version_with(&slow, t0, timed_out), Asked::Unanswered);
+    assert_eq!(probes.get(), 1);
     assert_eq!(
         cached_version_with(&slow, first - Duration::from_secs(1), timed_out),
-        None
+        Asked::Unanswered,
+        "unanswered still"
     );
     assert_eq!(probes.get(), 1, "not before the back-off");
-    assert_eq!(cached_version_with(&slow, first, timed_out), None);
-    assert_eq!(probes.get(), 2, "asked again");
     let second = first + 2 * VERSION_RETRY_FIRST;
     assert_eq!(
+        cached_version_with(&slow, first, timed_out),
+        Asked::Unanswered
+    );
+    assert_eq!(probes.get(), 2, "asked again");
+    assert_eq!(
         cached_version_with(&slow, second - Duration::from_secs(1), timed_out),
-        None
+        Asked::Unanswered
     );
     assert_eq!(probes.get(), 2, "the back-off doubled");
     // Answered at last: remembered.
@@ -5178,10 +6389,13 @@ fn a_timed_out_version_probe_is_retried_on_a_back_off() {
         probes.set(probes.get() + 1);
         Probed::Version(Version::parse("2.1.282").expect("v"))
     };
-    assert_eq!(cached_version_with(&slow, second, answers), Some(v.clone()));
+    assert_eq!(
+        cached_version_with(&slow, second, answers),
+        Asked::Answered(Some(v.clone()))
+    );
     assert_eq!(
         cached_version_with(&slow, second + VERSION_RETRY_MAX, answers),
-        Some(v)
+        Asked::Answered(Some(v))
     );
     assert_eq!(probes.get(), 3, "an answer is not asked again");
     // NEGATIVE CONTROL: a clean failure is remembered for the file as it is.
@@ -5191,16 +6405,22 @@ fn a_timed_out_version_probe_is_retried_on_a_back_off() {
         probes.set(probes.get() + 1);
         Probed::NoVersion
     };
-    assert_eq!(cached_version_with(&bare, t0, fails), None);
+    assert_eq!(cached_version_with(&bare, t0, fails), Asked::Answered(None));
     assert_eq!(
         cached_version_with(&bare, t0 + VERSION_RETRY_MAX, fails),
-        None
+        Asked::Answered(None)
     );
     assert_eq!(probes.get(), 4, "a clean failure is not asked again");
     // ... until the file changes.
     std::fs::write(&bare, "#!/bin/sh\necho 2.1.283\n").expect("file");
     let _ = cached_version_with(&bare, t0, fails);
     assert_eq!(probes.get(), 5, "a changed file is asked at once");
+    // No file: nothing to ask, and nothing to ask again.
+    assert_eq!(
+        cached_version_with(&dir.join("absent"), t0, fails),
+        Asked::Answered(None)
+    );
+    assert_eq!(probes.get(), 5);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -5261,7 +6481,8 @@ fn a_draft_begun_before_the_signal_vetoes_it() {
         std::fs::write(
             project.join(format!("{SESSION}.jsonl")),
             format!(
-                r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
+                r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"Saved.\n{marker}"}}]}}}}"#
             ) + "\n",
         )
         .expect("transcript");
@@ -5331,7 +6552,8 @@ fn transcript_says(h: &Parked, text: &str) {
     std::fs::write(
         project.join(format!("{SESSION}.jsonl")),
         format!(
-            r#"{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
+            r#"{ASKED}
+{{"type":"assistant","message":{{"content":[{{"type":"text","text":"{text}"}}]}}}}"#
         ) + "\n",
     )
     .expect("transcript");
@@ -5678,7 +6900,11 @@ fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
         let body = &src[at..];
         &body[..body.find("\n}\n").unwrap_or(body.len())]
     };
-    let relaunch = body_of("\npub(super) fn relaunch(\n");
+    assert!(
+        body_of("\npub(super) fn relaunch(\n")
+            .contains("relaunch_held(opts, r, st, c, &mut hand, session, k)")
+    );
+    let relaunch = body_of("\nfn relaunch_held(\n");
     let read = relaunch
         .find("let dialect = shell_dialect(shell, &table());")
         .expect("the dialect read off the live shell");
@@ -5686,7 +6912,9 @@ fn a_relaunch_typed_at_bash_takes_the_key_its_live_shell_names() {
         .find("type_relaunch_line(")
         .expect("the line typed");
     assert!(read < typed && relaunch[typed..].contains("\n        dialect,\n"));
-    for caller in ["\npub(super) fn restart_from(\n", "\npub fn after_exit(\n"] {
+    // A relaunch on exit — the agent's own, or its host's — is typed in
+    // `after_exit_as`, the one body both of those wrap.
+    for caller in ["\npub(super) fn restart_from(\n", "\nfn after_exit_as(\n"] {
         assert!(
             body_of(caller).contains("relaunch(opts, r, &mut st, &mut c, &session, &Live)"),
             "{caller}"
@@ -6994,12 +8222,169 @@ fn a_listed_model_replaces_every_launch_model_spelling() {
     );
 }
 
+/// THE RELAUNCH ARGV, END TO END THROUGH THE RULE: a launch's argv, the model
+/// the conversation runs and what the build offers, made into the line the
+/// relaunch types by the same three calls the upgrade, the relaunch on exit
+/// and the restart in place make — [`upgrade::launch_model`],
+/// [`models::model_due`] (over the seeded list), and [`line_for`] (whose
+/// `with_model` puts the model in place of the launch's own). The first row
+/// is the 2026-09-25 incident: no `--model`, the transcript on Opus 5, the
+/// build's newest Opus 5.5 — the line this rule types carries `--model
+/// claude-opus-5-5`, where the line typed that day carried none and the
+/// session came back on Opus 5.
+#[test]
+fn the_relaunch_line_moves_the_model_within_its_family_first_and_keeps_the_rest() {
+    const ID: &str = "446a0b3c-1979-414f-ae20-e06e26a2ef44";
+    let offered: Vec<String> = [
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-opus-5",
+    ]
+    .map(String::from)
+    .to_vec();
+    let relaunch = |argv: &[&str], live: &str, offered: &[String]| -> String {
+        let argv: Vec<String> = argv.iter().map(|w| (*w).to_string()).collect();
+        let launch = upgrade::launch_model(&argv);
+        let live = models::LiveModel {
+            id: live.to_string(),
+            by_command: false,
+        };
+        let asked = match models::model_due(
+            &Priority::seed(0),
+            Some(&live),
+            offered,
+            launch.as_deref(),
+            None,
+            &ModelRecord::default(),
+        ) {
+            ModelVerdict::Due { to, .. } => Some(to),
+            ModelVerdict::Keep(_) => None,
+        };
+        line_for(
+            Dialect::Bash,
+            None,
+            None,
+            std::path::Path::new("/x/claude"),
+            &argv,
+            Some(ID),
+            asked.as_deref(),
+            None,
+        )
+        .unwrap_or_else(|_| panic!("a line for {argv:?}"))
+    };
+    let line = |words: &[&str]| {
+        std::iter::once("/x/claude")
+            .chain(words.iter().copied())
+            .chain(["--resume", ID])
+            .map(|w| format!(" '{w}'"))
+            .collect::<String>()
+    };
+    let rows: [(&[&str], &str, &[&str]); 10] = [
+        // The incident: nothing named, the newest of the family asked for.
+        (
+            &["claude", "--dangerously-skip-permissions"],
+            "claude-opus-5",
+            &[
+                "--dangerously-skip-permissions",
+                "--model",
+                "claude-opus-5-5",
+            ],
+        ),
+        // An exact id the launch pinned moves within its family; every other
+        // flag, `--fallback-model` included, rides verbatim.
+        (
+            &[
+                "claude",
+                "--fallback-model",
+                "claude-opus-5",
+                "--model",
+                "claude-opus-5",
+            ],
+            "claude-opus-5",
+            &[
+                "--fallback-model",
+                "claude-opus-5",
+                "--model",
+                "claude-opus-5-5",
+            ],
+        ),
+        // The 1M window rides the move, from an inline spelling too.
+        (
+            &["claude", "--model=claude-opus-5[1m]"],
+            "claude-opus-5",
+            &["--model", "claude-opus-5-5[1m]"],
+        ),
+        // A family the list never named, by the build's own newest.
+        (
+            &["claude", "--model", "claude-sonnet-5"],
+            "claude-sonnet-5",
+            &["--model", "claude-sonnet-5-5"],
+        ),
+        // An ALIAS is kept verbatim: the build resolves it to its newest.
+        (
+            &["claude", "--model", "opus"],
+            "claude-opus-5",
+            &["--model", "opus"],
+        ),
+        (
+            &["claude", "--model", "sonnet[1m]"],
+            "claude-sonnet-5",
+            &["--model", "sonnet[1m]"],
+        ),
+        // An id outside the grammar is untouched: never guessed at.
+        (
+            &["claude", "--model", "us.anthropic.claude-opus-5-v1:0"],
+            "claude-opus-5",
+            &["--model", "us.anthropic.claude-opus-5-v1:0"],
+        ),
+        // Nothing newer of its family, and a Fable NOBODY chose: the list's
+        // step moves it up to the Opus 5.5 ranked above it...
+        (
+            &["claude", "--verbose"],
+            "claude-fable-5-1",
+            &["--verbose", "--model", "claude-opus-5-5"],
+        ),
+        // ...but a Fable the LAUNCH chose is never moved across families.
+        (
+            &["claude", "--model", "claude-fable-5-1"],
+            "claude-fable-5-1",
+            &["--model", "claude-fable-5-1"],
+        ),
+        // A family with nothing on offer, off the list: no `--model` added.
+        (&["claude", "--verbose"], "claude-haiku-4-5", &["--verbose"]),
+    ];
+    for (argv, live, want) in rows {
+        assert_eq!(relaunch(argv, live, &offered), line(want), "{argv:?}");
+    }
+    // NEVER DOWN: the build offers only an older Opus — and a Fable the list
+    // ranks BELOW Opus 5.5, which the list's step never takes.
+    assert_eq!(
+        relaunch(
+            &["claude", "--verbose"],
+            "claude-opus-5-5",
+            &["claude-opus-5".to_string(), "claude-fable-5-1".to_string()]
+        ),
+        line(&["--verbose"])
+    );
+    // Nothing newer of Opus 5's family (Opus 5.5 not on offer) and nobody
+    // chose it: the list's step takes it up to Fable 5.1.
+    assert_eq!(
+        relaunch(
+            &["claude", "--verbose"],
+            "claude-opus-5",
+            &["claude-fable-5-1".to_string(), "claude-opus-5".to_string()]
+        ),
+        line(&["--verbose", "--model", "claude-fable-5-1"])
+    );
+}
+
 /// No model half (a test's pass, an unreadable list): nothing is ever due,
 /// so the driver behaves exactly as it did before the model layer.
 #[test]
 fn without_a_model_half_no_model_is_ever_due() {
     let ctx = ModelCtx::none();
-    assert!(ctx.target.is_none());
+    assert!(ctx.offered.is_empty());
 }
 
 /// A SAME-BUILD (model) restart the list no longer asks for is forgotten while
@@ -7109,13 +8494,15 @@ fn the_windows_step_answers_with_the_tabs_own_word_before_its_daemons() {
 /// (the owner's answer of 2026-09-26): a Claude Code whose own status is
 /// `busy` — its turn over, a workflow it waits on — is announced to when the
 /// window's host takes the step at the break (`Opts::background`), on a
-/// screen that has just moved (the loop's settle stands for it); then
-/// nothing more there — a re-ask or the restart waits `background`, typing
-/// nothing and ending nothing. NEGATIVE CONTROL: the same busy session at an
-/// idle point's step waits `not-idle`, as before.
+/// screen that has just moved (the loop's settle stands for it). Then,
+/// within the re-ask interval, nothing more there: the step waits
+/// `background`, typing nothing and ending nothing. (The re-ask a whole
+/// `REASK_S` later is the reducer's, pinned in `upgrade_tests`.) NEGATIVE
+/// CONTROL: the same busy session at an idle point's step waits `not-idle`,
+/// as before.
 #[cfg(unix)]
 #[test]
-fn a_break_of_background_work_takes_the_first_notice_and_ends_nothing() {
+fn a_break_of_background_work_takes_a_notice_and_ends_nothing() {
     let busy = |h: &mut Parked| {
         let path = h
             .opts
@@ -7157,7 +8544,701 @@ fn a_break_of_background_work_takes_the_first_notice_and_ends_nothing() {
     );
 }
 
+// ---------------------------------------------------------------- D1: no task
+
+/// A user row the harness typed, as the E2E's transcripts hold one.
+#[cfg(unix)]
+fn harness_row(text: &str) -> String {
+    user_row(&format!("[aterm harness] {text}"))
+}
+
+/// WHETHER A CONVERSATION HAS A TASK, READ ON (D1 of the live E2E of
+/// 2026-09-26): nobody can say without readable projects; with them, no
+/// transcript is no message and no task; the harness's own turns, answered,
+/// are no task; a line caught half-written is read once whole; someone
+/// else's prompt is a task the moment it is whole — before its answer (the
+/// review of 2026-09-26) — and for good, and the next ask of the same
+/// conversation reads only what was written since. Two transcripts claiming
+/// the conversation: nobody can say. NEGATIVE CONTROL: another conversation
+/// is read from its own start.
+#[cfg(unix)]
+#[test]
+fn whether_a_conversation_has_a_task_is_read_on_from_where_the_last_read_ended() {
+    let dir = scratch("tasked-memo");
+    let home = dir.join("home");
+    assert_eq!(
+        tasked(&home, SESSION, &[]),
+        None,
+        "no projects: nobody can say"
+    );
+    let project = home.join(".claude/projects/p");
+    std::fs::create_dir_all(&project).expect("projects");
+    assert_eq!(tasked(&home, SESSION, &[]), Some(false), "no message yet");
+    let path = project.join(format!("{SESSION}.jsonl"));
+    let ready = turn_by("claude-haiku-4-5", "ATERM-UPGRADE-READY-5b2e0fc4");
+    let own = [
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        ready.clone(),
+        harness_row("Upgraded: carry on"),
+        turn_by(
+            "claude-haiku-4-5",
+            "What would you like me to help you with?",
+        ),
+    ];
+    std::fs::write(&path, own.join("\n") + "\n").expect("transcript");
+    let mut memo = Tasked::default();
+    assert_eq!(
+        memo.of(&home, SESSION, &[]),
+        Some(false),
+        "the harness's own turns"
+    );
+    let read = memo.read_to;
+    assert_eq!(read, std::fs::metadata(&path).expect("len").len());
+    // A person's prompt caught half-written, then whole and answered.
+    let person = user_row("Staged harness test, please follow exactly.");
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .expect("append");
+    write!(f, "{}", &person[..20]).expect("half");
+    assert_eq!(memo.of(&home, SESSION, &[]), Some(false));
+    assert_eq!(memo.read_to, read, "a half line is not taken");
+    writeln!(f, "{}", &person[20..]).expect("rest");
+    assert_eq!(
+        memo.of(&home, SESSION, &[]),
+        Some(true),
+        "asked: a task before its answer"
+    );
+    writeln!(f, "{}", turn_by("claude-haiku-4-5", "Stage 1 complete.")).expect("answer");
+    assert_eq!(memo.of(&home, SESSION, &[]), Some(true));
+    // For good: nothing is read for it again (a rewrite is not looked at).
+    std::fs::write(&path, "").expect("emptied");
+    assert_eq!(memo.of(&home, SESSION, &[]), Some(true));
+    // NEGATIVE CONTROL: another conversation starts over.
+    let other = "0badf00d-9999-2222-3333-444455556666";
+    std::fs::write(
+        project.join(format!("{other}.jsonl")),
+        own.join("\n") + "\n",
+    )
+    .expect("other");
+    assert_eq!(memo.of(&home, other, &[]), Some(false));
+    // Two transcripts claim it: nobody can say.
+    let second = home.join(".claude/projects/q");
+    std::fs::create_dir_all(&second).expect("second project");
+    std::fs::write(second.join(format!("{other}.jsonl")), "").expect("twin");
+    assert_eq!(tasked(&home, other, &[]), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A stand-in agent in [`TAB`] whose conversation holds `rows` — its state
+/// Pending on the newer build, its screen quiet an hour — and what a visit
+/// under `kernel` answers, the state it left, and every line typed.
+#[cfg(unix)]
+fn visit_holding(
+    name: &str,
+    rows: &[String],
+    dry_run: bool,
+    kernel: &Script,
+) -> (Report, Option<St>, usize) {
+    visit_seen(name, rows, dry_run, kernel, 77, None, None)
+}
+
+/// [`visit_holding`], the last look having seen the screen at `last_seq` an
+/// hour ago (the screen now reads `seq` 77), the tab's `status` saying
+/// `status` (`None`: nothing held, no agent verdict), and — `Some` — the
+/// tab's supervisor having ledgered those texts as typed
+/// ([`Opts::aterm_state`]; `None`: no ledger known).
+#[cfg(unix)]
+fn visit_seen(
+    name: &str,
+    rows: &[String],
+    dry_run: bool,
+    kernel: &Script,
+    last_seq: u64,
+    status: Option<&str>,
+    ledger: Option<&[&str]>,
+) -> (Report, Option<St>, usize) {
+    let (r, st, asked) = visit_answered(
+        name,
+        rows,
+        dry_run,
+        kernel,
+        last_seq,
+        status,
+        ledger,
+        Answers::default(),
+    );
+    (r, st, asked.iter().filter(|l| l.contains(" turn ")).count())
+}
+
+/// [`visit_seen`] on a stand-in answering as `answers` says: every request
+/// the visit made, in order, instead of the count of its turns.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn visit_answered(
+    name: &str,
+    rows: &[String],
+    dry_run: bool,
+    kernel: &Script,
+    last_seq: u64,
+    status: Option<&str>,
+    ledger: Option<&[&str]>,
+    answers: Answers,
+) -> (Report, Option<St>, Vec<String>) {
+    use crate::supervise::approvals;
+    let dir = scratch(name);
+    let (sock, asked) = instance_with(&dir, answers);
+    if let Some(status) = status {
+        std::fs::write(dir.join("t.status"), format!("{status}\n")).expect("status");
+    }
+    let aterm_state = ledger.map(|typed| {
+        let root = dir.join("aterm-state");
+        let path = approvals::path_under(&root, Some(TAB)).expect("ledger dir");
+        let rows: Vec<String> = typed
+            .iter()
+            .map(|text| {
+                approvals::Row {
+                    rule_id: "continue@v1",
+                    outcome: approvals::Outcome::Typed,
+                    command: text,
+                    reason: "the turn-end policy",
+                    box_seq: 1,
+                }
+                .to_json(1_000, Some(TAB))
+            })
+            .collect();
+        std::fs::write(path, rows.join("\n") + "\n").expect("ledger");
+        root
+    });
+    let opts = Opts {
+        sock: Some(sock),
+        dry_run,
+        aterm_state,
+        ..drive(&dir)
+    };
+    // An argv a restart carries (the filter alone: a positional, dropped).
+    let mut agent = Command::new(std::env::current_exe().expect("exe"))
+        .arg(PARK[0])
+        .env(PARK_ENV, "1")
+        .env("ATERM_PARENT_SESSION_ID", TAB)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("agent");
+    wait_exec(agent.id());
+    let sf = register(&opts.home, agent.id(), SESSION);
+    let project = opts.home.join(".claude/projects/p");
+    std::fs::create_dir_all(&project).expect("projects");
+    if !rows.is_empty() {
+        std::fs::write(
+            project.join(format!("{SESSION}.jsonl")),
+            rows.join("\n") + "\n",
+        )
+        .expect("transcript");
+    }
+    let st = St {
+        phase: Phase::Pending,
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        last_seq,
+        seq_since_s: now_s() - 3600,
+        ..St::default()
+    };
+    std::fs::create_dir_all(state_dir(&opts)).expect("state");
+    std::fs::write(state_path(&opts, SESSION), st.to_json()).expect("write");
+    let table = vec![(kernel.shell, 1, "zsh".to_string())];
+    let files = session_files(&opts.home);
+    let args = atpkg::caller_shell::process_args(agent.id()).expect("agent argv");
+    let r = visit_with_claim(
+        &opts,
+        &sf,
+        files.as_deref(),
+        &table,
+        &newer(),
+        kernel,
+        Some(&args),
+        None,
+    );
+    let saved = load(&opts, SESSION);
+    let asked = asked.lock().map(|a| a.clone()).unwrap_or_default();
+    let _ = agent.kill();
+    let _ = agent.wait();
+    let _ = std::fs::remove_dir_all(&dir);
+    (r, saved, asked)
+}
+
+/// D1: AN UPGRADE NEVER ANNOUNCES TO A CONVERSATION WITH NO TASK — the E2E's
+/// fresh sessions (0eada4a1, 16827ada, 1a5299ab) were each typed the notice,
+/// which started a conversation nobody asked for. A fresh session, and one
+/// holding only the harness's own turns, is restarted AFRESH instead
+/// (`would-restart:fresh`). NEGATIVE CONTROLS: once a person's prompt was
+/// answered it is announced to (`would-announce`), as before — and so is one
+/// whose first prompt is recorded and not answered yet (the review of
+/// 2026-09-26: it read taskless, and the fresh restart ended it in flight).
+#[cfg(unix)]
+#[test]
+fn an_upgrade_restarts_a_conversation_with_no_task_afresh_and_announces_to_one_with_a_task() {
+    let shell = dead_pid();
+    let own = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        turn_by("claude-haiku-4-5", "I cannot stop now."),
+    ];
+    let person = vec![
+        user_row("Staged harness test, please follow exactly."),
+        turn_by("claude-haiku-4-5", "Stage 1 complete."),
+    ];
+    let first = vec![own[0].clone(), own[1].clone(), person[0].clone()];
+    for (name, rows, want) in [
+        ("fresh-none", Vec::new(), "would-restart:fresh"),
+        ("fresh-own", own, "would-restart:fresh"),
+        ("fresh-person", person, "would-announce"),
+        ("fresh-first-prompt", first, "would-announce"),
+    ] {
+        let (r, _, typed) = visit_holding(name, &rows, true, &Script::new(shell, usize::MAX, None));
+        assert_eq!(r.step, want, "{name}: {r:?}");
+        assert_eq!(typed, 0, "{name}: a dry run types nothing");
+    }
+}
+
+/// D1: WHAT THE TAB'S OWN SUPERVISOR TYPED IS NO TASK (the review of
+/// 2026-09-26): a record holding the harness's notice and the supervisor's
+/// own `keep going` and `answer_text` — unmarked, but in the tab's loop's
+/// ledger under [`Opts::aterm_state`] — is restarted afresh. NEGATIVE
+/// CONTROLS: the same record with no ledger known, and with a ledger of
+/// other words, is announced to (its `keep going` read as someone's).
+#[cfg(unix)]
+#[test]
+fn what_the_tabs_own_supervisor_typed_is_no_task() {
+    let shell = dead_pid();
+    let cfg = crate::supervise::SupervisorConfig::default();
+    let rows = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        turn_by("claude-haiku-4-5", "I cannot stop now."),
+        user_row(&cfg.continue_text),
+        turn_by("claude-haiku-4-5", "What would you like me to work on?"),
+        user_row(&cfg.answer_text),
+        turn_by("claude-haiku-4-5", "Please tell me what to do."),
+    ];
+    let typed = [cfg.continue_text.as_str(), cfg.answer_text.as_str()];
+    for (name, ledger, want) in [
+        ("ours-ledgered", Some(&typed[..]), "would-restart:fresh"),
+        ("ours-unknown", None, "would-announce"),
+        ("ours-other", Some(&["carry on"][..]), "would-announce"),
+    ] {
+        let (r, _, typed) = visit_seen(
+            name,
+            &rows,
+            true,
+            &Script::new(shell, usize::MAX, None),
+            77,
+            None,
+            ledger,
+        );
+        assert_eq!(r.step, want, "{name}: {r:?}");
+        assert_eq!(typed, 0, "{name}: a dry run types nothing");
+    }
+}
+
+/// D1: THE FRESH RESTART IS THE UPGRADE'S RESTART WITHOUT THE NOTICE AND
+/// WITHOUT `--resume`: nothing is typed into the agent, the line it plans
+/// starts the newer build on the launch's flags alone, and every last look
+/// before the signal stands — here the agent is put in the background under
+/// it, so nothing is signalled and the state goes back to where it was (its
+/// cause with it: a later restart of a conversation that gained a task
+/// resumes it).
+#[cfg(unix)]
+#[test]
+fn a_fresh_restart_types_nothing_plans_no_resume_and_keeps_every_last_look() {
+    let shell = dead_pid();
+    let own = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        turn_by("claude-haiku-4-5", "I cannot stop now."),
+    ];
+    // Foreground for the visit's two job reads and the restart's two, then
+    // backgrounded: the read right before the signal refuses it.
+    let (r, saved, typed) =
+        visit_holding("fresh-restart", &own, false, &Script::new(shell, 4, None));
+    assert_eq!(r.step, "wait:changed-before-signal", "{r:?}");
+    assert_eq!(typed, 0, "no notice, nothing typed");
+    let saved = saved.expect("state");
+    assert_eq!(saved.phase, Phase::Pending, "never signalled");
+    assert!(saved.cause.is_empty(), "{:?}", saved.cause);
+    assert!(saved.line.contains("/nonexistent/claude"), "{}", saved.line);
+    assert!(!saved.line.contains("--resume"), "afresh: {}", saved.line);
+}
+
+/// ND1 OF THE LIVE RE-TEST OF 2026-09-26: A RESTART HOLDS THE TAB FROM ITS
+/// LAST LOOK ([`Hand`]) — the fresh restart fired 1.3 s after the first
+/// idle verdict, the moment an orchestrator's `await agent idle` returns, and
+/// the tab was a bare shell with `hand=-` until the relaunch line: a first
+/// prompt sent then ran as a shell command line. The hand is taken before
+/// the last look and every read of that look comes after it; a look that
+/// then stops the restart (here the agent put in the background under it)
+/// gives it back, nothing signalled. NEGATIVE CONTROL: another driver's live
+/// lease on the tab is theirs — the restart waits `held`, reads no last
+/// look, signals nothing and releases nothing.
+#[cfg(unix)]
+#[test]
+fn a_restart_holds_the_tab_from_its_last_look_and_gives_it_back_when_it_stops() {
+    let shell = dead_pid();
+    let own = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        turn_by("claude-haiku-4-5", "I cannot stop now."),
+    ];
+    let acquire = format!(
+        "lease acquire ttl={HAND_TTL_MS} holder={} hard",
+        hand_name()
+    );
+    let release = format!("lease release holder={}", hand_name());
+    let (r, saved, asked) = visit_answered(
+        "hand-taken",
+        &own,
+        false,
+        &Script::new(shell, 4, None),
+        77,
+        None,
+        None,
+        Answers {
+            lease: "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000",
+            ..Answers::default()
+        },
+    );
+    assert_eq!(r.step, "wait:changed-before-signal", "{r:?}");
+    assert_eq!(saved.expect("state").phase, Phase::Pending);
+    let at = |needle: &str| asked.iter().position(|l| l.ends_with(needle));
+    let taken = at(&acquire).unwrap_or_else(|| panic!("the hand taken: {asked:#?}"));
+    let given = at(&release).unwrap_or_else(|| panic!("the hand given back: {asked:#?}"));
+    assert!(taken < given, "{asked:#?}");
+    // The last look — its screen and its status — is read under the hand.
+    for read in [" text ", " status"] {
+        assert!(
+            asked[taken..given].iter().any(|l| l.contains(read)),
+            "{read} under the hand: {asked:#?}"
+        );
+    }
+    assert!(!asked.iter().any(|l| l.contains(" signal ")), "{asked:#?}");
+    assert_eq!(turns_in(&asked), 0, "nothing typed");
+    // NEGATIVE CONTROL: another driver holds the tab.
+    let (r, saved, asked) = visit_answered(
+        "hand-theirs",
+        &own,
+        false,
+        &Script::new(shell, usize::MAX, None),
+        77,
+        None,
+        None,
+        Answers {
+            lease: "ERR lease held holder=orchestrator expires_in_ms=5000",
+            ..Answers::default()
+        },
+    );
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert_eq!(saved.expect("state").phase, Phase::Pending);
+    let taken = at_in(&asked, &acquire).unwrap_or_else(|| panic!("asked: {asked:#?}"));
+    assert!(
+        !asked[taken..].iter().any(|l| l.contains(" text ")),
+        "no last look: {asked:#?}"
+    );
+    assert!(!asked.iter().any(|l| l.contains(" signal ")), "{asked:#?}");
+    assert!(!asked.iter().any(|l| l.ends_with(&release)), "{asked:#?}");
+}
+
+/// ND1, THE LAST LOOK AND THE SIGNAL (the review of the first cut: nothing
+/// covered a person's key or a prompt arriving between the first look and
+/// the last, and removing that re-read passed every test). Between the
+/// restart's first look — under its hand — and the signal, the state is
+/// written; a person who keys the tab then (`human_ms` inside the grace), or
+/// a prompt sent then and not read yet (`input=pending`), is seen by the
+/// LAST look, and nothing is signalled: the state goes back, the hand is
+/// given back. And the signal itself is the last word, one server decision
+/// (`signal term pid=<p> quiet=<grace>`): a keystroke after the last look
+/// refuses it (`ERR busy person …`) — a wait, the state back, the hand
+/// given back. NEGATIVE CONTROL: the same restart with nothing arriving
+/// sends the signal, `quiet=` the grace.
+#[cfg(unix)]
+#[test]
+fn a_key_or_a_prompt_after_the_first_look_stops_the_restart_before_its_signal() {
+    let shell = dead_pid();
+    let own = vec![
+        harness_row("Claude Code 2.1.283 (managed) is installed"),
+        turn_by("claude-haiku-4-5", "I cannot stop now."),
+    ];
+    let release = format!("lease release holder={}", hand_name());
+    let restart = |name: &str, after_first_look: Option<&'static str>, signal: &'static str| {
+        visit_answered(
+            name,
+            &own,
+            false,
+            &Script::new(shell, usize::MAX, None),
+            77,
+            None,
+            None,
+            Answers {
+                lease: "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1",
+                after_first_look,
+                signal,
+                ..Answers::default()
+            },
+        )
+    };
+    for (name, later) in [
+        ("look-person", "OK schema=1 hold=0 hand=- human_ms=500"),
+        ("look-prompt", "OK schema=1 hold=0 hand=- input=pending"),
+    ] {
+        let (r, saved, asked) = restart(name, Some(later), "");
+        assert_eq!(r.step, "wait:changed-before-signal", "{name}: {r:?}");
+        let saved = saved.expect("state");
+        assert_eq!(saved.phase, Phase::Pending, "{name}: back as it was");
+        assert!(saved.cause.is_empty(), "{name}: {saved:?}");
+        assert!(
+            !asked.iter().any(|l| l.contains(" signal ")),
+            "{name}: {asked:#?}"
+        );
+        assert!(
+            asked.last().is_some_and(|l| l.ends_with(&release)),
+            "{name}: the hand given back: {asked:#?}"
+        );
+    }
+    // A keystroke after the last look: the signal refuses itself.
+    let (r, saved, asked) = restart("look-signal", None, "ERR busy person human_ms=300");
+    assert_eq!(r.step, "wait:signal-held", "{r:?}");
+    assert_eq!(saved.expect("state").phase, Phase::Pending);
+    let signal = asked
+        .iter()
+        .find(|l| l.contains(" signal "))
+        .unwrap_or_else(|| panic!("the signal asked: {asked:#?}"));
+    assert!(signal.ends_with(" quiet=120"), "{signal}");
+    assert!(
+        asked.last().is_some_and(|l| l.ends_with(&release)),
+        "the hand given back: {asked:#?}"
+    );
+}
+
+/// The first request of `asked` that ends with `needle`.
+#[cfg(unix)]
+fn at_in(asked: &[String], needle: &str) -> Option<usize> {
+    asked.iter().position(|l| l.ends_with(needle))
+}
+
+/// D1: A CONVERSATION WITH NO TASK IS CARRIED ON WITH NOTHING — a carry-on
+/// ("Continue where you left off … decide for yourself") typed into one
+/// starts a conversation nobody asked for (the E2E's B 1a5299ab). A
+/// relaunched conversation whose record holds only the harness's own turns is
+/// done (`done:taskless`, said once in the ledger) and nothing is typed.
+/// NEGATIVE CONTROL: one a person asked something is carried on — as the
+/// E2E's C was, whose finished task haiku then padded with invented work
+/// (an open hazard, not this rule's).
+#[cfg(unix)]
+#[test]
+fn a_conversation_with_no_task_is_carried_on_with_nothing() {
+    let own = [
+        harness_row("Relaunched: Claude Code exited without anyone asking"),
+        turn_by(
+            "claude-haiku-4-5",
+            "What would you like me to help you with?",
+        ),
+    ];
+    let rig = Rig::new("carry-taskless", &own);
+    let mut st = rig.st.clone();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_eq!(r.step, "done:taskless", "{r:?}");
+    assert!(rig.typed().is_empty(), "nothing typed: {:?}", rig.typed());
+    assert_eq!(st.phase, Phase::Done);
+    assert_eq!(rig.details("done:taskless").len(), 1, "said once");
+    // NEGATIVE CONTROL: asked something, carried on.
+    let asked = [
+        user_row("Reply with one short sentence saying hello."),
+        turn_by("claude-haiku-4-5", "Hello."),
+    ];
+    let rig = Rig::new("carry-tasked", &asked);
+    let mut st = rig.st.clone();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    assert_ne!(r.step, "done:taskless", "{r:?}");
+    assert_eq!(rig.typed().len(), 1, "{r:?}");
+}
+
+/// D3(b) OF THE LIVE E2E OF 2026-09-26: THE SETTLE IS THE AGENT'S VERDICT'S,
+/// NOT THE SCREEN'S. Quiet was counted from the look that first saw a new
+/// screen `seq`, so Claude Code's dim `❯ continue` suggestion, drawn between
+/// two looks, started it over and the notice waited five more minutes. Now it
+/// is how long the server's own verdict has said the agent's turn is over
+/// (`status agent=idle agent_since_ms=`): a screen that moved since the last
+/// look, with the agent idle 30 s, is announced to at once. NEGATIVE
+/// CONTROLS: the agent idle only 5 s, or busy, waits `settling`; and a
+/// server that publishes no verdict, or one with no evidence (`unknown`), is
+/// measured by the looks' samples, as before — a moved screen waits.
+#[cfg(unix)]
+#[test]
+fn the_settle_is_measured_from_the_agents_verdict_not_from_a_repaint() {
+    let shell = dead_pid();
+    let asked = vec![
+        user_row("Staged harness test, please follow exactly."),
+        turn_by("claude-haiku-4-5", "Stage 1 complete."),
+    ];
+    let kernel = || Script::new(shell, usize::MAX, None);
+    let idle = |ms: u32| format!("OK schema=1 hold=0 hand=- agent=idle agent_since_ms={ms}");
+    let other = |word: &str| format!("OK schema=1 hold=0 hand=- agent={word} agent_since_ms=90000");
+    // (name, the seq the last look saw — the screen reads 77 — the status, the step)
+    for (name, last_seq, status, want) in [
+        ("settle-idle-30s", 76, Some(idle(30_000)), "would-announce"),
+        ("settle-idle-5s", 76, Some(idle(5_000)), "wait:settling"),
+        ("settle-busy", 77, Some(other("busy")), "wait:settling"),
+        ("settle-no-verdict", 76, None, "wait:settling"),
+        // No evidence either way: the screen's own samples decide.
+        (
+            "settle-unknown-moved",
+            76,
+            Some(other("unknown")),
+            "wait:settling",
+        ),
+        (
+            "settle-unknown-still",
+            77,
+            Some(other("unknown")),
+            "would-announce",
+        ),
+    ] {
+        let (r, _, typed) = visit_seen(
+            name,
+            &asked,
+            true,
+            &kernel(),
+            last_seq,
+            status.as_deref(),
+            None,
+        );
+        assert_eq!(r.step, want, "{name}: {r:?}");
+        assert_eq!(typed, 0, "{name}");
+    }
+}
+
+/// D5 OF THE LIVE E2E OF 2026-09-26: A TURN THE HARNESS TYPES RETURNS ONCE ITS
+/// SUBMIT IS TAKEN, NOT WHEN THE AGENT'S ANSWER IS OVER. The step is taken in
+/// the session's loop while the loop is still, and typed `idle=1500
+/// timeout=30000`: the tab was held up to 30 s and the answer the carry-on
+/// started ended inside the step, unseen by the loop — `keep going` followed
+/// it half a second later. Here the stand-in agent answers for 3 s after
+/// every submit: the carry-on and the notice each return at once, asked
+/// `idle=1 timeout=10000` ([`TURN_WAIT`]). NEGATIVE CONTROL: a turn asked to
+/// settle on quiet, as they were, waits the answer out.
+#[cfg(unix)]
+#[test]
+fn a_typed_turn_returns_once_its_submit_is_taken_not_after_the_answer() {
+    let answer = Duration::from_secs(3);
+    let answers = || Answers {
+        answer,
+        ..Answers::default()
+    };
+    let asked = [
+        user_row("Reply with one short sentence saying hello."),
+        turn_by("claude-haiku-4-5", "Hello."),
+    ];
+    // The carry-on.
+    let rig = Rig::with("turn-wait-carry", &asked, answers());
+    let mut st = rig.st.clone();
+    let t0 = Instant::now();
+    let r = rig.carry_on_from(&mut st, MODEL_WAIT);
+    let took = t0.elapsed();
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{r:?}");
+    assert!(typed[0].contains(&format!(" {TURN_WAIT} ")), "{typed:?}");
+    assert!(
+        took < answer,
+        "the carry-on waited the answer out: {took:?}"
+    );
+    // NEGATIVE CONTROL: the old settle waits it out.
+    let mut c = connect(&rig.opts, TAB).expect("control connection");
+    let t0 = Instant::now();
+    let (head, _) = c
+        .request_counted(&format!("@{TAB} turn yield=0.2 idle=1500 timeout=30000 hi"))
+        .expect("turn");
+    assert!(head.starts_with("OK"), "{head}");
+    assert!(
+        t0.elapsed() >= answer,
+        "the stand-in answers as the server settles"
+    );
+    drop(rig);
+    // The notice.
+    let dir = scratch("turn-wait-notice");
+    let (sock, log) = instance_with(&dir, answers());
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    let mut c = connect(&opts, TAB).expect("control connection");
+    let t0 = Instant::now();
+    assert_eq!(
+        turn_fenced(&mut c, TAB, "[aterm harness] notice", None),
+        Ok(())
+    );
+    assert!(t0.elapsed() < answer, "the notice waited the answer out");
+    assert!(
+        log.lock()
+            .expect("log")
+            .iter()
+            .any(|l| l.contains(" turn ") && l.contains(&format!(" {TURN_WAIT} "))),
+        "{log:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// The stall of 2026-09-25/26: F1-F3 and the review's findings through the
 /// real driver, and the Tier-1 bind of `harness_upgrade_never_strands_model`.
 #[path = "upgrade_stall_tests.rs"]
 mod stall;
+
+/// A STOP THAT REPEATS RESTS LONGER, NEVER FOR GOOD (the no-stall review of
+/// 2026-09-27, S1): the same reason in a row stretches the rest — RETRY_S, then
+/// twice, then four times as long, and no longer — so a relaunch that never
+/// comes up is not re-asked, re-signalled and left dead every RETRY_S. A
+/// different reason starts the streak over, and the rest still ends: the
+/// round re-arms. NEGATIVE CONTROL: the first stop rests exactly RETRY_S.
+#[test]
+fn a_stop_that_repeats_rests_longer_and_never_for_good() {
+    let now = 1_000_000;
+    let rest = |st: &St| st.failed_at.saturating_add(upgrade::RETRY_S) - now;
+    let mut st = St::default();
+    st.fail("relaunch-refused", now);
+    assert_eq!(rest(&st), upgrade::RETRY_S, "the first stop rests RETRY_S");
+    let mut rests = Vec::new();
+    for _ in 0..5 {
+        st.fail("relaunch-refused", now);
+        rests.push(rest(&st));
+    }
+    let r = upgrade::RETRY_S;
+    assert_eq!(
+        rests,
+        [2 * r, 4 * r, 4 * r, 4 * r, 4 * r],
+        "doubling, then capped"
+    );
+    assert_eq!(st.stop_streak, 6);
+    st.fail("signal-refused", now);
+    assert_eq!(
+        (st.stop_streak, rest(&st)),
+        (1, r),
+        "a new reason starts over"
+    );
+    // The stretched rest still ends: the round re-arms once it has passed.
+    st.fail("signal-refused", now);
+    let due_at = st.failed_at + upgrade::RETRY_S;
+    assert!(!upgrade::retry_due(
+        &st.phase,
+        st.failed_for(due_at - 1),
+        false
+    ));
+    assert!(upgrade::retry_due(&st.phase, st.failed_for(due_at), false));
+    // And it survives a restart of the sweep: the streak is on disk.
+    let back = St::from_json(&st.to_json()).expect("parses");
+    assert_eq!(
+        (back.stop_streak, back.streak_why.as_str()),
+        (2, "signal-refused")
+    );
+}
+
+/// The login wall of 2026-09-27: no notice into it, no ask spent on a notice
+/// it answered, a late READY honoured, and the Tier-1 bind of
+/// `harness_login_wall_model` to the real code.
+#[path = "upgrade_login_wall_tests.rs"]
+mod login_wall;

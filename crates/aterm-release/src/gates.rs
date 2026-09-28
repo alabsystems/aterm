@@ -21,8 +21,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::changelog;
+use crate::channel;
 use crate::ledger::{Error, GitRunner, Result, git_ok, rev_parse};
-use crate::mirror;
 
 /// Free-disk floor for a cut. A universal release build carries two full
 /// `--release` target trees (Trust arm64 + rustup x86_64, both with
@@ -451,20 +451,9 @@ pub fn run_all(
     // ...and that the scheduler will not starve the one proof that runs after the
     // claim.
     launchd_qos_gate(opts.paint_smoke)?;
-    let universal = if opts.arm64_only {
-        false
-    } else {
-        // The cut appends the remedies itself: the probe returns a fault, and this is
-        // the only caller that must STOP, so it is the only one that has to say what to
-        // do about it right here.
-        x86_target_probe().map_err(|e| {
-            Error::new(format!(
-                "{e}\nfix:  {}",
-                X86_SLICE_REMEDIES.replace('\n', "\n      ")
-            ))
-        })?;
-        true
-    };
+    let universal = universal_gate(opts.arm64_only, x86_target_probe, || {
+        rosetta_runs(&mut |command| command.output())
+    })?;
     let free_disk_gib = disk_gate(tree)?;
     let processes_checked =
         staged_bundle_liveness_gate(&state.join("dist"), &crate::bundle::running_processes)?;
@@ -1017,7 +1006,7 @@ fn short(sha: &str) -> &str {
 
 /// Prove the public channel's source tree already carries the version being cut.
 ///
-/// The pure comparison is [`mirror::check_channel_version`]; this is only its I/O
+/// The pure comparison is [`channel::check_channel_version`]; this is only its I/O
 /// shell — resolve the channel slug from the local manifest, read that channel's
 /// `Cargo.toml` at `main`, hand both to the pure function.
 ///
@@ -1037,7 +1026,7 @@ fn short(sha: &str) -> &str {
 pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result<Option<String>> {
     let local = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("cannot read workspace Cargo.toml: {e}")))?;
-    let Some(slug) = mirror::update_channel_slug(&local)? else {
+    let Some(slug) = channel::update_channel_slug(&local)? else {
         return Ok(None);
     };
     if offline {
@@ -1076,9 +1065,9 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
     }
 
     let body = String::from_utf8_lossy(&out.stdout).to_string();
-    match mirror::check_channel_version(version, &body)? {
-        mirror::ChannelVersion::Agrees => Ok(Some(version.to_string())),
-        mirror::ChannelVersion::NoManifest => Ok(None),
+    match channel::check_channel_version(version, &body)? {
+        channel::ChannelVersion::Agrees => Ok(Some(version.to_string())),
+        channel::ChannelVersion::NoManifest => Ok(None),
     }
 }
 
@@ -1479,7 +1468,7 @@ pub fn cutter_identity_verdict(
 }
 
 /// Apply the real-mutation cutter check to the checkout the caller is about
-/// to act from. Resume, recovery, abandon, retire and yank do not enter
+/// to act from. Resume, recovery, abandon and yank do not enter
 /// [`run_all`], so each of those paths uses this shared boundary before its
 /// first remote mutation.
 pub fn current_cutter_identity_gate(git: &dyn GitRunner) -> Result<()> {
@@ -2183,7 +2172,8 @@ pub fn x86_target_probe() -> Result<()> {
             // otherwise refuses.
             Error::new(format!(
                 "failed to run rustup ({e}). The x86_64 compat slice needs upstream \
-                 stable's std for that target (Trust has none — the one documented \
+                 stable's std for that target (the installed host Trust sysroot carries \
+                 only its host std — the one documented \
                  exception to the single-Trust lane). Either install rustup and run \
                  `rustup +stable target add x86_64-apple-darwin`, or pass --arm64-only \
                  to ship an Apple-Silicon-only build deliberately."
@@ -2207,6 +2197,57 @@ pub fn x86_target_probe() -> Result<()> {
          build is impossible"
             .to_string(),
     ))
+}
+
+/// Whether this cut ships a universal binary, and — when it does — the proof, BEFORE the
+/// claim, that this builder can both BUILD the x86_64 slice (`target`, the stable
+/// `x86_64-apple-darwin` std) and RUN it (`rosetta`). The build lane runs the slice under
+/// Rosetta after it is linked (buildplan.rs, docs/DESIGN-intel-just-works-2026-09-14.md
+/// §3.1) — past `ledger::claim`, which has already pushed the release commit and taken a
+/// build number. A builder without Rosetta found out THERE used to burn that number: the
+/// cut's refusals fire pre-claim so a refused cut consumes nothing and retries freely.
+/// `--arm64-only` asks neither probe. Both probes are injected so every arm is testable
+/// on a machine that has Rosetta.
+pub(crate) fn universal_gate(
+    arm64_only: bool,
+    target: impl FnOnce() -> Result<()>,
+    rosetta: impl FnOnce() -> std::result::Result<(), String>,
+) -> Result<bool> {
+    if arm64_only {
+        return Ok(false);
+    }
+    // The cut appends the remedies itself: the probe returns a fault, and this is the only
+    // caller that must STOP, so it is the only one that has to say what to do about it.
+    target().map_err(|e| {
+        Error::new(format!(
+            "{e}\nfix:  {}",
+            X86_SLICE_REMEDIES.replace('\n', "\n      ")
+        ))
+    })?;
+    rosetta().map_err(Error::new)?;
+    Ok(true)
+}
+
+/// The refusal a universal cut gets on a builder that cannot RUN its x86_64 slice.
+pub(crate) const ROSETTA_REFUSAL: &str = "the universal cut RUNS its x86_64 slice under Rosetta before it \
+     ships (an unexecuted slice is how every Intel-only fault reached a release), and Rosetta \
+     does not run here — softwareupdate --install-rosetta --agree-to-license, or pass \
+     --arm64-only to ship an Apple-Silicon-only build deliberately";
+
+/// Whether Rosetta runs a trivial x86_64 program here (`/usr/bin/arch -x86_64
+/// /usr/bin/true`). `run` spawns, injected so the refusal is testable on a machine that
+/// has Rosetta. The ONE Rosetta probe: the pre-claim [`universal_gate`], the provision
+/// audit, and the post-build slice run all ask it.
+pub(crate) fn rosetta_runs(
+    run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
+) -> std::result::Result<(), String> {
+    let mut rosetta = Command::new("/usr/bin/arch");
+    rosetta.args(["-x86_64", "/usr/bin/true"]);
+    if run(&mut rosetta).is_ok_and(|out| out.status.success()) {
+        Ok(())
+    } else {
+        Err(ROSETTA_REFUSAL.to_string())
+    }
 }
 
 /// Free-disk gate via `df -Pk` (POSIX output format; std has no statfs).
@@ -2240,6 +2281,124 @@ pub fn disk_gate(repo: &Path) -> Result<u64> {
         )));
     }
     Ok(free_gib)
+}
+
+#[cfg(test)]
+mod universal_gate_tests {
+    use std::cell::Cell;
+    use std::os::unix::process::ExitStatusExt as _;
+
+    use super::*;
+
+    fn exited(code: i32) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: b"bad CPU type in executable".to_vec(),
+        }
+    }
+
+    /// A builder without Rosetta is refused by the PRE-CLAIM gate, naming the remedy and
+    /// the escape — it used to learn it inside `buildplan::run`, after `ledger::claim` had
+    /// pushed the release commit and taken a build number.
+    #[test]
+    fn no_rosetta_is_refused_before_the_claim() {
+        let err = universal_gate(false, || Ok(()), || Err(ROSETTA_REFUSAL.to_string()))
+            .expect_err("no Rosetta must refuse a universal cut");
+        assert_eq!(err.to_string(), ROSETTA_REFUSAL);
+        assert!(
+            ROSETTA_REFUSAL.contains("softwareupdate --install-rosetta")
+                && ROSETTA_REFUSAL.contains("--arm64-only")
+        );
+    }
+
+    /// Each arm asks only what it needs: `--arm64-only` neither probe; a missing stable
+    /// target stops before Rosetta is asked, with the target remedies laid out; both
+    /// present is a universal cut.
+    #[test]
+    fn each_arm_asks_only_the_probes_it_needs() {
+        let asked = Cell::new(0);
+        let probe = || {
+            asked.set(asked.get() + 1);
+            Ok(())
+        };
+        assert!(
+            !universal_gate(true, probe, || unreachable!("arm64-only asks no Rosetta")).unwrap()
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "--arm64-only must not probe the x86_64 target"
+        );
+
+        let err = universal_gate(
+            false,
+            || Err(Error::new("x86_64-apple-darwin target missing")),
+            || unreachable!("a missing target stops before Rosetta is asked"),
+        )
+        .expect_err("a missing target refuses");
+        let err = err.to_string();
+        assert!(
+            err.contains("target missing") && err.contains("fix:  rustup +stable target add"),
+            "{err}"
+        );
+
+        assert!(universal_gate(false, || Ok(()), || Ok(())).unwrap());
+    }
+
+    /// The one Rosetta probe runs `/usr/bin/arch -x86_64 /usr/bin/true`, and a failed
+    /// spawn is the same refusal as a failed run.
+    #[test]
+    fn the_rosetta_probe_runs_a_trivial_x86_64_program() {
+        let mut seen = Vec::new();
+        let err = rosetta_runs(&mut |command| {
+            seen.push(
+                std::iter::once(command.get_program())
+                    .chain(command.get_args())
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>(),
+            );
+            Ok(exited(1))
+        })
+        .unwrap_err();
+        assert_eq!(err, ROSETTA_REFUSAL);
+        assert_eq!(
+            seen,
+            vec![vec!["/usr/bin/arch", "-x86_64", "/usr/bin/true"]]
+        );
+        assert_eq!(
+            rosetta_runs(&mut |_| Err(std::io::Error::other("no arch"))).unwrap_err(),
+            ROSETTA_REFUSAL
+        );
+        assert_eq!(rosetta_runs(&mut |_| Ok(exited(0))), Ok(()));
+    }
+
+    /// Bound to the real gate: `run_all` — which `publish.rs` runs before `ledger::claim` —
+    /// decides universality through `universal_gate` with the REAL Rosetta probe. Asserted as
+    /// source because the alternative is a builder without Rosetta.
+    #[test]
+    fn the_pre_claim_gate_asks_rosetta() {
+        let gates = include_str!("gates.rs");
+        let body = &gates[gates.find("pub fn run_all(").expect("run_all")..];
+        let body = &body[..body.find("\n}\n").expect("end of run_all")];
+        // Split so these assertions do not match themselves.
+        let decided = body
+            .find(concat!(
+                "universal_gate(",
+                "opts.arm64_only, x86_target_probe"
+            ))
+            .expect("run_all decides universality through universal_gate");
+        assert!(
+            body[decided..].contains(concat!("rosetta_runs(", "&mut |command| command.output())")),
+            "run_all must hand universal_gate the real Rosetta probe"
+        );
+        let publish = include_str!("publish.rs");
+        let gated = publish
+            .find("gates::run_all(")
+            .expect("the cut runs the gates");
+        let claimed = publish.find("ledger::claim(").expect("the cut claims");
+        assert!(gated < claimed, "the gates must run before the claim");
+    }
 }
 
 #[cfg(test)]

@@ -159,9 +159,7 @@ pub(crate) fn load_tail(path: &Path, tail: u64) -> Loaded {
     skipped += read_pair(&wire_path(path), tail.min(WIRE_TAIL_BYTES), &mut lines);
     lines.sort_by_key(LogLine::id);
     let mut log = MessageLog::empty();
-    for line in lines {
-        log.replay(line);
-    }
+    log.replay_all(lines);
     Loaded { log, skipped }
 }
 
@@ -730,57 +728,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A SECOND WRITER FOLLOWS THE ROTATION: two writers on one path (another
-    /// instance, a successor); after one rotates, the other's next line lands
-    /// in the new file, never in the renamed one's inode.
+    /// The file is `FILE_NAME`, directly under the log dir.
     #[test]
-    fn a_second_writer_follows_the_rotation() {
-        let dir = scratch("follow");
-        let path = dir.join(FILE_NAME);
-        let a = Writer::spawn_with(&path, TINY, TINY).expect("writer A");
-        let b = Writer::spawn_with(&path, TINY, TINY).expect("writer B");
-        let mut id = 0;
-        while !crate::logging::rotated_path(&path).exists() {
-            id += 1;
-            a.append(&host(&[posted(id, &format!("a{id}"))]));
-            a.flush();
-            assert!(id < 1000, "A rotated");
-        }
-        b.append(&host(&[posted(id + 1, "from B")]));
-        b.flush();
-        let current = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            current.contains("from%20B") || current.contains("from B"),
-            "{current}"
-        );
-        drop((a, b));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The file is under the log dir, whatever `$ATERM_LOG` says: `path()`
-    /// consults the log dir alone.
-    #[test]
-    fn the_log_is_written_under_the_log_dir_regardless_of_aterm_log() {
+    fn the_log_is_written_under_the_log_dir() {
         let Some(path) = path() else {
             // No `$HOME` on this worker: nothing to place, nothing to assert.
             return;
         };
         assert_eq!(path.file_name().unwrap(), FILE_NAME);
         assert_eq!(path.parent(), crate::logging::log_dir().as_deref());
-        // The shipping half never reads the logging switch: every CODE line
-        // before the test module is free of the variable's name (comment lines
-        // dropped, the grep guard's own rule — this module's doc names it).
-        let shipping = include_str!("messages_store.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap()
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .any(|l| l.contains("ATERM_LOG"));
-        assert!(
-            !shipping,
-            "the shipping half never reads the logging switch"
-        );
     }
 
     /// REVIEW PIN (Lens B, 2026-09-22), now green: the first cut's

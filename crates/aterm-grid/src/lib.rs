@@ -60,7 +60,7 @@ mod spec_proof_anchors;
 // Re-export Grid and related types at crate root.
 pub use grid::Grid;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
-pub use grid::{CellDataView, VisibleRowView};
+pub use grid::{CellDataView, HistoryLines, VisibleRowView};
 pub use grid::{
     HistoryFence, HistoryFenceBroken, OlderHistory, OlderHistoryClaim, OlderHistoryRefusal,
 };

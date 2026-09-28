@@ -144,8 +144,8 @@ pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         // Modifier keys reported as key events. winit reports `Alt`/`Control`/
         // `Shift`/`Super`/`Meta`/`Hyper` without a left/right distinction in the
         // logical key (the side lives in `KeyLocation`); map to the LEFT variant
-        // as the canonical representative — the engine's Kitty modifier encoding
-        // (`kitty_modifiers_for_event`) treats left/right identically.
+        // here, and [`sided_modifier`] moves a right-side press to its *Right
+        // variant — kitty reports each side by its own code.
         WinitNamed::Shift => NamedKey::ShiftLeft,
         WinitNamed::Control => NamedKey::ControlLeft,
         WinitNamed::Alt => NamedKey::AltLeft,
@@ -156,6 +156,51 @@ pub(crate) fn map_named_key(named: WinitNamed) -> Option<NamedKey> {
         // keys, brightness/power, etc. fall through to None.
         _ => return None,
     })
+}
+
+/// A modifier key on the side it was pressed: [`map_logical_key`] names every
+/// modifier by its LEFT variant, because winit's logical key carries no side, and
+/// the side lives in `location`. kitty reports the two sides by different codes
+/// (`LEFT_SHIFT` 57441, `RIGHT_SHIFT` 57447, …), so a right-side press becomes the
+/// engine's *Right variant; every other key, and a modifier on any other
+/// location, is returned as it is.
+#[must_use]
+pub fn sided_modifier(key: Key, location: KeyLocation) -> Key {
+    if location != KeyLocation::Right {
+        return key;
+    }
+    let right = match key {
+        Key::Named(NamedKey::ShiftLeft) => NamedKey::ShiftRight,
+        Key::Named(NamedKey::ControlLeft) => NamedKey::ControlRight,
+        Key::Named(NamedKey::AltLeft) => NamedKey::AltRight,
+        Key::Named(NamedKey::SuperLeft) => NamedKey::SuperRight,
+        Key::Named(NamedKey::HyperLeft) => NamedKey::HyperRight,
+        Key::Named(NamedKey::MetaLeft) => NamedKey::MetaRight,
+        other => return other,
+    };
+    Key::Named(right)
+}
+
+/// The physical key on the OTHER side of a sided modifier (`ShiftLeft` ↔
+/// `ShiftRight`, and Control, Alt and Super likewise), or `None` for any other
+/// key. Whether that key is still held decides a modifier release's own kitty
+/// bit ([`aterm_types::keyboard::NamedKey::modifier_twin`]).
+#[must_use]
+pub fn physical_modifier_twin(physical: PhysicalKey) -> Option<PhysicalKey> {
+    let PhysicalKey::Code(code) = physical else {
+        return None;
+    };
+    Some(PhysicalKey::Code(match code {
+        KeyCode::ShiftLeft => KeyCode::ShiftRight,
+        KeyCode::ShiftRight => KeyCode::ShiftLeft,
+        KeyCode::ControlLeft => KeyCode::ControlRight,
+        KeyCode::ControlRight => KeyCode::ControlLeft,
+        KeyCode::AltLeft => KeyCode::AltRight,
+        KeyCode::AltRight => KeyCode::AltLeft,
+        KeyCode::SuperLeft => KeyCode::SuperRight,
+        KeyCode::SuperRight => KeyCode::SuperLeft,
+        _ => return None,
+    }))
 }
 
 /// The keypad key a winit press IS — the one road from a physical numpad to
@@ -577,6 +622,57 @@ mod tests {
                 manifest.display(),
                 i + 1
             );
+        }
+    }
+
+    /// A right-side modifier press is the engine's *Right key (kitty's
+    /// `RIGHT_SHIFT` 57447, not `LEFT_SHIFT` 57441); a left or standard one,
+    /// and every non-modifier key, is unchanged.
+    #[test]
+    fn a_right_side_modifier_press_maps_to_its_right_variant() {
+        for (winit, left, right) in [
+            (WinitNamed::Shift, NamedKey::ShiftLeft, NamedKey::ShiftRight),
+            (
+                WinitNamed::Control,
+                NamedKey::ControlLeft,
+                NamedKey::ControlRight,
+            ),
+            (WinitNamed::Alt, NamedKey::AltLeft, NamedKey::AltRight),
+            (WinitNamed::Super, NamedKey::SuperLeft, NamedKey::SuperRight),
+            (WinitNamed::Hyper, NamedKey::HyperLeft, NamedKey::HyperRight),
+            (WinitNamed::Meta, NamedKey::MetaLeft, NamedKey::MetaRight),
+        ] {
+            let key = map_logical_key(&WinitKey::Named(winit)).expect("a modifier maps");
+            assert_eq!(key, Key::Named(left));
+            assert_eq!(
+                sided_modifier(key.clone(), KeyLocation::Right),
+                Key::Named(right)
+            );
+            for loc in [KeyLocation::Left, KeyLocation::Standard] {
+                assert_eq!(sided_modifier(key.clone(), loc), Key::Named(left));
+            }
+        }
+        let a = Key::Character('a');
+        assert_eq!(sided_modifier(a.clone(), KeyLocation::Right), a);
+    }
+
+    /// Each sided modifier's physical twin is the other side of the SAME
+    /// modifier (the pairing a release's kitty bit is decided by), the map is
+    /// its own inverse, and no other key has one.
+    #[test]
+    fn a_sided_modifier_has_its_other_side_as_twin() {
+        for (l, r) in [
+            (KeyCode::ShiftLeft, KeyCode::ShiftRight),
+            (KeyCode::ControlLeft, KeyCode::ControlRight),
+            (KeyCode::AltLeft, KeyCode::AltRight),
+            (KeyCode::SuperLeft, KeyCode::SuperRight),
+        ] {
+            let (l, r) = (PhysicalKey::Code(l), PhysicalKey::Code(r));
+            assert_eq!(physical_modifier_twin(l), Some(r));
+            assert_eq!(physical_modifier_twin(r), Some(l));
+        }
+        for other in [KeyCode::KeyA, KeyCode::CapsLock, KeyCode::Meta, KeyCode::Fn] {
+            assert_eq!(physical_modifier_twin(PhysicalKey::Code(other)), None);
         }
     }
 }

@@ -2098,7 +2098,7 @@ mod tests {
     }
 
     fn snapshots(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let id = store.open("file:///tmp/draft.md".to_string(), text.to_string());
         let snapshot = store.snapshot(id).unwrap();
         (store, id, snapshot)

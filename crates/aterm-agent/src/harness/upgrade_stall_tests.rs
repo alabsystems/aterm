@@ -144,7 +144,7 @@ fn the_incident_replays_to_a_restart_never_a_stall() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(GAVE_UP_AT);
     assert_eq!(st.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
     assert_eq!(st.release, "gave-up", "the agent is owed its release");
     // 06:00: the four notices delivered at once, and the agent's answer.
@@ -204,21 +204,21 @@ fn the_owners_hold_releases_the_agent_and_forgets_its_answers() {
     };
     announced.announced("ATERM-UPGRADE-READY-0badf00d".to_string(), 10, 1);
     let mut stopped = announced.clone();
-    stopped.stop("signal-refused");
+    stopped.stop("signal-refused", 10);
     assert_eq!(stopped.release, "signal-refused");
     // A relaunch's record, and a Codex one, typed no Claude notice: nothing owed.
     let mut relaunch = announced.clone();
     relaunch.cause = crate::harness::relaunch::CAUSE_EXIT.to_string();
-    relaunch.stop("no-resume");
+    relaunch.stop("no-resume", 10);
     assert!(relaunch.release.is_empty());
     let mut codex = announced.clone();
     codex.agent = upgrade::Agent::Codex;
-    codex.give_up();
+    codex.give_up(10);
     assert!(codex.release.is_empty());
     // Once per abandonment: the first reason kept.
     let mut twice = announced.clone();
-    twice.give_up();
-    twice.stop("resumed-elsewhere");
+    twice.give_up(10);
+    twice.stop("resumed-elsewhere", 10);
     assert_eq!(twice.release, "gave-up");
     // A new notice supersedes a release still owed.
     twice.announced("ATERM-UPGRADE-READY-feedface".to_string(), 20, 1);
@@ -274,7 +274,7 @@ fn a_give_up_spends_the_owners_now() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(GAVE_UP_AT);
     assert_eq!(
         (st.request.clone(), st.request_tab.as_str(), st.request_at),
         (Request::None, "", 0)
@@ -295,7 +295,7 @@ fn a_give_up_spends_the_owners_now() {
         request_tab: TAB.to_string(),
         ..st.clone()
     };
-    skipped.give_up();
+    skipped.give_up(GAVE_UP_AT);
     assert_eq!(skipped.request, Request::Skip("2.1.284".to_string()));
 }
 
@@ -498,9 +498,13 @@ fn a_voided_ready_owes_one_release_typed_once() {
         ..drive(&dir)
     };
     let marker = "ATERM-UPGRADE-READY-0badf00d";
+    // A session at work when the notice came: a conversation holding only
+    // the harness's own turns has no task, and is restarted afresh instead
+    // of asked (D1 of the live E2E of 2026-09-26).
     write_transcript(
         &opts,
         &[
+            user("Tidy the parser module."),
             user(&notice(marker)),
             said_by_agent(&format!("Saved.\n{marker}")),
         ],
@@ -589,7 +593,7 @@ fn a_gave_up_record_restarts_on_a_late_ready_or_releases_its_agent() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(now_s());
     let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
     delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
     write_transcript(&opts, &delivered);
@@ -680,15 +684,18 @@ fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
         st.markers.is_empty(),
         "the restart consumes the READY it acts on"
     );
-    st.signal_failed(back);
+    st.signal_failed(back, now_s());
     assert_eq!(st.phase, Phase::Failed("signal-refused".to_string()));
     assert_eq!(st.release, "signal-refused");
     assert!(st.marker.is_empty() && st.markers.is_empty());
+    // Stopped at this look (a stop older than the stamp is re-armed at
+    // once: `a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs`).
     let old = St {
         phase: Phase::Failed("signal-refused".to_string()),
         marker: marker.to_string(),
         markers: vec![marker.to_string()],
         release: "signal-refused".to_string(),
+        failed_at: now_s(),
         ..base
     };
     for (name, record) in [("refused-after-ready", st), ("refused-kept-markers", old)] {
@@ -714,7 +721,8 @@ fn a_restart_refused_after_ready_releases_the_agent_it_asked() {
         assert!(kept.release.is_empty() && kept.markers.is_empty(), "{name}");
         let second = agent.visit(&opts, shell);
         assert_eq!(second.step, "wait:failed", "{name}");
-        assert_eq!(after(&second.step, 0), After::Finished, "{name}");
+        // Resting, not finished: looked at again until its next round.
+        assert!(matches!(after(&second.step, 0), After::Later(_)), "{name}");
         assert_eq!(turns(&asked), 1, "{name}: typed once, and nothing else");
         drop(agent);
         let _ = std::fs::remove_dir_all(&dir);
@@ -741,7 +749,7 @@ fn a_late_ready_whose_restart_waits_keeps_its_gates_word() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(now_s());
     let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
     delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
     for (name, screen, word) in [
@@ -901,7 +909,7 @@ fn a_release_follows_only_the_process_the_notice_reached() {
             phase: phase.clone(),
             ..St::default()
         };
-        st.stop("resumed-elsewhere");
+        st.stop("resumed-elsewhere", 10);
         assert!(
             st.release.is_empty(),
             "{phase:?}: nothing owed after the signal"
@@ -921,7 +929,7 @@ fn a_release_follows_only_the_process_the_notice_reached() {
         source: Source::Managed,
     };
     let mut stopped = asked.clone();
-    stopped.stop("signal-refused");
+    stopped.stop("signal-refused", 10);
     for prior in [asked, stopped] {
         let st = St::for_target(Some(prior.clone()), &version("2.1.280"), &target, None, 30);
         assert!(!st.release.is_empty(), "{:?}", prior.phase);
@@ -954,7 +962,7 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(now_s());
     let mut after_notice: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
     after_notice.push(user_row(
         r#""isMeta":true,"#,
@@ -973,6 +981,7 @@ fn a_release_is_dropped_where_it_is_no_longer_the_upgrades() {
     let current = Targets {
         managed: None,
         native: None,
+        unanswered: false,
     };
     for (name, rows, other, targets, word) in [
         (
@@ -1061,7 +1070,7 @@ fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(now_s());
     let mut delivered: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
     delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
     let now = now_s();
@@ -1092,10 +1101,15 @@ fn a_late_ready_held_past_the_drain_is_voided_and_its_agent_released() {
     assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
     assert_eq!(kept.release, "gave-up", "still owed");
     assert!(kept.markers.is_empty(), "the stale READY can never end it");
+    assert!(
+        kept.failed_at >= now,
+        "its rest begins again at the void: {}",
+        kept.failed_at
+    );
     let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
     assert!(
         ledger.contains("a draft nobody sent had held the restart")
-            && ledger.contains("not asked again for this build"),
+            && ledger.contains("a new round asks it again in 2h"),
         "{ledger}"
     );
     drop(agent);
@@ -1181,7 +1195,7 @@ fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
     for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
         st.announced(marker.to_string(), at, asks);
     }
-    st.give_up();
+    st.give_up(now_s());
     let notices: Vec<String> = LEDGER.iter().map(|(_, m)| user(&notice(m))).collect();
     let message = user("[from s-d3346b29] v0.91.0 is out; the parser branch can wait");
     let answer = said_by_agent("Noted; the parser branch waits.");
@@ -1246,8 +1260,9 @@ fn a_direction_before_the_ready_never_drops_the_release_its_void_owes() {
             assert!(
                 ledger.contains(r#""step":"drain-expired:background""#)
                     && ledger.contains(
-                        "nothing will restart the session, nothing the notice asked of it still \
-                         applies, and to carry on as it would have without it"
+                        "nothing will restart the session without asking it again first, \
+                         nothing the notice asked of it still applies, and to carry on as it \
+                         would have without it"
                     ),
                 "{name}: {ledger}"
             );
@@ -1458,8 +1473,20 @@ fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
     };
     let live = s["live"] == 1;
     let owed = s["owed"] == 1;
+    let now = if s["window"] == 1 {
+        T0 + upgrade::REASK_S
+    } else {
+        T0 + 60
+    };
+    // A stopped round's rest: run out (`RETRY_S` ago), or begun at this look.
+    let failed_at = match s["phase"] {
+        2 | 4 if s["rest"] == 1 => now - upgrade::RETRY_S,
+        2 | 4 => now,
+        _ => 0,
+    };
     let st = St {
         phase,
+        failed_at,
         to: "9.9.9".to_string(),
         tab: TAB.to_string(),
         notice_pid: AGENT_PID,
@@ -1471,17 +1498,16 @@ fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
         } else {
             String::new()
         },
-        asked: if s["phase"] == 0 {
+        // A pending round that owes a release is one a re-arm started: the
+        // round before it asked, and its markers stay the release's to read
+        // a direction against ([`St::rearm`] keeps them; its first notice
+        // clears them).
+        asked: if s["phase"] == 0 && s["owed"] == 0 {
             Vec::new()
         } else {
             vec![marker(1)]
         },
         ..St::default()
-    };
-    let now = if s["window"] == 1 {
-        T0 + upgrade::REASK_S
-    } else {
-        T0 + 60
     };
     let mut tail = vec![user(&notice(&marker(1)))];
     if history {
@@ -1504,12 +1530,14 @@ fn real_of(s: &S, history: bool) -> (St, Facts, u64, Vec<String>) {
 /// record's RAW state, not the driver's reading of it (the review of
 /// 2026-09-26: a projection that zeroed `live` for every stopped phase hid a
 /// stop that kept its markers): `live`, the round's markers kept; `ready`, an
-/// answer to one of them ([`answered`]). The agent's, the conversation's and
-/// the ghosts' are taken from `s`.
-fn project(s: &S, st: &St, tail: &[String]) -> S {
+/// answer to one of them ([`answered`]); `rest`, a stopped round's rest run
+/// out at `now` ([`St::failed_for`]). A pending round has asked nothing
+/// ([`St::rearm`] resets the asks). The agent's, the conversation's and the
+/// ghosts' are taken from `s`.
+fn project(s: &S, st: &St, tail: &[String], now: u64) -> S {
     let mut p = s.clone();
     let (phase, asks) = match &st.phase {
-        Phase::Pending => (0, s["asks"]),
+        Phase::Pending => (0, 0),
         Phase::Announced { asks, .. } => (1, model_asks(*asks)),
         Phase::Failed(why) if why == upgrade::GAVE_UP => (2, s["asks"]),
         Phase::Done | Phase::Exiting { .. } | Phase::Relaunched { .. } => (3, s["asks"]),
@@ -1523,6 +1551,7 @@ fn project(s: &S, st: &St, tail: &[String]) -> S {
     );
     p.insert("ready", i64::from(answered(st, Some(&tail.join("\n")))));
     p.insert("owed", i64::from(!st.release.is_empty()));
+    p.insert("rest", i64::from(st.failed_for(now) >= upgrade::RETRY_S));
     p
 }
 
@@ -1574,6 +1603,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     if st.ready_since != 0 {
         f.ready_s = now - st.ready_since;
     }
+    st.time_failed(&mut f, now);
     let step = upgrade::requested_step(&Request::None, &st.phase, &f, ready, now, &st.to);
     let reask = step == Step::Announce && st.phase != Phase::Pending;
     if holds == Holds::Refused && !(step == Step::Terminate || reask) {
@@ -1584,7 +1614,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     let mut word = match step {
         Step::Announce if holds == Holds::Refused => {
             // `unplanned`: the relaunch refuses the plan the re-ask asks first.
-            st.stop("argv:--bogus");
+            st.stop("argv:--bogus", now);
             actions.push("Abandon");
             "refused:--bogus".to_string()
         }
@@ -1600,18 +1630,20 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             agent.insert("holding", 1);
             agent.insert("told", 0);
             agent.insert("directed", 0);
-            actions.push("Announce");
+            // Over a READY it stands for (the agent's own work outlived the
+            // answer): the notice that supersedes it.
+            actions.push(if ready { "Supersede" } else { "Announce" });
             format!("announced:{asks}")
         }
         Step::GiveUp => {
-            st.give_up();
-            actions.push("GiveUp");
+            st.give_up(now);
+            actions.push(if ready { "GiveUpOutlived" } else { "GiveUp" });
             "gave-up".to_string()
         }
         Step::Terminate => {
             let back = st.signalled(AGENT_PID, 1, TAB, "claude --resume x".to_string(), now);
             if holds == Holds::Refused {
-                st.signal_failed(back);
+                st.signal_failed(back, now);
                 actions.push("Abandon");
                 "failed:signal-refused".to_string()
             } else {
@@ -1633,6 +1665,15 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             format!("drain-expired:{why}")
         }
         Step::Wait(why) => format!("wait:{why}"),
+        // A stopped round that has rested: a new one ([`rearm`]'s record
+        // transition; its first notice is the next look's).
+        Step::Rearm => {
+            let why = st.rearm(now);
+            actions.push("Rearm");
+            format!("rearmed:{why}")
+        }
+        // The model's conversation has a task: never restarted afresh.
+        Step::Fresh => unreachable!("a conversation with a task: {f:?}"),
     };
     if release_is_next(&step, &word) && !st.release.is_empty() {
         let text = tail.join("\n");
@@ -1668,14 +1709,18 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
             };
         }
     }
-    if actions.is_empty() && !f.limited && after(&word, 0) == After::Finished {
+    if actions.is_empty() && !f.limited && quiet(&word) {
         agent.insert("stuck", s["holding"]);
+        if s["rest"] == 1 {
+            agent.insert("stalled", 1);
+        }
         actions.push("Look");
     }
     let owed = !st.release.is_empty();
-    let mut next = project(&agent, &st, &tail);
+    let mut next = project(&agent, &st, &tail, now);
     let window = match st.phase {
         Phase::Announced { at_s, .. } => i64::from(now.saturating_sub(at_s) >= upgrade::REASK_S),
+        Phase::Pending => 0,
         _ => s["window"],
     };
     next.insert("window", window);
@@ -1687,14 +1732,24 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
     })
 }
 
+/// THE UPGRADE'S QUIET WORD — nothing it would do for the agent at this look
+/// (the model's `Look`): its last word ([`After::Finished`]), or a stopped
+/// round resting before its next (`wait:failed`), which the window looks at
+/// again ([`after`]) but which asks, releases and restarts nothing until the
+/// rest runs out.
+fn quiet(word: &str) -> bool {
+    word == "wait:failed" || after(word, 0) == After::Finished
+}
+
 /// The reducer's actions, the environment's aside; `Void` is a person's or
 /// the agent's own work's, `Abandon` a refusal's.
-const REDUCER: [&str; 6] = [
+const REDUCER: [&str; 7] = [
     "Announce",
     "GiveUp",
     "Restart",
     "Release",
     "DropRelease",
+    "Rearm",
     "Look",
 ];
 
@@ -1719,8 +1774,9 @@ fn reachable(m: &Model) -> Vec<S> {
 
 /// Whether `m` admits what the real visit decided at `s` under `holds`: at an
 /// idle look, the reducer's own step is the ONE the model's guards enable (a
-/// wait where none is); held, the void exactly where the model voids;
-/// refused, the round abandoned — and the model, firing the same actions in
+/// wait where none is); held by a person, the void exactly where the model
+/// voids; held by the agent's own work, the re-ask or give-up over the READY
+/// where the model takes one, else its void; refused, the round abandoned — and the model, firing the same actions in
 /// the same order, lands where the real record does.
 fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
     let lands = || {
@@ -1736,9 +1792,18 @@ fn agrees(m: &Model, s: &S, holds: Holds, d: &Decided) -> bool {
             want == d.actions.first().copied().into_iter().collect::<Vec<_>>()
                 && (d.actions.is_empty() || lands())
         }
-        Holds::Person | Holds::Background => {
+        Holds::Person => {
             let voided = d.actions.first() == Some(&"Void");
             m.action_enabled("Void", s) == voided && (!voided || lands())
+        }
+        // The agent's own work under a READY past the bound: the re-ask that
+        // supersedes it, or the give-up over it, where the model takes one;
+        // else the void where the model voids (a gave-up upgrade's).
+        Holds::Background => {
+            let held = ["Supersede", "GiveUpOutlived", "Void"];
+            let want = held.into_iter().find(|a| m.action_enabled(a, s));
+            let took = d.actions.first().copied().filter(|a| held.contains(a));
+            want == took && (want.is_none() || lands())
         }
         Holds::Refused => {
             d.actions.first() == Some(&"Abandon") && m.action_enabled("Abandon", s) && lands()
@@ -1769,7 +1834,13 @@ fn reads_as(m: &Model, s: &S, action: &str, history: bool) -> Option<bool> {
     let text = tail.join("\n");
     let drops = release_void(&st, &agent_file(), TAB, Some(&text)).is_some();
     let mut point = t.clone();
-    for (var, value) in [("owed", 1), ("ready", 0), ("limited", 0), ("phase", 2)] {
+    for (var, value) in [
+        ("owed", 1),
+        ("ready", 0),
+        ("limited", 0),
+        ("phase", 2),
+        ("rest", 0),
+    ] {
         point.insert(var, value);
     }
     Some(
@@ -1785,6 +1856,7 @@ fn defective() -> Vec<(&'static str, Model)> {
     std::iter::once(("Buggy", aterm_spec::interp::with_buggy(&model, 1)))
         .chain(
             [
+                "Terminal",
                 "NoF1",
                 "NoF2",
                 "NoOwe",
@@ -1808,8 +1880,9 @@ fn defective() -> Vec<(&'static str, Model)> {
 /// and release rules, and the window's reading of each word ([`after`]) —
 /// takes the step the model's guards allow and lands where the model's
 /// actions land: at an idle look the one reducer step; under a person's hold
-/// or the agent's own work past the drain, the void exactly where the model
-/// voids; under a refused signal or plan, the round abandoned and its release
+/// past the drain, the void exactly where the model voids; under the agent's
+/// own work past it, the re-ask that supersedes the READY (or the give-up
+/// over it) where the model takes one, else the void; under a refused signal or plan, the round abandoned and its release
 /// typed; the release dropped exactly where the model drops it; and the last
 /// word only where the model says it. Each state is decided over its plain
 /// transcript and, where it fits, over THE SECOND REVIEW'S HISTORY — a peer's
@@ -1892,6 +1965,38 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
                 }
             }
         }
+        // A stopped round's rest runs out RETRY_S after its stop, limited or
+        // not (`Rests`): the look that finds it so re-arms it, or — a
+        // gave-up round's late READY in hand — acts on the answer.
+        if (s["phase"] == 2 || s["phase"] == 4) && s["rest"] == 0 {
+            let later = now + upgrade::RETRY_S;
+            let runs = st.failed_for(later) >= upgrade::RETRY_S
+                && st.failed_for(later - 1) < upgrade::RETRY_S;
+            assert_eq!(runs, model.action_enabled("Rests", s), "Rests at {s:?}");
+            let ready = heard(
+                &st,
+                &agent_file(),
+                TAB,
+                Some(&real_of(s, false).3.join("\n")),
+            );
+            let mut aged = f.clone();
+            st.time_failed(&mut aged, later);
+            let rearms = upgrade::next_step(&st.phase, &aged, ready, later) == Step::Rearm;
+            let mut rested = s.clone();
+            assert!(model.fire("Rests", &mut rested));
+            assert_eq!(
+                rearms,
+                model.action_enabled("Rearm", &rested),
+                "Rearm after the rest at {rested:?}"
+            );
+            for (name, m) in &defective {
+                if runs != m.action_enabled("Rests", s)
+                    || rearms != m.action_enabled("Rearm", &rested)
+                {
+                    *disagree.get_mut(name).expect("a knob") += 1;
+                }
+            }
+        }
         // A limit the window's loop saw holds it too: its close starts the
         // window again, as `LimitResets` does.
         if s["phase"] == 1 && s["limited"] == 1 {
@@ -1916,9 +2021,12 @@ fn the_real_upgrade_conforms_to_the_never_strands_model() {
         }
     }
     assert!(histories > 0, "the second review's history is decided");
+    // The reducer's seven, the held three (`Void`, and the re-ask and give-up
+    // over a READY the agent's work outlived), `Abandon`, and the
+    // conversation's three.
     assert_eq!(
         taken.len(),
-        REDUCER.len() + 5,
+        REDUCER.len() + 7,
         "every step of the upgrade, and every move of the conversation, is taken by the real \
          code: {taken:?}"
     );
@@ -2008,4 +2116,357 @@ fn the_incident_schedule_conforms_and_the_pre_fix_run_is_caught() {
     assert_eq!(refused, Some("Announce"), "the first notice at the limit");
     assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
     assert!(!buggy.check_invariant("NoNoticeWhileLimited", &s), "{s:?}");
+}
+
+// ------------------------------------------ no stop is for good (2026-09-27)
+
+/// EVERY STOP IS STAMPED, AND A RE-ARM IS A NEW ROUND ([`St::fail`],
+/// [`St::rearm`]). The give-up, a stop, a refused signal and a gave-up
+/// round's void each stamp the rest's start; the new round is pending with a
+/// fresh salt past every marker the old one could mint, its markers and
+/// stamp gone, the owner's spent `--now` gone (a skip kept), the release
+/// still owed carried for the new notice to supersede, and why the old one
+/// stopped kept until that notice. A state an older build wrote carries no
+/// stamp — no migration: it reads as stopped long ago and is due at once.
+#[test]
+fn a_stop_is_stamped_and_a_rearm_is_a_new_round() {
+    let mut st = St {
+        to: "9.9.9".to_string(),
+        salt: 1_000,
+        request: Request::Now,
+        request_tab: TAB.to_string(),
+        request_at: 900,
+        ..St::default()
+    };
+    st.announced(marker(1), 1_000, 1);
+    st.give_up(2_000);
+    assert_eq!(st.failed_at, 2_000);
+    assert_eq!(st.failed_for(2_000 + upgrade::RETRY_S), upgrade::RETRY_S);
+    let mut stopped = St::default();
+    stopped.stop("resumed-elsewhere", 3_000);
+    assert_eq!(stopped.failed_at, 3_000);
+    let mut refused = St::default();
+    refused.announced(marker(1), 10, 1);
+    let back = refused.signalled(AGENT_PID, 1, TAB, "claude --resume x".to_string(), 20);
+    refused.signal_failed(back, 30);
+    assert_eq!(
+        (refused.phase.clone(), refused.failed_at),
+        (Phase::Failed("signal-refused".to_string()), 30)
+    );
+    // A gave-up round's void begins its rest again.
+    let mut voided = st.clone();
+    voided.void(5_000);
+    assert_eq!(voided.failed_at, 5_000);
+    // THE NEW ROUND.
+    let mut skip = st.clone();
+    skip.request = Request::Skip("9.9.9".to_string());
+    let why = st.rearm(9_000);
+    assert_eq!(why, upgrade::GAVE_UP);
+    assert_eq!(st.phase, Phase::Pending);
+    assert!(st.marker.is_empty() && st.markers.is_empty());
+    assert!(st.salt > 1_000 + u64::from(upgrade::MAX_ASKS));
+    assert_eq!(st.failed_at, 0);
+    assert_eq!(
+        st.failed_for(u64::MAX),
+        0,
+        "a pending round has not stopped"
+    );
+    assert_eq!(st.release, "gave-up", "carried for the new notice");
+    assert_eq!(st.last_stop, upgrade::GAVE_UP);
+    assert_eq!(
+        (st.request.clone(), st.request_tab.as_str(), st.request_at),
+        (Request::None, "", 0),
+        "the owner's --now was spent with the round it hurried"
+    );
+    let _ = skip.rearm(9_000);
+    assert_eq!(skip.request, Request::Skip("9.9.9".to_string()), "kept");
+    // Its first notice is ask 1, supersedes the release and clears the stop.
+    assert_eq!(upgrade::announce_asks(&st.phase, false), 1);
+    st.announced(marker(2), 9_100, 1);
+    assert!(st.release.is_empty() && st.last_stop.is_empty());
+    assert_eq!(st.markers, vec![marker(2)]);
+    // The record keeps the stamp, and an older build's reads with none.
+    let mut again = St::default();
+    again.stop("no-resume", 7_000);
+    let text = again.to_json();
+    assert!(text.contains(r#""failed_at":7000"#), "{text}");
+    assert_eq!(St::from_json(&text).expect("reads").failed_at, 7_000);
+    let older = text.replace(r#","failed_at":7000"#, "");
+    assert_ne!(older, text);
+    let old = St::from_json(&older).expect("an older build's state reads");
+    assert_eq!(old.failed_at, 0);
+    assert_eq!(old.failed_for(T0), T0, "stopped long ago");
+    assert!(upgrade::retry_due(&old.phase, old.failed_for(T0), false));
+}
+
+/// THE OWNER'S STALL OF 2026-09-27, THROUGH THE REAL VISIT (tab
+/// `s-d3346b29dd236432b852`: `phase=failed:unanswered pending_for=1d22h
+/// wait=background … stalled=gave-up`, and `--dry-run` said
+/// `step=wait:failed`). The round gave up after four notices; the agent
+/// answered READY late; a shell of its own ran on under it past the drain.
+/// The READY is voided and the agent released — and the round RESTS, looked
+/// at again (`wait:failed` is no last word), never waited on for ever. Once
+/// it has rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the
+/// ledger, nothing typed), and the next look types its first notice, with a
+/// marker of its own, NAMING WHAT RUNS under the agent. At a BREAK of that
+/// work — where the owner's tab took nearly every step — the same record,
+/// as an older build wrote it (no stamp), is re-armed and asked there.
+/// NEGATIVE CONTROLS: the owner's `--skip` of the build holds the stopped
+/// round for good, typing nothing; a limited session is re-armed but not
+/// asked.
+#[cfg(unix)]
+#[test]
+fn a_stopped_round_rests_then_a_new_one_asks_again_naming_what_runs() {
+    let now = now_s();
+    let mut st = St {
+        from: "1.0.0".to_string(),
+        to: "9.9.9".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    for (asks, (at, marker)) in (1u32..).zip(LEDGER) {
+        st.announced(marker.to_string(), at, asks);
+    }
+    let old_salt = st.salt;
+    st.give_up(now - 60);
+    // A conversation at work when the notices came (one with no task is
+    // restarted afresh, never asked).
+    let mut delivered = vec![user("Tidy the parser module.")];
+    delivered.extend(LEDGER.iter().map(|(_, m)| user(&notice(m))));
+    delivered.push(said_by_agent(&format!("Stopping.\n{}", LEDGER[3].1)));
+    let run = |opts: &Opts, agent: &Agent| {
+        let shell = dead_pid();
+        // A shell the agent left running, under it: its own work.
+        let table = vec![
+            (shell, 1, "zsh".to_string()),
+            (agent.sf.pid + 100_000, agent.sf.pid, "zsh".to_string()),
+        ];
+        let args = atpkg::caller_shell::process_args(agent.sf.pid).expect("argv");
+        let files = session_files(&opts.home);
+        visit_with_claim(
+            opts,
+            &agent.sf,
+            files.as_deref(),
+            &table,
+            &newer(),
+            &Script::new(shell, usize::MAX, None),
+            Some(&args),
+            None,
+        )
+    };
+    let dir = scratch("owners-stall");
+    let (sock, asked) = instance(&dir);
+    let opts = Opts {
+        sock: Some(sock),
+        ..drive(&dir)
+    };
+    write_transcript(&opts, &delivered);
+    let heard = St {
+        ready_since: now - upgrade::DRAIN_S,
+        ..st.clone()
+    };
+    let agent = Agent::start(&opts, &heard);
+    // The READY its own work outlived: voided, the agent released.
+    assert_eq!(run(&opts, &agent).step, "released:gave-up");
+    assert_eq!(typed(&asked, "Upgrade off:"), 1);
+    // Resting, NOT finished: looked at again, nothing typed.
+    let resting = run(&opts, &agent);
+    assert_eq!(resting.step, "wait:failed");
+    assert!(matches!(after(&resting.step, 9), After::Later(_)));
+    assert_eq!(turns(&asked), 1);
+    // The rest runs out.
+    let mut rested = load(&opts, SESSION).expect("state");
+    assert!(rested.failed_at >= now, "the void began the rest again");
+    rested.failed_at = now_s() - upgrade::RETRY_S;
+    save(&opts, SESSION, &rested);
+    let rearmed = run(&opts, &agent);
+    assert_eq!(rearmed.step, "rearmed:unanswered");
+    assert_eq!(turns(&asked), 1, "a new round types nothing itself");
+    let fresh = load(&opts, SESSION).expect("state");
+    assert_eq!(fresh.phase, Phase::Pending);
+    assert!(fresh.salt > old_salt + u64::from(upgrade::MAX_ASKS));
+    let ledger = std::fs::read_to_string(state_dir(&opts).join("ledger.jsonl")).expect("ledger");
+    assert!(
+        ledger.contains(r#""step":"rearmed:unanswered""#) && ledger.contains("no stop is for good"),
+        "{ledger}"
+    );
+    assert!(matches!(after(&rearmed.step, 0), After::Later(_)));
+    // Its first notice: a marker of its own, and what runs under the agent.
+    let notice = run(&opts, &agent);
+    assert_eq!(notice.step, "announced:1");
+    let typed_notice = asked
+        .lock()
+        .expect("log")
+        .iter()
+        .rfind(|l| l.contains(" turn "))
+        .cloned()
+        .expect("a notice");
+    assert!(
+        typed_notice.contains(&format!(
+            "Running under you now, as aterm sees it: pid {} (zsh",
+            agent.sf.pid + 100_000
+        )),
+        "{typed_notice}"
+    );
+    let marker = load(&opts, SESSION).expect("state").marker;
+    assert!(marker.starts_with(upgrade::READY_PREFIX), "{marker}");
+    assert!(
+        LEDGER.iter().all(|(_, m)| *m != marker),
+        "a marker of its own"
+    );
+    drop(agent);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // AT A BREAK, as an older build wrote the record: no stamp, the READY
+    // long voided (its markers gone), a stale READY in the transcript.
+    let mut stale = st.clone();
+    stale.forget_markers();
+    stale.release.clear();
+    stale.failed_at = 0;
+    let older = stale.to_json().replace(r#","failed_at":0"#, "");
+    let stale = St::from_json(&older).expect("an older build's state");
+    for (name, screen, request, words) in [
+        (
+            "brk-rearm",
+            None,
+            Request::None,
+            ["rearmed:unanswered", "announced:1"],
+        ),
+        (
+            "brk-limited",
+            Some(limited_screen()),
+            Request::None,
+            ["rearmed:unanswered", "wait:limited"],
+        ),
+        (
+            "brk-skip",
+            None,
+            Request::Skip("9.9.9".to_string()),
+            ["wait:skipped", "wait:skipped"],
+        ),
+    ] {
+        let dir = scratch(name);
+        let (sock, asked) = instance_with(
+            &dir,
+            Answers {
+                screen: screen.unwrap_or_else(idle_screen),
+                ..Answers::default()
+            },
+        );
+        let opts = Opts {
+            sock: Some(sock),
+            background: true,
+            ..drive(&dir)
+        };
+        write_transcript(&opts, &delivered);
+        let record = St {
+            request: request.clone(),
+            request_tab: if request == Request::None {
+                String::new()
+            } else {
+                TAB.to_string()
+            },
+            ..stale.clone()
+        };
+        let agent = Agent::start(&opts, &record);
+        for word in words {
+            assert_eq!(run(&opts, &agent).step, word, "{name}");
+        }
+        let kept = load(&opts, SESSION).expect("state");
+        match name {
+            "brk-rearm" => {
+                assert_eq!(turns(&asked), 1, "{name}: the notice, at the break");
+                assert!(matches!(kept.phase, Phase::Announced { asks: 1, .. }));
+            }
+            "brk-limited" => {
+                assert_eq!(turns(&asked), 0, "{name}: never asked at the limit");
+                assert_eq!(kept.phase, Phase::Pending);
+            }
+            _ => {
+                assert_eq!(turns(&asked), 0, "{name}: the skip holds it");
+                assert_eq!(kept.phase, Phase::Failed(upgrade::GAVE_UP.to_string()));
+            }
+        }
+        drop(agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// TIER-1, THE OWNER'S STALL AS A SCHEDULE: the environment as it ran (the
+/// agent's late READY, its own work outliving it, the rest running out) and
+/// the REAL decisions between — the give-up, the void, the release, the new
+/// round, its notice, the restart on its READY — each transition admitted by
+/// the model and every state within `NeverStalls` and `NeverStranded`. The
+/// same schedule under `Terminal = 1` (the reducer as it ran) is refused at
+/// the new round the real code takes, and ends at the quiet word past the
+/// rest: `NeverStalls` catches it.
+#[test]
+fn the_owners_stall_schedule_conforms_and_the_terminal_run_is_caught() {
+    let model = harness_upgrade_never_strands_model();
+    let terminal = aterm_spec::interp::with_consts(&model, &[("Terminal", 1)]);
+    let admit = |m: &Model, prev: &S, next: &S| aterm_spec::interp::admits(m, prev, next);
+    let env = |s: &S, action: &str| {
+        let mut next = s.clone();
+        assert!(model.fire(action, &mut next), "{action} at {s:?}");
+        next
+    };
+    let look = |s: &S, holds: Holds| decide(s, holds, false).expect("a look");
+    let mut trace = vec![model.init_state()];
+    let push = |trace: &mut Vec<S>, next: S| {
+        let prev = trace.last().expect("a state").clone();
+        assert!(
+            admit(&model, &prev, &next).is_some(),
+            "{prev:?} -> {next:?}"
+        );
+        for inv in ["NeverStalls", "NeverStranded", "NoNoticeWhileLimited"] {
+            assert!(model.check_invariant(inv, &next), "{inv} at {next:?}");
+        }
+        trace.push(next);
+    };
+    let last = |trace: &Vec<S>| trace.last().expect("a state").clone();
+    // One real look: its actions fired in the model one by one, each state
+    // admitted, landing where the real record does.
+    let step = |trace: &mut Vec<S>, holds: Holds, want: &[&str]| {
+        let d = look(&last(trace), holds);
+        assert_eq!(d.actions, want, "{:?}", last(trace));
+        for action in &d.actions {
+            let mut next = last(trace);
+            assert!(model.fire(action, &mut next), "{action}");
+            push(trace, next);
+        }
+        assert_eq!(last(trace), d.next);
+    };
+    step(&mut trace, Holds::Nothing, &["Announce"]);
+    let next = env(&last(&trace), "Elapse");
+    push(&mut trace, next);
+    step(&mut trace, Holds::Nothing, &["Announce"]);
+    let next = env(&last(&trace), "Elapse");
+    push(&mut trace, next);
+    // The give-up, with a box up at the tab that holds its release back —
+    // so the agent's READY can come late, as the owner's did.
+    step(&mut trace, Holds::Person, &["GiveUp"]);
+    let next = env(&last(&trace), "AgentReady");
+    push(&mut trace, next);
+    // Its own work outlives the READY past the drain: voided, and the agent
+    // released at the same look.
+    step(&mut trace, Holds::Background, &["Void", "Release"]);
+    // Resting: the quiet word, not stranded (released), not stalled.
+    step(&mut trace, Holds::Nothing, &["Look"]);
+    let rested = env(&last(&trace), "Rests");
+    push(&mut trace, rested.clone());
+    step(&mut trace, Holds::Nothing, &["Rearm"]);
+    step(&mut trace, Holds::Nothing, &["Announce"]);
+    let next = env(&last(&trace), "AgentReady");
+    push(&mut trace, next);
+    step(&mut trace, Holds::Nothing, &["Restart"]);
+    assert_eq!((last(&trace)["phase"], last(&trace)["holding"]), (3, 0));
+
+    // THE TERMINAL RUN: the real code's new round is no move of its.
+    let mut rearmed = rested.clone();
+    assert!(model.fire("Rearm", &mut rearmed));
+    assert_eq!(admit(&terminal, &rested, &rearmed), None, "refused");
+    assert_eq!(look(&rested, Holds::Nothing).actions, ["Rearm"]);
+    let mut s = rested;
+    assert!(terminal.fire("Look", &mut s), "{s:?}");
+    assert!(!terminal.check_invariant("NeverStalls", &s), "{s:?}");
 }

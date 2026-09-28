@@ -54,7 +54,7 @@ target-trust
 !vendor/**/debug/
 
 # Sibling target dirs at the root (2026-09-13): the merge gate's per-lane dirs
-# (target-regex, target-xtask, target-drivers), its own `target-gate`, and the
+# (target-xtask, target-drivers), its own `target-gate`, and the
 # `target-tippy` lint dir, which is often a SYMLINK. No trailing slash on
 # purpose: `/target-*/` matches directories only, and `git check-ignore` measured
 # it leaving a `target-tippy` symlink untracked. Nothing tracked starts with

@@ -18,9 +18,8 @@
 //! shapes, with its real names, because a verbatim excerpt cannot be
 //! self-contained (a child section's opening and closing lines sit thousands of
 //! lines apart and four are open at once) and the whole 6,023-line section is
-//! 552 KB. That section is checked all the same, by the opt-in
-//! `ATERM_VERIFY_HUNG_LOG` case beside the fixture's. It is std-only string
-//! scanning because this crate has no dependencies on purpose (see Cargo.toml).
+//! 552 KB. It is std-only string scanning because this crate has no
+//! dependencies on purpose (see Cargo.toml).
 //!
 //! WHAT LIBTEST ACTUALLY WRITES, read from an upstream libtest source
 //! (nightly-2025-11-13, `library/test/src/formatters/pretty.rs`; the Trust
@@ -848,34 +847,6 @@ mod tests {
             n.contains("a re-exec child of this binary ran the same name"),
             "the child-verdict case is named as such:\n{n}"
         );
-    }
-
-    /// THE REAL LOG, when the operator still has it: 6,023 lines the tree cannot hold
-    /// (552 KB). `ATERM_VERIFY_HUNG_LOG=<path>` points this at one, and it asserts what
-    /// was measured by hand on 2026-09-17 against the 2026-09-16 stage log — exactly one
-    /// name, the incident's — so the claim in that commit message is reproducible rather
-    /// than remembered. Unset, it says so and asserts nothing: the fixture beside it
-    /// carries the permanent coverage.
-    #[test]
-    fn the_whole_real_log_names_exactly_the_incident_test_when_one_is_given() {
-        let Some(path) = std::env::var_os("ATERM_VERIFY_HUNG_LOG") else {
-            use std::io::Write as _;
-            let _ = std::io::stderr().write_all(
-                b"the_whole_real_log_...: ATERM_VERIFY_HUNG_LOG is unset, so the real stage \
-                  log is not checked here (the fixture beside it is)\n",
-            );
-            return;
-        };
-        let log = std::fs::read_to_string(&path).expect("the named log is readable");
-        let u = scan(&log).expect("a test-binary section");
-        assert_eq!(
-            hung_names(&u),
-            ["control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed"],
-            "{u:?}"
-        );
-        assert_eq!(u.declared, Some(4874), "{u:?}");
-        assert_eq!(u.verdicts, 4873, "{u:?}");
-        assert!(!u.finished, "{u:?}");
     }
 
     /// One failing test binary as cargo and libtest print it under

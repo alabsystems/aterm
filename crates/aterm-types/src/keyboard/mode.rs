@@ -59,6 +59,30 @@ bitflags! {
         /// modifier and is stripped before encoding. Absent (the default) keeps
         /// NumLock as a special modifier, matching xterm's power-on `numLock`.
         const NO_SPECIAL_MODIFIERS = 1 << 14;
+        /// ConPTY win32-input-mode (DEC private mode 9001) is SET: the console
+        /// host on the far side of the PTY asked for INPUT_RECORD-faithful key
+        /// reports (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, microsoft/terminal
+        /// spec #4999). conhost requests it at every ConPTY start, and it is the
+        /// ONLY way a key can carry Windows modifiers across the pipe: legacy VT
+        /// has no byte for Shift+Enter or Ctrl+Enter, and conhost reads aterm's
+        /// legacy Shift+Enter LF (0x0a) as Ctrl+Enter (measured 2026-09-22:
+        /// `ReadKey` → `KEY=Enter MODS=Control CHAR=0xA`, so PSReadLine ran
+        /// InsertLineAbove instead of AddLine).
+        ///
+        /// A NEGOTIATION BIT WITH THE HOST, NOT A KITTY FLAG. It lives in this
+        /// word only because the encoder reads one word; it is never part of
+        /// the `CSI ? flags u` answer, the kitty push/pop stack, or any
+        /// projection an application sees (`kitty_suppresses_predictive_echo`,
+        /// `kitty_reports_functional_keys`). In the ENCODER, though, it
+        /// outranks a kitty push for the chords it covers: under ConPTY conhost
+        /// is the only reader, an application's `CSI > 1 u` reaches this
+        /// terminal verbatim through the pipe, and conhost's input parser then
+        /// DROPS the `CSI 13;2 u` written back (measured 2026-09-22: no record
+        /// reached a `ReadKey` loop) — so the record is the only spelling of
+        /// Shift+Enter that ever arrives at the application that asked for
+        /// kitty. The kitty flags themselves stay set; every key the record
+        /// does not cover follows them exactly as before.
+        const WIN32_INPUT = 1 << 15;
 
         /// Aggregate: any kitty keyboard protocol progressive-enhancement flag.
         /// When any of these is active the app negotiated kitty semantics, which

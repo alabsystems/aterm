@@ -22,33 +22,47 @@
 //! of the 7 layouts to 1-3 `set*` calls per draw stream, which is W4's encode
 //! job, not a resource.
 //!
-//! # The wgpu variant is the live one
+//! # Which arm is live where
 //!
-//! Until W6's flip, every production construction site routes through
-//! [`DeviceHandle::Wgpu`] and the behavior is IDENTICAL to the direct wgpu
-//! calls this layer replaced — same descriptors, same labels, same usage
-//! bits, same upload layouts. The proof is the untouched paint-parity suite
-//! plus the whole aterm-gui suite running through the routed renderer. The
-//! Metal variant is reached by tests only (the W3/W4 differential ladder and
-//! the atlas-grow parity), and its resources are minted through
+//! The file has two halves, and they are compiled differently.
+//!
+//! THE RESOURCE HALF (`TexUsage`, `SamplerKind`, `DeviceHandle`,
+//! `LayerTexture`, `LayerBuffer`, `LayerSampler`) is the wgpu arm's
+//! resource seam, compiled only under `cfg(wgpu_arm)` (`build.rs` — every
+//! non-macOS target, and macOS only under the `wgpu-oracle` feature the
+//! test/bench builds turn on). On Linux and Windows [`DeviceHandle::Wgpu`] is
+//! production, and its behavior is IDENTICAL to the direct wgpu calls this
+//! layer replaced — same descriptors, same labels, same usage bits, same
+//! upload layouts; the paint-parity suite and the aterm-gui suite run through
+//! it. Its Metal variants are a test-only differential rig
+//! (`cfg(all(target_os = "macos", test))`, the W3/W4 ladder and the
+//! atlas-grow parity), minted through
 //! [`crate::metal::resources::MetalResourceDevice`] so every texture carries
 //! its loss-domain stamp (the W1 judge's two-latch residual, sealed
-//! structurally in `metal::resources`).
+//! structurally in `metal::resources`). The macOS production renderer
+//! allocates its resources in `metal/` directly (`FrameRes::Metal`, THE FLIP,
+//! map §5 W6), and the shipped macOS closure compiles no wgpu.
+//!
+//! THE FRAME-SEAM HALF ([`TexelFormat`], [`ClearColor4`], [`FrameLoad`],
+//! [`FrameEncoder`], [`FramePass`], the `Frame*` handle enums, and
+//! [`metal_try_read_back`] / [`metal_stage_readback`]) is compiled on EVERY
+//! build, its Metal arms under `cfg(target_os = "macos")` alone. It is the
+//! macOS production encode's seam: `renderer.rs::run_frame_plan` drives a
+//! [`FrameEncoder::Metal`] with `FrameRes::Metal`'s views, uniforms,
+//! pipelines, atlases and streams, the scroll shift
+//! (`metal_shift_offscreen_band_px`) copies through one, and the capture
+//! read-back is [`metal_try_read_back`].
 //!
 //! # Crossing back out
 //!
-//! Seams that are still wgpu-only until later waves (bind-group creation,
-//! `encode_frame`, the present path) take the live resource out of the enum
-//! via [`LayerTexture::wgpu`]/[`LayerBuffer::wgpu`] and friends. On a Metal
-//! resource those accessors PANIC BY NAME — that panic is the W6 flip's todo
-//! list, enumerable by grep, and until the flip it is unreachable from
-//! production because production only constructs the Wgpu variant.
-//!
-//! The W3 header recorded ONE production resource outside that greppable
-//! list: the scroll-shift scratch in `renderer.rs::shift_offscreen_band_px`.
-//! W4 item 3 ROUTED it — the scratch is a `LayerTexture` and its two staged
-//! copies run through [`FrameEncoder::copy_texture_rect`] — so the greppable
-//! crossing list is once again the COMPLETE W6 flip todo.
+//! The wgpu-typed seams (bind-group creation, `encode_frame`, the present
+//! path) take the resource out of the enum via
+//! [`LayerTexture::wgpu`]/[`LayerBuffer::wgpu`] and friends. On a Metal
+//! resource those accessors PANIC BY NAME: a cross-backend guard for the
+//! oracle build, where both arms are compiled side by side — not a to-do
+//! list, since production never holds a Metal variant of the resource enums.
+//! The frame-seam handles guard the same way: a handle crossed into the other
+//! arm's encoder panics by name ("device layer").
 
 #[cfg(target_os = "macos")]
 use crate::metal::ffi as mtl;
@@ -223,7 +237,8 @@ pub(crate) enum SamplerKind {
 /// One backend, borrowed — the handle a routed construction site does its
 /// resource work through. Production hands out only the Wgpu arm
 /// ([`crate::GpuContext::device_layer`]); the Metal arm exists for the
-/// differential ladder and becomes the live one at W6.
+/// differential ladder (macOS production renders through the armed Metal
+/// path, never through this handle).
 #[derive(Clone, Copy)]
 #[cfg(wgpu_arm)]
 pub(crate) enum DeviceHandle<'a> {
@@ -475,10 +490,9 @@ impl DeviceHandle<'_> {
         }
     }
 
-    /// The live wgpu device — for construction seams that stay wgpu-typed
-    /// until their own wave (bind-group layouts, bind groups, pipelines,
-    /// shader modules). Panics by name on the Metal arm, exactly like
-    /// [`LayerTexture::wgpu`].
+    /// The live wgpu device — for the wgpu-typed construction seams
+    /// (bind-group layouts, bind groups, pipelines, shader modules). Panics
+    /// by name on the Metal arm, exactly like [`LayerTexture::wgpu`].
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu_device(&self) -> &wgpu::Device {
         match self {
@@ -486,7 +500,9 @@ impl DeviceHandle<'_> {
             Self::Wgpu { device, .. } => device,
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
-                "device layer: a METAL handle reached a wgpu-only construction                  seam (bind-group layout / pipeline / shader module) — that                  seam's wave has not routed it yet"
+                "device layer: a METAL handle reached a wgpu-only construction \
+                 seam (bind-group layout / pipeline / shader module) — mixed \
+                 backends in the oracle build"
             ),
         }
     }
@@ -529,10 +545,10 @@ pub(crate) enum LayerTexture {
 
 #[cfg(wgpu_arm)]
 impl LayerTexture {
-    /// The live wgpu texture — the crossing into seams that stay wgpu-typed
-    /// until their own wave (bind groups, encode, present). Panics by name on
-    /// the Metal variant: that panic is unreachable from production until the
-    /// W6 flip re-routes those seams.
+    /// The live wgpu texture — the crossing into the wgpu-typed seams (bind
+    /// groups, encode, present). Panics by name on the Metal variant, which
+    /// exists only in the macOS oracle test build: a guard against mixing
+    /// backends there, unreachable from production.
     #[cfg(wgpu_arm)]
     pub(crate) fn wgpu(&self) -> &wgpu::Texture {
         match self {
@@ -541,8 +557,8 @@ impl LayerTexture {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL texture reached a wgpu-only seam \
-                 (bind group / encode / present) — that seam's wave has not \
-                 routed it yet; see the W6 flip list in device_layer.rs"
+                 (bind group / encode / present) — mixed backends in the \
+                 oracle build"
             ),
         }
     }
@@ -556,8 +572,8 @@ impl LayerTexture {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL texture reached a wgpu-only seam \
-                 (bind group / encode / present) — that seam's wave has not \
-                 routed it yet; see the W6 flip list in device_layer.rs"
+                 (bind group / encode / present) — mixed backends in the \
+                 oracle build"
             ),
         }
     }
@@ -619,8 +635,8 @@ impl LayerBuffer {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL buffer reached a wgpu-only seam \
-                 (bind group / encode / present) — that seam's wave has not \
-                 routed it yet; see the W6 flip list in device_layer.rs"
+                 (bind group / encode / present) — mixed backends in the \
+                 oracle build"
             ),
         }
     }
@@ -634,8 +650,8 @@ impl LayerBuffer {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL buffer reached a wgpu-only seam \
-                 (bind group / encode / present) — that seam's wave has not \
-                 routed it yet; see the W6 flip list in device_layer.rs"
+                 (bind group / encode / present) — mixed backends in the \
+                 oracle build"
             ),
         }
     }
@@ -693,7 +709,7 @@ impl LayerSampler {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL sampler reached a wgpu-only seam — \
-                 that seam's wave has not routed it yet"
+                 mixed backends in the oracle build"
             ),
         }
     }
@@ -707,7 +723,7 @@ impl LayerSampler {
             #[cfg(all(target_os = "macos", test))]
             Self::Metal(_) => panic!(
                 "device layer: a METAL sampler reached a wgpu-only seam — \
-                 that seam's wave has not routed it yet"
+                 mixed backends in the oracle build"
             ),
         }
     }
@@ -862,8 +878,8 @@ pub(crate) enum FrameUniforms<'a> {
 }
 
 /// A texture on one backend for the mid-frame COPY verbs (scroll shift). The
-/// Wgpu side is a raw `wgpu::Texture` (the offscreen family stays wgpu-typed
-/// until W5/W6); the Metal side is sealed, so the copy verbs can refuse a
+/// Wgpu side is a raw `wgpu::Texture` (the wgpu arm's offscreen family is
+/// wgpu-typed); the Metal side is sealed, so the copy verbs can refuse a
 /// foreign loss domain.
 #[derive(Clone, Copy)]
 pub(crate) enum FrameCopyTexture<'a> {
@@ -1501,8 +1517,9 @@ mod tests {
 
     /// ARMS the crossing guards: a Metal resource reaching a wgpu-only seam
     /// (and a wgpu handle reaching a Metal-only seam) must panic BY NAME —
-    /// "device layer" — never misbehave silently. These panics are the W6
-    /// flip's todo list; this test is what keeps them honest messages.
+    /// "device layer" — never misbehave silently. These panics are the oracle
+    /// build's cross-backend guards; this test is what keeps them honest
+    /// messages.
     #[test]
     fn crossing_a_metal_resource_into_a_wgpu_seam_panics_by_name() {
         let Some(mint) = mint() else {

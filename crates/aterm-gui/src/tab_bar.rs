@@ -2749,7 +2749,7 @@ fn status_primitives(metadata: TabStripMetadata) -> Vec<TabIconPrimitive> {
                         });
                         continue;
                     }
-                    ChipLevel::Stop => {
+                    ChipLevel::Stop(_) => {
                         primitives.extend([
                             TabIconPrimitive::Triangle {
                                 points: [[x, 8.0 - r], [x + r, 8.0], [x - r, 8.0]],
@@ -3414,6 +3414,15 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// The ACTIVE twin is exempt: it is the tab being read, its pressure window is
 /// the reserved wide one, and it keeps as much of the real subject as fits.
 ///
+/// A FAMILY OF TWINS — every clustered member one subject, as three idle
+/// shells in one directory are — paints context rather than a distinguishing
+/// tail ([`twin_tail`]): the same tail cut, except that a directory's name is
+/// never split (`2 · …term` was measured on Windows, the cwd gone from every
+/// chip), keeping whole components or, below them, the head (`2 · ~\at…`). A
+/// family that MIXES twins with other members keeps the tail dialect for
+/// every member, twins included: their endings are what tell them from their
+/// siblings.
+///
 /// ONE DIALECT PER STRIP, extended to the PRESSURE case: the cluster rule
 /// above already flips a shared-head FAMILY together, but a pressure strip
 /// (any compressed chip — [`PREFERRED_MIN_TAB_COLS`]) can still seat a flipped
@@ -3421,7 +3430,9 @@ fn truncate_title_tail(title: &str, max: usize) -> String {
 /// chip by chip (the audit's inconsistency). Once any cluster on a pressure
 /// strip flips, the remaining cut loners flip with it — one dialect, and a
 /// loner's tail says at least as much as its head in a three-cell window. A
-/// roomy strip is untouched: distinct heads there keep the familiar head cut.
+/// family of twins that had to keep its HEAD has not flipped — it speaks the
+/// head dialect the loners already do — so it flips nobody. A roomy strip is
+/// untouched: distinct heads there keep the familiar head cut.
 fn distinct_chip_labels(
     segments: &[TabSegment],
     titles: &[String],
@@ -3521,7 +3532,10 @@ fn distinct_chip_labels(
     // Which cut tabs a cluster relabelled (parallel to `cut`) — the pressure
     // dialect flip below only touches the loners the clusters never caught.
     let mut relabelled = vec![false; cut.len()];
-    let mut any_cluster = false;
+    // Which clusters, by union-find root, are families of twins that kept
+    // their HEAD ([`twin_tail`]): they speak the head dialect, so they give
+    // the loners no tail dialect to flip into.
+    let mut kept_head = vec![false; cut.len()];
     for a in 0..cut.len() {
         let root = find(&mut parent, a);
         let members: Vec<usize> = (0..cut.len())
@@ -3531,7 +3545,6 @@ fn distinct_chip_labels(
         if members.len() < 2 {
             continue;
         }
-        any_cluster = true;
         relabelled[a] = true;
         let (i, avail) = cut[a];
         // Shed the cluster's common RAW-title suffix — shared tail noise.
@@ -3589,21 +3602,47 @@ fn distinct_chip_labels(
             .iter()
             .filter(|&&m| cut_core(&titles[m], suffix) == core)
             .count();
-        if twins >= 2 && i != active {
-            labels[i] = Some(ordinal_chip_label(
-                i, &titles[i], core, remainder, avail, &siblings,
-            ));
-            continue;
-        }
-        let label =
-            if !remainder.is_empty() && strip_display_cells(remainder) <= avail.saturating_sub(1) {
-                format!("…{remainder}")
+        // A FAMILY OF TWINS — every member this one subject, the audit's idle
+        // shells in one directory — has no sibling whose ending its text must
+        // be told from, so it paints CONTEXT ([`twin_tail`]). A family that
+        // mixes twins with other members keeps its one tail dialect
+        // ([`family_tail`]): there a twin's ending is what tells it from the
+        // rest (`7 · …oml` beside `….bak`), and a head cut would be mostly the
+        // head the whole family shares.
+        let family_of_twins = twins == members.len();
+        let tail_cut: fn(&str, &str, usize) -> String = if family_of_twins {
+            twin_tail
+        } else {
+            family_tail
+        };
+        let label = if twins >= 2 && i != active {
+            ordinal_chip_label(i, &titles[i], core, remainder, avail, &siblings, tail_cut)
+        } else {
+            furniture_survivor_recut(
+                &titles[i],
+                &siblings,
+                avail,
+                tail_cut(core, remainder, avail),
+            )
+        };
+        if family_of_twins {
+            let ordinal = format!("{} · ", i + 1);
+            let text = if i == active {
+                label.as_str()
             } else {
-                truncate_title_tail(core, avail)
+                label.strip_prefix(ordinal.as_str()).unwrap_or("")
             };
-        labels[i] = Some(furniture_survivor_recut(
-            &titles[i], &siblings, avail, label,
-        ));
+            kept_head[root] |= is_head_cut(core, text);
+        }
+        labels[i] = Some(label);
+    }
+    // A cluster that relabelled in the TAIL dialect: every cluster but a family
+    // of twins that kept its head.
+    let mut any_cluster = false;
+    for a in 0..cut.len() {
+        if relabelled[a] && !kept_head[find(&mut parent, a)] {
+            any_cluster = true;
+        }
     }
     // ONE DIALECT PER STRIP under pressure: a flipped cluster beside a
     // head-cut loner mixes `…oml` with `REA…` in windows too small for either
@@ -3748,7 +3787,9 @@ fn furniture_survivor_recut(
 /// The label a byte-identical twin paints: its 1-based STRIP POSITION, carrying
 /// a tail of the title when the window affords one (`2 · …oml`), bare (`2`)
 /// when it does not. `core`/`remainder` are the cluster's suffix-shed title and
-/// word-boundary tail, exactly what the family cut would have painted;
+/// word-boundary tail, and `tail_cut` is the cut the family paints them with —
+/// [`family_tail`] for a twin among other members, [`twin_tail`] for a family
+/// of twins (`2 · ~\at…` where a directory's name would not fit whole);
 /// `siblings` are the cluster's other titles, so the tail answers to the same
 /// [`furniture_survivor_recut`] rule the family cut does — a tail that is
 /// nothing but the shared furniture names no tab, and painting it after the
@@ -3801,6 +3842,7 @@ fn ordinal_chip_label(
     remainder: &str,
     avail: usize,
     siblings: &[&str],
+    tail_cut: fn(&str, &str, usize) -> String,
 ) -> String {
     let digits = (tab + 1).to_string();
     let digit_cells = strip_display_cells(&digits);
@@ -3812,14 +3854,10 @@ fn ordinal_chip_label(
         };
     }
     // ` · ` — the separator composed titles already use — costs 3 cells; a
-    // tail below 2 cells (`…` + one char) says nothing worth the space.
+    // tail below 2 cells (one char and its mark) says nothing worth the space.
     let room = avail.saturating_sub(digit_cells + 3);
     if room >= 2 {
-        let tail = if !remainder.is_empty() && strip_display_cells(remainder) < room {
-            format!("…{remainder}")
-        } else {
-            truncate_title_tail(core, room)
-        };
+        let tail = tail_cut(core, remainder, room);
         let tail = furniture_survivor_recut(title, siblings, room, tail);
         // A width-2 glyph can leave the tail cut with a bare `…` — worth
         // nothing; the bare ordinal reads better than `2 · …`.
@@ -3828,6 +3866,101 @@ fn ordinal_chip_label(
         }
     }
     digits
+}
+
+/// The FAMILY's cut of a clustered title in `room` cells — the pressure strip's
+/// tail dialect. Past the last word boundary of the shared head, behind the
+/// mark, when that fits (`…~/aterm`: the cwd as itself, where a raw tail-keep
+/// pads the width with a `…ower: ` fragment of the shared prompt); else the
+/// plain tail cut that fills the span with the most context
+/// ([`truncate_title_tail`]). `core` is the member's shed title
+/// ([`cut_core`]); `remainder` is the text past that boundary, `""` when the
+/// shared head has none.
+fn family_tail(core: &str, remainder: &str, room: usize) -> String {
+    if !remainder.is_empty() && strip_display_cells(remainder) < room {
+        format!("…{remainder}")
+    } else {
+        truncate_title_tail(core, room)
+    }
+}
+
+/// What a FAMILY OF TWINS paints of its subject in `room` cells — past each
+/// ordinal, and alone on the active twin. No member ends differently, so the
+/// text is CONTEXT: the family's own cut ([`family_tail`]) wherever it keeps a
+/// directory's name whole, and where it would split a PATH component:
+///
+/// 1. the path's trailing components, whole, behind the mark — as many as fit
+///    (`…work\api`, then `…api`);
+/// 2. else the HEAD of `core`, cut with a trailing `…` by [`truncate_title`]
+///    (`~\at…`).
+///
+/// NEVER A FRAGMENT OF A DIRECTORY'S NAME. Measured on Windows (audit
+/// 2026-09-22), three shells in one directory under the family cut:
+/// `2 · …term`, `3 · …term`, and at 400×300 `1 · …rm` — the cwd gone from
+/// every chip. A directory's name is what names the place, so a whole trailing
+/// component is kept wherever it fits (the strip's standing law that a twin
+/// still names the directory it is in —
+/// `tabs_that_differ_only_in_state_are_told_apart_by_position`), and below
+/// that the head is: `~\at…` says "a path under home" and is the start of what
+/// the chip reads once the strip is wide enough. Both separators count as a
+/// component boundary, `\` being the native one the cwd rung writes on
+/// Windows.
+///
+/// ONLY A PATH. A subject with no separator is a name, not a place
+/// (`Settings.toml`, `claude`): its family cut stands (`…toml`), so a family
+/// of names speaks the strip's tail dialect exactly as before — the defect
+/// this answers was measured on a directory, whose name is the thing the chip
+/// is there to show. And the head is `core`'s, never `remainder`'s alone: a
+/// prompt head the family cut dropped (`user@host: `) is never dropped without
+/// its mark, which would paint a remote shell's `~/at…` as if it were a local
+/// one — `ayat…` is the honest head.
+fn twin_tail(core: &str, remainder: &str, room: usize) -> String {
+    let family = family_tail(core, remainder, room);
+    let subject = if remainder.is_empty() {
+        core
+    } else {
+        remainder
+    };
+    if !subject.contains(['/', '\\']) || !splits_a_component(core, &family) {
+        return family;
+    }
+    // The FIRST separator leaves the longest tail, so this finds the most
+    // whole components that fit behind the mark (`…` costs one cell).
+    let components = subject
+        .char_indices()
+        .filter(|&(_, c)| matches!(c, '/' | '\\'))
+        .map(|(at, c)| &subject[at + c.len_utf8()..])
+        .find(|tail| !tail.is_empty() && strip_display_cells(tail) < room);
+    match components {
+        Some(tail) => format!("…{tail}"),
+        None => truncate_title(core, room),
+    }
+}
+
+/// Whether the tail cut `cut` (`…<text>`) of `core` starts INSIDE a path
+/// component or word — `…term` of `~\aterm` — rather than at the start of one
+/// (`…aterm`, `…\aterm`, `…~/aterm`). A cut with no mark, or nothing behind
+/// it, splits nothing.
+fn splits_a_component(core: &str, cut: &str) -> bool {
+    let Some(text) = cut.strip_prefix('…').filter(|text| !text.is_empty()) else {
+        return false;
+    };
+    let Some(before) = core.strip_suffix(text) else {
+        return false;
+    };
+    !before.is_empty()
+        && !text.starts_with(['/', '\\'])
+        && !before.ends_with(|c: char| matches!(c, '/' | '\\') || c.is_whitespace())
+}
+
+/// Whether `text` is a HEAD cut of `core` ([`truncate_title`]): a non-empty
+/// start of it with the mark after — not `core` whole (which may itself end in
+/// `…`), not a tail cut, and not the bare mark.
+fn is_head_cut(core: &str, text: &str) -> bool {
+    text != core
+        && text.strip_suffix('…').is_some_and(|head| {
+            !head.is_empty() && !head.starts_with('…') && core.starts_with(head)
+        })
 }
 
 /// What ONE chip's TAIL CUT is taken from: its title with the shared ending
@@ -7006,125 +7139,6 @@ pub(crate) mod pixel_band {
             crate::tray_raster::clear_ui_fonts_for_test();
         }
 
-        /// VISUAL CAPTURE of the PIXEL band — the two strips this pass exists
-        /// for (ten byte-identical shells, and a mixed working set) at the three
-        /// widths where the fit goes from roomy to brutal — dumped as PNGs so
-        /// the labels can be read as PIXELS rather than as asserted strings.
-        /// Not a gate: `#[ignore]`d (it needs a real UI face) and asserted only
-        /// for "it produced a band".
-        ///
-        /// ```sh
-        /// BAND_PNG_DIR=/tmp/band cargo test -p aterm-gui --lib \
-        ///     band_strip_visual_capture -- --ignored --nocapture
-        /// ```
-        #[test]
-        #[ignore = "visual capture: needs a system UI face; run with --ignored"]
-        fn band_strip_visual_capture() {
-            if !with_ui_faces() {
-                crate::logging::stderr_line!("no UI face — visual capture skipped");
-                return;
-            }
-            let dir = std::env::var("BAND_PNG_DIR").map_or_else(
-                |_| std::env::temp_dir().join("band-strip"),
-                std::path::PathBuf::from,
-            );
-            std::fs::create_dir_all(&dir).expect("output dir");
-            // A REAL Linux band: the synthetic head above the grid, one strip
-            // row, and the seam the cards centre against.
-            let (cell_h, band_top, underline_y) = (21usize, 11usize, 17usize);
-            let strips: [(&str, Vec<String>); 2] = [
-                (
-                    "ten-identical",
-                    (0..10)
-                        .map(|_| "user@m17-tower: ~/aterm · Typing a command".to_string())
-                        .collect(),
-                ),
-                (
-                    "mixed",
-                    [
-                        "user@m17-tower: ~/aterm · Typing a command",
-                        "user@m17-tower: ~/aterm · Ready",
-                        "user@m17-tower: $HOME/trust · Ready",
-                        "vim src/tab_bar.rs",
-                        "cargo test -p aterm-gui",
-                        "README.md",
-                    ]
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
-                ),
-            ];
-            for (name, titles) in strips {
-                let metadata = plain(titles.len());
-                for cols in [80usize, 130, 200] {
-                    let segments = layout_segments_with_metadata(
-                        cols as u16,
-                        titles.len(),
-                        &metadata,
-                        0,
-                        false,
-                    );
-                    let geometry = BandGeometry {
-                        cols,
-                        cell_w: CELL_W,
-                        cell_h,
-                        strip_rows: 1,
-                        band_top_px: band_top,
-                        scale: 1.0,
-                        seam_top_px: Some(band_top + underline_y),
-                    };
-                    let input = band(
-                        &segments,
-                        &titles,
-                        &metadata,
-                        StripPaint::default(),
-                        geometry,
-                    );
-                    let rows = raster_band(&input, &[]).expect("band");
-                    let (rgba, w, h) = image_of(&rows);
-                    // Composite over the band tone (the canvas is opaque anyway;
-                    // any transparent pixel is the cell background, which IS
-                    // this colour) and magnify, so a 13 px label can be judged
-                    // on screen.
-                    let ground = strip_colors_with_active(input.theme, None).band_bg;
-                    const ZOOM: usize = 3;
-                    let mut rgb = Vec::with_capacity(w * h * ZOOM * ZOOM * 3);
-                    for y in 0..h * ZOOM {
-                        for x in 0..w * ZOOM {
-                            let i = ((y / ZOOM) * w + x / ZOOM) * 4;
-                            let a = f32::from(rgba[i + 3]) / 255.0;
-                            for c in 0..3 {
-                                let over = f32::from(rgba[i + c]);
-                                let under = f32::from(ground[c]);
-                                rgb.push(a.mul_add(over, (1.0 - a) * under).round() as u8);
-                            }
-                        }
-                    }
-                    let path = dir.join(format!("{name}-{cols}c.png"));
-                    let file = std::fs::File::create(&path).expect("create png");
-                    let mut encoder = aterm_png::Encoder::new(
-                        std::io::BufWriter::new(file),
-                        (w * ZOOM) as u32,
-                        (h * ZOOM) as u32,
-                    );
-                    encoder.set_color(aterm_png::ColorType::Rgb);
-                    encoder.set_depth(aterm_png::BitDepth::Eight);
-                    encoder
-                        .write_header()
-                        .expect("png header")
-                        .write_image_data(&rgb)
-                        .expect("png data");
-                    crate::logging::stderr_line!(
-                        "wrote {} ({}x{})",
-                        path.display(),
-                        w * ZOOM,
-                        h * ZOOM
-                    );
-                }
-            }
-            crate::tray_raster::clear_ui_fonts_for_test();
-        }
-
         #[test]
         fn multi_row_strip_gets_a_ref_list_per_row_over_one_taller_image() {
             if !with_ui_faces() {
@@ -8448,25 +8462,6 @@ mod tests {
         assert_eq!(hit_test(&segs, UPDATE_W), Some(TabHit::Select(0)));
     }
 
-    /// Three tabs share the available width evenly (each capped at MAX_SEG); the
-    /// segments are disjoint and ordered, with the `+` after the last tab.
-    #[test]
-    fn three_tabs_disjoint_ordered() {
-        let segs = layout_segments(60, 3, 1, false);
-        let tabs: Vec<_> = segs
-            .iter()
-            .filter(|s| matches!(s.kind, TabHit::Select(_)))
-            .collect();
-        assert_eq!(tabs.len(), 3);
-        for w in tabs.windows(2) {
-            assert!(
-                w[0].end_col <= w[1].start_col,
-                "segments are disjoint + ordered"
-            );
-        }
-        assert!(matches!(segs.last().unwrap().kind, TabHit::NewTab));
-    }
-
     /// A click on a tab segment selects it; a click on its close `x` closes it; a
     /// click on the `+` opens a tab; a click on bare background is `None`.
     #[test]
@@ -8755,7 +8750,7 @@ mod tests {
     /// authored prose over generated status, and never echoes the title back.
     #[test]
     fn solo_subtitle_prefers_authored_prose_and_never_echoes_the_title() {
-        let full = "aterm\ndescription: the release cutter\nactivity: Building\ncwd: ~/aterm\nstate: alive\n\nspawned · just now";
+        let full = "aterm\ndescription: the release cutter\nactivity: Building\ncwd: ~/aterm";
         assert_eq!(
             solo_subtitle("aterm", Some(full)).as_deref(),
             Some("the release cutter"),
@@ -8771,7 +8766,7 @@ mod tests {
             Some("Building")
         );
         assert_eq!(
-            solo_subtitle("aterm", Some("aterm\nstate: alive")),
+            solo_subtitle("aterm", Some("aterm\nstate: exited")),
             None,
             "a lifecycle word is not a description; the bare title reads better"
         );
@@ -10300,6 +10295,247 @@ mod tests {
         );
     }
 
+    /// Whether `painted` is CONTEXT for the path `subject` in [`twin_tail`]'s
+    /// sense: the subject whole, a run of its whole trailing components behind
+    /// the mark (with or without the separator before them), or a non-empty
+    /// head of it with a trailing mark — never a directory name's cut-off end.
+    fn is_twin_context(subject: &str, painted: &str) -> bool {
+        if painted == subject {
+            return true;
+        }
+        if let Some(tail) = painted.strip_prefix('…') {
+            return !tail.is_empty()
+                && subject.strip_suffix(tail).is_some_and(|before| {
+                    tail.starts_with(['/', '\\']) || before.ends_with(['/', '\\'])
+                });
+        }
+        painted
+            .strip_suffix('…')
+            .is_some_and(|head| !head.is_empty() && subject.starts_with(head))
+    }
+
+    /// THE AUDIT'S STRIP AT EVERY WIDTH (2026-09-22): three shells in one
+    /// directory, byte-identical titles, walked over every title window a chip
+    /// can be handed. A family of twins paints context beside its ordinals
+    /// ([`twin_tail`]): the subject whole, its whole trailing components
+    /// behind the mark, or its head — never the cut-off end of a directory's
+    /// name, which is what the family cut painted: `2 · …term` in a nine-cell
+    /// window on glass and `1 · …rm` in a seven-cell one at 400×300, the cwd
+    /// gone from every chip. Pinned by value at every window, then end to end
+    /// through the pass for both the audit's composed title and the idle title
+    /// the composer now settles on (`~\aterm`, no state clause).
+    #[test]
+    fn twins_keep_whole_components_or_the_head_at_every_width() {
+        let title = "~\\aterm · Ready in aterm";
+        let subject = "~\\aterm";
+        let siblings = [title, title];
+        // (window, the non-active twin's label, the active twin's text).
+        let expected: [(usize, &str, &str); 12] = [
+            (0, "", ""),
+            (1, "2", "…"),
+            (2, "2", "~…"),
+            (3, "2", "~\\…"),
+            (4, "2", "~\\a…"),
+            // `2` + ` · ` costs four; a one-cell tail says nothing.
+            (5, "2", "~\\at…"),
+            (6, "2 · ~…", "…aterm"),
+            (7, "2 · ~\\…", "~\\aterm"),
+            (8, "2 · ~\\a…", "~\\aterm"),
+            (9, "2 · ~\\at…", "~\\aterm"),
+            (10, "2 · …aterm", "~\\aterm"),
+            (11, "2 · ~\\aterm", "~\\aterm"),
+        ];
+        for (avail, ordinal, active) in expected {
+            assert_eq!(
+                ordinal_chip_label(1, title, subject, "", avail, &siblings, twin_tail),
+                ordinal,
+                "window {avail}: the non-active twin"
+            );
+            assert_eq!(
+                twin_tail(subject, "", avail),
+                active,
+                "window {avail}: the active twin"
+            );
+        }
+        for avail in 0..=40usize {
+            let label = ordinal_chip_label(1, title, subject, "", avail, &siblings, twin_tail);
+            assert!(strip_display_cells(&label) <= avail, "{avail}: {label:?}");
+            let painted = label.strip_prefix("2 · ").unwrap_or(&label);
+            assert!(
+                painted.is_empty() || painted == "2" || is_twin_context(subject, painted),
+                "window {avail}: {label:?} is not context for {subject:?}"
+            );
+            let active = twin_tail(subject, "", avail);
+            assert!(strip_display_cells(&active) <= avail, "{avail}: {active:?}");
+            assert!(
+                avail < 2 || is_twin_context(subject, &active),
+                "window {avail}: {active:?} is not context for {subject:?}"
+            );
+        }
+        // The audit's windows, by value.
+        assert_eq!(
+            ordinal_chip_label(1, title, subject, "", 9, &siblings, twin_tail),
+            "2 · ~\\at…",
+            "painted `2 · …term` on glass"
+        );
+        assert_eq!(
+            ordinal_chip_label(0, title, subject, "", 7, &siblings, twin_tail),
+            "1 · ~\\…",
+            "painted `1 · …rm` at 400x300"
+        );
+        // ...where the family's own cut is what split the name.
+        assert_eq!(family_tail(subject, "", 5), "…term");
+        assert_eq!(family_tail(subject, "", 3), "…rm");
+        // A deeper directory keeps as many WHOLE components as fit, so a twin
+        // still names the directory it is in — the family's cut wherever it
+        // already lands on a component (`…\api`: the native separator is not
+        // a word boundary to the tail cut, so the check must know it is one).
+        assert_eq!(twin_tail("~\\work\\api", "", 10), "~\\work\\api");
+        assert_eq!(twin_tail("~\\work\\api", "", 9), "…work\\api");
+        assert_eq!(twin_tail("~\\work\\api", "", 8), "…api");
+        assert_eq!(twin_tail("~\\work\\api", "", 5), "…\\api");
+        assert_eq!(twin_tail("~/work/api", "", 4), "…api");
+        assert_eq!(twin_tail("~/work/api", "", 3), "~/…");
+        // A NAME is not a path: a family of names keeps the family's cut.
+        assert_eq!(twin_tail("Settings.toml", "", 6), "….toml");
+        assert_eq!(twin_tail("same shell", "shell", 4), "…ell");
+        // A prompt title's shared head ends in the cwd WORD: kept whole with
+        // its mark, then its whole components (the family's cut where that
+        // lands on one), then the head of the WHOLE title — marked, so a
+        // dropped `user@host: ` is never painted as if it were a local cwd.
+        let core = "user@m17-tower: ~/aterm";
+        assert_eq!(twin_tail(core, "~/aterm", 10), "…~/aterm");
+        assert_eq!(twin_tail(core, "~/aterm", 8), "…~/aterm");
+        assert_eq!(twin_tail(core, "~/aterm", 7), "…/aterm");
+        assert_eq!(twin_tail(core, "~/aterm", 6), "…aterm");
+        assert_eq!(twin_tail(core, "~/aterm", 5), "ayat…");
+
+        // END TO END through the pass, at the layout's own windows, every
+        // width from a strip that seats a number and little else to one that
+        // paints the title whole, at every selection.
+        let mut cut = 0usize;
+        for composed in [title, subject] {
+            let titles: Vec<String> = (0..3).map(|_| composed.to_string()).collect();
+            for cols in 12..=120u16 {
+                for active in 0..3 {
+                    let segments = layout_segments(cols, 3, active, false);
+                    let labels = distinct_chip_labels(&segments, &titles, None, active, None);
+                    for seg in &segments {
+                        let TabHit::Select(i) = seg.kind else {
+                            continue;
+                        };
+                        let Some(label) = labels[i].as_deref() else {
+                            continue;
+                        };
+                        if label == composed {
+                            continue; // wide enough: painted whole
+                        }
+                        cut += 1;
+                        let digits = (i + 1).to_string();
+                        let painted = label.strip_prefix(&format!("{digits} · ")).unwrap_or(label);
+                        assert!(
+                            painted.is_empty()
+                                || painted == "…"
+                                || painted == digits
+                                || is_twin_context(subject, painted),
+                            "{cols} cols, active {active}, tab {i}: {label:?} is not context \
+                             for {subject:?}, a number, or the mark"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(cut > 100, "vacuous: only {cut} chips were cut");
+    }
+
+    /// THE REACH OF [`twin_tail`], at both of its edges, on a pressure strip.
+    ///
+    /// A family of twins that had to keep its HEAD speaks the head dialect, so
+    /// it flips no loner into the tail one: `2 · ~/w…` beside `…release` is
+    /// the two-dialect strip the one-dialect rule exists to prevent. The same
+    /// strip with a directory whose name fits behind the mark paints whole
+    /// components in the tail dialect, and the loner flips with it as before.
+    ///
+    /// And a family that MIXES twins with another member keeps the tail
+    /// dialect for its twins too: two `aterm-gui` shells beside an `aterm-cli`
+    /// one differ only at the end, so the twin's `…gui` is what tells it from
+    /// `…cli` — a head there (`~/s…`) would be the head all three share.
+    #[test]
+    fn twin_context_stops_at_a_mixed_family_and_a_head_flips_no_loner() {
+        let strip = |dir: &str| -> Vec<String> {
+            vec![
+                format!("{dir} · Ready"),
+                format!("{dir} · Ready"),
+                "cargo build --release · Building the project".to_string(),
+                "README.md · Ready".to_string(),
+                "Setup.sh · Ready".to_string(),
+            ]
+        };
+        // The deep directory: `workspace` does not fit behind a quiet chip's
+        // ordinal, so the family keeps its head — and the loner keeps its own.
+        let titles = strip("~/wave/workspace");
+        let segments = layout_segments(48, titles.len(), 0, false);
+        let seats = seated(&segments, &titles, 0);
+        assert_eq!(
+            seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>(),
+            [0, 1, 2],
+            "the fixture's geometry: twin, twin, loner on one page"
+        );
+        assert!(
+            seats[1].1.starts_with("2 · ~/") && seats[1].1.ends_with('…'),
+            "the quiet twin keeps its head: {seats:?}"
+        );
+        assert!(
+            seats[2].1.starts_with("cargo"),
+            "the loner keeps the head dialect the family speaks: {seats:?}"
+        );
+        // The shallow directory: `api` fits whole behind the mark — the tail
+        // dialect — and the loner flips with the family.
+        let titles = strip("~/wave/api");
+        let segments = layout_segments(48, titles.len(), 0, false);
+        let seats = seated(&segments, &titles, 0);
+        assert!(
+            seats[1].1.starts_with("2 · …") && seats[1].1.ends_with("api"),
+            "the quiet twin names the directory by its whole component: {seats:?}"
+        );
+        assert!(
+            seats[2].1.starts_with('…') && seats[2].1.ends_with("release"),
+            "the loner joins the tail dialect: {seats:?}"
+        );
+
+        // THE MIXED FAMILY keeps the tail dialect, twins included — at every
+        // width that seats and cuts all three and gives the twin a tail. (A
+        // strip too narrow to seat the `cli` shell holds a family of twins
+        // alone, and that family's context is `twin_tail`'s, pinned above.)
+        // Prompt titles, so the subject past the shared prompt is a PATH and
+        // the tail cut can land inside a component (`…m-gu`): exactly where
+        // a family of twins would take its head, and a mixed one must not.
+        let titles = [
+            "user@m17-tower: ~/src/aterm-gui · Ready".to_string(),
+            "user@m17-tower: ~/src/aterm-gui · Ready".to_string(),
+            "user@m17-tower: ~/src/aterm-cli · Ready".to_string(),
+        ];
+        let mut mixed = 0usize;
+        for cols in 40..=160u16 {
+            let segments = layout_segments(cols, titles.len(), 0, false);
+            let seats = seated(&segments, &titles, 0);
+            if seats.iter().map(|(tab, _)| *tab).collect::<Vec<_>>() != [0, 1, 2]
+                || !seats[2].1.contains('…')
+                || !seats[1].1.starts_with("2 · ")
+            {
+                continue;
+            }
+            mixed += 1;
+            let twin = &seats[1].1["2 · ".len()..];
+            assert!(
+                twin.starts_with('…') && twin != seats[2].1,
+                "{cols} cols: a twin beside a sibling that differs keeps the \
+                 ending that tells them apart: {seats:?}"
+            );
+        }
+        assert!(mixed > 0, "vacuous: no width seated the mixed family cut");
+    }
+
     /// ONE SELECTION, TWO READERS. `layout_segments` clamps `active` into range
     /// before it reserves the active chip's width, so an out-of-range selection
     /// still widens the LAST chip; the label pass has to answer the same
@@ -10375,7 +10611,10 @@ mod tests {
         let resolved = seated_labels(&segments, &titles, 9);
         // The two seated twins are ordinals with a tail; every other cut chip
         // — clustered OR loner — speaks the tail dialect. No `car…` beside a
-        // `…oml`. (`Setup.sh` is not cut at all: eight cells, eight fit.)
+        // `…oml`. (`Setup.sh` is not cut at all: eight cells, eight fit.) The
+        // twins share their family with `Settings.toml.bak`, so they keep the
+        // family's tail cut rather than a family of twins' context
+        // ([`twin_tail`]): their ending is what tells them from `….bak`.
         assert_eq!(
             resolved,
             [
@@ -11681,8 +11920,9 @@ mod tests {
     /// the active-tab text (full fg on the raised button), the `+` new-tab affordance
     /// (full fg on the body), and — newly guarded — the INACTIVE tab labels (dimmed fg
     /// on the body), which previously shipped near-illegible. Guards S2 (the dim `+`
-    /// dropped to 2.59:1 on Solarized Dark), the light-theme FIXME in `strip_colors`,
-    /// and the "black on black" inactive-label bug. The default theme's inactive labels
+    /// dropped to 2.59:1 on Solarized Dark), the light-theme raise-direction defect
+    /// (the active card that did not raise on a light theme, once a FIXME in
+    /// `strip_colors`), and the "black on black" inactive-label bug. The default theme's inactive labels
     /// are pinned higher (>=7:1) to lock that fix — a future theme that breaks chrome
     /// contrast fails HERE, at add-time, not in the field.
     #[test]

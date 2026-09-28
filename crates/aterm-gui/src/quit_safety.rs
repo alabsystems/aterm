@@ -6,7 +6,9 @@
 //! kill an in-flight build or AI run — and confirmed by a second request inside a
 //! brief window. The decision logic is pure and unit-tested here; `App` wires the
 //! PTY (`tcgetpgrp` on the session master on unix; a child-process walk of the
-//! shell pid on windows) and the winit title/timer shims.
+//! shell pid on windows), the shell-integration state ([`shell_executing`]:
+//! the shell's own word that a command is running), and the winit title/timer
+//! shims.
 
 use std::time::{Duration, Instant};
 
@@ -137,6 +139,47 @@ pub(crate) fn foreground_is_job(fg_pgrp: i32, shell_pid: i32) -> bool {
     {
         false
     }
+}
+
+/// Whether `term`'s shell is EXECUTING a command: the shell said a command
+/// started (OSC 133;C) and has not yet said it finished (133;D).
+///
+/// THE DEFECT THIS CLOSES (audit 2026-09-22). On windows the job oracle is the
+/// child-process walk ([`foreground_is_job`]), and a cmdlet, loop or script
+/// running INSIDE `pwsh.exe` spawns no child: `close` on a last tab running
+/// `Start-Sleep 60` answered `OK closed` and the instance ended, while the same
+/// close on `ping -t` was refused. Yet the session model knew the shell was
+/// busy in both cases — `status`/`blocks` showed the block executing. This is
+/// that knowledge, read from the engine the close gesture is about to hang up.
+/// No shell integration (no 133 marks at all) reads as idle, so the process
+/// walk stays the only oracle for a bare shell.
+///
+/// It reads the engine's SHELL STATE, not its current block. The two are set
+/// together at 133;C and cleared together at 133;D, a new prompt (133;A) and
+/// a full reset — but the block is also dropped mid-command by anything that
+/// makes absolute rows unknowable: ED 3 (`CSI 3 J`, which `clear` / `cls` /
+/// `Clear-Host` emit) and a scrollback invalidation. A running in-shell loop
+/// that clears the screen (`while ($true) { Clear-Host; …; Start-Sleep 5 }`)
+/// therefore read idle through the block, and on windows the child walk misses
+/// it too — defect (a) again. The shell state carries no row, so neither
+/// touches it, and a 133;D still ends it (the phase it gates on survives too).
+pub(crate) fn shell_executing(term: &aterm_core::terminal::Terminal) -> bool {
+    term.shell_state() == aterm_core::terminal::ShellState::Executing
+}
+
+/// THE close guard's verdict for one session: busy when EITHER the PTY says a
+/// job holds the foreground ([`foreground_is_job`]) OR the shell said a command
+/// is executing ([`shell_executing`], passed in so the verdict is pure).
+///
+/// The shell is consulted FIRST on purpose: on windows the process walk is a
+/// whole system snapshot (~3 ms measured), so a session the shell already
+/// reports busy never pays for it. Neither signal subsumes the other — a bare
+/// shell without integration never says it is executing, and an in-shell loop
+/// has no child — so the guard is their union. Every close path (the ctl
+/// `close` / `tab close` refusal, the caption ✕, Close Tab, Quit) reads this
+/// one predicate, so the four cannot disagree about what "busy" means.
+pub(crate) fn foreground_busy(fg_pgrp: i32, shell_pid: i32, shell_executing: bool) -> bool {
+    shell_executing || foreground_is_job(fg_pgrp, shell_pid)
 }
 
 /// How long ONE system process-table capture may keep serving the tab-status
@@ -506,20 +549,22 @@ mod windows_jobs {
 mod tests {
     use super::*;
 
+    /// The close truth table: a busy tab is refused the first time and closes when
+    /// confirmed a second time within the window; an idle one closes immediately.
     #[test]
-    fn close_refused_first_time_while_a_job_runs() {
-        assert_eq!(close_decision(true, false), CloseDecision::Warn);
-    }
-
-    #[test]
-    fn close_confirmed_second_time_within_the_window() {
-        assert_eq!(close_decision(true, true), CloseDecision::Close);
-    }
-
-    #[test]
-    fn close_immediate_when_nothing_is_busy() {
-        assert_eq!(close_decision(false, false), CloseDecision::Close);
-        assert_eq!(close_decision(false, true), CloseDecision::Close);
+    fn close_decision_warns_once_while_busy_and_otherwise_closes() {
+        for (busy, confirmed, expected) in [
+            (true, false, CloseDecision::Warn),
+            (true, true, CloseDecision::Close),
+            (false, false, CloseDecision::Close),
+            (false, true, CloseDecision::Close),
+        ] {
+            assert_eq!(
+                close_decision(busy, confirmed),
+                expected,
+                "busy={busy} confirmed={confirmed}"
+            );
+        }
     }
 
     #[test]
@@ -610,6 +655,97 @@ mod tests {
                 "a tcgetpgrp error must not wedge the close"
             );
         }
+    }
+
+    /// A running block is busy on its own: the `Start-Sleep 60` shape — the
+    /// shell executing something with NO child process and NO foreground pgrp
+    /// (the windows answer for every ConPTY, and a `tcgetpgrp` error on unix)
+    /// — must arm the guard, where `foreground_is_job` alone reads it as idle.
+    #[test]
+    fn a_running_block_is_busy_without_a_foreground_child() {
+        assert!(
+            foreground_busy(-1, -1, true),
+            "the shell said a command is executing: busy, whatever the PTY says"
+        );
+        assert!(
+            !foreground_busy(-1, -1, false),
+            "no block and no foreground evidence is idle"
+        );
+        // A stub session (`master`/`pid` = -1) is exactly this shape, so a
+        // test harness session flips from idle to busy on the 133;C mark alone.
+        assert!(foreground_busy(-1, 0, true));
+    }
+
+    /// The union: the PTY's verdict still counts when the shell has no blocks
+    /// (a bare shell without integration), and an idle prompt stays idle.
+    #[test]
+    fn the_guard_is_the_union_of_the_pty_and_the_block() {
+        assert!(
+            foreground_busy(5678, 1234, false),
+            "a foreground job with no block state is still a job"
+        );
+        assert!(
+            !foreground_busy(1234, 1234, false),
+            "the shell's own pgrp at an idle prompt is idle"
+        );
+        assert!(
+            foreground_busy(1234, 1234, true),
+            "an executing block wins over an idle-looking pgrp (an in-shell loop)"
+        );
+    }
+
+    /// `shell_executing` follows the OSC 133 marks exactly: only the span
+    /// between C and D is busy; a prompt, an entered-but-unrun command line, a
+    /// completed command and a shell without integration are all idle.
+    #[test]
+    fn shell_executing_follows_the_133_marks() {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        assert!(!shell_executing(&term), "no shell integration: idle");
+        term.process(b"\x1b]133;A\x07PS> ");
+        assert!(!shell_executing(&term), "prompt only");
+        term.process(b"\x1b]133;B\x07Start-Sleep 60");
+        assert!(
+            !shell_executing(&term),
+            "entering the command line, not running it"
+        );
+        term.process(b"\n\x1b]133;C\x07");
+        assert!(
+            shell_executing(&term),
+            "133;C opened, no 133;D yet: executing"
+        );
+        term.process(b"\x1b]133;D;0\x07");
+        assert!(!shell_executing(&term), "133;D closed the command: idle");
+        // The next prompt after a completed command is idle too — the guard
+        // must not read the LAST command's state once a new prompt is up.
+        term.process(b"\x1b]133;A\x07PS> ");
+        assert!(!shell_executing(&term));
+    }
+
+    /// A running command that CLEARS THE SCROLLBACK stays busy. ED 3 (`CSI 3
+    /// J`: `clear`, `cls`, `Clear-Host`) drops the engine's current block —
+    /// its rows dangle once scrollback is gone — so a guard reading the block
+    /// saw `while ($true) { Clear-Host; …; Start-Sleep 5 }` go idle on its
+    /// first iteration, and on windows the child walk never saw it at all.
+    /// Only the shell's own 133;D ends the command.
+    #[test]
+    fn a_command_that_clears_the_scrollback_is_still_executing() {
+        let mut term = aterm_core::terminal::Terminal::new(24, 80);
+        term.process(b"\x1b]133;A\x07PS> \x1b]133;B\x07Clear-Host; Start-Sleep 60\n\x1b]133;C\x07");
+        assert!(shell_executing(&term), "precondition: executing");
+        term.process(b"\x1b[H\x1b[2J\x1b[3J");
+        assert!(
+            term.current_block().is_none(),
+            "precondition: ED 3 dropped the block, the reading this guard used to take"
+        );
+        assert!(
+            shell_executing(&term),
+            "the command is still running: ED 3 is output, not the end of the command"
+        );
+        term.process(b"\x1b]133;D;0\x07");
+        assert!(
+            !shell_executing(&term),
+            "133;D after the clear still ends the command"
+        );
     }
 
     #[cfg(windows)]

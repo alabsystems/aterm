@@ -108,7 +108,7 @@ mod tests {
         assert_eq!(resolve_account(Some("my-org")).owner, "my-org");
         assert_eq!(resolve_account(Some("my-org")).repo, INDEX_REPO);
         // An invalid (URL-metacharacter) account is rejected → falls back to default,
-        // so it can never redirect the index fetch off api.github.com.
+        // so it can never splice another host or path into the index's download URL.
         assert_eq!(
             resolve_account(Some("evil.com/x")).owner,
             aterm_update_core::ATPKG_INDEX_OWNER

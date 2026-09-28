@@ -106,13 +106,13 @@
 #                                                     # on first launch with live progress
 #   tools/install.sh --no-cli                         # exclude the `aterm` command
 #   tools/install.sh --no-app                         # exclude the app
-#   tools/install.sh --no-toolchain                   # lean zip, toolset excluded — but the
-#                                                     # exclusion does not persist yet: no
-#                                                     # config is written, so the app's first
-#                                                     # launch still installs the ALab toolset
-#                                                     # unless `[packages].auto_install = false`
-#                                                     # is in ~/.config/aterm/aterm.toml first
-#                                                     # (`aterm help pkg`)
+#   tools/install.sh --no-toolchain                   # lean zip, toolset excluded — and it
+#                                                     # stays excluded: writes
+#                                                     # `[packages] auto_install = false` into
+#                                                     # ~/.config/aterm/aterm.toml (never over a
+#                                                     # value already there), so the app does not
+#                                                     # install the ALab toolset on its own — and
+#                                                     # an installed toolset gets no new member
 #   tools/install.sh --no-path                        # don't touch the shell profile
 #   tools/install.sh --version 0.5.0                  # pin the app release
 #   tools/install.sh --dry-run                        # print the whole install plan —
@@ -153,8 +153,8 @@ On Linux the app is the signed `aterm` binary, which updates itself (aterm updat
 
   --no-app          leave the app alone (Linux: the signed `aterm` binary)
   --no-cli          leave the `aterm` command alone
-  --no-toolchain    skip the ALab toolset (the app's first launch still installs it
-                    unless ~/.config/aterm/aterm.toml sets [packages].auto_install = false)
+  --no-toolchain    skip the ALab toolset, and keep it skipped: writes
+                    [packages] auto_install = false into ~/.config/aterm/aterm.toml
   --no-path         leave your shell profile alone
   --version X.Y.Z   install that release instead of the latest
   --dry-run         print the plan and change nothing
@@ -880,6 +880,104 @@ desktop_exec_path_ok() {
 	[[ "$p" =~ ^[A-Za-z0-9/._+-]+$ ]]
 }
 
+# Defined in the library half (above the ATERM_INSTALL_LIBRARY_ONLY return) so
+# tools/test-install-channel.sh can drive it; it reads BIN_DIR and ROOT, which
+# the install half sets before calling it.
+install_linux_desktop_entry() {
+	# Desktop identity (best-effort, NON-FATAL, Linux only): GNOME/KDE identify
+	# an aterm window by the Wayland app_id / X11 WM_CLASS the GUI sets
+	# ("aterm", crates/aterm-gui/src/app_window.rs) and resolve its icon,
+	# launcher entry, and dock pinning through a desktop file of the SAME
+	# basename — without aterm.desktop the compositor shows a generic gear and
+	# no launcher entry exists. So: aterm.desktop into the XDG applications
+	# dir, and the repo's shipped hicolor PNGs (assets/linux/icons/hicolor,
+	# cut from the same brand art as the mac/windows icons) beside it. Same
+	# contract as man pages/completions: the binaries are already in place, so
+	# an unwritable tree or a missing source skips just this trimming, loudly,
+	# never the install. Every skip names its remedy.
+	[[ "$(uname -s)" == Linux ]] || return 0
+	local aterm_bin="$BIN_DIR/aterm"
+	# The entry launches the INSTALLED command (the store-backed symlink), so a
+	# run that never landed one (pure trimmings repair) writes nothing.
+	[[ -x "$aterm_bin" ]] || return 0
+	if ! desktop_exec_path_ok "$aterm_bin"; then
+		# Exec= is written unquoted by design (desktop_exec_path_ok), so a path
+		# outside the allowlist is refused outright rather than escaped.
+		echo "install.sh: SKIPPED the desktop entry: $aterm_bin contains characters an unquoted desktop Exec= line cannot carry safely (set ATERM_BIN_DIR to a plain path)" >&2
+		return 0
+	fi
+	local xdg_data="${XDG_DATA_HOME:-$HOME/.local/share}"
+	local app_dir="$xdg_data/applications"
+	# mkdir -p succeeds on an existing unwritable dir, hence the explicit -w.
+	if ! mkdir -p "$app_dir" 2>/dev/null || [[ ! -w "$app_dir" ]]; then
+		echo "install.sh: SKIPPED the desktop entry: cannot create/write $app_dir" >&2
+		return 0
+	fi
+	local entry="$app_dir/aterm.desktop"
+	# A pre-existing entry WITHOUT our marker is someone else's file. Replacing
+	# it is what an installer does, but silently is not — say so, because a
+	# later uninstall removes OUR replacement and their original stays gone.
+	if [[ -f "$entry" ]] && ! grep -qF "$ATERM_DESKTOP_MARKER" "$entry" 2>/dev/null; then
+		echo "install.sh: NOTE: replacing a pre-existing $entry this installer did not write (no backup is kept)"
+	fi
+	# Write to a temp then rename, so a mid-write failure never leaves a
+	# half-written entry behind. The marker line is the uninstall sweep's
+	# ownership receipt (ATERM_DESKTOP_MARKER) — keep it first.
+	if ! printf '%s\n' \
+		"$ATERM_DESKTOP_MARKER" \
+		"[Desktop Entry]" \
+		"Type=Application" \
+		"Name=aterm" \
+		"GenericName=Terminal" \
+		"Comment=The batteries-included terminal for AI" \
+		"TryExec=$aterm_bin" \
+		"Exec=$aterm_bin --window" \
+		"Icon=aterm" \
+		"Terminal=false" \
+		"Categories=System;TerminalEmulator;" \
+		"Keywords=terminal;shell;console;command line;" \
+		"StartupNotify=true" \
+		"StartupWMClass=aterm" >"$entry.tmp.$$" 2>/dev/null ||
+		! mv "$entry.tmp.$$" "$entry" 2>/dev/null; then
+		rm -f "$entry.tmp.$$" 2>/dev/null
+		echo "install.sh: SKIPPED the desktop entry: could not write $entry" >&2
+		return 0
+	fi
+
+	# The icon, at every size the repo ships. Source is the CHECKOUT
+	# (assets/linux/icons/hicolor). A piped install has no checkout — Linux
+	# delivery is one signed binary, no tarball — so it gets the generic icon;
+	# the entry above still buys window grouping + the launcher row, so that
+	# is a NOTE, not a rollback. tools/test-install-channel.sh pins the clone
+	# run installing all five sizes.
+	local icon_n=0 src size dest
+	if [[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]]; then
+		for src in "$ROOT"/assets/linux/icons/hicolor/*/apps/aterm.png; do
+			[[ -e "$src" ]] || continue
+			size="${src#"$ROOT/assets/linux/icons/hicolor/"}"
+			size="${size%%/*}"
+			dest="$xdg_data/icons/hicolor/$size/apps"
+			if mkdir -p "$dest" 2>/dev/null && install -m 644 "$src" "$dest/aterm.png" 2>/dev/null; then
+				icon_n=$((icon_n + 1))
+			fi
+		done
+	fi
+
+	# Best-effort: tell launchers the entry exists NOW rather than at their next
+	# rescan. Its absence (or failure) is fine — desktops rescan on their own.
+	if command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$app_dir" >/dev/null 2>&1 || true
+	fi
+
+	if [[ "$icon_n" -gt 0 ]]; then
+		echo "install.sh: installed the desktop entry -> $entry (+ the aterm icon at $icon_n size(s) under $xdg_data/icons/hicolor)"
+	else
+		echo "install.sh: installed the desktop entry -> $entry"
+		echo "install.sh: NOTE: no checkout to source the aterm icon from — the launcher entry works, with a generic icon; run tools/install.sh from a clone to add it" >&2
+	fi
+	return 0
+}
+
 # Six random bytes as hex. od reads EXACTLY its byte count, so pipefail never
 # sees a SIGPIPE here (a `head -c` over /dev/urandom would).
 random_suffix() {
@@ -961,11 +1059,10 @@ elect_container() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 		ASSET_SHA="$zip_sha"
 		if [[ "$toolchain" -eq 0 ]]; then
 			# --no-toolchain excludes the toolset: lean zip, and this run
-			# defers nothing — this script's own toolset step is skipped.
-			# The exclusion does not persist yet: no config is written
-			# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review
-			# corrections" 1), so the app's first launch still adopts and
-			# installs unless [packages].auto_install = false is set first.
+			# defers nothing — this script's own toolset step is skipped,
+			# and persist_no_toolchain writes `[packages] auto_install =
+			# false` into aterm.toml (never over a value already there), so
+			# the app's first launch leaves the toolset alone too.
 			LEAN_REASON=no-toolchain
 		else
 			LEAN_REASON=default
@@ -1925,6 +2022,255 @@ if __name__ == "__main__":
 ATERM_LINUX_VERIFY_PY
 }
 
+# --- OWNERSHIP: one set of tests for BOTH directions ---------------------------
+#
+# The uninstaller always refused to delete what it did not place; the installer
+# used to move aside whatever sat at $DEST/aterm.app and `ln -sfn` over whatever
+# sat at $BIN_DIR/aterm without looking. These are the uninstaller's own tests,
+# hoisted so the install path asks the same questions and prints the same
+# SKIPPED line (docs/AUDIT-distribution-channel-2026-08-31.md, "ownership
+# asymmetry"). Defined above the library guard so tools/test-install-channel.sh
+# pins them.
+
+# The one SKIPPED line both directions print for an entry that is not ours.
+ownership_skip() { # <path> <reason>
+	echo "install.sh: SKIPPED $1 — $2" >&2
+}
+
+# The bundle's CFBundleIdentifier, or nothing when it has none readable.
+bundle_identifier() { # <app-dir>
+	local plist="$1/Contents/Info.plist"
+	[[ -f "$plist" ]] || return 0
+	defaults read "$plist" CFBundleIdentifier 2>/dev/null || true
+}
+
+# Whether <app-dir> is an aterm bundle — the only kind either direction touches.
+bundle_is_ours() { # <app-dir>
+	[[ "$(bundle_identifier "$1")" == "com.aterm.aterm" ]]
+}
+
+# What may happen at the app destination <app-dir> (normally $DEST/aterm.app),
+# one word (then a reason) — the install path's question, as bin_aterm_verdict
+# is the bin entry's:
+#   absent   nothing there — install
+#   ours     an aterm bundle (bundle_is_ours) — set aside and replaced
+#   damaged  a real bundle directory with no readable CFBundleIdentifier whose
+#            own Contents/MacOS/aterm answers `--version` as aterm (run bounded
+#            and stdin-less): an interrupted copy or a lost Info.plist. It is
+#            aterm's, so a re-run REPAIRS it — set aside and replaced, and said
+#            so. (The uninstaller stays on bundle_is_ours: deleting asks more.)
+#   foreign <reason>  anything else — left in place; the reason names the
+#            remedy when the bundle might be a damaged aterm that cannot answer
+app_dest_verdict() { # <app-dir>
+	local app="$1" id exe
+	if [[ ! -e "$app" && ! -L "$app" ]]; then
+		echo absent
+		return 0
+	fi
+	if bundle_is_ours "$app"; then
+		echo ours
+		return 0
+	fi
+	id="$(bundle_identifier "$app")"
+	if [[ -n "$id" ]]; then
+		echo "foreign not an aterm bundle (CFBundleIdentifier=$id)"
+		return 0
+	fi
+	exe="$app/Contents/MacOS/aterm"
+	if [[ -d "$app" && ! -L "$app" && -f "$exe" && -x "$exe" ]] &&
+		first_line_bounded "$VERSION_PROBE_SECS" "$exe" --version | grep -q '^aterm '; then
+		echo "damaged no readable CFBundleIdentifier, but its binary answers as aterm"
+		return 0
+	fi
+	echo "foreign no readable CFBundleIdentifier and no binary that answers as aterm — if it is a damaged aterm install, move it aside (mv '$app' '$app.broken') and re-run"
+}
+
+# Whether a bin entry is a symlink this installer places: into an aterm.app
+# bundle, or into the store.
+bin_entry_is_ours() { # <path> <store-dir>
+	[[ -L "$1" ]] || return 1
+	case "$(readlink "$1" 2>/dev/null || true)" in
+	*/aterm.app/Contents/MacOS/* | "$2"/*) return 0 ;;
+	esac
+	return 1
+}
+
+# What may happen at the `aterm` bin entry <path>, one word (then a reason):
+#   absent     nothing there — write it
+#   ours       our symlink (bundle or store) — re-point it
+#   pre-store  a REGULAR file that answers `--version` as aterm: a pre-store
+#              install. The installer replaces it, and says so — it would shadow
+#              the store. (The uninstaller still leaves it: removing a binary is
+#              not the same act as superseding one.)
+#   foreign <reason>  anything else — the installer leaves it and says SKIPPED
+bin_aterm_verdict() { # <path> <store-dir>
+	local p="$1"
+	if [[ ! -e "$p" && ! -L "$p" ]]; then
+		echo absent
+	elif bin_entry_is_ours "$p" "$2"; then
+		echo ours
+	elif [[ -L "$p" ]]; then
+		echo "foreign symlink points outside an aterm bundle or store ($(readlink "$p" 2>/dev/null || true))"
+	elif [[ -f "$p" && -x "$p" ]] && first_line_bounded "$VERSION_PROBE_SECS" "$p" --version | grep -q '^aterm '; then
+		echo pre-store
+	else
+		echo "foreign not a symlink — a hand-built binary this installer did not place"
+	fi
+}
+
+# How long bin_aterm_verdict and app_dest_verdict wait for a foreign binary to
+# answer `--version`. A script constant, not an environment knob: the suite that
+# sources this file as a library widens it for the cases that need an ANSWER from a
+# script it has just written, whose first exec waits on the system's code
+# assessment — measured past 5 s on a loaded machine (2026-09-26, load ~50).
+VERSION_PROBE_SECS=5
+
+# first_line_bounded <seconds> <exe> [args…] -> the first line the run printed, or nothing.
+#
+# For running a binary this installer did NOT place (bin_aterm_verdict asks a regular
+# file at $BIN_DIR/aterm who it is). stdin is /dev/null: under the advertised
+# `curl … | bash` the inherited stdin IS the rest of this script, and a foreign binary
+# that reads it swallows the installer, which then stops silently after the CLI half.
+# And a run still going after <seconds> is killed, so one that blocks cannot hang the
+# install — macOS ships no `timeout`, so it is a background job this loop polls.
+first_line_bounded() {
+	local limit="$1" out pid ticks=0
+	shift
+	out="$(mktemp "${TMPDIR:-/tmp}/aterm-probe.XXXXXX")" || return 0
+	"$@" </dev/null >"$out" 2>/dev/null &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null; do
+		if [[ "$ticks" -ge $((limit * 10)) ]]; then
+			kill -KILL "$pid" 2>/dev/null || true
+			break
+		fi
+		sleep 0.1
+		ticks=$((ticks + 1))
+	done
+	wait "$pid" 2>/dev/null || true
+	head -n 1 "$out"
+	rm -f "$out"
+}
+
+# The plan's line for the ONE `aterm` on PATH, per bin_aterm_verdict — the same
+# question the install path asks (claim_bin_aterm), so --dry-run promises only what a
+# real run would do: link it, replace a pre-store file first, or leave a foreign one.
+bin_aterm_plan() { # <path> <store-dir>
+	local verdict
+	verdict="$(bin_aterm_verdict "$1" "$2")"
+	case "$verdict" in
+	absent | ours) echo "install.sh: cli: ONE command on PATH — the $1 symlink (bundle-backed when the installed app ships the toolset; otherwise a source build into $2), plus man pages/completions where writable" ;;
+	pre-store) echo "install.sh: cli: would REPLACE $1 — a regular file from a pre-store install that answers as aterm — with the ONE symlink (bundle-backed, or a source build into $2), plus man pages/completions where writable" ;;
+	*) echo "install.sh: cli: $1 would be SKIPPED — ${verdict#foreign } (left exactly as it is; the command would be installed but not on PATH)" ;;
+	esac
+}
+
+# env_twin_on <VAR> -> 1 when the env twin of a --no-* flag leaves the half ON, 0 when it
+# opts out. Only `1` opts out — what the usage line documents (`ATERM_NO_TOOLCHAIN=1`,
+# `ATERM_NO_PATH=1`); unset, empty and `0` leave it on; anything else is refused (exit 2)
+# rather than guessed. `${VAR:+0}` read ANY non-empty value as the opt-out, so a wrapper
+# exporting `ATERM_NO_TOOLCHAIN=0` to mean "on" skipped the toolset — and, since the
+# opt-out persists `[packages] auto_install = false` (persist_no_toolchain), opted the
+# machine out of the toolset for good.
+env_twin_on() { # <VAR>
+	local value="${!1:-}"
+	case "$value" in
+	"" | 0) echo 1 ;;
+	1) echo 0 ;;
+	*)
+		echo "install.sh: $1='$value' is not 1 or 0 — set $1=1 to opt out, leave it unset (or 0) to keep it" >&2
+		return 2
+		;;
+	esac
+}
+
+# --- --no-toolchain PERSISTS -----------------------------------------------------
+#
+# The flag used to exclude the toolset for THIS run only: nothing was written, so
+# the app's first launch adopted and installed the whole set anyway unless
+# `[packages] auto_install = false` was already in aterm.toml
+# (docs/DESIGN-cli-toolchain-seed-2026-08-31.md, "Review corrections" 1). The
+# flag now writes that key — the documented install consent atpkg reads
+# (crates/atpkg/src/config.rs `auto_install`) — and NEVER overwrites a value the
+# person set: an existing `auto_install` (or its retired spelling
+# `seed_install`) under [packages], or a [packages] this line-oriented edit
+# cannot read safely (an inline table, a dotted `packages.` key), is left as it
+# is and named.
+
+# What the persisted key does, in the one sentence the plan and the write both
+# print. It is atpkg's install consent (crates/atpkg/src/cli.rs
+# `should_complete_set`), so it reaches past a fresh machine: on one that already
+# runs the toolset it stops the set being COMPLETED — a program added to the
+# default set later is never installed unattended — while what is installed keeps
+# updating. A re-run with --no-toolchain only to reinstall the app says so.
+NO_TOOLCHAIN_EFFECT="the app will not install the ALab toolset on its own; an already-installed toolset keeps updating but gets no new default-set member (\`aterm pkg install --default-set\` installs the whole set when you want it; deleting the key undoes the exclusion)"
+
+# The config file atpkg and the app read (config.rs `config_path`).
+aterm_config_path() {
+	echo "${XDG_CONFIG_HOME:-$HOME/.config}/aterm/aterm.toml"
+}
+
+# What persisting the exclusion would do to <cfg>, one word (then detail):
+#   create   no file — it would be created with the key
+#   append   a file with no [packages] table — the table would be appended
+#   insert   a [packages] table without the key — it would gain the line
+#   keep <what>   a value is already there (or cannot be read safely) — untouched
+no_toolchain_plan() { # <cfg>
+	local cfg="$1"
+	[[ -e "$cfg" ]] || {
+		echo create
+		return 0
+	}
+	awk '
+		function strip(s) { sub(/[ \t]*#.*$/, "", s); sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+		{
+			line = strip($0)
+			if (line ~ /^packages[ \t]*=/ || line ~ /^packages\./) { odd = 1 }
+			if (line ~ /^\[/) { inpk = (line ~ /^\[[ \t]*packages[ \t]*\]$/); if (inpk) table = 1; next }
+			if (inpk && line ~ /^(auto_install|seed_install)[ \t]*=/) { have = line }
+		}
+		END {
+			if (odd) { print "keep [packages] is written in a form this installer does not edit"; exit }
+			if (have != "") { print "keep " have; exit }
+			print (table ? "insert" : "append")
+		}' "$cfg"
+}
+
+# Persist the exclusion into <cfg> per no_toolchain_plan. Writes THROUGH a
+# symlinked config (a dotfiles repo keeps its link) and keeps the file's mode.
+persist_no_toolchain() { # <cfg>
+	local cfg="$1" plan tmp
+	plan="$(no_toolchain_plan "$cfg")"
+	case "$plan" in
+	create)
+		mkdir -p "$(dirname "$cfg")" || return 1
+		printf '[packages]\nauto_install = false\n' >"$cfg" || return 1
+		;;
+	append)
+		# A file whose last byte is not a newline would glue the header to it.
+		if [[ -s "$cfg" && -n "$(tail -c 1 "$cfg")" ]]; then printf '\n' >>"$cfg" || return 1; fi
+		printf '\n[packages]\nauto_install = false\n' >>"$cfg" || return 1
+		;;
+	insert)
+		tmp="$(mktemp "${TMPDIR:-/tmp}/aterm-config.XXXXXX")" || return 1
+		awk '
+			{ print }
+			!done {
+				line = $0; sub(/[ \t]*#.*$/, "", line); gsub(/^[ \t]+|[ \t]+$/, "", line)
+				if (line ~ /^\[[ \t]*packages[ \t]*\]$/) { print "auto_install = false"; done = 1 }
+			}' "$cfg" >"$tmp" && cat "$tmp" >"$cfg"
+		local status=$?
+		rm -f "$tmp"
+		[[ $status -eq 0 ]] || return 1
+		;;
+	keep*)
+		echo "install.sh: --no-toolchain: $cfg already says \`${plan#keep }\` — left as it is"
+		return 0
+		;;
+	esac
+	echo "install.sh: --no-toolchain: wrote \`[packages] auto_install = false\` into $cfg — $NO_TOOLCHAIN_EFFECT"
+}
+
 if [[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]]; then
 	return 0 2>/dev/null || exit 0
 fi
@@ -1969,7 +2315,7 @@ uninstall_everything() {
 		removed=$((removed + 1))
 	}
 	_skip() {
-		echo "install.sh: SKIPPED $1 — $2" >&2
+		ownership_skip "$1" "$2"
 		skipped=$((skipped + 1))
 	}
 
@@ -1981,7 +2327,7 @@ uninstall_everything() {
 	#    unrunnable and multiple GB were stranded with no supported way out
 	#    (2026-08-20 round-8 audit). Best-effort and never fatal: an uninstall must
 	#    still remove the app if the toolchain sweep cannot run.
-	local dir app plist id
+	local dir app id
 	local atpkg_bin=""
 	# SAME OVERRIDE RULE AS THE BUNDLE SWEEP BELOW. This used to scan
 	# /Applications first unconditionally, so an uninstall aimed at a scratch
@@ -2031,12 +2377,10 @@ uninstall_everything() {
 		for name in aterm.app aterm.app.rollback; do
 			app="$dir/$name"
 			[[ -d "$app" ]] || continue
-			plist="$app/Contents/Info.plist"
-			id=""
-			[[ -f "$plist" ]] && id="$(defaults read "$plist" CFBundleIdentifier 2>/dev/null || true)"
-			if [[ "$id" == "com.aterm.aterm" ]]; then
+			if bundle_is_ours "$app"; then
 				_rm "$app" "app bundle"
 			else
+				id="$(bundle_identifier "$app")"
 				_skip "$app" "not an aterm bundle (CFBundleIdentifier=${id:-unreadable})"
 			fi
 		done
@@ -2067,12 +2411,11 @@ uninstall_everything() {
 			esac
 		fi
 		bin="$bd/aterm"
-		if [[ -L "$bin" ]]; then
+		if bin_entry_is_ours "$bin" "$store"; then
+			_rm "$bin" "aterm command"
+		elif [[ -L "$bin" ]]; then
 			target="$(readlink "$bin" 2>/dev/null || true)"
-			case "$target" in
-			*/aterm.app/Contents/MacOS/* | "$store"/*) _rm "$bin" "aterm command" ;;
-			*) _skip "$bin" "symlink points outside an aterm bundle or store ($target)" ;;
-			esac
+			_skip "$bin" "symlink points outside an aterm bundle or store ($target)"
 		elif [[ -e "$bin" ]]; then
 			_skip "$bin" "not a symlink — a hand-built binary this installer did not place"
 		fi
@@ -2328,7 +2671,7 @@ print_install_plan() {
 	elif [[ -n "$CLI_SKIP" ]]; then
 		echo "install.sh: cli: would be SKIPPED: $CLI_SKIP"
 	else
-		echo "install.sh: cli: ONE command on PATH — the $BIN_DIR/aterm symlink (bundle-backed when the installed app ships the toolset; otherwise a source build into $STORE_DIR), plus man pages/completions where writable"
+		bin_aterm_plan "$BIN_DIR/aterm" "$STORE_DIR"
 		# The skip FIRST: every refusal found after a cargo was (no rustup
 		# behind it, the pinned toolchain absent, a cargo that ignores the
 		# pin, a rustc beside it that is not the proxy, an unwritable store)
@@ -2343,6 +2686,14 @@ print_install_plan() {
 
 	if [[ "$DO_TOOLCHAIN" -eq 0 ]]; then
 		echo "install.sh: toolset: excluded (--no-toolchain / ATERM_NO_TOOLCHAIN=1)"
+		local cfg plan
+		cfg="$(aterm_config_path)"
+		plan="$(no_toolchain_plan "$cfg")"
+		case "$plan" in
+		create) echo "  config:   creates $cfg with \`[packages] auto_install = false\` — the exclusion persists: $NO_TOOLCHAIN_EFFECT" ;;
+		append | insert) echo "  config:   adds \`auto_install = false\` to [packages] in $cfg — the exclusion persists: $NO_TOOLCHAIN_EFFECT" ;;
+		keep*) echo "  config:   $cfg already says \`${plan#keep }\` — left as it is" ;;
+		esac
 	elif [[ "${TOOLCHAIN_DEFERRED:-0}" -eq 1 || "${CONTAINER_KIND:-}" == zip ]]; then
 		echo "install.sh: toolset: installs on aterm's first launch (~4.4 GiB on disk when finished)"
 	elif [[ "${CONTAINER_KIND:-}" == dmg ]]; then
@@ -2426,8 +2777,7 @@ DO_CLI=1
 # — rendered exactly as atpkg's `cost::human_bytes` renders it at seed time
 # (binary units, one decimal). Re-derive it from the pinned pkg manifests when
 # the published set moves; do not re-estimate.)
-DO_TOOLCHAIN="${ATERM_NO_TOOLCHAIN:+0}"
-DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
+DO_TOOLCHAIN="$(env_twin_on ATERM_NO_TOOLCHAIN)" || exit 2
 # The container election (2026-08-23 funnel flip — DESIGN-streaming-batteries
 # §7): the LEAN zip on every CPU (aterm opens immediately; the toolchain
 # installs itself on first launch with live progress). --batteries — the
@@ -2445,8 +2795,7 @@ DO_TOOLCHAIN="${DO_TOOLCHAIN:-1}"
 # there is no ~/.bash_profile), fish under $XDG_CONFIG_HOME, an rc that did not
 # exist when atpkg's pass ran, and an rc atpkg's TCC fence skips.
 # Opt out with ATERM_NO_PATH=1.
-DO_PATH="${ATERM_NO_PATH:+0}"
-DO_PATH="${DO_PATH:-1}"
+DO_PATH="$(env_twin_on ATERM_NO_PATH)" || exit 2
 DO_UNINSTALL=0
 DRY_RUN=0
 while [[ $# -gt 0 ]]; do
@@ -2642,6 +2991,21 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			fi
 			if ! ensure_dirs_writable "$DEST"; then
 				APP_SKIP="cannot create/write $DEST (set ATERM_INSTALL_DIR to a writable dir)"
+			elif APP_DEST_VERDICT="$(app_dest_verdict "$DEST/aterm.app")" &&
+				[[ "$APP_DEST_VERDICT" == foreign* ]]; then
+				# OWNERSHIP, the uninstaller's own test: a bundle that is not
+				# aterm's is never moved aside and replaced — the same entry
+				# --uninstall refuses to delete. A damaged aterm (no readable
+				# identifier, a binary that answers as aterm) is repaired below.
+				APP_SKIP="$DEST/aterm.app — ${APP_DEST_VERDICT#foreign }; left in place"
+			elif [[ "$APP_DEST_VERDICT" == damaged* ]]; then
+				# A damaged aterm: nothing to compare a version against, so the
+				# install below replaces it — the repair a re-run is for.
+				if [[ "$DRY_RUN" -eq 1 ]]; then
+					echo "install.sh: app: $DEST/aterm.app is a damaged aterm install (${APP_DEST_VERDICT#damaged }) — would be set aside and replaced"
+				else
+					echo "install.sh: $DEST/aterm.app is a damaged aterm install (${APP_DEST_VERDICT#damaged }) — setting it aside and replacing it"
+				fi
 			elif [[ -f "$DEST/aterm.app/Contents/Info.plist" ]] && app_already_current "$TAG" "$TAG_EXPLICIT" \
 				"$(defaults read "$DEST/aterm.app/Contents/Info.plist" CFBundleIdentifier 2>/dev/null || true)" \
 				"$(defaults read "$DEST/aterm.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null || true)"; then
@@ -2787,6 +3151,10 @@ LINUX_APP_INSTALLED=0
 # app's own pass — holds the store lock), so a toolchain-only repair run can
 # exit 0 without touching INSTALLED_ANY's meaning.
 CLI_PATH_HINT_WANTED=0
+# Whether $BIN_DIR/aterm is this run's: expose_store_binary (the store lanes)
+# and install_cli's bundle lane set it; 0 only when claim_bin_aterm left a
+# foreign entry there, which say_store_command and the completions then honour.
+BIN_ATERM_EXPOSED=1
 PATH_BLOCK_WROTE=0
 TOOLCHAIN_RAN=0
 # atpkg's EX_TEMPFAIL contention code (crates/atpkg/src/lock.rs CONTENDED_EXIT):
@@ -2916,11 +3284,7 @@ install_app() {
 			# first launch, which the run's last toolset line says.
 			echo "  then: aterm.app -> $DEST"
 		else
-			# --no-toolchain writes no config (docs/DESIGN-cli-toolchain-seed-
-			# 2026-08-31.md, "Review corrections" 1), so the app's own first
-			# launch still adopts and installs the set. Only the key in
-			# aterm.toml, set first, stops that.
-			echo "  then: aterm.app -> $DEST; its first launch still installs the ALab toolset unless ~/.config/aterm/aterm.toml sets [packages].auto_install = false"
+			echo "  then: aterm.app -> $DEST; --no-toolchain writes \`[packages] auto_install = false\` to $(aterm_config_path) (never over a value already there): $NO_TOOLCHAIN_EFFECT"
 		fi
 	fi
 	# THE ONE WRITE OUTSIDE THE INSTALL DIRS RIDES THE SAME PLAN. By default
@@ -3139,7 +3503,8 @@ install_linux_app() {
 		exit 1
 	}
 	expose_store_binary
-	echo "install.sh: installed aterm ${TAG#v} -> $BIN_DIR/aterm"
+	echo "install.sh: installed aterm ${TAG#v} -> $STORE_DIR/aterm"
+	say_store_command ""
 	INSTALLED_ANY=1
 	LINUX_APP_INSTALLED=1
 }
@@ -3194,7 +3559,9 @@ install_cli() {
 		# ONE name on PATH (the [workspace.metadata.atpkg] expose declaration):
 		# `aterm` alone — a symlink at the bundle's one binary (or, against a
 		# previous-generation bundle, its aterm-cli front door).
+		claim_bin_aterm || return 0
 		ln -sfn "$target" "$BIN_DIR/aterm"
+		BIN_ATERM_EXPOSED=1
 		echo "install.sh: linked $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm (follows the app's updates)"
 	elif [[ -n "$CLI_CARGO_SKIP" ]]; then
 		# Neither source is available here: no installed bundle ships the
@@ -3257,7 +3624,8 @@ install_cli_from_source() {
 	fi
 	# STORE_DIR was pre-flighted (created + writability-checked) before the build.
 	place_store_binary "$rel/aterm"
-	echo "install.sh: installed $("$BIN_DIR/aterm" --version | head -n 1) -> $BIN_DIR/aterm"
+	echo "install.sh: installed $("$STORE_DIR/aterm" --version | head -n 1) -> $STORE_DIR"
+	say_store_command ""
 }
 
 # Land ONE binary in the private store and expose it: the argv0 verb siblings
@@ -3292,10 +3660,42 @@ expose_store_binary() {
 	for alias in aterm-cli aterm-ctl atpkg aterm-fleet aterm-drive aterm-link aterm-gui; do
 		ln -sfn aterm "$STORE_DIR/$alias"
 	done
-	# rm first: a leftover REGULAR FILE from a pre-store install must not
-	# survive as a stale copy shadowing the store.
-	rm -f "$BIN_DIR/aterm"
+	# The entry on PATH only when it is ours to write (claim_bin_aterm): a
+	# leftover REGULAR FILE from a pre-store install is replaced — it would
+	# shadow the store — and anything foreign is left, SKIPPED. Which of the two
+	# happened is BIN_ATERM_EXPOSED, so no caller claims a PATH entry it left.
+	BIN_ATERM_EXPOSED=0
+	claim_bin_aterm || return 0
 	ln -sfn "$STORE_DIR/aterm" "$BIN_DIR/aterm"
+	BIN_ATERM_EXPOSED=1
+}
+
+# The store lanes' PATH line, true either way: the ONE command when
+# expose_store_binary linked it, else where the command is and why PATH's is not it.
+say_store_command() { # <what the command is>
+	if [[ "$BIN_ATERM_EXPOSED" -eq 1 ]]; then
+		echo "  ONE command on PATH: $BIN_DIR/aterm$1"
+	else
+		echo "  NOT on PATH: $BIN_DIR/aterm is not this installer's (SKIPPED above) — run $STORE_DIR/aterm, or move that file aside and re-run"
+	fi
+}
+
+# Whether $BIN_DIR/aterm may be (re)written, per bin_aterm_verdict: absent or
+# ours, yes; a pre-store aterm file, yes — removed first, and said; anything
+# else, no — SKIPPED with the uninstaller's line and left exactly as it is.
+claim_bin_aterm() {
+	local p="$BIN_DIR/aterm" verdict
+	verdict="$(bin_aterm_verdict "$p" "$STORE_DIR")"
+	case "$verdict" in
+	absent | ours) return 0 ;;
+	pre-store)
+		rm -f "$p" || return 1
+		echo "install.sh: replaced $p — a regular file from a pre-store install that answers as aterm; left in place it would shadow the managed command"
+		return 0
+		;;
+	esac
+	ownership_skip "$p" "${verdict#foreign }"
+	return 1
 }
 
 # Earlier installs (and the pre-one-command layout) exposed `aterm-ctl` on
@@ -3359,6 +3759,13 @@ install_cli_completions() {
 	# nowhere loads is not an install, and claiming it teaches people the
 	# feature is broken.
 	local ac="$BIN_DIR/aterm"
+	# Completions are for the `aterm` PATH resolves: when that entry was left
+	# foreign (BIN_ATERM_EXPOSED=0), running it would ask someone else's binary
+	# for our verbs — and install completions for a command that is not ours.
+	if [[ "$BIN_ATERM_EXPOSED" -eq 0 ]]; then
+		echo "install.sh: shell completions: skipped — $ac is not this installer's"
+		return 0
+	fi
 	[[ -x "$ac" ]] || return 0
 	local xdg_data="${XDG_DATA_HOME:-$HOME/.local/share}"
 	local xdg_config="${XDG_CONFIG_HOME:-$HOME/.config}"
@@ -3455,98 +3862,6 @@ install_cli_completions() {
 	return 0
 }
 
-install_linux_desktop_entry() {
-	# Desktop identity (best-effort, NON-FATAL, Linux only): GNOME/KDE identify
-	# an aterm window by the Wayland app_id / X11 WM_CLASS the GUI sets
-	# ("aterm", crates/aterm-gui/src/app_window.rs) and resolve its icon,
-	# launcher entry, and dock pinning through a desktop file of the SAME
-	# basename — without aterm.desktop the compositor shows a generic gear and
-	# no launcher entry exists. So: aterm.desktop into the XDG applications
-	# dir, and the repo's shipped hicolor PNGs (assets/linux/icons/hicolor,
-	# cut from the same brand art as the mac/windows icons) beside it. Same
-	# contract as man pages/completions: the binaries are already in place, so
-	# an unwritable tree or a missing source skips just this trimming, loudly,
-	# never the install. Every skip names its remedy.
-	[[ "$(uname -s)" == Linux ]] || return 0
-	local aterm_bin="$BIN_DIR/aterm"
-	# The entry launches the INSTALLED command (the store-backed symlink), so a
-	# run that never landed one (pure trimmings repair) writes nothing.
-	[[ -x "$aterm_bin" ]] || return 0
-	if ! desktop_exec_path_ok "$aterm_bin"; then
-		# Exec= is written unquoted by design (desktop_exec_path_ok), so a path
-		# outside the allowlist is refused outright rather than escaped.
-		echo "install.sh: SKIPPED the desktop entry: $aterm_bin contains characters an unquoted desktop Exec= line cannot carry safely (set ATERM_BIN_DIR to a plain path)" >&2
-		return 0
-	fi
-	local xdg_data="${XDG_DATA_HOME:-$HOME/.local/share}"
-	local app_dir="$xdg_data/applications"
-	# mkdir -p succeeds on an existing unwritable dir, hence the explicit -w.
-	if ! mkdir -p "$app_dir" 2>/dev/null || [[ ! -w "$app_dir" ]]; then
-		echo "install.sh: SKIPPED the desktop entry: cannot create/write $app_dir" >&2
-		return 0
-	fi
-	local entry="$app_dir/aterm.desktop"
-	# A pre-existing entry WITHOUT our marker is someone else's file. Replacing
-	# it is what an installer does, but silently is not — say so, because a
-	# later uninstall removes OUR replacement and their original stays gone.
-	if [[ -f "$entry" ]] && ! grep -qF "$ATERM_DESKTOP_MARKER" "$entry" 2>/dev/null; then
-		echo "install.sh: NOTE: replacing a pre-existing $entry this installer did not write (no backup is kept)"
-	fi
-	# Write to a temp then rename, so a mid-write failure never leaves a
-	# half-written entry behind. The marker line is the uninstall sweep's
-	# ownership receipt (ATERM_DESKTOP_MARKER) — keep it first.
-	if ! printf '%s\n' \
-		"$ATERM_DESKTOP_MARKER" \
-		"[Desktop Entry]" \
-		"Type=Application" \
-		"Name=aterm" \
-		"GenericName=Terminal" \
-		"Comment=The batteries-included terminal for AI" \
-		"TryExec=$aterm_bin" \
-		"Exec=$aterm_bin --window" \
-		"Icon=aterm" \
-		"Terminal=false" \
-		"Categories=System;TerminalEmulator;" \
-		"Keywords=terminal;shell;console;command line;" \
-		"StartupNotify=true" \
-		"StartupWMClass=aterm" >"$entry.tmp.$$" 2>/dev/null ||
-		! mv "$entry.tmp.$$" "$entry" 2>/dev/null; then
-		rm -f "$entry.tmp.$$" 2>/dev/null
-		echo "install.sh: SKIPPED the desktop entry: could not write $entry" >&2
-		return 0
-	fi
-
-	# The icon, at every size the repo ships. Source is the CHECKOUT (icons
-	# live in the repo, not the released tarball — the tarball follow-up is
-	# tracked); a piped run has none, and the entry above still buys window
-	# grouping + the launcher row, so that is a NOTE, not a rollback.
-	local icon_n=0 src size dest
-	if [[ -n "$ROOT" && -d "$ROOT/assets/linux/icons/hicolor" ]]; then
-		for src in "$ROOT"/assets/linux/icons/hicolor/*/apps/aterm.png; do
-			[[ -e "$src" ]] || continue
-			size="${src#"$ROOT/assets/linux/icons/hicolor/"}"
-			size="${size%%/*}"
-			dest="$xdg_data/icons/hicolor/$size/apps"
-			if mkdir -p "$dest" 2>/dev/null && install -m 644 "$src" "$dest/aterm.png" 2>/dev/null; then
-				icon_n=$((icon_n + 1))
-			fi
-		done
-	fi
-
-	# Best-effort: tell launchers the entry exists NOW rather than at their next
-	# rescan. Its absence (or failure) is fine — desktops rescan on their own.
-	if command -v update-desktop-database >/dev/null 2>&1; then
-		update-desktop-database "$app_dir" >/dev/null 2>&1 || true
-	fi
-
-	if [[ "$icon_n" -gt 0 ]]; then
-		echo "install.sh: installed the desktop entry -> $entry (+ the aterm icon at $icon_n size(s) under $xdg_data/icons/hicolor)"
-	else
-		echo "install.sh: installed the desktop entry -> $entry"
-		echo "install.sh: NOTE: no checkout to source the aterm icon from — the launcher entry works, with a generic icon; run tools/install.sh from a clone to add it" >&2
-	fi
-	return 0
-}
 
 cli_path_hint() {
 	local rc_name f
@@ -3826,6 +4141,12 @@ if [[ "$DO_TOOLCHAIN" -eq 1 ]]; then
 	else
 		install_toolchain
 	fi
+else
+	# --no-toolchain PERSISTS (persist_no_toolchain): the app's first launch
+	# reads the same key and leaves the toolset alone. A write that fails is
+	# said, never fatal — the halves already installed stand.
+	persist_no_toolchain "$(aterm_config_path)" ||
+		echo "install.sh: NOTE: could not write $(aterm_config_path); set \`[packages] auto_install = false\` there by hand to keep the toolset out" >&2
 fi
 if [[ "$DO_PATH" -eq 1 ]]; then
 	wire_shell_path

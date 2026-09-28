@@ -14,9 +14,11 @@
 //! window. A bug that evicted out of order, dropped an extra event, or left a hole
 //! would violate it. Pure Rust + real code, so it always runs.
 
-use aterm_buffer::{Edit, Surface, WriteCap};
+use aterm_buffer::{Edit, Surface};
+mod support;
 use aterm_spec::derive::evict_full_model;
 use std::collections::BTreeSet;
+use support::write_cap;
 
 /// The real ring cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`).
 const CAP: u64 = 1 << 16;
@@ -34,7 +36,7 @@ fn real_eventlog_live_set_is_contiguous_window() {
     // Drive past the cap so eviction is actually exercised.
     let n_appends = CAP + 8;
     for i in 0..n_appends {
-        s.apply(&WriteCap, Edit::AppendLine(format!("e{i}")));
+        s.apply(&write_cap(), Edit::AppendLine(format!("e{i}")));
     }
 
     let seq = s.seq().0;

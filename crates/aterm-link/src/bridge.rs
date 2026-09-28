@@ -52,12 +52,19 @@
 //!
 //! DESIGN §5.2's stated mitigation — "the bridge collapses a session's `exited`
 //! presence row into an `ev` record after `--exited-keep <n>` (default 64)
-//! sessions" — IS NOT IMPLEMENTED, and `--exited-keep` is refused by `serve`'s
-//! own argument parser as an unknown flag. That is written here rather than left
-//! for an operator to discover at 4096, because this crate's docs are its only
-//! evidence: the ceiling is real, it is roughly a thousand sessions per node id,
-//! and the recovery today is minting a new node id (which abandons that node's
-//! mail lane by design).
+//! sessions" — would reclaim NOTHING, so this crate does not carry it (`serve`
+//! refuses `--exited-keep` as an unknown flag). The broker counts a subject
+//! against its producer the first time the subject enters the last-value index
+//! (`astream-broker` `store.rs`, live in `index_last` and again when the index is
+//! rebuilt on open) and never un-counts it: only retention compaction drops
+//! records, and it drops by offset, not by subject. A session's `presence` and
+//! `ev` subjects are minted when it spawns, so collapsing its later rows frees no
+//! budget. The fix is a subject-RETIRE record in the astream broker that removes
+//! a subject from the index and decrements its producer's count (live and on
+//! rebuild); once the vendor/astream pin carries it, the bridge retires an exited
+//! session's two subjects. Until then the ceiling is real, it is roughly a
+//! thousand sessions per node id, and the recovery is minting a new node id
+//! (which abandons that node's mail lane by design).
 //!
 //! ## The two lanes to aterm, and why losing either one must END this process
 //!
@@ -511,6 +518,21 @@ struct StatusSample {
     hold: bool,
     detail: String,
     agent: Option<String>,
+    /// An explicit batch deferral, distinct from an older single-status reply
+    /// with no `agent=` field (which still clears the phase as before).
+    agent_deferred: bool,
+}
+
+impl StatusSample {
+    fn apply_presence(&self, fields: &mut Fields) {
+        fields.set_detail(Some(&self.detail));
+        // `agent_deferred=1` says the GUI could not read the timeline without
+        // blocking its event loop. Keep the last verdict (including a newer
+        // pushed one), rather than turning a busy Claude session into `phase=-`.
+        if !self.agent_deferred {
+            fields.set_agent(self.agent.as_deref());
+        }
+    }
 }
 
 /// One row of `sessions status`. `Stale` is a local id whose stable sid or
@@ -529,6 +551,7 @@ fn parse_batch_status<'a>(
     tokens: impl Iterator<Item = &'a str>,
 ) -> Option<StatusSample> {
     let (mut sid, mut revision, mut hold, mut detail, mut agent) = (None, None, None, None, None);
+    let mut agent_deferred = false;
     for tok in tokens {
         if let Some(v) = tok.strip_prefix("sid=") {
             if sid.replace(v.parse::<u64>().ok()?).is_some() {
@@ -551,6 +574,11 @@ fn parse_batch_status<'a>(
             if v.is_empty() || agent.replace(v.to_string()).is_some() {
                 return None;
             }
+        } else if tok == "agent_deferred=1" {
+            if agent_deferred {
+                return None;
+            }
+            agent_deferred = true;
         } else {
             // A literal space inside detail would create another token. The
             // GUI percent-encodes it; never accept a truncated free-text row.
@@ -561,10 +589,18 @@ fn parse_batch_status<'a>(
         }
     }
     let _revision = revision?;
+    let agent = match (agent, agent_deferred) {
+        (Some(word), false) => Some(word),
+        (None, true) => None,
+        // An absent field is malformed; only the explicit marker defers the
+        // verdict. Both fields together are contradictory and retried singly.
+        _ => return None,
+    };
     (sid == Some(local)).then_some(StatusSample {
         hold: hold?,
         detail: detail?,
-        agent: Some(agent?),
+        agent,
+        agent_deferred,
     })
 }
 
@@ -627,9 +663,9 @@ fn parse_batch_rows<'a>(
 /// `deliver` and `Commit`. That window is microseconds wide and there is no
 /// honest way to hit it from outside the process: a test that raced it would be
 /// the flake this codebase keeps refusing to accept. So the bridge kills ITSELF
-/// at exactly the named point. The crash is real — [`Fault::fire`] calls
-/// `abort()`, which raises `SIGABRT` and runs no destructor; only the timing is
-/// chosen, and it is chosen by the process whose progress defines the window.
+/// at exactly the named point. The crash is real — [`Fault::fire`] sends this
+/// process `SIGKILL`, which runs no destructor; only the timing is chosen, and it
+/// is chosen by the process whose progress defines the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
     None,
@@ -779,19 +815,20 @@ impl Fault {
     /// destructors, flush the connection and publish a clean goodbye — which is
     /// the opposite of what the rung is testing.
     ///
-    /// `abort()` and NOT a raw `kill(2)`, for the reason [`crate::notify`]'s
-    /// identical one-shot fault gives in as many words: it keeps this module
-    /// free of `unsafe`. §11.2 pins aterm's unsafe surface to the cordon that
-    /// already owns raw-descriptor syscalls (`aterm-uds`), and the bridge's run
-    /// loop is not that cordon — a reviewer auditing by the documented rule
-    /// would never look here. `abort` satisfies every property this fault
-    /// needs: the process dies at this instruction, no destructor runs, and
-    /// nothing is flushed.
+    /// `aterm_uds::process::kill_self_now` and NOT a raw `kill(2)` here: it keeps
+    /// this module free of `unsafe`. §11.2 pins aterm's unsafe surface to the
+    /// cordon that already owns raw-descriptor syscalls (`aterm-uds`), and the
+    /// bridge's run loop is not that cordon — a reviewer auditing by the
+    /// documented rule would never look here. Not `abort()` either, which this
+    /// used until 2026-09-27: it satisfied every property the fault needs, but
+    /// `SIGABRT` is a core-dump signal, so macOS wrote a crash report for every
+    /// fault a test fired. `SIGKILL` stops the process at this call, runs no
+    /// destructor, flushes nothing, and writes no report.
     fn fire(self, at: Fault, state: &StateDir) -> ! {
         assert_eq!(self, at);
         let _ = std::fs::write(state.root().join("fault-fired"), b"1\n");
         eprintln!("aterm-link: ATERM_LINK_FAULT={at:?} — killing this process now");
-        std::process::abort();
+        aterm_uds::process::kill_self_now()
     }
 }
 
@@ -2051,6 +2088,13 @@ impl Bridge {
         // path, records nothing either: an `ev undeliverable` per broadcast per
         // observer is a bus write for a message nobody on this node asked for.
         if self.attachment == Attachment::Observer {
+            return;
+        }
+        // The subscription is fleet-wide even when no local session has a
+        // topic. Keep its head and checkpoint clocks moving, but do not parse
+        // or allocate for broadcasts that nobody here can consume.
+        if self.topics.is_empty() {
+            self.advance_frontier(frontier, off.saturating_add(1));
             return;
         }
         let Some(say) = subject::parse_say(&self.cfg.fleet, subject) else {
@@ -4057,11 +4101,11 @@ impl Bridge {
     }
 
     /// The presence fields one `status` reply carries: `detail=` and the
-    /// server's `agent=` verdict (`phase=`).
+    /// server's `agent=` verdict (`phase=`). A deferred batch agent leaves the
+    /// last verdict in place.
     fn status_into_presence(&mut self, sid: &str, sample: &StatusSample) {
         let fields = &mut self.presence.entry(sid.to_string()).or_default().fields;
-        fields.set_detail(Some(&sample.detail));
-        fields.set_agent(sample.agent.as_deref());
+        sample.apply_presence(fields);
     }
 
     /// Publish `sid`'s presence row when a field moved and the row on the bus
@@ -6570,6 +6614,7 @@ mod tests {
                 hold: true,
                 detail,
                 agent: Some(agent),
+                agent_deferred: false,
             })) if detail == "Claude%20Code" && agent == "prompt"
         ));
         assert!(matches!(
@@ -6578,6 +6623,7 @@ mod tests {
                 hold: false,
                 detail,
                 agent: Some(agent),
+                agent_deferred: false,
             })) if detail == "-" && agent == "-"
         ));
         assert!(matches!(parsed.get(&3), Some(BatchSample::Stale)));
@@ -6587,6 +6633,41 @@ mod tests {
         let wrong_sid = ["2 s-other b2 sid=2 revision=88 hold=1 detail=other"];
         let parsed = parse_batch_rows(wrong_sid.into_iter(), &locals, &epochs);
         assert!(matches!(parsed.get(&2), Some(BatchSample::Stale)));
+    }
+
+    #[test]
+    fn deferred_batch_agent_keeps_the_last_presence_verdict() {
+        let locals = BTreeMap::from([(1, "s-one".to_string())]);
+        let epochs = BTreeMap::from([("s-one".to_string(), "a1".to_string())]);
+        let row = "1 s-one a1 sid=1 revision=7 hold=1 detail=Claude%20Code agent_deferred=1";
+        let mut parsed = parse_batch_rows(std::iter::once(row), &locals, &epochs);
+        let Some(BatchSample::Ready(sample)) = parsed.remove(&1) else {
+            panic!("a deferred agent is a usable hold/detail sample");
+        };
+        assert!(sample.hold);
+        assert_eq!(sample.agent, None);
+        assert!(sample.agent_deferred);
+        let mut fields = Fields::default();
+        fields.set_agent(Some("prompt"));
+        sample.apply_presence(&mut fields);
+        assert_eq!(fields.detail, "Claude%20Code");
+        assert_eq!(fields.phase, "prompt", "a busy writer is not agent=-");
+        StatusSample::default().apply_presence(&mut fields);
+        assert_eq!(
+            fields.phase, "-",
+            "an old single-status reply without agent= still clears the phase"
+        );
+
+        for malformed in [
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent=idle",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=1 agent_deferred=1",
+            "1 s-one a1 sid=1 revision=7 hold=1 detail=- agent_deferred=0",
+        ] {
+            assert!(
+                parse_batch_rows(std::iter::once(malformed), &locals, &epochs).is_empty(),
+                "malformed agent availability must retry singly: {malformed}"
+            );
+        }
     }
 
     #[test]
@@ -7477,8 +7558,8 @@ mod tests {
     /// beside the `BRIDGE_VERB_FD` / `BRIDGE_PUSH_FD` constants that place the
     /// descriptor it adopts; until it moves, a second block anywhere, or a
     /// second call site for that one, fails here. (A raw `kill(2)` FFI in the
-    /// run loop was the defect that first put this scan here; `notify.rs`
-    /// solved the same one-shot fault with `abort()`.)
+    /// run loop was the defect that first put this scan here; both one-shot
+    /// faults now reach `kill(2)` through `aterm_uds::process::kill_self_now`.)
     #[test]
     fn the_crates_unsafe_surface_is_exactly_the_ctl_adoption() {
         // EVERY FILE THIS CRATE SHIPS, read from the directory rather than from a
@@ -7875,6 +7956,34 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    #[test]
+    fn a_broadcast_with_no_topics_advances_the_head_without_decoding_its_body() {
+        let (lane, mut bridge) = FakeVerbLane::bridge(&[(1, "s-a")]);
+        let subject = "/f/f/pub/n-src/s-src/say/quiet".to_string();
+        bridge.say_drained_to = 5;
+        bridge.say_bus_head = 5;
+        let decoded = crate::body::decode_calls();
+
+        // This is a valid broadcast subject, so the old path decoded even an
+        // oversized, malformed body before it found there were no recipients.
+        bridge.on_say_record(&(5, subject.clone(), vec![b'x'; 1024 * 1024]));
+        assert_eq!(crate::body::decode_calls(), decoded);
+        assert_eq!((bridge.say_drained_to, bridge.say_bus_head), (6, 6));
+        assert_eq!(bridge.say_checkpoint_tick, 1);
+        assert!(lane.delivery_offsets().is_empty());
+
+        // The next record after a subscription still takes the normal decode
+        // and delivery path from the head the quiet record advanced.
+        bridge.topics.insert(
+            "s-a".to_string(),
+            BTreeMap::from([("quiet".to_string(), TopicCursor { next: 6 })]),
+        );
+        bridge.on_say_record(&(6, subject, Body::new(0).encode(None)));
+        assert_eq!(crate::body::decode_calls(), decoded + 1);
+        assert_eq!(lane.delivery_offsets(), [6]);
+        assert_eq!(bridge.topics["s-a"]["quiet"].next, 7);
     }
 
     /// Tier-1 for `FabricRefillRetry`: the group's durable cursor has already

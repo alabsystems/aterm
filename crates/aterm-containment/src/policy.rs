@@ -4,24 +4,16 @@
 
 //! Containment policy — maps mode to allowed capabilities.
 //!
-//! The policy functions here mirror the operators of the INTENDED
-//! `tla/Containment.tla` model (`PolicyNetwork`, `PolicyFs`, `PolicyProcess`,
-//! `PolicyMcp`, `PolicyPlugins`, `PolicyOutput`, `PolicyInput`,
-//! `PolicyCommand`). That model is NOT in-tree and is on no build/CI path
-//! (see the crate-root note); these functions and the tests below are the
-//! source of truth. The `TLA+:` tags on each function name the corresponding
-//! operator in that intended model — they are naming, not a discharged proof.
+//! These functions and the tests below are the specification; the opt-in
+//! `kani_proofs` harnesses re-check the same table.
 
-use crate::capability::{
-    CommandCapability, FsCapability, InputCapability, McpCapability, NetworkCapability,
-    OutputCapability, PluginCapability, ProcessCapability,
-};
+use crate::capability::{FsCapability, NetworkCapability, ProcessCapability};
 use crate::mode::ContainmentMode;
 
 /// Complete capability set for a containment mode.
 ///
-/// This is the output of [`ContainmentPolicy::capabilities`] — all 8
-/// subsystem capabilities resolved for a given mode.
+/// This is the output of [`ContainmentPolicy::capabilities`] — the three
+/// capability axes resolved for a given mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub struct Capabilities {
@@ -31,16 +23,6 @@ pub struct Capabilities {
     pub fs: FsCapability,
     /// Process creation level.
     pub process: ProcessCapability,
-    /// MCP tool access level.
-    pub mcp: McpCapability,
-    /// Plugin access level.
-    pub plugins: PluginCapability,
-    /// Output handling level.
-    pub output: OutputCapability,
-    /// Input handling level.
-    pub input: InputCapability,
-    /// Command execution level (`CaMeL` tier cap).
-    pub command: CommandCapability,
 }
 
 /// The containment policy engine.
@@ -50,9 +32,8 @@ pub struct Capabilities {
 ///
 /// The policy is defined once and is immutable — it encodes the security
 /// contract between the launcher and aterm. This Rust implementation IS the
-/// specification: the intended `tla/Containment.tla` model is not in-tree, so
-/// nothing cross-checks these functions except the tests in this module and
-/// the opt-in, `#[cfg(kani)]`-gated `kani_proofs` harnesses.
+/// specification, pinned by the tests in this module and re-checked by the
+/// opt-in, `#[cfg(kani)]`-gated `kani_proofs` harnesses.
 #[derive(Debug, Clone, Copy)]
 pub struct ContainmentPolicy;
 
@@ -65,17 +46,11 @@ impl ContainmentPolicy {
             network: Self::network(mode),
             fs: Self::fs(mode),
             process: Self::process(mode),
-            mcp: Self::mcp(mode),
-            plugins: Self::plugins(mode),
-            output: Self::output(mode),
-            input: Self::input(mode),
-            command: Self::command(mode),
         }
     }
 
     /// Network capability for mode.
     ///
-    /// TLA+: `PolicyNetwork(m)`
     /// - Master → Full, User → Full, Safety → Allowlist, Containment → None
     #[inline(always)]
     #[must_use]
@@ -89,7 +64,6 @@ impl ContainmentPolicy {
 
     /// Filesystem capability for mode.
     ///
-    /// TLA+: `PolicyFs(m)`
     /// - Master → Full, User → `HomeRW`, Safety → `ProjectRW`, Containment → `TmpOnly`
     #[inline(always)]
     #[must_use]
@@ -104,7 +78,6 @@ impl ContainmentPolicy {
 
     /// Process capability for mode.
     ///
-    /// TLA+: `PolicyProcess(m)`
     /// - Master → Full, User → Full, Safety → Restricted, Containment → `NoFork`
     #[inline(always)]
     #[must_use]
@@ -115,110 +88,26 @@ impl ContainmentPolicy {
             ContainmentMode::Containment => ProcessCapability::NoFork,
         }
     }
-
-    /// MCP capability for mode.
-    ///
-    /// TLA+: `PolicyMcp(m)`
-    /// - Master → Full, User → Full, Safety → Allowlist, Containment → Disabled
-    #[inline(always)]
-    #[must_use]
-    pub(crate) const fn mcp(mode: ContainmentMode) -> McpCapability {
-        match mode {
-            ContainmentMode::Master | ContainmentMode::User => McpCapability::Full,
-            ContainmentMode::Safety => McpCapability::Allowlist,
-            ContainmentMode::Containment => McpCapability::Disabled,
-        }
-    }
-
-    /// Plugin capability for mode.
-    ///
-    /// TLA+: `PolicyPlugins(m)`
-    /// - Master → Full, User → Full, Safety → Allowlist, Containment → Disabled
-    #[inline(always)]
-    #[must_use]
-    pub(crate) const fn plugins(mode: ContainmentMode) -> PluginCapability {
-        match mode {
-            ContainmentMode::Master | ContainmentMode::User => PluginCapability::Full,
-            ContainmentMode::Safety => PluginCapability::Allowlist,
-            ContainmentMode::Containment => PluginCapability::Disabled,
-        }
-    }
-
-    /// Output capability for mode.
-    ///
-    /// TLA+: `PolicyOutput(m)`
-    /// - Master → Unmodified, User → `ShadowScanned`, Safety → `ShadowScanned`,
-    ///   Containment → Filtered
-    #[inline(always)]
-    #[must_use]
-    pub(crate) const fn output(mode: ContainmentMode) -> OutputCapability {
-        match mode {
-            ContainmentMode::Master => OutputCapability::Unmodified,
-            ContainmentMode::User | ContainmentMode::Safety => OutputCapability::ShadowScanned,
-            ContainmentMode::Containment => OutputCapability::Filtered,
-        }
-    }
-
-    /// Input capability for mode.
-    ///
-    /// TLA+: `PolicyInput(m)`
-    /// - Master → Unmodified, User → Scanned, Safety → Scanned,
-    ///   Containment → Filtered
-    #[inline(always)]
-    #[must_use]
-    pub(crate) const fn input(mode: ContainmentMode) -> InputCapability {
-        match mode {
-            ContainmentMode::Master => InputCapability::Unmodified,
-            ContainmentMode::User | ContainmentMode::Safety => InputCapability::Scanned,
-            ContainmentMode::Containment => InputCapability::Filtered,
-        }
-    }
-
-    /// Command execution capability for mode.
-    ///
-    /// TLA+: `PolicyCommand(m)`
-    /// - Master → `AllTiers` (`CmdAll`, tier 4, `Critical`)
-    /// - User → `UpToTier3` (`CmdTier3`, tier 3, `HighRisk`)
-    /// - Safety → `UpToTier2` (`CmdTier2`, tier 2, `MediumRisk`)
-    /// - Containment → `NoCommands` (`CmdNone`)
-    #[inline(always)]
-    #[must_use]
-    pub const fn command(mode: ContainmentMode) -> CommandCapability {
-        match mode {
-            ContainmentMode::Master => CommandCapability::AllTiers,
-            ContainmentMode::User => CommandCapability::UpToTier3,
-            ContainmentMode::Safety => CommandCapability::UpToTier2,
-            ContainmentMode::Containment => CommandCapability::NoCommands,
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verify all policy mappings match the intended policy table exactly.
+    /// Verify all policy mappings match the policy table exactly.
     ///
-    /// Policy table (named after the intended `tla/Containment.tla` model,
-    /// which is not in-tree — this table and these assertions are the
-    /// authority):
-    /// | Mode        | Net       | Fs        | Proc      | MCP       | Plug      | Out          | In        |
-    /// |-------------|-----------|-----------|-----------|-----------|-----------|--------------|-----------|
-    /// | Master(3)   | Full(2)   | Full(3)   | Full(2)   | Full(2)   | Full(2)   | Unmodified(2)| Unmod(2)  |
-    /// | User(2)     | Full(2)   | HomeRW(2) | Full(2)   | Full(2)   | Full(2)   | Shadow(1)    | Scan(1)   |
-    /// | Safety(1)   | Allow(1)  | ProjRW(1) | Restr(1)  | Allow(1)  | Allow(1)  | Shadow(1)    | Scan(1)   |
-    /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) | Disabled(0)| Disabled(0)| Filtered(0) | Filt(0)  |
+    /// | Mode        | Net       | Fs        | Proc      |
+    /// |-------------|-----------|-----------|-----------|
+    /// | Master(3)   | Full(2)   | Full(3)   | Full(2)   |
+    /// | User(2)     | Full(2)   | HomeRW(2) | Full(2)   |
+    /// | Safety(1)   | Allow(1)  | ProjRW(1) | Restr(1)  |
+    /// | Contain(0)  | None(0)   | TmpOnly(0)| NoFork(0) |
     #[test]
     fn test_master_policy() {
         let c = ContainmentPolicy::capabilities(ContainmentMode::Master);
         assert_eq!(c.network, NetworkCapability::Full);
         assert_eq!(c.fs, FsCapability::Full);
         assert_eq!(c.process, ProcessCapability::Full);
-        assert_eq!(c.mcp, McpCapability::Full);
-        assert_eq!(c.plugins, PluginCapability::Full);
-        assert_eq!(c.output, OutputCapability::Unmodified);
-        assert_eq!(c.input, InputCapability::Unmodified);
-        assert_eq!(c.command, CommandCapability::AllTiers);
     }
 
     #[test]
@@ -227,11 +116,6 @@ mod tests {
         assert_eq!(c.network, NetworkCapability::Full);
         assert_eq!(c.fs, FsCapability::HomeReadWrite);
         assert_eq!(c.process, ProcessCapability::Full);
-        assert_eq!(c.mcp, McpCapability::Full);
-        assert_eq!(c.plugins, PluginCapability::Full);
-        assert_eq!(c.output, OutputCapability::ShadowScanned);
-        assert_eq!(c.input, InputCapability::Scanned);
-        assert_eq!(c.command, CommandCapability::UpToTier3);
     }
 
     #[test]
@@ -240,11 +124,6 @@ mod tests {
         assert_eq!(c.network, NetworkCapability::Allowlist);
         assert_eq!(c.fs, FsCapability::ProjectReadWrite);
         assert_eq!(c.process, ProcessCapability::Restricted);
-        assert_eq!(c.mcp, McpCapability::Allowlist);
-        assert_eq!(c.plugins, PluginCapability::Allowlist);
-        assert_eq!(c.output, OutputCapability::ShadowScanned);
-        assert_eq!(c.input, InputCapability::Scanned);
-        assert_eq!(c.command, CommandCapability::UpToTier2);
     }
 
     #[test]
@@ -253,14 +132,9 @@ mod tests {
         assert_eq!(c.network, NetworkCapability::None);
         assert_eq!(c.fs, FsCapability::TmpOnly);
         assert_eq!(c.process, ProcessCapability::NoFork);
-        assert_eq!(c.mcp, McpCapability::Disabled);
-        assert_eq!(c.plugins, PluginCapability::Disabled);
-        assert_eq!(c.output, OutputCapability::Filtered);
-        assert_eq!(c.input, InputCapability::Filtered);
-        assert_eq!(c.command, CommandCapability::NoCommands);
     }
 
-    /// TLA+ NonEscalation: mode can NEVER increase in capability.
+    /// NonEscalation: mode can NEVER increase in capability.
     /// Verify that for all modes m1 < m2, every capability of m1 <= m2.
     #[test]
     fn test_monotonic_capabilities() {
@@ -283,50 +157,26 @@ mod tests {
                     cl.process <= ch.process,
                     "process: {lower} should <= {higher}"
                 );
-                assert!(cl.mcp <= ch.mcp, "mcp: {lower} should <= {higher}");
-                assert!(
-                    cl.plugins <= ch.plugins,
-                    "plugins: {lower} should <= {higher}"
-                );
-                assert!(cl.output <= ch.output, "output: {lower} should <= {higher}");
-                assert!(cl.input <= ch.input, "input: {lower} should <= {higher}");
-                assert!(
-                    cl.command <= ch.command,
-                    "command: {lower} should <= {higher}"
-                );
             }
         }
     }
 
-    /// Exhaustive numeric cross-check against the policy table this crate
-    /// implements (named after the intended `tla/Containment.tla` model, which
-    /// is NOT in-tree — see the crate-root note).
+    /// Exhaustive numeric cross-check against the policy table: encodes the
+    /// intended discriminants as raw u8 constants and verifies each policy
+    /// function returns the matching capability, catching any drift between the
+    /// documented encoding and the implementation.
     ///
-    /// Encodes the intended numeric values as raw u8 constants and verifies
-    /// each Rust policy function returns the matching capability, catching any
-    /// drift between the documented encoding and the Rust implementation.
-    ///
-    /// Numeric encoding reference:
     ///   Network: None=0, Allowlist=1, Full=2
     ///   Fs:      TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3
     ///   Process: NoFork=0, Restricted=1, Full=2
-    ///   MCP:     Disabled=0, Allowlist=1, Full=2
-    ///   Plugins: Disabled=0, Allowlist=1, Full=2
-    ///   Output:  Filtered=0, ShadowScan=1, Unmodified=2
-    ///   Input:   Filtered=0, Scanned=1, Unmodified=2
-    ///   Command: NoCommands=0, UpToTier2=1, UpToTier3=2, AllTiers=3
     #[test]
-    fn test_tla_numeric_cross_check() {
-        // TLA+ policy table: [mode_level] -> (net, fs, proc, mcp, plug, out, in, cmd)
-        let tla_table: [(u8, [u8; 8]); 4] = [
-            // Containment(0): Net=0, Fs=0, Proc=0, MCP=0, Plug=0, Out=0, In=0, Cmd=0
-            (0, [0, 0, 0, 0, 0, 0, 0, 0]),
-            // Safety(1):      Net=1, Fs=1, Proc=1, MCP=1, Plug=1, Out=1, In=1, Cmd=1
-            (1, [1, 1, 1, 1, 1, 1, 1, 1]),
-            // User(2):        Net=2, Fs=2, Proc=2, MCP=2, Plug=2, Out=1, In=1, Cmd=2
-            (2, [2, 2, 2, 2, 2, 1, 1, 2]),
-            // Master(3):      Net=2, Fs=3, Proc=2, MCP=2, Plug=2, Out=2, In=2, Cmd=3
-            (3, [2, 3, 2, 2, 2, 2, 2, 3]),
+    fn test_numeric_policy_table() {
+        // [mode_level] -> (net, fs, proc)
+        let table: [(u8, [u8; 3]); 4] = [
+            (0, [0, 0, 0]), // Containment
+            (1, [1, 1, 1]), // Safety
+            (2, [2, 2, 2]), // User
+            (3, [2, 3, 2]), // Master
         ];
 
         let modes = [
@@ -336,50 +186,13 @@ mod tests {
             ContainmentMode::Master,
         ];
 
-        for (mode, &(expected_level, ref expected_caps)) in modes.iter().zip(tla_table.iter()) {
+        for (mode, &(expected_level, ref expected_caps)) in modes.iter().zip(table.iter()) {
             assert_eq!(mode.level(), expected_level, "mode {mode} level mismatch");
 
             let caps = ContainmentPolicy::capabilities(*mode);
-            assert_eq!(
-                caps.network as u8, expected_caps[0],
-                "TLA+ PolicyNetwork({mode}) = {}, Rust = {}",
-                expected_caps[0], caps.network as u8
-            );
-            assert_eq!(
-                caps.fs as u8, expected_caps[1],
-                "TLA+ PolicyFs({mode}) = {}, Rust = {}",
-                expected_caps[1], caps.fs as u8
-            );
-            assert_eq!(
-                caps.process as u8, expected_caps[2],
-                "TLA+ PolicyProcess({mode}) = {}, Rust = {}",
-                expected_caps[2], caps.process as u8
-            );
-            assert_eq!(
-                caps.mcp as u8, expected_caps[3],
-                "TLA+ PolicyMcp({mode}) = {}, Rust = {}",
-                expected_caps[3], caps.mcp as u8
-            );
-            assert_eq!(
-                caps.plugins as u8, expected_caps[4],
-                "TLA+ PolicyPlugins({mode}) = {}, Rust = {}",
-                expected_caps[4], caps.plugins as u8
-            );
-            assert_eq!(
-                caps.output as u8, expected_caps[5],
-                "TLA+ PolicyOutput({mode}) = {}, Rust = {}",
-                expected_caps[5], caps.output as u8
-            );
-            assert_eq!(
-                caps.input as u8, expected_caps[6],
-                "TLA+ PolicyInput({mode}) = {}, Rust = {}",
-                expected_caps[6], caps.input as u8
-            );
-            assert_eq!(
-                caps.command as u8, expected_caps[7],
-                "TLA+ PolicyCommand({mode}) = {}, Rust = {}",
-                expected_caps[7], caps.command as u8
-            );
+            assert_eq!(caps.network as u8, expected_caps[0], "network({mode})");
+            assert_eq!(caps.fs as u8, expected_caps[1], "fs({mode})");
+            assert_eq!(caps.process as u8, expected_caps[2], "process({mode})");
         }
     }
 }

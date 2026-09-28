@@ -164,6 +164,7 @@ pub mod packages_log;
 mod pending_wake;
 pub mod pin;
 pub mod platform;
+pub mod prereq;
 pub mod progress;
 /// The folders macOS guards with a consent dialog, named once, so no UNATTENDED lane
 /// (the update pass, the seed, the doctor's walk) ever opens one in aterm's name.
@@ -207,7 +208,7 @@ pub mod vendor;
 pub mod vendor_direct;
 pub mod verify;
 
-pub use activate::{Aliases, activate_channel, atomic_symlink, install_shims};
+pub use activate::{Aliases, activate_build, atomic_symlink, install_shims};
 pub use apply::{Group, TxnOutcome, plan_groups};
 pub use cache::IndexCache;
 pub use config::{LinkTarget, PackagesConfig, classify_link, repo_overrides};

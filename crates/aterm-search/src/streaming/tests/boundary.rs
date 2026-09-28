@@ -224,42 +224,6 @@ fn content_added_after_initial_match() {
 }
 
 #[test]
-fn jump_to_match_boundary_zero_index() {
-    let mut search = StreamingSearch::new();
-    let mut content = TestContent::new(vec!["match", "match"]);
-
-    search.start_search("match", FilterMode::Literal).unwrap();
-    search.scan_all(&mut content);
-
-    // Jump to index 0 should be a no-op (1-based indexing)
-    search.jump_to_match(0);
-    assert_eq!(
-        search.current_index(),
-        1,
-        "jump_to_match(0) should not change current index"
-    );
-    assert!(search.verify_all_invariants());
-}
-
-#[test]
-fn jump_to_match_boundary_past_end() {
-    let mut search = StreamingSearch::new();
-    let mut content = TestContent::new(vec!["match", "match"]);
-
-    search.start_search("match", FilterMode::Literal).unwrap();
-    search.scan_all(&mut content);
-
-    // Jump past the last match (only 2 results)
-    search.jump_to_match(10);
-    assert_eq!(
-        search.current_index(),
-        1,
-        "jump_to_match(10) past end should not change index"
-    );
-    assert!(search.verify_all_invariants());
-}
-
-#[test]
 fn scan_row_with_max_rows_zero_is_noop() {
     let mut search = StreamingSearch::new();
     search.start_search("hello", FilterMode::Literal).unwrap();

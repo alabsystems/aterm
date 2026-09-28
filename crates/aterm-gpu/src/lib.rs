@@ -59,9 +59,6 @@ pub(crate) fn verbose() -> bool {
 
 use aterm_render::Frame;
 
-#[cfg(all(target_os = "macos", feature = "acquire-conformance"))]
-pub use metal::acquire_probe::{AcquireProbe, install_acquire_probe};
-
 mod device_layer;
 mod format_plan;
 // THE PIPELINE TABLE: the one declaration of all eighteen render pipelines —
@@ -321,10 +318,9 @@ pub struct GpuContext {
     /// seam wgpu's callback feeds. Metal has no device-lost callback to
     /// register (`metal/loss.rs` — loss is classified from command-buffer
     /// outcomes), so the latch IS the callback's stand-in and this cell is
-    /// its delivery. Empty until the W6 flip wires a live Metal surface
-    /// (production today never sets it — `device_lost()`'s answer is
-    /// byte-identical to the pre-W5 load); the W5 wiring test drives it with
-    /// an injected loss.
+    /// its delivery. Production wires it once at construct (the macOS
+    /// constructors, since THE FLIP made the Metal arm the macOS backend);
+    /// the W5 wiring test drives it with an injected loss.
     #[cfg(target_os = "macos")]
     metal_loss: std::sync::OnceLock<std::sync::Arc<metal::loss::LossLatch>>,
     /// H1 (Windows Mica/Acrylic): whether THIS instance was built on the DX12
@@ -898,8 +894,8 @@ impl GpuContext {
 
     /// This context as the W3 DEVICE LAYER's live arm — the handle every
     /// routed construction site does its resource work through. Always the
-    /// Wgpu variant here: the Metal arm is minted by the differential tests
-    /// (and by W6's flip) from `metal::resources::MetalResourceDevice`.
+    /// Wgpu variant here: the Metal arm is minted only by the differential
+    /// tests, from `metal::resources::MetalResourceDevice`.
     #[cfg(wgpu_arm)]
     pub(crate) fn device_layer(&self) -> crate::device_layer::DeviceHandle<'_> {
         crate::device_layer::DeviceHandle::Wgpu {

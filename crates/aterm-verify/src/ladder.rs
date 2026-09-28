@@ -263,16 +263,16 @@ mod tests {
 
     #[test]
     fn ladder_columns_match_the_script_byte_for_byte() {
-        let mut r = Report::new("build (--workspace)");
-        r.pass("targo build --workspace");
-        r.skip("tippy lint (selftest: not executed)");
+        let mut r = Report::new("test compile (--workspace)");
+        r.pass("targo test --workspace --no-run");
+        r.skip("tippy lint (no tippy)");
         r.fail("license_check.sh");
         r.cannot_run("targo not found");
         assert_eq!(
             r.render(),
-            "\n=== build (--workspace) ===\n\
-             \x20 ok    targo build --workspace\n\
-             \x20 skip  tippy lint (selftest: not executed)\n\
+            "\n=== test compile (--workspace) ===\n\
+             \x20 ok    targo test --workspace --no-run\n\
+             \x20 skip  tippy lint (no tippy)\n\
              \x20 FAIL  license_check.sh\n\
              \x20 FAIL  targo not found\n"
         );

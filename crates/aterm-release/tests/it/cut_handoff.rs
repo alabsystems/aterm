@@ -279,11 +279,8 @@ fn a_resume_is_handed_to_the_release_commits_cutter_in_the_cut_tree() {
         verify_pubkey: None,
         signature_machine_id: None,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         linux: None,
         done: vec!["lock".into()],
     };
@@ -306,4 +303,112 @@ fn a_resume_is_handed_to_the_release_commits_cutter_in_the_cut_tree() {
     let tree = s.root.join("op-cut.noindex");
     assert_eq!(git(&tree, &["rev-parse", "HEAD"]), s.published);
     assert_operator_checkout_unmoved(&s);
+}
+
+/// A journal of ANOTHER format, as the cutter before publish-once wrote it (format 10:
+/// the private-origin step list), naming the release commit.
+fn older_journal(s: &Scratch, done: &[&str]) {
+    let done: Vec<String> = done.iter().map(|step| format!("{step:?}")).collect();
+    fs::create_dir_all(s.op.join("dist")).unwrap();
+    fs::write(
+        s.op.join("dist/cut-state.toml"),
+        format!(
+            "format = 10\nversion = \"0.92.0\"\nbuild_number = 1790000002\n\
+             commit = \"{}\"\ndraft_create_issued = true\nmirror_create_issued = false\n\
+             done = [{}]\n",
+            s.published,
+            done.join(", ")
+        ),
+    )
+    .unwrap();
+}
+
+/// THE JOURNAL IS FINISHED BY THE CUTTER THAT WROTE IT, whatever its format. A cut an
+/// older cutter started and left unfinished is resumed — and abandoned — by the cutter
+/// built at its claim commit: this cutter reads the journal's HEADER, puts the cut tree
+/// there and hands the verb over, before it would refuse a format it does not read.
+#[test]
+fn an_older_format_journal_is_resumed_and_abandoned_by_its_own_cutter() {
+    for (verb, args) in [
+        ("resume", &["cut", "--resume"][..]),
+        ("abandon", &["cut", "--abandon", "v0.92.0"][..]),
+    ] {
+        let s = scratch(&format!("older-{verb}"));
+        older_journal(&s, &["lock", "build", "selfcheck", "draft", "upload"]);
+        let out = cutter(&s, args, None);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{verb}: stdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        assert_eq!(
+            log(&s, "cutter.log"),
+            Some(format!(
+                "cwd={}\nargs={}\nmarker={}\n",
+                s.op.display(),
+                args.join(" "),
+                s.published
+            )),
+            "{verb}: handed to the claim's cutter, same verb\n{stdout}"
+        );
+        let tree = s.root.join("op-cut.noindex");
+        assert_eq!(git(&tree, &["rev-parse", "HEAD"]), s.published, "{verb}");
+        assert!(
+            s.op.join("dist/cut-state.toml").is_file(),
+            "{verb}: the journal is its cutter's to change"
+        );
+        assert_operator_checkout_unmoved(&s);
+    }
+}
+
+/// A FINISHED journal of another format is history: a fresh cut clears it and goes on
+/// (here, to its own handoff) instead of refusing a file whose cut released its lease.
+/// NEGATIVE CONTROL: the same journal short of `unlock` refuses the fresh cut by name,
+/// before anything is claimed or built.
+#[test]
+fn a_finished_older_journal_is_history_to_a_fresh_cut() {
+    let s = scratch("older-finished");
+    older_journal(
+        &s,
+        &[
+            "lock",
+            "build",
+            "selfcheck",
+            "draft",
+            "upload",
+            "preflip",
+            "tag",
+            "flip",
+            "archive",
+            "verify",
+            "mirror",
+            "unlock",
+        ],
+    );
+    let out = cutter(&s, &["cut", "--min-build", "1790000001"], None);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(
+        !s.op.join("dist/cut-state.toml").exists(),
+        "the finished journal was cleared"
+    );
+    assert!(log(&s, "cutter.log").is_some(), "and the cut went on");
+
+    let s = scratch("older-unfinished");
+    older_journal(
+        &s,
+        &["lock", "build", "selfcheck", "draft", "upload", "preflip"],
+    );
+    let out = cutter(&s, &["cut", "--min-build", "1790000001"], None);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("a cut is already in progress")
+            && stderr.contains("after step \"preflip\" by a format-10 cutter"),
+        "{stderr}"
+    );
+    assert!(log(&s, "targo.log").is_none(), "nothing built");
+    assert!(s.op.join("dist/cut-state.toml").is_file());
 }

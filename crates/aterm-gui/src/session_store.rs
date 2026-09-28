@@ -924,25 +924,47 @@ impl ExitReason {
 }
 
 /// WHO retired a session — the `by=` token. A control-socket close names the
-/// caller's own session; a UI/window close is the human at the keyboard; a path
-/// that cannot say writes `-`.
+/// caller's own session when its token was granted to one, else the kind of
+/// client it was (`ctl` for an owner-token client, `bridge` for the fabric
+/// bridge); a UI/window close is the human at the keyboard; a path that cannot
+/// say writes `-`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ExitActor {
     /// The sid of the control connection that issued the close.
     Sid(String),
     /// The human, through the window chrome or a keyboard shortcut.
     Human,
+    /// An owner-token control client (`aterm ctl … close`, an in-session
+    /// agent's `@self` connection). The per-instance token names the
+    /// instance's owner, not a session, so this is the most the socket knows
+    /// about who called — and it is what it knows: until 2026-09-22 the row
+    /// read `by=-` beside `reason=ctl-close` while `help exits` promised
+    /// `by=<caller>`, so a ledger reader could not tell a control close from a
+    /// path that never attributed at all.
+    Ctl,
+    /// The fabric bridge (the `aterm-link serve` child the instance spawned):
+    /// a CONNECTION the server pre-resolves, never a token, so it has no sid
+    /// to write either, and naming it apart from `ctl` is what lets a reader
+    /// see that a fleet order, not a local client, retired the session.
+    /// Unix-only like the bridge scope it names
+    /// (`crate::control::Scope::Bridge`): the bridge is an inherited
+    /// `socketpair`, so a Windows build has no path that could write it.
+    #[cfg(any(unix, test))]
+    Bridge,
     /// Not attributable on that path.
     Unknown,
 }
 
 impl ExitActor {
-    /// The stable wire token (`by=<sid|human|->`).
+    /// The stable wire token (`by=<sid|human|ctl|bridge|->`).
     #[must_use]
     pub(crate) fn as_wire(&self) -> &str {
         match self {
             ExitActor::Sid(sid) => sid.as_str(),
             ExitActor::Human => "human",
+            ExitActor::Ctl => "ctl",
+            #[cfg(any(unix, test))]
+            ExitActor::Bridge => "bridge",
             ExitActor::Unknown => "-",
         }
     }
@@ -1569,7 +1591,7 @@ impl SessionStore {
     }
 }
 
-/// The `closing` event's payload: `reason=<token> by=<sid|human|->`. The sid is
+/// The `closing` event's payload: `reason=<token> by=<sid|human|ctl|bridge|->`. The sid is
 /// pct-encoded like every other free value on a timeline row (a sid is plain
 /// ASCII, so this is the identity today — the encode is the one-line guarantee).
 fn closing_payload(reason: ExitReason, actor: &ExitActor) -> String {
@@ -2662,6 +2684,8 @@ title = \"zsh\"
         );
         assert_eq!(ExitActor::Sid("s-z".into()).as_wire(), "s-z");
         assert_eq!(ExitActor::Human.as_wire(), "human");
+        assert_eq!(ExitActor::Ctl.as_wire(), "ctl");
+        assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
         assert_eq!(ExitActor::Unknown.as_wire(), "-");
     }
 

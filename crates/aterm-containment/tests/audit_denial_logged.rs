@@ -177,6 +177,9 @@ fn decide_permit_is_not_logged_as_denied() {
     // records the OS-sandbox posture. A PERMITTED spawn must never surface in the
     // audit stream as `DENIED:` — otherwise a `containment_audit | grep DENIED`
     // audit aggregation false-positives on every successful/permitted spawn.
+    // The one spawn that IS refused — Containment where the platform has no OS
+    // sandbox (the owner's fail-closed ruling, 2026-09-25) — is logged as exactly
+    // one `DENIED:` naming that gap, and as no posture line.
     let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let _ = aterm_log::set_logger(&LOGGER);
     // Capture both posture (Info) and any denial (Warn) lines.
@@ -184,6 +187,7 @@ fn decide_permit_is_not_logged_as_denied() {
 
     captured().lock().unwrap().clear();
 
+    let sandboxed = aterm_containment::os_sandbox_actuated();
     for mode in [
         ContainmentMode::Containment,
         ContainmentMode::Safety,
@@ -191,29 +195,43 @@ fn decide_permit_is_not_logged_as_denied() {
         ContainmentMode::Master,
     ] {
         let decision = aterm_containment::decide_spawn(mode);
-        assert!(
+        let expected = mode != ContainmentMode::Containment || sandboxed;
+        assert_eq!(
             decision.is_permitted(),
-            "the initial shell is permitted in {mode} mode; got {decision:?}"
+            expected,
+            "{mode} is permitted iff it needs no OS sandbox or this platform has one \
+             (os_sandbox_actuated = {sandboxed}); got {decision:?}"
         );
     }
 
     let records = captured().lock().unwrap();
-    // A posture line per mode is still emitted (single-stream coverage preserved).
+    // One record per decision either way: a posture line per permitted spawn,
+    // one denial for a refused one.
+    assert_eq!(records.len(), 4, "expected one audit record per decision");
+    let denied: Vec<&CapturedRecord> = records
+        .iter()
+        .filter(|r| r.message.contains("DENIED:"))
+        .collect();
     assert_eq!(
-        records.len(),
-        4,
-        "expected one posture record per permitted spawn"
+        denied.len(),
+        usize::from(!sandboxed),
+        "only a refused Containment spawn is logged as DENIED (os_sandbox_actuated = {sandboxed})"
     );
+    for record in &denied {
+        assert_eq!(record.level, aterm_log::Level::Warn, "a denial is Warn");
+        assert!(
+            record
+                .message
+                .contains(aterm_containment::NO_OS_SANDBOX_REASON),
+            "the refusal names the platform gap: {}",
+            record.message
+        );
+    }
     for record in records.iter() {
         assert_eq!(record.target, "containment_audit", "wrong log target");
         assert!(
-            !record.message.contains("DENIED:"),
-            "a PERMITTED spawn must NOT be logged as DENIED: {}",
-            record.message
-        );
-        assert!(
-            record.message.contains("CONTAINMENT:"),
-            "posture line should carry the CONTAINMENT: prefix: {}",
+            record.message.contains("CONTAINMENT:") || record.message.contains("DENIED:"),
+            "every audit line carries its prefix: {}",
             record.message
         );
     }

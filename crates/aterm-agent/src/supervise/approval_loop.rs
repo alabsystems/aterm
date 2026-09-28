@@ -139,12 +139,15 @@
 //! `tier1_a_question_key_goes_only_where_the_model_allows`
 //! (`run_engine_tests.rs`) binds this loop to it.
 
+use super::super::policy::WorkerEnv;
 use super::super::policy::approval::{
     Answer, AnswerTarget, ApprovalCtx, Choice, Decision, DeclineStep, RULE_READ_ONLY, decide,
 };
 use super::super::policy::question::{RULE_ANSWER_RECOMMENDED, begun};
 use super::*;
+use crate::harness::upgrade_drive::{LiveTab, roster_rows, unique_tab_for_group};
 use aterm_phase::{QuestionDialog, QuestionFocus, QuestionForm};
+use aterm_types::domain::ENV_PARENT_SESSION_ID;
 
 /// One answer since the last review point: the parser's command (the safe
 /// rules' cap, [`MAX_APPROVALS_OF_ONE_COMMAND`]); for a key that ANSWERS a
@@ -430,9 +433,56 @@ fn shown_subject(subject: &str, command: &str) -> String {
 
 /// The box needs the session's working directory: the vendor's rm/rmdir
 /// circuit breaker of any kind ([`aterm_phase::PromptV2::rm_breaker`]), the
-/// folder-trust dialog.
+/// folder-trust dialog, and a Bash box that may run git ([`may_run_git`]).
 fn needs_cwd(p: &aterm_phase::PromptV2) -> bool {
-    p.kind == PromptKind::Trust || p.rm_breaker().is_some()
+    p.kind == PromptKind::Trust || p.rm_breaker().is_some() || may_run_git(p)
+}
+
+/// A Bash box whose command may run git: its configuration is read where the
+/// session's Bash tool stands as well ([`ApprovalCtx::shell_cwds`]).
+fn may_run_git(p: &aterm_phase::PromptV2) -> bool {
+    p.kind == PromptKind::Bash && p.command_rows.iter().any(|r| r.contains("git"))
+}
+
+/// The session's `s-…` id and the foreground process group of its PTY, off a
+/// `who` reply's rows ([`roster_rows`], the live upgrade's one reading of the
+/// roster): the row of `stable` — the `s-…` id the loop addresses (`@s-…`),
+/// which no other session or instance reuses — where the loop has one, else
+/// the row whose instance-local id is `local` (what `status sid=` named; a
+/// local id is reused, and means this instance's session only). Refused when
+/// the roster cannot be read, when the kernel could not read the group, and
+/// when another row names the same group ([`unique_tab_for_group`]: a group
+/// two PTYs claim is no session's alone).
+pub(super) fn session_group(
+    rows: &str,
+    stable: Option<&str>,
+    local: Option<&str>,
+) -> Result<(String, u32), String> {
+    let rows = roster_rows(rows).ok_or("`who` answered no roster this check can read")?;
+    let sid = match (stable, local) {
+        (Some(stable), _) => stable.to_string(),
+        (None, Some(local)) => rows
+            .iter()
+            .find(|(id, _)| id.to_string() == local)
+            .map(|(_, tab)| tab.sid.clone())
+            .ok_or_else(|| format!("session {local} is not on the instance's roster (`who`)"))?,
+        (None, None) => return Err("the session's id is unknown (`status` named none)".to_string()),
+    };
+    let tabs: Vec<LiveTab> = rows.into_iter().map(|(_, tab)| tab).collect();
+    let group = tabs
+        .iter()
+        .find(|tab| tab.sid == sid)
+        .ok_or_else(|| format!("session {sid} is not on the instance's roster (`who`)"))?
+        .fgpgid
+        .ok_or_else(|| format!("{sid}'s foreground process group is unknown"))?;
+    if unique_tab_for_group(&tabs, group) != Some(sid.as_str()) {
+        return Err(format!(
+            "{sid}'s foreground process group {group} is another session's too"
+        ));
+    }
+    let group = u32::try_from(group)
+        .map_err(|_| format!("{sid}'s foreground process group {group} is out of range"))?;
+    Ok((sid, group))
 }
 
 /// How long a box on a screen whose named program is no agent waits for
@@ -464,9 +514,11 @@ impl<C: Ctl> Session<'_, C> {
         }
         if !r.ok() {
             self.person = None;
+            self.status_sid = None;
             return Ok(None);
         }
         let field = |f: &str| super::escalate::status_field(&r.stdout, f).map(str::to_string);
+        self.status_sid = field("sid").filter(|s| s != "-");
         self.person = field("human_ms")
             .and_then(|ms| ms.parse::<u64>().ok())
             .and_then(|ms| Instant::now().checked_sub(Duration::from_millis(ms)));
@@ -495,11 +547,16 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The approval policy's context: the session's cwd (`meta` read fresh
-    /// when `fresh_cwd`), the footer's mode, the process's home/uid/
-    /// `$TMPDIR`, the approve level and trust roots `opts` sets.
+    /// when `fresh_cwd`), for a box that may run git (`git`) the worker's
+    /// environment ([`ApprovalCtx::worker`]) and the directories its Bash
+    /// tool may stand in, from the transcripts under the worker's own Claude
+    /// Code directory ([`ApprovalCtx::shell_cwds`]), the footer's mode, the
+    /// process's home/uid/`$TMPDIR`, the approve level and trust roots `opts`
+    /// sets.
     fn approval_ctx(
         &mut self,
         fresh_cwd: bool,
+        git: bool,
         opts: &SuperviseOpts,
         allow: &[String],
     ) -> Result<ApprovalCtx, Fail> {
@@ -536,7 +593,59 @@ impl<C: Ctl> Session<'_, C> {
         ctx.answer_questions = opts.policy.answer_questions;
         ctx.model_fallback = opts.policy.model_fallback.is_some();
         ctx.python_allow = allow.to_vec();
+        if git {
+            let worker = match env.worker {
+                WorkerSource::Session => self.worker_env(),
+                WorkerSource::Fixed(worker) => worker,
+            };
+            if let (Ok(w), Some(cwd)) = (&worker, cwd.as_deref())
+                && let Some(claude) = w.claude_dir()
+            {
+                ctx.shell_cwds = crate::harness::footer::shell_cwds(&claude, cwd);
+            }
+            ctx.worker = worker;
+        }
         Ok(ctx)
+    }
+
+    /// The WORKER's environment ([`WorkerEnv`]): the environment at exec of
+    /// the session's foreground process group's leader — `who`'s `fgpgid=` on
+    /// the session's row ([`session_group`]: by the `@s-…` the loop addresses,
+    /// else by the local id the last `status` named) — read through the
+    /// kernel ([`atpkg::caller_shell::process_args`]), and bound to this
+    /// session by the `ATERM_PARENT_SESSION_ID` every aterm session hands its
+    /// shell: a process whose variable names another session, or none, is not
+    /// taken for the worker. `Err` says what could not be read or did not
+    /// hold.
+    pub(super) fn worker_env(&mut self) -> Result<WorkerEnv, String> {
+        let stable = self
+            .sid
+            .as_deref()
+            .and_then(|s| s.strip_prefix('@'))
+            .filter(|s| s.starts_with("s-"))
+            .map(str::to_string);
+        let r = self
+            .ctl
+            .call(&["who"])
+            .map_err(|e| format!("`who` failed: {e}"))?;
+        if !r.ok() {
+            return Err(format!("`who` refused: {}", r.stderr.trim()));
+        }
+        let (sid, group) = session_group(&r.stdout, stable.as_deref(), self.status_sid.as_deref())?;
+        let args = atpkg::caller_shell::process_args(group).ok_or_else(|| {
+            format!("the environment of {sid}'s foreground process {group} could not be read")
+        })?;
+        let worker = WorkerEnv::new(args);
+        match worker.var(ENV_PARENT_SESSION_ID) {
+            Some(tab) if tab == sid => Ok(worker),
+            Some(tab) => Err(format!(
+                "{sid}'s foreground process {group} belongs to session {tab}"
+            )),
+            None => Err(format!(
+                "{sid}'s foreground process {group} names no session \
+                 ({ENV_PARENT_SESSION_ID} unset, or its environment hidden)"
+            )),
+        }
     }
 
     /// The decision on the box on `screen`: read by the reader for the
@@ -596,7 +705,8 @@ impl<C: Ctl> Session<'_, C> {
             }
         }
         let fresh_cwd = reading.prompt.as_ref().is_some_and(needs_cwd);
-        let mut ctx = self.approval_ctx(fresh_cwd, opts, allow)?;
+        let git = reading.prompt.as_ref().is_some_and(may_run_git);
+        let mut ctx = self.approval_ctx(fresh_cwd, git, opts, allow)?;
         // THE SESSION'S WORD (2026-09-25): a question dialog is answered by
         // this session's own `questions` word where it has one — `ask` hands
         // it to a person, `recommended` answers it — over the table's

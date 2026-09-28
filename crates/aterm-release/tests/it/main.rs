@@ -31,6 +31,9 @@ mod bundle;
 #[path = "../../src/changelog.rs"]
 #[allow(dead_code)]
 mod changelog;
+#[path = "../../src/channel.rs"]
+#[allow(dead_code)]
+mod channel;
 #[path = "../../src/cli.rs"]
 #[allow(dead_code)]
 mod cli;
@@ -49,9 +52,6 @@ mod machines;
 #[path = "../../src/manifest_out.rs"]
 #[allow(dead_code)]
 mod manifest_out;
-#[path = "../../src/mirror.rs"]
-#[allow(dead_code)]
-mod mirror;
 #[path = "../../src/provision.rs"]
 #[allow(dead_code)]
 mod provision;

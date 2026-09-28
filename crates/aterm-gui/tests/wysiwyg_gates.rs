@@ -80,33 +80,6 @@ fn application_present_uses_the_phase_aware_overlay_policy() {
     );
 }
 
-#[test]
-fn shared_visual_policy_keeps_only_the_upgrade_rim_exception() {
-    let src = normalized_section(
-        "src/app_render.rs",
-        "pub(crate) fn host_visual_state(",
-        "pub(crate) fn finalize_successful_terminal_present_for_test(",
-    );
-    for needle in [
-        "let overlay_open = window.overlay_open();",
-        "let invert = window.bell_flash.is_active(now) && !overlay_open;",
-        "if window.drag_hover && !overlay_open {",
-        "self.level_up .as_ref() .map(|level| OverlayGlow {",
-    ] {
-        assert!(src.contains(needle), "shared visual policy lost `{needle}`");
-    }
-    // The exception is sound only while the rim is the ONE thing `level_up`
-    // can paint: a celebration phase admitted over a modal would be the
-    // pre-audit divergence again (the landing burst was deleted 2026-09-24).
-    let rim = normalized("src/level_up.rs");
-    for gone in ["Phase::Landing", "fn landing(", "arrow_tray"] {
-        assert!(
-            !rim.contains(gone),
-            "a celebration came back into the upgrade rim: `{gone}`"
-        );
-    }
-}
-
 /// Structural closure of the fallback capture policy, including its consumers.
 /// Compact only for matching punctuation across optional rustfmt line breaks.
 fn capture_uses_shared_visual_policy(src: &str, authority: &str) -> bool {

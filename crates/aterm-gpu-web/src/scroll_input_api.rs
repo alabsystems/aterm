@@ -388,10 +388,13 @@ mod tests {
     }
 
     /// The GPU present paths need a browser WebGL surface (`init` is
-    /// wasm-only), so the render smoke here verifies the exact snapshot
-    /// `render`/`render_offscreen` hand to aterm-gpu — the same
-    /// `cell_frame_into` + `stamp` sequence — carries the banked residual,
-    /// and that a kept scratch is re-stamped to zero after a snap.
+    /// wasm-only), so the render smoke here drives `build_frame` — the
+    /// engine-side half both `render` and `render_offscreen` run before they
+    /// touch aterm-gpu (the damage-scoped refill, the effects pass, `stamp`) —
+    /// and checks the snapshot it leaves carries the banked residual, and that
+    /// a kept scratch is re-stamped to zero after a snap. That the scoped
+    /// refill equals a full extraction is
+    /// `build_frame_scoped_refill_matches_a_full_extraction_over_a_mutation_stream`'s.
     #[test]
     fn render_snapshot_carries_the_banked_residual() {
         let Some(mut t) = terminal_with_history() else {
@@ -399,10 +402,8 @@ mod tests {
             return;
         };
         t.scroll_px(t.cell_height() as f64 / 2.0);
-        let (rows, cols) = (t.rows, t.cols);
-        t.term.cell_frame_into(&mut t.frame_scratch, rows, cols);
-        let (_, ch) = t.cpu.cell_size();
-        t.scroll_input.stamp(&mut t.frame_scratch, rows, ch);
+        let rows = t.rows;
+        t.build_frame();
         assert!(t.frame_scratch.scroll_frac_px < 0, "residual is presented");
         assert_eq!(
             (t.frame_scratch.grid_top_row, t.frame_scratch.grid_bot_row),
@@ -411,8 +412,7 @@ mod tests {
         );
         // Snap: the KEPT scratch must be re-stamped to zero next frame.
         t.scroll_to_bottom();
-        t.term.cell_frame_into(&mut t.frame_scratch, rows, cols);
-        t.scroll_input.stamp(&mut t.frame_scratch, rows, ch);
+        t.build_frame();
         assert_eq!(t.frame_scratch.scroll_frac_px, 0, "no stale shift");
     }
 }

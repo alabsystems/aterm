@@ -7,7 +7,7 @@
 //! agents read these runs top to bottom and know where to look. Concurrency
 //! changes when a stage RUNS, never where it PRINTS.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::Ctx;
 use crate::cli::Mode;
@@ -20,13 +20,13 @@ use crate::cli::Mode;
 pub enum Lane {
     /// Shells out to nothing that touches a target dir.
     Pure,
-    /// `target/` — the workspace build, its tests and doctests, and the three
-    /// `--full` tiers. (Until 2026-09-13 also the regex lane, the xtask verbs
+    /// `target/` — the workspace's test compile, its tests and doctests, and
+    /// the `--full` tiers that compile. (Until 2026-09-13 also the xtask verbs
     /// and every driven binary; those have their own lanes below.)
     MainTarget,
-    /// `target-tippy/` — the lint keeps a SEPARATE target dir so the trust
-    /// toolchain's artifacts stay off the stock build. That is also what makes
-    /// it free to run beside the build.
+    /// `target-tippy/` — the lint keeps a SEPARATE target dir: a `check`
+    /// compile and a test compile share no artifacts, and in one directory
+    /// each would queue on the other's cargo lock instead of overlapping.
     TippyTarget,
     /// `tools/freeze-safety-gate/` is its own workspace with its own target dir.
     FreezeGateTarget,
@@ -34,15 +34,9 @@ pub enum Lane {
     /// and its emitted-symbol gate. The oracle owns both directories and may
     /// run beside the main workspace without contending for Cargo's lock.
     LibcOracleTarget,
-    /// `target-regex/` — the regex search lane alone. Moved off `target/` on
-    /// 2026-09-13: `-p aterm-search --features regex` resolves a feature set
-    /// the workspace test never builds, so in `target/` it compiled its own
-    /// variants serially, after the doctests. Same argv, own lock, t0.
-    RegexTarget,
-    /// `target-xtask/` — the xtask-verb stages (formatting, feature gates, the
-    /// proof inventory). The verbs they run spawn no cargo (grep of
-    /// `crates/xtask/src/gate.rs`, 2026-09-13), so the only lock they take is
-    /// the one `targo run -p xtask` takes to build xtask.
+    /// `target-xtask/` — the xtask-verb stages (formatting, forge, the foreign
+    /// cells). The only lock they take in it is the one `targo run -p xtask`
+    /// takes to build xtask; `cells-foreign` compiles its cells elsewhere.
     XtaskTarget,
     /// `target-drivers/` — every binary the gate DRIVES rather than tests: the
     /// smokes' `aterm-gui`/`aterm-ctl`, the redraw harness, the eight objc
@@ -63,17 +57,18 @@ pub enum Lane {
     /// It lives UNDER `target/` and is still a lane of its own, because a lane
     /// is a cargo target directory and cargo's build lock is taken per target
     /// directory: the main lane's children never open this one, so priming it
-    /// contends with nothing the build stage is doing.
+    /// contends with nothing the test compile is doing.
     ConformanceRelease,
 }
 
 /// Every stage of the gate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum StageId {
-    Build,
+    /// The test stage's compile, at t0: the main lane's first compile, and the
+    /// row that says COULD NOT RUN when there is no pinned `targo`.
+    TestCompile,
     Test,
     Doctests,
-    RegexLane,
     /// The sealed cross-host rung of the fabric bridge, `--features sealed`. A
     /// DRIVER-lane stage: its suite boots real `aterm-gui`s (see `plan`).
     SealedLane,
@@ -82,17 +77,15 @@ pub enum StageId {
     GrepGuards,
     /// The offline suites over the scripts that build, sign, install and
     /// publish the app (`stages::DELIVERY_SUITES`). "Release tooling" until
-    /// 2026-09-26, when dev-app's signing identity and cargo pin joined it.
+    /// 2026-09-26, when dev-app's signing identity and cargo pin joined it
+    /// (and, 2026-09-27, the fabric demo's cleanup check).
     DeliveryTooling,
     AtpkgTooling,
-    TrustGateVerdict,
     TrustContractProbe,
+    /// `--full` only: the startup-comparison harness's own test.
     StartCompare,
-    LicenseHeaders,
-    FeatureGates,
     LibcOracle,
     FreezeGate,
-    ProofInventory,
     DriverBuilds,
     /// The RELEASE `aterm` the paint and spin suites judge, built in its own
     /// lane at t0 so the measuring stage finds it warm.
@@ -117,9 +110,12 @@ pub enum StageId {
     /// The foreground handback lane (`stages::FOREGROUND_HANDBACK_SUITE`): a
     /// real shell's job control, in a private headless `aterm` this run built.
     ForegroundHandback,
-    DifferentialOracle,
     KaniFloor,
     CrossCells,
+    /// `xtask gate forge`, every tier (2026-09-25).
+    Forge,
+    /// `xtask gate cells-foreign`, every tier (2026-09-25).
+    ForeignCells,
     /// `--full` ONLY, and run alone: the Codex live upgrade
     /// (`stages::CODEX_LIVE_UPGRADE_SUITE`), which moves this machine's
     /// managed-store Codex from an older build to its current one — so its
@@ -143,20 +139,18 @@ pub struct StageSpec {
     /// Lanes whose stages must all have FINISHED before this one starts —
     /// apart from stages behind an exclusive barrier declared after it, which
     /// cannot overlap it anyway (see `crate::sched`). Only the test run uses
-    /// it: before 2026-09-13 the regex lane, the xtask verbs and the driver
-    /// builds were serialised behind it in `target/`, so waiting for their new
-    /// lanes keeps it at least as isolated as it was.
+    /// it, to wait for the driver lane (see `plan`).
     pub after_lanes: Vec<Lane>,
 }
 
 /// The target directory a lane's cargo children use. `None` for [`Lane::Pure`],
 /// which has none.
 ///
-/// `MainTarget` keeps the rule it always had: the caller's `CARGO_TARGET_DIR`
-/// (relative to the root, as cargo reads it) or `<root>/target`, and its
-/// children inherit the variable rather than being handed one. The side lanes
-/// are absolute paths under the root, because they ARE handed to children whose
-/// cwd is the root and a relative one would be read twice.
+/// `MainTarget` is `<root>/target`, cargo's own default: its children are
+/// handed no directory and inherit none — a caller's `CARGO_TARGET_DIR` never
+/// reaches a child ([`crate::CHILD_ENV_REMOVED`]). The side lanes are absolute
+/// paths under the root, because they ARE handed to children whose cwd is the
+/// root and a relative one would be read twice.
 #[must_use]
 pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
     let under_root = |rel: &str| {
@@ -165,22 +159,11 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
     };
     match lane {
         Lane::Pure => None,
-        Lane::MainTarget => Some(ctx.env.cargo_target_dir.as_deref().map_or_else(
-            || ctx.root.join("target"),
-            |d| {
-                let d = Path::new(d);
-                if d.is_absolute() {
-                    d.to_path_buf()
-                } else {
-                    ctx.root.join(d)
-                }
-            },
-        )),
+        Lane::MainTarget => Some(ctx.root.join("target")),
         // Spelled as `stages::tippy_cmd` spells it, which is unchanged.
         Lane::TippyTarget => Some(ctx.root.join("target-tippy")),
         Lane::FreezeGateTarget => under_root("tools/freeze-safety-gate/target"),
         Lane::LibcOracleTarget => under_root("libc-oracle/target"),
-        Lane::RegexTarget => under_root("target-regex"),
         Lane::XtaskTarget => under_root("target-xtask"),
         Lane::DriverTarget => under_root("target-drivers"),
         // Spelled as `release_bin` spells it — `root.join("target/conformance-release")`
@@ -199,8 +182,8 @@ pub fn lane_dir(ctx: &Ctx, lane: Lane) -> Option<PathBuf> {
 /// compile that crate" (atpkg's `untracked_stage`, the third, went with the
 /// untracked lanes on 2026-09-24). Whole-tree always does. A narrowing that selects neither runs
 /// no suite that would ever open the lane, and priming it would be a minutes-long
-/// build for nobody — the same reason the regex and sealed lanes are REMOVED
-/// rather than skipped under a scope that has nothing for them.
+/// build for nobody — the same reason the sealed lane is REMOVED rather than
+/// skipped under a scope that has nothing for it.
 #[must_use]
 fn primes_conformance_release(ctx: &Ctx) -> bool {
     ctx.scope.includes_crate("aterm-conformance")
@@ -209,11 +192,10 @@ fn primes_conformance_release(ctx: &Ctx) -> bool {
 /// Build the run's stage list.
 ///
 /// Two things can remove a stage entirely (as opposed to skipping it):
-///  * `--scope` narrowing away from `aterm-search` drops the regex lane, away
-///    from `aterm-link` the sealed fabric lane, and away from
-///    `aterm-conformance` the conformance-release prime
-///    ([`primes_conformance_release`]), because there is nothing for any of them
-///    to run — the script never printed the regex lane's header either;
+///  * `--scope` narrowing away from `aterm-link` drops the sealed fabric lane,
+///    and away from `aterm-conformance` the conformance-release prime
+///    ([`primes_conformance_release`]), because there is nothing for either of
+///    them to run;
 ///  * `--fast` drops the four `--full`-only stages.
 ///
 /// Nothing else is conditional here. Absent TOOLS produce skips inside a stage,
@@ -223,20 +205,33 @@ fn primes_conformance_release(ctx: &Ctx) -> bool {
 pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     let label = ctx.scope.label();
     let mut v = vec![
-        spec(StageId::Build, format!("build ({label})"), Lane::MainTarget),
-        // THE TEST RUN WAITS FOR THE SIDE LANES (2026-09-13). They start at t0
-        // beside the build; the test run still owns the machine's cargo work
-        // the way it did when they queued behind it in `target/`. The sealed
-        // fabric rung is one of the driver lane's stages, so it is waited for
-        // through `DriverTarget`.
+        // THE TEST COMPILE, AT t0 (2026-09-27). The test run below waits for the
+        // driver lane, and its compile does not need to: a compile is exactly the
+        // work that overlapped the driver builds when a `targo build --workspace`
+        // row held this slot. That row compiled a second, non-test variant of
+        // the workspace which no stage ran; this one compiles what the test run
+        // runs, so the test run's own `--no-run` child is a fingerprint check.
+        // It is also where a missing or refused `targo` is said: COULD NOT RUN,
+        // never a skip, because nothing about the tree can be decided without it.
+        spec(
+            StageId::TestCompile,
+            format!("test compile ({label})"),
+            Lane::MainTarget,
+        ),
+        // THE TEST RUN WAITS FOR THE DRIVER LANE. Its stages start at t0; the
+        // driven binaries are built there, the sealed rung and the atpkg pack
+        // run there, and the aterm-link harness refuses daemons it did not
+        // start, so the run owns the machine's driven processes the way it did
+        // when they queued behind it in `target/`. The sealed fabric rung is one
+        // of the driver lane's stages, so it is waited for through
+        // `DriverTarget`.
         //
-        // NOT FOR TIPPY (2026-09-23). It waited for tippy's whole-workspace
-        // compile from 2026-09-18, because a paint take inside the test run was
-        // measured descheduled for 50 ms beside it. The tests that measure now
-        // run in their own exclusive stage (`StageId::MeasuringTests`), so the
-        // run no longer holds its start for the lint.
+        // NOT FOR TIPPY (2026-09-23) OR THE XTASK LANE (2026-09-27). Both only
+        // compile; the tests that measure the machine run in their own exclusive
+        // stage (`StageId::MeasuringTests`), so the run no longer holds its
+        // start for a compile.
         StageSpec {
-            after_lanes: vec![Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget],
+            after_lanes: vec![Lane::DriverTarget],
             ..spec(StageId::Test, format!("test ({label})"), Lane::MainTarget)
         },
         spec(
@@ -245,13 +240,6 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
             Lane::MainTarget,
         ),
     ];
-    if ctx.scope.includes_regex_lane() {
-        v.push(spec(
-            StageId::RegexLane,
-            "regex search lane (aterm-search --features regex)",
-            Lane::RegexTarget,
-        ));
-    }
     v.push(spec(
         StageId::Tippy,
         format!("tippy lint ({label})"),
@@ -276,7 +264,11 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "formatting (targo-fmt --all + the per-file sweep)",
         Lane::XtaskTarget,
     ));
-    v.push(spec(StageId::GrepGuards, "grep guards", Lane::Pure));
+    v.push(spec(
+        StageId::GrepGuards,
+        "grep guards and license headers",
+        Lane::Pure,
+    ));
     // DELIVERY TOOLING — "release tooling (installer update channel, export
     // policy, release preflight, after-cut; stubbed)" until 2026-09-26, when
     // five orphaned suites joined it and two of them made "release" false:
@@ -284,29 +276,13 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // installer (`stages.rs` section 3.5 has the roster and the reason).
     v.push(spec(
         StageId::DeliveryTooling,
-        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity; offline)",
-        Lane::Pure,
-    ));
-    v.push(spec(
-        StageId::TrustGateVerdict,
-        "trust-gate verdict self-test",
+        "delivery tooling (installer channel and guards, cargo pin, export policy, release preflight, shape and after-cut, site sync, dev signing identity, fabric demo cleanup; offline)",
         Lane::Pure,
     ));
     v.push(spec(
         StageId::TrustContractProbe,
         "trust contract probe (self-field ensures proves; off-switch no ICE)",
         Lane::Pure,
-    ));
-    v.push(spec(
-        StageId::StartCompare,
-        "startup comparison scheduler",
-        Lane::Pure,
-    ));
-    v.push(spec(StageId::LicenseHeaders, "license headers", Lane::Pure));
-    v.push(spec(
-        StageId::FeatureGates,
-        "feature gates (drift/dormant)",
-        Lane::XtaskTarget,
     ));
     v.push(spec(
         StageId::LibcOracle,
@@ -318,9 +294,31 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         "L0 temporal-safety gate (freeze/data-loss/deadlock — 6 obligations)",
         Lane::FreezeGateTarget,
     ));
+    // THE TWO GATE VERBS THAT HAD NO AUTOMATIC CALLER (decided 2026-09-25
+    // under the owner's standing direction). Both are xtask verbs, so both sit
+    // in the xtask lane, which only compiles and so runs beside the test run.
+    // `forge` is a flat ~9-14 s with no compiler and no network; `cells-foreign`
+    // (five cells) is 8 s warm and 278 s after a core edit, 432 s cold into
+    // 2.6 GiB of the snapshot's cells lane (re-measured 2026-09-27 on a loaded
+    // M5 Max, with the gate's CARGO_INCREMENTAL=0). Nothing waits for it, so it
+    // costs a run only where it outlasts the test run — and it did not delay
+    // even the test run's START while that still waited for this lane: in a
+    // merge-contract run after an edit to aterm-grid's lib.rs it ended 238 s
+    // before the build and 657 s before the test run started, which the
+    // driver lane held (2026-09-27, `--timings`). It is the only
+    // automatic compile of the cells no box in the fleet hosts — the Windows
+    // binary shipped unbuildable (v0.82.0) while that compile lived behind
+    // `--full`, and a Unix-only harness change reached main red for both
+    // Windows cells on 2026-09-26. `stages::forge_gate` and
+    // `stages::foreign_cells` carry the rest.
     v.push(spec(
-        StageId::ProofInventory,
-        "computed proof inventory",
+        StageId::Forge,
+        "third-party surface (xtask gate forge)",
+        Lane::XtaskTarget,
+    ));
+    v.push(spec(
+        StageId::ForeignCells,
+        "foreign-cell type-check (xtask gate cells-foreign: the cells no fleet box hosts)",
         Lane::XtaskTarget,
     ));
     // DRIVER BUILDS (2026-09-13): the smoke, redraw and objc binaries — and,
@@ -362,8 +360,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // the helper into its nested cargo, which two build scripts track).
     //
     // NOT in `after_lanes` of anything, and nothing waits on this lane: the
-    // point is to overlap the build stage, and a waiter would put the cost back
-    // on the critical path it was taken off. Nor is it a MEASUREMENT risk: the
+    // point is to overlap the test compile, and a waiter would put the cost
+    // back on the critical path it was taken off. Nor is it a MEASUREMENT risk: the
     // two suites that use this artifact are the measuring stage's, which is
     // exclusive, so neither of them can start before this row has finished.
     if primes_conformance_release(ctx) {
@@ -628,8 +626,8 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     // after the barrier in a `--fast` run is in this lane, so nothing else is
     // in flight while it waits on real shells under deadlines (`ctl await …
     // timeout=`), and a compile beside it turns a slow machine into a red row.
-    // (In a `--full` run the three tiers below are MainTarget stages after the
-    // same barrier and do overlap it, as they overlap the redraw gate and the
+    // (In a `--full` run the tiers below run after the same barrier and do
+    // overlap it, as they overlap the redraw gate and the
     // drives; the lane's deadlines are 10-20 s against a ~20 s run.) Declared
     // after the barrier, it is awaited by nothing. Never removed by a
     // narrowing.
@@ -643,21 +641,20 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
     ));
     if ctx.mode == Mode::Full {
         v.push(spec(
-            StageId::DifferentialOracle,
-            "differential oracle (aterm vs alacritty)",
-            Lane::MainTarget,
-        ));
-        v.push(spec(
             StageId::KaniFloor,
             "trust-mc / Kani BMC floor (config-free parser harnesses)",
             Lane::MainTarget,
         ));
-        // THE OTHER FOUR CELLS, COMPILED. `--fast` type-checks exactly one of
-        // the five targets aterm ships for; forge measures all five and
-        // compiles none. `xtask gate cells` closes that with a real compiler
-        // per triple, and it is `--full`-only for one measured reason: the
-        // five-cell matrix costs ~19 s warm and ~106 s cold, against a `--fast`
-        // budget that exists to be paid on every commit.
+        // THE WHOLE MATRIX, COMPILED. Every tier type-checks the host's own
+        // cell (the test and lint lanes) and, since 2026-09-25, the five
+        // cells no fleet box hosts (`ForeignCells` above); forge measures all
+        // eight and compiles none. `xtask gate cells` adds the rest — `mac-x64`,
+        // and `mac-arm`/`linux` where the box is not that host — with a real
+        // compiler per triple. It is `--full`-only because each of those is
+        // native on some box, where that box's own lanes compile it, and its
+        // cross verdict differs from the native one (gate.rs,
+        // `FLEET_HOST_TRIPLES`). (Until 2026-09-25 this comment read "`--fast`
+        // type-checks exactly one of the five targets", true then.)
         //
         // WHAT `--fast` DOES NOT SEE, corrected 2026-09-01 because the previous
         // version of this sentence was FALSE IN BOTH DIRECTIONS. It listed
@@ -672,11 +669,12 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // `#[cfg(target_os = "linux")]` in `crates/aterm-gui/src/control.rs`
         // left `gate cells` GREEN.
         //
-        // What `--fast` really does not see: `#[cfg(windows)]`,
+        // What `--fast` did not see before `ForeignCells`: `#[cfg(windows)]`,
         // `#[cfg(target_os = "linux")]`, the `unix` arms that exclude Apple,
         // `#[cfg(target_arch = "wasm32")]`, and every third-party crate that
-        // only appears on a non-native cell. `--full` sees all four of those
-        // now: measured over the 3,245 platform `cfg` attribute sites under
+        // only appears on a non-native cell. `--fast` now sees the Windows,
+        // wasm32 and ARM-Linux arms through the foreign cells; the x86_64
+        // `linux` cell stays here, and `--full` sees all four of those: measured over the 3,245 platform `cfg` attribute sites under
         // `crates/`, some cell reaches 2,894 of them, against 2,143 before the
         // shim rows. Of the 351 left, 232 are in crates no cell's graph carries
         // at all (`aterm-release`, `atpkg-keys`, `aterm-conformance`,
@@ -691,8 +689,16 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // work it launches ends up.
         v.push(spec(
             StageId::CrossCells,
-            "cross-cell type-check (forge's five cells, each for its own triple)",
+            "cross-cell type-check (every forge cell, each for its own triple)",
             Lane::MainTarget,
+        ));
+        // THE STARTUP-COMPARISON HARNESS'S OWN TEST (2026-09-27: per commit
+        // until then). It guards the evidence path a publishable startup
+        // comparison takes, which only `--full`-grade work produces.
+        v.push(spec(
+            StageId::StartCompare,
+            "startup comparison scheduler",
+            Lane::Pure,
         ));
         // THE CODEX LIVE UPGRADE (2026-09-26) — `--full` only, and run alone.
         //
@@ -722,17 +728,17 @@ pub fn plan(ctx: &Ctx) -> Vec<StageSpec> {
         // Codex people actually run, which is the lane's whole point.
         //
         // So it is in the tier that already holds world-dependent evidence (the
-        // alacritty oracle, the trust-mc floor), where a missing prerequisite is
-        // a NAMED SKIP — counted, printed with the lane's own reason, and
+        // trust-mc floor), where a missing prerequisite is a NAMED SKIP —
+        // counted, printed with the lane's own reason, and
         // forfeiting that run's contract claim, never a pass — and a FAIL after a
         // vendor update with an unchanged tree is exactly what the tier is for:
         // aterm's host (or the lane's release-specific checks) has to catch up
         // with the Codex people now run. EXCLUSIVE and LAST: it waits on real
         // idle points and ten-second ledger polls for ~10 minutes (581 s on
-        // 2026-09-26), and in `--full` the three tiers above are MainTarget
-        // compiles after the smokes' barrier, so without exclusivity it would
-        // run beside them. Last, so nothing waits behind it. Its own first child
-        // is the handback row's build (a fingerprint no-op by then).
+        // 2026-09-26), and in `--full` the tiers above run after the smokes'
+        // barrier, so without exclusivity it would run beside them. Last, so
+        // nothing waits behind it. Its own first child is the handback row's
+        // build (a fingerprint no-op by then).
         v.push(exclusive(
             StageId::CodexLiveUpgrade,
             "Codex live upgrade (the managed store's older Codex moved onto its current one by a private headless aterm; reads this machine's store and the vendor's Codex; run alone)",
@@ -774,7 +780,6 @@ mod tests {
             PathBuf::from("/repo"),
             mode,
             scope,
-            false,
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
@@ -789,22 +794,18 @@ mod tests {
         assert_eq!(
             ids(&ctx(Mode::Fast, Scope::workspace())),
             [
-                StageId::Build,
+                StageId::TestCompile,
                 StageId::Test,
                 StageId::Doctests,
-                StageId::RegexLane,
                 StageId::Tippy,
                 StageId::Formatting,
                 StageId::GrepGuards,
                 StageId::DeliveryTooling,
-                StageId::TrustGateVerdict,
                 StageId::TrustContractProbe,
-                StageId::StartCompare,
-                StageId::LicenseHeaders,
-                StageId::FeatureGates,
                 StageId::LibcOracle,
                 StageId::FreezeGate,
-                StageId::ProofInventory,
+                StageId::Forge,
+                StageId::ForeignCells,
                 StageId::DriverBuilds,
                 StageId::ConformanceRelease,
                 StageId::SealedLane,
@@ -827,56 +828,27 @@ mod tests {
         );
     }
 
-    /// Until 2026-09-13 the regex lane, the xtask verbs and every driver build
-    /// queued behind the test run in `target/`. Now they have lanes of their
-    /// own and start at t0, so the test run waits for all three, and for every
-    /// stage of theirs that is not behind an exclusive barrier (those cannot
-    /// overlap it by the barrier rule). It does NOT wait for tippy any more
-    /// (2026-09-23): that wait existed for the paint takes, which now run in
-    /// the exclusive measuring stage.
+    /// The test run waits for the driver lane — whose stages build and drive
+    /// the binaries the run's own suites would otherwise meet mid-link — and
+    /// nothing in the plan can deadlock on that wait. Its compile does not
+    /// wait: the test compile row starts at t0.
     #[test]
-    fn the_test_run_waits_for_every_new_side_lane() {
+    fn the_test_run_waits_for_the_driver_lane_and_its_compile_does_not() {
         for mode in [Mode::Fast, Mode::Full] {
             let p = plan(&ctx(mode, Scope::workspace()));
-            let test = p.iter().position(|s| s.id == StageId::Test).expect("test");
-            assert_eq!(
-                p[test].after_lanes,
-                [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget]
-            );
-            let awaited: Vec<StageId> = crate::sched::awaited(&p, test).map(|j| p[j].id).collect();
-            assert!(!awaited.contains(&StageId::Tippy), "{awaited:?}");
-            assert_eq!(
-                awaited,
-                [
-                    StageId::RegexLane,
-                    StageId::Formatting,
-                    StageId::FeatureGates,
-                    StageId::ProofInventory,
-                    StageId::DriverBuilds,
-                    StageId::SealedLane,
-                    StageId::AtpkgTooling,
-                ],
-                "{mode:?}"
-            );
-            // Everything else in those lanes sits behind the smokes' barrier.
-            let barrier = p
-                .iter()
-                .position(|s| s.exclusive)
-                .expect("an exclusive stage");
-            for (j, s) in p.iter().enumerate() {
-                if p[test].after_lanes.contains(&s.lane) && !awaited.contains(&s.id) {
-                    assert!(
-                        j >= barrier,
-                        "{:?} is neither awaited nor behind the barrier",
-                        s.id
-                    );
-                }
-            }
-            // No other stage waits on lanes.
+            let at = |id| p.iter().position(|s| s.id == id).expect("planned");
+            let (compile, test) = (at(StageId::TestCompile), at(StageId::Test));
             assert!(
-                p.iter()
-                    .filter(|s| s.id != StageId::Test)
-                    .all(|s| s.after_lanes.is_empty())
+                p[test].after_lanes.contains(&Lane::DriverTarget),
+                "{mode:?}: {:?}",
+                p[test].after_lanes
+            );
+            assert!(compile < test, "{mode:?}");
+            assert!(p[compile].after_lanes.is_empty(), "{mode:?}");
+            let nothing = vec![false; p.len()];
+            assert!(
+                crate::sched::ready(&p, &nothing, &nothing, 0, compile),
+                "{mode:?}: the test compile starts at t0"
             );
             crate::sched::check_after_lanes(&p).expect("the plan cannot deadlock");
         }
@@ -980,119 +952,27 @@ mod tests {
         }
     }
 
-    /// A GATE NOBODY INVOKES IS NOT A GATE. The redraw harness is the only check
-    /// in the tree that can see a control `select` actually repaint a window —
-    /// every `#[test]` builds its host with `proxy: None` — and for a while it
-    /// sat behind an off-by-default feature that no workflow, script or stage
-    /// ever named. Dropping it from the plan is how that state returns.
+    /// A GATE NOBODY INVOKES IS NOT A GATE, for the two gate verbs that had no
+    /// automatic caller until 2026-09-25. `cells-foreign` is the only automatic compile of the
+    /// cells no fleet box hosts, and `forge` the only automatic read of the
+    /// third-party surface; a narrowing is exactly when someone is in a hurry,
+    /// so neither may be scoped away.
     #[test]
-    fn the_redraw_gate_runs_in_every_tier_and_every_scope() {
+    fn forge_and_the_foreign_cells_run_in_every_tier_and_every_scope() {
         for mode in [Mode::Fast, Mode::Full] {
             for scope in [
                 Scope::workspace(),
                 Scope::crate_only("aterm-grid"),
                 Scope::changed("main", vec![], true),
             ] {
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::RedrawConformance),
-                    "{mode:?} / {} lost the redraw gate",
-                    scope.label()
-                );
-            }
-        }
-    }
-
-    /// THE SAME OBLIGATION, for the live-class auditor. It is the only check in
-    /// the tree that reads the class `vendor/winit`'s ported delegate actually
-    /// registered — the seam census checks a mirror it declares itself, and two
-    /// compile-verified plants passed that mirror while the build stayed green.
-    /// A gate nobody invokes is not a gate.
-    #[test]
-    fn the_objc_class_audit_runs_in_every_tier_and_every_scope() {
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-grid"),
-                Scope::changed("main", vec![], true),
-            ] {
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcClassAudit),
-                    "{mode:?} / {} lost the objc live-class audit",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcImeDrive),
-                    "{mode:?} / {} lost the objc IME drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcToolbarDrive),
-                    "{mode:?} / {} lost the objc toolbar drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcEventDrive),
-                    "{mode:?} / {} lost the objc event drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcAlertDrive),
-                    "{mode:?} / {} lost the objc alert drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcSwizzleDrive),
-                    "{mode:?} / {} lost the objc swizzle drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ObjcBoundDrive),
-                    "{mode:?} / {} lost the objc bound drive",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::WindowServerTests),
-                    "{mode:?} / {} lost the window-server unit tests, the only runner of \
-                     the rows every parallel test run ignores",
-                    scope.label()
-                );
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::ForegroundHandback),
-                    "{mode:?} / {} lost the foreground handback, the only runner of \
-                     tools/test-foreground-handback.sh",
-                    scope.label()
-                );
-                // The Codex live upgrade is `--full`'s, and a narrowing can no
-                // more remove it there than the handback here; the per-commit
-                // ladder never plans it (its verdict reads the machine's store
-                // and the vendor's Codex — `plan` says why).
-                assert_eq!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::CodexLiveUpgrade),
-                    mode == Mode::Full,
-                    "{mode:?} / {}",
-                    scope.label()
-                );
-            }
-        }
-    }
-
-    /// This is the only route that resolves the pinned registry libc beside the
-    /// first-party replacement and executes the non-const checks. In
-    /// particular, a Linux gate host's native cell is what executes the Linux
-    /// pointer-constant and C-macro runtime oracle; cross `cargo check` cannot.
-    #[test]
-    fn the_libc_oracle_runs_in_every_tier_and_every_scope() {
-        for mode in [Mode::Fast, Mode::Full] {
-            for scope in [
-                Scope::workspace(),
-                Scope::crate_only("aterm-grid"),
-                Scope::changed("main", vec![], true),
-            ] {
-                assert!(
-                    ids(&ctx(mode, scope.clone())).contains(&StageId::LibcOracle),
-                    "{mode:?} / {} lost the libc oracle",
-                    scope.label()
-                );
+                let got = ids(&ctx(mode, scope.clone()));
+                for id in [StageId::Forge, StageId::ForeignCells] {
+                    assert!(
+                        got.contains(&id),
+                        "{mode:?} / {} lost {id:?}",
+                        scope.label()
+                    );
+                }
             }
         }
     }
@@ -1105,31 +985,18 @@ mod tests {
         assert_eq!(
             full[fast.len()..],
             [
-                StageId::DifferentialOracle,
                 StageId::KaniFloor,
                 StageId::CrossCells,
+                StageId::StartCompare,
                 StageId::CodexLiveUpgrade,
             ]
         );
     }
 
-    #[test]
-    fn scoping_puts_the_crate_in_every_header_that_names_a_scope() {
-        let p = plan(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
-        let titles: Vec<&str> = p.iter().map(|s| s.title.as_str()).collect();
-        assert!(titles.contains(&"build (-p aterm-grid)"));
-        assert!(titles.contains(&"test (-p aterm-grid)"));
-        assert!(titles.contains(&"doctests (-p aterm-grid)"));
-        assert!(titles.contains(&"tippy lint (-p aterm-grid)"));
-        // The whole-tree stages keep their whole-tree titles.
-        assert!(titles.contains(&"grep guards"));
-        assert!(titles.contains(&"license headers"));
-    }
-
-    /// THE STAGE-SET PROOF across modes and scopes. Three rows follow their
-    /// own crates: the regex lane is aterm-search's, the sealed lane is
-    /// aterm-link's, and the conformance-release prime belongs to the crate
-    /// whose suites build that artifact (aterm-conformance).
+    /// THE STAGE-SET PROOF across modes and scopes. Two rows follow their
+    /// own crates: the sealed lane is aterm-link's, and the conformance-release
+    /// prime belongs to the crate whose suites build that artifact
+    /// (aterm-conformance).
     /// Every mode and scope plans EXACTLY the whole-tree ladder of its mode
     /// minus the lane rows its crates dropped — in the same order, nothing else
     /// lost. With the literal fast ladder above and `--full`'s four appended
@@ -1149,7 +1016,6 @@ mod tests {
                 let expected: Vec<StageId> = whole
                     .iter()
                     .filter(|id| match id {
-                        StageId::RegexLane => c.scope.includes_regex_lane(),
                         StageId::SealedLane => c.scope.includes_sealed_lane(),
                         StageId::ConformanceRelease => primes_conformance_release(&c),
                         _ => true,
@@ -1164,17 +1030,12 @@ mod tests {
                 );
             }
         }
-        // A scope holding none of the three crates drops all three.
+        // A scope holding neither crate drops both.
         let scoped = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-grid")));
-        assert!(!scoped.contains(&StageId::RegexLane));
         assert!(!scoped.contains(&StageId::SealedLane));
         assert!(!scoped.contains(&StageId::ConformanceRelease));
-        assert!(
-            ids(&ctx(Mode::Fast, Scope::crate_only("aterm-search"))).contains(&StageId::RegexLane)
-        );
         let link_only = ids(&ctx(Mode::Fast, Scope::crate_only("aterm-link")));
         assert!(link_only.contains(&StageId::SealedLane));
-        assert!(!link_only.contains(&StageId::RegexLane));
     }
 
     /// THE PRIME FOLLOWS THE SUITES THAT WOULD OTHERWISE BUILD IT.
@@ -1340,49 +1201,6 @@ mod tests {
     }
 
     #[test]
-    fn every_cargo_stage_declares_the_target_dir_it_contends_for() {
-        // A stage that lied about its lane would let two cargo invocations queue
-        // on a lock the scheduler thought was free — slower, and unexplainable.
-        for s in plan(&ctx(Mode::Full, Scope::workspace())) {
-            let want = match s.id {
-                StageId::Tippy => Lane::TippyTarget,
-                StageId::FreezeGate => Lane::FreezeGateTarget,
-                StageId::LibcOracle => Lane::LibcOracleTarget,
-                StageId::RegexLane => Lane::RegexTarget,
-                StageId::ConformanceRelease => Lane::ConformanceRelease,
-                StageId::Formatting | StageId::FeatureGates | StageId::ProofInventory => {
-                    Lane::XtaskTarget
-                }
-                StageId::DriverBuilds
-                | StageId::SealedLane
-                | StageId::AtpkgTooling
-                | StageId::ControlSocketSmoke
-                | StageId::GuiSmoke
-                | StageId::RedrawConformance
-                | StageId::ObjcClassAudit
-                | StageId::ObjcImeDrive
-                | StageId::ObjcToolbarDrive
-                | StageId::ObjcWindowDrive
-                | StageId::ObjcEventDrive
-                | StageId::ObjcAlertDrive
-                | StageId::ObjcSwizzleDrive
-                | StageId::ObjcBoundDrive
-                | StageId::WindowServerTests
-                | StageId::ForegroundHandback
-                | StageId::CodexLiveUpgrade => Lane::DriverTarget,
-                StageId::GrepGuards
-                | StageId::DeliveryTooling
-                | StageId::TrustGateVerdict
-                | StageId::TrustContractProbe
-                | StageId::StartCompare
-                | StageId::LicenseHeaders => Lane::Pure,
-                _ => Lane::MainTarget,
-            };
-            assert_eq!(s.lane, want, "{:?} declares the wrong lane", s.id);
-        }
-    }
-
-    #[test]
     fn each_cargo_lane_names_its_own_target_dir() {
         let mut c = ctx(Mode::Fast, Scope::workspace());
         let dir = |c: &Ctx, l| lane_dir(c, l).map(|p| p.display().to_string());
@@ -1391,10 +1209,6 @@ mod tests {
         assert_eq!(
             dir(&c, Lane::TippyTarget).as_deref(),
             Some("/repo/target-tippy")
-        );
-        assert_eq!(
-            dir(&c, Lane::RegexTarget).as_deref(),
-            Some("/repo/target-regex")
         );
         assert_eq!(
             dir(&c, Lane::XtaskTarget).as_deref(),
@@ -1420,26 +1234,12 @@ mod tests {
             dir(&c, Lane::LibcOracleTarget).as_deref(),
             Some("/repo/libc-oracle/target")
         );
-        // The main lane alone follows the caller's redirect, as cargo does.
-        c.env.cargo_target_dir = Some("rel".into());
-        assert_eq!(dir(&c, Lane::MainTarget).as_deref(), Some("/repo/rel"));
-        assert_eq!(
-            dir(&c, Lane::DriverTarget).as_deref(),
-            Some("/repo/target-drivers")
-        );
-        c.env.cargo_target_dir = Some("/abs".into());
-        assert_eq!(dir(&c, Lane::MainTarget).as_deref(), Some("/abs"));
-        assert_eq!(
-            dir(&c, Lane::RegexTarget).as_deref(),
-            Some("/repo/target-regex")
-        );
-        // …and the conformance lane least of all: the suites' helper computes
-        // its directory from the workspace root and knows nothing about a
-        // caller's redirect, so a lane that followed one would prime a
-        // directory the suites never open.
-        assert_eq!(
-            dir(&c, Lane::ConformanceRelease).as_deref(),
-            Some("/repo/target/conformance-release")
+        // The driven binaries never share the main lane's directory: the test
+        // run would relink them under a smoke, a rung or a pack that is
+        // driving them.
+        assert_ne!(
+            lane_dir(&c, Lane::DriverTarget),
+            lane_dir(&c, Lane::MainTarget)
         );
         // A relative root still yields absolute side-lane dirs.
         c.root = PathBuf::from("relative-repo");
@@ -1449,26 +1249,5 @@ mod tests {
             "{}",
             d.display()
         );
-    }
-
-    #[test]
-    fn a_missing_tool_never_removes_a_stage() {
-        // Toolchain absence is invisible in the plan: it becomes a skip INSIDE
-        // the stage, so the ladder still shows the row and the verdict still
-        // names it. A stage that disappeared would be a stage nobody missed.
-        let nothing_installed = ctx(Mode::Full, Scope::workspace());
-        assert!(!nothing_installed.tools.have_targo());
-        // 31 since 2026-09-08: the atpkg publish-tooling suites joined the ladder.
-        // 32 since 2026-09-13: the driver builds row.
-        // 33 since 2026-09-14: the sealed fabric lane — the one test covering the
-        // vendored astream-aead is feature-gated and ran on no cadence before it.
-        // 34 since 2026-09-22: the conformance-release prime.
-        // 35 since 2026-09-23: the measuring tests, out of the test run.
-        // 36 since 2026-09-26: the window-server unit tests, out of every test run.
-        // 37 since 2026-09-26: the live aterm lanes, which nothing ran before.
-        // 38 later that day: the Codex half of those lanes left the per-commit
-        // row for a `--full` stage of its own (its verdict reads the machine's
-        // store and the vendor's Codex).
-        assert_eq!(plan(&nothing_installed).len(), 38);
     }
 }

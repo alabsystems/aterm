@@ -6,6 +6,7 @@
 //! Replaces the `dirs` crate with direct environment variable lookups
 //! and platform-specific conventions.
 
+use std::ffi::OsStr;
 use std::path::PathBuf;
 
 /// Return the user's home directory.
@@ -107,6 +108,57 @@ fn home_from_passwd(contents: &[u8], uid: u32) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// THE `aterm.toml` path: the file the window loads and hot-reloads, the one
+/// `aterm-gui --write-config` writes, and the one the CLI's `explain-config` and
+/// `doctor` name. Resolved, never created. [`resolve_aterm_config_path`] is the
+/// rule; this reads the three variables it consults.
+#[must_use]
+pub fn aterm_config_path() -> Option<PathBuf> {
+    resolve_aterm_config_path(
+        std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        std::env::var_os("APPDATA").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+}
+
+/// The rule behind [`aterm_config_path`], pure so it is testable on every host:
+///
+/// 1. `$XDG_CONFIG_HOME/aterm/aterm.toml` when the variable is set and
+///    non-empty — on EVERY platform, so an explicit XDG override wins even on
+///    Windows;
+/// 2. **Windows only**: `%APPDATA%\aterm\aterm.toml` when set and non-empty,
+///    the roaming per-user config dir (Windows has no XDG and usually no
+///    `HOME`; `appdata` is ignored elsewhere, so a stray `APPDATA` on a Unix
+///    box changes nothing);
+/// 3. `$HOME/.config/aterm/aterm.toml` — macOS AND Linux: `aterm.toml` predates
+///    the macOS Application Support convention and stays where its users
+///    already edit it.
+///
+/// This is deliberately NOT `<OS config dir>/aterm/aterm.toml`. That convention
+/// (Application Support on macOS, no XDG on Windows) and this rule disagree on
+/// exactly the machines where a wrong path is a silent
+/// no-op — settings that never load and a hot-reload watcher that watches
+/// nothing. `aterm-gui`'s `app_config::config_path` delegates here, so the
+/// window and every CLI diagnostic name ONE file: measured 2026-09-22 on
+/// Windows, `aterm-gui --help` printed the Unix literal `~/.config/aterm/aterm.toml`
+/// while the window it describes was reading `%APPDATA%\aterm\aterm.toml`.
+#[must_use]
+pub fn resolve_aterm_config_path(
+    xdg_config_home: Option<&OsStr>,
+    appdata: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Option<PathBuf> {
+    if let Some(x) = xdg_config_home.filter(|x| !x.is_empty()) {
+        return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
+    }
+    if cfg!(windows)
+        && let Some(appdata) = appdata.filter(|a| !a.is_empty())
+    {
+        return Some(PathBuf::from(appdata).join("aterm").join("aterm.toml"));
+    }
+    home.map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
 }
 
 /// Return the user's data directory.
@@ -318,6 +370,63 @@ mod tests {
         assert_eq!(
             home_from_env(Some(OsStr::new("/Users//someone"))),
             Some(PathBuf::from("/Users//someone"))
+        );
+    }
+
+    /// THE aterm.toml RULE (2026-09-22), pure: a set XDG_CONFIG_HOME wins on
+    /// every platform; Windows then takes %APPDATA%; everyone else HOME/.config
+    /// — the macOS arm included, which is the one way this differs from the OS
+    /// config-dir convention (Application Support). An empty value is an unset
+    /// one.
+    #[test]
+    fn aterm_config_path_follows_the_one_rule_the_window_loads_by() {
+        let xdg = OsStr::new("/xdg");
+        let appdata = OsStr::new(r"C:\Users\who\AppData\Roaming");
+        let home = OsStr::new("/Users//who");
+        let under_home = PathBuf::from(home).join(".config/aterm/aterm.toml");
+
+        assert_eq!(
+            resolve_aterm_config_path(Some(xdg), Some(appdata), Some(home)),
+            Some(PathBuf::from(xdg).join("aterm").join("aterm.toml")),
+            "a set XDG_CONFIG_HOME wins everywhere, APPDATA and HOME notwithstanding"
+        );
+        assert_eq!(
+            resolve_aterm_config_path(Some(OsStr::new("")), None, Some(home)),
+            Some(under_home.clone()),
+            "an empty XDG_CONFIG_HOME is unset"
+        );
+        let with_appdata = resolve_aterm_config_path(None, Some(appdata), Some(home));
+        if cfg!(windows) {
+            assert_eq!(
+                with_appdata,
+                Some(PathBuf::from(appdata).join("aterm").join("aterm.toml")),
+                "Windows: %APPDATA%\\aterm\\aterm.toml"
+            );
+            assert_eq!(
+                resolve_aterm_config_path(None, Some(OsStr::new("")), Some(home)),
+                Some(under_home.clone()),
+                "an empty APPDATA is unset, and HOME is the last resort"
+            );
+        } else {
+            assert_eq!(
+                with_appdata,
+                Some(under_home.clone()),
+                "APPDATA means nothing off Windows"
+            );
+        }
+        assert_eq!(
+            resolve_aterm_config_path(None, None, None),
+            None,
+            "nothing to resolve from is None, not a panic"
+        );
+        // The live resolver IS the rule over the live environment.
+        assert_eq!(
+            aterm_config_path(),
+            resolve_aterm_config_path(
+                std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+                std::env::var_os("APPDATA").as_deref(),
+                std::env::var_os("HOME").as_deref(),
+            )
         );
     }
 

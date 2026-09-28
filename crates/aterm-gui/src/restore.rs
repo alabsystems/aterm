@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(crate) const SCHEMA: u32 = 2;
 const LEGACY_SCHEMA: u32 = 1;
 
-const MAX_WINDOWS: usize = 64;
+pub(crate) const MAX_WINDOWS: usize = 64;
 const MAX_TABS_PER_WINDOW: usize = 256;
 const MAX_DOCUMENT_URI_BYTES: usize = 8 * 1024;
 const MAX_SETTINGS_ROUTE_BYTES: usize = 128;
@@ -146,6 +146,40 @@ pub(crate) struct TerminalLeafRestore {
     /// handoff record instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// THE AGENT THIS LEAF HOSTED (2026-09-27; additive, absent tolerated):
+    /// what a relaunch needs, read while it ran by the window's supervisor
+    /// host — carried by the crash journal ([`crate::crash_journal`]) and by
+    /// the quit layout of a restart, a logout or a shutdown
+    /// ([`crate::system_quit`]), never by the one a person's own quit
+    /// writes, so an end they did not choose (a crash, a kill, a power loss,
+    /// the system's quit) relaunches it on its conversation in its restored
+    /// tab, and one they chose does not.
+    /// Boxed: the other leaf kinds are a fraction of its size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<Box<AgentRestore>>,
+}
+
+/// A hosted agent as its leaf's restore carries it (see
+/// [`TerminalLeafRestore::agent`]): the relaunch snapshot's durable half
+/// (`aterm_agent::harness::relaunch::Snapshot`), without the tab and the
+/// shell, which the restored leaf provides.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct AgentRestore {
+    /// The agent's pid when it ran, and its kernel start: the pid-reuse guard
+    /// that tells a process still running from the one that ended.
+    pub pid: u32,
+    pub start: String,
+    /// What it ran (an absolute path) and its argv, program first.
+    pub program: String,
+    pub argv: Vec<String>,
+    /// Its conversation, when it had registered one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The directory it was started in.
+    pub cwd: String,
+    /// Its version, when it had registered one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 impl TerminalLeafRestore {
@@ -1045,6 +1079,7 @@ impl RestoredTab {
                         attention: None,
                         questions: None,
                         identity: None,
+                        agent: None,
                     }))
                 }
                 PaneLayout::Split {
@@ -1183,6 +1218,29 @@ impl RestoreManifest {
             }
         }
         leaves
+    }
+
+    /// Put on every terminal leaf the agent `hosted` says its session
+    /// (`local_id`) runs — the crash journal's capture ([`crate::crash_journal`]);
+    /// a leaf whose session hosts none carries none.
+    pub(crate) fn fill_agents(&mut self, hosted: &dyn Fn(u64) -> Option<AgentRestore>) {
+        fn fill(node: &mut RestoredSplitTree, hosted: &dyn Fn(u64) -> Option<AgentRestore>) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(terminal),
+                } => terminal.agent = terminal.local_id.and_then(hosted).map(Box::new),
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    fill(first, hosted);
+                    fill(second, hosted);
+                }
+            }
+        }
+        for window in &mut self.windows {
+            for tab in &mut window.restored_tabs {
+                fill(&mut tab.root, hosted);
+            }
+        }
     }
 
     /// True only when this layout names every authenticated inherited terminal
@@ -2259,6 +2317,7 @@ metadata = "opaque=copy-me"
                     attention: None,
                     questions: None,
                     identity: None,
+                    agent: None,
                 },
             ))),
         };
@@ -2284,6 +2343,7 @@ metadata = "opaque=copy-me"
             attention: None,
             questions: None,
             identity: None,
+            agent: None,
         }));
         for _ in 0..=MAX_SPLIT_DEPTH {
             root = RestoredSplitTree::Split {
@@ -2303,6 +2363,7 @@ metadata = "opaque=copy-me"
                         attention: None,
                         questions: None,
                         identity: None,
+                        agent: None,
                     },
                 ))),
             };
@@ -2360,6 +2421,7 @@ metadata = "opaque=copy-me"
                     attention: None,
                     identity: None,
                     questions: None,
+                    agent: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -2731,5 +2793,77 @@ metadata = "opaque=copy-me"
         std::fs::write(&path, text).unwrap();
         assert_eq!(load_cell_metrics_from(&path, "Fira|lh=1", 1.0, 12.0), None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE AGENT RIDES ITS LEAF (2026-09-27): the crash journal's capture puts on
+    /// each terminal leaf the agent its session hosts, and the manifest
+    /// carries it through its own codec unchanged. NEGATIVE CONTROL: a leaf
+    /// whose session hosts none carries none, and a manifest never filled
+    /// (a person's own quit) carries none at all.
+    #[test]
+    fn a_hosted_agent_rides_its_leaf_through_the_codec() {
+        fn number(node: &mut RestoredSplitTree, next: &mut u64) {
+            match node {
+                RestoredSplitTree::Leaf {
+                    view: RestoredView::Terminal(t),
+                } => {
+                    t.local_id = Some(*next);
+                    *next += 1;
+                }
+                RestoredSplitTree::Leaf { .. } => {}
+                RestoredSplitTree::Split { first, second, .. } => {
+                    number(first, next);
+                    number(second, next);
+                }
+            }
+        }
+        fn agents(m: &RestoreManifest) -> Vec<Option<AgentRestore>> {
+            fn walk(node: &RestoredSplitTree, out: &mut Vec<Option<AgentRestore>>) {
+                match node {
+                    RestoredSplitTree::Leaf {
+                        view: RestoredView::Terminal(t),
+                    } => out.push(t.agent.as_deref().cloned()),
+                    RestoredSplitTree::Leaf { .. } => {}
+                    RestoredSplitTree::Split { first, second, .. } => {
+                        walk(first, out);
+                        walk(second, out);
+                    }
+                }
+            }
+            let mut out = Vec::new();
+            for w in &m.windows {
+                for t in &w.restored_tabs {
+                    walk(&t.root, &mut out);
+                }
+            }
+            out
+        }
+        let claude = AgentRestore {
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/Users//me/.local/bin/claude".into(),
+            argv: vec![
+                "/Users//me/.local/bin/claude".into(),
+                "--dangerously-skip-permissions".into(),
+            ],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/Users//me/work".into(),
+            version: Some("2.1.283".into()),
+        };
+        let mut m = sample();
+        let mut next = 0;
+        for w in &mut m.windows {
+            for t in &mut w.restored_tabs {
+                number(&mut t.root, &mut next);
+            }
+        }
+        assert!(next >= 2, "the sample has leaves to fill");
+        assert!(agents(&m).iter().all(Option::is_none), "never filled: none");
+        m.fill_agents(&|id| (id == 1).then(|| claude.clone()));
+        let filled = agents(&m);
+        assert_eq!(filled.iter().filter(|a| a.is_some()).count(), 1);
+        assert_eq!(filled[1].as_ref(), Some(&claude));
+        let back = RestoreManifest::from_toml(&m.to_toml().expect("toml")).expect("parse");
+        assert_eq!(agents(&back), filled, "through the codec unchanged");
     }
 }

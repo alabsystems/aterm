@@ -897,14 +897,14 @@ impl Keybindings {
         //   arrives here as a plain `ctrl+alt+<digit>` chord. Seeding it would
         //   switch tabs while a German user typed a brace into their shell.
         //
-        // Windows Terminal ships Ctrl+Alt+digit anyway, so the chord is
-        // defensible — but it is an OWNER's call to trade brace input for tab
-        // jumping by default, not a polish patch's, and this file already
-        // carried a reasoned rejection of jump-to-tab that a default must not
-        // silently overturn. Tab nav stays covered by next/prev (Ctrl+Tab,
-        // Ctrl+Shift+Left/Right, Ctrl+PageUp/Down), and a user who wants N-jump
-        // has both spellings available: `switch_tab_N` parses and dispatches, so
-        // `ctrl+alt+1 = "switch_tab_1"` in `[keybindings]` works today.
+        // Decided 2026-09-25 under the owner's standing direction: UNSEEDED.
+        // Windows Terminal ships Ctrl+Alt+digit, but brace input outranks a tab
+        // shortcut the user can bind in one line, and the pinning test below
+        // (`Ctrl+Alt+{n} must stay free`) holds that. Tab nav stays covered by
+        // next/prev (Ctrl+Tab, Ctrl+Shift+Left/Right, Ctrl+PageUp/Down), and a
+        // user who wants N-jump has both spellings available: `switch_tab_N`
+        // parses and dispatches, so `ctrl+alt+1 = "switch_tab_1"` in
+        // `[keybindings]` works today.
     ];
 
     /// The platform's BUILT-IN default keybindings. macOS ships an EMPTY table — the

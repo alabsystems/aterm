@@ -509,7 +509,7 @@ impl GithubFetcher {
             match classify(build, Ok(answer)) {
                 Probe::Published(_) => Ok(true),
                 Probe::Missing => Ok(false),
-                Probe::Deferred => {
+                Probe::Deferred | Probe::Suppressed(_) => {
                     let mut msg = String::from("HEAD ");
                     msg.push_str(&url);
                     msg.push_str(" answered ");

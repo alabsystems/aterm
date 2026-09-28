@@ -7,6 +7,52 @@
 
 use super::*;
 
+/// An empty store makes no network request. One five-second park after work
+/// appears, the seated session may start its first index HEAD; an empty local
+/// look must not consume the thirty-second *completed network* cooldown.
+/// `Buggy=1` records the old behavior of stamping that cooldown on an empty
+/// look. Tier-1 drives the runner with an injected eligibility flag and clock.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn atpkg_session_index_eligibility_model() -> Model {
+    crate::ty_model! {
+        AtpkgSessionIndexEligibility {
+            const Buggy = 0;
+            const Interval = 6;
+            const MaxAge = 7;
+            // Ages count five-second runner parks. No network probe has run,
+            // so the network age starts past its completed-probe cooldown.
+            var local_age = 1;
+            var network_age = 6;
+            var eligible = 0;
+            var requests = 0;
+            var first_eligible_look = 0;
+            var missed = 0;
+
+            action EmptyLook when (eligible == 0 && local_age > 0) {
+                local_age = 0;
+                network_age = if Buggy == 1 { 0 } else { network_age };
+            }
+            action Tick when (local_age <= MaxAge - 1 || network_age <= MaxAge - 1) {
+                local_age = if local_age <= MaxAge - 1 { local_age + 1 } else { local_age };
+                network_age = if network_age <= MaxAge - 1 { network_age + 1 } else { network_age };
+            }
+            action Enable when (eligible == 0) {
+                eligible = 1;
+            }
+            action FirstEligibleLook when (
+                eligible == 1 && local_age > 0 && first_eligible_look == 0
+            ) {
+                first_eligible_look = 1;
+                requests = if network_age > Interval - 1 { 1 } else { 0 };
+                missed = if network_age > Interval - 1 { 0 } else { 1 };
+            }
+
+            invariant NoArtificialNetworkWarmup: missed == 0;
+        }
+    }
+}
+
 /// One published build, one session seat and a window which can arrive after
 /// the HEAD starts. `Buggy=1` replays three mistakes: another session starts a
 /// network worker, a stale claim launches behind a window, and the far answer

@@ -107,6 +107,17 @@ fn hold_the_pass(root: &Path) {
 /// `(stderr, screen)`. `reroute` leaves the reroute engaged; without it the launch
 /// carries `--no-reroute`.
 fn launch(root: &Path, reroute: bool) -> (String, String) {
+    // Every spawn in this binary is a `launch`, and each opens a pty: held from the
+    // `openpty` until this launch's own slave copies are dropped, this lock keeps a
+    // sibling launch's `aterm` from inheriting THIS pty's slave (openpty opens both
+    // ends inheritable, and std's stderr pipe is made close-on-exec non-atomically
+    // on macOS). An inherited slave lives as long as the sibling's session, and this
+    // launch's terminal drain would wait on it past its 10 s grace (the fd-copy
+    // sweep of 2026-09-27).
+    static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let spawning = SPAWN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut master, mut slave) = (-1, -1);
     // SAFETY: `openpty` writes the two fds through its out-params; the trailing three are
     // NULL, which the API defines as "default termios and window size".
@@ -120,6 +131,13 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
         )
     };
     assert_eq!(rc, 0, "openpty failed: {}", std::io::Error::last_os_error());
+    for fd in [master, slave] {
+        // SAFETY: `fd` is a live descriptor `openpty` just returned.
+        assert_eq!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            0
+        );
+    }
     // SAFETY: both fds come from the successful `openpty` above and are owned here.
     let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
 
@@ -137,6 +155,7 @@ fn launch(root: &Path, reroute: bool) -> (String, String) {
     // slave must go too, or the master never sees EOF and the drain below never ends.
     drop(cmd);
     drop(slave);
+    drop(spawning);
 
     let mut stderr = child.stderr.take().expect("piped stderr");
     let stderr_drain = std::thread::spawn(move || {

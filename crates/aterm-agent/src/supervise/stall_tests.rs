@@ -209,7 +209,7 @@ fn the_host_is_told_the_stall_it_holds_and_that_it_lifted() {
         fn wants(&self) -> bool {
             false
         }
-        fn at_idle(&self) -> Option<String> {
+        fn at_idle(&self) -> Option<HostStep> {
             None
         }
         fn owns_turn_end(&self) -> bool {
@@ -247,9 +247,7 @@ fn a_press_refused_input_unread_reads_status_before_it_presses_again() {
     m.vanish_after = Some(4);
     m.key_replies.push_back(err(
         "busy input-unread bytes=1 wait_ms=1500 input=pending (the program has not read \
-         input queued 1.5s ago: a key sent now is read after it, against a screen the program \
-         has not drawn — retry later, restart a frozen program with signal term, or lead \
-         send/key with unread=ok to queue anyway)",
+         input queued 1s ago; retry in a moment)",
     ));
     // Read 1 is the box's program; from read 2 — the look's own read after
     // the back-off — the stall is published.

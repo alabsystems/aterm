@@ -24,6 +24,15 @@ pub const RETIRED_STRAND_REFUSAL: &str = "--strand-pre-roster-clients is retired
      than v0.21.0 are abandoned and every current client authorizes a release by the machine \
      roster alone, so a rostered key needs no acknowledgement — drop the flag";
 
+/// The retired exit for a cut that went live on the private origin and could not be
+/// mirrored. A cut publishes once now, onto the channel, so that state cannot exist.
+pub const RETIRED_UNMIRRORED_FLAG: &str = "--retire-unmirrored";
+
+/// The one sentence [`RETIRED_UNMIRRORED_FLAG`] is refused with.
+pub const RETIRED_UNMIRRORED_REFUSAL: &str = "--retire-unmirrored is retired: a cut publishes \
+     once, straight onto the release channel, so there is no origin release left unmirrored — \
+     a cut the channel's floors refuse before its head PATCH is `--abandon vX.Y.Z`'s case";
+
 pub const USAGE: &str = "aterm-release — the `targo --unverified ship` release cutter
 
 USAGE
@@ -38,26 +47,20 @@ USAGE
                  [--arm64-only] [--no-paint-smoke] [--release-credentials <profile.toml>]
                  [--linux-artifacts DIRECTORY] [--linux-target aarch64|x86_64]...
       Cut a release: gates → ledger claim → universal build → bundle/sign/DMG
-      → draft-first publish → late tag → flip → verify.
+      → tag → ONE publication onto the release channel, made the head last.
         --dry-run          gates + provisional number + full local build into
                            dist/; zero commits, zero uploads
         --resume           re-enter the journaled cut (dist/cut-state.toml) at
                            its first incomplete step
-        --abandon vX.Y.Z   delete that version's draft release + the local
-                           journal (the claim commit stays; a later cut recuts)
-        --retire-unmirrored vX.Y.Z
-                           release the lease and retire the journal, leaving the
-                           origin release exactly as it is. The supported exit
-                           for a cut that flipped on the origin but whose mirror
-                           step the fleet's roster floor now refuses (a roster
-                           join landed between the origin flip and the public
-                           flip): the public channel never made it the head,
-                           and the next cut, attributed under the current
-                           generation, supersedes it
+        --abandon vX.Y.Z   withdraw an unpublished cut: its own draft deleted, or
+                           exactly its uploads taken back off the engine's source
+                           release; its origin tag and the local journal deleted
+                           (the claim commit stays; a later cut recuts)
         --min-build N      emit an operator apply floor into the manifest
         --gate             additionally run tools/verify.sh --full inline
-        --rehearse O/R     full real cut published to the scratch repo O/R
-                           (provisional number, no ledger push, no tag)
+        --rehearse O/R     full real cut published to the scratch channel O/R,
+                           which must be PUBLIC (provisional number, no ledger
+                           push, no tag on origin)
         --arm64-only       ship a single-arch build (explicit opt-out)
         --linux-artifacts DIRECTORY
                            require declared Linux handoffs before signing;
@@ -125,8 +128,9 @@ USAGE
                            re-run the post-publish check anytime
   targo --unverified ship yank <build> [--release-credentials <profile.toml>]
                            publish + fully verify a min_build-ratcheted
-                           successor FIRST; only then remove the inert bad
-                           tag and release (crash-convergent cleanup). That
+                           successor FIRST; only then delete the inert bad
+                           build's origin tag and demote its channel release to
+                           a prerelease (crash-convergent cleanup). That
                            successor is a REAL cut, so it takes the cut's
                            signing input and means exactly what it means there
                            — with the paper master armed it refuses pre-claim
@@ -147,7 +151,6 @@ pub enum Cmd {
     Cut {
         opts: publish::CutOptions,
         abandon: Option<String>,
-        retire_unmirrored: Option<String>,
     },
     Provision {
         id: String,
@@ -418,15 +421,9 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
 fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<Cmd, String> {
     let mut opts = publish::CutOptions::default();
     let mut abandon: Option<String> = None;
-    let mut retire_unmirrored: Option<String> = None;
     while let Some(flag) = it.next() {
         match flag {
-            "--retire-unmirrored" => {
-                let v = it
-                    .next()
-                    .ok_or("--retire-unmirrored needs a version (vX.Y.Z)")?;
-                retire_unmirrored = Some(normalize_version(v)?);
-            }
+            RETIRED_UNMIRRORED_FLAG => return Err(RETIRED_UNMIRRORED_REFUSAL.to_string()),
             "--dry-run" => opts.dry_run = true,
             "--resume" => opts.resume = true,
             "--gate" => opts.gate = true,
@@ -525,11 +522,7 @@ fn parse_cut<'a>(it: &mut impl Iterator<Item = &'a str>) -> std::result::Result<
     if opts.dry_run && opts.rehearse.is_some() {
         return Err("--dry-run and --rehearse are mutually exclusive".to_string());
     }
-    Ok(Cmd::Cut {
-        opts,
-        abandon,
-        retire_unmirrored,
-    })
+    Ok(Cmd::Cut { opts, abandon })
 }
 
 /// Accept "0.2.0" or "v0.2.0"; store the bare canonical MAJOR.MINOR.PATCH
@@ -556,10 +549,6 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
         Cmd::Cut {
             abandon: Some(v), ..
         } => verify::run_abandon(&repo_root()?, &v),
-        Cmd::Cut {
-            retire_unmirrored: Some(v),
-            ..
-        } => verify::run_retire_unmirrored(&repo_root()?, &v),
         Cmd::Cut { opts, .. } => publish::run_cut(&repo_root()?, &opts),
         Cmd::Provision {
             id,

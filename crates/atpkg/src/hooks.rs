@@ -26,12 +26,35 @@
 //! the intended rule all along (*"the managed copy is the one that runs **inside an aterm
 //! session**"*), so the gate is the implementation catching up with its own sentence.
 //!
+//! THE REROUTE DIRECTORY RIDES THAT GATE, IN FRONT (owner ruling 2026-09-27: *"yes, in
+//! aterm hosted shells. do not block cargo, but do wrap it so that a message is printed to
+//! tell the AI and users"*). `<prefix>/reroute` ([`crate::reroute`]) holds the stubs that
+//! announce `targo` and then run the upstream `cargo`/`rustc` asked for; they only answer
+//! when they come FIRST. Measured 2026-09-24 in a TTY `aterm` login shell (fake `HOME`,
+//! macOS `/etc/zprofile`'s `path_helper`, a `.zshrc` that prepends `~/.local/bin` and then
+//! sources this hook): the spawn seam's front-insert came out at position 12-14, behind
+//! `/usr/local/bin` and `/opt/homebrew/bin`, so a bare `cargo` ran Homebrew's cargo with no
+//! message at all. A window tab's shell integration re-asserts it from `$ATERM_REROUTE_DIR`;
+//! the transparent-session lane carries no integration by design, and the rc-sourced hook
+//! is the one thing both lanes run after the user's startup files. So the gated arm writes
+//! `reroute:agents:…` — every earlier mention of either removed first, the seam's own order
+//! — except under `aterm --no-reroute`'s marker ([`crate::reroute::PASSTHROUGH_ENV`], read as
+//! the stubs read it), where that session asked for every upstream tool and only agents is
+//! prepended. Outside aterm the false arm takes the reroute dir OUT, exactly as it does
+//! agents: it stays session-scoped, and an iTerm launched from an aterm tab heals.
+//! (Same-day review, 2026-09-27: for the reroute dir alone, "inside aterm" is that union
+//! OR a non-empty [`crate::reroute::REROUTE_DIR_ENV`] — the seams' handle, read and never
+//! set — because a TTY launch whose front door handed no agents dir carries none of the
+//! union and is still an aterm-hosted shell. The agents gate is unchanged.)
+//!
 //! What is NOT scoped, and must never be: `bin/`. The Trust toolchain and the verifiers —
 //! `targo`, `trustc`, `tippy`, `trustfmt`, `ty`, `ay`, `clean` — are the default compiler on
 //! this machine in ANY terminal (owner standing instruction), so the bin half stays
 //! unconditional. The two halves are written in that order, bin first, precisely so a parse
 //! error in the agents gate can never cost the toolchain: a shell abandons a sourced file at
 //! the error and runs nothing after it. See the POSIX body's comment for the measurement.
+//! (The reroute dir is part of the GATED half, never the bin one: a typo there costs the
+//! announcement, not the compiler.)
 //!
 //! MOVE-TO-FRONT, NEVER SKIP-IF-PRESENT (2026-09-10). The first cut guarded the prepend with
 //! "already on PATH?", and on a macOS login shell the answer was always yes: aterm's spawn had
@@ -195,17 +218,30 @@ pub(crate) fn rc_hook_wired(home: &Path, shell: &str) -> Option<(bool, &'static 
     Some((wired, hook))
 }
 
-/// The `(filename, content)` for each shell dialect, parametrized on `bin_dir` (APPENDED)
-/// and `agents_dir` (MOVED TO THE FRONT — the agent programs' shims, module doc).
+/// The `(filename, content)` for each shell dialect, parametrized on `bin_dir` (APPENDED),
+/// `agents_dir` (MOVED TO THE FRONT — the agent programs' shims, module doc) and
+/// `reroute_dir` (moved in FRONT OF THAT, inside aterm only and not under `aterm
+/// --no-reroute` — [`crate::reroute`]'s stubs, module doc; "inside aterm" for this one
+/// dir also counts a non-empty `$ATERM_REROUTE_DIR`, 2026-09-27).
 /// NEVER a `.sh` (fish sources `*.sh`, which a POSIX body would break).
 #[must_use]
-pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
+pub fn hook_files(bin_dir: &Path, agents_dir: &Path, reroute_dir: &Path) -> Vec<(String, String)> {
     let bin = sh_quote(bin_dir);
     let agents = sh_quote(agents_dir);
+    let reroute = sh_quote(reroute_dir);
     // fish is not a POSIX shell and its double quotes are not sh's, so the fish body below
     // is rendered through its own quoter ([`fish_quote`]), never this one.
     let fish_bin = fish_quote(bin_dir);
     let fish_agents = fish_quote(agents_dir);
+    let fish_reroute = fish_quote(reroute_dir);
+    // The `aterm --no-reroute` marker, read by the reroute half of the gated arm in each
+    // dialect — the constant the stubs read ([`crate::reroute::PASSTHROUGH_ENV`]), with
+    // their reading ([`crate::reroute::engaged`]: non-empty and not "0").
+    let passthrough = crate::reroute::PASSTHROUGH_ENV;
+    // The spawn seams' reroute handle ([`crate::reroute::REROUTE_DIR_ENV`]), READ — never
+    // set — by the reroute half as one more "inside aterm" marker, for that half only
+    // (review finding 2026-09-27, the POSIX body's comment).
+    let reroute_marker = crate::reroute::REROUTE_DIR_ENV;
     // The agents gate in each dialect, rendered from THE ONE LIST ([`AGENTS_MARKERS`]).
     let markers_sh = agents_markers_sh();
     let markers_fish: String = AGENTS_MARKERS.iter().map(|m| format!("${m}")).collect();
@@ -263,6 +299,39 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // means nothing is left; deciding on the STRIPPED string instead dropped a sole empty
     // entry (`:dir`, `dir:`, `dir::dir`) that the old prepend kept (review finding,
     // 2026-09-10).
+    //
+    // THE REROUTE DIR RIDES THE SAME GATE, IN FRONT OF AGENTS (owner ruling 2026-09-27:
+    // "yes, in aterm hosted shells. do not block cargo, but do wrap it so that a message is
+    // printed to tell the AI and users"). The stubs already announce and then run upstream
+    // (crate::reroute, "announce, do not prevent"); what failed was their PLACE. Measured
+    // 2026-09-24 in a TTY `aterm` login shell (fake HOME, macOS /etc/zprofile path_helper, a
+    // .zshrc that prepends ~/.local/bin and then sources this hook): <prefix>/reroute ended
+    // at PATH position 12-14, behind /usr/local/bin and /opt/homebrew/bin, so a bare `cargo`
+    // ran Homebrew's cargo with no message. The window tab's integration re-asserts it from
+    // $ATERM_REROUTE_DIR after the rc files; the transparent-session lane carries no
+    // integration by design, so this hook — the one thing every aterm shell's rc sources —
+    // is where the order is decided for it. Same removal as agents (every `:dir:`, framed,
+    // to a fixpoint), both dirs in ONE loop, so the gated arm writes `reroute:agents:…`,
+    // the spawn seam's own order. Under `aterm --no-reroute` (the passthrough marker,
+    // engaged as the stubs read it) the session asked for every upstream tool, so only
+    // agents is prepended and the reroute dir stays out. Nothing here makes it
+    // machine-wide: outside aterm the false arm removes it, like agents, so an iTerm
+    // launched from an aterm tab heals instead of inheriting it.
+    //
+    // 2026-09-27, the same day's review: the reroute half reads ONE MORE marker than the
+    // agents half — a non-empty `$ATERM_REROUTE_DIR`, the spawn seams' own handle, read
+    // here and never set. A TTY launch whose front door could hand no agents dir (a file
+    // or a link at `agents/`, a refused `mkdir`; one stderr line) carries NONE of the
+    // union, because that lane sets neither ATERM_CHILD nor ATERM_SESSION_ID — yet it is
+    // an aterm-hosted shell whose seam front-inserted the reroute dir and exported the
+    // handle for it, and the union alone took the dir out there: a bare `cargo` ran the
+    // upstream one with no message (reproduced in zsh and bash). Only aterm's seams set
+    // the handle, and each blanks an inherited one under `--no-reroute` or with nothing
+    // laid, so a non-empty one is as much "inside aterm" as the union. It never widens the
+    // agents half, whose gate stays THE ONE LIST. So `__atpkg_front` is built in two
+    // steps: agents iff a marker (ATPKG_AGENTS exported with it, unset otherwise), then
+    // the reroute dir ahead of it iff a marker or the handle, and the passthrough marker
+    // not engaged; an empty front writes exactly the PATH the old false arm wrote.
     let posix = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          __atpkg_bin=\"{bin}\"\n\
@@ -270,13 +339,17 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
          export ATPKG_BIN=\"$__atpkg_bin\"\n\
          unset __atpkg_bin\n\
          __atpkg_agents=\"{agents}\"\n\
+         __atpkg_reroute=\"{reroute}\"\n\
          __atpkg_p=\":$PATH:\"\n\
-         while :; do __atpkg_q=\"${{__atpkg_p//\":$__atpkg_agents:\"/:}}\"; [ \"$__atpkg_q\" = \"$__atpkg_p\" ] && break; __atpkg_p=\"$__atpkg_q\"; done\n\
-         case \"{markers_sh}\" in\n\
-         \"\") case \"$__atpkg_p\" in :) export PATH=\"\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_p\" ;; esac; unset ATPKG_AGENTS ;;\n\
-         *) case \"$__atpkg_p\" in :) export PATH=\"$__atpkg_agents\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_agents:$__atpkg_p\" ;; esac; export ATPKG_AGENTS=\"$__atpkg_agents\" ;;\n\
+         while :; do __atpkg_q=\"${{__atpkg_p//\":$__atpkg_agents:\"/:}}\"; __atpkg_q=\"${{__atpkg_q//\":$__atpkg_reroute:\"/:}}\"; [ \"$__atpkg_q\" = \"$__atpkg_p\" ] && break; __atpkg_p=\"$__atpkg_q\"; done\n\
+         __atpkg_front=\n\
+         case \"{markers_sh}\" in \"\") unset ATPKG_AGENTS ;; *) __atpkg_front=\"$__atpkg_agents\"; export ATPKG_AGENTS=\"$__atpkg_agents\" ;; esac\n\
+         case \"${{{passthrough}-}}\" in \"\"|0) case \"{markers_sh}${{{reroute_marker}-}}\" in \"\") ;; *) __atpkg_front=\"$__atpkg_reroute${{__atpkg_front:+:}}$__atpkg_front\" ;; esac ;; esac\n\
+         case \"$__atpkg_front\" in\n\
+         \"\") case \"$__atpkg_p\" in :) export PATH=\"\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_p\" ;; esac ;;\n\
+         *) case \"$__atpkg_p\" in :) export PATH=\"$__atpkg_front\" ;; *) __atpkg_p=\"${{__atpkg_p#:}}\"; __atpkg_p=\"${{__atpkg_p%:}}\"; export PATH=\"$__atpkg_front:$__atpkg_p\" ;; esac ;;\n\
          esac\n\
-         unset __atpkg_agents __atpkg_p __atpkg_q\n"
+         unset __atpkg_agents __atpkg_reroute __atpkg_front __atpkg_p __atpkg_q\n"
     );
     // fish: the agents dir moved to the front by an explicit equality loop (`string match`
     // would read the directory as a wildcard pattern; the quoted `"$__atpkg_d"` keeps an
@@ -284,25 +357,41 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
     // is grown with `set __atpkg_rest $__atpkg_rest …`, never `set -a`: fish 2.x has no
     // `-a`, the append fails there, the list stays empty, and the final `set -gx PATH` would
     // leave PATH as the agents dir alone. This file is sourced from a plain config.fish too,
-    // where an old fish may run (review finding, 2026-09-10).
+    // where an old fish may run (review finding, 2026-09-10). The reroute dir (the POSIX
+    // body's comment) is dropped by the same loop and leads `$__atpkg_front`, a list
+    // declared at the file's top level — a `set -l` inside the `if` would die with the
+    // block — unless the passthrough marker is engaged (non-empty and not "0"). Since the
+    // 2026-09-27 review it is built as the POSIX `__atpkg_front` is: empty, agents iff a
+    // marker, then the reroute dir ahead iff a marker or `$ATERM_REROUTE_DIR` (an unset
+    // fish variable expands to nothing inside the quotes), under a NESTED `if` so the
+    // passthrough test keeps the `if …; or …` shape fish 2.x already parses here.
     let fish = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          set -l __atpkg_bin \"{fish_bin}\"\n\
          if not contains $__atpkg_bin $PATH; set -gx PATH $PATH $__atpkg_bin; end\n\
          set -gx ATPKG_BIN $__atpkg_bin\n\
          set -l __atpkg_agents \"{fish_agents}\"\n\
+         set -l __atpkg_reroute \"{fish_reroute}\"\n\
+         set -l __atpkg_front\n\
+         if test -n \"{markers_fish}\"; set __atpkg_front \"$__atpkg_agents\"; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -e ATPKG_AGENTS; end\n\
+         if test -z \"${passthrough}\"; or test \"${passthrough}\" = 0; if test -n \"{markers_fish}${reroute_marker}\"; set __atpkg_front \"$__atpkg_reroute\" $__atpkg_front; end; end\n\
          set -l __atpkg_rest\n\
-         for __atpkg_d in $PATH; if test \"$__atpkg_d\" != \"$__atpkg_agents\"; set __atpkg_rest $__atpkg_rest \"$__atpkg_d\"; end; end\n\
-         if test -n \"{markers_fish}\"; set -gx PATH \"$__atpkg_agents\" $__atpkg_rest; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -gx PATH $__atpkg_rest; set -e ATPKG_AGENTS; end\n"
+         for __atpkg_d in $PATH; if test \"$__atpkg_d\" != \"$__atpkg_agents\"; and test \"$__atpkg_d\" != \"$__atpkg_reroute\"; set __atpkg_rest $__atpkg_rest \"$__atpkg_d\"; end; end\n\
+         set -gx PATH $__atpkg_front $__atpkg_rest\n"
     );
     // PowerShell (Windows-native, and cross-platform pwsh): the aterm PowerShell integration
     // dot-sources `~/.aterm/shell.d/*.ps1`, so this is the ONLY thing that puts the managed
     // dirs on an interactive PowerShell's PATH — on Windows there is no zsh/bash/fish to run
     // the POSIX hooks above. Same shape as the POSIX policy (agents moved to the front, bin/
     // appended, each idempotent) using `[System.IO.Path]::PathSeparator` (';' on Windows, ':'
-    // on Unix), so it is correct wherever pwsh runs.
+    // on Unix), so it is correct wherever pwsh runs. The reroute dir leads the gated arm as
+    // in the POSIX body; Windows lays no stubs there (crate::reroute), so on Windows it is
+    // an entry that finds nothing. Its gate is the POSIX one too (2026-09-27 review): the
+    // union, or `$env:ATERM_REROUTE_DIR`, parenthesised — PowerShell's `-or` and `-and`
+    // share ONE precedence, left to right, so the grouping is spelled, never implied.
     let ps_bin = ps_quote(bin_dir);
     let ps_agents = ps_quote(agents_dir);
+    let ps_reroute = ps_quote(reroute_dir);
     let powershell = format!(
         "# Generated by atpkg -- DO NOT EDIT (rewritten on every install/update).\n\
          $__atpkg_sep = [System.IO.Path]::PathSeparator\n\
@@ -310,9 +399,13 @@ pub fn hook_files(bin_dir: &Path, agents_dir: &Path) -> Vec<(String, String)> {
          if (($env:PATH -split [regex]::Escape($__atpkg_sep)) -notcontains $__atpkg_bin) {{ $env:PATH = \"$env:PATH$__atpkg_sep$__atpkg_bin\" }}\n\
          $env:ATPKG_BIN = $__atpkg_bin\n\
          $__atpkg_agents = '{ps_agents}'\n\
-         $__atpkg_rest = @(($env:PATH -split [regex]::Escape($__atpkg_sep)) | Where-Object {{ $_ -ne $__atpkg_agents }})\n\
-         if ({markers_ps}) {{ $env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep; $env:ATPKG_AGENTS = $__atpkg_agents }} else {{ $env:PATH = $__atpkg_rest -join $__atpkg_sep; Remove-Item Env:\\ATPKG_AGENTS -ErrorAction SilentlyContinue }}\n\
-         Remove-Variable __atpkg_agents, __atpkg_bin, __atpkg_sep, __atpkg_rest\n"
+         $__atpkg_reroute = '{ps_reroute}'\n\
+         $__atpkg_rest = @(($env:PATH -split [regex]::Escape($__atpkg_sep)) | Where-Object {{ $_ -ne $__atpkg_agents -and $_ -ne $__atpkg_reroute }})\n\
+         $__atpkg_front = @()\n\
+         if ({markers_ps}) {{ $__atpkg_front = @($__atpkg_agents); $env:ATPKG_AGENTS = $__atpkg_agents }} else {{ Remove-Item Env:\\ATPKG_AGENTS -ErrorAction SilentlyContinue }}\n\
+         if (({markers_ps} -or $env:{reroute_marker}) -and (-not $env:{passthrough} -or $env:{passthrough} -eq '0')) {{ $__atpkg_front = @($__atpkg_reroute) + $__atpkg_front }}\n\
+         $env:PATH = ($__atpkg_front + $__atpkg_rest) -join $__atpkg_sep\n\
+         Remove-Variable __atpkg_agents, __atpkg_reroute, __atpkg_front, __atpkg_bin, __atpkg_sep, __atpkg_rest\n"
     );
     vec![
         (format!("{HOOK_BASENAME}.zsh"), posix.clone()),
@@ -400,13 +493,18 @@ fn restore_prev(dest: &Path, prev: Prev) {
 /// prompt — so a pass that rewrote four identical hooks every six hours re-sourced them
 /// in every tab on the machine. A hook already current (a regular file, these bytes,
 /// `0600`) is left exactly as it is.
-pub fn write_hooks(shell_d: &Path, bin_dir: &Path, agents_dir: &Path) -> io::Result<Vec<String>> {
+pub fn write_hooks(
+    shell_d: &Path,
+    bin_dir: &Path,
+    agents_dir: &Path,
+    reroute_dir: &Path,
+) -> io::Result<Vec<String>> {
     // Stage every temp, then rename every destination; both phases are all-or-nothing.
     // The dialects are only correct as a set — one shell reads each — so a partial publish
     // leaves some carrying the new PATH policy and some the old. Each destination's previous
     // file is moved aside and put back if a later rename fails, so a failed publish leaves
     // `shell.d` as it found it and the next pass retries hooks and rc wiring together.
-    let files = hook_files(bin_dir, agents_dir);
+    let files = hook_files(bin_dir, agents_dir, reroute_dir);
     let current: Vec<String> = files
         .iter()
         .filter(|(name, content)| hook_is_current(&shell_d.join(name), content))
@@ -594,10 +692,16 @@ fn pass_as(layout: &Layout, home: &Path, wiring: RcWiring, exe: Option<&Path>) -
 /// another module (`cli`'s repair report, `doctor`'s rc lines) can drive the real pass on
 /// a synthetic home instead of the account running the tests.
 pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPass {
-    refresh_at(home, &layout.bin_dir(), &layout.agents_dir(), wiring)
+    refresh_at(
+        home,
+        &layout.bin_dir(),
+        &layout.agents_dir(),
+        &layout.reroute_dir(),
+        wiring,
+    )
 }
 
-/// [`refresh_with`] over an explicit `home` and the two managed directories, so a test
+/// [`refresh_with`] over an explicit `home` and the three managed directories, so a test
 /// can drive a whole pass under a throwaway home.
 ///
 /// The block never leads the hooks. The rc block is the only thing that makes a hook
@@ -605,13 +709,19 @@ pub(crate) fn pass_at(layout: &Layout, home: &Path, wiring: RcWiring) -> HookPas
 /// only be written once the hook it names is on disk: a marker-bounded block naming a file
 /// that was never written sources nothing, and no later pass rewrites it. The wiring runs
 /// only when the hooks are there, and the next pass retries the two together.
-fn refresh_at(home: &Path, bin_dir: &Path, agents_dir: &Path, wiring: RcWiring) -> HookPass {
+fn refresh_at(
+    home: &Path,
+    bin_dir: &Path,
+    agents_dir: &Path,
+    reroute_dir: &Path,
+    wiring: RcWiring,
+) -> HookPass {
     let aterm = home.join(".aterm");
     let shell_d = aterm.join("shell.d");
     if ensure_private_dir(&aterm).is_err() || ensure_private_dir(&shell_d).is_err() {
         return HookPass::NotHardened;
     }
-    let hooks_written = write_hooks(&shell_d, bin_dir, agents_dir).is_ok();
+    let hooks_written = write_hooks(&shell_d, bin_dir, agents_dir, reroute_dir).is_ok();
     #[cfg(unix)]
     let rc = if hooks_written {
         ensure_rc_sources_hooks(home, wiring)
@@ -1706,7 +1816,13 @@ mod tests {
         }
         let shell_d = home.join(".aterm/shell.d");
         fs::create_dir_all(&shell_d).unwrap();
-        let written = write_hooks(&shell_d, Path::new("/p/bin"), Path::new("/p/agents")).unwrap();
+        let written = write_hooks(
+            &shell_d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        )
+        .unwrap();
         for sh in ["zsh", "bash", "fish", "pwsh"] {
             let (path, hook) = hook_file(&home, sh).unwrap_or_else(|| panic!("{sh}"));
             assert_eq!(path, shell_d.join(hook));
@@ -2092,6 +2208,7 @@ mod tests {
             &home,
             Path::new("/opt/atpkg-fixture/bin"),
             Path::new("/opt/atpkg-fixture/agents"),
+            Path::new("/opt/atpkg-fixture/reroute"),
             RcWiring::HonorOptOut,
         );
 
@@ -2949,7 +3066,11 @@ mod tests {
 
     #[test]
     fn hook_files_cover_exactly_zsh_bash_fish_ps1_and_never_sh() {
-        let files = hook_files(Path::new("/p/bin"), Path::new("/p/agents"));
+        let files = hook_files(
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(
             names,
@@ -2968,7 +3089,11 @@ mod tests {
 
     #[test]
     fn powershell_dialect_appends_bin_and_moves_agents_to_the_front_via_platform_separator() {
-        let files = hook_files(Path::new("/p/bin"), Path::new("/p/agents"));
+        let files = hook_files(
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         let (_, ps) = files.iter().find(|(n, _)| n.ends_with(".ps1")).unwrap();
         assert!(
             ps.contains("[System.IO.Path]::PathSeparator"),
@@ -2979,11 +3104,25 @@ mod tests {
             "bin/ is appended, never prepended"
         );
         assert!(
-            ps.contains("Where-Object { $_ -ne $__atpkg_agents }")
-                && ps.contains(
-                    "$env:PATH = (@($__atpkg_agents) + $__atpkg_rest) -join $__atpkg_sep"
-                ),
+            ps.contains("Where-Object { $_ -ne $__atpkg_agents -and $_ -ne $__atpkg_reroute }")
+                && ps.contains("{ $__atpkg_front = @($__atpkg_agents); $env:ATPKG_AGENTS")
+                && ps.contains("$env:PATH = ($__atpkg_front + $__atpkg_rest) -join $__atpkg_sep\n"),
             "agents/ is MOVED TO THE FRONT (the one exception): removed, then prepended"
+        );
+        // reroute/ ahead of it: any agents marker OR the seams' handle (the degraded TTY
+        // launch carries only the handle, 2026-09-27 review), grouped explicitly — `-or` and
+        // `-and` share one precedence in PowerShell — and never under --no-reroute's marker.
+        assert!(
+            ps.contains(&format!(
+                "if (($env:ATERM_AGENTS_DIR -or $env:ATERM_CHILD -or $env:ATERM_SESSION_ID -or $env:{r}) -and (-not $env:{p} -or $env:{p} -eq '0')) {{ $__atpkg_front = @($__atpkg_reroute) + $__atpkg_front }}",
+                r = crate::reroute::REROUTE_DIR_ENV,
+                p = crate::reroute::PASSTHROUGH_ENV
+            )),
+            "reroute/ leads agents/ inside aterm unless --no-reroute's marker is engaged: {ps}"
+        );
+        assert!(
+            !ps.contains(&format!("$env:{} =", crate::reroute::REROUTE_DIR_ENV)),
+            "the handle is read, never set: {ps}"
         );
         assert!(
             ps.contains("-notcontains $__atpkg_bin")
@@ -2999,6 +3138,7 @@ mod tests {
         let files = hook_files(
             Path::new(r"C:\Users\x\AppData\Local\aterm\pkg\bin"),
             Path::new(r"C:\Users\x\AppData\Local\aterm\pkg\agents"),
+            Path::new(r"C:\Users\x\AppData\Local\aterm\pkg\reroute"),
         );
         let (_, ps) = files.iter().find(|(n, _)| n.ends_with(".ps1")).unwrap();
         assert!(
@@ -3006,6 +3146,7 @@ mod tests {
             "a single-quoted PS literal keeps backslashes verbatim"
         );
         assert!(ps.contains(r"$__atpkg_agents = 'C:\Users\x\AppData\Local\aterm\pkg\agents'"));
+        assert!(ps.contains(r"$__atpkg_reroute = 'C:\Users\x\AppData\Local\aterm\pkg\reroute'"));
     }
 
     /// The PATH policy in one test: the managed `bin/` is APPENDED (never ahead of a
@@ -3014,7 +3155,11 @@ mod tests {
     /// guard (module doc: an order failure), exported as `ATPKG_AGENTS` beside `ATPKG_BIN`.
     #[test]
     fn posix_dialects_append_bin_first_then_move_the_agents_dir_to_the_front_only_inside_aterm() {
-        let files = hook_files(Path::new("/p/bin"), Path::new("/p/agents"));
+        let files = hook_files(
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         for (name, body) in &files {
             if name.ends_with(".zsh") || name.ends_with(".bash") {
                 assert!(
@@ -3026,9 +3171,38 @@ mod tests {
                     "bin/ is never prepended"
                 );
                 assert!(
-                    body.contains("export PATH=\"$__atpkg_agents:$__atpkg_p\"")
-                        && body.contains("in :) export PATH=\"$__atpkg_agents\" ;;"),
+                    body.contains("export PATH=\"$__atpkg_front:$__atpkg_p\"")
+                        && body.contains("in :) export PATH=\"$__atpkg_front\" ;;"),
                     "agents/ goes to the front"
+                );
+                // And the reroute dir in front of it, in the SAME gated arm (owner ruling
+                // 2026-09-27: in aterm hosted shells a bare `cargo` is announced): removed
+                // by the same fixpoint loop, prepended unless `aterm --no-reroute`'s
+                // marker is engaged — read with the stubs' reading, "" and "0" are not.
+                // 2026-09-27 review: for the reroute dir, "inside aterm" is the agents
+                // union OR a non-empty `$ATERM_REROUTE_DIR` (the degraded TTY launch whose
+                // front door handed no agents dir carries only that); agents/ first iff a
+                // marker, the reroute dir ahead of whatever the front holds.
+                assert!(
+                    body.contains(&format!(
+                        "case \"{m}\" in \"\") unset ATPKG_AGENTS ;; *) __atpkg_front=\"$__atpkg_agents\"; export ATPKG_AGENTS=\"$__atpkg_agents\" ;; esac\n\
+                         case \"${{{p}-}}\" in \"\"|0) case \"{m}${{{r}-}}\" in \"\") ;; *) __atpkg_front=\"$__atpkg_reroute${{__atpkg_front:+:}}$__atpkg_front\" ;; esac ;; esac\n",
+                        m = agents_markers_sh(),
+                        p = crate::reroute::PASSTHROUGH_ENV,
+                        r = crate::reroute::REROUTE_DIR_ENV
+                    )),
+                    "reroute/ leads agents/ inside aterm: {body}"
+                );
+                assert!(
+                    body.contains("__atpkg_q=\"${__atpkg_q//\":$__atpkg_reroute:\"/:}\"")
+                        && !body.contains("*\":$__atpkg_reroute:\"*) ;;"),
+                    "reroute/ is removed like agents/, never skipped-if-present: {body}"
+                );
+                assert!(
+                    !body.contains("ATERM_REROUTE_DIR=")
+                        && !body.contains("export ATERM_REROUTE_DIR")
+                        && !body.contains("unset ATERM_REROUTE_DIR"),
+                    "the hook READS the spawn seam's handle and never sets it: {body}"
                 );
                 assert!(
                     !body.contains("*\":$__atpkg_agents:\"*) ;;"),
@@ -3085,23 +3259,39 @@ mod tests {
                     "outside aterm the agents element is actively removed and its variable \
                      unset — inheritance is the leak this closes"
                 );
-                assert!(body.contains("\"/p/agents\"") && body.contains("\"/p/bin\""));
+                assert!(
+                    body.contains("\"/p/agents\"")
+                        && body.contains("\"/p/bin\"")
+                        && body.contains("\"/p/reroute\"")
+                );
             }
         }
     }
 
     #[test]
     fn fish_dialect_appends_bin_moves_agents_to_the_front_and_avoids_posix_export() {
-        let files = hook_files(Path::new("/p/bin"), Path::new("/p/agents"));
+        let files = hook_files(
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         let (_, fish) = files.iter().find(|(n, _)| n.ends_with(".fish")).unwrap();
         assert!(
             fish.contains("set -gx PATH $PATH $__atpkg_bin"),
             "fish append"
         );
         assert!(
-            fish.contains("set -gx PATH \"$__atpkg_agents\" $__atpkg_rest")
-                && fish.contains("if test \"$__atpkg_d\" != \"$__atpkg_agents\""),
-            "fish moves the agents dir to the front by equality"
+            fish.contains("set -gx PATH $__atpkg_front $__atpkg_rest\n")
+                && fish.contains("set -l __atpkg_front\n")
+                && fish.contains(&format!(
+                    "if test -n \"$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID\"; set __atpkg_front \"$__atpkg_agents\"; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -e ATPKG_AGENTS; end\n\
+                     if test -z \"${p}\"; or test \"${p}\" = 0; if test -n \"$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID${r}\"; set __atpkg_front \"$__atpkg_reroute\" $__atpkg_front; end; end\n",
+                    p = crate::reroute::PASSTHROUGH_ENV,
+                    r = crate::reroute::REROUTE_DIR_ENV
+                ))
+                && !fish.contains(&format!("set -gx {}", crate::reroute::REROUTE_DIR_ENV))
+                && fish.contains("if test \"$__atpkg_d\" != \"$__atpkg_agents\"; and test \"$__atpkg_d\" != \"$__atpkg_reroute\";"),
+            "fish moves the agents dir (and the reroute dir ahead of it) to the front by equality"
         );
         assert!(fish.contains("set -gx ATPKG_AGENTS $__atpkg_agents"));
         assert!(
@@ -3133,7 +3323,12 @@ mod tests {
         let blocked = d.join(format!(".{HOOK_BASENAME}.fish.tmp-{}", std::process::id()));
         fs::create_dir_all(&blocked).unwrap();
 
-        let out = write_hooks(&d, Path::new("/p/bin"), Path::new("/p/agents"));
+        let out = write_hooks(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         assert!(
             out.is_err(),
             "the blocked dialect must fail the whole write"
@@ -3168,7 +3363,12 @@ mod tests {
         let dest = d.join("00-atpkg.ps1");
         fs::create_dir_all(dest.join("occupied")).unwrap();
 
-        let out = write_hooks(&d, Path::new("/p/bin"), Path::new("/p/agents"));
+        let out = write_hooks(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         assert!(out.is_err(), "a rename onto a directory must fail");
 
         let litter: Vec<String> = fs::read_dir(&d)
@@ -3208,7 +3408,12 @@ mod tests {
         // the first three already renamed into place.
         fs::create_dir_all(d.join("00-atpkg.ps1").join("occupied")).unwrap();
 
-        let out = write_hooks(&d, Path::new("/p/bin"), Path::new("/p/agents"));
+        let out = write_hooks(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
         assert!(out.is_err(), "a rename onto a directory must fail the pass");
 
         for name in ["00-atpkg.zsh", "00-atpkg.bash", "00-atpkg.fish"] {
@@ -3259,7 +3464,7 @@ mod tests {
             "sh: the backtick IS special in a POSIX double-quoted string, and stays escaped"
         );
 
-        let files = hook_files(&hostile, &hostile);
+        let files = hook_files(&hostile, &hostile, &hostile);
         let body = |ext: &str| -> String {
             files
                 .iter()
@@ -3320,7 +3525,13 @@ mod tests {
         let d = tmp("write");
         // Plant a stray POSIX .sh that fish would choke on.
         fs::write(d.join("00-atpkg.sh"), b"echo stray\n").unwrap();
-        let written = write_hooks(&d, Path::new("/p/bin"), Path::new("/p/agents")).unwrap();
+        let written = write_hooks(
+            &d,
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        )
+        .unwrap();
         assert_eq!(written.len(), 4);
         for name in [
             "00-atpkg.zsh",
@@ -3357,8 +3568,12 @@ mod tests {
     fn write_hooks_leaves_identical_hooks_untouched() {
         use std::os::unix::fs::MetadataExt as _;
         let d = tmp("identical");
-        let (bin, agents) = (Path::new("/p/bin"), Path::new("/p/agents"));
-        write_hooks(&d, bin, agents).unwrap();
+        let (bin, agents, reroute) = (
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        );
+        write_hooks(&d, bin, agents, reroute).unwrap();
         let inode = |name: &str| fs::metadata(d.join(name)).unwrap().ino();
         let names = [
             "00-atpkg.zsh",
@@ -3367,14 +3582,14 @@ mod tests {
             "00-atpkg.ps1",
         ];
         let before: Vec<u64> = names.iter().map(|n| inode(n)).collect();
-        let again = write_hooks(&d, bin, agents).unwrap();
+        let again = write_hooks(&d, bin, agents, reroute).unwrap();
         assert_eq!(again.len(), 4, "every dialect is still in place: {again:?}");
         let after: Vec<u64> = names.iter().map(|n| inode(n)).collect();
         assert_eq!(before, after, "no hook was rewritten");
         // One drifted in content, one in mode: those two, and only those, are rewritten.
         fs::write(d.join("00-atpkg.zsh"), "# edited by hand\n").unwrap();
         fs::set_permissions(d.join("00-atpkg.fish"), fs::Permissions::from_mode(0o644)).unwrap();
-        write_hooks(&d, bin, agents).unwrap();
+        write_hooks(&d, bin, agents, reroute).unwrap();
         for (name, was) in names.iter().zip(&before) {
             let drifted = *name == "00-atpkg.zsh" || *name == "00-atpkg.fish";
             assert_eq!(inode(name) != *was, drifted, "{name}");
@@ -3392,20 +3607,28 @@ mod tests {
 
     /// THE MEASURED FAILURE, REPLAYED IN REAL SHELLS (module doc). The inherited PATH is the
     /// m27 login shell's shape: `~/.local/bin` first, `/opt/homebrew/bin` ahead of the agents
-    /// dir, the agents dir listed twice, and an EMPTY entry the user owns. Sourcing the
-    /// generated hook must leave the agents dir FIRST and once, keep every other entry — the
-    /// empty one included — in order, append bin/ last, and change nothing on a second source.
+    /// dir, the agents dir listed twice, and an EMPTY entry the user owns — and, since
+    /// 2026-09-27, the reroute dir demoted behind them too (the 2026-09-24 TTY-session
+    /// measurement). Sourcing the generated hook inside aterm must leave the reroute dir
+    /// FIRST and the agents dir SECOND, each once, keep every other entry — the empty one
+    /// included — in order, append bin/ last, and change nothing on a second source.
     /// bash is macOS's 3.2 when that is what `bash` is; zsh is skipped where it is absent.
     #[cfg(unix)]
     #[test]
     fn posix_hook_moves_the_agents_dir_to_the_front_in_real_shells() {
         let root = tmp("realsh");
         let agents = root.join("Application Support/pkg/agents");
+        let reroute = root.join("Application Support/pkg/reroute");
         let bin = root.join("Application Support/pkg/bin");
-        let files = hook_files(&bin, &agents);
-        let (a, b) = (agents.to_str().unwrap(), bin.to_str().unwrap());
-        let inherited = format!("/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin:{a}::/bin:{a}");
-        let want = format!("{a}:/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin::/bin:{b}");
+        let files = hook_files(&bin, &agents, &reroute);
+        let (a, r, b) = (
+            agents.to_str().unwrap(),
+            reroute.to_str().unwrap(),
+            bin.to_str().unwrap(),
+        );
+        let inherited =
+            format!("/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin:{r}:{a}::/bin:{a}:{r}");
+        let want = format!("{r}:{a}:/Users//u/.local/bin:/usr/bin:/opt/homebrew/bin::/bin:{b}");
         for (shell, args, ext) in [
             ("bash", &["--noprofile", "--norc", "-c"][..], "bash"),
             ("zsh", &["-f", "-c"][..], "zsh"),
@@ -3439,6 +3662,8 @@ mod tests {
                     // This fixture tests an aterm session, not a foreign shell
                     // where the production hook must demote managed agents.
                     .env("ATERM_SESSION_ID", "atpkg-hook-test")
+                    // Nor an `aterm --no-reroute` one, whatever session runs the suite.
+                    .env_remove(crate::reroute::PASSTHROUGH_ENV)
                     .env("ATPKG_TEST_HOOK", &hook)
                     .env("ATPKG_TEST_PATH", path)
                     .output()
@@ -3463,16 +3688,145 @@ mod tests {
             );
             assert_eq!(run(&got), want, "{shell}: idempotent");
             // A sole EMPTY entry beside the agents dir survives (review finding
-            // 2026-09-10), and a PATH of only the agents dir stays exactly that.
+            // 2026-09-10), and a PATH of only the managed dirs stays exactly those.
             for (path, expect) in [
-                (format!(":{a}"), format!("{a}::{b}")),
-                (format!("{a}:"), format!("{a}::{b}")),
-                (format!("{a}::{a}"), format!("{a}::{b}")),
-                (a.to_string(), format!("{a}:{b}")),
+                (format!(":{a}"), format!("{r}:{a}::{b}")),
+                (format!("{a}:"), format!("{r}:{a}::{b}")),
+                (format!("{a}::{a}"), format!("{r}:{a}::{b}")),
+                (format!("{r}::{a}"), format!("{r}:{a}::{b}")),
+                (a.to_string(), format!("{r}:{a}:{b}")),
+                (r.to_string(), format!("{r}:{a}:{b}")),
             ] {
                 assert_eq!(run(&path), expect, "{shell}: {path:?}");
             }
         }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A TMUX SERVER CARRIES THE GATE IT WAS BORN WITH (plan PLAN-agents-dir-aterm-only
+    /// §9, risks 1-2). A pane's shell inherits the SERVER's environment, not the client's:
+    /// a private `tmux -L` server started with aterm's markers fronts the agents dir in
+    /// its panes; one started without them demotes it — even when an agents-first PATH
+    /// was inherited. Skipped, and said, where tmux is not installed (it is not on the
+    /// machines this was written on: the arm was added unexecuted, and a Mac with tmux
+    /// is the first to run it). Each server is private to this test and killed after.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_tmux_server_fronts_agents_only_when_born_with_the_markers() {
+        // Resolved on THIS process's PATH once: the server below is started with a
+        // PATH of the test's own, which is not where tmux lives.
+        let Some(tmux) = std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join("tmux"))
+                .find(|candidate| candidate.is_file())
+        }) else {
+            eprintln!("SKIP: tmux is not installed; the tmux arm of the agents gate did not run");
+            return;
+        };
+        let root = tmp("tmux");
+        let agents = root.join("pkg/agents");
+        let bin = root.join("pkg/bin");
+        let hook = root.join("hook.bash");
+        let reroute = root.join("pkg/reroute");
+        let body = &hook_files(&bin, &agents, &reroute)
+            .into_iter()
+            .find(|(n, _)| n.ends_with(".bash"))
+            .unwrap()
+            .1;
+        fs::write(&hook, body).unwrap();
+        let (a, b, r) = (
+            agents.to_str().unwrap(),
+            bin.to_str().unwrap(),
+            reroute.to_str().unwrap(),
+        );
+        let pane_path = |markers: bool, rerouted: bool| -> String {
+            let socket = format!("atpkg-hook-{}-{markers}-{rerouted}", std::process::id());
+            let out = root.join(format!("pane-{markers}-{rerouted}.out"));
+            let _ = fs::remove_file(&out);
+            struct Server(PathBuf, String);
+            impl Drop for Server {
+                fn drop(&mut self) {
+                    let _ = std::process::Command::new(&self.0)
+                        .args(["-L", &self.1, "kill-server"])
+                        .output();
+                }
+            }
+            let _server = Server(tmux.clone(), socket.clone());
+            let pane = "bash --noprofile --norc -c '. \"$ATPKG_TEST_HOOK\"; \
+                        printf \"PATH=%s\\n\" \"$PATH\" > \"$ATPKG_TEST_OUT\"'";
+            let mut command = std::process::Command::new(&tmux);
+            command
+                .args([
+                    "-L",
+                    &socket,
+                    "-f",
+                    "/dev/null",
+                    "new-session",
+                    "-d",
+                    "-s",
+                    "t",
+                ])
+                .arg(pane)
+                .env("PATH", format!("{a}:/usr/bin:/bin"))
+                // tmux runs the pane command through `$SHELL -c`: a plain sh with a
+                // scratch HOME reads no dotfile that could move PATH first.
+                .env("SHELL", "/bin/sh")
+                .env("HOME", &root)
+                .env("ATPKG_TEST_HOOK", &hook)
+                .env("ATPKG_TEST_OUT", &out)
+                .env_remove("BASH_ENV")
+                .env_remove("TMUX")
+                // Run from an aterm tab, THIS process carries the reroute handle and
+                // maybe the passthrough marker: the server's environment is the test's.
+                .env_remove(crate::reroute::REROUTE_DIR_ENV)
+                .env_remove(crate::reroute::PASSTHROUGH_ENV);
+            for marker in AGENTS_MARKERS {
+                command.env_remove(marker);
+            }
+            if markers {
+                command.env("ATERM_SESSION_ID", "atpkg-tmux-test");
+            }
+            if rerouted {
+                command.env(crate::reroute::REROUTE_DIR_ENV, &reroute);
+            }
+            let started = command.output().expect("tmux starts");
+            assert!(
+                started.status.success(),
+                "tmux new-session: {}",
+                String::from_utf8_lossy(&started.stderr)
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Ok(text) = fs::read_to_string(&out)
+                    && let Some(path) = text.trim_end().strip_prefix("PATH=")
+                {
+                    return path.to_owned();
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pane never reported its PATH"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        };
+        // Inside aterm the hook fronts the reroute dir, then the agents dir; the
+        // reroute handle alone (a front door that handed no agents dir) fronts the
+        // reroute dir only; outside aterm both are demoted.
+        assert_eq!(
+            pane_path(true, false),
+            format!("{r}:{a}:/usr/bin:/bin:{b}"),
+            "a server born inside aterm fronts the reroute dir, then the agents dir"
+        );
+        assert_eq!(
+            pane_path(false, true),
+            format!("{r}:/usr/bin:/bin:{b}"),
+            "a server born with only the reroute handle fronts the reroute dir alone"
+        );
+        assert_eq!(
+            pane_path(false, false),
+            format!("/usr/bin:/bin:{b}"),
+            "a server born outside aterm demotes the inherited agents dir"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -3481,11 +3835,13 @@ mod tests {
         let files = hook_files(
             Path::new("/Users//x/Library/Application Support/aterm/pkg/bin"),
             Path::new("/Users//x/Library/Application Support/aterm/pkg/agents"),
+            Path::new("/Users//x/Library/Application Support/aterm/pkg/reroute"),
         );
         let (_, zsh) = files.iter().find(|(n, _)| n.ends_with(".zsh")).unwrap();
         assert!(
             zsh.contains("\"/Users//x/Library/Application Support/aterm/pkg/bin\"")
-                && zsh.contains("\"/Users//x/Library/Application Support/aterm/pkg/agents\""),
+                && zsh.contains("\"/Users//x/Library/Application Support/aterm/pkg/agents\"")
+                && zsh.contains("\"/Users//x/Library/Application Support/aterm/pkg/reroute\""),
             "a path with a space stays one double-quoted PATH element"
         );
     }

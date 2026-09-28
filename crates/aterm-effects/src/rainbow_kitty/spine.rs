@@ -13,10 +13,9 @@
 //! ## The law
 //!
 //! v1 shipped **five** momentum integrators — the style-shared typing `heat`
-//! and its jump `flare` (`cursor_glow.rs:8953`, `:9039`), the eased `disp`
-//! spine, the canonical [`TypingMomentum`], a private `erase_mom`, and the
-//! `disp_peak` resume memory (`:9990`, `:10180`, `:12543`) — and they
-//! disagreed. A jump flare lit the star field with no keystroke behind it; a
+//! and its jump `flare`, the eased `disp` spine, the canonical
+//! [`TypingMomentum`], a private `erase_mom`, and the `disp_peak` resume
+//! memory (all in v1's `cursor_glow.rs`) — and they disagreed. A jump flare lit the star field with no keystroke behind it; a
 //! key-repeat flood maxed `heat` in eight keys; the cat's earn law was a key
 //! COUNT. §19.1 deletes all five answers and keeps one:
 //!

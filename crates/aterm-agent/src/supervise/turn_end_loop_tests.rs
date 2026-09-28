@@ -506,6 +506,128 @@ fn a_lost_login_types_login_and_its_badge_goes_when_the_worker_works() {
     assert_eq!(m.attention, None, "cleared once the worker worked");
 }
 
+/// Claude Code 2.1.281's `/login` method picker (the binary's strings, read
+/// 2026-09-27: `Select login method:` and its three options), in the frame
+/// it draws under the typed command — no composer. HAND-BUILT.
+fn login_picker() -> Vec<String> {
+    let mut r = login_expired();
+    r.truncate(r.len() - 4);
+    r.extend(rows(&[
+        "❯ /login",
+        "",
+        &"─".repeat(100),
+        " Claude Code can be used with your Claude subscription or billed based on API usage \
+         through your Console account.",
+        "",
+        " Select login method:",
+        "",
+        " ❯ 1. Claude account with subscription · Pro, Max, Team, or Enterprise",
+        "   2. Anthropic Console account · API usage billing",
+        "   3. 3rd-party platform · Amazon Bedrock, Microsoft Foundry, or Vertex AI",
+        "",
+    ]));
+    r
+}
+
+/// The incident's screen: the supervisor's `continue` answered by `⏺ Login
+/// expired · Please run /login` ([`aterm_phase::prompt::fixtures::LOGIN_EXPIRED`]).
+fn login_expired() -> Vec<String> {
+    aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED)
+}
+
+/// [`login_expired`] once the person's `/login` is done: its command and
+/// Claude Code's `Login successful` under the wall's row.
+fn login_back() -> Vec<String> {
+    let mut r = login_expired();
+    let at = r
+        .iter()
+        .position(|row| row.starts_with("⏺ Login expired"))
+        .expect("the wall row");
+    r.splice(
+        at + 1..at + 1,
+        rows(&["", "❯ /login", "  ⎿  Login successful"]),
+    );
+    r
+}
+
+/// THE LOGIN WALL OF 2026-09-27 IN THE LOOP, over the incident's screen: the
+/// supervisor's own `continue` answered by `⏺ Login expired · Please run
+/// /login`. Main read it idle and typed `keep going` into it; now `/login` is
+/// typed once under `auth-login@v1` and the owner is told as it is — the
+/// badge `claude wall: Login expired · Please run /login (finish sign-in in
+/// the browser)` — and the method picker it opens (no composer) is handed
+/// to a person with no key pressed: which account to sign in with is theirs.
+/// Nothing is continued until the login is back: at the person's `Login
+/// successful` the worker is continued ONCE, and its next turn end is the
+/// ordinary policy's. NEGATIVE CONTROL: no `keep going` is typed while the
+/// wall stands (main typed one at each point).
+#[test]
+fn the_login_expired_row_is_told_once_and_the_login_back_is_continued() {
+    let (dir, path) = journal_file("te-login-expired");
+    let mut m = Mock::new(
+        true,
+        vec![
+            busy_screen(),
+            login_expired(),
+            login_picker(),
+            login_back(),
+            busy_screen(),
+            ended(STOP),
+        ],
+    );
+    m.turn_gates = vec![1, 3];
+    m.vanish_after = Some(2);
+    let opts = SuperviseOpts {
+        journal: Some(path.clone()),
+        ..hosted(30)
+    };
+    let (lines, _) = watch_lines(&mut m, &opts);
+    let (records, _) = journal_records(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+    let decided: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("TYPED") || l.starts_with("CONTINUED"))
+        .collect();
+    assert_eq!(
+        decided,
+        [
+            "TYPED seq=102 rule=auth-login@v1 /login",
+            "CONTINUED seq=104 rule=continue@v1 keep going",
+        ],
+        "{lines:#?}\n{:#?}",
+        m.requests
+    );
+    assert!(
+        m.requests.iter().any(|r| r.starts_with(
+            "meta set attention owner=supervisor claude wall: Login expired · Please run /login \
+             (finish sign-in in the browser)"
+        )),
+        "{:#?}",
+        m.requests
+    );
+    assert!(
+        !m.requests.iter().any(|r| r.starts_with("key")),
+        "no key pressed on the login picker: {:#?}",
+        m.requests
+    );
+    assert!(
+        m.requests.iter().any(|r| r.starts_with(
+            "meta set attention owner=supervisor claude other: Claude Code can be used with your \
+             Claude subscription"
+        )),
+        "the picker is a person's: {:#?}",
+        m.requests
+    );
+    assert!(
+        records.iter().any(|r| r.kind == "escalated"),
+        "{records:#?}"
+    );
+    assert!(
+        lines.contains(&"EVENT idle seq=104 ⎿  Login successful".to_string()),
+        "{lines:#?}"
+    );
+}
+
 /// NEVER OVER A PERSON: a draft in the composer (the cursor after it) gets
 /// nothing typed and raises nothing within the grace — a draft first seen
 /// is a keystroke just made ([`a_draft_left_standing_is_submitted_once_the_

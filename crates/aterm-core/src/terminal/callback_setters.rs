@@ -9,6 +9,11 @@
 use super::{ClipboardOperation, Terminal, types};
 #[cfg(any(test, target_os = "linux"))]
 use super::{WindowOperation, WindowResponse};
+use crate::grid::ResizePolicy;
+
+#[cfg(test)]
+#[path = "resize_conpty_tests.rs"]
+mod resize_conpty_tests;
 
 impl Terminal {
     /// Resize the terminal.
@@ -24,7 +29,24 @@ impl Terminal {
     /// `1..=`[`MAX_GRID_ROWS`](crate::grid::MAX_GRID_ROWS)`/`[`MAX_GRID_COLS`](crate::grid::MAX_GRID_COLS)
     /// (§5.8 ingress bound), so a hostile resize cannot request an
     /// arbitrarily large cell allocation.
+    ///
+    /// This is [`resize_with_policy`](Self::resize_with_policy) under
+    /// [`ResizePolicy::Native`] — the grid is the frame, as under a Unix PTY.
     pub fn resize(&mut self, rows: u16, cols: u16) {
+        self.resize_with_policy(rows, cols, ResizePolicy::Native);
+    }
+
+    /// [`resize`](Self::resize) with the seam policy the PTY backend requires.
+    ///
+    /// The host picks the policy from what sits behind the PTY, never from the
+    /// platform alone: under Windows ConPTY conhost repaints the whole viewport
+    /// after every resize, row-0-anchored, so the row accounting at the
+    /// history/viewport seam must match that repaint or lines are lost
+    /// (revealed history painted over) or duplicated (a re-seated tail painted
+    /// twice) — see [`ResizePolicy`] for the measurements. Both grids get the
+    /// policy: conhost repaints the alt screen exactly as it repaints the main
+    /// one, and the saved grid must keep the same seam law for when it returns.
+    pub fn resize_with_policy(&mut self, rows: u16, cols: u16, policy: ResizePolicy) {
         // Captured BEFORE the resize: afterwards both grids carry the new width.
         let cols_changed = self.grid.cols() != cols;
         // Likewise the height: `finalize_resize` needs the SHRINK amount, and the
@@ -41,16 +63,16 @@ impl Terminal {
         if self.modes.alternate_screen {
             // Alt screen active: don't reflow current grid (app-managed content).
             // Saved primary grid should reflow normally.
-            self.grid.resize_no_reflow(rows, cols);
+            self.grid.resize_no_reflow_with_policy(rows, cols, policy);
             if let Some(ref mut saved_primary) = self.alt_grid {
-                saved_primary.resize(rows, cols);
+                saved_primary.resize_with_policy(rows, cols, policy);
             }
         } else {
             // Primary screen active: reflow current grid.
             // Alt grid (if present) should not be reflowed.
-            self.grid.resize(rows, cols);
+            self.grid.resize_with_policy(rows, cols, policy);
             if let Some(ref mut alt) = self.alt_grid {
-                alt.resize_no_reflow(rows, cols);
+                alt.resize_no_reflow_with_policy(rows, cols, policy);
             }
         }
         self.finalize_resize(cols_changed, rows_before);
@@ -72,6 +94,21 @@ impl Terminal {
         rows: u16,
         cols: u16,
     ) -> Option<aterm_grid::PendingScrollbackReflow> {
+        self.resize_offloading_scrollback_with_policy(rows, cols, ResizePolicy::Native)
+    }
+
+    /// [`resize_offloading_scrollback`](Self::resize_offloading_scrollback) with
+    /// the seam policy the PTY backend requires — the offloaded twin of
+    /// [`resize_with_policy`](Self::resize_with_policy), same reasoning. Under
+    /// [`ResizePolicy::ConPty`] the re-attach performs no deficit fill (there is
+    /// no `pending_fill_target`), so a repaint conhost sends BEFORE the worker
+    /// re-attaches is never shifted under a re-seated history line.
+    pub fn resize_offloading_scrollback_with_policy(
+        &mut self,
+        rows: u16,
+        cols: u16,
+        policy: ResizePolicy,
+    ) -> Option<aterm_grid::PendingScrollbackReflow> {
         // Captured BEFORE the resize, as in `resize`.
         let cols_changed = self.grid.cols() != cols;
         let rows_before = self.grid.rows();
@@ -83,15 +120,17 @@ impl Terminal {
         let pending = if self.modes.alternate_screen {
             // Alt active: current (alt) grid is app-managed; the SAVED PRIMARY
             // holds the scrollback that reflows.
-            self.grid.resize_no_reflow(rows, cols);
-            self.alt_grid
-                .as_mut()
-                .and_then(|saved_primary| saved_primary.resize_offloading_scrollback(rows, cols))
+            self.grid.resize_no_reflow_with_policy(rows, cols, policy);
+            self.alt_grid.as_mut().and_then(|saved_primary| {
+                saved_primary.resize_offloading_scrollback_with_policy(rows, cols, policy)
+            })
         } else {
             // Primary active: current grid reflows (offloaded); alt is unreflowed.
-            let pending = self.grid.resize_offloading_scrollback(rows, cols);
+            let pending = self
+                .grid
+                .resize_offloading_scrollback_with_policy(rows, cols, policy);
             if let Some(ref mut alt) = self.alt_grid {
-                alt.resize_no_reflow(rows, cols);
+                alt.resize_no_reflow_with_policy(rows, cols, policy);
             }
             pending
         };
@@ -187,6 +226,23 @@ impl Terminal {
             Some(&mut self.grid)
         };
         target.map_or(0, |grid| grid.drain_lazy_bounded(max_lines))
+    }
+
+    /// THRU-5: one bounded drain OPPORTUNITY for a host polling mid-flood (the
+    /// compression worker's once-a-second trickle, a wasm host's per-frame
+    /// drain), on the same backlog [`drain_lazy_bounded`](Self::drain_lazy_bounded)
+    /// drains: the batch is skipped while the flood path is cutting that
+    /// backlog AND the stream delivered a batch or more since the previous
+    /// opportunity, so one flood leaves one marker and a slow tail is still
+    /// promoted. See
+    /// [`Grid::trickle_lazy_bounded`](aterm_grid::Grid::trickle_lazy_bounded).
+    pub fn trickle_lazy_bounded(&mut self, max_lines: usize) -> usize {
+        let target = if self.modes.alternate_screen {
+            self.alt_grid.as_mut()
+        } else {
+            Some(&mut self.grid)
+        };
+        target.map_or(0, |grid| grid.trickle_lazy_bounded(max_lines))
     }
 
     /// Shared post-resize side effects for [`resize`](Self::resize) and the
@@ -625,6 +681,43 @@ mod offload_tests {
             after > 100,
             "saved-primary history preserved across an alt-screen offload \
              (before={before}, after={after})"
+        );
+    }
+
+    /// The compression worker's trickle works the SAME backlog its drain
+    /// drains — the saved primary's under an alt screen too: an opportunity
+    /// right after a flood that outran it skips, and the next one, with
+    /// nothing new arrived, promotes a batch (the cut's marker first).
+    #[test]
+    fn trickle_skips_a_flood_that_outruns_it_on_the_backlog_the_worker_drains() {
+        // A 2 MB budget holds fewer staged `L<n>` rows than the 20k floor, so
+        // the floor is the cap; the store's 100k limit is far away, so the
+        // drops are a real cut.
+        let sb = Scrollback::new(64, 512, 2_000_000);
+        let mut t = Terminal::with_scrollback(24, 80, 8, sb);
+        t.set_compress_offload_active(true);
+        let mut buf = Vec::new();
+        for i in 0..22_000 {
+            buf.extend_from_slice(format!("L{i}\r\n").as_bytes());
+        }
+        t.process(&buf);
+        let backlog = t.lazy_backlog_len();
+        assert!(
+            t.scrollback_truncated_lines() > 0,
+            "precondition: a flood past the cap is cutting"
+        );
+
+        t.process(b"\x1b[?1049h");
+        assert_eq!(
+            t.trickle_lazy_bounded(256),
+            backlog,
+            "22k lines arrived since the last opportunity: skipped, on the saved \
+             primary's backlog"
+        );
+        assert_eq!(
+            t.trickle_lazy_bounded(256),
+            backlog - 256,
+            "nothing arrived since: a batch is promoted"
         );
     }
 }

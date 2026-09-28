@@ -9,8 +9,7 @@
 //! (maximally restrictive).
 
 use aterm_containment::{
-    CommandCapability, ContainmentMode, ContainmentPolicy, FsCapability, InputCapability,
-    McpCapability, NetworkCapability, OutputCapability, PluginCapability, ProcessCapability,
+    ContainmentMode, ContainmentPolicy, FsCapability, NetworkCapability, ProcessCapability,
 };
 
 #[test]
@@ -30,9 +29,4 @@ fn uninitialized_mode_gets_most_restrictive_capabilities() {
     assert_eq!(caps.network, NetworkCapability::None);
     assert_eq!(caps.fs, FsCapability::TmpOnly);
     assert_eq!(caps.process, ProcessCapability::NoFork);
-    assert_eq!(caps.mcp, McpCapability::Disabled);
-    assert_eq!(caps.plugins, PluginCapability::Disabled);
-    assert_eq!(caps.output, OutputCapability::Filtered);
-    assert_eq!(caps.input, InputCapability::Filtered);
-    assert_eq!(caps.command, CommandCapability::NoCommands);
 }

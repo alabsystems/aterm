@@ -2,48 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! Native Settings-tab host glue: singleton view discovery, open/focus/close, stable
-//! route navigation, and compatibility control projections. The lower half retains
-//! the former overlay-input adapter as test scaffolding around [`crate::settings`];
-//! production cannot construct its `Overlay::Settings` variant.
+//! route navigation, and compatibility control projections. The retired Settings card
+//! survives only as the `cfg(test)` `Overlay::Settings` slot that [`App::settings_enter`]
+//! and [`App::settings_exit`] fill and clear; production cannot construct it.
 
-#[cfg(test)]
-use crate::Wake;
-use crate::{App, WindowState};
-
-/// The §L.3 anonymous suggestion form (Google Forms): the landing page's Send
-/// opens it PREFILLED in the default browser — the overlay itself never talks
-/// to the network, and the form collects no respondent identity.
-const SUGGEST_FORM_URL: &str = "https://docs.google.com/forms/d/e/1FAIpQLScet_59v_RHdQ3PtyKFSb95jmg87dOyiJSvlhFnomEC3atE2A/viewform";
-/// The form's one paragraph question ("What should our next aterm update be?").
-const SUGGEST_FORM_FIELD: &str = "entry.2053788710";
-
-/// Minimal RFC 3986 query-value percent-encoder for the prefill URL: unreserved
-/// bytes pass, everything else (incl. UTF-8 continuation bytes) becomes `%XX`.
-/// Std-only and bounded by the input length — no crate for one query value.
-fn percent_encode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len().saturating_mul(3));
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                out.push('%');
-                out.push(
-                    char::from_digit(u32::from(b >> 4), 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-                out.push(
-                    char::from_digit(u32::from(b & 0xF), 16)
-                        .unwrap_or('0')
-                        .to_ascii_uppercase(),
-                );
-            }
-        }
-    }
-    out
-}
+use crate::App;
 
 /// `/usr/bin/tccutil`'s presence, read at most once per process.
 ///
@@ -612,52 +575,12 @@ impl App {
             .map(|(_, _, _, state)| &state.legacy)
     }
 
-    /// Host for the retired Settings overlay used by legacy model tests. Production
+    /// Host window for the retired Settings overlay used by tests. Production
     /// Settings is a native tab and never enters the window overlay slot.
-    fn settings_host(&self) -> Option<&WindowState> {
-        self.frontmost_window.and_then(|wid| self.windows.get(&wid))
-    }
-
-    /// Mutable twin of [`Self::settings_host`].
-    fn settings_host_mut(&mut self) -> Option<&mut WindowState> {
+    #[cfg(test)]
+    fn settings_host_mut(&mut self) -> Option<&mut crate::WindowState> {
         let wid = self.frontmost_window?;
         self.windows.get_mut(&wid)
-    }
-
-    /// Refresh the open overlay's Kitty Log SNAPSHOT (§F4.6) from the App's
-    /// in-memory log when it is stale — the snapshot discipline that keeps
-    /// `settings_tray` a pure painter. Called on overlay open, on category
-    /// switches, at the start of every redraw (the drain-while-open path: a
-    /// sighting bumps the host revision, the next frame syncs + repaints),
-    /// and before legacy overlay model tests serialize. Cheap at rest: one revision
-    /// compare, no clone. The repaint rides `RepaintKey::settings_fp`, which
-    /// folds the revision only while the Kitty Log category is active.
-    #[cfg(test)]
-    pub(crate) fn sync_settings_kitty_log(&mut self) {
-        let rev = self.kitty_log.revision();
-        let stale = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| s.kitty_log.revision != rev);
-        if !stale {
-            return;
-        }
-        let view = self.kitty_log.view();
-        if let Some(ws) = self.settings_host_mut() {
-            let on_page = ws
-                .settings_mut()
-                .map(|s| {
-                    *s.kitty_log = view;
-                    s.category == crate::prefs::Section::KittyLog
-                })
-                .unwrap_or(false);
-            // Only the Kitty Log page folds the revision into `settings_fp`, so a
-            // sighting recorded while a DIFFERENT category is open changes no
-            // pixels — scheduling a repaint there would be a wasted no-op frame.
-            if on_page && let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
     }
 
     /// Select the process-singleton Settings app in the FRONTMOST window,
@@ -914,8 +837,8 @@ impl App {
         self.settings_tab_open()
     }
 
-    /// Open the Settings overlay on the front window (no-op if already open). Snapshots
-    /// the live config into the panel's control list.
+    /// Put the retired Settings card in the front window's overlay slot (no-op if already
+    /// there): a modal that consumes input, for tests that need an open overlay.
     #[cfg(test)]
     pub(crate) fn settings_enter(&mut self) {
         // The modal steals the mouse: settle any in-flight divider/selection drag
@@ -938,14 +861,11 @@ impl App {
                 w.request_redraw();
             }
         }
-        // Open-time Kitty Log snapshot (§F4.6): memory only, no IO.
-        self.sync_settings_kitty_log();
         self.overlay_a11y_update();
     }
 
     /// Close the Settings overlay on the front window (no-op if already closed). The
     /// `settings_fp` key term drops to `0`, so the next frame repaints the clean terminal.
-    ///
     #[cfg(test)]
     pub(crate) fn settings_exit(&mut self) {
         if let Some(ws) = self.settings_host_mut()
@@ -957,204 +877,6 @@ impl App {
             }
         }
         self.overlay_a11y_update();
-    }
-
-    /// The content band height in CELLS for a settings host window — the single band
-    /// the painter, scroll clamps, and hit-test share ([`crate::settings::pane_geom_cells`]).
-    /// Flat search rows are 1 cell tall, so the same number serves both modes.
-    /// `pub(crate)`: the config-reload rebuild (`app_config.rs`) re-clamps with it too.
-    pub(crate) fn settings_band(ws: &WindowState) -> usize {
-        crate::settings::pane_geom_cells(ws.cols as usize, ws.settings_panel_rows()).group_band()
-    }
-
-    /// The footnote WRAP width (chars per row) for a settings host window — the
-    /// same [`crate::settings::footnote_wrap_chars`] the painter derives from
-    /// `cols`, threaded into every grouped-layout walk so scroll clamps and the
-    /// keyboard walk agree with the painted rows (design §3.2 footnote wrap).
-    pub(crate) fn settings_wrap(ws: &WindowState) -> usize {
-        crate::settings::footnote_wrap_chars(ws.cols as usize)
-    }
-
-    /// ↑/↓: move the sidebar CATEGORY while the sidebar pane is focused, the flat
-    /// filtered selection while searching, else the grouped content selection —
-    /// keeping the target on-screen (design §6).
-    #[cfg(test)]
-    pub(crate) fn settings_move(&mut self, delta: isize) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                if s.filtering() {
-                    s.move_selection(delta, band);
-                } else if s.pane == crate::settings::SettingsPane::Sidebar {
-                    s.sidebar_move(delta);
-                } else {
-                    s.move_selection_grouped(delta, band, wrap);
-                }
-            }
-        }
-        // A sidebar move may have landed on the Kitty Log page: refresh its
-        // snapshot (§F4.6 — snapshot on category switch).
-        self.sync_settings_kitty_log();
-        self.settings_repaint_front();
-    }
-
-    /// Select control row `idx` directly (a mouse click / an a11y Focus action),
-    /// clamped to the list. Outside search mode the CATEGORY follows the selection
-    /// (an a11y client can focus any control) and the content pane takes focus.
-    pub(crate) fn settings_select(&mut self, idx: usize) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                s.selected = idx.min(s.fields.len().saturating_sub(1));
-                s.status = None; // a selection move clears the transient status (§3.3)
-                if s.filtering() {
-                    s.clamp_scroll(band);
-                } else {
-                    // `selected` is in the category we set, so `set_category`'s snap
-                    // keeps it — the category follows the selection, not vice versa.
-                    if let Some(f) = s.fields.get(s.selected) {
-                        s.set_category(crate::prefs::section_of(f.key));
-                    }
-                    s.pane = crate::settings::SettingsPane::Content;
-                    s.clamp_group_scroll(band, wrap);
-                }
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Activate sidebar category `sec` (a click on its row): sidebar takes focus, the
-    /// content pane re-anchors to the category (scroll resets on change).
-    pub(crate) fn settings_set_category(&mut self, sec: crate::prefs::Section) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.set_category(sec);
-            s.pane = crate::settings::SettingsPane::Sidebar;
-        }
-        // Category-switch Kitty Log snapshot (§F4.6).
-        #[cfg(test)]
-        self.sync_settings_kitty_log();
-        self.settings_repaint_front();
-    }
-
-    /// →/Tab/↵ from the sidebar: give the content pane keyboard focus.
-    #[cfg(test)]
-    pub(crate) fn settings_focus_content(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.focus_content();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Esc/Tab from the content pane: give the sidebar keyboard focus.
-    #[cfg(test)]
-    pub(crate) fn settings_focus_sidebar(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.focus_sidebar();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Tab/⇧Tab: toggle keyboard focus between the two panes (design §6).
-    #[cfg(test)]
-    pub(crate) fn settings_toggle_pane(&mut self) {
-        let sidebar = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| s.pane == crate::settings::SettingsPane::Sidebar);
-        if sidebar {
-            self.settings_focus_content();
-        } else {
-            self.settings_focus_sidebar();
-        }
-    }
-
-    /// Focus the settings SEARCH bar (`/` / Cmd-F): subsequent typing filters the list.
-    pub(crate) fn settings_search_begin(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.search_begin();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Append a character to the search query (keeping the selection visible + scrolled in).
-    /// A fresh "kitty" completion in the query summons the §L.4 cameo over the
-    /// sidebar — GUI only (a headless driver must not park a never-ticking cameo).
-    #[cfg(test)]
-    pub(crate) fn settings_search_push(&mut self, c: char) {
-        let headless = self.headless;
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            if let Some(s) = ws.settings_mut() {
-                s.search_push(c);
-                s.clamp_scroll(band);
-                if s.note_kitty_in_query() && !headless {
-                    s.summon_kitty(crate::settings::KittyHost::Sidebar);
-                }
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Delete the last search-query character.
-    #[cfg(test)]
-    pub(crate) fn settings_search_backspace(&mut self) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            if let Some(s) = ws.settings_mut() {
-                s.search_backspace();
-                s.clamp_scroll(band);
-                let _ = s.note_kitty_in_query();
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Drop search-bar focus but KEEP the filter (Enter/↓ from the search bar → the list).
-    /// An EMPTIED query confirms back into GROUPED mode (`search_confirm` re-anchors
-    /// the category + re-zeroes the scroll unit); the grouped clamp then brings the
-    /// selected row's box into view — mirrors `settings_search_clear`.
-    #[cfg(test)]
-    pub(crate) fn settings_search_confirm(&mut self) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                s.search_confirm();
-                if !s.filtering() {
-                    s.clamp_group_scroll(band, wrap);
-                }
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Clear the filter and leave search (the single Esc level out of a filtered list).
-    /// `search_clear` re-anchors the category on the selection; the grouped clamp then
-    /// scrolls the selected row's box into view.
-    #[cfg(test)]
-    pub(crate) fn settings_search_clear(&mut self) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                s.search_clear();
-                s.clamp_group_scroll(band, wrap);
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Leave the §L landing page for the two-pane panel (the Get-started bubble,
-    /// ↵ on an empty box, Tab/↓, or a click on the bubble land here).
-    pub(crate) fn settings_landing_get_started(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.landing = false;
-            s.status = None;
-            s.pane = crate::settings::SettingsPane::Sidebar;
-        }
-        self.settings_repaint_front();
     }
 
     /// `settings section <name>` (socket): navigate the OPEN native Settings tab to the
@@ -1173,287 +895,11 @@ impl App {
             .ok_or_else(|| "could not focus the native Settings tab".to_string())
     }
 
-    /// Landing ↵: a non-empty suggestion box SENDS; an empty one is Get started
-    /// (the hero's one Enter affordance stays useful either way).
-    #[cfg(test)]
-    pub(crate) fn settings_landing_confirm(&mut self) {
-        let has_text = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| !s.comment.trim().is_empty());
-        if has_text {
-            self.settings_comment_send();
-        } else {
-            self.settings_landing_get_started();
-        }
-    }
-
-    /// Append to the landing suggestion box (§L.3). A fresh "kitty" completion
-    /// summons the cameo (§L.4) — GUI only: a headless driver typing into the
-    /// box must not park a never-ticking cameo in the fingerprint.
-    #[cfg(test)]
-    pub(crate) fn settings_comment_push(&mut self, c: char) {
-        let headless = self.headless;
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            // Generous-but-bounded buffer: the prefill URL stays a sane length.
-            if s.comment.chars().count() < 400 {
-                s.comment.push(c);
-            }
-            s.status = None;
-            if s.note_kitty_in_comment() && !headless {
-                s.summon_kitty(crate::settings::KittyHost::Landing);
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Delete the last suggestion-box character (the kitty high-water count
-    /// follows DOWN so deleting + retyping summons again).
-    #[cfg(test)]
-    pub(crate) fn settings_comment_backspace(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.comment.pop();
-            s.status = None;
-            let _ = s.note_kitty_in_comment();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Send the §L.3 suggestion: open the PREFILLED anonymous suggestion form in
-    /// the default browser (`open_url_external` — the same helper link clicks
-    /// use). The overlay itself never talks to the network; submitting is the
-    /// user's explicit second step in the browser, and the form collects no
-    /// identity. The buffer clears optimistically with a footer confirmation.
-    pub(crate) fn settings_comment_send(&mut self) {
-        let text = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .map(|s| s.comment.trim().to_string())
-            .unwrap_or_default();
-        if text.is_empty() {
-            return;
-        }
-        let url = format!(
-            "{SUGGEST_FORM_URL}?usp=pp_url&{SUGGEST_FORM_FIELD}={}",
-            percent_encode(&text)
-        );
-        crate::app_mouse::open_url_external(&url);
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.comment.clear();
-            s.comment_kitties = 0;
-            s.status = Some(
-                "Opening your browser — press Submit there to send it anonymously.".to_string(),
-            );
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Reset the SELECTED control to its built-in default (Del / Cmd-Backspace): persist
-    /// the key as REMOVED (`None`) through the retired overlay's test-only persistence
-    /// seam, then optimistically clear the row's seed so it shows the
-    /// default this frame.
-    #[cfg(test)]
-    pub(crate) fn settings_reset_selected(&mut self) {
-        let key = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.action_target().and_then(|i| s.fields.get(i)))
-            .map(|f| f.key);
-        let Some(key) = key else { return };
-
-        let outcome = crate::prefs::save_prefs_edits(&[(key, None)]);
-        let persisted = matches!(outcome, crate::prefs::SaveOutcome::Saved);
-        let status = match &outcome {
-            crate::prefs::SaveOutcome::Saved => {
-                #[cfg(test)]
-                if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::ConfigReload);
-                }
-                format!("reset: {key} = (default)")
-            }
-            crate::prefs::SaveOutcome::Unchanged => format!("{key}: already default"),
-            crate::prefs::SaveOutcome::Conflict { message, .. } => {
-                format!("reset conflict: {message}; reload aterm.toml before retrying")
-            }
-            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => format!(
-                "reset publication unverified: {message}; reload aterm.toml before retrying"
-            ),
-            crate::prefs::SaveOutcome::Error(e) => format!("reset failed: {e}"),
-        };
-        if let Some(ws) = self.settings_host_mut() {
-            if let Some(s) = ws.settings_mut() {
-                if persisted {
-                    // Clear the row's seed optimistically: display_value falls back
-                    // to the placeholder (the effective default), so the row shows
-                    // the just-applied reset this frame instead of the old value
-                    // until the ConfigReload rebuild lands.
-                    for f in s.fields.iter_mut().filter(|f| f.key == key) {
-                        f.seed = None;
-                    }
-                }
-                s.status = Some(status);
-            }
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        self.overlay_a11y_update();
-    }
-
-    /// ACTIVATE the selected control: a popup-chip row (Theme / long Enum) opens its
-    /// anchored MENU; a Color row opens the COLOUR WHEEL popover (design §7); a
-    /// Bool/short-Enum toggles/cycles and persists via the shared
-    /// [`Self::settings_commit_value`] seam; a free-form row (Float/Integer/Text)
-    /// opens the in-panel text editor.
-    pub(crate) fn settings_activate(&mut self) {
-        // A wheel scroll moves the band without the selection; a keyboard gesture
-        // acts ON the selection, so first snap the band back onto it — otherwise
-        // Enter would mutate an off-screen row and the popup menu would anchor to a
-        // row outside the band. Same view-follows-selection rule as ↑/↓.
-        self.settings_rescue_selection();
-        // Popup rows open the menu with the current value highlighted, NEVER cycle —
-        // cycling from a custom (non-registry) theme value would silently destroy it.
-        let popup = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.action_target().and_then(|i| s.fields.get(i)))
-            .is_some_and(crate::settings::uses_popup);
-        if popup {
-            self.settings_menu_open();
-            return;
-        }
-        // Colour rows open the wheel popover — the free-text editor route is
-        // retired for Color only (the inline well still shows swatch + hex).
-        let color = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.action_target().and_then(|i| s.fields.get(i)))
-            .is_some_and(|f| matches!(f.kind, crate::prefs::EditKind::Color));
-        if color {
-            self.settings_wheel_open();
-            return;
-        }
-        let edit = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.action_target().and_then(|i| s.fields.get(i)))
-            .and_then(crate::settings::cycle_edit);
-        let Some((key, val)) = edit else {
-            // Not a cycle/toggle row → it's a free-form Text/Float/Integer control;
-            // Enter/Space opens the in-panel text editor instead of no-op'ing.
-            self.settings_edit_begin();
-            return;
-        };
-        self.settings_commit_value(key, val);
-    }
-
-    /// Persist ONE control value through the shared seam — the single commit path the
-    /// activate (toggle/cycle), popup-menu, and ←/→ step gestures all funnel into:
-    /// [`crate::prefs::save_prefs_edits`] (pure, atomic, format-preserving), then
-    /// a footer status,
-    /// and an optimistic seed update so the row reflects the value THIS frame (the
-    /// authoritative rebuild follows when the reload lands; both produce the same seed).
-    pub(crate) fn settings_commit_value(
-        &mut self,
-        key: &'static str,
-        val: Option<String>,
-    ) -> String {
-        // THE TYPING-SOUND AUDITION rides every commit gesture on its row
-        // (before the "unchanged" early return below — see the fn).
-        self.settings_commit_audition(key, val.as_deref());
-        // Already the stored raw value → skip the writer outright. This is what makes
-        // committing a preserved CUSTOM entry a true no-op: an unrecognized enum
-        // spelling would otherwise be domain-REJECTED by the writer even though it is
-        // the value already on disk.
-        let unchanged = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.fields.iter().find(|f| f.key == key))
-            .is_some_and(|f| f.seed == val);
-        if unchanged {
-            if let Some(ws) = self.settings_host_mut() {
-                if let Some(s) = ws.settings_mut() {
-                    s.status = Some(format!("{key}: unchanged"));
-                }
-                if let Some(w) = &ws.os_window {
-                    w.request_redraw();
-                }
-            }
-            self.overlay_a11y_update();
-            return format!("{key}: unchanged");
-        }
-
-        // Persist through the shared pure, atomic, format-preserving writer. A clone
-        // keeps `val` for the optimistic snapshot below.
-        let outcome = crate::prefs::save_prefs_edits(&[(key, val.clone())]);
-        let persisted = matches!(outcome, crate::prefs::SaveOutcome::Saved);
-        let status = match &outcome {
-            crate::prefs::SaveOutcome::Saved => {
-                // Retired overlay test seam: request its explicit local resample.
-                #[cfg(test)]
-                if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::ConfigReload);
-                }
-                format!("saved: {key} = {}", val.as_deref().unwrap_or(""))
-            }
-            crate::prefs::SaveOutcome::Unchanged => format!("{key}: unchanged"),
-            crate::prefs::SaveOutcome::Conflict { message, .. } => {
-                format!("save conflict: {message}; reload aterm.toml before retrying")
-            }
-            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => {
-                format!("publication unverified: {message}; reload aterm.toml before retrying")
-            }
-            crate::prefs::SaveOutcome::Error(e) => format!("save failed: {e}"),
-        };
-
-        // Optimistic update keyed by `key` (not `selected`) so every commit gesture —
-        // including a menu whose anchor could drift from the selection — hits its row.
-        if let Some(ws) = self.settings_host_mut() {
-            if let Some(s) = ws.settings_mut() {
-                if persisted {
-                    // Re-seed by KEY (not `selected`) so every commit gesture —
-                    // including a popover whose anchor could drift from the
-                    // selection — hits its row this frame, ahead of the
-                    // ConfigReload rebuild.
-                    for f in s.fields.iter_mut().filter(|f| f.key == key) {
-                        f.seed = val.clone();
-                    }
-                }
-                s.status = Some(status.clone());
-            }
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        self.overlay_a11y_update();
-        status
-    }
-
-    /// The commit-time half of the typing-sound audition: every commit
-    /// gesture on the "Typing sound" row — Enter on the highlighted entry, a
-    /// popup pick, a ←/→ step — auditions the committed voice
-    /// UNCONDITIONALLY, the "unchanged" case included: Enter on the current
-    /// voice is "play it again", and scrubbing the list with ←/→ auditions
-    /// each voice as it goes by. A cleared value is the default, `auto`; an
-    /// unparseable one (a preserved custom entry) is what the runtime would
-    /// play for it — `auto` too. Split from [`Self::settings_commit_value`]
-    /// so the hook is provable without touching the on-disk config.
-    fn settings_commit_audition(&mut self, key: &str, val: Option<&str>) {
-        if key != crate::prefs::EDIT_TRAIL_SOUND_STYLE {
-            return;
-        }
-        let voice = val
-            .and_then(aterm_effects::trail_sound::SoundVoice::parse)
-            .unwrap_or_default();
-        self.audition_typing_sound(voice);
-    }
-
-    /// The reload-time half of the typing-sound audition, decided BEFORE a
-    /// config swap against the latch: a native-window pick or a hand edit
-    /// that CHANGES the voice returns it for one audition after the swap;
-    /// the in-app row already auditioned at commit time and latched the same
-    /// voice, so its own reload is silent; startup never reaches the swap.
-    /// Pure over `(next config, latch)` so the dedupe law is provable.
+    /// The typing-sound audition, decided BEFORE a config swap against the
+    /// latch: a native-window pick or a hand edit that CHANGES the voice
+    /// returns it for one audition after the swap; re-applying the voice
+    /// already latched is silent; startup never reaches the swap. Pure over
+    /// `(next config, latch)` so the dedupe law is provable.
     pub(crate) fn typing_sound_to_audition_on_swap(
         &self,
         next: &crate::app_config::Config,
@@ -1472,8 +918,8 @@ impl App {
     /// ([`crate::app_input::keystroke_click_audible`]): a live audio host, the
     /// "Music effects" master, a non-zero volume, and serious mode allowing
     /// terminal sound — so the preview can never speak where a keystroke
-    /// could not. Latches `typing_sound_auditioned` either way, so the config
-    /// reload that follows an in-app commit does not play the voice twice.
+    /// could not. Latches `typing_sound_auditioned` either way, so re-applying
+    /// the same voice does not play it twice.
     pub(crate) fn audition_typing_sound(&mut self, voice: aterm_effects::trail_sound::SoundVoice) {
         use aterm_effects::trail_sound::{SoundEvent, SoundGesture, SoundKind};
         self.typing_sound_auditioned = voice;
@@ -1504,415 +950,6 @@ impl App {
             // voice an octave up.
             shifted: false,
         });
-    }
-
-    /// The live [`crate::settings::SettingsGeom`] of the front window's settings card —
-    /// the SAME cell/font/row numbers `splice_settings_panel` paints with, consumed by
-    /// the menu placement + mouse hit-test paths. `None` when the overlay is closed.
-    pub(crate) fn settings_geom_front(&self) -> Option<crate::settings::SettingsGeom> {
-        let wid = self.frontmost_window?;
-        self.windows.get(&wid)?.settings()?;
-        self.overlay_coordinate_transform(wid)
-            .map(|transform| transform.geom)
-    }
-
-    /// The open menu's on-screen option-row count (its scroll window), from the SAME
-    /// [`crate::settings::menu_geom`] the painter and hit-test use. `1` when unknown.
-    fn settings_menu_visible(&self) -> usize {
-        let Some(geom) = self.settings_geom_front() else {
-            return 1;
-        };
-        self.settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| crate::settings::menu_geom(s, &geom))
-            .map_or(1, |mg| mg.visible)
-    }
-
-    /// Open the popup menu on the selected row (Enter/Space/click on a popup chip).
-    pub(crate) fn settings_menu_open(&mut self) {
-        let opened = self
-            .settings_host_mut()
-            .and_then(|ws| ws.settings_mut())
-            .is_some_and(crate::settings::SettingsState::menu_open);
-        if opened {
-            // Snap the menu's scroll window onto the highlighted (current) entry.
-            let visible = self.settings_menu_visible();
-            if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-                s.menu_move(0, visible);
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Close the popup menu with NO change (Esc / click-away).
-    pub(crate) fn settings_menu_cancel(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.menu_cancel();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Move the popup menu highlight by `delta` (clamped, no wrap).
-    #[cfg(test)]
-    pub(crate) fn settings_menu_move(&mut self, delta: isize) {
-        let visible = self.settings_menu_visible();
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.menu_move(delta, visible);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Jump the popup menu highlight to the next option starting with `c`.
-    #[cfg(test)]
-    pub(crate) fn settings_menu_jump(&mut self, c: char) {
-        let visible = self.settings_menu_visible();
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.menu_jump(c, visible);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Wheel-scroll the popup menu's option window by `delta` rows.
-    #[cfg(test)]
-    pub(crate) fn settings_menu_scroll(&mut self, delta: isize) {
-        let visible = self.settings_menu_visible();
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.menu_scroll_by(delta, visible);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Commit the popup menu's highlighted option: close the menu, then persist through
-    /// the SAME seam as activate ([`Self::settings_commit_value`]). Committing the
-    /// already-current entry (including a preserved custom value) closes with no change.
-    pub(crate) fn settings_menu_commit(&mut self) {
-        let pending = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(crate::settings::SettingsState::menu_pending);
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.menu_cancel();
-        }
-        match pending {
-            Some((key, val)) => {
-                self.settings_commit_value(key, val);
-            }
-            None => self.settings_repaint_front(),
-        }
-    }
-
-    /// Open the colour-wheel popover on the selected Color row (↵/Space or a
-    /// widget-region click — the route that replaced the free-text editor for
-    /// Color rows, design §7). The model seeds from the row's effective hex; an
-    /// unset key falls back to the live theme's colour FOR THAT KEY
-    /// ([`crate::settings::theme_color_for_key`]: fg/bg/cursor/selection) — the
-    /// App reads the theme, the pure model never does. Seeding the accent for
-    /// every key made opening the wheel on an unset Background instantly preview
-    /// (and one ↵ persist) the cursor green.
-    pub(crate) fn settings_wheel_open(&mut self) {
-        let key = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.action_target().and_then(|i| s.fields.get(i)))
-            .map_or("", |f| f.key);
-        let fallback = crate::settings::theme_color_for_key(self.theme, key);
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_open(fallback);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Close the colour wheel with NO change (Esc / click-away) — the working
-    /// colour is discarded; nothing was written while scrubbing.
-    pub(crate) fn settings_wheel_cancel(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_cancel();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Commit the wheel's working colour (↵): close the popover, then persist the
-    /// canonical `#RRGGBB` (or `None` for an emptied hex — reset to the theme
-    /// default) ONCE through the UNCHANGED [`Self::settings_commit_value`] seam —
-    /// the same path every widget uses.
-    #[cfg(test)]
-    pub(crate) fn settings_wheel_commit(&mut self) {
-        let pending = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(crate::settings::SettingsState::wheel_pending);
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_cancel();
-        }
-        match pending {
-            Some((key, val)) => {
-                self.settings_commit_value(key, val);
-            }
-            None => self.settings_repaint_front(),
-        }
-    }
-
-    /// Tab inside the wheel popover: cycle keyboard focus Wheel → Value → Hex.
-    #[cfg(test)]
-    pub(crate) fn settings_wheel_focus_next(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_focus_next();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Arrow-key adjust of the wheel's focused sub-control (`big` = Shift): hue/
-    /// saturation on the disk, brightness on the value slider (design §7).
-    #[cfg(test)]
-    pub(crate) fn settings_wheel_arrow(&mut self, dx: f32, dy: f32, big: bool) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_arrow(dx, dy, big);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Type into the wheel's hex readout (no-op unless the hex field has focus).
-    #[cfg(test)]
-    pub(crate) fn settings_wheel_hex_push(&mut self, c: char) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_hex_push(c);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Delete the last hex character (no-op unless the hex field has focus).
-    #[cfg(test)]
-    pub(crate) fn settings_wheel_hex_backspace(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.wheel_hex_backspace();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// A press ON the wheel's disk: set (h, s) from the polar point, give the disk
-    /// keyboard focus, and ARM the drag — motion keeps scrubbing until release.
-    pub(crate) fn settings_wheel_press_disk(&mut self, h: f32, s: f32) {
-        if let Some(st) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            st.wheel_set_hs(h, s);
-            if let Some(w) = st.wheel.as_mut() {
-                w.focus = crate::settings::WheelFocus::Wheel;
-                w.drag = Some(crate::settings::WheelDrag::Disk);
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// A press ON the wheel's value slider: set `v` from the track x, focus it, and
-    /// arm the slider drag.
-    pub(crate) fn settings_wheel_press_slider(&mut self, v: f32) {
-        if let Some(st) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            st.wheel_set_v(v);
-            if let Some(w) = st.wheel.as_mut() {
-                w.focus = crate::settings::WheelFocus::Value;
-                w.drag = Some(crate::settings::WheelDrag::Slider);
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// A click on the wheel's hex readout: give it keyboard focus (typing edits it).
-    pub(crate) fn settings_wheel_focus_hex(&mut self) {
-        if let Some(w) = self
-            .settings_host_mut()
-            .and_then(|ws| ws.settings_mut())
-            .and_then(|s| s.wheel.as_mut())
-        {
-            w.focus = crate::settings::WheelFocus::Hex;
-        }
-        self.settings_repaint_front();
-    }
-
-    /// End an in-flight wheel scrub (left release): the working colour keeps its
-    /// last dragged value; nothing persists until ↵. No-op when nothing is held.
-    pub(crate) fn settings_wheel_drag_end(&mut self) {
-        if let Some(w) = self
-            .settings_host_mut()
-            .and_then(|ws| ws.settings_mut())
-            .and_then(|s| s.wheel.as_mut())
-        {
-            w.drag = None;
-        }
-    }
-
-    /// ←/→ IN-PLACE adjust of the selected control (design §6): toggle a Bool, step an
-    /// Enum/Theme to its prev/next option (custom value included, so it is stepped FROM
-    /// rather than clobbered), nudge a bounded numeric one step (`big` = Shift = ×10)
-    /// clamped to its range — each press committing via the shared seam. Free-form rows
-    /// no-op ([`crate::settings::step_edit`]).
-    #[cfg(test)]
-    pub(crate) fn settings_step(&mut self, delta: isize, big: bool) {
-        // Same rescue as `settings_activate`: ←/→ act on the selection, which a wheel
-        // scroll may have moved out of the band.
-        self.settings_rescue_selection();
-        let edit = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| {
-                let f = s.action_target().and_then(|i| s.fields.get(i))?;
-                // Thread the loaded Trail Pack ids so ←/→ cycles the pack options.
-                crate::settings::step_edit_with(f, delta, big, &s.trail_pack_ids)
-            });
-        match edit {
-            Some((key, val)) => {
-                self.settings_commit_value(key, val);
-            }
-            // No-op row: still repaint — the rescue may have moved the scroll window.
-            None => self.settings_repaint_front(),
-        }
-    }
-
-    /// Wheel-scroll the content band by `delta` rows — moves the scroll window WITHOUT
-    /// touching the selection (the wash may leave the band). Grouped or flat per mode.
-    #[cfg(test)]
-    pub(crate) fn settings_scroll_body(&mut self, delta: isize) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                if s.filtering() {
-                    s.scroll_body(delta, band);
-                } else {
-                    s.scroll_grouped(delta, band, wrap);
-                }
-            }
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Snap the scroll window back onto the SELECTED control before a keyboard
-    /// gesture acts on it (the clamp brings an off-band selection back into view in
-    /// either direction). Wheel scrolling deliberately leaves the selection behind;
-    /// every mutating gesture routes through here first so it never operates on a row
-    /// the user cannot see.
-    fn settings_rescue_selection(&mut self) {
-        if let Some(ws) = self.settings_host_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                if s.filtering() {
-                    s.clamp_scroll(band);
-                } else {
-                    s.clamp_group_scroll(band, wrap);
-                }
-            }
-        }
-    }
-
-    /// Begin editing the selected free-form control (Text/Float/Integer) — opens the
-    /// in-panel text editor seeded with the configured value. No-op on Bool/Enum rows
-    /// (those cycle via [`Self::settings_activate`]) or when already editing.
-    pub(crate) fn settings_edit_begin(&mut self) {
-        let began = self
-            .settings_host_mut()
-            .and_then(|ws| ws.settings_mut())
-            .is_some_and(crate::settings::SettingsState::edit_begin);
-        if began {
-            self.settings_repaint_front();
-        }
-    }
-
-    /// Append a typed character to the in-panel edit buffer.
-    #[cfg(test)]
-    pub(crate) fn settings_edit_push(&mut self, c: char) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.edit_push(c);
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Delete the last character of the in-panel edit buffer.
-    #[cfg(test)]
-    pub(crate) fn settings_edit_backspace(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.edit_backspace();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Abandon the in-progress edit (Esc), reverting to the displayed value.
-    pub(crate) fn settings_edit_cancel(&mut self) {
-        if let Some(s) = self.settings_host_mut().and_then(|ws| ws.settings_mut()) {
-            s.edit_cancel();
-        }
-        self.settings_repaint_front();
-    }
-
-    /// Commit the in-panel edit (Enter): persist the typed value through the SAME prefs
-    /// seam. A rejected value (bad number) sets a status message
-    /// and STAYS in edit mode so the user can fix it; a clean commit leaves edit mode.
-    #[cfg(test)]
-    pub(crate) fn settings_edit_commit(&mut self) {
-        let pending = self
-            .settings_host()
-            .and_then(|ws| ws.settings())
-            .and_then(crate::settings::SettingsState::edit_pending);
-        let Some((key, val)) = pending else { return };
-
-        let outcome = crate::prefs::save_prefs_edits(&[(key, val.clone())]);
-        // Saved → update the optimistic seed + leave edit; Unchanged → leave edit (the
-        // value already matched); Error → stay in edit mode so the bad value can be fixed.
-        let (update_seed, leave_edit) = match &outcome {
-            crate::prefs::SaveOutcome::Saved => (true, true),
-            crate::prefs::SaveOutcome::Unchanged => (false, true),
-            crate::prefs::SaveOutcome::Conflict { .. }
-            | crate::prefs::SaveOutcome::PublishedUnverified { .. }
-            | crate::prefs::SaveOutcome::Error(_) => (false, false),
-        };
-        let status = match &outcome {
-            crate::prefs::SaveOutcome::Saved => {
-                #[cfg(test)]
-                if let Some(proxy) = self.proxy.as_ref() {
-                    let _ = proxy.send_event(Wake::ConfigReload);
-                }
-                match val.as_deref() {
-                    Some(v) => format!("saved: {key} = {v}"),
-                    None => format!("saved: {key} = (default)"),
-                }
-            }
-            crate::prefs::SaveOutcome::Unchanged => format!("{key}: unchanged"),
-            crate::prefs::SaveOutcome::Conflict { message, .. } => {
-                format!("conflict for {key}: {message}; reload aterm.toml before retrying")
-            }
-            crate::prefs::SaveOutcome::PublishedUnverified { message, .. } => format!(
-                "publication for {key} is unverified: {message}; reload aterm.toml before retrying"
-            ),
-            crate::prefs::SaveOutcome::Error(e) => format!("invalid {key}: {e}"),
-        };
-
-        if let Some(ws) = self.settings_host_mut() {
-            if let Some(s) = ws.settings_mut() {
-                if update_seed && let Some(f) = s.fields.get_mut(s.selected) {
-                    f.seed = val;
-                }
-                if leave_edit {
-                    s.editing = None;
-                }
-                s.status = Some(status);
-            }
-            if let Some(w) = &ws.os_window {
-                w.request_redraw();
-            }
-        }
-        self.overlay_a11y_update();
-    }
-
-    /// Request a redraw of the front window so the panel's state change is presented.
-    /// The change is carried by `RepaintKey::settings_fp` (see [`crate::settings::SettingsState::fingerprint`]),
-    /// so this only needs to ask winit for a frame — no early-out side-channel. Also
-    /// pushes the updated accessibility tree (a no-op without the `a11y-accesskit`
-    /// feature / no attached screen reader).
-    fn settings_repaint_front(&mut self) {
-        if let Some(ws) = self.settings_host_mut()
-            && let Some(w) = &ws.os_window
-        {
-            w.request_redraw();
-        }
-        self.overlay_a11y_update();
     }
 
     /// Push the FRONT window's OPEN overlay accessibility tree (Settings / About / Palette /
@@ -2580,6 +1617,26 @@ impl App {
                 capsules: Vec::new(),
             });
         }
+
+        // The close/quit confirmation (Windows, `close_confirm`): the question the
+        // native dialog used to ask, announced the way that dialog was — assertively,
+        // as an alert dialog — with the two answer keys as its description. Same
+        // no-Click rule as the paste question: an activate names neither answer.
+        if let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) {
+            out.push(GridMessage {
+                message: ChromeMessage::CloseConfirm,
+                text: crate::close_confirm::question(&pending.prompt),
+                detail: Some(crate::close_confirm::answer_keys(&pending.prompt)),
+                busy: false,
+                progress: None,
+                alarm: false,
+                activates: false,
+                // Like the paste band, it overwrites the frame's top rows rather than
+                // reserving a row of its own.
+                bar_row: None,
+                capsules: Vec::new(),
+            });
+        }
         out
     }
 
@@ -2644,10 +1701,10 @@ impl App {
                     let _ = self.open_messages_entry(wid, None);
                 }
             }
-            // No Click in the published tree. The paste question is answered by
-            // Enter/Escape and a generic activate names neither answer, which on a
-            // security prompt must not be guessed.
-            ChromeMessage::PasteConfirm => {}
+            // No Click in the published tree. The paste and close questions are
+            // answered by Enter/Escape and a generic activate names neither answer,
+            // which on a security or destructive prompt must not be guessed.
+            ChromeMessage::PasteConfirm | ChromeMessage::CloseConfirm => {}
         }
     }
 
@@ -2709,8 +1766,6 @@ impl App {
     /// branching on [`crate::overlay::OverlayKind`] so each surface decodes the request with
     /// the SAME id scheme its `a11y()` builder minted (a mismatch would silently misroute a
     /// screen-reader Click):
-    /// - **Settings** — node id `field_index + 1`: Focus selects the row, Click activates it
-    ///   (toggle / cycle / begin-edit), exactly like a keyboard/mouse activate.
     /// - **Palette** — a filtered row id contains its current target-set epoch and slot:
     ///   Focus moves the cursor, Click selects then activates the command (a disabled row
     ///   carries no Click, and a delayed request from an old tab/generation is rejected).
@@ -2761,19 +1816,8 @@ impl App {
         };
         match kind {
             #[cfg(test)]
-            OverlayKind::Settings => {
-                let Some(idx) = (req.target_node.0 as usize).checked_sub(1) else {
-                    return; // the window root carries no control
-                };
-                match req.action {
-                    accesskit::Action::Focus => self.settings_select(idx),
-                    accesskit::Action::Click => {
-                        self.settings_select(idx);
-                        self.settings_activate();
-                    }
-                    _ => {}
-                }
-            }
+            // The retired Settings card publishes an empty tree: nothing to act on.
+            OverlayKind::Settings => {}
             OverlayKind::Palette => {
                 let Some(idx) = self
                     .windows
@@ -2930,7 +1974,6 @@ mod tests {
     use crate::App;
     use crate::native_app::{ActionInvocation, AppEffect, AppEvent, SemanticInput};
     use crate::native_ui::ActionId;
-    use crate::settings::{canonical_hex, u32_rgb};
     use aterm_effects::cursor_glow::GlowStyle;
     use aterm_effects::trail_sound::{SoundGesture, SoundKind, SoundVoice};
 
@@ -3975,76 +3018,6 @@ mod tests {
         );
     }
 
-    /// The wheel's seed hex on the front window's open settings, or panics.
-    fn wheel_hex(app: &App) -> String {
-        app.front()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.wheel.as_ref())
-            .map(|w| w.hex.clone())
-            .expect("colour wheel open")
-    }
-
-    /// REGRESSION (audit — the settings-v2 headline defect): opening the colour
-    /// wheel on an UNSET Color row seeds from the live theme's colour FOR THAT
-    /// KEY (design §7) — the wheel on an unset Background opens ≈ `theme.bg`,
-    /// never the accent (`theme.cursor`). The old one-size accent fallback made
-    /// the preview instantly re-tint the whole mock cursor-green and a bare ↵
-    /// persist `background = "#50FA7B"`.
-    #[test]
-    fn wheel_on_unset_background_seeds_theme_bg_not_accent() {
-        let mut app = App::headless_for_test();
-        app.settings_enter();
-        let idx = app
-            .front()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| {
-                s.fields
-                    .iter()
-                    .position(|f| f.key == crate::prefs::EDIT_BACKGROUND)
-            })
-            .expect("background row");
-        assert_eq!(
-            app.front()
-                .and_then(|ws| ws.settings())
-                .and_then(|s| s.fields[idx].seed.clone()),
-            None,
-            "background is unset in the default config (the fallback fires)"
-        );
-        app.settings_select(idx);
-        app.settings_wheel_open();
-        let hex = wheel_hex(&app);
-        assert_eq!(
-            hex,
-            canonical_hex(u32_rgb(app.theme.bg)),
-            "the unset Background row seeds the LIVE theme bg"
-        );
-        assert_ne!(
-            hex,
-            canonical_hex(u32_rgb(app.theme.cursor)),
-            "…not the accent (bg and cursor are distinct in the default theme)"
-        );
-    }
-
-    /// The per-key fallback covers every colour row: an unset Foreground seeds
-    /// `theme.fg` (only cursor_color may legitimately equal the accent).
-    #[test]
-    fn wheel_on_unset_foreground_seeds_theme_fg() {
-        let mut app = App::headless_for_test();
-        app.settings_enter();
-        let idx = app
-            .front()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| {
-                s.fields
-                    .iter()
-                    .position(|f| f.key == crate::prefs::EDIT_FOREGROUND)
-            })
-            .expect("foreground row");
-        app.settings_select(idx);
-        app.settings_wheel_open();
-        assert_eq!(wheel_hex(&app), canonical_hex(u32_rgb(app.theme.fg)));
-    }
-
     // -- the typing-sound audition ----------------------------------------
 
     /// One captured cue's `(voice, kind, gain)`.
@@ -4069,51 +3042,6 @@ mod tests {
         let mut app = App::headless_for_test();
         app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
         app
-    }
-
-    /// Committing the "Typing sound" row plays EXACTLY ONE keystroke of the
-    /// committed voice at the user's volume — for a picker pick, and again
-    /// for the same value (Enter on the current entry is "play it again"),
-    /// and again per ←/→ step; a cleared value auditions `auto`. Other rows
-    /// audition nothing.
-    #[test]
-    fn committing_the_typing_sound_row_auditions_one_keystroke() {
-        let mut app = app_with_capture();
-        app.config.trail_sound_volume = Some(0.25);
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("music box"));
-        assert_eq!(
-            captured_typed(&mut app),
-            vec![(SoundVoice::RainbowKittyV2, 0.25)]
-        );
-        // "Play it again": the same value auditions again.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("music box"));
-        assert_eq!(captured_typed(&mut app).len(), 1);
-        // The deleted glass bell's spelling is an alias of the music box.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("glass bell"));
-        assert_eq!(
-            captured_typed(&mut app),
-            vec![(SoundVoice::RainbowKittyV2, 0.25)]
-        );
-        // Scrubbing: each step auditions the voice it lands on (aliases too).
-        for (raw, voice) in [
-            ("typewriter", SoundVoice::Typewriter),
-            ("Marimba", SoundVoice::Marimba),
-            ("water", SoundVoice::Of(GlowStyle::Water)),
-            ("felt", SoundVoice::Felt),
-        ] {
-            app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some(raw));
-            assert_eq!(captured_typed(&mut app), vec![(voice, 0.25)], "{raw}");
-        }
-        // Cleared = the default = auto; a preserved custom entry plays what
-        // the runtime would play for it, auto.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, None);
-        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Style, 0.25)]);
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("kazoo"));
-        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Style, 0.25)]);
-        // Any other row is silent.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_VOLUME, Some("0.5"));
-        app.settings_commit_audition(crate::prefs::EDIT_CURSOR_TRAIL_STYLE, Some("water"));
-        assert!(captured_typed(&mut app).is_empty());
     }
 
     /// The audition is gated exactly like a keystroke: the "Music effects"
@@ -4146,9 +3074,9 @@ mod tests {
         assert_eq!(app.typing_sound_auditioned, SoundVoice::Mech);
     }
 
-    /// The reload path auditions a CHANGED voice once, an unchanged one
-    /// never, and the in-app commit followed by its own reload plays ONE
-    /// keystroke in total (the latch dedupes).
+    /// The reload path auditions a CHANGED voice once and an unchanged one
+    /// never: the swap latches the voice it played, so re-applying the same
+    /// config (or an alias of it) is silent.
     #[test]
     fn a_config_swap_auditions_only_a_changed_voice_and_never_twice() {
         let mut app = app_with_capture();
@@ -4168,15 +3096,6 @@ mod tests {
         // Aliases dedupe by VOICE, not spelling: `water` is still droplet.
         next.trail_sound_style = Some(" Water ".into());
         assert_eq!(app.typing_sound_to_audition_on_swap(&next), None);
-        // THE PAIR: in-app commit (auditions + latches) then its own reload.
-        app.settings_commit_audition(crate::prefs::EDIT_TRAIL_SOUND_STYLE, Some("marimba"));
-        assert_eq!(captured_typed(&mut app), vec![(SoundVoice::Marimba, 0.4)]);
-        next.trail_sound_style = Some("marimba".into());
-        assert_eq!(
-            app.typing_sound_to_audition_on_swap(&next),
-            None,
-            "the commit's own reload must not play the voice a second time"
-        );
         // Clearing the key back to auto from a file edit auditions auto once.
         next.trail_sound_style = None;
         assert_eq!(

@@ -1637,8 +1637,11 @@ fn the_complete_echo_says_the_finished_form_without_a_reflow() {
             // The log states the outcome (ruling 259): the finished words
             // alone — delivered work keeps no in-flight frame (ruling 265) —
             // under the ✓ Success mark.
+            // A title with no past tense says `— done`, as its echo's time
+            // slot did (ruling 270).
             let rec = c.log().get(id).unwrap();
-            assert_eq!(rec.title, finished, "the record states the outcome");
+            let logged = crate::words::done_form(finished).unwrap_or_else(|| finished.to_string());
+            assert_eq!(rec.title, logged, "the record states the outcome");
             assert!(rec.detail.is_empty(), "{title}: {:?}", rec.detail);
             assert_eq!(
                 (rec.severity, rec.glyph.ch()),

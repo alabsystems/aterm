@@ -388,3 +388,67 @@ fn scroll_up_zero_noop() {
         "scroll_up(0): marked damage for no-op with symbolic scroll region",
     );
 }
+
+// =============================================================================
+// A3 (PROOF_CARRYING_PERFORMANCE.md): the scroll swap chain is a PERMUTATION
+// =============================================================================
+//
+// The all-sizes form of `storage.rs`'s exhaustive
+// `shift_visible_rows_permutes_row_slices_and_allocates_nothing_at_capacity`:
+// over a full ring (the mock's `total_lines == rows.len()`) with a symbolic head
+// and symbolic `(top, bottom, n)`, every row slice present before the shift is
+// present exactly once after it — none lost, none aliased by two rows. The mock
+// rows borrow a local backing array, so no page store is involved and no
+// allocation can occur on this path at all. Discharged with `trust-mc-driver`
+// once a working trust-mc is on the box (the managed bundle awaits its repack).
+
+/// `shift_visible_rows_up` permutes the ring's row slices.
+#[kani::proof]
+#[kani::unwind(6)] // KANI_MOCK_ROWS (4) + 2: the swap chain and the counting loops
+fn shift_visible_rows_up_permutes_row_slices() {
+    shift_permutes_row_slices(false);
+}
+
+/// `shift_visible_rows_down` permutes the ring's row slices.
+#[kani::proof]
+#[kani::unwind(6)] // KANI_MOCK_ROWS (4) + 2: the swap chain and the counting loops
+fn shift_visible_rows_down_permutes_row_slices() {
+    shift_permutes_row_slices(true);
+}
+
+fn shift_permutes_row_slices(down: bool) {
+    const R: usize = Grid::KANI_MOCK_ROWS as usize;
+    let mut cells = [[Cell::EMPTY; Grid::KANI_MOCK_COLS as usize]; R];
+    let mut grid = Grid::kani_mock(&mut cells);
+    kani::assert(
+        grid.storage.rows.len() == R && grid.storage.total_lines == R,
+        "the mock ring is full",
+    );
+    let head: usize = kani::any();
+    kani::assume(head < R);
+    grid.storage.ring_head = head;
+    let top: usize = kani::any();
+    let bottom: usize = kani::any();
+    let n: usize = kani::any();
+    kani::assume(top <= bottom && bottom < R && n <= R);
+
+    let mut before = [0usize; R];
+    for (i, row) in grid.storage.rows.iter().enumerate() {
+        before[i] = row.as_slice().as_ptr() as usize;
+    }
+    if down {
+        grid.storage.shift_visible_rows_down(top, bottom, n);
+    } else {
+        grid.storage.shift_visible_rows_up(top, bottom, n);
+    }
+    kani::assert(grid.storage.rows.len() == R, "the ring kept its length");
+    for want in before {
+        let mut seen = 0usize;
+        for row in &grid.storage.rows {
+            if row.as_slice().as_ptr() as usize == want {
+                seen += 1;
+            }
+        }
+        kani::assert(seen == 1, "every row slice survives the shift exactly once");
+    }
+}

@@ -20,6 +20,16 @@ use aterm_render::{DamageOutcome, Frame, RenderInput, Theme};
 use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
+// The resident pet's laws are the engine's, one copy: this host feeds its
+// driver (`WindowState::companion`) and reuses the custody and shed laws for
+// the flying head it still owns.
+use aterm_effects::companion::{
+    CompanionDuty, cursor_cat_color_key, cursor_companion_duty, cursor_companion_on_glass,
+    cursor_companion_presentable, flying_kitty_admitted, pet_hit_rect_win, pin_pet_mode_exit,
+    resident_pet_owner_present, shed_companion_alpha, shed_companion_presentable,
+    shed_envelope_transitioning,
+};
+
 use crate::app_input::{Deliveries, DeliveryTicket};
 use crate::present::{CpuFrameBuffer as _, CpuPresenter as _};
 use crate::{
@@ -162,132 +172,51 @@ pub(crate) fn trace_spawn_enabled() -> bool {
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CursorFxSnapshotDelta {
-    Same,
-    ProcessOnly,
-    CoordinateDiverged,
-}
-
-/// Independent facts observed across the LOCK-A/LOCK-B extraction seam.
-///
-/// Keeping the three projection changes as booleans is load-bearing: a TUI can
-/// move the caret, flip DECTCEM and change DECSCUSR in one parser batch, and
-/// every consequence must compose. `snapshot` separately states whether the
-/// underlying grid coordinate space changed or only its process sequence did.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CursorFxCommit {
-    snapshot: CursorFxSnapshotDelta,
-    moved: bool,
-    visibility_changed: bool,
-    style_changed: bool,
-}
-
-impl CursorFxCommit {
-    const SAME: Self = Self {
-        snapshot: CursorFxSnapshotDelta::Same,
-        moved: false,
-        visibility_changed: false,
-        style_changed: false,
-    };
-
-    #[inline]
-    const fn coordinate_diverged(self) -> bool {
-        matches!(self.snapshot, CursorFxSnapshotDelta::CoordinateDiverged)
-    }
-
-    #[inline]
-    const fn projection_torn(self) -> bool {
-        self.coordinate_diverged() || self.moved || self.visibility_changed || self.style_changed
-    }
-
-    #[inline]
-    const fn is_same(self) -> bool {
-        matches!(self.snapshot, CursorFxSnapshotDelta::Same)
-            && !self.moved
-            && !self.visibility_changed
-            && !self.style_changed
-    }
-
-    /// The LOCK-A companion cannot be paired with LOCK B's caret truth.
-    #[inline]
-    const fn companion_projection_torn(self) -> bool {
-        self.moved || self.visibility_changed
-    }
-
-    /// The frame-carried body/light candidate was built at an old cell or for
-    /// an old DECSCUSR shape. Visibility alone preserves resident light.
-    #[inline]
-    const fn body_projection_torn(self) -> bool {
-        self.moved || self.style_changed
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct CursorFxProjection {
-    generation: aterm_effects::cursor_trail::ContentGeneration,
-    scroll: ContentScrollState,
-    cursor: (u16, u16),
-    visible: bool,
-    style: CursorStyle,
-}
-
-/// Classify the LOCK A effect tick against the LOCK B frame that will actually
-/// be presented. A process-sequence change alone does not move a cursor-owned
-/// projection: the terminal/screen identity, visibility, and cursor shape are
-/// its placement key, while the cumulative content-scroll state is the
-/// coordinate-space key for every row-bound point. DECSCUSR is classified
-/// separately: it invalidates the shape-specific body candidate without
-/// inventing a coordinate change that grounds the cat or resident pet.
-/// Keeping a projection across ordinary output avoids a one-frame
-/// rainbow/kitty blackout, and a scroll between the two locks must fail closed
-/// even when it returns the caret to the same cell: LOCK A's scratch has not
-/// observed that transform.
-///
-/// A BARE CARET MOVE IS NOT A DIVERGENCE (docs/design/EFFECTS-LICENSE-
-/// REDESIGN.md). The caret is not part of the coordinate space — cells did not
-/// move, so resident light is exactly as true as it was a microsecond ago.
-/// Only THIS frame's scratch, emitted at the old cell, is stale. The proof era
-/// classified every such frame `Diverged` and reset both engines, then bought
-/// typing back out of its own fence with a twin-witness exception and a
-/// one-shot settle latch. The witness remains gone: the arm is unconditional
-/// and destroys nothing. The commit seam below still buys one BOUNDED recovery
-/// train through the existing decoration scheduler, because retaining state
-/// cannot by itself create the next coherent redraw that projects it.
-#[inline]
-fn classify_cursor_fx_commit(
-    observed: CursorFxProjection,
-    committed: CursorFxProjection,
-) -> CursorFxCommit {
-    let snapshot = if observed.generation.terminal_id != committed.generation.terminal_id
-        || observed.generation.alternate_screen != committed.generation.alternate_screen
-        || observed.scroll != committed.scroll
+/// The resize seam policy for the PTY behind `master`, asked of the PTY crate
+/// rather than of the platform. On Windows a live session is ConPTY (spawned
+/// or adopted) and conhost repaints the whole viewport after every resize,
+/// row-0-anchored, from its own buffer — so the engine must append grown rows
+/// at the bottom instead of revealing history into them, and must not
+/// bottom-anchor a width change, or conhost's repaint paints the moved lines
+/// over (16 history lines lost on a 24→40 grow, a duplicated wrap fragment on
+/// a widen — audit 2026-09-22; the measurements are on
+/// `aterm_core::grid::ResizePolicy`). A stub or replay session on Windows has
+/// no registered pseudoconsole and keeps the native accounting, exactly like
+/// every Unix PTY, where nothing repaints.
+pub(crate) fn pty_resize_policy(master: i32) -> aterm_core::grid::ResizePolicy {
+    #[cfg(windows)]
     {
-        CursorFxSnapshotDelta::CoordinateDiverged
-    } else if observed.generation.process_sequence != committed.generation.process_sequence {
-        CursorFxSnapshotDelta::ProcessOnly
-    } else {
-        CursorFxSnapshotDelta::Same
-    };
-    CursorFxCommit {
-        snapshot,
-        moved: observed.cursor != committed.cursor,
-        visibility_changed: observed.visible != committed.visible,
-        style_changed: observed.style != committed.style,
+        if aterm_pty::backend_is_conpty(master) {
+            return aterm_core::grid::ResizePolicy::ConPty;
+        }
+    }
+    let _ = master;
+    aterm_core::grid::ResizePolicy::Native
+}
+
+#[cfg(test)]
+mod pty_resize_policy_tests {
+    use super::pty_resize_policy;
+    use aterm_core::grid::ResizePolicy;
+
+    /// A master no PTY backend registered — the stub sessions every GUI test
+    /// builds, and a closed session — keeps the native policy on EVERY
+    /// platform: the gate is the backend, not `cfg(windows)`.
+    #[test]
+    fn unregistered_master_keeps_the_native_policy() {
+        assert_eq!(pty_resize_policy(-1), ResizePolicy::Native);
+        assert_eq!(pty_resize_policy(0x7fff_ffff), ResizePolicy::Native);
     }
 }
 
-/// Retire every cursor-coordinate owner when a torn LOCK A/LOCK B frame
-/// actually DIVERGED the cursor's COORDINATE SPACE (`classify_cursor_fx_commit`
-/// — a terminal/screen identity change or a scroll; DECSCUSR and a bare
-/// visibility flip are independent projection facts, not divergences).
-/// Resident light is anchored in that space, so when the
-/// space itself is replaced the light has no cell left to be true about.
-/// A merely newer generation with a stable projection key and scroll clock
-/// keeps both the engines and this frame's projection live, and so — since the
-/// license redesign — does a bare caret move. `free_scratch` is deliberately
-/// conservative: the cursor kitty, resident pet, and Robi share that untagged
-/// sprite plane, so keeping any of it would risk one frame at the old cursor.
+/// Retire every cursor-coordinate owner when the cursor's COORDINATE SPACE is
+/// replaced — a terminal or screen identity change
+/// ([`sync_cursor_effect_coordinate_space`]) or a composed layout re-grid.
+/// Resident light is anchored in that space, so when the space itself is
+/// replaced the light has no cell left to be true about. `free_scratch` is
+/// deliberately conservative: the cursor kitty, resident pet, and Robi share
+/// that untagged sprite plane, so keeping any of it would risk one frame at the
+/// old cursor.
 fn retire_torn_cursor_fx(window: &mut WindowState) {
     retire_torn_cursor_fx_with(window, TornBandLaw::Curtain);
 }
@@ -350,11 +279,10 @@ fn retire_torn_cursor_fx_with(window: &mut WindowState, band: TornBandLaw) {
     window.cursor_cat.retire_unowned_cursor_motion();
     window.cursor_cat.rebase_placement();
     window.word_decos.rebase_kitty_cursor_placement();
-    window.retire_cursor_pet_coordinate_space();
+    window.companion.retire_coordinate_space();
     window.glow_scratch.clear();
     window.trail_scratch.clear();
     window.free_scratch.clear();
-    window.pet_hit_rect = None;
     window.robi_hit_rect = None;
     window.robi_tip_request = None;
     window.robi_tip_posted = None;
@@ -364,22 +292,6 @@ fn retire_torn_cursor_fx_with(window: &mut WindowState, band: TornBandLaw) {
     window.composed_cursor_style_override = None;
     window.block_fill = None;
     suppress_torn_cursor_projection(&mut window.input_scratch);
-}
-
-/// Retire only the shape-specific cursor-body family after a late DECSCUSR
-/// change. Unlike a terminal/screen/scroll divergence, the grid coordinate
-/// space is still exact, so the glow/trail engines and both companion brains
-/// must keep their earned lifecycle.
-fn retire_torn_cursor_body(window: &mut WindowState) {
-    window.cursor_rainbow = crate::cursor_rainbow::CursorRainbow::default();
-    window.cursor_droplet = crate::cursor_droplet::CursorDroplet::default();
-    window.cursor_beamrod = crate::cursor_beam::CursorBeamRod::default();
-    window.cursor_fireball = crate::cursor_fireball::CursorFireball::default();
-    window.cursor_comet = crate::cursor_comet::CursorComet::default();
-    window.cursor_phaser = crate::cursor_phaser::CursorPhaser::default();
-    window.composed_cursor_fill = None;
-    window.composed_cursor_style_override = None;
-    window.block_fill = None;
 }
 
 /// Rebaseline every cursor-coordinate owner when the focused terminal changes
@@ -412,64 +324,10 @@ pub(crate) fn sync_cursor_effect_coordinate_space(
     window.cursor_scroll_state = None;
     window.last_blink_at = None;
     window.blink_reseed = true;
-    window.pet_last_cmd = None;
-    window.pet_content_seq = None;
+    // The pet's completion and content probes described the old screen's
+    // stream: rebaseline them silently (its coordinates retired above).
+    window.companion.retire_owner();
     true
-}
-
-/// Apply the stateful half of one final-extraction classification. Returns
-/// whether this frame must suppress LOCK A's effect-owned cursor style before
-/// presenting LOCK B's terminal cursor state.
-fn apply_cursor_fx_commit(
-    window: &mut WindowState,
-    commit: CursorFxCommit,
-    cursor_owned_free: std::ops::Range<usize>,
-    observed_at: Instant,
-) -> bool {
-    let projection_torn = commit.projection_torn();
-    if projection_torn {
-        // LOCK A emitted cursor-owned pixels against facts that LOCK B proved
-        // stale. This frame correctly suppresses those pixels below, but the
-        // committed caret/style is only a RepaintKey term: it prevents a LATER
-        // redraw from early-outing, it does not create that redraw. A cold first
-        // echo and a settled resident pet own no effect cadence of their own, so
-        // without a bounded recovery owner the suppressed frame can remain on
-        // glass until unrelated input.
-        //
-        // Reuse the level-triggered decoration latch rather than requesting a
-        // redraw from inside redraw handling. Its deadline survives unrelated
-        // WaitCancelled parks, buys the next coherent LOCK-A sample, and expires
-        // after DECO_ANIM_LEVEL_FRAMES if no producer refreshes it.
-        window.note_deco_animating(observed_at);
-    }
-    if commit.coordinate_diverged() {
-        retire_torn_cursor_fx(window);
-        return true;
-    }
-    if commit.style_changed {
-        retire_torn_cursor_body(window);
-    }
-    if commit.companion_projection_torn() {
-        // The retained engines/brains own their next frame, not this torn
-        // companion. Remove only its recorded span: word cats before it and
-        // Robi after it are independent current-frame art. `RepaintKey`
-        // carries cursor position/visibility, so the bounded recovery redraw
-        // armed above cannot early-out and re-emits the current projection.
-        remove_cursor_free_sprite_span(&mut window.free_scratch, cursor_owned_free);
-        window.pet_hit_rect = None;
-    }
-    if commit.moved || commit.visibility_changed || commit.style_changed {
-        // The status sensor describes what this frame actually paints. The
-        // matching cursor body/style projection is suppressed below on each
-        // of these torn facts, so retaining LOCK A's owner would lie about the
-        // glass even though its engine state is deliberately preserved.
-        window.block_fill = None;
-    }
-    projection_torn
-}
-
-fn suppress_torn_robi_tip(bubble: &mut Option<crate::robi_bubble::RobiBubble>) {
-    *bubble = None;
 }
 
 fn suppress_torn_cursor_projection(input: &mut aterm_core::render::RenderInput) {
@@ -488,91 +346,12 @@ fn suppress_torn_cursor_projection(input: &mut aterm_core::render::RenderInput) 
     input.free_atlas = None;
 }
 
-/// Drop the LOCK-A cursor-light/body candidate while retaining the companion
-/// sprite planes. A DECSCUSR-only race changes rendering shape, not pane/grid
-/// coordinates; grounding a flying cat or resident pet here would turn a
-/// harmless bar/block toggle into a lifecycle reset.
-fn suppress_torn_cursor_body_projection(input: &mut aterm_core::render::RenderInput) {
-    input.cursor_glow_add.clear();
-    input.glow_halo.clear();
-    input.fire_patch.clear();
-    input.glow_under.clear();
-    input.char_fg.clear();
-    input.fire_halo.clear();
-    input.cursor_trail.clear();
-    input.cursor_effect_style_override = None;
-    input.cursor_fill_override = None;
-}
-
-/// Remove exactly the cursor companion's recorded span from the shared free-
-/// sprite plane. Word decorations precede this range and independent chrome
-/// sprites (Robi) follow it, so a torn cursor must not blink either neighbour.
-/// Invalid provenance fails closed because retaining an unidentified old-caret
-/// sprite is worse than one conservatively blank free-sprite frame.
-fn remove_cursor_free_sprite_span(
-    sprites: &mut Vec<aterm_core::render::FreeSprite>,
-    cursor_owned: std::ops::Range<usize>,
-) {
-    if cursor_owned.start > cursor_owned.end || cursor_owned.end > sprites.len() {
-        sprites.clear();
-        return;
-    }
-    sprites.drain(cursor_owned);
-}
-
-/// Keep the cursor-owned suffix of the shared free-sprite scratch while
-/// dropping grid-scanned word decorations from a stale LOCK A snapshot. The
-/// range is recorded immediately after the word engine and immediately after
-/// the cursor companions, so later independent sprites (Robi) are excluded.
-/// Invalid provenance fails closed.
-fn retain_cursor_free_sprite_span(
-    sprites: &mut Vec<aterm_core::render::FreeSprite>,
-    cursor_owned: std::ops::Range<usize>,
-) {
-    if cursor_owned.start > cursor_owned.end || cursor_owned.end > sprites.len() {
-        sprites.clear();
-        return;
-    }
-    sprites.truncate(cursor_owned.end);
-    sprites.drain(..cursor_owned.start);
-}
-
 #[cfg(test)]
 mod cursor_fx_generation_fence_tests {
-    use super::{
-        CursorFxCommit, CursorFxProjection, CursorFxSnapshotDelta, apply_cursor_fx_commit,
-        classify_cursor_fx_commit, emit_single_cursor_companion, retain_cursor_free_sprite_span,
-        retire_torn_cursor_fx, suppress_torn_cursor_body_projection,
-        suppress_torn_cursor_projection, suppress_torn_robi_tip, take_due_trail_tick,
-    };
+    use super::retire_torn_cursor_fx;
     use crate::{App, WindowId};
-    use aterm_core::render::{
-        CharFg, FireHaloCell, FreeSprite, GlowQuad, RainHalo, SceneAtlas, SpriteQuad, TrailCell,
-    };
-    use aterm_core::terminal::{ContentScrollState, CursorStyle};
-    use aterm_effects::cursor_glow::{
-        BlockFill, BlockFillOwner, CursorCatMotionKind, CursorCatMotionPulse, Geom, GlowStyle,
-        ProbeTrust,
-    };
-    use aterm_effects::cursor_trail::{ContentGeneration, TrailConfig};
-    use aterm_effects::kitty_pet::{PetAction, PetSense};
-    use aterm_effects::kitty_registry::KittyLook;
-    use std::sync::Arc;
+    use aterm_core::terminal::ContentScrollState;
     use std::time::{Duration, Instant};
-
-    const fn fx_commit(
-        snapshot: CursorFxSnapshotDelta,
-        moved: bool,
-        visibility_changed: bool,
-        style_changed: bool,
-    ) -> CursorFxCommit {
-        CursorFxCommit {
-            snapshot,
-            moved,
-            visibility_changed,
-            style_changed,
-        }
-    }
 
     /// A rainbow-kitty window with one lit ribbon cell on glass, built through
     /// the REAL frame path: the seam twins below each fire one host seam at it
@@ -641,7 +420,7 @@ mod cursor_fx_generation_fence_tests {
 
     /// **RAINBOW PATH v3 step 7 (A2): a coordinate-space seam curtains the
     /// ribbon instead of cutting it.** `retire_torn_cursor_fx` — the alt
-    /// screen, a tab switch, a torn frame, a layout re-grid — used to `reset()`
+    /// screen, a tab switch, a layout re-grid — used to `reset()`
     /// the glow: a lit band was gone on the next frame (15 → 0 lit cells inside
     /// one 17 ms frame on glass, audit s8). Through the real seam: a typed key
     /// lays a lit cell, the seam fires, and the body is still on glass half-way
@@ -990,1133 +769,6 @@ mod cursor_fx_generation_fence_tests {
                 .v2_ribbon()
                 .is_some_and(|r| !r.curtained()),
             "a history viewport is not a coordinate-space seam: no curtain (D-4)"
-        );
-    }
-
-    #[test]
-    fn block_fill_sensor_tracks_the_projection_that_reaches_glass() {
-        let observed_at = Instant::now();
-        let owned = BlockFill {
-            owner: BlockFillOwner::Rainbow,
-            fill: 0x00FF_6600,
-            base: Some(0x0000_00FF),
-        };
-        for commit in [
-            fx_commit(CursorFxSnapshotDelta::Same, true, false, false),
-            fx_commit(CursorFxSnapshotDelta::Same, false, true, false),
-            fx_commit(CursorFxSnapshotDelta::Same, false, false, true),
-            fx_commit(
-                CursorFxSnapshotDelta::CoordinateDiverged,
-                false,
-                false,
-                false,
-            ),
-        ] {
-            let mut app = App::headless_for_test();
-            let ws = app.windows.get_mut(&WindowId(0)).expect("headless window");
-            ws.block_fill = Some(owned);
-            assert!(apply_cursor_fx_commit(ws, commit, 0..0, observed_at));
-            assert_eq!(
-                ws.block_fill, None,
-                "a suppressed LOCK-A body cannot remain the reported owner: {commit:?}"
-            );
-        }
-
-        let mut app = App::headless_for_test();
-        let ws = app.windows.get_mut(&WindowId(0)).expect("headless window");
-        ws.block_fill = Some(owned);
-        assert!(!apply_cursor_fx_commit(
-            ws,
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, false, false),
-            0..0,
-            observed_at,
-        ));
-        assert_eq!(
-            ws.block_fill,
-            Some(owned),
-            "process-only churn retains the body that remains on glass"
-        );
-    }
-
-    #[test]
-    fn projection_key_divergence_retires_resident_cursor_and_companion_projection() {
-        let observed = ContentGeneration {
-            process_sequence: 41,
-            terminal_id: 7,
-            alternate_screen: false,
-        };
-        let committed = ContentGeneration {
-            process_sequence: 42,
-            ..observed
-        };
-        assert_eq!(
-            classify_cursor_fx_commit(
-                CursorFxProjection {
-                    generation: observed,
-                    scroll: ContentScrollState::default(),
-                    cursor: (2, 2),
-                    visible: true,
-                    style: CursorStyle::SteadyBlock,
-                },
-                CursorFxProjection {
-                    generation: committed,
-                    scroll: ContentScrollState::default(),
-                    cursor: (2, 2),
-                    visible: true,
-                    style: CursorStyle::SteadyBlock,
-                },
-            ),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, false, false),
-            "content churn at a stable caret keeps the current projection"
-        );
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        let glow_cfg = app.glow_config();
-        assert!(matches!(glow_cfg.style, GlowStyle::Lumen));
-        let trail_cfg = TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(300),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.5,
-            warmth: 0.0,
-        };
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let now = Instant::now();
-        app.robi_bubble = Some(crate::robi_bubble::RobiBubble::new(
-            "stale lock-a tip",
-            Some((11.0, 12.0)),
-            now,
-        ));
-        {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            ws.cursor_glow
-                .tick(Some((2, 2)), now, &glow_cfg, geom, &mut ws.glow_scratch);
-            ws.cursor_trail
-                .tick(Some((2, 2)), now, &trail_cfg, &mut ws.trail_scratch);
-            ws.cursor_glow.note_synthetic_move(now);
-            ws.cursor_trail.note_synthetic_move(now);
-            assert!(
-                ws.cursor_glow.move_licensed(now) && ws.cursor_trail.move_licensed(now),
-                "the fence test starts with a real live license on both engines"
-            );
-            ws.glow_scratch.push(GlowQuad::default());
-            ws.trail_scratch.push(TrailCell {
-                row: 2,
-                col: 2,
-                alpha: 255,
-            });
-            ws.free_scratch.push(FreeSprite::default());
-            ws.pet_hit_rect = Some((1, 2, 3, 4));
-            ws.robi_hit_rect = Some((5, 6, 7, 8));
-            ws.robi_tip_request = Some(0);
-            ws.robi_tip_posted = Some(0);
-            ws.robi_bubble_anchor = Some((9.0, 10.0));
-
-            // Seed the REAL classic companion and its new fold clock. A
-            // coordinate divergence must ground ordinary motion, not merely
-            // clear the already-emitted scratch while leaving a 60fps owner.
-            for i in 0..96u64 {
-                ws.cursor_cat
-                    .on_key(now + Duration::from_millis(i * 40), true);
-            }
-            assert!(ws.cursor_cat.is_active(), "fixture earns the cursor cat");
-            let fold_at = now + Duration::from_secs(4);
-            ws.cursor_cat.on_motion_pulse(CursorCatMotionPulse {
-                at: fold_at,
-                kind: CursorCatMotionKind::FoldForward,
-            });
-            assert!(ws.cursor_cat.placement_frame(fold_at).fold.is_some());
-
-            // Seed the REAL resident companion into a live cross-screen arc.
-            // Clearing `free_scratch`/`pet_hit_rect` alone cannot satisfy this
-            // fixture: the brain itself owns pane-local position and flight.
-            let pet_sense = |at, caret| PetSense {
-                caret_drawn: true,
-                now: at,
-                caret,
-                rows: geom.rows as u16,
-                cols: geom.cols as u16,
-                cell_w: geom.cw as u16,
-                cell_h: geom.ch as u16,
-                reduced_motion: false,
-                output_burst: false,
-                pointer: None,
-                wrapped: false,
-            };
-            let born = ws
-                .cursor_pet
-                .tick_static_capture(pet_sense(fold_at, Some((2, 2))));
-            assert!(born.alpha > 0 && ws.cursor_pet.is_active());
-            // A fresh resident is asleep. Exercise the same two-key wake and
-            // settle cadence as the live host before asking it to pounce; a
-            // direct far sighting from Sleep is deliberately only a wake-up.
-            let mut pet_at = fold_at;
-            for caret in [(2, 3), (2, 4)] {
-                pet_at += Duration::from_millis(50);
-                let _ = ws.cursor_pet.tick(pet_sense(pet_at, Some(caret)));
-            }
-            for _ in 0..120 {
-                pet_at += Duration::from_millis(16);
-                let _ = ws.cursor_pet.tick(pet_sense(pet_at, Some((2, 4))));
-            }
-            let mut flying_pet = None;
-            for _ in 0..180 {
-                pet_at += Duration::from_millis(16);
-                let frame = ws.cursor_pet.tick(pet_sense(pet_at, Some((2, 24))));
-                if frame.action == PetAction::Leap && frame.lift > 0.0 {
-                    flying_pet = Some(frame);
-                    break;
-                }
-            }
-            let flying_pet = flying_pet.expect("fixture earns an active resident-pet flight");
-            assert!(ws.cursor_pet.is_active() && ws.cursor_pet.needs_frames());
-
-            retire_torn_cursor_fx(ws);
-            assert!(
-                !ws.cursor_glow.move_licensed(now) && !ws.cursor_trail.move_licensed(now),
-                "a genuinely torn coordinate space spends every license too"
-            );
-            assert!(ws.glow_scratch.is_empty() && ws.trail_scratch.is_empty());
-            assert!(ws.free_scratch.is_empty());
-            assert!(ws.pet_hit_rect.is_none() && ws.robi_hit_rect.is_none());
-            assert!(ws.robi_tip_request.is_none());
-            assert!(ws.robi_tip_posted.is_none());
-            assert!(ws.robi_bubble_anchor.is_none());
-            assert!(
-                !ws.cursor_cat.is_active() && ws.cursor_cat.placement_frame(fold_at).fold.is_none(),
-                "ordinary cat lifecycle and fold cannot survive coordinate divergence"
-            );
-            assert!(
-                !ws.cursor_pet.is_active() && !ws.cursor_pet.needs_frames(),
-                "resident position and flight cannot survive coordinate divergence"
-            );
-            let replacement_caret = if flying_pet.col < 40.0 {
-                (1, 70)
-            } else {
-                (1, 2)
-            };
-            let replacement = ws.cursor_pet.tick_static_capture(pet_sense(
-                fold_at + Duration::from_secs(2),
-                Some(replacement_caret),
-            ));
-            assert_eq!(replacement.row, f32::from(replacement_caret.0));
-            assert!(
-                (replacement.col - flying_pet.col).abs() > 20.0,
-                "the fresh sighting must materialize in the committed coordinate space: \
-                 old=({}, {}) new=({}, {})",
-                flying_pet.col,
-                flying_pet.row,
-                replacement.col,
-                replacement.row,
-            );
-
-            // A promised collection appearance survives, but is re-anchored
-            // at the new live caret instead of continuing old edge travel.
-            ws.cursor_cat.on_collect(fold_at, KittyLook::default());
-            ws.cursor_cat.on_motion_pulse(CursorCatMotionPulse {
-                at: fold_at,
-                kind: CursorCatMotionKind::FoldForward,
-            });
-            assert!(ws.cursor_cat.placement_frame(fold_at).fold.is_some());
-            retire_torn_cursor_fx(ws);
-            assert!(ws.cursor_cat.is_active(), "collection promise is preserved");
-            assert!(
-                ws.cursor_cat.placement_frame(fold_at).fold.is_none(),
-                "collection body re-anchors instead of carrying old travel"
-            );
-
-            let atlas = Arc::new(SceneAtlas {
-                width: 1,
-                height: 1,
-                rgba: vec![255, 255, 255, 255],
-                version: 1,
-            });
-            let input = &mut ws.input_scratch;
-            input.cursor_glow_add.push(GlowQuad::default());
-            input.glow_halo.push(RainHalo::default());
-            input.fire_patch.push(Default::default());
-            input.glow_under.push(GlowQuad::default());
-            input.char_fg.push(CharFg {
-                row: 2,
-                col: 2,
-                fg: 0x00FF_FFFF,
-            });
-            input.fire_halo.push(FireHaloCell {
-                row: 2,
-                col: 2,
-                strength: 255,
-            });
-            input.cursor_trail.push(TrailCell {
-                row: 2,
-                col: 2,
-                alpha: 255,
-            });
-            input.cursor_effect_style_override = Some(CursorStyle::Bolt);
-            input.cursor_fill_override = Some(0x0050_FA7B);
-            input.cat_quads.push(SpriteQuad::default());
-            input.cat_atlas = Some(Arc::clone(&atlas));
-            input.free_sprites.push(FreeSprite::default());
-            input.free_atlas = Some(atlas);
-            suppress_torn_cursor_projection(input);
-            assert!(input.cursor_glow_add.is_empty());
-            assert!(input.glow_halo.is_empty());
-            assert!(input.fire_patch.is_empty());
-            assert!(input.glow_under.is_empty());
-            assert!(input.char_fg.is_empty());
-            assert!(input.fire_halo.is_empty());
-            assert!(input.cursor_trail.is_empty());
-            assert!(input.cursor_effect_style_override.is_none());
-            assert!(input.cursor_fill_override.is_none());
-            assert!(input.cat_quads.is_empty() && input.cat_atlas.is_none());
-            assert!(input.free_sprites.is_empty() && input.free_atlas.is_none());
-        }
-        suppress_torn_robi_tip(&mut app.robi_bubble);
-        assert!(
-            app.robi_bubble.is_none(),
-            "a LOCK-A Robi bubble cannot outlive its suppressed speaker"
-        );
-    }
-
-    /// TORN-FRAME PIN (v0.49.0): a PTY chunk landing between LOCK A and
-    /// LOCK B is a standing, several-times-per-second event under a streaming
-    /// TUI. Content churn with an identical projection key keeps the current
-    /// overlays; a COORDINATE-SPACE change (identity, screen, scroll)
-    /// suppresses and resets; DECSCUSR retires only the shape-specific body;
-    /// a bare caret move
-    /// suppresses this frame's stale scratch and resets NOTHING, whoever moved
-    /// the caret and whether or not a key licensed it.
-    #[test]
-    fn torn_frame_projection_classifier_is_proportionate() {
-        let observed = ContentGeneration {
-            process_sequence: 41,
-            terminal_id: 7,
-            alternate_screen: true,
-        };
-        let committed = ContentGeneration {
-            process_sequence: 42,
-            ..observed
-        };
-        let observed_scroll = ContentScrollState::default();
-        let observed_projection = CursorFxProjection {
-            generation: observed,
-            scroll: observed_scroll,
-            cursor: (3, 9),
-            visible: true,
-            style: CursorStyle::SteadyBlock,
-        };
-        let classify = |generation, cursor, visible, style| {
-            classify_cursor_fx_commit(
-                observed_projection,
-                CursorFxProjection {
-                    generation,
-                    scroll: observed_scroll,
-                    cursor,
-                    visible,
-                    style,
-                },
-            )
-        };
-        assert_eq!(
-            classify(committed, (3, 9), true, CursorStyle::SteadyBlock),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, false, false),
-            "an output-only mid-frame batch keeps this frame's resident light"
-        );
-        assert_eq!(
-            classify(committed, (4, 0), true, CursorStyle::SteadyBlock),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, true, false, false),
-            "a mid-frame caret move suppresses stale scratch and resets nothing"
-        );
-        assert_eq!(
-            classify(observed, (4, 0), true, CursorStyle::SteadyBlock),
-            fx_commit(CursorFxSnapshotDelta::Same, true, false, false),
-            "no generation step is required: cells did not move, so light is not stale"
-        );
-        assert_eq!(
-            classify(committed, (3, 9), false, CursorStyle::SteadyBlock),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, true, false),
-            "a bare visibility flip rebinds the presented style and resets \
-             NOTHING — no cell moved, so resident light is still exactly true. \
-             The proof era called this a divergence, which meant a blinking \
-             caret could blank the ribbon; a repaint-blinking TUI (DECTCEM \
-             hide inside a synchronized update) flips this several times a \
-             second."
-        );
-        assert_eq!(
-            classify(
-                ContentGeneration {
-                    alternate_screen: false,
-                    ..committed
-                },
-                (3, 9),
-                true,
-                CursorStyle::SteadyBlock,
-            ),
-            fx_commit(
-                CursorFxSnapshotDelta::CoordinateDiverged,
-                false,
-                false,
-                false,
-            ),
-            "a mid-frame screen swap owns a hard reset"
-        );
-        assert_eq!(
-            classify(
-                ContentGeneration {
-                    terminal_id: 8,
-                    ..committed
-                },
-                (3, 9),
-                true,
-                CursorStyle::SteadyBlock,
-            ),
-            fx_commit(
-                CursorFxSnapshotDelta::CoordinateDiverged,
-                false,
-                false,
-                false,
-            ),
-            "a mid-frame terminal identity change owns a hard reset"
-        );
-        assert_eq!(
-            classify(committed, (4, 0), true, CursorStyle::SteadyBar),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, true, false, true),
-            "DECSCUSR retirement and old-caret suppression compose"
-        );
-        assert_eq!(
-            classify(committed, (3, 9), true, CursorStyle::SteadyBar),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, false, true),
-            "DECSCUSR alone invalidates only the old body shape"
-        );
-        assert_eq!(
-            classify(committed, (3, 9), false, CursorStyle::SteadyBar),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, false, true, true),
-            "DECSCUSR retirement and DECTCEM projection suppression compose"
-        );
-        assert_eq!(
-            classify(committed, (4, 0), false, CursorStyle::SteadyBar),
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, true, true, true),
-            "move, visibility and style changes remain independent facts"
-        );
-        assert_eq!(
-            classify(
-                ContentGeneration {
-                    alternate_screen: false,
-                    ..committed
-                },
-                (4, 0),
-                false,
-                CursorStyle::SteadyBar,
-            ),
-            fx_commit(CursorFxSnapshotDelta::CoordinateDiverged, true, true, true,),
-            "coordinate divergence does not erase its compositional projection facts"
-        );
-        assert_eq!(
-            classify_cursor_fx_commit(
-                observed_projection,
-                CursorFxProjection {
-                    generation: committed,
-                    scroll: ContentScrollState {
-                        uniform_up_rows: 1,
-                        ..observed_scroll
-                    },
-                    cursor: (3, 9),
-                    visible: true,
-                    style: CursorStyle::SteadyBlock,
-                },
-            ),
-            fx_commit(
-                CursorFxSnapshotDelta::CoordinateDiverged,
-                false,
-                false,
-                false,
-            ),
-            "a mid-frame scroll cannot retain LOCK A row-bound scratch even when the caret returns"
-        );
-        assert_eq!(
-            classify(observed, (3, 9), true, CursorStyle::SteadyBlock),
-            CursorFxCommit::SAME,
-            "an exact LOCK A/B observation is coherent"
-        );
-    }
-
-    #[test]
-    fn bare_cursor_move_preserves_resident_pet_but_divergence_retires_it() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let now = Instant::now();
-        let sense = PetSense {
-            caret_drawn: true,
-            now,
-            caret: Some((4, 12)),
-            rows: 24,
-            cols: 80,
-            cell_w: 8,
-            cell_h: 16,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let ws = app.windows.get_mut(&wid).expect("headless window");
-        let frame = ws.cursor_pet.tick_static_capture(sense);
-        assert!(frame.alpha > 0 && ws.cursor_pet.is_active());
-        ws.free_scratch.extend([
-            FreeSprite {
-                x: 10,
-                ..FreeSprite::default()
-            },
-            FreeSprite {
-                x: 20,
-                ..FreeSprite::default()
-            },
-            FreeSprite {
-                x: 30,
-                ..FreeSprite::default()
-            },
-        ]);
-        ws.pet_hit_rect = Some((96, 64, 144, 112));
-        ws.robi_hit_rect = Some((4, 5, 6, 7));
-
-        assert!(apply_cursor_fx_commit(
-            ws,
-            fx_commit(CursorFxSnapshotDelta::Same, true, false, false),
-            1..2,
-            now,
-        ));
-        assert!(
-            ws.cursor_pet.is_active(),
-            "c5 licenses retained coordinates across a bare caret move"
-        );
-        assert!(
-            ws.free_scratch
-                .iter()
-                .map(|sprite| sprite.x)
-                .collect::<Vec<_>>()
-                == [10, 30]
-                && ws.pet_hit_rect.is_none(),
-            "only this frame's old-caret companion projection is dropped"
-        );
-        assert_eq!(
-            ws.robi_hit_rect,
-            Some((4, 5, 6, 7)),
-            "independent Robi custody survives a torn caret"
-        );
-
-        assert!(apply_cursor_fx_commit(
-            ws,
-            fx_commit(
-                CursorFxSnapshotDelta::CoordinateDiverged,
-                false,
-                false,
-                false,
-            ),
-            0..0,
-            now,
-        ));
-        assert!(
-            !ws.cursor_pet.is_active() && !ws.cursor_pet.needs_frames(),
-            "only coordinate-space divergence retires the resident brain"
-        );
-    }
-
-    #[test]
-    fn visibility_drift_withholds_only_this_frames_companion() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let now = Instant::now();
-        let ws = app.windows.get_mut(&wid).expect("headless window");
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let mut halo = Vec::new();
-        ws.cursor_rainbow.tick(
-            Some((4, 12)),
-            now,
-            1.0,
-            true,
-            true,
-            geom,
-            &crate::cursor_rainbow::RainbowConfig {
-                enabled: true,
-                intensity: 1.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
-                paint: None,
-                ground: None,
-                flare_at: None,
-            },
-            &mut halo,
-        );
-        let key_start = now - Duration::from_millis(95 * 40);
-        for index in 0..96 {
-            ws.cursor_cat
-                .on_key(key_start + Duration::from_millis(index * 40), true);
-        }
-        let cat_frame = ws.cursor_cat.frame(now);
-        let pet = ws.cursor_pet.tick_static_capture(PetSense {
-            caret_drawn: true,
-            now,
-            caret: Some((4, 12)),
-            rows: 24,
-            cols: 80,
-            cell_w: 8,
-            cell_h: 16,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        });
-        assert!(ws.cursor_cat.is_active() && cat_frame.alpha > 0);
-        assert!(pet.alpha > 0 && ws.cursor_pet.is_active());
-        let effect_geom = crate::word_decorations::EffectGeom {
-            cell_w: 8,
-            cell_h: 16,
-            rows: 24,
-            cols: 80,
-        };
-        ws.free_scratch.push(FreeSprite {
-            x: 10,
-            ..FreeSprite::default()
-        });
-        ws.word_decos.begin_host_frame();
-        let cursor_start = ws.free_scratch.len();
-        assert_ne!(
-            emit_single_cursor_companion(
-                ws,
-                effect_geom,
-                Some((4, 12)),
-                false,
-                // A fixture, not the drawn present: never spends a hello.
-                false,
-                pet,
-                cat_frame,
-                cat_frame.alpha,
-                now,
-                false,
-                0x0010_1010,
-                0x00FF_FFFF,
-                0x0050_FA7B,
-            ),
-            0,
-            "the production emitter creates the LOCK-A flying companion"
-        );
-        let cursor_end = ws.free_scratch.len();
-        assert_eq!(cursor_end - cursor_start, 1);
-        ws.free_scratch.push(FreeSprite {
-            x: 30,
-            ..FreeSprite::default()
-        });
-        ws.pet_hit_rect = Some((96, 64, 144, 112));
-        ws.robi_hit_rect = Some((4, 5, 6, 7));
-
-        assert!(apply_cursor_fx_commit(
-            ws,
-            fx_commit(CursorFxSnapshotDelta::Same, false, true, false),
-            cursor_start..cursor_end,
-            now,
-        ));
-        assert!(
-            ws.cursor_rainbow.is_active() && ws.cursor_cat.is_active() && ws.cursor_pet.is_active(),
-            "DECTCEM drift preserves the body engine and both companion brains"
-        );
-        assert_eq!(
-            ws.free_scratch
-                .iter()
-                .map(|sprite| sprite.x)
-                .collect::<Vec<_>>(),
-            [10, 30],
-            "only the cursor-owned middle span is withheld"
-        );
-        assert!(ws.pet_hit_rect.is_none());
-        assert_eq!(ws.robi_hit_rect, Some((4, 5, 6, 7)));
-
-        let recovery_at = ws
-            .plan_terminal_effect_lane(now, true, true)
-            .expect("the withheld companion owns a bounded recovery frame");
-        assert!(take_due_trail_tick(
-            &mut ws.next_trail_tick,
-            &mut ws.last_trail_fire,
-            recovery_at,
-        ));
-
-        ws.free_scratch.clear();
-        ws.free_scratch.push(FreeSprite {
-            x: 10,
-            ..FreeSprite::default()
-        });
-        ws.word_decos.begin_host_frame();
-        let coherent_start = ws.free_scratch.len();
-        let coherent_at = recovery_at;
-        let coherent_cat = ws.cursor_cat.frame(coherent_at);
-        assert_ne!(
-            emit_single_cursor_companion(
-                ws,
-                effect_geom,
-                Some((4, 12)),
-                false,
-                // A fixture, not the drawn present: never spends a hello.
-                false,
-                pet,
-                coherent_cat,
-                coherent_cat.alpha,
-                coherent_at,
-                false,
-                0x0010_1010,
-                0x00FF_FFFF,
-                0x0050_FA7B,
-            ),
-            0
-        );
-        let coherent_end = ws.free_scratch.len();
-        ws.free_scratch.push(FreeSprite {
-            x: 30,
-            ..FreeSprite::default()
-        });
-        assert!(!apply_cursor_fx_commit(
-            ws,
-            CursorFxCommit::SAME,
-            coherent_start..coherent_end,
-            coherent_at,
-        ));
-        assert_eq!(coherent_end - coherent_start, 1);
-        assert_eq!(ws.free_scratch.len(), 3);
-        assert_eq!(ws.free_scratch.first().map(|sprite| sprite.x), Some(10));
-        assert_eq!(ws.free_scratch.last().map(|sprite| sprite.x), Some(30));
-    }
-
-    #[test]
-    fn descsusr_style_drift_retires_body_candidate_but_preserves_companion_lifecycles() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let now = Instant::now();
-        let ws = app.windows.get_mut(&wid).expect("headless window");
-        let geom = Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        };
-        let mut halo = Vec::new();
-        ws.cursor_rainbow.tick(
-            Some((4, 12)),
-            now,
-            1.0,
-            true,
-            true,
-            geom,
-            &crate::cursor_rainbow::RainbowConfig {
-                enabled: true,
-                intensity: 1.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
-                paint: None,
-                ground: None,
-                flare_at: None,
-            },
-            &mut halo,
-        );
-        for index in 0..120 {
-            ws.cursor_cat
-                .on_key(now + Duration::from_millis(index * 40), true);
-        }
-        let pet = ws.cursor_pet.tick_static_capture(PetSense {
-            caret_drawn: true,
-            now,
-            caret: Some((4, 12)),
-            rows: 24,
-            cols: 80,
-            cell_w: 8,
-            cell_h: 16,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        });
-        assert!(ws.cursor_rainbow.is_active());
-        assert!(ws.cursor_cat.is_active());
-        assert!(pet.alpha > 0 && ws.cursor_pet.is_active());
-
-        ws.input_scratch.cursor_glow_add.push(GlowQuad::default());
-        ws.input_scratch.cursor_effect_style_override = Some(CursorStyle::Bolt);
-        ws.input_scratch.cursor_fill_override = Some(0x0050_FA7B);
-        ws.input_scratch.cat_quads.push(SpriteQuad::default());
-        ws.input_scratch.free_sprites.push(FreeSprite::default());
-
-        assert!(apply_cursor_fx_commit(
-            ws,
-            fx_commit(CursorFxSnapshotDelta::Same, false, false, true),
-            0..0,
-            now,
-        ));
-        suppress_torn_cursor_body_projection(&mut ws.input_scratch);
-        assert!(
-            !ws.cursor_rainbow.is_active(),
-            "the old DECSCUSR body cannot survive the style edge"
-        );
-        assert!(
-            ws.input_scratch.cursor_glow_add.is_empty()
-                && ws.input_scratch.cursor_effect_style_override.is_none()
-                && ws.input_scratch.cursor_fill_override.is_none(),
-            "the old-shape candidate is suppressed for this frame"
-        );
-        assert!(
-            ws.cursor_cat.is_active() && ws.cursor_pet.is_active(),
-            "style-only divergence cannot ground either companion brain"
-        );
-        assert_eq!(ws.input_scratch.cat_quads.len(), 1);
-        assert_eq!(ws.input_scratch.free_sprites.len(), 1);
-
-        ws.cursor_rainbow.tick(
-            Some((4, 12)),
-            now + Duration::from_millis(1),
-            1.0,
-            true,
-            true,
-            geom,
-            &crate::cursor_rainbow::RainbowConfig {
-                enabled: true,
-                intensity: 1.0,
-                blinking: false,
-                base: None,
-                head_rgb: None,
-                paint: None,
-                ground: None,
-                flare_at: None,
-            },
-            &mut halo,
-        );
-        ws.free_scratch.extend([
-            FreeSprite {
-                x: 10,
-                ..FreeSprite::default()
-            },
-            FreeSprite {
-                x: 20,
-                ..FreeSprite::default()
-            },
-            FreeSprite {
-                x: 30,
-                ..FreeSprite::default()
-            },
-        ]);
-        ws.pet_hit_rect = Some((96, 64, 144, 112));
-        ws.robi_hit_rect = Some((4, 5, 6, 7));
-        assert!(apply_cursor_fx_commit(
-            ws,
-            fx_commit(CursorFxSnapshotDelta::Same, false, true, true),
-            1..2,
-            now,
-        ));
-        assert!(!ws.cursor_rainbow.is_active());
-        assert!(ws.cursor_cat.is_active() && ws.cursor_pet.is_active());
-        assert_eq!(
-            ws.free_scratch
-                .iter()
-                .map(|sprite| sprite.x)
-                .collect::<Vec<_>>(),
-            [10, 30],
-            "compound style/visibility drift composes body retirement with exact companion suppression"
-        );
-        assert!(ws.pet_hit_rect.is_none());
-        assert_eq!(ws.robi_hit_rect, Some((4, 5, 6, 7)));
-    }
-
-    struct StraddledEchoFixture {
-        app: App,
-        await_at: Instant,
-        baseline_cells: [char; 16],
-    }
-
-    fn echo_generation(process_sequence: u32) -> ContentGeneration {
-        ContentGeneration {
-            process_sequence,
-            terminal_id: 7,
-            alternate_screen: false,
-        }
-    }
-
-    fn echo_geom() -> Geom {
-        Geom {
-            cw: 8,
-            ch: 16,
-            rows: 24,
-            cols: 80,
-            origin_x: 0,
-            origin_y: 0,
-            win_w: 640,
-            win_h: 384,
-            head: 0,
-        }
-    }
-
-    fn echo_trail_config() -> TrailConfig {
-        TrailConfig {
-            enabled: true,
-            duration: Duration::from_millis(400),
-            max_len: 24,
-            color: 0x0050_FA7B,
-            intensity: 0.5,
-            warmth: 0.0,
-        }
-    }
-
-    /// Drive the real engines through a LOCK-A/LOCK-B caret straddle: the
-    /// tick runs at `origin`, then the frame commits at `target` because the
-    /// keystroke's echo landed between the two locks.
-    ///
-    /// `resident` picks the two cases that were ever load-bearing. `true` is
-    /// light already earned, which the commit may not destroy. `false` is the
-    /// cold first key, where no engine owns an animation deadline — the case
-    /// the retired settle latch existed to buy a frame for.
-    fn straddled_echo_fixture(resident: bool) -> StraddledEchoFixture {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.config.cursor_trail = Some(true);
-        app.config.cursor_trail_style = Some("lumen".to_string());
-        let glow_cfg = app.glow_config();
-        let trail_cfg = echo_trail_config();
-        let geom = echo_geom();
-        let observed_generation = echo_generation(6);
-        let committed_generation = echo_generation(7);
-        let t0 = Instant::now();
-        let origin = (2, 2);
-        let target = (2, 3);
-        let ws = app.windows.get_mut(&wid).unwrap();
-
-        // Baseline both engines and their content clock. Moving to `origin`
-        // without an input license stays dark; the resident arm licenses that
-        // move with a real synthetic note, exactly as the host's gesture seam
-        // does.
-        ws.cursor_glow
-            .tick(Some((2, 1)), t0, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some((2, 1)), t0, &trail_cfg, &mut ws.trail_scratch);
-        let origin_at = t0 + Duration::from_millis(1);
-        if resident {
-            ws.cursor_glow.note_synthetic_move(origin_at);
-            ws.cursor_trail.note_synthetic_move(origin_at);
-        }
-        ws.cursor_glow.tick(
-            Some(origin),
-            origin_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail
-            .tick(Some(origin), origin_at, &trail_cfg, &mut ws.trail_scratch);
-        assert_eq!(ws.cursor_glow.live_sparks() > 0, resident);
-        assert_eq!(ws.cursor_trail.is_active(), resident);
-
-        let mut baseline_cells = [' '; 16];
-        baseline_cells[0] = '>';
-        let key_at = origin_at + Duration::from_millis(1);
-        ws.cursor_glow.note_typed_cells(key_at, 1);
-        ws.cursor_trail.note_typed(key_at);
-
-        // Run the production LOCK-A seam against the still-unchanged
-        // generation: the row probe, then the engine tick at `origin`.
-        let await_at = key_at + Duration::from_millis(1);
-        ws.cursor_glow.observe_row_with_trust(
-            origin.0,
-            origin.1,
-            &baseline_cells,
-            await_at,
-            ProbeTrust::Full,
-        );
-        ws.cursor_glow.tick(
-            Some(origin),
-            await_at,
-            &glow_cfg,
-            geom,
-            &mut ws.glow_scratch,
-        );
-        ws.cursor_trail
-            .tick(Some(origin), await_at, &trail_cfg, &mut ws.trail_scratch);
-
-        // The key that will explain this straddle is still fresh on both
-        // engines — but the commit below is not allowed to care, and is handed
-        // no witness to care with.
-        assert!(ws.cursor_glow.move_licensed(await_at));
-        assert!(ws.cursor_trail.move_licensed(await_at));
-        let commit = classify_cursor_fx_commit(
-            CursorFxProjection {
-                generation: observed_generation,
-                scroll: ContentScrollState::default(),
-                cursor: origin,
-                visible: true,
-                style: CursorStyle::SteadyBlock,
-            },
-            CursorFxProjection {
-                generation: committed_generation,
-                scroll: ContentScrollState::default(),
-                cursor: target,
-                visible: true,
-                style: CursorStyle::SteadyBlock,
-            },
-        );
-        assert_eq!(
-            commit,
-            fx_commit(CursorFxSnapshotDelta::ProcessOnly, true, false, false)
-        );
-        assert!(apply_cursor_fx_commit(ws, commit, 0..0, await_at));
-
-        StraddledEchoFixture {
-            app,
-            await_at,
-            baseline_cells,
-        }
-    }
-
-    /// THE RETENTION LAW AT THE TORN SEAM (docs/design/EFFECTS-LICENSE-
-    /// REDESIGN.md): a caret that moves between the two locks suppresses the
-    /// stale scratch plane and NOTHING ELSE. Before the redesign this frame
-    /// was `Diverged` unless a twin-engine license witness rescued it, and the
-    /// rescue was narrow enough (exactly one parser batch, cursor visible) that
-    /// an ordinary streaming collision reset both engines mid-ribbon.
-    #[test]
-    fn a_mid_frame_caret_move_keeps_the_light_it_tore() {
-        let mut fixture = straddled_echo_fixture(true);
-        let ws = fixture.app.windows.get_mut(&WindowId(0)).unwrap();
-        assert!(
-            ws.cursor_glow.live_sparks() > 0,
-            "resident aurora survives a torn caret"
-        );
-        assert!(
-            ws.cursor_trail.is_active(),
-            "resident comet survives a torn caret"
-        );
-        assert!(
-            ws.cursor_glow.move_licensed(fixture.await_at)
-                && ws.cursor_trail.move_licensed(fixture.await_at),
-            "the commit spends no license either"
-        );
-        assert!(
-            ws.free_scratch.is_empty() && ws.pet_hit_rect.is_none(),
-            "the stale companion sprite plane IS dropped for this frame"
-        );
-    }
-
-    /// THE COLD FIRST KEY, driven through the complete bounded recovery
-    /// sequence. No engine owns animation cadence when LOCK A samples the old
-    /// caret, so preserving the fresh movement licence is not enough: the
-    /// changed RepaintKey can prevent a later redraw from early-outing, but only
-    /// an owned deadline can make that redraw exist. The torn commit refreshes
-    /// the existing decoration latch, the terminal-effects lane turns it into a
-    /// future slot, the event-loop judge consumes that slot, and the coherent
-    /// LOCK A at the committed caret finally mints the light.
-    #[test]
-    fn cold_licensed_echo_owns_and_births_on_a_bounded_recovery_frame() {
-        let mut fixture = straddled_echo_fixture(false);
-        let wid = WindowId(0);
-        let target = (2, 3);
-        let glow_cfg = fixture.app.glow_config();
-        let trail_cfg = echo_trail_config();
-        let geom = echo_geom();
-        let ws = fixture.app.windows.get_mut(&wid).unwrap();
-        assert!(
-            !ws.cursor_fx_active(fixture.await_at, false),
-            "negative control: a cold first key owns no resident cadence"
-        );
-        let interval = ws.effect_present_interval();
-        let grace = ws.deco_anim_hold();
-        let stale_frame_started = fixture
-            .await_at
-            .checked_sub(grace)
-            .expect("fixture instant has recovery headroom");
-        let delayed_first_park = fixture.await_at + grace - interval;
-        assert!(
-            delayed_first_park >= stale_frame_started + grace,
-            "negative control: a latch anchored at frame start is already expired"
-        );
-        let armed = ws
-            .plan_terminal_effect_lane(delayed_first_park, false, true)
-            .expect("the torn commit owns one bounded recovery deadline");
-        assert!(
-            armed > delayed_first_park,
-            "the recovery deadline is strictly future, never redraw recursion"
-        );
-        assert_eq!(ws.next_trail_tick, Some(armed));
-        assert_eq!(
-            ws.plan_terminal_effect_lane(armed - Duration::from_nanos(1), false, true),
-            Some(armed),
-            "an unrelated pre-deadline park preserves the same recovery slot"
-        );
-        assert!(take_due_trail_tick(
-            &mut ws.next_trail_tick,
-            &mut ws.last_trail_fire,
-            armed,
-        ));
-        assert_eq!(ws.next_trail_tick, None);
-        assert_eq!(ws.last_trail_fire, Some(armed));
-
-        let mut current_cells = fixture.baseline_cells;
-        current_cells[2] = 'x';
-        ws.cursor_glow.observe_row_with_trust(
-            target.0,
-            target.1,
-            &current_cells,
-            armed,
-            ProbeTrust::Full,
-        );
-        ws.cursor_glow
-            .tick(Some(target), armed, &glow_cfg, geom, &mut ws.glow_scratch);
-        ws.cursor_trail
-            .tick(Some(target), armed, &trail_cfg, &mut ws.trail_scratch);
-        assert!(
-            !apply_cursor_fx_commit(ws, CursorFxCommit::SAME, 0..0, armed),
-            "the recovery LOCK A/B pair is coherent and keeps its projection"
-        );
-        assert!(
-            ws.cursor_glow.live_sparks() > 0,
-            "the scheduled coherent frame births cold licensed light"
-        );
-        assert!(
-            !ws.trail_scratch.is_empty(),
-            "cold exact echo births the classic trail"
-        );
-    }
-
-    #[test]
-    fn stable_drift_retains_only_cursor_owned_free_sprites() {
-        let mut sprites = (0..5).map(|_| FreeSprite::default()).collect::<Vec<_>>();
-        retain_cursor_free_sprite_span(&mut sprites, 2..4);
-        assert_eq!(sprites.len(), 2, "word sprites and later Robi are dropped");
-
-        let mut invalid = vec![FreeSprite::default()];
-        retain_cursor_free_sprite_span(&mut invalid, 1..2);
-        assert!(
-            invalid.is_empty(),
-            "invalid ownership provenance fails closed"
         );
     }
 }
@@ -4303,11 +2955,12 @@ mod canonical_layout_scheduler_tests {
         {
             let state = app.windows.get_mut(&wid).unwrap();
             state
-                .cursor_pet
+                .companion
                 .set_species(aterm_effects::kitty_pet::PetSpecies::Dog);
-            let pet = state
-                .cursor_pet
-                .tick_static_capture(aterm_effects::kitty_pet::PetSense {
+            let pet = crate::app_render::pet_tick_for_test(
+                state,
+                aterm_effects::host::CaptureMode::StaticCapture,
+                aterm_effects::kitty_pet::PetSense {
                     caret_drawn: true,
                     now,
                     caret: Some((4, 12)),
@@ -4319,9 +2972,13 @@ mod canonical_layout_scheduler_tests {
                     output_burst: false,
                     pointer: None,
                     wrapped: false,
-                });
-            assert!(pet.alpha > 0 && state.cursor_pet.is_active());
-            state.pet_hit_rect = Some((96, 64, 144, 112));
+                },
+            );
+            assert!(pet.alpha > 0 && state.companion.brain().is_active());
+            assert!(
+                state.companion.hit_rect().is_some(),
+                "the live resident owns this frame's hit target"
+            );
 
             for index in 0..120 {
                 state
@@ -4345,10 +3002,10 @@ mod canonical_layout_scheduler_tests {
         app.windows.get_mut(&wid).unwrap().scale = 2.0;
         assert!(!app.prepare_layout_coordinate_space(wid, route));
         let state = app.windows.get_mut(&wid).unwrap();
-        assert!(!state.cursor_pet.is_active() && !state.cursor_pet.needs_frames());
-        assert!(state.pet_hit_rect.is_none());
+        assert!(!state.companion.brain().is_active() && !state.companion.brain().needs_frames());
+        assert!(state.companion.hit_rect().is_none());
         assert_eq!(
-            state.cursor_pet.species(),
+            state.companion.brain().species(),
             aterm_effects::kitty_pet::PetSpecies::Dog,
             "layout rebasing preserves the configured companion identity"
         );
@@ -4497,7 +3154,8 @@ mod canonical_layout_scheduler_tests {
     /// anything left on the planes is re-presented verbatim at a FROZEN age
     /// (`Mote::born` is measured against `PetBrain::clock`, which only `tick`
     /// advances), and nothing on them consults the trail master — so
-    /// `retire_pet_without_owner`, which lives on the terminal routes, never runs.
+    /// the owner's switch (`CompanionOwner::prepare`), which runs on the terminal
+    /// routes only, never runs.
     ///
     /// SEPARATE seams already close each half, which is exactly why this drives them
     /// together rather than unit-testing either — the audit's sighting is the
@@ -4521,7 +3179,7 @@ mod canonical_layout_scheduler_tests {
     ///   not the free-sprite one. Good news for the product, and the reason the
     ///   correction is recorded here rather than quietly dropped.
     /// * THE BRAIN. The front-content identity fence (`lib.rs`'s `sync_window` arm,
-    ///   `retire_cursor_pet_coordinate_space`) fires first on this edge, and
+    ///   `CompanionOwner::retire_owner`) fires first on this edge, and
     ///   `prepare_layout_coordinate_space` → `retire_torn_cursor_fx` backs it up
     ///   (`route` is a term of [`crate::LayoutCoordinateSpaceKey`], so fronting a
     ///   native tab IS a coordinate change). Neuter BOTH and this test fails on the
@@ -4557,15 +3215,23 @@ mod canonical_layout_scheduler_tests {
                 pointer: None,
                 wrapped: false,
             };
-            let _ = ws.cursor_pet.tick(sense(now, Some((2, 2))));
-            let _ = ws
-                .cursor_pet
-                .tick(sense(now + Duration::from_millis(16), Some((2, 2))));
-            let _ = ws
-                .cursor_pet
-                .tick(sense(now + Duration::from_millis(420), Some((2, 34))));
+            let _ = crate::app_render::pet_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::Present,
+                sense(now, Some((2, 2))),
+            );
+            let _ = crate::app_render::pet_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::Present,
+                sense(now + Duration::from_millis(16), Some((2, 2))),
+            );
+            let _ = crate::app_render::pet_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::Present,
+                sense(now + Duration::from_millis(420), Some((2, 34))),
+            );
             assert!(
-                ws.cursor_pet.is_active() && ws.cursor_pet.needs_frames(),
+                ws.companion.brain().is_active() && ws.companion.brain().needs_frames(),
                 "fixture: a pet walking after a moved caret is on glass and owes frames"
             );
             // …and the frame it drew: a companion body plus the free-floating mote
@@ -4592,11 +3258,11 @@ mod canonical_layout_scheduler_tests {
             "…nor the supernova and cursor light beside them"
         );
         assert!(
-            !ws.cursor_pet.is_active(),
+            !ws.companion.brain().is_active(),
             "…and the brain that would have re-emitted them holds no body or mote"
         );
         assert!(
-            !ws.cursor_pet.needs_frames(),
+            !ws.companion.brain().needs_frames(),
             "…nor a frame debt this route can never tick back down"
         );
     }
@@ -7968,7 +6634,7 @@ mod native_damage_tests {
 /// app's repaints (the blink is stamped by the app's PREVIOUS burst) while
 /// still shutting the probe off promptly when a non-blinking alt-screen app
 /// (vim/less) takes over the same pane. Shared with the headless capture path
-/// (`app_introspect`), which mirrors this LOCK A derivation exactly.
+/// (`app_introspect`), which mirrors this frame-hold derivation exactly.
 pub(crate) const BLINK_RECENT_MAX: Duration = Duration::from_secs(1);
 
 /// Resolve one captured frame's row-probe [`aterm_effects::cursor_glow::ProbeTrust`]
@@ -7986,7 +6652,7 @@ pub(crate) const BLINK_RECENT_MAX: Duration = Duration::from_secs(1);
 /// the move now), but the probe's TRUST CLASS is kept and is what the
 /// erase-poof lane still reads: every kill/poof branch refuses `ContentOnly`
 /// inside the engine, so the phantom-poof fence holds exactly as before.
-/// All four capture seams (single-pane LOCK A, the
+/// All four capture seams (the single-pane frame hold, the
 /// composed live/headless seam, the split-pane compose pass, and the headless
 /// `app_introspect` capture) resolve trust through this one function.
 pub(crate) fn row_probe_trust(
@@ -7998,109 +6664,6 @@ pub(crate) fn row_probe_trust(
     } else {
         aterm_effects::cursor_glow::ProbeTrust::ContentOnly
     }
-}
-
-/// Resolve the companion's local terminal palette from every grid cell its
-/// prospective sprite intersects. The explicit cap keeps this cold emission
-/// path allocation-free and O(1), even under degenerate cell metrics.
-pub(crate) fn cursor_cat_color_key(
-    cells: &[Vec<RenderCell>],
-    geom: aterm_effects::word_decorations::EffectGeom,
-    footprint: aterm_effects::word_decorations::CatFootprint,
-    fallback_bg: u32,
-    fallback_fg: u32,
-    fallback_accent: u32,
-) -> aterm_effects::cat_baker::CatColorKey {
-    const MAX_SAMPLES: u32 = 64;
-    if geom.cell_w == 0 || geom.cell_h == 0 || cells.is_empty() {
-        return aterm_effects::cat_baker::CatColorKey::from_rgb(
-            fallback_bg,
-            fallback_fg,
-            fallback_accent,
-        );
-    };
-
-    let cw = i64::from(geom.cell_w);
-    let ch = i64::from(geom.cell_h);
-    let x0 = i64::from(footprint.x).max(0);
-    let y0 = i64::from(footprint.y).max(0);
-    let x1 = (i64::from(footprint.x) + i64::from(footprint.w)).min(i64::from(geom.cols) * cw);
-    let y1 = (i64::from(footprint.y) + i64::from(footprint.h)).min(i64::from(geom.rows) * ch);
-    if x1 <= x0 || y1 <= y0 {
-        return aterm_effects::cat_baker::CatColorKey::from_rgb(
-            fallback_bg,
-            fallback_fg,
-            fallback_accent,
-        );
-    }
-    let c0 = usize::try_from(x0 / cw).unwrap_or(0);
-    let c1 = usize::try_from((x1 - 1) / cw).unwrap_or(usize::MAX);
-    let r0 = usize::try_from(y0 / ch).unwrap_or(0);
-    let r1 = usize::try_from((y1 - 1) / ch).unwrap_or(usize::MAX);
-
-    let mut bg_sum = [0u32; 3];
-    let mut fg_sum = [0u32; 3];
-    let mut sampled = 0u32;
-    let mut visible = 0u32;
-    let mut min_background_band = 3u8;
-    let mut max_background_band = 0u8;
-    let mut principal_fg = None;
-    let fallback_bg_rgb = [
-        (fallback_bg >> 16) as u8,
-        (fallback_bg >> 8) as u8,
-        fallback_bg as u8,
-    ];
-    let pack =
-        |rgb: [u8; 3]| (u32::from(rgb[0]) << 16) | (u32::from(rgb[1]) << 8) | u32::from(rgb[2]);
-    'rows: for line in (r0..=r1).map(|row| cells.get(row)) {
-        for col in c0..=c1 {
-            let cell = line.and_then(|line| line.get(col));
-            let background_rgb = cell.map_or(fallback_bg_rgb, |cell| cell.bg);
-            let background = pack(background_rgb);
-            let band = aterm_effects::cat_baker::CatColorKey::background_band(background);
-            min_background_band = min_background_band.min(band);
-            max_background_band = max_background_band.max(band);
-            for (dst, src) in bg_sum.iter_mut().zip(background_rgb) {
-                *dst += u32::from(src);
-            }
-            sampled += 1;
-            if let Some(cell) = cell
-                && !cell.wide
-                && !cell.ch.is_whitespace()
-                && cell.ch != '\0'
-            {
-                principal_fg.get_or_insert(cell.fg);
-                for (dst, src) in fg_sum.iter_mut().zip(cell.fg) {
-                    *dst += u32::from(src);
-                }
-                visible += 1;
-            }
-            if sampled == MAX_SAMPLES {
-                break 'rows;
-            }
-        }
-    }
-    if sampled == 0 {
-        return aterm_effects::cat_baker::CatColorKey::from_rgb(
-            fallback_bg,
-            fallback_fg,
-            fallback_accent,
-        );
-    }
-    let background = pack(bg_sum.map(|channel| (channel / sampled) as u8));
-    let foreground = principal_fg.map_or(fallback_fg, pack);
-    let surrounding = if visible == 0 {
-        fallback_accent
-    } else {
-        pack(fg_sum.map(|channel| (channel / visible) as u8))
-    };
-    aterm_effects::cat_baker::CatColorKey::from_rgb_span(
-        background,
-        foreground,
-        surrounding,
-        min_background_band,
-        max_background_band,
-    )
 }
 
 /// Whether ordinary forward-typing momentum is allowed to own the cursor cat.
@@ -8174,120 +6737,6 @@ pub(crate) fn cursor_cat_presentation_enabled(
     collection_hello: bool,
 ) -> bool {
     collection_hello || (animate_cat && ordinary_kitty_cursor_enabled(cursor_trail_enabled, style))
-}
-
-/// WHO OWNS THE RESIDENT PET — the config half of its presentation law, split out
-/// so ownership and presentation can never drift apart.
-///
-/// The three terms here are the ones that mean "this window is supposed to have a
-/// pet at all": the trail master is on, the selected style IS the pet style, and the
-/// resolved trail is in pet mode. Deliberately EXCLUDED is everything that merely
-/// hides a pet that still exists — focus, a scrolled viewport, the load-shed latch —
-/// because those come back, and a resident that forgot itself on every blur would
-/// return as a different cat.
-///
-/// [`retire_pet_without_owner`] is the consumer that matters: it is the switch.
-#[inline]
-pub(crate) fn resident_pet_owner_present(
-    pet_mode: bool,
-    cursor_trail_enabled: bool,
-    style: crate::cursor_glow::GlowStyle,
-) -> bool {
-    pet_mode && cursor_trail_enabled && matches!(style, crate::cursor_glow::GlowStyle::RainbowKitty)
-}
-
-/// The resident pet's presentation law, shared by glass and explicit capture.
-/// Unlike the earned flying kitty, the pet does not require animation or
-/// typing momentum: it sleeps and watches at the caret whenever its surface is
-/// presentable and the selected rainbow-kitty-pet style owns the trail.
-#[inline]
-pub(crate) fn resident_pet_presentation_enabled(
-    pet_mode: bool,
-    cursor_companion_presentable: bool,
-    cursor_trail_enabled: bool,
-    style: crate::cursor_glow::GlowStyle,
-) -> bool {
-    cursor_companion_presentable
-        && resident_pet_owner_present(pet_mode, cursor_trail_enabled, style)
-}
-
-/// NOTHING THE RESIDENT PET OWNS MAY OUTLIVE ITS SWITCH: drop it all the moment its
-/// trail owner goes away.
-///
-/// The exact twin of [`retire_kitty_cursor_without_owner`], which the earned flying
-/// kitty has always had and the resident pet never did. Without it the only lever a
-/// host had was to stop feeding the brain a caret, and that is a graceful EXIT rather
-/// than a switch — `PetBrain::tick`'s no-caret arm fades over `FADE_OUT` and keeps the
-/// MOTE lane drifting on its own clock.
-///
-/// WHAT LEAKED, stated precisely (the pixel story is NOT the story). Every pet emitter
-/// — single-pane, composed, and the three capture arms — already gates on
-/// [`resident_pet_presentation_enabled`], the same predicate this switch moves, so the
-/// very first frame after `cursor_trail = false` draws no pet and no mote: the glass is
-/// clean. What survived was the BRAIN, and through it the frame train.
-/// `PetBrain::needs_frames()` stays true for the whole `FADE_OUT` ramp and for every
-/// mote left in the lane, and `App::cursor_dependents_need_frame_cadence` (lib.rs)
-/// consumes that directly — it takes `animate_cursor_cat && cursor_pet.needs_frames()`
-/// and does NOT take the trail master as a term. So the switch the user threw to make
-/// the terminal quieter left the window presenting at 60 fps, for a second or more, to
-/// animate a companion it had already stopped drawing. On the owner's minimal-fast
-/// Windows directive that is the whole point of the switch, undone.
-///
-/// Called every frame from every path that ticks the brain, live and capture, so
-/// startup-with-the-trail-off, a hot config reload, a style change and a serious-mode
-/// toggle all retire through this one line.
-/// [`aterm_effects::kitty_pet::PetBrain::retire_unowned`] no-ops on an already-retired
-/// brain, so "off" costs one predicate per frame.
-#[inline]
-pub(crate) fn retire_pet_without_owner(
-    pet_mode: bool,
-    cursor_trail_enabled: bool,
-    style: crate::cursor_glow::GlowStyle,
-    pet: &mut aterm_effects::kitty_pet::PetBrain,
-) {
-    if !resident_pet_owner_present(pet_mode, cursor_trail_enabled, style) {
-        pet.retire_unowned();
-    }
-}
-
-/// Describe the one cursor companion actually drawn on this frame, for the
-/// ambient word-cats' pixel yield.
-///
-/// Driven by [`CompanionDuty`], the same value the emitters match on, so the
-/// rect handed to the engine always belongs to the sprite that is really
-/// drawn. That identity is the whole fix for the owner's "two overlapping
-/// kitties": the yield used to model the FLYING HEAD as a 2-cell band on the
-/// caret, while the head actually flies ~1.75 cells right of the caret column
-/// and ~0.4 rows above its row. An ambient cat drawn squarely ON the singing
-/// head intersected that band by under 5% of itself, sailed past the
-/// one-third stacking threshold, and drew a second kitty on top of the first.
-///
-/// The resident pet's exact body is authoritative and may outlive a visible
-/// caret for the bounded DECTCEM fade. In that case `cell` stays `None`: the
-/// ambient-word engine receives the real pixel ownership without inventing a
-/// stale caret anchor.
-///
-/// `head_px` is the flying head's live footprint
-/// ([`crate::word_decorations::WordDecorations::kitty_cursor_footprint`], the
-/// same rect `kitty_cursor_at_placement` debug-asserts its placement against).
-/// `None` degrades to the caret band alone — honest for a host that cannot
-/// resolve it, never correct for one that can.
-#[inline]
-pub(crate) fn cursor_companion_on_glass(
-    duty: CompanionDuty,
-    cursor: Option<(u16, u16)>,
-    head_px: Option<(i32, i32, i32, i32)>,
-    pet_body_px: Option<(i32, i32, i32, i32)>,
-) -> Option<crate::word_decorations::CompanionOnGlass> {
-    match duty {
-        CompanionDuty::Idle => None,
-        CompanionDuty::Pet => pet_body_px
-            .map(|body_px| crate::word_decorations::CompanionOnGlass::at_body(cursor, body_px)),
-        CompanionDuty::FlyingHead { cell } => Some(head_px.map_or_else(
-            || crate::word_decorations::CompanionOnGlass::at_cell(cell),
-            |head_px| crate::word_decorations::CompanionOnGlass::at_head(cell, head_px),
-        )),
-    }
 }
 
 /// The flying head's live drawn rect in grid pixels `(x0, x1, y0, y1)`, for
@@ -8398,34 +6847,181 @@ mod pet_console_observation_tests {
     }
 }
 
-/// Feed the resident pet the presentation context shared by live glass and
-/// explicit capture immediately before its one frame tick.
-///
-/// `pane` is present only for a composed surface. Binding the focused pane must
-/// precede the ink read: [`WordDecorations`](crate::word_decorations::WordDecorations)
-/// parks one independent scan per session, and the live slot otherwise belongs
-/// to whichever pane the preceding compose loop visited last. The single-grid
-/// callers declare their scan session earlier, before `needs_rescan`, and pass
-/// `None` here so that declaration cannot accidentally move after the scan gate.
-pub(crate) fn prepare_resident_pet_tick(
-    word_decos: &mut crate::word_decorations::WordDecorations,
-    cursor_pet: &mut aterm_effects::kitty_pet::PetBrain,
-    species: aterm_effects::kitty_pet::PetSpecies,
-    pane: Option<(u64, (i32, i32))>,
-) {
-    if let Some((session, px_origin)) = pane {
-        word_decos.bind_pane(session, px_origin);
-    }
-    cursor_pet.set_species(species);
-    let (spans, live) = word_decos.pet_ink();
-    cursor_pet.sense_ink(0, spans, live);
+/// THE FIXTURES' ONE DOOR TO THE PET: drive the window's resident through its
+/// owner exactly as a frame does, from a hand-built `PetSense` — focused,
+/// owned, in pet mode, at the grid's origin, the sense's caret and paint as
+/// the facts. `capture` picks the tick: `Present` runs the live tick (and the
+/// pointer, in fractional cells, as frame px), `StaticCapture` the
+/// materialising still. Test-only: production feeds the owner real facts.
+#[cfg(test)]
+pub(crate) fn pet_tick_for_test(
+    ws: &mut WindowState,
+    capture: aterm_effects::host::CaptureMode,
+    sense: aterm_effects::kitty_pet::PetSense,
+) -> aterm_effects::kitty_pet::PetFrame {
+    pet_owner_tick_for_test(ws, capture, sense).pet
+}
+
+/// [`pet_tick_for_test`], keeping the owner's whole frame (custody, body).
+#[cfg(test)]
+pub(crate) fn pet_owner_tick_for_test(
+    ws: &mut WindowState,
+    capture: aterm_effects::host::CaptureMode,
+    sense: aterm_effects::kitty_pet::PetSense,
+) -> aterm_effects::companion::CompanionFrame {
+    let facts = aterm_effects::host::TerminalFacts {
+        session: 0,
+        caret: sense.caret,
+        cursor_visible: sense.caret_drawn,
+        display_offset: 0,
+        live_viewport: true,
+        content_seq: 0,
+        wrap_serial: 0,
+        scrolled: false,
+        shell_executing: false,
+        cmd_done: None,
+        block: None,
+        alt_screen: false,
+    };
+    let host = aterm_effects::host::HostFrameInput {
+        now: sense.now,
+        visibility: aterm_effects::host::Visibility::Focused,
+        reduced_motion: sense.reduced_motion,
+        serious: false,
+        shed_envelope: 1.0,
+        shed_active: false,
+        pointer_px: sense
+            .pointer
+            .map(|(col, row)| (col * f32::from(sense.cell_w), row * f32::from(sense.cell_h))),
+        capture,
+        geometry: aterm_effects::host::FrameGeom {
+            rows: sense.rows,
+            cols: sense.cols,
+            cell_w: sense.cell_w,
+            cell_h: sense.cell_h,
+            origin_px: (0, 0),
+        },
+    };
+    let tick = ws.companion.prepare(
+        aterm_effects::companion::PetFacts {
+            facts: &facts,
+            host: &host,
+            glow: aterm_effects::companion::GlowOwnership {
+                enabled: true,
+                style: crate::cursor_glow::GlowStyle::RainbowKitty,
+                style_raw_names_pet: true,
+            },
+            sing: aterm_effects::host::SingFacts::default(),
+            focused: true,
+            obscured: false,
+            pane: None,
+            room: None,
+        },
+        &mut ws.word_decos,
+    );
+    ws.companion.tick(tick)
+}
+
+/// One present `prepare` through the owner with the stream facts a fixture
+/// names — the session, a caret, and the most recent completion — at a 24x80
+/// grid of 8x16 cells. The tick is left to the caller: the grief gate reads
+/// between the two.
+#[cfg(test)]
+pub(crate) fn pet_prepare_for_test(
+    ws: &mut WindowState,
+    now: Instant,
+    session: u64,
+    caret: Option<(u16, u16)>,
+    cmd_done: Option<(u64, i32, Option<u64>)>,
+) -> aterm_effects::companion::PetTick {
+    pet_prepare_shed_for_test(ws, now, session, caret, cmd_done, (1.0, false))
+}
+
+/// [`pet_prepare_for_test`] under the load shed the native host feeds every
+/// frame: `(shed_envelope, shed_active)` — the effective envelope and the
+/// latch — exactly as the live present hands `HostFrameInput` them.
+#[cfg(test)]
+pub(crate) fn pet_prepare_shed_for_test(
+    ws: &mut WindowState,
+    now: Instant,
+    session: u64,
+    caret: Option<(u16, u16)>,
+    cmd_done: Option<(u64, i32, Option<u64>)>,
+    (shed_envelope, shed_active): (f32, bool),
+) -> aterm_effects::companion::PetTick {
+    let facts = aterm_effects::host::TerminalFacts {
+        session,
+        caret,
+        cursor_visible: caret.is_some(),
+        display_offset: 0,
+        live_viewport: true,
+        content_seq: 0,
+        wrap_serial: 0,
+        scrolled: false,
+        shell_executing: false,
+        cmd_done,
+        block: None,
+        alt_screen: false,
+    };
+    let host = aterm_effects::host::HostFrameInput {
+        now,
+        visibility: aterm_effects::host::Visibility::Focused,
+        reduced_motion: false,
+        serious: false,
+        shed_envelope,
+        shed_active,
+        pointer_px: None,
+        capture: aterm_effects::host::CaptureMode::Present,
+        geometry: aterm_effects::host::FrameGeom {
+            rows: 24,
+            cols: 80,
+            cell_w: 8,
+            cell_h: 16,
+            origin_px: (0, 0),
+        },
+    };
+    ws.companion.prepare(
+        aterm_effects::companion::PetFacts {
+            facts: &facts,
+            host: &host,
+            glow: aterm_effects::companion::GlowOwnership {
+                enabled: true,
+                style: crate::cursor_glow::GlowStyle::RainbowKitty,
+                style_raw_names_pet: true,
+            },
+            sing: aterm_effects::host::SingFacts::default(),
+            focused: true,
+            obscured: false,
+            pane: None,
+            room: None,
+        },
+        &mut ws.word_decos,
+    )
+}
+
+/// A failed command (`exit 1`, `dur_ms` of runtime) finishing in the pet's
+/// session, through the owner's completion latch: a baseline frame, then the
+/// completion. Returns what the grief gate reads between the notes and the
+/// tick.
+#[cfg(test)]
+pub(crate) fn pet_fails_a_command_for_test(
+    ws: &mut WindowState,
+    now: Instant,
+    dur_ms: Option<u64>,
+) -> bool {
+    let baseline = pet_prepare_for_test(ws, now, 0, None, None);
+    let _ = ws.companion.tick(baseline);
+    let failed = pet_prepare_for_test(ws, now, 0, None, Some((1, 1, dur_ms)));
+    let grieving = ws.companion.grieving();
+    let _ = ws.companion.tick(failed);
+    grieving
 }
 
 /// Drive the real resident brain into a live far-caret arc for present/capture
 /// regression fixtures. Test-only: production has no synthetic pet controls.
 #[cfg(test)]
 pub(crate) fn seed_resident_pet_mid_flight_for_test(
-    cursor_pet: &mut aterm_effects::kitty_pet::PetBrain,
+    ws: &mut WindowState,
     start: Instant,
     rows: u16,
     cols: u16,
@@ -8433,6 +7029,7 @@ pub(crate) fn seed_resident_pet_mid_flight_for_test(
     cell_h: u16,
     target: (u16, u16),
 ) -> (Instant, aterm_effects::kitty_pet::PetFrame) {
+    use aterm_effects::host::CaptureMode;
     let sense = |now, caret| aterm_effects::kitty_pet::PetSense {
         caret_drawn: true,
         now,
@@ -8446,22 +7043,22 @@ pub(crate) fn seed_resident_pet_mid_flight_for_test(
         pointer: None,
         wrapped: false,
     };
-    *cursor_pet = aterm_effects::kitty_pet::PetBrain::default();
-    let first = cursor_pet.tick_static_capture(sense(start, Some((2, 2))));
+    ws.companion.drain();
+    let first = pet_tick_for_test(ws, CaptureMode::StaticCapture, sense(start, Some((2, 2))));
     assert!(first.alpha > 0, "fixture materializes the resident");
 
     let mut now = start;
     for caret in [(2, 3), (2, 4)] {
         now += Duration::from_millis(50);
-        let _ = cursor_pet.tick(sense(now, Some(caret)));
+        let _ = pet_tick_for_test(ws, CaptureMode::Present, sense(now, Some(caret)));
     }
     for _ in 0..120 {
         now += Duration::from_millis(16);
-        let _ = cursor_pet.tick(sense(now, Some((2, 4))));
+        let _ = pet_tick_for_test(ws, CaptureMode::Present, sense(now, Some((2, 4))));
     }
     for _ in 0..180 {
         now += Duration::from_millis(16);
-        let frame = cursor_pet.tick(sense(now, Some(target)));
+        let frame = pet_tick_for_test(ws, CaptureMode::Present, sense(now, Some(target)));
         if frame.action == aterm_effects::kitty_pet::PetAction::Leap && frame.lift > 0.0 {
             return (now, frame);
         }
@@ -8469,105 +7066,10 @@ pub(crate) fn seed_resident_pet_mid_flight_for_test(
     panic!("fixture failed to earn a resident-pet flight");
 }
 
-/// THE ARRIVAL MAPPING (kitty-motion §2.0.4, Rungs + the sufficient-
-/// difference gate): how loudly THIS frame's verdict lands on the pet, from
-/// the winner report, the tenure gate's authorised [`crate::app_kitty::Arrival`],
-/// and the pair the pet is actually wearing. Pure — one law both sync sites
-/// call, so single-pane and composed rendering can never rule differently:
-///
-///   * a NON-program rung (favourite, launch) is always Quiet — a pinned
-///     favourite and the base cat announce nothing, ever;
-///   * a program rung carries the gate's ruling — Quiet stays Quiet;
-///   * an authorised Ceremony is DEMOTED to Quiet when the incoming coat
-///     sits within [`aterm_effects::kitty_registry::SUFFICIENT_DIFFERENCE`]
-///     of the coat on glass ([`aterm_effects::kitty_registry::coat_distance`],
-///     the min-over-backgrounds metric): a ceremony that announces nothing a
-///     viewer can see is noise, so the theater is withheld — and because the
-///     commit rides the PERFORMED ceremony, the floor is not stamped and the
-///     debt is kept (§2.0.8's identical-pair precedent, generalised to
-///     insufficiently-different pairs). A pet never yet dressed (`worn`
-///     `None`) has nothing on glass to compare against: the ceremony stands.
-pub(crate) fn pet_arrival_for_sync(
-    rung: crate::launch_kitty::CompanionRung,
-    authorised: crate::app_kitty::Arrival,
-    worn: Option<(u8, u8)>,
-    incoming_coat: u8,
-) -> aterm_effects::kitty_pet::PetArrival {
-    use aterm_effects::kitty_pet::PetArrival;
-    use aterm_effects::kitty_registry::{SUFFICIENT_DIFFERENCE, coat_distance};
-    if rung != crate::launch_kitty::CompanionRung::Program {
-        return PetArrival::Quiet;
-    }
-    match authorised {
-        crate::app_kitty::Arrival::Quiet => PetArrival::Quiet,
-        crate::app_kitty::Arrival::Ceremony => match worn {
-            Some(old) if coat_distance(old.0, incoming_coat) < SUFFICIENT_DIFFERENCE => {
-                PetArrival::Quiet
-            }
-            _ => PetArrival::Ceremony,
-        },
-    }
-}
-
-/// THE PERFORMANCE SEAM (kitty-motion §2.0.4's correction: *"the ceremony is
-/// committed where it RENDERS, not where it is authorised"*): the ONE
-/// function through which both sync sites — `emit_single_cursor_companion`
-/// (single-grid, shared with both capture splices) and
-/// `compose_pet_companion` (split) — dress the pet, so the mapping, the sync
-/// and the commit can never disagree between surfaces. Maps the verdict
-/// through [`pet_arrival_for_sync`], hands pair + arrival to the brain's
-/// `sync_look`, and returns the `(coat, iris)` actually WORN (the latch the
-/// caller must draw, never the verdict it passed).
-///
-/// THE COMMIT ([`crate::app_kitty::KittyTenure::commit_hello`]) fires only
-/// when ALL of:
-///   * `present` — this call is a DRAWN present, not a capture: a capture
-///     splice reaches the same emitter (`aterm-ctl image`), and a hello
-///     nobody saw must not be spent (the `kitty_summon` precedent, applied
-///     exactly — correction 1's background-window leak, closed at the seam);
-///   * the arrival passed was `Ceremony` — a demoted or floor-spaced hello
-///     performs nothing and commits nothing (debt kept);
-///   * the pair in hand DIFFERS from the pair on glass (`pair != worn`) — a
-///     ceremony that parks nothing was not performed (§2.0.8), and the
-///     silent alpha-0 apply (worn comes back equal) stays free.
-///
-/// Deliberately `pair != outcome.worn`, NOT the narrower `outcome.parked`
-/// edge: a capture splice syncing first would consume that edge, and the
-/// present's agreeing re-sync would then never commit — the hello performed
-/// on glass while its debt stayed open forever. Committing on the standing
-/// difference is restamp-safe because the commit itself consumes the
-/// authorisation (the arrival latch falls to Quiet), so the next present
-/// frame maps to Quiet and cannot commit again.
-///
-/// Callers reach here only with the pet ON GLASS (`pet_on_glass` at site 1;
-/// `ctx.pet_visible` + `alpha > 0` at site 2) — the drawn-path half of the
-/// predicate the docstrings above each site keep.
-pub(crate) fn sync_pet_companion_look(
-    ws: &mut WindowState,
-    look: aterm_effects::kitty_registry::KittyLook,
-    present: bool,
-    now: Instant,
-) -> (u8, u8) {
-    let pair = (look.coat, look.iris);
-    let arrival = pet_arrival_for_sync(
-        ws.kitty_rung,
-        ws.kitty_tenure.arrival(),
-        ws.cursor_pet.worn_pair(),
-        look.coat,
-    );
-    let outcome = ws.cursor_pet.sync_look(pair, arrival);
-    if present && arrival == aterm_effects::kitty_pet::PetArrival::Ceremony && pair != outcome.worn
-    {
-        ws.kitty_tenure.commit_hello(now);
-    }
-    outcome.worn
-}
-
 /// A cursor-glow [`crate::cursor_glow::Geom`] for a PANE (or the whole grid)
 /// where only the cell metrics and the grid extent are read — the v2
-/// companion router's seat law and its pet-sense projection
-/// ([`aterm_effects::rainbow_kitty::companion::placement`] /
-/// [`aterm_effects::rainbow_kitty::companion::sense`]) read `cw`, `ch`,
+/// companion router's seat law
+/// ([`aterm_effects::rainbow_kitty::companion::placement`]) reads `cw`, `ch`,
 /// `rows` and `cols` and nothing else. The window-absolute fields are zero
 /// on purpose: nothing here emits window-space pixels.
 fn companion_router_geom(
@@ -8584,52 +7086,6 @@ fn companion_router_geom(
         win_h: 0,
         head: 0,
     }
-}
-
-/// WHAT THE PET SENSES — the `PetSense` the resident's `PetBrain::tick` takes,
-/// built by Rainbow Kitty v2's router
-/// ([`aterm_effects::rainbow_kitty::companion::sense`]) out of the four host
-/// facts v2 cannot see ([`aterm_effects::rainbow_kitty::companion::HostSense`])
-/// plus the frame's geometry and motion posture. ONE projection for both
-/// render arms — the single-pane present and the composed one — so a split
-/// window can never feed the pet a differently-shaped sense than a single
-/// pane does (the router's KNOWN GAP, host stage).
-///
-/// A pure projection whatever the style: `sense` reads `now`, the geometry
-/// and `reduced_motion` and nothing else, so under the nine other styles it
-/// yields the exact `PetSense` the two inline literals it replaces used to
-/// build. The spine is deliberately NOT injected (D13): the pet runs its own
-/// `vhat` estimator against its owner-tuned thresholds, and a second momentum
-/// signal would retime the chase and the pounce — so the `Ctx` carries zeros
-/// there, which `sense` never reads.
-pub(crate) fn companion_pet_sense(
-    now: Instant,
-    geom: aterm_effects::word_decorations::EffectGeom,
-    glow_cfg: &crate::cursor_glow::GlowConfig,
-    reduced_motion: bool,
-    host: aterm_effects::rainbow_kitty::companion::HostSense,
-) -> aterm_effects::kitty_pet::PetSense {
-    let cfg = aterm_effects::rainbow_kitty::Config::from_glow(glow_cfg, reduced_motion);
-    let ctx = aterm_effects::rainbow_kitty::Ctx {
-        now,
-        geom: companion_router_geom(geom),
-        cfg: &cfg,
-        disp: 0.0,
-        birth_disp: 0.0,
-        phase: 0.0,
-        caret: host.caret.unwrap_or((0, 0)),
-        caret_t: 0.0,
-        // No band under a router caret: the landing walks from its own field.
-        caret_walk: None,
-        // The same zeros, for the same reason: the router reads neither the
-        // crisp edge's stretch nor the flow state.
-        surge: 0.0,
-        flow: aterm_effects::rainbow_kitty::Flow::default(),
-        // The companion router reads no birth price, so the tick's mend mark
-        // (the typo-fix birth, `RAINBOW-KITTY-V2.md` §23) is nothing to it.
-        mend: None,
-    };
-    aterm_effects::rainbow_kitty::companion::sense(&ctx, host)
 }
 
 /// WHICH rendered-cell snapshot the v2 companion router probes for ink: the
@@ -8657,7 +7113,7 @@ fn flying_head_lead_px(cell_w: u16) -> i32 {
 /// render arms ([`emit_single_cursor_companion`], which the live present and
 /// both capture splices share, and `App::compose_cursor_companion`, the split
 /// path) so an impulse minted for a frame always reaches the body that frame
-/// actually draws — the router's KNOWN GAP, closed at the host.
+/// actually draws.
 ///
 /// Inert unless v2 owns the frame (one `Option` read — `v2_status` is `Some`
 /// only while the engine is engaged, which since phase 7 is exactly while the
@@ -8682,7 +7138,8 @@ fn flying_head_lead_px(cell_w: u16) -> i32 {
 ///      the path arrives late; a cat at the landing on frame 0 is the meteor's
 ///      proof of speed); a vertical flight (Enter) keeps the shipped
 ///      `Δy ≤ 2·ch` glide exactly as today. The spine floor, the whip, the
-///      squint and the landing squash are exposed as DATA on the `Flight`
+///      eyes (squint and look-back) and the landing squash are exposed as
+///      DATA on the `Flight`
 ///      ([`Flight::disp_floor`](aterm_effects::rainbow_kitty::companion::Flight::disp_floor),
 ///      [`Flight::lead_at`](aterm_effects::rainbow_kitty::companion::Flight::lead_at),
 ///      [`Flight::landed`](aterm_effects::rainbow_kitty::companion::Flight::landed))
@@ -8693,12 +7150,13 @@ fn flying_head_lead_px(cell_w: u16) -> i32 {
 ///      that the animator's own lead overwrote on the next frame would read
 ///      as a jerk, which is worse than the shipped glide.
 ///    * the pet's `Perk { at }` — the whole of the pet's coupling (D13): an
-///      OFFER of the arrival edge and nothing else. `PetBrain` has no
-///      perk-edge entry (open owner question 14, default: keeps its own
-///      pounce), so the offer is taken and dropped; the pet's choreography is
+///      OFFER of the arrival edge and nothing else. The pet already took that
+///      same edge one call earlier, through [`route_v2_pet_offer`]
+///      (`Engine::pet_offer` → `PetBrain::note_v2_offer`), so it is dropped
+///      here; owner Q14 is ruled "no teleport", and the pet's choreography is
 ///      untouched, as §7.2(b) requires.
 ///    * `React(Delight)` — the flying head's existing pose entry
-///      (`CursorCat::on_delight`), which no host seam fires today; the pet has
+///      (`CursorCat::on_delight`), fired here and by no other host seam; the pet has
 ///      no delight entry. `React(Wince)` is NOT re-fired: the host already
 ///      fires the head's oops at the key (`on_kill`), and a second firing per
 ///      erase would drain its momentum. `React(Land)` has no receiver.
@@ -8738,15 +7196,6 @@ pub(crate) fn route_v2_companion(
     let cells: &[Vec<RenderCell>] = match ink {
         CompanionInk::Single => &ws.input_scratch.cells,
         CompanionInk::Composed => &ws.composed_focus_scratch.cells,
-    };
-    // The host's custody enum restated in the router's vocabulary — the
-    // engine's `companion::CompanionDuty` is the same three verdicts.
-    let duty = match duty {
-        CompanionDuty::Idle => aterm_effects::companion::CompanionDuty::Idle,
-        CompanionDuty::Pet => aterm_effects::companion::CompanionDuty::Pet,
-        CompanionDuty::FlyingHead { cell } => {
-            aterm_effects::companion::CompanionDuty::FlyingHead { cell }
-        }
     };
     let body = body_for(CompanionAdmission {
         duty,
@@ -8857,7 +7306,7 @@ pub(crate) fn route_v2_pet_offer(
     // LATCH-DON'T-ACT, host side: the brain takes what it wants and hands
     // back at most one star, on the paw's landing frame. `catch_star` spends
     // that star's remaining life and draws nothing at all.
-    if let Some(star) = ws.cursor_pet.note_v2_offer(&offer) {
+    if let Some(star) = ws.companion.note_v2_offer(&offer) {
         ws.cursor_glow.catch_star(star, now);
     }
 }
@@ -8865,12 +7314,11 @@ pub(crate) fn route_v2_pet_offer(
 #[cfg(test)]
 mod v2_companion_router_tests {
     use super::{
-        CompanionDuty, CompanionInk, companion_pet_sense, flying_head_lead_px, input_clock_ms,
-        route_v2_companion, route_v2_pet_offer,
+        CompanionDuty, CompanionInk, flying_head_lead_px, input_clock_ms, route_v2_companion,
+        route_v2_pet_offer,
     };
     use crate::{App, WindowId};
     use aterm_core::terminal::RenderCell;
-    use aterm_effects::rainbow_kitty::companion::HostSense;
     use aterm_effects::word_decorations::{EffectGeom, KittyCursorLayout};
     use std::time::{Duration, Instant};
 
@@ -8940,34 +7388,6 @@ mod v2_companion_router_tests {
         assert_eq!(rest.x - cursor_right, flying_head_lead_px(GEOM.cell_w));
         assert_eq!(flying_head_lead_px(8), 6);
         assert_eq!(flying_head_lead_px(0), 0);
-    }
-
-    /// `companion_pet_sense` is a projection of the literal it replaced: the
-    /// same fields, from the same facts, under every style.
-    #[test]
-    fn the_routers_pet_sense_is_the_literal_it_replaced() {
-        let app = App::headless_for_test();
-        let cfg = app.glow_config();
-        let now = Instant::now();
-        let host = HostSense {
-            caret: Some((3, 7)),
-            caret_drawn: true,
-            wrapped: true,
-            output_burst: false,
-            pointer: Some((1.5, 2.5)),
-        };
-        let sense = companion_pet_sense(now, GEOM, &cfg, true, host);
-        assert_eq!(sense.now, now);
-        assert_eq!(sense.caret, Some((3, 7)));
-        assert!(sense.wrapped);
-        assert!(!sense.output_burst);
-        assert_eq!(sense.pointer, Some((1.5, 2.5)));
-        assert_eq!((sense.rows, sense.cols), (24, 80));
-        assert_eq!((sense.cell_w, sense.cell_h), (8, 16));
-        assert!(sense.reduced_motion);
-        let full = companion_pet_sense(now, GEOM, &cfg, false, HostSense::default());
-        assert!(!full.reduced_motion);
-        assert_eq!(full.caret, None);
     }
 
     /// THE OCCLUSION FIX (L-D), host side: with v2 engaged and the words
@@ -9068,7 +7488,7 @@ mod v2_companion_router_tests {
             "fixture: v2 owns the frame"
         );
         assert_eq!(
-            ws.cursor_pet.pending_v2_offer(),
+            ws.companion.brain().pending_v2_offer(),
             (false, false),
             "fixture: the resident has been offered nothing"
         );
@@ -9078,17 +7498,26 @@ mod v2_companion_router_tests {
         ws.cursor_glow
             .tick(Some((3, 40)), t1, &cfg, glow_geom(), &mut out);
         // The host's order, verbatim: the pet's own tick, then the offer.
-        let host = HostSense {
-            caret_drawn: true,
-            caret: Some((3, 40)),
-            ..HostSense::default()
-        };
-        let pet_frame = ws
-            .cursor_pet
-            .tick(companion_pet_sense(t1, GEOM, &cfg, false, host));
+        let pet_frame = crate::app_render::pet_tick_for_test(
+            ws,
+            aterm_effects::host::CaptureMode::Present,
+            aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
+                now: t1,
+                caret: Some((3, 40)),
+                rows: GEOM.rows,
+                cols: GEOM.cols,
+                cell_w: GEOM.cell_w,
+                cell_h: GEOM.cell_h,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            },
+        );
         route_v2_pet_offer(ws, &pet_frame, glow_geom(), (0, 0), t1);
         assert!(
-            ws.cursor_pet.pending_v2_offer().0,
+            ws.companion.brain().pending_v2_offer().0,
             "the meteor's arrival edge never reached the resident"
         );
         // …and the router's drain still had the impulse to route: the offer
@@ -9118,7 +7547,7 @@ mod v2_companion_router_tests {
 ///
 /// `present` says whether this emission is a DRAWN present (`redraw_window`)
 /// or a capture splice re-using the emitter (`app_introspect`, both arms):
-/// only a present may spend a hello — see [`sync_pet_companion_look`].
+/// only a present may spend a hello — see [`emit_resident_pet`].
 #[allow(
     clippy::too_many_arguments,
     reason = "one resolved companion frame carries geometry, palette, motion and custody inputs"
@@ -9127,9 +7556,8 @@ pub(crate) fn emit_single_cursor_companion(
     ws: &mut WindowState,
     geom: crate::word_decorations::EffectGeom,
     cursor: Option<(u16, u16)>,
-    pet_on_glass: bool,
+    pet: &aterm_effects::companion::CompanionFrame,
     present: bool,
-    pet_frame: aterm_effects::kitty_pet::PetFrame,
     mut cat_frame: crate::kitty_cursor::CatFrame,
     kitty_alpha: u8,
     now: Instant,
@@ -9142,47 +7570,26 @@ pub(crate) fn emit_single_cursor_companion(
     // ONE BODY, ONE MATCH ([`CompanionDuty`]). Two independent `if`s used to
     // stand here — a shape in which a future seam that set both alphas would
     // silently draw two companions. The match makes that unrepresentable.
-    let duty = cursor_companion_duty(pet_on_glass, kitty_alpha, cursor);
+    let duty = cursor_companion_duty(pet.on_glass, kitty_alpha, cursor);
     // THE COMPANION SEAM ([`route_v2_companion`]): Rainbow Kitty v2's one
     // call, before either body is drawn, so the impulse and the seat land on
     // the frame copy the arms below emit. The composed path's twin is in
     // `compose_cursor_companion`.
     route_v2_companion(ws, CompanionInk::Single, duty, now, geom, &mut cat_frame);
     if let CompanionDuty::Pet = duty {
-        let look = cat_frame.look.normalized();
-        let (coat, iris) = sync_pet_companion_look(ws, look, present, now);
-        let colors = ws.cursor_pet.appearance_colors().unwrap_or_else(|| {
-            // Resolve contrast from the full body the pet actually covers:
-            // ART_ROWS tall, bottom-aligned to its baseline.
-            let pet_h = (aterm_effects::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
-            let pet_w = (pet_h * aterm_effects::kitty_pet::ART_ASPECT).round();
-            let sampled = cursor_cat_color_key(
-                &ws.input_scratch.cells,
-                geom,
-                aterm_effects::word_decorations::CatFootprint {
-                    x: (pet_frame.col * f32::from(geom.cell_w)) as i32,
-                    y: ((pet_frame.row + 1.0) * f32::from(geom.cell_h)) as i32 - pet_h as i32,
-                    w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                    h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                },
-                default_bg,
-                cursor_color,
+        fp ^= emit_resident_pet(
+            ws,
+            pet,
+            cat_frame.look.normalized(),
+            CompanionInk::Single,
+            present,
+            now,
+            aterm_effects::companion::ContrastFallback {
+                bg: default_bg,
+                cursor: cursor_color,
                 accent,
-            );
-            ws.cursor_pet.colors_for_appearance(sampled)
-        });
-        if let Some(pet_fp) = ws.word_decos.pet_cursor(
-            aterm_effects::word_decorations::PetCursorFrame {
-                geom,
-                colors,
-                coat,
-                iris,
-                pet: pet_frame,
             },
-            &mut ws.free_scratch,
-        ) {
-            fp ^= pet_fp.rotate_left(29);
-        }
+        );
     }
 
     if let CompanionDuty::FlyingHead { cell } = duty {
@@ -9237,26 +7644,65 @@ pub(crate) fn emit_single_cursor_companion(
     fp
 }
 
+/// THE PERFORMANCE SEAM, host half (kitty-motion §2.0.4: *"the ceremony is
+/// committed where it RENDERS, not where it is authorised"*): dress the pet's
+/// owner with this window's verdict — the look the flying cat latched (ONE
+/// APPEARANCE WEARS ONE CAT), the tenure gate's authorised arrival and the
+/// rung that won — let the owner draw the pair it actually WEARS, and spend
+/// the tenure's hello only for a drawn `present`, never for a capture splice.
+/// The one call both sync sites make ([`emit_single_cursor_companion`] and
+/// `App::compose_pet_companion`), so a split can never rule a ceremony
+/// differently from a single pane. The single grid draws into `free_scratch`;
+/// the composed pane into `pane_free`, which the caller translates.
+pub(crate) fn emit_resident_pet(
+    ws: &mut WindowState,
+    pet: &aterm_effects::companion::CompanionFrame,
+    look: aterm_effects::kitty_registry::KittyLook,
+    ink: CompanionInk,
+    present: bool,
+    now: Instant,
+    fallback: aterm_effects::companion::ContrastFallback,
+) -> u64 {
+    ws.companion.set_look(
+        (look.coat, look.iris),
+        ws.kitty_tenure.arrival().pet_arrival(),
+        ws.kitty_rung,
+    );
+    let (fp, outcome) = match ink {
+        CompanionInk::Single => ws.companion.emit(
+            pet,
+            &ws.input_scratch.cells,
+            fallback,
+            &mut ws.word_decos,
+            &mut ws.free_scratch,
+        ),
+        CompanionInk::Composed => ws.companion.emit(
+            pet,
+            &ws.composed_focus_scratch.cells,
+            fallback,
+            &mut ws.word_decos,
+            &mut ws.pane_free,
+        ),
+    };
+    if ws.companion.commit_hello_due(present, outcome) {
+        ws.kitty_tenure.commit_hello(now);
+    }
+    fp
+}
+
 #[cfg(test)]
 mod resident_pet_presentation_tests {
-    use super::{
-        CompanionDuty, cursor_companion_duty, cursor_companion_on_glass, prepare_resident_pet_tick,
-        resident_pet_presentation_enabled, shed_companion_alpha, shed_companion_presentable,
-        shed_envelope_transitioning,
-    };
-    use crate::cursor_glow::GlowStyle;
-    use crate::word_decorations::WordDecorations;
-    use aterm_core::terminal::Terminal;
-    use aterm_effects::kitty_pet::{PetBrain, PetSense, PetSpecies};
-    use aterm_lexicon::Lexicon;
-    use std::time::Instant;
+    //! The host half of the resident's presentation. The pure laws (the
+    //! owner gate, custody, the shed envelope, the yield box, the pane-bound
+    //! ink read) are the engine's, pinned in `aterm_effects::companion`; what
+    //! is left here is this host's emitter driven by the one owner.
+    use aterm_effects::host::CaptureMode;
+    use aterm_effects::kitty_pet::PetSense;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn resident_pet_under_load_keeps_full_body_cursor_home_and_no_frame_debt() {
-        use aterm_effects::rainbow_kitty::companion::HostSense;
-        use std::time::Duration;
         let mut app = crate::App::headless_for_test();
-        let cfg = app.glow_config();
         let geom = aterm_effects::word_decorations::EffectGeom {
             cell_w: 10,
             cell_h: 20,
@@ -9269,31 +7715,33 @@ mod resident_pet_presentation_tests {
         // Partial fade-out, exact zero, and partial recovery all keep a
         // static full resident. Move the caret between episodes to prove the
         // stationary posture still follows actual input on the next frame.
-        for (episode, envelope) in [0.75f32, 0.25, 0.0, 0.5].into_iter().enumerate() {
-            let caret = (4, [12_u16, 60, 8, 48][episode]);
-            let visible = super::resident_pet_surface_presentable(true, true, true, true, false);
-            let reduced = super::resident_pet_reduced_motion(false, envelope == 0.0, envelope);
-            assert!(visible && reduced);
+        for caret_col in [12_u16, 60, 8, 48] {
+            let caret = (4, caret_col);
             let mut previous = None;
             for _ in 0..20 {
                 let now = start + Duration::from_millis(tick * 16);
                 tick += 1;
-                ws.cursor_pet.set_console_presentable(visible);
-                let frame = ws.cursor_pet.tick(super::companion_pet_sense(
-                    now,
-                    geom,
-                    &cfg,
-                    reduced,
-                    HostSense {
+                // The load-shed posture: static, full body.
+                let pet = crate::app_render::pet_owner_tick_for_test(
+                    ws,
+                    CaptureMode::Present,
+                    PetSense {
                         caret_drawn: true,
+                        now,
                         caret: Some(caret),
-                        ..HostSense::default()
+                        rows: geom.rows,
+                        cols: geom.cols,
+                        cell_w: geom.cell_w,
+                        cell_h: geom.cell_h,
+                        reduced_motion: true,
+                        output_burst: false,
+                        pointer: None,
+                        wrapped: false,
                     },
-                ));
-                assert_eq!(frame.alpha, 255, "pressure must not fade the resident");
-                let body = frame
-                    .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
-                    .unwrap();
+                );
+                assert!(pet.on_glass);
+                assert_eq!(pet.pet.alpha, 255, "pressure must not fade the resident");
+                let body = pet.body_px.expect("the static resident is drawn");
                 assert!(body.1 - body.0 >= 5 * i32::from(geom.cell_w));
                 assert!(body.3 - body.2 >= i32::from(geom.cell_h));
                 let cursor_x = i32::from(caret.1) * i32::from(geom.cell_w);
@@ -9302,14 +7750,14 @@ mod resident_pet_presentation_tests {
                         <= 10 * i32::from(geom.cell_w)
                 );
                 assert!(
-                    !ws.cursor_pet.needs_frames(),
+                    !ws.companion.needs_frames(),
                     "a retained static body owes no idle animation"
                 );
                 if let Some(previous) = previous {
-                    assert_eq!(frame.fp(), previous, "idle frames remain byte-stable");
+                    assert_eq!(pet.fp, previous, "idle frames remain byte-stable");
                 }
-                previous = Some(frame.fp());
-                assert!(super::pet_hit_rect_for_frame(true, 1.0, &frame, geom, (0, 0)).is_some());
+                previous = Some(pet.fp);
+                assert!(ws.companion.hit_rect().is_some());
                 ws.free_scratch.clear();
                 ws.word_decos.begin_host_frame();
                 let head = ws.cursor_cat.static_frame(now);
@@ -9317,13 +7765,12 @@ mod resident_pet_presentation_tests {
                     ws,
                     geom,
                     Some(caret),
-                    true,
+                    &pet,
                     false,
-                    frame,
                     head,
                     0,
                     now,
-                    reduced,
+                    true,
                     0x0010_1010,
                     0x00FF_FFFF,
                     0x0050_FA7B,
@@ -9338,311 +7785,8 @@ mod resident_pet_presentation_tests {
             }
         }
         // Genuine ownership loss remains an immediate negative control.
-        for denied in [
-            super::resident_pet_surface_presentable(false, true, true, true, false),
-            super::resident_pet_surface_presentable(true, false, true, true, false),
-            super::resident_pet_surface_presentable(true, true, false, true, false),
-            super::resident_pet_surface_presentable(true, true, true, false, false),
-        ] {
-            assert!(!denied);
-        }
-        super::retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut ws.cursor_pet);
-        assert!(!ws.cursor_pet.is_active() && !ws.cursor_pet.needs_frames());
-    }
-
-    #[test]
-    fn resident_pet_does_not_depend_on_flying_kitty_animation() {
-        assert!(resident_pet_presentation_enabled(
-            true,
-            true,
-            true,
-            GlowStyle::RainbowKitty,
-        ));
-        for denied in [
-            resident_pet_presentation_enabled(false, true, true, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, false, true, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, true, false, GlowStyle::RainbowKitty),
-            resident_pet_presentation_enabled(true, true, true, GlowStyle::Lumen),
-        ] {
-            assert!(!denied, "every resident-pet owner gate is necessary");
-        }
-    }
-
-    #[test]
-    fn flying_heads_keep_continuous_shed_admission_and_alpha() {
-        for (envelope, expected) in [(1.0, 200), (0.75, 150), (0.5, 100), (0.25, 50)] {
-            assert!(
-                shed_companion_presentable(true, envelope),
-                "both render paths retain flying-head custody at {envelope}"
-            );
-            assert_eq!(shed_companion_alpha(200, envelope), expected);
-        }
-        assert!(!shed_companion_presentable(true, 0.0));
-        assert!(!shed_companion_presentable(false, 1.0));
-        assert_eq!(shed_companion_alpha(200, 0.0), 0);
-        assert_eq!(shed_companion_alpha(200, f32::NAN), 0);
-        assert!(shed_envelope_transitioning(true, 0.5));
-        assert!(!shed_envelope_transitioning(true, 0.0));
-        assert!(shed_envelope_transitioning(false, 0.0));
-        assert!(!shed_envelope_transitioning(false, 1.0));
-        assert!(!shed_envelope_transitioning(false, f32::NAN));
-    }
-
-    #[test]
-    fn hidden_caret_keeps_exact_resident_body_custody_without_a_stale_cell() {
-        let body = (37, 66, 48, 82);
-        let fading = cursor_companion_on_glass(CompanionDuty::Pet, None, None, Some(body))
-            .expect("a visible fading pet still owns glass");
-        assert_eq!(fading.cell, None, "DECTCEM supplies no honest caret cell");
-        assert_eq!(
-            fading.body_px,
-            Some(body),
-            "the emitted body is the yield box"
-        );
-        assert!(
-            !fading.guards_caret,
-            "the pet stands where its brain walked it and has no caret claim"
-        );
-
-        assert_eq!(
-            cursor_companion_duty(false, 255, None),
-            CompanionDuty::Idle,
-            "the flying head may not guess a hidden cursor anchor"
-        );
-        assert!(
-            cursor_companion_on_glass(CompanionDuty::Idle, None, None, None).is_none(),
-            "an idle frame owns no glass"
-        );
-
-        // THE OWNER'S BUG: the head is NOT at the caret, so a caret band alone
-        // under-covers it and an ambient cat drawn on the head sails through
-        // the yield. The rect handed in must be the sprite's own.
-        let head = (26, 85, 73, 123);
-        let duty = cursor_companion_duty(false, 255, Some((4, 9)));
-        assert_eq!(duty, CompanionDuty::FlyingHead { cell: (4, 9) });
-        let flying = cursor_companion_on_glass(duty, Some((4, 9)), Some(head), None)
-            .expect("a visible classic kitty owns its caret");
-        assert_eq!(flying.cell, Some((4, 9)));
-        assert_eq!(flying.body_px, Some(head), "the head's REAL drawn rect");
-        assert!(
-            flying.guards_caret,
-            "the escorting head guards the caret cell as well as its sprite"
-        );
-        let degraded = cursor_companion_on_glass(duty, Some((4, 9)), None, None)
-            .expect("an unresolved footprint still claims the caret band");
-        assert_eq!(degraded.body_px, None);
-        assert!(degraded.guards_caret);
-    }
-
-    #[test]
-    fn exactly_one_companion_can_own_a_frame_even_if_both_alphas_arrive() {
-        // Both alphas positive at once is not reachable through the custody
-        // law ([`pet_companion_admitted`] is the exact complement of
-        // [`flying_kitty_admitted`] in pet mode) — which is why the SHAPE
-        // matters: a future seam that broke that complement must still not be
-        // able to draw two bodies. The pet, as the resident, wins.
-        assert_eq!(
-            cursor_companion_duty(true, 255, Some((4, 9))),
-            CompanionDuty::Pet,
-        );
-        // The yield box then describes the PET, never the head, so an ambient
-        // cat is never told to avoid a sprite that is not there.
-        let pet_body = (37, 66, 48, 82);
-        let head = (26, 85, 73, 123);
-        let on_glass = cursor_companion_on_glass(
-            cursor_companion_duty(true, 255, Some((4, 9))),
-            Some((4, 9)),
-            Some(head),
-            Some(pet_body),
-        )
-        .expect("the pet owns the frame");
-        assert_eq!(on_glass.body_px, Some(pet_body));
-        assert!(!on_glass.guards_caret);
-        // Negative control: with the pet off glass the very same inputs hand
-        // the frame to the head, so the assertion above is not vacuous.
-        assert_eq!(
-            cursor_companion_on_glass(
-                cursor_companion_duty(false, 255, Some((4, 9))),
-                Some((4, 9)),
-                Some(head),
-                Some(pet_body),
-            )
-            .expect("the head owns the frame")
-            .body_px,
-            Some(head),
-        );
-    }
-
-    #[test]
-    fn pre_tick_setup_binds_focused_ink_before_read_and_applies_species() {
-        let cfg = crate::app_config::Config::default()
-            .sparkle_deco_config()
-            .expect("default scanner");
-        let lexicon = Lexicon::with_languages(&["en"]);
-        let now = Instant::now();
-        let mut decorations = WordDecorations::default();
-
-        let mut inked = Terminal::new(6, 40);
-        inked.process(b"\x1b[3;1Hxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
-        decorations.bind_pane(11, (0, 0));
-        decorations.rescan(&inked, 6, 40, &lexicon, &cfg, 1, now);
-        assert_eq!(decorations.pet_ink().1, Some(2));
-
-        let blank = Terminal::new(6, 40);
-        decorations.bind_pane(22, (400, 0));
-        decorations.rescan(&blank, 6, 40, &lexicon, &cfg, 1, now);
-        assert_eq!(
-            decorations.pet_ink().1,
-            None,
-            "negative control: the live slot belongs to the final blank pane"
-        );
-
-        let sense = PetSense {
-            caret_drawn: true,
-            now,
-            caret: Some((2, 10)),
-            rows: 6,
-            cols: 40,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut focused_pet = PetBrain::default();
-        prepare_resident_pet_tick(
-            &mut decorations,
-            &mut focused_pet,
-            PetSpecies::Dog,
-            Some((11, (0, 0))),
-        );
-        let focused = focused_pet.tick_static_capture(sense);
-        assert_eq!(focused_pet.species(), PetSpecies::Dog);
-        assert_eq!(
-            focused.row, 3.0,
-            "focused-pane ink moves a cold pet onto the blank row below"
-        );
-
-        let mut sibling_pet = PetBrain::default();
-        prepare_resident_pet_tick(
-            &mut decorations,
-            &mut sibling_pet,
-            PetSpecies::Cat,
-            Some((22, (400, 0))),
-        );
-        let sibling = sibling_pet.tick_static_capture(sense);
-        assert_eq!(
-            sibling.row, 2.0,
-            "negative control: the sibling's blank map leaves the same pet on the caret row"
-        );
-    }
-}
-
-/// THE HOST HALF OF THE RESIDENT'S SWITCH — [`retire_pet_without_owner`].
-///
-/// The engine half ([`aterm_effects::kitty_pet::PetBrain::retire_unowned`]) has its
-/// own test for what retirement means. What is pinned HERE is the wiring: which
-/// config verdicts count as "no owner", that an owned pet is not touched, and — the
-/// property the whole switch exists for — that a retired pet stops claiming the
-/// host's 60 fps effects lane. `App::cursor_dependents_need_frame_cadence` consumes
-/// `cursor_pet.needs_frames()` and does NOT take the trail master as a term, so a
-/// brain left mid-fade with motes in the lane keeps a window presenting at frame
-/// cadence to animate a companion the same switch already stopped drawing.
-#[cfg(test)]
-mod retire_pet_without_owner_tests {
-    use super::retire_pet_without_owner;
-    use crate::cursor_glow::GlowStyle;
-    use aterm_effects::kitty_pet::{PetBrain, PetSense};
-    use std::time::{Duration, Instant};
-
-    /// A pet that is awake, visible and owes frames — the state a switch has to be
-    /// able to interrupt. Returns the brain and the clock it stopped at.
-    fn a_live_pet() -> (PetBrain, Instant) {
-        let sense = |now, caret| PetSense {
-            caret_drawn: true,
-            now,
-            caret,
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        };
-        let mut pet = PetBrain::default();
-        let mut t = Instant::now();
-        // Walk the caret so the resident is genuinely mid-motion, not merely faded in.
-        for step in 0u16..40 {
-            t += Duration::from_millis(16);
-            let _ = pet.tick(sense(t, Some((4, 10 + step % 8))));
-        }
-        assert!(pet.is_active(), "fixture: a visible resident");
-        assert!(pet.needs_frames(), "fixture: it is claiming the lane");
-        (pet, t)
-    }
-
-    /// The wiring, verdict by verdict. Ownership is `pet_mode && trail && the pet
-    /// style`; anything less retires, and the owned case must not be disturbed.
-    #[test]
-    fn every_missing_owner_retires_the_pet_and_a_present_one_never_does() {
-        // OWNED — the negative control. Nothing is taken away.
-        let (mut owned, _) = a_live_pet();
-        retire_pet_without_owner(true, true, GlowStyle::RainbowKitty, &mut owned);
-        assert!(
-            owned.is_active() && owned.needs_frames(),
-            "an owned resident must survive the level call it takes every frame"
-        );
-
-        // …and each way of losing the owner, one at a time.
-        for (what, pet_mode, trail, style) in [
-            (
-                "the trail master went off",
-                true,
-                false,
-                GlowStyle::RainbowKitty,
-            ),
-            (
-                "the style stopped being the pet",
-                true,
-                true,
-                GlowStyle::Lumen,
-            ),
-            (
-                "pet mode resolved off",
-                false,
-                true,
-                GlowStyle::RainbowKitty,
-            ),
-        ] {
-            let (mut pet, _) = a_live_pet();
-            retire_pet_without_owner(pet_mode, trail, style, &mut pet);
-            assert!(!pet.is_active(), "{what}: the pet must paint nothing");
-            assert!(
-                !pet.needs_frames(),
-                "{what}: …and must release the host's frame lane at once — \
-                 `cursor_dependents_need_frame_cadence` reads exactly this"
-            );
-        }
-    }
-
-    /// LEVEL, NOT EDGE: hosts call this on every frame the pet has no owner, so the
-    /// steady "off" state must be a no-op that keeps owing nothing. (A switch that
-    /// only fired on an edge would miss a window that STARTED with the trail off.)
-    #[test]
-    fn retiring_an_already_retired_pet_is_a_no_op() {
-        let (mut pet, _) = a_live_pet();
-        for _ in 0..4 {
-            retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut pet);
-            assert!(!pet.is_active() && !pet.needs_frames());
-        }
-        // A fresh brain — the startup-with-the-trail-already-off case — is
-        // untouched and still owes nothing.
-        let mut fresh = PetBrain::default();
-        retire_pet_without_owner(true, false, GlowStyle::RainbowKitty, &mut fresh);
-        assert!(!fresh.is_active() && !fresh.needs_frames());
+        ws.companion.retire();
+        assert!(!ws.companion.brain().is_active() && !ws.companion.needs_frames());
     }
 }
 
@@ -12545,7 +10689,7 @@ fn rain_refresh_needed(
         && engine.is_none_or(|e| e.needs_rescan(epoch) || e.needs_material_sample())
 }
 
-/// LOCK B EFFECT-ONLY REUSE (2026-08 draw-path audit, tier-1 item 1): may this
+/// EFFECT-ONLY REUSE (2026-08 draw-path audit, tier-1 item 1): may this
 /// frame present `scratch` UNCHANGED, skipping the terminal-mutex grid
 /// extraction entirely?
 ///
@@ -12564,7 +10708,7 @@ fn rain_refresh_needed(
 /// cells (cursor, selection, colors, `line_sizes`, images, the D-2 revision
 /// lane), so "no cell changed" is NOT the question. The clauses:
 ///
-/// * `uncontended` — the LOCK B guard was taken with `term_try_lock`, i.e. NOT
+/// * `uncontended` — the frame hold was taken with `term_try_lock`, i.e. NOT
 ///   handed over by a writer that was mid-batch. Contention is evidence the grid
 ///   is about to move; refusing there costs one refill and buys a freshness
 ///   margin. This is also what keeps the fast path from ever introducing a wait.
@@ -12601,15 +10745,15 @@ fn rain_refresh_needed(
 /// scratch is an intermediate, not a presentable frame, and only the very next
 /// fill restamps them.
 ///
-/// WHERE THE CALLER SITS NOW. LOCK B sits AHEAD of the effect pass (the
-/// composed-frame work: the exact terminal snapshot is authorized and extracted
+/// WHERE THE CALLER SITS. In the single-pane frame's ONE terminal hold, ahead
+/// of the effect pass (the exact terminal snapshot is authorized and extracted
 /// before the host-side producers run, so a late synchronized-output edge cannot
 /// discard state they advanced). Nothing in this predicate depends on that
 /// order: it relates the RESIDENT scratch — filled by some earlier frame's
 /// extraction — to the engine as it stands under this hold, and every host
 /// mutator that runs after an extraction bumps `snapshot_seq` past
 /// `engine_fill_seq`, which is exactly what the clause above reads. The
-/// synchronized-output recheck the block performs under the same hold is
+/// synchronized-output hold the block decides under the same hold is
 /// unaffected and still runs on every frame, reused or not.
 ///
 /// FRESHNESS IS NOT WEAKENED, ONLY FAST-PATHED: every `false` falls through to
@@ -13167,47 +11311,6 @@ mod pane_free_crop_tests {
     }
 }
 
-/// The pet's petting hit-box for one frame: the brain's LIVE drawn body
-/// (`PetFrame::body_px`, grid-interior px) offset into FRAME px by the
-/// effects origin — plus, on the composed path, the focused pane's own
-/// pixel origin folded into `origin` by the caller. `None` propagates
-/// "nothing drawn", which is what CLEARS the stash on undrawn frames.
-pub(crate) fn pet_hit_rect_win(
-    body: Option<(i32, i32, i32, i32)>,
-    origin: (i32, i32),
-) -> Option<(i32, i32, i32, i32)> {
-    body.map(|(x0, x1, y0, y1)| {
-        (
-            x0.saturating_add(origin.0),
-            x1.saturating_add(origin.0),
-            y0.saturating_add(origin.1),
-            y1.saturating_add(origin.1),
-        )
-    })
-}
-
-/// Resolve the per-frame pet hit target from the exact presentation decision.
-/// A still-fading brain frame can retain non-zero alpha after its caret was
-/// hidden; presentation must win so history clears the old clickable body on
-/// the very first suppressed frame.
-///
-/// The four grid metrics `body_px` needs ride in as one [`EffectGeom`] rather
-/// than four scalars: they are one thing (this surface's grid), the emitter that
-/// must agree with this rect already speaks that type, and four positional `u16`s
-/// in a row are exactly the shape a `cols`/`rows` swap hides in.
-pub(crate) fn pet_hit_rect_for_frame(
-    pet_visible: bool,
-    sing: f32,
-    frame: &aterm_effects::kitty_pet::PetFrame,
-    geom: aterm_effects::word_decorations::EffectGeom,
-    origin: (i32, i32),
-) -> Option<(i32, i32, i32, i32)> {
-    let body = (pet_companion_admitted(pet_visible, sing) && frame.alpha > 0)
-        .then(|| frame.body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows))
-        .flatten();
-    pet_hit_rect_win(body, origin)
-}
-
 // ═══════════════════════════ THE VERDICT ═══════════════════════════
 //
 // A command's exit code, in three senses, on one clock: the shell's own OSC
@@ -13297,29 +11400,42 @@ pub(crate) fn verdict_voice(failed: bool, dur_ms: Option<u64>) -> Option<(bool, 
     (dur >= VERDICT_MIN_MS).then_some((false, dur >= VERDICT_ICE_MS))
 }
 
-/// PERK-AND-WATCH (wave 2): the burst conjunction, in one pure function so
-/// the law is testable without a terminal. A frame is a BURST only when the
-/// pane visibly gained output (`scrolled` — new scrollback rows — or
-/// `seq_advanced` — the content clock moved within one session) AND the
-/// shell reports an executing command (OSC 133/633 C..D — this conjunct is
-/// what keeps keystroke echo, which also moves the content clock, from ever
-/// perking the pet) AND the viewport is at the live bottom (scrolled-back
-/// history is not a stream the pet can see).
-pub(crate) fn pet_output_burst(
-    scrolled: bool,
-    seq_advanced: bool,
-    shell_executing: bool,
-    live_bottom: bool,
-) -> bool {
-    (scrolled || seq_advanced) && shell_executing && live_bottom
+/// The resident pet's frame grid in the host contract's terms: the cursor
+/// effects' cell metrics and this surface's extent (the window grid, or the
+/// focused pane's), clamped to `u16`, with the grid's `(0, 0)` at `origin_px`
+/// in frame pixels (the effects origin, plus the pane's own on a split).
+pub(crate) fn pet_frame_geom(
+    cell: (usize, usize),
+    grid: (usize, usize),
+    origin_px: (i32, i32),
+) -> aterm_effects::host::FrameGeom {
+    let clamp = |v: usize| v.min(usize::from(u16::MAX)) as u16;
+    aterm_effects::host::FrameGeom {
+        rows: clamp(grid.0),
+        cols: clamp(grid.1),
+        cell_w: clamp(cell.0),
+        cell_h: clamp(cell.1),
+        origin_px,
+    }
+}
+
+/// The window's presentability as the pet owner reads it. A native window
+/// never reports `Hidden` per frame: its presentability EDGE (focus lost with
+/// no synthetic focus to keep it lit) retires the pet's coordinates where the
+/// edge is observed, in `lib.rs`, and an overlay is `PetFacts::obscured`.
+pub(crate) fn pet_visibility(focused: bool) -> aterm_effects::host::Visibility {
+    if focused {
+        aterm_effects::host::Visibility::Focused
+    } else {
+        aterm_effects::host::Visibility::VisibleUnfocused
+    }
 }
 
 /// **THE ROOM'S FACTS** (Rainbow Kitty v2 panel #9) — what the resident pet
 /// is told about the session it lives in, on a frame the host is ALREADY
-/// drawing, through the sanctioned `note_*` idiom: never a light, never a
-/// wake. One projection for both render arms (the single-pane present and
-/// the composed one), fed just ahead of `note_executing` at the two sites
-/// that already hold the pet and the session, so a split can never tell
+/// drawing: plain data the pet's owner notes through the sanctioned `note_*`
+/// idiom (never a light, never a wake). One projection for both render arms
+/// (the single-pane present and the composed one), so a split can never tell
 /// the pet a different room than a single pane does.
 ///
 /// * **(a) the lease** — `SessionCtx::turn_lease` live at `now_us`
@@ -13338,195 +11454,54 @@ pub(crate) fn pet_output_burst(
 /// * **(e) the inbox** — [`crate::fabric::SessionFabric::room_facts`]: the
 ///   newest unread row, a passed deadline, a standing hold.
 ///
-/// Every read is a short leaf lock taken with LOCK A already released (the
+/// Every read is a short leaf lock taken with the frame hold already released (the
 /// probes above these sites are done), the same locks the control thread's
 /// `who`/`turns`/`inbox` verbs take standalone, so no new lock edge is
 /// introduced. A session the pool no longer holds tells the pet nothing but
 /// "nobody is driving".
-fn note_room_facts(
-    pet: &mut aterm_effects::kitty_pet::PetBrain,
+fn room_facts(
     session: Option<&crate::Session>,
     status: Option<&crate::session_status::Status>,
-    now: Instant,
     sibling: Option<(f32, f32)>,
-) {
-    pet.note_room_quiet(status.is_some_and(|s| s.phase == crate::session_status::Phase::Quiet));
-    pet.note_room_sibling(now, sibling);
-    let Some(session) = session else {
-        pet.note_room_lease(false);
-        return;
-    };
-    let ctx = &session.ctx;
-    let now_us = crate::metrics::now_us();
-    let lease = ctx
-        .turn_lease
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .as_ref()
-        .is_some_and(|l| l.is_live(now_us));
-    pet.note_room_lease(lease);
-    let (turn_id, settled) = {
-        let turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
-        match turns.high_id() {
-            // `since(id − 1)` is the suffix at `id` exactly (ids are unique
-            // and strictly increasing), i.e. the newest record.
-            Some(id) => (
-                id,
-                turns
-                    .since(Some(id.saturating_sub(1)))
-                    .next()
-                    .is_some_and(|r| r.status == "settled"),
-            ),
-            None => (0, false),
-        }
-    };
-    pet.note_room_turn(now, turn_id, settled);
-    let (unseen, overdue, hold) = ctx.fabric.room_facts(crate::turn_ledger::now_ms());
-    pet.note_room_inbox(
-        now,
-        aterm_effects::kitty_pet::RoomInbox {
-            unseen,
-            overdue,
-            hold,
-        },
-    );
-}
-
-/// THE WRAP FACT (kitty-motion §4.1): one edge-detect over the emulator's
-/// autowrap serial, in one pure function so both production feeds (the
-/// single-pane present and the composed focused pane) diff by the same law.
-/// `wrapped` is true only when the SAME session's serial CHANGED since this
-/// window's last read; a session switch — or the very first read — only
-/// stores the new baseline and NEVER reports a wrap, exactly like the
-/// `pet_content_seq` burst latch beside it. The comparison is `!=`, not `>`,
-/// because main/alt buffer swaps keep per-grid serials (see
-/// `WindowState::pet_wrap_serial`): inequality costs at most one spurious
-/// wrap at a swap or restore, where an ordering test would go blind instead.
-pub(crate) fn wrap_fact_edge(seen: &mut Option<(u64, u64)>, session: u64, serial: u64) -> bool {
-    let wrapped = matches!(*seen, Some((sid, s)) if sid == session && s != serial);
-    *seen = Some((session, serial));
-    wrapped
-}
-
-#[cfg(test)]
-mod wrap_fact_edge_tests {
-    use super::wrap_fact_edge;
-
-    /// The latch law: first sight and session switches baseline silently,
-    /// a same-session serial change reads as exactly one wrap, and a swap
-    /// back to an older serial still reads (`!=`, not `>`).
-    #[test]
-    fn same_session_change_is_a_wrap_and_a_session_switch_never_is() {
-        let mut seen = None;
-        // First read: baseline only, never a wrap.
-        assert!(!wrap_fact_edge(&mut seen, 7, 41));
-        // Unchanged serial: quiet.
-        assert!(!wrap_fact_edge(&mut seen, 7, 41));
-        // Same session, serial moved: the wrap fact — once.
-        assert!(wrap_fact_edge(&mut seen, 7, 42));
-        assert!(!wrap_fact_edge(&mut seen, 7, 42));
-        // Session switch resets the baseline, even at a differing serial.
-        assert!(!wrap_fact_edge(&mut seen, 8, 0));
-        // A move BACKWARD (main/alt swap kept per-grid serials) still reads.
-        assert!(wrap_fact_edge(&mut seen, 8, u64::MAX));
-        assert!(wrap_fact_edge(&mut seen, 8, 3));
-    }
-}
-
-/// POINTER PLAY (wave 2): map the raw window-pixel pointer onto the pet's
-/// pane as a fractional cell `(col, row)` — pointer px minus the pane's
-/// frame-space origin (the effects origin, plus the focused pane's own
-/// pixel offset on the composed path — exactly `pet_hit_rect_win`'s
-/// geometry), over the cell metrics. `None` once the pointer leaves the
-/// pane's grid: outside the pane the pointer does not exist for the pet.
-pub(crate) fn pet_pointer_cell(
-    pointer_px: (f64, f64),
-    origin: (i32, i32),
-    cell: (usize, usize),
-    grid: (usize, usize),
-) -> Option<(f32, f32)> {
-    let (cw, ch) = cell;
-    if cw == 0 || ch == 0 {
-        return None;
-    }
-    let col = (pointer_px.0 - f64::from(origin.0)) / cw as f64;
-    let row = (pointer_px.1 - f64::from(origin.1)) / ch as f64;
-    (col >= 0.0 && row >= 0.0 && col < grid.0 as f64 && row < grid.1 as f64)
-        .then_some((col as f32, row as f32))
-}
-
-#[cfg(test)]
-mod pet_pointer_cell_tests {
-    use super::pet_pointer_cell;
-
-    /// The px→cell map is the hit-rect's geometry inverted: origin off,
-    /// cell metrics down, and anything off the grid is `None`.
-    #[test]
-    fn pointer_maps_into_pane_cells_and_dies_at_the_edge() {
-        // Origin (20, 40), 10×20 cells, 80×24 grid.
-        assert_eq!(
-            pet_pointer_cell((125.0, 90.0), (20, 40), (10, 20), (80, 24)),
-            Some((10.5, 2.5))
-        );
-        // Left/above the origin: outside.
-        assert_eq!(
-            pet_pointer_cell((19.0, 90.0), (20, 40), (10, 20), (80, 24)),
-            None
-        );
-        // Past the last column: outside.
-        assert_eq!(
-            pet_pointer_cell((20.0 + 800.0, 90.0), (20, 40), (10, 20), (80, 24)),
-            None
-        );
-        // Degenerate metrics never divide.
-        assert_eq!(
-            pet_pointer_cell((5.0, 5.0), (0, 0), (0, 20), (80, 24)),
-            None
-        );
-    }
-}
-
-#[cfg(test)]
-mod pet_output_burst_tests {
-    use super::pet_output_burst;
-
-    /// The echo law: content movement alone is NEVER a burst — the shell
-    /// must be executing, and the viewport must be live.
-    #[test]
-    fn typing_echo_never_reads_as_a_burst() {
-        // Echo: the content clock moves, the shell is NOT executing.
-        assert!(!pet_output_burst(false, true, false, true));
-        // A real stream: rows scrolled while the shell runs, live bottom.
-        assert!(pet_output_burst(true, false, true, true));
-        assert!(pet_output_burst(false, true, true, true));
-        // Scrolled-back history is not a stream the pet can see.
-        assert!(!pet_output_burst(true, true, true, false));
-        // An executing shell that wrote nothing this frame is quiet.
-        assert!(!pet_output_burst(false, false, true, true));
-    }
-}
-
-#[cfg(test)]
-mod pet_hit_rect_tests {
-    use super::pet_hit_rect_win;
-
-    /// The offset math is exactly the emitter's: body px + effects origin
-    /// (x on both x's, y on both y's), and `None` — pet not drawn — stays
-    /// `None`, which is what clears the stash.
-    #[test]
-    fn pet_hit_rect_win_offsets_the_body_by_the_effects_origin() {
-        assert_eq!(pet_hit_rect_win(None, (7, 9)), None);
-        assert_eq!(
-            pet_hit_rect_win(Some((10, 30, 40, 60)), (7, 9)),
-            Some((17, 37, 49, 69))
-        );
-        // A row-0 pet's head rises above the grid top: the rect keeps the
-        // negative overhang (the strip/modals still win the click by ORDER,
-        // not by clamping the cat's face away).
-        assert_eq!(
-            pet_hit_rect_win(Some((0, 20, -12, 8)), (4, 30)),
-            Some((4, 24, 18, 38))
-        );
+) -> aterm_effects::companion::RoomFacts {
+    aterm_effects::companion::RoomFacts {
+        quiet: status.is_some_and(|s| s.phase == crate::session_status::Phase::Quiet),
+        sibling,
+        session: session.map(|session| {
+            let ctx = &session.ctx;
+            let now_us = crate::metrics::now_us();
+            let lease = ctx
+                .turn_lease
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .is_some_and(|l| l.is_live(now_us));
+            let turn = {
+                let turns = ctx.turns.lock().unwrap_or_else(|p| p.into_inner());
+                match turns.high_id() {
+                    // `since(id − 1)` is the suffix at `id` exactly (ids are
+                    // unique and strictly increasing), i.e. the newest record.
+                    Some(id) => (
+                        id,
+                        turns
+                            .since(Some(id.saturating_sub(1)))
+                            .next()
+                            .is_some_and(|r| r.status == "settled"),
+                    ),
+                    None => (0, false),
+                }
+            };
+            let (unseen, overdue, hold) = ctx.fabric.room_facts(crate::turn_ledger::now_ms());
+            aterm_effects::companion::SessionRoom {
+                lease,
+                turn,
+                inbox: aterm_effects::kitty_pet::RoomInbox {
+                    unseen,
+                    overdue,
+                    hold,
+                },
+            }
+        }),
     }
 }
 
@@ -13663,158 +11638,34 @@ fn sing_outro_event(gain: f32, sig: u32) -> aterm_effects::trail_sound::SoundEve
     }
 }
 
-/// The resident always receives its caret while its surface is presentable.
-/// A song changes the surrounding effects, not the animal's home or identity.
-/// Keep the existing signature so both live paths and capture share one gate.
-pub(crate) fn pet_caret_admitted(pet_visible: bool, drive: f32, reduced_motion: bool) -> bool {
-    aterm_effects::companion::pet_caret_admitted(pet_visible, drive, reduced_motion)
-}
-
-/// The flying companion belongs to classic mode. Pet mode keeps its full-body
-/// resident through the entire song, including a delayed or skipped tail frame.
-pub(crate) fn flying_kitty_admitted(pet_mode: bool, sing: f32) -> bool {
-    aterm_effects::companion::flying_kitty_admitted(pet_mode, sing)
-}
-
-/// Exactly one companion owns pet mode: the full resident, independent of song
-/// drive. A song must neither hide it nor replace it with a floating head.
-pub(crate) fn pet_companion_admitted(pet_visible: bool, sing: f32) -> bool {
-    aterm_effects::companion::pet_companion_admitted(pet_visible, sing)
-}
-
-/// WHICH companion — at most ONE, always — puts a body in this frame.
+/// Whether the Sparkle Words engine may PRESENT (and so spend births rather
+/// than bank them): the window's UN-WOKEN motion focus (`App::motion_focus` —
+/// raw focus OR the recording pin), never the typed wake, and not suspended.
 ///
-/// [`flying_kitty_admitted`] and [`pet_companion_admitted`] compute two
-/// ALPHAS, and an alpha is only a permission. This is the custody law as a
-/// single value, so the emitters cannot draw two bodies even if both alphas
-/// somehow arrived positive: there is one variant, one match, one sprite.
-/// Every seam that must agree about the companion reads it —
-/// [`emit_single_cursor_companion`], `compose_cursor_companion`, and
-/// [`cursor_companion_on_glass`], which is how the ambient word-cats' pixel
-/// yield is guaranteed to describe the sprite that is really drawn rather than
-/// the other animal's.
-///
-/// THE PET WINS A TIE. It is the resident; the flying head is the earned
-/// flypast from classic mode. A song never grants a second companion in pet
-/// mode. The shared gates forbid a tie; this final choice also resolves one
-/// safely if a future caller hands it inconsistent alphas.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CompanionDuty {
-    /// No companion body this frame.
-    Idle,
-    /// The full-body resident pet ([`aterm_effects::kitty_pet`]).
-    Pet,
-    /// The earned flying head ([`crate::kitty_cursor`]), escorting the caret
-    /// at `cell`.
-    FlyingHead { cell: (u16, u16) },
-}
-
-/// Resolve [`CompanionDuty`] from this frame's two already-gated alphas.
-pub(crate) fn cursor_companion_duty(
-    pet_on_glass: bool,
-    kitty_alpha: u8,
-    cursor: Option<(u16, u16)>,
-) -> CompanionDuty {
-    if pet_on_glass {
-        return CompanionDuty::Pet;
-    }
-    match cursor {
-        // The head has no independent placement: it can claim glass only while
-        // a visible cursor cell exists to escort.
-        Some(cell) if kitty_alpha > 0 => CompanionDuty::FlyingHead { cell },
-        _ => CompanionDuty::Idle,
-    }
-}
-
-/// Cursor companions are active-grid decorations. Keep the broader decoration
-/// lifecycle running while history is visible, but never project the flying
-/// body or resident pet over retained rows.
-fn cursor_companion_presentable(decoration_presentable: bool, live_viewport: bool) -> bool {
-    decoration_presentable && live_viewport
-}
-
-/// The resident keeps its body and caret while performance pressure reduces
-/// animation. Stable accessibility/focus policy still wins, and an in-progress
-/// shed fade stays static until full amplitude has returned. This changes no
-/// flying-head or trail policy; their existing alpha envelope remains separate.
-#[inline]
-pub(crate) fn resident_pet_reduced_motion(
-    policy_reduced: bool,
-    shed_active: bool,
-    envelope: f32,
-) -> bool {
-    aterm_effects::companion::resident_pet_reduced_motion(policy_reduced, shed_active, envelope)
-}
-
-/// Actual surface custody for the full resident. Load shedding is deliberately
-/// absent: it changes the motion posture above, never ownership of the body.
-#[inline]
-pub(crate) fn resident_pet_surface_presentable(
-    focused: bool,
-    companions_allowed: bool,
-    unobscured: bool,
-    live_viewport: bool,
-    reading_interest: bool,
-) -> bool {
-    aterm_effects::companion::resident_pet_surface_presentable(
-        focused,
-        companions_allowed,
-        unobscured,
-        live_viewport,
-        reading_interest,
-    )
-}
-
-#[inline]
-fn shed_companion_presentable(base_presentable: bool, envelope: f32) -> bool {
-    base_presentable && envelope.is_finite() && envelope > 0.0
-}
-
-/// Apply the adaptive load-shed envelope to the flying head. The full resident
-/// keeps its opacity and uses a static posture while pressure persists.
-#[inline]
-fn shed_companion_alpha(alpha: u8, envelope: f32) -> u8 {
-    let envelope = if envelope.is_finite() {
-        envelope.clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    (f32::from(alpha) * envelope).round() as u8
-}
-
-/// Whether the soft-shed envelope still owes another presentation. The latch
-/// direction matters at the endpoints: fade-out stops at zero, while fade-in
-/// must start from that exact-zero edge and stops only at full amplitude.
-#[inline]
-fn shed_envelope_transitioning(shed_active: bool, envelope: f32) -> bool {
-    if !envelope.is_finite() {
-        return false;
-    }
-    if shed_active {
-        envelope > 0.0
-    } else {
-        envelope < 1.0
-    }
-}
-
-/// A stale classic episode cannot paint a detached exit flourish over the
-/// resident. Pet mode keeps the full body during singing and never admits the
-/// flying head; pinning the copied exit also keeps that policy explicit here.
-fn pin_pet_mode_exit(pet_mode: bool, frame: &mut crate::kitty_cursor::CatFrame) {
-    if pet_mode {
-        frame.exit = crate::kitty_cursor::CatExit::Plain;
-    }
+/// Decided 2026-09-25 under the owner's standing direction
+/// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 17): the typed wake
+/// keeps waking the cursor COMPANION — the kitty it was built for — but not the
+/// word engine. Gating the words on the woken focus flapped them on every
+/// typing gap (`spend_next_births` re-latches on each rising edge) and lit the
+/// crowd of cats the owner ruled out ("don't want all the kitties
+/// appearing"). ONE predicate for the single-pane present and the composed
+/// word pass, so the two paths cannot drift.
+#[must_use]
+pub(crate) fn sparkle_words_presentable(word_focus: bool, suspended: bool) -> bool {
+    word_focus && !suspended
 }
 
 #[cfg(test)]
 mod pet_sing_swap_tests {
     use super::{
         CursorFxInputs, cursor_companion_presentable, forward_kitty_cursor_motion,
-        pet_caret_admitted, pet_companion_admitted, pet_hit_rect_for_frame, pin_pet_mode_exit,
-        retire_kitty_cursor_without_owner,
+        pin_pet_mode_exit, retire_kitty_cursor_without_owner,
     };
     use crate::kitty_cursor::{CatExit, CatFrame, CatPose, CatReaction};
     use crate::{App, WindowId};
+    use aterm_effects::companion::{
+        pet_caret_admitted, pet_companion_admitted, pet_hit_rect_for_frame,
+    };
     use aterm_effects::cursor_glow::{
         BlockFill, BlockFillOwner, CursorCatMotionKind, CursorCatMotionPulse,
     };
@@ -13840,25 +11691,29 @@ mod pet_sing_swap_tests {
         let frame = {
             let ws = app.windows.get_mut(&wid).expect("window");
             ws.focused = true;
-            ws.cursor_pet.tick(PetSense {
-                caret_drawn: true,
-                now,
-                caret: Some((4, 12)),
-                rows: 24,
-                cols: 80,
-                cell_w: 10,
-                cell_h: 20,
-                reduced_motion: true,
-                output_burst: false,
-                pointer: None,
-                wrapped: false,
-            })
+            crate::app_render::pet_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::Present,
+                PetSense {
+                    caret_drawn: true,
+                    now,
+                    caret: Some((4, 12)),
+                    rows: 24,
+                    cols: 80,
+                    cell_w: 10,
+                    cell_h: 20,
+                    reduced_motion: true,
+                    output_burst: false,
+                    pointer: None,
+                    wrapped: false,
+                },
+            )
         };
         assert_eq!(frame.alpha, 255, "the first reduced frame has real pixels");
 
         let ws = app.windows.get_mut(&wid).expect("window");
         assert!(
-            !ws.cursor_pet.needs_frames(),
+            !ws.companion.brain().needs_frames(),
             "the static placement itself has no unfinished motion"
         );
         assert!(
@@ -13871,20 +11726,27 @@ mod pet_sing_swap_tests {
             "an opaque reduced still owes no follow-up frame train"
         );
         // The same brain must report actual motion again when it is enabled.
-        let _ = ws.cursor_pet.tick(PetSense {
-            caret_drawn: true,
-            now: now + Duration::from_millis(16),
-            caret: Some((4, 50)),
-            rows: 24,
-            cols: 80,
-            cell_w: 10,
-            cell_h: 20,
-            reduced_motion: false,
-            output_burst: false,
-            pointer: None,
-            wrapped: false,
-        });
-        assert!(ws.cursor_pet.needs_frames(), "real resumed motion is owed");
+        let _ = crate::app_render::pet_tick_for_test(
+            ws,
+            aterm_effects::host::CaptureMode::Present,
+            PetSense {
+                caret_drawn: true,
+                now: now + Duration::from_millis(16),
+                caret: Some((4, 50)),
+                rows: 24,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            },
+        );
+        assert!(
+            ws.companion.brain().needs_frames(),
+            "real resumed motion is owed"
+        );
     }
 
     /// Real pet ticks and the shipping sprite emitter, with a moving caret
@@ -13905,19 +11767,24 @@ mod pet_sing_swap_tests {
                         col += 2;
                     }
                     let caret = (4, col);
-                    let frame = ws.cursor_pet.tick(PetSense {
-                        caret_drawn: true,
-                        now,
-                        caret: pet_caret_admitted(true, drive, reduced).then_some(caret),
-                        rows: geom.rows,
-                        cols: geom.cols,
-                        cell_w: geom.cell_w,
-                        cell_h: geom.cell_h,
-                        reduced_motion: reduced,
-                        output_burst: false,
-                        pointer: None,
-                        wrapped: false,
-                    });
+                    let pet = crate::app_render::pet_owner_tick_for_test(
+                        ws,
+                        aterm_effects::host::CaptureMode::Present,
+                        PetSense {
+                            caret_drawn: true,
+                            now,
+                            caret: pet_caret_admitted(true, drive, reduced).then_some(caret),
+                            rows: geom.rows,
+                            cols: geom.cols,
+                            cell_w: geom.cell_w,
+                            cell_h: geom.cell_h,
+                            reduced_motion: reduced,
+                            output_burst: false,
+                            pointer: None,
+                            wrapped: false,
+                        },
+                    );
+                    let frame = pet.pet;
                     if drive == 0.0 && col == 12 && tick < 20 {
                         continue; // only the initial appearance ramp
                     }
@@ -13939,13 +11806,13 @@ mod pet_sing_swap_tests {
                     head.alpha = 211; // a stale head must lose the final custody tie
                     ws.free_scratch.clear();
                     ws.word_decos.begin_host_frame();
+                    assert_eq!(pet.on_glass, pet_companion_admitted(true, drive));
                     let fp = super::emit_single_cursor_companion(
                         ws,
                         geom,
                         Some(caret),
-                        pet_companion_admitted(true, drive),
+                        &pet,
                         false,
-                        frame,
                         head,
                         211,
                         now,
@@ -13980,9 +11847,14 @@ mod pet_sing_swap_tests {
                         ws,
                         geom,
                         Some(caret),
+                        &aterm_effects::companion::CompanionFrame {
+                            on_glass: false,
+                            duty: super::CompanionDuty::Idle,
+                            body_px: None,
+                            companion: None,
+                            ..pet
+                        },
                         false,
-                        false,
-                        frame,
                         head,
                         211,
                         now,
@@ -14461,9 +12333,14 @@ pub(crate) struct ComposeDecoCtx<'a> {
     /// The FOCUSED pane's caret in PANE-LOCAL cells; `None` while it is
     /// scrolled into history or its cursor is hidden.
     pub(crate) focus_cursor: Option<(u16, u16)>,
-    /// RAW window focus folded with the motion policy — the presentability
-    /// predicate every pane's `set_presentable` takes.
+    /// The window focus the cursor effects fold: `App::cursor_fx_focus`
+    /// (raw focus, the recording pin, and a live TYPED WAKE) on the live
+    /// present; the raw focus on a capture splice.
     pub(crate) win_focused: bool,
+    /// The UN-WOKEN focus (`App::motion_focus`: raw focus OR the recording
+    /// pin, no typed wake) — the Sparkle Words presentability input every
+    /// pane's `set_presentable` takes ([`sparkle_words_presentable`]).
+    pub(crate) word_focus: bool,
     /// Whether the MOTION POLICY (W11) still animates word sparkles.
     pub(crate) animate_sparkles: bool,
     /// Whether the motion policy still animates PRISM WAKE's output streak.
@@ -14478,15 +12355,14 @@ pub(crate) struct ComposeDecoCtx<'a> {
     pub(crate) kitty_alpha: u8,
     pub(crate) cat_frame: crate::kitty_cursor::CatFrame,
     /// The PET companion's resolved frame, already ticked for this composed
-    /// present (the brain advances outside this path so it can never freeze —
-    /// see the tick site). `pet_visible` already includes the custody gate, so
-    /// it is mutually exclusive with the flying face in pet mode.
-    pub(crate) pet: aterm_effects::kitty_pet::PetFrame,
-    pub(crate) pet_visible: bool,
+    /// pass by its owner (the brain advances outside this path so it can never
+    /// freeze — see the tick site). Its `on_glass` carries the custody gate,
+    /// so it is mutually exclusive with the flying face in pet mode.
+    pub(crate) pet: aterm_effects::companion::CompanionFrame,
     /// Whether this composed pass is a DRAWN present (`redraw_compose`) or a
     /// capture splice (`app_introspect`'s composed arm) re-using the same
     /// deco path. Only a present may spend a hello at the pet sync site —
-    /// see [`sync_pet_companion_look`]; everything else in the pass is
+    /// see [`emit_resident_pet`]; everything else in the pass is
     /// present/capture-agnostic by design.
     pub(crate) present: bool,
     pub(crate) accent: u32,
@@ -15398,6 +13274,76 @@ mod active_pane_mark_compose_tests {
             .expect("two panes");
         app.windows.get_mut(&wid).expect("test window").focused = true;
         (app, wid, left, right)
+    }
+
+    /// THE TYPED WAKE WAKES THE COMPANION, NOT SPARKLE WORDS
+    /// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 17, decided
+    /// 2026-09-25): an unfocused window being typed into keeps its cursor
+    /// companion, but the word engine is not presentable — or it flaps on
+    /// every typing gap and spends a crowd of births each time. RED before: the
+    /// composed pass fed `set_presentable` the typed-wake-folded focus.
+    #[test]
+    fn a_typed_wake_wakes_the_companion_but_not_sparkle_words_in_a_split() {
+        let (mut app, wid, _, _) = pure_split();
+        app.prepared_sparkle = app.config.prepare_sparkle_runtime();
+        app.recompute_sparkle();
+        assert!(app.sparkle.is_some(), "fixture: Sparkle Words resolve ON");
+        let now = Instant::now();
+        // Control: a focused window's words present.
+        assert!(compose_pure(&mut app, wid, now));
+        assert!(app.windows[&wid].word_decos.presentable());
+
+        let later = now + Duration::from_millis(16);
+        {
+            let ws = app.windows.get_mut(&wid).expect("test window");
+            ws.focused = false;
+            ws.last_key_at = Some(later);
+        }
+        assert!(
+            app.cursor_fx_focus(wid, false, later),
+            "the typed wake is live: the companion's focus input is held"
+        );
+        assert!(compose_pure(&mut app, wid, later));
+        assert!(
+            !app.windows[&wid].word_decos.presentable(),
+            "the word engine takes the UN-WOKEN focus"
+        );
+    }
+
+    /// …and the single-pane present takes the SAME predicate
+    /// ([`sparkle_words_presentable`]) over the SAME input, `motion_focus` —
+    /// which a typed wake does not move although `cursor_fx_focus` does. This
+    /// pins the predicate and that input, NOT the single-pane call site: that
+    /// present cannot run glass-less, so reverting its input to the woken focus
+    /// would leave this test green. Only the composed pass above is driven
+    /// through its real caller.
+    #[test]
+    fn sparkle_words_presentability_ignores_the_typed_wake() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let now = Instant::now();
+        {
+            let ws = app.windows.get_mut(&wid).expect("test window");
+            ws.focused = false;
+            ws.last_key_at = Some(now);
+        }
+        assert!(
+            app.cursor_fx_focus(wid, false, now),
+            "the companion is woken"
+        );
+        assert!(
+            !app.motion_focus(wid, false),
+            "the words' focus input is not"
+        );
+        assert!(!sparkle_words_presentable(
+            app.motion_focus(wid, false),
+            false
+        ));
+        assert!(sparkle_words_presentable(true, false));
+        assert!(
+            !sparkle_words_presentable(true, true),
+            "suspension still wins"
+        );
     }
 
     fn focus_pure_pane(app: &mut App, wid: WindowId, session: u64) {
@@ -16826,6 +14772,86 @@ mod cursor_body_master_switch_tests {
             lit_tick.block_fill.is_some(),
             "a master switched on at runtime must reclaim the caret's body on the next frame"
         );
+    }
+
+    /// THE COMPOSE-SIDE RIBBON WITNESS (`docs/RELEASE-PROOF-DISCIPLINE.md`
+    /// item 6): `fx_under_frames` counts ticks whose `glow_under` stream — the
+    /// rainbow ribbon body's own — was non-empty. The counters are
+    /// process-global and shared with every parallel test, so the positive arm
+    /// is read as a DELTA and the zero arm as the per-window stream the tick
+    /// hands `note_fx_composed`.
+    ///
+    /// NEGATIVE CONTROL, the case the first witness (any `glow_add` quad or
+    /// trail cell, `fx_frames_composed`) could not fail: the `off` style typed
+    /// the same way still composes `glow_add` light (the momentum glow is its
+    /// own default-on effect on every style), and composes no `glow_under`.
+    #[test]
+    fn the_cursor_effect_tick_publishes_its_ribbon_witness() {
+        let t0 = Instant::now();
+        let before = crate::metrics::snapshot().fx_under_frames;
+        let (app, wid, _) = ribbon_witness_take("rainbow kitty", t0);
+        let window = &app.windows[&wid];
+        assert!(
+            !window.cursor_glow.under_quads().is_empty(),
+            "fixture: the rainbow kitty band is on the frame"
+        );
+        assert!(
+            crate::metrics::snapshot().fx_under_frames > before,
+            "a tick that composed the band books an under frame"
+        );
+
+        let (app, wid, _) = ribbon_witness_take("off", t0);
+        let window = &app.windows[&wid];
+        assert!(
+            !window.glow_scratch.is_empty(),
+            "control: the off style still lights glow_add, which the any-quad witness counted"
+        );
+        assert!(
+            window.cursor_glow.under_quads().is_empty(),
+            "the off style composes no glow_under, so the witness reads 0"
+        );
+    }
+
+    /// Type three licensed keys into a focused window of `style` through the
+    /// real tick path (the same shape as `rainbow_window_with_a_lit_band`),
+    /// each fed to the engines the printable-key arm feeds.
+    fn ribbon_witness_take(style: &str, t0: Instant) -> (App, WindowId, Instant) {
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("full".into());
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some(style.into());
+        app.config.trail_sounds = Some(false);
+        let wid = WindowId(0);
+        {
+            let window = app.windows.get_mut(&wid).expect("headless window");
+            window.focused = true;
+            window.poof_row_buf = vec![' '; 80];
+        }
+        let mut seed = CursorFxInputs::sample_for_test(t0);
+        seed.cur = Some((2, 2));
+        app.tick_cursor_fx(wid, seed).expect("seed cursor engines");
+        let mut at = t0;
+        for col in 3..=5u16 {
+            let typed = at + std::time::Duration::from_millis(1);
+            {
+                let ws = app.windows.get_mut(&wid).expect("window");
+                ws.last_key_at = Some(typed);
+                ws.typing_cadence.on_keystroke(typed);
+                ws.cursor_glow.note_typed(typed);
+                // The printable-key arm's feed, as `app_input` makes it.
+                ws.momentum_glow
+                    .on_key(typed, aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S);
+            }
+            at = typed + std::time::Duration::from_millis(1);
+            let mut live = CursorFxInputs::sample_for_test(at);
+            live.cur = Some((2, col));
+            app.tick_cursor_fx(wid, live).expect("live cursor tick");
+        }
+        let settled = at + std::time::Duration::from_millis(40);
+        let mut on = CursorFxInputs::sample_for_test(settled);
+        on.cur = Some((2, 5));
+        app.tick_cursor_fx(wid, on).expect("settle tick");
+        (app, wid, settled)
     }
 }
 
@@ -18556,6 +16582,82 @@ mod composed_cursor_effect_advance_tests {
         assert!(pure.windows[&pure_wid].output_streak_panes.is_empty());
     }
 
+    /// THE STREAK TAKES THE CURSOR TRAIL'S FOCUS
+    /// (`docs/DESIGN-output-streak-2026-08-30.md` §11 Q2, decided 2026-09-25 as
+    /// shipped): `motion.animate(OutputStreak)` resolves on `cursor_fx_focus`,
+    /// so an UNFOCUSED window spawns no streak unless it is being typed into
+    /// (the typed wake) or recorded (the recording pin) — and does spawn during
+    /// either. Each arm is its own fresh split, driven by real output.
+    #[test]
+    fn an_unfocused_window_streaks_only_while_typed_into_or_recorded() {
+        #[derive(Clone, Copy, Debug)]
+        enum Arm {
+            Nothing,
+            TypedWake,
+            Recorded,
+        }
+        let streaked = |arm: Arm| -> bool {
+            let (mut app, wid, term) = pure_fixture("fire");
+            enable_output_streak(&mut app);
+            let t0 = Instant::now();
+            app.windows.get_mut(&wid).expect("test window").focused = false;
+            match arm {
+                Arm::Nothing => {}
+                Arm::TypedWake => {
+                    app.windows.get_mut(&wid).expect("test window").last_key_at = Some(t0);
+                }
+                Arm::Recorded => {
+                    let root = std::env::temp_dir()
+                        .join(format!("aterm-streak-focus-video-{}", std::process::id()));
+                    let _ = std::fs::remove_dir_all(&root);
+                    crate::control_auth::ensure_private_dir(&root).unwrap();
+                    let dir = crate::control_auth::confine_video_dir(&root).unwrap();
+                    let (reply, _rx) = std::sync::mpsc::channel();
+                    app.video_rec = Some(crate::VideoRec {
+                        window: wid,
+                        deadline: t0,
+                        started_us: 0,
+                        keys: false,
+                        key_log: Vec::new(),
+                        trail: false,
+                        trail_log: Vec::new(),
+                        trail_seen: 0,
+                        trail_lost: 0,
+                        pace_ticks: Vec::new(),
+                        unseamed_at_begin: 0,
+                        unlogged_other_window: 0,
+                        mode: crate::VideoMode::SwapchainTap,
+                        next_frame: None,
+                        presented: None,
+                        dir,
+                        handoff: None,
+                        cancel: crate::VideoCancellation::new(),
+                        reply,
+                    });
+                }
+            }
+            term_lock(&term).process(b"first");
+            assert!(redraw_pure(&mut app, wid, t0));
+            let mut any = !app.windows[&wid].input_scratch.nova_add.is_empty();
+            for step in 1..6u64 {
+                term_lock(&term).process(b" more output");
+                let at = t0 + Duration::from_millis(120 * step);
+                assert!(redraw_pure(&mut app, wid, at));
+                any |= !app.windows[&wid].input_scratch.nova_add.is_empty();
+            }
+            any
+        };
+        assert!(
+            !streaked(Arm::Nothing),
+            "an unfocused, untyped, unrecorded window spawns no streak"
+        );
+        assert!(
+            streaked(Arm::TypedWake),
+            "the typed wake lights the streak (the non-vacuous control)"
+        );
+        assert!(streaked(Arm::Recorded), "the recording pin lights it too");
+    }
+
     #[test]
     fn output_streak_fingerprint_tracks_placement_while_preserving_idle_zero() {
         let pane = ComposedOutputStreakPane {
@@ -19667,7 +17769,7 @@ mod composed_cursor_effect_advance_tests {
     //
     // Round A wired Rainbow Kitty's content witness (`ribbon_rows` →
     // `observe_ribbon_row`/`capture_ribbon_row` → `Engine::witness_rows`)
-    // at LOCK A in
+    // in the frame hold of
     // `redraw_window` — the SINGLE-PANE path — and nowhere else. Every split
     // pane, every ZOOMED pane (a single zoomed leaf routes as composed too)
     // and every `aterm ctl image`/`video` capture therefore ran with the
@@ -19777,7 +17879,7 @@ mod composed_cursor_effect_advance_tests {
         ThreePane,
         /// A split, then the focused leaf ZOOMED — one visible leaf that still
         /// routes as composed (`visible_content_route_from_plan`: `composed:
-        /// plan.zoomed`), so it must be fed here and not at LOCK A.
+        /// plan.zoomed`), so it must be fed here and not in the single-pane hold.
         Zoomed,
     }
 
@@ -21936,6 +20038,8 @@ pub(crate) struct TerminalCaptureFocus {
     pub(crate) content_seq: u64,
     pub(crate) alternate_screen: bool,
     pub(crate) live_viewport: bool,
+    /// Rows scrolled back into history (`0` on the live viewport).
+    pub(crate) display_offset: usize,
     pub(crate) cursor: Option<(u16, u16)>,
     /// Bounded console facts paired with these exact captured cells. The pet
     /// must never refresh ownership or scroll history by re-locking later.
@@ -23245,6 +21349,11 @@ mod motion_policy_tests {
             started_us: 0,
             keys: false,
             key_log: Vec::new(),
+            trail: false,
+            trail_log: Vec::new(),
+            trail_seen: 0,
+            trail_lost: 0,
+            pace_ticks: Vec::new(),
             unseamed_at_begin: 0,
             unlogged_other_window: 0,
             mode: crate::VideoMode::SwapchainTap,
@@ -23620,16 +21729,76 @@ mod motion_policy_tests {
         );
     }
 
+    /// THE SHED CLEARS AT THE CADENCE THE SHED ITSELF CAUSES
+    /// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 10). A shed window
+    /// stops animating, so the only presents left may be sparse keystroke
+    /// echoes; every other recovery test feeds cheap costs at a 16 ms cadence.
+    /// The dwell is wall-clock (`perf_flip_at`), so cheap presents every 400 ms
+    /// — the first one INSIDE the dwell — must still clear the latch within the
+    /// dwell plus `PERF_HYSTERESIS_FRAMES` presents, and hand motion back.
+    #[test]
+    fn a_shed_clears_at_a_sparse_keystroke_echo_cadence() {
+        use std::time::Duration;
+        let mut app = App::headless_for_test();
+        app.config.motion = Some("auto".into());
+        app.system_reduce_motion = false;
+        let fi = Duration::from_millis(16);
+        let t0 = std::time::Instant::now();
+        for frame in 0..u64::from(PERF_HYSTERESIS_FRAMES) {
+            app.note_present_cost(30_000_000, fi, t0 + Duration::from_millis(frame * 16));
+        }
+        assert!(
+            app.perf_reduced,
+            "fixture: sustained overload latched the shed"
+        );
+        assert_eq!(app.motion_policy(true), MotionPolicy::Reduced);
+        let shed_at = app.perf_flip_at.expect("the latch records its flip");
+
+        let cadence = Duration::from_millis(400);
+        let deadline =
+            shed_at + crate::app_render::PERF_SHED_DWELL_MIN + cadence * PERF_HYSTERESIS_FRAMES;
+        let mut at = shed_at + cadence;
+        assert!(
+            at < shed_at + crate::app_render::PERF_SHED_DWELL_MIN,
+            "fixture: the first echo lands inside the dwell"
+        );
+        let mut cleared_at = None;
+        while at <= deadline {
+            if app.note_present_cost(1_000_000, fi, at) {
+                cleared_at = Some(at);
+                break;
+            }
+            at += cadence;
+        }
+        let cleared_at = cleared_at.unwrap_or_else(|| {
+            panic!("sparse echoes never cleared the shed within dwell + hysteresis")
+        });
+        assert!(
+            cleared_at >= shed_at + crate::app_render::PERF_SHED_DWELL_MIN,
+            "…and never before the anti-flap dwell"
+        );
+        assert!(!app.perf_reduced);
+        assert_eq!(
+            app.motion_policy(true),
+            MotionPolicy::Full,
+            "motion is handed back once the latch clears"
+        );
+    }
+
     #[test]
     fn a_performance_shed_keeps_the_pet_static_and_preserves_head_policy() {
         for envelope in [0.0f32, 0.25, 0.75, 1.0] {
-            assert!(super::resident_pet_reduced_motion(false, true, envelope));
+            assert!(aterm_effects::companion::resident_pet_reduced_motion(
+                false, true, envelope
+            ));
             assert_eq!(
-                super::resident_pet_reduced_motion(false, false, envelope),
+                aterm_effects::companion::resident_pet_reduced_motion(false, false, envelope),
                 envelope < 1.0,
                 "the resident remains static until the fade has fully recovered",
             );
-            assert!(super::resident_pet_reduced_motion(true, false, envelope));
+            assert!(aterm_effects::companion::resident_pet_reduced_motion(
+                true, false, envelope
+            ));
         }
     }
 
@@ -24014,7 +22183,7 @@ mod witness_row_capture_tests {
 }
 
 /// One frame's terminal-state snapshot for [`App::tick_cursor_fx`] — the exact
-/// per-frame inputs `redraw_window`'s LOCK A reads for the cursor-effect pass,
+/// per-frame inputs `redraw_window`'s frame hold reads for the cursor-effect pass,
 /// snapshotted under the caller's Terminal lock (cursor + colours stay one
 /// coherent observation), plus the animation clock and the window's cell grid.
 pub(crate) struct CursorFxInputs {
@@ -24024,13 +22193,18 @@ pub(crate) struct CursorFxInputs {
     pub rows: usize,
     /// Window grid cols.
     pub cols: usize,
-    /// The visible cursor cell (`None` when hidden) — the engines' move sensor.
+    /// The cursor cell — the engines' move sensor. `None` on a scrolled-back
+    /// viewport; the composed, focus and headless paths also give `None` for
+    /// a DECTCEM-hidden caret, while the single-pane present hands it over
+    /// (a hidden cursor is still a caret, for the pet) and says so in
+    /// [`Self::cursor_visible`].
     pub cur: Option<(u16, u16)>,
     /// Whether this frame presents the active grid rather than retained
     /// scrollback. Cursor-owned geometry is invalid in history coordinates and
     /// is retired immediately; DECTCEM hiding on the live grid stays distinct.
     pub live_viewport: bool,
-    /// Raw cursor visibility (feeds the `ATERM_TRACE_SPAWN` diagnostic).
+    /// Raw cursor visibility (DECTCEM): feeds the `ATERM_TRACE_SPAWN`
+    /// diagnostic and the glow engine's `observe_caret_drawn`.
     pub cursor_visible: bool,
     /// Live cursor shape (the rainbow cursor requires a BLOCK).
     pub cursor_style: CursorStyle,
@@ -24062,11 +22236,18 @@ pub(crate) struct CursorFxInputs {
     /// while the kill/poof detector keeps refusing exactly what it always
     /// refused there.
     pub row_probe: Option<(u16, u16, aterm_effects::cursor_glow::ProbeTrust)>,
-    /// Flanking-row presence for a pane-local probe translated into window
-    /// coordinates while Rainbow Kitty owns the frame. `None` means infer
-    /// ordinary whole-grid edges from `row_probe`; composed callers supply
-    /// `Some` so an active rainbow pane edge is not mistaken for a real blank
-    /// row merely because it lies inside the window.
+    /// Flanking-row presence as [`capture_cursor_neighbor_rows`] answered it
+    /// under the same lock as `row_probe`: `false` for a grid edge, and for
+    /// both rows on a frame v2 did not own (the capture skipped them). Every
+    /// live caller supplies `Some`. `None` (the test sample's default, which
+    /// feeds no probe) infers ordinary whole-grid edges from `row_probe`
+    /// alone, and a caller that feeds a probe must not lean on it: inferred,
+    /// an uncaptured row inside the grid reads as present, and the engine
+    /// keeps the cleared buffer as a real blank row for the seam's content
+    /// witnesses (Rainbow Kitty's first frame after it engages). Composed
+    /// callers need it besides so an active rainbow pane edge is not
+    /// mistaken for a real blank row merely because it lies inside the
+    /// window.
     pub row_probe_neighbors: Option<(bool, bool)>,
     /// The live default FOREGROUND (`0x00RRGGBB`), the twin of `default_bg`.
     /// The cursor-effect layer anchors its fresh-typed glyph tint on it, and
@@ -24080,6 +22261,14 @@ pub(crate) struct CursorFxInputs {
     /// lane; `None` (a scrolled-back viewport, an unwired caller) leaves the
     /// engine's previous sample in place and the lane idle.
     pub print_anchor: Option<(u16, u16, u64)>,
+    /// The glyph at that print run's LAST cell (`Terminal::print_anchor_glyph`),
+    /// from the SAME lock hold and under the same live-viewport guard as
+    /// `print_anchor` — no translation, it is a cell's content. The witness the
+    /// engine's visible-parked lane reads to tell a key's echo from a status
+    /// row's (zsh's i-search minibuffer ends on its fake cursor `_`, as far as
+    /// two rows below the caret under a wrapped match). `None` means unknown:
+    /// the engine then judges exactly as a host that never sampled it.
+    pub print_anchor_glyph: Option<char>,
 }
 
 // bench-support: the frame-latency bench builds its per-frame inputs by
@@ -24121,6 +22310,7 @@ impl CursorFxInputs {
             row_probe_neighbors: None,
             default_fg: Theme::default().fg,
             print_anchor: None,
+            print_anchor_glyph: None,
         }
     }
 }
@@ -24250,7 +22440,10 @@ mod sync_cursor_fx_hold_tests {
                 open_dirty: terminal.sync_open_dirty(),
             }
         };
-        assert!(!preflight.active, "LOCK A deliberately samples sync false");
+        assert!(
+            !preflight.active,
+            "the preflight deliberately samples sync false"
+        );
         assert!(!update_sync_frame_hold(
             app.windows.get_mut(&wid).expect("window"),
             preflight,
@@ -24294,7 +22487,7 @@ mod sync_cursor_fx_hold_tests {
         );
         assert!(
             late_hold,
-            "LOCK B must revoke the candidate before effects run"
+            "the exact capture must revoke the candidate before effects run"
         );
         let mut candidate = CursorFxInputs::sample_for_test(candidate_at);
         candidate.cur = Some(target);
@@ -24523,14 +22716,39 @@ struct FocusedComposedCursorFxSample {
     /// The ECHO ANCHOR (`Terminal::print_anchor`), from the same lock hold —
     /// pane-local like `cursor`; the inputs build translates it.
     print_anchor: Option<(u16, u16, u64)>,
+    /// The glyph at that run's last cell (`Terminal::print_anchor_glyph`),
+    /// same hold; a cell's content, so nothing to translate.
+    print_anchor_glyph: Option<char>,
 }
 
-/// The flanking rows only feed Rainbow Kitty's text-first star landing gate
-/// and content witness.
-/// `observe_neighbor_rows` ignores them until v2 owns the frame, so sampling
-/// them for an off or another trail style only scans the terminal grid.
-/// Clearing the resident buffers on the skipped arm also prevents a later
-/// style change from mistaking old glyphs for this frame's observation.
+/// THE PROGRAM CAT's raw claim for `session`, read under a terminal guard the
+/// caller already holds (`App::app_kitty_claim` takes the lock itself). Lock
+/// order term → app_kitty, never reversed.
+pub(crate) fn app_kitty_claim_under(
+    session: &crate::Session,
+    term: &Terminal,
+) -> Option<crate::app_kitty::AppIdentity> {
+    let block = term.current_block().or_else(|| term.all_blocks().last());
+    let mut slot = session
+        .ctx
+        .app_kitty
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    slot.resolve(block).cloned()
+}
+
+/// The flanking rows only feed Rainbow Kitty: v2's occupancy for its
+/// text-first star landing gate, the engine's retained copies its seam's
+/// content witnesses read (`NbrProbe` in `cursor_glow`), and the abandoned
+/// band's content witness (`captured_witness_neighbor`). Nothing reads them
+/// until v2 owns the frame, so the capture skips them for an off or another
+/// trail style (it would only scan the terminal grid) and answers `false`.
+/// The caller hands that answer to `observe_neighbor_rows` with the probe
+/// (`CursorFxInputs::row_probe_neighbors`): the engine copies whatever row
+/// it is handed, whatever v2's state, so a skipped row must arrive as no row
+/// and never as the buffer cleared here. Clearing the resident buffers on
+/// the skipped arm also prevents a later style change from mistaking old
+/// glyphs for this frame's observation.
 pub(crate) fn capture_cursor_neighbor_rows(
     terminal: &Terminal,
     row: usize,
@@ -24620,7 +22838,7 @@ impl SinglePaneRowProbeKey {
 /// A private copy is deliberate: composed rendering and headless capture may
 /// move or overwrite the window's `poof_*` scratch. Restoring this copy on a
 /// hit costs a bounded memory copy, but avoids all terminal cell resolution
-/// under LOCK A while feeding the engines their row observations every frame.
+/// under the frame hold while feeding the engines their row observations every frame.
 #[derive(Debug, Default)]
 pub(crate) struct SinglePaneRowProbeCache {
     key: Option<SinglePaneRowProbeKey>,
@@ -24965,6 +23183,7 @@ fn focused_composed_cursor_fx_sample(
         row_above_present,
         row_below_present,
         print_anchor: terminal.print_anchor(),
+        print_anchor_glyph: terminal.print_anchor_glyph(),
     }
 }
 
@@ -25199,12 +23418,11 @@ impl App {
                 else {
                     continue;
                 };
-                targets.push((
-                    ti,
-                    session,
-                    (leaf.rect.size.height.round() as u16).max(1),
-                    (leaf.rect.size.width.round() as u16).max(1),
-                ));
+                // The ONE rounding rule, shared with `panes` (`read_pane_layout`)
+                // so what the verb prints is the grid this pass sizes (a shared
+                // session's minimum is applied below, by the same helper).
+                let (sub_rows, sub_cols) = Self::leaf_grid_cells(&leaf.rect);
+                targets.push((ti, session, sub_rows, sub_cols));
             }
         }
         // Proxy for waking the loop to repaint after an off-thread scrollback
@@ -25225,11 +23443,9 @@ impl App {
             if active_only && ti != active && !shared {
                 continue;
             }
-            let (sub_rows, sub_cols) = if shared {
-                self.shared_target_geometry(id)
-            } else {
-                (sub_rows, sub_cols)
-            };
+            // `pane_target_grid` is the rule `panes` reports with, so the verb
+            // prints the shared minimum here too, never the larger leaf.
+            let (sub_rows, sub_cols) = self.pane_target_grid(id, (sub_rows, sub_cols));
             // RULING 240: a wheel glide in flight over this engine LANDS at its
             // target before a width change can detach the history, so the
             // detach records the place the reader was going to as the one the
@@ -25254,6 +23470,12 @@ impl App {
                 }
             }
             let Some(s) = self.pool.get(id) else { continue };
+            // The seam policy comes from the PTY backend: under ConPTY conhost
+            // repaints the viewport right after this resize, and the engine's
+            // row accounting must match that repaint (`pty_resize_policy`).
+            // Asked BEFORE `term_lock`: the answer takes the PTY registry's own
+            // lock, which must not nest under the engine's.
+            let policy = pty_resize_policy(s.master);
             let pending = {
                 let mut term = term_lock(&s.term);
                 // CELL-PX-1: before the unchanged-dims early-continue, exactly like
@@ -25276,7 +23498,7 @@ impl App {
                 // which diffs the engine geometry under term_lock and emits an ordered
                 // `Op::Resize` before its next `RawIn` — so EVERY resize path, main or
                 // cross-session, is captured without a per-path enqueue. See spawn.rs.)
-                term.resize_offloading_scrollback(sub_rows, sub_cols)
+                term.resize_offloading_scrollback_with_policy(sub_rows, sub_cols, policy)
             };
             if let Some(pending) = pending {
                 // `pending` OWNS the entire detached off-screen scrollback. If
@@ -25723,9 +23945,7 @@ impl App {
     pub(crate) fn app_kitty_claim(&self, session: u64) -> Option<crate::app_kitty::AppIdentity> {
         let s = self.pool.get(session)?;
         let term = term_lock(&s.term);
-        let block = term.current_block().or_else(|| term.all_blocks().last());
-        let mut slot = s.ctx.app_kitty.lock().unwrap_or_else(|p| p.into_inner());
-        slot.resolve(block).cloned()
+        app_kitty_claim_under(s, &term)
     }
 
     /// THE ONE COMPANION VERDICT (gauntlet F3 hardening): every surface that
@@ -25758,8 +23978,21 @@ impl App {
         focus_session: u64,
         now: std::time::Instant,
     ) -> aterm_effects::kitty_registry::KittyLook {
-        let favourite = self.kitty_log.favourite_look();
         let raw = self.app_kitty_claim(focus_session);
+        self.companion_verdict_with_claim(wid, raw, now)
+    }
+
+    /// [`Self::companion_verdict`] with the focused pane's raw program claim
+    /// already read — by a caller that holds that pane's terminal anyway (the
+    /// single-pane present reads it inside its one frame hold, through
+    /// [`app_kitty_claim_under`], rather than taking the lock a second time).
+    pub(crate) fn companion_verdict_with_claim(
+        &mut self,
+        wid: WindowId,
+        raw: Option<crate::app_kitty::AppIdentity>,
+        now: std::time::Instant,
+    ) -> aterm_effects::kitty_registry::KittyLook {
+        let favourite = self.kitty_log.favourite_look();
         let app = self
             .windows
             .get_mut(&wid)
@@ -25768,7 +24001,7 @@ impl App {
             crate::launch_kitty::companion_precedence(favourite, app, self.launch_kitty);
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.kitty_rung = rung;
-            if rung != crate::launch_kitty::CompanionRung::Program {
+            if rung != aterm_effects::companion::CompanionRung::Program {
                 ws.kitty_tenure.note_non_program_verdict();
             }
         }
@@ -26326,7 +24559,7 @@ impl App {
             }
         };
         window.word_decos.set_kitty_sprite_source(source);
-        window.cursor_pet.invalidate_colors();
+        window.companion.invalidate_colors();
         window.installed_kitty_asset_fp = kitty_asset_fp;
         window.installed_config_assets = Some(assets);
         // RAINBOW KITTY v2 needs no seam here (§17.3 phase 7): the engine
@@ -26558,8 +24791,9 @@ impl App {
             crate::motion::MotionPolicy::resolve(mode, self.system_reduce_motion, win_focused);
         let shed = self.effective_shed_envelope(mode, now);
         let glow_cfg = self.glow_config();
-        let pet_action = if ws.pet_hit_rect.is_some() {
-            format!("{:?}", ws.cursor_pet.action()).to_ascii_lowercase()
+        let pet = ws.companion.brain();
+        let pet_action = if ws.companion.hit_rect().is_some() {
+            format!("{:?}", pet.action()).to_ascii_lowercase()
         } else {
             "none".to_string()
         };
@@ -26624,16 +24858,16 @@ impl App {
                 .momentum_glow
                 .value(now, aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S),
             glow_active: ws.cursor_glow.is_active(),
-            pet_active: self.trail_is_kitty_pet() && ws.cursor_pet.is_active(),
+            pet_active: self.trail_is_kitty_pet() && pet.is_active(),
             pet_action: &pet_action,
-            pet_content: ws.cursor_pet.content(),
-            pet_pending: ws.cursor_pet.pending_pets(),
-            pet_focus: ws.cursor_pet.console_attention().name(),
-            pet_reason: ws.cursor_pet.console_reason(),
-            pet_anchor: ws.cursor_pet.console_anchor_id(),
-            pet_event_seq: ws.cursor_pet.console_event_seq(),
-            pet_pose: ws.cursor_pet.pose_name(),
-            pet_body: ws.pet_hit_rect,
+            pet_content: pet.content(),
+            pet_pending: pet.pending_pets(),
+            pet_focus: pet.console_attention().name(),
+            pet_reason: pet.console_reason(),
+            pet_anchor: pet.console_anchor_id(),
+            pet_event_seq: pet.console_event_seq(),
+            pet_pose: pet.pose_name(),
+            pet_body: ws.companion.hit_rect(),
             cat_active: ws.cursor_cat.is_active(),
             // WHO OWNS THE CARET — the gate none of the three above reports.
             // Recorded by the tick that resolved it (`tick_cursor_fx`, and the
@@ -26713,6 +24947,7 @@ impl App {
             row_probe,
             row_probe_neighbors,
             print_anchor,
+            print_anchor_glyph,
         } = fx;
         // MOTION POLICY (W11): the one resolved gate for every decorative
         // animation this present composes — config `motion` × the live OS
@@ -26926,6 +25161,10 @@ impl App {
             // engine that landing band is off-grid padding (provably
             // glyph-free), while a host that skips this call entirely leaves
             // the neighbors UNKNOWN and displaced stars fall back in-cell.
+            // The presence is the capture's own (`row_probe_neighbors`): a
+            // row it skipped because v2 did not own the frame yet reaches
+            // the engine as `None` too, so the seam's content witnesses
+            // never read the cleared buffer as a real blank row.
             let (above_present, below_present) =
                 row_probe_neighbors.unwrap_or((prow > 0, usize::from(prow) + 1 < rows));
             ws.cursor_glow.observe_neighbor_rows(
@@ -26966,8 +25205,16 @@ impl App {
         }
         // ECHO-ANCHOR feed, immediately before the tick like the row probe:
         // where the terminal's last print run ended, so the hidden/parked-
-        // caret lane can anchor a licensed echo to its real mutation site.
-        ws.cursor_glow.observe_print_anchor(print_anchor);
+        // caret lane can anchor a licensed echo to its real mutation site —
+        // with the glyph that run ended on, so a visible-parked caret's
+        // minibuffer (zsh's i-search `<glyph>_`) is not laid as the key —
+        // and whether DECTCEM draws the caret: the single-pane path hands a
+        // hidden one over too (for the pet), and that gate is a law about a
+        // drawn caret, so a hidden-caret TUI keeps the lane it has on the
+        // composed paths, which hand over no caret at all.
+        ws.cursor_glow
+            .observe_print_anchor_glyph(print_anchor, print_anchor_glyph);
+        ws.cursor_glow.observe_caret_drawn(cursor_visible);
         let glow_fp = ws.cursor_glow.tick(
             cur,
             frame_started,
@@ -27592,8 +25839,8 @@ impl App {
             shed_env,
         );
         // Resolve one candidate from the exact fill precedence. Do not publish
-        // it yet: focus overrides, composed clipping, an early-out, or the late
-        // LOCK-A/LOCK-B fence can still prevent this body reaching the frame.
+        // it yet: focus overrides, composed clipping, or an early-out can still
+        // prevent this body reaching the frame.
         let terminal_cursor_color = aterm_render::rgb_to_u32(live_cursor_rgb);
         let block_fill = project_block_fill(
             resolve_block_fill(
@@ -27621,6 +25868,14 @@ impl App {
                 .wrapping_mul(1_000_003)
                 .wrapping_add(u64::from(owned.fill) | (1 << 32))
         });
+        // The compose-side prim counters: every path's tick lands here.
+        if let Some(ws) = self.windows.get(&id) {
+            metrics::note_fx_composed(
+                ws.glow_scratch.len(),
+                ws.cursor_glow.under_quads().len(),
+                ws.trail_scratch.len(),
+            );
+        }
         Some(CursorFxTick {
             win_focused,
             motion,
@@ -27956,6 +26211,7 @@ impl App {
             row_above_present,
             row_below_present,
             print_anchor: sampled_print_anchor,
+            print_anchor_glyph: sampled_print_anchor_glyph,
         } = sample;
         let (row_probe, row_above_present, row_below_present) = {
             let Some(window) = self.windows.get_mut(&wid) else {
@@ -28046,7 +26302,7 @@ impl App {
             }
         }
         // THE CONTENT WITNESS, on the COMPOSED frame (2026-09-13). Round A
-        // wired Rainbow Kitty's witness at LOCK A in `redraw_window` — the
+        // wired Rainbow Kitty's witness in `redraw_window`'s frame hold — the
         // SINGLE-PANE path — and nowhere else, so every split pane, every
         // ZOOMED pane (a single zoomed leaf routes through here too) and every
         // `aterm ctl image`/`video` capture ran with it starved: an abandoned
@@ -28181,6 +26437,9 @@ impl App {
                             seq,
                         )
                     }),
+                print_anchor_glyph: (display_offset == 0)
+                    .then_some(sampled_print_anchor_glyph)
+                    .flatten(),
             },
         ) else {
             return false;
@@ -30103,6 +28362,9 @@ impl App {
             .is_some_and(|recording| recording.window == id)
         {
             let t_us = crate::metrics::now_us();
+            // The `trail` ledger rides the same stamp: harvest the verdicts the
+            // recorded window made since the last recorded present.
+            self.harvest_video_trail(id, t_us);
             let mut capture_stopped = false;
             if let (Some(gpu), Some(state)) = (self.backend.gpu_mut(), self.windows.get_mut(&id))
                 && let Some(
@@ -30661,6 +28923,12 @@ impl App {
         match ws0.present.as_ref() {
             Some(PresentTarget::Gpu { .. }) if self.backend.is_gpu() && window.is_some() => {}
             Some(PresentTarget::Cpu { .. }) if !self.backend.is_gpu() && window.is_some() => {}
+            // TEST-ONLY: a scripted CPU surface needs no OS window — it is how a
+            // headless test drives this whole path, present included
+            // (`crate::present::scripted`).
+            #[cfg(test)]
+            Some(PresentTarget::Cpu { surface })
+                if !self.backend.is_gpu() && surface.scripted().is_some() => {}
             // The glass-less recording target (attached ONLY while an
             // offscreen-present-real `video` is in flight — the mode-honesty
             // law): the WaitUntil recording loop drives this same redraw into
@@ -30727,7 +28995,7 @@ impl App {
         if !matches!(route, crate::VisibleContentRoute::Terminal { .. })
             && let Some(ws) = self.windows.get_mut(&id)
         {
-            ws.pet_hit_rect = None;
+            ws.companion.withdraw_hit_rect();
         }
         // THE PER-PANE SNAPSHOTS retire with their route — one rule, named
         // once, so it can be asked directly (the redraw seam itself has no
@@ -30806,7 +29074,7 @@ impl App {
 
         // The cursor-effect resolution that used to live here (MOTION POLICY fold,
         // glow/trail configs, cell geometry) moved VERBATIM into `tick_cursor_fx`,
-        // which the single-pane path calls after LOCK A — shared with the headless
+        // which the single-pane path calls after its frame hold — shared with the headless
         // `image` capture. The multi-pane compose resolves its own copies (below).
 
         // M2 "ink that dries": resolve the stream-fade settings once per redraw.
@@ -30912,8 +29180,6 @@ impl App {
         let bonk_detonations = self.curse_bonk_detonation_enabled();
         let bonk_volume = self.config.trail_sound_volume();
         let bonk_style = self.glow_config().style;
-        let mut suppress_cursor_effect_style_after_torn = false;
-        let mut cursor_fx_commit = CursorFxCommit::SAME;
         let title = if multi_pane {
             match self.redraw_compose_from_plan(
                 id,
@@ -30937,10 +29203,18 @@ impl App {
                 }
             }
         } else {
+            // TYPING-3 effective load-shed snapshot: under an allowed
+            // sustained-overload latch expensive per-frame decoration work is
+            // suspended. Explicit Full motion and the adaptive opt-out leave this
+            // false, matching `motion_policy()`.
             let load_shed = self.load_shed_active();
             // The off path must not allocate or rebuild console perception.
             // Custody/focus are resolved later; this is only the style owner.
             let pet_glow = self.glow_config();
+            // Whether the cursor-glow engine — the only reader of the cursor-row
+            // probes this frame captures — is live at all (master switch and
+            // Serious Mode fold into `enabled`).
+            let cursor_fx_live = pet_glow.enabled;
             let pet_console_owned = resident_pet_owner_present(
                 self.trail_presentation().pet_species.is_some(),
                 pet_glow.enabled
@@ -30958,11 +29232,6 @@ impl App {
             let Some(ws) = self.windows.get_mut(&id) else {
                 return;
             };
-            // The free-sprite plane mixes grid-scanned word decorations with
-            // cursor companions. Record the cursor-owned span while LOCK A's
-            // projection is built so a stable LOCK B content drift can retain
-            // the kitty without retaining stale word positions.
-            let mut cursor_owned_free = 0..0;
             // THE UNSPLIT WINDOW NAMES ITS SESSION. This renderer drives the
             // whole window as ONE grid, so it never calls `bind_pane` — and the
             // engine read that missing binding as "matches every session",
@@ -30974,7 +29243,7 @@ impl App {
             //
             // DECLARED HERE, not beside the tick: the declaration also
             // invalidates the live scan when the session actually changes, and
-            // `needs_rescan` is consulted under LOCK A a few dozen lines below.
+            // `needs_rescan` is consulted under the frame hold a few dozen lines below.
             // Announcing the switch after that read would leave the first frame
             // of a newly-front tab decorated with the PREVIOUS tab's word list.
             // Unconditional (above every suspend/sync fork) because it is a
@@ -30985,10 +29254,10 @@ impl App {
             // which must re-baseline the age map (a
             // switched-to screen is settled content, not fresh ink).
             let fade_token = std::sync::Arc::as_ptr(&front_terminal.term) as usize;
-            // Resident strip-row pool reclaim, hoisted AHEAD of LOCK A so it also
+            // Resident strip-row pool reclaim, hoisted AHEAD of the frame hold so it also
             // salvages a sparkle-RESCAN frame's surplus rows. The prior present's
             // strip splice left `strip` surplus rows on `input_scratch.cells`; both
-            // the LOCK A rescan extract and the LOCK B extract are about to
+            // the frame hold's extraction (rescan or not) is about to
             // `resize_with(rows)` and DROP those tail buffers. On a rescan frame that
             // free lands under the Terminal mutex and the pool (only refilled here)
             // never sees the buffers, so `prepend_strip_rows` clones fresh every frame
@@ -31041,18 +29310,21 @@ impl App {
                     pool.push(buf);
                 }
             }
-            // ---- SHORT LOCK A (snapshot). The single-pane path previously held the
-            // Terminal mutex across EVERY per-frame effect tick, the should_repaint
-            // decision, the O(rows×cols) stream-fade pass, and ~8 clone_from buffer
-            // copies — starving the PTY reader (which contends on the SAME mutex per
-            // 8 KiB chunk) under load. Only `cell_frame_into` + `take_damage` + these
-            // cheap scalar reads NEED the lock, so mirror the multi-pane compose path
-            // (`redraw_compose`): snapshot the cheap Terminal state into host locals
-            // here, tick + decide UNLOCKED, and re-lock ONLY to extract the grid +
-            // consume damage (LOCK B, below). Byte-parity is preserved — no concurrent
-            // writer interleaves in the single-threaded tests, so every read yields
-            // exactly the pre-split value; under a real load burst the PTY reader now
-            // makes progress across the ticks instead of blocking on this hold. ----
+            // ---- ONE TERMINAL HOLD per frame (typing-to-pixels audit, P1). Every
+            // terminal fact this frame is keyed, probed, ticked and presented
+            // with — the cursor and style scalars, the effect probes, the colours,
+            // the grid extraction and its damage consume — is read under this ONE
+            // acquisition, and the effect ticks, the should_repaint decision, the
+            // O(rows×cols) stream-fade pass and every projection copy then run
+            // UNLOCKED off that snapshot, so the PTY reader (which contends on the
+            // same mutex per 8 KiB chunk) is never blocked across them. It used to
+            // be two holds — a short LOCK A for the probes, then LOCK B for the
+            // extraction — and a PTY write landing between them tore the frame:
+            // the effects described one grid and the cells another, which a whole
+            // classify-and-suppress fence existed to repair. The composed path
+            // already rendered from one focused sample; this is its single-pane
+            // twin, and the fence is gone with the tear
+            // (`single_hold_redraw_tests`). ----
             let sparkle_on = self.sparkle.is_some();
             // PHOSPHOR rain: the resolved parameters (Copy) for this frame,
             // ENGAGED only while the front session is effectively on OR this
@@ -31063,17 +29335,24 @@ impl App {
             let rain_cfg = self
                 .rain
                 .filter(|_| rain_session_on || ws.matrix_rain.is_some());
-            // TYPING-3 effective load-shed snapshot (disjoint field, like
-            // `sparkle_on`): under an allowed sustained-overload latch we suspend
-            // expensive per-frame decoration work. Explicit Full motion and the
-            // adaptive opt-out leave this false, matching `motion_policy()`.
-            // LOCK A registers as a UI waiter while it blocks (P63): the reader
-            // yields its next slice to it instead of re-taking the unfair mutex.
-            // The acquire closes on the binding line on purpose: the L0 freeze
-            // guard tracks a let-bound guard only from a same-line acquire.
-            let ui_waiting = &front_terminal.ui_waiting;
-            let site = crate::metrics::TermWaitSite::RedrawA;
-            let mut term = crate::term_lock_ui(&front_terminal.term, ui_waiting, site);
+            // THE HOLD, taken with `term_try_lock` FIRST: a mutex that was free is
+            // evidence no writer is mid-batch, which the effect-only reuse gate
+            // below reads as `uncontended`. A failed try is not an error and never
+            // skips the frame — it falls straight through to the blocking
+            // acquisition, which registers as a UI waiter while it blocks (P63)
+            // so the reader yields its next slice to it instead of re-taking the
+            // unfair mutex.
+            let site = crate::metrics::TermWaitSite::Redraw;
+            let (mut term, uncontended) = match term_try_lock(&front_terminal.term) {
+                Some(term) => {
+                    metrics::note_term_wait(site, 0);
+                    (term, true)
+                }
+                None => (
+                    crate::term_lock_ui(&front_terminal.term, &front_terminal.ui_waiting, site),
+                    false,
+                ),
+            };
             // Cursor (terminal coords). A pure cursor move marks no grid damage, so
             // these key terms force the post-move repaint; they also feed the aurora's
             // move detection.
@@ -31087,8 +29366,9 @@ impl App {
             let cursor_style = term.cursor_style();
             // The ECHO ANCHOR, from the same lock hold as the caret it stands
             // in for when a TUI hides/parks that caret (single pane → no pane
-            // translation needed).
+            // translation needed) — and the glyph its run ended on.
             let print_anchor = term.print_anchor();
+            let print_anchor_glyph = term.print_anchor_glyph();
             // VI-1: when keyboard copy-mode is active, its cursor (grid line/col) is
             // painted INSTEAD of the terminal cursor — mapped to a screen row via the
             // display offset below. `None` when vi mode is off (the normal cursor shows).
@@ -31126,22 +29406,18 @@ impl App {
             // native rain one bounded Execute choreography license.
             let shell_executing = term.shell_state() == aterm_core::terminal::ShellState::Executing;
             let is_alt = term.is_alternate_screen();
-            let content_generation = aterm_effects::cursor_trail::ContentGeneration {
-                process_sequence: term.pipeline_timestamps().process_sequence,
-                terminal_id: term.render_identity(),
-                alternate_screen: is_alt,
-            };
+            let terminal_id = term.render_identity();
             // SYNC-1: is this (single) pane holding DEC-2026 synchronized output? Read
             // under the SAME lock, then arm/hold so the app's multi-write update lands
             // tear-free. Arm ONLY on the FALSE->TRUE rising edge (so a timeout release
             // does not immediately re-hold), and clear whenever we are NOT holding (sync
             // ended OR the safety-valve deadline passed) — a stale past deadline would
             // busy-spin the event loop (see the `next_deadline`-in-the-past guards). The
-            // `sync_hold` result gates BOTH the rescan's `take_damage` below AND the
-            // present (via the early return before LOCK B), so a held frame strands
+            // `sync_hold` result gates the extraction's `take_damage` below AND the
+            // present (via the early return right here), so a held frame strands
             // nothing: the accumulated writes stay pending for the release frame.
             let sync_observation = SyncObservation {
-                terminal_id: content_generation.terminal_id,
+                terminal_id,
                 active: term.modes().synchronized_output(),
                 end_seq: term.sync_end_seq(),
                 open_dirty: term.sync_open_dirty(),
@@ -31170,7 +29446,7 @@ impl App {
             let content_scroll_state = term.content_scroll_state();
             // Reset/translate against the old coordinate plane before feeding
             // this frame's context and repaint-blink edge.
-            sync_cursor_effect_coordinate_space(ws, content_generation.terminal_id, is_alt);
+            sync_cursor_effect_coordinate_space(ws, terminal_id, is_alt);
             let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
             // ERASE-POOF probe: capture the cursor row's per-column chars under
             // this SAME lock (disjoint `ws` field, the `rain_hidden_band` /
@@ -31182,7 +29458,7 @@ impl App {
             // one frame so the slide can never read as a kill). The probe rides
             // to `tick_cursor_fx` as `(row, caret)`; `None` leaves the engine's
             // previous probe in place.
-            // REPAINT-BLINK edge detector, on the SAME LOCK A read (zero new
+            // REPAINT-BLINK edge detector, on the SAME hold (zero new
             // acquisitions): the epoch advances when the app hides the cursor
             // INSIDE a DEC-2026 synchronized update — Claude Code's
             // per-keystroke repaint bracket (live byte capture), which vim/
@@ -31220,10 +29496,22 @@ impl App {
             // engine's kill/poof branches refuse ContentOnly probes, so the
             // phantom-poof fence holds unchanged (see [`row_probe_trust`]).
             let probe_trust = row_probe_trust(is_alt, blink_recent);
+            // THE PROBE COPIES ONLY FOR A LIVE CURSOR EFFECT (typing-to-pixels
+            // audit, P2). Every reader of these rows is the cursor-glow engine
+            // (the poof/kill detector, the typed-echo confirm proof, the star
+            // landings, Rainbow Kitty's ribbon witness), and it is inert while
+            // its master switch or Serious Mode has it off — so an effects-off
+            // echo frame copies no row at all. The engine's baseline is dropped
+            // instead, so re-enabling can never diff a stale row against a
+            // live one (a phantom poof).
+            if !cursor_fx_live {
+                ws.cursor_glow.drop_row_probe();
+            }
             // Advance/drop cursor-effect geometry before sampling the new row.
             // The terminal snapshot remains monotonic even when retained
             // scrollback is capped at zero or full.
-            let row_probe = if display_offset == 0 && !scroll_change.changed() {
+            let mut row_probe_neighbors = None;
+            let row_probe = if cursor_fx_live && display_offset == 0 && !scroll_change.changed() {
                 let v2_owns_frame = ws.cursor_glow.v2_owns_frame();
                 let (_, neighbor_above, neighbor_below) = ws.single_pane_row_probe_cache.sample(
                     &term,
@@ -31279,6 +29567,11 @@ impl App {
                         }
                     }
                 }
+                // The capture's own answer rides with the probe: a row it
+                // skipped (a grid edge, or every row while v2 does not own
+                // the frame yet) must reach the engine as no row, not as the
+                // buffer it just cleared (`CursorFxInputs::row_probe_neighbors`).
+                row_probe_neighbors = Some((neighbor_above, neighbor_below));
                 Some((cpos.row, cpos.col, probe_trust))
             } else {
                 ws.single_pane_row_probe_cache.invalidate();
@@ -31288,20 +29581,15 @@ impl App {
             // RepaintKey fingerprints it — both after the lock drops.
             let selection = term.text_selection().clone();
             // Live default-bg (folded with DECSCNM reverse-video) + cursor colour for
-            // the renderer PADDING band + cursor, resolved under the lock so OSC
-            // 11/111/12/112 (and DECSCNM ?5) track. Applied to `input_scratch` after
-            // LOCK B. Default path (no OSC) is byte-identical to the theme.
+            // the renderer PADDING band + cursor, resolved under the hold so OSC
+            // 11/111/12/112 (and DECSCNM ?5) track — the same hold as the cells,
+            // so a colour write can never tear cells from padding or cursor.
+            // Default path (no OSC) is byte-identical to the theme.
             let (default_bg_u32, default_fg_u32, cursor_color_u32) = terminal_frame_colors(&term);
             let title = term.title_arc();
-            // Sparkle rescan is the ONE grid extraction that must precede the decision
-            // (a rescan always forces a present via `deco_rescan`, so the extract is
-            // never wasted). Extract AND consume the damage HERE, under the SAME lock,
-            // so the presented cells and the `take_damage` are the same grid state —
-            // if a PTY write landed between this lock and a later one, consuming it
-            // without also extracting it would strand the new content (its damage
-            // cleared but the pixels never shown, and the epoch not advanced to force
-            // a repaint). The scan + animate run unlocked below off this snapshot;
-            // non-rescan frames instead extract + consume at LOCK B.
+            // A sparkle rescan (and a rain refresh) scans the extraction below and
+            // always forces a present via `deco_rescan`, so its extract is never
+            // wasted. The scan + animate run unlocked off this hold's snapshot.
             // Alt-screen sparkles are on by default; `suppress_in_alt_screen` opts back
             // into the v1 behavior (vim/less/htop undecorated). ONE flag gates both the
             // rescan here and the deco render below so the two can never disagree.
@@ -31355,15 +29643,44 @@ impl App {
                 ws.matrix_rain.as_deref(),
                 epoch,
             );
-            // ONE extraction per refresh frame regardless of which engine asked
-            // (same lock, same epoch — no torn read); scans/sampling below run
-            // unlocked off this snapshot.
-            if deco_rescan || rain_refresh {
-                // The same historical extract+take pair as LOCK B, so it takes
-                // the same DMG-1 scoped arm (and re-establishes the continuity
-                // chain a plain pair would break for the NEXT frame — the
-                // scoped fn restamps `extract_gen`, `cell_frame_into` +
-                // `take_damage` does not).
+            // THE EXTRACTION, in this same hold: the cells and the `take_damage`
+            // are the grid state every fact above was read from, so no write can
+            // be consumed without being extracted (its damage cleared, its pixels
+            // never shown) — and none can be extracted without the effects, the
+            // key and the colours seeing it too.
+            //
+            // …AND ON AN EFFECT-ONLY FRAME THE EXTRACTION DOES NOT RUN AT ALL
+            // (2026-08 draw-path audit, tier-1 item 1). The audit measured 16.6x
+            // more frames drawn while typing than the content requires — every
+            // one of them an honest effect tick that owes a present, and every
+            // one of them taking this grid extraction to rediscover an unchanged
+            // grid. `effect_only_snapshot_reusable` proves, from scalars this hold
+            // already reads, that a refill would reproduce `input_scratch`
+            // exactly; when it does, the snapshot is presented as it stands.
+            // Nothing is deferred and nothing is stranded: the predicate requires
+            // `!has_damage()`, so the `take_damage` folded into the refill would
+            // have consumed nothing, and NOT bumping `extract_gen` leaves this
+            // scratch (and every sibling) a valid damage-scoped baseline for the
+            // next real refill. A refresh frame always refills (its scan reads
+            // the extraction), and a tab-strip window is refused by
+            // `strip_rows_n == 0`: `undo_host_row_prepend` leaves `cursor_row`
+            // and the selections shifted on purpose, so an un-spliced scratch is
+            // an intermediate, not a presentable frame. Otherwise one DMG-1
+            // scoped refill — the continuity chain `cell_frame_damage_scoped_into`
+            // restamps for the NEXT frame.
+            if !(deco_rescan || rain_refresh)
+                && strip_rows_n == 0
+                && effect_only_snapshot_reusable(
+                    uncontended,
+                    &ws.input_scratch,
+                    &term,
+                    epoch,
+                    rows,
+                    cols,
+                )
+            {
+                metrics::note_frame_refill_skipped();
+            } else {
                 let refill = term.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
                 metrics::note_frame_refill(refill);
             }
@@ -31371,159 +29688,29 @@ impl App {
             // will (the write path honors EA-Ambiguous width), so the overlay
             // below reads the SAME mode bit under the same lock.
             let ambiguous_cjk = term.modes().ambiguous_width_double;
-            // Refresh frames keep this snapshot. Every other frame captures
-            // its facts beside the newer extraction under LOCK B below, so
-            // avoid a block scan here whose result would be discarded.
-            let mut pet_world_facts =
-                (pet_console_owned && (deco_rescan || rain_refresh)).then(|| {
-                    aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
-                });
+            // The resident pet's world facts, beside the extraction they describe.
+            let pet_world_facts = pet_console_owned.then(|| {
+                aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
+            });
+            // …and the focused pane's raw program-cat claim, read in this same
+            // hold rather than by a second acquisition in the companion verdict.
+            let app_kitty_raw = self
+                .pool
+                .get(front_terminal.session)
+                .and_then(|session| app_kitty_claim_under(session, &term));
             // The hover under a still pointer, re-probed against THIS hold when
-            // the fill above moved it (G04): a rescan frame is the frame, and
-            // its LOCK A is the acquisition the fill rode — so the probe rides
-            // it too, and can neither defer nor owe a retry. The `&mut self`
-            // call ends the `ws` borrow; it is re-taken right after.
-            if deco_rescan || rain_refresh {
-                self.refresh_hover_for_frame_locked(id, &term);
-            }
+            // the fill above moved it (G04) — and when the motion path's
+            // non-blocking probe left it unanswered. This hold is the
+            // acquisition the fill rode; the probe rides it too, so it can
+            // neither defer nor owe a retry frame, and the answer reaches the key
+            // below (`link_caption`) on the frame that carries the fill. The
+            // reuse arm keys identically to the frame before it, so there the
+            // compare is the whole cost. (The `&mut self` call ends the `ws`
+            // borrow; the effect pass below re-takes it.)
+            self.refresh_hover_for_frame_locked(id, &term);
             drop(term);
-            let Some(ws) = self.windows.get_mut(&id) else {
-                return;
-            };
-            // Rescan frames extracted under LOCK A and therefore keep these
-            // LOCK-A colors. Non-rescan frames overwrite both under LOCK B
-            // beside their newer grid extraction, preventing a PTY color write
-            // between the locks from producing a mixed one-frame snapshot.
-            let mut presented_default_bg_u32 = default_bg_u32;
-            let mut presented_cursor_color_u32 = cursor_color_u32;
-            // Non-refresh frames authorize and capture their exact terminal
-            // snapshot BEFORE any effect/deco/audio clock advances. Once this
-            // lock drops, that complete snapshot remains eligible for glass
-            // even if the PTY immediately opens a new synchronized-output
-            // bracket; the new bracket's writes remain pending for the next
-            // frame. This closes the false-at-A/true-at-B race without holding
-            // the Terminal mutex across any host-side effect work.
-            if !(deco_rescan || rain_refresh) {
-                // Acquired with `term_try_lock` FIRST (see the reuse gate
-                // below): a mutex that was free is evidence no writer is
-                // mid-batch. A failed try is not an error and never skips the
-                // hold — it falls straight through to the historical blocking
-                // acquisition and, with `uncontended == false`, to the
-                // historical unconditional refill. The synchronized-output
-                // recheck below is reached identically on both arms.
-                let (mut committed, uncontended) = match term_try_lock(&front_terminal.term) {
-                    Some(committed) => (committed, true),
-                    None => (
-                        crate::term_lock_ui(
-                            &front_terminal.term,
-                            &front_terminal.ui_waiting,
-                            crate::metrics::TermWaitSite::RedrawB,
-                        ),
-                        false,
-                    ),
-                };
-                let current_sync = SyncObservation {
-                    terminal_id: committed.render_identity(),
-                    active: committed.modes().synchronized_output(),
-                    end_seq: committed.sync_end_seq(),
-                    open_dirty: committed.sync_open_dirty(),
-                };
-                if recheck_sync_frame_hold(
-                    ws,
-                    sync_observation,
-                    current_sync,
-                    frame_started,
-                    sync_hold_timeout,
-                ) {
-                    let held_title = committed.title_arc();
-                    drop(committed);
-                    metrics::note_redraw_sync_hold();
-                    if let Some(window) = &window {
-                        self.apply_title(id, window, &held_title);
-                    }
-                    return;
-                }
-                // …AND ON AN EFFECT-ONLY FRAME THE EXTRACTION DOES NOT RUN AT
-                // ALL (2026-08 draw-path audit, tier-1 item 1). The audit
-                // measured 16.6x more frames drawn while typing than the
-                // content requires — every one of them an honest effect tick
-                // that owes a present, and every one of them taking this grid
-                // extraction to rediscover an unchanged grid.
-                // `effect_only_snapshot_reusable` proves, from scalars this
-                // block already reads under this same hold, that a refill would
-                // reproduce `input_scratch` exactly; when it does, the snapshot
-                // is presented as it stands. Nothing is deferred and nothing is
-                // stranded: the predicate requires `!has_damage()`, so the
-                // `take_damage` folded into the refill would have consumed
-                // nothing, and NOT bumping `extract_gen` leaves this scratch (and
-                // every sibling) a valid damage-scoped baseline for the next real
-                // refill. A tab-strip window is refused by `strip_rows_n == 0`:
-                // `undo_host_row_prepend` leaves `cursor_row` and the selections
-                // shifted on purpose, so an un-spliced scratch is an intermediate,
-                // not a presentable frame.
-                let live_epoch = committed.damage_epoch();
-                if strip_rows_n == 0
-                    && effect_only_snapshot_reusable(
-                        uncontended,
-                        &ws.input_scratch,
-                        &committed,
-                        live_epoch,
-                        rows,
-                        cols,
-                    )
-                {
-                    metrics::note_frame_refill_skipped();
-                } else {
-                    let refill =
-                        committed.cell_frame_damage_scoped_into(&mut ws.input_scratch, rows, cols);
-                    metrics::note_frame_refill(refill);
-                }
-                // The hover under a still pointer, re-probed against THIS hold
-                // when the fill moved it (G04) — and when the motion path's
-                // non-blocking probe left it unanswered. LOCK B is the
-                // acquisition the fill rode; the probe rides it too, so it can
-                // neither defer nor owe a retry frame, and the answer reaches
-                // the key below (`link_caption`) on the frame that carries the
-                // fill. The reuse arm keys identically to the frame before it,
-                // so there the compare is the whole cost. (`&mut self` ends the
-                // `ws` borrow; nothing below this hold reads it before the
-                // re-take under the effect pass.)
-                self.refresh_hover_for_frame_locked(id, &committed);
-                let committed_generation = aterm_effects::cursor_trail::ContentGeneration {
-                    process_sequence: committed.pipeline_timestamps().process_sequence,
-                    terminal_id: committed.render_identity(),
-                    alternate_screen: committed.is_alternate_screen(),
-                };
-                let committed_cursor = committed.cursor();
-                let committed_cursor_visible = committed.cursor_visible();
-                let committed_cursor_style = committed.cursor_style();
-                let committed_scroll_state = committed.content_scroll_state();
-                (presented_default_bg_u32, _, presented_cursor_color_u32) =
-                    terminal_frame_colors(&committed);
-                pet_world_facts = pet_console_owned.then(|| {
-                    aterm_effects::pet_world::PetWorldFacts::read(
-                        &committed,
-                        front_terminal.session,
-                    )
-                });
-                drop(committed);
-                cursor_fx_commit = classify_cursor_fx_commit(
-                    CursorFxProjection {
-                        generation: content_generation,
-                        scroll: content_scroll_state,
-                        cursor: (cpos.row, cpos.col),
-                        visible: cursor_visible,
-                        style: cursor_style,
-                    },
-                    CursorFxProjection {
-                        generation: committed_generation,
-                        scroll: committed_scroll_state,
-                        cursor: (committed_cursor.row, committed_cursor.col),
-                        visible: committed_cursor_visible,
-                        style: committed_cursor_style,
-                    },
-                );
-            }
+            #[cfg(test)]
+            redraw_hold_hook::after_terminal_hold();
             // ---- END TERMINAL CUSTODY. Everything below is host state only. ----
             // Caret for the IME candidate window (single pane → no pane offset). Reported
             // after the block, so the default one-pane layout anchors the CJK / dead-key
@@ -31581,8 +29768,11 @@ impl App {
                     default_bg: default_bg_u32,
                     default_fg: default_fg_u32,
                     row_probe,
-                    row_probe_neighbors: None,
+                    row_probe_neighbors,
                     print_anchor: (display_offset == 0).then_some(print_anchor).flatten(),
+                    print_anchor_glyph: (display_offset == 0)
+                        .then_some(print_anchor_glyph)
+                        .flatten(),
                 },
             ) else {
                 if sync_hold {
@@ -31611,6 +29801,11 @@ impl App {
                 momentum_steady,
                 ..
             } = fx;
+            // The Sparkle Words presentability input: the UN-WOKEN focus
+            // ([`sparkle_words_presentable`]), resolved here while `self` is
+            // free of the `ws` borrow.
+            let word_focus =
+                self.motion_focus(id, self.windows.get(&id).is_some_and(|ws| ws.focused));
             // The ONE blink law (`compose_caret_style_override`), on the path
             // every focused single-pane `RedrawRequested` renders through.
             // This site used to spell bolt/twinkle alone and DROP
@@ -31636,7 +29831,8 @@ impl App {
             // tenure gate — folded by the ONE verdict seam every dressing
             // surface shares ([`Self::companion_verdict`]).
             let front_session = self.focused_session_id(id).unwrap_or(0);
-            let companion_verdict = self.companion_verdict(id, front_session, frame_started);
+            let companion_verdict =
+                self.companion_verdict_with_claim(id, app_kitty_raw, frame_started);
             // Likewise a pure config read, hoisted above the window borrow: it
             // selects WHICH companion the draw block below emits.
             let trail_presentation = self.trail_presentation();
@@ -31724,7 +29920,7 @@ impl App {
             // Full motion advances the fade/bob machine. Reduced motion samples
             // a collection hello as one opaque still; ordinary earned flights
             // remain hidden and the scheduler arms only its one erase deadline.
-            let decoration_presentable = win_focused && !deco_suspend;
+            let words_presentable = sparkle_words_presentable(word_focus, deco_suspend);
             // Sparkle Words may opt out of alternate-screen presentation, but
             // the cursor companion is an independent trail surface. It obeys
             // focus/load shedding and live-grid coordinates, not that word-only
@@ -31751,7 +29947,7 @@ impl App {
             // those births instead (owner: "when I restore focus to a window,
             // I don't want all the kitties appearing again").
             ws.word_decos
-                .set_presentable(frame_started, decoration_presentable);
+                .set_presentable(frame_started, words_presentable);
             if !cursor_companions_allowed {
                 // Input may re-arm this cosmetic detector after the Serious
                 // Mode transition drain but before this render. Retire it
@@ -31926,6 +30122,9 @@ impl App {
             //
             // Pet mode keeps the full resident throughout singing. The
             // shared custody gate also suppresses the head's hit/ink claims.
+            // The head's own gated alpha BEFORE the shed, for the custody law
+            // the pet's owner evaluates (it applies the shed itself).
+            let flying_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
             let kitty_alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
@@ -31940,9 +30139,9 @@ impl App {
             // earned companion can never be seen doing it. So the pet takes the
             // PRESENTATION gate (focused, master on, the trail style actually
             // selected, and the shared soft-shed envelope) and none of the
-            // momentum gate. Its own
-            // fade envelope, driven by whether the caret is visible at all, is
-            // the only thing that turns it off.
+            // momentum gate. It is driven by its ONE driver,
+            // [`aterm_effects::companion::CompanionOwner`] — the code the web
+            // pipeline runs — fed the facts this frame read under the frame hold.
             if let Some(facts) = pet_world_facts.as_ref() {
                 let (exclusions, count) = pet_console_exclusions(
                     &ws.input_scratch,
@@ -31950,269 +30149,140 @@ impl App {
                     ws.predictor.pending_bounds(),
                     ws.search.is_some(),
                 );
-                ws.cursor_pet.observe_console_with_exclusions(
+                let observed = ws.companion.observe_console(
                     &ws.input_scratch,
                     facts,
                     aterm_effects::pet_world::PetPane::full(&ws.input_scratch),
                     &exclusions[..count],
                 );
-                metrics::note_pet_world_observation(ws.cursor_pet.observed_cells());
+                metrics::note_pet_world_observation(observed);
             }
-            // Reading owns a certified content surface, never a fabricated
-            // caret. The flying head retains its live-viewport-only gate.
-            let pet_presentable = resident_pet_surface_presentable(
-                win_focused,
-                cursor_companions_allowed,
-                !ws.overlay_open() && ws.tab_menu.is_none(),
-                display_offset == 0,
-                ws.cursor_pet.has_reading_interest(),
-            );
-            let pet_visible = resident_pet_presentation_enabled(
-                pet_mode,
-                pet_presentable,
-                glow_cfg.enabled && cursor_companions_allowed,
-                glow_cfg.style,
-            );
-            // THE SWITCH, BEFORE THE TICK. An unowned pet is retired outright here
-            // (motes and all) rather than left to fade, because the tick below is
-            // the last one the scheduler owes it — see `retire_pet_without_owner`.
-            retire_pet_without_owner(
-                pet_mode,
-                glow_cfg.enabled && cursor_companions_allowed,
-                glow_cfg.style,
-                &mut ws.cursor_pet,
-            );
-            // THE BRAIN TICKS UNCONDITIONALLY, exactly like `cursor_cat.frame`
-            // above and for exactly the same reason: the scheduler asks
-            // `cursor_pet.needs_frames()` (lib.rs) whether to keep the 60 fps
-            // lane armed, and that is a pure read of brain state which only
-            // `tick` advances. Ticking inside the draw gate would freeze the
-            // brain the instant the pet stopped being drawable — an alt-screen
-            // app, an unfocused window, the trail switched off — and the
-            // predicate would latch at whatever it last said, pinning a full
-            // frame rate on a window with no cat on it, forever.
-            //
-            // A pet that cannot be drawn is fed `caret: None`, which is the
-            // truth (there is no caret it could be chasing on this surface):
-            // it fades out, settles, and releases the lane on its own.
-            //
-            // Singing never withdraws the resident's caret or pixels. The
-            // same admission helpers are used by the split and capture paths.
-            //
-            // EXIT-CODE EMPATHY (wave 1): the pet is the SECOND consumer of
-            // the LOCK-A completion probe, keyed (session, seq) with its OWN
-            // latch — the rain's (`rain_last_cmd`) only advances inside the
-            // rain-enabled gate, and the pet must feel a finished command
-            // when no rain is falling. Same laws otherwise: a tab switch
-            // re-baselines SILENTLY (no stale replay from another session's
-            // history), the None→Some edge within one session is a real
-            // first completion, and the note itself only latches — the tick
-            // below is what acts, under the brain's precedence ladder.
-            //
-            // ═══ THE VERDICT rides this same edge ═══ (see `verdict_voice`).
-            // Three senses, one clock: the pet's latch is already here, the
-            // music box's cue is collected into `verdict_cue` for the audio
-            // push below, and the rainbow's hot-resume door is opened on the
-            // glow engine in place. Nothing here draws: the light rides the
-            // KEY the door prices, never this edge.
-            let mut verdict_cue: Option<(bool, bool)> = None;
-            {
-                let seq = cmd_done.map_or(0, |(e, _)| e);
-                let key = (front_terminal.session, seq);
-                if ws.pet_last_cmd != Some(key) {
-                    let same_session = ws
-                        .pet_last_cmd
-                        .is_some_and(|(sid, _)| sid == front_terminal.session);
-                    ws.pet_last_cmd = Some(key);
-                    if same_session && let Some((_, code)) = cmd_done {
-                        ws.cursor_pet
-                            .note_command_done(frame_started, code != 0, cmd_dur_ms);
-                        // THE ARM ([`verdict_armed`]), spent whatever it says
-                        // — including by a command too quick to be worth a
-                        // word. One Enter, one command, one verdict.
-                        if keyed_celebration_completion(
-                            &mut ws.kitty_sing,
-                            &mut ws.verdict_spent,
-                            front_terminal.session,
-                            output_echo.last_boundary_at,
-                            frame_started,
-                            code,
-                        ) {
-                            let failed = code != 0;
-                            verdict_cue = verdict_voice(failed, cmd_dur_ms);
-                            // SENSE 3, THE RAINBOW: a green build opens the
-                            // door and mints nothing. The first key typed
-                            // inside it is born at full momentum with its
-                            // tine lit — the light rides that key, not this.
-                            if let Some((false, true)) = verdict_cue {
-                                ws.cursor_glow.note_command_verdict(frame_started);
-                            }
-                            // …and THE ONE GUARD arms with it: the exhale
-                            // PRISM WAKE owes this episode is now the
-                            // verdict's to speak (drained at the streak's
-                            // voice below).
-                            ws.verdict_hush |= verdict_cue.is_some();
-                        }
-                    }
-                }
-            }
-            // THE ROOM (panel #9): the session's facts, on this frame the
-            // host is already drawing — see [`note_room_facts`]. No sibling
-            // in a single pane.
-            note_room_facts(
-                &mut ws.cursor_pet,
-                self.pool.get(front_terminal.session),
-                self.session_status.status(front_terminal.session),
-                frame_started,
-                None,
-            );
-            // THE VIGIL'S LEVEL (THE VERDICT, sense 1): the OSC 133/633
-            // EXECUTE phase, forwarded every composed frame. The host read it
-            // under LOCK A for the perk-and-watch conjunction long before the
-            // verdict wanted it, so this is a bool and never a wake. The pet
-            // starts no clock of its own and strikes no pose here — the note
-            // idiom, held to for a level as for an edge.
-            ws.cursor_pet.note_executing(frame_started, shell_executing);
-            // PERK-AND-WATCH (wave 2): is the pane genuinely STREAMING this
-            // frame? Every input is per-frame state the LOCK-A probe already
-            // read — new scrollback rows, the content clock, the OSC 133/633
-            // Execute phase, the live bottom. The content-clock diff rides
-            // the pet's own (session, seq) latch, re-baselined SILENTLY on a
-            // tab switch exactly like `pet_last_cmd` (a session change is
-            // never a burst). The AND with `shell_executing` is what keeps
-            // keystroke echo from ever perking the cat (`pet_output_burst`).
-            let pet_burst = {
-                let advanced = ws
-                    .pet_content_seq
-                    .is_some_and(|(sid, s)| sid == front_terminal.session && content_seq > s);
-                ws.pet_content_seq = Some((front_terminal.session, content_seq));
-                pet_output_burst(
-                    scroll_change.changed(),
-                    advanced,
-                    shell_executing,
-                    display_offset == 0,
-                )
-            };
-            // THE WRAP FACT (kitty-motion §4.1): did the EMULATOR resolve an
-            // autowrap since this window's last read of this session? Rides
-            // the pet's own `(session, serial)` latch, re-baselined SILENTLY
-            // on a tab switch exactly like `pet_content_seq` (a session
-            // change is never a wrap). `!=` rather than `>` — see the field's
-            // law on `WindowState::pet_wrap_serial`.
-            let pet_wrapped =
-                wrap_fact_edge(&mut ws.pet_wrap_serial, front_terminal.session, wrap_serial);
-            // POINTER PLAY (wave 2): the pointer in fractional grid cells —
-            // `last_cursor_px` (tracked on every CursorMoved) minus the
-            // effects origin, over the cell metrics; `None` once it leaves
-            // the grid. Pixels-to-cells only: the brain is its own motion
-            // sensor (the own-sensor doctrine). The sampled pixel is stamped
-            // so the motion path's pet wake fires on a cell of DISPLACEMENT
-            // from here, not on every event (`pet_wake_wanted`).
-            ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
-            let pet_pointer = pet_pointer_cell(
-                ws.last_cursor_px,
-                (i32::from(origin_x), i32::from(origin_y)),
+            let pet_geom = pet_frame_geom(
                 (glow_geom.cw, glow_geom.ch),
-                (glow_geom.cols, glow_geom.rows),
+                (glow_geom.rows, glow_geom.cols),
+                (i32::from(origin_x), i32::from(origin_y)),
             );
-            // THE INK/SKIN SEAM (gauntlet F1/F3/F5/F8): live glass and capture
-            // share this exact pre-tick setup. One frame stale by construction
-            // (the rescan runs later in this frame) — content that has not
-            // changed has not moved its ink. The unsplit scan session was
-            // declared above LOCK A, before `needs_rescan`.
-            if !win_focused {
-                ws.retire_cursor_pet_coordinate_space();
+            // POINTER PLAY (wave 2): the brain samples `last_cursor_px`
+            // (tracked on every CursorMoved). The sampled pixel is stamped so
+            // the motion path's pet wake fires on a cell of DISPLACEMENT from
+            // here, not on every event (`pet_wake_wanted`).
+            ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
+            ws.companion.set_species(pet_species);
+            let pet_tick = ws.companion.prepare(
+                aterm_effects::companion::PetFacts {
+                    facts: &aterm_effects::host::TerminalFacts {
+                        session: front_terminal.session,
+                        // `cur` survives a DECTCEM hide: the pet chases a
+                        // caret a TUI hid for its repaint.
+                        caret: cur,
+                        cursor_visible: cur_drawn,
+                        display_offset: i32::try_from(display_offset).unwrap_or(i32::MAX),
+                        live_viewport: display_offset == 0,
+                        content_seq,
+                        wrap_serial,
+                        scrolled: scroll_change.changed(),
+                        shell_executing,
+                        cmd_done: cmd_done.map(|(seq, code)| (seq, code, cmd_dur_ms)),
+                        block: None,
+                        alt_screen: is_alt,
+                    },
+                    host: &aterm_effects::host::HostFrameInput {
+                        now: frame_started,
+                        visibility: pet_visibility(win_focused),
+                        reduced_motion: !cursor_motion
+                            .animate(crate::motion::MotionEffect::CursorGlow),
+                        serious: !cursor_companions_allowed,
+                        shed_envelope,
+                        shed_active: load_shed,
+                        pointer_px: Some((ws.last_cursor_px.0 as f32, ws.last_cursor_px.1 as f32)),
+                        capture: aterm_effects::host::CaptureMode::Present,
+                        geometry: pet_geom,
+                    },
+                    glow: aterm_effects::companion::GlowOwnership {
+                        enabled: glow_cfg.enabled,
+                        style: glow_cfg.style,
+                        style_raw_names_pet: pet_mode,
+                    },
+                    sing: aterm_effects::host::SingFacts {
+                        drive: sing_drive,
+                        flying_alpha,
+                    },
+                    focused: win_focused,
+                    obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+                    pane: None,
+                    // THE ROOM (panel #9): the session's facts, on this frame
+                    // the host is already drawing. No sibling in a single pane.
+                    room: Some(room_facts(
+                        self.pool.get(front_terminal.session),
+                        self.session_status.status(front_terminal.session),
+                        None,
+                    )),
+                },
+                &mut ws.word_decos,
+            );
+            // ═══ THE VERDICT rides the pet's completion edge ═══ (see
+            // `verdict_voice`). Three senses, one clock: the pet has latched
+            // it already, the music box's cue is collected into `verdict_cue`
+            // for the audio push below, and the rainbow's hot-resume door is
+            // opened on the glow engine in place. Nothing here draws: the
+            // light rides the KEY the door prices, never this edge.
+            let mut verdict_cue: Option<(bool, bool)> = None;
+            if let Some((code, dur_ms)) = pet_tick.completion
+                // THE ARM ([`verdict_armed`]), spent whatever it says —
+                // including by a command too quick to be worth a word. One
+                // Enter, one command, one verdict.
+                && keyed_celebration_completion(
+                    &mut ws.kitty_sing,
+                    &mut ws.verdict_spent,
+                    front_terminal.session,
+                    output_echo.last_boundary_at,
+                    frame_started,
+                    code,
+                )
+            {
+                verdict_cue = verdict_voice(code != 0, dur_ms);
+                // SENSE 3, THE RAINBOW: a green build opens the door and
+                // mints nothing. The first key typed inside it is born at full
+                // momentum with its tine lit — the light rides that key, not
+                // this.
+                if let Some((false, true)) = verdict_cue {
+                    ws.cursor_glow.note_command_verdict(frame_started);
+                }
+                // …and THE ONE GUARD arms with it: the exhale PRISM WAKE owes
+                // this episode is now the verdict's to speak (drained at the
+                // streak's voice below).
+                ws.verdict_hush |= verdict_cue.is_some();
             }
-            prepare_resident_pet_tick(&mut ws.word_decos, &mut ws.cursor_pet, pet_species, None);
             // THE GRIEF GATE (gauntlet F4a): a failed command's droop window
             // hushes the caret-jump fanfare — no party ring at a failure.
-            if ws.cursor_pet.grieving() {
+            if ws.companion.grieving() {
                 ws.cursor_glow.hush_fanfare(frame_started);
             }
             // THE HAND FOUND ITS FLOW: one latch per flow ENTRY, drained here
             // beside the grief gate because this is where the host already
             // holds both engines. Nothing is forwarded on an EXIT, and the
-            // latch buys no frame — it rides the pet tick this arm is running
-            // anyway (`kitty_pet::PetBrain::note_flow`).
+            // latch buys no frame — it rides the pet tick run below.
             if ws.cursor_glow.take_flow_entry() {
-                ws.cursor_pet.note_flow(frame_started);
+                ws.companion.note_flow(frame_started);
             }
-            // WHAT THE PET SENSES is projected by Rainbow Kitty v2's router
-            // ([`companion_pet_sense`]) for BOTH render arms, from the four
-            // host facts only the host holds; the geometry and posture ride
-            // the same `glow_geom` / motion policy this frame already resolved.
-            ws.cursor_pet
-                .set_console_presentable(pet_companion_admitted(pet_visible, cat_frame.sing));
-            let pet_frame = ws.cursor_pet.tick(companion_pet_sense(
-                frame_started,
-                aterm_effects::word_decorations::EffectGeom {
-                    cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
-                    cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
-                    rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
-                    cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
-                },
-                &glow_cfg,
-                resident_pet_reduced_motion(
-                    !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    load_shed,
-                    shed_envelope,
-                ),
-                aterm_effects::rainbow_kitty::companion::HostSense {
-                    caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat) {
-                        cur
-                    } else {
-                        None
-                    },
-                    // DRAWN, not admitted: the song's law above withholds the
-                    // caret on purpose (a policy), so a withheld caret is not
-                    // a painted one either.
-                    caret_drawn: cur_drawn
-                        && pet_caret_admitted(pet_visible, sing_drive, !animate_cat),
-                    wrapped: pet_wrapped,
-                    output_burst: pet_burst,
-                    // Pointer contact requires the last drawn body and current
-                    // surface custody, including while the resident is static.
-                    pointer: if ws.pet_hit_rect.is_some()
-                        && pet_companion_admitted(pet_visible, cat_frame.sing)
-                    {
-                        pet_pointer
-                    } else {
-                        None
-                    },
-                },
-            ));
+            // THE BRAIN TICKS UNCONDITIONALLY: the scheduler asks the owner's
+            // `needs_frames()` (lib.rs) whether to keep the effect lane armed,
+            // and only this tick advances it. A pet that cannot be drawn is
+            // fed `caret: None`, fades out, settles, and releases the lane.
+            let pet = ws.companion.tick(pet_tick);
             // RAINBOW KITTY v2's OFFER TO THE RESIDENT ([`route_v2_pet_offer`],
             // panel #10) — after the pet's own tick, on the frame it just
             // published, and BEFORE `emit_single_cursor_companion` drains the
-            // impulse slot the perk edge lives in. The resident keeps its own
-            // opacity under load. Single pane: its world is the window grid.
-            route_v2_pet_offer(ws, &pet_frame, glow_geom, (0, 0), frame_started);
-            // The brain can begin returning below the face-swap threshold,
-            // but only one companion is put on glass.
-            let pet_on_glass =
-                pet_companion_admitted(pet_visible, cat_frame.sing) && pet_frame.alpha > 0;
+            // impulse slot the perk edge lives in. Single pane: its world is
+            // the window grid.
+            route_v2_pet_offer(ws, &pet.pet, glow_geom, (0, 0), frame_started);
+            let pet_on_glass = pet.on_glass;
             // THE FRAME'S ONE COMPANION ([`CompanionDuty`]), resolved once and
             // read by both the ambient word-cats' yield box below and
             // [`emit_single_cursor_companion`] — so the rect the word engine
-            // avoids is always the sprite the emitter really draws.
+            // avoids is always the sprite the emitter really draws. The head
+            // escorts `cur` through a DECTCEM hide, as it always has here.
             let companion_duty = cursor_companion_duty(pet_on_glass, kitty_alpha, cur);
-            // PETTING (wave 1): stash the body the emitter is about to draw,
-            // in FRAME px, for the mouse seam's hit test — and CLEAR it on
-            // every frame the pet is not drawn, so a stale rect can never
-            // eat a click after a style switch or a fade-out. Post-tick by
-            // construction: the rect is THIS frame's body, not last frame's.
-            ws.pet_hit_rect = pet_hit_rect_for_frame(
-                pet_visible,
-                cat_frame.sing,
-                &pet_frame,
-                aterm_effects::word_decorations::EffectGeom {
-                    cell_w: glow_geom.cw.min(usize::from(u16::MAX)) as u16,
-                    cell_h: glow_geom.ch.min(usize::from(u16::MAX)) as u16,
-                    rows: glow_geom.rows.min(usize::from(u16::MAX)) as u16,
-                    cols: glow_geom.cols.min(usize::from(u16::MAX)) as u16,
-                },
-                (i32::from(origin_x), i32::from(origin_y)),
-            );
             let glow_fp = glow_fp ^ if kitty_alpha > 0 { cat_frame.fp() } else { 0 };
             // On the way out, the cat sometimes does a flourish — a heart rising
             // (heart meow) or a sparkling star (star wink). It is emitted LATER
@@ -32275,7 +30345,7 @@ impl App {
                     // Live geometry is part of the cold palette scan as well as
                     // emission: the context key samples the prospective cat's
                     // exact multi-row footprint and then freezes for the episode.
-                    // The grid was already extracted into `input_scratch` under LOCK A
+                    // The grid was already extracted into `input_scratch` under the frame hold
                     // when a rescan was due (`deco_rescan`, same `epoch` — no torn
                     // read); scan those cells here on host state, no lock held.
                     if deco_rescan {
@@ -32286,7 +30356,7 @@ impl App {
                         // `base_y` is the exact delta that finds the word on
                         // the row it moved to rather than on the shell's
                         // `command not found: sit`. Same snapshot as the cells
-                        // (LOCK A, same `epoch`), so the pair cannot be torn.
+                        // (the frame hold, same `epoch`), so the pair cannot be torn.
                         ws.word_decos.set_scan_base_y(Some(ws.input_scratch.base_y));
                         ws.word_decos.rescan_from_cells_with_geom_at_cursor(
                             &ws.input_scratch.cells,
@@ -32364,16 +30434,7 @@ impl App {
                                 ),
                                 _ => None,
                             },
-                            pet_on_glass
-                                .then(|| {
-                                    pet_frame.body_px(
-                                        effect_geom.cell_w,
-                                        effect_geom.cell_h,
-                                        effect_geom.cols,
-                                        effect_geom.rows,
-                                    )
-                                })
-                                .flatten(),
+                            pet.body_px,
                         ),
                         Some(sel_view),
                         ws.focused,
@@ -32410,24 +30471,12 @@ impl App {
                     // start law) and forward the landed HEAD to the pet as
                     // fractional cells of this grid — the head peeks rows
                     // away from its word, and the bat swipes at the head.
-                    // A pet-less frame drains-and-drops; the note only
-                    // latches (range-checked brain-side, retired by its
-                    // TTL), and the brain consumes it on the ground next
-                    // tick — the latch law's one frame of latency.
-                    {
-                        let (word_decos, cursor_pet) = (&mut ws.word_decos, &mut ws.cursor_pet);
-                        let bat_on = pet_visible;
-                        for cue in word_decos.drain_peek_cues() {
-                            if bat_on {
-                                let (x0, x1, y0, y1) = cue.head_px;
-                                cursor_pet.note_peek(
-                                    frame_started,
-                                    (x0 + x1) as f32 * 0.5 / f32::from(effect_geom.cell_w.max(1)),
-                                    (y0 + y1) as f32 * 0.5 / f32::from(effect_geom.cell_h.max(1)),
-                                );
-                            }
-                        }
-                    }
+                    // A pet-less frame drains-and-drops.
+                    ws.companion.note_peeks(
+                        frame_started,
+                        ws.word_decos.drain_peek_cues(),
+                        (effect_geom.cell_w, effect_geom.cell_h),
+                    );
                     // Curse-BONK drain (the sparkle-words sound seam):
                     // PROMPTLY after the tick, beside the kitty drain — the
                     // cue vec clears at the next tick's start. A disabled
@@ -32583,20 +30632,14 @@ impl App {
                 // cursor companion below.
                 0
             };
-            // Cursor-owned free sprites are appended after every optional word
-            // or typed-dog sprite. This exact suffix can therefore survive a
-            // process-sequence-only projection drift without retaining content-
-            // owned art from the older snapshot.
-            let cursor_free_start = ws.free_scratch.len();
             deco_fp ^= emit_single_cursor_companion(
                 ws,
                 effect_geom,
                 cur,
-                pet_on_glass,
+                &pet,
                 // The DRAWN present — the one caller allowed to spend a
                 // hello (both capture splices pass `false`).
                 true,
-                pet_frame,
                 cat_frame,
                 kitty_alpha,
                 frame_started,
@@ -32605,7 +30648,6 @@ impl App {
                 cursor_color_u32,
                 glow_cfg.accent,
             );
-            cursor_owned_free = cursor_free_start..ws.free_scratch.len();
             // ROBI THE HELPER ROBOT (`aterm_effects::robi`): the RESIDENT —
             // walks the typed row, jumping jacks, ladder, tab-bar monkey
             // bars, tips above his head, forever. DELIBERATELY OUTSIDE the
@@ -32731,7 +30773,7 @@ impl App {
                     win_bot: i32::from(win_h) - i32::from(origin_y),
                 };
                 let mut robi_fp = 0u64;
-                // The hit-box is THIS frame's truth (the `pet_hit_rect`
+                // The hit-box is THIS frame's truth (the pet owner's hit-rect
                 // discipline): cleared before the evaluation so a frame that
                 // draws nothing — geometry not ready, a bake miss with no
                 // fallback — can never leave a stale body eating clicks.
@@ -32836,7 +30878,7 @@ impl App {
             );
             // PHOSPHOR rain tick (design §5/§6): grid-scanned like the sparkle
             // words (Tier-A occupancy on epoch change, Tier-B live predicates
-            // per tick), running in this same unlocked region off LOCK-A
+            // per tick), running in this same unlocked region off frame-hold
             // locals only. Emits into the resident scratch; the fingerprint
             // joins the RepaintKey so a live field is never skipped by the
             // early-out — and is EXACTLY 0 whenever the feature is off or the
@@ -32891,7 +30933,7 @@ impl App {
                     } else {
                         crate::matrix_rain::RainVisibility::VisibleUnfocused
                     });
-                    // The agent-output weather signal (LOCK-A read above):
+                    // The agent-output weather signal (frame-hold read above):
                     // only an actual seq change registers.
                     engine.note_activity(content_seq);
                     if shell_execute_edge {
@@ -32920,7 +30962,7 @@ impl App {
                     }
                     if rain_refresh && engine.can_emit() {
                         // The grid was extracted into `input_scratch` under
-                        // LOCK A at this same `epoch` (no torn read); scan
+                        // the frame hold at this same `epoch` (no torn read); scan
                         // those cells here on host state, no lock held.
                         // Scrolled-back frames — and engines that CANNOT emit
                         // (reduced motion / unfocused past the drain) — SKIP
@@ -32967,7 +31009,7 @@ impl App {
                         rows: rows as u16,
                         cols: cols as u16,
                     };
-                    // Tier-B live inputs, all LOCK-A snapshot state: the
+                    // Tier-B live inputs, all frame-hold snapshot state: the
                     // visible-cursor band (±2 rows in-engine), the hidden-
                     // cursor damage band maintained above, the live selection
                     // (mutates with zero damage marking — never baked into
@@ -33369,7 +31411,7 @@ impl App {
                 // auto titlebar mock splits on it and no other term moves (main.rs).
                 system_dark: repaint_system_dark(self.os_appearance),
                 // The link caption: published by the motion path's settle or by
-                // the frame-time re-probe under LOCK A/B above, painted by the
+                // the frame-time re-probe under the frame hold above, painted by the
                 // splice below this gate, dirtying no cell (see `RepaintKey`).
                 link_caption: ws.link_hover,
                 claude_footer_fp,
@@ -33379,11 +31421,6 @@ impl App {
                 // present (covers the engine-reset-with-unchanged-epoch edges:
                 // toggle re-enable, layout return) or stale quads strand.
                 && !rain_refresh
-                // A LOCK-A/B drift means the authorized snapshot differs from
-                // the candidate key below. It has already consumed matching
-                // damage, so it must reach glass rather than be mistaken for
-                // an idempotent host-only tick.
-                && cursor_fx_commit.is_same()
                 && !should_repaint_or_recover(
                     last_present,
                     key,
@@ -33399,15 +31436,17 @@ impl App {
                 && !ws.stream_fade.is_active(frame_started)
             {
                 metrics::note_redraw_early_out();
+                ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
                 // WHY THE EFFECT TICK MAY NOT STAND DOWN HERE, AND WHY IT NEED
                 // NOT (2026-08-24 responsiveness audit, item 9: "57% of redraws
                 // are effect ticks killed by the early-out").
                 //
-                // The exact snapshot is now authorized before the effect pass
-                // to make a late synchronized-output edge harmless. This return
-                // therefore passes through LOCK B — but on the frame shape that
-                // reaches it, the effect-only reuse gate normally answers there
-                // with `frame_refills_skipped`, so the hold costs a handful of
+                // The exact snapshot is authorized in the frame's one hold, before
+                // the effect pass, to make a late synchronized-output edge
+                // harmless. This return therefore passes through that hold's
+                // extraction — but on the frame shape that reaches it, the
+                // effect-only reuse gate normally answers there with
+                // `frame_refills_skipped`, so the hold costs a handful of
                 // scalar reads and NO grid walk; a gate refusal falls back to
                 // one damage-scoped refill (a row-retaining check on an
                 // unchanged frame). Either way this return still avoids
@@ -33433,9 +31472,9 @@ impl App {
                 //   while :; do printf '\033]0;probe\007'; sleep 0.004; done
                 //   aterm ctl --pid <p> metrics   # redraw_early_outs/redraw_attempts
                 //
-                // Nothing visible changed since the last present. The exact
-                // refill found no projection drift, so consuming its paired
-                // damage is safe: `input_scratch` already holds that same grid.
+                // Nothing visible changed since the last present. The frame's
+                // one hold extracted and consumed together, so consuming its
+                // paired damage is safe: `input_scratch` already holds that grid.
                 // Refresh only window chrome and skip renderer/present work —
                 // and close the output stamps this frame proved moved no pixels,
                 // so the NEXT real present does not book this idle stretch as
@@ -33445,76 +31484,6 @@ impl App {
                     self.apply_title(id, w, &title);
                 }
                 return;
-            }
-            // Apply the projection fence only after every host-side producer has
-            // emitted its candidate. The exact terminal snapshot was already
-            // authorized and extracted before those producers ran, so no late
-            // synchronized-output edge can discard state they advanced.
-            // Refresh frames are not an exception to custody: they never take
-            // LOCK B. Their cells, cursor/visibility/style scalars and effect
-            // tick all come from the one LOCK-A snapshot; any later parser
-            // edge remains damaged for the next frame. Only the non-refresh
-            // arm below can observe two snapshots and therefore need a fence.
-            if !(deco_rescan || rain_refresh) {
-                // Freshness vs. decoration consistency: this is a NON-rescan frame, so
-                // the word decorations were emitted (`tick`, above) against the LOCK A
-                // grid at `epoch`. If a PTY write interleaved between LOCK A and LOCK B
-                // (the lock split invites exactly that), the grid just extracted is a
-                // NEWER damage session — `snapshot_seq != epoch` — so the decorations'
-                // cell positions no longer match the presented cells. Drop the
-                // word-deco overlay (deco/ink/cat/nova) for THIS frame: present the
-                // fresh grid undecorated rather than paint ink/sprites a cell off. The
-                // `take_damage` above advanced the epoch, so the next frame is a rescan
-                // (deco_rescan == true → forced present) that re-emits at the correct
-                // positions — the artifact is bounded to one frame and never mispaints.
-                // Cursor-owned effects use the projection-key fence above: a
-                // Process-sequence-only drift retains them. CUP, DECTCEM and
-                // DECSCUSR suppress only the projections each fact invalidates;
-                // content scroll or a screen/terminal change retires the whole
-                // coordinate-space family.
-                if ws.input_scratch.snapshot_seq != epoch {
-                    ws.deco_scratch.clear();
-                    ws.ink_scratch.clear();
-                    if cursor_fx_commit.coordinate_diverged() || cursor_fx_commit.moved {
-                        ws.free_scratch.clear();
-                        cursor_owned_free = 0..0;
-                    } else {
-                        retain_cursor_free_sprite_span(
-                            &mut ws.free_scratch,
-                            cursor_owned_free.clone(),
-                        );
-                        // `retain_cursor_free_sprite_span` rebases the retained
-                        // cursor suffix to the start of the vector. Carry that
-                        // exact new provenance into the visibility fence below.
-                        cursor_owned_free = 0..ws.free_scratch.len();
-                    }
-                    ws.nova_scratch.clear();
-                    // PHOSPHOR rain is grid-scanned too: its occupancy (and so
-                    // this frame's quads) matched the LOCK-A grid at `epoch`,
-                    // not the newer grid just extracted — drop the overlay for
-                    // THIS frame rather than rain over relocated text. The
-                    // next frame is a rescan (forced present) that re-emits at
-                    // the correct cells.
-                    ws.rain_scratch.clear();
-                    ws.rain_add_scratch.clear();
-                }
-                // A recovery latch is correctness, not animation polish: a cold
-                // torn frame may itself spend more than four panel intervals in
-                // fallback/shader work. Anchor its bounded hold at LOCK B's
-                // commit seam, not `frame_started`, or the scheduler can first
-                // inspect an already-expired latch. Stable/process-only frames
-                // keep the one-clock-per-redraw hot-path contract.
-                let cursor_fx_commit_at = if cursor_fx_commit.projection_torn() {
-                    Instant::now()
-                } else {
-                    frame_started
-                };
-                suppress_cursor_effect_style_after_torn = apply_cursor_fx_commit(
-                    ws,
-                    cursor_fx_commit,
-                    cursor_owned_free.clone(),
-                    cursor_fx_commit_at,
-                );
             }
             // Stream-fade and every projection copy below remain terminal-lock
             // free; they consume the already-authorized resident snapshot.
@@ -33597,7 +31566,7 @@ impl App {
                     .overlay_ime_preedit(&ws.preedit, ws.preedit_caret, ambiguous_cjk);
                 // IME-2 ANCHOR: the composition's OWN caret, not the engine
                 // cursor it starts at. Nothing has reached the PTY yet, so the
-                // caret captured under LOCK A is the column the composition
+                // caret captured under the frame hold is the column the composition
                 // BEGINS at — anchoring there drags the OS candidate list left
                 // by the whole width of what has been typed so far, which for
                 // Japanese phrase input is routinely twenty columns. The overlay
@@ -33624,15 +31593,13 @@ impl App {
             // Hand the renderer this frame's aurora (grid-interior pixels; the
             // tab-strip splice below shifts it down with the cursor).
             // `cell_frame_into` does not touch this field, so set it after the refill.
-            ws.input_scratch
-                .cursor_glow_add
-                .clone_from(&ws.glow_scratch);
-            ws.input_scratch.cursor_effect_style_override =
-                if suppress_cursor_effect_style_after_torn {
-                    None
-                } else {
-                    cursor_effect_style_override
-                };
+            // This single-pane frame is the sole consumer of the emitted glow.
+            // The next effect tick clears `glow_scratch` before writing again, so
+            // exchange its buffer with the previous frame's input instead of
+            // copying every quad on each animated present. Composed frames keep
+            // their retained scratch for capture and use their own projection.
+            std::mem::swap(&mut ws.input_scratch.cursor_glow_add, &mut ws.glow_scratch);
+            ws.input_scratch.cursor_effect_style_override = cursor_effect_style_override;
             // …and this frame's RADIAL halos (fire embers / crown / impact
             // flash — EMBERFORGE round light), same coords, same splice rules.
             ws.cursor_glow.swap_halos(&mut ws.input_scratch.glow_halo);
@@ -33694,16 +31661,6 @@ impl App {
             // style → byte-identical to no trail.
             ws.input_scratch.cursor_trail.clone_from(&ws.trail_scratch);
             ws.input_scratch.cursor_trail_color = trail_color;
-            if cursor_fx_commit.coordinate_diverged() {
-                // The coordinate space itself changed after LOCK A.
-                suppress_torn_cursor_projection(&mut ws.input_scratch);
-            } else if cursor_fx_commit.body_projection_torn() {
-                // A move invalidates the old-caret light/body candidate;
-                // DECSCUSR invalidates its old shape. Either fact composes
-                // with visibility, whose companion projection was already
-                // removed by its exact recorded free-sprite span.
-                suppress_torn_cursor_body_projection(&mut ws.input_scratch);
-            }
             ws.block_fill = presented_block_fill(
                 cursor_override,
                 ws.input_scratch.cursor_fill_override,
@@ -33728,13 +31685,11 @@ impl App {
             ws.input_scratch.fx_clip = None;
             // Live default-bg (folded with DECSCNM reverse-video) + cursor colour, so
             // the renderer's PADDING band and the cursor track OSC 11/111 and OSC 12/112
-            // (and DECSCNM ?5), not just the static config theme. Both were resolved
-            // These values were sampled under whichever lock extracted this
-            // exact snapshot (LOCK A for rescan, LOCK B otherwise), so a PTY
-            // OSC/DECSCNM write between locks cannot tear cells from padding or
-            // cursor color.
-            ws.input_scratch.default_bg = presented_default_bg_u32;
-            ws.input_scratch.cursor_color = presented_cursor_color_u32;
+            // (and DECSCNM ?5), not just the static config theme. Both were sampled
+            // in the hold that extracted this exact snapshot, so a PTY OSC/DECSCNM
+            // write cannot tear cells from padding or cursor color.
+            ws.input_scratch.default_bg = default_bg_u32;
+            ws.input_scratch.cursor_color = cursor_color_u32;
             ws.stamp_present_decision(key);
             title
         };
@@ -33781,7 +31736,7 @@ impl App {
         // IDLE GUARD (predict findings): with nothing pending and no ghost
         // still in the retained app-present artifact, the whole block is skipped
         // — no pmode resolve, no
-        // EXTRA term-lock acquisition (this was a third lock after LOCK A/B),
+        // EXTRA term-lock acquisition (this was once a lock of its own),
         // no reconcile — so an idle predictor costs zero per presented frame
         // (Claude Code repaints per keystroke; its no-echo gate keeps the
         // predictor permanently idle there). `pred_shown` keeps the one erase
@@ -33948,12 +31903,6 @@ impl App {
         // prefers the modal card, so it shows only when no overlay is open. A no-op when
         // the setting is off.
         self.splice_build_badge(id);
-        if !cursor_fx_commit.is_same() {
-            // LOCK A may have queued or refreshed a Robi speech bubble at the
-            // old sprite coordinates. The body plane was suppressed above, so
-            // suppress his bubble for this torn frame too.
-            suppress_torn_robi_tip(&mut self.robi_bubble);
-        }
         // ROBI's tip request, drained OUTSIDE the window borrow (the bubble is
         // App-global). It competes with nothing since the retired notice's other
         // producers became message-band rows: a new tip replaces an older one.
@@ -34238,13 +32187,14 @@ impl App {
                                 continue;
                             }
                         };
-                        // Same identity shed as `resolved_terminal_title_rung`,
-                        // or the painted strip and the chrome push would label
-                        // the same tab differently. Borrowed, so the refill's
+                        // Same identity and program-path shed as
+                        // `resolved_terminal_title_rung`, or the painted strip
+                        // and the chrome push would label the same tab
+                        // differently. Borrowed, so the refill's
                         // no-per-frame-allocation invariant is untouched; an
                         // emptied title falls into the cwd arm below exactly as
                         // an absent one does.
-                        let t = crate::tab_label::without_local_identity(term.title());
+                        let t = crate::tab_label::informative(term.title());
                         slot.clear();
                         if !t.is_empty() {
                             slot.push_str(t);
@@ -34901,6 +32851,17 @@ impl App {
             if let Some(surface) = pending_surface {
                 ws.on_gpu_acquire_pending(surface);
             }
+            // THE REPAINT SCOPE, PUBLISHED (responsiveness audit item 5): how many
+            // presents took the scissored dirty-row path, how many repainted
+            // everything, and how many rigid scrolls the band blit rescued. The
+            // renderer has counted them all along; nothing read them.
+            if let Some(gpu) = backend.gpu_mut() {
+                metrics::note_gpu_repaint_totals(
+                    gpu.scissor_taken(),
+                    gpu.full_repaints(),
+                    gpu.scroll_rescues(),
+                );
+            }
             presented
         } else {
             // CPU present: rasterize via the renderer's damage-tracked cache and
@@ -35360,6 +33321,8 @@ impl App {
                     .and_then(crate::tab_model::View::terminal_session)
                     && let Some(sess) = self.pool.get(sid)
                 {
+                    #[cfg(test)]
+                    crate::work_counts::latency_stamp_touched();
                     sess.last_output_ns.store(0, Ordering::Relaxed);
                 }
             }
@@ -35387,6 +33350,8 @@ impl App {
             // by whichever window presents first — unchanged: that race existed
             // for visible leaves before this change and is the honest answer
             // (the content did reach a glass).
+            #[cfg(test)]
+            crate::work_counts::latency_stamp_touched();
             let stamp = sess.last_output_ns.swap(0, Ordering::Relaxed);
             if stamp != 0 {
                 let dt = now.saturating_sub(stamp);
@@ -35691,7 +33656,8 @@ impl App {
                     snapshot_seq: ws.input_scratch.snapshot_seq,
                     content_seq,
                 });
-                let live_viewport = term.grid().display_offset() == 0;
+                let display_offset = term.grid().display_offset();
+                let live_viewport = display_offset == 0;
                 let cursor = term.cursor();
                 let focus = TerminalCaptureFocus {
                     view: *view,
@@ -35700,6 +33666,7 @@ impl App {
                     content_seq,
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
+                    display_offset,
                     cursor: (term.cursor_visible() && live_viewport)
                         .then_some((cursor.row, cursor.col)),
                     pet_world: aterm_effects::pet_world::PetWorldFacts::read(&term, *session),
@@ -35883,7 +33850,8 @@ impl App {
                 ws.input_scratch.absolute_row_revision = ws.pane_scratch.absolute_row_revision;
                 ws.input_scratch.history_renumber_epoch = ws.pane_scratch.history_renumber_epoch;
                 focused_cursor_rgb = Some(terminal_cursor_rgb(&term));
-                let live_viewport = term.grid().display_offset() == 0;
+                let display_offset = term.grid().display_offset();
+                let live_viewport = display_offset == 0;
                 capture_focus = Some(TerminalCaptureFocus {
                     view,
                     session,
@@ -35891,6 +33859,7 @@ impl App {
                     content_seq,
                     alternate_screen: term.is_alternate_screen(),
                     live_viewport,
+                    display_offset,
                     cursor: (term.cursor_visible() && live_viewport).then(|| {
                         let cursor = term.cursor();
                         (cursor.row, cursor.col)
@@ -36406,8 +34375,10 @@ impl App {
             let rescan = !suspended && ws.word_decos.needs_rescan(epoch);
             // A pane that cannot present must not birth a storm of entrances the
             // moment it becomes visible; a pane that CAN spends its backlog.
-            ws.word_decos
-                .set_presentable(ctx.now, ctx.win_focused && !suspended);
+            ws.word_decos.set_presentable(
+                ctx.now,
+                sparkle_words_presentable(ctx.word_focus, suspended),
+            );
             if suspended {
                 // v3 §1.1: both suspension causes are freeze/thaw, not resets —
                 // recovery resumes every episode where it paused.
@@ -36469,9 +34440,8 @@ impl App {
             // The pet also hands in its LIVE drawn body: its world is the
             // focused pane (see `compose_pet_companion`), so the rect is
             // already in this pane's pixel space, same as the word-cats'.
-            let companion_pet = ctx.pet_visible && ctx.pet.alpha > 0;
             let companion_duty =
-                cursor_companion_duty(companion_pet, ctx.kitty_alpha, ctx.focus_cursor);
+                cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.focus_cursor);
             let companion_at = input
                 .focused
                 .then(|| {
@@ -36499,12 +34469,7 @@ impl App {
                             ),
                             _ => None,
                         },
-                        companion_pet
-                            .then(|| {
-                                ctx.pet
-                                    .body_px(geom.cell_w, geom.cell_h, geom.cols, geom.rows)
-                            })
-                            .flatten(),
+                        ctx.pet.body_px,
                     )
                 })
                 .flatten();
@@ -36541,19 +34506,17 @@ impl App {
             // only the FOCUSED pane's cues reach the pet: its world IS that
             // pane, and the engine's rects are pane-local px, which is
             // exactly the pet's own pixel space (no translate needed).
-            {
-                let (word_decos, cursor_pet) = (&mut ws.word_decos, &mut ws.cursor_pet);
-                let bat_on = input.focused && ctx.pet_visible;
-                for cue in word_decos.drain_peek_cues() {
-                    if bat_on {
-                        let (x0, x1, y0, y1) = cue.head_px;
-                        cursor_pet.note_peek(
-                            ctx.now,
-                            (x0 + x1) as f32 * 0.5 / (ctx.cell_w.max(1) as f32),
-                            (y0 + y1) as f32 * 0.5 / (ctx.cell_h.max(1) as f32),
-                        );
-                    }
-                }
+            if input.focused {
+                ws.companion.note_peeks(
+                    ctx.now,
+                    ws.word_decos.drain_peek_cues(),
+                    (
+                        ctx.cell_w.min(u32::from(u16::MAX)) as u16,
+                        ctx.cell_h.min(u32::from(u16::MAX)) as u16,
+                    ),
+                );
+            } else {
+                ws.word_decos.drain_peek_cues().for_each(drop);
             }
             let bonk_gain = bonk_sound_gain(
                 ws.focused,
@@ -36719,14 +34682,17 @@ impl App {
         ctx: &ComposeDecoCtx<'_>,
         focus_place: Option<PanePlace>,
     ) -> u64 {
-        if ctx.pet.alpha == 0 {
+        if !ctx.pet.on_glass {
             return 0;
         }
         let Some(place) = focus_place else {
             return 0;
         };
-        let default_bg = self.theme.bg;
-        let (accent, cursor_color) = (ctx.accent, ctx.cursor_color);
+        let fallback = aterm_effects::companion::ContrastFallback {
+            bg: self.theme.bg,
+            cursor: ctx.cursor_color,
+            accent: ctx.accent,
+        };
         let Some(ws) = self.windows.get_mut(&wid) else {
             return 0;
         };
@@ -36737,60 +34703,25 @@ impl App {
                 i32::from(place.row_off) * ctx.cell_h as i32,
             ),
         );
-        let geom = crate::word_decorations::EffectGeom {
-            cell_w: ctx.cell_w as u16,
-            cell_h: ctx.cell_h as u16,
-            rows: place.rows,
-            cols: place.cols,
-        };
-        // The palette samples the rect the pet actually covers, in PANE cells —
-        // `ART_ROWS` tall with its bottom on the row baseline, `art_cols` wide.
-        let pet_h = (aterm_effects::kitty_pet::ART_ROWS * f32::from(geom.cell_h)).round();
-        let pet_w = (pet_h * aterm_effects::kitty_pet::ART_ASPECT).round();
-        let look = ctx.cat_frame.look.normalized();
         // THE PERFORMANCE SEAM — the single-pane site's twin, through the
-        // same one mapping/sync/commit function so a split window can never
-        // rule a ceremony differently from a single pane. Reached only with
-        // the pet on glass (`ctx.pet_visible`, custody-gated, and the
-        // `alpha == 0` early-return above), so `ctx.present` is the whole
-        // remaining drawn-path question: the composed PRESENT may spend a
-        // hello here; the composed capture splice may not.
-        let (coat, iris) = sync_pet_companion_look(ws, look, ctx.present, ctx.now);
-        let colors = match ws.cursor_pet.appearance_colors() {
-            Some(colors) => colors,
-            None => {
-                let sampled = cursor_cat_color_key(
-                    &ws.composed_focus_scratch.cells,
-                    geom,
-                    aterm_effects::word_decorations::CatFootprint {
-                        x: (ctx.pet.col * f32::from(geom.cell_w)) as i32,
-                        y: ((ctx.pet.row + 1.0) * f32::from(geom.cell_h)) as i32 - pet_h as i32,
-                        w: (pet_w as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                        h: (pet_h as i32).clamp(1, i32::from(u16::MAX)) as u16,
-                    },
-                    default_bg,
-                    cursor_color,
-                    accent,
-                );
-                ws.cursor_pet.colors_for_appearance(sampled)
-            }
-        };
-        // ONE APPEARANCE WEARS ONE CAT: same latch as the single-pane twin —
-        // this window's verdict is the SYNC input, the worn pair is what draws.
+        // same one function so a split window can never rule a ceremony
+        // differently from a single pane. Reached only with the pet on glass,
+        // so `ctx.present` is the whole remaining drawn-path question: the
+        // composed PRESENT may spend a hello here; the composed capture
+        // splice may not. The palette samples the focused pane's own cells.
         ws.pane_free.clear();
-        let fp = ws.word_decos.pet_cursor(
-            aterm_effects::word_decorations::PetCursorFrame {
-                geom,
-                colors,
-                coat,
-                iris,
-                pet: ctx.pet,
-            },
-            &mut ws.pane_free,
+        let fp = emit_resident_pet(
+            ws,
+            &ctx.pet,
+            ctx.cat_frame.look.normalized(),
+            CompanionInk::Composed,
+            ctx.present,
+            ctx.now,
+            fallback,
         );
         translate_free_into_pane(&mut ws.pane_free, place);
         ws.free_scratch.extend_from_slice(&ws.pane_free);
-        fp.map_or(0, |f| f.rotate_left(29))
+        fp
     }
 
     fn compose_cursor_companion(
@@ -36808,7 +34739,7 @@ impl App {
         // `pet_visible` already carries the shared one-companion custody gate;
         // [`CompanionDuty`] is that gate as ONE value, matched here and in the
         // single-pane twin so neither path can put two bodies in a frame.
-        let duty = cursor_companion_duty(ctx.pet_visible, ctx.kitty_alpha, ctx.focus_cursor);
+        let duty = cursor_companion_duty(ctx.pet.on_glass, ctx.kitty_alpha, ctx.focus_cursor);
         // THE COMPANION SEAM ([`route_v2_companion`]) — the single-pane twin's
         // call, made for EVERY duty (the impulse is consumed even on an idle
         // or pet frame) at the focused pane's geometry and against the focused
@@ -37210,11 +35141,13 @@ impl App {
         let mut focus_probe_below = false;
         // The focused pane's ECHO ANCHOR, window-translated like `focus_probe`.
         let mut focus_print_anchor: Option<(u16, u16, u64)> = None;
+        // …and the glyph its run ended on, same hold, same guard.
+        let mut focus_print_anchor_glyph: Option<char> = None;
         // PHOSPHOR rain, compose path (split-pane audit): the FOCUSED pane
         // rains — the aurora/comet law ("effects follow focus, clipped to the
         // pane") applied to the ambient effect. These locals snapshot the
         // focused pane's rain inputs under its pass-1 lock, the single-pane
-        // LOCK A capture's split twin; the engine block below the loop
+        // frame-hold capture's split twin; the engine block below the loop
         // consumes them unlocked.
         let mut focus_epoch = 0u64;
         let mut focus_content_seq = 0u64;
@@ -37389,7 +35322,7 @@ impl App {
                 focus_default_bg = aterm_render::rgb_to_u32(focus_blank.bg);
                 focus_title_sample = term.title_arc();
                 focus_ambiguous_cjk = term.modes().ambiguous_width_double;
-                // ERASE-POOF probe, split panes: the single-pane LOCK A capture
+                // ERASE-POOF probe, split panes: the single-pane frame-hold capture
                 // with row/caret reported in WINDOW coords (+ row_off/col_off,
                 // matching `win_cur` below) so the engine and geom agree. Only
                 // the engine read (`row_cols_into`) runs under the lock; the
@@ -37403,7 +35336,7 @@ impl App {
                     // FOCUSED pane kept the historical `cell_frame_into` +
                     // `take_damage` pair, so a split window still paid ONE full
                     // O(rows x cols) resolve every presented frame while the
-                    // single-pane path beside it (LOCK B) had been scoped since
+                    // single-pane path beside it had been scoped since
                     // a78dd8a1. `composed_focus_scratch` is already the
                     // per-window RESIDENT buffer this pane — and only this pane
                     // — is filled into, so arming it costs no new memory at all:
@@ -37453,7 +35386,7 @@ impl App {
                     // it before re-stating this pane's exact alt/blink inputs.
                     sync_cursor_effect_coordinate_space(ws, term.render_identity(), pane_alt);
                     let scroll_change = sync_cursor_effect_scroll(ws, content_scroll_state);
-                    // REPAINT-BLINK edge + context feed — the single-pane LOCK A
+                    // REPAINT-BLINK edge + context feed — the single-pane frame-hold
                     // detector's twin (same lock, same engines, `now` clock).
                     let blink_epoch = term.repaint_blink_epoch();
                     if ws.blink_reseed {
@@ -37509,6 +35442,8 @@ impl App {
                                     seq,
                                 )
                             });
+                    focus_print_anchor_glyph =
+                        (d_off == 0).then(|| term.print_anchor_glyph()).flatten();
                     focus_scrolled_rows = usize::from(scroll_change.translated_rows)
                         + usize::from(scroll_change.invalidated)
                         + usize::from(scroll_change.band_moves);
@@ -37525,7 +35460,7 @@ impl App {
                                 )
                             })
                         });
-                    // PHOSPHOR rain input snapshot — the single-pane LOCK A
+                    // PHOSPHOR rain input snapshot — the single-pane frame-hold
                     // capture's split twin, all under this SAME pane lock.
                     focus_epoch = term.damage_epoch();
                     focus_content_seq = term.content_seq();
@@ -37610,7 +35545,7 @@ impl App {
                 }
                 // The hover under a still pointer, re-probed against THIS
                 // pane's hold when the focused fill above moved it (G04): the
-                // composed route's twin of the single-pane LOCK B call. The
+                // composed route's twin of the single-pane hold's call. The
                 // focused pane is the only one a hover can stand on (the
                 // resolver's gate requires the pointer inside it), so the
                 // background panes owe nothing here.
@@ -37619,7 +35554,7 @@ impl App {
                 let staged = ws.unfocused_pane_scratch.entry(pane_index).or_default();
                 // THE ROOM (panel #9(d)): the sibling's content clock as of
                 // the LAST composed frame, read before this frame's refill
-                // stamps it — the `pet_content_seq` latch's shape, on the
+                // stamps it — the pet owner's content latch's shape, on the
                 // staged scratch the pane already owns, so no new state.
                 let staged_seq = staged.content_seq;
                 let refill = term.cell_frame_damage_scoped_into(
@@ -37634,7 +35569,7 @@ impl App {
                 // never stamped (`0`, its first frame) is a baseline, not a
                 // burst.
                 if staged_seq != 0
-                    && pet_output_burst(
+                    && aterm_effects::companion::pet_output_burst(
                         false,
                         staged.content_seq > staged_seq,
                         term.shell_state() == aterm_core::terminal::ShellState::Executing,
@@ -37854,6 +35789,7 @@ impl App {
                 row_probe: focus_probe,
                 row_probe_neighbors: Some((focus_probe_above, focus_probe_below)),
                 print_anchor: focus_print_anchor,
+                print_anchor_glyph: focus_print_anchor_glyph,
             },
         )?;
         let glow_fp = fx.glow_fp;
@@ -37905,41 +35841,26 @@ impl App {
         let pet_species = trail_presentation
             .pet_species
             .unwrap_or(aterm_effects::kitty_pet::PetSpecies::Cat);
-        let reading_presentable = if let Some(ws) = self.windows.get_mut(&wid) {
-            if pet_mode && let Some(facts) = focus_world_facts.as_ref() {
-                let (exclusions, count) = pet_console_exclusions(
-                    &ws.composed_focus_scratch,
-                    !ws.preedit.is_empty(),
-                    ws.predictor.pending_bounds(),
-                    ws.search.is_some(),
-                );
-                ws.cursor_pet.observe_console_with_exclusions(
-                    &ws.composed_focus_scratch,
-                    facts,
-                    aterm_effects::pet_world::PetPane::full(&ws.composed_focus_scratch),
-                    &exclusions[..count],
-                );
-                metrics::note_pet_world_observation(ws.cursor_pet.observed_cells());
-            }
-            ws.cursor_pet.has_reading_interest()
-        } else {
-            false
-        };
-        let pet_presentable = resident_pet_surface_presentable(
-            focused,
-            cursor_companions_allowed,
-            self.windows
-                .get(&wid)
-                .is_some_and(|ws| !ws.overlay_open() && ws.tab_menu.is_none()),
-            !focus_scrolled,
-            reading_presentable,
-        );
-        let pet_visible = resident_pet_presentation_enabled(
-            pet_mode,
-            pet_presentable,
-            glow_cfg.enabled && cursor_companions_allowed,
-            glow_cfg.style,
-        );
+        // THE WORLD UNDER THE PET: the focused pane's own grid — never the
+        // composite, because the pet's world (and so its body box) is that pane.
+        if pet_mode
+            && let Some(facts) = focus_world_facts.as_ref()
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            let (exclusions, count) = pet_console_exclusions(
+                &ws.composed_focus_scratch,
+                !ws.preedit.is_empty(),
+                ws.predictor.pending_bounds(),
+                ws.search.is_some(),
+            );
+            let observed = ws.companion.observe_console(
+                &ws.composed_focus_scratch,
+                facts,
+                aterm_effects::pet_world::PetPane::full(&ws.composed_focus_scratch),
+                &exclusions[..count],
+            );
+            metrics::note_pet_world_observation(observed);
+        }
         // The pet's WORLD is the focused pane, not the window: it chases that
         // pane's caret, and its viewport clamp is that pane's grid. Anything
         // else and a cat in the left half of a vertical split would happily walk
@@ -37971,7 +35892,7 @@ impl App {
             i32::from(fx_ox) + i32::from(focus_off.1) * glow_cw as i32,
             i32::from(fx_oy) + i32::from(focus_off.0) * glow_ch as i32,
         );
-        let (cat_frame, kitty_alpha, riff, outro, pet_frame) = {
+        let (cat_frame, kitty_alpha, riff, outro, pet) = {
             let ws = self.windows.get_mut(&wid)?;
             // THE COMPANION PRECEDENCE LAW — the single-pane seam's twin,
             // through the same one verdict (favourite > program with tenure
@@ -37980,14 +35901,6 @@ impl App {
             ws.cursor_cat.set_look(companion_verdict);
             // `tick_cursor_fx` consumed and forwarded this frame's licensed
             // motion pulse before this presentation-only companion pass.
-            // The single-pane seam's twin: an unowned resident is retired outright,
-            // motes included, rather than left to fade on frames nobody owes it.
-            retire_pet_without_owner(
-                pet_mode,
-                glow_cfg.enabled && cursor_companions_allowed,
-                glow_cfg.style,
-                &mut ws.cursor_pet,
-            );
             ws.cursor_cat
                 .set_collection_presentable(now, cursor_companion_presentable);
             // Single-pane twin: carry the companion through both sides of the
@@ -38086,6 +35999,7 @@ impl App {
             // the RepaintKey, or claim the caret cell from a word-cat.
             // The shared gate keeps the full resident through every song
             // phase and gives no pixel custody to a replacement head.
+            let flying_alpha = if kitty_enabled { cat_frame.alpha } else { 0 };
             let alpha = if kitty_enabled && flying_kitty_admitted(pet_mode, cat_frame.sing) {
                 shed_companion_alpha(cat_frame.alpha, shed_envelope)
             } else {
@@ -38094,183 +36008,126 @@ impl App {
             cat_frame.alpha = alpha;
             // THE PET BRAIN TICKS HERE, unconditionally and exactly once per
             // composed frame — outside `compose_word_decorations`, which
-            // early-returns whenever the sparkle master is off. The scheduler
-            // reads `needs_frames()`, and only `tick` advances it: freezing
-            // the brain anywhere the predicate is still consulted latches a
-            // permanent wake train (the single-pane path learned this the
-            // hard way). A pet that cannot be drawn is fed `caret: None`, so
-            // it fades out and releases the lane honestly.
-            //
-            // Song-independent caret custody, shared with the single-pane
-            // path: the resident tracks the focused pane during the song.
+            // early-returns whenever the sparkle master is off — through the
+            // single-pane twin's one driver, at the focused PANE's geometry:
+            // the pet's world is that pane, so it chases that pane's caret and
+            // its viewport clamp is that pane's grid.
             let (pane_rows, pane_cols) = focus_pane_dims.unwrap_or((0, 0));
-            // EXIT-CODE EMPATHY (wave 1) — the single-pane dedupe's
-            // split twin, on the pet's OWN (session, seq) latch: a
-            // pane-focus switch re-baselines silently, only a genuinely
-            // new completion in the same session notes the brain, and
-            // the note only latches (the tick below acts). Pass 1's
-            // snapshot is proven valid by the early return above, so
-            // these locals are the focused pane's real probe.
-            {
-                let seq = focus_cmd_done.map_or(0, |(e, _)| e);
-                let key = (focus, seq);
-                if ws.pet_last_cmd != Some(key) {
-                    let same_session = ws.pet_last_cmd.is_some_and(|(sid, _)| sid == focus);
-                    ws.pet_last_cmd = Some(key);
-                    if same_session && let Some((_, code)) = focus_cmd_done {
-                        ws.cursor_pet
-                            .note_command_done(now, code != 0, focus_cmd_dur_ms);
-                        // The same keyed completion edge as a single pane.
-                        // The song arm belongs to the focused session; a pane
-                        // switch only re-baselines and cannot replay history.
-                        let focus_boundary = self.pool.get(focus).and_then(|session| {
-                            session
-                                .ctx
-                                .output_echo
-                                .sample(&session.ctx.sink, now)
-                                .last_boundary_at
-                        });
-                        keyed_celebration_completion(
-                            &mut ws.kitty_sing,
-                            &mut ws.verdict_spent,
-                            focus,
-                            focus_boundary,
-                            now,
-                            code,
-                        );
-                    }
-                }
-            }
-            // THE VIGIL'S LEVEL (THE VERDICT, sense 1) — the single-pane
-            // twin, on the focused pane's own Execute level. The vigil is the
-            // PET's sense and travels with the pet into a split; the
-            // verdict's VOICE and its rainbow door stay with the single-pane
-            // arm, which is the one that also holds the streak cue THE ONE
-            // GUARD has to replace (the composed path pushes each pane's pip
-            // from `compose_output_streak`, where no single episode is "the"
-            // one a focused command ended).
-            // THE ROOM (panel #9) — the single-pane site's split twin, with
-            // the one fact only a split has: the talking sibling's caret,
-            // translated from window cells into the focused pane's.
-            note_room_facts(
-                &mut ws.cursor_pet,
-                self.pool.get(focus),
-                self.session_status.status(focus),
-                now,
-                sibling_talking.map(|(row, col)| {
-                    (
-                        f32::from(col) - f32::from(focus_off.1),
-                        f32::from(row) - f32::from(focus_off.0),
-                    )
-                }),
-            );
-            ws.cursor_pet.note_executing(now, focus_shell_exec);
-            // PERK-AND-WATCH (wave 2) — the single-pane burst probe's
-            // split twin: the focused pane's scroll delta, content
-            // clock, Execute LEVEL and live bottom, through the same
-            // `pet_output_burst` conjunction and the same silent
-            // (session, seq) re-baseline on a pane-focus switch.
-            let pet_burst = {
-                let advanced = ws
-                    .pet_content_seq
-                    .is_some_and(|(sid, s)| sid == focus && focus_content_seq > s);
-                ws.pet_content_seq = Some((focus, focus_content_seq));
-                pet_output_burst(
-                    focus_scrolled_rows > 0,
-                    advanced,
-                    focus_shell_exec,
-                    focus_d_off == 0,
-                )
-            };
-            // THE WRAP FACT (kitty-motion §4.1) — the single-pane edge's
-            // split twin, through the same `wrap_fact_edge` law and the
-            // same silent (session, serial) re-baseline on a pane-focus
-            // switch: a focus move is never a wrap.
-            let pet_wrapped = wrap_fact_edge(&mut ws.pet_wrap_serial, focus, focus_wrap_serial);
-            // POINTER PLAY (wave 2): the single-pane pointer map at the
-            // focused PANE's frame-space origin (`pet_origin` — the same
-            // origin the hit-rect stash uses), bounded by the pane grid. The
-            // sampled pixel is stamped exactly as on the single-pane path.
+            // POINTER PLAY (wave 2): the single-pane pointer at the focused
+            // PANE's frame-space origin (`pet_origin` — the same origin the
+            // hit-rect stash uses), bounded by the pane grid. The sampled
+            // pixel is stamped exactly as on the single-pane path.
             ws.pet_pointer_sampled_px = Some(ws.last_cursor_px);
-            let pet_pointer = pet_pointer_cell(
-                ws.last_cursor_px,
-                pet_origin,
-                (glow_cw, glow_ch),
-                (usize::from(pane_cols), usize::from(pane_rows)),
-            );
-            // THE INK/SKIN SEAM, split-path twin. Bind BEFORE reading: the
-            // preceding composed frame leaves the engine on its final iterated
-            // pane, which need not be the pane focused on this frame.
-            if !focused {
-                ws.retire_cursor_pet_coordinate_space();
-            }
-            prepare_resident_pet_tick(
+            ws.companion.set_species(pet_species);
+            let pet_tick = ws.companion.prepare(
+                aterm_effects::companion::PetFacts {
+                    facts: &aterm_effects::host::TerminalFacts {
+                        session: focus,
+                        // Only the scroll is a coordinate-space refusal; a
+                        // DECTCEM-hidden caret still travels (`focus_vis`
+                        // is its painted half).
+                        caret: (focus_pane_dims.is_some() && !focus_scrolled)
+                            .then_some(focus_cur_pos),
+                        cursor_visible: focus_vis,
+                        display_offset: i32::try_from(focus_d_off).unwrap_or(i32::MAX),
+                        live_viewport: !focus_scrolled,
+                        content_seq: focus_content_seq,
+                        wrap_serial: focus_wrap_serial,
+                        scrolled: focus_scrolled_rows > 0,
+                        shell_executing: focus_shell_exec,
+                        cmd_done: focus_cmd_done.map(|(seq, code)| (seq, code, focus_cmd_dur_ms)),
+                        block: None,
+                        alt_screen: focus_alt,
+                    },
+                    host: &aterm_effects::host::HostFrameInput {
+                        now,
+                        visibility: pet_visibility(focused),
+                        reduced_motion: !cursor_motion
+                            .animate(crate::motion::MotionEffect::CursorGlow),
+                        serious: !cursor_companions_allowed,
+                        shed_envelope,
+                        shed_active: load_shed,
+                        pointer_px: Some((ws.last_cursor_px.0 as f32, ws.last_cursor_px.1 as f32)),
+                        capture: aterm_effects::host::CaptureMode::Present,
+                        geometry: pet_frame_geom(
+                            (glow_cw, glow_ch),
+                            (usize::from(pane_rows), usize::from(pane_cols)),
+                            pet_origin,
+                        ),
+                    },
+                    glow: aterm_effects::companion::GlowOwnership {
+                        enabled: glow_cfg.enabled,
+                        style: glow_cfg.style,
+                        style_raw_names_pet: pet_mode,
+                    },
+                    sing: aterm_effects::host::SingFacts {
+                        drive: sing_drive,
+                        flying_alpha,
+                    },
+                    focused,
+                    obscured: ws.overlay_open() || ws.tab_menu.is_some(),
+                    // THE INK/SKIN SEAM, split-path twin. Bind BEFORE reading:
+                    // the preceding composed frame leaves the engine on its
+                    // final iterated pane, which need not be the pane focused
+                    // on this frame.
+                    pane: Some((
+                        focus,
+                        (
+                            i32::from(focus_off.1) * glow_cw as i32,
+                            i32::from(focus_off.0) * glow_ch as i32,
+                        ),
+                    )),
+                    // THE ROOM (panel #9) — the single-pane site's split twin,
+                    // with the one fact only a split has: the talking
+                    // sibling's caret, translated from window cells into the
+                    // focused pane's.
+                    room: Some(room_facts(
+                        self.pool.get(focus),
+                        self.session_status.status(focus),
+                        sibling_talking.map(|(row, col)| {
+                            (
+                                f32::from(col) - f32::from(focus_off.1),
+                                f32::from(row) - f32::from(focus_off.0),
+                            )
+                        }),
+                    )),
+                },
                 &mut ws.word_decos,
-                &mut ws.cursor_pet,
-                pet_species,
-                Some((
-                    focus,
-                    (
-                        i32::from(focus_off.1) * glow_cw as i32,
-                        i32::from(focus_off.0) * glow_ch as i32,
-                    ),
-                )),
             );
+            // The same keyed completion edge as a single pane. The song arm
+            // belongs to the focused session; a pane switch only re-baselines
+            // and cannot replay history. The verdict's VOICE and its rainbow
+            // door stay with the single-pane arm, which is the one that also
+            // holds the streak cue THE ONE GUARD has to replace (the composed
+            // path pushes each pane's pip from `compose_output_streak`, where
+            // no single episode is "the" one a focused command ended).
+            if let Some((code, _)) = pet_tick.completion {
+                let focus_boundary = self.pool.get(focus).and_then(|session| {
+                    session
+                        .ctx
+                        .output_echo
+                        .sample(&session.ctx.sink, now)
+                        .last_boundary_at
+                });
+                keyed_celebration_completion(
+                    &mut ws.kitty_sing,
+                    &mut ws.verdict_spent,
+                    focus,
+                    focus_boundary,
+                    now,
+                    code,
+                );
+            }
             // THE GRIEF GATE (gauntlet F4a), split-path twin.
-            if ws.cursor_pet.grieving() {
+            if ws.companion.grieving() {
                 ws.cursor_glow.hush_fanfare(now);
             }
             // THE HAND FOUND ITS FLOW, split-path twin — the same one-shot
             // drain, on the same arm's clock.
             if ws.cursor_glow.take_flow_entry() {
-                ws.cursor_pet.note_flow(now);
+                ws.companion.note_flow(now);
             }
-            // The single-pane twin's projection ([`companion_pet_sense`]) at
-            // the focused PANE's geometry — one router, both arms.
-            ws.cursor_pet
-                .set_console_presentable(pet_companion_admitted(pet_visible, cat_frame.sing));
-            let pet_frame = ws.cursor_pet.tick(companion_pet_sense(
-                now,
-                aterm_effects::word_decorations::EffectGeom {
-                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
-                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
-                    rows: pane_rows,
-                    cols: pane_cols,
-                },
-                &glow_cfg,
-                resident_pet_reduced_motion(
-                    !cursor_motion.animate(crate::motion::MotionEffect::CursorGlow),
-                    load_shed,
-                    shed_envelope,
-                ),
-                aterm_effects::rainbow_kitty::companion::HostSense {
-                    caret: if pet_caret_admitted(pet_visible, sing_drive, !animate_cat)
-                        && focus_pane_dims.is_some()
-                    {
-                        // `focus_vis` (DECTCEM) used to sit in this `&&` too,
-                        // so a split pane lost its caret to a repaint exactly
-                        // as the single-pane arm did. Only the scroll is a
-                        // coordinate-space refusal; see the `cur` note above.
-                        (!focus_scrolled).then_some(focus_cur_pos)
-                    } else {
-                        None
-                    },
-                    caret_drawn: focus_vis
-                        && focus_pane_dims.is_some()
-                        && pet_caret_admitted(pet_visible, sing_drive, !animate_cat),
-                    wrapped: pet_wrapped,
-                    output_burst: pet_burst,
-                    // The focused split pane obeys the same touch custody as
-                    // the single-pane resident, including a static shed.
-                    pointer: if ws.pet_hit_rect.is_some()
-                        && pet_companion_admitted(pet_visible, cat_frame.sing)
-                    {
-                        pet_pointer
-                    } else {
-                        None
-                    },
-                },
-            ));
+            let pet = ws.companion.tick(pet_tick);
             // RAINBOW KITTY v2's OFFER TO THE RESIDENT — the single-pane
             // seam's twin, through the same one function
             // ([`route_v2_pet_offer`]), before `compose_cursor_companion`
@@ -38278,22 +36135,8 @@ impl App {
             // sky's is the window, so the focused pane's offset is what
             // reconciles them; the glow engine ticked on `pane_geom`'s window
             // grid in `tick_cursor_fx` this same frame.
-            route_v2_pet_offer(ws, &pet_frame, pane_geom, focus_off, now);
-            // PETTING (wave 1): stash/clear the hit-box post-tick — the
-            // single-pane law verbatim, at the focused pane's origin.
-            ws.pet_hit_rect = pet_hit_rect_for_frame(
-                pet_visible,
-                cat_frame.sing,
-                &pet_frame,
-                aterm_effects::word_decorations::EffectGeom {
-                    cell_w: glow_cw.min(usize::from(u16::MAX)) as u16,
-                    cell_h: glow_ch.min(usize::from(u16::MAX)) as u16,
-                    rows: pane_rows,
-                    cols: pane_cols,
-                },
-                pet_origin,
-            );
-            (cat_frame, alpha, riff, outro, pet_frame)
+            route_v2_pet_offer(ws, &pet.pet, pane_geom, focus_off, now);
+            (cat_frame, alpha, riff, outro, pet)
         };
         if let Some((bar, gain, sig)) = riff {
             self.trail_audio.push(sing_riff_event(bar, gain, sig));
@@ -38301,8 +36144,8 @@ impl App {
         if let Some((gain, sig)) = outro {
             self.trail_audio.push(sing_outro_event(gain, sig));
         }
-        // The brain tick used the base gate; presentation uses the custody gate.
-        let pet_visible = pet_companion_admitted(pet_visible, cat_frame.sing);
+        let word_focus =
+            self.motion_focus(wid, self.windows.get(&wid).is_some_and(|ws| ws.focused));
         let deco_fp = self.compose_word_decorations(
             wid,
             &ComposeDecoCtx {
@@ -38315,13 +36158,13 @@ impl App {
                 cell_h: glow_ch as u32,
                 focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
                 win_focused: focused,
+                word_focus,
                 animate_sparkles,
                 animate_streak: policy.animate(crate::motion::MotionEffect::OutputStreak),
                 animate_cat,
                 kitty_alpha,
                 cat_frame,
-                pet: pet_frame,
-                pet_visible,
+                pet,
                 // The composed DRAWN present — the composed capture splice
                 // builds its ctx with `false`.
                 present: true,
@@ -38346,13 +36189,13 @@ impl App {
                 cell_h: glow_ch as u32,
                 focus_cursor: (focus_vis && !focus_scrolled).then_some(focus_cur_pos),
                 win_focused: focused,
+                word_focus,
                 animate_sparkles,
                 animate_streak: policy.animate(crate::motion::MotionEffect::OutputStreak),
                 animate_cat,
                 kitty_alpha,
                 cat_frame,
-                pet: pet_frame,
-                pet_visible,
+                pet,
                 present: true,
                 accent: glow_cfg.accent,
                 cursor_color: focus_cursor_rgb
@@ -38549,6 +36392,11 @@ impl App {
                 .get(&wid)
                 .is_none_or(|ws| !ws.predictor.is_displaying(now) && !ws.pred_shown)
         {
+            // The screen is PROVED unchanged: the `video` recorder's sampling
+            // ledger counts this as a sample (see `redraws_proved_unchanged`).
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.redraws_proved_unchanged = ws.redraws_proved_unchanged.wrapping_add(1);
+            }
             return None;
         }
         // FOCUSED-PANE clip box: the exact pane-local bounds for every composed
@@ -38768,7 +36616,7 @@ impl App {
                         Some(false)
                     } else {
                         // Cursor position and the no-echo gate (alt screen OR an
-                        // app-owned Kitty composer) both ride the pass-1 LOCK A
+                        // app-owned Kitty composer) both ride the pass-1 lock's
                         // sample, so the reconcile agrees with the very cells it
                         // compares against instead of re-reading a terminal that
                         // may have moved on. The resolver then indexes THIS pane's
@@ -40804,7 +38652,8 @@ impl App {
     }
 
     /// Device-pixel floor below the top-row BANNER band — the multi-line-paste
-    /// confirmation banner of THIS window, when it is up.
+    /// confirmation banner of THIS window, or the close/quit confirmation
+    /// (Windows, [`crate::close_confirm`]) that shares its slot, when one is up.
     ///
     /// The banner overwrites composed rows starting at the renderer's grid
     /// origin (`pad_top + head`). Tray cards are a later pixel pass, so every
@@ -40817,11 +38666,20 @@ impl App {
         let Some(window) = self.windows.get(&wid) else {
             return 0;
         };
-        let rows = self
+        let paste_rows = self
             .paste_banner
             .as_ref()
             .filter(|p| p.wid == wid)
-            .map_or(0, crate::paste_banner::PendingPaste::wanted_rows)
+            .map_or(0, crate::paste_banner::PendingPaste::wanted_rows);
+        // The close/quit confirm (Windows) shares the paste banner's slot — see
+        // `splice_close_banner` — so its band is the same click-floor.
+        let close_rows = self
+            .close_banner
+            .as_ref()
+            .filter(|p| p.wid == wid)
+            .map_or(0, crate::close_confirm::PendingClose::wanted_rows);
+        let rows = paste_rows
+            .max(close_rows)
             .min(window.input_scratch.cells.len());
         if rows == 0 {
             return 0;
@@ -41229,7 +39087,12 @@ impl App {
     pub(crate) fn splice_paste_banner(&mut self, wid: WindowId) {
         let panel_rows = {
             let Some(pending) = self.paste_banner.as_ref().filter(|p| p.wid == wid) else {
-                return; // no confirmation here -> byte-identical frame
+                // No paste question here: the close/quit confirm (Windows) takes
+                // the same band. The two are never up together on one window —
+                // the paste banner is a no-native-alert platform's — so the
+                // paste question keeps the band whenever it has one to paint.
+                self.splice_close_banner(wid);
+                return;
             };
             let avail = match self.windows.get(&wid) {
                 Some(ws) => ws.input_scratch.cells.len(),
@@ -41259,6 +39122,48 @@ impl App {
                 return;
             };
             crate::paste_banner::banner_rows(pending.text(), cols, panel_rows, theme)
+        };
+        self.splice_band_rows(wid, built, cols, panel_rows, cell_h);
+    }
+
+    /// Paint the CLOSE/QUIT CONFIRMATION banner (`self.close_banner`, Windows —
+    /// [`crate::close_confirm`]) over `wid`'s top rows: the same band mechanics
+    /// and the same slot as [`Self::splice_paste_banner`], which calls this when
+    /// it has no paste question of its own to paint. Per-WINDOW, no TTL; a no-op
+    /// — and a byte-identical frame — whenever no confirm stands over `wid`.
+    fn splice_close_banner(&mut self, wid: WindowId) {
+        let panel_rows = {
+            let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) else {
+                return; // no confirmation here -> byte-identical frame
+            };
+            let avail = match self.windows.get(&wid) {
+                Some(ws) => ws.input_scratch.cells.len(),
+                None => return,
+            };
+            pending.wanted_rows().min(avail)
+        };
+        if panel_rows == 0 {
+            return;
+        }
+        let cols = match self.windows.get(&wid) {
+            Some(ws) => ws.cols as usize,
+            None => return,
+        };
+        let cell_h = self.win_cell_size(wid).1;
+        // Tint off the live OSC-11 background (like splice_paste_banner) so the
+        // band colors keep the banner text WCAG-AA legible on a recoloured bg.
+        let mut theme = self.theme;
+        if let Some(ws) = self.windows.get(&wid) {
+            let live = ws.input_scratch.default_bg;
+            if live != aterm_core::render::COLOR_UNSET {
+                theme.bg = live;
+            }
+        }
+        let built = {
+            let Some(pending) = self.close_banner.as_ref().filter(|p| p.wid == wid) else {
+                return;
+            };
+            crate::close_confirm::banner_rows(&pending.prompt, cols, panel_rows, theme)
         };
         self.splice_band_rows(wid, built, cols, panel_rows, cell_h);
     }
@@ -41450,6 +39355,7 @@ impl App {
             ws.cursor_trail.reset();
             ws.rows = rows;
             ws.cols = cols;
+            ws.note_normal_grid();
             // The grid dimensions (and thus the cursor coordinate space predictions are
             // anchored in) just changed — resize, scale-factor, or font-zoom re-grid —
             // so drop any in-flight predictions rather than paint them at stale coords.
@@ -41894,8 +39800,11 @@ pub(crate) fn reflow_thread_ceiling(jobs: usize) -> usize {
 ///
 /// The measurement, on that MacBook Pro (quiet machine: load average 2 on 8
 /// logical CPUs; `-O3`), with a probe that MODELS the settle, not with
-/// `workspace_scaling` — the x86_64 rows of the arm64 table are still
-/// unmeasured, and a release build of that bench on this host is the follow-up.
+/// `workspace_scaling`. The x86_64 rows of the arm64 `workspace_scaling` table
+/// are unmeasured, and the physical-core ceiling does not rest on them (it rests
+/// on the probe table below); filling them needs a release run of that bench on
+/// the Intel host with its pinned stock toolchain (Trust has no
+/// x86_64-apple-darwin std).
 /// The probe is `benches/reflow_smt_probe.rs` (`cargo bench -p aterm-gui
 /// --features bench-support --bench reflow_smt_probe -- 2 4 6 8 120`): N pooled
 /// workers drain a queue of 120 jobs (a 30-tab x 4-pane settle), each job eight
@@ -46570,7 +44479,7 @@ mod split_sparkle_tests {
             .filter(|sprite| matches!(sprite.z, aterm_core::render::FreeZ::OverText))
             .count();
         assert!(
-            resident_after >= 1 && ws.cursor_pet.is_active(),
+            resident_after >= 1 && ws.companion.brain().is_active(),
             "the hidden-caret frame genuinely carries the fading resident body"
         );
         assert_eq!(
@@ -46609,7 +44518,7 @@ mod split_sparkle_tests {
         let (flight_at, flying) = {
             let ws = app.windows.get_mut(&wid).expect("window");
             seed_resident_pet_mid_flight_for_test(
-                &mut ws.cursor_pet,
+                ws,
                 t0 + Duration::from_millis(16),
                 pane_rows,
                 pane_cols,
@@ -46632,14 +44541,16 @@ mod split_sparkle_tests {
         let visible_at = flight_at + Duration::from_millis(16);
         assert!(compose(&mut app, wid, visible_at).is_some());
         let before = app.windows[&wid]
-            .pet_hit_rect
+            .companion
+            .hit_rect()
             .expect("production present draws the mid-flight resident");
 
         term_lock(&term).process(b"\x1b[?25l");
         let hidden_at = visible_at + Duration::from_millis(16);
         assert!(compose(&mut app, wid, hidden_at).is_some());
         let hidden = app.windows[&wid]
-            .pet_hit_rect
+            .companion
+            .hit_rect()
             .expect("the first hidden frame retains the fading resident");
         assert!(
             (hidden.0 - before.0).abs() <= cw as i32,
@@ -46665,7 +44576,8 @@ mod split_sparkle_tests {
         let returned_at = hidden_at + Duration::from_millis(16);
         assert!(compose(&mut app, wid, returned_at).is_some());
         let returned = app.windows[&wid]
-            .pet_hit_rect
+            .companion
+            .hit_rect()
             .expect("quick return keeps the resident on glass");
         assert!(
             (returned.0 - hidden.0).abs() <= (2 * cw) as i32,
@@ -51275,8 +49187,9 @@ mod strip_lane_oracle {
 
     /// ONE presented frame of the single-pane strip window, modelled at exactly
     /// the three seams this fix touches and in the shipping order: the resident
-    /// scratch's reclaim/UN-SPLICE (hoisted ahead of LOCK A in `redraw_window`),
-    /// the damage-scoped re-extract under LOCK B, and the tab-strip prepend.
+    /// scratch's reclaim/UN-SPLICE (hoisted ahead of the frame hold in
+    /// `redraw_window`), the damage-scoped re-extract under that hold, and the
+    /// tab-strip prepend.
     ///
     /// The fallback branch is the pre-fix reclaim verbatim, so a step whose
     /// prepend could not be inverted still salvages its buffers exactly as before.
@@ -55212,7 +53125,7 @@ mod trail_verdict {
                 "external scheduling grants no frame train"
             );
             assert!(
-                !ws.cursor_pet.needs_frames(),
+                !ws.companion.brain().needs_frames(),
                 "a song does not grant a static pet frame debt"
             );
             if phase < 3 {
@@ -55983,5 +53896,265 @@ mod native_ime_anchor_tests {
                 );
             }
         }
+    }
+}
+
+/// TEST-ONLY: a hook the single-pane redraw calls the instant its one
+/// terminal hold is released — the seam the old LOCK A / LOCK B split left open
+/// to a PTY write mid-frame. The adversarial writer test installs a write here,
+/// the most hostile moment still available: after every terminal fact of the
+/// frame was read, before the effect pass and the present that use them.
+#[cfg(test)]
+pub(crate) mod redraw_hold_hook {
+    use std::cell::RefCell;
+
+    type Hook = Box<dyn FnMut()>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = RefCell::new(None);
+    }
+
+    /// Run `hook` after every later terminal hold on this thread.
+    pub(crate) fn install(hook: impl FnMut() + 'static) {
+        HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    }
+
+    pub(crate) fn clear() {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+
+    pub(crate) fn after_terminal_hold() {
+        HOOK.with(|h| {
+            if let Some(hook) = h.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod single_hold_redraw_tests {
+    //! ONE TERMINAL HOLD PER SINGLE-PANE FRAME (typing-to-pixels audit, P1):
+    //! the probes the effect pass reads, the grid extraction, the damage
+    //! consume and the cursor/colour facts the frame is keyed and presented
+    //! with all come from ONE acquisition, so no PTY write can land between
+    //! them. Driven through the real `redraw_window` on a scripted CPU surface.
+    use super::redraw_hold_hook;
+    use crate::scripted_redraw_fixture::{feed, has_damage, scripted_app};
+    use crate::{WindowId, term_lock, term_lock_acquisitions_on_this_thread};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// `(damage epoch, caret)` as the frame's hold left them.
+    type HoldFacts = (u64, (u16, u16));
+
+    /// Every cell of the window's composed frame, row by row.
+    fn frame_text(app: &crate::App, wid: WindowId) -> String {
+        let mut text = String::new();
+        for row in &app.windows[&wid].input_scratch.cells {
+            text.extend(row.iter().map(|cell| cell.ch));
+            text.push('\n');
+        }
+        text
+    }
+
+    /// The scripted fixture with the shipped cursor effect (Rainbow Kitty) live.
+    fn lit_app() -> crate::App {
+        let mut app = scripted_app();
+        app.config.serious_mode = Some(false);
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty".into());
+        app.kitty_cursor_enabled_cache = None;
+        app.recompute_sparkle();
+        app
+    }
+
+    /// An ordinary echo frame takes the terminal mutex exactly once — with the
+    /// effects off and with the shipped cursor effect live (whose probes, ribbon
+    /// witness and program-cat claim all ride the same hold). It measured two
+    /// acquisitions per echo frame before the holds were merged.
+    #[test]
+    fn an_ordinary_echo_frame_takes_the_terminal_lock_once() {
+        let wid = WindowId(0);
+        for (name, mut app) in [
+            ("effects off", scripted_app()),
+            ("rainbow kitty", lit_app()),
+        ] {
+            app.redraw_window(wid);
+            for echo in [&b"e"[..], b"c", b"h", b"o"] {
+                feed(&app, echo);
+                let before = term_lock_acquisitions_on_this_thread();
+                app.redraw_window(wid);
+                let taken = term_lock_acquisitions_on_this_thread() - before;
+                assert!(
+                    !has_damage(&app),
+                    "{name}: the echo frame consumed its damage"
+                );
+                assert_eq!(
+                    taken, 1,
+                    "{name}: an ordinary echo frame takes ONE terminal hold (took {taken})"
+                );
+            }
+        }
+    }
+
+    /// ADVERSARIAL WRITER: a PTY write lands the instant the frame's hold is
+    /// released — after every terminal fact of the frame was read, before the
+    /// effect pass and the present that use them: the moment the old LOCK A /
+    /// LOCK B seam left open. The frame stays ONE state — its repaint key, its
+    /// extraction and its glass all describe the grid before the write — and
+    /// the write is neither lost nor half-consumed: it stays damaged and the
+    /// next frame presents it.
+    #[test]
+    fn a_write_landing_after_the_hold_leaves_the_frame_coherent_and_presents_next() {
+        let wid = WindowId(0);
+        let mut app = scripted_app();
+        feed(&app, b"$ ");
+        app.redraw_window(wid);
+        feed(&app, b"x");
+        let term = app
+            .front_terminal(wid)
+            .expect("front terminal")
+            .term
+            .clone();
+        let seen: Rc<Cell<Option<HoldFacts>>> = Rc::default();
+        {
+            let (term, seen) = (term.clone(), Rc::clone(&seen));
+            redraw_hold_hook::install(move || {
+                let mut t = term_lock(&term);
+                // Nothing has written since the hold: these ARE the frame's facts.
+                let cursor = t.cursor();
+                seen.set(Some((t.damage_epoch(), (cursor.row, cursor.col))));
+                t.process(b"\r\nADVERSARY");
+            });
+        }
+        app.redraw_window(wid);
+        redraw_hold_hook::clear();
+        let (epoch, cursor) = seen.get().expect("the hook ran after the hold");
+        {
+            let ws = &app.windows[&wid];
+            let key = ws.last_present.as_ref().expect("the frame presented");
+            assert_eq!(key.damage_epoch, epoch, "the key is the hold's epoch");
+            assert_eq!(
+                (key.cursor_row, key.cursor_col),
+                (usize::from(cursor.0), usize::from(cursor.1)),
+                "the key's caret is the hold's caret"
+            );
+            assert_eq!(
+                ws.input_scratch.snapshot_seq, epoch,
+                "the extraction is the hold's grid"
+            );
+        }
+        assert!(
+            !frame_text(&app, wid).contains("ADVERSARY"),
+            "the late write is not in this frame"
+        );
+        assert!(has_damage(&app), "the late write is pending, not consumed");
+
+        app.redraw_window(wid);
+        assert!(!has_damage(&app), "the next frame consumed it");
+        assert!(
+            frame_text(&app, wid).contains("ADVERSARY"),
+            "and presented it"
+        );
+        let now = term_lock(&term).cursor();
+        let key = app.windows[&wid].last_present.as_ref().expect("presented");
+        assert_eq!(
+            (key.cursor_row, key.cursor_col),
+            (usize::from(now.row), usize::from(now.col))
+        );
+    }
+
+    /// THE PROBE COPY FOLLOWS A LIVE CURSOR EFFECT (typing-to-pixels audit,
+    /// P2): with the cursor-glow engine off, an echo frame copies no cursor
+    /// row into the probe buffers; with it on (the control), it does.
+    #[test]
+    fn an_effects_off_echo_frame_copies_no_cursor_row() {
+        let wid = WindowId(0);
+        let mut off = scripted_app();
+        off.redraw_window(wid);
+        for echo in [&b"e"[..], b"c", b"h", b"o"] {
+            feed(&off, echo);
+            off.redraw_window(wid);
+            let ws = &off.windows[&wid];
+            assert!(
+                ws.poof_row_buf.is_empty()
+                    && ws.poof_row_above_buf.is_empty()
+                    && ws.poof_row_below_buf.is_empty(),
+                "an effects-off echo frame copies no row"
+            );
+        }
+
+        let mut lit = lit_app();
+        lit.redraw_window(wid);
+        feed(&lit, b"echo");
+        lit.redraw_window(wid);
+        assert!(
+            !lit.windows[&wid].poof_row_buf.is_empty(),
+            "control: with the glow engine live the cursor row is probed"
+        );
+    }
+
+    /// The normal single-pane present owns the glow buffer after the effect
+    /// tick. A second present must use the previous RenderInput allocation and
+    /// still show the new frame; switching the effect off must erase that frame.
+    #[test]
+    fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
+        let wid = WindowId(0);
+        let mut app = lit_app();
+        app.config.motion = Some("full".into());
+        app.config.stream_fade = Some(false);
+        let (first_source, second_source) = {
+            let ws = app.windows.get_mut(&wid).expect("scripted window");
+            ws.focused = true;
+            ws.glow_scratch.reserve(16_384);
+            ws.input_scratch.cursor_glow_add.reserve(16_384);
+            (
+                ws.glow_scratch.as_ptr() as usize,
+                ws.input_scratch.cursor_glow_add.as_ptr() as usize,
+            )
+        };
+        assert_ne!(first_source, second_source, "two resident buffers");
+
+        app.redraw_window(wid);
+        let ws = &app.windows[&wid];
+        assert!(
+            !ws.input_scratch.cursor_glow_add.is_empty(),
+            "control: a focused rainbow caret emits additive glow"
+        );
+        assert_eq!(
+            ws.input_scratch.cursor_glow_add.as_ptr() as usize,
+            first_source,
+            "the renderer owns the emitted buffer, with no quad copy ({} quads, {} capacity)",
+            ws.input_scratch.cursor_glow_add.len(),
+            ws.input_scratch.cursor_glow_add.capacity()
+        );
+
+        feed(&app, b"x");
+        app.redraw_window(wid);
+        let ws = &app.windows[&wid];
+        assert!(
+            !ws.input_scratch.cursor_glow_add.is_empty(),
+            "the next echo frame still receives fresh glow"
+        );
+        assert_eq!(
+            ws.input_scratch.cursor_glow_add.as_ptr() as usize,
+            second_source,
+            "the second present reuses the prior input allocation"
+        );
+
+        app.config.cursor_trail = Some(false);
+        app.redraw_window(wid);
+        let ws = &app.windows[&wid];
+        assert!(
+            ws.input_scratch.cursor_glow_add.is_empty(),
+            "disabling the effect must erase the prior glow on this frame"
+        );
+        let unchanged_before = ws.redraws_proved_unchanged;
+        app.redraw_window(wid);
+        assert!(
+            app.windows[&wid].redraws_proved_unchanged > unchanged_before,
+            "a settled frame still reaches the repaint early-out"
+        );
     }
 }

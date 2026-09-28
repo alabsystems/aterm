@@ -65,6 +65,7 @@
 use aterm_scrollback::{Line, ScrollbackStorage};
 
 use super::Grid;
+use super::reflow::ResizePolicy;
 use super::state::{DetachedReaderAim, PendingScrollbackSettings};
 use crate::Damage;
 
@@ -682,12 +683,26 @@ impl Grid {
         new_rows: u16,
         new_cols: u16,
     ) -> Option<PendingScrollbackReflow> {
+        self.resize_offloading_scrollback_with_policy(new_rows, new_cols, ResizePolicy::Native)
+    }
+
+    /// [`Self::resize_offloading_scrollback`] under an explicit
+    /// [`ResizePolicy`]. `Native` is exactly that method; `ConPty` skips the
+    /// two bottom-anchoring moves conhost's post-resize repaint would paint
+    /// over — the boundary-continuation lift into the job and the deficit fill
+    /// at re-attach (see `ResizePolicy` for the measurements).
+    pub fn resize_offloading_scrollback_with_policy(
+        &mut self,
+        new_rows: u16,
+        new_cols: u16,
+        policy: ResizePolicy,
+    ) -> Option<PendingScrollbackReflow> {
         let old_cols = self.storage.cols;
         // Only a width change rewraps scrollback, and only a tiered grid has the
         // unbounded off-screen history worth offloading. Otherwise the plain
         // resize is already O(viewport).
         if new_cols == old_cols || self.storage.scrollback.is_none() {
-            self.resize(new_rows, new_cols);
+            self.resize_with_policy(new_rows, new_cols, policy);
             return None;
         }
 
@@ -739,14 +754,30 @@ impl Grid {
         // newest ring history line, so joining them here lets the off-thread
         // rewrap process the boundary-straddling line as ONE unit; the
         // re-attach deficit fill pulls the rewrapped tail back into view.
-        ring_lines.extend(self.take_boundary_continuation_lines());
-        self.storage.pending_fill_target = Some(pending_fill_target);
+        //
+        // Neither under ConPTY. The fill runs at re-attach, which is AFTER
+        // conhost's repaint has already painted the viewport row-0-anchored
+        // with the freed rows `CSI K` (measured, `ResizePolicy`): it would
+        // re-seat the newest history line on top of an already-complete frame
+        // and shift conhost's rows down under it — the audit's duplicated
+        // 80-col wrap fragment, and the 58-not-57 history line count after
+        // narrowing back. With no fill, the lift would strand the tail in
+        // history while conhost keeps painting it at row 0; so the seam stays
+        // where conhost keeps it (`reflow.rs`, the synchronous twin). The
+        // synchronous resize below then severs that fragment from its head
+        // (`sever_top_row_continuation`) — AFTER the take above has read the
+        // head at the full width autowrap filled it to, which is the order the
+        // sever needs.
+        if policy == ResizePolicy::Native {
+            ring_lines.extend(self.take_boundary_continuation_lines());
+            self.storage.pending_fill_target = Some(pending_fill_target);
+        }
 
         // With the store detached, the lazy buffer emptied and the ring history
         // lifted into the job, the resize's `take_scrollback_lines` rewraps
         // NOTHING — the synchronous cost is the visible-grid reflow,
         // O(viewport), the budget the bounded-cost obligation checks.
-        self.resize(new_rows, new_cols);
+        self.resize_with_policy(new_rows, new_cols, policy);
         // This window's reader-descent baseline. The resize above just clamped
         // `display_offset` to `prev_offset.min(scrollback_lines())` with all three
         // history layers already in this job, so the VALUE it left is worthless as a

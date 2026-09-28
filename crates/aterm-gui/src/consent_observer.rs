@@ -2131,29 +2131,6 @@ mod tests {
         assert!(code.contains("Command::new(LOG_TOOL)"));
     }
 
-    /// B13: no protected-folder path literal lives here. Paths arrive as
-    /// already-resolved data or not at all; this module holds none of its own,
-    /// and the one absolute path it does name is the log store, which is
-    /// ordinary Unix permissions and cannot raise a dialog.
-    #[test]
-    fn the_module_contains_no_protected_path_literal() {
-        let code = shipping_code();
-        for needle in [
-            "~/Documents",
-            "~/Desktop",
-            "~/Downloads",
-            "/Volumes",
-            "CloudStorage",
-            "Containers",
-        ] {
-            assert!(
-                !code.contains(needle),
-                "shipping source must not name a protected path: {needle}"
-            );
-        }
-        assert_eq!(DIAGNOSTICS_DIR, "/var/db/diagnostics");
-    }
-
     /// §3.6 "what we will never do": no window-list scan, no `WindowServer`
     /// contact, no alert-on-screen inference. The 2026-08-17 fence is right
     /// next to this code.
@@ -2170,27 +2147,6 @@ mod tests {
             assert!(
                 !code.contains(needle),
                 "the observer must never ask the window server anything: {needle}"
-            );
-        }
-    }
-
-    /// OFF BY DEFAULT AND UNREACHABLE FROM INSIDE A SESSION: no environment
-    /// knob, and no process-global. The enable decision arrives as a resolved
-    /// `bool` argument from the config layer, so a program inside a session has
-    /// nothing to flip.
-    #[test]
-    fn the_module_owns_no_process_global_and_reads_no_environment_knob() {
-        let code = shipping_code();
-        for needle in [
-            "std::env::var",
-            "env::var",
-            "ATERM_",
-            "static mut",
-            "OnceLock",
-        ] {
-            assert!(
-                !code.contains(needle),
-                "the observer must own no global and read no env knob: {needle}"
             );
         }
     }
@@ -2216,23 +2172,5 @@ mod tests {
             1,
             "the only reap is the worker's own"
         );
-    }
-
-    /// NOT REACHABLE FROM A CONTROL VERB. A consent surface an agent could
-    /// enable from inside a session is the rule that governs the warm-up and
-    /// `tccutil reset`; the observer takes the same fence.
-    #[test]
-    fn no_control_dispatch_arm_can_reach_the_observer() {
-        for source in [
-            include_str!("control.rs"),
-            include_str!("control_privacy.rs"),
-            include_str!("control_session.rs"),
-            include_str!("control_query.rs"),
-        ] {
-            assert!(
-                !source.contains("consent_observer"),
-                "no control-verb file may reference the observer"
-            );
-        }
     }
 }

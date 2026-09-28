@@ -563,46 +563,19 @@ impl Attribution {
 }
 
 /// RFC3339 (`YYYY-MM-DDTHH:MM:SSZ`) → unix seconds, or `None` for anything this does not
-/// recognise — which every caller treats as LAPSED, never as absent.
+/// recognise — which every caller treats as LAPSED, never as absent. The workspace's one
+/// strict parser, `aterm_types::rfc3339::parse_utc` (this crate's private near-twin of
+/// `atpkg::flow`'s was folded into it 2026-09-25, so the two gates cannot disagree about
+/// the same string).
 ///
-/// Deliberately local and deliberately strict. It is a near-twin of `atpkg::flow`'s
-/// private copy; lifting one shared version into `aterm-types` would be the tidier move,
-/// but that crate is outside this change's ownership and a date parser is not worth a
-/// cross-crate edit to share. The duplication is 20 lines of pure arithmetic with a test
-/// on each side, which is the cheap half of the tradeoff.
-///
-/// The `Z` suffix is REQUIRED and the length exact — the same bar the twin sets, so the
-/// two gates cannot disagree about the same string. A zone-offset stamp (`…+05:30`) names
+/// The `Z` suffix is REQUIRED and the length exact. A zone-offset stamp (`…+05:30`) names
 /// a DIFFERENT instant than the digits ahead of it do, and reading it as UTC would move a
 /// deadline the wrong way: `not_after = "2026-12-31T23:59:59+05:30"` expires at 18:29:59Z,
 /// so a parser that ignored the offset would keep that machine authorizing for another
 /// 5.5 h — up to 14 h at the extreme of the offset range. Fractional seconds and trailing
 /// bytes are refused on the same principle: the producers all emit exactly this shape
 /// (`roster_ops` stamps it), so anything else is a hand-edit this gate must not guess at.
-fn rfc3339_to_unix(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() != 20
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'Z'
-    {
-        return None;
-    }
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let mo: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    let h: i64 = s.get(11..13)?.parse().ok()?;
-    let mi: i64 = s.get(14..16)?.parse().ok()?;
-    let se: i64 = s.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
-        return None;
-    }
-    let days = aterm_types::rfc3339::days_from_civil(y, mo, d);
-    Some(days * 86400 + h * 3600 + mi * 60 + se)
-}
+use aterm_types::rfc3339::parse_utc as rfc3339_to_unix;
 
 impl Roster {
     /// Serialize to the published TOML shape — the producer half, used by the minting tool

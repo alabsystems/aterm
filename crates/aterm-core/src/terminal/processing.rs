@@ -851,6 +851,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // Repaint-blink epoch: bumped by the DEC dispatcher on a DECTCEM hide
         // processed inside DEC-2026 sync (forwarded so the handler can bump).
         repaint_blink_epoch: _,
+        // The foreground handback's asserted evidence: set by the DEC/CSI
+        // dispatchers (forwarded so they can set it), taken by the host.
+        evidence_asserted: _,
         absolute_row_revision: _,
         // --- Session-only (not forwarded to handler) ---
         // Host config's last-applied values for the app-negotiated modes. Kept
@@ -899,6 +902,9 @@ fn _terminal_field_exhaustiveness_check(t: &mut Terminal) {
         // Reused row-text scratch for the kernel's row scan — ephemeral,
         // observation-only, never VT state.
         row_text_scratch: _,
+        // Reused damage-scoped refill row mask — ephemeral render scratch,
+        // never VT state.
+        refill_mask_scratch: _,
         // Lock-free publication of the encoder fold for the input seam:
         // derived FROM VT state under the lock, never an input to the handler.
         mode_mirror: _,

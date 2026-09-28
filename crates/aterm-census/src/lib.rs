@@ -1312,7 +1312,7 @@ mod tests {
         assert!(g.contains("term"));
     }
 
-    /// P63's registering acquire binds the SAME guard: redraw LOCK A is
+    /// P63's registering acquire binds the SAME guard: the redraw's hold is
     /// `let mut term = crate::term_lock_ui(&t.term, ui_waiting, site);`, and a
     /// `term.resize(` under it must stay a hazard (it went blind when the needle
     /// only knew `= term_lock(`). Both the path-qualified and bare spellings, and

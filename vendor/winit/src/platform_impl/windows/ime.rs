@@ -2,8 +2,8 @@ use std::ffi::{c_void, OsString};
 use std::os::windows::prelude::OsStringExt;
 use std::ptr::null_mut;
 
-use windows_sys::Win32::Foundation::{POINT, RECT};
-use windows_sys::Win32::Globalization::HIMC;
+use windows_sys::Win32::Foundation::{HWND, POINT, RECT};
+use windows_sys::Win32::UI::Input::Ime::HIMC;
 use windows_sys::Win32::UI::Input::Ime::{
     ImmAssociateContextEx, ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
     ImmSetCandidateWindow, ImmSetCompositionWindow, ATTR_TARGET_CONVERTED,
@@ -13,7 +13,6 @@ use windows_sys::Win32::UI::Input::Ime::{
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_IMMENABLED};
 
 use crate::dpi::{Position, Size};
-use crate::platform::windows::HWND;
 
 pub struct ImeContext {
     hwnd: HWND,
@@ -144,9 +143,9 @@ impl ImeContext {
         }
 
         if allowed {
-            unsafe { ImmAssociateContextEx(hwnd, 0, IACE_DEFAULT) };
+            unsafe { ImmAssociateContextEx(hwnd, null_mut(), IACE_DEFAULT) };
         } else {
-            unsafe { ImmAssociateContextEx(hwnd, 0, IACE_CHILDREN) };
+            unsafe { ImmAssociateContextEx(hwnd, null_mut(), IACE_CHILDREN) };
         }
     }
 

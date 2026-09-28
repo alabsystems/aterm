@@ -75,12 +75,23 @@ pub(crate) fn trimmed_len<'a>(rows: impl Iterator<Item = &'a str>) -> usize {
 /// grammar — it denied a flag the same catalog entry documents two lines further
 /// on (audit D-9). One `const`, so the two arms and the catalog cannot drift apart
 /// again.
-pub(crate) const TEXT_USAGE: &str = "ERR usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>]\n";
+pub(crate) const TEXT_USAGE: &str =
+    "ERR usage: text [--json] [trim] [tail=<n>|rows=<a>-<b>] [order=<logical|display>]\n";
 
-/// The answer to a `rows=<a>-<b>` span that selects NO row: `b < a`, or `a` past
-/// the last row of the grid. Distinct from the usage line because the grammar was
-/// right — it is the numbers that name nothing.
-pub(crate) const TEXT_BAD_ROWS: &str = "ERR bad rows\n";
+/// The answer to a `rows=<a>-<b>` span with `b < a`, which selects no row on any
+/// grid. Distinct from the usage line because the grammar was right — it is the
+/// numbers that name nothing.
+pub(crate) const ROWS_REVERSED: &str = "ERR bad rows: the span ends before it starts\n";
+
+/// The answer to a row span that meets no row of a `grid_rows`-row grid, with
+/// the rows that do exist. `text rows=` and `await match|gone … rows` refuse in
+/// these same words.
+pub(crate) fn rows_off_grid(grid_rows: usize) -> String {
+    format!(
+        "ERR bad rows: the span meets no visible row (grid rows 0..={})\n",
+        grid_rows.saturating_sub(1)
+    )
+}
 
 /// Which rows of the visible grid a `text` read returns.
 ///
@@ -105,7 +116,7 @@ pub(crate) enum TextShape {
 impl TextShape {
     /// The half-open row range `first..end` this shape selects on a grid of
     /// `grid_rows` rows. `Tail` and `Rows` clamp to the grid; a `Rows` span with no
-    /// row on it is [`TEXT_BAD_ROWS`] — the caller asked for rows that do not exist,
+    /// row on it is [`rows_off_grid`] — the caller asked for rows that do not exist,
     /// which an empty `OK 0` would hide.
     pub(crate) fn select(self, grid_rows: usize) -> Result<(usize, usize), String> {
         match self {
@@ -113,7 +124,7 @@ impl TextShape {
             TextShape::Tail(n) => Ok((grid_rows.saturating_sub(n), grid_rows)),
             TextShape::Rows(a, b) => {
                 if a >= grid_rows {
-                    return Err(TEXT_BAD_ROWS.to_string());
+                    return Err(rows_off_grid(grid_rows));
                 }
                 Ok((a, b.saturating_add(1).min(grid_rows)))
             }
@@ -128,6 +139,28 @@ impl TextShape {
 pub(crate) struct TextArgs {
     pub(crate) trim: bool,
     pub(crate) shape: TextShape,
+    /// `order=display`: each row as the frame PAINTS it — a right-to-left run
+    /// reversed in place, the renderer's own permutation
+    /// ([`Terminal::row_display_order`]) — rather than the logical order a driver
+    /// `send`s against (the default, `order=logical`). The JSON form then also
+    /// carries each row's visual→logical column map.
+    pub(crate) display: bool,
+}
+
+/// One row as [`TextArgs::display`] asks for it: the logical [`visible_row`],
+/// or the display-order text and, when the order is not the identity, the
+/// visual→logical column map (`map[v] == l`: logical column `l` is drawn at
+/// visual column `v`).
+fn row_in_order(t: &Terminal, r: usize, display: bool) -> (String, Option<Vec<usize>>) {
+    if !display {
+        return (visible_row(t, r), None);
+    }
+    let Some((text, map)) = u16::try_from(r).ok().and_then(|r| t.row_display_order(r)) else {
+        return (visible_row(t, r), None);
+    };
+    let text: String = text.chars().map(visible_char).collect();
+    let identity = map.iter().enumerate().all(|(v, &l)| v == l);
+    (text, (!identity).then_some(map))
 }
 
 /// The `text` / `text --json` argument tail: `trim`, and at most ONE of `tail=<n>`
@@ -136,18 +169,31 @@ pub(crate) struct TextArgs {
 /// the dispatch used to drop this tail on the floor, so an agent guessing a modifier
 /// (`text compact`) got the full grid back with no signal that it had guessed wrong
 /// (F4's sub-finding). A well-formed span that names no row (`rows=5-2`) is
-/// [`TEXT_BAD_ROWS`]. The reply line is the `Err` so both arms answer with the same
+/// [`ROWS_REVERSED`]. The reply line is the `Err` so both arms answer with the same
 /// bytes.
 pub(crate) fn text_args(rest: &str) -> Result<TextArgs, String> {
     let usage = || Err(TEXT_USAGE.to_string());
     let mut args = TextArgs::default();
     let mut shaped = false;
+    let mut ordered = false;
     for tok in rest.split_whitespace() {
         if tok == "trim" {
             if args.trim {
                 return usage();
             }
             args.trim = true;
+            continue;
+        }
+        if let Some(order) = tok.strip_prefix("order=") {
+            if ordered {
+                return usage();
+            }
+            args.display = match order {
+                "display" => true,
+                "logical" => false,
+                _ => return usage(),
+            };
+            ordered = true;
             continue;
         }
         if shaped {
@@ -166,7 +212,7 @@ pub(crate) fn text_args(rest: &str) -> Result<TextArgs, String> {
                 return usage();
             };
             if a > b {
-                return Err(TEXT_BAD_ROWS.to_string());
+                return Err(ROWS_REVERSED.to_string());
             }
             TextShape::Rows(a, b)
         } else {
@@ -397,7 +443,7 @@ pub(crate) fn cmd_text_opt(term: &Arc<Mutex<Terminal>>, args: TextArgs) -> Strin
         let rows = end - first;
         let mut body = String::with_capacity(rows * (t.cols() as usize + 1));
         for r in first..end {
-            body.push_str(&visible_row(&t, r));
+            body.push_str(&row_in_order(&t, r, args.display).0);
             body.push('\n');
         }
         (first, rows, body)
@@ -596,20 +642,27 @@ fn read_dims(
     })?
 }
 
-/// Read the grid dimensions for lock-free process metrics without ever waiting
-/// on the terminal mutex. `None` means the terminal was actively locked; callers
-/// expose that as `busy`/JSON `null` while still returning every scheduler and
-/// renderer counter. A poisoned mutex is recoverable, matching [`term_lock`].
-fn try_metrics_dims(term: Option<&Arc<Mutex<Terminal>>>) -> Option<(u32, u32)> {
+/// Read the grid dimensions — and the scrollback loss counter, the one engine
+/// figure `metrics` must carry (2026-09-22: it reached no surface at all, and a
+/// 91k-line flood hole went unnoticed) — for lock-free process metrics without
+/// ever waiting on the terminal mutex. `None` means the terminal was actively
+/// locked; callers expose that as `busy`/JSON `null` while still returning
+/// every scheduler and renderer counter. A poisoned mutex is recoverable,
+/// matching [`term_lock`].
+fn try_metrics_dims(term: Option<&Arc<Mutex<Terminal>>>) -> Option<(u32, u32, u64)> {
     let Some(term) = term else {
-        return Some((0, 0));
+        return Some((0, 0, 0));
+    };
+    let read = |terminal: &Terminal| {
+        (
+            u32::from(terminal.rows()),
+            u32::from(terminal.cols()),
+            terminal.scrollback_truncated_lines(),
+        )
     };
     match term.try_lock() {
-        Ok(terminal) => Some((u32::from(terminal.rows()), u32::from(terminal.cols()))),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-            let terminal = poisoned.into_inner();
-            Some((u32::from(terminal.rows()), u32::from(terminal.cols())))
-        }
+        Ok(terminal) => Some(read(&terminal)),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(read(&poisoned.into_inner())),
         Err(std::sync::TryLockError::WouldBlock) => None,
     }
 }
@@ -877,6 +930,15 @@ pub(crate) fn cmd_dims(
 /// as `n_*` + p50/p95/p99 ms fields, conservative by construction (bucket upper
 /// edge), plus the occluded/parked/capture twin `present_tainted_*`. Same funnel
 /// and honesty bounds as the scalars; zeroed by `metrics reset` like the maxima.
+/// The input legs close the line (`metrics::input_legs_fields_text`):
+/// `out_req_*` is output → redraw request, the first half of `present_*` (the
+/// burst's leading edge to the turn that admits its redraw, once per burst);
+/// `ime_*` is an IME composition's preedit → commit, with `ime_cancelled` for
+/// compositions that ended without one; `input_refused` counts input a full
+/// input queue refused rather than park or queue without bound — keys and
+/// pastes (said once per session in Messages), and mouse, wheel, focus and
+/// colour-scheme reports (silently); `reply_dropped` counts terminal query replies a full reply lane
+/// dropped (a program flooding queries whose answers it never reads).
 pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     let wants_json = rest
@@ -943,6 +1005,7 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return format!(
             "OK n_input={} input_p50_ms={:.2} input_p95_ms={:.2} input_p99_ms={:.2} \
+             input_edges_dropped={} \
              n_present={} present_p50_ms={:.2} present_p95_ms={:.2} present_p99_ms={:.2} \
              n_render={} render_p50_ms={:.2} render_p95_ms={:.2} render_p99_ms={:.2} \
              n_key_write={} key_write_p50_ms={:.2} key_write_p95_ms={:.2} \
@@ -959,11 +1022,15 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
              n_resize={} resize_p50_ms={:.2} resize_p95_ms={:.2} resize_p99_ms={:.2} \
              n_reflow={} reflow_p50_ms={:.2} reflow_p95_ms={:.2} reflow_p99_ms={:.2} \
              n_present_tainted={} present_tainted_p50_ms={:.2} \
-             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2}{}{}{}\n",
+             present_tainted_p95_ms={:.2} present_tainted_p99_ms={:.2} \
+             turns_by_root={}{}{}{}{}\n",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
             p(input, 0.99),
+            // Keystrokes a full per-window edge ring could not hold: their
+            // slices are missing from `input_*`, and this says how many.
+            crate::metrics::input_edges_dropped(),
             present.count(),
             p(present, 0.50),
             p(present, 0.95),
@@ -1010,8 +1077,11 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             p(tainted, 0.50),
             p(tainted, 0.95),
             p(tainted, 0.99),
-            // UI-THREAD TERMINAL-MUTEX WAIT, per acquiring site (redraw LOCK A,
-            // LOCK B fallback, key press): the span the typing audit listed as
+            // THE MAIN-LOOP TURN DISTRIBUTION PER ROOT (responsiveness audit
+            // item 3): the census on the summary line keeps last/max/count only.
+            turns_by_root_pairs(),
+            // UI-THREAD TERMINAL-MUTEX WAIT, per acquiring site (the redraw's one
+            // frame hold, the key press): the span the typing audit listed as
             // unmeasured. Formatted by one helper so text and JSON stay twins.
             text_term_wait_fields(),
             // ECHO ROUND TRIP (audit item 5): the one slice on this line that is
@@ -1022,15 +1092,19 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
             // PRESENT → GLASS: the compositor leg after present-return that
             // every slice above stops short of.
             crate::metrics::present_glass_fields_text(),
+            // THE INPUT LEGS: output → redraw request (the first half of
+            // `present_*`), the IME preedit → commit clock, and the inputs a
+            // full input queue refused.
+            crate::metrics::input_legs_fields_text(),
         );
     }
     if rest.trim() == "reset" {
         crate::metrics::reset();
         crate::echo_rtt::reset();
     }
-    let (rows, cols) = try_metrics_dims(term).map_or_else(
-        || ("busy".to_string(), "busy".to_string()),
-        |(rows, cols)| (rows.to_string(), cols.to_string()),
+    let (rows, cols, truncated) = try_metrics_dims(term).map_or_else(
+        || ("busy".to_string(), "busy".to_string(), "busy".to_string()),
+        |(rows, cols, truncated)| (rows.to_string(), cols.to_string(), truncated.to_string()),
     );
     let m = crate::metrics::snapshot();
     // TAIL SURFACING (audit item 10). The summary used to publish only `last_`
@@ -1057,9 +1131,11 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
     let arms = crate::metrics::deadline_arm_attribution();
     let refill_causes = crate::metrics::frame_refill_full_causes();
     let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
+    let gpu_repaints = crate::metrics::gpu_repaint_counts();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     format!(
-        "OK backend={backend} rows={rows} cols={cols} frames={} \
+        "OK backend={backend} rows={rows} cols={cols} \
+         scrollback_truncated_lines={truncated} frames={} \
          last_present_latency_ms={:.2} max_present_latency_ms={:.2} \
          last_frame_render_ms={:.2} max_frame_render_ms={:.2} \
          slow_frames={} slow_threshold_ms={:.1} \
@@ -1075,6 +1151,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          redraw_attempts={} redraw_early_outs={} redraw_sync_holds={} redraw_retry_gated={} \
          frame_refills_scoped={} frame_refills_full={} frame_refills_skipped={} \
          pet_world_observations={} pet_world_cells={} \
+         fx_glow_quads_last={} fx_under_quads_last={} fx_trail_cells_last={} \
+         fx_under_frames={} \
          frame_refill_full_causes={} \
          offscreen_rasters={} last_offscreen_raster_ms={:.2} \
          max_offscreen_raster_ms={:.2} \
@@ -1088,7 +1166,8 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
          event_wakes={} timer_wakes={} wait_cancelled_wakes={} poll_wakes={} \
          wake_kind={} wake_owner={} wake_late_ms={:.2} deadline_owner={} \
          deadline_in_ms={:.2} deadline_late_ms={:.2} past_deadline_arms={} \
-         deadline_arms_by_owner={} \
+         deadline_arms_by_owner={} deadline_fires_by_owner={} wakes_by_variant={} \
+         gpu_scissor_taken={} gpu_full_repaints={} gpu_scroll_rescues={} \
          past_arm_streak_heals={} \
          stale_arm_heals={}{} \
          max_frame_gap_ms={:.2} \
@@ -1167,6 +1246,10 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         m.frame_refills_skipped,
         m.pet_world_observations,
         m.pet_world_cells,
+        m.fx_glow_quads_last,
+        m.fx_under_quads_last,
+        m.fx_trail_cells_last,
+        m.fx_under_frames,
         refill_cause_pairs(&refill_causes),
         // THE PIXELS THAT NEVER REACH GLASS. `record_offscreen_raster` exists
         // so an `image` / `window` / `snapshot` rasterization stops moving
@@ -1219,6 +1302,11 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         deadline_arm_pairs(&arms),
+        name_count_pairs(&crate::metrics::deadline_fire_attribution()),
+        name_count_pairs(&crate::metrics::user_wake_attribution()),
+        gpu_repaints.0,
+        gpu_repaints.1,
+        gpu_repaints.2,
         streak_heal_pairs(&streak_heals),
         m.stale_arm_heals,
         // WHEN, AND WHOSE (2026-09-15 attribution audit). `wake_late_ms` and
@@ -1327,6 +1415,79 @@ pub(crate) fn cmd_metrics(term: Option<&Arc<Mutex<Terminal>>>, rest: &str) -> St
 /// session-status observer folded under that label. This field names it.
 /// Non-zero owners only, so a healthy instance prints two or three pairs and a
 /// sick one puts its culprit in plain sight.
+/// A sparse `<name>:<count>` ledger for the `metrics` line (`none` when empty,
+/// so a whitespace-splitting reader always gets a token).
+fn name_count_pairs(pairs: &[(&str, u64)]) -> String {
+    if pairs.is_empty() {
+        return "none".to_string();
+    }
+    pairs
+        .iter()
+        .map(|(name, n)| format!("{name}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The same ledger as a JSON object.
+fn name_count_object(pairs: &[(&str, u64)]) -> String {
+    let body = pairs
+        .iter()
+        .map(|(name, n)| format!("\"{}\":{n}", crate::control::json_escape(name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// The main-loop turn distribution per work root (`metrics percentiles`):
+/// `<root>:<n>/<p50>/<p95>/<p99>` in ms, roots with no turn omitted, `none`
+/// when every root is empty.
+fn turns_by_root_pairs() -> String {
+    let rows = turn_root_rows();
+    if rows.is_empty() {
+        return "none".to_string();
+    }
+    rows.iter()
+        .map(|(root, n, p50, p95, p99)| format!("{root}:{n}/{p50:.2}/{p95:.2}/{p99:.2}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// The JSON twin of [`turns_by_root_pairs`].
+fn turns_by_root_object() -> String {
+    let body = turn_root_rows()
+        .iter()
+        .map(|(root, n, p50, p95, p99)| {
+            format!(
+                "\"{root}\":{{\"n\":{n},\"p50_ms\":{p50:.2},\"p95_ms\":{p95:.2},\"p99_ms\":{p99:.2}}}"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{{body}}}")
+}
+
+/// `(root, n, p50_ms, p95_ms, p99_ms)` per work root with at least one turn.
+fn turn_root_rows() -> Vec<(&'static str, u64, f64, f64, f64)> {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    (0..crate::metrics::TURN_ROOT_SLOTS)
+        .filter_map(|slot| {
+            let root = u8::try_from(slot).ok()?;
+            let h = crate::metrics::turn_distribution(root)?;
+            let n = h.count();
+            (n != 0).then(|| {
+                let p = |q: f64| ms(h.percentile(q).unwrap_or(0));
+                (
+                    crate::watchdog::Breadcrumb::from_u8(root).metric_name(),
+                    n,
+                    p(0.50),
+                    p(0.95),
+                    p(0.99),
+                )
+            })
+        })
+        .collect()
+}
+
 fn deadline_arm_pairs(arms: &[crate::metrics::OwnerArms]) -> String {
     if arms.is_empty() {
         // Never emit a bare `key=` — every field in this line carries a token,
@@ -1465,7 +1626,7 @@ fn cell_pipeline_object(cell_ns: &[u64; aterm_gpu::startup_probe::CELL_PIPELINE_
 }
 
 /// The per-site UI-thread terminal-mutex wait fields (text form): for each of
-/// `redraw_a` / `redraw_b` / `press`, ` n_term_wait_<site>=N
+/// `redraw` / `press`, ` n_term_wait_<site>=N
 /// term_wait_<site>_p50_ms=… _p95_ms=… _p99_ms=… max_term_wait_<site>_ms=…`.
 /// Leading space; empty never (the sites are static).
 fn text_term_wait_fields() -> String {
@@ -1517,9 +1678,9 @@ fn json_term_wait_fields() -> String {
 
 /// Structured twin of [`cmd_metrics`]. All scheduler/redraw counters and typed
 /// owner/reason labels are present so automation never has to scrape the text
-/// line. `reset` and `percentiles` retain the text verb's semantics, with one
-/// known gap: the JSON `percentiles` body does not yet carry the text form's
-/// `n_reflow`/`reflow_p50_ms`/`reflow_p95_ms`/`reflow_p99_ms` quartet.
+/// line. `reset` and `percentiles` retain the text verb's semantics, and the
+/// `percentiles` body is a key-for-key twin of the text form
+/// (`every_text_percentiles_key_has_a_json_twin` pins it).
 pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &str) -> String {
     let ms = |ns: u64| ns as f64 / 1e6;
     if command.trim() == "percentiles" {
@@ -1542,11 +1703,13 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         let acquire_queue = crate::metrics::acquire_queue_distribution();
         let (last_queue_ns, max_queue_ns) = crate::metrics::acquire_queue_last_max_ns();
         let resize = crate::metrics::resize_present_distribution();
+        // Twin of the text form's bounds-change -> grid-commit slice (see there).
+        let reflow = crate::metrics::resize_reflow_distribution();
         let tainted = crate::metrics::tainted_present_distribution();
         let p = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
         return json_ok(&format!(
             "{{\"n_input\":{},\"input_p50_ms\":{:.2},\"input_p95_ms\":{:.2},\
-             \"input_p99_ms\":{:.2},\"n_present\":{},\"present_p50_ms\":{:.2},\
+             \"input_p99_ms\":{:.2},\"input_edges_dropped\":{},\"n_present\":{},\"present_p50_ms\":{:.2},\
              \"present_p95_ms\":{:.2},\"present_p99_ms\":{:.2},\"n_render\":{},\
              \"render_p50_ms\":{:.2},\"render_p95_ms\":{:.2},\"render_p99_ms\":{:.2},\
              \"n_key_write\":{},\"key_write_p50_ms\":{:.2},\"key_write_p95_ms\":{:.2},\
@@ -1565,13 +1728,18 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
              \"last_acquire_queue_ms\":{:.2},\"max_acquire_queue_ms\":{:.2},\
              \"n_resize\":{},\
              \"resize_p50_ms\":{:.2},\"resize_p95_ms\":{:.2},\
-             \"resize_p99_ms\":{:.2},\"n_present_tainted\":{},\
+             \"resize_p99_ms\":{:.2},\
+             \"n_reflow\":{},\"reflow_p50_ms\":{:.2},\"reflow_p95_ms\":{:.2},\
+             \"reflow_p99_ms\":{:.2},\"n_present_tainted\":{},\
              \"present_tainted_p50_ms\":{:.2},\"present_tainted_p95_ms\":{:.2},\
-             \"present_tainted_p99_ms\":{:.2}{}{}{}}}",
+             \"present_tainted_p99_ms\":{:.2},\"turns_by_root\":{}{}{}{}{}}}",
             input.count(),
             p(input, 0.50),
             p(input, 0.95),
             p(input, 0.99),
+            // Keystrokes a full per-window edge ring could not hold: their
+            // slices are missing from `input_*`, and this says how many.
+            crate::metrics::input_edges_dropped(),
             present.count(),
             p(present, 0.50),
             p(present, 0.95),
@@ -1610,25 +1778,33 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
             p(resize, 0.50),
             p(resize, 0.95),
             p(resize, 0.99),
+            reflow.count(),
+            p(reflow, 0.50),
+            p(reflow, 0.95),
+            p(reflow, 0.99),
             tainted.count(),
             p(tainted, 0.50),
             p(tainted, 0.95),
             p(tainted, 0.99),
+            // Twin of the text form's per-root turn distribution.
+            turns_by_root_object(),
             // Field-for-field twin of the text form's term-wait fragment.
             json_term_wait_fields(),
             // Field-for-field twin of the text form's echo fragment.
             crate::echo_rtt::percentile_fields_json(),
             // Field-for-field twin of the text form's present→glass fragment.
             crate::metrics::present_glass_fields_json(),
+            // Field-for-field twin of the text form's input-leg fragment.
+            crate::metrics::input_legs_fields_json(),
         ));
     }
     if command.trim() == "reset" {
         crate::metrics::reset();
         crate::echo_rtt::reset();
     }
-    let (rows, cols) = try_metrics_dims(term).map_or_else(
-        || ("null".to_string(), "null".to_string()),
-        |(rows, cols)| (rows.to_string(), cols.to_string()),
+    let (rows, cols, truncated) = try_metrics_dims(term).map_or_else(
+        || ("null".to_string(), "null".to_string(), "null".to_string()),
+        |(rows, cols, truncated)| (rows.to_string(), cols.to_string(), truncated.to_string()),
     );
     let m = crate::metrics::snapshot();
     // Same tail surfacing and same honesty split as the text form — the child's
@@ -1636,12 +1812,14 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
     // never has to scrape the line.
     let (h_input, h_present, _) = crate::metrics::distributions();
     let pct = |h: &crate::metrics::Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    let gpu_repaints = crate::metrics::gpu_repaint_counts();
     let arms = crate::metrics::deadline_arm_attribution();
     let refill_causes = crate::metrics::frame_refill_full_causes();
     let streak_heals = crate::metrics::past_arm_streak_heal_attribution();
     let backend = if m.backend_gpu { "gpu" } else { "cpu" };
     json_ok(&format!(
         "{{\"backend\":\"{backend}\",\"rows\":{rows},\"cols\":{cols},\
+         \"scrollback_truncated_lines\":{truncated},\
          \"frames\":{},\"last_present_latency_ms\":{:.2},\"max_present_latency_ms\":{:.2},\
          \"last_frame_render_ms\":{:.2},\"max_frame_render_ms\":{:.2},\"slow_frames\":{},\
          \"slow_threshold_ms\":{:.1},\"last_input_present_ms\":{:.2},\
@@ -1659,6 +1837,8 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"frame_refills_scoped\":{},\"frame_refills_full\":{},\
          \"frame_refills_skipped\":{},\
          \"pet_world_observations\":{},\"pet_world_cells\":{},\
+         \"fx_glow_quads_last\":{},\"fx_under_quads_last\":{},\"fx_trail_cells_last\":{},\
+         \"fx_under_frames\":{},\
          \"frame_refill_full_causes\":{},\
          \"offscreen_rasters\":{},\"last_offscreen_raster_ms\":{:.2},\
          \"max_offscreen_raster_ms\":{:.2},\"pre_present_attempts\":{},\
@@ -1675,7 +1855,9 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
          \"poll_wakes\":{},\"wake_kind\":\"{}\",\"wake_owner\":\"{}\",\
          \"wake_late_ms\":{:.2},\"deadline_owner\":\"{}\",\"deadline_in_ms\":{:.2},\
          \"deadline_late_ms\":{:.2},\"past_deadline_arms\":{},\
-         \"deadline_arms_by_owner\":{},\"past_arm_streak_heals\":{},\
+         \"deadline_arms_by_owner\":{},\"deadline_fires_by_owner\":{},\
+         \"wakes_by_variant\":{},\"gpu_scissor_taken\":{},\"gpu_full_repaints\":{},\
+         \"gpu_scroll_rescues\":{},\"past_arm_streak_heals\":{},\
          \"stale_arm_heals\":{}{},\
          \"max_frame_gap_ms\":{:.2},\
          \"rust_main_to_first_present_ms\":{:.2},\
@@ -1753,6 +1935,10 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         m.frame_refills_skipped,
         m.pet_world_observations,
         m.pet_world_cells,
+        m.fx_glow_quads_last,
+        m.fx_under_quads_last,
+        m.fx_trail_cells_last,
+        m.fx_under_frames,
         refill_cause_object(&refill_causes),
         // Field-for-field twin of the text form's offscreen-raster ledger.
         m.offscreen_rasters,
@@ -1788,6 +1974,11 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
         ms(m.last_deadline_late_ns),
         m.past_deadline_arms,
         deadline_arm_object(&arms),
+        name_count_object(&crate::metrics::deadline_fire_attribution()),
+        name_count_object(&crate::metrics::user_wake_attribution()),
+        gpu_repaints.0,
+        gpu_repaints.1,
+        gpu_repaints.2,
         streak_heal_object(&streak_heals),
         m.stale_arm_heals,
         // Field-for-field twin of the text summary's lateness fragment.
@@ -1864,9 +2055,45 @@ pub(crate) fn cmd_metrics_json(term: Option<&Arc<Mutex<Terminal>>>, command: &st
 
 /// `lines` -> `OK <total_scrollback_lines>\n` — how many lines of history
 /// (tiered + ring-buffer scrollback) currently exist above the visible screen.
+/// Once history has been LOST to a flood cut (the engine dropped output that
+/// arrived faster than its compression worker could retain it), the reply is
+/// `OK <n> truncated=<k>\n`: the field appears only when `k > 0`, so a reader
+/// of the bare count keeps working until there is something it has to know,
+/// and a count that looks complete is never silently short (2026-09-22: 120k
+/// lines printed, `lines` said 28,171, and nothing said 91k were missing).
 pub(crate) fn cmd_lines(term: &Arc<Mutex<Terminal>>) -> String {
     let t = term_lock(term);
-    format!("OK {}\n", t.grid().scrollback_lines())
+    lines_reply(t.grid().scrollback_lines(), t.scrollback_truncated_lines())
+}
+
+/// `mainscreen`: force the PRIMARY screen of the resolved target — the host's
+/// recovery for an alternate screen a killed full-screen app left up with no
+/// `?1049l` (`TerminalHandler::leave_orphaned_alternate_screen` in aterm-core has
+/// the ConPTY measurement), for a shell that sends no OSC 133 prompt mark to
+/// trigger the engine's own recovery. The engine does the whole job under its
+/// own batch (`Terminal::leave_alternate_screen`: the alt grid's last frame goes
+/// to the archive whole, then the exit the dead app's reset would have been);
+/// this is the wire face plus the repaint the swap needs. Host-based like the
+/// selection verbs, so it is correct cross-session, and `OK left=<0|1>` states
+/// what happened rather than echoing the request.
+pub(crate) fn cmd_mainscreen(host: &impl aterm_control::SessionHost, sid: u64) -> String {
+    let Some(left) = host.with_terminal_mut(sid, Terminal::leave_alternate_screen) else {
+        return "ERR no such session\n".to_string();
+    };
+    if left {
+        host.request_redraw(sid);
+    }
+    format!("OK left={}\n", u8::from(left))
+}
+
+/// The `lines` reply for `lines` retained and `truncated` lost — the one
+/// formatter, so the "only when nonzero" rule is testable without a flood.
+fn lines_reply(lines: usize, truncated: u64) -> String {
+    if truncated > 0 {
+        format!("OK {lines} truncated={truncated}\n")
+    } else {
+        format!("OK {lines}\n")
+    }
 }
 
 /// The `offscreen` grammar, as the wire states it on a usage error. ONE constant:
@@ -2223,6 +2450,72 @@ pub(crate) fn abs_row_wrapped(t: &Terminal, abs_row: u64) -> bool {
         .is_some_and(aterm_core::grid::Row::is_wrapped)
 }
 
+/// Append the text and soft-wrap flag of absolute rows `first..first + count`
+/// to `text` and `wrapped` — row for row what [`abs_row_text`] and
+/// [`abs_row_wrapped`] answer, an evicted or unreadable row reading as an
+/// empty, unwrapped one.
+///
+/// The scrollback part is read through ONE dense walk
+/// ([`Grid::history_lines_from`]): one decode per tiered segment, the text and
+/// the wrap flag taken from the same yielded line. Reading it through the two
+/// per-row readers paid a binary search, a block-cache probe and a `Line` clone
+/// per tiered row, twice. Rows stay keyed by position — an undecodable segment
+/// yields one placeholder per line it spans — so every later row keeps its
+/// absolute coordinate. The visible rows keep the combining-aware per-row
+/// reader (FIDELITY I-1). Pinned against the per-row readers by
+/// `abs_rows_read_matches_the_per_row_readers_*`.
+pub(crate) fn read_abs_rows(
+    t: &Terminal,
+    first: u64,
+    count: usize,
+    text: &mut Vec<String>,
+    wrapped: &mut Vec<bool>,
+) {
+    let grid = t.grid();
+    let oldest = grid.oldest_absolute_row();
+    let history_end = oldest.saturating_add(grid.scrollback_lines() as u64);
+    let end = first.saturating_add(count as u64);
+    let rows_until = |bound: u64, from: u64| {
+        usize::try_from(bound.min(end).saturating_sub(from)).unwrap_or(usize::MAX)
+    };
+    let mut abs = first;
+    // Rows scrolled past the cap.
+    let evicted = rows_until(oldest, abs);
+    text.extend(std::iter::repeat_n(String::new(), evicted));
+    wrapped.extend(std::iter::repeat_n(false, evicted));
+    abs = abs.saturating_add(evicted as u64);
+    // Scrollback, through the dense walk. The oldest retained row is never a
+    // continuation (`abs_row_wrapped`'s rule): its run's head is gone.
+    let in_history = rows_until(history_end, abs);
+    if in_history > 0 {
+        let start = abs - oldest;
+        let mut lines = grid.history_lines_from(usize::try_from(start).unwrap_or(usize::MAX));
+        for k in 0..in_history {
+            match lines.next().flatten() {
+                Some(line) => {
+                    wrapped.push((start > 0 || k > 0) && line.is_wrapped());
+                    text.push(line.to_string());
+                }
+                None => {
+                    wrapped.push(false);
+                    text.push(String::new());
+                }
+            }
+        }
+        abs = abs.saturating_add(in_history as u64);
+    }
+    // The visible screen, and anything past its bottom. Counted, not bounded by
+    // `end`, so exactly `count` rows are appended whatever saturates.
+    for _ in evicted.saturating_add(in_history)..count {
+        text.push(match abs_row_text(t, abs) {
+            AbsRow::Text(s) => s,
+            AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
+        });
+        wrapped.push(abs_row_wrapped(t, abs));
+        abs = abs.saturating_add(1);
+    }
+}
+
 /// How far back a logical-line walk will look for the row a soft-wrap run
 /// starts on. A run this long is not a wrapped sentence, it is a file with no
 /// newlines catted into the grid, and the walk runs once per anchored search —
@@ -2255,7 +2548,7 @@ pub(crate) fn logical_origin(t: &Terminal, abs_row: u64, floor: u64) -> Option<u
 /// `<abs_row> <col> <len>` per match.
 ///
 /// SEARCH-1: backed by the engine's real `TerminalSearch`, indexing BOTH the
-/// SCROLLBACK (`get_history_line(0..scrollback_lines)`) AND the visible rows
+/// SCROLLBACK (one dense walk, [`read_abs_rows`]) AND the visible rows
 /// with grapheme-aware text — so a term that has scrolled OFF the screen is
 /// still found, not just the visible page. Each match's row is an ABSOLUTE row
 /// (B-2's one coordinate space): feed it straight to `line`/`text`, which
@@ -3101,9 +3394,10 @@ pub(crate) fn search_full_history_direction(
     // Miss: snapshot only the newest suffix the configured index can retain.
     // Copying/indexing an older prefix merely to trigger repeated 25%-evictions
     // made cold search scale with unsearchable history (and churn O(n log n)
-    // key sorts). `abs_row_text` converts each retained absolute row against the
-    // LIVE frame at read time, so a row that scrolls off mid-snapshot reads as
-    // evicted (empty) — exactly what a fresh build under the shifted frame lacks.
+    // key sorts). `read_abs_rows` converts each chunk's absolute rows against
+    // the LIVE frame at read time, so a row that scrolls off mid-snapshot reads
+    // as evicted (empty) — exactly what a fresh build under the shifted frame
+    // lacks.
     let visible_base = usize::try_from(oldest.saturating_add(scrollback_u64)).unwrap_or(usize::MAX);
     let reusable = take_reusable_search_index(
         term,
@@ -3130,7 +3424,18 @@ pub(crate) fn search_full_history_direction(
         // was visible and then scrolled away between searches cannot retain
         // stale text. This remains bounded to the old visible rows plus newly
         // appended rows (and is clipped at the retained-history floor).
-        (index, previous_visible_base.max(retained_base))
+        //
+        // Or from the CURRENT boundary when that is lower: a rows-grow that
+        // reveals history (`Terminal::resize`, native policy) hands history
+        // rows back to the screen under their own keys, with no epoch or
+        // revision move, and there they are editable again — the audit's
+        // repaint over the revealed band (2026-09-22) left `grow 22` reported
+        // on the row that then held `grow 38`, and `grow 38` not found at all.
+        // `Terminal::indexed_search` takes the same minimum for the same reason.
+        (
+            index,
+            previous_visible_base.min(visible_base).max(retained_base),
+        )
     } else {
         (
             TerminalSearch::with_capacity_and_max(retained_total, max_lines),
@@ -3185,19 +3490,21 @@ pub(crate) fn search_full_history_direction(
         {
             torn = true;
         }
-        let end = (lines.len() + SNAPSHOT_CHUNK_LINES).min(snapshot_lines);
-        for j in lines.len()..end {
-            let abs = snapshot_start_u64.saturating_add(u64::try_from(j).unwrap_or(u64::MAX));
-            let text = match abs_row_text(&t, abs) {
-                AbsRow::Text(s) => s,
-                AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
-            };
-            // The FIRST snapshot row starts a logical line by construction (the
-            // walk above put it on one), whatever the grid says about the row
-            // above it — the index has nothing older to join it to.
-            wrapped.push(j > 0 && abs_row_wrapped(&t, abs));
-            lines.push(text);
-        }
+        let done = lines.len();
+        let chunk = SNAPSHOT_CHUNK_LINES.min(snapshot_lines - done);
+        read_abs_rows(
+            &t,
+            snapshot_start_u64.saturating_add(u64::try_from(done).unwrap_or(u64::MAX)),
+            chunk,
+            &mut lines,
+            &mut wrapped,
+        );
+    }
+    // The FIRST snapshot row starts a logical line by construction (the walk
+    // above put it on one), whatever the grid says about the row above it — the
+    // index has nothing older to join it to.
+    if let Some(first) = wrapped.first_mut() {
+        *first = false;
     }
     join_wrapped_rows(&mut lines, &wrapped, wrap.cols);
 
@@ -3656,14 +3963,11 @@ fn store_search_snapshot(snapshot: SearchSnapshot) {
 /// `event` is the same fact as the `PressCustody` model's `last_event` tag, so a
 /// driving client can compare a live terminal against the spec's own vocabulary:
 /// 0 a user gesture, 1 typing, 2 an auto-repeat tick, 3 a bare modifier, 4 a release,
-/// 5 output that missed the selected rows, 6 output that REPLACED them, 7 output that
-/// invalidated the coordinate space. It reads `-` for
-/// `OutputTookTheSelectionUnattributed`, which is a real answer with NO model action:
-/// output took the highlight for one of the five reasons `post_process` cannot
-/// attribute to a damage band, so the model has no name for it and the tag space has
-/// no room for it. That is still strictly better than the `last=none` this case used
-/// to print, which was indistinguishable from a terminal that had never done
-/// anything — and it rules out the keyboard, which is what the user wanted to know.
+/// 5 output that missed the selected rows, 6 output that TOOK the highlight (it
+/// replaced the selected rows, or `post_process` failed closed on it —
+/// `OutputTookTheSelectionUnattributed`, which rules out the keyboard), 7 output that
+/// invalidated the coordinate space, 8 a user gesture back toward live that is not
+/// typing. It reads `-` only with `last=none`.
 ///
 /// `owner` is DERIVED from the offset (`TailOwnerAtBottom`: an offset above the tail
 /// means the user owns the viewport), never carried separately — the same derivation
@@ -3677,17 +3981,7 @@ pub(crate) fn cmd_custody(term: &Arc<Mutex<Terminal>>) -> String {
     let offset = t.grid().display_offset();
     let (last, event) = t.last_custody_transition().map_or_else(
         || ("none".to_string(), "-".to_string()),
-        |c| {
-            let tag = c.last_event();
-            // A negative tag is deliberately outside the model's `0..=7` space — see
-            // `CustodyTransition::OutputTookTheSelectionUnattributed`.
-            let event = if tag < 0 {
-                "-".to_string()
-            } else {
-                tag.to_string()
-            };
-            (c.action().to_string(), event)
-        },
+        |c| (c.action().to_string(), c.last_event().to_string()),
     );
     let changed = t
         .last_custody_change()
@@ -4049,16 +4343,19 @@ pub(crate) fn cmd_text_json_read(
     // reply still describes one instant; the escaping and JSON assembly are pure
     // string work over owned data, and doing them under the mutex made the PTY
     // reader's `process()` and the frame snapshot queue behind a screen read.
-    let (rows_text, c, vis, style, rows, cols, seq, generation, first) = {
+    let (rows_text, maps, c, vis, style, rows, cols, seq, generation, first) = {
         let t = term_lock(term);
         let rows = t.rows() as usize;
         let (first, end) = match args.shape.select(rows) {
             Ok(span) => span,
             Err(err) => return err,
         };
-        let rows_text: Vec<String> = (first..end).map(|r| visible_row(&t, r)).collect();
+        let (rows_text, maps): (Vec<String>, Vec<Option<Vec<usize>>>) = (first..end)
+            .map(|r| row_in_order(&t, r, args.display))
+            .unzip();
         (
             rows_text,
+            maps,
             t.cursor(),
             t.cursor_visible(),
             cursor_style_name(t.cursor_style()),
@@ -4108,6 +4405,31 @@ pub(crate) fn cmd_text_json_read(
         }
         if first > 0 {
             let _ = write!(out, ",\"first\":{first}");
+        }
+        // `order=display`: the rows above are painted order, and `display_map[i]`
+        // is row i's visual→logical column map — `null` where the order is the
+        // identity (a pure left-to-right row), so only the rows that moved pay.
+        if args.display {
+            out.push_str(",\"order\":\"display\",\"display_map\":[");
+            for (i, map) in maps.iter().take(sent).enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                match map {
+                    None => out.push_str("null"),
+                    Some(map) => {
+                        out.push('[');
+                        for (j, l) in map.iter().enumerate() {
+                            if j > 0 {
+                                out.push(',');
+                            }
+                            let _ = write!(out, "{l}");
+                        }
+                        out.push(']');
+                    }
+                }
+            }
+            out.push(']');
         }
         out.push('}');
     }
@@ -5212,7 +5534,7 @@ mod tests {
         );
         assert_eq!(
             cmd_custody(&term),
-            "OK last=OutputTookTheSelectionUnattributed event=- \
+            "OK last=OutputTookTheSelectionUnattributed event=6 \
              changed=OutputTookTheSelectionUnattributed \
              took_selection=OutputTookTheSelectionUnattributed offset=0 owner=tail \
              selection=no scrollback=2\n",
@@ -5740,6 +6062,50 @@ mod tests {
         assert!(cmd_search(&term, "OLD_VISIBLE_TOKEN").starts_with("OK 0"));
     }
 
+    /// The other direction: a rows-grow that REVEALS history moves the visible
+    /// boundary DOWN (to lower rows), and the revealed rows are editable again.
+    /// The refresh must start at the lower of the two boundaries, or a repaint
+    /// over the revealed band stays invisible to search — the audit's stale
+    /// `grow 22` reported on the row holding `grow 38`, with `grow 38` itself
+    /// not found (2026-09-22, a conhost repaint after a native reveal).
+    #[test]
+    fn incremental_refresh_re_reads_rows_a_rows_grow_revealed_and_output_rewrote() {
+        let _serial = super::search_cap_test_guard();
+        let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
+        for i in 0..10 {
+            term.lock().unwrap().process(format!("L{i}\r\n").as_bytes());
+        }
+        assert!(cmd_search(&term, "L4").starts_with("OK 1"), "primed");
+
+        // L3..L6 come back on screen as rows 0..3, then a full-viewport
+        // repaint (conhost's shape: `CSI H`, `<text> CSI K` per row) paints the
+        // pre-grow viewport over them.
+        term.lock().unwrap().resize(8, 20);
+        assert_eq!(term.lock().unwrap().grid().scrollback_lines(), 3);
+        let mut repaint = b"\x1b[HL7\x1b[K\r\nL8\x1b[K\r\nL9\x1b[K".to_vec();
+        repaint.extend_from_slice(&b"\r\n\x1b[K".repeat(5));
+        repaint.extend_from_slice(b"\x1b[4;1H");
+        term.lock().unwrap().process(&repaint);
+
+        assert!(
+            cmd_search(&term, "L4").starts_with("OK 0"),
+            "a line the repaint overwrote is gone"
+        );
+        let hit = cmd_search(&term, "L9");
+        let mut lines = hit.lines();
+        assert_eq!(lines.next(), Some("OK 1"), "{hit}");
+        let row: u64 = lines
+            .next()
+            .and_then(|l| l.split(' ').next())
+            .and_then(|r| r.parse().ok())
+            .expect("a match row");
+        assert_eq!(
+            row_text(&term, row),
+            "L9",
+            "reported on the row it is printed on"
+        );
+    }
+
     /// A soft-wrap run is indexed as ONE line keyed at the row it starts on, so
     /// an incremental refresh that began INSIDE a run would leave that run's
     /// head holding text for rows the refresh has since re-read — a hit spliced
@@ -6202,601 +6568,342 @@ mod tests {
         );
     }
 
+    /// The JSON `percentiles` body is a KEY-FOR-KEY twin of the text form. A
+    /// hand-listed key set is what let the text form's `n_reflow` quartet ship
+    /// without its JSON twin; this walks every `key=` the text line publishes
+    /// instead, so a field added to one form only fails here.
     #[test]
-    fn metrics_json_exposes_redraw_scheduler_and_drop_diagnostics() {
-        let text = super::cmd_metrics(None, "");
-        for field in [
-            "redraw_attempts=",
-            "redraw_retry_gated=",
-            "frame_refills_scoped=",
-            "frame_refills_full=",
+    fn every_text_percentiles_key_has_a_json_twin() {
+        let text = super::cmd_metrics(None, "percentiles");
+        let body = text
+            .strip_prefix("OK ")
+            .expect("text percentiles is an OK line");
+        let json = super::cmd_metrics_json(None, "percentiles");
+        let json_body = json.strip_prefix("OK 1\n").unwrap().trim_end();
+        let value: aterm_json::Value = aterm_json::from_str(json_body).unwrap();
+        let mut keys = 0;
+        for token in body.split_whitespace() {
+            let Some((key, _)) = token.split_once('=') else {
+                continue;
+            };
+            keys += 1;
+            assert!(
+                value.get(key).is_some(),
+                "text percentiles publishes `{key}` but the JSON twin omits it"
+            );
+        }
+        assert!(
+            keys > 40,
+            "the text form parsed to only {keys} keys: {text}"
+        );
+    }
+
+    /// THE METRICS WIRE CONTRACT, ONE TABLE. Every published field, and every form it
+    /// rides: the summary text a driver reads by default (`ST`), its JSON twin (`SJ`),
+    /// and the `percentiles` text/JSON pair (`PT`/`PJ`). A field is pinned in every form
+    /// its row names, so none can go dark in one form only — the gap `acquire_*` had
+    /// until it was published here. The text forms are matched by KEY (a whitespace
+    /// token starting `name=`), never by substring.
+    ///
+    /// Two families publish their own field lists and are pinned from them, so a field
+    /// added to either rides both summary forms without touching this test, and the
+    /// guard-the-guard rows keep the lists from going vacuous:
+    /// - `echo_rtt` — the CHILD's echo round trip, the one slice that says whether a
+    ///   laggy session is aterm or the program on the far side of the PTY. It may not
+    ///   publish a percentile apart from the sample/coalesce/expiry ledger that
+    ///   qualifies it (a lag report once blamed aterm from `input_p99_ms` while the
+    ///   unread `echo_p99_ms=150.04` sat against aterm's own `key_write_p99_ms=6.29`).
+    /// - the main-loop TURN CENSUS — a 100–600 ms park in a NON-redraw handler left no
+    ///   attributable trace while still charged to `present_latency`; a max may not be
+    ///   published apart from the count and long-turn tally that qualify it.
+    #[test]
+    fn every_metrics_field_rides_every_form_its_row_names() {
+        const ST: u8 = 1;
+        const SJ: u8 = 2;
+        const PT: u8 = 4;
+        const PJ: u8 = 8;
+        const SUMMARY: u8 = ST | SJ;
+        const PERCENTILES: u8 = PT | PJ;
+        const ALL: u8 = SUMMARY | PERCENTILES;
+        let rows: &[(&str, u8)] = &[
+            // THE SUMMARY: the redraw scheduler, the refill and drop diagnostics, the
+            // startup ledgers and the tails a healthy median must never hide.
+            ("redraw_attempts", SUMMARY),
+            ("redraw_retry_gated", SUMMARY),
+            ("frame_refills_scoped", SUMMARY),
+            ("frame_refills_full", SUMMARY),
             // The effect-only reuse gate's honesty term: scoped + full + skipped
             // is still one per presented non-rescan frame.
-            "frame_refills_skipped=",
+            ("frame_refills_skipped", SUMMARY),
             // The resident pet's per-frame world walk, as a pair: how many
             // observations ran, and how many cells they classified between
             // them. The effects lane's one unconditional O(window) cost, now
             // readable from a live instance instead of a bench alone.
-            "pet_world_observations=",
-            "pet_world_cells=",
-            "frame_refill_full_causes=",
-            "last_pre_present_ms=",
-            "pre_present_total_ms=",
-            "last_present_drop_reason=",
-            "wake_owner=",
-            "deadline_owner=",
-            "past_deadline_arms=",
+            ("pet_world_observations", SUMMARY),
+            ("pet_world_cells", SUMMARY),
+            // The compose-side prim counters (RELEASE-PROOF-DISCIPLINE item 6).
+            ("fx_glow_quads_last", SUMMARY),
+            ("fx_under_quads_last", SUMMARY),
+            ("fx_trail_cells_last", SUMMARY),
+            ("fx_under_frames", SUMMARY),
+            ("frame_refill_full_causes", SUMMARY),
+            ("last_pre_present_ms", SUMMARY),
+            ("pre_present_total_ms", SUMMARY),
+            ("last_present_drop_reason", SUMMARY),
+            ("wake_owner", SUMMARY),
+            ("deadline_owner", SUMMARY),
+            ("past_deadline_arms", SUMMARY),
             // ITEM 6: the per-owner ledger that names a spin's producer.
-            "deadline_arms_by_owner=",
+            ("deadline_arms_by_owner", SUMMARY),
+            // Responsiveness audit items 2 and 5: fires apart from arms, the
+            // proxy events by variant, and the GPU repaint scope.
+            ("deadline_fires_by_owner", SUMMARY),
+            ("wakes_by_variant", SUMMARY),
+            ("gpu_scissor_taken", SUMMARY),
+            ("gpu_full_repaints", SUMMARY),
+            ("gpu_scroll_rescues", SUMMARY),
             // ITEMS 18/19: the per-owner ledger that names the spin the fold
             // is actively healing (the windowed past-arm streak clamp).
-            "past_arm_streak_heals=",
+            ("past_arm_streak_heals", SUMMARY),
             // ITEM 10 tail surfacing: a healthy median must never again be the
             // only thing the summary shows.
-            "n_input=",
-            "input_p50_ms=",
-            "input_p95_ms=",
-            "input_p99_ms=",
-            "n_present=",
-            "present_p95_ms=",
-            "present_p99_ms=",
+            ("n_input", ST | SJ | PJ),
+            ("input_p50_ms", SUMMARY),
+            ("input_p95_ms", SUMMARY),
+            ("input_p99_ms", ST | SJ | PJ),
+            ("n_present", ST | SJ | PJ),
+            ("present_p95_ms", SUMMARY),
+            ("present_p99_ms", ST | SJ | PJ),
             // ITEM 10 honesty split: the diverted samples stay VISIBLE.
-            "present_tainted=",
-            "max_present_tainted_ms=",
-            "capture_episodes=",
-            "capture_active=",
-            "stale_arm_heals=",
-            "rust_main_to_first_present_ms=",
-            "startup_phase_schema=",
-            "startup_phase_valid=",
-            "startup_router_ms=",
-            "startup_gui_prepare_ms=",
-            "startup_winit_dispatch_ms=",
-            "startup_initial_surface_attach_ms=",
-            "startup_surface_to_successful_redraw_ms=",
-            "startup_successful_compose_ms=",
-            "startup_successful_surface_transaction_ms=",
-            "startup_successful_finalize_ms=",
-            "startup_attach_schema=",
-            "startup_attach_valid=",
-            "startup_attach_dispatch_ms=",
-            "startup_attach_prepare_ms=",
-            "startup_attach_window_create_ms=",
-            "startup_attach_window_setup_ms=",
-            "startup_attach_backend_finalize_ms=",
-            "startup_attach_chrome_geometry_ms=",
-            "startup_attach_surface_create_ms=",
-            "startup_attach_finish_ms=",
-            "startup_worker_schema=",
-            "startup_worker_valid=",
-            "startup_worker_total_ms=",
-            "startup_worker_overlap_ms=",
-            "startup_worker_after_join_ms=",
-            "startup_worker_post_join_ms=",
-            "startup_worker_gpu_build_ms=",
-            "startup_worker_font_seal_ms=",
-            "startup_worker_epilogue_ms=",
-            "startup_gpu_schema=",
-            "startup_gpu_valid=",
-            "startup_gpu_instance_ms=",
-            "startup_gpu_adapter_ms=",
-            "startup_gpu_device_ms=",
-            "startup_gpu_font_thread_ms=",
-            "startup_gpu_font_join_ms=",
-            "startup_gpu_pipelines_ms=",
-            "startup_gpu_pipe_cell_ms=",
-            "startup_gpu_tail_ms=",
-            "startup_gpu_cell_pipeline_ms=",
+            ("present_tainted", SUMMARY),
+            ("max_present_tainted_ms", SUMMARY),
+            ("capture_episodes", SUMMARY),
+            ("capture_active", SUMMARY),
+            ("stale_arm_heals", SUMMARY),
+            ("rust_main_to_first_present_ms", SUMMARY),
+            ("startup_phase_schema", SUMMARY),
+            ("startup_phase_valid", SUMMARY),
+            ("startup_router_ms", SUMMARY),
+            ("startup_gui_prepare_ms", SUMMARY),
+            ("startup_winit_dispatch_ms", SUMMARY),
+            ("startup_initial_surface_attach_ms", SUMMARY),
+            ("startup_surface_to_successful_redraw_ms", SUMMARY),
+            ("startup_successful_compose_ms", SUMMARY),
+            ("startup_successful_surface_transaction_ms", SUMMARY),
+            ("startup_successful_finalize_ms", SUMMARY),
+            ("startup_attach_schema", SUMMARY),
+            ("startup_attach_valid", SUMMARY),
+            ("startup_attach_dispatch_ms", SUMMARY),
+            ("startup_attach_prepare_ms", SUMMARY),
+            ("startup_attach_window_create_ms", SUMMARY),
+            ("startup_attach_window_setup_ms", SUMMARY),
+            ("startup_attach_backend_finalize_ms", SUMMARY),
+            ("startup_attach_chrome_geometry_ms", SUMMARY),
+            ("startup_attach_surface_create_ms", SUMMARY),
+            ("startup_attach_finish_ms", SUMMARY),
+            ("startup_worker_schema", SUMMARY),
+            ("startup_worker_valid", SUMMARY),
+            ("startup_worker_total_ms", SUMMARY),
+            ("startup_worker_overlap_ms", SUMMARY),
+            ("startup_worker_after_join_ms", SUMMARY),
+            ("startup_worker_post_join_ms", SUMMARY),
+            ("startup_worker_gpu_build_ms", SUMMARY),
+            ("startup_worker_font_seal_ms", SUMMARY),
+            ("startup_worker_epilogue_ms", SUMMARY),
+            ("startup_gpu_schema", SUMMARY),
+            ("startup_gpu_valid", SUMMARY),
+            ("startup_gpu_instance_ms", SUMMARY),
+            ("startup_gpu_adapter_ms", SUMMARY),
+            ("startup_gpu_device_ms", SUMMARY),
+            ("startup_gpu_font_thread_ms", SUMMARY),
+            ("startup_gpu_font_join_ms", SUMMARY),
+            ("startup_gpu_pipelines_ms", SUMMARY),
+            ("startup_gpu_pipe_cell_ms", SUMMARY),
+            ("startup_gpu_tail_ms", SUMMARY),
+            ("startup_gpu_cell_pipeline_ms", SUMMARY),
             // The demand-build ledger: `0` on a default launch is the standing
             // proof the nine effect pipelines are not compiled for pixels the
             // config never draws.
-            "effect_pipeline_builds=",
-            "effect_pipeline_build_ms=",
-            "effect_pipelines_built=",
-            "first_present_ms=",
-        ] {
-            assert!(
-                text.contains(field),
-                "text metrics omitted `{field}`: {text}"
-            );
-        }
-        let reply = super::cmd_metrics_json(None, "");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-        for key in [
-            "redraw_attempts",
-            "redraw_early_outs",
-            "redraw_retry_gated",
-            "frame_refills_scoped",
-            "frame_refills_full",
-            "frame_refills_skipped",
-            "pet_world_observations",
-            "pet_world_cells",
-            "frame_refill_full_causes",
-            "pre_present_attempts",
-            "last_pre_present_ms",
-            "pre_present_total_ms",
-            "max_pre_present_ms",
-            "present_drops",
-            "last_present_drop_reason",
-            "last_present_drop_parked",
-            "wake_kind",
-            "wake_owner",
-            "deadline_owner",
-            "deadline_in_ms",
-            "deadline_late_ms",
-            "past_deadline_arms",
-            "deadline_arms_by_owner",
-            "past_arm_streak_heals",
-            "n_input",
-            "input_p50_ms",
-            "input_p95_ms",
-            "input_p99_ms",
-            "n_present",
-            "present_p95_ms",
-            "present_p99_ms",
-            "present_tainted",
-            "last_present_tainted_ms",
-            "max_present_tainted_ms",
-            "capture_episodes",
-            "capture_active",
-            "stale_arm_heals",
-            "rust_main_to_first_present_ms",
-            "startup_phase_schema",
-            "startup_phase_valid",
-            "startup_router_ms",
-            "startup_gui_prepare_ms",
-            "startup_winit_dispatch_ms",
-            "startup_initial_surface_attach_ms",
-            "startup_surface_to_successful_redraw_ms",
-            "startup_successful_compose_ms",
-            "startup_successful_surface_transaction_ms",
-            "startup_successful_finalize_ms",
-            "startup_attach_schema",
-            "startup_attach_valid",
-            "startup_attach_dispatch_ms",
-            "startup_attach_prepare_ms",
-            "startup_attach_window_create_ms",
-            "startup_attach_window_setup_ms",
-            "startup_attach_backend_finalize_ms",
-            "startup_attach_chrome_geometry_ms",
-            "startup_attach_surface_create_ms",
-            "startup_attach_finish_ms",
-            "startup_worker_schema",
-            "startup_worker_valid",
-            "startup_worker_total_ms",
-            "startup_worker_overlap_ms",
-            "startup_worker_after_join_ms",
-            "startup_worker_post_join_ms",
-            "startup_worker_gpu_build_ms",
-            "startup_worker_font_seal_ms",
-            "startup_worker_epilogue_ms",
-            "startup_gpu_schema",
-            "startup_gpu_valid",
-            "startup_gpu_instance_ms",
-            "startup_gpu_adapter_ms",
-            "startup_gpu_device_ms",
-            "startup_gpu_font_thread_ms",
-            "startup_gpu_font_join_ms",
-            "startup_gpu_pipelines_ms",
-            "startup_gpu_pipe_cell_ms",
-            "startup_gpu_tail_ms",
-            "startup_gpu_cell_pipeline_ms",
-            "effect_pipeline_builds",
-            "effect_pipeline_build_ms",
-            "effect_pipelines_built",
-            "first_present_ms",
-        ] {
-            assert!(
-                value.get(key).is_some(),
-                "metrics JSON omitted `{key}`: {reply}"
-            );
-        }
-
-        let pct = super::cmd_metrics_json(None, "percentiles");
-        let pct_body = pct.strip_prefix("OK 1\n").unwrap().trim_end();
-        let pct_value: aterm_json::Value = aterm_json::from_str(pct_body).unwrap();
-        for key in [
-            "n_input",
-            "input_p99_ms",
-            "n_present",
-            "present_p99_ms",
-            "n_render",
-            "render_p99_ms",
-            "n_key_write",
-            "key_write_p99_ms",
-            "n_pre_present",
-            "pre_present_p99_ms",
-            "n_acquire",
-            "acquire_p99_ms",
+            ("effect_pipeline_builds", SUMMARY),
+            ("effect_pipeline_build_ms", SUMMARY),
+            ("effect_pipelines_built", SUMMARY),
+            ("first_present_ms", SUMMARY),
+            // Published in the summary JSON only.
+            ("redraw_early_outs", SJ),
+            ("pre_present_attempts", SJ),
+            ("max_pre_present_ms", SJ),
+            ("present_drops", SJ),
+            ("last_present_drop_parked", SJ),
+            ("wake_kind", SJ),
+            ("deadline_in_ms", SJ),
+            ("deadline_late_ms", SJ),
+            ("last_present_tainted_ms", SJ),
+            // THE PERCENTILES: every distribution beside the sample count that qualifies it.
+            ("n_render", PJ),
+            ("render_p99_ms", PJ),
+            ("n_key_write", PERCENTILES),
+            ("key_write_p99_ms", PERCENTILES),
+            ("n_pre_present", PERCENTILES),
+            ("pre_present_p99_ms", PERCENTILES),
+            ("n_acquire", PERCENTILES),
+            ("acquire_p99_ms", PJ),
             // The worker's scheduling delay. Published beside the park it is
             // invisible to, so a JSON driver can attribute a stalled present.
-            "n_acquire_queue",
-            "acquire_queue_p99_ms",
-            "n_resize",
-            "resize_p99_ms",
+            ("n_acquire_queue", PERCENTILES),
+            ("acquire_queue_p99_ms", PERCENTILES),
+            ("n_resize", PERCENTILES),
+            ("resize_p99_ms", PERCENTILES),
+            ("n_reflow", PERCENTILES),
+            ("reflow_p99_ms", PERCENTILES),
             // ECHO ROUND TRIP (audit item 5): the only slice on this line that
             // measures the CHILD rather than aterm. Its counters are asserted
             // alongside its percentiles because a percentile published without
             // its sample/expiry ledger cannot be read honestly.
-            "n_echo",
-            "echo_p50_ms",
-            "echo_p95_ms",
-            "echo_p99_ms",
-            "echo_total",
-            "echo_arms",
-            "echo_coalesced",
-            "echo_expired",
-            "echo_dropped_locked",
+            ("n_echo", PERCENTILES),
+            ("echo_p50_ms", PERCENTILES),
+            ("echo_p95_ms", PJ),
+            ("echo_p99_ms", PERCENTILES),
+            ("echo_total", PJ),
+            ("echo_arms", PJ),
+            ("echo_coalesced", PERCENTILES),
+            ("echo_expired", PERCENTILES),
+            ("echo_dropped_locked", PJ),
             // ITEM 10 honesty split. The tainted twin is published BESIDE the
             // clean distribution, never instead of it: `n_present +
             // n_present_tainted` still accounts for every content present, so
             // the exclusion is auditable rather than a silent filter.
-            "n_present_tainted",
-            "present_tainted_p50_ms",
-            "present_tainted_p95_ms",
-            "present_tainted_p99_ms",
-        ] {
-            assert!(
-                pct_value.get(key).is_some(),
-                "percentiles JSON omitted `{key}`"
-            );
-        }
+            ("n_present_tainted", PERCENTILES),
+            ("present_tainted_p50_ms", PJ),
+            ("present_tainted_p95_ms", PERCENTILES),
+            ("present_tainted_p99_ms", PERCENTILES),
+            // THE OS-QUEUE SHARE OF `key_write`: `note_key_arrival_queued` backdates the
+            // arrival by the NSEvent queue age, so an 18 ms `max_key_write_ms` could not be
+            // told from 18 ms of on-thread press work — opposite fixes. The queue leg rides
+            // both percentile forms BESIDE the `key_write_*` total it splits, never instead.
+            ("n_key_queue", PERCENTILES),
+            ("key_queue_p50_ms", PERCENTILES),
+            ("key_queue_p95_ms", PERCENTILES),
+            ("key_queue_p99_ms", PERCENTILES),
+            ("last_key_queue_ms", PERCENTILES),
+            ("max_key_queue_ms", PERCENTILES),
+            // THE DRAWABLE-PARK MAX (2026-08 draw-path audit, tier-1 item 3): recorded on
+            // every present and read by no snapshot, while one 200 ms `nextDrawable` park is
+            // invisible in a p99 over thousands of ~0.02 ms samples. All four forms.
+            ("last_acquire_wait_ms", ALL),
+            ("max_acquire_wait_ms", ALL),
+            // THE ARMED GPU PARK: both unbounded `waitUntilCompleted` calls are kept out
+            // of `frame_render` and booked as one park, which only helps if it is SEEN.
+            ("last_gpu_park_ms", SUMMARY),
+            ("max_gpu_park_ms", SUMMARY),
+            // THE WORST LATENESS SURVIVES, AND A MAX SAYS WHEN (2026-09-15 attribution
+            // audit): `wake_late_ms`/`deadline_late_ms` are last-writer readings the next
+            // `WaitCancelled` zeroes, so each max carries its owner and instant, the present
+            // max its frame gap, and `metrics_now_ms` anchors "how long ago".
+            ("max_wake_late_ms", SUMMARY),
+            ("max_wake_late_owner", SUMMARY),
+            ("max_wake_late_at_ms", SUMMARY),
+            ("max_deadline_late_ms", SUMMARY),
+            ("max_deadline_late_owner", SUMMARY),
+            ("max_deadline_late_at_ms", SUMMARY),
+            ("max_present_latency_at_ms", SUMMARY),
+            ("max_present_latency_gap_ms", SUMMARY),
+            ("max_input_present_at_ms", SUMMARY),
+            ("metrics_now_ms", SUMMARY),
+        ];
 
-        let text_pct = super::cmd_metrics(None, "percentiles");
-        for field in [
-            "n_key_write=",
-            "n_pre_present=",
-            "pre_present_p99_ms=",
-            "n_acquire=",
-            "n_acquire_queue=",
-            "acquire_queue_p99_ms=",
-            "n_resize=",
-            "resize_p99_ms=",
-            "n_echo=",
-            "echo_p50_ms=",
-            "echo_p99_ms=",
-            "echo_expired=",
-            "echo_coalesced=",
-            "n_present_tainted=",
-            "present_tainted_p95_ms=",
-            "present_tainted_p99_ms=",
-        ] {
-            assert!(
-                text_pct.contains(field),
-                "text percentiles omitted `{field}`: {text_pct}"
-            );
-        }
-    }
-
-    /// THE OS-QUEUE SHARE OF `key_write` IS PUBLISHED, IN BOTH PERCENTILE FORMS.
-    ///
-    /// `metrics::note_key_arrival_queued` backdates the key-arrival stamp by the
-    /// NSEvent queue age, so `key_write_*` and `input_*` both price a parked
-    /// event loop — and it kept nothing else, so an 18.13 ms `max_key_write_ms`
-    /// could not be told apart from 18 ms of on-thread `on_key`/`input_to_session`
-    /// work. Those have opposite fixes (present pacing vs. the press path), and
-    /// the ledger answered neither. The queue leg now has its own distribution
-    /// and scalars; this pins them into the text form AND the JSON twin, beside
-    /// the `key_write_*` they split, so the pair can never go dark in one form
-    /// only — the exact gap `acquire_*` had until it was published here.
-    #[test]
-    fn the_key_queue_share_is_published_beside_key_write_in_both_forms() {
-        let text = super::cmd_metrics(None, "percentiles");
-        for field in [
-            "n_key_queue=",
-            "key_queue_p50_ms=",
-            "key_queue_p95_ms=",
-            "key_queue_p99_ms=",
-            "last_key_queue_ms=",
-            "max_key_queue_ms=",
-        ] {
-            assert!(
-                text.contains(field),
-                "text percentiles omitted `{field}`: {text}"
-            );
-        }
-        // BESIDE, never instead of: the total it splits stays published, or the
-        // subtraction a reader performs has nothing to subtract from.
-        assert!(
-            text.contains("n_key_write=") && text.contains("key_write_p99_ms="),
-            "the key-queue split must not displace the total it qualifies: {text}"
-        );
-
-        let reply = super::cmd_metrics_json(None, "percentiles");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid percentiles JSON");
-        for key in [
-            "n_key_queue",
-            "key_queue_p50_ms",
-            "key_queue_p95_ms",
-            "key_queue_p99_ms",
-            "last_key_queue_ms",
-            "max_key_queue_ms",
-            "n_key_write",
-            "key_write_p99_ms",
-        ] {
-            assert!(
-                value.get(key).is_some(),
-                "percentiles JSON omitted `{key}`: {reply}"
-            );
-        }
-    }
-
-    /// TIER-1 ITEM 3 (2026-08 draw-path audit): THE DRAWABLE-PARK MAX IS
-    /// PUBLISHED.
-    ///
-    /// `metrics::note_acquire_wait` had recorded `LAST_ACQUIRE_WAIT_NS` and
-    /// `MAX_ACQUIRE_WAIT_NS` on every present — and `reset` had cleared them —
-    /// since the swapchain-acquire slice was first instrumented, while no
-    /// snapshot ever read either one. The only acquire figures a reader could
-    /// obtain were the histogram's percentiles, and a single 200 ms
-    /// `nextDrawable` park (the largest known macOS typing stall: it blocks the
-    /// winit main thread while keyDowns queue in the OS event queue) is
-    /// arithmetically invisible in a p99 taken over thousands of ~0.02 ms
-    /// samples. This pins both scalars into all four published forms — the
-    /// summary a driver reads by default and the `percentiles` line they qualify
-    /// — so the stall can never go dark again.
-    #[test]
-    fn the_acquire_wait_max_is_published_in_every_metrics_form() {
-        let text = super::cmd_metrics(None, "");
-        for field in ["last_acquire_wait_ms=", "max_acquire_wait_ms="] {
-            assert!(
-                text.contains(field),
-                "summary text metrics omitted `{field}`: {text}"
-            );
-        }
-        let text_pct = super::cmd_metrics(None, "percentiles");
-        for field in ["last_acquire_wait_ms=", "max_acquire_wait_ms="] {
-            assert!(
-                text_pct.contains(field),
-                "text percentiles omitted `{field}`: {text_pct}"
-            );
-        }
-        for command in ["", "percentiles"] {
+        let json = |command: &str| -> aterm_json::Value {
             let reply = super::cmd_metrics_json(None, command);
             let body = reply
                 .strip_prefix("OK 1\n")
                 .expect("status frame")
                 .trim_end();
-            let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-            for key in ["last_acquire_wait_ms", "max_acquire_wait_ms"] {
+            aterm_json::from_str(body).expect("valid metrics JSON")
+        };
+        let has_key = |text: &str, name: &str| {
+            text.split_whitespace().any(|token| {
+                token
+                    .strip_prefix(name)
+                    .is_some_and(|rest| rest.starts_with('='))
+            })
+        };
+        let summary_text = super::cmd_metrics(None, "");
+        let summary_json = json("");
+        let percentiles_text = super::cmd_metrics(None, "percentiles");
+        let percentiles_json = json("percentiles");
+        for &(name, forms) in rows {
+            if forms & ST != 0 {
                 assert!(
-                    value.get(key).is_some(),
-                    "metrics JSON (`{command}`) omitted `{key}`: {reply}"
+                    has_key(&summary_text, name),
+                    "the metrics SUMMARY omits `{name}`: {summary_text}"
+                );
+            }
+            if forms & SJ != 0 {
+                assert!(
+                    summary_json.get(name).is_some(),
+                    "the metrics summary JSON omits `{name}`"
+                );
+            }
+            if forms & PT != 0 {
+                assert!(
+                    has_key(&percentiles_text, name),
+                    "text percentiles omit `{name}`: {percentiles_text}"
+                );
+            }
+            if forms & PJ != 0 {
+                assert!(
+                    percentiles_json.get(name).is_some(),
+                    "percentiles JSON omits `{name}`"
                 );
             }
         }
-    }
 
-    /// THE ARMED GPU PARK IS PUBLISHED IN BOTH SUMMARY FORMS.
-    ///
-    /// The armed Metal arm blocks its UI thread in `waitUntilCompleted` twice
-    /// per present — `await_frame_slot` on the previous frame's Submit A before
-    /// any resident shared buffer is rewritten, and `drain_pending` on the
-    /// oldest command buffer and present ticket once the ring passes depth 3 —
-    /// and neither call is bounded. The first ran INSIDE the renderer's present
-    /// work timer, so a GPU or WindowServer contention stall was reported as
-    /// `frame_render` (compose plus CPU encode) and counted against
-    /// `slow_frames`; the second ran before that timer started and was reported
-    /// nowhere, surfacing only as unexplained `redraw_total` slack. The
-    /// renderer now keeps both out of `frame_render` and books them as one
-    /// park — which only helps if a reader can SEE it, exactly the rule the
-    /// drawable-park test above pins.
-    #[test]
-    fn the_gpu_park_is_published_in_both_metrics_summary_forms() {
-        let text = super::cmd_metrics(None, "");
-        for field in ["last_gpu_park_ms=", "max_gpu_park_ms="] {
-            assert!(
-                text.contains(field),
-                "summary text metrics omitted `{field}`: {text}"
-            );
-        }
-        let reply = super::cmd_metrics_json(None, "");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-        for key in ["last_gpu_park_ms", "max_gpu_park_ms"] {
-            assert!(
-                value.get(key).is_some(),
-                "metrics JSON omitted `{key}`: {reply}"
-            );
-        }
-    }
-
-    /// THE WORST LATENESS SURVIVES, AND A MAX SAYS WHEN (2026-09-15
-    /// attribution audit).
-    ///
-    /// `wake_late_ms` and `deadline_late_ms` are LAST-WRITER readings: a `Timer`
-    /// wake books `now - due`, and the next `WaitCancelled` — one per PTY output
-    /// burst — stores `0` over it. A live line therefore read
-    /// `max_present_latency_ms=560.54 wake_late_ms=0.00 deadline_late_ms=0.00`
-    /// with every in-redraw slice bounded (`max_redraw_total_ms=13.84`,
-    /// `max_pre_present_ms=7.32`), and nothing published could say whether those
-    /// 560 ms were a late wake, a late deadline, or an idle stretch of an OPEN
-    /// interval — nor even which hour of the process they belonged to, the same
-    /// lifetime having also contained a 5.3 s update-handoff freeze.
-    ///
-    /// This pins the answer into both summary forms: each lateness max with the
-    /// owner that produced it and when, the instants of the present/input
-    /// maxima, the frame gap that qualifies the present max, and the
-    /// process-clock anchor that turns a stamp into "how long ago".
-    #[test]
-    fn the_worst_lateness_and_the_time_of_the_worst_present_ride_both_summary_forms() {
-        let fields = [
-            "max_wake_late_ms",
-            "max_wake_late_owner",
-            "max_wake_late_at_ms",
-            "max_deadline_late_ms",
-            "max_deadline_late_owner",
-            "max_deadline_late_at_ms",
-            "max_present_latency_at_ms",
-            "max_present_latency_gap_ms",
-            "max_input_present_at_ms",
-            "metrics_now_ms",
-        ];
-        let text = super::cmd_metrics(None, "");
-        for field in fields {
-            assert!(
-                text.contains(&format!(" {field}=")),
-                "the metrics SUMMARY omits `{field}`: the worst lateness dies with the next \
-                 wake and a max cannot be placed in time: {text}"
-            );
-        }
-        let reply = super::cmd_metrics_json(None, "");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-        for field in fields {
-            assert!(
-                value.get(field).is_some(),
-                "the metrics summary JSON omits `{field}`: {reply}"
-            );
-        }
-    }
-
-    /// THE SUMMARY NAMES WHO OWES THE TIME — us or the program (2026-09-15).
-    ///
-    /// `echo_rtt` exists to answer exactly one question: is a session that
-    /// FEELS laggy aterm being slow, or the TUI on the far side of the PTY?
-    /// It was published only by `metrics percentiles`. The line the owner
-    /// actually reads — `aterm ctl metrics` — carried `input_*`, `present_*`,
-    /// `key_write_*` and `render_*`, every one of them ATERM's own slice, so a
-    /// lag report could quote a sick tail off it and still not say whose. It
-    /// did: a typing-lag episode was filed as an aterm present regression from
-    /// `max_present_latency_ms=560.54` and `input_p99_ms=83.89`, while the
-    /// unasked second question held `n_echo=499 echo_p95_ms=75.69
-    /// echo_p99_ms=150.04 echo_max_ms=367.85` against aterm's own
-    /// `key_write_p99_ms=6.29` — the child waiting for the scheduler.
-    ///
-    /// The names are read OUT OF the fragment instead of being listed here, on
-    /// purpose. `echo_rtt` may not publish a percentile apart from the
-    /// sample/coalesce/expiry ledger that qualifies it, so this fails if the
-    /// summary ever carries a cherry-picked `echo_p99_ms` — and a field added
-    /// to the fragment is pinned in BOTH forms without touching this test.
-    #[test]
-    fn the_childs_echo_round_trip_rides_the_metrics_summary_in_both_forms() {
-        let fragment = crate::echo_rtt::percentile_fields_text();
-        let names: Vec<&str> = fragment
-            .split_whitespace()
-            .map(|field| {
-                field
-                    .split_once('=')
-                    .expect("every echo field is key=value")
-                    .0
-            })
-            .collect();
-        // Guard the guard: a fragment that stopped spelling the tail would make
-        // every assertion below vacuous.
-        for required in ["n_echo", "echo_p95_ms", "echo_p99_ms", "echo_expired"] {
-            assert!(
-                names.contains(&required),
-                "the echo fragment no longer spells `{required}`: {fragment}"
-            );
-        }
-
-        let text = super::cmd_metrics(None, "");
-        for name in &names {
-            assert!(
-                text.contains(&format!(" {name}=")),
-                "the metrics SUMMARY omits the child's `{name}`, so a reader of \
-                 this line cannot tell aterm's lag from the program's: {text}"
-            );
-        }
-
-        let reply = super::cmd_metrics_json(None, "");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-        for name in &names {
-            assert!(
-                value.get(name).is_some(),
-                "the metrics summary JSON omits the child's `{name}`: {reply}"
-            );
-        }
-    }
-
-    /// THE PARK OUTSIDE THE REDRAW RIDES BOTH FORMS (2026-09-15 responsiveness
-    /// audit).
-    ///
-    /// `redraw_total` covers `redraw_window` alone, the `user_event` /
-    /// `window_event` handlers were never timed, and the release stall watchdog
-    /// only fires at 5 s — so a 100–600 ms main-thread park in a NON-redraw
-    /// handler left no attributable trace, while still being charged to
-    /// `present_latency`. That is the shape behind a live
-    /// `max_present_latency_ms=560.54` sitting beside `present_drops=0` and a
-    /// bounded `max_redraw_total_ms=13.84`, read at the time as a GPU problem.
-    ///
-    /// The names are read OUT OF the fragment rather than listed here, on the
-    /// `echo_rtt` precedent: a max may not be published apart from the count and
-    /// the long-turn tally that qualify it, so this fails if the summary ever
-    /// carries a cherry-picked `max_turn_ms` — and a field added to the fragment
-    /// is pinned in BOTH forms without touching this test.
-    #[test]
-    fn the_main_loop_turn_census_rides_the_metrics_summary_in_both_forms() {
-        let fragment = crate::watchdog::turn_census_fields_text();
-        let names: Vec<&str> = fragment
-            .split_whitespace()
-            .map(|field| {
-                field
-                    .split_once('=')
-                    .expect("every turn-census field is key=value")
-                    .0
-            })
-            .collect();
-        // Guard the guard: a fragment that stopped spelling the max, its owner
-        // or the counts that qualify it would make every assertion below vacuous.
-        for required in [
-            "max_turn_ms",
-            "max_turn_owner",
-            "max_turn_at_ms",
-            "last_turn_ms",
-            "turns",
-            "long_turns",
-            "long_turn_threshold_ms",
+        for (fragment, required) in [
+            (
+                crate::echo_rtt::percentile_fields_text(),
+                &["n_echo", "echo_p95_ms", "echo_p99_ms", "echo_expired"][..],
+            ),
+            (
+                crate::watchdog::turn_census_fields_text(),
+                &[
+                    "max_turn_ms",
+                    "max_turn_owner",
+                    "max_turn_at_ms",
+                    "last_turn_ms",
+                    "turns",
+                    "long_turns",
+                    "long_turn_threshold_ms",
+                ][..],
+            ),
         ] {
-            assert!(
-                names.contains(&required),
-                "the turn-census fragment no longer spells `{required}`: {fragment}"
-            );
+            let names: Vec<&str> = fragment
+                .split_whitespace()
+                .map(|field| {
+                    field
+                        .split_once('=')
+                        .expect("every fragment field is key=value")
+                        .0
+                })
+                .collect();
+            for name in required {
+                assert!(
+                    names.contains(name),
+                    "the fragment no longer spells `{name}`: {fragment}"
+                );
+            }
+            for name in &names {
+                assert!(
+                    has_key(&summary_text, name),
+                    "the metrics SUMMARY omits `{name}`: {summary_text}"
+                );
+                assert!(
+                    summary_json.get(name).is_some(),
+                    "the metrics summary JSON omits `{name}`"
+                );
+            }
         }
-
-        let text = super::cmd_metrics(None, "");
-        for name in &names {
-            assert!(
-                text.contains(&format!(" {name}=")),
-                "the metrics SUMMARY omits `{name}`, so a main-thread park outside \
-                 the redraw has no producer anyone can name: {text}"
-            );
-        }
-
-        let reply = super::cmd_metrics_json(None, "");
-        let body = reply
-            .strip_prefix("OK 1\n")
-            .expect("status frame")
-            .trim_end();
-        let value: aterm_json::Value = aterm_json::from_str(body).expect("valid metrics JSON");
-        for name in &names {
-            assert!(
-                value.get(name).is_some(),
-                "the metrics summary JSON omits `{name}`: {reply}"
-            );
-        }
-        // The owner is a LABEL, not a number scraped by position — and `none`
-        // until a turn is booked, never a claim about a root that never ran.
-        let owner = value
+        // The worst turn's owner is a LABEL, not a number scraped by position — and
+        // `none` until a turn is booked, never a claim about a root that never ran.
+        let owner = summary_json
             .get("max_turn_owner")
             .and_then(aterm_json::Value::as_str)
             .expect("the worst turn names its root");
@@ -7026,7 +7133,7 @@ mod tests {
 
         let text = super::cmd_metrics(Some(&term), "");
         assert!(
-            text.contains("rows=busy cols=busy"),
+            text.contains("rows=busy cols=busy scrollback_truncated_lines=busy"),
             "text diagnostics identify only the unavailable grid fields: {text}"
         );
         assert!(text.contains("redraw_attempts="));
@@ -7036,6 +7143,7 @@ mod tests {
         let value: aterm_json::Value = aterm_json::from_str(body).unwrap();
         assert!(value["rows"].is_null());
         assert!(value["cols"].is_null());
+        assert!(value["scrollback_truncated_lines"].is_null());
         assert!(value.get("redraw_attempts").is_some());
     }
 
@@ -7346,15 +7454,27 @@ mod trim_tests {
     use aterm_core::terminal::Terminal;
 
     use super::{
-        TEXT_BAD_ROWS, TEXT_USAGE, TextArgs, TextShape, cmd_blocktext_args, cmd_text,
-        cmd_text_json, cmd_text_json_opt, cmd_text_opt, frame_rows_reply, split_trim_tail,
-        text_args, trim_lines_reply, trimmed_len,
+        ROWS_REVERSED, TEXT_USAGE, TextArgs, TextShape, cmd_blocktext_args, cmd_text,
+        cmd_text_json, cmd_text_json_opt, cmd_text_opt, frame_rows_reply, lines_reply,
+        split_trim_tail, text_args, trim_lines_reply, trimmed_len,
     };
+
+    /// `lines` stays the bare `OK <n>` until history has actually been lost,
+    /// and then says so — the field can never appear for a complete history
+    /// and can never be absent for a cut one.
+    #[test]
+    fn lines_reply_names_truncation_only_when_something_was_lost() {
+        assert_eq!(lines_reply(0, 0), "OK 0\n");
+        assert_eq!(lines_reply(28_171, 0), "OK 28171\n");
+        assert_eq!(lines_reply(28_171, 91_357), "OK 28171 truncated=91357\n");
+        assert_eq!(lines_reply(0, 1), "OK 0 truncated=1\n");
+    }
 
     /// `text trim`: the whole grid, minus its blank tail.
     const TRIM: TextArgs = TextArgs {
         trim: true,
         shape: TextShape::All,
+        display: false,
     };
 
     /// The parsed form of one argument tail, for a tail the test knows is valid.
@@ -7378,6 +7498,47 @@ mod trim_tests {
         assert_eq!(trimmed_len(["", "x"].into_iter()), 2, "leading blank kept");
     }
 
+    /// `order=display` (INTROSPECTION F2): text and pixels disagreed on a
+    /// right-to-left run — `text` served logical order while the frame reverses
+    /// the run in place — and no read bridged them. The display form lays each
+    /// row out as painted and, in JSON, carries the visual→logical column map
+    /// (`null` for a row whose order is the identity). Logical order stays the
+    /// default: it is what a driver `send`s against.
+    #[test]
+    fn text_order_display_reads_a_right_to_left_run_as_painted() {
+        assert!(args("order=display").display);
+        assert!(!args("order=logical trim").display);
+        for bad in ["order=visual", "order=display order=display", "order="] {
+            assert_eq!(text_args(bad), Err(TEXT_USAGE.to_string()), "{bad:?}");
+        }
+        let term = Arc::new(Mutex::new(Terminal::new(3, 10)));
+        term.lock()
+            .unwrap()
+            .process("ab \u{05D0}\u{05D1}\r\nplain".as_bytes());
+        let logical = cmd_text_opt(&term, args("rows=0-1"));
+        assert!(logical.contains("ab \u{05D0}\u{05D1}\n"), "{logical:?}");
+        let display = cmd_text_opt(&term, args("rows=0-1 order=display"));
+        assert!(
+            display.contains("ab \u{05D1}\u{05D0}\n"),
+            "painted order: {display:?}"
+        );
+        assert!(
+            display.contains("plain\n"),
+            "an LTR row is unchanged: {display:?}"
+        );
+        let json = cmd_text_json_opt(&term, args("rows=0-1 order=display"));
+        assert!(
+            json.contains("\"rows\":[\"ab \u{05D1}\u{05D0}\",\"plain\"]"),
+            "{json}"
+        );
+        assert!(
+            json.contains(",\"order\":\"display\",\"display_map\":[[0,1,2,4,3,5,6,7,8,9],null]"),
+            "{json}"
+        );
+        let plain = cmd_text_json_opt(&term, args("rows=0-1"));
+        assert!(!plain.contains("display_map"), "{plain}");
+    }
+
     /// The `text` tail: empty, `trim`, and at most one of `tail=<n>` / `rows=<a>-<b>`
     /// parse, in any order; anything else is the usage line — a bare number, a
     /// doubled option, `tail=0`, a malformed span. A well-formed span that is empty
@@ -7393,6 +7554,7 @@ mod trim_tests {
         let tail5 = TextArgs {
             trim: false,
             shape: TextShape::Tail(5),
+            display: false,
         };
         assert_eq!(text_args("tail=5"), Ok(tail5));
         assert_eq!(
@@ -7415,6 +7577,7 @@ mod trim_tests {
             Ok(TextArgs {
                 trim: false,
                 shape: TextShape::Rows(20, 23),
+                display: false,
             })
         );
         assert_eq!(
@@ -7422,6 +7585,7 @@ mod trim_tests {
             Ok(TextArgs {
                 trim: true,
                 shape: TextShape::Rows(7, 7),
+                display: false,
             }),
             "a one-row span is a span"
         );
@@ -7455,7 +7619,7 @@ mod trim_tests {
         }
         assert_eq!(
             text_args("rows=5-2"),
-            Err(TEXT_BAD_ROWS.to_string()),
+            Err(ROWS_REVERSED.to_string()),
             "well-formed, but names no row on any grid"
         );
     }
@@ -7485,12 +7649,12 @@ mod trim_tests {
         );
         assert_eq!(
             TextShape::Rows(24, 30).select(24),
-            Err(TEXT_BAD_ROWS.to_string()),
-            "start past the last row"
+            Err("ERR bad rows: the span meets no visible row (grid rows 0..=23)\n".to_string()),
+            "start past the last row, and the rows that exist"
         );
         assert_eq!(
             TextShape::Rows(0, 0).select(0),
-            Err(TEXT_BAD_ROWS.to_string())
+            Err(super::rows_off_grid(0))
         );
     }
 
@@ -7743,7 +7907,7 @@ mod trim_tests {
         );
         assert_eq!(
             cmd_text_opt(&term, args("rows=99-100")),
-            TEXT_BAD_ROWS,
+            super::rows_off_grid(24),
             "no row of the span is on the grid"
         );
         // A tail larger than the grid is the grid, byte-identical to the bare read.
@@ -7826,7 +7990,10 @@ mod trim_tests {
             assert!(bare.ends_with(",\"first\":20}\n"), "{bare}");
             bare
         });
-        assert_eq!(cmd_text_json_opt(&term, args("rows=99-100")), TEXT_BAD_ROWS);
+        assert_eq!(
+            cmd_text_json_opt(&term, args("rows=99-100")),
+            super::rows_off_grid(24)
+        );
         let whole = cmd_text_json_opt(&term, args("tail=99"));
         assert_eq!(
             whole,
@@ -8567,5 +8734,186 @@ mod story_tests {
             parse_story("exit tab\there"),
             Err("ERR story: text carries a control character\n".to_string())
         );
+    }
+}
+
+/// DENSE HISTORY on the native search: the snapshot the `search` verb and the
+/// find bar index reads its scrollback through [`read_abs_rows`]'s one dense
+/// walk, row for row what the per-row readers answer.
+#[cfg(test)]
+mod dense_history_tests {
+    use std::sync::{Arc, Mutex};
+
+    use aterm_core::terminal::Terminal;
+
+    use super::{AbsRow, abs_row_text, abs_row_wrapped, cmd_search, read_abs_rows};
+
+    /// A terminal whose history runs through a TIERED store holding a corrupt
+    /// warm block between its cold tier and its healthy warm blocks, a needle
+    /// on each side of it, and soft-wrapped lines in the lazy/ring history and
+    /// across the history/screen edge — the shapes a skipping reader, or one
+    /// that took the wrap flag from a different row than the text, gets wrong.
+    fn corrupt_tiered_terminal() -> (Terminal, usize) {
+        let mut sb = aterm_scrollback::Scrollback::with_block_size(4, 12, 10_000_000, 4);
+        for i in 0..40 {
+            match i {
+                2 => sb.push_str("NEEDLE_before the corrupt block"),
+                38 => sb.push_str("NEEDLE_after the corrupt block"),
+                _ => sb.push_str(&format!("carried {i:03}")),
+            }
+        }
+        assert!(sb.cold_line_count() > 2, "the first needle sits in cold");
+        let corrupt = 5;
+        sb.inject_corrupted_warm_block(corrupt);
+        let mut t = Terminal::with_scrollback(6, 40, 5, sb);
+        for i in 0..20 {
+            if i % 4 == 1 {
+                // 95 columns into a 40-column grid: one head row, two
+                // continuation rows.
+                t.process(format!("wrapped {i:03} {}\r\n", "w".repeat(83)).as_bytes());
+            } else {
+                t.process(format!("live {i:03}\r\n").as_bytes());
+            }
+        }
+        // End on a run whose head has scrolled into history and whose seven
+        // rows' tail fills the screen: it straddles the history/screen edge.
+        t.process(format!("edge {}", "e".repeat(250)).as_bytes());
+        assert_eq!(
+            t.grid()
+                .history_lines_from(0)
+                .filter(Option::is_none)
+                .count(),
+            corrupt,
+            "the fixture's corrupt block is still in the store"
+        );
+        (t, corrupt)
+    }
+
+    /// A ring-only terminal whose history has been capped, so the oldest
+    /// absolute rows are EVICTED and the oldest retained row is a soft-wrap
+    /// continuation whose head is gone.
+    fn evicted_terminal() -> Terminal {
+        let mut t = Terminal::new(4, 20);
+        t.set_scrollback_line_limit(Some(9));
+        // Every line is two rows: a head and one continuation.
+        for i in 0..30 {
+            t.process(format!("row {i:02} {}\r\n", "r".repeat(30)).as_bytes());
+        }
+        if !oldest_is_a_continuation(&t) {
+            let keep = t.grid().scrollback_lines() - 1;
+            t.set_scrollback_line_limit(Some(keep));
+        }
+        assert!(t.grid().oldest_absolute_row() > 0, "rows were evicted");
+        assert!(
+            oldest_is_a_continuation(&t),
+            "the oldest retained row is a continuation whose head was evicted"
+        );
+        t
+    }
+
+    fn oldest_is_a_continuation(t: &Terminal) -> bool {
+        t.grid()
+            .history_lines_from(0)
+            .next()
+            .flatten()
+            .is_some_and(|line| line.is_wrapped())
+    }
+
+    /// The per-row oracle: what `abs_row_text` / `abs_row_wrapped` answer.
+    fn per_row(t: &Terminal, first: u64, count: usize) -> (Vec<String>, Vec<bool>) {
+        (first..first + count as u64)
+            .map(|abs| {
+                let text = match abs_row_text(t, abs) {
+                    AbsRow::Text(s) => s,
+                    AbsRow::Evicted | AbsRow::OutOfRange => String::new(),
+                };
+                (text, abs_row_wrapped(t, abs))
+            })
+            .unzip()
+    }
+
+    fn dense(t: &Terminal, first: u64, count: usize) -> (Vec<String>, Vec<bool>) {
+        let (mut text, mut wrapped) = (Vec::new(), Vec::new());
+        read_abs_rows(t, first, count, &mut text, &mut wrapped);
+        (text, wrapped)
+    }
+
+    /// Every window `first..first + count` over evicted rows, the whole
+    /// retained history, the screen and past its bottom.
+    fn assert_matches_everywhere(t: &Terminal) {
+        let oldest = t.grid().oldest_absolute_row();
+        let bottom = oldest + t.grid().scrollback_lines() as u64 + u64::from(t.rows());
+        let lo = oldest.saturating_sub(3);
+        for first in lo..=bottom + 2 {
+            for count in 0..=usize::try_from(bottom + 3 - first).expect("small") {
+                assert_eq!(
+                    dense(t, first, count),
+                    per_row(t, first, count),
+                    "rows {first}..{} (oldest {oldest})",
+                    first + count as u64
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn abs_rows_read_matches_the_per_row_readers_over_a_corrupt_tiered_segment() {
+        let (t, corrupt) = corrupt_tiered_terminal();
+        assert_matches_everywhere(&t);
+        let oldest = t.grid().oldest_absolute_row();
+        let total = t.grid().scrollback_lines() + usize::from(t.rows());
+        let (text, wrapped) = dense(&t, oldest, total);
+        let scrollback = t.grid().scrollback_lines();
+        assert!(
+            wrapped[..scrollback].iter().any(|&w| w),
+            "history holds soft wraps"
+        );
+        assert!(
+            wrapped[scrollback] && wrapped[total - 1],
+            "the last run straddles the history/screen edge"
+        );
+        // NEGATIVE CONTROL: a reader that skips the undecodable segment (the
+        // shape `ScrollbackIter` has) moves every later row onto its
+        // neighbour's coordinate — the conformance above would catch it.
+        let skipping: Vec<String> = t
+            .grid()
+            .history_lines_from(0)
+            .flatten()
+            .map(|line| line.to_string())
+            .collect();
+        let after = |rows: &[String]| {
+            rows.iter()
+                .position(|row| row.starts_with("NEEDLE_after"))
+                .expect("the second needle is read")
+        };
+        assert_eq!(after(&skipping) + corrupt, after(&text));
+    }
+
+    #[test]
+    fn abs_rows_read_matches_the_per_row_readers_over_evicted_history() {
+        let t = evicted_terminal();
+        assert_matches_everywhere(&t);
+        let oldest = t.grid().oldest_absolute_row();
+        let (_, wrapped) = dense(&t, oldest, 1);
+        assert_eq!(wrapped, [false], "which reads as the start of a line");
+    }
+
+    /// PRODUCT LEVEL: the `search` verb (the find bar's engine) over a corrupt
+    /// tiered segment keys each needle at its own absolute row — the corrupt
+    /// block's placeholder rows sit between them.
+    #[test]
+    fn native_search_over_a_corrupt_tiered_segment_keeps_absolute_rows() {
+        let _serial = super::search_cap_test_guard();
+        let (t, corrupt) = corrupt_tiered_terminal();
+        let oldest = t.grid().oldest_absolute_row();
+        let term = Arc::new(Mutex::new(t));
+        let reply = cmd_search(&term, "NEEDLE_");
+        let rows: Vec<u64> = reply
+            .lines()
+            .skip(1)
+            .map(|hit| hit.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        assert!(reply.starts_with("OK 2"), "both needles are found: {reply}");
+        assert_eq!(rows, [oldest + 2, oldest + 38 + corrupt as u64], "{reply}");
     }
 }

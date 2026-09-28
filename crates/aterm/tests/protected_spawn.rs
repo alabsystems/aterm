@@ -8,23 +8,18 @@
 //! `libc::forkpty` in `aterm-cli/src`) with a behavioral check that the protected
 //! spawn actually works end-to-end.
 //!
-//! It also carries the SESSION-MODEL arming regression, which shares this file's
-//! bounded-wait harness and drives the same binary down the same session path:
-//! the in-process VT model is demand-driven and must stay OFF unless
-//! `$ATERM_SESSION_MODEL` asks for it. The unit tests in `aterm-cli` pin the
-//! arming RULE; only running the real binary can pin that `session_main`
-//! consults it.
+//! It also pins that a session builds no VT model, sharing this file's
+//! bounded-wait harness and the same session path.
+//!
+//! The unix tests drive a POSIX `/bin/sh` through the binary; the `#[cfg(windows)]`
+//! twin drives the platform's default shell through the ConPTY seam. No box in
+//! this fleet runs Windows natively, so `gate cells-foreign` type-checks the twin
+//! on every `gate all` and it RUNS only on a Windows host.
 
-// The tests drive a POSIX `/bin/sh` through the binary; a `#[cfg(windows)]`
-// twin (echo via cmd.exe) is the follow-up once the ConPTY seam lands.
-#[cfg(unix)]
 use std::io::{Read, Write};
-#[cfg(unix)]
 use std::process::{Child, Command, Output, Stdio};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
@@ -35,7 +30,6 @@ mod launch_isolation;
 /// workspace gate (`cargo test`) has no per-test timeout, so without this bound a
 /// doesn't-exit regression manifests as `cargo test` hanging forever instead of a
 /// red test — the failure would hide inside the harness meant to detect it.
-#[cfg(unix)]
 const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// THE ONE WAY THIS FILE SPAWNS `aterm --session` (2026-09-10 review). The session
@@ -45,8 +39,7 @@ const CLI_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 /// HOME/config/data roots whose `aterm.toml` switches the package and native-update
 /// lanes off (`launch_isolation::CONFIG_OFF` — settings, since the environment vetoes
 /// are gone), and `--no-reroute`, so nothing is laid for the upstream Rust names.
-/// `/bin/sh` is the shell, and piped stdio still routes to the SESSION.
-#[cfg(unix)]
+/// `/bin/sh` is the shell on unix, and piped stdio still routes to the SESSION.
 fn session_command(test: &str) -> Command {
     let root = std::env::temp_dir().join(format!(
         "aterm-protected-spawn-{test}-{}",
@@ -65,7 +58,6 @@ fn session_command(test: &str) -> Command {
 /// main thread polls `try_wait` against `CLI_EXIT_DEADLINE`. On expiry the child
 /// is killed, the drains are joined, and we panic with whatever output was
 /// captured — turning a would-be infinite hang into a diagnosable failure.
-#[cfg(unix)]
 fn wait_with_output_bounded(mut child: Child) -> Output {
     // One drain thread per pipe. Tests that route a stream to `Stdio::null()`
     // simply have no handle here and the thread returns an empty buffer. A read
@@ -167,21 +159,21 @@ fn cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly() {
     );
 }
 
-/// THE DEFAULT: a session builds NO VT model. The daily driver used to construct
-/// a full `Terminal` and feed it every PTY byte — an O(bytes) parse and
-/// O(scrollback) memory — for a model nothing in the process could read, and a
-/// change that quietly restores that default would be invisible in every other
-/// test in this repo. The `--verbose` epilogue is the one place the session
-/// states which of the two it was, so it is what this pins, in BOTH directions:
-/// unset means unarmed, and `=1` means armed (a test that only checked the
-/// default would pass just as well against a binary that could never arm at all).
+/// A SESSION BUILDS NO VT MODEL. The daily driver once constructed a full
+/// `Terminal` and fed it every PTY byte — an O(bytes) parse and O(scrollback)
+/// memory for a model nothing could read — and later kept a development seam
+/// (`ATERM_SESSION_MODEL`) that armed it for a consumer that never came
+/// (docs/HARDCORE_BACKLOG.md §4 P0, closed 2026-09-25). aterm-cli no longer
+/// links the engine at all. The `--verbose` epilogue is where the session says
+/// what it did with the bytes; it names passthrough alone, and the old seam
+/// set in the environment arms nothing (the negative control: before the
+/// deletion, `=1` printed "session model ARMED").
 #[cfg(unix)]
 #[test]
-fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
+fn a_session_builds_no_vt_model_and_the_old_seam_arms_nothing() {
     let run = |model: Option<&str>| -> String {
         let mut cmd = session_command("model");
         cmd.arg("--verbose") // the epilogue is the observable
-            .env_remove("ATERM_SESSION_MODEL")
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
@@ -197,38 +189,22 @@ fn the_session_model_is_off_by_default_and_arms_only_on_demand() {
             .expect("write to aterm stdin");
         String::from_utf8_lossy(&wait_with_output_bounded(child).stderr).into_owned()
     };
-
-    let unarmed = run(None);
-    assert!(
-        unarmed.contains("bytes passed through.") && !unarmed.contains("into the armed VT core"),
-        "an ordinary session must build NO VT model, and its summary says nothing of one \
-         (the seam is dev-only — a shipped binary cannot arm it); stderr={unarmed:?}"
-    );
-    assert!(
-        !unarmed.contains("session model on"),
-        "an unarmed session must not announce a model; stderr={unarmed:?}"
-    );
-
-    let armed = run(Some("1"));
-    assert!(
-        armed.contains("session model on"),
-        "$ATERM_SESSION_MODEL=1 must arm the model and say so; stderr={armed:?}"
-    );
-    assert!(
-        armed.contains("into the armed VT core"),
-        "an armed session's summary must say the bytes reached the engine; stderr={armed:?}"
-    );
-
-    // The disabling spelling is the default, not an arming: `=0` must read as OFF.
-    let refused = run(Some("0"));
-    assert!(
-        refused.contains("bytes passed through.") && !refused.contains("into the armed VT core"),
-        "$ATERM_SESSION_MODEL=0 must leave the model OFF; stderr={refused:?}"
-    );
+    for model in [None, Some("1")] {
+        let err = run(model);
+        assert!(
+            err.contains("bytes passed through."),
+            "the epilogue names the passthrough ({model:?}); stderr={err:?}"
+        );
+        assert!(
+            !err.contains("ARMED") && !err.contains("VT core"),
+            "no session models the screen ({model:?}); stderr={err:?}"
+        );
+    }
 }
 
 /// `--containment containment` wraps the spawn in `sandbox-exec` (deny
-/// network + credential/private-data reads). A basic shell command must STILL run
+/// network, writes outside the temp roots, and credential/private-data
+/// reads). A basic shell command must STILL run
 /// under the sandbox — the OS confinement must not break normal shell operation.
 /// macOS-only (Seatbelt `sandbox-exec` is the actuated path).
 #[cfg(target_os = "macos")]
@@ -262,12 +238,12 @@ fn cli_runs_under_the_os_sandbox_in_containment_mode() {
 
 /// Security: the `--containment` value may be attacker-influenced. A MALFORMED value
 /// must FAIL CLOSED to Containment (the most restrictive mode) — never silently
-/// fall through to the unconfined `User` default. The binary still spawns and runs
-/// (Containment is confined, not a refusal-to-start), but in the confined mode, and
-/// it announces the fallback rather than silently swallowing the garbage. Platform-
-/// independent (the fallback path is the mode-parse logic; on non-macOS Containment
-/// simply has no actuated OS sandbox, but the mode is still confined) — though the
-/// harness drives `/bin/sh`, so it runs on POSIX hosts only.
+/// fall through to the unconfined `User` default — and it announces the fallback
+/// rather than silently swallowing the garbage. What Containment then does is
+/// the platform's: on macOS the shell runs under the OS sandbox; everywhere else
+/// there is no OS sandbox, so Containment refuses to start (the owner's fail-closed
+/// ruling, 2026-09-25) and the binary exits 1 naming the gap. The harness drives
+/// `/bin/sh`, so it runs on POSIX hosts only.
 #[cfg(unix)]
 #[test]
 fn malformed_containment_mode_fails_closed_not_open() {
@@ -278,12 +254,12 @@ fn malformed_containment_mode_fails_closed_not_open() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn the aterm CLI binary with a malformed mode");
-    child
+    // The shell may never start (off macOS), so a closed pipe is not an error.
+    let _ = child
         .stdin
         .take()
         .expect("aterm stdin")
-        .write_all(b"echo ATERM_FAILCLOSED_$((5+5))\nexit\n")
-        .expect("write to aterm stdin");
+        .write_all(b"echo ATERM_FAILCLOSED_$((5+5))\nexit\n");
     let out = wait_with_output_bounded(child);
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -293,14 +269,68 @@ fn malformed_containment_mode_fails_closed_not_open() {
             .contains("--containment takes master, user, safety or containment; using containment"),
         "a malformed mode must announce the fallback to containment; stderr={stderr:?}"
     );
-    // And it still ran the shell (Containment is confined, not refuse-to-start).
+    // `aterm_containment::os_sandbox_actuated()` is exactly this cfg.
+    if cfg!(target_os = "macos") {
+        // macOS: the confined shell runs a basic command and exits success.
+        assert!(
+            stdout.contains("ATERM_FAILCLOSED_10"),
+            "the confined shell must still run a basic command; stdout={stdout:?}"
+        );
+        assert!(
+            out.status.success(),
+            "aterm must still exit success; got {:?}",
+            out.status
+        );
+    } else {
+        // No OS sandbox: no shell at all, exit 1, the gap named.
+        assert!(
+            !stdout.contains("ATERM_FAILCLOSED_10"),
+            "no shell may run without the OS sandbox; stdout={stdout:?}"
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "a refused Containment exits 1; stderr={stderr:?}"
+        );
+        assert!(
+            stderr.contains("no OS sandbox on this platform"),
+            "the refusal names the platform gap; stderr={stderr:?}"
+        );
+    }
+}
+
+/// THE WINDOWS TWIN of `cli_runs_a_command_through_the_protected_spawn_and_exits_cleanly`:
+/// the session runs the platform's default shell (`pwsh` → `powershell` →
+/// `%COMSPEC%`, `aterm_pty`'s windows `shell.rs`) through the ConPTY seam, with
+/// stdin a pipe (`driver_windows`' piped pump). Two echo lines, one per shell
+/// family, each of which evaluates to the marker only when a real shell RAN it
+/// (the ConPTY echo of the typed line shows the literal `%OS%` / `$(6*7)`), and
+/// the shell's `exit 7` must come back as the session's own exit status.
+#[cfg(windows)]
+#[test]
+fn cli_runs_a_command_through_the_conpty_seam_and_exits_with_the_shells_status() {
+    let mut child = session_command("protected-win")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn the aterm CLI binary");
+    child
+        .stdin
+        .take()
+        .expect("aterm stdin")
+        .write_all(b"echo ATERM_P0_MARKER_%OS%\r\necho \"ATERM_P0_MARKER_$(6*7)\"\r\nexit 7\r\n")
+        .expect("write to aterm stdin");
+    let out = wait_with_output_bounded(child);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("ATERM_FAILCLOSED_10"),
-        "the confined shell must still run a basic command; stdout={stdout:?}"
+        stdout.contains("ATERM_P0_MARKER_Windows_NT") || stdout.contains("ATERM_P0_MARKER_42"),
+        "the shell did not evaluate the command through the protected spawn; stdout={stdout:?}"
     );
-    assert!(
-        out.status.success(),
-        "aterm must still exit success; got {:?}",
+    assert_eq!(
+        out.status.code(),
+        Some(7),
+        "aterm must exit with the shell's own status; got {:?}",
         out.status
     );
 }

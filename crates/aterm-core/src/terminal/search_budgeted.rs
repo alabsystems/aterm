@@ -338,25 +338,17 @@ impl Terminal {
                 .saturating_add(row_budget.max(1))
                 .min(state.engine.total_rows())
         };
+        self.feed_budgeted_history(&mut state, end);
+        // Visible rows. The walk above fed every history row below `end`
+        // (`feed_row_owned` accepts each while `rows_fed < total_rows`, and
+        // `hist_end <= end <= total_rows`), so every row left here is visible.
         while state.engine.rows_fed() < end {
             let i = state.engine.rows_fed();
-            // Same row sources (and bounded history read) as the one-shot
-            // build in `search_index.rs::build_search_index` — the
-            // results-equality contract depends on it.
-            let text = if i < state.scrollback {
-                self.grid
-                    .get_history_line(i)
-                    .map(|l| {
-                        line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
-                    })
-                    .unwrap_or_default()
-            } else {
-                let visible_row = i - state.scrollback;
-                u16::try_from(visible_row)
-                    .ok()
-                    .and_then(|r| self.get_line_text(i32::from(r), None))
-                    .unwrap_or_default()
-            };
+            let text = i
+                .checked_sub(state.scrollback)
+                .and_then(|visible_row| u16::try_from(visible_row).ok())
+                .and_then(|r| self.get_line_text(i32::from(r), None))
+                .unwrap_or_default();
             state.engine.feed_row_owned(text);
         }
 
@@ -387,6 +379,34 @@ impl Terminal {
         };
         self.budgeted_search = Some(state);
         Ok(step)
+    }
+
+    /// Feed the budgeted scan's HISTORY rows below `end`. Same row sources
+    /// (and bounded history read) as the one-shot build in
+    /// `search_index.rs::build_search_index` — the results-equality contract
+    /// depends on it: the same DENSE walk (item `k` is `get_history_line(start +
+    /// k)`, an unreadable line a `None` placeholder → empty text), padded with
+    /// placeholders should the walk ever be shorter than the retained count
+    /// this search was keyed to.
+    fn feed_budgeted_history(&self, state: &mut BudgetedSearchState, end: usize) {
+        let hist_start = state.engine.rows_fed();
+        let hist_end = end.min(state.scrollback);
+        if hist_start >= hist_end {
+            return;
+        }
+        let lines = self
+            .grid
+            .history_lines_from(hist_start)
+            .chain(std::iter::repeat_with(|| None))
+            .take(hist_end - hist_start);
+        for line in lines {
+            let text = line
+                .map(|l| {
+                    line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
+                })
+                .unwrap_or_default();
+            state.engine.feed_row_owned(text);
+        }
     }
 
     /// Drop any in-flight budgeted search (frees its partial index; any
@@ -530,6 +550,21 @@ mod tests {
         }
         t.process(b"case Needle mixed\r\n");
         t
+    }
+
+    /// The budgeted scan walks history through the same DENSE walk as the
+    /// one-shot build, so over a corrupt tiered segment every budget still
+    /// reproduces the one-shot results — same rows on both sides of the
+    /// placeholders.
+    #[test]
+    fn budgeted_completion_equals_one_shot_over_a_corrupt_tiered_segment() {
+        for budget in [1, 3, 7, 1_000] {
+            let (mut t, _) = crate::terminal::search_index::tests::corrupt_tiered_terminal();
+            let oracle = one_shot(&mut t, "NEEDLE_", true, false);
+            assert_eq!(oracle.matches.len(), 2);
+            let (got, _) = drive(&mut t, "NEEDLE_", true, false, budget);
+            assert_eq!(got, oracle, "budget={budget}");
+        }
     }
 
     /// Resume-equality oracle at the terminal level: for every filter mode and

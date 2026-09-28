@@ -174,19 +174,52 @@ pub fn open_create_write(path: &Path, _mode: u32) -> io::Result<File> {
         .open(path)
 }
 
+/// Open `path` the way [`sync_file_contents`] needs it: WITH write access.
+/// `FlushFileBuffers` is documented to require `GENERIC_WRITE` on the handle, and it
+/// refuses a read-only one with `ERROR_ACCESS_DENIED` (5) — measured 2026-09-22: every
+/// stage on this platform died in `sync_tree` with `io: Access is denied.` the moment the
+/// digest gates let it through, and 18 `install::tests` failed the same way at HEAD.
+/// Nothing is created or truncated: `write(true)` alone on an existing file.
+pub fn open_for_sync(path: &Path) -> io::Result<File> {
+    OpenOptions::new().write(true).open(path)
+}
+
 /// Push ONE open file's contents to the filesystem — the Windows analogue of the Unix
 /// `fsync(2)`: `FlushFileBuffers`, which is what std's `sync_data` calls here. Used by
 /// [`crate::store::sync_tree`] to make a staged tree durable before the renames that
-/// publish it, and by the readiness marker's write.
+/// publish it, and by the readiness marker's write. The handle must carry write access
+/// ([`open_for_sync`]); a read-only one answers `Access is denied`.
 pub fn sync_file_contents(f: &File) -> io::Result<()> {
     f.sync_data()
 }
 
-/// No permission bits on Windows — reports `0` (callers mask/treat it as not-applicable;
-/// the tree-root hash is therefore self-consistent per-platform, not Unix-comparable).
+/// No permission bits on Windows — reports `0` (callers mask/treat it as not-applicable).
+/// The tree-root hash does NOT fold this: a signed `tree_root` is folded from the modes
+/// the stage declared, and a client folding `0` could never reproduce one (measured
+/// 2026-09-22, `crate::tree`'s module docs) — see [`folded_mode`] and
+/// [`HAS_POSIX_MODES`].
 #[must_use]
 pub fn permission_mode(_meta: &Metadata) -> u32 {
     0
+}
+
+/// Whether this platform's filesystems store POSIX permission bits an `fstat` reads
+/// back. Windows stores none, so the tree-root walk folds the stage's declared-mode
+/// record ([`crate::tree::tree_root_declared`]) and the extraction-time fold records
+/// the mode it was asked to apply ([`folded_mode`]).
+pub const HAS_POSIX_MODES: bool = false;
+
+/// The mode slot the extraction-time fold records for a file just written with
+/// `requested` bits: the request itself, masked to `0o7777`. There is no stored mode to
+/// read back here — `set_mode_on` is a no-op and `meta` reports `0` — and the signed
+/// root was folded by a producer that applied exactly these bits (`0755`/`0644` after
+/// `safe_mode`, `0755` for a raw binary), so the declared mode is the only value that
+/// can reproduce it. The content digest and the relpath still describe the bytes laid
+/// down; only the slot no filesystem here can store is taken from the request.
+#[must_use]
+pub fn folded_mode(meta: &Metadata, requested: u32) -> u32 {
+    let _ = meta;
+    requested & 0o7777
 }
 
 /// The encoded bytes of an `OsStr` (WTF-8), for the tree-root path hash.
@@ -353,7 +386,7 @@ fn backslashed(p: &Path) -> std::ffi::OsString {
 /// Point `link` at directory `target` via a **junction** (`mklink /J`, no admin required).
 /// Not atomically swappable like a POSIX rename; any existing link is removed first, so
 /// there is a brief window where `link` is absent (acceptable — activation runs under the
-/// apply lock). Used for `channels/<ch>/current` and the sysroot/toolchain dir links.
+/// apply lock). Used for `store/<program>/current` and the sysroot/toolchain dir links.
 /// Both paths are normalized to `\` separators first — `mklink` (unlike the Win32 API)
 /// rejects `/`-separated paths, reading path segments as switches.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {

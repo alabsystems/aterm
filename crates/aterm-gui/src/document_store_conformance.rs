@@ -126,7 +126,7 @@ fn committed(outcome: DocumentTxnOutcome) -> (Seq, Vec<crate::document_store::Ed
 #[test]
 fn surface_occ_publication_conforms_and_rejects_corrupted_projection() {
     let model = native_document_publication_model();
-    let mut store = DocumentStore::new();
+    let mut store = DocumentStore::for_test();
     let document = store.open("mem://conformance/publication".into(), "alpha".into());
     let markdown = DocumentViewId(101);
     store.attach_view(document, markdown).unwrap();
@@ -351,7 +351,7 @@ fn close_projection(
 #[test]
 fn last_markdown_after_editor_close_conforms_to_durable_atomic_ordering() {
     let model = native_close_plan_model();
-    let mut store = DocumentStore::new();
+    let mut store = DocumentStore::for_test();
     let document = store.open("mem://conformance/close".into(), "draft".into());
     let markdown = DocumentViewId(201);
     let editor = DocumentViewId(202);

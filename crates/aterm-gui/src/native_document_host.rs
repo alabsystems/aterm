@@ -1506,11 +1506,11 @@ fn write_lock_busy() -> String {
 ///
 /// The budget is deliberately SMALL, for two non-optional reasons:
 ///
-///  1. This is NOT reached only from the `aterm-native-document` worker.
-///     `App::settings_commit_value` (app_settings.rs:998) calls `prefs::save_prefs_edits`
-///     SYNCHRONOUSLY on the event-loop thread, and the config worker writes the same
-///     `aterm.toml` from another thread — so contention here is real, and every
-///     millisecond is a dropped frame on a keypress. 25 ms is ~1.5 frames and ~20x the
+///  1. This is NOT reached only from the `aterm-native-document` worker: the config
+///     worker writes the same `aterm.toml` from another thread, so contention here is
+///     real. The budget was sized while the retired Settings card still saved
+///     SYNCHRONOUSLY on the event-loop thread, where every millisecond was a dropped
+///     frame on a keypress; that caller is gone. 25 ms is ~1.5 frames and ~20x the
 ///     worst measured fork window.
 ///  2. `held_save_lock_returns_busy_and_retry_commits` asserts
 ///     `started.elapsed() < Duration::from_secs(1)` around a whole commit. That is an
@@ -1636,11 +1636,10 @@ fn acquire_write_lock(lock_file: &File) -> Result<(), String> {
 /// `WRITE_LOCK_RETRY_BUDGET` alone is an order of magnitude short of that.
 ///
 /// THE COST, stated plainly because it is real: this is NOT reached only from the
-/// `aterm-native-document` worker. `App::settings_commit_value`
-/// (app_settings.rs:915/:1036) calls `prefs::save_prefs_edits` SYNCHRONOUSLY on the
-/// event-loop thread, and `execute_native_config_persistence` (app_native.rs:770)
-/// writes the same `aterm.toml` from another thread — so a Settings keystroke can
-/// contend, and spending this budget there is a visible hitch.
+/// `aterm-native-document` worker. `execute_native_config_persistence` (app_native.rs)
+/// writes the same `aterm.toml` from another thread, so two saves can contend and one
+/// of them waits out this budget. (The retired Settings card's synchronous event-loop
+/// save, which made that wait a visible hitch, is gone.)
 ///
 /// It is still the right trade. The budget is only consumed while a peer actually
 /// holds the lock, which is bounded by that peer's own `F_FULLFSYNC` pair (82.5-279.7
@@ -2469,6 +2468,10 @@ mod tests {
         assert!(started.elapsed() < std::time::Duration::from_secs(30));
         assert_eq!(fs::read(&path).unwrap(), b"before");
 
+        // Released by LOCK_UN, not by the close alone: a fork's copy outlives the
+        // close until its exec (measured up to 523 ms here), and the retry's
+        // preflight gives up after 500 ms (the fd-copy sweep of 2026-09-27).
+        held.unlock().expect("release the write lock");
         drop(held);
         assert!(matches!(
             commit_atomic_bytes(&contents.baseline, b"after"),
@@ -2552,7 +2555,7 @@ mod tests {
             crate::native_config_service::MAX_CONFIG_FILE_BYTES + 1
         );
 
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),
@@ -2678,7 +2681,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(opened.grant.canonical_uri.clone(), "new".to_string());
         let snapshot = documents.snapshot(document).unwrap();
         let mut reducer = SaveReducer::new(document, opened.observed);
@@ -2723,7 +2726,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(opened.grant.canonical_uri.clone(), "ours".to_string());
         let mut reducer = SaveReducer::new(document, opened.observed);
         let plan = reducer
@@ -2768,7 +2771,7 @@ mod tests {
         let opened = grants
             .open_local(&file_uri(&path), GrantAccess::ReadWrite, 1024)
             .unwrap();
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(opened.grant.canonical_uri.clone(), "saved".to_string());
         let snapshot = documents.snapshot(document).unwrap();
         let mut persistence = DocumentPersistenceStore::default();
@@ -2939,7 +2942,7 @@ mod tests {
             first.canonicalize().unwrap()
         );
 
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(opened.grant.canonical_uri.clone(), "updated".to_string());
         let mut reducer = SaveReducer::new(document, opened.observed);
         let plan = reducer
@@ -3022,7 +3025,7 @@ mod tests {
             .unwrap();
         assert_eq!(opened.grant.id, direct.grant.id);
         assert_eq!(opened.grant.logical_path(), logical);
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),
@@ -3073,7 +3076,7 @@ mod tests {
         let opened = grants
             .open_local_config(&file_uri(&logical), GrantAccess::ReadWrite, 4096)
             .unwrap();
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open(
             opened.grant.canonical_uri.clone(),
             "theme = \"Nord\"\n".to_string(),

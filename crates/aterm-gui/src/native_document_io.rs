@@ -1311,7 +1311,7 @@ mod tests {
     use aterm_spec::interp::admits;
 
     fn snapshot(text: &str) -> (DocumentStore, DocumentId, DocumentSnapshot) {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let id = store.open("file:///draft.md".to_string(), text.to_string());
         let snapshot = store.snapshot(id).expect("document snapshot");
         (store, id, snapshot)

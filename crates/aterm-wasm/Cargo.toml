@@ -51,7 +51,7 @@ console_error_panic_hook = "0.1"
 # If a transitive dep ever does select getrandom on wasm32, the build fails
 # loudly with getrandom's own "unsupported target" error — a better outcome
 # than paying 9,774 lines forever against the possibility. Guarded by
-# tools/grep_guard.sh B13.
+# tools/grep_guard.sh B18.
 
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm

@@ -203,7 +203,11 @@ impl TurnLedger {
     pub(crate) fn since(&self, after: Option<u64>) -> impl ExactSizeIterator<Item = &TurnRecord> {
         let start = match after {
             None => 0,
-            Some(a) => self.records.partition_point(|r| r.id <= a),
+            Some(a) => self.records.partition_point(|r| {
+                #[cfg(test)]
+                crate::work_counts::retained_record_touched();
+                r.id <= a
+            }),
         };
         self.records.range(start..)
     }

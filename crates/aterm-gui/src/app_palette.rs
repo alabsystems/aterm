@@ -738,46 +738,6 @@ mod tests {
     }
 
     #[test]
-    fn palette_is_mutually_exclusive_with_settings() {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.settings_enter();
-        assert!(app.windows.get(&wid).unwrap().settings().is_some());
-        app.palette_enter();
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(ws.palette().is_some(), "palette open");
-        assert!(ws.settings().is_none(), "settings closed");
-    }
-
-    #[test]
-    fn each_overlay_enter_closes_the_other() {
-        // The overlays share ONE card slot and must be mutually exclusive in BOTH
-        // directions. Regression: settings_enter used to leave a live palette, which
-        // then swallowed every key (the on_key gate checks palette first) UNDER the
-        // shown card — visible card, hidden controller.
-        let wid = WindowId(0);
-
-        // Palette open first, then Settings → Settings wins, palette must close.
-        let mut app = App::headless_for_test();
-        app.palette_enter();
-        app.settings_enter();
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(ws.settings().is_some(), "settings open");
-        assert!(
-            ws.palette().is_none(),
-            "settings_enter must close the palette"
-        );
-
-        // …and the other way round.
-        let mut app = App::headless_for_test();
-        app.settings_enter();
-        app.palette_enter();
-        let ws = app.windows.get(&wid).unwrap();
-        assert!(ws.palette().is_some(), "palette open");
-        assert!(ws.settings().is_none(), "palette_enter must close settings");
-    }
-
-    #[test]
     fn filter_then_activate_posts_the_action() {
         let mut app = App::headless_for_test();
         let wid = WindowId(0);

@@ -1453,7 +1453,11 @@ impl SessionTimeline {
     ) -> impl DoubleEndedIterator<Item = &TimelineEvent> + ExactSizeIterator {
         let start = match after {
             None => 0,
-            Some(a) => self.events.partition_point(|e| e.id <= a),
+            Some(a) => self.events.partition_point(|e| {
+                #[cfg(test)]
+                crate::work_counts::retained_record_touched();
+                e.id <= a
+            }),
         };
         self.events.range(start..)
     }

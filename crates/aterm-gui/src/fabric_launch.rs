@@ -560,7 +560,7 @@ mod tests {
     /// reason a fabric-unaware machine pays nothing for the feature existing.
     #[test]
     fn the_fabric_is_off_unless_it_is_configured() {
-        aterm_log::env::scoped_unset(FABRIC_COMMAND_ENV, || {
+        crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             assert_eq!(configured_command(&Config::default()), None);
             assert_eq!(configured_command(&with_command(None)), None);
             assert_eq!(
@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn the_env_var_wins_over_the_config_key() {
         let cfg = with_command(Some("from-config --flag"));
-        aterm_log::env::scoped(FABRIC_COMMAND_ENV, "aterm-link serve --fleet lab", || {
+        crate::test_env::scoped(FABRIC_COMMAND_ENV, "aterm-link serve --fleet lab", || {
             assert_eq!(
                 configured_command(&cfg),
                 Some(vec![
@@ -588,7 +588,7 @@ mod tests {
                 ])
             );
         });
-        aterm_log::env::scoped_unset(FABRIC_COMMAND_ENV, || {
+        crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             assert_eq!(
                 configured_command(&cfg),
                 Some(vec!["from-config".to_string(), "--flag".to_string()])
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn a_metacharacter_is_an_argument_and_not_a_second_command() {
         let cfg = Config::default();
-        aterm_log::env::scoped(FABRIC_COMMAND_ENV, "bridge ; rm -rf /", || {
+        crate::test_env::scoped(FABRIC_COMMAND_ENV, "bridge ; rm -rf /", || {
             assert_eq!(
                 configured_command(&cfg),
                 Some(vec![
@@ -695,8 +695,8 @@ mod tests {
             pair("ATERM_EDGE_TOKENS", "/run/aterm/edge.tok"),
             pair("ATERM_SESSION_ID", "s-0123456789abcdef0123"),
             pair("ATERM_LAUNCH_NONCE", "0".repeat(32).as_str()),
+            pair("ATERM_LINK_BROKER", "/run/aterm/broker.sock"),
             pair("ATERM_LINK_CAP_FILE", "/etc/aterm/outer.cap"),
-            pair("ATERM_LINK_BROKER", "/run/aterm/outer.sock"),
             pair("ATERM_LINK_FLEET", "outer"),
             pair("ATERM_FABRIC_COMMAND", "aterm-link serve --fleet outer"),
             pair("ANTHROPIC_API_KEY", "sk-x"),
@@ -711,8 +711,8 @@ mod tests {
             "ATERM_EDGE_TOKENS",
             "ATERM_SESSION_ID",
             "ATERM_LAUNCH_NONCE",
-            "ATERM_LINK_CAP_FILE",
             "ATERM_LINK_BROKER",
+            "ATERM_LINK_CAP_FILE",
             "ATERM_LINK_FLEET",
             "ATERM_FABRIC_COMMAND",
             "ANTHROPIC_API_KEY",
@@ -857,7 +857,7 @@ mod tests {
     /// moments.
     #[test]
     fn the_startup_path_records_the_configured_command_and_arms_through_the_one_seam() {
-        aterm_log::env::scoped_unset(FABRIC_COMMAND_ENV, || {
+        crate::test_env::scoped_unset(FABRIC_COMMAND_ENV, || {
             crate::fabric::with_link_reset(|| {
                 assert!(!spawn_supervisor(&Config::default()));
                 let s = status();

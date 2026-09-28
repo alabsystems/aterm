@@ -44,11 +44,10 @@ fn check_invariants(term: &Terminal) {
         "cursor col {} escaped bounds (cols {cols})",
         cur.col
     );
-    // Wire in the engine's OWN formal invariants (cursor bounds, scroll-region,
-    // ring-buffer structure — everything except the violable WideCharConsistent),
-    // which were written (grid/invariants.rs) but never called anywhere. This
-    // turns that dead TLA+-spec infra into a live fuzz oracle.
+    // Wire in the engine's OWN formal invariants (grid/invariants.rs): cursor
+    // bounds, scroll-region, ring-buffer structure, and wide-char pairing.
     term.grid().assert_structural_invariants();
+    term.grid().assert_wide_char_consistent();
 }
 
 /// Every cell must be accessible without panic (corruption would index-panic).
@@ -156,19 +155,6 @@ fn process_unicode_edges_never_panics() {
 /// Deeper invariants for the reflow stress: everything `check_invariants` pins,
 /// plus scrollback consistency (`total_lines >= visible rows`, the spec's
 /// `TotalLinesMinimum`) and full visible-cell accessibility after every resize.
-///
-/// NOTE — wide-char pairing is deliberately NOT asserted here. This fuzz
-/// discovered that the engine's own (currently-unwired) formal invariant
-/// `Grid::assert_wide_char_consistent` (grid/invariants.rs `WideCharConsistent`)
-/// is violable: writing a wide grapheme whose main cell lands on a prior wide
-/// char's continuation spacer (reachable via autowrap on a narrow grid with CJK
-/// content) leaves the prior cell a dangling WIDE main with no continuation —
-/// e.g. on a 1x100 grid, `o 界 🚀 日` produced cells `[W界][W…][c][W日][c]`
-/// (cell 1 WIDE without its spacer at cell 2). That is a real spec-vs-impl gap,
-/// but the wide-char write/erase semantics are owner-territory (a prior wide-char
-/// change was reverted for differential-oracle divergence), so this fuzz pins
-/// only the invariants that hold and the gap is documented for the owner rather
-/// than asserted (which would be a false-failure here).
 fn check_invariants_reflow(term: &Terminal) {
     check_invariants(term);
     let (rows, cols) = (term.rows(), term.cols());
@@ -298,6 +284,28 @@ fn reflow_wide_char_resize_never_panics() {
         }
     }
     walk_all_cells(&term);
+}
+
+/// The shape the WideCharConsistent assertion found in the fuzzer above,
+/// replayed from BYTES (2026-09-27 review): `ESC # 6` makes the row DECDWL,
+/// 45 cells then U+A0E2 (a wide Yi syllable) put an intact pair at 45/46, and
+/// a resize 112 -> 46 truncates the row in place through that pair. The head
+/// in the new last column must be blanked, never left WIDE without its
+/// continuation.
+#[test]
+fn a_decdwl_row_resized_through_its_wide_pair_stays_consistent() {
+    let mut term = Terminal::new(4, 112);
+    let mut bytes = b"\x1b#6".to_vec();
+    bytes.extend(std::iter::repeat_n(b'a', 45));
+    bytes.extend("\u{A0E2}".as_bytes());
+    term.process(&bytes);
+    term.grid().assert_wide_char_consistent();
+    assert!(
+        term.grid().is_wide_continuation_at(0, 46),
+        "the pair is intact before the resize"
+    );
+    term.resize(4, 46);
+    term.grid().assert_wide_char_consistent();
 }
 
 #[test]

@@ -140,20 +140,31 @@ impl Document {
 
 /// Serialized owner of native documents. It performs no filesystem I/O; read/write grants
 /// and atomic persistence are host effects layered above this deterministic core.
-#[derive(Default)]
 pub(crate) struct DocumentStore {
     next_id: u64,
     documents: BTreeMap<DocumentId, Document>,
     by_uri: BTreeMap<String, DocumentId>,
+    /// The buffer-write capability every Surface edit presents, granted by the
+    /// launcher's one `aterm_cap::Authority` in `main_entry`. Production reads
+    /// go through the cached projection, so the store holds no read cap.
+    write: WriteCap,
 }
 
 impl DocumentStore {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(write: WriteCap) -> Self {
         Self {
             next_id: 1,
             documents: BTreeMap::new(),
             by_uri: BTreeMap::new(),
+            write,
         }
+    }
+
+    /// A store whose write cap comes from a test-local authority — unit tests,
+    /// and the `bench-support` headless fixture (`App::headless_for_test_with_sink`).
+    #[cfg(any(test, feature = "bench-support"))]
+    pub(crate) fn for_test() -> Self {
+        Self::new(test_authority().grant(aterm_cap::Tier::Trusted))
     }
 
     /// Open or reuse the unique document for a canonical URI.
@@ -169,7 +180,7 @@ impl DocumentStore {
         // Surface owns the original String allocation; the flat Arc projection
         // is the separate immutable cache shared by every document snapshot.
         let projection: Arc<str> = Arc::from(text.as_str());
-        surface.apply(&WriteCap, SurfaceEdit::AppendLine(text));
+        surface.apply(&self.write, SurfaceEdit::AppendLine(text));
         let head = surface.seq();
         let text_rope = crate::native_text::TextRope::from(projection.as_ref());
         let document = Document {
@@ -347,10 +358,11 @@ impl DocumentStore {
                 inserted_len: edit.insert.len(),
             })
             .collect::<Vec<_>>();
-        let outcome =
-            document
-                .surface
-                .transact(&WriteCap, base, vec![SurfaceEdit::SetLine(LineId(0), next)]);
+        let outcome = document.surface.transact(
+            &self.write,
+            base,
+            vec![SurfaceEdit::SetLine(LineId(0), next)],
+        );
         let Seq(seq) = match outcome {
             TxnOutcome::Committed(seq) => seq,
             TxnOutcome::Conflict => {
@@ -579,7 +591,7 @@ impl DocumentStore {
     fn surface_text(&self, id: DocumentId) -> Option<String> {
         let document = self.documents.get(&id)?;
         let read = document.surface.read_text(
-            &aterm_buffer::ReadCap,
+            &test_authority().grant(aterm_cap::Tier::Trusted),
             aterm_buffer::Range {
                 start: LineId(0),
                 end: LineId(1),
@@ -598,6 +610,15 @@ impl DocumentStore {
             )
         })
     }
+}
+
+/// Test-only mint (unit tests and the `bench-support` fixture): a test or bench
+/// process that handles no untrusted input is its own trusted launcher.
+#[cfg(any(test, feature = "bench-support"))]
+fn test_authority() -> aterm_cap::Authority {
+    // SAFETY: see above — the `root_authority` contract is "trusted launcher,
+    // before untrusted input", which a unit test satisfies.
+    unsafe { aterm_cap::Authority::root_authority() }
 }
 
 /// Rebase one byte position through committed edits. Positions inside a replaced range
@@ -628,7 +649,7 @@ mod tests {
     use super::*;
 
     fn open() -> (DocumentStore, DocumentId) {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let id = store.open("mem://readme".into(), "hello\nworld".into());
         (store, id)
     }
@@ -643,7 +664,7 @@ mod tests {
 
     #[test]
     fn large_document_uses_balanced_chunk_storage_behind_surface_projection() {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let source = (0..3_000)
             .map(|line| format!("line {line} — persistent text\n"))
             .collect::<String>();
@@ -857,7 +878,7 @@ mod tests {
 
     #[test]
     fn batch_detach_is_atomic_across_documents() {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let first = store.open("mem://batch/first".into(), "one".into());
         let second = store.open("mem://batch/second".into(), "two".into());
         let first_view = DocumentViewId(31);

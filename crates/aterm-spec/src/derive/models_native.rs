@@ -9,15 +9,17 @@
 use super::*;
 
 /// Lane-exact admission for the fixed control-socket worker pool. The listener
-/// may admit exactly `LaneCap` queued-or-running connections and rejects an
-/// arrival when every lane is owned; accepted work remains outstanding until its
-/// worker completes, and completion releases exactly the lane it held. `Buggy=1`
+/// may admit exactly `LaneCap` queued-or-running jobs and rejects an arrival
+/// when every lane is owned; accepted work remains outstanding until its worker
+/// completes, and completion releases exactly the lane it held. `Buggy=1`
 /// restores over-admission at full capacity, which `LaneBounded` catches, and a
 /// worker that returns without releasing its lane, as a panicking handler would
 /// without `DispatchCompletion`'s drop guard, which `AcceptedWorkAccounted`
 /// catches; `BoundedDispatch::serve_next` holds that guard for every worker.
 /// `arrivals` counts `try_submit` calls, which return either `Ok` or the stream,
-/// so accepted plus rejected arrivals always equal it.
+/// so accepted plus rejected arrivals always equal it. A job is a REQUEST, not a
+/// connection: where a connection goes between requests — parked, on a wait
+/// lane — is [`control_lane_tenure_model`]'s.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn control_connection_admission_model() -> Model {
@@ -57,6 +59,106 @@ pub fn control_connection_admission_model() -> Model {
             invariant LaneBounded: outstanding <= LaneCap;
             invariant ArrivalsBounded: arrivals <= MaxArrivals;
             invariant AcceptedWorkAccounted: accepted == outstanding + completed;
+        }
+    }
+}
+
+/// WHERE A CONTROL CONNECTION IS between its requests, and so what a fresh
+/// client is refused for (`aterm-gui/src/control_lanes.rs`). Each connection is
+/// `working` (on a request lane: authenticating or serving a request),
+/// `waiting` (on a wait lane: an `await`-class request or a relay), `parked`
+/// (idle, in the parker), or `queued` (readable again, back in the request
+/// queue); `held` is an idle connection kept on a request lane — the old design,
+/// where a lane held a connection for as long as it stayed open (no action of
+/// the shipping design touches it, so none leaves it either: a dead action would
+/// be a vacuous negative control, `ty --strict-vacuity`). A fresh client
+/// is admitted when a request lane is free of work and fewer than `Cap`
+/// connections are open (`Cap` is the parker's capacity, so an idle connection
+/// always has a place to park), and refused otherwise.
+///
+/// `Buggy=1` is five defects at once, each caught by its own invariant:
+/// finishing a request keeps the idle connection on its lane — THE 2026-09-26
+/// DEFECT, where persistent drivers used up every lane and a fresh client was
+/// refused (`NoIdleHold`, `NoRefusalByIdleDriver`); admission ignores both
+/// bounds (`RequestLanesBounded`, and with no open-connection bound the parker
+/// overflows: `ParkBounded`); a wait takes a wait lane past the cap
+/// (`WaitLanesBounded`); the parker closes a hung-up connection without ending
+/// its tenure (`EveryConnectionPlaced`).
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn control_lane_tenure_model() -> Model {
+    crate::ty_model! {
+        ControlLaneTenure {
+            const Buggy = 0;
+            const Lanes = 2;
+            const Waits = 1;
+            const Cap = 2;
+            // Bounds the arrivals the checker walks (a `Buggy` admission ignores
+            // `Cap`, and would otherwise admit for ever).
+            const Arrivals = 4;
+            var working = 0;
+            var held = 0;
+            var waiting = 0;
+            var parked = 0;
+            var queued = 0;
+            var open = 0;
+            var arrivals = 0;
+            // A fresh client was refused while an idle connection held a lane.
+            var refused_idle = 0;
+            action Admit when (
+                arrivals <= Arrivals - 1 &&
+                (Buggy == 1 || open <= Cap - 1) &&
+                working + held + queued <= if Buggy == 1 { Lanes } else { Lanes - 1 }
+            ) {
+                working = working + 1;
+                open = open + 1;
+                arrivals = arrivals + 1;
+            }
+            action Refuse when (Lanes <= working + held + queued || Cap <= open) {
+                refused_idle = if held > 0 { 1 } else { refused_idle };
+            }
+            action Finish when (working > 0) {
+                working = working - 1;
+                held = if Buggy == 1 { held + 1 } else { held };
+                parked = if Buggy == 1 { parked } else { parked + 1 };
+            }
+            action Defer when (
+                working > 0 && (Buggy == 1 || waiting <= Waits - 1)
+            ) {
+                working = working - 1;
+                waiting = waiting + 1;
+            }
+            action WaitFinish when (waiting > 0) {
+                waiting = waiting - 1;
+                parked = parked + 1;
+            }
+            action Wake when (parked > 0) {
+                parked = parked - 1;
+                queued = queued + 1;
+            }
+            action Pick when (queued > 0 && working + held <= Lanes - 1) {
+                queued = queued - 1;
+                working = working + 1;
+            }
+            action Close when (working > 0) {
+                working = working - 1;
+                open = open - 1;
+            }
+            action WaitClose when (waiting > 0) {
+                waiting = waiting - 1;
+                open = open - 1;
+            }
+            action ParkedClose when (parked > 0) {
+                parked = parked - 1;
+                open = if Buggy == 1 { open } else { open - 1 };
+            }
+            invariant NoIdleHold: held == 0;
+            invariant NoRefusalByIdleDriver: refused_idle == 0;
+            invariant RequestLanesBounded: working + held <= Lanes;
+            invariant WaitLanesBounded: waiting <= Waits;
+            invariant ParkBounded: parked + queued <= Cap;
+            invariant EveryConnectionPlaced:
+                working + held + waiting + parked + queued == open;
         }
     }
 }

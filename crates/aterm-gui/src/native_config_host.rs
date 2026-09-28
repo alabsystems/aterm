@@ -303,7 +303,7 @@ mod tests {
     use crate::document_store::DocumentStore;
 
     fn document() -> DocumentId {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         store.open(
             "document:test".to_string(),
             "manual diagnostics".to_string(),

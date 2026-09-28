@@ -35,7 +35,7 @@
 //! real `aterm_core::terminal::Terminal` driven byte for byte; the
 //! content-scroll seam first (`sync_cursor_effect_scroll` — a frame that
 //! scrolled or moved a band samples nothing, as `app_render.rs` does); then
-//! LOCK A's rows (`row_cols_into` after the batch, fed to
+//! the frame hold's rows (`row_cols_into` after the batch, fed to
 //! `CursorGlow::observe_row` / `observe_ribbon_row` / `ribbon_rows`); then
 //! `CursorGlow::tick`. Frames come at 16 ms, the cadence a fading ribbon
 //! keeps. A RED reading is `(followed, frames the copy's row was lit out of
@@ -64,7 +64,7 @@ const COLS: usize = 80;
 
 /// The GUI's frame seam (`trail_host::Core`): the content-scroll seam first
 /// (a scroll or band move is applied to the engine and the frame samples
-/// nothing), the alt-screen re-baseline, then LOCK A — the caret row's
+/// nothing), the alt-screen re-baseline, then the frame hold — the caret row's
 /// probe, which is also its witness sample, and the rows the witness names,
 /// all read AFTER the last `process` — then the tick.
 const SEAM: Opts = Opts {

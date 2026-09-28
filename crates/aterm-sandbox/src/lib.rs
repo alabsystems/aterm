@@ -8,17 +8,17 @@
 //! (so the limits are inherited by the shell and everything it runs). Installing
 //! a sandbox is a privileged effect, so [`Limits::apply`] requires a
 //! [`Cap<Sandbox>`] from `aterm-cap` (capability-gated; the cap cannot be
-//! struct-literal-forged outside `aterm-cap` — see that crate for the exact,
-//! honest scope of the guarantee, and §5.4 for the stronger sealed mint).
+//! struct-literal-forged outside `aterm-cap`, and its root mint is sealed behind
+//! `aterm-cap`'s `launcher-mint` feature — see that crate for the scope).
 //!
-//! This is the portable resource-limit layer. A macOS Seatbelt / Endpoint
-//! Security profile (filesystem/network scoping) is a separate, platform-specific
-//! lane on top of it and is not implemented here.
+//! This is the portable resource-limit layer only. OS filesystem/network scoping
+//! is `aterm-containment`'s Seatbelt lane (`actuator.rs`), not this crate.
 //!
 //! Platform split: the cap gate and the `Limits` policy surface are shared; the
-//! actuator is per-platform (`src/unix.rs` = the POSIX `setrlimit` loop,
-//! `src/windows.rs` = a documented, capability-gated NO-OP until the Job Object
-//! resource lane lands).
+//! actuator is per-platform. `src/unix.rs` is the POSIX `setrlimit` loop.
+//! `src/windows.rs` has two lanes: [`Limits::apply`] is a capability-gated no-op
+//! (Windows has no rlimits), and `Limits::apply_to_job` is the real Job Object
+//! lane, which `aterm-pty`'s ConPTY seam calls on the suspended child's job.
 //!
 //! STATUS (per §0.1): the cap gate and `setrlimit` application are tested (the
 //! application is verified by reading the limit back); not yet Trust-proven.
@@ -28,7 +28,7 @@ use std::io;
 use aterm_cap::{Cap, Tier};
 
 // Per-platform actuator behind one module name (module split, not inline cfg):
-// unix = the real setrlimit loop; windows = the honest no-op.
+// unix = the real setrlimit loop; windows = the no-op `apply` + the Job Object lane.
 #[cfg(unix)]
 #[path = "unix.rs"]
 mod imp;
@@ -84,9 +84,13 @@ impl Limits {
     pub fn shell_default() -> Self {
         Limits {
             cpu_seconds: None,
-            // macOS rejects ANY finite `RLIMIT_AS` (only `RLIM_INFINITY` is
-            // accepted — `setrlimit` returns `EINVAL` otherwise), so leave the
-            // address space unbounded there and rely on the other limits.
+            // macOS refuses (`EINVAL`) any `RLIMIT_AS` below the process's
+            // CURRENT mapped size, and an arm64 process already maps ~415 GiB
+            // before it runs a line (measured 2026-09-23, macOS 26.6: python3
+            // and zsh alike), so the 16 GiB cap below cannot be expressed
+            // there, and a value large enough to be accepted bounds nothing
+            // real. Leave the address space unbounded on macOS and rely on the
+            // other limits.
             address_space: if cfg!(target_os = "macos") {
                 None
             } else {
@@ -123,9 +127,9 @@ impl Limits {
     /// `fork`, before `exec`. Requires a `Trusted`+ [`Cap<Sandbox>`].
     ///
     /// The cap gate hard-fails, but the individual `setrlimit` calls are applied
-    /// BEST-EFFORT: a resource the OS does not support (e.g. `RLIMIT_AS` on
-    /// macOS) must NOT prevent the limits that DO work (`RLIMIT_NOFILE`) from
-    /// being installed. Every limit is attempted; the first per-limit error is
+    /// BEST-EFFORT: a limit the OS refuses (e.g. a 16 GiB `RLIMIT_AS` on macOS,
+    /// which is below the address space every process already maps) must NOT
+    /// prevent the limits that DO work (`RLIMIT_NOFILE`) from being installed. Every limit is attempted; the first per-limit error is
     /// returned only after all have been tried, so one unsupported resource can
     /// never silently leave the child unconfined.
     ///
@@ -144,12 +148,12 @@ impl Limits {
     /// `AllSupportedApplied` invariant — once apply has run, EVERY restriction the
     /// policy *requested* that the OS *supports* is actually installed — is exactly
     /// the macOS no-op regression this best-effort-per-limit loop fixes: a requested
-    /// limit the OS supports is never silently skipped because an earlier unsupported
-    /// one (e.g. `RLIMIT_AS` on macOS) errored. There is NO Tier-1 binding: the one
-    /// that existed drove a pure per-slot rule this loop never called (the loop runs
-    /// post-fork and may not allocate), so it bound a model to code that did not
-    /// ship and was retired (2026-09-25). `apply_actually_sets_the_limit` reads the
-    /// installed limit back.
+    /// limit the OS supports is never silently skipped because an earlier refused
+    /// one (e.g. a 16 GiB `RLIMIT_AS` on macOS) errored. There is NO Tier-1
+    /// binding: the one that existed drove a pure per-slot rule this loop never
+    /// called (the loop runs post-fork and may not allocate), so it bound a model to
+    /// code that did not ship and was retired (2026-09-25).
+    /// `apply_actually_sets_the_limit` reads the installed limit back.
     // PROJECTION (TRUST_VACUITY_GATE §2.2 / finding 2): `Apply` projects the real
     // best-effort-per-limit apply loop onto the spec's `<<requested, supported,
     // applied, done>>`. The L2 obligation requires the projection NAME be present
@@ -304,22 +308,38 @@ mod tests {
     #[test]
     fn unsupported_limit_does_not_block_the_working_ones() {
         let _serialized = nofile_guard();
-        // Regression: `RLIMIT_AS` EINVALs on macOS; the old `?`-early-return
-        // there skipped the `RLIMIT_NOFILE` that DOES work, so the child got
-        // ZERO confinement. Applying an (often-unsupported) huge AS alongside a
-        // small NOFILE must STILL install NOFILE — best-effort per limit.
+        // Regression: `shell_default()`'s 16 GiB `RLIMIT_AS` EINVALed on macOS;
+        // the old `?`-early-return there skipped the `RLIMIT_NOFILE` that DOES
+        // work, so the child got ZERO confinement. Applying a REFUSED AS
+        // alongside a small NOFILE must STILL install NOFILE — best-effort per
+        // limit.
         let auth = unsafe { Authority::root_authority() };
         let cap: Cap<Sandbox> = auth.grant(Tier::Trusted);
         let target = 256u64;
-        // 64 TiB AS: macOS rejects it (EINVAL), Linux accepts it; either way
-        // NOFILE must land. (Discard the Result — on macOS apply() now reports
-        // the AS error AFTER applying NOFILE.)
-        let _ = Limits {
-            address_space: Some(64 * 1024 * 1024 * 1024 * 1024),
+        // macOS refuses any AS below the process's current mapped size, and a
+        // 64-bit Mach-O maps a 4 GiB `__PAGEZERO` before anything else, so 1 GiB
+        // is refused on every Mac — the path under test. (This used 64 TiB and
+        // claimed macOS rejects it; macOS ACCEPTS 64 TiB, so on macOS the test
+        // never reached the refused path it exists for.) Off macOS keep 64 TiB:
+        // accepted and harmless, where 1 GiB would cap this test process itself.
+        let address_space: u64 = if cfg!(target_os = "macos") {
+            1024 * 1024 * 1024
+        } else {
+            64 * 1024 * 1024 * 1024 * 1024
+        };
+        let result = Limits {
+            address_space: Some(address_space),
             open_files: Some(target),
             ..Default::default()
         }
         .apply(&cap);
+        if cfg!(target_os = "macos") {
+            assert!(
+                result.is_err(),
+                "macOS must refuse an RLIMIT_AS below the mapped size, or this test \
+                 exercises nothing"
+            );
+        }
         assert_eq!(
             current(libc::RLIMIT_NOFILE),
             target,
@@ -329,9 +349,10 @@ mod tests {
 
     #[test]
     fn shell_default_omits_unsupported_address_space_on_macos() {
-        // The REAL production value: macOS must NOT request RLIMIT_AS (it would
-        // EINVAL and — before the best-effort fix — abort the whole apply, so
-        // the child was unconfined). Construction-only: no setrlimit, no
+        // The REAL production value: macOS must NOT request RLIMIT_AS (16 GiB is
+        // below what every process already maps, so it would EINVAL and — before
+        // the best-effort fix — abort the whole apply, so the child was
+        // unconfined). Construction-only: no setrlimit, no
         // process-wide fd-limit side effect / test-ordering hazard.
         let d = Limits::shell_default();
         #[cfg(target_os = "macos")]

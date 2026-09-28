@@ -103,7 +103,7 @@ fn assert_transition(model: &Model, before: &State, after: &State, action: &'sta
 #[test]
 fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let model = native_editor_modal_model();
-    let mut store = DocumentStore::new();
+    let mut store = DocumentStore::for_test();
     let document = store.open("mem://editor-modal-conformance".into(), "abc".into());
     // The model's `Cap` is the length of the document this trace opens.
     let cap = model
@@ -239,7 +239,7 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     // Bind the added goto lifecycle to genuine shipping code. A two-line
     // buffer makes the abstract zero-based target `1` equal the real byte of
     // line 2, so acceptance is checked as a transition rather than inferred.
-    let mut goto_store = DocumentStore::new();
+    let mut goto_store = DocumentStore::for_test();
     let goto_document = goto_store.open("mem://editor-goto-conformance".into(), "\nx".into());
     let mut goto_workspace = EditorWorkspace::new();
     let mut goto_view = goto_workspace

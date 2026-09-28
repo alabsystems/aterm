@@ -1,57 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The plumbing the two smokes stand on, and the self-check that keeps it honest.
+//! The plumbing the two smokes stand on. Unix only, like the smokes
+//! (`crate::smoke_stages`).
 //!
-//! `tools/verify.sh` grew a `smoke_helpers_selftest` after a real incident: a
-//! "friendlier" temp prefix pushed the instance socket path past macOS's
-//! `SUN_LEN` ceiling and the smoke started timing out with a child log that said
-//! `path must be shorter than SUN_LEN` — a product-shaped failure caused entirely
-//! by the harness. Those invariants are unit tests here AND still run under
-//! `--selftest`, because the point was always to check the harness on a machine,
-//! not only in a test binary.
+//! Its invariants are unit tests below — among them the one a real incident
+//! taught: a "friendlier" temp prefix pushed the instance socket path past
+//! macOS's `SUN_LEN` ceiling and the smoke started timing out with a child log
+//! that said `path must be shorter than SUN_LEN`, a product-shaped failure
+//! caused entirely by the harness.
 
-use std::ffi::OsStr;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
 /// macOS's `sockaddr_un.sun_path` ceiling. Every smoke socket path must stay
 /// under it, which is why the smokes live in `/tmp` and not in `$TMPDIR`.
 pub const SUN_LEN: usize = 104;
-
-/// The ordinary debug binaries ARE the smoke artifacts. Launching them directly
-/// (rather than through `targo run`) keeps the recorded PID attached to the real
-/// process, so teardown and activation are deterministic — and keeps the driver's
-/// lane banner out of a captured control-socket reply.
-///
-/// A relative `CARGO_TARGET_DIR` is interpreted from the repo root, matching cargo.
-#[must_use]
-pub fn debug_bin(root: &Path, cargo_target_dir: Option<&OsStr>, name: &str) -> PathBuf {
-    let dir = cargo_target_dir.map_or_else(
-        || root.join("target"),
-        |d| {
-            let p = Path::new(d);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                root.join(p)
-            }
-        },
-    );
-    dir.join("debug").join(name)
-}
-
-/// The same, for a `[[example]]` target — cargo puts those under
-/// `<target>/debug/examples/`, not beside the binaries.
-///
-/// A separate function rather than a `name` a caller spells with a slash: the
-/// layout is cargo's, and a caller encoding it in a string is a caller that
-/// will be wrong on the day it changes.
-#[must_use]
-pub fn debug_example(root: &Path, cargo_target_dir: Option<&OsStr>, name: &str) -> PathBuf {
-    debug_bin(root, cargo_target_dir, "examples").join(name)
-}
 
 /// Pull `<field>=<digits>` out of a metrics reply.
 ///
@@ -143,7 +108,6 @@ pub fn signal(pid: u32, sig: &str) -> (bool, String) {
 /// launched being the process it measured.
 ///
 /// Returns `(ok, stderr_from_kill)`.
-#[cfg(unix)]
 pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     use std::os::unix::process::ExitStatusExt;
 
@@ -181,52 +145,14 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
     (ok, noise)
 }
 
-/// Windows analogue of the above. There is no signal to ask politely with and no
-/// `signal()` on `ExitStatus` to classify the death by, so the sequence is: give the
-/// child two seconds to leave on its own, then `TerminateProcess` via [`Child::kill`].
-///
-/// The Unix contract — only a death WE caused counts as a clean retirement — is kept:
-/// a self-exit is judged by its code, and a terminated child is a success only when
-/// this function is the one that terminated it.
-#[cfg(not(unix))]
-pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
-    let mut noise = String::new();
-
-    let mut exited = false;
-    for _ in 0..40 {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                exited = true;
-                break;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(50)),
-            Err(_) => break,
-        }
-    }
-    let mut kill_sent = false;
-    if !exited && matches!(child.try_wait(), Ok(None)) {
-        match child.kill() {
-            Ok(()) => kill_sent = true,
-            Err(e) => noise.push_str(&e.to_string()),
-        }
-    }
-    let ok = match child.wait() {
-        // Left on its own terms, cleanly.
-        Ok(st) if st.code() == Some(0) => true,
-        // Any other exit is clean only if this function is what ended it.
-        Ok(_) => kill_sent,
-        Err(_) => false,
-    };
-    (ok, noise)
-}
-
 /// Block until `pid` — a child of this process that ends by itself — has EXITED:
 /// a zombie in `ps`, its status fixed and not yet reaped, so the pid is still
 /// ours and nothing can be recycled under a signal sent to it next. The state,
 /// never a nap: a loaded machine can keep `sh -c 'exit 7'` alive past any fixed
 /// sleep, and a TERM that beats it to its `exit` turns "died on its own" into
-/// "retired by us". Bounded only as a fail-safe (`false`).
-#[cfg(unix)]
+/// "retired by us". Bounded only as a fail-safe (`false`). The smokes' own
+/// tests use it to witness a child's exit before a teardown.
+#[cfg(test)]
 #[must_use]
 pub(crate) fn exited_on_its_own(pid: u32) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -244,14 +170,6 @@ pub(crate) fn exited_on_its_own(pid: u32) -> bool {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// Off unix [`retire_smoke_child`] itself gives the child two seconds to leave on
-/// its own before it terminates anything, so there is nothing to wait for here.
-#[cfg(not(unix))]
-#[must_use]
-pub(crate) fn exited_on_its_own(_pid: u32) -> bool {
-    true
 }
 
 /// Bring exactly the launched GUI process to the front without Accessibility or
@@ -375,7 +293,6 @@ pub fn smoke_log_tail(label: &str, path: &Path) -> String {
 
 /// Is this path a bound unix socket (or a symlink to one)? The script's
 /// `[ -S "$sock" ] || [ -L "$sock" ]`.
-#[cfg(unix)]
 #[must_use]
 pub fn is_socket_or_symlink(path: &Path) -> bool {
     use std::os::unix::fs::FileTypeExt;
@@ -390,120 +307,14 @@ pub fn is_socket_or_symlink(path: &Path) -> bool {
 /// it before `listen(2)`, and a client that dials in between is refused
 /// (`ECONNREFUSED`), which a loaded machine turns from a microsecond window into
 /// a smoke stage's first `aterm-ctl` call failing (2026-09-24).
-#[cfg(unix)]
 #[must_use]
 pub fn socket_listening(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
-/// Off unix std has no `AF_UNIX` client to probe with, so the bound FILE is the
-/// signal there, exactly as before the listening probe existed.
-#[cfg(not(unix))]
-#[must_use]
-pub fn socket_listening(path: &Path) -> bool {
-    is_socket_or_symlink(path)
-}
-
-/// Windows has no `S_IFSOCK`: a bound `AF_UNIX` socket lands on disk as a REPARSE
-/// POINT, which `FileType::is_socket` (absent there) could not report anyway. So the
-/// honest analogue tests the reparse attribute alongside the symlink case — still
-/// specific, and still false for the plain file the selftest asserts against.
-#[cfg(not(unix))]
-#[must_use]
-pub fn is_socket_or_symlink(path: &Path) -> bool {
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    #[cfg(windows)]
-    use std::os::windows::fs::MetadataExt as _;
-    std::fs::symlink_metadata(path)
-        .map(|m| {
-            #[cfg(windows)]
-            {
-                m.file_type().is_symlink()
-                    || (m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
-            }
-            #[cfg(not(windows))]
-            {
-                let _ = FILE_ATTRIBUTE_REPARSE_POINT;
-                m.file_type().is_symlink()
-            }
-        })
-        .unwrap_or(false)
-}
-
-/// The `--selftest` harness check: pure and temporary coverage of the plumbing
-/// the real smokes depend on. Same assertions the script made.
-#[must_use]
-pub fn smoke_helpers_selftest(root: &Path) -> bool {
-    let Ok(tmp) = crate::mktemp_dir("atx") else {
-        return false;
-    };
-    let got = debug_bin(root, Some(OsStr::new("relative-target")), "aterm-gui");
-    let expected = root.join("relative-target/debug/aterm-gui");
-    // Pin the maximum macOS instance-socket spelling below SUN_LEN: this catches
-    // a future "friendlier" temp prefix silently reintroducing the timeout whose
-    // child log said `path must be shorter than SUN_LEN`.
-    let sock = tmp.join("run/aterm/aterm-4294967295.sock");
-
-    let mut noise = String::new();
-    let mut retired = false;
-    if let Ok(mut long) = Command::new("sleep")
-        .arg("30")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        let (ok, err) = retire_smoke_child(&mut long);
-        retired = ok;
-        noise.push_str(&err);
-    }
-    // Negative control: a child that exited on its own must NOT be reported as
-    // successfully retired — retired only once it HAS exited, so a TERM can
-    // never beat a starved `sh` to its `exit 7`.
-    let mut unexpected_accepted = true;
-    if let Ok(mut quick) = Command::new("/bin/sh")
-        .args(["-c", "exit 7"])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        let exited = exited_on_its_own(quick.id());
-        let (ok, err) = retire_smoke_child(&mut quick);
-        unexpected_accepted = ok || !exited;
-        noise.push_str(&err);
-    }
-
-    let ok = got == expected
-        && metric_u64("OK backend=gpu frames=17 present_drops=0", "frames") == Some(17)
-        && metric_u64("OK max_frames=9", "frames").is_none()
-        && retired
-        && !unexpected_accepted
-        && noise.is_empty()
-        && sock.as_os_str().len() < SUN_LEN;
-    std::fs::remove_dir_all(&tmp).ok();
-    ok
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_debug_binary_path_follows_cargo_target_dir() {
-        let root = Path::new("/repo");
-        assert_eq!(
-            debug_bin(root, None, "aterm-gui"),
-            Path::new("/repo/target/debug/aterm-gui")
-        );
-        assert_eq!(
-            debug_bin(root, Some(OsStr::new("relative-target")), "aterm-gui"),
-            Path::new("/repo/relative-target/debug/aterm-gui"),
-            "a relative CARGO_TARGET_DIR is interpreted from the repo root"
-        );
-        assert_eq!(
-            debug_bin(root, Some(OsStr::new("/elsewhere")), "aterm-ctl"),
-            Path::new("/elsewhere/debug/aterm-ctl")
-        );
-    }
 
     #[test]
     fn a_metric_field_must_be_the_whole_field() {
@@ -544,7 +355,7 @@ mod tests {
 
     #[test]
     fn the_longest_instance_socket_path_stays_under_sun_len() {
-        // The incident invariant, checked here as well as under --selftest.
+        // The incident invariant.
         let tmp = crate::mktemp_dir("atx").expect("mktemp");
         let sock = tmp.join("run/aterm/aterm-4294967295.sock");
         assert!(
@@ -628,11 +439,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The `#[cfg(unix)]` half of [`is_socket_or_symlink`]. Gated on the
-    /// SYMLINK, not on the socket: `std::os::unix::fs::symlink` has no portable
-    /// spelling, and the Windows analogue needs a privilege a test runner has
-    /// no claim to. The `not(unix)` twin below keeps the negative half pinned.
-    #[cfg(unix)]
     #[test]
     fn only_a_socket_or_a_symlink_counts_as_a_bound_socket() {
         let tmp = crate::mktemp_dir("atv-sock").expect("mktemp");
@@ -647,30 +453,6 @@ mod tests {
         std::os::unix::fs::symlink(&plain, &link).expect("symlink");
         assert!(is_socket_or_symlink(&link), "the script accepted a symlink");
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// The `not(unix)` half, negative side only — and that limit is the honest
-    /// one: minting a reparse point to prove the positive side needs a
-    /// privilege the runner may not hold, while the FALSE answers are what the
-    /// smoke actually depends on (a plain file must never read as a bound
-    /// socket, or the GUI smoke would wait forever on a socket nobody bound).
-    #[cfg(not(unix))]
-    #[test]
-    fn a_plain_file_is_never_a_bound_socket_where_there_is_no_s_ifsock() {
-        let tmp = crate::mktemp_dir("atv-sock").expect("mktemp");
-        let plain = tmp.join("aterm.sock");
-        assert!(!is_socket_or_symlink(&plain), "absent is not bound");
-        std::fs::write(&plain, b"not a socket").expect("write");
-        assert!(
-            !is_socket_or_symlink(&plain),
-            "a regular file is not a bound socket"
-        );
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn the_harness_selftest_passes_on_this_machine() {
-        assert!(smoke_helpers_selftest(Path::new("/repo")));
     }
 
     /// THE SWIFT AND THE RUST MAY NOT DISAGREE ABOUT THE BUDGET. The activation

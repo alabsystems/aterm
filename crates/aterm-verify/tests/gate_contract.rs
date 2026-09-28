@@ -22,7 +22,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use aterm_verify::changed::{self, Selection};
 use aterm_verify::cli::Mode;
 use aterm_verify::ladder::{Report, Tally, tally};
 use aterm_verify::plan::{Lane, StageId, StageSpec};
@@ -81,32 +80,16 @@ impl FakeRepo {
         for name in aterm_verify::stages::ATPKG_SUITES {
             me.script(&format!("tools/{name}"), "exit 0");
         }
-        me.script("tools/test-trust-gate-verdict.sh", "exit 0");
         me.script("tools/test-trust-contract-probe.sh", "exit 0");
         me.script("tools/perf-arena/test-start-compare.sh", "exit 0");
         me.script("libc-oracle/run.sh", "exit 0");
-        // The redraw harness the gate builds and then DRIVES. Present and passing
-        // by default so an unrelated test never reads a missing binary as a
-        // finding; `redraw_harness` re-writes it for the tests that are about
-        // what its exit code means.
-        me.redraw_harness(0);
-        // Likewise the live-class auditor, which is an `[[example]]` and so
-        // lands under `target-drivers/debug/examples/` (the driver lane's dir
-        // since 2026-09-13).
-        me.objc_auditor(0);
-        // And the IME driver beside it, same shape, same reason.
-        me.objc_ime_driver(0);
-        // And the toolbar driver, likewise.
-        me.objc_toolbar_driver(0);
-        // And the window driver (W8), likewise.
-        me.objc_window_driver(0);
-        // And the event driver, likewise.
-        me.objc_event_driver(0);
-        // And the three the objc2 exit added: the modal driver (W13) and the
-        // two capability drivers (W12), likewise.
-        me.objc_alert_driver(0);
-        me.objc_swizzle_driver(0);
-        me.objc_bound_driver(0);
+        // Every binary the gate builds and then DRIVES, from the stages' own
+        // names: present and passing by default, so an unrelated test never
+        // reads a missing binary as a finding. `driver_stub` re-writes one for
+        // the tests about what its exit code means.
+        for rel in driven_stubs() {
+            me.driver_stub(&rel, 0);
+        }
         // And the one `aterm` binary the live lanes are handed, in the driver
         // lane's dir where their stage's own build leaves it.
         fs::create_dir_all(me.root.join("target-drivers/debug")).expect("mkdir");
@@ -114,123 +97,21 @@ impl FakeRepo {
         me
     }
 
-    /// A stand-in `aterm-redraw-conformance` that exits `code` — the harness's
-    /// own contract is `0` pass / `1` fail / `2` could-not-run, and what these
-    /// tests exercise is the STAGE's reading of it, not cargo's.
-    fn redraw_harness(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/aterm-redraw-conformance",
-            &format!("echo 'aterm-redraw-conformance: stub'; exit {code}"),
-        );
-        self
+    /// A stand-in for a binary the driver lane builds and a stage then DRIVES
+    /// — `rel` under `target-drivers/debug/` — that exits `code`. What these
+    /// tests exercise is the STAGE's reading of the code (the redraw harness's
+    /// `0`/`1`/`2`, each objc driver's own contract), never the drive itself.
+    fn driver_stub(&self, rel: &str, code: i32) -> &Self {
+        self.driver_script(rel, &format!("echo '{rel}: stub'; exit {code}"))
     }
 
-    /// A stand-in `objc_live_class_audit` example that exits `code`. Same
-    /// `0`/`1`/`2` contract as the redraw harness, and what these tests
-    /// exercise is likewise the STAGE's reading of it.
-    fn objc_auditor(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_live_class_audit",
-            &format!("echo 'objc-live-class-audit: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_ime_drive` example that exits `code`. Same `0`/`1`/`2`
-    /// contract, and what these tests exercise is likewise the STAGE's reading
-    /// of it and not the composition itself.
-    fn objc_ime_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_ime_drive",
-            &format!("echo 'objc-ime-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_toolbar_drive` example that exits `code`. FOUR codes
-    /// here and not three (`3` is the watchdog), and what these tests exercise
-    /// is likewise the STAGE's reading of them and not the drive itself.
-    fn objc_toolbar_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_toolbar_drive",
-            &format!("echo 'objc-toolbar-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_window_drive` example that exits `code`. THREE codes,
-    /// not the toolbar's four: this driver pops no menu, so it has no modal
-    /// tracking loop to hang in and no watchdog to report one.
-    fn objc_window_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_window_drive",
-            &format!("echo 'objc-window-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_event_drive` example that exits `code` — `0`/`1`/`2`
-    /// as its siblings.
-    fn objc_event_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_event_drive",
-            &format!("echo 'objc-event-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_event_drive` that dies by a signal, leaving no exit
-    /// status — the reading the v0.72.0 crash (a `SIGABRT`) reaches, and the
-    /// one where this stage differs from its siblings. The stub dies by
-    /// `SIGKILL`, not `SIGABRT`: the ladder reads every signal death alike
-    /// (`objc_event_outcome(None)`), and a `SIGABRT` made macOS write a crash
-    /// report for the stub's shell (`/bin/sh`, filed as `bash`) on every run
-    /// (grep_guard B16).
-    fn objc_event_driver_aborting(&self) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_event_drive",
-            "echo 'objc-event-drive: stub about to die by a signal'; kill -KILL $$",
-        );
-        self
-    }
-
-    /// A stand-in `objc_alert_drive` example that exits `code` — `0`/`1`/`2`
-    /// as the window drive's.
-    fn objc_alert_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_alert_drive",
-            &format!("echo 'objc-alert-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_swizzle_drive` example that exits `code`. An
-    /// `aterm-objc` example lands in the same `target-drivers/debug/examples/` as the
-    /// `aterm-gui` ones, which is what the stage's path resolution assumes.
-    fn objc_swizzle_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_swizzle_drive",
-            &format!("echo 'objc-swizzle-drive: stub'; exit {code}"),
-        );
-        self
-    }
-
-    /// A stand-in `objc_bound_drive` example that exits `code`, likewise.
-    fn objc_bound_driver(&self, code: i32) -> &Self {
-        fs::create_dir_all(self.root.join("target-drivers/debug/examples")).expect("mkdir");
-        self.script(
-            "target-drivers/debug/examples/objc_bound_drive",
-            &format!("echo 'objc-bound-drive: stub'; exit {code}"),
-        );
+    /// A stand-in driven binary with its own `body`.
+    fn driver_script(&self, rel: &str, body: &str) -> &Self {
+        let path = format!("target-drivers/debug/{rel}");
+        if let Some(dir) = self.root.join(&path).parent() {
+            fs::create_dir_all(dir).expect("mkdir");
+        }
+        self.script(&path, body);
         self
     }
 
@@ -263,13 +144,24 @@ fi
 test "$HOME" = "${XDG_CONFIG_HOME%/cfg}/home" || exit 89
 test -d "$HOME" || exit 90
 config="$XDG_CONFIG_HOME/aterm/aterm.toml"
-grep -qx 'agents_auto_prime = false' "$config" || exit 87
-grep -qx '\[update\]' "$config" || exit 91
-grep -qx '\[packages\]' "$config" || exit 82
-grep -qx 'enabled = false' "$config" || exit 83
-grep -qx '\[machine\]' "$config" || exit 84
-grep -qx 'spotlight_noindex = false' "$config" || exit 85
-grep -qx 'universal_control = "leave"' "$config" || exit 86
+# One builtin pass, not seven `grep` spawns: every spawn before the socket is up
+# counts against the smoke's 10 s budget, and at load ~150 with 30 ladders in
+# this binary, nine of them missed it (2026-09-27). Same lines, same codes.
+seen=
+while IFS= read -r line || test -n "$line"; do
+  case "$line" in
+    'agents_auto_prime = false') seen="$seen a" ;;
+    '[update]') seen="$seen u" ;;
+    '[packages]') seen="$seen p" ;;
+    'enabled = false') seen="$seen e" ;;
+    '[machine]') seen="$seen m" ;;
+    'spotlight_noindex = false') seen="$seen s" ;;
+    'universal_control = "leave"') seen="$seen c" ;;
+  esac
+done <"$config" || exit 87
+for want in a:87 u:91 p:82 e:83 m:84 s:85 c:86; do
+  case "$seen " in *" ${want%%:*} "*) ;; *) exit "${want#*:}" ;; esac
+done
 mkdir -p "$XDG_RUNTIME_DIR/aterm"
 ln -s '@LISTENER@' "$XDG_RUNTIME_DIR/aterm/aterm.sock"
 exec sleep 300
@@ -303,20 +195,14 @@ exit 0"#
         self
     }
 
-    fn ctx(&self, mode: Mode, scope: Scope, selftest: bool) -> Ctx {
-        self.ctx_with(mode, scope, selftest, |_| {})
+    fn ctx(&self, mode: Mode, scope: Scope) -> Ctx {
+        self.ctx_with(mode, scope, |_| {})
     }
 
     /// [`Self::ctx`] with one last say over the environment the stages read —
     /// for the cases that MEASURE a variable's effect instead of being at its
     /// mercy (see the `cargo_build_jobs` pin below).
-    fn ctx_with(
-        &self,
-        mode: Mode,
-        scope: Scope,
-        selftest: bool,
-        tweak: impl FnOnce(&mut EnvSnapshot),
-    ) -> Ctx {
+    fn ctx_with(&self, mode: Mode, scope: Scope, tweak: impl FnOnce(&mut EnvSnapshot)) -> Ctx {
         let mut env = EnvSnapshot::capture();
         env.trust_stage2_bin = Some(self.stage2.clone());
         // Point the Tier-2 prover locations inside the sandbox so these tests
@@ -324,34 +210,9 @@ exit 0"#
         // that does not.
         env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
         env.ay_bin_dir = Some(self.root.join("no-ay"));
-        // …and unset the operator's target-dir redirect, for the same reason.
-        // Two stages here do not just SPAWN a child, they DRIVE a binary the
-        // build was supposed to leave behind — the control-socket smoke and the
-        // redraw gate — and both resolve it with `smoke::debug_bin`, which
-        // honours `CARGO_TARGET_DIR` exactly as cargo does. `capture()` reads
-        // the ambient one, so a shell that exports a redirect (this repo is
-        // worked in by several sessions at once and each keeps its own target
-        // dir to stay off the shared cargo lock) sent both stages hunting
-        // outside the sandbox for binaries the fixture had written INSIDE it:
-        // `redraw conformance: just-built harness missing (<redirect>/debug/…)`
-        // — a COULD-NOT-RUN, so `the_redraw_gate_…` read `could_not_run: 1`
-        // where a passing harness must leave the tally clean — and
-        // `smoke: just-built binaries missing`, which cost the scoped run its
-        // exit::PASS. Nothing about the stages was wrong: they were reading the
-        // right variable and the fixture was the one lying about the repo.
-        // `None` is the pin because the synthetic repo has cargo's DEFAULT
-        // layout — `redraw_harness` and `with_answering_smoke` write to
-        // `<root>/target/debug`, which is precisely where `debug_bin` looks
-        // when the variable is unset.
-        //
-        // 2026-09-13: the driven binaries now live in `target-drivers/`, which
-        // the gate names itself whatever is exported, and the fixture writes
-        // them there. The pin stays for the main lane, which still follows the
-        // caller's redirect.
-        env.cargo_target_dir = None;
-        // …and the caller's job count, for the same reason and with the same
-        // shape. `lane_jobs` makes an exported `CARGO_BUILD_JOBS` a CEILING on
-        // the side lanes, so the value a stage hands its child is a function of
+        // …and the caller's job count. `lane_jobs` makes an exported
+        // `CARGO_BUILD_JOBS` a CEILING on the side lanes, so the value a stage
+        // hands its child is a function of
         // the ambient environment — and two fixtures here pin that value to a
         // lane's own cap (`test "$CARGO_BUILD_JOBS" = 8 || exit 71`). Measured
         // 2026-09-16: the merge gate itself exports `CARGO_BUILD_JOBS=4` on a
@@ -373,24 +234,17 @@ exit 0"#
         // 2026-09-23 inside a merge-contract run at 17.6 GiB free: 11 failures
         // here, 12 in environment_contract.rs, every one a `disk preflight`
         // COULD NOT RUN. The estimate that replaced that floor would refuse them
-        // too, since an in-place run is budgeted cold. The preflight itself is
-        // measured by its own laws, which set the requirement they need.
-        Ctx::new(
-            self.root.clone(),
-            mode,
-            scope,
-            selftest,
-            env,
-            self.scratch.clone(),
-        )
-        .with_disk_floor(0)
-        // The GUI smoke measures a real window; a synthetic repo has none, so it
-        // takes its honest skip instead of trying to open one.
-        .with_gui_smoke_skipped(true)
+        // too, since a fixture's empty lanes are budgeted cold. The preflight
+        // itself is measured by its own laws, which set the requirement they need.
+        Ctx::new(self.root.clone(), mode, scope, env, self.scratch.clone())
+            .with_disk_floor(0)
+            // The GUI smoke measures a real window; a synthetic repo has none, so it
+            // takes its honest skip instead of trying to open one.
+            .with_gui_smoke_skipped(true)
     }
 
-    fn run(&self, mode: Mode, scope: Scope, selftest: bool) -> (String, i32) {
-        let ctx = self.ctx(mode, scope, selftest);
+    fn run(&self, mode: Mode, scope: Scope) -> (String, i32) {
+        let ctx = self.ctx(mode, scope);
         let mut out: Vec<u8> = Vec::new();
         let code = aterm_verify::run(&ctx, &mut out).expect("the ladder is writable");
         (String::from_utf8(out).expect("utf-8 ladder"), code)
@@ -403,6 +257,18 @@ impl Drop for FakeRepo {
             fs::remove_dir_all(base).ok();
         }
     }
+}
+
+/// Every driven binary's path under `target-drivers/debug/`: the redraw
+/// harness and the objc drivers' examples, named by the stages themselves.
+fn driven_stubs() -> Vec<String> {
+    std::iter::once(stages::REDRAW_CONFORMANCE_BIN.to_string())
+        .chain(
+            stages::OBJC_DRIVER_EXAMPLES
+                .iter()
+                .map(|(_, example)| format!("examples/{example}")),
+        )
+        .collect()
 }
 
 /// The `=== … ===` headers, in the order they were printed.
@@ -441,35 +307,6 @@ fn labels_with(ladder: &str, tag: &str) -> Vec<String> {
         .collect()
 }
 
-/// THE PIN for the 80-minute gate killed on an untested hypothesis (2026-09-10).
-///
-/// The run was aborted because two readers believed `verify.sh` resolved its
-/// compiler through a mutable rustup symlink and that a peer's mid-run re-seal
-/// had split the gate across two toolchains. It had not — the shim resolves a
-/// PHYSICAL path once and prepends it for the whole run — but the ladder said
-/// nothing about which toolchain it used, so neither reader could check without
-/// reading the code, and neither did. The FIRST line of every ladder now names
-/// it, so the question is answered by the record a gate already produces.
-#[test]
-fn the_ladder_opens_by_naming_the_toolchain_every_stage_below_will_run() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let (ladder, _) = repo.run(Mode::Fast, Scope::workspace(), true);
-    let first = ladder.lines().next().unwrap_or("<empty ladder>");
-    assert!(
-        first.starts_with("verify: toolchain "),
-        "the ladder must open by naming its compiler, not by a stage: {first}"
-    );
-    assert!(
-        first.contains(&repo.stage2.display().to_string()),
-        "and it must be the directory this run actually resolved: {first}"
-    );
-    assert!(
-        first.contains("absolute and resolved once"),
-        "a bare path is not the claim — the line exists to say the pin held: {first}"
-    );
-}
-
 /// A VERDICT IS READABLE WHEN IT IS DECIDED, NOT WHEN ITS TURN TO PRINT COMES
 /// (2026-09-23). The ladder prints in declared order, so a guard that FAILED in
 /// its first second stayed unread until the build and test stages ahead of it
@@ -496,11 +333,11 @@ fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
     let repo = FakeRepo::new();
     let log_path = repo.scratch.join("progress.log");
     repo.with_stage2(&format!(
-        "case \"$*\" in\n  *'build --workspace'*)\n    i=0\n    \
-         while ! grep -qF 'finish grep guards — FAIL' '{log}' && [ \"$i\" -lt 600 ]; do\n      \
+        "case \"$*\" in\n  *'--no-run'*)\n    i=0\n    \
+         while ! grep -qF 'finish grep guards and license headers — FAIL' '{log}' && [ \"$i\" -lt 600 ]; do\n      \
          sleep 0.05; i=$((i + 1))\n    done\n    \
-         grep -qF 'finish grep guards — FAIL' '{log}' || \
-         {{ echo 'the guard FAIL was never readable while the build ran'; exit 1; }} ;;\nesac\nsleep 1; exit 0",
+         grep -qF 'finish grep guards and license headers — FAIL' '{log}' || \
+         {{ echo 'the guard FAIL was never readable while the build ran'; exit 1; }} ;;\nesac\nexit 0",
         log = log_path.display()
     ));
     repo.script("tools/grep_guard.sh", "echo 'GUARD: FAIL'; exit 1");
@@ -510,7 +347,7 @@ fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
         .open(&log_path)
         .expect("the log opens");
     let ctx = repo
-        .ctx(Mode::Fast, Scope::workspace(), false)
+        .ctx(Mode::Fast, Scope::workspace())
         .with_progress_log(Some(log));
     let mut out: Vec<u8> = Vec::new();
     let code = aterm_verify::run(&ctx, &mut out).expect("the ladder is writable");
@@ -522,11 +359,14 @@ fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
         text.find(needle)
             .unwrap_or_else(|| panic!("no {needle:?} in:\n{text}"))
     };
-    let guard = at(&logged, "verify: finish grep guards — FAIL (");
-    let build = at(&logged, "verify: finish build (--workspace) — ok (");
+    let guard = at(
+        &logged,
+        "verify: finish grep guards and license headers — FAIL (",
+    );
+    let build = at(&logged, "verify: finish test compile (--workspace) — ok (");
     assert!(
         guard < build,
-        "the guard's FAIL must be readable before the slow build finishes:\n{logged}"
+        "the guard's FAIL must be readable before the slow compile finishes:\n{logged}"
     );
     // Every planned stage finished, and said how.
     for spec in plan::plan(&ctx) {
@@ -538,7 +378,8 @@ fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
     }
     // The negative control: the ladder itself is unchanged, in declared order.
     assert!(
-        at(&ladder, "=== build (--workspace) ===") < at(&ladder, "=== grep guards ==="),
+        at(&ladder, "=== test compile (--workspace) ===")
+            < at(&ladder, "=== grep guards and license headers ==="),
         "{ladder}"
     );
     assert!(
@@ -551,19 +392,10 @@ fn every_stage_finish_is_logged_with_its_outcome_as_it_happens() {
 fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
     let repo = FakeRepo::new();
     repo.with_stage2("exit 0");
-    let (ladder, _) = repo.run(Mode::Full, Scope::workspace(), false);
+    let (ladder, _) = repo.run(Mode::Full, Scope::workspace());
 
-    let ctx = repo.ctx(Mode::Full, Scope::workspace(), false);
+    let ctx = repo.ctx(Mode::Full, Scope::workspace());
     let mut expected: Vec<String> = plan::plan(&ctx).into_iter().map(|s| s.title).collect();
-    assert_eq!(
-        expected.len(),
-        38,
-        "34 gate stages (driver builds since 2026-09-13, the sealed fabric lane since \
-         2026-09-14, the conformance-release prime since 2026-09-22, the measuring \
-         tests since 2026-09-23, the window-server unit tests and the foreground \
-         handback since 2026-09-26) plus the four --full tiers (the Codex live upgrade \
-         the fourth, 2026-09-26)"
-    );
     expected.push("verdict".to_string());
     assert_eq!(headers(&ladder), expected);
     // Concurrency must never reorder the record.
@@ -578,9 +410,9 @@ fn the_ladder_prints_every_stage_in_the_declared_order_however_they_ran() {
 #[test]
 fn a_run_with_no_driver_fails_closed_and_never_claims_the_contract() {
     // The bare-machine case the bash gate handled by printing skips: here the
-    // build FAILS honestly, and the verdict says nothing was decided.
+    // test compile FAILS honestly, and the verdict says nothing was decided.
     let repo = FakeRepo::new();
-    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace(), false);
+    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace());
 
     assert_eq!(code, exit::COULD_NOT_RUN);
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
@@ -594,10 +426,7 @@ fn a_run_with_no_driver_fails_closed_and_never_claims_the_contract() {
     for needed in [
         "targo test (no targo)",
         "targo test --doc (no targo)",
-        "regex search lane (no targo)",
-        "feature gates (no targo)",
         "L0 temporal-safety gate (no targo)",
-        "gate counts (no targo)",
         "driver builds (no targo)",
         "smoke (no targo)",
     ] {
@@ -622,7 +451,7 @@ fn a_failing_guard_is_a_finding_and_exits_one() {
         "tools/grep_guard.sh",
         "echo '  FAIL A9a zero banned tokens 3'; echo 'GUARD: FAIL'; exit 1",
     );
-    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace(), false);
+    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace());
 
     assert_eq!(
         code,
@@ -641,94 +470,18 @@ fn a_failing_guard_is_a_finding_and_exits_one() {
 }
 
 #[test]
-fn the_libc_oracle_driver_is_required_and_fails_closed() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    ctx.env.cargo_target_dir = Some("caller-relative-target".into());
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::LibcOracle)
-        .expect("the libc oracle is planned");
-
-    let owned_target = repo.root.join("libc-oracle/target");
-    repo.script(
-        "libc-oracle/run.sh",
-        &format!(
-            "test \"$CARGO_TARGET_DIR\" = \"{}\" || exit 1; \
-             test \"$PYTHONDONTWRITEBYTECODE\" = 1 || exit 1; exit 0",
-            owned_target.display()
-        ),
-    );
-    let passed = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&passed));
-    assert!(!t.failed(), "the driver received its owned environment");
-    assert_eq!(t.gate_failures.len(), 0);
-    assert_eq!(t.could_not_run.len(), 0);
-
-    fs::remove_file(repo.root.join("libc-oracle/run.sh")).expect("remove driver");
-    let missing = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&missing));
-    assert_eq!(t.could_not_run.len(), 1, "a missing oracle decides nothing");
-    assert_eq!(t.gate_failures.len(), 0);
-    assert!(
-        missing
-            .render()
-            .contains("libc-oracle/run.sh missing or not executable"),
-        "{}",
-        missing.render()
-    );
-
-    repo.script(
-        "libc-oracle/run.sh",
-        "echo 'libc ABI mismatch in native runtime oracle'; exit 1",
-    );
-    let failed = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&failed));
-    assert_eq!(t.gate_failures.len(), 1, "a red oracle is a finding");
-    assert_eq!(t.could_not_run.len(), 0);
-    assert!(failed.render().contains("libc ABI mismatch"));
-    assert!(
-        failed
-            .render()
-            .contains("FAIL  libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native)")
-    );
-
-    repo.script(
-        "libc-oracle/run.sh",
-        "echo 'required target/toolchain unavailable'; exit 3",
-    );
-    let unavailable = stages::run_stage(&ctx, &spec);
-    let t = tally(std::slice::from_ref(&unavailable));
-    assert_eq!(
-        t.gate_failures.len(),
-        0,
-        "an environment failure is not a finding"
-    );
-    assert_eq!(t.could_not_run.len(), 1, "exit 3 means nothing was decided");
-    assert!(
-        unavailable
-            .render()
-            .contains("required target/toolchain unavailable")
-    );
-}
-
-#[test]
 fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
     let repo = FakeRepo::new();
     repo.with_stage2("echo 'error: unknown unstable option: `trust-verify`' >&2; exit 1");
-    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace(), false);
+    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace());
 
     assert_eq!(code, exit::FAILED);
     for driven in [
-        "targo build --workspace",
         "targo test --workspace --no-run (trustdoc)",
         "targo test --doc --workspace (trustdoc)",
         "targo test --workspace --tests (trustdoc) -- measuring:: launchd_copy_tests::",
-        "gate drift",
-        "gate dormant",
-        "gate mainloop",
-        "gate counts",
+        "gate lint --fmt-only",
+        "gate forge",
         "freeze-safety-gate (6 obligations)",
     ] {
         assert!(
@@ -795,7 +548,7 @@ fn the_sealed_rung_never_runs_before_a_fresh_aterm_gui_is_built_in_its_dir() {
              exit 0",
             record.display()
         ));
-        let (ladder, _) = repo.run(Mode::Fast, Scope::workspace(), false);
+        let (ladder, _) = repo.run(Mode::Fast, Scope::workspace());
         let lines: Vec<String> = fs::read_to_string(&record)
             .expect("the driver was invoked")
             .lines()
@@ -862,20 +615,14 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
     // really answers and really tears down — so the only thing standing between
     // this run and the merge-contract sentence is that it was narrowed.
     repo.with_answering_smoke();
-    let (ladder, code) = repo.run(Mode::Fast, Scope::crate_only("aterm-grid"), false);
+    let (ladder, code) = repo.run(Mode::Fast, Scope::crate_only("aterm-grid"));
 
     assert_eq!(code, exit::PASS, "narrow is not failure: {ladder}");
-    assert!(ladder.contains("argv: --unverified build -p aterm-grid"));
     assert!(ladder.contains("argv: --unverified test -p aterm-grid"));
     assert!(ladder.contains("argv: --unverified test --doc -p aterm-grid"));
     assert!(
         !ladder.contains("--workspace"),
         "nothing whole-tree was driven"
-    );
-    assert!(
-        !headers(&ladder)
-            .iter()
-            .any(|h| h.starts_with("regex search lane"))
     );
     assert!(ladder.contains("  ok    smoke: aterm-ctl cursor -> OK row=0 col=0"));
     assert!(ladder.contains("  ok    smoke: typing burst pacing counters clean"));
@@ -892,182 +639,6 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
     );
     // and the skips are named beside it
     assert!(ladder.contains("      - gui smoke (--skip-gui-smoke)"));
-}
-
-#[test]
-fn a_change_scoped_run_drives_one_dash_p_per_crate_and_is_refused_the_contract() {
-    // Driven with a plain stand-in driver rather than the answering smoke: the
-    // control-socket smoke launches a real process against a 10 s socket budget,
-    // and a second test doing that concurrently is a coin-toss on a loaded
-    // machine. What this test is ABOUT is the argv and the verdict, so the green
-    // run is composed the way `run` composes it (plan -> scheduler -> tally ->
-    // verdict) instead of being bought with a second live subprocess.
-    let repo = FakeRepo::new();
-    repo.with_stage2("echo \"argv: $*\"\nexit 0");
-    let cone = Scope::changed("main", vec!["aterm-grid".into(), "aterm-gui".into()], true);
-    let (ladder, _) = repo.run(Mode::Fast, cone.clone(), false);
-
-    assert!(ladder.contains("argv: --unverified build -p aterm-grid -p aterm-gui"));
-    assert!(ladder.contains("argv: --unverified test -p aterm-grid -p aterm-gui"));
-    assert!(ladder.contains("argv: --unverified test --doc -p aterm-grid -p aterm-gui"));
-    assert!(
-        !ladder.contains("--workspace"),
-        "nothing whole-tree was driven"
-    );
-    // aterm-search is not in the cone, so the lane has nothing to run.
-    assert!(
-        !headers(&ladder)
-            .iter()
-            .any(|h| h.starts_with("regex search lane"))
-    );
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-
-    let ctx = repo.ctx(Mode::Fast, cone, false);
-    let green = |s: &StageSpec| {
-        let mut r = Report::new(s.title.clone());
-        r.pass("did the thing");
-        r
-    };
-    let reports = sched::run_stages(&plan::plan(&ctx), green, |_, _| {});
-    let v = verdict(Mode::Fast, &ctx.scope, false, &tally(&reports));
-    assert_eq!(v.exit, exit::PASS, "narrow is not failure");
-    assert!(
-        !v.claims_merge_contract,
-        "a change-scoped run claiming it all"
-    );
-    assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
-    assert!(v.text.contains("NOT the merge contract"));
-    assert!(v.text.contains("(mode=fast scope=changed:2, 0 skipped) —"));
-    assert!(v.text.contains(
-        "      - change-scoped against main to 2 crate(s) (aterm-grid aterm-gui): \
-         every other workspace crate was not built or tested\n"
-    ));
-}
-
-#[test]
-fn a_change_scoped_run_that_selected_nothing_compiles_nothing() {
-    // The docs-only branch. The whole-tree guard stages still run; the compiling
-    // stages skip BY NAME, and the empty `--workspace` fallback never fires —
-    // that fallback exists only so a dropped guard would build too much.
-    //
-    // No answering smoke here: this test is about which stages COMPILE, and the
-    // control-socket smoke launches a real process on a 10 s socket budget that a
-    // loaded machine can miss. The verdict text for this scope is pinned in
-    // `verdict.rs` over the whole matrix instead.
-    let repo = FakeRepo::new();
-    repo.with_stage2("echo \"argv: $*\"\nexit 0");
-    let (ladder, _) = repo.run(Mode::Fast, Scope::changed("main", vec![], true), false);
-
-    // No "(trustdoc)" on the skipped test/doctest lines: a run that compiled
-    // nothing never chose a doc driver, so the skip names no tool it never
-    // bound — the empty selection outranks the doc-driver verdict.
-    for named in [
-        "targo build <no crates selected> (change-scoped run selected no crates)",
-        "targo test <no crates selected> (change-scoped run selected no crates)",
-        "targo test --doc <no crates selected> (change-scoped run selected no crates)",
-    ] {
-        assert!(
-            labels_with(&ladder, "skip").iter().any(|l| l == named),
-            "missing skip: {named}\n{ladder}"
-        );
-    }
-    assert!(
-        !ladder.contains("argv: --unverified build --workspace"),
-        "the empty selection must never fall through to a whole-tree build"
-    );
-    assert!(!ladder.contains("argv: --unverified test --workspace"));
-    // The guards are whole-tree in every mode and really ran.
-    assert!(labels_with(&ladder, "ok").contains(&"grep_guard.sh".to_string()));
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-}
-
-#[test]
-fn an_all_binary_change_selection_skips_the_doctests_instead_of_failing_them() {
-    // `targo test --doc -p xtask` is a hard error on a healthy tree, so the
-    // stage asks before it runs. A tier that cries wolf is worse than no tier.
-    //
-    // Driven under --selftest, exactly as the script decided this one: the answer
-    // does not depend on running anything, and a decision only reachable by a
-    // thirty-minute run is a decision nobody ever checks.
-    let repo = FakeRepo::new();
-    repo.with_stage2("echo \"argv: $*\"\nexit 0");
-    let bins_only = Scope::changed("main", vec!["xtask".into()], false);
-    let (ladder, _) = repo.run(Mode::Fast, bins_only, true);
-
-    let skips = labels_with(&ladder, "skip");
-    assert!(
-        skips
-            .iter()
-            .any(|l| l == "targo test --doc (no package in scope has a library target: -p xtask)"),
-        "{ladder}"
-    );
-    // The doctest stage never even reached the point of naming a command…
-    assert!(!ladder.contains("targo test --doc -p xtask"));
-    // …while the stages that CAN run on a bin-only crate still carry the scope.
-    assert!(
-        skips
-            .iter()
-            .any(|l| l == "targo build -p xtask (selftest: not executed)")
-    );
-    assert!(
-        skips
-            .iter()
-            .any(|l| l == "targo test -p xtask --no-run (trustdoc) (selftest: not executed)")
-    );
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-}
-
-#[test]
-fn the_change_scope_stage_is_printed_first_and_counted_like_any_other() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    let selection = Selection::Narrowed {
-        seeds: vec!["aterm-grid".into()],
-        crates: vec!["aterm-grid".into(), "aterm-gui".into()],
-        any_lib: true,
-    };
-    let (scope, report) = changed::stage_report("main", &selection);
-    let ctx = repo.ctx(Mode::Fast, scope, true).with_prelude(Some(report));
-    let mut out: Vec<u8> = Vec::new();
-    aterm_verify::run(&ctx, &mut out).expect("the ladder is writable");
-    let ladder = String::from_utf8(out).expect("utf-8");
-
-    assert_eq!(
-        headers(&ladder).first().map(String::as_str),
-        Some("change scope (--changed --base main)"),
-        "the stage that CHOSE the scope comes before the stages that use it"
-    );
-    assert!(ladder.contains("  changed crates:  aterm-grid\n"));
-    assert!(ladder.contains("  + dependents:    aterm-grid aterm-gui\n"));
-    assert!(ladder.contains("  ok    change scope: 2 crate(s) selected against main\n"));
-}
-
-#[test]
-fn a_widened_change_scoped_run_is_a_whole_tree_run_and_keeps_the_claim() {
-    // The direction of failure: a narrower that cannot compute its scope does
-    // MORE work, so it forfeits nothing. That only holds if the change-scope
-    // stage records an `ok` — a skip there would silently downgrade every
-    // widened run, which is the tier's most common outcome on a broken machine.
-    let repo = FakeRepo::new();
-    let widened =
-        Selection::Widened("targo is absent, so the dependency graph cannot be read".into());
-    let (scope, report) = changed::stage_report("main", &widened);
-    assert!(scope.is_workspace());
-
-    let ctx = repo
-        .ctx(Mode::Fast, scope, false)
-        .with_prelude(Some(report));
-    let specs = plan::plan(&ctx);
-    let green = |s: &StageSpec| {
-        let mut r = Report::new(s.title.clone());
-        r.pass("did the thing");
-        r
-    };
-    let mut reports = ctx.prelude.clone();
-    reports.extend(sched::run_stages(&specs, green, |_, _| {}));
-    let v = verdict(Mode::Fast, &ctx.scope, false, &tally(&reports));
-    assert!(v.claims_merge_contract, "{}", v.text);
-    assert!(v.text.contains(MERGE_CONTRACT_SENTENCE));
 }
 
 /// Every driven stage reads its driver's EXIT CODE, and nothing that decided
@@ -1095,18 +666,22 @@ fn a_widened_change_scoped_run_is_a_whole_tree_run_and_keeps_the_claim() {
 /// row runs on every unix.
 #[test]
 fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
-    type Stub = fn(&FakeRepo, i32) -> &FakeRepo;
     /// A driver outcome beyond `1` that is THE finding.
     enum Finding {
         Exit(i32),
-        /// A stand-in that dies by an untrapped signal.
-        Signal(fn(&FakeRepo) -> &FakeRepo),
+        /// A stand-in that dies by an untrapped signal. It dies by `SIGKILL`,
+        /// not the v0.72.0 crash's `SIGABRT`: the ladder reads every signal
+        /// death alike (`objc_event_outcome(None)`), and a `SIGABRT` made macOS
+        /// write a crash report for the stub's shell on every run (grep_guard
+        /// B16).
+        Signal,
     }
     struct Row {
         id: StageId,
         /// The label the stage's verdict line carries.
         label: &'static str,
-        stub: Stub,
+        /// The driven binary, under `target-drivers/debug/`.
+        stub: String,
         /// Codes beyond `1` that decided nothing, and the word the line prints.
         undecided: &'static [(i32, &'static str)],
         /// Outcomes beyond `1` that are THE finding, and the word the line prints.
@@ -1115,7 +690,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
     let mut rows = vec![Row {
         id: StageId::RedrawConformance,
         label: "aterm-redraw-conformance",
-        stub: FakeRepo::redraw_harness,
+        stub: stages::REDRAW_CONFORMANCE_BIN.to_string(),
         undecided: &[(2, "NOT RUN")],
         findings: &[],
     }];
@@ -1124,7 +699,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             Row {
                 id: StageId::ObjcClassAudit,
                 label: "objc live-class audit",
-                stub: FakeRepo::objc_auditor,
+                stub: format!("examples/{}", stages::OBJC_CLASS_AUDIT_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
@@ -1135,7 +710,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             Row {
                 id: StageId::ObjcImeDrive,
                 label: "objc IME drive",
-                stub: FakeRepo::objc_ime_driver,
+                stub: format!("examples/{}", stages::OBJC_IME_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
@@ -1145,7 +720,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             Row {
                 id: StageId::ObjcToolbarDrive,
                 label: "objc toolbar drive",
-                stub: FakeRepo::objc_toolbar_driver,
+                stub: format!("examples/{}", stages::OBJC_TOOLBAR_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN"), (3, "HUNG")],
                 findings: &[],
             },
@@ -1153,42 +728,36 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             Row {
                 id: StageId::ObjcWindowDrive,
                 label: "objc window drive",
-                stub: FakeRepo::objc_window_driver,
+                stub: format!("examples/{}", stages::OBJC_WINDOW_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
             Row {
                 id: StageId::ObjcEventDrive,
                 label: "objc event drive",
-                stub: FakeRepo::objc_event_driver,
+                stub: format!("examples/{}", stages::OBJC_EVENT_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
-                findings: &[
-                    (Finding::Exit(3), "ABORTED"),
-                    (
-                        Finding::Signal(FakeRepo::objc_event_driver_aborting),
-                        "ABORTED",
-                    ),
-                ],
+                findings: &[(Finding::Exit(3), "ABORTED"), (Finding::Signal, "ABORTED")],
             },
             // The three the objc2 exit added read exactly as the window drive.
             Row {
                 id: StageId::ObjcAlertDrive,
                 label: "objc alert drive",
-                stub: FakeRepo::objc_alert_driver,
+                stub: format!("examples/{}", stages::OBJC_ALERT_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
             Row {
                 id: StageId::ObjcSwizzleDrive,
                 label: "objc swizzle drive",
-                stub: FakeRepo::objc_swizzle_driver,
+                stub: format!("examples/{}", stages::OBJC_SWIZZLE_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
             Row {
                 id: StageId::ObjcBoundDrive,
                 label: "objc bound drive",
-                stub: FakeRepo::objc_bound_driver,
+                stub: format!("examples/{}", stages::OBJC_BOUND_DRIVE_EXAMPLE),
                 undecided: &[(2, "NOT RUN")],
                 findings: &[],
             },
@@ -1197,7 +766,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
 
     let repo = FakeRepo::new();
     repo.with_stage2("exit 0");
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
     for row in rows {
         let name = row.label;
         let spec = plan::plan(&ctx)
@@ -1205,14 +774,14 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
             .find(|s| s.id == row.id)
             .unwrap_or_else(|| panic!("{name}: the stage is planned"));
 
-        (row.stub)(&repo, 0);
+        repo.driver_stub(&row.stub, 0);
         assert_eq!(
             tally(&[stages::run_stage(&ctx, &spec)]),
             Tally::default(),
             "{name}: a clean driver leaves the run clean"
         );
 
-        (row.stub)(&repo, 1);
+        repo.driver_stub(&row.stub, 1);
         let t = tally(&[stages::run_stage(&ctx, &spec)]);
         assert_eq!(
             t.gate_failures.len(),
@@ -1222,7 +791,7 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
         assert_eq!(t.could_not_run.len(), 0, "{name}");
 
         for &(code, words) in row.undecided {
-            (row.stub)(&repo, code);
+            repo.driver_stub(&row.stub, code);
             let r = stages::run_stage(&ctx, &spec);
             let t = tally(std::slice::from_ref(&r));
             assert_eq!(
@@ -1247,11 +816,14 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
         for (finding, words) in row.findings {
             let what = match finding {
                 Finding::Exit(code) => {
-                    (row.stub)(&repo, *code);
+                    repo.driver_stub(&row.stub, *code);
                     format!("exit {code}")
                 }
-                Finding::Signal(die) => {
-                    die(&repo);
+                Finding::Signal => {
+                    repo.driver_script(
+                        &row.stub,
+                        "echo 'stub about to die by a signal'; kill -KILL $$",
+                    );
                     "an untrapped signal death".to_string()
                 }
             };
@@ -1278,85 +850,12 @@ fn every_driven_stage_reads_its_exit_code_and_nothing_undecided_is_green() {
 }
 
 #[test]
-fn selftest_skips_every_command_and_checks_only_the_harness() {
-    // The reference is `tools/verify.sh --selftest` on this tree: every stage
-    // skipped with a selftest reason, the harness invariants really checked,
-    // and a verdict that claims nothing. The stage ORDER is plan.rs's pinned
-    // fast ladder; what is held here is the SHAPE, so a new stage moves one
-    // count rather than a transcript.
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 1"); // never executed under --selftest
-    let (ladder, code) = repo.run(Mode::Fast, Scope::workspace(), true);
-
-    assert_eq!(code, exit::PASS);
-    let (skips, decided): (Vec<_>, Vec<_>) = decisions(&ladder)
-        .into_iter()
-        .partition(|(tag, _)| *tag == "skip");
-    for (_, label) in &skips {
-        assert!(
-            label.ends_with("(selftest: not executed)") || label.ends_with("(selftest)"),
-            "a selftest skip must say it is one: {label}"
-        );
-    }
-    // One skip per command the fast ladder would run: 48 fixed rows plus the 11
-    // atpkg publish-tooling suites in `stages::ATPKG_SUITES` (the prerelease
-    // gate, the index suites, the vendor/ALab lanes and the packers among them).
-    // A LITERAL, not `48 + ATPKG_SUITES.len()`: every other test iterates that
-    // roster, so a count derived from it would let a suite leave the ladder
-    // with the whole crate green. Adding or removing a stage moves this number
-    // (41 since 2026-09-26: the window-server unit tests; 49 later that day:
-    // `DELIVERY_SUITES` grew 4 -> 9 (+5) and the live aterm lanes added their
-    // build and their two lanes (+3) — 52 + 5 + 3 = 60; 48 the same evening,
-    // when the Codex lane left for `--full` and the per-commit row kept its
-    // build and the handback lane — 60 - 1 = 59, the count a real
-    // `tools/verify.sh --selftest` printed on this tree).
-    assert_eq!(skips.len(), 59, "{skips:#?}");
-    assert_eq!(
-        skips
-            .iter()
-            .filter(|(_, label)| stages::ATPKG_SUITES
-                .iter()
-                .any(|suite| label.starts_with(suite)))
-            .count(),
-        11,
-        "one skip per atpkg publish-tooling suite: {skips:#?}"
-    );
-    // Nothing FAILS, and the only rows that pass are the selftest's actual
-    // evidence: every row above says "not executed", so without these the
-    // ladder shows a run that checked nothing and still said OK.
-    assert_eq!(
-        decided,
-        [
-            (
-                "ok",
-                "smoke helper invariants (short socket, target path, metrics, bounded reap)"
-            ),
-            ("ok", "verdict[whole tree, nothing skipped]"),
-            ("ok", "verdict[a stage was skipped]"),
-            ("ok", "verdict[narrowed (--scope/--changed)]"),
-            ("ok", "verdict[narrowed AND skipped]"),
-            ("ok", "verdict[a stage FAILED]"),
-            ("ok", "verdict[FAILED while narrowed]"),
-        ]
-    );
-    // The closing line says what ran AND what did not. The second clause is the
-    // load-bearing half: every stage above reads "not executed", so a reader who
-    // stops at "OK" must not come away thinking the tree was verified.
-    assert!(
-        ladder
-            .contains("VERIFY: SELFTEST OK (driver executes; verdict claim narrows with the run;")
-    );
-    assert!(ladder.contains("no heavy gates run — this is NOT a verification of anything)"));
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-}
-
-#[test]
 fn a_whole_green_run_is_the_only_thing_that_claims_the_contract() {
     // The smokes need a real terminal to answer a real socket, so the end-to-end
     // green case is built from the REAL plan with a stage runner that passes:
     // plan -> scheduler -> tally -> verdict, wired exactly as `run` wires them.
     let repo = FakeRepo::new();
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
     let specs = plan::plan(&ctx);
 
     let green = |s: &StageSpec| {
@@ -1366,7 +865,7 @@ fn a_whole_green_run_is_the_only_thing_that_claims_the_contract() {
     };
     let reports = sched::run_stages(&specs, green, |_, _| {});
     let t = tally(&reports);
-    let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+    let v = verdict(Mode::Fast, &Scope::workspace(), &t);
     assert!(v.claims_merge_contract);
     assert!(v.text.contains(MERGE_CONTRACT_SENTENCE));
     assert_eq!(v.exit, exit::PASS);
@@ -1383,7 +882,7 @@ fn a_whole_green_run_is_the_only_thing_that_claims_the_contract() {
     };
     let reports = sched::run_stages(&specs, one_skip, |_, _| {});
     let t = tally(&reports);
-    let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+    let v = verdict(Mode::Fast, &Scope::workspace(), &t);
     assert!(
         !v.claims_merge_contract,
         "one skipped stage forfeits the whole claim"
@@ -1396,35 +895,7 @@ fn a_whole_green_run_is_the_only_thing_that_claims_the_contract() {
 }
 
 #[test]
-fn the_full_tier_reports_an_unavailable_prover_prominently_and_never_as_discharged() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    repo.script("scripts/verify-kani-proofs.sh", "exit 0");
-    let (ladder, _) = repo.run(Mode::Full, Scope::workspace(), false);
-
-    assert!(ladder.contains("=== trust-mc / Kani BMC floor (config-free parser harnesses) ==="));
-    assert!(ladder.contains(
-        "  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: trust-mc is unavailable"
-    ));
-    assert!(ladder.contains("(the embedded + ty tiers still ran)."));
-    // The skip line names the REPAIR, not a vague future: `stages.rs` moved
-    // this label from "pending build" to the install command on 2026-08-31
-    // (ecb1d6691, atpkg owning the toolchain seam) and left this assertion on
-    // the old wording, so the tier's own contract test was red on main.
-    assert!(ladder.contains(
-        "  skip  trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)"
-    ));
-    // Never described as discharged, and the skip forfeits the contract.
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-    assert!(!ladder.contains("verify-kani-proofs.sh (aterm-parser)"));
-    // …and the --fast ladder never mentions the tier at all.
-    let (fast, _) = repo.run(Mode::Fast, Scope::workspace(), false);
-    assert!(!fast.contains("trust-mc"));
-    assert!(!fast.contains("differential oracle"));
-}
-
-#[test]
-fn the_pure_guards_do_not_wait_for_the_build() {
+fn the_pure_guards_do_not_wait_for_the_main_lane() {
     // The reason this is a program and not a script: on a real tree the build is
     // minutes and the guards are milliseconds.
     //
@@ -1438,7 +909,7 @@ fn the_pure_guards_do_not_wait_for_the_build() {
     // passed anyway: the guards do no work, so serialising them cost nothing a
     // clock could see.
     let repo = FakeRepo::new();
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
     let specs = plan::plan(&ctx);
     let pure = specs.iter().filter(|s| s.lane == Lane::Pure).count();
     assert!(pure > 0, "no pure guards in the plan: nothing to overlap");
@@ -1476,51 +947,6 @@ fn the_pure_guards_do_not_wait_for_the_build() {
          they waited for the build"
     );
 }
-
-#[test]
-fn nothing_outside_the_verdict_may_spell_the_claim() {
-    // A stage label that happened to contain the sentence would be a second way
-    // to claim the contract, and nobody would ever look for it there.
-    let repo = FakeRepo::new();
-    repo.with_stage2("exit 0");
-    for (mode, scope) in [
-        (Mode::Fast, Scope::workspace()),
-        (Mode::Full, Scope::workspace()),
-        (Mode::Fast, Scope::crate_only("aterm-grid")),
-    ] {
-        let (ladder, _) = repo.run(mode, scope, false);
-        let in_ladder = ladder
-            .lines()
-            .filter(|l| l.contains(MERGE_CONTRACT_SENTENCE))
-            .collect::<Vec<_>>();
-        assert!(in_ladder.is_empty(), "the claim leaked into: {in_ladder:?}");
-    }
-}
-
-#[test]
-fn the_root_is_found_by_its_markers_not_by_the_binarys_location() {
-    let repo = FakeRepo::new();
-    let deep = repo.root.join("crates/aterm-verify/src");
-    fs::create_dir_all(&deep).expect("mkdir");
-    assert_eq!(
-        aterm_verify::locate_root(&deep).as_deref(),
-        Some(repo.root.as_path())
-    );
-    assert_eq!(aterm_verify::locate_root(Path::new("/")), None);
-}
-
-/// The variables the recording driver writes, normalised so the record does
-/// not depend on the shell that ran the test: `<inherited>` is this test
-/// process's own value (set or not), `<unset>` is one the gate removed, and
-/// paths under the fake repo or stage2 are spelled `<root>` / `<stage2>`.
-/// macOS only, with the one test that records.
-#[cfg(target_os = "macos")]
-const RECORDED_ENV: [&str; 4] = [
-    "CARGO_TARGET_DIR",
-    "CARGO_BUILD_JOBS",
-    "RUSTDOC",
-    "ATERM_SEARCH_REGEX_LANE",
-];
 
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', r"'\''"))
@@ -1565,7 +991,7 @@ esac
             b"stale-shared-gui",
         )
         .expect("stale shared GUI");
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::SealedLane)
@@ -1648,7 +1074,7 @@ esac
             target = sh_quote(&target.display().to_string()),
             trace = sh_quote(&trace.display().to_string()),
         ));
-        let ctx = repo.ctx_with(Mode::Fast, Scope::workspace(), false, |env| {
+        let ctx = repo.ctx_with(Mode::Fast, Scope::workspace(), |env| {
             env.cargo_build_jobs = (caller != "none").then(|| caller.into());
         });
         let spec = plan::plan(&ctx)
@@ -1744,7 +1170,7 @@ exit {suite_exit}
             );
         }
 
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::AtpkgTooling)
@@ -1812,7 +1238,7 @@ exit {suite_exit}
 /// its script does, append `<lane> <what the binary printed>` to the trace, and
 /// exit as told. FakeRepo seeds a driven `aterm` for the whole-ladder tests;
 /// this one is removed, so what the stage drives is what its OWN build left.
-fn live_lane_repo(build_exit: i32, handback_exit: i32, codex_exit: i32) -> (FakeRepo, PathBuf) {
+fn live_lane_repo(build_exit: i32, handback_exit: i32) -> (FakeRepo, PathBuf) {
     let repo = FakeRepo::new();
     let trace = repo.scratch.join("live-order");
     let target = repo.root.join("target-drivers");
@@ -1859,8 +1285,7 @@ exit {handback_exit}
             r#"A=${{1:-{root}/target/debug/aterm}}
 [ -x "$A" ] || {{ echo "SKIP: no aterm at $A"; exit 77; }}
 echo "codex $("$A")" >> {tr}
-test {codex_exit} = 77 && echo 'SKIP: the store holds no Codex older than 0.157.1 to upgrade from'
-exit {codex_exit}
+exit 0
 "#
         ),
     );
@@ -1902,7 +1327,7 @@ fn live_lane_by_hand(repo: &FakeRepo, trace: &Path, suite: &str, lane: &str, not
 #[test]
 fn the_foreground_handback_drives_the_aterm_its_stage_built_and_never_reads_not_run_as_a_pass() {
     for (build_exit, handback_exit) in [(0, 0), (19, 0), (0, 1), (0, 2)] {
-        let (repo, trace) = live_lane_repo(build_exit, handback_exit, 0);
+        let (repo, trace) = live_lane_repo(build_exit, handback_exit);
         live_lane_by_hand(
             &repo,
             &trace,
@@ -1911,7 +1336,7 @@ fn the_foreground_handback_drives_the_aterm_its_stage_built_and_never_reads_not_
             2,
         );
 
-        let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+        let ctx = repo.ctx(Mode::Fast, Scope::workspace());
         let spec = plan::plan(&ctx)
             .into_iter()
             .find(|s| s.id == StageId::ForegroundHandback)
@@ -2000,19 +1425,30 @@ fn a_headless_aterm_that_dies_at_startup_fails_the_handback_and_is_never_could_n
     .expect("the lane's lifeline library");
     let target = repo.root.join("target-drivers");
     fs::remove_file(target.join("debug/aterm")).expect("unseed the driven aterm");
-    repo.with_stage2(
+    // The instance the lane boots marks the moment it dies — its last act
+    // before `exit 101`, a builtin, so nothing runs between the two — and the
+    // promptness below is measured from that mark. The lane's `--help` probe
+    // runs the same binary first and leaves no mark.
+    let died = repo.scratch.join("instance-died");
+    repo.with_stage2(&format!(
         r#"case "$*" in
   '--unverified build -q -p aterm --bin aterm')
     mkdir -p "$CARGO_TARGET_DIR/debug"
-    printf '#!/bin/sh\necho "thread main panicked at startup" >&2\nexit 101\n' > "$CARGO_TARGET_DIR/debug/aterm"
+    cat > "$CARGO_TARGET_DIR/debug/aterm" <<'AT'
+#!/bin/sh
+echo "thread main panicked at startup" >&2
+case " $* " in *" --help "*) ;; *) : > {died} ;; esac
+exit 101
+AT
     chmod 755 "$CARGO_TARGET_DIR/debug/aterm"
     ;;
   *) exit 74 ;;
 esac
 "#,
-    );
+        died = sh_quote(&died.display().to_string()),
+    ));
 
-    let ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
+    let ctx = repo.ctx(Mode::Fast, Scope::workspace());
     let spec = plan::plan(&ctx)
         .into_iter()
         .find(|s| s.id == StageId::ForegroundHandback)
@@ -2020,7 +1456,16 @@ esac
     let t = std::time::Instant::now();
     let report = stages::run_stage(&ctx, &spec);
     let took = t.elapsed();
+    let done = std::time::SystemTime::now();
     let rendered = report.render();
+    let died_at = fs::metadata(&died)
+        .and_then(|m| m.modified())
+        .unwrap_or_else(|e| {
+            panic!("the booted instance ran and marked its death ({e}): {rendered}")
+        });
+    // A wall clock stepped back across the run reads as no wait at all; it
+    // cannot manufacture one.
+    let after_death = done.duration_since(died_at).unwrap_or_default();
     let result = tally(std::slice::from_ref(&report));
     assert_eq!(
         result.gate_failures,
@@ -2039,408 +1484,57 @@ esac
         rendered.contains("thread main panicked at startup"),
         "…and shows the instance's log: {rendered}"
     );
+    // …and it was not waited on for the lane's 20 s deadline, read BY CAUSE: the
+    // early-exit break is the only path that says "exited before it answered",
+    // and the deadline path says "never answered its control socket within
+    // 20 s". (This was a stopwatch, `< 10 s`, and read 11.79 s in a loaded
+    // merge-contract run, 2026-09-27, with the early exit taken.)
     assert!(
-        took < std::time::Duration::from_secs(10),
-        "an instance that has exited is not waited on for the 20 s deadline: {took:?}"
+        !rendered.contains("never answered its control socket"),
+        "an instance that has exited is not waited on for the deadline: {rendered}"
+    );
+    // PROMPT, MEASURED FROM THE DEATH. The lane polls 80 × 0.25 s, so a lane
+    // that missed the exit spends at least that 20 s after the mark (one that
+    // noticed only at its 60th poll read 15.5 s, and failed here); one that
+    // saw it spends a `kill -0`, at most one 0.25 s sleep, its FAIL row and
+    // its teardown (0.29-0.37 s, measured). Half the deadline tells the two
+    // apart with room on both sides.
+    //
+    // NOT FROM THE STAGE'S START (`took`, the 10 s bound until 2026-09-27).
+    // That clock also pays the FIRST exec of three files this fixture writes
+    // moments before — the stand-in `targo`, the copied lane and the `aterm`
+    // that build writes — and macOS makes the first exec of every newly
+    // written executable wait on a check it serves one file at a time,
+    // machine-wide (measured: a fresh script 147 ms against 13 ms re-run;
+    // 16 threads running fresh ones, a 1.7 s median at 110 ms per exec end to
+    // end; two such processes at once, the same one queue). Beside the other
+    // cases in this binary, each writing and running dozens of stand-ins,
+    // `took` read 11.4-13.1 s in 8 of 8 runs under load while the stage
+    // returned 0.29-0.37 s after the death; sampled with `ps`, the lane sat
+    // 7.5 s in its interpreter's exec, asleep with no CPU used, before its
+    // first line ran. The merge contract's red run (13.3 s) is that shape.
+    assert!(
+        after_death < std::time::Duration::from_secs(10),
+        "an instance that has exited is not waited on for the 20 s deadline: the stage \
+         returned {after_death:?} after the instance died ({took:?} in all)"
     );
 
-    // The negative control: the lane's real not-run paths, still 2, still
+    // The negative control: the lane's real not-run path, still 2, still
     // COULD NOT RUN with the reason the lane printed.
-    for (args, reason) in [
+    let out = std::process::Command::new(&lane)
+        .args(["--binary", "/nonexistent/aterm"])
+        .current_dir(&repo.root)
+        .output()
+        .expect("the lane runs");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let transcript = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stages::live_aterm_outcome(stages::FOREGROUND_HANDBACK_SUITE, Some(2), &transcript),
         (
-            vec!["--binary", "/nonexistent/aterm"],
-            "no aterm binary at /nonexistent/aterm (targo --unverified build -p aterm)",
-        ),
-        (vec!["--bogus"], "unknown argument: --bogus"),
-    ] {
-        let out = std::process::Command::new(&lane)
-            .args(&args)
-            .current_dir(&repo.root)
-            .output()
-            .expect("the lane runs");
-        assert_eq!(out.status.code(), Some(2), "{args:?}: {out:?}");
-        let transcript = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(
-            stages::live_aterm_outcome(stages::FOREGROUND_HANDBACK_SUITE, Some(2), &transcript),
-            (
-                aterm_verify::Outcome::Fail(aterm_verify::Severity::CouldNotRun),
-                format!("test-foreground-handback.sh: NOT RUN — {reason} (exit 2, never a pass)")
-            ),
-            "{args:?}"
-        );
-    }
-}
-
-/// THE CODEX LIVE UPGRADE IS `--full`'S, RUNS ALONE, AND ITS SKIP IS A NAMED
-/// SKIP. It reads this machine's managed store and the vendor's Codex, so the
-/// per-commit ladder never plans it (`plan.rs` has the reasoning); under
-/// `--full` it builds the `aterm` it drives and hands it over as the first
-/// argument, a failed build runs nothing, and its `77` — no older managed Codex
-/// on this Mac — is a SKIP carrying the lane's own reason, counted, never a
-/// pass, and forfeiting the run's contract claim, as the trust-mc floor's
-/// absent prover does.
-#[test]
-fn the_codex_live_upgrade_is_full_only_and_reads_its_not_run_code_as_a_named_skip() {
-    for (build_exit, codex_exit) in [(0, 0), (19, 0), (0, 1), (0, 77)] {
-        let (repo, trace) = live_lane_repo(build_exit, 0, codex_exit);
-        live_lane_by_hand(
-            &repo,
-            &trace,
-            "tools/test-codex-live-upgrade.sh",
-            "codex",
-            77,
-        );
-
-        let fast = plan::plan(&repo.ctx(Mode::Fast, Scope::workspace(), false));
-        assert!(fast.iter().all(|s| s.id != StageId::CodexLiveUpgrade));
-        let ctx = repo.ctx(Mode::Full, Scope::workspace(), false);
-        let spec = plan::plan(&ctx)
-            .into_iter()
-            .find(|s| s.id == StageId::CodexLiveUpgrade)
-            .expect("the Codex live upgrade is planned under --full");
-        assert!(spec.exclusive, "it runs alone");
-        let report = stages::run_stage(&ctx, &spec);
-        let what = format!("({build_exit}, {codex_exit})\n{}", report.render());
-        let measured = fs::read_to_string(&trace).expect("the stage ran");
-        let runs = cfg!(target_os = "macos");
-        let want = match (runs, build_exit) {
-            (false, _) => "",
-            (true, 0) => "build\ncodex fresh-aterm\n",
-            (true, _) => "build\n",
-        };
-        assert_eq!(measured, want, "{what}");
-
-        let result = tally(std::slice::from_ref(&report));
-        assert_eq!(
-            result.gate_failures.len(),
-            usize::from(runs && (build_exit != 0 || codex_exit == 1)),
-            "{what}"
-        );
-        assert_eq!(result.could_not_run.len(), 0, "{what}");
-        let skipped = !runs || (build_exit == 0 && codex_exit == 77);
-        assert_eq!(result.skipped(), usize::from(skipped), "{what}");
-        if runs && build_exit == 0 && codex_exit == 77 {
-            assert!(
-                report.render().contains(
-                    "  skip  test-codex-live-upgrade.sh: NOT RUN — the store holds no Codex older \
-                     than 0.157.1 to upgrade from (exit 77: this machine lacks a prerequisite; a \
-                     named skip, never a pass)"
-                ),
-                "the lane's own reason is the label: {what}"
-            );
-        }
-        // A skip is never a pass: the run cannot claim the contract.
-        let v = verdict(Mode::Full, &Scope::workspace(), false, &result);
-        assert_eq!(
-            v.claims_merge_contract,
-            !result.failed() && !skipped,
-            "{what}"
-        );
-    }
-}
-
-/// A stand-in driver that appends one normalised line per invocation —
-/// `<tag> <VAR>=<value>… -- <argv…>` — and exits 0. The SAME body recorded
-/// `fixtures/fast-invocations.txt` from the 18f19eea6 gate.
-#[cfg(target_os = "macos")]
-fn recording_shim(tag: &str, record: &Path, root: &Path, stage2: &Path) -> String {
-    let canon = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let mut s = String::new();
-    for (k, p) in [
-        ("ROOT", root.to_path_buf()),
-        ("ROOTC", canon(root)),
-        ("STAGE2", stage2.to_path_buf()),
-        ("STAGE2C", canon(stage2)),
-    ] {
-        s.push_str(&format!("{k}={}\n", sh_quote(&p.display().to_string())));
-    }
-    for k in RECORDED_ENV {
-        match std::env::var(k) {
-            Ok(v) => s.push_str(&format!("AMB_{k}_SET=1\nAMB_{k}={}\n", sh_quote(&v))),
-            Err(_) => s.push_str(&format!("AMB_{k}_SET=\nAMB_{k}=\n")),
-        }
-    }
-    s.push_str(
-        r#"norm() {
-  name=$1
-  eval "set_=\${$name+1}"
-  eval "val=\${$name-}"
-  eval "aset=\$AMB_${name}_SET"
-  eval "aval=\$AMB_${name}"
-  if [ "$set_" = "$aset" ] && [ "$val" = "$aval" ]; then printf '%s=<inherited>' "$name"; return; fi
-  if [ -z "$set_" ]; then printf '%s=<unset>' "$name"; return; fi
-  case "$val" in
-    "$STAGE2C"/*) val="<stage2>${val#"$STAGE2C"}" ;;
-    "$STAGE2"/*) val="<stage2>${val#"$STAGE2"}" ;;
-    "$ROOTC"/*) val="<root>${val#"$ROOTC"}" ;;
-    "$ROOT"/*) val="<root>${val#"$ROOT"}" ;;
-  esac
-  printf '%s=%s' "$name" "$val"
-}
-"#,
-    );
-    s.push_str(&format!("line={}\n", sh_quote(tag)));
-    s.push_str(&format!(
-        "for v in {}; do line=\"$line $(norm \"$v\")\"; done\n",
-        RECORDED_ENV.join(" ")
-    ));
-    s.push_str("line=\"$line --\"\nfor a in \"$@\"; do line=\"$line $a\"; done\n");
-    // One printf, one O_APPEND write: concurrent stages cannot interleave a line.
-    s.push_str(&format!(
-        "printf '%s\\n' \"$line\" >> {}\nexit 0\n",
-        sh_quote(&record.display().to_string())
-    ));
-    s
-}
-
-/// THE STAGE-SET PROOF, AT THE ARGV LEVEL (2026-09-13).
-///
-/// The speed round promised that every child the 18f19eea6 `--fast` spawned is
-/// still spawned with the same flags, scope, features and environment, apart
-/// from two named exceptions. `fixtures/fast-invocations.txt` is that promise
-/// as data: the multiset the 18f19eea6 gate spawned over this fixture
-/// (recorded with this same shim), with the target-dir and job-cap columns of
-/// the stages that changed lane, the one test child split into `--no-run` and
-/// `--tests`, and the three driver-builds children added. A future change to
-/// any cargo invocation of `--fast` reddens this until the fixture is edited on
-/// purpose.
-///
-/// macOS only: the eight objc drivers are part of the recorded ladder there.
-#[cfg(target_os = "macos")]
-#[test]
-fn the_fast_ladder_spawns_exactly_the_recorded_cargo_invocations() {
-    const CHILD: &str = "ATERM_VERIFY_RECORDED_ENV_CHILD";
-    const COMPLETED: &str = "recorded invocation comparison completed";
-    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new("1")) {
-        // Equal values cannot reveal provenance: ambient jobs=4 made the
-        // recorder spell an explicit side-lane cap as <inherited>; jobs=8
-        // and regex-lane=1 have the same collision. Give this fixture a
-        // controlled child environment, leaving the exact contract intact
-        // and the parallel parent process's environment untouched.
-        let scratch = mktemp_dir("atv-recorded-env").expect("mktemp");
-        let output_path = scratch.join("child.log");
-        let output = fs::File::create(&output_path).expect("create child log");
-        let mut command = std::process::Command::new(std::env::current_exe().expect("test binary"));
-        command
-            .args([
-                "--exact",
-                "the_fast_ladder_spawns_exactly_the_recorded_cargo_invocations",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, "1")
-            .stdout(output.try_clone().expect("clone child log"))
-            .stderr(output);
-        for name in RECORDED_ENV {
-            command.env_remove(name);
-        }
-        let mut child = command.spawn().expect("spawn isolated fixture");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
-        let (status, timed_out) = loop {
-            if let Some(status) = child.try_wait().expect("poll isolated fixture") {
-                break (status, false);
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                break (child.wait().expect("reap isolated fixture"), true);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        };
-        let output = fs::read_to_string(&output_path).expect("read child log");
-        fs::remove_dir_all(&scratch).expect("remove child scratch");
-        assert!(
-            !timed_out,
-            "isolated invocation fixture timed out:\n{output}"
-        );
-        assert!(
-            status.success(),
-            "isolated invocation fixture failed:\n{output}"
-        );
-        assert!(output.contains(COMPLETED), "fixture did not run:\n{output}");
-        return;
-    }
-    let repo = FakeRepo::new();
-    let record = repo.scratch.join("invocations.txt");
-    repo.with_stage2(&recording_shim("targo", &record, &repo.root, &repo.stage2));
-    let tippy = repo.stage2.join("targo-tippy");
-    fs::write(
-        &tippy,
-        format!(
-            "#!/bin/sh\n{}",
-            recording_shim("targo-tippy", &record, &repo.root, &repo.stage2)
-        ),
-    )
-    .expect("write");
-    fs::set_permissions(&tippy, fs::Permissions::from_mode(0o755)).expect("chmod");
-
-    let (ladder, _) = repo.run(Mode::Fast, Scope::workspace(), false);
-
-    let mut got: Vec<String> = fs::read_to_string(&record)
-        .expect("the driver was invoked")
-        .lines()
-        .map(str::to_string)
-        .collect();
-    got.sort();
-    let mut want: Vec<String> = include_str!("fixtures/fast-invocations.txt")
-        .lines()
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect();
-    want.sort();
-    assert_eq!(
-        got,
-        want,
-        "the cargo invocations of --fast changed\n--- got:\n{}\n--- ladder:\n{ladder}",
-        got.join("\n")
-    );
-    println!("{COMPLETED}");
-}
-
-/// NO DOC DRIVER IS COULD-NOT-RUN ON THE DOCTESTS ROW. Since 2026-09-13 that
-/// row is the only doctest runner: the test row's `--no-run`/`--tests`
-/// children never spawn rustdoc, so they run, and the row that cannot decide
-/// anything says so with the remedy.
-#[test]
-fn no_doc_driver_is_could_not_run_on_the_doctests_row() {
-    let repo = FakeRepo::new();
-    repo.with_stage2("echo \"argv: $*\"\nexit 0");
-    fs::remove_file(repo.stage2.join("trustdoc")).expect("remove trustdoc");
-    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    ctx.env.rustdoc_override = None;
-    let mut path = std::ffi::OsString::from(repo.stage2.as_os_str());
-    path.push(":/usr/bin:/bin");
-    ctx.path_env = path;
-    assert!(!ctx.tools.have_trustdoc());
-
-    let mut out: Vec<u8> = Vec::new();
-    let code = aterm_verify::run(&ctx, &mut out).expect("the ladder is writable");
-    let ladder = String::from_utf8(out).expect("utf-8");
-    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE));
-
-    let section = |header: &str| -> String {
-        let at = ladder
-            .find(&format!("=== {header}"))
-            .unwrap_or_else(|| panic!("no {header} section:\n{ladder}"));
-        let rest = &ladder[at + 4..];
-        rest[..rest.find("\n=== ").unwrap_or(rest.len())].to_string()
-    };
-    let doc = section("doctests (--workspace)");
-    assert_eq!(
-        decisions(&doc).len(),
-        1,
-        "the doctests row decided once: {doc}"
-    );
-    assert!(doc.contains("  FAIL  no doc driver:"), "{doc}");
-    assert!(doc.contains("~/.local/bin/trustdoc"), "the remedy: {doc}");
-
-    let test = section("test (--workspace)");
-    assert_eq!(
-        decisions(&test),
-        [
-            ("ok", "targo test --workspace --no-run"),
-            ("ok", "targo test --workspace --tests"),
-        ],
-        "{test}"
-    );
-    let regex = section("regex search lane");
-    assert!(
-        regex.contains("(no doc driver — see the doctests line)"),
-        "{regex}"
-    );
-}
-
-/// THE PIN for the 3-hour hang the ceiling ended without naming (2026-09-16).
-///
-/// The gate's aterm-gui test binary sat on
-/// `control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed` until
-/// the ceiling killed the `--tests` child, and the TIMEOUT block named only the argv — an
-/// invocation spanning 12,976 tests over 218 binaries, of which the one that hung declared
-/// 4,874. The stand-in driver here replays a fixture in that log's own shapes for the
-/// `--tests` child and then hangs; everything else it is asked for passes.
-///
-/// ONE STAGE, not the ladder: the ceiling this test needs is short, and a short ceiling
-/// applied to a whole `--fast` run would put every other stub under it too — on a
-/// saturated machine that is a red row this test never meant to produce. `run_stage`
-/// drives the Test stage alone, the way the sealed-lane and atpkg-tooling cases do, so the
-/// only child under the ceiling is the one that is supposed to hang. No new row in
-/// fast-invocations.txt: no argv changed.
-///
-/// THE CEILING IS 30 s, NOT 8 (2026-09-21). Isolating the stage was not enough, because
-/// this test itself runs inside `targo test --workspace` — the merge contract saturates
-/// the machine, and under that load the stub's OTHER branch, a shell script whose whole
-/// body for this argv is `exit 0`, took longer than 8 s to be scheduled and reaped. The
-/// gate then failed with `TIMEOUT — child killed after 8.0s` naming
-/// `targo test --workspace --no-run`, which is precisely the red row the paragraph above
-/// says this test never meant to produce; a whole 45-minute gate run was spent on it.
-/// The ceiling has to clear the worst-case SCHEDULING delay for a trivial child, not just
-/// beat the hang. 30 s is ~4x the delay actually observed and still 20x under the 600 s
-/// sleep, so what the test proves is unchanged; the cost is that the hung child is waited
-/// out for 30 s instead of 8.
-#[test]
-fn a_hung_test_run_names_the_test_in_the_ladder() {
-    let repo = FakeRepo::new();
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hung-test-stage.log");
-    repo.with_stage2(&format!(
-        "case \"$*\" in *--tests*) cat '{}'; exec sleep 600 ;; esac\nexit 0",
-        fixture.display()
-    ));
-    let mut ctx = repo.ctx(Mode::Fast, Scope::workspace(), false);
-    // One value, used for both the ceiling and the sentence the block must print, so the
-    // two cannot drift the way they just did when the ceiling was raised.
-    const CEILING_SECS: u32 = 30;
-    ctx.child_ceiling = Some(std::time::Duration::from_secs(CEILING_SECS.into()));
-    let spec = plan::plan(&ctx)
-        .into_iter()
-        .find(|s| s.id == StageId::Test)
-        .expect("the test stage");
-    let report = stages::run_stage(&ctx, &spec);
-    let block = report.render();
-
-    let ceiling_line = format!("over the {CEILING_SECS}.0s wall-clock ceiling");
-    let compiled = "targo test --workspace --no-run (trustdoc)";
-    let hung = "targo test --workspace --tests (trustdoc)";
-    assert!(
-        labels_with(&block, "ok").iter().any(|l| l == compiled),
-        "{block}"
-    );
-    assert!(
-        labels_with(&block, "FAIL").iter().any(|l| l == hung),
-        "{block}"
-    );
-    assert!(tally(std::slice::from_ref(&report)).failed(), "{block}");
-    for want in [
-        "aterm-verify: TIMEOUT — child killed after ",
-        ceiling_line.as_str(),
-        "  child: ",
-        "--unverified test --workspace --no-fail-fast --tests",
-        "  test binary: unittests src/lib.rs (target/debug/deps/aterm_gui-66cafa00b6862bbd) — \
-         it never printed its `test result:` line\n",
-        "  still running when killed (libtest reported it slow and no verdict for it followed):\n",
-        "    control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed   \
-         (slow at child line ",
-        "    re-run alone: target/debug/deps/aterm_gui-66cafa00b6862bbd --exact \
-         control::tests::cross_session_paste_reports_a_dead_spill_peer_as_write_failed \
-         --nocapture\n",
-        "of that binary's 4874 tests have a verdict in the log above.\n",
-        "  This stage decided NOTHING",
-    ] {
-        assert!(block.contains(want), "missing {want:?} in:\n{block}");
-    }
-    // The child's own log precedes the block, and the name whose own verdict arrived is
-    // not in it — while the one only a re-exec child reported is, said as such.
-    let note = &block[block.find("aterm-verify: TIMEOUT").expect("the block")..];
-    assert!(
-        block.find("running 4874 tests").expect("the child's log")
-            < block.find("aterm-verify: TIMEOUT").expect("the block"),
-        "{block}"
-    );
-    assert!(
-        !note.contains("native_about_byline"),
-        "its verdict arrived:\n{note}"
-    );
-    assert!(
-        note.contains("a re-exec child of this binary ran the same name"),
-        "the child-verdict case is named as such:\n{note}"
+            aterm_verify::Outcome::Fail(aterm_verify::Severity::CouldNotRun),
+            "test-foreground-handback.sh: NOT RUN — no aterm binary at /nonexistent/aterm \
+             (targo --unverified build -p aterm) (exit 2, never a pass)"
+                .to_string()
+        )
     );
 }

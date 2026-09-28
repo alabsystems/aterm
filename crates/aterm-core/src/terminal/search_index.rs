@@ -294,13 +294,22 @@ impl Terminal {
         let refresh_start = cached.visible_base.min(visible_base).max(hist_base);
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
         if refresh_start < visible_base {
-            let grid = &self.grid;
             let start_hist = refresh_start.saturating_sub(hist_base);
             let count = visible_base.saturating_sub(refresh_start);
-            index.index_numbered_content_owned((0..count).map(|j| {
+            // The dense history walk: item `j` IS `get_history_line(start_hist
+            // + j)` (placeholder `None` → empty text, as before), so the
+            // absolute-row keys are unchanged — only the per-line tier lookup
+            // is gone. `chain(repeat(None))` keeps the historical padding if
+            // the walk is ever shorter than `count` (it cannot be: `count` is
+            // bounded by the same retained history).
+            let lines = self
+                .grid
+                .history_lines_from(start_hist)
+                .chain(std::iter::repeat_with(|| None))
+                .take(count);
+            index.index_numbered_content_owned(lines.enumerate().map(|(j, line)| {
                 let absolute_row = refresh_start.saturating_add(j);
-                let text = grid
-                    .get_history_line(start_hist.saturating_add(j))
+                let text = line
                     .map(|l| {
                         line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
                     })
@@ -333,7 +342,12 @@ impl Terminal {
         let mut search = TerminalSearch::new();
 
         // Scrollback history 0..scrollback → absolute oldest + i. Line text via
-        // `get_history_line` (the same source the legacy loop used), but bounded:
+        // the DENSE history walk (`Grid::history_lines_from`), whose item `i`
+        // is exactly `get_history_line(i)` — the source the legacy loop used —
+        // with an unreadable line as a `None` placeholder (empty text, as
+        // before) so every later line keeps its absolute row. It decodes each
+        // warm block / cold page once instead of paying a binary search, a
+        // block-cache probe and a `Line` clone per tiered line. Bounded:
         // a stored `Line`'s byte length is unbounded (a crafted checkpoint can
         // inject a multi-MiB `Line`), so a plain `to_string()` here would allocate
         // the whole line per row — the same memory-amplification DoS closed in
@@ -348,19 +362,22 @@ impl Terminal {
         // Behavior is unchanged: the same lines are enumerated in the same order
         // and keyed at `base + offset`, so the line set, absolute-row keys and
         // eviction/INCOMPLETE semantics — and therefore every `SearchMatch`
-        // coordinate — are identical. The only difference is that the
-        // `get_history_line` reads now interleave with trigram insertion instead
-        // of all preceding it, which nothing can observe: `get_history_line`
-        // takes `&self`, so the grid cannot mutate (nor `content_gen` bump)
-        // mid-build. The `legacy_results` oracle test below deliberately keeps
-        // the collect form and asserts result equality — it is this change's
-        // regression guard.
+        // coordinate — are identical. The only difference is that the history
+        // reads now interleave with trigram insertion instead of all preceding
+        // it, which nothing can observe: the walk borrows the grid `&self`, so
+        // it cannot mutate (nor `content_gen` bump) mid-build. The
+        // `legacy_results` oracle test below deliberately keeps the per-line
+        // `get_history_line` collect form and asserts result equality — it is
+        // this change's regression guard.
         use super::selection::{MAX_SCROLLBACK_LINE_SCAN_BYTES, line_text_bounded};
         let hist_base = usize::try_from(oldest).unwrap_or(usize::MAX);
-        search.index_numbered_content_owned((0..scrollback).map(|i| {
+        let history = grid
+            .history_lines_from(0)
+            .chain(std::iter::repeat_with(|| None))
+            .take(scrollback);
+        search.index_numbered_content_owned(history.enumerate().map(|(i, line)| {
             let absolute_row = hist_base.saturating_add(i);
-            let text = grid
-                .get_history_line(i)
+            let text = line
                 .map(|l| {
                     line_text_bounded(l.as_bytes(), MAX_SCROLLBACK_LINE_SCAN_BYTES).into_owned()
                 })
@@ -427,7 +444,7 @@ impl Terminal {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::Terminal;
 
     /// Build the index the legacy (uncached) way for a behavior-identity
@@ -462,6 +479,62 @@ mod tests {
             .iter()
             .map(|m| (m.line, m.start_col, m.len()))
             .collect()
+    }
+
+    /// A terminal whose history runs through a TIERED store holding a corrupt
+    /// warm block between its cold tier and its healthy warm blocks, with a
+    /// needle on both sides of it — the shape a skipping history reader would
+    /// get wrong by shifting every later line onto its neighbour's row.
+    pub(crate) fn corrupt_tiered_terminal() -> (Terminal, usize) {
+        use aterm_grid::Grid;
+        use aterm_scrollback::Scrollback;
+        // Cold holds the oldest lines (needle at 2), the hot tier the newest
+        // (needle at 38); the corrupt block is injected at the warm FRONT,
+        // i.e. between them, and nothing afterwards pushes enough to evict it.
+        let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+        for i in 0..40 {
+            match i {
+                2 => sb.push_str("NEEDLE_before the corrupt block"),
+                38 => sb.push_str("NEEDLE_after the corrupt block"),
+                _ => sb.push_str(&format!("carried {i:03}")),
+            }
+        }
+        assert!(
+            sb.cold_line_count() > 2,
+            "the first needle must sit in cold"
+        );
+        let corrupt = 5;
+        sb.inject_corrupted_warm_block(corrupt);
+        let mut t = Terminal::with_grid(Grid::with_tiered_scrollback(6, 40, 5, sb));
+        for i in 0..20 {
+            t.process(format!("live {i:03}\r\n").as_bytes());
+        }
+        assert_eq!(
+            t.grid()
+                .history_lines_from(0)
+                .filter(Option::is_none)
+                .count(),
+            corrupt,
+            "the fixture's corrupt block is still in the store"
+        );
+        (t, corrupt)
+    }
+
+    /// DENSE HISTORY, PRODUCT LEVEL: over a corrupt tiered segment the cached
+    /// index's matches equal the per-line legacy oracle's — same line set,
+    /// same absolute rows — and the needle AFTER the corrupt block lands on
+    /// its own row, `corrupt` placeholder rows past the needle before it plus
+    /// the healthy lines between them.
+    #[test]
+    fn search_over_a_corrupt_tiered_segment_keeps_absolute_rows() {
+        let (mut t, corrupt) = corrupt_tiered_terminal();
+        let got = cached_results(&mut t, "NEEDLE_");
+        assert_eq!(got, legacy_results(&t, "NEEDLE_"));
+        assert_eq!(got.len(), 2, "both needles are found: {got:?}");
+        let oldest = usize::try_from(t.grid().oldest_absolute_row()).expect("row");
+        // The corrupt block's placeholder rows sit between the two needles.
+        assert_eq!(got[0].0, oldest + 2);
+        assert_eq!(got[1].0, oldest + 38 + corrupt);
     }
 
     fn cached_results(t: &mut Terminal, pat: &str) -> Vec<(usize, usize, usize)> {

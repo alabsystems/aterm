@@ -1118,11 +1118,8 @@ fn journal_with(done: &[&str]) -> Journal {
         signature_pubkey: None,
         signature_machine_id: None,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         done: done.iter().map(|s| (*s).to_string()).collect(),
     }
 }

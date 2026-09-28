@@ -147,10 +147,6 @@ impl MetalWindowSurface {
         }
         let _mt = aterm_objc::MainThread::new()
             .ok_or("attached drawable worker must be registered on main")?;
-        #[cfg(feature = "acquire-conformance")]
-        if super::acquire_probe::synchronous_control() {
-            return Ok(());
-        }
         self.worker = Some(
             AcquireWorker::spawn(LayerAcquire::run, notify)
                 .map_err(|error| format!("cannot start drawable worker: {error}"))?,

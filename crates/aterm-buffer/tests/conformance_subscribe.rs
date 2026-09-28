@@ -18,9 +18,11 @@
 //! behind reader (a silent loss), this test catches it. Unlike the `ty` tests,
 //! this is pure Rust (the model interpreter) + real code, so it always runs.
 
-use aterm_buffer::{Edit, ReadCap, SubUpdate, Surface, WriteCap};
+use aterm_buffer::{Edit, SubUpdate, Surface};
+mod support;
 use aterm_spec::derive::subscribe_model;
 use std::collections::BTreeMap;
+use support::{read_cap, write_cap};
 
 /// The real ring cap (mirrors `aterm_buffer::MAX_LOG_EVENTS = 1<<16`); a cursor
 /// only falls behind once eviction passes it, i.e. after > CAP appends.
@@ -50,10 +52,10 @@ fn state(s: &Surface, cursor_at: u64) -> BTreeMap<&'static str, i64> {
 fn real_poll_not_behind_delivers_matching_model() {
     let m = subscribe_model();
     let mut s = Surface::new();
-    let cur = s.subscribe(&ReadCap); // at = current head = 0
+    let cur = s.subscribe(&read_cap()); // at = current head = 0
     let cursor_at = s.seq().0;
     for i in 0..3 {
-        s.apply(&WriteCap, Edit::AppendLine(format!("e{i}"))); // no eviction (< CAP)
+        s.apply(&write_cap(), Edit::AppendLine(format!("e{i}"))); // no eviction (< CAP)
     }
     let (upd, _next) = s.poll(cur);
     let gapped = matches!(upd, SubUpdate::Gap { .. });
@@ -78,11 +80,11 @@ fn real_poll_not_behind_delivers_matching_model() {
 fn real_poll_behind_gaps_no_silent_loss() {
     let m = subscribe_model();
     let mut s = Surface::new();
-    let cur = s.subscribe(&ReadCap); // at = 0
+    let cur = s.subscribe(&read_cap()); // at = 0
     let cursor_at = s.seq().0; // 0
     // Drive past the cap so eviction passes the cursor (oldest live > cursor + 1).
     for i in 0..(CAP + 4) {
-        s.apply(&WriteCap, Edit::AppendLine(format!("e{i}")));
+        s.apply(&write_cap(), Edit::AppendLine(format!("e{i}")));
     }
     let (upd, _next) = s.poll(cur);
     let gapped = matches!(upd, SubUpdate::Gap { .. });

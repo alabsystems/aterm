@@ -11,42 +11,29 @@
 //! resolves UAX #9 embedding levels and returns a visual→logical permutation the
 //! renderer can apply per row.
 //!
-//! ## Honest scope (what this DOES and does NOT implement)
+//! ## Scope
 //!
-//! This is the **implicit** Bidirectional Algorithm — the part that matters for
-//! real terminal content (Latin mixed with Hebrew/Arabic, numbers in RTL runs,
-//! neutral punctuation between strong runs). Concretely it implements:
+//! The whole algorithm through rule L2, over one line:
 //!
-//! - **P2/P3** — paragraph (line) base level from the first strong character, or
-//!   a caller-forced base direction.
-//! - **W1–W7** — weak-type resolution (combining marks, European/Arabic numbers,
-//!   separators and terminators).
-//! - **N1/N2** — neutral resolution (neutrals take the surrounding strong
-//!   direction, else the embedding direction).
-//! - **I1/I2** — implicit level assignment.
-//! - **L1** — reset of segment/paragraph separators and trailing whitespace to
-//!   the base level.
-//! - **L2** — the level-run reversal that produces the visual order.
+//! - **P1–P3** — the line splits into paragraphs at `B`; each paragraph's base
+//!   level comes from its first strong character (skipping isolates) or a
+//!   caller-forced direction.
+//! - **X1–X10** — explicit embeddings, overrides and isolates (LRE/RLE/LRO/RLO/
+//!   PDF, LRI/RLI/FSI/PDI) on the 125-deep directional status stack, X9's
+//!   removals, and the isolating run sequences with their `sos`/`eos`.
+//! - **W1–W7**, **N0** (bracket pairs, BD16, with canonical equivalence and the
+//!   NSM follow-up), **N1/N2**, **I1/I2**, **L1** and **L2**.
+//! - The full `Bidi_Class` property ([`bidi_class`]) and `Bidi_Paired_Bracket`
+//!   pairs ([`bracket_of`]), generated from the UCD (`src/tables.rs`,
+//!   `tables/gen.py`).
 //!
-//! It deliberately does **NOT** implement:
+//! Conformance is pinned against the UCD's own `BidiTest.txt` and
+//! `BidiCharacterTest.txt` (`tests/uax9_conformance.rs`). L3/L4 (combining-mark
+//! and mirrored-glyph rendering) belong to the renderer and are out of scope.
 //!
-//! - **Explicit formatting** (LRE/RLE/LRO/RLO/PDF) and **isolates**
-//!   (LRI/RLI/FSI/PDI) — rules X1–X10 and the isolating-run-sequence machinery.
-//!   These are treated as boundary-neutral (i.e. as neutral characters). Terminal
-//!   content essentially never contains them; a single base level spanning the
-//!   line is assumed.
-//! - **N0** bracket-pair resolution — mirrored brackets resolve via N1/N2 like
-//!   any other neutral rather than by pair matching.
-//! - The **full Unicode Character Database** bidi-class table — [`bidi_class`]
-//!   uses a curated subset covering Latin, Hebrew, Arabic, the common number and
-//!   punctuation classes, and the major combining-mark ranges. Unlisted code
-//!   points default to `L` (letters) or `ON` (punctuation/symbols).
-//!
-//! Within that scope the reordering is correct (see the test vectors). Outside it
-//! — explicit-formatting-heavy or exotic scripts — output may differ from a full
-//! UAX #9 implementation. This is why BiDi rendering is wired behind an
-//! **off-by-default** feature in the consuming crates: the default terminal build
-//! is unchanged, and reordering is opt-in.
+//! Characters removed by X9 (the embedding controls and `BN`) take the level of
+//! the character before them, so every character — removed or not — has a place
+//! in the visual order and the result is always a permutation of the input.
 //!
 //! ## Example
 //!
@@ -61,6 +48,8 @@
 
 #![forbid(unsafe_code)]
 
+mod tables;
+
 /// The base (paragraph) direction to resolve a line against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BaseDirection {
@@ -72,7 +61,7 @@ pub enum BaseDirection {
     Rtl,
 }
 
-/// The subset of UAX #9 bidirectional character classes this crate resolves.
+/// The UAX #9 bidirectional character classes (`Bidi_Class`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BidiClass {
     /// Left-to-Right (strong).
@@ -93,7 +82,7 @@ pub enum BidiClass {
     CS,
     /// Non-Spacing Mark.
     NSM,
-    /// Boundary Neutral (here: explicit-formatting code points, treated as neutral).
+    /// Boundary Neutral.
     BN,
     /// Paragraph Separator.
     B,
@@ -103,29 +92,130 @@ pub enum BidiClass {
     WS,
     /// Other Neutral.
     ON,
+    /// Left-to-Right Embedding.
+    LRE,
+    /// Left-to-Right Override.
+    LRO,
+    /// Right-to-Left Embedding.
+    RLE,
+    /// Right-to-Left Override.
+    RLO,
+    /// Pop Directional Format.
+    PDF,
+    /// Left-to-Right Isolate.
+    LRI,
+    /// Right-to-Left Isolate.
+    RLI,
+    /// First Strong Isolate.
+    FSI,
+    /// Pop Directional Isolate.
+    PDI,
 }
 
-use BidiClass::{AL, AN, B, BN, CS, EN, ES, ET, L, NSM, ON, R, S, WS};
+use BidiClass::{
+    AL, AN, B, BN, CS, EN, ES, ET, FSI, L, LRE, LRI, LRO, NSM, ON, PDF, PDI, R, RLE, RLI, RLO, S,
+    WS,
+};
+
+/// A character's paired-bracket property (UAX #9 BD14/BD15), keyed by the
+/// code point of the OPENING bracket of its pair after canonical equivalence
+/// (U+2329/U+232A pair with U+3008/U+3009), so an opener and a closer match
+/// exactly when their keys are equal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Bracket {
+    /// Not a paired bracket.
+    #[default]
+    None,
+    /// An opening paired bracket.
+    Open(u32),
+    /// A closing paired bracket.
+    Close(u32),
+}
+
+/// The bidirectional class of `c` (the UCD `Bidi_Class` property).
+#[must_use]
+pub fn bidi_class(c: char) -> BidiClass {
+    let u = u32::from(c);
+    let table = tables::BIDI_CLASS_RANGES;
+    match table.binary_search_by(|&(lo, hi, _)| {
+        if hi < u {
+            std::cmp::Ordering::Less
+        } else if lo > u {
+            std::cmp::Ordering::Greater
+        } else {
+            std::cmp::Ordering::Equal
+        }
+    }) {
+        Ok(i) => table.get(i).map_or(L, |&(_, _, class)| class),
+        Err(_) => L,
+    }
+}
+
+/// Canonical equivalence for the two bracket pairs that have one (BD16).
+fn canonical_bracket(u: u32) -> u32 {
+    match u {
+        0x2329 => 0x3008,
+        0x232A => 0x3009,
+        other => other,
+    }
+}
+
+/// The paired-bracket property of `c` (see [`Bracket`]).
+#[must_use]
+pub fn bracket_of(c: char) -> Bracket {
+    let u = u32::from(c);
+    if tables::BRACKET_PAIRS
+        .binary_search_by_key(&u, |&(open, _)| open)
+        .is_ok()
+    {
+        return Bracket::Open(canonical_bracket(u));
+    }
+    let closers = tables::BRACKET_CLOSERS;
+    match closers.binary_search_by_key(&u, |&(close, _)| close) {
+        Ok(i) => closers.get(i).map_or(Bracket::None, |&(_, open)| {
+            Bracket::Close(canonical_bracket(open))
+        }),
+        Err(_) => Bracket::None,
+    }
+}
+
+/// Whether rule X9 removes a character of this class (the embedding controls
+/// and `BN`). Removed characters get no level of their own in UAX #9's
+/// conformance data; here they take the level before them (see the crate docs).
+#[must_use]
+pub fn removed_by_x9(class: BidiClass) -> bool {
+    matches!(class, RLE | LRE | RLO | LRO | PDF | BN)
+}
 
 /// Quick test for whether a line needs the Bidirectional Algorithm at all.
 ///
-/// Returns `true` if any character is right-to-left (`R`/`AL`) or an Arabic
-/// number (`AN`). A line for which this is `false` is pure left-to-right and the
-/// renderer can skip reordering entirely (the identity permutation).
+/// Returns `true` if any character is right-to-left (`R`/`AL`), an Arabic
+/// number (`AN`), or an explicit control that can open a right-to-left level
+/// (RLE/RLO/RLI/FSI). A line for which this is `false` resolves to even levels
+/// only, so its visual order is the identity and the renderer can skip it.
 #[must_use]
 pub fn has_bidi(text: &[char]) -> bool {
-    text.iter().any(|&c| matches!(bidi_class(c), R | AL | AN))
+    text.iter().any(|&c| is_bidi_class(bidi_class(c)))
 }
 
 /// Class-slice companion to [`has_bidi`].
-///
-/// Identical predicate, but for a caller that has ALREADY computed the per-
-/// character [`BidiClass`] slice (e.g. the cell-reorder bridge, which computes
-/// the classes once for both this check and the base/level resolution). Avoids
-/// recomputing [`bidi_class`] over the line.
 #[must_use]
 pub fn has_bidi_classes(classes: &[BidiClass]) -> bool {
-    classes.iter().any(|&c| matches!(c, R | AL | AN))
+    classes.iter().any(|&c| is_bidi_class(c))
+}
+
+fn is_bidi_class(c: BidiClass) -> bool {
+    matches!(c, R | AL | AN | RLE | RLO | RLI | FSI)
+}
+
+fn classes_and_brackets(text: &[char]) -> (Vec<BidiClass>, Vec<Bracket>) {
+    let mut classes = Vec::with_capacity(text.len());
+    let mut brackets = Vec::with_capacity(text.len());
+    for &c in text {
+        classes.push(bidi_class(c));
+        brackets.push(bracket_of(c));
+    }
+    (classes, brackets)
 }
 
 /// Compute the visual→logical index permutation for `text`.
@@ -136,13 +226,13 @@ pub fn has_bidi_classes(classes: &[BidiClass]) -> bool {
 #[must_use]
 pub fn reorder_visual_to_logical(text: &[char], base: BaseDirection) -> Vec<usize> {
     let levels = resolve_levels(text, base);
-    reorder_from_levels(&levels)
+    let (classes, _) = classes_and_brackets(text);
+    let mut order = Vec::new();
+    reorder_paragraphs_into(&classes, &levels, &mut order);
+    order
 }
 
 /// Convenience wrapper over [`reorder_visual_to_logical`] taking a `&str`.
-///
-/// The permutation is over Unicode scalar values (`char`s), in `str::chars`
-/// order — the caller is responsible for any grapheme grouping.
 #[must_use]
 #[cfg(test)]
 pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
@@ -153,19 +243,12 @@ pub fn reorder_str(s: &str, base: BaseDirection) -> Vec<usize> {
 /// Compute the visual→logical **cell** permutation for a terminal row.
 ///
 /// Terminal rows store a WIDE glyph (CJK, wide emoji) as two cells: a lead cell
-/// carrying the glyph and a right-half *continuation* cell (`is_wide_continuation`
-/// `true`, its `char` a space). The Bidirectional Algorithm runs on the LOGICAL
-/// CHARACTERS — one per lead/single cell — and each character's cell(s) are then
-/// emitted as a unit in lead-then-continuation order: a wide glyph is never
-/// mirrored, only its *position* in the line is reordered.
-///
-/// `cell_chars` and `is_wide_continuation` are parallel per-cell slices of equal
-/// length. The result has that same length; `result[v] == l` means the cell at
-/// logical index `l` is drawn at visual column `v` (left to right). For a pure-LTR
-/// row this is the identity, and the result is always a permutation of `0..n` (so
-/// a renderer can apply it unconditionally). Malformed input (a continuation cell
-/// with no preceding lead) degrades gracefully — that cell is treated as its own
-/// single-width character — and the result stays a valid permutation.
+/// carrying the glyph and a right-half *continuation* cell. The Bidirectional
+/// Algorithm runs on the LOGICAL CHARACTERS — one per lead/single cell — and each
+/// character's cell(s) are then emitted as a unit in lead-then-continuation
+/// order: a wide glyph is never mirrored, only its *position* in the line is
+/// reordered. The result is always a permutation of `0..n`; a malformed
+/// continuation cell with no lead is treated as its own character.
 #[must_use]
 #[cfg(test)]
 pub fn reorder_cells(
@@ -173,646 +256,823 @@ pub fn reorder_cells(
     is_wide_continuation: &[bool],
     base: BaseDirection,
 ) -> Vec<usize> {
-    // Build the per-cell class vec with an explicit push-loop rather than
-    // `.map(..).collect()`: the `Map`-adapter `collect` is an unmodeled bulk
-    // allocation for the verifier (the count is not derivable, and the closure
-    // adapter chain is not lowerable), whereas a plain push-loop carries no
-    // unbounded-allocation obligation. The resulting vec is identical.
-    let mut cell_classes: Vec<BidiClass> = Vec::new();
-    for &c in cell_chars {
-        cell_classes.push(bidi_class(c));
-    }
-    reorder_cells_with_classes(&cell_classes, is_wide_continuation, base)
+    let (classes, brackets) = classes_and_brackets(cell_chars);
+    reorder_cells_with_classes(&classes, &brackets, is_wide_continuation, base)
 }
 
-/// Class-taking companion to [`reorder_cells`].
-///
-/// Takes the per-CELL [`BidiClass`] slice instead of the raw `char`s, so a
-/// caller that already computed the classes (for the [`has_bidi_classes`] check
-/// and base detection) avoids recomputing [`bidi_class`]. `cell_classes` and
-/// `is_wide_continuation` are parallel per-cell slices of equal length, and the
-/// result is the SAME visual→logical CELL permutation [`reorder_cells`] returns
-/// for the characters those classes came from (same wide-pair / malformed-input
-/// guarantees).
+/// Class-taking companion to [`reorder_cells`]: per-CELL classes and brackets
+/// (parallel to `is_wide_continuation`), so a caller that already computed them
+/// does not recompute. A missing bracket entry reads as [`Bracket::None`].
 #[must_use]
 pub fn reorder_cells_with_classes(
     cell_classes: &[BidiClass],
+    cell_brackets: &[Bracket],
     is_wide_continuation: &[bool],
     base: BaseDirection,
 ) -> Vec<usize> {
-    // Allocating wrapper over the buffer-reusing core: fresh scratch per call for
-    // external/test callers. The per-frame render bridge instead calls
-    // [`reorder_cells_with_classes_into`] with persistent scratch.
-    let mut logical = Vec::new();
-    let mut lead_cell = Vec::new();
-    let mut has_cont = Vec::new();
-    let mut types = Vec::new();
-    let mut levels = Vec::new();
-    let mut char_order = Vec::new();
+    let mut scratch = Scratch::default();
     let mut out = Vec::new();
     reorder_cells_with_classes_into(
         cell_classes,
+        cell_brackets,
         is_wide_continuation,
         base,
-        &mut logical,
-        &mut lead_cell,
-        &mut has_cont,
-        &mut types,
-        &mut levels,
-        &mut char_order,
+        &mut scratch,
         &mut out,
     );
     out
 }
 
-/// Buffer-in/buffer-out companion to [`reorder_cells_with_classes`].
-///
-/// Writes the visual→logical CELL permutation into the caller-provided `out`
-/// (cleared then refilled) and uses the caller's `logical`/`lead_cell`/
-/// `has_cont`/`types`/`levels`/`char_order` buffers as working scratch (each
-/// cleared + refilled), so a per-row caller that holds persistent scratch (the
-/// render bridge) reorders without any heap allocation after warmup. The output
-/// in `out` is byte-identical to what [`reorder_cells_with_classes`] returns for
-/// the same input; every bounds-checked `.get()` and `saturating_add` is
-/// preserved.
-// Each buffer is a distinct, independently-reused working set the render bridge
-// owns on its persistent scratch; bundling them into a struct would only obscure
-// that, so the explicit buffer list is intentional.
-#[allow(clippy::too_many_arguments)]
+/// Reusable working memory for the `_into` entry points: a per-row caller that
+/// keeps one of these reorders without heap allocation after warmup.
+#[derive(Debug, Default)]
+pub struct Scratch {
+    logical: Vec<BidiClass>,
+    logical_brackets: Vec<Bracket>,
+    lead_cell: Vec<usize>,
+    has_cont: Vec<bool>,
+    levels: Vec<u8>,
+    char_order: Vec<usize>,
+    resolve: Resolve,
+}
+
+/// Buffer-in/buffer-out companion to [`reorder_cells_with_classes`]: the
+/// visual→logical CELL permutation is written into `out` (cleared then
+/// refilled), and every working buffer lives in `scratch`.
 pub fn reorder_cells_with_classes_into(
     cell_classes: &[BidiClass],
+    cell_brackets: &[Bracket],
     is_wide_continuation: &[bool],
     base: BaseDirection,
-    logical: &mut Vec<BidiClass>,
-    lead_cell: &mut Vec<usize>,
-    has_cont: &mut Vec<bool>,
-    types: &mut Vec<BidiClass>,
-    levels: &mut Vec<u8>,
-    char_order: &mut Vec<usize>,
+    scratch: &mut Scratch,
     out: &mut Vec<usize>,
 ) {
-    // `cell_classes` and `is_wide_continuation` are documented as parallel
-    // equal-length slices. No assert on that here: every access below is a
-    // bounds-checked `.get()` with a graceful default, so a mismatched caller
-    // still gets a valid permutation of `0..cell_classes.len()` (missing
-    // continuation flags read as `false`), and the function stays panic-free
-    // for the verifier.
-
-    // 1. Fold cells into logical characters' classes: each non-continuation cell
-    //    starts a character that also owns the immediately-following continuation
-    //    cell. `logical[k]` is the class of the cell at `lead_cell[k]`.
-    logical.clear();
-    lead_cell.clear();
-    has_cont.clear();
+    // 1. Fold cells into logical characters: each non-continuation cell starts a
+    //    character that also owns the immediately-following continuation cell.
+    let s = scratch;
+    s.logical.clear();
+    s.logical_brackets.clear();
+    s.lead_cell.clear();
+    s.has_cont.clear();
     let mut i = 0;
     while i < cell_classes.len() {
-        // `i + 1` cannot overflow because `i < cell_classes.len() <= isize::MAX`;
-        // wrapping into the total `.get()` keeps the probe obligation-free.
         let cont = is_wide_continuation
             .get(i.wrapping_add(1))
             .copied()
             .unwrap_or(false);
-        if let Some(&cls) = cell_classes.get(i) {
-            logical.push(cls);
-            lead_cell.push(i);
-            has_cont.push(cont);
+        if let Some(&class) = cell_classes.get(i) {
+            s.logical.push(class);
+            s.logical_brackets
+                .push(cell_brackets.get(i).copied().unwrap_or_default());
+            s.lead_cell.push(i);
+            s.has_cont.push(cont);
         }
-        // `i < cell_classes.len() <= isize::MAX`, so the step cannot overflow;
-        // saturation never fires on real inputs and (were it ever to) would only
-        // pin `i` at usize::MAX, exiting the loop.
         i = i.saturating_add(if cont { 2 } else { 1 });
     }
 
-    // 2. Reorder the logical characters per UAX #9 (from their precomputed
-    //    classes — no recompute of `bidi_class`), reusing the level/order scratch.
-    resolve_levels_from_classes_into(logical.as_slice(), base, types, levels);
-    reorder_from_levels_into(levels.as_slice(), char_order);
+    // 2. Reorder the logical characters.
+    resolve_into(
+        &s.logical,
+        &s.logical_brackets,
+        base,
+        &mut s.resolve,
+        &mut s.levels,
+    );
+    reorder_paragraphs_into(&s.logical, &s.levels, &mut s.char_order);
 
-    // 3. Expand each logical character back to its cell(s): lead, then the
-    //    continuation half (the glyph is not mirrored).
+    // 3. Expand each logical character back to its cell(s).
     out.clear();
-    for &c in char_order.iter() {
-        if let Some(&lead) = lead_cell.get(c) {
+    for &c in &s.char_order {
+        if let Some(&lead) = s.lead_cell.get(c) {
             out.push(lead);
-            // `lead` is a real cell index (`< n <= isize::MAX`), so `lead + 1`
-            // cannot overflow.
-            if has_cont.get(c).copied().unwrap_or(false) {
+            if s.has_cont.get(c).copied().unwrap_or(false) {
                 out.push(lead.saturating_add(1));
             }
         }
     }
 }
 
-/// Resolve the UAX #9 embedding level of every character in `text`.
-///
-/// Implements P2/P3 → W1–W7 → N1/N2 → I1/I2 → L1 over a single base-level run
-/// (see the crate docs for the deliberate scope). The returned levels feed
-/// [`reorder_from_levels`].
+/// Resolve the UAX #9 embedding level of every character in `text` (see the
+/// crate docs for the scope; removed X9 characters take the level before them).
 #[must_use]
 pub fn resolve_levels(text: &[char], base: BaseDirection) -> Vec<u8> {
-    // Explicit push-loop instead of `.map(..).collect()`: the `Map`-adapter
-    // `collect` is an unmodeled bulk allocation for the verifier, while a plain
-    // push-loop carries no unbounded-allocation obligation. Identical result.
-    let mut classes: Vec<BidiClass> = Vec::new();
-    for &c in text {
-        classes.push(bidi_class(c));
-    }
-    resolve_levels_from_classes(&classes, base)
+    let (classes, brackets) = classes_and_brackets(text);
+    resolve_levels_from_classes(&classes, &brackets, base)
 }
 
-/// Resolve the UAX #9 embedding levels from a PRECOMPUTED [`BidiClass`] slice.
-///
-/// The class-taking companion to [`resolve_levels`]: a caller that already holds
-/// the per-character classes (e.g. the cell-reorder bridge, which computes them
-/// once for the [`has_bidi_classes`] check and base detection) threads them in
-/// here to avoid recomputing [`bidi_class`]. The result is identical to
-/// `resolve_levels` over the characters those classes came from.
+/// [`resolve_levels`] from precomputed classes and brackets (a missing bracket
+/// entry reads as [`Bracket::None`]).
 #[must_use]
-pub fn resolve_levels_from_classes(classes: &[BidiClass], base: BaseDirection) -> Vec<u8> {
-    // Allocating wrapper over the buffer-reusing core (fresh scratch per call).
-    let mut types = Vec::new();
+pub fn resolve_levels_from_classes(
+    classes: &[BidiClass],
+    brackets: &[Bracket],
+    base: BaseDirection,
+) -> Vec<u8> {
+    let mut resolve = Resolve::default();
     let mut levels = Vec::new();
-    resolve_levels_from_classes_into(classes, base, &mut types, &mut levels);
+    resolve_into(classes, brackets, base, &mut resolve, &mut levels);
     levels
 }
 
-/// Buffer-in/buffer-out companion to [`resolve_levels_from_classes`].
-///
-/// Resolves the embedding levels into the caller-provided `levels_out` (cleared,
-/// then refilled to length `classes.len()`), using `types_scratch` as the working
-/// per-character type array (cleared + `extend_from_slice(classes)` instead of
-/// `classes.to_vec()`). A per-row caller that holds persistent scratch reuses both
-/// buffers without allocating. `levels_out` is byte-identical to what
-/// [`resolve_levels_from_classes`] returns for the same input.
-pub fn resolve_levels_from_classes_into(
-    classes: &[BidiClass],
-    base: BaseDirection,
-    types_scratch: &mut Vec<BidiClass>,
-    levels_out: &mut Vec<u8>,
-) {
-    types_scratch.clear();
-    levels_out.clear();
-    let n = classes.len();
-    if n == 0 {
-        return;
-    }
-    let para = paragraph_level_from_classes(classes, base);
-    types_scratch.extend_from_slice(classes);
-    // Explicit push-loop instead of `resize(n, para)`: `resize`'s bulk
-    // `extend_with` is an unmodeled allocation for the verifier (it refutes the
-    // internal assertion with a degenerate huge `n`), while a plain push-loop
-    // carries no unbounded-allocation obligation. `levels_out` was cleared
-    // above, so pushing `para` n times is identical to `resize(n, para)`.
-    for _ in 0..n {
-        levels_out.push(para);
-    }
-
-    // No explicit embeddings are processed, so a single level run spans the whole
-    // line and sor == eor == the direction of the paragraph level.
-    let bound = dir_of_level(para);
-    resolve_weak(types_scratch.as_mut_slice(), bound);
-    resolve_neutral(types_scratch.as_mut_slice(), bound, para);
-    resolve_implicit(types_scratch.as_slice(), levels_out.as_mut_slice());
-    apply_l1(classes, levels_out.as_mut_slice(), para);
-}
-
-/// The base paragraph level for `text` (0 = LTR, 1 = RTL).
+/// The base level of the FIRST paragraph of `text` (0 = LTR, 1 = RTL).
 #[must_use]
 #[cfg(test)]
 pub fn paragraph_level(text: &[char], base: BaseDirection) -> u8 {
-    if text.is_empty() {
-        return matches!(base, BaseDirection::Rtl) as u8;
-    }
-    // Explicit push-loop instead of `.map(..).collect()`: the `Map`-adapter
-    // `collect` is an unmodeled bulk allocation for the verifier, while a plain
-    // push-loop carries no unbounded-allocation obligation. Identical result.
-    let mut classes: Vec<BidiClass> = Vec::new();
-    for &c in text {
-        classes.push(bidi_class(c));
-    }
-    paragraph_level_from_classes(&classes, base)
+    let (classes, _) = classes_and_brackets(text);
+    let end = classes
+        .iter()
+        .position(|&c| c == B)
+        .map_or(classes.len(), |i| i + 1);
+    let mut matching = Vec::new();
+    match_isolates(classes.get(..end).unwrap_or(&[]), &mut matching);
+    paragraph_level_of(classes.get(..end).unwrap_or(&[]), &matching, base)
 }
 
 /// Apply UAX #9 rule L2 to a resolved level array, returning the visual→logical
 /// permutation.
 ///
 /// Reverses contiguous runs from the highest level down to the lowest odd level.
-/// Exposed separately so a caller that already has levels (e.g. cached per row)
-/// can reorder without re-resolving.
 #[must_use]
 pub fn reorder_from_levels(levels: &[u8]) -> Vec<usize> {
-    // Allocating wrapper over the buffer-reusing core (fresh order Vec per call).
     let mut order = Vec::new();
     reorder_from_levels_into(levels, &mut order);
     order
 }
 
 /// Buffer-out companion to [`reorder_from_levels`].
-///
-/// Writes the visual→logical permutation into the caller-provided `order_out`
-/// (cleared, then seeded with `0..n` and reversed in place by rule L2) instead of
-/// allocating a fresh `Vec`, so a per-row caller reuses one buffer across rows.
-/// `order_out` is byte-identical to what [`reorder_from_levels`] returns for the
-/// same `levels`; every bounds-checked `.get()`/`.get_mut()` and the
-/// `saturating_sub` level decrement are preserved.
 pub fn reorder_from_levels_into(levels: &[u8], order_out: &mut Vec<usize>) {
-    let n = levels.len();
     order_out.clear();
-    order_out.extend(0..n);
+    order_out.extend(0..levels.len());
+    reverse_by_levels(levels, order_out);
+}
+
+/// L2 within each paragraph of the line: a line that holds a `B` is two
+/// paragraphs, each reordered on its own and kept in logical sequence.
+fn reorder_paragraphs_into(classes: &[BidiClass], levels: &[u8], order_out: &mut Vec<usize>) {
+    order_out.clear();
+    order_out.extend(0..levels.len());
+    let mut start = 0;
+    while start < levels.len() {
+        let end = classes
+            .get(start..)
+            .and_then(|rest| rest.iter().position(|&c| c == B))
+            .map_or(levels.len(), |off| start + off + 1)
+            .min(levels.len());
+        if let (Some(lv), Some(ord)) = (levels.get(start..end), order_out.get_mut(start..end)) {
+            reverse_by_levels(lv, ord);
+        }
+        start = end;
+    }
+}
+
+/// Rule L2 over one line whose `order` starts as that line's logical indices.
+fn reverse_by_levels(levels: &[u8], order: &mut [usize]) {
+    let n = levels.len();
     if n == 0 {
         return;
     }
-    let max_level = *levels.iter().max().unwrap_or(&0);
-    let mut lowest_odd = max_level.wrapping_add(1);
-    for &l in levels {
-        if l % 2 == 1 && l < lowest_odd {
-            lowest_odd = l;
-        }
-    }
+    let max_level = levels.iter().copied().max().unwrap_or(0);
+    let lowest_odd = levels
+        .iter()
+        .copied()
+        .filter(|l| l % 2 == 1)
+        .min()
+        .unwrap_or(u8::MAX);
     if lowest_odd > max_level {
-        // No odd level anywhere → nothing to reverse (pure LTR). Identity.
         return;
     }
     let mut level = max_level;
     loop {
-        let len = levels.len();
         let mut i = 0;
-        while i < len {
+        while i < n {
             if levels.get(i).is_some_and(|&l| l >= level) {
                 let start = i;
-                while i < len && levels.get(i).is_some_and(|&l| l >= level) {
+                while i < n && levels.get(i).is_some_and(|&l| l >= level) {
                     i += 1;
                 }
-                if let Some(run) = order_out.get_mut(start..i) {
+                if let Some(run) = order.get_mut(start..i) {
                     run.reverse();
                 }
             } else {
                 i += 1;
             }
         }
-        if level == lowest_odd {
+        if level <= lowest_odd {
             break;
         }
-        // The loop runs from `max_level` down to `lowest_odd` and breaks once they
-        // are equal, so `level > lowest_odd >= 0` here and the decrement cannot
-        // underflow the u8.
         level = level.saturating_sub(1);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Internal resolution steps
+// The algorithm
 // ---------------------------------------------------------------------------
 
-#[inline]
-fn dir_of_level(level: u8) -> BidiClass {
-    if level.is_multiple_of(2) { L } else { R }
+/// The deepest explicit embedding level (BD2).
+const MAX_DEPTH: u8 = 125;
+/// The bracket-pair stack bound (BD16): past it, pairing stops for the sequence.
+const MAX_BRACKET_STACK: usize = 63;
+
+/// Working memory for one resolution (reused across calls through [`Scratch`]).
+#[derive(Debug, Default)]
+struct Resolve {
+    types: Vec<BidiClass>,
+    matching_pdi: Vec<usize>,
+    stack: Vec<StatusEntry>,
+    runs: Vec<(usize, usize)>,
+    run_of_char: Vec<usize>,
+    seq: Vec<usize>,
+    bracket_stack: Vec<(u32, usize)>,
+    pairs: Vec<(usize, usize)>,
 }
 
-fn paragraph_level_from_classes(classes: &[BidiClass], base: BaseDirection) -> u8 {
-    match base {
-        BaseDirection::Ltr => 0,
-        BaseDirection::Rtl => 1,
-        BaseDirection::Auto => {
-            // P2/P3: base level from the first strong character. (Isolates are not
-            // handled, so there is nothing to skip over.)
-            for &c in classes {
-                match c {
-                    L => return 0,
-                    R | AL => return 1,
-                    _ => {}
-                }
-            }
-            0
+#[derive(Debug, Clone, Copy)]
+struct StatusEntry {
+    level: u8,
+    override_to: Option<BidiClass>,
+    isolate: bool,
+}
+
+/// Resolve `classes` (and their brackets) into `levels` — P1 splits at `B`,
+/// then each paragraph runs X1–L1.
+fn resolve_into(
+    classes: &[BidiClass],
+    brackets: &[Bracket],
+    base: BaseDirection,
+    r: &mut Resolve,
+    levels: &mut Vec<u8>,
+) {
+    levels.clear();
+    levels.resize(classes.len(), 0);
+    let mut start = 0;
+    while start < classes.len() {
+        let end = classes
+            .get(start..)
+            .and_then(|rest| rest.iter().position(|&c| c == B))
+            .map_or(classes.len(), |off| start + off + 1)
+            .min(classes.len());
+        if let (Some(cls), Some(lv)) = (classes.get(start..end), levels.get_mut(start..end)) {
+            let br = brackets.get(start..end).unwrap_or(&[]);
+            resolve_paragraph(cls, br, base, r, lv);
         }
+        start = end;
     }
 }
 
-/// W1–W7. `bound` is the strong class at both run boundaries (sor == eor).
-fn resolve_weak(types: &mut [BidiClass], bound: BidiClass) {
-    // Explicit-formatting code points are treated as neutral (we do not process
-    // X1–X10), so collapse BN to ON up front.
-    for t in types.iter_mut() {
-        if *t == BN {
-            *t = ON;
-        }
-    }
-
-    // W1: NSM takes the type of the previous character, or the boundary at start.
-    let mut i = 0;
-    while i < types.len() {
-        if types.get(i).copied() == Some(NSM) {
-            let prev = if i == 0 {
-                bound
-            } else {
-                // `i >= 1` here; wrapping into the total `.get()` is obligation-free.
-                types.get(i.wrapping_sub(1)).copied().unwrap_or(bound)
-            };
-            if let Some(t) = types.get_mut(i) {
-                *t = prev;
+/// BD9: `matching[i]` is the index of the PDI matching the isolate initiator at
+/// `i` (or `n` when it has none), and for a matched PDI the index of its
+/// initiator; `usize::MAX` elsewhere.
+fn match_isolates(classes: &[BidiClass], matching: &mut Vec<usize>) {
+    let n = classes.len();
+    matching.clear();
+    matching.resize(n, usize::MAX);
+    let mut open: Vec<usize> = Vec::new();
+    for (i, &c) in classes.iter().enumerate() {
+        match c {
+            LRI | RLI | FSI => {
+                if let Some(m) = matching.get_mut(i) {
+                    *m = n;
+                }
+                open.push(i);
             }
-        }
-        i = i.wrapping_add(1); // no-op wrap: `i < len` in-path; removes the add obligation
-    }
-
-    // W2: EN becomes AN if the previous strong type is AL.
-    let mut last_strong = bound;
-    for t in types.iter_mut() {
-        match *t {
-            R | L | AL => last_strong = *t,
-            EN if last_strong == AL => *t = AN,
-            _ => {}
-        }
-    }
-
-    // W3: AL becomes R.
-    for t in types.iter_mut() {
-        if *t == AL {
-            *t = R;
-        }
-    }
-
-    // W4: a single ES between two EN → EN; a single CS between two EN → EN; a
-    // single CS between two AN → AN.
-    {
-        let len = types.len();
-        // Interior indices only. Neighbour indices use wrapping arithmetic fed into
-        // `.get()`, which is total: for the in-range `i` we visit (`1 <= i` and
-        // `i < len - 1`) the wraps never fire, and any out-of-range probe simply
-        // yields `None`. This keeps the loop free of overflow/underflow obligations.
-        let mut i = 1;
-        while i < len.saturating_sub(1) {
-            let prev = types.get(i.wrapping_sub(1)).copied();
-            let next = types.get(i.wrapping_add(1)).copied();
-            if let Some(cur) = types.get_mut(i) {
-                match *cur {
-                    ES if prev == Some(EN) && next == Some(EN) => *cur = EN,
-                    CS if prev == Some(EN) && next == Some(EN) => *cur = EN,
-                    CS if prev == Some(AN) && next == Some(AN) => *cur = AN,
-                    _ => {}
+            PDI => {
+                if let Some(init) = open.pop() {
+                    if let Some(m) = matching.get_mut(init) {
+                        *m = i;
+                    }
+                    if let Some(m) = matching.get_mut(i) {
+                        *m = init;
+                    }
                 }
             }
-            i = i.wrapping_add(1); // no-op wrap: `i < len` in-path; removes the add obligation
-        }
-    }
-
-    // W5: a contiguous run of ET adjacent to EN → EN.
-    let len = types.len();
-    let mut i = 0;
-    while i < len {
-        if types.get(i).copied() == Some(ET) {
-            let start = i;
-            while i < len && types.get(i).copied() == Some(ET) {
-                i = i.wrapping_add(1); // no-op wrap: `i < len` in-path; removes the add obligation
-            }
-            // `start >= 1` here; wrapping into `.get()` keeps this obligation-free.
-            let before_en = start > 0 && types.get(start.wrapping_sub(1)).copied() == Some(EN);
-            let after_en = types.get(i).copied() == Some(EN);
-            if (before_en || after_en)
-                && let Some(run) = types.get_mut(start..i)
-            {
-                for t in run {
-                    *t = EN;
-                }
-            }
-        } else {
-            i = i.wrapping_add(1); // no-op wrap: `i < len` in-path; removes the add obligation
-        }
-    }
-
-    // W6: any remaining ES, ET, CS → ON.
-    for t in types.iter_mut() {
-        if matches!(*t, ES | ET | CS) {
-            *t = ON;
-        }
-    }
-
-    // W7: EN becomes L if the previous strong type is L.
-    let mut last_strong = bound;
-    for t in types.iter_mut() {
-        match *t {
-            R | L => last_strong = *t,
-            EN if last_strong == L => *t = L,
             _ => {}
         }
     }
 }
 
-/// N1/N2. `bound` is the boundary strong class; `para` the base level.
-fn resolve_neutral(types: &mut [BidiClass], bound: BidiClass, para: u8) {
-    let embedding = dir_of_level(para);
-    let is_ni = |t: BidiClass| matches!(t, B | S | WS | ON);
-    let len = types.len();
-    let mut i = 0;
-    while i < len {
-        if types.get(i).copied().is_some_and(is_ni) {
-            let start = i;
-            while i < len && types.get(i).copied().is_some_and(is_ni) {
-                i += 1;
-            }
-            // For N1, EN and AN count as R.
-            let before = if start == 0 {
-                bound
-            } else {
-                // `start >= 1` here, so `start - 1` is in bounds.
-                types
-                    .get(start - 1)
-                    .copied()
-                    .map_or(bound, strong_for_neutral)
-            };
-            // `i == len` at end of line; otherwise `i < len` so `types[i]` exists.
-            let after = types.get(i).copied().map_or(bound, strong_for_neutral);
-            let resolved = if before == after && (before == L || before == R) {
-                before // N1: same direction on both sides
-            } else {
-                embedding // N2: otherwise the embedding direction
-            };
-            if let Some(run) = types.get_mut(start..i) {
-                for t in run {
-                    *t = resolved;
+/// P2/P3 over `classes[..]`, skipping isolated content: 1 when the first strong
+/// character is R/AL, else 0.
+fn first_strong_level(
+    classes: &[BidiClass],
+    matching: &[usize],
+    from: usize,
+    to: usize,
+) -> Option<u8> {
+    let mut i = from;
+    while i < to {
+        match classes.get(i).copied() {
+            Some(L) => return Some(0),
+            Some(R | AL) => return Some(1),
+            Some(LRI | RLI | FSI) => {
+                // Skip to the matching PDI (or the end when unmatched).
+                let m = matching.get(i).copied().unwrap_or(to);
+                if m >= to {
+                    return None;
                 }
+                i = m;
             }
-        } else {
-            i += 1;
-        }
-    }
-}
-
-#[inline]
-fn strong_for_neutral(t: BidiClass) -> BidiClass {
-    match t {
-        L => L,
-        R | EN | AN => R,
-        other => other,
-    }
-}
-
-/// I1/I2: bump levels by resolved type relative to the (single) base level.
-fn resolve_implicit(types: &[BidiClass], levels: &mut [u8]) {
-    for (t, lvl) in types.iter().zip(levels.iter_mut()) {
-        // Real embedding levels stay tiny (a single base run never exceeds 2), so
-        // saturation never triggers; it only discharges the u8 overflow obligation
-        // for the degenerate `lvl` near 255 the verifier must rule out.
-        if *lvl % 2 == 0 {
-            // Even (LTR) level.
-            match t {
-                R => *lvl = lvl.saturating_add(1),
-                AN | EN => *lvl = lvl.saturating_add(2),
-                _ => {}
-            }
-        } else {
-            // Odd (RTL) level.
-            match t {
-                L | EN | AN => *lvl = lvl.saturating_add(1),
-                _ => {}
-            }
-        }
-    }
-}
-
-/// L1: reset segment/paragraph separators and trailing whitespace to the base
-/// level. Uses the ORIGINAL classes (before W/N resolution), per the spec.
-fn apply_l1(orig: &[BidiClass], levels: &mut [u8], para: u8) {
-    let mut i = 0;
-    while i < orig.len() {
-        if orig.get(i).is_some_and(|c| matches!(c, S | B)) {
-            if let Some(lvl) = levels.get_mut(i) {
-                *lvl = para;
-            }
-            // Reset the whitespace/BN run immediately preceding the separator.
-            let mut j = i;
-            // `j >= 1` in the guard, so `j - 1` is in bounds.
-            while j > 0 && orig.get(j - 1).is_some_and(|c| matches!(c, WS | BN)) {
-                j -= 1;
-                if let Some(lvl) = levels.get_mut(j) {
-                    *lvl = para;
-                }
-            }
+            _ => {}
         }
         i += 1;
     }
-    // Trailing whitespace/BN at end of line.
-    let mut k = orig.len();
-    // `k >= 1` in the guard, so `k - 1` is in bounds.
-    while k > 0 && orig.get(k - 1).is_some_and(|c| matches!(c, WS | BN)) {
-        k -= 1;
-        if let Some(lvl) = levels.get_mut(k) {
-            *lvl = para;
-        }
+    None
+}
+
+fn paragraph_level_of(classes: &[BidiClass], matching: &[usize], base: BaseDirection) -> u8 {
+    match base {
+        BaseDirection::Ltr => 0,
+        BaseDirection::Rtl => 1,
+        BaseDirection::Auto => first_strong_level(classes, matching, 0, classes.len()).unwrap_or(0),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bidi character class table (curated subset — see crate docs)
-// ---------------------------------------------------------------------------
-
-/// The bidirectional class of `c` (curated UAX #9 subset).
-///
-/// Covers Latin, Hebrew, Arabic, the number classes (EN/AN/ES/ET/CS), the major
-/// combining-mark (NSM) ranges, and the separator/whitespace/neutral classes.
-/// Code points outside the listed ranges default to `L` (letters/CJK) or `ON`
-/// (ASCII/Latin-1 punctuation and the general-punctuation/symbol blocks).
-#[must_use]
-pub fn bidi_class(c: char) -> BidiClass {
-    let u = c as u32;
-    match u {
-        // Explicit embedding / override / isolate formatting → boundary neutral.
-        0x202A..=0x202E | 0x2066..=0x2069 => BN,
-        0x200E => L,  // LEFT-TO-RIGHT MARK
-        0x200F => R,  // RIGHT-TO-LEFT MARK
-        0x061C => AL, // ARABIC LETTER MARK
-
-        // Paragraph separators.
-        0x000A | 0x000D | 0x001C..=0x001E | 0x0085 | 0x2029 => B,
-        // Segment separators.
-        0x0009 | 0x000B | 0x001F => S,
-        // Whitespace.
-        0x000C | 0x0020 | 0x1680 | 0x2000..=0x200A | 0x2028 | 0x205F | 0x3000 => WS,
-
-        // European numbers.
-        0x0030..=0x0039 | 0x00B2 | 0x00B3 | 0x00B9 | 0x2070..=0x2079 | 0x2080..=0x2089 => EN,
-        // European number separators (+ -).
-        0x002B | 0x002D | 0x207A | 0x207B | 0x208A | 0x208B | 0x2212 => ES,
-        // European number terminators (# $ % currencies ° ± ‰).
-        0x0023..=0x0025
-        | 0x00A2..=0x00A5
-        | 0x00B0
-        | 0x00B1
-        | 0x066A
-        | 0x2030
-        | 0x2031
-        | 0x20A0..=0x20BF => ET,
-
-        // Arabic numbers (must precede the Arabic-letter block below).
-        0x0600..=0x0605 | 0x0660..=0x0669 | 0x066B | 0x066C | 0x06DD | 0x08E2 => AN,
-        // Common separators (, . / : NBSP, Arabic comma, fullwidth forms).
-        0x002C | 0x002E | 0x002F | 0x003A | 0x00A0 | 0x060C | 0xFF0C | 0xFF0E | 0xFF1A => CS,
-
-        // Non-spacing marks (major combining ranges; precede the strong blocks so
-        // Hebrew points / Arabic marks classify as NSM, not R/AL).
-        0x0300..=0x036F
-        | 0x0483..=0x0489
-        | 0x0591..=0x05BD
-        | 0x05BF
-        | 0x05C1
-        | 0x05C2
-        | 0x05C4
-        | 0x05C5
-        | 0x05C7
-        | 0x0610..=0x061A
-        | 0x064B..=0x065F
-        | 0x0670
-        | 0x06D6..=0x06DC
-        | 0x06DF..=0x06E4
-        | 0x06E7
-        | 0x06E8
-        | 0x06EA..=0x06ED
-        | 0x0711
-        | 0x0730..=0x074A
-        | 0x07A6..=0x07B0
-        | 0x07EB..=0x07F3
-        | 0x0816..=0x0819
-        | 0x081B..=0x0823
-        | 0x0825..=0x0827
-        | 0x0829..=0x082D
-        | 0xFE20..=0xFE2F => NSM,
-
-        // Right-to-left (Hebrew letters/punctuation, NKo, Samaritan, Mandaic,
-        // Hebrew presentation forms).
-        0x0590..=0x05FF | 0x07C0..=0x089F | 0xFB1D..=0xFB4F => R,
-
-        // Arabic letters (Arabic, Syriac-adjacent, extended, presentation forms).
-        0x0600..=0x06FF | 0x0750..=0x077F | 0x08A0..=0x08FF | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => {
-            AL
-        }
-
-        // Everything else: ASCII/Latin-1 punctuation & the general-punctuation /
-        // symbol blocks are Other Neutral; all remaining letters/CJK are L.
-        _ => default_class(u),
+fn least_greater_odd(level: u8) -> u8 {
+    if level.is_multiple_of(2) {
+        level.saturating_add(1)
+    } else {
+        level.saturating_add(2)
     }
 }
 
-fn default_class(u: u32) -> BidiClass {
-    match u {
-        0x0021
-        | 0x0022
-        | 0x0026..=0x002A
-        | 0x003B..=0x0040
-        | 0x005B..=0x0060
-        | 0x007B..=0x007E
-        | 0x00A1
-        | 0x00A6..=0x00A9
-        | 0x00AB
-        | 0x00AC
-        | 0x00AE
-        | 0x00AF
-        | 0x00B4
-        | 0x00B6..=0x00B8
-        | 0x00BB..=0x00BF
-        | 0x2010..=0x2027
-        | 0x2032..=0x205E
-        | 0x2190..=0x2BFF => ON,
-        _ => L,
+fn least_greater_even(level: u8) -> u8 {
+    if level.is_multiple_of(2) {
+        level.saturating_add(2)
+    } else {
+        level.saturating_add(1)
+    }
+}
+
+fn direction_of(level: u8) -> BidiClass {
+    if level.is_multiple_of(2) { L } else { R }
+}
+
+/// X1–L1 over one paragraph.
+fn resolve_paragraph(
+    classes: &[BidiClass],
+    brackets: &[Bracket],
+    base: BaseDirection,
+    r: &mut Resolve,
+    levels: &mut [u8],
+) {
+    let n = classes.len();
+    let mut matching = std::mem::take(&mut r.matching_pdi);
+    match_isolates(classes, &mut matching);
+    let para = paragraph_level_of(classes, &matching, base);
+
+    // X1–X8: explicit levels and overrides.
+    r.types.clear();
+    r.types.extend_from_slice(classes);
+    r.stack.clear();
+    r.stack.push(StatusEntry {
+        level: para,
+        override_to: None,
+        isolate: false,
+    });
+    let mut overflow_isolates = 0usize;
+    let mut overflow_embeddings = 0usize;
+    let mut valid_isolates = 0usize;
+    for i in 0..n {
+        let class = classes.get(i).copied().unwrap_or(ON);
+        let top = r.stack.last().copied().unwrap_or(StatusEntry {
+            level: para,
+            override_to: None,
+            isolate: false,
+        });
+        match class {
+            RLE | LRE | RLO | LRO => {
+                let new_level = if matches!(class, RLE | RLO) {
+                    least_greater_odd(top.level)
+                } else {
+                    least_greater_even(top.level)
+                };
+                if new_level <= MAX_DEPTH && overflow_isolates == 0 && overflow_embeddings == 0 {
+                    r.stack.push(StatusEntry {
+                        level: new_level,
+                        override_to: match class {
+                            RLO => Some(R),
+                            LRO => Some(L),
+                            _ => None,
+                        },
+                        isolate: false,
+                    });
+                } else if overflow_isolates == 0 {
+                    overflow_embeddings += 1;
+                }
+                set(levels, i, top.level);
+            }
+            RLI | LRI | FSI => {
+                set(levels, i, top.level);
+                if let Some(o) = top.override_to {
+                    set(&mut r.types, i, o);
+                }
+                let rtl = match class {
+                    RLI => true,
+                    LRI => false,
+                    _ => {
+                        let end = matching.get(i).copied().unwrap_or(n).min(n);
+                        first_strong_level(classes, &matching, i + 1, end) == Some(1)
+                    }
+                };
+                let new_level = if rtl {
+                    least_greater_odd(top.level)
+                } else {
+                    least_greater_even(top.level)
+                };
+                if new_level <= MAX_DEPTH && overflow_isolates == 0 && overflow_embeddings == 0 {
+                    valid_isolates += 1;
+                    r.stack.push(StatusEntry {
+                        level: new_level,
+                        override_to: None,
+                        isolate: true,
+                    });
+                } else {
+                    overflow_isolates += 1;
+                }
+            }
+            PDI => {
+                if overflow_isolates > 0 {
+                    overflow_isolates -= 1;
+                } else if valid_isolates > 0 {
+                    overflow_embeddings = 0;
+                    while r.stack.last().is_some_and(|e| !e.isolate) {
+                        r.stack.pop();
+                    }
+                    r.stack.pop();
+                    valid_isolates -= 1;
+                }
+                let top = r.stack.last().copied().unwrap_or(top);
+                set(levels, i, top.level);
+                if let Some(o) = top.override_to {
+                    set(&mut r.types, i, o);
+                }
+            }
+            PDF => {
+                if overflow_isolates > 0 {
+                } else if overflow_embeddings > 0 {
+                    overflow_embeddings -= 1;
+                } else if !top.isolate && r.stack.len() >= 2 {
+                    r.stack.pop();
+                }
+                set(levels, i, top.level);
+            }
+            B => set(levels, i, para),
+            BN => set(levels, i, top.level),
+            _ => {
+                set(levels, i, top.level);
+                if let Some(o) = top.override_to {
+                    set(&mut r.types, i, o);
+                }
+            }
+        }
+    }
+
+    // X9: removed characters are skipped from here on (`removed_by_x9`).
+    // X10: level runs over the kept characters, then isolating run sequences.
+    r.runs.clear();
+    r.run_of_char.clear();
+    r.run_of_char.resize(n, usize::MAX);
+    let mut current: Option<(usize, usize, u8)> = None;
+    for i in 0..n {
+        if classes.get(i).copied().is_none_or(removed_by_x9) {
+            continue;
+        }
+        let level = levels.get(i).copied().unwrap_or(para);
+        match current {
+            Some((start, _, l)) if l == level => current = Some((start, i, l)),
+            Some((start, last, _)) => {
+                r.runs.push((start, last));
+                current = Some((i, i, level));
+            }
+            None => current = Some((i, i, level)),
+        }
+    }
+    if let Some((start, last, _)) = current {
+        r.runs.push((start, last));
+    }
+    for (k, &(start, last)) in r.runs.iter().enumerate() {
+        for i in start..=last {
+            if let Some(slot) = r.run_of_char.get_mut(i) {
+                *slot = k;
+            }
+        }
+    }
+
+    let runs = std::mem::take(&mut r.runs);
+    let run_of_char = std::mem::take(&mut r.run_of_char);
+    let mut seq = std::mem::take(&mut r.seq);
+    for &(start, _) in &runs {
+        // A run that begins with a PDI matching an initiator continues that
+        // initiator's sequence; it never starts one.
+        if classes.get(start) == Some(&PDI) && matching.get(start).is_some_and(|&m| m < n) {
+            continue;
+        }
+        seq.clear();
+        let mut run = run_of_char.get(start).copied().unwrap_or(usize::MAX);
+        while let Some(&(s, e)) = runs.get(run) {
+            for i in s..=e {
+                if classes.get(i).copied().is_some_and(|c| !removed_by_x9(c)) {
+                    seq.push(i);
+                }
+            }
+            let last = e;
+            let continues = matches!(classes.get(last), Some(LRI | RLI | FSI))
+                && matching.get(last).is_some_and(|&m| m < n);
+            if !continues {
+                break;
+            }
+            let pdi = matching.get(last).copied().unwrap_or(n);
+            run = run_of_char.get(pdi).copied().unwrap_or(usize::MAX);
+        }
+        resolve_sequence(&seq, classes, brackets, &matching, levels, para, r);
+    }
+    r.runs = runs;
+    r.run_of_char = run_of_char;
+    r.seq = seq;
+
+    // I1/I2 on the kept characters; removed ones take the level before them.
+    let mut previous = para;
+    for i in 0..n {
+        let class = classes.get(i).copied().unwrap_or(ON);
+        if removed_by_x9(class) {
+            set(levels, i, previous);
+            continue;
+        }
+        let level = levels.get(i).copied().unwrap_or(para);
+        let t = r.types.get(i).copied().unwrap_or(ON);
+        let resolved = if level.is_multiple_of(2) {
+            match t {
+                R => level.saturating_add(1),
+                AN | EN => level.saturating_add(2),
+                _ => level,
+            }
+        } else {
+            match t {
+                L | EN | AN => level.saturating_add(1),
+                _ => level,
+            }
+        };
+        set(levels, i, resolved);
+        previous = resolved;
+    }
+
+    // L1: separators, and whitespace/isolate controls (with removed characters
+    // among them) before a separator or at the end of the line, go to `para`.
+    let mut trailing = true;
+    for i in (0..n).rev() {
+        let class = classes.get(i).copied().unwrap_or(ON);
+        match class {
+            S | B => {
+                set(levels, i, para);
+                trailing = true;
+            }
+            WS | LRI | RLI | FSI | PDI => {
+                if trailing {
+                    set(levels, i, para);
+                }
+            }
+            c if removed_by_x9(c) => {
+                if trailing {
+                    set(levels, i, para);
+                }
+            }
+            _ => trailing = false,
+        }
+    }
+    r.matching_pdi = matching;
+}
+
+fn set<T: Copy>(slice: &mut [T], i: usize, value: T) {
+    if let Some(slot) = slice.get_mut(i) {
+        *slot = value;
+    }
+}
+
+/// W1–W7, N0, N1/N2 over one isolating run sequence (`seq` holds its kept
+/// characters' indices in order).
+fn resolve_sequence(
+    seq: &[usize],
+    classes: &[BidiClass],
+    brackets: &[Bracket],
+    matching: &[usize],
+    levels: &[u8],
+    para: u8,
+    r: &mut Resolve,
+) {
+    let (Some(&first), Some(&last)) = (seq.first(), seq.last()) else {
+        return;
+    };
+    let n = classes.len();
+    let level = levels.get(first).copied().unwrap_or(para);
+    // sos: the higher of this level and the level of the kept character before
+    // the sequence (or the paragraph level).
+    let before = (0..first)
+        .rev()
+        .find(|&i| classes.get(i).copied().is_some_and(|c| !removed_by_x9(c)))
+        .and_then(|i| levels.get(i).copied())
+        .unwrap_or(para);
+    let sos = direction_of(level.max(before));
+    // eos: the same after the sequence — unless it ends with an (unmatched)
+    // isolate initiator, which takes the paragraph level.
+    let after = if matches!(classes.get(last), Some(LRI | RLI | FSI)) {
+        para
+    } else {
+        (last + 1..n)
+            .find(|&i| classes.get(i).copied().is_some_and(|c| !removed_by_x9(c)))
+            .and_then(|i| levels.get(i).copied())
+            .unwrap_or(para)
+    };
+    let eos = direction_of(level.max(after));
+    let _ = matching;
+
+    let t = |r: &Resolve, k: usize| -> BidiClass {
+        seq.get(k)
+            .and_then(|&i| r.types.get(i).copied())
+            .unwrap_or(ON)
+    };
+    let put = |r: &mut Resolve, k: usize, c: BidiClass| {
+        if let Some(&i) = seq.get(k) {
+            set(&mut r.types, i, c);
+        }
+    };
+    let m = seq.len();
+
+    // W1: NSM takes the previous type (ON after an isolate control; sos first).
+    for k in 0..m {
+        if t(r, k) == NSM {
+            let prev = if k == 0 {
+                sos
+            } else {
+                match t(r, k - 1) {
+                    LRI | RLI | FSI | PDI => ON,
+                    other => other,
+                }
+            };
+            put(r, k, prev);
+        }
+    }
+    // W2: EN after AL (looking back to the last strong type) becomes AN.
+    let mut last_strong = sos;
+    for k in 0..m {
+        match t(r, k) {
+            c @ (L | R | AL) => last_strong = c,
+            EN if last_strong == AL => put(r, k, AN),
+            _ => {}
+        }
+    }
+    // W3: AL → R.
+    for k in 0..m {
+        if t(r, k) == AL {
+            put(r, k, R);
+        }
+    }
+    // W4: a single ES between ENs, or a single CS between two numbers of one type.
+    for k in 1..m.saturating_sub(1) {
+        let (prev, cur, next) = (t(r, k - 1), t(r, k), t(r, k + 1));
+        match (prev, cur, next) {
+            (EN, ES | CS, EN) => put(r, k, EN),
+            (AN, CS, AN) => put(r, k, AN),
+            _ => {}
+        }
+    }
+    // W5: a run of ETs adjacent to EN becomes EN.
+    let mut k = 0;
+    while k < m {
+        if t(r, k) == ET {
+            let start = k;
+            while k < m && t(r, k) == ET {
+                k += 1;
+            }
+            let before_en = start > 0 && t(r, start - 1) == EN;
+            let after_en = k < m && t(r, k) == EN;
+            if before_en || after_en {
+                for j in start..k {
+                    put(r, j, EN);
+                }
+            }
+        } else {
+            k += 1;
+        }
+    }
+    // W6: remaining separators and terminators → ON.
+    for k in 0..m {
+        if matches!(t(r, k), ES | ET | CS) {
+            put(r, k, ON);
+        }
+    }
+    // W7: EN after L (looking back to the last strong type, sos first) → L.
+    let mut last_strong = sos;
+    for k in 0..m {
+        match t(r, k) {
+            c @ (L | R) => last_strong = c,
+            EN if last_strong == L => put(r, k, L),
+            _ => {}
+        }
+    }
+
+    // N0: paired brackets (BD16) among ON characters.
+    let embedding = direction_of(level);
+    r.bracket_stack.clear();
+    r.pairs.clear();
+    for k in 0..m {
+        let Some(&i) = seq.get(k) else { continue };
+        if t(r, k) != ON {
+            continue;
+        }
+        match brackets.get(i).copied().unwrap_or_default() {
+            Bracket::Open(key) => {
+                if r.bracket_stack.len() >= MAX_BRACKET_STACK {
+                    break;
+                }
+                r.bracket_stack.push((key, k));
+            }
+            Bracket::Close(key) => {
+                if let Some(depth) = r.bracket_stack.iter().rposition(|&(open, _)| open == key) {
+                    if let Some(&(_, open_k)) = r.bracket_stack.get(depth) {
+                        r.pairs.push((open_k, k));
+                    }
+                    r.bracket_stack.truncate(depth);
+                }
+            }
+            Bracket::None => {}
+        }
+    }
+    r.pairs.sort_unstable();
+    let strong = |c: BidiClass| match c {
+        L => Some(L),
+        R | AN | EN => Some(R),
+        _ => None,
+    };
+    let pairs = std::mem::take(&mut r.pairs);
+    for &(open_k, close_k) in &pairs {
+        let mut found_embedding = false;
+        let mut found_opposite = false;
+        for k in open_k + 1..close_k {
+            match strong(t(r, k)) {
+                Some(d) if d == embedding => found_embedding = true,
+                Some(_) => found_opposite = true,
+                None => {}
+            }
+        }
+        let resolved = if found_embedding {
+            Some(embedding)
+        } else if found_opposite {
+            let context = (0..open_k)
+                .rev()
+                .find_map(|k| strong(t(r, k)))
+                .unwrap_or(sos);
+            Some(if context == embedding {
+                embedding
+            } else {
+                context
+            })
+        } else {
+            None
+        };
+        if let Some(d) = resolved {
+            for bracket_k in [open_k, close_k] {
+                put(r, bracket_k, d);
+                // NSMs that originally followed the bracket take its new type.
+                let mut j = bracket_k + 1;
+                while j < m {
+                    let Some(&idx) = seq.get(j) else { break };
+                    if classes.get(idx) != Some(&NSM) {
+                        break;
+                    }
+                    put(r, j, d);
+                    j += 1;
+                }
+            }
+        }
+    }
+    r.pairs = pairs;
+
+    // N1/N2: runs of neutrals and isolate controls take the direction on both
+    // sides when it agrees (numbers count as R), else the embedding direction.
+    let is_ni = |c: BidiClass| matches!(c, B | S | WS | ON | LRI | RLI | FSI | PDI);
+    let mut k = 0;
+    while k < m {
+        if is_ni(t(r, k)) {
+            let start = k;
+            while k < m && is_ni(t(r, k)) {
+                k += 1;
+            }
+            let before = if start == 0 {
+                sos
+            } else {
+                strong(t(r, start - 1)).unwrap_or(embedding)
+            };
+            let after = if k >= m {
+                eos
+            } else {
+                strong(t(r, k)).unwrap_or(embedding)
+            };
+            let d = if before == after { before } else { embedding };
+            for j in start..k {
+                put(r, j, d);
+            }
+        } else {
+            k += 1;
+        }
     }
 }
 
@@ -1117,11 +1377,12 @@ mod tests {
         ] {
             let t = chars(s);
             let classes: Vec<BidiClass> = t.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = t.iter().map(|&c| bracket_of(c)).collect();
             assert_eq!(has_bidi(&t), has_bidi_classes(&classes), "has_bidi {s:?}");
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
                 assert_eq!(
                     resolve_levels(&t, base),
-                    resolve_levels_from_classes(&classes, base),
+                    resolve_levels_from_classes(&classes, &brackets, base),
                     "resolve_levels {s:?} {base:?}"
                 );
             }
@@ -1139,10 +1400,11 @@ mod tests {
         ];
         for (cc, wide) in cases {
             let classes: Vec<BidiClass> = cc.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = cc.iter().map(|&c| bracket_of(c)).collect();
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
                 assert_eq!(
                     reorder_cells(cc, wide, base),
-                    reorder_cells_with_classes(&classes, wide, base),
+                    reorder_cells_with_classes(&classes, &brackets, wide, base),
                     "{cc:?} {base:?}"
                 );
             }
@@ -1151,68 +1413,43 @@ mod tests {
 
     #[test]
     fn into_variants_match_vec_returning() {
-        // The buffer-in/buffer-out companions must produce byte-identical output to
-        // the Vec-returning wrappers (the render bridge relies on this equality).
-        // Reusing one set of scratch buffers across all cases also exercises the
-        // clear+refill reuse path (capacity persists, contents do not leak).
+        // The buffer-in/buffer-out companions produce byte-identical output to the
+        // Vec-returning wrappers (the render bridge relies on this equality), and
+        // one Scratch reused across every case exercises the clear+refill path.
         let cell_cases: &[(Vec<char>, Vec<bool>)] = &[
             (chars("hello"), vec![false; 5]),
-            (chars("\u{05D0}\u{05D1}\u{05D2}"), vec![false; 3]), // pure RTL
-            (chars("hi \u{05D0}\u{05D1} bye"), vec![false; 9]),  // mixed LTR/RTL
-            (chars("\u{05D0}12"), vec![false; 3]),               // RTL + numbers
-            (vec![ALEF, CJK, ' '], vec![false, false, true]),    // RTL + wide pair
+            (chars("\u{05D0}\u{05D1}\u{05D2}"), vec![false; 3]),
+            (chars("hi \u{05D0}\u{05D1} bye"), vec![false; 9]),
+            (chars("\u{05D0}12"), vec![false; 3]),
+            (chars("a \u{2067}(\u{05D0}) b\u{2069} c"), vec![false; 10]),
+            (vec![ALEF, CJK, ' '], vec![false, false, true]),
             (vec![CJK, ' ', ALEF, '1'], vec![false, true, false, false]),
-            (vec![' ', 'a'], vec![true, false]), // malformed leading continuation
-            (chars(""), vec![]),                 // empty
+            (vec![' ', 'a'], vec![true, false]),
+            (chars(""), vec![]),
         ];
-        // Persistent scratch reused across every case/base (mirrors the bridge).
-        let mut logical = Vec::new();
-        let mut lead_cell = Vec::new();
-        let mut has_cont = Vec::new();
-        let mut types = Vec::new();
-        let mut levels = Vec::new();
-        let mut char_order = Vec::new();
+        let mut scratch = Scratch::default();
         let mut cell_order = Vec::new();
         for (cc, wide) in cell_cases {
             let classes: Vec<BidiClass> = cc.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = cc.iter().map(|&c| bracket_of(c)).collect();
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                // reorder_cells_with_classes_into == reorder_cells_with_classes
                 reorder_cells_with_classes_into(
                     &classes,
+                    &brackets,
                     wide,
                     base,
-                    &mut logical,
-                    &mut lead_cell,
-                    &mut has_cont,
-                    &mut types,
-                    &mut levels,
-                    &mut char_order,
+                    &mut scratch,
                     &mut cell_order,
                 );
                 assert_eq!(
                     cell_order,
-                    reorder_cells_with_classes(&classes, wide, base),
+                    reorder_cells_with_classes(&classes, &brackets, wide, base),
                     "reorder_cells_with_classes_into {cc:?} {base:?}"
                 );
-
-                // resolve_levels_from_classes_into == resolve_levels_from_classes
-                let mut types2 = Vec::new();
-                let mut levels_out = Vec::new();
-                resolve_levels_from_classes_into(&classes, base, &mut types2, &mut levels_out);
-                assert_eq!(
-                    levels_out,
-                    resolve_levels_from_classes(&classes, base),
-                    "resolve_levels_from_classes_into {cc:?} {base:?}"
-                );
-
-                // reorder_from_levels_into == reorder_from_levels
+                let levels = resolve_levels_from_classes(&classes, &brackets, base);
                 let mut order_out = Vec::new();
-                reorder_from_levels_into(&levels_out, &mut order_out);
-                assert_eq!(
-                    order_out,
-                    reorder_from_levels(&levels_out),
-                    "reorder_from_levels_into {cc:?} {base:?}"
-                );
+                reorder_from_levels_into(&levels, &mut order_out);
+                assert_eq!(order_out, reorder_from_levels(&levels), "{cc:?} {base:?}");
             }
         }
     }
@@ -1248,7 +1485,8 @@ mod proptests {
         prop::sample::select(vec![
             'a', 'Z', '5', '0', '+', '-', '$', '%', ',', '.', ':', '/', ' ', '\t', '\n', '!', '(',
             ')', '\u{05D0}', '\u{05D1}', '\u{05EA}', '\u{0627}', '\u{0628}', '\u{0660}',
-            '\u{0669}', '\u{200F}', '\u{200E}',
+            '\u{0669}', '\u{200F}', '\u{200E}', '[', ']', '\u{0301}', '\u{202A}', '\u{202B}',
+            '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
         ])
     }
 
@@ -1270,16 +1508,25 @@ mod proptests {
             }
         }
 
-        /// Levels match the input length and never fall below the base level (I1/I2
-        /// only raise; L1 resets to base).
+        /// Levels match the input length and never fall below their PARAGRAPH's
+        /// base level (explicit embeddings and I1/I2 only raise; L1 resets to
+        /// base). A `B` ends a paragraph, and the next one has its own base.
         #[test]
         fn levels_well_formed(line in bidi_line()) {
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
                 let levels = resolve_levels(&line, base);
                 prop_assert_eq!(levels.len(), line.len());
-                let para = paragraph_level(&line, base);
-                for &l in &levels {
-                    prop_assert!(l >= para);
+                let mut start = 0;
+                while start < line.len() {
+                    let end = line[start..]
+                        .iter()
+                        .position(|&c| bidi_class(c) == B)
+                        .map_or(line.len(), |off| start + off + 1);
+                    let para = paragraph_level(&line[start..end], base);
+                    for &l in &levels[start..end] {
+                        prop_assert!(l >= para);
+                    }
+                    start = end;
                 }
             }
         }
@@ -1307,57 +1554,38 @@ mod proptests {
         #[test]
         fn class_taking_matches_char_taking(line in bidi_line()) {
             let classes: Vec<BidiClass> = line.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = line.iter().map(|&c| bracket_of(c)).collect();
             let wide = vec![false; line.len()];
             prop_assert_eq!(has_bidi(&line), has_bidi_classes(&classes));
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
                 prop_assert_eq!(
                     resolve_levels(&line, base),
-                    resolve_levels_from_classes(&classes, base)
+                    resolve_levels_from_classes(&classes, &brackets, base)
                 );
                 prop_assert_eq!(
                     reorder_cells(&line, &wide, base),
-                    reorder_cells_with_classes(&classes, &wide, base)
+                    reorder_cells_with_classes(&classes, &brackets, &wide, base)
                 );
             }
         }
 
-        /// The buffer-in/buffer-out `_into` companions are byte-identical to the
-        /// Vec-returning wrappers for any input and base (the equality the render
-        /// bridge's scratch reuse depends on).
+        /// The `_into` companion is byte-identical to the Vec-returning wrapper
+        /// for any input and base, with one Scratch reused across bases.
         #[test]
         fn into_variants_match_vec_returning_prop(line in bidi_line()) {
             let classes: Vec<BidiClass> = line.iter().map(|&c| bidi_class(c)).collect();
+            let brackets: Vec<Bracket> = line.iter().map(|&c| bracket_of(c)).collect();
             let wide = vec![false; line.len()];
-            let mut logical = Vec::new();
-            let mut lead_cell = Vec::new();
-            let mut has_cont = Vec::new();
-            let mut types = Vec::new();
-            let mut levels = Vec::new();
-            let mut char_order = Vec::new();
+            let mut scratch = Scratch::default();
             let mut cell_order = Vec::new();
             for base in [BaseDirection::Auto, BaseDirection::Ltr, BaseDirection::Rtl] {
-                let mut types2 = Vec::new();
-                let mut levels_out = Vec::new();
-                resolve_levels_from_classes_into(&classes, base, &mut types2, &mut levels_out);
-                prop_assert_eq!(&levels_out, &resolve_levels_from_classes(&classes, base));
-
-                let mut order_out = Vec::new();
-                reorder_from_levels_into(&levels_out, &mut order_out);
-                prop_assert_eq!(&order_out, &reorder_from_levels(&levels_out));
-
                 reorder_cells_with_classes_into(
-                    &classes,
-                    &wide,
-                    base,
-                    &mut logical,
-                    &mut lead_cell,
-                    &mut has_cont,
-                    &mut types,
-                    &mut levels,
-                    &mut char_order,
-                    &mut cell_order,
+                    &classes, &brackets, &wide, base, &mut scratch, &mut cell_order,
                 );
-                prop_assert_eq!(&cell_order, &reorder_cells_with_classes(&classes, &wide, base));
+                prop_assert_eq!(
+                    &cell_order,
+                    &reorder_cells_with_classes(&classes, &brackets, &wide, base)
+                );
             }
         }
     }

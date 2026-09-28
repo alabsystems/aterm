@@ -3,6 +3,7 @@
 
 //! The seam: what a verb body needs from whatever is hosting the session.
 
+use std::borrow::Cow;
 use std::time::Duration;
 
 use aterm_core::terminal::Terminal;
@@ -233,6 +234,22 @@ pub trait SessionHost {
     /// Place `text` on the system clipboard; `false` if the write failed. Only
     /// called when [`HostCapabilities::clipboard`] is set.
     fn clipboard_set(&self, text: &str) -> bool;
+
+    /// A shell-reported working directory as the path THIS host's platform
+    /// names it by — what `blocks` prints for a block's `cwd`.
+    ///
+    /// The engine stores the cwd as the shell reported it, and for OSC 7 that is
+    /// the RFC 8089 URI path: `/C:/Users//x` on Windows, from
+    /// `file://host/C:/Users//x`. It stays that way on purpose (a recorded
+    /// session must decode the same on every platform), which leaves the local
+    /// meaning to the host. The default is the identity, correct on every POSIX
+    /// host; a Windows host converts, so a pwsh block's cwd reads `C:\Users\x`,
+    /// as that host's `cwd` verb and a cmd block (whose `$P` is native
+    /// already) do — measured before this seam: `cwd=/C:/Users//m6-an` under
+    /// pwsh beside `cwd=C:\Windows\Temp` under cmd, in one window.
+    fn native_cwd<'p>(&self, reported: &'p str) -> Cow<'p, str> {
+        Cow::Borrowed(reported)
+    }
 }
 
 #[cfg(test)]

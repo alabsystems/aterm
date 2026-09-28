@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Policy engine: precompiled decision tree + `PolicyEngine::evaluate`
-//! implementing §4.2 of `designs/2026-04-19-osc-policy-engine.md`.
+//! Policy engine: precompiled decision tree + `PolicyEngine::evaluate`.
 //!
 //! The engine is the runtime consumer of [`Policy`]. It
 //!
@@ -29,24 +28,15 @@
 //! id shared via `Arc`, so a match is a refcount bump rather than a heap
 //! allocation), and always returns a defined value — including when the rule
 //! list is empty or every rule's selector failed to compile. This is codified
-//! by the §8.1 Kani harnesses in this module.
+//! by the unit tests in this module and in `tests.rs`.
 //!
 //! # Rate limits
 //!
-//! Rate-limit enforcement lands in #7995. The engine exposes the matched
+//! The engine exposes the matched
 //! [`Rule`]'s `rate_limit` field to the caller via [`Decision::rate_limit`]
 //! so the handler site can consult the bucket. The engine itself only
 //! decides response + rate-limit id; it does not own bucket state.
 
-// Under Kani verification we substitute `HashMap` with `BTreeMap` so the
-// model checker does not hit the unsupported `CCRandomGenerateBytes` call
-// that `HashMap`'s default randomised hasher makes on macOS. Production
-// builds keep the `HashMap` for its better expected performance on small
-// rule sets. The two types share the `.get / .entry / .or_default / .push`
-// surface used by this module so the engine code is otherwise identical.
-#[cfg(kani)]
-use std::collections::BTreeMap as BucketMap;
-#[cfg(not(kani))]
 use std::collections::HashMap as BucketMap;
 use std::sync::Arc;
 
@@ -65,7 +55,7 @@ use crate::{
 /// Returns the winning [`Response`] plus the matched rule's named rate-limit
 /// reference (if any). The rate-limit id is the string key into
 /// [`Policy::rate_limits`]; the engine itself does not consult the bucket —
-/// #7995 wires the bucket check at the handler site.
+/// the handler site does.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Decision {
     /// The effective response for the evaluated sequence.
@@ -132,8 +122,7 @@ pub struct PolicyEngine {
     /// every match. `None` mirrors `rule.rate_limit == None`.
     rate_limit_ids: Vec<Option<Arc<str>>>,
     /// Runtime rate-limiter buckets seeded from `policy.rate_limits`.
-    /// Consulted by [`Self::rate_limit_try_consume`] at handler call sites
-    /// (#7995).
+    /// Consulted by [`Self::rate_limit_try_consume`] at handler call sites.
     limiters: RateLimiterSet,
 }
 
@@ -184,8 +173,7 @@ impl PolicyEngine {
         }
     }
 
-    /// Borrow the underlying [`Policy`] — useful for introspection (FFI,
-    /// host UIs, mirror-field sync in #7993).
+    /// Borrow the underlying [`Policy`] — useful for introspection.
     #[must_use]
     pub fn policy(&self) -> &Policy {
         &self.policy
@@ -285,7 +273,7 @@ impl PolicyEngine {
     }
 
     // -----------------------------------------------------------------
-    // Rate-limit API (#7995)
+    // Rate-limit API
     // -----------------------------------------------------------------
 
     /// Attempt to debit `amount` tokens from the named rate-limit bucket.
@@ -534,7 +522,7 @@ mod tests {
         // The id is precomputed once in `new` and handed out via an `Arc`
         // refcount bump, so repeated evaluations of the same match return
         // clones of the *same* allocation (no per-match `String` malloc on the
-        // hot path). Guards the #7998 hotpath regression gate.
+        // hot path).
         let eng = PolicyEngine::new(profiles::standard());
         let a = eng
             .evaluate(&osc(9, &["build done"]), OriginTag::User)
@@ -581,8 +569,3 @@ mod tests {
         assert_eq!(eng.policy().rules[idx].sequence, "OSC 9");
     }
 }
-
-// The Kani proofs for `PolicyEngine::evaluate` (totality, refinement,
-// determinism, mirror-invariant) live in `crate::kani_proofs`, gated by
-// `#[cfg(kani)]` in `lib.rs`. See §8.1 of
-// `designs/2026-04-19-osc-policy-engine.md` for the harness matrix.

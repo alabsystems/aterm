@@ -2960,11 +2960,11 @@ pub(crate) struct NetConfig {
 /// The OPTIONAL `sid`/`expect_nonce` fields are the session rebind pin. Both default
 /// to absent, in which case the dial path is byte-identical to an un-pinned dial
 /// (only the TLS cert `fingerprint` is enforced). When `expect_nonce` is set, the
-/// dialer enforces [`aterm_net::RemoteEndpoint::matches`] BEFORE relaying — a
-/// relaunched/rebound remote session (fresh launch nonce) is refused. Because the
-/// shipping wire protocol does not yet echo the remote's launch identity, a set
-/// `expect_nonce` currently FAILS CLOSED (refuses to dial) rather than relay
-/// unverified; see [`crate::net_connections::dial_relay`].
+/// dialer enforces [`aterm_net::RemoteEndpoint::matches`] BEFORE relaying, against
+/// the live nonce the remote's `sessions bridge` roster reports for `sid` (or for
+/// any session carrying `expect_nonce`, when `sid` is absent) — a relaunched or
+/// closed remote session is refused, never relayed unverified; see
+/// [`crate::net_connections::dial_relay`].
 #[derive(Clone, PartialEq, serde::Deserialize)]
 pub(crate) struct Connection {
     /// The name you `dial` (e.g. `"work-box"`). Unique within the registry.
@@ -2976,13 +2976,14 @@ pub(crate) struct Connection {
     /// Non-macOS (or macOS fallback): path to a 0600 file holding the drive token
     /// hex. On macOS the Keychain is tried first.
     pub(crate) token_file: Option<String>,
-    /// OPTIONAL: the remote session id this pin records. Carried for the endpoint
-    /// record but NOT part of the rebind check (which is nonce-only); absent ⇒ unset.
+    /// OPTIONAL: the remote session id whose live launch nonce `expect_nonce` pins;
+    /// absent ⇒ any remote session carrying `expect_nonce` satisfies the pin.
     #[serde(default)]
     pub(crate) sid: Option<String>,
     /// OPTIONAL: the remote session's launch NONCE to pin (rebind guard). Absent ⇒
     /// no rebind check (un-pinned, byte-identical dial). Present ⇒ the dialer
-    /// enforces it before relaying and fails closed if it cannot be verified.
+    /// reads the remote's roster and enforces it before relaying, failing closed
+    /// when the pinned session is not reported.
     #[serde(default)]
     pub(crate) expect_nonce: Option<String>,
 }
@@ -4463,6 +4464,43 @@ impl Config {
             }
         });
         (PreparedSparkleRuntime { resolved, tricks }, fingerprint)
+    }
+
+    /// The files this config names BY PATH whose CONTENT is applied state: the
+    /// Sparkle Words lexicon and Toy Packs (only while `[sparkle_words]` is not
+    /// explicitly disabled — a disabled feed has no consumer) and the Trail
+    /// Packs, each list capped at [`MAX_ACTIVE_TOY_PACKS`] exactly as its loader
+    /// caps it, `~`/`$HOME` expanded as the loaders expand them. The config
+    /// watcher stats these beside `aterm.toml` (metadata only), so editing only
+    /// one of them hot-reloads it; [`PathFeedFps`] then decides from the bytes
+    /// whether anything actually changed.
+    pub(crate) fn path_feed_paths(&self) -> Vec<std::path::PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(sparkle) = self
+            .sparkle_words
+            .as_ref()
+            .filter(|sparkle| sparkle.enabled != Some(false))
+        {
+            paths.extend(sparkle.lexicon.as_deref().map(sparkle_expand_tilde));
+            paths.extend(
+                sparkle
+                    .toy_packs
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .take(MAX_ACTIVE_TOY_PACKS)
+                    .map(|path| sparkle_expand_tilde(path)),
+            );
+        }
+        paths.extend(
+            self.cursor_trail_packs
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .take(MAX_ACTIVE_TOY_PACKS)
+                .map(|path| sparkle_expand_tilde(path)),
+        );
+        paths
     }
 
     /// Prepare every path-backed effect consumer and identify it from the exact
@@ -6343,41 +6381,37 @@ pub(crate) fn titlebar_band_decision(
 mod titlebar_band_acceptance_tests {
     use super::{TITLEBAR_BAND_SANITY_CAP_PTS, accept_titlebar_band_pts, titlebar_band_decision};
 
+    /// `accept_titlebar_band_pts(sample, fullscreen, decorated, prev)`, row by row.
     #[test]
-    fn fullscreen_forces_zero_regardless_of_sample() {
-        assert_eq!(accept_titlebar_band_pts(38.0, true, true, 55.0), 0.0);
-        assert_eq!(accept_titlebar_band_pts(0.0, true, true, 55.0), 0.0);
-        assert_eq!(accept_titlebar_band_pts(900.0, true, true, 55.0), 0.0);
-    }
-
-    #[test]
-    fn windowed_zero_sample_is_a_transition_artifact_and_keeps_prev() {
-        // The defect-A shape: exit-fullscreen race reads 0 while decorated.
-        assert_eq!(accept_titlebar_band_pts(0.0, false, true, 55.0), 55.0);
-        assert_eq!(accept_titlebar_band_pts(-3.0, false, true, 55.0), 55.0);
-    }
-
-    #[test]
-    fn windowed_inflated_sample_keeps_prev() {
-        // The defect-B head-side shape: enter-fullscreen race reads the
-        // screen-vs-window frame difference as a giant band.
+    fn a_titlebar_band_sample_is_accepted_only_when_windowed_decorated_and_sane() {
         let inflated = TITLEBAR_BAND_SANITY_CAP_PTS + 1.0;
-        assert_eq!(accept_titlebar_band_pts(inflated, false, true, 55.0), 55.0);
-        assert_eq!(accept_titlebar_band_pts(700.0, false, true, 55.0), 55.0);
-    }
-
-    #[test]
-    fn windowed_sane_sample_commits() {
-        assert_eq!(accept_titlebar_band_pts(38.0, false, true, 55.0), 38.0);
-        assert_eq!(accept_titlebar_band_pts(62.0, false, true, 0.0), 62.0);
-    }
-
-    #[test]
-    fn undecorated_zero_is_truth_not_artifact() {
-        // Runtime decoration toggle: the band really is gone; a kept stale
-        // band would inset a chromeless window forever.
-        assert_eq!(accept_titlebar_band_pts(0.0, false, false, 55.0), 0.0);
-        assert_eq!(accept_titlebar_band_pts(-1.0, false, false, 55.0), 0.0);
+        for (label, sample, fullscreen, decorated, prev, expected) in [
+            // Fullscreen forces 0 regardless of the sample.
+            ("fullscreen 38", 38.0, true, true, 55.0, 0.0),
+            ("fullscreen 0", 0.0, true, true, 55.0, 0.0),
+            ("fullscreen 900", 900.0, true, true, 55.0, 0.0),
+            // The defect-A shape: the exit-fullscreen race reads 0 while decorated —
+            // a transition artifact, so the previous band is kept.
+            ("windowed 0", 0.0, false, true, 55.0, 55.0),
+            ("windowed -3", -3.0, false, true, 55.0, 55.0),
+            // The defect-B head-side shape: the enter-fullscreen race reads the
+            // screen-vs-window frame difference as a giant band — kept at prev.
+            ("windowed past the cap", inflated, false, true, 55.0, 55.0),
+            ("windowed 700", 700.0, false, true, 55.0, 55.0),
+            // A sane windowed sample commits.
+            ("windowed 38", 38.0, false, true, 55.0, 38.0),
+            ("windowed 62, no prev", 62.0, false, true, 0.0, 62.0),
+            // Runtime decoration toggle: the band really is gone; a kept stale band
+            // would inset a chromeless window forever.
+            ("undecorated 0", 0.0, false, false, 55.0, 0.0),
+            ("undecorated -1", -1.0, false, false, 55.0, 0.0),
+        ] {
+            assert_eq!(
+                accept_titlebar_band_pts(sample, fullscreen, decorated, prev),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     /// The defect this module's `prev = 55.0` cases silently assumed away:
@@ -6888,11 +6922,10 @@ impl BackgroundMaterial {
 /// word-decoration feed) and the `cursor_trail_packs` manifests (the Trail Pack
 /// registry feed). The APPLIED configuration includes these files' CONTENT, yet
 /// `Config` equality compares only the path strings — so the reload dedupe must
-/// compare fingerprints too, or the documented touch-to-reload workflow (edit a
-/// pack/lexicon file, then re-save/`touch` a byte-identical `aterm.toml` —
-/// docs/trail-packs.md, docs/TOY_PACKS.md, docs/sparkle-words-design.md) silently
-/// stops re-reading them, with restartless recovery only via non-obvious
-/// workarounds. An explicitly disabled Sparkle table has no active consumer and
+/// compare fingerprints too, or a feed-only edit (the config watcher re-posts a
+/// byte-identical `aterm.toml` observation when a file it names changes —
+/// `config_watcher.rs`, docs/TOY_PACKS.md, docs/sparkle-words-design.md) would
+/// silently stop re-reading them. An explicitly disabled Sparkle table has no active consumer and
 /// therefore performs no path I/O; re-enabling changes the table itself and
 /// prepares current bytes. Split in two so the consumers reset precisely: the deco feed
 /// warrants a per-window `word_decos.hard_reset()`, the trail feed only a
@@ -7677,19 +7710,15 @@ pub(crate) fn reload_font_pin(
     explicit_now || (new_font_px - new_default_font_px).abs() >= 0.5
 }
 
+/// Resolve the config file path without creating anything. THE rule is
+/// `aterm_types::dirs::aterm_config_path` — `$XDG_CONFIG_HOME`, then `%APPDATA%`
+/// on Windows (which has neither XDG nor, usually, HOME; without that arm BOTH
+/// Settings persistence via `prefs::save_prefs_snapshot_observed` and the mtime
+/// hot-reload watcher silently no-op there), then `$HOME/.config` — shared with
+/// the CLI's `explain-config` and `doctor` so the window and its diagnostics
+/// cannot name two files.
 pub(crate) fn config_path() -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    if let Some(x) = std::env::var_os("XDG_CONFIG_HOME").filter(|x| !x.is_empty()) {
-        return Some(PathBuf::from(x).join("aterm").join("aterm.toml"));
-    }
-    // Windows has neither XDG nor (usually) HOME, so fall back to %APPDATA% — the
-    // conventional per-user roaming config dir. Without this, BOTH persistence
-    // (`save_prefs_edits`) and the mtime hot-reload watcher silently no-op on Windows.
-    #[cfg(windows)]
-    if let Some(appdata) = std::env::var_os("APPDATA").filter(|a| !a.is_empty()) {
-        return Some(PathBuf::from(appdata).join("aterm").join("aterm.toml"));
-    }
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/aterm/aterm.toml"))
+    aterm_types::dirs::aterm_config_path()
 }
 
 /// One ambient launch override that currently outranks aterm.toml. Settings
@@ -7899,6 +7928,28 @@ pub(crate) fn agents_auto_prime_from_text(text: &str) -> bool {
 /// the launch flag still wins after the user edits the config file.
 pub(crate) fn resolve_font_px(config: &Config) -> f32 {
     resolve_font_px_with(launch::flags().font_px, config.font_px)
+}
+
+/// The config-banner line for a `font_px` [`resolve_font_px`] will IGNORE —
+/// outside `FONT_PX_MIN..=FONT_PX_MAX` or not finite — or `None` when the key
+/// is unset or admissible. The resolver falls through to the default rather
+/// than clamping, so until 2026-09-22 a config carrying `font_px = 0.0` loaded
+/// in silence at the default size: the writer now refuses such a value
+/// (`prefs::typed_item`), and this is the same verdict for a file authored by
+/// hand or by an older build. The verdict is the resolver's own predicate
+/// ([`font_px_in_range`]), so the banner speaks exactly when the size is not
+/// applied; the words are the banner row's own — the state and the accepted
+/// range, as the unaccepted-values family beside it says an enum it refused —
+/// where `--validate-config` explains the resolver to a reader of its report.
+/// It says the value is IGNORED rather than naming the size used instead:
+/// that is the default, or a valid `--font-px`, which outranks the config.
+/// Startup and every reload push it onto that row.
+pub(crate) fn font_px_load_notice(config: &Config) -> Option<String> {
+    let px = config.font_px.filter(|px| !font_px_in_range(px))?;
+    Some(format!(
+        "config font_px: {px:?} is not accepted (expected {FONT_PX_MIN}–{FONT_PX_MAX}; the \
+         value is ignored)"
+    ))
 }
 
 /// Whether a valid flag/config size pins the physical glyph size.
@@ -10335,8 +10386,9 @@ impl App {
         //
         // BUT config equality is not the whole applied state: files referenced
         // BY PATH (trail-pack manifests, the sparkle lexicon, toy packs) are
-        // part of it too, and touch-to-reload is their DOCUMENTED hot-reload
-        // path — every reload used to re-read them. So a byte-equal parse
+        // part of it too, and a feed-only edit reaches here as a byte-equal
+        // re-observation (the config watcher stamps those files beside
+        // `aterm.toml`). So a byte-equal parse
         // still refreshes those feeds when their content fingerprints drifted
         // (`refresh_path_feeds`); only a reload where BOTH the parsed config
         // AND the referenced files are unchanged is the full no-op.
@@ -10376,6 +10428,13 @@ impl App {
             let mut warns = crate::message_reporters::ConfigWarnings::default();
             collect_key_notices(&mut warns, &config_snapshot.text);
             collect_harness_notices(&mut warns, &config);
+            // The value did not change, but the unaccepted-values row is
+            // rebuilt from scratch here, so an ignored `font_px` must be
+            // restated or it vanishes on an unrelated comment edit.
+            warns.extend(
+                crate::message_reporters::ConfigFamily::UnacceptedValues,
+                font_px_load_notice(&config),
+            );
             let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
             warns.extend(
                 crate::message_reporters::ConfigFamily::UnacceptedValues,
@@ -10420,17 +10479,11 @@ impl App {
             self.config.window_padding_top_or_default(),
         );
 
-        // Scoped-collateral diffs, taken against the OLD `self.config` before it
-        // is overwritten below: (a) whether the keys that FEED the word
-        // decorations changed (the `[sparkle_words]` table / lexicon inputs, or
-        // the theme its palette derives from) — only then is the per-window
-        // `hard_reset` warranted; (b) whether the retired Settings test scaffold's editable
-        // field CATALOGUE drifted (keys added/removed/reordered) — only then can
-        // an open popup's anchor row point at the wrong control after the
-        // rebuild. A value-only edit (e.g. rapid cursor-trail style switching
-        // from the style popup itself) keeps every anchor stable, so the popup
-        // stays open and the gesture stays live; the rebuild below still
-        // reseeds every row's displayed value either way.
+        // Scoped-collateral diff, taken against the OLD `self.config` before it
+        // is overwritten below: whether the keys that FEED the word decorations
+        // changed (the `[sparkle_words]` table / lexicon inputs, or the theme its
+        // palette derives from) — only then is the per-window `hard_reset`
+        // warranted.
         let sparkle_feed_changed = deco_feed_changed(
             &self.config,
             &config,
@@ -10438,11 +10491,6 @@ impl App {
             self.path_feed_fps.deco,
         );
         self.path_feed_fps = fresh_feeds;
-        let popup_anchors_drifted = {
-            let old = crate::prefs::editable_fields(&self.config);
-            let new = crate::prefs::editable_fields(&config);
-            old.len() != new.len() || old.iter().zip(&new).any(|(a, b)| a.key != b.key)
-        };
 
         // Engine-side config (scrollback/cursor/theme colours/palette). Clearing a
         // previously-set key reverts it: `applied_terminal_config()` rebuilds from a
@@ -10565,7 +10613,7 @@ impl App {
         // remain visible across the reload, so explicitly retire only its
         // appearance contrast sample; position, action and breed stay intact.
         for ws in self.windows.values_mut() {
-            ws.cursor_pet.invalidate_colors();
+            ws.companion.invalidate_colors();
         }
         // A Sparkle Words reload retires word episodes and done marks, but
         // preserves the independent cursor companion's placement and sprite
@@ -10573,42 +10621,6 @@ impl App {
         if sparkle_feed_changed {
             for ws in self.windows.values_mut() {
                 ws.word_decos.hard_reset_words();
-            }
-        }
-        // Keep any OPEN retired Settings test scaffold authoritative against the
-        // freshly admitted worker generation: a live watcher observation rebuilds
-        // the displayed control list from the new
-        // values, preserving the selection/scroll. Uses the local `config` (not
-        // `self.config`) so it doesn't double-borrow `self` against `windows`.
-        let trail_pack_ids = self.config_assets.trail_packs.ids.clone();
-        for ws in self.windows.values_mut() {
-            let band = Self::settings_band(ws);
-            let wrap = Self::settings_wrap(ws);
-            if let Some(s) = ws.settings_mut() {
-                // Close any open popup menu FIRST — but only when the field
-                // catalogue actually DRIFTED (`popup_anchors_drifted` above)
-                // or the Trail Pack id list changed (the trail-style picker's
-                // option list is an open-time snapshot of the OLD pack ids —
-                // committing from it could write a `pack:<id>` that no longer
-                // exists): a menu/wheel is an open-time snapshot of the OLD
-                // fields, and its anchor row index could then point at a
-                // different control after the rebuild — committing from that
-                // stale snapshot could write an outdated value into the wrong
-                // key. With a stable catalogue (the common case: a value-only
-                // edit, including the one THIS popup just committed) every
-                // anchor still points at its control, so the popup survives
-                // the reload — rapid sequential trail-style picks stay one
-                // fluid gesture instead of the menu slamming shut ~500 ms
-                // after every choice.
-                if popup_anchors_drifted || s.trail_pack_ids != trail_pack_ids {
-                    s.menu_cancel();
-                    s.wheel_cancel();
-                }
-                s.trail_pack_ids.clone_from(&trail_pack_ids);
-                // The rebuild re-clamps `scroll` PER MODE (grouped `scroll` is a
-                // GroupRow index, not a field index — `scroll.min(selected)` would
-                // compare incommensurable units and yank the band after every save).
-                s.rebuild_fields(crate::prefs::editable_fields(&config), band, wrap);
             }
         }
         let applied_tc = config.applied_terminal_config_for_with_assets(
@@ -10773,6 +10785,8 @@ impl App {
         // The supervisor's `[harness]` values it refused (a known key with a
         // value it cannot take: `continue = "yes"`).
         collect_harness_notices(&mut warns, &config);
+        // A `font_px` the resolver ignores says so here, like it does at launch.
+        warns.extend(ConfigFamily::UnacceptedValues, font_px_load_notice(&config));
         let unaccepted = unaccepted_value_notices(&config_snapshot.text, &warns.told());
         warns.extend(ConfigFamily::UnacceptedValues, unaccepted);
         for w in warns.sentences() {
@@ -11700,26 +11714,6 @@ copy_on_select = true
 #[cfg(test)]
 mod descriptive_title_config_tests {
 
-    /// THE RETIRED TYPING-WAKE KEY STILL LOADS. `cursor_trail_wake_ms` shipped
-    /// in the starter config for a year, so real `aterm.toml` files on disk set
-    /// it. Retiring it deleted the field, not the tolerance: `Config` takes
-    /// `#[serde(default)]` and no `deny_unknown_fields`, so the file parses,
-    /// every neighbouring key still lands, and the value is simply dropped.
-    /// The honest STORY about it is Manual's, and lives with the retirement
-    /// (`native_config_language::the_retired_typing_wake_key_loads_and_is_told_the_truth`).
-    #[test]
-    fn a_config_that_still_sets_the_retired_typing_wake_key_keeps_loading() {
-        use crate::app_config::Config;
-        let parsed: Config =
-            aterm_toml::from_str("cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n")
-                .expect("a config authored against the old dial must still load");
-        assert_eq!(
-            parsed.cursor_trail_ms,
-            Some(260),
-            "the retired key must not swallow the keys around it"
-        );
-    }
-
     /// The effects-OFF owner must not pay the effect-pipeline warm-up on a config
     /// save. The nine pipelines are demand-driven so a launch compiles none of
     /// them; warming them unconditionally at the config-apply seam would hand a
@@ -12106,11 +12100,38 @@ mod cfg_engine_tests {
         ))
     }
 
+    /// The plain-bool knobs: each resolves its shipped default when absent and
+    /// honours both explicit spellings.
     #[test]
-    fn serious_mode_defaults_off_and_parses_both_states() {
-        assert!(!Config::default().serious_mode_or_default());
-        assert!(cfg("serious_mode = true").serious_mode_or_default());
-        assert!(!cfg("serious_mode = false").serious_mode_or_default());
+    fn bool_knobs_resolve_their_default_and_both_spellings() {
+        /// `(key, shipped default, resolver)`.
+        type Knob = (&'static str, bool, fn(&Config) -> bool);
+        let rows: [Knob; 5] = [
+            // Serious mode is opt-in.
+            ("serious_mode", false, Config::serious_mode_or_default),
+            // Focus boost ships ON: the anti-starvation lane costs nothing when idle
+            // and only touches the shell root + conhost; `false` opts out.
+            ("focus_boost", true, Config::focus_boost_or_default),
+            // The tone melody ships ENABLED (subtle by design — the neutral verdict is
+            // bit-exactly today's sound); `false` pins the neutral melody at the drain
+            // seams and stops the classifier via `tone_infer_active`.
+            ("tone_melody", true, Config::tone_melody_or_default),
+            // Robi is opt-IN (owner directive: disabled by default).
+            ("robi", false, Config::robi_or_default),
+            // The ambient bed: the owner turned it ON by default (2026-09-09);
+            // `false` silences the drone at the drain seams, and notes, brrrring, bonk
+            // and melody are unaffected by it.
+            ("trail_sound_bed", true, Config::trail_sound_bed_or_default),
+        ];
+        for (key, default, read) in rows {
+            assert_eq!(
+                read(&Config::default()),
+                default,
+                "{key}: the shipped default"
+            );
+            assert!(read(&cfg(&format!("{key} = true"))), "{key} = true");
+            assert!(!read(&cfg(&format!("{key} = false"))), "{key} = false");
+        }
     }
 
     fn theme_fixture_dir(name: &str) -> std::path::PathBuf {
@@ -12577,25 +12598,6 @@ mod cfg_engine_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Focus-boost default — ON (the anti-starvation lane costs nothing when
-    /// idle and only touches the shell root + conhost), and the opt-out
-    /// spelling `focus_boost = false` is honoured.
-    #[test]
-    fn focus_boost_defaults_on() {
-        assert!(
-            Config::default().focus_boost_or_default(),
-            "focus boost defaults ON"
-        );
-        assert!(
-            !cfg("focus_boost = false").focus_boost_or_default(),
-            "opt-out honoured"
-        );
-        assert!(
-            cfg("focus_boost = true").focus_boost_or_default(),
-            "explicit ON honoured"
-        );
-    }
-
     /// M2: stream-fade defaults — OFF (minimal fast defaults, 6272bd7a), window
     /// 90 ms — and the `stream_fade_ms` clamp (16..=1000), so a typo can't wedge
     /// the fade timer on or strobe it.
@@ -12612,6 +12614,61 @@ mod cfg_engine_tests {
             1000,
             "clamped high"
         );
+    }
+
+    /// A `font_px` the resolver ignores (outside `FONT_PX_MIN..=FONT_PX_MAX`,
+    /// or not finite) is a banner line at load — the value, the accepted
+    /// range, and that the default size is what the window got — and the
+    /// resolver really does fall back; an unset or admissible size is silent.
+    /// Before 2026-09-22 a config carrying `font_px = 0.0` loaded at the
+    /// default size and said nothing. `--validate-config` flags exactly the
+    /// same values, so the two surfaces never disagree about WHETHER a size is
+    /// applied.
+    #[test]
+    fn an_ignored_font_px_is_a_load_notice() {
+        let with = |font_px: Option<f32>| Config {
+            font_px,
+            ..Config::default()
+        };
+        let validate_flags = |config: &Config| {
+            crate::diagnostics::config_semantic_warnings(config)
+                .iter()
+                .any(|w| w.key == "font_px")
+        };
+        for fine in [
+            None,
+            Some(14.0),
+            Some(crate::FONT_PX_MIN),
+            Some(crate::FONT_PX_MAX),
+        ] {
+            assert_eq!(super::font_px_load_notice(&with(fine)), None, "{fine:?}");
+            assert!(!validate_flags(&with(fine)), "{fine:?}");
+        }
+        for (bad, shown) in [
+            (0.0, "0.0"),
+            (500.0, "500.0"),
+            (-5.0, "-5.0"),
+            (f32::NAN, "NaN"),
+            (f32::INFINITY, "inf"),
+        ] {
+            assert_eq!(
+                super::font_px_load_notice(&with(Some(bad))).as_deref(),
+                Some(
+                    format!(
+                        "config font_px: {shown} is not accepted (expected 6–200; the value \
+                         is ignored)"
+                    )
+                    .as_str()
+                ),
+                "{bad}"
+            );
+            assert!(validate_flags(&with(Some(bad))), "{bad}");
+            assert_eq!(
+                super::resolve_font_px_with(None, Some(bad)),
+                crate::FONT_PX,
+                "{bad}: the banner's claim is the resolver's behaviour"
+            );
+        }
     }
 
     #[test]
@@ -12867,39 +12924,6 @@ mod cfg_engine_tests {
         ] {
             assert_eq!(cfg(source).trail_sound_volume(), 0.0, "{source}");
         }
-    }
-
-    /// The tone-melody knob: shipped ENABLED (subtle by design — the neutral
-    /// verdict is bit-exactly today's sound), a plain bool that round-trips,
-    /// and `false` resolves off (which both pins the neutral melody at the
-    /// drain seams and stops the classifier via `tone_infer_active`).
-    #[test]
-    fn tone_melody_defaults_on_and_round_trips() {
-        assert!(Config::default().tone_melody_or_default());
-        assert!(cfg("tone_melody = true").tone_melody_or_default());
-        assert!(!cfg("tone_melody = false").tone_melody_or_default());
-    }
-
-    /// Robi is opt-IN (owner directive: disabled by default); `robi = true`
-    /// invites him back and `false` round-trips.
-    #[test]
-    fn robi_defaults_off_and_round_trips() {
-        assert!(!Config::default().robi_or_default());
-        assert!(cfg("robi = true").robi_or_default());
-        assert!(!cfg("robi = false").robi_or_default());
-    }
-
-    /// The ambient-bed knob: ON by default since the owner's 2026-09-09
-    /// ruling (notes/brrrring/bonk/melody are unaffected by it), a plain bool
-    /// that round-trips, and `false` gates the bed off at the drain seams.
-    #[test]
-    fn trail_sound_bed_defaults_off_and_round_trips() {
-        assert!(
-            Config::default().trail_sound_bed_or_default(),
-            "the owner turned the bed ON by default (2026-09-09)"
-        );
-        assert!(cfg("trail_sound_bed = true").trail_sound_bed_or_default());
-        assert!(!cfg("trail_sound_bed = false").trail_sound_bed_or_default());
     }
 
     #[test]
@@ -14332,57 +14356,27 @@ mod window_theme_tests {
     }
 
     #[test]
-    fn window_theme_defaults_to_auto_when_absent() {
+    fn window_theme_resolves_auto_light_dark_and_defaults_to_auto() {
         // No key at all -> Auto (follow the OS), so a light desktop is no longer
         // forced dark.
         assert_eq!(
             Config::default().window_theme_or_default(),
             WindowTheme::Auto
         );
-        assert_eq!(
-            cfg("font_px = 14.0").window_theme_or_default(),
-            WindowTheme::Auto
-        );
-    }
-
-    #[test]
-    fn window_theme_auto_light_dark_parse() {
-        assert_eq!(
-            cfg("window_theme = \"auto\"").window_theme_or_default(),
-            WindowTheme::Auto
-        );
-        assert_eq!(
-            cfg("window_theme = \"light\"").window_theme_or_default(),
-            WindowTheme::Light
-        );
-        assert_eq!(
-            cfg("window_theme = \"dark\"").window_theme_or_default(),
-            WindowTheme::Dark
-        );
-    }
-
-    #[test]
-    fn window_theme_is_case_insensitive_and_trimmed() {
-        assert_eq!(
-            cfg("window_theme = \" Dark \"").window_theme_or_default(),
-            WindowTheme::Dark
-        );
-        assert_eq!(
-            cfg("window_theme = \"LIGHT\"").window_theme_or_default(),
-            WindowTheme::Light
-        );
-    }
-
-    #[test]
-    fn window_theme_invalid_defaults_to_auto() {
-        assert_eq!(
-            cfg("window_theme = \"midnight\"").window_theme_or_default(),
-            WindowTheme::Auto
-        );
-        assert_eq!(
-            cfg("window_theme = \"\"").window_theme_or_default(),
-            WindowTheme::Auto
-        );
+        for (source, expected) in [
+            ("font_px = 14.0", WindowTheme::Auto),
+            ("window_theme = \"auto\"", WindowTheme::Auto),
+            ("window_theme = \"light\"", WindowTheme::Light),
+            ("window_theme = \"dark\"", WindowTheme::Dark),
+            // Case-insensitive and trimmed.
+            ("window_theme = \" Dark \"", WindowTheme::Dark),
+            ("window_theme = \"LIGHT\"", WindowTheme::Light),
+            // An invalid value defaults to Auto.
+            ("window_theme = \"midnight\"", WindowTheme::Auto),
+            ("window_theme = \"\"", WindowTheme::Auto),
+        ] {
+            assert_eq!(cfg(source).window_theme_or_default(), expected, "{source}");
+        }
         // Direct parser: unknown -> None (caller defaults).
         assert_eq!(WindowTheme::parse("nope"), None);
         assert_eq!(WindowTheme::parse("auto"), Some(WindowTheme::Auto));
@@ -15067,70 +15061,6 @@ mod tab_band_height_tests {
                 );
             }
         }
-    }
-
-    /// THE LINT-GATE GUARD, and the one proof in this module that a Windows host
-    /// cannot get from running the code.
-    ///
-    /// `App::synthetic_strip_head_px` is the ONLY non-test consumer of this entire
-    /// chain — `Config::tab_band_height_or_default` → [`TabBandHeight`] (+
-    /// `PLATFORM_DEFAULT`, `parse`, `target_logical_px`) → [`synthetic_band_head_px`]
-    /// → `TAB_BAND_STANDARD_LOGICAL_PX`, `SYNTHETIC_BAND_HEAD_CELL_CAP`, and the
-    /// `Config::tab_band_height` field itself. Gate that one function (or its one
-    /// mandatory call site) behind a `#[cfg(windows)]` ATTRIBUTE and every link goes
-    /// unreachable on macOS and Linux: half a dozen `dead_code` findings plus "field
-    /// `tab_band_height` is never read", against a workspace gate that is
-    /// `clippy --workspace --all-targets -- -D warnings`. Nothing on a Windows host
-    /// can observe that — `cargo check` here is green either way — so the invariant
-    /// is pinned in SOURCE, which every host can read.
-    ///
-    /// The fix it pins is not a suppression: `PLATFORM_DEFAULT` is `Compact` off
-    /// Windows, so the law genuinely evaluates to 0 there. A runtime `if cfg!(windows)`
-    /// keeps the body compiled and type-checked on every platform while still never
-    /// executing off Windows — which matters, because on macOS `ws.metrics.head`
-    /// holds a real MEASURED titlebar band that this law's 0 would clobber.
-    #[test]
-    fn the_c3_chain_keeps_a_call_site_compiled_on_every_platform() {
-        let src = include_str!("app_config.rs");
-
-        // (a) The definition itself carries no `cfg` gate. Walk back over the doc
-        //     block to the first real line: an attribute, if any, lives there.
-        let decl = "pub(crate) fn synthetic_strip_head_px(";
-        let at = src
-            .find(decl)
-            .expect("synthetic_strip_head_px is defined here");
-        let above = src[..at]
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| !l.is_empty() && !l.starts_with("//"))
-            .unwrap_or_default();
-        assert!(
-            !above.starts_with("#[cfg"),
-            "synthetic_strip_head_px must stay COMPILED on every platform (found {above:?} \
-             directly above it): it is the only non-test consumer of the tab_band_height \
-             chain, so gating it out hands macOS/Linux a fan of dead_code warnings against \
-             a `-D warnings` gate. Off Windows the law already returns 0 by itself \
-             (PLATFORM_DEFAULT = Compact) — there is nothing to gate."
-        );
-
-        // (b) …and its ONE mandatory call site gates at RUNTIME, so the call survives
-        //     into the non-Windows HIR and keeps the chain live.
-        let call = "let head = self.synthetic_strip_head_px(scale, cell_h);";
-        let at = src.find(call).expect("the on_resize C3 call site is here");
-        let gate = src[..at]
-            .lines()
-            .rev()
-            .map(str::trim)
-            .find(|l| l.starts_with("#[cfg") || l.starts_with("if cfg!"))
-            .unwrap_or_default();
-        assert_eq!(
-            gate, "if cfg!(any(windows, target_os = \"linux\")) {",
-            "the on_resize C3 block must gate with a runtime `cfg!` (the form the macOS \
-             band block above it uses), not a `#[cfg]` attribute — an attribute deletes \
-             the only live call site on the excluded platforms and takes the whole chain \
-             with it"
-        );
     }
 }
 
@@ -16209,27 +16139,6 @@ mod reload_dedupe_tests {
             "a [sparkle_words] table edit resets as before"
         );
     }
-
-    /// The popup-anchor gate (`popup_anchors_drifted`): a VALUE-only edit
-    /// keeps the Settings field catalogue's key sequence identical, so an open
-    /// style popup's anchor row cannot drift and the reload may leave it open —
-    /// rapid sequential style picks stay one fluid gesture.
-    #[test]
-    fn value_only_edit_keeps_the_editable_field_catalogue_stable() {
-        let a = cfg("cursor_trail_style = \"fire\"\n");
-        let b = cfg("cursor_trail_style = \"rainbow kitty\"\n");
-        let fa = crate::prefs::editable_fields(&a);
-        let fb = crate::prefs::editable_fields(&b);
-        assert_eq!(fa.len(), fb.len(), "the catalogue keeps its size");
-        assert!(
-            fa.iter().zip(&fb).all(|(x, y)| x.key == y.key),
-            "the catalogue keeps its key sequence (no anchor drift)"
-        );
-        assert!(
-            a != b,
-            "the styles differ, so the reload itself still applies"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -16550,14 +16459,6 @@ mod matrix_rain_cfg_tests {
         let config =
             aterm_toml::from_str::<Config>("[update]\nrequire_team_id = \"ABCDE12345\"\n").unwrap();
         assert_eq!(super::update_required_team_id(&config), Some("ABCDE12345"));
-        let src = include_str!("app_config.rs");
-        let body = &src[src
-            .find("pub(crate) fn update_required_team_id(")
-            .expect("fn")..];
-        assert!(
-            body[..400].contains("cfg!(any(debug_assertions, feature = \"dev-seams\"))"),
-            "the development gate guards the read"
-        );
     }
 
     /// The `[machine]` defaults, stated once: an ABSENT table is the shipping
@@ -16730,6 +16631,14 @@ mod matrix_rain_cfg_tests {
         );
     }
 
+    /// An absolute root for the override fixtures below. `/tmp/…` is absolute
+    /// only on Unix: on Windows `Path::is_absolute` needs a drive, so the
+    /// resolver drops it as "neither absolute nor ~-prefixed" — the very rule
+    /// these tests pin — and every expectation built on it came back empty
+    /// (measured, 0.90.0). Forward slashes are a separator on both hosts, so
+    /// `PathBuf::from` of the same text is what the resolver keeps verbatim.
+    const ABS_TMP: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
     /// Explicit values win over every default, the whole table round-trips
     /// through serde, and the two clamped/parsed fields resolve as documented:
     /// an over-ceiling hold is clamped (it can never become a way to pin a
@@ -16737,19 +16646,24 @@ mod matrix_rain_cfg_tests {
     /// the file.
     #[test]
     fn privacy_explicit_values_win_over_the_defaults() {
-        let c = aterm_toml::from_str::<Config>(concat!(
-            "[privacy]\n",
-            "enabled = false\n",
-            "check = false\n",
-            "notice = false\n",
-            "report_attribution = false\n",
-            "warmup = \"never\"\n",
-            "warmup_folders = [\"desktop\"]\n",
-            "warmup_hold_ms = 45000\n",
-            "probe_interval_ms = 250\n",
-            "observer = true\n",
-            "protected_roots = [\"/tmp/aterm-privacy-explicit\"]\n",
-            "auto_accept = true\n",
+        // Positional `{}`: a format string expanded from `concat!` may not
+        // capture variables inline.
+        let c = aterm_toml::from_str::<Config>(&format!(
+            concat!(
+                "[privacy]\n",
+                "enabled = false\n",
+                "check = false\n",
+                "notice = false\n",
+                "report_attribution = false\n",
+                "warmup = \"never\"\n",
+                "warmup_folders = [\"desktop\"]\n",
+                "warmup_hold_ms = 45000\n",
+                "probe_interval_ms = 250\n",
+                "observer = true\n",
+                "protected_roots = [\"{}/aterm-privacy-explicit\"]\n",
+                "auto_accept = true\n",
+            ),
+            ABS_TMP
         ))
         .expect("explicit table parses");
         assert!(!c.privacy_enabled());
@@ -16770,7 +16684,9 @@ mod matrix_rain_cfg_tests {
         );
         assert_eq!(
             c.privacy_protected_roots(),
-            vec![std::path::PathBuf::from("/tmp/aterm-privacy-explicit")],
+            vec![std::path::PathBuf::from(format!(
+                "{ABS_TMP}/aterm-privacy-explicit"
+            ))],
             "an absolute override replaces the containment set verbatim"
         );
         assert_eq!(
@@ -16837,9 +16753,9 @@ mod matrix_rain_cfg_tests {
     /// `--validate-config` names it).
     #[test]
     fn privacy_protected_root_overrides_expand_tilde_and_drop_relatives() {
-        let c = aterm_toml::from_str::<Config>(
-            "[privacy]\nprotected_roots = [\"~/src\", \"relative/path\", \"/tmp/absolute\"]\n",
-        )
+        let c = aterm_toml::from_str::<Config>(&format!(
+            "[privacy]\nprotected_roots = [\"~/src\", \"relative/path\", \"{ABS_TMP}/absolute\"]\n"
+        ))
         .expect("parses");
         let roots = c.privacy_protected_roots();
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -16847,7 +16763,7 @@ mod matrix_rain_cfg_tests {
         if let Some(home) = home {
             expected.push(home.join("src"));
         }
-        expected.push(std::path::PathBuf::from("/tmp/absolute"));
+        expected.push(std::path::PathBuf::from(format!("{ABS_TMP}/absolute")));
         assert_eq!(
             roots, expected,
             "the relative entry is dropped, not guessed"

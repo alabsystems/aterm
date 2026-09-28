@@ -855,9 +855,10 @@ pub struct Baseline {
 //     the 2026-09-26 hang: a late 0.1 µs repeating CFRunLoopTimer made
 //     CoreFoundation walk ~10⁷ intervals with the run-loop lock held). TWO
 //     files of `vendor/winit` — `platform_impl/macos/observer.rs` (+25 / -74,
-//     the CFRunLoopTimer waker replaced by the first-party timer) and
-//     `platform_impl/macos/app_state.rs` (+5 / -2, one more `// LOCAL PATCH
-//     (aterm):` marker, so the marker census moves 122 -> 123) — so every cell
+//     the CFRunLoopTimer waker replaced by the first-party timer, and one more
+//     `// LOCAL PATCH (aterm):` marker, 5 -> 6 in that file, so the marker
+//     census moves 122 -> 123) and `platform_impl/macos/app_state.rs` (+5 /
+//     -2, its 13 markers unchanged) — so every cell
 //     that resolves winit loses exactly 46 physical lines, measured by `cargo
 //     forge survey` on all six:
 //
@@ -865,17 +866,38 @@ pub struct Baseline {
 //       linux / linux-arm      2,789,767 -> 2,789,721
 //       win / win-arm          3,588,127 -> 3,588,081
 //
-//     `vendor/winit/Cargo.toml` is byte-identical and the budget stays GREEN
-//     (a shrink under every ceiling; only `--update` lowers one). The commit
+//     `vendor/winit/Cargo.toml` is byte-identical. The six ceilings in
+//     `tools/forge-budget.tsv` are lowered to match by `cargo forge budget
+//     --update` (a ceiling above its measured row fails the ratchet-agreement
+//     test; each row keeps the reason of its last raise). The commit
 //     that made the edit did not re-pin these, and `aterm-forge`'s
 //     `the_real_tree_reproduces_the_measured_marker_floor` and the two survey
 //     totals tests caught it on the next run, as they are meant to.
+// RE-MEASURED 2026-09-27 — THE FORK'S windows-sys 0.52 -> 0.61 (aaf606af7,
+//     docs/THIRD_PARTY_ROAD_TO_ZERO.md). The Windows backend's handles became
+//     opaque pointers, so `vendor/winit` gained typed handle conversions
+//     (`platform_impl/windows/handle.rs`) and the Send/Sync impls the pointer
+//     types no longer derive: +78 physical lines in every cell that resolves
+//     winit. On x86_64 Windows the move also took windows-sys 0.52 out of the
+//     graph (-3 packages / -384,578 lines / -1 build script / its duplicate
+//     name); ARM Windows keeps 0.52 through ring 0.17's aarch64 CPU-feature
+//     probe, so there only the +78 moves. Measured by `cargo forge survey` on
+//     all six (`resolved` moves with `third_party`):
+//
+//       mac-arm / mac-x64      441,512 -> 441,590
+//       linux / linux-arm      2,789,721 -> 2,789,799
+//       win                    3,588,081 -> 3,203,581   (91 -> 88 packages)
+//       win-arm                3,588,081 -> 3,588,159
+//
+//     The commit that moved the fork re-pinned the budget but not these, and
+//     `aterm-forge`'s ratchet-agreement, `*_stays_within_the_measured_baseline`
+//     and survey-totals tests caught it once the gate ran them.
 pub const MAC_ARM: Baseline = Baseline {
     cell: "mac-arm",
     resolved: 124,
     workspace: 77,
     third_party: 47,
-    third_party_loc: 441_512,
+    third_party_loc: 441_590,
     build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
@@ -886,7 +908,7 @@ pub const LINUX: Baseline = Baseline {
     resolved: 274,
     workspace: 79,
     third_party: 195,
-    third_party_loc: 2_789_721,
+    third_party_loc: 2_789_799,
     build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
@@ -894,13 +916,13 @@ pub const LINUX: Baseline = Baseline {
 
 pub const WIN: Baseline = Baseline {
     cell: "win",
-    resolved: 164,
+    resolved: 161,
     workspace: 73,
-    third_party: 91,
-    third_party_loc: 3_588_081,
-    build_scripts: 19,
+    third_party: 88,
+    third_party_loc: 3_203_581,
+    build_scripts: 18,
     proc_macros: 7,
-    duplicate_names: 1,
+    duplicate_names: 0,
 };
 
 /// The CPU browser module, `crates/aterm-wasm` — the engine plus the
@@ -957,8 +979,9 @@ pub const WASM_GPU: Baseline = Baseline {
 // THE SECOND ARCHITECTURE OF EACH SHIPPED OS — measured 2026-09-18 on
 // m17-tower, the day these three triples became cells.
 //
-// EACH ONE READS EXACTLY LIKE ITS SIBLING, every field, and that is the fact
-// worth recording rather than a coincidence worth hiding: `cargo tree`'s
+// EACH ONE READ EXACTLY LIKE ITS SIBLING, every field, and that is the fact
+// worth recording rather than a coincidence worth hiding (until 2026-09-25,
+// when ARM Windows became the first to differ: see [`WIN_ARM`]): `cargo tree`'s
 // per-target resolve keys on `target_os` and `target_family` almost everywhere
 // in this graph, so the ARM Linux surface is the x86_64 Linux surface and the
 // Intel-Mac surface is the Apple-Silicon one. What the rows buy is the day that
@@ -976,7 +999,7 @@ pub const MAC_X64: Baseline = Baseline {
     resolved: 124,
     workspace: 77,
     third_party: 47,
-    third_party_loc: 441_512,
+    third_party_loc: 441_590,
     build_scripts: 10,
     proc_macros: 2,
     duplicate_names: 1,
@@ -989,20 +1012,23 @@ pub const LINUX_ARM: Baseline = Baseline {
     resolved: 274,
     workspace: 79,
     third_party: 195,
-    third_party_loc: 2_789_721,
+    third_party_loc: 2_789_799,
     build_scripts: 32,
     proc_macros: 16,
     duplicate_names: 6,
 };
 
 /// ARM Windows — the triple apps/aterm-win/build.ps1 selects for itself on an
-/// ARM64 host. Identical to [`WIN`] in every field.
+/// ARM64 host. Identical to [`WIN`] but for windows-sys 0.52, which ring 0.17's
+/// aarch64 CPU-feature probe still resolves here and nothing does on x86_64
+/// since the fork's 0.61 move (2026-09-25): +3 packages, +384,578 lines, +1
+/// build script and the duplicate name.
 pub const WIN_ARM: Baseline = Baseline {
     cell: "win-arm",
     resolved: 164,
     workspace: 73,
     third_party: 91,
-    third_party_loc: 3_588_081,
+    third_party_loc: 3_588_159,
     build_scripts: 19,
     proc_macros: 7,
     duplicate_names: 1,

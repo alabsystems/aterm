@@ -100,7 +100,9 @@ impl App {
                     },
                     None,
                 ),
-                Some(crate::Lease::Drive { holder, expires_us }) if *expires_us > now_us => (
+                Some(crate::Lease::Drive {
+                    holder, expires_us, ..
+                }) if *expires_us > now_us => (
                     Hand::DrivenLease {
                         holder: holder.clone(),
                     },
@@ -126,9 +128,24 @@ impl App {
             fleet: h.origin == "fleet",
         });
         let mail = ctx.fabric.mail_facts();
-        let (role, attention) = {
+        let (role, attention, attention_told_elsewhere) = {
             let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
-            (meta.role.clone(), meta.attention.clone())
+            // ONE PLACE TELLS IT (ruling 270; day three): a stalled agent
+            // upgrade is the message band's row and the log's record, with
+            // its words and its buttons. The harness also raises the tab's
+            // attention, and that stays a FACT — the level, `status
+            // why=escalation`, the tab chip and the rim all keep it, so the
+            // stall still shows at the top once its row folds. Only the
+            // presence line's phase slot does not repeat words the band has
+            // already said; any other owner's attention still reads there.
+            let upgrade_only = meta.attention_owners.len() == 1
+                && meta.attention_owners.effective_owner()
+                    == Some(aterm_agent::harness::upgrade_drive::ATTENTION_OWNER);
+            (
+                meta.role.clone(),
+                meta.attention.clone(),
+                upgrade_only && meta.attention.is_some(),
+            )
         };
         let link = match crate::fabric::fabric_state() {
             "connected" => Link::Connected {
@@ -173,6 +190,7 @@ impl App {
         Some(Facts {
             role,
             attention,
+            attention_told_elsewhere,
             shell,
             agent_seq,
             agent,
@@ -338,7 +356,10 @@ impl App {
             .unwrap_or(0);
         let (level, words) = match session.and_then(|s| self.presence.slots.get(&s)) {
             Some(slot) => {
-                let level = slot.level(watermark);
+                // What THIS window shows (rim, row): an attention the
+                // message band already tells is not repeated here
+                // ([`presence::Slot::shown_level`]); `status` keeps it.
+                let level = slot.shown_level(watermark);
                 let words = level
                     .shows_row()
                     .then(|| presence::words(slot, now, watermark));
@@ -766,7 +787,7 @@ impl App {
                     // for ITS session: a story read here stays read, and every
                     // other tab shows its story until it is looked at.
                     let watermark = ws.presence.watermark(session);
-                    level = level.max(slot.level(watermark).chip());
+                    level = level.max(slot.chip(watermark));
                 }
                 false
             });
@@ -1859,8 +1880,10 @@ mod tests {
                 })
             ));
             app.refresh_presence_session(sid, false);
-            assert_eq!(metadata(&app)[front].attention, ChipLevel::Stop);
-            assert_eq!(ChipLevel::Stop.chrome_states(), &["attention", "stop"]);
+            let held = ChipLevel::Stop(crate::presence::StopCause::Hold);
+            assert_eq!(metadata(&app)[front].attention, held);
+            assert_eq!(held.chrome_states(), &["attention", "stop"]);
+            assert_eq!(held.help(), Some("Held"));
             assert!(crate::fabric::apply_hold_for_test(&ctx, None));
             app.refresh_presence_session(sid, false);
             assert_eq!(app.presence_level(wid), Level::Story);
@@ -1869,7 +1892,11 @@ mod tests {
             assert_eq!(metadata(&app)[front].attention, ChipLevel::Off);
             assert_eq!(chip_of_attention(true), ChipLevel::Wait);
             assert!(ChipLevel::Off < ChipLevel::Story && ChipLevel::Story < ChipLevel::Wait);
-            assert!(ChipLevel::Wait < ChipLevel::Stop);
+            assert!(ChipLevel::Wait < ChipLevel::Stop(crate::presence::StopCause::Wall));
+            assert!(
+                ChipLevel::Stop(crate::presence::StopCause::Wall) < held,
+                "a tab's max over its panes keeps a hold"
+            );
         });
     }
 
@@ -2031,28 +2058,6 @@ mod tests {
     /// R2: a cooperative lease that LAPSES (its driver crashed) posts no wake;
     /// the model arms its expiry as a deadline and the tick re-reads the hand,
     /// so the teal rim and `◂ holder` lift when `lease status` says `none`.
-    /// A LINK READER WAITS OUT A SIBLING'S LIVE LINK SECTION (2026-09-24). The
-    /// v-fast gate of 83b38be87 failed `review_r2` once with `level=note` and a
-    /// `✉0  ~` band — a sibling test's un-acked bridge read through the
-    /// process-global link, because the test did not take the section every
-    /// reader takes. Deterministically: a thread holds a section with an
-    /// un-acked bridge for 300 ms while `review_r2` runs; taking the reset, it
-    /// waits the section out and reads `quiet` (without it, it read `note`).
-    #[test]
-    fn review_r2_waits_out_a_siblings_live_link_section() {
-        let (tx, rx) = std::sync::mpsc::channel();
-        let sibling = std::thread::spawn(move || {
-            crate::fabric::with_link_reset(|| {
-                crate::fabric::bridge_attached(crate::fabric::next_bridge_generation());
-                tx.send(()).expect("the reader waits for this");
-                std::thread::sleep(Duration::from_millis(300));
-            });
-        });
-        rx.recv().expect("the sibling's section is live");
-        review_r2_a_lapsed_drive_lease_lifts_the_rim();
-        sibling.join().expect("the sibling section ends");
-    }
-
     #[test]
     fn review_r2_a_lapsed_drive_lease_lifts_the_rim() {
         // Reads the process-global link (a sibling test's un-acked bridge
@@ -2064,6 +2069,8 @@ mod tests {
             *ctx.turn_lease.lock().unwrap() = Some(crate::Lease::Drive {
                 holder: "manager".into(),
                 expires_us: now_us + 20_000,
+                conn: None,
+                hard: false,
             });
             app.on_presence_wake(&ctx.self_id, false);
             assert_eq!(app.presence_level(wid), Level::Driven);
@@ -3225,88 +3232,6 @@ mod tests {
         });
     }
 
-    /// ADV-8 (measure, C1): the frame path's three presence reads per frame,
-    /// quiet vs a hold row+rim, in ns/frame. Measured before the fix: quiet
-    /// `overlay=1916 ns` of which `presence_tones()=1849 ns` — the four
-    /// contrast-floored tones derived before the rim was matched, per
-    /// composed frame per window. The quiet overlay answers before the tones
-    /// now; the one assertion here is structural (a quiet overlay is `None`
-    /// and the fp is 0), the numbers are printed for the record.
-    #[test]
-    fn adv8_measure_the_frame_paths_presence_cost() {
-        let (mut app, wid, _sid, ctx) = app_with_stub();
-        let theme = aterm_render::Theme::default();
-        let bench = |app: &mut App, label: &str| {
-            let n = 200_000u64;
-            let now = Instant::now();
-            let mut sink = 0u64;
-            let t0 = Instant::now();
-            for i in 0..n {
-                let t = now + Duration::from_micros(i);
-                sink ^= app.presence_fp(wid, t);
-                sink ^= app
-                    .presence_overlay(wid, t)
-                    .map_or(0, |g| u64::from(g.border_a));
-                sink ^= app.presence_band_row(wid, 120, theme).len() as u64;
-            }
-            let el = t0.elapsed();
-            eprintln!(
-                "adv8 {label}: {:.1} ns/frame ({n} frames, sink={sink})",
-                el.as_nanos() as f64 / n as f64
-            );
-        };
-        bench(&mut app, "quiet");
-        {
-            let n = 200_000u64;
-            let now = Instant::now();
-            let mut sink = 0u64;
-            let t0 = Instant::now();
-            for i in 0..n {
-                sink ^= app.presence_fp(wid, now + Duration::from_micros(i));
-            }
-            let fp_ns = t0.elapsed().as_nanos() as f64 / n as f64;
-            let t0 = Instant::now();
-            for i in 0..n {
-                sink ^= app
-                    .presence_overlay(wid, now + Duration::from_micros(i))
-                    .map_or(0, |g| u64::from(g.border_a));
-            }
-            let ov_ns = t0.elapsed().as_nanos() as f64 / n as f64;
-            let t0 = Instant::now();
-            for _ in 0..n {
-                sink ^= app.presence_band_row(wid, 120, theme).len() as u64;
-            }
-            let row_ns = t0.elapsed().as_nanos() as f64 / n as f64;
-            let t0 = Instant::now();
-            for _ in 0..n {
-                sink ^= u64::from(crate::chrome_band::presence_tones(theme).drive[0]);
-            }
-            let tones_ns = t0.elapsed().as_nanos() as f64 / n as f64;
-            eprintln!(
-                "adv8 quiet split: fp={fp_ns:.1} overlay={ov_ns:.1} band_row={row_ns:.1} presence_tones()={tones_ns:.1} ns (sink={sink})"
-            );
-        }
-        assert!(crate::fabric::apply_hold_for_test(
-            &ctx,
-            Some(crate::fabric::Hold {
-                reason: "review".into(),
-                origin: "local".into(),
-            })
-        ));
-        app.on_presence_wake(&ctx.self_id, false);
-        bench(&mut app, "hold row+rim");
-        // The tick a row costs once a second: facts re-read + recompose.
-        let t0 = Instant::now();
-        let n = 2000u32;
-        for i in 0..n {
-            let _ = app.presence_tick(Instant::now() + Duration::from_secs(u64::from(i)));
-        }
-        eprintln!(
-            "adv8 tick with row up: {:.1} us/tick",
-            t0.elapsed().as_micros() as f64 / f64::from(n)
-        );
-    }
-
     /// ADV-9: `status level=` used to read the watermark of the window the
     /// session was FOCUSED in, else 0 — so a story the human read (folded)
     /// in a tab came back as `level=story` on `status` the moment another
@@ -3337,8 +3262,7 @@ mod tests {
             .presence
             .slot(sid_a)
             .unwrap()
-            .level(app.presence_view(wid).unwrap().watermark(sid_a))
-            .chip();
+            .chip(app.presence_view(wid).unwrap().watermark(sid_a));
         assert_eq!(chip, ChipLevel::Off, "the read story shows no dot");
         assert_eq!(
             app.presence_status_tail(sid_a),

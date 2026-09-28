@@ -23,8 +23,9 @@
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private explicit control socket, a
 //! config with every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). SKIP (not fail) when an instance cannot
-//! boot.
+//! (`support/launch_isolation.rs`). An instance that cannot start FAILS the
+//! test (`support/headless_boot.rs` `await_ready`); SKIP only on a scratch, log
+//! or spawn refusal.
 
 #![cfg(unix)]
 
@@ -37,7 +38,10 @@ use std::time::{Duration, Instant};
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const MAX_SOCK_PATH: usize = 100;
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
+
+use headless_boot::MAX_SOCK_PATH;
 
 /// The scratch world, removed on drop.
 struct World(PathBuf);
@@ -79,34 +83,35 @@ fn world(tag: &str) -> Option<World> {
     None
 }
 
-/// Boot a headless instance on the explicit socket `sock`; `None` = SKIP.
+/// Boot a headless instance on the explicit socket `sock`. `None` = SKIP (a
+/// log or spawn refusal); an instance that exits or never listens PANICS
+/// (`headless_boot::await_ready`).
 fn boot(root: &Path, sock: &Path, tag: &str) -> Option<Reaped> {
-    let log = std::fs::File::create(root.join(format!("{tag}.log"))).ok()?;
+    let log_path = root.join(format!("{tag}.log"));
+    let (out, err) = match std::fs::File::create(&log_path).and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("SKIP: cannot open the instance log ({e})");
+            return None;
+        }
+    };
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
     launch_isolation::apply(&mut cmd, root);
     cmd.args(["--headless", launch_isolation::NO_REROUTE])
         .arg("--control-sock")
         .arg(sock)
         .stdin(Stdio::null())
-        .stdout(log.try_clone().ok()?)
-        .stderr(log);
+        .stdout(out)
+        .stderr(err);
     let lifeline = launch_isolation::lifeline(&mut cmd, root);
-    let child = match cmd.spawn() {
+    let mut child = match cmd.spawn() {
         Ok(child) => Reaped(child, Some(lifeline)),
         Err(e) => {
             eprintln!("SKIP: cannot launch aterm --headless ({e})");
             return None;
         }
     };
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !launch_isolation::control_listening(sock) {
-        if Instant::now() > deadline {
-            eprintln!("SKIP: instance {tag} never listened on {}", sock.display());
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    Some(child)
+    headless_boot::await_ready(&mut child, |r| &mut r.0, sock, &log_path, |_| true).then_some(child)
 }
 
 /// Collect a pipe's lines on a thread.

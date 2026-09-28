@@ -18,8 +18,8 @@ use std::process::Command;
 use std::time::Duration;
 
 use harness::{
-    depfile_inputs, newest_input, prepare_fixture_config, prepare_gui_environment,
-    process_age_secs, process_command, process_executable, target_dirs, target_root,
+    depfile_inputs, is_stray, newest_input, prepare_fixture_config, prepare_gui_environment,
+    process_age_secs, process_command, process_exe, target_dirs, target_root, this_checkouts,
     workspace_root, FIXTURE_GUI_CONFIG,
 };
 
@@ -243,51 +243,150 @@ fn stamp(secs: u64) -> String {
 }
 
 /// The executable reader names the binary a process RUNS, not the words on its command
-/// line: a shell whose script mentions `aterm-gui --headless` is a shell. Checked
-/// against two processes that certainly exist — this test binary, and a `sh` child
-/// whose arguments carry the daemon's pattern — so a `ps` that stops answering `comm`
-/// fails here instead of silently disarming the stray guard.
+/// line — as an ABSOLUTE PATH, so the stray guard can tell whose build it is, however
+/// the process was started: a shell whose script mentions `aterm-gui --headless` is a
+/// shell, and one started by its bare name (a PATH search, which `ps -o comm=` answers
+/// with the bare name) is read as the file it runs. Checked against two processes that
+/// certainly exist — this test binary (one of this checkout's builds), and a `sh` child
+/// whose arguments carry the daemon's pattern — so a reader that stops answering fails
+/// here instead of silently disarming the stray guard.
 #[test]
 fn self_check_executable_reader() {
     let me = std::process::id().to_string();
     let exe = std::env::current_exe().expect("this test binary");
-    let expected = exe.file_name().expect("this test binary's file name");
-    let expected = expected.as_encoded_bytes();
-    // Linux comm has 16 bytes including its NUL; Cargo's hash-suffixed test
-    // file names exceed that bound. Match the kernel's byte truncation.
-    #[cfg(target_os = "linux")]
-    let expected = &expected[..expected.len().min(15)];
-    let expected = String::from_utf8_lossy(expected);
+    let read = process_exe(&me).expect("the reader must read this process");
     assert_eq!(
-        process_executable(&me).as_deref(),
-        Some(expected.as_ref()),
-        "the reader must name this test binary"
+        std::fs::canonicalize(&read).expect("the path read resolves"),
+        std::fs::canonicalize(&exe).expect("this test binary resolves"),
+        "the reader must name this test binary: {}",
+        read.display()
+    );
+    assert!(
+        this_checkouts(&read),
+        "this test binary is this checkout's build: {} under {:?}",
+        read.display(),
+        target_dirs()
     );
     // Keep the shell blocked in its own builtin, with the daemon mention in
     // its command line. Piped stdin stays open until cleanup; no child escapes.
-    let mut mention = std::process::Command::new("/bin/sh")
+    let mut mention = std::process::Command::new("sh")
         .args(["-c", "read -r _; : aterm-gui --headless"])
         .stdin(std::process::Stdio::piped())
         .spawn()
         .expect("spawn a shell that names the daemon");
     let pid = mention.id().to_string();
     let line = process_command(&pid);
-    let named = process_executable(&pid);
+    let named = process_exe(&pid);
     let _ = mention.kill();
     let _ = mention.wait();
     assert!(
         line.contains("aterm-gui --headless"),
         "the probe's command line names the pattern, as `pgrep -f` sees it: {line}"
     );
-    assert!(named.is_some(), "the reader must read a live child");
+    let named = named.expect("the reader must read a live child");
+    assert!(
+        named.is_absolute(),
+        "a child started by its bare name is read as the file it runs: {}",
+        named.display()
+    );
     assert_ne!(
-        named.as_deref(),
+        named.file_name().and_then(|n| n.to_str()),
         Some("aterm-gui"),
         "a shell that only names `aterm-gui --headless` is not the daemon"
     );
     assert_eq!(
-        process_executable("0"),
+        process_exe("0"),
         None,
         "pid 0 is not ours to see; the reader must answer None"
     );
+}
+
+/// A STRAY IS THIS CHECKOUT'S (the stray guard, 2026-09-27): another worktree's live
+/// suite runs its own `aterm-gui --headless` and `aterm-link serve`, older than this
+/// process, from its OWN `target/` — and until this day the guard, reading only the
+/// executable's name, answered COULD NOT RUN on them, so parallel sessions ran with the
+/// guard switched off. Over the rule itself ([`is_stray`], the one `strays_now` applies to
+/// every process `pgrep` matches) and the real ownership test ([`this_checkouts`]): the
+/// same daemons, the same ages, built in a sibling checkout — or in a worktree NESTED in
+/// this one, which is a checkout of its own — are nobody's here. NEGATIVE CONTROLS: this
+/// checkout's own builds, older than this process, ARE strays — in the target dir this
+/// test was built into and in any other lane's beside it (`target-gui/`: a stray a run
+/// into another target dir left, which the 2026-09-27 review found this rule had
+/// stopped catching) — the guard is not disarmed; while one younger than this process
+/// (this run's own), a shell naming the pattern, and a process whose executable cannot
+/// be read are not.
+#[test]
+fn another_checkouts_daemons_are_never_strays_here() {
+    let root = workspace_root();
+    let here = target_dirs()
+        .into_iter()
+        .next()
+        .expect("the target dir this test was built into");
+    let other = root
+        .parent()
+        .expect("a checkout has a parent directory")
+        .join(format!("atl-other-checkout-{}", std::process::id()))
+        .join("target");
+    // A worktree parked inside this checkout, in a directory `.gitignore` keeps out of
+    // the tree (`/target-*`) and no target dir of this run names; removed before any
+    // assertion, so a red leaves nothing behind in the checkout.
+    let nested = root.join(format!("target-atl-nested-{}", std::process::id()));
+    std::fs::create_dir_all(&nested).expect("the nested checkout");
+    std::fs::write(nested.join(".git"), "gitdir: /nonexistent\n").expect("its .git file");
+    let nested_read: Vec<(bool, bool)> = ["aterm-gui", "aterm-link"]
+        .iter()
+        .map(|binary| {
+            let exe = nested.join("target/debug").join(binary);
+            (
+                this_checkouts(&exe),
+                is_stray(binary, Some(&exe), Some(3_600), 100, this_checkouts),
+            )
+        })
+        .collect();
+    std::fs::remove_dir_all(&nested).expect("remove the nested checkout");
+    assert_eq!(
+        nested_read,
+        [(false, false), (false, false)],
+        "a worktree nested in this checkout is another checkout: {}",
+        nested.display()
+    );
+    let (my_age, old, young) = (100, Some(3_600), Some(101));
+    for binary in ["aterm-gui", "aterm-link"] {
+        let ours = here.join("debug").join(binary);
+        let lane = root.join("target-gui").join("rv-stray").join(binary);
+        let theirs = other.join("debug").join(binary);
+        assert!(this_checkouts(&ours), "{}", ours.display());
+        assert!(this_checkouts(&lane), "{}", lane.display());
+        assert!(!this_checkouts(&theirs), "{}", theirs.display());
+        assert!(
+            !is_stray(binary, Some(&theirs), old, my_age, this_checkouts),
+            "another checkout's live {binary} is not a stray here: {}",
+            theirs.display()
+        );
+        for exe in [&ours, &lane] {
+            assert!(
+                is_stray(binary, Some(exe), old, my_age, this_checkouts),
+                "this checkout's older {binary} is a stray: {}",
+                exe.display()
+            );
+        }
+        assert!(
+            !is_stray(binary, Some(&ours), young, my_age, this_checkouts),
+            "one this run started is not"
+        );
+        assert!(
+            !is_stray(
+                binary,
+                Some(std::path::Path::new("/bin/sh")),
+                old,
+                my_age,
+                this_checkouts
+            ),
+            "a shell naming the pattern is not"
+        );
+        assert!(
+            !is_stray(binary, None, old, my_age, this_checkouts),
+            "a process that cannot be read is not guessed at"
+        );
+    }
 }

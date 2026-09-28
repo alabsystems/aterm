@@ -330,8 +330,8 @@ pub(crate) enum MenuAction {
     /// the clicked tab as the subject, the palette/invoke path the front one.
     ConnectToSession,
     /// Show Connection Map (design §5): raise the instance's aggregated
-    /// connection map. The map surface is a later slice — dispatch routes to
-    /// the palette until it lands.
+    /// connection map — `App::open_connection_map` (app_connection_map.rs) on
+    /// the front window.
     ShowConnectionMap,
     /// Configure Connection… (`session.configure_connection`, design §2.3):
     /// the §2.5 sheet directly when the subject has exactly ONE connected
@@ -345,9 +345,10 @@ pub(crate) enum MenuAction {
     // Fabric menu (round 19, SPEC19 §9): the menu bar's face of the fabric —
     // what `aterm fabric`, the inbox, the halt and the ledger already do on
     // the wire, reachable by a human from the bar.
-    /// Fleet… — the fleet screen. Round 20 builds `/fleet`; until it lands
-    /// this opens the Sessions/Connection Map (`App::open_connection_map`),
-    /// and the item's help says so. Instance-wide, never greyed.
+    /// Fleet… — the Fabric menu's route to the Sessions/Connection Map
+    /// (`App::open_connection_map`), and the item's help says so. A separate
+    /// fleet screen was retired 2026-09-25 (docs/FABRIC-LITERALLY-2026-09-19.md
+    /// §8 never committed to one). Instance-wide, never greyed.
     Fleet,
     /// Inbox… — THIS window's focused session's inbox, METADATA ONLY (the
     /// `inbox --peek --meta` rows: id, offset, sender, kind, trust — never a
@@ -389,10 +390,24 @@ pub(crate) enum MenuAction {
     /// Set Role… — the same inline editor over the active tab, editing the
     /// focused session's `meta role` (the presence band's first slot and the
     /// name a driven peer's band prints for its driver). Terminal-only, like
-    /// the pin. (Round 18's identities put "Show Identity" — read-only —
-    /// directly under this row; round 18 landed on main after this menu was
-    /// designed, so the row is a follow-up: omitted here, not disabled.)
+    /// the pin.
     SetRole,
+    /// Show Identity — READ-ONLY: the focused session's agent identity (round
+    /// 18), opened as a Markdown tab — the `identities <name>` row and its
+    /// agents, or a sentence saying the session runs under the user's own
+    /// agent configuration. Terminal-only, directly under Set Role….
+    ShowIdentity,
+    /// New Window With Identity… — the identity PICKER (`App::open_identity_picker`):
+    /// every identity by name, and a NEW one named by typing into its filter;
+    /// choosing opens a window whose first shell runs under it — the menu twin
+    /// of `spawn place=window identity=<name>`, and like that verb the one path
+    /// that may CREATE an identity. (Decided 2026-09-25 under the owner's
+    /// standing direction: one own-rendered, introspectable picker on every
+    /// platform rather than runtime-built NSMenu submenus.)
+    NewWindowWithIdentity,
+    /// New Tab With Identity… — the same picker; choosing opens a tab in the
+    /// front window under the chosen identity.
+    NewTabWithIdentity,
     /// Minimise the window.
     Minimize,
     /// Zoom (toggle maximised) the window.
@@ -485,6 +500,10 @@ impl MenuAction {
             MenuAction::TogglePresenceRim => 68,
             // Phase 2 of the unified message system (2026-09-22).
             MenuAction::Messages => 69,
+            // Round 18's identity rows (SPEC19 §9), 2026-09-25.
+            MenuAction::ShowIdentity => 70,
+            MenuAction::NewWindowWithIdentity => 71,
+            MenuAction::NewTabWithIdentity => 72,
         }
     }
 
@@ -560,6 +579,9 @@ impl MenuAction {
             67 => MenuAction::TogglePresenceBand,
             68 => MenuAction::TogglePresenceRim,
             69 => MenuAction::Messages,
+            70 => MenuAction::ShowIdentity,
+            71 => MenuAction::NewWindowWithIdentity,
+            72 => MenuAction::NewTabWithIdentity,
             _ => return None,
         })
     }
@@ -633,6 +655,10 @@ pub(crate) const fn requires_terminal_tab(action: MenuAction) -> bool {
             | MenuAction::HoldSession
             | MenuAction::LiftHold
             | MenuAction::SetRole
+            // The focused session's identity: no session under a native tab.
+            // (The two identity SPAWNS need no focused session — a new window
+            // or tab under an identity is instance-level.)
+            | MenuAction::ShowIdentity
     )
 }
 
@@ -936,6 +962,12 @@ impl MenuAction {
             | MenuAction::NewControlledTab
             | MenuAction::NewControllerWindow
             | MenuAction::NewControllerTab => OwnerOnly,
+            // Round 18's identity rows: a spawn under an identity may CREATE it
+            // (`spawn identity=` is Owner-only on the wire), and Show Identity
+            // discloses the `identities` roster row (Owner-only too).
+            MenuAction::NewWindowWithIdentity
+            | MenuAction::NewTabWithIdentity
+            | MenuAction::ShowIdentity => OwnerOnly,
             // The connection PICKER can mint the same standing authority the
             // presets do, the MAP is the instance-wide aggregated view (§5.3),
             // and configure/disconnect REWRITE/DISSOLVE standing authority —
@@ -1087,6 +1119,9 @@ impl MenuAction {
             | MenuAction::FabricOff
             | MenuAction::RenameSession
             | MenuAction::SetRole
+            | MenuAction::ShowIdentity
+            | MenuAction::NewWindowWithIdentity
+            | MenuAction::NewTabWithIdentity
             | MenuAction::Minimize
             | MenuAction::Zoom
             | MenuAction::NextTab
@@ -1167,8 +1202,7 @@ impl MenuAction {
             MenuAction::ConfigureConnection => "Change the direction of this session's connection.",
             MenuAction::DisconnectSession => "Dissolve this session's connection.",
             MenuAction::Fleet => {
-                "Show the fleet. Until the fleet screen lands (round 20) this opens \
-                 the Sessions and Connection Map."
+                "Open the Sessions/Connection Map: every session here and its connections."
             }
             MenuAction::Inbox => {
                 "Open this session's inbox as a tab: who wrote, what kind, how trusted; \
@@ -1192,6 +1226,15 @@ impl MenuAction {
             MenuAction::SetRole => {
                 "Give this session a role (its `meta role`), the word the presence band leads with."
             }
+            MenuAction::ShowIdentity => {
+                "Open this session's agent identity as a tab: its name, directory and agents."
+            }
+            MenuAction::NewWindowWithIdentity => {
+                "Open a new window whose shell runs under an agent identity you choose or name."
+            }
+            MenuAction::NewTabWithIdentity => {
+                "Open a new tab whose shell runs under an agent identity you choose or name."
+            }
             MenuAction::Minimize => "Minimise this window.",
             MenuAction::Zoom => "Zoom this window.",
             MenuAction::NextTab => "Show the next tab.",
@@ -1203,6 +1246,26 @@ impl MenuAction {
                 "Show the presence rim around the window (saved in aterm.toml as [presence] rim)."
             }
             MenuAction::Help => "Open the aterm guide.",
+        }
+    }
+
+    /// Whether this build's platform can DO what the row offers. The in-app
+    /// updater exists only where [`aterm_update::enabled`] says so (macOS and
+    /// Linux; it is false on Windows, where `update status` answers `no updater
+    /// on this platform`), so "Check for Updates…" and the Version menu's
+    /// "↑ Install update now" are dead rows everywhere else: the palette greys
+    /// the first and drops the second when nothing is staged (`PaletteState::
+    /// resolve`), while the static model behind the `chrome` verb went on
+    /// listing both — measured 2026-09-22 on Windows, a `menu "Version": ↑
+    /// Update — apply now, …` line (the row's label then) beside a `controls
+    /// menu` with no such row.
+    /// ONE predicate for every surface, so they cannot disagree again — and it
+    /// asks the updater itself rather than restating its platform list.
+    #[must_use]
+    pub(crate) fn offered_on_this_platform(self) -> bool {
+        match self {
+            MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate => aterm_update::enabled(),
+            _ => true,
         }
     }
 
@@ -1276,6 +1339,9 @@ impl MenuAction {
             "FabricOn" => Some(MenuAction::FabricOn),
             "FabricOff" => Some(MenuAction::FabricOff),
             "SetRole" => Some(MenuAction::SetRole),
+            "ShowIdentity" => Some(MenuAction::ShowIdentity),
+            "NewWindowWithIdentity" => Some(MenuAction::NewWindowWithIdentity),
+            "NewTabWithIdentity" => Some(MenuAction::NewTabWithIdentity),
             "TogglePresenceBand" => Some(MenuAction::TogglePresenceBand),
             "TogglePresenceRim" => Some(MenuAction::TogglePresenceRim),
             _ => None,
@@ -1376,9 +1442,9 @@ const APP_MENU: &[MenuEntry] = &[
     },
     Separator,
     // The ONE update entry point: opens the Software Update route and checks in one gesture.
-    // macOS-only as a live verb: off macOS the in-app updater lane does not exist, so the
-    // palette's resolve pass disables this row (`palette::PaletteState::resolve`) rather
-    // than letting it silently no-op.
+    // Live only where the in-app updater exists (`MenuAction::offered_on_this_platform`):
+    // elsewhere the palette's resolve pass disables this row (`palette::PaletteState::resolve`)
+    // rather than letting it silently no-op, and the `chrome` menu lines leave it out.
     Item {
         label: "Check for Updates…",
         action: MenuAction::SoftwareUpdate,
@@ -1438,13 +1504,21 @@ const FILE_MENU: &[MenuEntry] = &[
         key: "t",
         mods: MenuMods::Command,
     },
-    // ROUND 18'S IDENTITY ROWS SLOT HERE, between New Terminal Tab and the
-    // Driving submenu: "New Window With Identity…" and "New Tab With
-    // Identity…", each an identity-picker submenu listing `identities` by
-    // name plus "New identity…" (SPEC19 §9). They are OMITTED — not disabled
-    // — in this slice: round 18 (identities) landed on main after this menu
-    // was designed, so the two `Submenu` entries and the picker rows they
-    // hold are the follow-up that reads the `identities` roster.
+    // ROUND 18'S IDENTITY ROWS (SPEC19 §9): each opens the identity picker —
+    // every identity by name, plus a new one typed into its filter. No key
+    // equivalents: choosing may CREATE an identity, an Owner act.
+    Item {
+        label: "New Window With Identity…",
+        action: MenuAction::NewWindowWithIdentity,
+        key: "",
+        mods: MenuMods::None,
+    },
+    Item {
+        label: "New Tab With Identity…",
+        action: MenuAction::NewTabWithIdentity,
+        key: "",
+        mods: MenuMods::None,
+    },
     Separator,
     // DRIVING (round 19): the session-connection spawn presets (design §2.3)
     // — the pre-fabric driving model's four rows, moved under one submenu
@@ -1793,8 +1867,13 @@ const WINDOW_MENU: &[MenuEntry] = &[
         key: "",
         mods: MenuMods::None,
     },
-    // ROUND 18'S "Show Identity" (read-only) SLOTS HERE, under Set Role…,
-    // with the identity picker rows above. Omitted in this slice, not disabled.
+    // Round 18's read-only identity row, directly under Set Role….
+    Item {
+        label: "Show Identity",
+        action: MenuAction::ShowIdentity,
+        key: "",
+        mods: MenuMods::None,
+    },
 ];
 
 const HELP_MENU: &[MenuEntry] = &[Item {
@@ -2021,6 +2100,10 @@ fn chrome_lines_for(title: &str, entries: &[MenuEntry]) -> Vec<String> {
     let mut nested: Vec<String> = Vec::new();
     for e in entries {
         match e {
+            // A row this platform cannot act on is not reported as offered:
+            // on Windows there is no updater, and `controls menu` (the palette)
+            // does not offer it either ([`MenuAction::offered_on_this_platform`]).
+            MenuEntry::Item { action, .. } if !action.offered_on_this_platform() => {}
             MenuEntry::Item { label, .. } => labels.push((*label).to_string()),
             MenuEntry::Separator => {}
             MenuEntry::Submenu {
@@ -3066,12 +3149,56 @@ mod macos {
         });
     }
 
+    /// Whether the `terminate:` AppKit is asking about now is the SYSTEM's —
+    /// a logout, a restart or a shutdown: the quit Apple Event being handled
+    /// carries a `kAEQuitReason` naming one ([`crate::system_quit::reason_is_the_systems`]).
+    /// A person's Dock Quit or an AppleScript `quit` carries none; ⌘Q is the
+    /// app menu's and never reaches here. Any read that fails is no reason.
+    fn terminate_is_the_systems() -> bool {
+        // SAFETY: Foundation sends on the main thread inside
+        // `applicationShouldTerminate:`. `+sharedAppleEventManager` and
+        // `-currentAppleEvent` return BORROWED objects (nil outside an event);
+        // `-attributeDescriptorForKeyword:` takes an `AEKeyword` (a 32-bit
+        // `FourCharCode`, passed in a full register) and returns a borrowed
+        // descriptor or nil; `-enumCodeValue` returns an `OSType`, the low
+        // 32 bits of the return register.
+        autoreleasepool(|_| unsafe {
+            let manager = appkit::send_id(
+                class(c"NSAppleEventManager").as_id(),
+                sel!(sharedAppleEventManager),
+            );
+            if manager.is_null() {
+                return false;
+            }
+            let event = appkit::send_id(manager, sel!(currentAppleEvent));
+            if event.is_null() {
+                return false;
+            }
+            let reason = appkit::send_id_usize(
+                event,
+                sel!(attributeDescriptorForKeyword:),
+                crate::system_quit::KEY_QUIT_REASON as usize,
+            );
+            if reason.is_null() {
+                return false;
+            }
+            let code = (appkit::send_usize(reason, sel!(enumCodeValue)) & 0xFFFF_FFFF) as u32;
+            crate::system_quit::reason_is_the_systems(code)
+        })
+    }
+
     /// AppKit's synchronous `applicationShouldTerminate:` hook. The first request
     /// is vetoed and posted to the typed event loop; duplicates remain vetoed while
     /// the same generation is awaiting confirmation/save proofs. Once `App` marks
     /// the generation complete, a re-entrant terminate is allowed (normal aterm
     /// shutdown uses `ActiveEventLoop::exit` and does not need to re-enter AppKit).
     pub(crate) fn defer_quit_for_terminate() -> bool {
+        // WHY AppKit asks (2026-09-27): a restart, a logout or a shutdown is
+        // an exit the person did not choose for aterm, so its quit keeps the
+        // agents aterm hosts for the next launch (`crate::system_quit`).
+        if terminate_is_the_systems() {
+            crate::system_quit::note();
+        }
         let decision = super::with_native_terminate(NativeTerminateArbiter::request);
         match decision {
             NativeTerminateDecision::AllowExit => true,
@@ -3384,32 +3511,6 @@ mod macos {
             // re-derives the object pointer from the reference's ADDRESS. That
             // address is the probe's live instance.
             unsafe { &*std::ptr::from_ref::<MenuProbe>(probe).cast::<MenuTarget>() }
-        }
-
-        /// The generated `-dealloc` drops the Rust ivars.
-        #[test]
-        fn dropping_a_declared_instance_drops_its_ivars() {
-            static DROPS: AtomicUsize = AtomicUsize::new(0);
-            struct Spy;
-            impl Drop for Spy {
-                fn drop(&mut self) {
-                    DROPS.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            aterm_objc::declare_class! {
-                struct MenuDropProbe: NSObject {
-                    const NAME: &str = "ATermMenuDropProbe";
-                    type Ivars = Spy;
-
-                    @sel(ping)
-                    fn ping(&self) {}
-                }
-            }
-            DROPS.store(0, Ordering::SeqCst);
-            let t = MenuDropProbe::alloc_init(crate::appkit::test_witness(), Spy).expect("probe");
-            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-            drop(t);
-            assert_eq!(DROPS.load(Ordering::SeqCst), 1);
         }
 
         /// Keeps `Obj` used even if a future edit drops the only other use.
@@ -4000,6 +4101,10 @@ mod tests {
         MenuAction::SetRole,
         MenuAction::TogglePresenceBand,
         MenuAction::TogglePresenceRim,
+        // Round 18's identity rows (2026-09-25).
+        MenuAction::ShowIdentity,
+        MenuAction::NewWindowWithIdentity,
+        MenuAction::NewTabWithIdentity,
     ];
 
     /// Every `invoke` name that resolved BEFORE round 19's menu rework, verbatim
@@ -4341,15 +4446,16 @@ mod tests {
         }
         assert!(
             MenuAction::Fleet.help().contains("Connection Map"),
-            "Fleet… says it opens the map until round 20"
+            "Fleet… says it opens the Connection Map"
         );
     }
 
     /// FILE ▸ DRIVING carries the four presets UNCHANGED (same labels, same
-    /// actions, no key equivalents), and the identity rows are absent — not
-    /// disabled — in this slice (the round-18 follow-up adds them).
+    /// actions, no key equivalents), and round 18's two identity rows sit
+    /// between New Terminal Tab and Driving — no key equivalents either (choosing
+    /// may create an identity) — with Show Identity directly under Set Role….
     #[test]
-    fn file_driving_holds_the_four_presets_unchanged_and_identity_is_omitted() {
+    fn file_driving_holds_the_four_presets_and_the_identity_rows_sit_above_it() {
         let file = MENU_MODEL.iter().find(|s| s.title == "File").unwrap();
         let driving = file
             .entries
@@ -4389,10 +4495,57 @@ mod tests {
                 ),
             ]
         );
-        let labels: Vec<&str> = model_items().iter().map(|(l, _, _, _)| *l).collect();
+        let order: Vec<Option<(&str, MenuAction, &str)>> = file
+            .entries
+            .iter()
+            .map(|e| match e {
+                MenuEntry::Item {
+                    label, action, key, ..
+                } => Some((*label, *action, *key)),
+                MenuEntry::Submenu { label, .. } => Some((*label, MenuAction::Help, "▸")),
+                _ => None,
+            })
+            .collect();
+        let at = |label: &str| {
+            order
+                .iter()
+                .position(|e| e.is_some_and(|(l, _, _)| l == label))
+                .unwrap_or_else(|| panic!("File menu lacks {label}"))
+        };
         assert!(
-            !labels.iter().any(|l| l.contains("Identity")),
-            "identity rows are omitted in this slice, not disabled: {labels:?}"
+            at("New Terminal Tab") < at("New Window With Identity…")
+                && at("New Window With Identity…") < at("New Tab With Identity…")
+                && at("New Tab With Identity…") < at("Driving"),
+            "the identity rows sit between New Terminal Tab and Driving: {order:?}"
+        );
+        for (label, action) in [
+            (
+                "New Window With Identity…",
+                MenuAction::NewWindowWithIdentity,
+            ),
+            ("New Tab With Identity…", MenuAction::NewTabWithIdentity),
+        ] {
+            assert_eq!(
+                order[at(label)],
+                Some((label, action, "")),
+                "{label}: its action, and no key equivalent"
+            );
+        }
+        let window = MENU_MODEL.iter().find(|s| s.title == "Window").unwrap();
+        let window_labels: Vec<&str> = window
+            .entries
+            .iter()
+            .flat_map(MenuEntry::items)
+            .map(|(l, _, _, _)| l)
+            .collect();
+        let role = window_labels
+            .iter()
+            .position(|l| *l == "Set Role…")
+            .unwrap();
+        assert_eq!(
+            window_labels.get(role + 1),
+            Some(&"Show Identity"),
+            "Show Identity sits directly under Set Role…"
         );
     }
 
@@ -4535,15 +4688,32 @@ mod tests {
     /// or the presence surfaces. Now the four presets sit under File ▸ Driving
     /// unchanged, a Fabric menu carries the fleet, this session's inbox and ledger,
     /// the halt pair, the connection rows and the three `aterm fabric` commands,
-    /// Window gains Set Role…, and View gains the two presence checkables. The
-    /// identity rows (round 18) are omitted in this slice, not disabled.
+    /// Window gains Set Role…, and View gains the two presence checkables. Round
+    /// 18's identity rows followed (2026-09-25): File gains New Window / New Tab
+    /// With Identity… above Driving, and Window gains Show Identity.
     #[test]
     fn chrome_lines_render_titled_sections() {
         let lines = menu_chrome_lines();
+        // The two update rows are offered only where an updater exists
+        // (`aterm_update::enabled()`: macOS and Linux);
+        // `update_rows_are_not_offered_where_no_updater_exists` pins the rule.
+        let (app_line, version_line) = if aterm_update::enabled() {
+            (
+                "menu \"aterm\": About aterm, Check for Updates…, Settings…, Packages…, \
+                 Messages…, Open aterm.toml, Quit aterm",
+                "menu \"Version\": ↑ Install update now, About aterm — build & version…",
+            )
+        } else {
+            (
+                "menu \"aterm\": About aterm, Settings…, Packages…, Messages…, \
+                 Open aterm.toml, Quit aterm",
+                "menu \"Version\": About aterm — build & version…",
+            )
+        };
         let expected = [
-            "menu \"aterm\": About aterm, Check for Updates…, Settings…, Packages…, \
-             Messages…, Open aterm.toml, Quit aterm",
-            "menu \"File\": New Window, New Terminal Tab, Driving ▸, Open Markdown…, \
+            app_line,
+            "menu \"File\": New Window, New Terminal Tab, New Window With Identity…, \
+             New Tab With Identity…, Driving ▸, Open Markdown…, \
              Open File in Editor…, Reopen Closed Tab, Reopen Closed View, \
              Move Tab to New Window, Move Tab to Next Window, Open Session in New Window, \
              Close Tab",
@@ -4559,9 +4729,9 @@ mod tests {
              Disconnect Session…, Show Connection Map, Fabric Status…, Turn Fabric On…, \
              Turn Fabric Off…",
             "menu \"Window\": Minimize, Zoom, Show Next Tab, Show Previous Tab, \
-             Rename Session…, Set Role…",
+             Rename Session…, Set Role…, Show Identity",
             "menu \"Help\": aterm Help",
-            "menu \"Version\": ↑ Install update now, About aterm — build & version…",
+            version_line,
         ];
         assert_eq!(
             lines, expected,
@@ -4572,6 +4742,46 @@ mod tests {
             !lines.iter().any(|l| l.contains(", ,")),
             "separators must be filtered"
         );
+    }
+
+    /// The `chrome` verb's menu lines offer "Check for Updates…" and "↑ Install
+    /// update now" exactly where an updater exists ([`aterm_update::enabled`]),
+    /// so they agree with `controls menu` (the palette, which greys the first
+    /// and drops the second where there is none) and with `update status` (`no
+    /// updater on this platform`). Measured 2026-09-22 on Windows: both rows
+    /// listed, neither actionable.
+    #[test]
+    fn update_rows_are_not_offered_where_no_updater_exists() {
+        let offered = |label: &str| menu_chrome_lines().iter().any(|l| l.contains(label));
+        let updater = aterm_update::enabled();
+        // Anchor the oracle to the hosts this was measured on, so a change to
+        // the updater's platform list cannot silently pass through here.
+        if cfg!(windows) {
+            assert!(!updater, "Windows has no in-app updater");
+        }
+        if cfg!(target_os = "macos") {
+            assert!(updater, "macOS has the in-app updater");
+        }
+        assert_eq!(
+            MenuAction::SoftwareUpdate.offered_on_this_platform(),
+            updater
+        );
+        assert_eq!(MenuAction::ApplyUpdate.offered_on_this_platform(), updater);
+        assert_eq!(offered("Check for Updates…"), updater);
+        assert_eq!(offered("↑ Install update now"), updater);
+        // The rows are hidden, not the sections: About stays where it was.
+        assert!(offered("About aterm — build & version…"));
+        assert!(offered("About aterm, "));
+        // Nothing else is platform-gated.
+        for section in MENU_MODEL {
+            for entry in section.entries {
+                if let MenuEntry::Item { action, .. } = entry
+                    && !matches!(action, MenuAction::SoftwareUpdate | MenuAction::ApplyUpdate)
+                {
+                    assert!(action.offered_on_this_platform(), "{action:?}");
+                }
+            }
+        }
     }
 
     /// The anti-shadowing key-equivalents the comments call load-bearing are transcribed
@@ -4659,6 +4869,8 @@ mod tests {
                     | MenuAction::HoldSession
                     | MenuAction::LiftHold
                     | MenuAction::SetRole
+                    // The focused session's identity (read-only).
+                    | MenuAction::ShowIdentity
             );
             assert_eq!(
                 super::requires_terminal_tab(action),

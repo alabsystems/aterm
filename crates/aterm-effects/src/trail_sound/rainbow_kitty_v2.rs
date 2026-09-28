@@ -64,8 +64,8 @@
 //! bit for bit (A27).
 
 use super::glyph_class::{
-    BANG, CLOSE, COLON, COMMA, DASH, DIGIT, LETTER, LINE, MATH, OPEN, QMARK, QUOTE, RISE, SEMI,
-    SIGIL, STOP,
+    BANG, CLOSE, COLON, COMMA, DASH, DIGIT, LETTER, LINE, MATH, OPEN, QMARK, QUOTE, RISE, SECRET,
+    SEMI, SIGIL, STOP,
 };
 use super::{
     ERASE_MIN_GAP, EventMeta, HELD_ERASE_RUN_WINDOW, OutputGesture, PAN_LAW_SCALE, Palette,
@@ -971,7 +971,57 @@ fn flow_key_headroom(flow: f32) -> f32 {
 /// which is what hands "the capital rings an octave up" to the ear.
 /// "No bloom bonus on shifted keys" (Q4) is KEPT: the bloom's level, decay
 /// and attack do not read `shifted`.
+///
+/// ~~the key's own octave~~ **RE-RULED 2026-09-27: A TWELFTH** — see
+/// [`CAP_RING_LIFT_DEG`]. The level is unchanged at −6 dB, and that was
+/// measured, not assumed: −4.5 dB (0.5957) was tried with the twelfth to
+/// make the capital's signature a little more present, and it put a
+/// shouted line at 10 cps at −13.30 dBFS, over the pre-forte ceiling
+/// `the_ting_and_a_word_opening_capital_crest_no_higher_than_before_forte`
+/// holds (−13.35). The ceiling is not widened for it; the ring's presence
+/// comes from its register — out of the strike's own partials, where the
+/// octave was half-masked by the strike's 2f — and not from level.
 const CAP_RING_LEVEL: f32 = 0.501_187_2;
+/// **THE CAPITAL'S RING IS A TWELFTH, NOT AN OCTAVE** (owner, 2026-09-27,
+/// asked *"do you want any pitch lift back, for example on the capital's
+/// ring only?"*: *"capitals yes make them speical"*). The 2026-09-20 ruling
+/// still stands for the STRIKE — *"FORTE in a piano versus just a higher
+/// tone"* — so the strike is the line's own note, struck forte, and the lift
+/// is the RING's alone: [`FLOW_ECHO_OCTAVE_DEG`] + this, three pentatonic
+/// degrees past the octave. The flow echo stays at the octave: a different
+/// voice with a different job (body, not identity), and
+/// [`FLOW_ECHO_OCTAVE_DEG`]'s own doc is why no ruling on the capital may
+/// reach it.
+///
+/// On this lattice (`PENTA` = C D E G A, just) three degrees up is a fifth
+/// from three of the five classes and not quite one from the other two —
+/// the ring over the strike, per class of the strike's own degree:
+///
+/// ```text
+///   strike   ring      interval over the octave   ring / strike
+///   C        G         3/2  (a just fifth)        3.000
+///   D        A         40/27 (a fifth, −21.5 ¢)   2.963
+///   E        C         8/5  (a minor sixth)       3.200
+///   G        D         3/2                        3.000
+///   A        E         3/2                        3.000
+/// ```
+///
+/// Every one of them is a lattice tone — in key under every chord of the
+/// loop, as the octave was — and every one is a note of its own: none lands
+/// on a partial of the strike's tine (`1f`, [`P2_RATIO`] `2f`, [`P3_RATIO`]
+/// `2.76f`, the nearest 123 cents away), which is why the octave's phase
+/// lock is gone (see the rings branch in `v2_typed`). What still sits at
+/// `3f` is forte's lower phase-modulation sideband ([`FORTE_FM_RATIO`] 4:
+/// `|1 − 4|f`), on a 45 ms index decay ([`FORTE_FM_TAU_S`]): by the ring's
+/// [`CAP_RING_DELAY_S`] the index is a quarter of its onset value and the
+/// sideband more than 20 dB under the ring, so a drawn phase moves the
+/// ring's bin by well under a decibel (measured in
+/// `the_capital_ring_is_a_twelfth_on_its_own_phase_and_its_draws_are_spent_either_way`).
+///
+/// Register: the ring of a strike on the verse's top degree (G6) is D8,
+/// 4709 Hz at `song_key` 0, under the key's own lit roof like every other
+/// voice of a shifted key (the design's F12).
+const CAP_RING_LIFT_DEG: i32 = 3;
 /// WHERE IT OPENS — measured, not chosen. At 25 / 18 ms (the flow echo's
 /// own delay and swell) the ring crested on the bloom + glint window and the
 /// bench's Capital probe read +2.84 dB over Typed: phase-random voices
@@ -1921,9 +1971,10 @@ const QUEST_RISE_LEVEL: f32 = 0.707_945_8;
 /// UP for `( [ {` and DOWN for `) ] }` (reflected into the register), 45 ms
 /// after the key on a 35 ms τ (dur by the tail law, 2.7τ), at −8 dB — an
 /// ornament: under the note, above the sparkle. `(` and `)` share rank 42,
-/// so a `)` typed directly after `(` is a re-strike and gets no tink; the
-/// pair is heard whenever a glyph sits between them (a KNOWN LIMITATION,
-/// §10.4 — widening the rank would break its privacy rationale).
+/// so a `)` typed directly after `(` re-strikes the `(`'s degree; the tink
+/// is still heard, because the graft gate lets a CLOSE straight after an
+/// OPEN through (`MelodyV2::prev_class`) — the rank stays shared (§10.4's
+/// privacy rationale) and the tink's direction is what tells the pair apart.
 const TINK_DEG: i32 = 1;
 const TINK_DELAY_S: f32 = 0.045;
 const TINK_TAU_S: f32 = 0.035;
@@ -3095,7 +3146,8 @@ pub struct MelodyV2 {
     /// the text, and un-singing a key does not un-press the modifier before
     /// it.
     lift: Option<(u8, u32)>,
-    /// THE CURRENT KEY'S RING — the shifted key's octave ([`CAP_RING_LEVEL`]),
+    /// THE CURRENT KEY'S RING — the shifted key's ~~octave~~ twelfth
+    /// (2026-09-27, [`CAP_RING_LIFT_DEG`]; [`CAP_RING_LEVEL`]),
     /// same addressing: a Backspace retires it (unheard if it has not opened,
     /// a 40 ms ramp if it has) so a deleted capital does not still ring.
     /// Not on [`Undo`] for the same reason as `lead`.
@@ -3107,6 +3159,13 @@ pub struct MelodyV2 {
     /// key or line boundary, so deleting that key cannot retire an older one.
     /// Not on [`Undo`], as `lead`.
     graft: Option<(u8, u32)>,
+    /// THE PREVIOUS TYPED KEY'S GLYPH CLASS, read by one gate only: a CLOSE
+    /// straight after an OPEN keeps its tink although it re-strikes the
+    /// open's degree (`(` and `)` share a rank, [`TINK_DEG`]). Reset to
+    /// `LETTER` wherever the decoration addresses are forgotten (an erase, a
+    /// kill, a space, a paste, an Enter), so only a pair with nothing between
+    /// its brackets qualifies. Not on [`Undo`], as `graft`.
+    prev_class: u8,
     /// **THE VERDICT'S OPEN DOOR** (sense 3, the tine's half): `at_ms` of a
     /// green long verdict, spent by the next typed key
     /// ([`MelodyV2::take_verdict_lit`]). Deliberately NOT on [`Undo`]: the
@@ -3203,6 +3262,7 @@ impl MelodyV2 {
             lift: None,
             ring: None,
             graft: None,
+            prev_class: LETTER,
             verdict_at_ms: None,
             bell: None,
             thump: None,
@@ -4687,7 +4747,8 @@ struct Forte {
     force: f32,
     /// The strike's weight. Exactly 1.0 on a plain key.
     gain: f32,
-    /// Does the key's octave RING behind it ([`CAP_RING_LEVEL`])? A capital
+    /// Does the key's ~~octave~~ twelfth (2026-09-27, [`CAP_RING_LIFT_DEG`])
+    /// RING behind it ([`CAP_RING_LEVEL`])? A capital
     /// LETTER that OPENS something — a word or a shifted run — and nothing
     /// else: sympathetic resonance is what one accented note leaves behind,
     /// not what every key of a shouted line or a line of code does.
@@ -5273,8 +5334,10 @@ impl TrailSynth {
     /// `delay_s` is how far behind the strike the locked voice opens — the
     /// phase the strike's 2f will have reached by then. The flow echo passes
     /// [`FLOW_ECHO_DELAY_S`] (the operand this always read, so its phase is
-    /// bit-for-bit what it was) and since 2026-09-20 the capital's ring
-    /// passes [`CAP_RING_DELAY_S`].
+    /// bit-for-bit what it was); from 2026-09-20 the capital's ring passed
+    /// [`CAP_RING_DELAY_S`], ~~and still does~~ **until 2026-09-27**, when
+    /// the ring moved to a twelfth ([`CAP_RING_LIFT_DEG`]) that no partial of
+    /// the strike shares and stopped asking.
     fn v2_flow_echo_phase(&self, fundamental: f32, delay_s: f32) -> Option<f32> {
         let (slot, born) = self.v2.lead?;
         let lead = &self.voices[usize::from(slot)];
@@ -5461,6 +5524,19 @@ impl TrailSynth {
         let SoundGesture::Trail(kind) = ev.kind else {
             return;
         };
+        // **A KEY AT A PASSWORD PROMPT IS ONE TONE** (owner, 2026-09-27:
+        // *"password: fix to all same tone"*; [`SECRET`]). The host stamps
+        // the class on a keyed cue its tty will not echo; a Typed or a Space
+        // cue carrying it is voiced by [`TrailSynth::v2_secret`] and by
+        // nothing else below. It is read as a Typed cue for the preamble's
+        // one kind-dependent line (the bed's kick), so a space and a letter
+        // at the prompt kick the bed alike, and it does not latch a flow
+        // heat: the preamble below is bookkeeping about the HAND (a key was
+        // pressed, the sky drifts, the rate estimate counts it), never about
+        // which key.
+        let secret =
+            matches!(kind, SoundKind::Typed | SoundKind::Space) && meta.glyph_class == SECRET;
+        let kind = if secret { SoundKind::Typed } else { kind };
         // THE SKY'S COLOUR (THE PRISM §3.2): the hue's arc position through
         // a one-pole with τ = `BED_HUE_TAU_S`, stepped by the real time since
         // the last event (read BEFORE the rate bookkeeping resets it). Seeded
@@ -5490,7 +5566,9 @@ impl TrailSynth {
         // this push mints is priced on one number — and on `0.0`, which is
         // every unstamped host and every archived render, on the shipped
         // constants themselves.
-        self.v2.flow = meta.flow;
+        if !secret {
+            self.v2.flow = meta.flow;
+        }
         // THE BED'S KICK (§3.2 "How it starts") — v1's own feed, the one
         // table both engines call (`bed_kick`), behind the same `ev.bed`
         // gate: with the `trail_sound_bed` setting off the bed's energy
@@ -5522,6 +5600,11 @@ impl TrailSynth {
         // replaces it. Its address stays live for both.
 
         match kind {
+            SoundKind::Typed if secret => {
+                self.since_voice = 0.0;
+                self.damp_pending_shimmer();
+                self.v2_secret(&ev);
+            }
             SoundKind::Typed => {
                 self.since_voice = 0.0;
                 self.damp_pending_shimmer();
@@ -5550,6 +5633,7 @@ impl TrailSynth {
                 // asks; a fifth already swelling goes with its key).
                 self.v2_retire(self.v2.graft, ERASE_MUTE_S);
                 self.v2.graft = None;
+                self.v2.prev_class = LETTER;
                 self.v2.on_backspace(at);
                 // THE ERASE GATE, byte-unchanged, on the POOF alone: a
                 // deletion's sound is thinned against OTHER DELETIONS and
@@ -5580,6 +5664,7 @@ impl TrailSynth {
                 self.v2_retire_lane(LANE_GRAFT, ERASE_MUTE_S);
                 self.v2.ring = None;
                 self.v2.graft = None;
+                self.v2.prev_class = LETTER;
                 self.v2.on_kill(at);
                 self.design_trail(ev, kind, 1.0, 0.0);
             }
@@ -5627,6 +5712,15 @@ impl TrailSynth {
         }
     }
 }
+
+/// **THE PASSWORD TONE'S DEGREE** (2026-09-27; [`TrailSynth::v2_secret`]):
+/// the lattice anchor, C5 at `song_key` 0 — the tonic, the one degree that is
+/// in every chord's key and is nobody's melody.
+const SECRET_DEG: i32 = 0;
+/// …and its τ: 69 ms, [`tau_v_s`] at a 150 ms IOI (a steady 6.7 keys a
+/// second), FIXED — the real IOI is the hand's rhythm and would shape each
+/// tone by the gap before it.
+const SECRET_TAU_S: f32 = 0.069;
 
 /// The Backspace / Kill mute (§10.4, §11). 40 ms rather than the 12 ms damp
 /// everything else uses: an erase is a slower, softer gesture than a
@@ -5943,12 +6037,15 @@ impl TrailSynth {
         // [`LANE_GRAFT`] (fade-steal, cap 2: an identity is never dropped),
         // on the key's own pan and gain, behind the bloom stop like every
         // decoration and on a STEP only: a re-struck `??` or `((` does not
-        // ask or open twice (§9.2's ladder). The STOP's breath is not a
+        // ask or open twice (§9.2's ladder). The one re-strike that grafts
+        // is a close straight after its open — `()` shares a rank, and a
+        // pair is not a mark struck twice. The STOP's breath is not a
         // pitched graft and not behind the stop — it is the space's own
         // exhale, and it fires on every touch a pluck does. All four go
         // through [`TrailSynth::v2_spawn_decoration`]: under a full pool the
         // decoration is what does not happen, never the mark's own pluck.
-        if stops.bloom && plan.touch == Touch::Step && classed {
+        let closes_its_open = class == CLOSE && self.v2.prev_class == OPEN;
+        if stops.bloom && (plan.touch == Touch::Step || closes_its_open) && classed {
             match class {
                 // `?` RISES: a fifth above, 60 ms on, −3 dB, struck — and
                 // from a D it rises a FOURTH, to the G ([`QUEST_RISE_D_DEG`]):
@@ -6013,6 +6110,7 @@ impl TrailSynth {
                 _ => {}
             }
         }
+        self.v2.prev_class = if classed { class } else { LETTER };
         // A STOP BREATHES: the space's exhale, 20 ms behind the mark, on the
         // space's own draw (a pan) — at the space's level behind the full
         // stop and [`PAUSE_BREATH_MUL`] of it behind `,` `;` `:`.
@@ -6035,7 +6133,8 @@ impl TrailSynth {
         }
 
         // **FLOW'S ECHO, AND THE CAPITAL'S RING** (§22 lever 1;
-        // [`CAP_RING_LEVEL`]) — the key's own octave, given back to every
+        // [`CAP_RING_LEVEL`]) — the key's own octave (the ring's a twelfth
+        // since 2026-09-27, [`CAP_RING_LIFT_DEG`]), given back to every
         // LIT STEP once the hand is in flow at [`FLOW_ECHO_DELAY_S`] behind
         // its own strike and [`FLOW_ECHO_LEVEL`] under it, and to EVERY
         // SHIFTED STEP, in or out of flow, as the ring: [`CAP_RING_DELAY_S`]
@@ -6077,9 +6176,12 @@ impl TrailSynth {
         // AN OPENER LEAVES ONE** ([`Forte::ring`]; owner: "FORTE in a piano").
         // Until that day EVERY shifted step rang — every `(`, `:` and `_` of a
         // line of code, and every key of a shouted word. Now a capital LETTER
-        // that opens a word or a shifted run rings, one octave over the note
-        // the LINE wrote (the strike's octave is gone, so the ring is back
-        // under 3140 Hz at `song_key` 0), and:
+        // that opens a word or a shifted run rings, ~~one octave over the
+        // note the LINE wrote (the strike's octave is gone, so the ring is
+        // back under 3140 Hz at `song_key` 0)~~ **RE-RULED 2026-09-27** (owner:
+        // "capitals yes make them speical"): a TWELFTH over the note the LINE
+        // wrote ([`CAP_RING_LIFT_DEG`]; under 4710 Hz at `song_key` 0) — the
+        // strike is still the line's own note — and:
         //
         // - **every OTHER shifted step makes the ring's four draws and
         //   discards them**, so each seeded stream behind a shifted key is
@@ -6089,12 +6191,18 @@ impl TrailSynth {
         //   always had it;
         // - **a shifted key takes no flow echo**: it would be a second octave
         //   voice on a key whose ring was just refused;
-        // - **the ring is PHASE-LOCKED to the strike's own 2f**, as the echo
+        // - ~~**the ring is PHASE-LOCKED to the strike's own 2f**, as the echo
         //   has been since 2026-09-10 ([`FLOW_ECHO_PHASE`]) and for the same
         //   reason, which forte made worse: the ring's fundamental IS the
         //   strike's octave partial's frequency, forte puts more level in
         //   that partial, and two sines at one frequency on a drawn phase
-        //   are a per-key lottery between cancelling and doubling;
+        //   are a per-key lottery between cancelling and doubling;~~
+        //   **RE-RULED 2026-09-27: the ring is a TWELFTH over the strike**
+        //   ([`CAP_RING_LIFT_DEG`]; owner: *"capitals yes make them
+        //   speical"*), a note of its own on no partial of the strike's tine,
+        //   so there is nothing to lock it to and it keeps its DRAWN phase —
+        //   through the same `v2_spawn_ph0`, which makes the same four draws,
+        //   so every seeded stream behind a ringing capital is where it was;
         // - **its 2.76f strike partial is muted**: a resonance is not struck.
         let ring_gain = if ev.shifted {
             gain * CAP_RING_LEVEL.max(FLOW_ECHO_LEVEL * flow)
@@ -6110,8 +6218,20 @@ impl TrailSynth {
         // already sounding — the ting IS it — so the ring is not spawned, and
         // its four draws are made and discarded like every other refused
         // ring's, so the seeded stream behind the capital is where it was.
-        let rings =
-            hammer.ring && !self.v2_live_ting_at(penta(TINE_BASE_HZ, deg + FLOW_ECHO_OCTAVE_DEG));
+        //
+        // (2026-09-27: ~~one octave over the strike~~ a TWELFTH over it,
+        // [`CAP_RING_LIFT_DEG`] — still in the ting's register from the
+        // verse's lowest degrees, and still a lattice tone, so the check
+        // stands and reads the ring's own pitch: a capital on G5 under a
+        // ting on D7 is the same collision the C6-under-C7 one was.)
+        let ring_deg = deg + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG;
+        #[cfg(test)]
+        let ring_deg = if self.ring_at_octave {
+            deg + FLOW_ECHO_OCTAVE_DEG
+        } else {
+            ring_deg
+        };
+        let rings = hammer.ring && !self.v2_live_ting_at(penta(TINE_BASE_HZ, ring_deg));
         if ev.shifted && struck && !rings && !self.voices.iter().all(|v| v.on) {
             for _ in 0..4 {
                 let _ = self.rnd();
@@ -6121,8 +6241,16 @@ impl TrailSynth {
         // 30 ms decay). Flow must not reintroduce the hang staccato deletes.
         let echoes = flow > 0.0 && plan.lit && !plucked && !ev.shifted;
         if (echoes || rings) && struck {
+            // `echoes` and `rings` are exclusive (`echoes` needs an unshifted
+            // key, a ring a shifted letter): the octave is the echo's, the
+            // twelfth the ring's.
+            let echo_deg = if rings {
+                ring_deg
+            } else {
+                deg + FLOW_ECHO_OCTAVE_DEG
+            };
             let mut echo = tine(
-                penta(TINE_BASE_HZ, deg + FLOW_ECHO_OCTAVE_DEG),
+                penta(TINE_BASE_HZ, echo_deg),
                 Touch::Step,
                 tau,
                 roof,
@@ -6180,13 +6308,13 @@ impl TrailSynth {
                 echo.attack = CAP_RING_ATTACK_S;
                 echo.delay = CAP_RING_DELAY_S;
                 echo.lane = LANE_GRAFT;
-                let ph0 = self.v2_flow_echo_phase(echo.p[0].f0, CAP_RING_DELAY_S);
-                #[cfg(test)]
-                let ph0 = if self.ring_unlocked { None } else { ph0 };
+                // The DRAWN phase (2026-09-27): a twelfth has no partial of
+                // the strike to lock to ([`CAP_RING_LIFT_DEG`]). `None`
+                // keeps the draw; the four draws are made either way.
                 self.v2.ring = if self.voices.iter().all(|v| v.on) {
                     None
                 } else {
-                    self.v2_spawn_ph0(echo, ring_gain, pan, ph0)
+                    self.v2_spawn_ph0(echo, ring_gain, pan, None)
                 };
             } else {
                 echo.attack = BLOOM_ATTACK_S;
@@ -6310,6 +6438,7 @@ impl TrailSynth {
     fn v2_space(&mut self, ev: &SoundEvent, at: u32) {
         self.v2.ring = None;
         self.v2.graft = None;
+        self.v2.prev_class = LETTER;
         let head = self.v2.on_space(at);
         let g = g_ioi(self.v2.ioi_ms * 0.001);
         // The live chord's root — the dyad's fundamental, the twinkle's pitch
@@ -6430,6 +6559,34 @@ impl TrailSynth {
         self.v2.lift = self.v2_spawn(ting(f), ev.gain * KEY_TINE_TRIM * TING_LEVEL, pan);
     }
 
+    /// **SECRET** — a key typed at a password prompt (owner, 2026-09-27,
+    /// verbatim: *"password: fix to all same tone"*; the host stamps
+    /// [`SECRET`] on a keyed cue whose press the tty will not echo). ONE
+    /// fixed plain tine: [`SECRET_DEG`] over the lattice anchor in the
+    /// song's key, a [`Touch::Step`] tine on [`SECRET_TAU_S`] under the
+    /// plain roof [`ROOF_PLAIN_LO_HZ`] at cold flow, gain `ev.gain ×`
+    /// [`KEY_TINE_TRIM`], centre pan. No forte, no bloom, no echo, no ring,
+    /// no glint, no breath, no seeded velocity and no pan jitter — nothing a
+    /// letter, a capital, a digit, a mark or the space could make different,
+    /// and nothing an ear could count letters by beyond the key-press itself
+    /// (which the prompt's own silence cannot hide either: the keys are
+    /// heard on the desk).
+    ///
+    /// **IT MOVES NO MELODY.** `on_typed` is not called and no field of
+    /// [`MelodyV2`] is written — not the walk, the chord, the undo frames,
+    /// the IOI, the phrase marks, the flow latch or the voice addresses —
+    /// so the line after the prompt is exactly the line that would have
+    /// played had the secret never been typed. §9.5 law 5 as the nav tick
+    /// has it: every secret key is the same pitch, so a same-pitch damp
+    /// first makes a fast password REPLACE its last tone rather than comb
+    /// against it. rng: spawn's 4 draws, every time.
+    fn v2_secret(&mut self, ev: &SoundEvent) {
+        let f = penta(TINE_BASE_HZ, SECRET_DEG + i32::from(self.song_key));
+        self.v2_damp_same_pitch(LANE_TUNE, f);
+        let voice = tine(f, Touch::Step, SECRET_TAU_S, ROOF_PLAIN_LO_HZ, false, 0.0);
+        self.v2_spawn(voice, ev.gain * KEY_TINE_TRIM, 0.0);
+    }
+
     /// **NAV TICK** — the mini-fan's voice (D17, §12.3's floor): the verse
     /// note, P1 only, no mallet, −24 dB. The sound of a hop too small to be a
     /// meteor, and the sound a fizzled arm resolves into.
@@ -6544,6 +6701,7 @@ impl TrailSynth {
         // and preserves the melody/undo state the strum does not advance.
         self.v2.ring = None;
         self.v2.graft = None;
+        self.v2.prev_class = LETTER;
         let lit = sky_bed_degrees(usize::from(self.v2.chord));
         let degrees = [lit[0], lit[1], lit[2], lit[0] + 5];
         let ioi_s = self.v2.ioi_ms * 0.001;
@@ -6582,6 +6740,7 @@ impl TrailSynth {
     fn v2_enter(&mut self, ev: &SoundEvent, at: u32, cells: u16) {
         self.v2.ring = None;
         self.v2.graft = None;
+        self.v2.prev_class = LETTER;
         self.v2_hand_back_key(at);
         let (full, closed) = self.v2.on_enter(at);
         // §10.4 reads `walk` AFTER the phrase has been cadenced, so the
@@ -9318,7 +9477,8 @@ for it up front.\n\
     /// the letter, and an octave echo 25 ms behind it at −8 dB. The letter
     /// is its own single step lifted [`CAPITAL_LIFT_DEG`] degrees — the same
     /// derivation as its lowercase twin, higher — with ONE ring in
-    /// [`LANE_GRAFT`] at its octave, [`CAP_RING_DELAY_S`] behind it on a
+    /// [`LANE_GRAFT`] at its ~~octave~~ twelfth (2026-09-27,
+    /// [`CAP_RING_LIFT_DEG`]), [`CAP_RING_DELAY_S`] behind it on a
     /// [`CAP_RING_ATTACK_S`] swell, no mallet, at [`CAP_RING_LEVEL`] of the
     /// key's own gain (same pan, same draw), and ONE sparkle twice the
     /// lowercase key's ([`FORTE_GLINT_MUL`] since 2026-09-20; an identical
@@ -9424,8 +9584,10 @@ for it up front.\n\
                 v.p[0].f0
             );
         }
-        // THE RING: one GRAFT voice at the octave, 60 ms on, swelling, no
-        // mallet, −6 dB re the key's own gain on the key's own pan.
+        // THE RING: one GRAFT voice at the ~~octave~~ TWELFTH (RE-PINNED
+        // 2026-09-27; owner: "capitals yes make them speical" —
+        // [`CAP_RING_LIFT_DEG`]), 60 ms on, swelling, no mallet, −6 dB re
+        // the key's own gain on the key's own pan.
         let rings: Vec<&Voice> = spawned.iter().filter(|v| v.lane == LANE_GRAFT).collect();
         assert_eq!(
             rings.len(),
@@ -9434,11 +9596,14 @@ for it up front.\n\
             rings.len()
         );
         let ring = rings[0];
+        let twelfth = penta(
+            TINE_BASE_HZ,
+            i32::from(high) + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG,
+        );
         assert!(
-            (ring.p[0].f0 - 2.0 * f).abs() < SAME_PITCH_HZ,
-            "the ring is at {} Hz, not the key's octave {}",
+            (ring.p[0].f0 - twelfth).abs() < SAME_PITCH_HZ,
+            "the ring is at {} Hz, not the key's twelfth {twelfth}",
             ring.p[0].f0,
-            2.0 * f
         );
         assert_eq!(
             ring.delay, CAP_RING_DELAY_S,
@@ -9585,6 +9750,12 @@ for it up front.\n\
     /// OPENERS, so both still ring, and the body and octave-bin floors hold.
     /// The cross-context pin is now
     /// `a_shifted_key_is_forte_not_higher_and_a_word_opening_capital_is_loudest`.
+    ///
+    /// **RE-PINNED 2026-09-27** (owner: *"capitals yes make them speical"*):
+    /// the ring is a twelfth over the strike ([`CAP_RING_LIFT_DEG`]), so the
+    /// "octave-bin" floor reads each key's TWELFTH bin — the ring's — and
+    /// not its 2f, which after the move still passed on forte's longer P2
+    /// alone and so no longer pinned the ring at all.
     #[test]
     fn a_capital_rings_and_out_peaks_its_plain_self_by_its_weight() {
         const SEEDS: [u32; 4] = [SEED, 0x5EED_1234, 0x504F_4F46, 0xCAFE_F00D];
@@ -9619,8 +9790,10 @@ for it up front.\n\
         const ANNOUNCED_PEAK_SLACK_DB: f32 = 3.4;
         /// The body must carry the ring: broadband, over the bloom's hang…
         const BODY_FLOOR_DB: f32 = 1.5;
-        /// …and at the octave, where the ring lives.
-        const BODY_2F_FLOOR_DB: f32 = 3.0;
+        /// …and at ~~the octave~~ the TWELFTH, where the ring lives
+        /// (RE-PINNED 2026-09-27; owner: "capitals yes make them speical" —
+        /// [`CAP_RING_LIFT_DEG`]).
+        const BODY_RING_FLOOR_DB: f32 = 3.0;
         /// The two contexts: a WORD HEAD (after `"hello "`) and MID-WORD
         /// (after `"hel"`, no Space) — the key under test lands at 1 900 ms
         /// in both.
@@ -9671,8 +9844,16 @@ for it up front.\n\
             .into_iter()
             .find(|w| (ratio / w - 1.0).abs() < 1e-4)
         };
+        // A lattice pitch's twelfth — the ring's pitch over that strike
+        // ([`CAP_RING_LIFT_DEG`]).
+        let twelfth_of = |f: f32| -> f32 {
+            let d = (-10..30)
+                .find(|&d| penta(TINE_BASE_HZ, d) == f)
+                .expect("a strike is a lattice pitch");
+            penta(TINE_BASE_HZ, d + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG)
+        };
         // One take: the render from the key (or from the Shift ahead of it)
-        // and the key's own fundamental, for the octave bin.
+        // and the key's own fundamental, for the ring's bin.
         let take = |seed: u32, ctx: &str, ch: char, lead_shift: bool| -> (Vec<f32>, f32) {
             let mut s = TrailSynth::new(SR, seed);
             head(&mut s, ctx);
@@ -9784,20 +9965,24 @@ for it up front.\n\
                         "seed {seed:#x} `{cap}` after {ctx:?}: the body after the key is \
                          {b1:.2} dB against the plain {b0:.2} — the ring is not heard"
                     );
-                    // At the octave the plain take holds only P2's 55 ms
-                    // tail; the capital holds the ring. Both bins at the
-                    // CAPITAL's 2f — the lifted degree is the register's
-                    // business, and the plain key's own octave is censused
+                    // ~~At the octave~~ AT THE TWELFTH (RE-PINNED
+                    // 2026-09-27 — until then both bins were at 2f, and
+                    // the ring's move off it left that assertion passing
+                    // on forte's longer P2 alone): the plain take holds
+                    // nothing there once its 2.76f strike partial is gone;
+                    // the capital holds the ring. Each bin at its own key's
+                    // twelfth — the lifted degree is the register's
+                    // business, and the plain key's own twelfth is censused
                     // as the control.
                     let (o0, o1) = (
-                        db(bin_at(body(&plain), 2.0 * f_plain)),
-                        db(bin_at(body(&capital), 2.0 * f_cap)),
+                        db(bin_at(body(&plain), twelfth_of(f_plain))),
+                        db(bin_at(body(&capital), twelfth_of(f_cap))),
                     );
                     assert!(
-                        o1 >= o0 + BODY_2F_FLOOR_DB,
-                        "seed {seed:#x} `{cap}` after {ctx:?}: the octave in the body is \
-                         {o1:.2} dB against the plain key's own octave {o0:.2} — the ring \
-                         is not heard AS THE OCTAVE"
+                        o1 >= o0 + BODY_RING_FLOOR_DB,
+                        "seed {seed:#x} `{cap}` after {ctx:?}: the twelfth in the body is \
+                         {o1:.2} dB against the plain key's own twelfth {o0:.2} — the ring \
+                         is not heard AS THE TWELFTH"
                     );
                 }
             }
@@ -10284,109 +10469,169 @@ for it up front.\n\
     ///   the twin's, whose ring sounded.
     /// - **ORDER** — when the STRIKE took the ting's pitch the ting is
     ///   already fading and costs the capital nothing.
+    ///
+    /// **RE-PINNED 2026-09-27** (owner: *"capitals yes make them speical"*):
+    /// the ring moved from the octave to the twelfth ([`CAP_RING_LIFT_DEG`]).
+    /// The ring's pitch is read off the twin's ring rather than computed as
+    /// `2 × strike`; the search types four lines before the Shift instead of
+    /// "hello " alone; and since no natural word head of the search puts its
+    /// twelfth on a live ting any more, T22 is also driven FORCED — the ting
+    /// tuned onto each ringing capital's twelfth — and the fixture's ring
+    /// collision count is natural + forced.
     #[test]
     fn a_strike_or_a_ring_on_the_tings_pitch_never_combs() {
         let cents = |a: f32, b: f32| (1200.0 * (a / b).log2()).abs();
-        let (mut strikes, mut yields, mut misses) = (0, 0, 0);
-        for chord in 0..CHORD_LOOP.len() as u8 {
-            for k in 0..5u8 {
-                let mut base = synth();
-                for (i, ch) in "hello ".chars().enumerate() {
-                    let kind = if ch == ' ' {
-                        SoundKind::Space
-                    } else {
-                        SoundKind::Typed
-                    };
-                    push_ch(&mut base, kind, 1_000 + i as u32 * 150, ch);
-                }
-                let _ = render_mono(&mut base, 40);
-                base.v2.chord = chord;
-                base.shift_step = k;
-                push(&mut base, SoundKind::Shift, 2_400, 0.0, false);
-                let (slot, born) = base.v2.lift.expect("the ting's address");
-                let slot = usize::from(slot);
-                let ting_f = base.voices[slot].p[0].f0;
-                for ch in ('a'..='z').chain('A'..='Z') {
-                    let run = |detuned: bool| -> (TrailSynth, Vec<Voice>) {
-                        let mut s = base.clone();
-                        if detuned {
-                            // A quarter-tone off every lattice pitch.
-                            s.voices[slot].p[0].f0 *= 1.03;
-                        }
-                        let mark = s.born_seq;
-                        push_ch(&mut s, SoundKind::Typed, 2_460, ch);
-                        let spawned = since(&s, mark);
-                        (s, spawned)
-                    };
-                    let (s, spawned) = run(false);
-                    let (twin, twin_spawned) = run(true);
-                    let strike = tune_voices(&spawned)[0];
-                    let ting_v = s.voices[slot];
-                    assert!(ting_v.on && ting_v.born == born);
-                    let struck_on_it = cents(strike.p[0].f0, ting_f) < 1.0;
-                    // T21.
-                    if struck_on_it {
-                        strikes += 1;
-                        assert_eq!(
-                            ting_v.damp, LANE_FADE_STEAL_S,
-                            "chord {chord} step {k} `{ch}`: a strike on the ting's own \
-                             {ting_f} Hz left it ringing — two phases at one pitch"
-                        );
-                    } else {
-                        assert_eq!(
-                            ting_v.damp, 0.0,
-                            "chord {chord} step {k} `{ch}`: a strike at {} Hz damped a ting \
-                             at {ting_f} Hz",
-                            strike.p[0].f0
-                        );
+        let (mut strikes, mut yields, mut misses, mut forced_yields) = (0, 0, 0, 0);
+        // THE CONTEXTS THE SEARCH TYPES FIRST. Until 2026-09-27 this was
+        // "hello " alone: the ring sat an octave over the strike and a word
+        // head after it reached the ting's register often enough. The ring
+        // is a TWELFTH now ([`CAP_RING_LIFT_DEG`]; owner: "capitals yes make
+        // them speical"), in the ting's 1240-2480 Hz only over the verse's
+        // lowest four degrees, so the search walks lines that leave a word
+        // head down there too.
+        const CONTEXTS: [&str; 4] = ["hello ", "a ", "zoo ", "mmm tt "];
+        for ctx in CONTEXTS {
+            for chord in 0..CHORD_LOOP.len() as u8 {
+                for k in 0..5u8 {
+                    let mut base = synth();
+                    for (i, ch) in ctx.chars().enumerate() {
+                        let kind = if ch == ' ' {
+                            SoundKind::Space
+                        } else {
+                            SoundKind::Typed
+                        };
+                        push_ch(&mut base, kind, 1_000 + i as u32 * 150, ch);
                     }
-                    assert_eq!(twin.voices[slot].damp, 0.0, "the twin's ting is off-pitch");
-                    // T22.
-                    let twin_rang = twin.v2.ring.is_some();
-                    let ring_on_it = twin_rang && cents(2.0 * strike.p[0].f0, ting_f) < 1.0;
-                    if ring_on_it && !struck_on_it {
-                        yields += 1;
-                        assert!(
-                            s.v2.ring.is_none() && !spawned.iter().any(|v| v.lane == LANE_GRAFT),
-                            "chord {chord} step {k} `{ch}`: a ring swelled in on the live \
-                             ting's own {ting_f} Hz"
-                        );
-                        assert_eq!(spawned.len() + 1, twin_spawned.len());
-                    } else {
-                        if twin_rang {
-                            misses += 1;
+                    let _ = render_mono(&mut base, 40);
+                    base.v2.chord = chord;
+                    base.shift_step = k;
+                    push(&mut base, SoundKind::Shift, 2_400, 0.0, false);
+                    let (slot, born) = base.v2.lift.expect("the ting's address");
+                    let slot = usize::from(slot);
+                    let ting_f = base.voices[slot].p[0].f0;
+                    for ch in ('a'..='z').chain('A'..='Z') {
+                        let run = |detuned: bool| -> (TrailSynth, Vec<Voice>) {
+                            let mut s = base.clone();
+                            if detuned {
+                                // A quarter-tone off every lattice pitch.
+                                s.voices[slot].p[0].f0 *= 1.03;
+                            }
+                            let mark = s.born_seq;
+                            push_ch(&mut s, SoundKind::Typed, 2_460, ch);
+                            let spawned = since(&s, mark);
+                            (s, spawned)
+                        };
+                        let (s, spawned) = run(false);
+                        let (twin, twin_spawned) = run(true);
+                        let strike = tune_voices(&spawned)[0];
+                        let ting_v = s.voices[slot];
+                        assert!(ting_v.on && ting_v.born == born);
+                        let struck_on_it = cents(strike.p[0].f0, ting_f) < 1.0;
+                        // T21.
+                        if struck_on_it {
+                            strikes += 1;
+                            assert_eq!(
+                                ting_v.damp, LANE_FADE_STEAL_S,
+                                "chord {chord} step {k} `{ch}`: a strike on the ting's own \
+                                 {ting_f} Hz left it ringing — two phases at one pitch"
+                            );
+                        } else {
+                            assert_eq!(
+                                ting_v.damp, 0.0,
+                                "chord {chord} step {k} `{ch}`: a strike at {} Hz damped a ting \
+                                 at {ting_f} Hz",
+                                strike.p[0].f0
+                            );
                         }
-                        assert_eq!(
-                            s.v2.ring.is_some(),
-                            twin_rang,
-                            "chord {chord} step {k} `{ch}`: the ring yielded to a ting it \
-                             does not collide with"
-                        );
-                    }
-                    // …and the seeded stream is where the twin's is, whatever
-                    // happened: the next key is the same voice.
-                    assert_eq!(s.rng, twin.rng, "chord {chord} step {k} `{ch}`: the draws");
-                    let next = |mut s: TrailSynth| -> Vec<(f32, f32, f32)> {
-                        let mark = s.born_seq;
-                        push_ch(&mut s, SoundKind::Typed, 2_610, 'e');
-                        since(&s, mark)
-                            .iter()
-                            .map(|v| (v.p[0].ph, v.gl, v.gr))
-                            .collect()
-                    };
-                    if ring_on_it {
-                        assert_eq!(next(s), next(twin), "`{ch}`: the key behind the capital");
+                        assert_eq!(twin.voices[slot].damp, 0.0, "the twin's ting is off-pitch");
+                        // T22.
+                        let twin_rang = twin.v2.ring.is_some();
+                        // The ring's pitch is read off the twin's ring (the
+                        // twin's detune moved only the ting). RE-PINNED
+                        // 2026-09-27 (owner: "capitals yes make them speical"):
+                        // this read `2.0 * strike`, the octave; the ring is the
+                        // twelfth now ([`CAP_RING_LIFT_DEG`]).
+                        let ring_on_it = twin.v2.ring.is_some_and(|(slot, _)| {
+                            cents(twin.voices[usize::from(slot)].p[0].f0, ting_f) < 1.0
+                        });
+                        if ring_on_it && !struck_on_it {
+                            yields += 1;
+                            assert!(
+                                s.v2.ring.is_none()
+                                    && !spawned.iter().any(|v| v.lane == LANE_GRAFT),
+                                "chord {chord} step {k} `{ch}`: a ring swelled in on the live \
+                                 ting's own {ting_f} Hz"
+                            );
+                            assert_eq!(spawned.len() + 1, twin_spawned.len());
+                        } else {
+                            if twin_rang {
+                                misses += 1;
+                            }
+                            assert_eq!(
+                                s.v2.ring.is_some(),
+                                twin_rang,
+                                "chord {chord} step {k} `{ch}`: the ring yielded to a ting it \
+                                 does not collide with"
+                            );
+                        }
+                        // …and the seeded stream is where the twin's is, whatever
+                        // happened: the next key is the same voice.
+                        assert_eq!(s.rng, twin.rng, "chord {chord} step {k} `{ch}`: the draws");
+                        let next = |mut s: TrailSynth| -> Vec<(f32, f32, f32)> {
+                            let mark = s.born_seq;
+                            push_ch(&mut s, SoundKind::Typed, 2_610, 'e');
+                            since(&s, mark)
+                                .iter()
+                                .map(|v| (v.p[0].ph, v.gl, v.gr))
+                                .collect()
+                        };
+                        // T22, FORCED (2026-09-27). With the ring on the twelfth a word
+                        // head's ring lands in the ting's register only from the verse's
+                        // lowest degrees, and the search's lines do not put a capital there
+                        // under a chord whose ting sits on that twelfth (measured: 0 of 4160
+                        // rings). So every capital that rang is typed once more with the ting
+                        // TUNED onto its ring's pitch — a real collision to the engine, which
+                        // reads the voice — and must yield exactly as a natural one did.
+                        if let Some((ring_slot, _)) = twin.v2.ring {
+                            let ring_f = twin.voices[usize::from(ring_slot)].p[0].f0;
+                            let mut tuned = base.clone();
+                            tuned.voices[slot].p[0].f0 = ring_f;
+                            let mark = tuned.born_seq;
+                            push_ch(&mut tuned, SoundKind::Typed, 2_460, ch);
+                            let forced = since(&tuned, mark);
+                            forced_yields += 1;
+                            assert!(
+                                tuned.v2.ring.is_none()
+                                    && !forced.iter().any(|v| v.lane == LANE_GRAFT),
+                                "chord {chord} step {k} `{ch}`: a ring swelled in on a live \
+                                 ting tuned to its own {ring_f} Hz"
+                            );
+                            assert_eq!(forced.len() + 1, twin_spawned.len());
+                            assert_eq!(tuned.rng, twin.rng, "`{ch}`: the refused ring's draws");
+                            assert_eq!(
+                                next(tuned),
+                                next(twin.clone()),
+                                "`{ch}`: the key behind the capital"
+                            );
+                        }
+                        if ring_on_it {
+                            assert_eq!(next(s), next(twin), "`{ch}`: the key behind the capital");
+                        }
                     }
                 }
             }
         }
         println!(
-            "strikes on the ting {strikes}, rings yielded {yields}, rings unaffected {misses}"
+            "strikes on the ting {strikes}, rings yielded {yields} (forced {forced_yields}), \
+             rings unaffected {misses}"
         );
+        // RE-PINNED 2026-09-27: `yields > 0` (a NATURAL ring collision) is
+        // `yields + forced_yields > 0` — see the forced T22 above.
         assert!(
-            strikes > 0 && yields > 0 && misses > 0,
+            strikes > 0 && yields + forced_yields > 0 && misses > 0,
             "fixture: the search must reach a strike collision ({strikes}), a ring collision \
-             ({yields}) and a ring that does not collide ({misses})"
+             ({yields} natural, {forced_yields} forced) and a ring that does not collide \
+             ({misses})"
         );
     }
 
@@ -10944,7 +11189,19 @@ for it up front.\n\
                 let ring = s.voices[usize::from(slot)];
                 assert_eq!(ring.born, born);
                 assert_eq!(ring.lane, LANE_GRAFT);
-                assert_eq!(ring.p[0].f0, 2.0 * f);
+                // ~~`2.0 * f`, the octave~~ RE-PINNED 2026-09-27 (owner:
+                // "capitals yes make them speical"): the ring is the twelfth
+                // ([`CAP_RING_LIFT_DEG`]); the strike above is still `f`.
+                assert_eq!(
+                    ring.p[0].f0,
+                    penta(
+                        TINE_BASE_HZ,
+                        i32::from(s.v2.walk())
+                            + i32::from(s.song_key)
+                            + FLOW_ECHO_OCTAVE_DEG
+                            + CAP_RING_LIFT_DEG
+                    )
+                );
                 assert_eq!(ring.p[2].lvl, 0.0, "a resonance is not struck");
                 assert_eq!(ring.n_lvl, 0.0);
                 assert_eq!(ring.delay, CAP_RING_DELAY_S);
@@ -12376,9 +12633,15 @@ for it up front.\n\
     ///
     /// NEGATIVE CONTROL: the frame is not blind — a typed mark with no
     /// Backspace behind it leaves a different one.
+    ///
+    /// **RE-PINNED 2026-09-27** (owner: *"password: fix to all same tone"*):
+    /// the unnamed id was `16`, and `16` is now [`SECRET`], a key that by
+    /// design moves no melody (`a_password_leaves_the_melody_where_it_was`),
+    /// so it cannot be typed-and-deleted here — its "typed" frame is its
+    /// "before". The unnamed id is `17`.
     #[test]
     fn backspace_unsings_a_phrase() {
-        for class in 0..=16u8 {
+        for class in (0..=15u8).chain([17]) {
             for shifted in [false, true] {
                 let mut s = synth();
                 let mut at = 1_000;
@@ -12527,7 +12790,9 @@ for it up front.\n\
     /// plain and shifted (`:` is a shifted key on the owner's layout) — and
     /// the engine is left in the same state, read as bit-identical output
     /// through the marks and through the next letter. An id nobody names
-    /// (`16`, `255`) is the letter, as the side-car's identity column says.
+    /// (~~`16`~~ **RE-PINNED 2026-09-27** `17`, `255` — `16` is now
+    /// [`SECRET`], the password prompt's one tone; owner: *"password: fix to
+    /// all same tone"*) is the letter, as the side-car's identity column says.
     ///
     /// NEGATIVE CONTROLS: the same comparison tells a stop from a letter, a
     /// stop from a line, and a breath-less stop (the split done wrong in
@@ -12645,8 +12910,11 @@ for it up front.\n\
             // so a shifted unnamed id is struck with a shifted MARK's force
             // (0.35, [`MARK_SHIFT_GAIN`]) on the letter's tine, not a
             // capital's. No host stamps such an id; this pins what one gets.
-            let first_unknown = take(16, shifted);
-            for unknown in [16u8, 17, 200, 255] {
+            // (16 left this list on 2026-09-27: it is [`SECRET`] now, which
+            // the host DOES stamp, and `a_password_key_is_one_tone_whatever_it_was`
+            // pins what it gets.)
+            let first_unknown = take(17, shifted);
+            for unknown in [17u8, 18, 200, 255] {
                 let got = take(unknown, shifted);
                 assert_eq!(got.0, first_unknown.0, "class {unknown}: a path of its own");
                 assert!(
@@ -12697,6 +12965,205 @@ for it up front.\n\
         }
         let dash = crate::trail_sound::typed_glyph_class(Some('-'));
         assert!(dash == DASH && !pluck_class(dash) && !stop_breathes(dash));
+    }
+
+    /// The keys a password might be made of, one of every class the keyboard
+    /// stamps: letters of both cases, digits, every mark bucket, and the
+    /// space. `(kind, shifted, rank)` is what the keyed seam would have sent
+    /// for each before 2026-09-27 — everything but the class.
+    const SECRET_KEYS: &str = "aZ7.,;:-([)]'\"_~/+=@#?! ";
+
+    /// One secret-stamped cue for `ch`, carrying everything its ordinary cue
+    /// would (kind, shift, rank, a moving pan) except the class.
+    fn push_secret(s: &mut TrailSynth, at: u32, ch: char, pan: f32) {
+        let kind = if ch == ' ' {
+            SoundKind::Space
+        } else {
+            SoundKind::Typed
+        };
+        s.push_meta(
+            event(
+                kind,
+                pan,
+                ch.is_uppercase() || "!?\"(){}_~+@#:".contains(ch),
+            ),
+            EventMeta {
+                at_ms: at,
+                glyph_class: SECRET,
+                rank: crate::trail_sound::typed_glyph_rank(Some(ch)),
+                ..EventMeta::default()
+            },
+        );
+    }
+
+    /// A line with a walk, a chord, a mark and an IOI in it, rendered out —
+    /// what a secret must not disturb. Returns the next free `at_ms`.
+    fn prose_prelude(s: &mut TrailSynth) -> u32 {
+        let mut at = 1_000;
+        for ch in "Hello, wor".chars() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            push_ch(s, kind, at, ch);
+            let _ = render_mono(s, 15);
+            at += 150;
+        }
+        at
+    }
+
+    /// **A PASSWORD KEY IS ONE TONE, WHATEVER IT WAS** (owner, 2026-09-27,
+    /// verbatim: *"password: fix to all same tone"*). At a canonical no-echo
+    /// prompt the host stamps [`SECRET`] on the keyed cue; before that day the
+    /// click still told a capital (forte and its ring), a digit (the wood
+    /// bar), each mark (a pluck, a cadence, a breath), the space (the bass)
+    /// and — through the rank — every letter's place in the melody.
+    ///
+    /// On one engine state, one secret cue per key of [`SECRET_KEYS`]: every
+    /// one spawns the SAME single voice (field for field — one plain tine,
+    /// no forte, on the password degree, centre pan) and renders the SAME
+    /// output, bit for bit, whatever kind, shift, rank or pan it carried.
+    ///
+    /// NEGATIVE CONTROL: the same keys with their ordinary classes are told
+    /// apart by the same comparison, so "equal" is not its only answer.
+    #[test]
+    fn a_password_key_is_one_tone_whatever_it_was() {
+        let take = |ch: char, secret: bool| -> (Vec<String>, Vec<u32>) {
+            let mut s = synth();
+            let at = prose_prelude(&mut s);
+            let mark = s.born_seq;
+            if secret {
+                // The pan moves with the key, as a caret would — the tone
+                // must not.
+                push_secret(&mut s, at, ch, (ch as u32 % 7) as f32 / 7.0 - 0.4);
+            } else {
+                let kind = if ch == ' ' {
+                    SoundKind::Space
+                } else {
+                    SoundKind::Typed
+                };
+                push_ch(&mut s, kind, at, ch);
+            }
+            let voices = since(&s, mark)
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>();
+            let out = render_mono(&mut s, 40);
+            (voices, out.iter().map(|x| x.to_bits()).collect())
+        };
+        let first = take('a', true);
+        assert_eq!(first.0.len(), 1, "one key, one tone: {:?}", first.0);
+        let mut s = synth();
+        let at = prose_prelude(&mut s);
+        let mark = s.born_seq;
+        push_secret(&mut s, at, 'Q', 0.3);
+        let v = since(&s, mark)[0];
+        let song_key = i32::from(s.song_key);
+        assert_eq!(v.lane, LANE_TUNE);
+        assert_eq!(v.p[0].f0, penta(TINE_BASE_HZ, SECRET_DEG + song_key));
+        assert_eq!(
+            (v.p[1].f0 / v.p[0].f0, v.p[2].f0 / v.p[0].f0),
+            (P2_RATIO, P3_RATIO),
+            "the tine's own partials: no wood bar, no pluck"
+        );
+        assert_eq!(v.p[0].fm_ratio, 0.0, "no forte");
+        assert_eq!(v.lp_cut, ROOF_PLAIN_LO_HZ, "the plain roof");
+        assert_eq!(v.decay, SECRET_TAU_S);
+        assert!(s.v2.ring.is_none() && s.v2.graft.is_none());
+        assert_eq!(v.gl, v.gr, "centre pan");
+        for ch in SECRET_KEYS.chars() {
+            let got = take(ch, true);
+            assert_eq!(got.0, first.0, "`{ch}`: a voice of its own at the prompt");
+            assert!(
+                got.1 == first.1,
+                "`{ch}`: an output of its own at the prompt"
+            );
+        }
+        // NEGATIVE CONTROL — unstamped, the keys are what they always were.
+        let plain: Vec<_> = ['a', 'Z', '7', '.', ' ']
+            .iter()
+            .map(|&ch| take(ch, false))
+            .collect();
+        for (i, a) in plain.iter().enumerate() {
+            assert!(
+                a.1 != first.1,
+                "key {i}: its ordinary click RENDERED as the password tone"
+            );
+            for b in &plain[i + 1..] {
+                assert!(
+                    a.1 != b.1,
+                    "two ordinary keys rendered alike: the control is blind"
+                );
+            }
+        }
+    }
+
+    /// **A PASSWORD LEAVES THE MELODY WHERE IT WAS** (2026-09-27, the same
+    /// ruling). Every secret key sounds, and not one of them moves
+    /// [`MelodyV2`]: after a whole password the line's state is, field for
+    /// field, the state before it — walk, steps, chord, undo frames, marks,
+    /// IOI, flow latch, voice addresses — and the next ordinary key is
+    /// derived exactly as it would have been had the password never been
+    /// typed. The seeded stream is the one thing a secret DOES advance (its
+    /// tine's four draws, like any voice), so the comparison of the next
+    /// key's voices hands the password take the untouched take's stream:
+    /// what is under test is the melody.
+    ///
+    /// NEGATIVE CONTROL: the same keys typed unstamped do move the line.
+    #[test]
+    fn a_password_leaves_the_melody_where_it_was() {
+        let mut with = synth();
+        let at0 = prose_prelude(&mut with);
+        let mut without = with.clone();
+        let before = format!("{:?}", with.v2);
+        let mut at = at0;
+        for ch in SECRET_KEYS.chars() {
+            push_secret(&mut with, at, ch, 0.0);
+            let _ = render_mono(&mut with, 3);
+            at += 120;
+        }
+        assert_eq!(
+            format!("{:?}", with.v2),
+            before,
+            "a password moved the melody's state"
+        );
+        let _ = render_mono(&mut with, 60);
+        let _ = render_mono(&mut without, 60 + 3 * SECRET_KEYS.chars().count());
+        with.rng = without.rng;
+        // The next ordinary key, on both.
+        let next = |s: &mut TrailSynth| -> (String, Vec<String>) {
+            let mark = s.born_seq;
+            push_ch(s, SoundKind::Typed, at, 'l');
+            let voices = since(s, mark)
+                .into_iter()
+                .map(|mut v| {
+                    v.born = 0;
+                    format!("{v:?}")
+                })
+                .collect();
+            (format!("{:?}", s.v2), voices)
+        };
+        let (a, b) = (next(&mut with), next(&mut without));
+        assert_eq!(
+            a.1, b.1,
+            "the key after the password is not the key it would have been"
+        );
+        assert!(!a.1.is_empty());
+        // NEGATIVE CONTROL — the same keys, unstamped, move the line.
+        let mut typed = synth();
+        let mut at = prose_prelude(&mut typed);
+        let before = format!("{:?}", typed.v2);
+        for ch in SECRET_KEYS.chars() {
+            let kind = if ch == ' ' {
+                SoundKind::Space
+            } else {
+                SoundKind::Typed
+            };
+            push_ch(&mut typed, kind, at, ch);
+            at += 120;
+        }
+        assert_ne!(format!("{:?}", typed.v2), before, "the control is blind");
     }
 
     /// **LETTERS, NUMBERS AND SYMBOLS ARE THREE TIMBRES ON ONE LINE** (owner,
@@ -13314,6 +13781,74 @@ for it up front.\n\
             restruck_plucks > 0,
             "fixture: no re-struck pluck was ever measured"
         );
+    }
+
+    /// **AN ADJACENT PAIR CLOSES WITH ITS TINK** (§10.4). `(` and `)` share
+    /// a rank, so a `)` typed straight after its `(` lands on the `(`'s
+    /// degree and is a RE-STRIKE — and the re-strike gate is for a mark
+    /// struck AGAIN (`((`, `??`), which a close after its open is not. The
+    /// pair needs no wider rank: the tink's direction already says open or
+    /// close, so the class the graft reads is all it takes. RED before: the
+    /// `)` of `()` — the commonest bracket pair in code — grafted nothing.
+    ///
+    /// Control: a close after a CLOSE is still a re-struck mark and grafts
+    /// nothing, so `))` does not tink twice.
+    #[test]
+    fn an_adjacent_pair_closes_with_its_tink() {
+        let lane = |vs: &[Voice], l: u8| -> Vec<Voice> {
+            vs.iter().filter(|v| v.lane == l).copied().collect()
+        };
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+            let mut s = synth();
+            for (i, c) in "hello ".chars().enumerate() {
+                let kind = if c == ' ' {
+                    SoundKind::Space
+                } else {
+                    SoundKind::Typed
+                };
+                push_ch(&mut s, kind, 1_000 + i as u32 * 150, c);
+            }
+            let _ = render_mono(&mut s, 12);
+            push_ch(&mut s, SoundKind::Typed, 1_900, open);
+            let _ = render_mono(&mut s, 12);
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, 2_040, close);
+            let vs = since(&s, mark);
+            assert!(
+                s.v2.restrike > 0,
+                "fixture: `{open}{close}` — the close did not land on its open's degree"
+            );
+            let g = lane(&vs, LANE_GRAFT);
+            assert_eq!(
+                g.len(),
+                1,
+                "`{open}{close}`: the close grafted {} tinks",
+                g.len()
+            );
+            let key = i32::from(s.song_key);
+            let want = penta(
+                TINE_BASE_HZ,
+                reflect_deg(i32::from(s.v2.walk()) - TINK_DEG) + key,
+            );
+            assert!(
+                (g[0].p[0].f0 - want).abs() < SAME_PITCH_HZ,
+                "`{open}{close}`: the tink is at {} Hz, not one degree DOWN at {want}",
+                g[0].p[0].f0
+            );
+            let _ = render_mono(&mut s, 12);
+            // Control: a second close is a re-struck mark.
+            let mark = s.born_seq;
+            push_ch(&mut s, SoundKind::Typed, 2_180, close);
+            let vs = since(&s, mark);
+            assert!(
+                s.v2.restrike > 0,
+                "fixture: `{close}{close}` — the second close did not re-strike"
+            );
+            assert!(
+                lane(&vs, LANE_GRAFT).is_empty(),
+                "`{close}{close}`: a re-struck close tinked again"
+            );
+        }
     }
 
     /// **A DELETED MARK DOES NOT STILL ASK** (§12.3, §4.4's retirement law).
@@ -18737,23 +19272,158 @@ for it up front.\n\
         );
     }
 
-    /// **THE CAPITAL'S RING IS LOCKED TO THE STRIKE'S OWN OCTAVE, AND A
-    /// SHIFTED KEY THAT DOES NOT RING STILL SPENDS THE RING'S DRAWS** (owner,
-    /// 2026-09-20: *"FORTE in a piano"* — [`Forte::ring`]).
+    /// **A WORD-OPENING CAPITAL RINGS A TWELFTH OVER ITS OWN STRIKE,
+    /// MEASURED FROM THE SOUND** (owner, 2026-09-27, asked *"do you want any
+    /// pitch lift back, for example on the capital's ring only?"*:
+    /// *"capitals yes make them speical"*; the 2026-09-20 *"FORTE in a piano
+    /// versus just a higher tone"* still governs the strike).
     ///
-    /// THE LOCK. The ring's fundamental is bit-for-bit the frequency of the
-    /// strike's [`P2_RATIO`] partial, and forte puts MORE level in that
-    /// partial, so on a drawn phase the octave a capital leaves behind is a
-    /// per-key lottery between cancelling and doubling — the flow echo's
-    /// 2026-09-10 defect ([`FLOW_ECHO_PHASE`]), made worse. One bin of the DFT
-    /// at the key's 2f over 80-200 ms (the ring is open, the strike's 2f is
-    /// still sounding), divided by the TUNE voice's own gain so the seeded
-    /// velocity cancels, over five seeds:
+    /// For capitals after "hello " whose word-head strikes land on a C6, an
+    /// A5 and a D6 of the lattice (so the rings are an exact `3f` and the
+    /// D's `40/27 × 2 = 2.963f`), the ear's two questions, answered
+    /// off the RENDER and not off the voice table: the loudest pitch within
+    /// ±20 % of the strike's fundamental over the first 40 ms is the line's
+    /// own note (the strike did not move), and the loudest pitch between
+    /// `2.4f` and `3.6f` over 150-400 ms — after the 2.76f strike partial
+    /// (40 ms τ) and forte's 3f sideband (45 ms τ) are gone, while the ring
+    /// swells and sustains — is the twelfth, to a quarter of a semitone.
+    /// NEGATIVE CONTROL: `ring_at_octave` moves that band's peak off the
+    /// twelfth (the octave ring puts nothing there, and the band's loudest
+    /// pitch is then the strike's own dying 2.76f or nothing at all).
+    #[test]
+    fn a_word_opening_capital_rings_a_twelfth_over_its_own_strike() {
+        // Peak pitch of `x` in [lo, hi] Hz, 1 Hz steps, Hann-windowed.
+        let peak = |x: &[f32], lo: f32, hi: f32| -> (f32, f32) {
+            let n = x.len();
+            let win: Vec<f32> = (0..n)
+                .map(|i| 0.5 * (1.0 - (core::f32::consts::TAU * i as f32 / n as f32).cos()))
+                .collect();
+            let mut best = (0.0f32, 0.0f32);
+            let mut f = lo;
+            while f <= hi {
+                let w = core::f32::consts::TAU * f / SR;
+                let (mut re, mut im) = (0.0f64, 0.0f64);
+                for (i, (&v, &h)) in x.iter().zip(&win).enumerate() {
+                    let ph = f64::from(w) * i as f64;
+                    re += f64::from(v * h) * ph.cos();
+                    im -= f64::from(v * h) * ph.sin();
+                }
+                let mag = ((re * re + im * im).sqrt() / n as f64) as f32;
+                if mag > best.1 {
+                    best = (f, mag);
+                }
+                f += 1.0;
+            }
+            best
+        };
+        let mut rang = 0;
+        let mut levels = Vec::new();
+        for ch in ['B', 'F', 'O', 'W', 'Z'] {
+            let take = |at_octave: bool| -> Option<(f32, f32, f32, f32, f32)> {
+                let mut s = synth();
+                s.ring_at_octave = at_octave;
+                s.set_v2_timbre_stops(TimbreStops::PLAIN);
+                for (i, c) in "hello ".chars().enumerate() {
+                    let kind = if c == ' ' {
+                        SoundKind::Space
+                    } else {
+                        SoundKind::Typed
+                    };
+                    push_ch(&mut s, kind, 1_000 + i as u32 * 150, c);
+                }
+                let _ = render_mono(&mut s, 60);
+                push_ch(&mut s, SoundKind::Typed, 2_500, ch);
+                s.v2.ring?;
+                let f = penta(TINE_BASE_HZ, i32::from(s.v2.walk()) + i32::from(s.song_key));
+                let x = render_mono(&mut s, 40);
+                let (strike_hz, strike_mag) = peak(&x[..1_920], 0.8 * f, 1.2 * f);
+                let (ring_hz, ring_mag) = peak(&x[7_200..19_200], 2.4 * f, 3.6 * f);
+                Some((
+                    f,
+                    strike_hz,
+                    ring_hz,
+                    20.0 * (ring_mag / strike_mag).log10(),
+                    ring_mag,
+                ))
+            };
+            let Some((f, strike_hz, ring_hz, ring_db, ring_mag)) = take(false) else {
+                continue;
+            };
+            rang += 1;
+            let twelfth = penta(
+                TINE_BASE_HZ,
+                i32::from({
+                    let mut s = synth();
+                    for (i, c) in "hello ".chars().enumerate() {
+                        let kind = if c == ' ' {
+                            SoundKind::Space
+                        } else {
+                            SoundKind::Typed
+                        };
+                        push_ch(&mut s, kind, 1_000 + i as u32 * 150, c);
+                    }
+                    push_ch(&mut s, SoundKind::Typed, 2_500, ch);
+                    s.v2.walk()
+                }) + FLOW_ECHO_OCTAVE_DEG
+                    + CAP_RING_LIFT_DEG,
+            );
+            let cents = |a: f32, b: f32| (1200.0 * (a / b).log2()).abs();
+            println!(
+                "`{ch}`: strike {strike_hz:.1} Hz (line {f:.1}), ring {ring_hz:.1} Hz \
+                 (twelfth {twelfth:.1}, x{:.3}), ring bin {ring_db:+.1} dB re the strike's onset bin",
+                ring_hz / f
+            );
+            assert!(
+                cents(strike_hz, f) < 25.0,
+                "`{ch}`: the strike sounded {strike_hz} Hz over a line at {f} Hz"
+            );
+            assert!(
+                cents(ring_hz, twelfth) < 25.0,
+                "`{ch}`: the ring sounded {ring_hz} Hz, not the twelfth {twelfth} Hz"
+            );
+            levels.push(ring_db);
+            let (_, _, octave_hz, _, octave_mag) = take(true).expect("the control rings too");
+            let below = 20.0 * (ring_mag / octave_mag).log10();
+            assert!(
+                below >= 12.0,
+                "negative control: with the ring on the octave the band's loudest pitch \
+                 ({octave_hz} Hz) is only {below:.1} dB under the twelfth's — the \
+                 measurement is not reading the ring"
+            );
+        }
+        assert_eq!(rang, 5, "fixture: only {rang} of the five capitals rang");
+        let (lo, hi) = levels
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(lo, hi), l| (lo.min(*l), hi.max(*l)));
+        println!("ring bins {lo:+.1} .. {hi:+.1} dB re the strike's onset over {rang} capitals");
+    }
+
+    /// ~~**THE CAPITAL'S RING IS LOCKED TO THE STRIKE'S OWN OCTAVE**~~
+    /// **THE CAPITAL'S RING IS A TWELFTH ON ITS OWN PHASE, AND A SHIFTED KEY
+    /// THAT DOES NOT RING STILL SPENDS THE RING'S DRAWS** (owner, 2026-09-20:
+    /// *"FORTE in a piano"* — [`Forte::ring`]; RE-PINNED AND RENAMED
+    /// 2026-09-27, owner: *"capitals yes make them speical"*, until then
+    /// `the_capital_ring_is_phase_locked_and_its_draws_are_spent_either_way`).
     ///
-    /// - locked (shipping): the spread is ≤ 1.0 dB;
-    /// - **NEGATIVE CONTROL** — `ring_unlocked`, the SAME four draws with the
-    ///   drawn phase kept: the spread is ≥ 3 dB. A pass that the control also
-    ///   passed would say nothing about the lock.
+    /// WHAT THIS PINNED UNTIL 2026-09-27: the ring's fundamental was
+    /// bit-for-bit the strike's [`P2_RATIO`] partial, forte put MORE level in
+    /// it, and on a drawn phase the octave a capital left behind was a per-key
+    /// lottery between cancelling and doubling — so the ring was locked to
+    /// that partial's phase, and its drawn-phase twin was the control.
+    ///
+    /// WHAT IT PINS NOW. The strike is the line's own note (the 2026-09-20
+    /// ruling, unchanged) and the ring is [`CAP_RING_LIFT_DEG`] past the
+    /// octave — a twelfth over this `W`'s C — on no partial of the strike's
+    /// tine, so it keeps its DRAWN phase and needs no lock: one bin of the
+    /// DFT at the ring's own frequency over 80-200 ms, divided by the TUNE
+    /// voice's gain so the seeded velocity cancels, spreads ≤ 1.0 dB over
+    /// five seeds (what is left at `3f` is forte's decaying FM sideband —
+    /// see [`CAP_RING_LIFT_DEG`]).
+    ///
+    /// - **NEGATIVE CONTROL** — `ring_at_octave`: the SAME four draws with
+    ///   the ring put back on the octave on its drawn phase spreads ≥ 3 dB.
+    ///   A ring that sat on a strike partial again would fail the pin, and a
+    ///   pass that the control also passed would say nothing.
     ///
     /// THE DRAWS. From one cloned line state under `TimbreStops::PLAIN` (no
     /// bloom or sparkle, whose own draws depend on the degree): a capital
@@ -18761,13 +19431,13 @@ for it up front.\n\
     /// does not, leave the seeded stream at the SAME point — and an unshifted
     /// key, which never drew for a ring, leaves it somewhere else.
     #[test]
-    fn the_capital_ring_is_phase_locked_and_its_draws_are_spent_either_way() {
+    fn the_capital_ring_is_a_twelfth_on_its_own_phase_and_its_draws_are_spent_either_way() {
         const SEEDS: [u32; 5] = [SEED, 0x5EED_1234, 0x504F_4F46, 0xCAFE_F00D, 0x0BAD_CAFE];
-        const LOCKED_SPREAD_CEIL_DB: f32 = 1.0;
-        const UNLOCKED_SPREAD_FLOOR_DB: f32 = 3.0;
-        let octave_bin = |seed: u32, unlocked: bool| -> f32 {
+        const OWN_PHASE_SPREAD_CEIL_DB: f32 = 1.0;
+        const OCTAVE_SPREAD_FLOOR_DB: f32 = 3.0;
+        let ring_bin = |seed: u32, at_octave: bool| -> f32 {
             let mut s = TrailSynth::new(SR, seed);
-            s.ring_unlocked = unlocked;
+            s.ring_at_octave = at_octave;
             s.set_v2_timbre_stops(TimbreStops::PLAIN);
             for (i, ch) in "hello ".chars().enumerate() {
                 let kind = if ch == ' ' {
@@ -18782,12 +19452,33 @@ for it up front.\n\
             let lead = s.voices[usize::from(s.v2.lead.expect("one strike").0)];
             let (slot, _) = s.v2.ring.expect("a word-opening capital rings");
             let ring = s.voices[usize::from(slot)];
+            let line = i32::from(s.v2.walk()) + i32::from(s.song_key);
             assert_eq!(
-                ring.p[0].f0, lead.p[1].f0,
-                "the ring IS the strike's octave"
+                lead.p[0].f0,
+                penta(TINE_BASE_HZ, line),
+                "the strike is the line's own note"
             );
-            assert_eq!(ring.p[0].f0, 2.0 * lead.p[0].f0);
             assert_eq!(ring.p[2].lvl, 0.0);
+            if at_octave {
+                assert_eq!(ring.p[0].f0, lead.p[1].f0, "control: the octave");
+            } else {
+                assert_eq!(
+                    ring.p[0].f0,
+                    penta(
+                        TINE_BASE_HZ,
+                        line + FLOW_ECHO_OCTAVE_DEG + CAP_RING_LIFT_DEG
+                    ),
+                    "the ring is the twelfth"
+                );
+                for p in lead.p.iter().filter(|p| p.lvl > 0.0) {
+                    let cents = 1200.0 * (ring.p[0].f0 / p.f0).log2();
+                    assert!(
+                        cents.abs() > 100.0,
+                        "the ring sits {cents:.0} cents from a strike partial at {} Hz",
+                        p.f0
+                    );
+                }
+            }
             let x = render_mono(&mut s, 20);
             let w = core::f32::consts::TAU * ring.p[0].f0 / SR;
             let body = &x[3_840..9_600];
@@ -18801,26 +19492,26 @@ for it up front.\n\
             let mag = (re * re + im * im).sqrt() / body.len() as f32;
             20.0 * (mag / (lead.gl * lead.gl + lead.gr * lead.gr).sqrt()).log10()
         };
-        let spread = |unlocked: bool| -> f32 {
-            let bins: Vec<f32> = SEEDS.iter().map(|s| octave_bin(*s, unlocked)).collect();
+        let spread = |at_octave: bool| -> f32 {
+            let bins: Vec<f32> = SEEDS.iter().map(|s| ring_bin(*s, at_octave)).collect();
             let (lo, hi) = bins
                 .iter()
                 .fold((f32::MAX, f32::MIN), |(lo, hi), b| (lo.min(*b), hi.max(*b)));
             println!(
-                "ring + P2 at 2f, unlocked {unlocked}: {bins:.2?} dB re the key — spread {:.2}",
+                "ring bin, at the octave {at_octave}: {bins:.2?} dB re the key — spread {:.2}",
                 hi - lo
             );
             hi - lo
         };
-        let (locked, unlocked) = (spread(false), spread(true));
+        let (own, octave) = (spread(false), spread(true));
         assert!(
-            locked <= LOCKED_SPREAD_CEIL_DB,
-            "the locked ring's octave wanders {locked:.2} dB over the seeds"
+            own <= OWN_PHASE_SPREAD_CEIL_DB,
+            "the twelfth's bin wanders {own:.2} dB over the seeds on its drawn phase"
         );
         assert!(
-            unlocked >= UNLOCKED_SPREAD_FLOOR_DB,
-            "negative control: on a DRAWN phase the octave wanders only {unlocked:.2} dB — \
-             the instrument cannot see the lottery the lock exists to end"
+            octave >= OCTAVE_SPREAD_FLOOR_DB,
+            "negative control: on the strike's octave the drawn ring wanders only \
+             {octave:.2} dB — the instrument cannot see the lottery a shared partial is"
         );
 
         // THE DRAWS.

@@ -2,33 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC / escape-sequence **policy engine data model** and built-in profiles.
+//! OSC / escape-sequence **policy engine**: the data model, the three built-in
+//! profiles, the decision-tree engine ([`engine::PolicyEngine`]) and the
+//! token-bucket rate limiter ([`limits`]).
 //!
-//! This crate is the Phase 0 scaffold for the Phase 2 policy engine described
-//! in `designs/2026-04-19-osc-policy-engine.md` (tracked by #7991). It
-//! hosts the data model, serde derives, the three built-in profiles, the
-//! decision-tree engine (#7992) and the canonical token-bucket rate limiter
-//! (#7995). Remaining work lands in follow-up issues:
-//!
-//! * #7992 — `PolicyEngine::evaluate` + decision tree + profile pre-compilation
-//! * #7993 — mirror-field invariant for the six `TerminalModes::allow_*`
-//!   booleans
-//! * #7994 — capability-module rewire
-//! * #7995 — canonical rate-limit data & handler wiring (see [`limits`]).
-//!   The `"response"` and `"palette"` entries in every built-in profile are
-//!   now the authoritative source for the 64 KiB/100 KiB/s response bucket
-//!   (from commit `2134b5559`) and the 16-pair OSC 4 / OSC 21 per-sequence
-//!   cap (from #7883). Handler sites consult the engine's `RateLimiterSet`
-//!   when one is installed via `Terminal::apply_policy_engine`, and fall
-//!   back to the pre-existing legacy constants otherwise.
-//! * #7996 — FFI (`aterm_policy_load_toml`)
-//! * #7997 — checkpoint v4 policy serialization
+//! It is live: the window installs a `standard`-profile engine on every
+//! session before its reader produces a byte (`aterm-gui` `spawn.rs`, via
+//! `Terminal::apply_policy_engine`), and `aterm-core`'s `policy_bridge.rs` routes
+//! the capability `try_mint` paths (responses, clipboard write/query, window ops,
+//! shell integration) through [`engine::PolicyEngine::evaluate`]. On a matching
+//! rule the engine's response is authoritative; on fallthrough the legacy
+//! `TerminalModes::allow_*` bit is, so the two never need mirroring. The
+//! `"response"` and `"palette"` rate limits of every built-in profile are the
+//! authoritative source for the 64 KiB/100 KiB/s response bucket and the
+//! 16-pair OSC 4 / OSC 21 per-sequence cap; with no engine installed the
+//! handlers fall back to the legacy constants. A checkpoint deliberately does
+//! not carry the policy — the host re-installs it after a restore (`aterm-core`
+//! `terminal/checkpoint.rs`).
 //!
 //! ## Profile refinement invariant
 //!
 //! Every profile is a complete [`Policy`] document. The three built-ins
 //! satisfy the ordering `Hardened ⊆ Standard ⊆ Permissive` over the
-//! unmatched-default response (§4.5 of the design, TLA+ invariant T2). See
+//! unmatched-default response, pinned by the refinement tests in `tests.rs`. See
 //! [`profiles::permissive`], [`profiles::standard`], [`profiles::hardened`].
 //!
 //! ## OriginTag
@@ -67,9 +63,6 @@ pub mod selector;
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(kani)]
-mod kani_proofs;
 
 /// Policy schema version shipped by this crate. The reader rejects any value
 /// other than this constant (§5.1 of the design).
@@ -199,13 +192,11 @@ pub enum Profile {
 // Response
 // ---------------------------------------------------------------------------
 
-/// Policy decision returned by `PolicyEngine::evaluate` (landing in #7992).
+/// Policy decision returned by [`engine::PolicyEngine::evaluate`].
 ///
-/// The engine itself is stubbed in this crate — this enum is the wire-format
-/// schema. The `Ask` and `Rewrite` variants carry no inline payload in the
-/// TOML schema; the referenced prompt / rewrite action is named by a sibling
-/// rule field ([`Rule::prompt_id`]) or a built-in rewrite table (resolved in
-/// #7992). This matches Appendix A of the design.
+/// The `Ask` and `Rewrite` variants carry no inline payload in the TOML
+/// schema; the referenced prompt is named by a sibling rule field
+/// ([`Rule::prompt_id`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -219,7 +210,6 @@ pub enum Response {
     /// Delegate to the host for user consent. See `Rule::prompt_id`.
     Ask,
     /// Apply a built-in rewrite (e.g. strip control bytes from an OSC 52 set).
-    /// The rewrite action table is resolved by the engine (#7992).
     Rewrite,
 }
 
@@ -255,7 +245,7 @@ pub struct Defaults {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    /// Sequence selector. Parsed by `SequenceSelector::parse` (#7992).
+    /// Sequence selector. Parsed by `SequenceSelector::parse`.
     /// Currently stored as the raw string form.
     pub sequence: String,
     /// Minimum acceptable origin. Origins that dominate this tag are admitted;
@@ -278,9 +268,8 @@ pub struct Rule {
 
 /// Named token-bucket configuration (§3.1).
 ///
-/// Mirrors the existing response + OSC 4/21 bucket constants. Actual bucket
-/// state is owned by the engine (landing in #7995); this struct is purely
-/// the schema.
+/// Mirrors the existing response + OSC 4/21 bucket constants. Bucket state is
+/// owned by the engine's `RateLimiterSet`; this struct is purely the schema.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RateLimit {
@@ -303,9 +292,9 @@ pub struct RateLimit {
 
 /// Root policy document (§3.1 + Appendix A).
 ///
-/// Loaded from TOML at rest, serialized to bincode in checkpoints. The exact
-/// encoding paths land in #7996 (FFI) and #7997 (checkpoint v4); this struct
-/// is the canonical schema both paths target.
+/// The TOML document a policy file parses into ([`Policy::to_toml`] writes it
+/// back). Checkpoints deliberately omit it; the host re-installs the engine
+/// after a restore.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Policy {

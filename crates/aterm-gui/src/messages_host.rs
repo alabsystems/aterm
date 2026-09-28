@@ -473,7 +473,7 @@ fn message_view(
             // could never be pressed again, and a dead Primary drawn in the
             // accent read as the thing to do. An intent that can come back
             // (`Install now`, `Open log`) stays, disabled while it cannot.
-            .filter(|(_, intent)| live.is_some() || !intent.ends_with_row())
+            .filter(|(_, intent)| live.is_some() || rec.still_offers(intent))
             .filter_map(|(k, intent)| {
                 Some(MessageActionView {
                     index: u8::try_from(k).ok()?,
@@ -501,8 +501,8 @@ fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::OpenSettings { .. }, false) => "Could not open Settings".to_string(),
         (Intent::OpenConfigEditor { .. }, true) => "Opened aterm.toml".to_string(),
         (Intent::OpenConfigEditor { .. }, false) => "Could not open aterm.toml".to_string(),
-        (Intent::OpenPath { .. }, true) => "Opened crash log".to_string(),
-        (Intent::OpenPath { .. }, false) => "Could not open the crash log".to_string(),
+        (Intent::OpenPath { .. }, true) => "Opened the log".to_string(),
+        (Intent::OpenPath { .. }, false) => "Could not open the log".to_string(),
         (Intent::OpenSystemPane { .. }, true) => "Opened System Settings".to_string(),
         (Intent::OpenSystemPane { .. }, false) => "System Settings did not open".to_string(),
         (Intent::ApplyUpdate { .. }, true) if applies => "Installing the update".to_string(),
@@ -519,8 +519,10 @@ fn act_feedback(intent: &Intent, performed: bool, applies: bool) -> String {
         (Intent::ShowTab { tab, .. }, true) => format!("Showed tab {tab}"),
         (Intent::ShowTab { .. }, false) => "That tab is gone".to_string(),
         // Written off this thread: what it did lands on the page as a record.
-        (Intent::AgentUpgrade { tab, .. }, true) => {
-            format!("{} asked for tab {tab}", intent.label())
+        // Queued, not done (ruling 270): what it did lands as the pressed
+        // entry's own words, or as a row if the harness refuses it.
+        (Intent::AgentUpgrade { .. }, true) => {
+            format!("Sent {}; what it did shows in this log", intent.label())
         }
         (Intent::AgentUpgrade { .. }, false) => "The upgrade no longer takes that word".to_string(),
     }
@@ -1004,6 +1006,18 @@ impl App {
             self.sync_messages();
         }
         withdrawn
+    }
+
+    /// The person's word on a live row was TAKEN (ruling 270): it retires
+    /// `Answered { label }` — the record says `answered: <label>`, never
+    /// `took` — for a capsule whose word is written off this thread and so
+    /// could not close the row at the press. `false` when `id` is not live.
+    pub(crate) fn answer_message(&mut self, id: MessageId, label: &str) -> bool {
+        let answered = self.messages.answer(id, label, Instant::now());
+        if answered {
+            self.sync_messages();
+        }
+        answered
     }
 
     /// After any message input, on the timer-wake sweep, at the park and
@@ -4022,7 +4036,7 @@ mod tests {
         assert_eq!(
             app.perform_message_act(wid, crash.raw(), 0),
             MessageActOutcome::Refused {
-                feedback: "Could not open the crash log".to_string()
+                feedback: "Could not open the log".to_string()
             }
         );
         assert_eq!(

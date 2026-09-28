@@ -23,18 +23,6 @@ pub const MANIFEST_ASSET: &str = "aterm-appcast.toml";
 /// Detached signature paired with [`MANIFEST_ASSET`] when Tier SIG is active.
 pub const MANIFEST_SIG_ASSET: &str = "aterm-appcast.toml.sig";
 
-/// Deterministic historical name used by the single-head channel migration.
-/// Renaming metadata preserves the exact bytes while removing old manifests
-/// from the client's exact-name discovery surface.
-pub fn archived_manifest_asset(tag: &str) -> String {
-    format!("aterm-appcast-{tag}.toml")
-}
-
-/// Historical signature name paired with [`archived_manifest_asset`].
-pub fn archived_manifest_signature_asset(tag: &str) -> String {
-    format!("{}.sig", archived_manifest_asset(tag))
-}
-
 /// Everything the §4 field set derives from — all resolved by the caller
 /// (publish.rs), so this module stays pure and fixture-testable.
 pub struct ManifestInputs<'a> {
@@ -65,10 +53,10 @@ pub struct ManifestInputs<'a> {
     /// channel** (`[workspace.metadata.aterm] update_channel`) whenever one is
     /// configured, NOT the private publish repo.
     ///
-    /// The same manifest bytes are attached to both the private release and the
-    /// mirrored public one, so this single string has to name the repository a
-    /// reader can actually fetch from. Naming the private repo produced a public
-    /// appcast whose `url` 404s for everyone without a credential.
+    /// The manifest bytes are published on the channel, so this single string has
+    /// to name the repository a reader can actually fetch from. Naming the private
+    /// repo (when the cut still published there first) produced a public appcast
+    /// whose `url` 404s for everyone without a credential.
     ///
     /// LOAD-BEARING on the credential-less update lane (since 2026-09-03): the
     /// web-lane client (`aterm_update::github::web_container_url_agrees`)

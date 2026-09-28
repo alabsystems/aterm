@@ -271,23 +271,27 @@
 //! "none"`, or on a foot that is no `Yes`/`No` permission box's, it is
 //! handed over.
 //!
-//! **What is not closed.** Git reads honour the repository's config and
-//! `.gitattributes` (`core.fsmonitor`, `diff.external`, a textconv driver),
-//! and a worker in accept-edits mode can write both inside its cwd: the
-//! read-only rule approves `git status` there all the same (the classifier
-//! refuses `--git-dir`/`--work-tree` and the driver flags, but approves
-//! `git -C <dir>` reads, whose repository's config is as writable). An
-//! owner decision on whether git reads stay approved under
-//! `approve = "safe"` is open (lane B2's review raised it again; nothing
-//! here decides it). Recommended, not decided: escalate every git invocation
-//! under that level, in this module's Bash rule, leaving the shared
-//! classifier's read-only label (which the supervise event stream reports)
-//! alone.
+//! **Git reads** (owner ruling, 2026-09-25). Git reads honour the
+//! repository's config and `.gitattributes` (`core.fsmonitor`,
+//! `diff.external`, a textconv driver), and a worker in accept-edits mode can
+//! write both inside its cwd. So under the safe rules a line the classifier
+//! reads as read-only is approved by the read-only rule (and the rm rule)
+//! only when no git read on it would load configuration that runs a program:
+//! [`super::git_config`] asks the worker's own git, in the worker's own
+//! environment ([`ApprovalCtx::worker`]), for the effective configuration in
+//! every directory the line's git reads may run in and escalates naming the
+//! key — which full power ([`Approve::All`]) then answers all the same, the
+//! key kept as its `unproven`. Not a blanket escalation — that would
+//! interrupt the person on every `git status` under `approve = "safe"`. Two
+//! refinements decided 2026-09-26 (owner's standing direction): a pager is
+//! exempt, and a filter driver counts only where the attributes select it
+//! ([`super::git_config`]).
 //!
-//! Pure but for the Read rule's one look at the filesystem (where the
-//! path's symlinks lead): no socket, no clock, no environment. The caller supplies the screen
-//! rows, the [`Reading`] of them and an [`ApprovalCtx`] (the session's cwd,
-//! the permission mode its footer last showed, the approve level and roots).
+//! Pure but for the Read rule's one look at the filesystem (where the path's
+//! symlinks lead) and the git rule's `git config` in the directories a git read
+//! runs in ([`ApprovalCtx::worker`]): no socket, no clock. The caller supplies the
+//! screen rows, the [`Reading`] of them and an [`ApprovalCtx`] (the session's
+//! cwd, the permission mode its footer last showed, the approve level and roots).
 
 use std::path::{Path, PathBuf};
 
@@ -297,6 +301,7 @@ use aterm_phase::prompt::{
 use aterm_phase::{Phase, Program, Reading, anchor};
 
 use super::super::config::Approve;
+use super::git_config::{GitView, WorkerEnv, git_reads, hazard};
 use super::guard::row_guard;
 use super::rm_breaker::{RmScope, ScratchRoot, abs_components, clip, resolve_rm_line};
 use crate::supervise::classify::{classify_command_with, classify_except_rm, glob_match};
@@ -624,6 +629,16 @@ pub struct ApprovalCtx {
     /// The `python3 <script>` globs the classifier treats as reads (none by
     /// default).
     pub python_allow: Vec<String>,
+    /// The worker's environment ([`WorkerEnv`]), which a git read's
+    /// configuration is read with ([`super::git_config`]) — or why it could
+    /// not be read, which every git read then escalates with. Unread until
+    /// the loop reads it for a box that may run git ([`worker_unread`]).
+    pub worker: Result<WorkerEnv, String>,
+    /// Where the session's Bash tool may stand beyond [`Self::cwd`], as Claude
+    /// Code's transcripts last recorded it
+    /// ([`crate::harness::footer::shell_cwds`]): a git read is checked there
+    /// too. Empty until the loop reads it for a box that may run git.
+    pub shell_cwds: Vec<PathBuf>,
 }
 
 impl ApprovalCtx {
@@ -670,6 +685,8 @@ impl ApprovalCtx {
             scratch_roots,
             tmpdir,
             python_allow: Vec::new(),
+            worker: worker_unread(),
+            shell_cwds: Vec::new(),
         };
         ctx.set_trust_roots(&defaults, uid);
         ctx
@@ -693,6 +710,21 @@ impl ApprovalCtx {
         ] {
             self.read_roots.extend(ScratchRoot::dir(Path::new(sys)));
         }
+    }
+}
+
+/// What [`ApprovalCtx::worker`] holds before the loop reads the worker's
+/// environment: nothing, so a git read escalates — but in this crate's own
+/// unit-test build a hermetic stand-in ([`WorkerEnv::hermetic`]), so no
+/// test's verdict depends on the developer's git config.
+fn worker_unread() -> Result<WorkerEnv, String> {
+    #[cfg(test)]
+    {
+        Ok(WorkerEnv::hermetic(None))
+    }
+    #[cfg(not(test))]
+    {
+        Err("the worker's environment was not read".to_string())
     }
 }
 
@@ -1248,6 +1280,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
                 ));
             }
         }
+        if let Err(why) = git_reads_clear(&readings, None, ctx) {
+            return Decision::escalate(format!("rm circuit breaker: {why}"));
+        }
         return match once_choice(prompt, rows) {
             Ok(choice) => Decision::Approve {
                 rule_id: RULE_RM_BREAKER,
@@ -1268,6 +1303,9 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
     if let Err(why) = read_only_every_reading(&readings, &ctx.python_allow) {
         return Decision::escalate(why);
     }
+    if let Err(why) = git_reads_clear(&readings, prompt.runs_on().as_deref(), ctx) {
+        return Decision::escalate(why);
+    }
     match once_choice(prompt, rows) {
         Ok(choice) => Decision::Approve {
             rule_id: RULE_READ_ONLY,
@@ -1278,6 +1316,73 @@ fn bash(prompt: &PromptV2, rows: &[String], ctx: &ApprovalCtx) -> Decision {
         },
         Err(why) => Decision::escalate(why),
     }
+}
+
+/// `Ok` when no git read on any reading of a read-only line would load
+/// configuration that runs a program ([`super::git_config`]); `Err` names the
+/// key, the hook, or why the check could not be made. A box that runs on
+/// another machine (`runs_on`) has that machine's configuration, which this
+/// one cannot read.
+fn git_reads_clear(
+    readings: &[String],
+    runs_on: Option<&str>,
+    ctx: &ApprovalCtx,
+) -> Result<(), String> {
+    let mut seen: Vec<(PathBuf, GitView)> = Vec::new();
+    let mut cwds = vec![ctx.cwd.clone()];
+    cwds.extend(ctx.shell_cwds.iter().filter(|d| **d != ctx.cwd).cloned());
+    for line in readings {
+        let Some(reads) = git_reads(line, &cwds, ctx.home.as_deref())? else {
+            continue;
+        };
+        if let Some(machine) = runs_on {
+            return Err(format!(
+                "a git read on {machine}: the configuration it loads is that machine's"
+            ));
+        }
+        if !ctx.cwd_known {
+            return Err("a git read with the session's cwd unknown (meta cwd=-)".to_string());
+        }
+        if let Some(why) = reads.remote.clone() {
+            return Err(why);
+        }
+        let worker = ctx
+            .worker
+            .as_ref()
+            .map_err(|why| format!("a git read whose environment is unknown: {why}"))?;
+        worker.settings_env(&ctx.cwd)?;
+        let writes = |dir: &Path| worker_writes(ctx, dir);
+        for dir in &reads.dirs {
+            if !seen.iter().any(|(d, _)| d == dir) {
+                seen.push((dir.clone(), worker.view(dir, &writes)?));
+            }
+            let view = &seen.iter().find(|(d, _)| d == dir).expect("just seen").1;
+            if let Some(why) = hazard(view, &reads) {
+                return Err(why);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether the worker may write under `dir` without anyone approving it — so
+/// a `git` there is the worker's to choose ([`WorkerEnv::view`]): the
+/// session's cwd and every directory its Bash tool stands in (an accept-edits
+/// worker writes there), and the scratch roots (temp directories, and where
+/// the rm rule itself deletes). Judged on `dir` as written and as it
+/// resolves, against the directories as written and as they resolve.
+fn worker_writes(ctx: &ApprovalCtx, dir: &Path) -> bool {
+    let resolved = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let forms = [dir.to_path_buf(), resolved(dir)];
+    let bases: Vec<PathBuf> = std::iter::once(&ctx.cwd)
+        .chain(&ctx.shell_cwds)
+        .flat_map(|b| [b.clone(), resolved(b)])
+        .collect();
+    forms.iter().any(|d| {
+        bases.iter().any(|b| d.starts_with(b))
+            || abs_components(&d.to_string_lossy())
+                .is_some_and(|comps| ctx.scratch_roots.iter().any(|r| r.holds(&comps)))
+    })
 }
 
 /// How a reason names a reading: by the join it has.

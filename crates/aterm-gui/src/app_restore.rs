@@ -28,6 +28,72 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+/// Whether this platform tracks a window's NORMAL (un-maximized) frame, so a
+/// maximized window's capture can persist the frame it restores DOWN to. On
+/// Windows and Linux (X11 / Wayland) maximize is a window-manager show state that
+/// winit reports and re-applies; the apply side places the normal frame and
+/// maximizes LAST, and the window manager then remembers that frame for
+/// restore-down. macOS is NOT wired: its "maximize" is NSWindow zoom, which
+/// animates, and whether `is_maximized` (isZoomed) holds through the
+/// animation's intermediate `Moved`/`Resized` frames has not been measured — if
+/// it does not, the tracker would record an intermediate frame as the normal
+/// one. Until that is measured on a real window, a macOS window reopens at the
+/// frame it was showing, zoomed or not. (The Linux wiring — `note_normal_origin`
+/// on `Moved`, `note_normal_grid` at the grid commit — is likewise unrun on a
+/// Linux host; the tracker's rule is [`NormalFrame::note_origin`] /
+/// [`NormalFrame::note_grid`], tested here.)
+pub(crate) const TRACKS_NORMAL_FRAME: bool = !cfg!(target_os = "macos");
+
+/// A window's last NOT-maximized frame: its origin (when the platform reports
+/// one — Wayland does not) and its grid. Updated on every `Moved` and every
+/// committed grid while the window is not maximized.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct NormalFrame {
+    pub(crate) origin: Option<(i32, i32)>,
+    pub(crate) rows: u16,
+    pub(crate) cols: u16,
+}
+
+impl NormalFrame {
+    /// The window moved to `origin` while showing `maximized`: only a move of
+    /// the NOT-maximized window is its normal origin (a maximize moves it to the
+    /// monitor corner, which restore-down must not return to).
+    pub(crate) fn note_origin(&mut self, maximized: bool, origin: (i32, i32)) {
+        if !maximized {
+            self.origin = Some(origin);
+        }
+    }
+
+    /// A grid of `(rows, cols)` was committed while showing `maximized`: only
+    /// the NOT-maximized window's grid is its normal one.
+    pub(crate) fn note_grid(&mut self, maximized: bool, (rows, cols): (u16, u16)) {
+        if !maximized {
+            self.rows = rows;
+            self.cols = cols;
+        }
+    }
+}
+
+/// What a restore capture persists for one window's frame: `(origin, (rows,
+/// cols))`. A window that is showing MAXIMIZED persists its normal frame (the
+/// apply side re-maximizes it after placing that frame, so restore-down lands
+/// where the user had it); every other window persists what it is showing. A
+/// maximized window with no known normal origin persists none, letting the
+/// window manager place it, rather than the maximized frame's corner.
+#[must_use]
+pub(crate) fn captured_frame(
+    live_origin: Option<(i32, i32)>,
+    live_grid: (u16, u16),
+    maximized: Option<bool>,
+    normal: NormalFrame,
+) -> (Option<(i32, i32)>, (u16, u16)) {
+    if maximized == Some(true) {
+        (normal.origin, (normal.rows, normal.cols))
+    } else {
+        (live_origin, live_grid)
+    }
+}
+
 /// WHICH PROCESS minted the `local_id`s of the descriptor being rebuilt — and so
 /// whether one of them may name a live handle. The two sources look identical on
 /// the wire (`TerminalLeafRestore` is one type) and only the caller knows which
@@ -122,6 +188,17 @@ pub(crate) fn take_session0_shell(
     }
 }
 
+/// Whether this process's layout is its own to journal: the first frame is on
+/// glass, no previous layout is still waiting to be rebuilt, and no update
+/// handoff is waiting for its Commit.
+pub(crate) fn crash_journal_writable(
+    first_present_done: bool,
+    restore_pending: bool,
+    handoff_pending: bool,
+) -> bool {
+    first_present_done && !restore_pending && !handoff_pending
+}
+
 /// Mint recovery authority only from the already-validated typed descriptor.
 /// Its copyable metadata is deliberately never parsed to recover a path/route.
 fn recovery_capability(
@@ -208,17 +285,36 @@ impl App {
                         None => (pos, None),
                     }
                 };
-                // Off Windows the field stays un-captured (`None`): the macOS
-                // strip keeps its zoom/solo-band semantics untouched, and the
-                // Unix seamless commit's topology equality must never see a live
-                // show-state bit it did not normalize (see
-                // `commit_layout_topology`). Wiring those platforms up is a
-                // deliberate follow-up, not an oversight.
+                // Off Windows: the show state is winit's, and a maximized
+                // window's origin is its tracked NORMAL origin
+                // (`captured_frame`). macOS captures no maximized bit by design
+                // (`TRACKS_NORMAL_FRAME`); its full-screen, minimized and stack
+                // state is the `show` capture below. The Unix seamless commit's topology
+                // equality normalizes the bit (`commit_layout_topology`), so a
+                // zoom during a handoff never reads as a structural change.
                 #[cfg(not(windows))]
-                let (pos, maximized) = (
-                    ws.os_window.as_ref().and_then(|w| w.outer_position().ok()),
-                    None::<bool>,
-                );
+                let (pos, maximized) = {
+                    let live = ws
+                        .os_window
+                        .as_ref()
+                        .and_then(|w| w.outer_position().ok())
+                        .map(|p| (p.x, p.y));
+                    let maximized = if TRACKS_NORMAL_FRAME {
+                        ws.os_window.as_ref().map(|w| w.is_maximized())
+                    } else {
+                        None
+                    };
+                    let (origin, _) =
+                        captured_frame(live, (ws.rows, ws.cols), maximized, ws.normal_frame);
+                    (
+                        origin.map(|(x, y)| winit::dpi::PhysicalPosition::new(x, y)),
+                        maximized,
+                    )
+                };
+                // The GRID half, on every platform: a maximized window persists
+                // its normal grid, so restore-down is the size the user had.
+                let (rows, cols) =
+                    captured_frame(None, (ws.rows, ws.cols), maximized, ws.normal_frame).1;
                 // THE macOS SHOW STATE (gap #29): full screen and minimized off
                 // the window itself — winit's full-screen state, and
                 // `isMiniaturized` through this window's own handle, reached
@@ -241,9 +337,9 @@ impl App {
                     self.frontmost_window == Some(wid),
                     self.carried_fullscreen_pending(wid),
                 );
-                // Everywhere else: not captured, so a restore changes nothing.
-                // (Windows carries its maximized state above; its minimized and
-                // full-screen state, and Linux's, are a follow-up.)
+                // Everywhere else no show state is captured — Windows and Linux
+                // carry only the maximized bit above — so a restore changes
+                // nothing here.
                 #[cfg(not(target_os = "macos"))]
                 let show = {
                     let _ = (index, wid);
@@ -297,8 +393,8 @@ impl App {
                     }
                 }
                 restore::WindowLayout {
-                    rows: ws.rows,
-                    cols: ws.cols,
+                    rows,
+                    cols,
                     active_tab: ws.tabs.active,
                     outer_x: pos.map(|p| p.x),
                     outer_y: pos.map(|p| p.y),
@@ -470,6 +566,7 @@ impl App {
                             .pool
                             .get(terminal.session)
                             .and_then(|s| s.identity.clone()),
+                        agent: None,
                     },
                 ))
             }
@@ -641,6 +738,27 @@ impl App {
         }
     }
 
+    /// The agent pool session `id` hosts, as the supervisor host last read it
+    /// ([`crate::harness_host::published_snapshot`]), in the form a restore
+    /// leaf carries — for the crash journal ([`crate::crash_journal`]) and a
+    /// restart's quit layout ([`crate::system_quit`]).
+    pub(crate) fn hosted_agent(&self, id: u64) -> Option<restore::AgentRestore> {
+        let sid = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            g.by_local(id)?.sid.as_str().to_string()
+        };
+        let snap = crate::harness_host::published_snapshot(&sid)?;
+        Some(restore::AgentRestore {
+            pid: snap.pid,
+            start: snap.start,
+            program: snap.program.to_string_lossy().into_owned(),
+            argv: snap.argv,
+            session: snap.session,
+            cwd: snap.cwd,
+            version: snap.version,
+        })
+    }
+
     /// A pane session's persisted `(cwd, title)`: the engine's OSC-7 cwd and OSC-0/2
     /// title, read under the session lock. An unknown id (can't happen while the pane
     /// tree and pool are in sync) degrades to empty metadata, never a panic at quit.
@@ -669,6 +787,46 @@ impl App {
         })
     }
 
+    /// THE CRASH JOURNAL'S CAPTURE (PTY keeper P1, [`crate::crash_journal`]), on
+    /// the way to every wait. It follows `restore_session` exactly as the quit's
+    /// layout write does — off, and the journal is withdrawn — and writes nothing
+    /// until this process's layout is its own: after the first frame, once the
+    /// deferred restore has rebuilt the previous layout, and — a self-update's
+    /// successor — only after its Commit (before it, the outgoing process owns
+    /// the sessions, and a refused candidate is reaped with SIGKILL). Then a
+    /// capture runs only when the lane says one is due (something other than a
+    /// timer woke the loop, and the write interval has passed), and hands the
+    /// writer an image only when it differs from the last.
+    pub(crate) fn tick_crash_journal(&mut self, now: std::time::Instant) {
+        if !self.crash_journal.is_active() {
+            return;
+        }
+        if !self.config.restore_session_or_default() {
+            self.crash_journal.withdraw();
+            return;
+        }
+        if !crash_journal_writable(
+            self.first_present_done,
+            self.pending_restore.is_some() || !self.seamless_adopt.is_empty(),
+            self.incoming_handoff_pending,
+        ) || !self.crash_journal.capture_due(now)
+        {
+            return;
+        }
+        // The layout, and on each leaf the agent its session hosts: what an
+        // end nobody chose leaves the next launch to relaunch (P6a, owner
+        // direction 2026-09-27).
+        let mut manifest = self.capture_restore_manifest();
+        manifest.fill_agents(&|id| self.hosted_agent(id));
+        let written = self.crash_journal.offer(manifest, now);
+        aterm_log::debug!(
+            "crash journal: capture {} {} (images {})",
+            self.crash_journal.captures,
+            if written { "handed over" } else { "unchanged" },
+            self.crash_journal.writes
+        );
+    }
+
     /// Rebuild the previous quit's layout (one-shot: drains `pending_restore`; a second
     /// `resumed` no-ops). Called after the first OS window is attached, so extra
     /// windows can create their surfaces and every spawned pane has a live event loop.
@@ -693,6 +851,58 @@ impl App {
         // just because its exact pane could not be reconstructed. A no-op on a cold
         // restore (`seamless_adopt` is empty).
         self.adopt_orphan_shells_as_tabs(&handed_off_leaves);
+        self.hand_restored_agents();
+    }
+
+    /// Hand the agents the restore pass found ([`Self::carry_restored_identity`])
+    /// to the supervisor host, which relaunches each in the tab that now
+    /// stands for it ([`crate::harness_host::HostHandle::relaunch_restored`]):
+    /// the tab's sid and its new shell, and what the live layout carried of
+    /// the agent. A session no longer here (its leaf failed to rebuild) is
+    /// dropped; with no host (the harness off) nothing is relaunched.
+    fn hand_restored_agents(&mut self) {
+        let restored = self.take_restored_agents();
+        if restored.is_empty() {
+            return;
+        }
+        if let Some(host) = &self.harness {
+            host.relaunch_restored(restored);
+        }
+    }
+
+    /// The restore pass's agents ([`Self::carry_restored_identity`]) as the
+    /// host relaunches them: each tab's sid, and a snapshot naming that tab,
+    /// its shell, and what the live layout carried of the agent. Taken: a
+    /// second call finds none.
+    fn take_restored_agents(&mut self) -> Vec<(String, aterm_agent::harness::relaunch::Snapshot)> {
+        let taken = std::mem::take(&mut self.restored_agents);
+        if taken.is_empty() {
+            return Vec::new();
+        }
+        {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            taken
+                .into_iter()
+                .filter_map(|(id, agent)| {
+                    let sid = g.by_local(id)?.sid.as_str().to_string();
+                    let shell = u32::try_from(self.pool.get(id)?.pid).ok()?;
+                    Some((
+                        sid.clone(),
+                        aterm_agent::harness::relaunch::Snapshot {
+                            tab: sid,
+                            pid: agent.pid,
+                            start: agent.start,
+                            shell,
+                            program: std::path::PathBuf::from(agent.program),
+                            argv: agent.argv,
+                            session: agent.session,
+                            cwd: agent.cwd,
+                            version: agent.version,
+                        },
+                    ))
+                })
+                .collect()
+        }
     }
 
     /// SEAMLESS CONNECTION RE-MINT (design §1.4#6): re-establish the manifest's
@@ -1936,6 +2146,21 @@ impl App {
         filling: FillingShell<'_>,
         ids: LeafIds,
     ) {
+        // THE AGENT THE LEAF HOSTED (2026-09-27): a cold restore of the live
+        // layout names the agent a crash of aterm took from this tab; the
+        // session that fills the leaf is where it is relaunched, once the
+        // pass is over ([`Self::hand_restored_agents`]). Never on a seamless
+        // handoff: its agents never stopped.
+        if ids == LeafIds::Retired
+            && !self.handoff_successor
+            && let Some(agent) = &leaf.agent
+        {
+            let session = match &filling {
+                FillingShell::Registered(session) => *session,
+                FillingShell::Unregistered(session) => session.id,
+            };
+            self.restored_agents.push((session, (**agent).clone()));
+        }
         let filling_adopted_as = match filling {
             FillingShell::Registered(session) => self
                 .pool
@@ -2624,6 +2849,91 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+
+    /// A MAXIMIZED window persists the frame it restores DOWN to — its tracked
+    /// normal origin and grid — so the reopened window is placed there and then
+    /// re-maximized, and restore-down lands where the user had it. The control:
+    /// a window that is not maximized (or whose show state is unknown) persists
+    /// exactly what it is showing.
+    #[test]
+    fn a_maximized_capture_persists_the_normal_frame() {
+        let normal = super::NormalFrame {
+            origin: Some((120, 80)),
+            rows: 30,
+            cols: 100,
+        };
+        let live_origin = Some((-8, -8)); // the maximized frame's corner
+        let live_grid = (62, 240);
+        assert_eq!(
+            super::captured_frame(live_origin, live_grid, Some(true), normal),
+            (Some((120, 80)), (30, 100)),
+            "maximized: the normal frame, never the maximized corner and grid"
+        );
+        for shown in [Some(false), None] {
+            assert_eq!(
+                super::captured_frame(live_origin, live_grid, shown, normal),
+                (live_origin, live_grid),
+                "not maximized ({shown:?}): the frame as shown"
+            );
+        }
+        // A maximized window whose normal origin was never observed (Wayland
+        // reports none) persists NO origin — the window manager places it —
+        // rather than the maximized frame's corner.
+        let unplaced = super::NormalFrame {
+            origin: None,
+            ..normal
+        };
+        assert_eq!(
+            super::captured_frame(live_origin, live_grid, Some(true), unplaced),
+            (None, (30, 100))
+        );
+    }
+
+    /// The tracker through a maximize and a restore-down, as the `Moved` and
+    /// grid-commit events drive it: the normal frame follows every move and
+    /// re-grid of the NOT-maximized window, ignores the maximize's corner and
+    /// grown grid, and the capture of the maximized window persists the frame
+    /// the user had. After restore-down the window is normal again and the
+    /// tracker follows it once more. The negative control: a tracker that took
+    /// the maximized events too would persist the monitor corner.
+    #[test]
+    fn the_tracker_keeps_the_normal_frame_through_a_maximize_and_restore() {
+        let mut frame = super::NormalFrame {
+            origin: None,
+            rows: 24,
+            cols: 80,
+        };
+        // Placed and resized by the user, not maximized.
+        frame.note_origin(false, (300, 200));
+        frame.note_grid(false, (30, 100));
+        frame.note_origin(false, (320, 210));
+        // Maximized: the window manager moves it to the corner and grows the grid.
+        frame.note_origin(true, (0, 0));
+        frame.note_grid(true, (62, 240));
+        assert_eq!(
+            super::captured_frame(Some((0, 0)), (62, 240), Some(true), frame),
+            (Some((320, 210)), (30, 100)),
+            "a maximized capture persists the frame the user had"
+        );
+        // Restored down: normal again, and the tracker follows.
+        frame.note_origin(false, (320, 210));
+        frame.note_grid(false, (30, 100));
+        frame.note_origin(false, (500, 50));
+        assert_eq!(
+            super::captured_frame(Some((500, 50)), (30, 100), Some(false), frame),
+            (Some((500, 50)), (30, 100))
+        );
+        assert_eq!(frame.origin, Some((500, 50)));
+        // Negative control: fed the maximized events as normal ones, the capture
+        // would persist the corner and the grown grid.
+        let mut naive = frame;
+        naive.note_origin(false, (0, 0));
+        naive.note_grid(false, (62, 240));
+        assert_ne!(
+            super::captured_frame(Some((0, 0)), (62, 240), Some(true), naive),
+            (Some((500, 50)), (30, 100))
+        );
+    }
     use crate::{App, CloseOutcome, WindowId, pane, restore};
 
     #[test]
@@ -3019,6 +3329,7 @@ mod tests {
             attention: Some("⚠ waiting on approval".to_string()),
             questions: Some("recommended".to_string()),
             identity: None,
+            agent: None,
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -3043,6 +3354,7 @@ mod tests {
             attention: None,
             questions: None,
             identity: None,
+            agent: None,
         };
         App::seed_restored_user_meta(&session, &bare);
         assert_eq!(
@@ -3068,6 +3380,7 @@ mod tests {
             // A hand-edited policy outside the four words is dropped.
             questions: Some("whatever claude thinks".to_string()),
             identity: None,
+            agent: None,
         };
         let session = crate::stub_session(9);
         App::seed_restored_user_meta(&session, &leaf);
@@ -3570,6 +3883,7 @@ mod tests {
                         attention: None,
                         questions: None,
                         identity: None,
+                        agent: None,
                     }),
                 )),
                 second: Box::new(restore::RestoredSplitTree::leaf(
@@ -3663,6 +3977,7 @@ mod tests {
                 attention: None,
                 questions: None,
                 identity: None,
+                agent: None,
             },
         ))
     }
@@ -4168,6 +4483,7 @@ mod tests {
             attention: None,
             questions: None,
             identity: None,
+            agent: None,
         }
     }
 
@@ -4396,8 +4712,7 @@ mod tests {
     /// seeds it. An icon-only seed moves no label, activity or connection
     /// revision the cache is keyed on; it recomposes only because the graft
     /// records its `meta-change`, which moves the timeline high-water mark.
-    /// (Seeded without that record, the tooltip stayed
-    /// "zsh\nstate: spawning\n\nspawned · just now".)
+    /// (Seeded without that record, the tooltip stayed without the icon.)
     #[test]
     fn a_graft_recomposes_the_chrome_the_first_present_cached() {
         let mut app = App::headless_for_test();
@@ -4783,7 +5098,7 @@ mod tests {
                 },
             ))
         };
-        aterm_log::env::scoped("ATERM_STATE_HOME", &state, || {
+        crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
             // Seamless, the leaf path: the record says `worker`, the session and
             // its handle say `worker`; the stand-in for leaf 0 says nothing.
             let mut new = App::headless_for_test();
@@ -4849,6 +5164,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state);
     }
 
+    /// THE AGENT A CRASH TOOK GOES BACK TO ITS TAB (2026-09-27): a cold
+    /// restore of the live layout whose leaf carries an agent hands the host
+    /// that agent with the sid of the tab that now stands for the leaf and
+    /// that tab's own shell — once: a second take finds nothing. NEGATIVE
+    /// CONTROLS: a leaf with no agent hands nothing, and neither does a
+    /// seamless successor (its agents never stopped).
+    #[test]
+    fn a_restored_leafs_agent_is_handed_to_its_new_tab_once() {
+        let agent = restore::AgentRestore {
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".into(),
+            program: "/opt/claude/bin/claude".into(),
+            argv: vec!["/opt/claude/bin/claude".into()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".into()),
+            cwd: "/tmp".into(),
+            version: Some("2.1.283".into()),
+        };
+        let leaf = |shell: u64, agent: Option<restore::AgentRestore>| {
+            restore::RestoredSplitTree::leaf(restore::RestoredView::Terminal(
+                restore::TerminalLeafRestore {
+                    local_id: Some(shell),
+                    agent: agent.map(Box::new),
+                    ..bare_leaf()
+                },
+            ))
+        };
+        let mut cold = App::headless_for_test();
+        cold.restore_into_window(
+            WindowId(0),
+            window_of(vec![leaf(7, None), leaf(8, Some(agent.clone()))]),
+        );
+        // A headless stub has no shell (pid -1): a tab with none takes no
+        // relaunch. Give each one a pid, as a real spawn has.
+        let mut probe = App::headless_for_test();
+        probe.restore_into_window(WindowId(0), window_of(vec![leaf(8, Some(agent.clone()))]));
+        assert!(
+            probe.take_restored_agents().is_empty(),
+            "no shell, no relaunch"
+        );
+        for (&id, pooled) in cold.pool.sessions.iter_mut() {
+            pooled.session.pid = 40_000 + i32::try_from(id).unwrap();
+        }
+        let handed = cold.take_restored_agents();
+        assert_eq!(handed.len(), 1, "{handed:?}");
+        let (sid, snap) = &handed[0];
+        assert_eq!(&snap.tab, sid);
+        assert_eq!(snap.session, agent.session);
+        assert_eq!(
+            (snap.pid, snap.start.as_str()),
+            (agent.pid, agent.start.as_str())
+        );
+        assert_eq!(snap.argv, agent.argv);
+        let session = {
+            let g = cold.store.read().unwrap();
+            g.snapshot()
+                .into_iter()
+                .find(|h| h.sid.as_str() == sid)
+                .map(|h| h.local_id)
+                .expect("the tab is a live session")
+        };
+        assert_eq!(
+            i64::from(snap.shell),
+            i64::from(cold.pool.sessions[&session].session.pid),
+            "the new tab's own shell"
+        );
+        assert!(cold.take_restored_agents().is_empty(), "handed once");
+
+        let mut successor = App::headless_for_test();
+        successor.handoff_successor = true;
+        successor.restore_into_window(WindowId(0), window_of(vec![leaf(8, Some(agent))]));
+        assert!(
+            successor.take_restored_agents().is_empty(),
+            "a handoff's agents never stopped"
+        );
+    }
+
     /// REVIEW (separation lens, 2026-09-17): ON A COLD RESTORE, THE WINDOW'S
     /// FIRST LEAF KEEPS ITS IDENTITY. The window's bootstrap shell is grafted
     /// onto its first terminal leaf, and the graft carried only the USER meta:
@@ -4902,7 +5293,7 @@ mod tests {
             ))
         };
         let worker = || Some("worker".to_string());
-        aterm_log::env::scoped("ATERM_STATE_HOME", &state, || {
+        crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
             crate::agent_identity::ensure("worker", true).expect("the verb's create");
             // The reviewer's shape: both leaves name `worker`; the bootstrap (a
             // stub, the human's own) wears none. Neither pane takes it — each
@@ -5125,6 +5516,27 @@ mod tests {
                 other => panic!("unexpected witness read: {other:?}"),
             }
         };
+        // A master the net closed reads EOF at its peer only once EVERY copy is
+        // closed, and a child another test in this binary is forking holds one
+        // until it execs (a socketpair end is made close-on-exec non-atomically
+        // on macOS, so it can even ride through the exec). So a master that is
+        // not in the pool is given 10 s to read closed before it is classified;
+        // a leak — `HandedMaster`'s `Drop` a no-op, the negative control above —
+        // never closes and still reads as the `BuggyDrop` step, 10 s later (the
+        // fd-copy sweep of 2026-09-27). An adopted master is read at once: a
+        // live master must never be waited into reading closed.
+        let eventually_closed = |peer: &UnixStream| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if closed(peer) {
+                    return true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
         for (what, window) in [("a front window", true), ("no window", false)] {
             let mut app = App::headless_for_test();
             app.handoff_successor = true;
@@ -5177,7 +5589,12 @@ mod tests {
                 let in_pool = app.pool.iter().any(|session| {
                     session.handoff_local_id == Some(*local_id) && session.ctx.sink.master() >= 3
                 });
-                match (in_pool, closed(peer)) {
+                let is_closed = if in_pool {
+                    closed(peer)
+                } else {
+                    eventually_closed(peer)
+                };
+                match (in_pool, is_closed) {
                     (true, false) => {
                         adopted += 1;
                         advance(&mut state, "Adopt", "adopted", adopted);
@@ -5258,6 +5675,7 @@ mod tests {
                 attention: identity.attention,
                 questions: identity.questions,
                 identity: None,
+                agent: None,
             },
         ))
     }

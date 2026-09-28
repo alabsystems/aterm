@@ -59,7 +59,6 @@ enum RowMatcher {
     CaseInsensitive(CaseInsensitiveMatcher),
     /// Regex (either case mode): compiled ONCE with the batch path's pattern
     /// length / NFA / DFA caps, reused across every resumed slice.
-    #[cfg(feature = "regex")]
     Regex(aterm_regex::Regex),
 }
 
@@ -135,14 +134,7 @@ impl BudgetedSearch {
         max_cached_lines: usize,
     ) -> Result<Self, SearchOptionsError> {
         let matcher = if is_regex {
-            #[cfg(feature = "regex")]
-            {
-                RowMatcher::Regex(SearchIndex::compile_regex(query, case_sensitive)?)
-            }
-            #[cfg(not(feature = "regex"))]
-            {
-                return Err(SearchOptionsError::RegexNotEnabled);
-            }
+            RowMatcher::Regex(SearchIndex::compile_regex(query, case_sensitive)?)
         } else if case_sensitive {
             RowMatcher::Literal
         } else {
@@ -364,7 +356,6 @@ impl BudgetedSearch {
                     matches.len() < MAX_SEARCH_MATCHES
                 });
             }
-            #[cfg(feature = "regex")]
             RowMatcher::Regex(re) => {
                 let fallback;
                 let col_map = match self.index.column_maps.get(&abs_row) {
@@ -505,15 +496,11 @@ mod tests {
             ("NEEDLE", false, false), // case-insensitive, uppercase query
             ("aa", true, false),      // short query (no trigram accel)
             ("aa", false, false),
-            ("\u{e9}", false, false),     // Unicode short query
-            ("\u{c4}rger", false, false), // Unicode folding
-            #[cfg(feature = "regex")]
-            ("ne+dle", true, true), // regex, case-sensitive
-            #[cfg(feature = "regex")]
-            ("ne+dle", false, true), // regex, case-insensitive
-            #[cfg(feature = "regex")]
-            ("n..dle", true, true), // regex with wildcards
-            #[cfg(feature = "regex")]
+            ("\u{e9}", false, false),      // Unicode short query
+            ("\u{c4}rger", false, false),  // Unicode folding
+            ("ne+dle", true, true),        // regex, case-sensitive
+            ("ne+dle", false, true),       // regex, case-insensitive
+            ("n..dle", true, true),        // regex with wildcards
             ("x{0,3}needle", false, true), // regex with optional prefix
         ];
         for &(query, case_sensitive, is_regex) in cases {
@@ -621,19 +608,10 @@ mod tests {
     }
 
     /// An invalid regex fails at construction, before any indexing work.
-    #[cfg(feature = "regex")]
     #[test]
     fn invalid_regex_fails_at_construction() {
         let err = BudgetedSearch::new("f(oo", false, true, 0, 10);
         assert!(matches!(err, Err(SearchOptionsError::InvalidRegex(_))));
-    }
-
-    /// Without the regex feature, regex mode fails closed at construction.
-    #[cfg(not(feature = "regex"))]
-    #[test]
-    fn regex_mode_fails_closed_without_the_feature() {
-        let err = BudgetedSearch::new("needle", false, true, 0, 10);
-        assert!(matches!(err, Err(SearchOptionsError::RegexNotEnabled)));
     }
 
     /// Partial results are a prefix of the final results (progressive display

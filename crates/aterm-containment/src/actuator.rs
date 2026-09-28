@@ -6,69 +6,50 @@
 //! (mode → [`Capabilities`](crate::Capabilities)) to a real, logged decision at
 //! the one place aterm forks a child shell.
 //!
-//! ## What this is, honestly (`ATERM_DESIGN` §0.1 / §5.6)
+//! ## What is enforced (`ATERM_DESIGN` §0.1 / §5.6) — the one scope statement
 //!
-//! The rest of this crate is a *policy data model*: it maps a [`ContainmentMode`]
-//! to a [`Capabilities`](crate::Capabilities) set whose monotonicity/non-escalation
-//! is encoded as Kani proof harnesses (opt-in; a TLA+ model is planned but not yet
-//! in-tree). That is a property of THAT MAPPING only — it does NOT, by itself, make
-//! the operating system enforce anything; before this module nothing consulted it
-//! at the spawn seam.
+//! The rest of this crate maps a [`ContainmentMode`] to a
+//! [`Capabilities`](crate::Capabilities) set; that mapping enforces nothing by
+//! itself. This module turns it into a [`SpawnDecision`] that both launchers
+//! (`aterm` and the window) consult BEFORE handing the PTY seam a spawn
+//! capability, and audits it. Per mode:
 //!
-//! This module is the actuation seam. Given the resolved mode it produces a
-//! [`SpawnDecision`] that the GUI launcher consults BEFORE handing the PTY seam a
-//! spawn capability. What is actuated TODAY:
+//! | Mode | Enforced |
+//! |---|---|
+//! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps the launching shell's resource limits. |
+//! | Safety | Hardened resource limits (`aterm-sandbox`: rlimits on Unix, the Job Object on Windows). No OS sandbox, on any platform. |
+//! | Containment | The hardened limits PLUS the OS sandbox below — and on a platform without one, NO SHELL (see "Fail closed"). |
 //!
-//! 1. **Process-capability gate (actuated).** The [`ProcessCapability`] for the
-//!    mode is checked. `Full`/`Restricted`/`NoFork` all permit the *initial*
-//!    interactive shell (`NoFork` means "no fork — exec only, for the initial
-//!    shell"), so a normal `$SHELL` still spawns; but the decision, the mode, and
-//!    the fact that it is permitted are recorded via the containment audit log.
-//! 2. **Resource limits (actuated, elsewhere).** `aterm-sandbox` installs
-//!    `setrlimit` bounds in the child before exec, fail-closed (`aterm-pty`).
-//! 3. **OS NETWORK + SECRET-FS + PRIVATE-DATA sandbox (actuated).** In
-//!    `Containment` mode (network policy = [`None`](crate::NetworkCapability::None),
-//!    FS policy = [`TmpOnly`](crate::FsCapability::TmpOnly)) on macOS, the spawn is
-//!    wrapped with `/usr/bin/sandbox-exec -p <SBPL>` applying the profile from
-//!    [`crate::sbpl::profile_for`] — `(version 1)(allow default)(deny network*)`
-//!    PLUS a conservative `(deny file-read* file-write* …)` over (a) a small fixed
-//!    set of SECRET/credential stores under `$HOME` (`.ssh`, `.aws`, `.gnupg`,
-//!    `.config/gh`, `.config/aterm`, `.netrc`, …) and (b) a fixed set of
-//!    PRIVATE-USER-DATA stores (`Documents`, `Desktop`, `Downloads`, media, and the
-//!    local Mail / Messages / keychain / cookies / browser-profile databases — see
-//!    [`crate::sbpl::PRIVATE_SUBDIRS`]). The kernel Seatbelt then DENIES all network
-//!    access AND read/write of those credential and private-data stores to the child
-//!    shell and everything it runs — while the rest of the filesystem (`~/.zshrc`,
-//!    dyld, `/dev/tty`, the tool caches/preferences under `~/Library`, …) stays
-//!    available so a normal `$SHELL` works. [`SpawnDecision::Permit::sbpl`] carries
-//!    the per-user SBPL profile so the launcher can build that wrap; the GUI fails
-//!    CLOSED if the wrapper is missing (it refuses to spawn an unsandboxed shell when
-//!    the policy demands the sandbox). [`os_sandbox_actuated`] is the build/platform
-//!    capability check; [`network_sandbox_actuated`] reports whether the sandbox is
-//!    in force for a given mode.
+//! **The Containment OS sandbox (macOS Seatbelt).** The spawn is wrapped with
+//! `/usr/bin/sandbox-exec -p <SBPL>`, the profile from [`crate::sbpl::profile_for`]
+//! (its module doc lists the rules in order). The kernel then, for the child shell
+//! and everything it runs:
 //!
-//! What is **NOT** actuated yet (honest, deferred):
+//! - denies ALL network (`(deny network*)`);
+//! - confines WRITES to the temp roots (`/private/tmp`, `/private/var/tmp`, the
+//!   user's own `$TMPDIR`) and `/dev`, plus the shell's own history files, so
+//!   nothing it does can plant code that a later unsandboxed shell runs
+//!   (`~/.zshrc`, a `~/Library/LaunchAgents` plist, a git hook, a `$PATH`
+//!   binary, a precompiled module in the user cache directory). Its working
+//!   directory and `$HOME` are read-only to it: decided 2026-09-26 under the
+//!   owner's standing direction, `TmpOnly` means what its name says
+//!   ([`crate::sbpl`] rule 3);
+//! - denies READ and write of the credential stores (`~/.ssh`, `~/.aws`,
+//!   `~/.gnupg`, `~/.config/gh`, `~/.config/aterm`, `~/.netrc`, …) and of the
+//!   private-data stores (`~/Documents`, `~/Desktop`, `~/Downloads`, media, and the
+//!   local Mail / Messages / keychain / cookies / browser-profile databases).
 //!
-//! - **GENERAL OS FILESYSTEM scoping (macOS Seatbelt `file-*` / Endpoint
-//!   Security).** Beyond the conservative SECRET + PRIVATE-DATA sets above, the
-//!   profile is deliberately `(allow default)` for the filesystem: a blanket
-//!   `(deny file-*)` base tight enough to be meaningful also breaks a normal
-//!   `$SHELL` (dyld, `path_helper`, the user's rc, `/dev/tty`). Turning the policy
-//!   inside-out into a positive per-[`FsCapability`](crate::FsCapability) allowlist
-//!   (deny-by-default, allow the specific roots a tier needs) is PARKED
-//!   (2026-09-25, `docs/REARCH-PLAN.md` B-1): nobody is building it, and the
-//!   unwired allowlist gates were deleted. The audit log and
-//!   [`os_sandbox_actuated`]/[`network_sandbox_actuated`] say exactly this —
-//!   network: enforced; secret-dir + private-data read/write: enforced; general
-//!   filesystem: not scoped.
-//! - **Non-macOS platforms.** `sandbox-exec` is macOS-only; on other targets
-//!   [`os_sandbox_actuated`] is `false` and `Containment` falls back to the
-//!   rlimit + process-cap posture with an explicit audit line. A Linux
-//!   seccomp/Landlock lane is PARKED (2026-09-25, `docs/REARCH-PLAN.md` B-1).
+//! Other READS stay allowed so a normal `$SHELL` works (dyld, `path_helper`, the rc
+//! files, `/dev/tty`): a deny-by-default READ allowlist breaks the shell and is
+//! not pursued. Every rule is proven against the live kernel by the enforcement
+//! tests in this module. [`SpawnDecision::Permit::sbpl`] carries the per-user
+//! profile; the PTY seam refuses to spawn if the wrapper binary is missing.
 //!
-//! The policy model's intended formal spec is a `tla/Containment.tla` model
-//! (planned, NOT yet in-tree; the in-tree checks are the Kani harnesses); see
-//! `ATERM_DESIGN` §5.6.
+//! **Fail closed.** Decided by the owner 2026-09-25: `Containment` NEVER degrades
+//! to a weaker posture. Where [`os_sandbox_actuated`] is false — Linux, Windows,
+//! every non-macOS target — [`decide`] returns [`SpawnDecision::Deny`] naming the
+//! platform gap, and both launchers exit without starting a shell. (A Linux
+//! Landlock/seccomp lane would lift that; nobody is building it.)
 
 use crate::audit::{log_denial, log_posture};
 use crate::capability::{NetworkCapability, ProcessCapability};
@@ -78,26 +59,16 @@ use crate::policy::ContainmentPolicy;
 /// Audit subsystem label for spawn-seam containment events.
 const SUBSYSTEM: &str = "spawn";
 
-/// Whether THIS BUILD/PLATFORM can actuate a real OS sandbox at the spawn seam.
-///
-/// `true` only on macOS, where the spawn seam wraps a network-denied
-/// (`Containment`) spawn with `/usr/bin/sandbox-exec` applying the Seatbelt profile
-/// from [`crate::sbpl::profile_for`], and the kernel enforces `(deny network*)`
-/// plus the conservative secret-dir `(deny file-read* file-write* …)` on the child
-/// (verified by the enforcement-proof tests in this module). `false` on every other
-/// platform — there `sandbox-exec` does not exist and `Containment` falls back to
-/// the rlimit + process-cap posture (a seccomp/Landlock lane is the follow-up).
-///
-/// IMPORTANT, honest scope: even when `true`, only the **network**, a
-/// **conservative SECRET-directory set** (`~/.ssh`, `~/.aws`, `~/.gnupg`,
-/// `~/.config/gh`, `~/.config/aterm`, `~/.netrc`, …) and a **fixed
-/// PRIVATE-USER-DATA set** (`~/Documents`, `~/Downloads`, media, the local
-/// Mail/Messages/keychain/cookies/browser-profile stores) are OS-enforced. The
-/// GENERAL filesystem is NOT scoped (the profile is `(allow default)` for the rest
-/// of the filesystem so a normal shell works) — that is an explicit follow-up.
-/// Callers must not read this as full "filesystem isolation". Use
-/// [`network_sandbox_actuated`] to know whether the sandbox is in force for a
-/// particular mode.
+/// Why [`decide`] refuses a `Containment` spawn on a platform with no OS sandbox.
+/// Both launchers print it verbatim.
+pub const NO_OS_SANDBOX_REASON: &str = "no OS sandbox on this platform (only macOS has one: \
+     Seatbelt via sandbox-exec); containment mode refuses to start rather than run a shell \
+     without network and filesystem confinement";
+
+/// Whether THIS BUILD/PLATFORM can actuate a real OS sandbox at the spawn seam:
+/// `true` only on macOS (Seatbelt via `sandbox-exec`). What that sandbox enforces
+/// is the module doc's scope statement; where this is `false`, `Containment`
+/// spawns are refused. Use [`network_sandbox_actuated`] for the per-mode answer.
 #[must_use]
 pub const fn os_sandbox_actuated() -> bool {
     cfg!(target_os = "macos")
@@ -121,7 +92,7 @@ pub fn network_sandbox_actuated(mode: ContainmentMode) -> bool {
 /// The actuated decision for the single spawn seam, given a containment mode.
 ///
 /// Not `Copy`: the `Permit` variant carries an owned, per-user `sbpl` `String`
-/// (the profile embeds the canonicalized `$HOME` secret paths, so it is no longer a
+/// (the profile embeds the canonicalized `$HOME` paths, so it is not a
 /// `&'static`). It stays `Clone`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -135,8 +106,7 @@ pub enum SpawnDecision {
     /// is never silent.
     ///
     /// `sbpl`, when `Some`, is the per-user Seatbelt profile string the launcher
-    /// passes to `/usr/bin/sandbox-exec -p <sbpl>` to actuate the network deny AND
-    /// the conservative secret-directory deny. It is `Some` exactly when
+    /// passes to `/usr/bin/sandbox-exec -p <sbpl>`. It is `Some` exactly when
     /// `os_sandbox` is `true`. The launcher fails CLOSED if it cannot apply a
     /// `Some(sbpl)` (e.g. the wrapper binary is missing): it must NOT spawn an
     /// unsandboxed shell when the policy demands the sandbox.
@@ -148,13 +118,15 @@ pub enum SpawnDecision {
         /// The SBPL profile to apply via `sandbox-exec`, `Some` iff `os_sandbox`.
         sbpl: Option<String>,
     },
-    /// Spawning is denied for this mode. A denial was logged to the containment
-    /// audit trail. (No current mode reaches this — the initial shell is allowed
-    /// in every mode, `NoFork` included — but the variant exists so a future,
-    /// stricter policy denies fail-closed rather than silently permitting.)
+    /// Spawning is denied for this mode; a denial was logged to the containment
+    /// audit trail and the launcher must exit without a shell. Reached by
+    /// `Containment` wherever [`os_sandbox_actuated`] is false, and by any future
+    /// process capability below `NoFork`.
     Deny {
         /// The mode this decision was made for.
         mode: ContainmentMode,
+        /// Why, in words the launcher prints verbatim.
+        reason: &'static str,
     },
 }
 
@@ -167,31 +139,45 @@ impl SpawnDecision {
 }
 
 /// Decide — and AUDIT — whether the single PTY spawn seam may run for `mode`,
-/// and (for `Containment`) whether/how the OS network sandbox backs it.
+/// and (for `Containment`) how the OS sandbox backs it.
 ///
 /// This is the seam wiring required by `ATERM_DESIGN` §5.6: the spawn is gated on
-/// the containment decision and the chosen mode is logged. For `Containment` mode
-/// on macOS the returned [`SpawnDecision::Permit`] carries `os_sandbox: true` and
-/// the per-user SBPL profile (`sbpl: Some(...)`) the launcher MUST apply via
-/// `sandbox-exec` to deny network AND the conservative secret-directory set at the
-/// OS level. For every other mode (and every non-macOS platform) `os_sandbox` is
-/// `false`, `sbpl` is `None`, and an explicit audit line records that the OS
-/// sandbox is NOT in force — an auditable choice, not a silent gap. (Even when the
-/// sandbox IS in force, the GENERAL filesystem beyond the secret set is not scoped
-/// — see the module docs; the audit line states this.)
+/// the containment decision and the chosen mode is logged. For `Containment` on
+/// macOS the returned [`SpawnDecision::Permit`] carries `os_sandbox: true` and the
+/// per-user SBPL profile the launcher MUST apply via `sandbox-exec`. For
+/// `Containment` anywhere else it is [`SpawnDecision::Deny`] with
+/// [`NO_OS_SANDBOX_REASON`] — never a silently weaker shell. For every other mode
+/// `os_sandbox` is `false`, `sbpl` is `None`, and an audit line records that no OS
+/// sandbox is in force.
 ///
-/// The initial interactive shell is permitted in every mode (including
+/// The initial interactive shell is otherwise permitted in every mode (including
 /// `Containment`/`NoFork`, whose contract is "exec only, for the initial
 /// shell"). A hypothetical future `ProcessCapability` below `NoFork` would
 /// fail closed via [`SpawnDecision::Deny`].
 #[must_use]
 pub fn decide(mode: ContainmentMode) -> SpawnDecision {
+    decide_on(mode, os_sandbox_actuated())
+}
+
+/// [`decide`] with the platform's sandbox capability as an argument, so the
+/// fail-closed arm is testable on the one platform that has a sandbox.
+fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
     let process_cap = ContainmentPolicy::process(mode);
+    let denies_network = ContainmentPolicy::network(mode) == NetworkCapability::None;
+    // Containment demands the OS sandbox. Where the platform has none, refuse
+    // the spawn outright — the owner's fail-closed ruling (2026-09-25).
+    if denies_network && !sandbox_available {
+        log_denial(SUBSYSTEM, "spawn initial shell", mode, NO_OS_SANDBOX_REASON);
+        return SpawnDecision::Deny {
+            mode,
+            reason: NO_OS_SANDBOX_REASON,
+        };
+    }
     // Resolve the OS sandbox posture for this mode. `os_sandbox` is true ONLY for a
     // Containment spawn on a platform that can actuate (macOS); `sbpl` is the
-    // per-user network-deny + secret-deny profile in that case and `None`
-    // otherwise. The two are kept in lockstep (sbpl.is_some() == os_sandbox).
-    let os_sandbox = network_sandbox_actuated(mode);
+    // per-user profile in that case and `None` otherwise. The two are kept in
+    // lockstep (sbpl.is_some() == os_sandbox).
+    let os_sandbox = denies_network && sandbox_available;
     let sbpl: Option<String> = if os_sandbox {
         crate::sbpl::profile_for(&ContainmentPolicy::capabilities(mode))
     } else {
@@ -208,28 +194,25 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
     // denials — they use `log_posture` (no `DENIED:` prefix) so a denial-stream
     // filter never miscounts a permitted/actuated spawn as a security denial.
     if os_sandbox {
-        // Honest record that the OS sandbox IS in force for this spawn — network
-        // AND the conservative secret-directory set AND the private-user-data set are
-        // denied; and, just as honestly, that the GENERAL filesystem is NOT scoped.
         log_posture(
             SUBSYSTEM,
             "os-network-sandbox",
             mode,
-            "OS sandbox ACTUATED via sandbox-exec (deny network*; deny read+write of secret dirs ~/.ssh ~/.aws ~/.gnupg ~/.config/gh ~/.config/aterm ~/.netrc; deny read+write of private data ~/Documents ~/Desktop ~/Downloads media ~/Library/{Mail,Messages,Keychains,Cookies,Safari} browser-profiles); general filesystem NOT scoped (follow-up)",
+            "OS sandbox ACTUATED via sandbox-exec (deny network*; writes confined to /private/tmp /private/var/tmp $TMPDIR /dev + shell history; deny read+write of secret dirs ~/.ssh ~/.aws ~/.gnupg ~/.config/gh ~/.config/aterm ~/.netrc; deny read+write of private data ~/Documents ~/Desktop ~/Downloads media ~/Library/{Mail,Messages,Keychains,Cookies,Safari} browser-profiles)",
         );
     } else {
-        // Explicit, non-silent record that the OS sandbox is NOT in force for this
-        // mode (network permitted by policy, or non-macOS platform). Platform-
-        // selected reason: on Windows the rlimit half is ALSO absent, and the
-        // record must never overstate the posture (the Unix bytes are unchanged).
+        // Explicit, non-silent record that no OS sandbox is in force for this mode
+        // (its policy permits network). Platform-selected reason: on Windows the
+        // rlimit half is ALSO absent, and the record must never overstate the
+        // posture.
         log_posture(
             SUBSYSTEM,
             "os-network-sandbox",
             mode,
             if cfg!(windows) {
-                "OS sandbox not actuated (non-macOS); process-cap gate only (resource limits unavailable on this platform)"
+                "OS sandbox not applied (network permitted by policy); process-cap gate only (resource limits unavailable on this platform)"
             } else {
-                "OS sandbox not actuated (network permitted by policy, or non-macOS); rlimits + process-cap gate only"
+                "OS sandbox not applied (network permitted by policy); rlimits + process-cap gate only"
             },
         );
     }
@@ -245,13 +228,9 @@ pub fn decide(mode: ContainmentMode) -> SpawnDecision {
         // Defensive default: any future, more-restrictive variant fails closed.
         #[allow(unreachable_patterns)]
         _ => {
-            log_denial(
-                SUBSYSTEM,
-                "spawn initial shell",
-                mode,
-                "process capability denies fork/exec",
-            );
-            SpawnDecision::Deny { mode }
+            let reason = "process capability denies fork/exec";
+            log_denial(SUBSYSTEM, "spawn initial shell", mode, reason);
+            SpawnDecision::Deny { mode, reason }
         }
     }
 }
@@ -289,18 +268,61 @@ mod tests {
     }
 
     #[test]
-    fn every_mode_permits_the_initial_shell() {
+    fn every_mode_permits_the_initial_shell_where_its_sandbox_exists() {
         for mode in [
             ContainmentMode::Master,
             ContainmentMode::User,
             ContainmentMode::Safety,
-            ContainmentMode::Containment,
         ] {
             let d = decide(mode);
             assert!(
                 d.is_permitted(),
                 "the initial shell must be permitted in {mode} mode, got {d:?}"
             );
+        }
+        // Containment only where the OS sandbox exists (macOS).
+        assert_eq!(
+            decide(ContainmentMode::Containment).is_permitted(),
+            os_sandbox_actuated()
+        );
+    }
+
+    #[test]
+    fn containment_fails_closed_without_an_os_sandbox() {
+        // The owner's ruling (2026-09-25): on a platform with no OS sandbox the
+        // Containment spawn is REFUSED, naming the gap — never a weaker shell.
+        assert_eq!(
+            decide_on(ContainmentMode::Containment, false),
+            SpawnDecision::Deny {
+                mode: ContainmentMode::Containment,
+                reason: NO_OS_SANDBOX_REASON,
+            }
+        );
+        assert!(NO_OS_SANDBOX_REASON.contains("no OS sandbox on this platform"));
+        // The other modes never demanded a sandbox, so its absence changes nothing.
+        for mode in [
+            ContainmentMode::Master,
+            ContainmentMode::User,
+            ContainmentMode::Safety,
+        ] {
+            assert_eq!(
+                decide_on(mode, false),
+                SpawnDecision::Permit {
+                    mode,
+                    os_sandbox: false,
+                    sbpl: None
+                },
+                "{mode} must not depend on the OS sandbox"
+            );
+        }
+        // Negative control: with a sandbox, Containment is permitted and wrapped.
+        match decide_on(ContainmentMode::Containment, true) {
+            SpawnDecision::Permit {
+                os_sandbox: true,
+                sbpl: Some(_),
+                ..
+            } => {}
+            other => panic!("Containment with a sandbox must Permit+wrap, got {other:?}"),
         }
     }
 
@@ -316,6 +338,9 @@ mod tests {
             ContainmentMode::Safety,
             ContainmentMode::Containment,
         ] {
+            if mode == ContainmentMode::Containment && !os_sandbox_actuated() {
+                continue; // refused there — `containment_fails_closed_without_an_os_sandbox`
+            }
             let expect_os = network_sandbox_actuated(mode);
             match decide(mode) {
                 SpawnDecision::Permit {
@@ -377,7 +402,8 @@ mod tests {
         );
         assert!(
             !SpawnDecision::Deny {
-                mode: ContainmentMode::Containment
+                mode: ContainmentMode::Containment,
+                reason: NO_OS_SANDBOX_REASON,
             }
             .is_permitted()
         );
@@ -553,7 +579,7 @@ mod tests {
     }
 
     /// PROOF 3 (SHELL-COMPAT, FULL generated Containment profile) — the whole point
-    /// of `(allow default)` + a SMALL secret deny: a NORMAL shell must keep working.
+    /// of `(allow default)` + targeted denies: a NORMAL shell must keep working.
     /// We take the EXACT profile the actuator hands the launcher for `Containment`
     /// (network deny + the canonicalized secret-dir denies, scoped under the real
     /// `$HOME`) and run an ordinary command pipeline under it. It MUST exit 0 with
@@ -703,6 +729,306 @@ mod tests {
              the Containment profile — the secret deny is too broad. rc={:?} stderr={}",
             allowed.status.code(),
             String::from_utf8_lossy(&allowed.stderr),
+        );
+    }
+
+    /// The exact profile `decide` hands the launcher for `Containment` on macOS.
+    #[cfg(target_os = "macos")]
+    fn containment_profile() -> String {
+        match decide(ContainmentMode::Containment) {
+            SpawnDecision::Permit {
+                os_sandbox: true,
+                sbpl: Some(profile),
+                ..
+            } => profile,
+            other => panic!("Containment on macOS must actuate the OS sandbox; got {other:?}"),
+        }
+    }
+
+    /// Open `path` for append (creating it if absent, writing nothing) under
+    /// `profile`, returning whether the open succeeded.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_append_ok(profile: &str, path: &std::path::Path) -> bool {
+        sandboxed_sh_ok(profile, &format!(": >> '{}'", path.display()))
+    }
+
+    /// Run `script` with `/bin/sh -c` under `profile`; whether it exited 0.
+    #[cfg(target_os = "macos")]
+    fn sandboxed_sh_ok(profile: &str, script: &str) -> bool {
+        sandbox_wrap(profile, "/bin/sh", &["-c", script])
+            .output()
+            .expect("run sh under the Containment profile")
+            .status
+            .success()
+    }
+
+    /// PROOF 5 (WRITE CONFINEMENT, FULL generated Containment profile) — a
+    /// contained shell cannot plant anything that later runs OUTSIDE the sandbox:
+    /// creating a file in `$HOME`, appending to `~/.zshrc`, or dropping a file in
+    /// `~/Library/LaunchAgents` (creating that directory, where it does not exist
+    /// yet) or into the user cache directory beside `$TMPDIR` all fail, while
+    /// the temp roots stay writable (the history allowance
+    /// has its own proof, 5b, over a scratch `$HOME`, since whether the real
+    /// one's history file gets it depends on what that file is). Each probe
+    /// opens for append without writing a byte, and anything a failed deny
+    /// would have created is removed. CONTROL: under the network deny alone the
+    /// same `$HOME` probe is writable, so its denial is the write confinement's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_containment_confines_writes() {
+        let Ok(home) = std::env::var("HOME") else {
+            eprintln!("HOME unset in test env — skipping write-confinement proof");
+            return;
+        };
+        let Ok(home) = std::fs::canonicalize(&home) else {
+            eprintln!("HOME does not resolve — skipping write-confinement proof");
+            return;
+        };
+        let profile = containment_profile();
+        let pid = std::process::id();
+
+        let mut denied = vec![
+            home.join(format!(".aterm_write_probe_{pid}")),
+            home.join(".zshrc"),
+        ];
+        let launch_agents = home.join("Library/LaunchAgents");
+        let agents_existed = launch_agents.is_dir();
+        if agents_existed {
+            denied.push(launch_agents.join(format!("aterm_write_probe_{pid}")));
+        }
+        let tmp = std::fs::canonicalize(std::env::temp_dir()).expect("canonical TMPDIR");
+        // Beside a per-user `…/T`: the user cache directory `…/C`, whose clang
+        // module cache later unsandboxed builds read, stays read-only.
+        let user_cache = tmp.parent().map(|per_user| per_user.join("C"));
+        if tmp.starts_with(crate::sbpl::USER_TEMP_PARENT)
+            && let Some(cache) = user_cache.filter(|c| c.is_dir())
+        {
+            denied.push(cache.join(format!("aterm_write_probe_{pid}")));
+        }
+        let allowed = [
+            tmp.join(format!("aterm_write_probe_{pid}")),
+            std::path::PathBuf::from(format!("/private/tmp/aterm_write_probe_{pid}")),
+        ];
+
+        let existed: Vec<bool> = denied.iter().chain(&allowed).map(|p| p.exists()).collect();
+        let denied_ok: Vec<bool> = denied
+            .iter()
+            .map(|p| sandboxed_append_ok(&profile, p))
+            .collect();
+        let allowed_ok: Vec<bool> = allowed
+            .iter()
+            .map(|p| sandboxed_append_ok(&profile, p))
+            .collect();
+        // No LaunchAgents directory yet: planting one is creating it.
+        let agents_made = !agents_existed
+            && sandboxed_sh_ok(&profile, &format!("mkdir '{}'", launch_agents.display()));
+        // CONTROL: the `$HOME` probe under the network deny alone — writable,
+        // so its denial above is the write confinement's.
+        let control_ok = sandboxed_append_ok(crate::sbpl::NETWORK_DENY_PROFILE, &denied[0]);
+        if agents_made {
+            let _ = std::fs::remove_dir(&launch_agents);
+        }
+        // Remove whatever the probes created before asserting.
+        for (path, pre) in denied.iter().chain(&allowed).zip(&existed) {
+            if !pre {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        assert!(
+            control_ok,
+            "CONTROL FAILED: {} is not writable even without the write confinement",
+            denied[0].display()
+        );
+        for (path, ok) in denied.iter().zip(&denied_ok) {
+            assert!(
+                !ok,
+                "WRITE CONFINEMENT FAILED: the Containment shell could write {}",
+                path.display()
+            );
+        }
+        assert!(
+            !agents_made,
+            "WRITE CONFINEMENT FAILED: the Containment shell could create {}",
+            launch_agents.display()
+        );
+        for (path, ok) in allowed.iter().zip(&allowed_ok) {
+            assert!(
+                ok,
+                "OVER-BROAD: the Containment shell could not write {}",
+                path.display()
+            );
+        }
+    }
+
+    /// A scratch `$HOME` for a live proof that must plant files: under the test
+    /// binary's target directory, which lies outside every
+    /// [`crate::sbpl::WRITABLE_ROOTS`] entry on a normal checkout. `None` (the
+    /// proof says so and stops) where the target directory is itself under a
+    /// writable root, since every write there is allowed and the proof would
+    /// prove nothing.
+    #[cfg(target_os = "macos")]
+    fn scratch_home_outside_writable_roots(tag: &str) -> Option<std::path::PathBuf> {
+        let exe = std::env::current_exe().ok()?;
+        // `…/target/debug/deps/<test>` → `…/target/debug` (never `deps/`, which
+        // is kept small).
+        let dir = std::fs::canonicalize(exe.parent()?.parent()?).ok()?;
+        if crate::sbpl::WRITABLE_ROOTS
+            .iter()
+            .any(|root| dir.starts_with(root))
+        {
+            eprintln!(
+                "{} lies under a writable root — skipping the {tag} proof",
+                dir.display()
+            );
+            return None;
+        }
+        let home = dir.join(format!("aterm-sbpl-home-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir(&home).ok()?;
+        Some(home)
+    }
+
+    /// PROOF 5b (HISTORY, FULL generated Containment profile over a scratch
+    /// `$HOME`) — the history allowance works, and cannot be turned into a write
+    /// anywhere else.
+    ///
+    /// - zsh saves its history there as it does at a prompt (lock, append, and a
+    ///   save-by-copy through `.zsh_history.new`) with no error;
+    /// - the contained shell cannot make a history name a symlink — neither to
+    ///   `$HOME` nor to `~/.zshrc` — nor hard-link `~/.zshrc` there;
+    /// - a symlink already at a history name carries no write: Seatbelt judges
+    ///   the file it resolves to, which is not allowed;
+    /// - the next session's profile, generated over a `~/.zsh_history` pointed
+    ///   at `$HOME` (planted from outside, since the session may not), names no
+    ///   part of `$HOME`, and that session cannot write `~/.zshrc` or create
+    ///   `~/Library/LaunchAgents`.
+    ///
+    /// CONTROL: the same `~/.zshrc` append succeeds under the network deny alone.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn enforcement_proof_history_allowance_widens_nothing() {
+        use crate::capability::FsCapability;
+        let Some(home) = scratch_home_outside_writable_roots("history") else {
+            return;
+        };
+        let zshrc = home.join(".zshrc");
+        std::fs::write(&zshrc, "echo original\n").unwrap();
+        let q = |p: &std::path::Path| format!("'{}'", p.display());
+        let hist = home.join(".zsh_history");
+        let hist_new = home.join(".zsh_history.new");
+        let hist_lock = home.join(".zsh_history.LOCK");
+        let agents = home.join("Library/LaunchAgents");
+        let generate = || crate::sbpl::profile_for_home(home.to_str(), None, FsCapability::TmpOnly);
+
+        // Session 1: the history file is absent, so its allowance is in force.
+        let first = generate();
+        let zsh = sandbox_wrap(
+            &first,
+            "/bin/zsh",
+            &[
+                "-f",
+                "-i",
+                "-c",
+                &format!(
+                    "HISTFILE={}; HISTSIZE=10; SAVEHIST=10; print -s aterm-probe; fc -AI; fc -W",
+                    q(&hist)
+                ),
+            ],
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run zsh under the Containment profile");
+        let zsh_stderr = String::from_utf8_lossy(&zsh.stderr).into_owned();
+        let saved = std::fs::read_to_string(&hist).unwrap_or_default();
+        let plant_home = sandboxed_sh_ok(
+            &first,
+            &format!("rm -f {h} && ln -s {} {h}", q(&home), h = q(&hist)),
+        );
+        let plant_zshrc = sandboxed_sh_ok(&first, &format!("ln -s {} {}", q(&zshrc), q(&hist_new)));
+        let _ = std::fs::remove_file(&hist_new);
+        let hard_link = sandboxed_sh_ok(&first, &format!("ln {} {}", q(&zshrc), q(&hist_lock)));
+        let _ = std::fs::remove_file(&hist_lock);
+        std::os::unix::fs::symlink(&zshrc, &hist_new).unwrap();
+        let through_symlink = sandboxed_sh_ok(&first, &format!("echo PLANTED >> {}", q(&hist_new)));
+        let _ = std::fs::remove_file(&hist_new);
+
+        // Session 2: a fresh profile over `~/.zsh_history -> $HOME`.
+        let _ = std::fs::remove_file(&hist);
+        std::os::unix::fs::symlink(&home, &hist).unwrap();
+        let second = generate();
+        let zshrc_second = sandboxed_append_ok(&second, &zshrc);
+        let agents_second = sandboxed_sh_ok(&second, &format!("mkdir -p {}", q(&agents)));
+        let control = sandboxed_append_ok(crate::sbpl::NETWORK_DENY_PROFILE, &zshrc);
+        let zshrc_after = std::fs::read_to_string(&zshrc).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&home);
+
+        assert!(
+            control,
+            "CONTROL FAILED: the scratch ~/.zshrc is not writable without the confinement"
+        );
+        assert!(
+            zsh.status.success() && zsh_stderr.is_empty() && saved.contains("aterm-probe"),
+            "OVER-BROAD: zsh could not save its history: rc={:?} stderr={zsh_stderr:?} history={saved:?}",
+            zsh.status.code()
+        );
+        for (made, what) in [
+            (plant_home, "made ~/.zsh_history a symlink to $HOME"),
+            (plant_zshrc, "made a history name a symlink to ~/.zshrc"),
+            (hard_link, "hard-linked ~/.zshrc at a history name"),
+            (
+                through_symlink,
+                "wrote ~/.zshrc through a symlink at a history name",
+            ),
+        ] {
+            assert!(
+                !made,
+                "WRITE CONFINEMENT FAILED: the contained shell {what}"
+            );
+        }
+        assert_eq!(
+            zshrc_after, "echo original\n",
+            "~/.zshrc changed under the Containment profile"
+        );
+        let home_named = format!("\"{}\")", home.display());
+        assert!(
+            !second.contains(&home_named),
+            "WRITE CONFINEMENT FAILED: a history symlink put $HOME in the profile: {second}"
+        );
+        assert!(
+            !zshrc_second,
+            "WRITE CONFINEMENT FAILED: after a history symlink the next session could write ~/.zshrc"
+        );
+        assert!(
+            !agents_second,
+            "WRITE CONFINEMENT FAILED: after a history symlink the next session could create ~/Library/LaunchAgents"
+        );
+    }
+
+    /// PROOF 6 (LOGIN SHELL) — the user's own login shell, rc files and all,
+    /// starts and exits 0 under the full Containment profile: the write
+    /// confinement and the denies do not break `$SHELL -lic`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shell_compat_login_shell_runs_under_containment() {
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|s| s.starts_with('/'))
+            .unwrap_or_else(|| "/bin/zsh".to_string());
+        let out = sandbox_wrap(
+            &containment_profile(),
+            &shell,
+            &["-l", "-i", "-c", "echo ok"],
+        )
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run the login shell under the Containment profile");
+        assert!(
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("ok"),
+            "SHELL BROKEN: `{shell} -lic` under Containment: rc={:?} stdout={:?} stderr={:?}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
         );
     }
 

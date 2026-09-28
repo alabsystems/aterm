@@ -199,6 +199,10 @@ pub(crate) struct ProgramUpdate {
     pub(crate) version: Option<String>,
     /// Where its builds come from.
     pub(crate) source: String,
+    /// A SHADOWED row's fix-line — `type alab-<tool> for the managed one` when the alias
+    /// is laid and would run the managed copy ([`atpkg::cli::shadowed_fix`]) — computed
+    /// against the same login PATH that made the row shadowed. First on the detail.
+    pub(crate) fix: Option<String>,
     /// When the active build went live (Unix seconds): a vendor build's verification, an
     /// ALab build's `current` flip.
     pub(crate) updated_at: Option<i64>,
@@ -271,6 +275,9 @@ impl ProgramUpdate {
             None => {}
         }
         let mut detail: Vec<String> = Vec::new();
+        if let Some(fix) = &self.fix {
+            detail.push(fix.clone());
+        }
         if let Some(at) = self.updated_at {
             detail.push(format!("Updated {}", when_words(at, now, clock)));
         }
@@ -541,6 +548,7 @@ impl PackagesProgramRow {
                 updated_at: None,
                 latest_known,
                 checked_at: None,
+                fix: None,
             },
             words: None,
             kind,
@@ -1439,6 +1447,13 @@ fn collect_packages_status_from_layout(
             None
         }
     });
+    // A SHADOWED row's fix-line, read against the PATH that shadowed it.
+    let shadow_fix = |name: &str, kind: &ProgramStateKind| match (layout, kind) {
+        (Some(layout), ProgramStateKind::Shadowed { path, .. }) => {
+            atpkg::cli::shadowed_fix(layout, name, std::path::Path::new(path), path_var)
+        }
+        _ => None,
+    };
     let links: Vec<(String, Option<std::path::PathBuf>)> = layout
         .map(|layout| match atpkg::linked_programs_checked(layout) {
             Ok(names) => names
@@ -1472,6 +1487,9 @@ fn collect_packages_status_from_layout(
         status.as_ref(),
         &links,
     );
+    for row in &mut report.programs {
+        row.update.fix = shadow_fix(&row.name, &row.kind);
+    }
     if let Some(layout) = layout {
         report.declined = layout.declined().is_file();
         // What the store says about each row: when it went live, the latest build known
@@ -4127,6 +4145,43 @@ mod tests {
             "{:?}",
             row(&ahead).state
         );
+        // NO ALIAS LAID: the row names the copy that runs and offers no name to type.
+        assert_eq!(row(&ahead).update.fix, None);
+        // THE ALIAS LAID: the row carries the fix-line `which` and `doctor` print after
+        // the same state, first on its detail. (Before, the page said which copy runs
+        // and never how to run ours.)
+        atpkg::activate::install_shims(
+            &layout,
+            &build,
+            &["ay".to_string()],
+            atpkg::activate::Aliases::Alab,
+        )
+        .unwrap();
+        let shadowed = row(&ahead);
+        assert_eq!(
+            shadowed.update.fix.as_deref(),
+            Some(atpkg::state::alias_hint("alab-ay").as_str())
+        );
+        let words = shadowed
+            .update
+            .words(&shadowed.kind, &shadowed.state, 0, LocalClock::default())
+            .expect("an installed row has words");
+        assert!(
+            words
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("type alab-ay for the managed one")),
+            "{words:?}"
+        );
+        // An alias that is ITSELF shadowed by a foreign copy runs someone else's too.
+        std::fs::write(foreign.join("alab-ay"), b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(
+            foreign.join("alab-ay"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(row(&ahead).update.fix, None);
+        std::fs::remove_file(foreign.join("alab-ay")).unwrap();
         let behind = std::env::join_paths([layout.bin_dir(), foreign]).unwrap();
         assert!(matches!(
             row(&behind).kind,

@@ -566,6 +566,23 @@ impl Predictor {
         &self.preds[..self.visible_count()]
     }
 
+    /// Retire the guesses whose glitch window has elapsed — [`Self::overlay`]'s
+    /// expiry without composing a frame — and say whether anything was dropped.
+    ///
+    /// The host's deadline sweep calls this when it wakes for
+    /// [`Self::next_deadline`], instead of peeking at the deadline and leaving the
+    /// consumption to the redraw: a redraw that is then suppressed would leave a
+    /// PAST deadline behind, which the event loop re-folds at turn rate (one redraw
+    /// path that skipped `overlay` already spun a core that way). After this call
+    /// `next_deadline()` is `None` or in the future. A dropped guess that was on
+    /// glass still needs its erase frame, so the host repaints when this returns
+    /// `true` (its own "a ghost is shown" latch keeps that frame un-skippable).
+    pub fn expire_due(&mut self, now: Instant) -> bool {
+        let before = self.preds.len();
+        self.expire(now);
+        self.preds.len() != before
+    }
+
     /// Retire guesses the program has not echoed within the glitch window.
     ///
     /// Only the EXPIRED head(s) go. The old code flushed the entire set, which on a
@@ -922,6 +939,37 @@ mod tests {
         assert_eq!(predictor.next_deadline(), deadline);
         predictor.reset();
         assert_eq!(predictor.pending_bounds(), None);
+    }
+
+    /// THE SWEEP CONSUMES ITS DEADLINE (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md`
+    /// item 7). One `expire_due` at a wake past the deadline, with no `overlay`
+    /// (a suppressed redraw), leaves `next_deadline()` `None` — never the past
+    /// instant a peek-only sweep left for the event loop to re-fold every turn.
+    /// Control: before the deadline it drops nothing and the deadline stands.
+    #[test]
+    fn expire_due_consumes_the_deadline_without_a_redraw() {
+        let mut p = Predictor::new(PredictMode::Always);
+        let born = t0();
+        assert!(!p.expire_due(born), "nothing pending, nothing due");
+        assert!(p.predict_char('a', (0, 0), 80, born));
+        let deadline = p.next_deadline().expect("a pending guess arms a deadline");
+
+        let early = born + Duration::from_millis(1);
+        assert!(!p.expire_due(early), "a guess inside its window is not due");
+        assert_eq!(p.next_deadline(), Some(deadline), "and its deadline stands");
+
+        let late = deadline + Duration::from_millis(1);
+        assert!(
+            p.next_deadline().is_some_and(|d| d <= late),
+            "fixture: the peek's view — a past deadline"
+        );
+        assert!(p.expire_due(late), "the expired guess is dropped");
+        assert!(
+            p.next_deadline().is_none_or(|d| d > late),
+            "no past deadline survives the sweep: {:?}",
+            p.next_deadline()
+        );
+        assert!(!p.expire_due(late), "a second sweep finds nothing");
     }
 
     /// One complete type→echo turn on row 0: arm `ch` at `col` at `at`, then confirm it

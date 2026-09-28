@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `subscribe … screen,events,ts` of a private headless aterm (150x50), the managed 2.1.283 launched by path with `--model haiku --dangerously-skip-permissions` · SHELL MODE with a command typed and not run: `!` then `ls` · cursor=47,4: after the command typed, on the caret row, as a repeat on 2026-09-27 (`subscribe … screen,cursor`) measured it (`ls -la` typed: column 8) · user and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/idle-r2/proj-sweep
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! ls
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode

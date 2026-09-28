@@ -54,9 +54,11 @@ links the `aterm` command and its man pages under `~/.local`. `--no-toolchain`
 excludes the toolset, `--no-path` leaves your shell profile untouched,
 `--dry-run` prints the whole plan — elected release, asset, every destination,
 every edit — and writes nothing, and `--uninstall` reverses everything it
-installed. The toolset exclusion does not persist yet: `--no-toolchain` writes
-no config, so the app's first launch still installs the toolset unless
-`[packages].auto_install = false` is in `aterm.toml` first (`aterm help pkg`).
+installed. The toolset exclusion persists: `--no-toolchain` writes
+`[packages] auto_install = false` into `aterm.toml` (never over a value already
+there), so the app's first launch leaves the toolset alone too, and a machine
+that already runs the toolset keeps updating it but gets a new default-set
+member only when `aterm pkg install --default-set` is run (`aterm help pkg`).
 
 aterm ships for macOS 11+ as a signed, notarized universal app (Apple silicon
 and Intel), from the
@@ -169,6 +171,14 @@ background checks from the next launch; explicit checks and applies remain
 available. Locally built installations require explicit
 `aterm update enable`; that trusts the local baseline, not unsigned future
 updates. No update can arrive until an admissible signed native release exists.
+
+On Windows there is no updater yet, and no `aterm.app`: nothing checks, stages
+or applies a build. To update a copy you built, run `git pull`, then
+`apps\aterm-win\build.ps1` and `apps\aterm-win\install.ps1` in your aterm
+checkout — for an MSIX install, `apps\aterm-win\msix\build-msix.ps1` after
+`build.ps1` instead of `install.ps1`. `aterm update status` and `aterm update
+check` say the same on a Windows machine. `apps/aterm-win/README.md` has the
+packaging detail and the known Windows limitations.
 
 ### Build from source
 
@@ -620,11 +630,14 @@ back to a checksum-only legacy tarball.
 
 Containment is a launch-time choice: `--containment <mode>` with modes `master`,
 `user` (default), `safety`, and `containment`. `--sandbox` is shorthand for the
-last and wraps the shell in the macOS sandbox: no network, and no reads or
-writes of credential stores or private data directories, failing closed if the
-wrapper is missing. Linux currently enforces resource limits plus the capability
-gate, and Windows the capability gate; both disclose the difference at startup
-and should not be assumed to provide the same OS confinement as macOS.
+last and wraps the shell in the macOS sandbox: no network, writes only under
+the temp directories (`$TMPDIR`, `/private/tmp`) and `/dev` plus the shell's
+history file, and no reads or writes of credential stores or private data
+directories, failing closed if the wrapper is missing. The working directory
+and `$HOME` are read-only there, so a contained tool that builds a project
+builds a copy under `$TMPDIR`. Linux and Windows have no OS sandbox, so there `--sandbox`
+refuses to start and names the gap rather than run a shell unconfined. `safety`
+is hardened resource limits with no OS sandbox, on every platform.
 
 Temporal recording is off by default, and pixel video starts only when requested.
 Each session retains a bounded in-memory asciicast output history. Granting

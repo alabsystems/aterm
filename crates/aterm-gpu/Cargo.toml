@@ -10,8 +10,6 @@ repository.workspace = true
 description = "aterm GPU renderer (wgpu/Metal): glyph-atlas + instanced cell quads. Renders the terminal grid on the GPU; offscreen render-to-texture readback for headless verification."
 
 [features]
-# Native drawable starvation conformance only; absent from shipped builds.
-acquire-conformance = []
 default = []
 # DEVELOPMENT SEAMS in an optimized build: this crate's `aterm_types::dev_seam!`
 # reads (the `ATERM_GPU_*` adapter/power/memblock/present/frame-latency seams and

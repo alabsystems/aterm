@@ -134,6 +134,19 @@ pub(crate) enum Arrival {
     Quiet,
 }
 
+impl Arrival {
+    /// The same ruling in the pet owner's vocabulary
+    /// ([`aterm_effects::kitty_pet::PetArrival`], two isomorphic variants):
+    /// the authorised arrival `CompanionOwner::set_look` carries to the
+    /// performance seam.
+    pub(crate) fn pet_arrival(self) -> aterm_effects::kitty_pet::PetArrival {
+        match self {
+            Self::Ceremony => aterm_effects::kitty_pet::PetArrival::Ceremony,
+            Self::Quiet => aterm_effects::kitty_pet::PetArrival::Quiet,
+        }
+    }
+}
+
 /// One remembered cat: a program whose costume this window has actually put
 /// on the pet. `at` is the LAST time it was worn (refreshed on every wear,
 /// INCLUDING quiet ones — two tools in rotation never grow stale, and

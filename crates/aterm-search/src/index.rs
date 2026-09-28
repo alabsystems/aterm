@@ -387,7 +387,6 @@ impl CaseInsensitiveMatcher {
 }
 
 impl SearchIndex {
-    #[cfg(feature = "regex")]
     pub(crate) fn compile_regex(
         query: &str,
         case_sensitive: bool,
@@ -416,7 +415,6 @@ impl SearchIndex {
     /// never be is `Ok` with a short list — the matches such a scan found are a
     /// prefix of the truth, and a prefix presented as the whole is the wrong
     /// answer this budget exists to prevent.
-    #[cfg(feature = "regex")]
     fn regex_scan_budget_exhausted() -> SearchOptionsError {
         SearchOptionsError::InvalidRegex(format!(
             "pattern is too expensive to scan: it exhausted the {REGEX_STEP_LIMIT}-unit \
@@ -844,9 +842,11 @@ impl SearchIndex {
     /// `is_saturated()` rebuild cadence, which is observable
     /// (`bloom_is_saturated`, the lifecycle differential oracles), so every
     /// new-text window is inserted exactly as before. Cost scales with the
-    /// EDIT's trigram delta, not the row's trigram count; the O(list-length)
-    /// cost per genuinely-changed trigram remains (that is the posting
-    /// CONTAINER's shape — blocked postings are the follow-up category fix).
+    /// EDIT's trigram delta, not the row's trigram count. Per changed trigram
+    /// the posting update is O(1) when this row is the list's newest entry
+    /// (the prompt-line edit: `insert` appends a gap, `remove` truncates one)
+    /// and O(list length) otherwise, because a varint stream is re-encoded
+    /// from the splice point.
     ///
     /// [`index_line`]: Self::index_line
     /// [`lower_need`]: crate::grapheme::lower_need
@@ -1606,7 +1606,6 @@ impl SearchIndex {
 ///
 /// Matches the streaming engine's default `max_pattern_len` (1024). Patterns
 /// beyond this limit are rejected before compilation to bound CPU cost.
-#[cfg(feature = "regex")]
 const MAX_REGEX_PATTERN_LEN: usize = 1024;
 
 /// Maximum compiled regex size (bytes) passed to `RegexBuilder::size_limit`.
@@ -1624,7 +1623,6 @@ const MAX_REGEX_PATTERN_LEN: usize = 1024;
 /// old 1 MiB ceiling) from being recompiled and re-scanned on every keystroke.
 /// 128 KiB is the smallest value that still admits a 1,024-byte literal
 /// pattern, which [`MAX_REGEX_PATTERN_LEN`] permits.
-#[cfg(feature = "regex")]
 pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 
 /// Maximum DFA size (bytes) passed to `RegexBuilder::dfa_size_limit`.
@@ -1634,7 +1632,6 @@ pub(crate) const REGEX_SIZE_LIMIT: usize = 128 * 1024; // 128 KiB
 /// documents the setting as inert rather than repurposing it silently.
 /// Per-query memory is already bounded by [`REGEX_SIZE_LIMIT`] — the VM's
 /// thread set is capped by the program size. Mirrors `aterm-observe`.
-#[cfg(feature = "regex")]
 pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 
 /// Scan budget (work units) for one search, passed to
@@ -1656,7 +1653,6 @@ pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20; // 1 MiB
 /// [`SearchOptionsError::InvalidRegex`] rather than as a short result list:
 /// a truncated result set that looks exhaustive is a wrong answer, and a
 /// refusal naming the cause is not. Mirrors `aterm-observe`.
-#[cfg(feature = "regex")]
 pub(crate) const REGEX_STEP_LIMIT: u64 = 1 << 22;
 
 /// Result of one [`SearchIndex::search_literal_narrowed`] step: the forward
@@ -1676,13 +1672,10 @@ pub struct NarrowedSearch {
     pub occurrence_lines: Option<Vec<u32>>,
 }
 
-/// Error returned when search options are invalid (e.g., regex feature not enabled).
+/// Error returned when search options are invalid (e.g., a malformed regex).
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, aterm_error::Error)]
 pub enum SearchOptionsError {
-    /// Regex was requested but the feature is not compiled in.
-    #[error("regex feature not enabled")]
-    RegexNotEnabled,
     /// The regex pattern is invalid.
     #[error("invalid regex: {0}")]
     InvalidRegex(String),
@@ -1817,101 +1810,93 @@ impl SearchIndex {
         case_sensitive: bool,
         direction: SearchDirection,
     ) -> Result<Vec<SearchMatch>, SearchOptionsError> {
-        #[cfg(feature = "regex")]
-        {
-            let re = Self::compile_regex(query, case_sensitive)?;
-            let mut matches = Vec::new();
-            // Absolute row IDs occupy a bounded retained range. Range-scan it
-            // directly instead of allocating and O(n log n)-sorting every hash
-            // key for each typed regex character.
-            let first = self.first_cached_line.min(self.line_count);
-            let mut line_nums = match direction {
-                SearchDirection::Forward => {
-                    CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count))
-                }
-                SearchDirection::Backward => CandidateSource::RangeRev(
-                    (line_as_u32(first)..line_as_u32(self.line_count)).rev(),
-                ),
+        let re = Self::compile_regex(query, case_sensitive)?;
+        let mut matches = Vec::new();
+        // Absolute row IDs occupy a bounded retained range. Range-scan it
+        // directly instead of allocating and O(n log n)-sorting every hash
+        // key for each typed regex character.
+        let first = self.first_cached_line.min(self.line_count);
+        let mut line_nums = match direction {
+            SearchDirection::Forward => {
+                CandidateSource::Range(line_as_u32(first)..line_as_u32(self.line_count))
+            }
+            SearchDirection::Backward => {
+                CandidateSource::RangeRev((line_as_u32(first)..line_as_u32(self.line_count)).rev())
+            }
+        };
+        'lines: while let Some(line_u32) = line_nums.next_candidate() {
+            let line_num = line_u32 as usize;
+            let Some(text) = self.lines.get(&line_num) else {
+                continue;
             };
-            'lines: while let Some(line_u32) = line_nums.next_candidate() {
-                let line_num = line_u32 as usize;
-                let Some(text) = self.lines.get(&line_num) else {
-                    continue;
-                };
-                // Use cached column map when available (#7373).
-                let fallback;
-                let col_map = match self.column_maps.get(&line_num) {
-                    Some(cm) => cm,
-                    None => {
-                        fallback = ColumnMap::new(text);
-                        &fallback
-                    }
-                };
-                match direction {
-                    SearchDirection::Forward => {
-                        for cap in re.find_iter(text) {
-                            // Skip zero-length matches (e.g. `^`, `\b`, `x*` at
-                            // non-matching positions), including byte spans that
-                            // resolve to zero display columns.
-                            if cap.start() == cap.end() {
-                                continue;
-                            }
-                            let start_col = col_map.byte_to_column(cap.start());
-                            let end_col = col_map.byte_to_column(cap.end());
-                            if start_col == end_col {
-                                continue;
-                            }
-                            matches.push(SearchMatch::new(line_num, start_col, end_col));
-                            if matches.len() >= MAX_SEARCH_MATCHES {
-                                break 'lines;
-                            }
+            // Use cached column map when available (#7373).
+            let fallback;
+            let col_map = match self.column_maps.get(&line_num) {
+                Some(cm) => cm,
+                None => {
+                    fallback = ColumnMap::new(text);
+                    &fallback
+                }
+            };
+            match direction {
+                SearchDirection::Forward => {
+                    for cap in re.find_iter(text) {
+                        // Skip zero-length matches (e.g. `^`, `\b`, `x*` at
+                        // non-matching positions), including byte spans that
+                        // resolve to zero display columns.
+                        if cap.start() == cap.end() {
+                            continue;
+                        }
+                        let start_col = col_map.byte_to_column(cap.start());
+                        let end_col = col_map.byte_to_column(cap.end());
+                        if start_col == end_col {
+                            continue;
+                        }
+                        matches.push(SearchMatch::new(line_num, start_col, end_col));
+                        if matches.len() >= MAX_SEARCH_MATCHES {
+                            break 'lines;
                         }
                     }
-                    SearchDirection::Backward => {
-                        // Regex iterators are forward-only within one line. A
-                        // terminal line is width-bounded, so buffer just this
-                        // line and consume it right-to-left; the global result
-                        // vector remains capped.
-                        let mut line_matches = Vec::new();
-                        for cap in re.find_iter(text) {
-                            if cap.start() == cap.end() {
-                                continue;
-                            }
-                            let start_col = col_map.byte_to_column(cap.start());
-                            let end_col = col_map.byte_to_column(cap.end());
-                            if start_col != end_col {
-                                line_matches.push(SearchMatch::new(line_num, start_col, end_col));
-                            }
+                }
+                SearchDirection::Backward => {
+                    // Regex iterators are forward-only within one line. A
+                    // terminal line is width-bounded, so buffer just this
+                    // line and consume it right-to-left; the global result
+                    // vector remains capped.
+                    let mut line_matches = Vec::new();
+                    for cap in re.find_iter(text) {
+                        if cap.start() == cap.end() {
+                            continue;
                         }
-                        for found in line_matches.into_iter().rev() {
-                            matches.push(found);
-                            if matches.len() >= MAX_SEARCH_MATCHES {
-                                break 'lines;
-                            }
+                        let start_col = col_map.byte_to_column(cap.start());
+                        let end_col = col_map.byte_to_column(cap.end());
+                        if start_col != end_col {
+                            line_matches.push(SearchMatch::new(line_num, start_col, end_col));
+                        }
+                    }
+                    for found in line_matches.into_iter().rev() {
+                        matches.push(found);
+                        if matches.len() >= MAX_SEARCH_MATCHES {
+                            break 'lines;
                         }
                     }
                 }
             }
-            // One check for the whole walk: `re` is compiled here and used
-            // nowhere else, so its sticky flag can only have been set by the
-            // lines just scanned. If any line was abandoned mid-scan, the list
-            // below is missing matches — say so instead of returning it.
-            if re.step_limit_exceeded() {
-                return Err(Self::regex_scan_budget_exhausted());
-            }
-            // Backward collection is globally newest/rightmost first. One
-            // linear reversal restores the ascending order expected by GUI
-            // mapping without an O(k log k) result sort.
-            if direction == SearchDirection::Backward {
-                matches.reverse();
-            }
-            Ok(matches)
         }
-        #[cfg(not(feature = "regex"))]
-        {
-            let _ = (query, case_sensitive, direction);
-            Err(SearchOptionsError::RegexNotEnabled)
+        // One check for the whole walk: `re` is compiled here and used
+        // nowhere else, so its sticky flag can only have been set by the
+        // lines just scanned. If any line was abandoned mid-scan, the list
+        // below is missing matches — say so instead of returning it.
+        if re.step_limit_exceeded() {
+            return Err(Self::regex_scan_budget_exhausted());
         }
+        // Backward collection is globally newest/rightmost first. One
+        // linear reversal restores the ascending order expected by GUI
+        // mapping without an O(k log k) result sort.
+        if direction == SearchDirection::Backward {
+            matches.reverse();
+        }
+        Ok(matches)
     }
 
     /// Case-insensitive literal search across all cached lines.
@@ -2237,7 +2222,7 @@ impl SearchIndex {
     /// Find one regex match at the directional anchor without materializing a
     /// capped global batch. Used by interactive navigation when total matches
     /// exceed [`MAX_SEARCH_MATCHES`].
-    #[cfg(all(test, feature = "regex"))]
+    #[cfg(test)]
     pub(crate) fn find_regex_from(
         &self,
         query: &str,
@@ -2247,28 +2232,13 @@ impl SearchIndex {
         direction: SearchDirection,
         inclusive: bool,
     ) -> Result<Option<SearchMatch>, SearchOptionsError> {
-        #[cfg(feature = "regex")]
-        {
-            let re = Self::compile_regex(query, case_sensitive)?;
-            let found =
-                self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
-            if re.step_limit_exceeded() {
-                return Err(Self::regex_scan_budget_exhausted());
-            }
-            Ok(found)
+        let re = Self::compile_regex(query, case_sensitive)?;
+        let found =
+            self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
+        if re.step_limit_exceeded() {
+            return Err(Self::regex_scan_budget_exhausted());
         }
-        #[cfg(not(feature = "regex"))]
-        {
-            let _ = (
-                query,
-                case_sensitive,
-                anchor_line,
-                anchor_col,
-                direction,
-                inclusive,
-            );
-            Err(SearchOptionsError::RegexNotEnabled)
-        }
+        Ok(found)
     }
 
     /// Regex point navigation with one compilation shared by the first pass
@@ -2289,58 +2259,41 @@ impl SearchIndex {
             inclusive,
             wrap,
         } = find;
-        #[cfg(feature = "regex")]
-        {
-            let re = Self::compile_regex(query, case_sensitive)?;
-            let found =
-                self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
-            // Checked after each pass, before the answer is used: a `None` from
-            // a walk that abandoned a line is not "there is no next match", and
-            // navigating past a match the scan never finished reading would
-            // move the cursor to the wrong place.
-            if re.step_limit_exceeded() {
-                return Err(Self::regex_scan_budget_exhausted());
-            }
-            if found.is_some() || !wrap {
-                return Ok(found);
-            }
-            let wrapped = match direction {
-                SearchDirection::Forward => self.find_compiled_regex_from(
-                    &re,
-                    self.first_cached_line.min(self.line_count),
-                    0,
-                    direction,
-                    true,
-                ),
-                SearchDirection::Backward => self.find_compiled_regex_from(
-                    &re,
-                    self.line_count.saturating_sub(1),
-                    usize::MAX,
-                    direction,
-                    true,
-                ),
-            };
-            if re.step_limit_exceeded() {
-                return Err(Self::regex_scan_budget_exhausted());
-            }
-            Ok(wrapped)
+        let re = Self::compile_regex(query, case_sensitive)?;
+        let found =
+            self.find_compiled_regex_from(&re, anchor_line, anchor_col, direction, inclusive);
+        // Checked after each pass, before the answer is used: a `None` from
+        // a walk that abandoned a line is not "there is no next match", and
+        // navigating past a match the scan never finished reading would
+        // move the cursor to the wrong place.
+        if re.step_limit_exceeded() {
+            return Err(Self::regex_scan_budget_exhausted());
         }
-        #[cfg(not(feature = "regex"))]
-        {
-            let _ = (
-                query,
-                case_sensitive,
-                anchor_line,
-                anchor_col,
+        if found.is_some() || !wrap {
+            return Ok(found);
+        }
+        let wrapped = match direction {
+            SearchDirection::Forward => self.find_compiled_regex_from(
+                &re,
+                self.first_cached_line.min(self.line_count),
+                0,
                 direction,
-                inclusive,
-                wrap,
-            );
-            Err(SearchOptionsError::RegexNotEnabled)
+                true,
+            ),
+            SearchDirection::Backward => self.find_compiled_regex_from(
+                &re,
+                self.line_count.saturating_sub(1),
+                usize::MAX,
+                direction,
+                true,
+            ),
+        };
+        if re.step_limit_exceeded() {
+            return Err(Self::regex_scan_budget_exhausted());
         }
+        Ok(wrapped)
     }
 
-    #[cfg(feature = "regex")]
     fn find_compiled_regex_from(
         &self,
         re: &aterm_regex::Regex,
@@ -2567,7 +2520,7 @@ impl Default for SearchIndex {
 /// `REGEX_SIZE_LIMIT` bounds what compiles; these tests are about what a
 /// compiled pattern then costs to run, which is a separate axis and used to be
 /// unbounded. See `REGEX_STEP_LIMIT`.
-#[cfg(all(test, feature = "regex"))]
+#[cfg(test)]
 mod regex_scan_budget_tests {
     use super::*;
 

@@ -538,7 +538,7 @@ fn unnotarized_and_rehearsal_cuts_skip_without_the_ack() {
 
 /// The smoke lives in "selfcheck", and "selfcheck" precedes every
 /// publish-facing step — so the typed line is spent against the
-/// just-built bundle BEFORE anything is drafted, uploaded, tagged or flipped.
+/// just-built bundle BEFORE anything is tagged or published.
 /// (Within the step, ordering against the signing gate is pinned by
 /// `the_paint_smoke_runs_before_the_signing_gate` above.)
 #[test]
@@ -550,9 +550,7 @@ fn the_selfcheck_owning_the_smoke_precedes_every_publish_step() {
             .unwrap_or_else(|| panic!("step {name} missing from publish::STEPS"))
     };
     let selfcheck = pos("selfcheck");
-    for later in [
-        "draft", "upload", "preflip", "tag", "flip", "verify", "mirror",
-    ] {
+    for later in ["tag", "publish"] {
         assert!(
             selfcheck < pos(later),
             "selfcheck (the paint smoke) must precede {later}"

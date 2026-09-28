@@ -20,9 +20,11 @@
 //! 2. **the app log** — warned (not logged) on the first check, then RE-warned every
 //!    [`RENOTICE_AFTER`], so a long-lived process keeps a live breadcrumb without
 //!    per-cycle spam.
-//! 3. **an OS notification**, once per process, through the GUI's existing
+//! 3. **an OS notification**, once per strand, through the GUI's existing
 //!    `HealthNotify` hook — the same channel the "update pipeline is broken" notice
-//!    uses. This is the only surface the owner sees without going looking.
+//!    uses. This is the only surface the owner sees without going looking. A
+//!    readable check re-arms it ([`StrandNotice`]), so a channel that heals and
+//!    breaks again in one long-lived process is announced again.
 //!
 //! [`is_stranded`] exposes the state to the background loop so it can fire (3) and
 //! back off a network cadence that cannot succeed.
@@ -77,7 +79,7 @@ pub(crate) fn clear() {
 /// Announce the stranded state on all three surfaces. Called on every check whose
 /// pointer answered that the channel cannot be read, but only the status write happens
 /// every time; the log warning is throttled to [`RENOTICE_AFTER`] and the notification
-/// is fired once per process by the caller of [`is_stranded`].
+/// is fired once per strand by the background loop's [`StrandNotice`].
 ///
 /// `explanation` comes from `github::unreadable_explanation`: it names every cause a
 /// 404 cannot distinguish, the consequence, and the remedy.
@@ -93,6 +95,30 @@ pub(crate) fn announce(staging: &Staging, current_build: u64, explanation: &str)
         // `warn`, not `log`: this is a defect in the channel, not a routine decision,
         // and it is the one condition under which the updater can never make progress.
         crate::warn(explanation);
+    }
+}
+
+/// The background loop's latch for the OS notification: once per STRAND, not once
+/// per process. A channel this machine cannot read is a configuration defect, not an
+/// event, so it is announced once and then lives in `status.toml` (rewritten every
+/// check) rather than nagging — but a readable check ends the strand ([`clear`]), and
+/// a later strand is a new defect the owner has not heard about. As a bare bool set
+/// once, the latch swallowed every strand after the first for the life of the process.
+#[derive(Debug, Default)]
+pub(crate) struct StrandNotice {
+    notified: bool,
+}
+
+impl StrandNotice {
+    /// Whether this cycle should raise the notification, given whether the last
+    /// completed check left the machine `stranded`. True on the first stranded cycle
+    /// of each strand; a non-stranded cycle re-arms the latch.
+    pub(crate) fn due(&mut self, stranded: bool) -> bool {
+        if !stranded {
+            self.notified = false;
+            return false;
+        }
+        !std::mem::replace(&mut self.notified, true)
     }
 }
 
@@ -123,6 +149,24 @@ pub(crate) fn notification() -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The latch re-arms when the strand clears. Before it, the loop's bare
+    /// `notified_unreadable` bool answered `false` at the second strand's first
+    /// cycle, so a channel that healed and broke again was never announced.
+    #[test]
+    fn the_strand_notice_fires_once_per_strand_and_re_arms_when_it_clears() {
+        let mut notice = StrandNotice::default();
+        assert!(!notice.due(false), "a readable channel announces nothing");
+        assert!(notice.due(true), "the first stranded cycle announces");
+        assert!(!notice.due(true), "and only the first");
+        assert!(!notice.due(true));
+        assert!(!notice.due(false), "the channel reads again");
+        assert!(
+            notice.due(true),
+            "a second strand in the same process is announced again"
+        );
+        assert!(!notice.due(true));
+    }
 
     #[test]
     fn the_notification_names_the_consequence_and_the_next_step() {

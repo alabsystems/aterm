@@ -14,7 +14,7 @@ description = "Owns-correctness capabilities (ATERM_DESIGN WS-G): an UNFORGEABLE
 # the trusted launcher binaries (aterm-gui, aterm-cli) and, via the `test` cfg, a
 # crate's own test build. Non-launcher crates cannot name the mint, so no
 # parser/handler/extension path can reach it (no-mint-reachability). Mirrors
-# `aterm-provenance`'s `internal-mint`; enforced by `mint_sites_are_launcher_only`.
+# `aterm-provenance`'s `internal-mint`; enforced by tests/mint_reachability.rs.
 launcher-mint = []
 
 [lints]

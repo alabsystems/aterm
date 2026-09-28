@@ -174,6 +174,15 @@ const FLAGS: &[(&str, Arity, Fate)] = &[
     ("--include-non-interactive", Arity::None, Fate::Drop),
     ("--last", Arity::None, Fate::Drop),
     ("--local-provider", Arity::One, Fate::Keep),
+    // The model is CARRIED, never moved (2026-09-26): the Claude lane's
+    // same-family move (`upgrade_models`) has no Codex counterpart. It rests
+    // on the installed build's own catalog, and aterm reads no Codex catalog
+    // (the vendor's `models_cache.json` is a network cache with its own
+    // `upgrade` pointer per model, which Codex acts on itself); and a
+    // daemon-mode client's thread keeps running in the daemon across the
+    // relaunch, where what a `-m` on `codex resume` does to it is unmeasured.
+    // So nothing is added, and a launch's model is kept verbatim: never
+    // guessed, never down.
     ("-m", Arity::One, Fate::Keep),
     ("--model", Arity::One, Fate::Keep),
     ("--no-alt-screen", Arity::None, Fate::Keep),
@@ -729,21 +738,25 @@ pub fn terminals_on_screen(rows: &[String]) -> bool {
 
 /// How every Codex notice opens: the supervisor's and the READY reader's tag
 /// ([`rollout_has_ready`] resets on it).
-pub const ANNOUNCE_HEAD: &str = "[aterm harness] Codex ";
+pub const ANNOUNCE_HEAD: &str = concat!(harness_mark!(), " Codex ");
 
 /// THE NOTICE to an EMBEDDED session: one ordinary user turn asking for a
 /// good stopping point and naming the one line to answer with. Never asks the
-/// agent to cancel anything.
+/// agent to cancel work that is still making progress. Like Claude Code's
+/// (`upgrade::STOPPING_POINT`), it says that a wait on something that has
+/// already ended is not such work.
 #[must_use]
 pub fn prepare_prompt(from: &Version, to: &Version, marker: &str) -> String {
     format!(
         "{ANNOUNCE_HEAD}{to} (managed) is installed; this session runs {from}. To move you onto \
          it, aterm will exit this Codex (/exit) and resume this same conversation in place \
          (codex resume, same tab, same flags). Please get to a good stopping point first: let \
-         any commands or background tasks you started finish (do not cancel them), save work \
-         in progress, and do not start new long-running work. When nothing of yours is still \
-         running, reply with {marker} on a line by itself. If you cannot stop now, say why; \
-         aterm will wait and ask again later."
+         commands or background tasks you started finish while they are still making progress \
+         (do not cancel them), but stop any of yours that only waits for something that has \
+         already ended or can never happen: that wait is not work. Save work in progress, and \
+         do not start new long-running work. When nothing of yours is still running, reply \
+         with {marker} on a line by itself. If you cannot stop now, say why; aterm will wait \
+         and ask again later."
     )
 }
 
@@ -752,8 +765,8 @@ pub fn prepare_prompt(from: &Version, to: &Version, marker: &str) -> String {
 #[must_use]
 pub fn continue_prompt(from: &Version, to: &Version) -> String {
     format!(
-        "[aterm harness] Upgraded: this session was restarted on Codex {to} (from {from}) and \
-         resumed. {}",
+        "{} Upgraded: this session was restarted on Codex {to} (from {from}) and resumed. {}",
+        super::upgrade::HARNESS_MARK,
         super::upgrade::CARRY_ON
     )
 }
@@ -805,7 +818,9 @@ impl Mode {
 /// and the give-up, word for word the Claude lane's), and for every other
 /// client the gate alone — idle, settled, the composer empty, no box, no
 /// busy row, no hold, nobody at the tab — then [`Step::Terminate`], which the
-/// Codex driver carries out as a typed `/exit`, never a signal. A daemon-mode
+/// Codex driver carries out as a typed `/exit`, never a signal. A stopped
+/// round of either kind starts a new one once it has rested
+/// [`super::upgrade::RETRY_S`] ([`Step::Rearm`]): no stop is for good. A daemon-mode
 /// client also waits for its daemon to be on the build it moves to
 /// (`daemon_behind`: the daemon's half goes first, so a relaunched client
 /// never attaches to an older server).
@@ -820,6 +835,11 @@ pub fn next_step(
 ) -> Step {
     if mode.cooperative() {
         return super::upgrade::next_step(phase, f, ready, now_s);
+    }
+    // No stop is for good: a stopped round rests `RETRY_S`, then a new one
+    // starts — it types nothing, so a break takes it too.
+    if super::upgrade::retry_due(phase, f.failed_s, false) {
+        return Step::Rearm;
     }
     // A client with no notice to take ends at its `/exit`: an idle point's
     // alone, never a break of the agent's own background work.
@@ -843,7 +863,8 @@ pub fn next_step(
 }
 
 /// [`next_step`] under the owner's word — [`super::upgrade::requested_step`]'s
-/// rule: a skip of THIS target or a deferral not run out holds it; `--now`
+/// rule: a skip of THIS target or a deferral not run out holds it, and a
+/// stopped round's new one ([`super::upgrade::rearm_held`]); `--now`
 /// waives the settling window and the attended-tab guard and nothing else.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
@@ -864,15 +885,17 @@ pub fn requested_step(
             "deferred"
         });
     }
-    if *request == Request::Now {
+    let step = if *request == Request::Now {
         let waived = Facts {
             owner_now: true,
             attended: false,
             ..f.clone()
         };
-        return next_step(mode, phase, &waived, ready, daemon_behind, now_s);
-    }
-    next_step(mode, phase, f, ready, daemon_behind, now_s)
+        next_step(mode, phase, &waived, ready, daemon_behind, now_s)
+    } else {
+        next_step(mode, phase, f, ready, daemon_behind, now_s)
+    };
+    super::upgrade::rearm_held(request, step, target, now_s)
 }
 
 // ---------------------------------------------------------------- the daemon

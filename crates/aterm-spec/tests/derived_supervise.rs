@@ -38,6 +38,127 @@ fn the_turn_end_policy_proves_and_catches_typing_over_a_person_and_escalating_do
     );
 }
 
+/// N1 OF THE LIVE E2E OF 2026-09-26: the harness's own turns (the upgrade's
+/// notice answered READY, its carry-on answered) are no work of the
+/// worker's — after them the streak and its back-off are what the worker's
+/// turns left, and a free point is continued; the policy that reads them as
+/// short turns of someone else's (`Buggy = 1`) backs off for them, caught by
+/// `NeverBackOffForTheHarness` on that path alone.
+#[test]
+fn the_turn_end_policy_backs_off_for_no_turn_of_the_harness() {
+    let m = aterm_spec::derive::supervisor_turn_end_model();
+    let asked = |mut st: std::collections::BTreeMap<&'static str, i64>| {
+        st.insert("asked", 1);
+        st.insert("tasked", 1);
+        st
+    };
+    let mut st = asked(m.init_state());
+    for action in ["HarnessTurn", "HarnessTurn"] {
+        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert_eq!((st["short"], st["backoff"]), (0, 0), "{st:?}");
+    assert!(m.action_enabled("Continue", &st), "{st:?}");
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut wrong = asked(buggy.init_state());
+    assert!(buggy.fire("HarnessTurn", &mut wrong));
+    assert!(
+        !buggy.check_invariant("NeverBackOffForTheHarness", &wrong),
+        "{wrong:?}"
+    );
+    for inv in &m.invariants {
+        if inv.name != "NeverBackOffForTheHarness" {
+            assert!(buggy.check_invariant(inv.name, &wrong), "{}", inv.name);
+        }
+    }
+}
+
+/// THE REVIEW OF THE N1 FIX: a harness turn answered with REAL WORK (the
+/// carry-on's answer is the worker's own work, resumed) ends the streak as
+/// any turn of real work does — after a short turn of the worker's has
+/// started a back-off, the long answer leaves the point free; the policy
+/// that leaves the streak standing for it (`Buggy = 1`) backs off after real
+/// work, caught by `NeverBackOffAfterRealWork` on that path alone.
+#[test]
+fn a_harness_turn_answered_with_real_work_ends_the_streak() {
+    let m = aterm_spec::derive::supervisor_turn_end_model();
+    let short_turn = |m: &aterm_spec::derive::Model| {
+        let mut st = m.init_state();
+        st.insert("asked", 1);
+        st.insert("tasked", 1);
+        for action in ["Continue", "WorkedShort"] {
+            assert!(m.fire(action, &mut st), "{action} at {st:?}");
+        }
+        assert_eq!(st["backoff"], 1, "{st:?}");
+        st
+    };
+    let mut st = short_turn(&m);
+    assert!(m.fire("HarnessTurnLong", &mut st));
+    assert_eq!((st["short"], st["backoff"]), (0, 0), "{st:?}");
+    assert!(m.action_enabled("Continue", &st), "{st:?}");
+    // …and answered short, the back-off stands.
+    let mut held = short_turn(&m);
+    assert!(m.fire("HarnessTurn", &mut held));
+    assert_eq!((held["short"], held["backoff"]), (1, 1), "{held:?}");
+    assert!(!m.action_enabled("Continue", &held), "{held:?}");
+    let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let mut wrong = short_turn(&buggy);
+    assert!(buggy.fire("HarnessTurnLong", &mut wrong));
+    assert!(
+        !buggy.check_invariant("NeverBackOffAfterRealWork", &wrong),
+        "{wrong:?}"
+    );
+    for inv in &m.invariants {
+        if inv.name != "NeverBackOffAfterRealWork" {
+            assert!(buggy.check_invariant(inv.name, &wrong), "{}", inv.name);
+        }
+    }
+}
+
+/// D3 OF THE LIVE E2E OF 2026-09-26: a turn end left to the session's host
+/// is decided again once the host owns nothing, and one a host step moved
+/// (it typed into the agent, or ended it) never is — proven; the loop that
+/// decides each point once (`Buggy = 1`) waits on one nobody decides, and
+/// the loop that decides again whatever a step left behind decides a point
+/// that is gone — each caught by its own invariant.
+#[test]
+fn the_host_turn_end_proves_and_catches_a_point_left_to_nobody() {
+    let model = aterm_spec::derive::supervisor_host_turn_end_model();
+    aterm_spec::verify::prove_and_catch_scalar(
+        &model,
+        "supervisor host turn end: a point the host lets go is decided again",
+    );
+    // Each bug `Buggy = 1` admits is reached on its own path.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    for (path, invariant) in [
+        (
+            &["TurnEnds", "HostLetsGo", "LoopWaits"][..],
+            "NoTurnEndLeftToNobody",
+        ),
+        (
+            &["TurnEnds", "HostMoves", "Redecide"][..],
+            "NeverDecideAPointAStepMoved",
+        ),
+    ] {
+        let mut st = buggy.init_state();
+        for action in path {
+            assert!(buggy.fire(action, &mut st), "{action} at {st:?}");
+        }
+        assert!(
+            !buggy.check_invariant(invariant, &st),
+            "{invariant}: {st:?}"
+        );
+        // The fixed loop cannot take that path's last step.
+        let mut fixed = model.init_state();
+        for action in &path[..2] {
+            assert!(model.fire(action, &mut fixed), "{action} at {fixed:?}");
+        }
+        assert!(
+            !model.action_enabled(path[2], &fixed),
+            "{invariant}: {fixed:?}"
+        );
+    }
+}
+
 /// THE QUESTION ANSWER (R3c of the critique of 2026-09-25): with a person's
 /// quiet and the progression rule, every key the supervisor writes is the
 /// next one Claude Code reads and meets the dialog as the read showed it —

@@ -17,10 +17,9 @@
 //!   query-modify-write, so any `LimitFlags` the caller already set (e.g.
 //!   `KILL_ON_JOB_CLOSE`) are preserved.
 //!
-//! NOTE (wiring): the ConPTY spawn seam does not yet CALL [`apply_to_job`] (it is
-//! sketched as the follow-up at the `aterm-pty` job-assignment step), so this
-//! lane is dormant until that one-line call lands — the child is only actually
-//! confined once the seam invokes it against the suspended child's job.
+//! The ConPTY seam (`aterm-pty/src/windows/mod.rs`, after
+//! `AssignProcessToJobObject`) calls [`apply_to_job`] on the still-suspended
+//! child's job and terminates the child if it fails.
 //!
 //! The cap gate in `lib.rs` runs on BOTH entry points (a weak `Cap<Sandbox>` can
 //! never actuate — SEC-2).
@@ -32,10 +31,9 @@ use std::os::windows::io::RawHandle;
 use crate::Limits;
 
 /// Windows: POSIX-style resource limits are NOT actuated by `apply` — return
-/// `Ok(())` so the capability-gated spawn proceeds, with the posture surfaced
-/// honestly via [`crate::rlimits_actuated`] and the launchers' startup notices.
-/// The real Windows resource lane is [`apply_to_job`], invoked at the ConPTY
-/// spawn seam against the child's Job Object.
+/// `Ok(())` so the capability-gated spawn proceeds. The real Windows resource
+/// lane is [`apply_to_job`], invoked at the ConPTY spawn seam against the
+/// child's Job Object.
 pub(crate) fn apply_limits(_limits: &Limits) -> io::Result<()> {
     Ok(())
 }

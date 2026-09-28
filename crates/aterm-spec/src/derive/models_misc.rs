@@ -1587,6 +1587,15 @@ pub fn focus_modifier_cache_model() -> Model {
 /// invariant no mutant can falsify is a ghost, which is how this model's first
 /// draft passed while stating nothing.
 ///
+/// Output that takes the highlight WITHOUT moving the view — an in-place rewrite
+/// over the selected rows, or a re-pin saturated at the history floor — and output
+/// that takes it for a reason the damage lattice cannot attribute
+/// (`post_process`'s fail-closed arms) are their own actions under the same tag and
+/// the same law as a damaging take, and a user gesture back TOWARD live that is not
+/// typing (End, a downward scroll, the ⌘-V / IME snaps) is `SnapToLive` /
+/// `UserScrollTowardLive`: it moves the view down and keeps the highlight
+/// (closed 2026-09-25; each was a KNOWN GAP of the Tier-1 conformance).
+///
 /// Scope: this is the PRESS-PATH half of custody (design Phase 1) plus the output
 /// repin it must not fight. The alt-screen round-trip, scrollback eviction and
 /// reflow anchoring are Phase 3 and are deliberately absent rather than asserted
@@ -1613,8 +1622,12 @@ pub fn press_custody_model() -> Model {
             var prev_selection = 0;
             // What kind of event just fired: 0 a user gesture, 1 a typing press,
             // 2 an auto-repeat tick, 3 a bare modifier, 4 a release, 5 output that
-            // missed the selected rows, 6 output that REPLACED them, 7 output that
-            // invalidated the coordinate space (ED 3 / clear_scrollback / RIS).
+            // missed the selected rows, 6 output that TOOK the highlight (it
+            // replaced the selected rows, or `post_process` failed closed on it),
+            // 7 output that invalidated the coordinate space (ED 3 /
+            // clear_scrollback / RIS), 8 a user gesture back TOWARD live that is
+            // not typing (a downward scroll, End / ScrollToBottom, the paste and
+            // IME snaps).
             var last_event = 0;
 
             action UserScroll when (offset <= MaxOffset - 1) {
@@ -1691,6 +1704,48 @@ pub fn press_custody_model() -> Model {
                 selection = 0;
                 last_event = 6;
             }
+            // The same take, IN PLACE: a damaging batch that advanced no rows (an
+            // in-place rewrite — `\r` plus EL over the selected row, a DECERA, a
+            // status line repainting itself) or whose re-pin saturated at the
+            // history floor. The view does not move, for a reader or at live; only
+            // the highlight goes. `Buggy = 1` snaps the reader to live, which
+            // `OutputNeverTakesCustody` catches.
+            action OutputDamagesTheSelectedRowsInPlace when (selection == 1) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = 0;
+                last_event = 6;
+            }
+            // Output took the highlight for a reason that is NOT damage overlap —
+            // `post_process`'s fail-closed arms (a malformed or saturated splice
+            // projection, a splice mixed with another scroll, the `left_alt`
+            // re-check, a whole-interval eviction at the history floor). Same
+            // tag and same law as a damaging take: the highlight may go, the
+            // reading position may not. The re-pin rides the arriving lines…
+            action OutputTookTheSelectionUnattributed
+                when (selection == 1 && offset <= MaxOffset - 1)
+            {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { if owner == 1 { offset + 1 } else { 0 } };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = 0;
+                last_event = 6;
+            }
+            // …or, when no row arrived or the re-pin saturated, stays where it was.
+            action OutputTookTheSelectionUnattributedInPlace when (selection == 1) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = if Buggy == 1 { 0 } else { offset };
+                owner = if Buggy == 1 { 0 } else { owner };
+                selection = 0;
+                last_event = 6;
+            }
             // ED 3 / `clear_scrollback` / RIS: `repin_display_offset` clamps to 0
             // because the coordinate space the offset named is gone. This IS output
             // handing the viewport back to the tail-follower, so it is spelled as
@@ -1711,6 +1766,32 @@ pub fn press_custody_model() -> Model {
                 // fail-OPEN direction this design exists to rule out.
                 selection = if Buggy == 1 { selection } else { 0 };
                 last_event = 7;
+            }
+            // The user brings the view back to LIVE without typing — End /
+            // `ScrollToBottom`, a page or wheel step that lands at the tail, the
+            // ⌘-V and IME snaps. Ownership goes back to the tail-follower because
+            // the view is at the tail; the highlight is the user's and stays.
+            // `Buggy = 1` deselects on the way, which
+            // `ReturningTowardLiveKeepsTheSelection` catches.
+            action SnapToLive when (offset > 0) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = 0;
+                owner = 0;
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 8;
+            }
+            // A downward scroll that stops short of live: the user still owns the
+            // view, one row nearer the tail. (Granularity as for `UserScroll`: a
+            // real page or notch moves further; Tier-1 drives the one-row form.)
+            action UserScrollTowardLive when (offset > 1) {
+                prev_owner = owner;
+                prev_offset = offset;
+                prev_selection = selection;
+                offset = offset - 1;
+                selection = if Buggy == 1 { 0 } else { selection };
+                last_event = 8;
             }
             // The ONE handover. Unchanged by this design — but `Buggy = 1` still
             // gives it a member (typing that deselects without snapping), because
@@ -1759,21 +1840,21 @@ pub fn press_custody_model() -> Model {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 7
+                    last_event <= 8
                 };
             invariant RepeatPressIsInert:
                 if last_event == 2 {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 7
+                    last_event <= 8
                 };
             invariant ReleaseIsInert:
                 if last_event == 4 {
                     offset == prev_offset && owner == prev_owner &&
                     selection == prev_selection
                 } else {
-                    last_event <= 7
+                    last_event <= 8
                 };
             // Output never takes the reading position — the half of the old
             // `OutputNeverTakesCustodyOrSelection` that is TRUE of the shipped
@@ -1788,7 +1869,7 @@ pub fn press_custody_model() -> Model {
                     if last_event == 6 {
                         owner == prev_owner && prev_offset <= offset
                     } else {
-                        last_event <= 7
+                        last_event <= 8
                     }
                 };
             // …and the selection half, narrowed to the case where it holds. The
@@ -1802,31 +1883,39 @@ pub fn press_custody_model() -> Model {
                 if last_event == 5 {
                     selection == prev_selection
                 } else {
-                    last_event <= 7
+                    last_event <= 8
                 };
             invariant TypingLandsAtLive:
                 if last_event == 1 {
                     offset == 0 && owner == 0 && selection == 0
                 } else {
-                    last_event <= 7
+                    last_event <= 8
                 };
             // The ONE handover, and the discipline it owes. ED 3 / `clear_scrollback`
             // / RIS destroy the coordinate space the anchors are stated in, so
             // handing the viewport back is correct — but a selection may not
             // OUTLIVE the space that gives its rows meaning. Every other invariant
-            // reaches event 7 only through an `else { last_event <= 7 }` arm, which
+            // reaches event 7 only through an `else { last_event <= 8 }` arm, which
             // is trivially true; without this one the model admits the action and
             // then says nothing whatever about it.
             invariant InvalidationCannotLeaveADanglingSelection:
                 if last_event == 7 {
                     offset == 0 && owner == 0 && selection == 0
                 } else {
-                    last_event <= 7
+                    last_event <= 8
+                };
+            // A gesture back toward live moves the view DOWN and nothing else: it is
+            // not typing, so the highlight survives it.
+            invariant ReturningTowardLiveKeepsTheSelection:
+                if last_event == 8 {
+                    selection == prev_selection && offset <= prev_offset - 1
+                } else {
+                    last_event <= 8
                 };
             invariant StateBounds:
                 owner <= 1 && offset <= MaxOffset && selection <= 1 &&
                 prev_owner <= 1 && prev_offset <= MaxOffset && prev_selection <= 1 &&
-                last_event <= 7;
+                last_event <= 8;
         }
     }
 }
@@ -3415,10 +3504,14 @@ pub fn exact_profanity_completion_model() -> Model {
 }
 
 /// Process-crash/interleaving model for the native updater's fixed-path install
-/// transaction and boot-health confirmation. This deliberately does **not**
-/// claim sudden-power-loss durability: the current atomic ledger writes and
-/// renames are not yet bound to file+directory fsync. Process crashes preserve
-/// every completed filesystem transition represented here.
+/// transaction and boot-health confirmation. It models PROCESS crashes, which
+/// preserve every completed filesystem transition represented here, and not
+/// sudden power loss. The implementation does sync for power loss on a best-
+/// effort basis — every ledger record goes through `manifest::write_durable`
+/// (file `sync_all`, rename, parent-directory sync) and the fixed-path swap
+/// syncs its parent directory — but a filesystem that reports a sync
+/// unsupported degrades to non-durable, so power-loss durability is not a
+/// claim this model makes.
 ///
 /// Identity `1` is exact OLD, `2` exact authorized NEW, and `3` a same-build or
 /// superseding-but-unauthorized artifact. The committed path verifies OLD's

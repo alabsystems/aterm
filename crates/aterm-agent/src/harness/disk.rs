@@ -13,6 +13,15 @@
 //! `--apply` that means "apply everything": the class is the grant, and a
 //! grant for `cargo-targets` cannot reach a row of any other class.
 //!
+//! # The one automatic grant: below the floor, stale build directories
+//!
+//! [`auto_plan`] is the only removal nobody names at the moment it happens:
+//! when free space is below `disk.auto_free_gib` ([`DEFAULT_AUTO_FREE_GIB`],
+//! decided 2026-09-25 under the owner's standing direction), the host's tick
+//! removes the removable [`Class::CargoTargets`] rows — each still behind its
+//! witness and [`guard`] — and nothing of any other class. Above the floor,
+//! or on a free figure nobody could read, it plans nothing.
+//!
 //! # Every row carries the witness that makes it safe to remove
 //!
 //! A row with no witness is not a candidate; it is a note. The three classes
@@ -60,15 +69,16 @@
 //! §5.5 keeps a 6 h tick, and §4.2 row 18 says why: a free-space figure has
 //! no event to hang on — nothing in aterm or the vendor announces "a gigabyte
 //! left". That tick belongs to the HOST that calls [`report`]; there is no
-//! sleep, no loop and no cadence in this file. Two event-shaped re-measure
-//! reasons ride it instead of a second clock ([`Trigger`]), so a host that
-//! has them can re-measure on the event and leave the tick as the floor.
+//! sleep, no loop and no cadence in this file. The window's harness host
+//! (`aterm-gui` `harness_host.rs`) keeps it, and hands each tick to
+//! [`super::cli::disk_tick`] ([`Trigger::Tick`]).
 //!
 //! STATUS (docs/README.md honesty ratchet): unit-tested, including the
 //! synthetic stale target that is reported and then removed with its witness
 //! in the row, the outside-the-safelist path that is refused with a denial
-//! row, and the report-only default. The 6 h tick and the `--diagnose` line
-//! of §5.5 have no host yet; [`Trigger`] is the vocabulary they will use.
+//! row, the report-only default, and the automatic floor (removes the stale
+//! build directory below it, nothing above it, nothing of another class). The
+//! `--diagnose` line of §5.5 has no host.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -88,8 +98,19 @@ pub const DEFAULT_WARN_FREE_GIB: u64 = 40;
 /// `disk.target_stale_days` (design §5.5).
 pub const DEFAULT_TARGET_STALE_DAYS: i64 = 14;
 
-/// `disk.apply` (design §5.5): report-only until the owner says otherwise.
+/// `disk.apply` (design §5.5): the owner's verb removes nothing until this is
+/// on. The automatic floor below is its own, narrower grant.
 pub const DEFAULT_APPLY: bool = false;
+
+/// `disk.auto_free_gib`: below this many free GiB the host's tick reclaims the
+/// witnessed stale build directories by itself — [`Class::CargoTargets`]
+/// only, each row carrying its witness ([`auto_plan`]). `0` turns it off.
+/// Decided 2026-09-25 under the owner's standing direction (self-healing,
+/// batteries included): a full disk stalled a worker for 21.8 h
+/// (`docs/AUDIT-claude-harness-2026-09-23.md`), and what this removes is a
+/// build cache a rebuild restores — stale by both its clocks, laid by a build
+/// tool, never a transcript, never another class.
+pub const DEFAULT_AUTO_FREE_GIB: u64 = 10;
 
 /// The `CACHEDIR.TAG` signature every cargo-compatible build tool writes into
 /// a target directory. VERIFIED against the Cache Directory Tagging
@@ -244,6 +265,9 @@ pub struct Config {
     /// The durable `disk.apply` switch. `false` makes [`plan`] answer
     /// [`Plan::Denied`] for every class, whatever the caller named.
     pub apply: bool,
+    /// Below this many free GiB the host's tick applies [`auto_plan`]; `0`
+    /// is off ([`DEFAULT_AUTO_FREE_GIB`]).
+    pub auto_free_gib: u64,
 }
 
 impl Default for Config {
@@ -252,7 +276,58 @@ impl Default for Config {
             warn_free_gib: DEFAULT_WARN_FREE_GIB,
             target_stale_days: DEFAULT_TARGET_STALE_DAYS,
             apply: DEFAULT_APPLY,
+            auto_free_gib: DEFAULT_AUTO_FREE_GIB,
         }
+    }
+}
+
+/// Every `[disk]` key of `aterm.toml`, in the order the help lists them. The
+/// window's settings checker knows each one (aterm-gui's config language pins
+/// the two lists), so none of them reads there as "unknown".
+pub const KEYS: &[&str] = &[
+    "apply",
+    "warn_free_gib",
+    "target_stale_days",
+    "auto_free_gib",
+];
+
+impl Config {
+    /// The shipped default of `[disk] <key>` as a settings help line shows it
+    /// (`None` for a key that is not in [`KEYS`]).
+    #[must_use]
+    pub fn default_shown(key: &str) -> Option<String> {
+        let d = Config::default();
+        Some(match key {
+            "apply" => d.apply.to_string(),
+            "warn_free_gib" => d.warn_free_gib.to_string(),
+            "target_stale_days" => d.target_stale_days.to_string(),
+            "auto_free_gib" => format!("{} (0: off)", d.auto_free_gib),
+            _ => return None,
+        })
+    }
+
+    /// How a NEGATIVE `[disk] <key>` is read, for the settings checker to say
+    /// on the line: a floor below zero is never crossed, so `auto_free_gib`
+    /// reads it as `0`, off (never as the default, which would leave the
+    /// removal on for a person who wrote `-1` to stop it); the other two fall
+    /// back to their defaults, the safe side for a warning threshold and for
+    /// a stale window (a negative one would make every directory stale).
+    #[must_use]
+    pub fn negative_reading(key: &str) -> Option<String> {
+        let d = Config::default();
+        Some(match key {
+            "auto_free_gib" => "0: the automatic removal is off".to_owned(),
+            "warn_free_gib" => format!("the default, {}", d.warn_free_gib),
+            "target_stale_days" => format!("the default, {}", d.target_stale_days),
+            _ => return None,
+        })
+    }
+
+    /// Whether `free` bytes is below the automatic floor. An unknown figure
+    /// never is (it FAILS OPEN: nothing is removed on a number nobody read).
+    #[must_use]
+    pub fn below_auto_floor(&self, free: Option<u64>) -> bool {
+        self.auto_free_gib > 0 && free.is_some_and(|f| f < self.auto_free_gib.saturating_mul(GIB))
     }
 }
 
@@ -313,12 +388,14 @@ pub struct StoreBuild {
     pub bytes_partial: bool,
 }
 
-/// What made the host re-measure. The tick and the update-done event of §5.5
-/// were never wired; the owner's verb is the one trigger that exists.
+/// What made the host re-measure: the owner's verb, or the window's harness
+/// host on §5.5's one timer (a free-space figure has no event to hang on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Trigger {
     /// The owner typed the verb.
     OnDemand,
+    /// The host's tick.
+    Tick,
 }
 
 impl Trigger {
@@ -327,6 +404,7 @@ impl Trigger {
     pub fn as_str(self) -> &'static str {
         match self {
             Trigger::OnDemand => "on-demand",
+            Trigger::Tick => "tick",
         }
     }
 }
@@ -1121,6 +1199,41 @@ impl Applied {
     }
 }
 
+/// THE AUTOMATIC GRANT. PURE. Below the report's automatic floor
+/// ([`Config::below_auto_floor`]) the removable [`Class::CargoTargets`] rows —
+/// and never a row of another class, whatever `disk.apply` says; at or above
+/// it, or on an unknown free figure, `None`: nothing is planned.
+#[must_use]
+pub fn auto_plan(rep: &Report) -> Option<Vec<Row>> {
+    rep.config.below_auto_floor(rep.free_bytes).then(|| {
+        rep.rows
+            .iter()
+            .filter(|r| r.class == Class::CargoTargets && r.removable)
+            .cloned()
+            .collect()
+    })
+}
+
+/// Carry out [`auto_plan`] against `rep` through `remove`, each path behind
+/// [`guard`] as [`apply`]'s are. `None` when the floor was not crossed.
+pub fn apply_auto(
+    rep: &Report,
+    transcripts: Option<&Path>,
+    remove: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+) -> Option<Applied> {
+    let rows = auto_plan(rep)?;
+    let mut done = Applied::default();
+    remove_rows(
+        rep,
+        transcripts,
+        Class::CargoTargets,
+        rows,
+        remove,
+        &mut done,
+    );
+    Some(done)
+}
+
 /// Carry out `class` against `rep`, removing through `remove`.
 ///
 /// `remove` is INJECTED so this function is testable without a disk and so
@@ -1146,6 +1259,19 @@ pub fn apply(
         done.denials.push(Refusal::NoClass);
         return done;
     };
+    remove_rows(rep, transcripts, class, rows, remove, &mut done);
+    done
+}
+
+/// Remove `rows` of `class`, each behind [`guard`], into `done`.
+fn remove_rows(
+    rep: &Report,
+    transcripts: Option<&Path>,
+    class: Class,
+    rows: Vec<Row>,
+    remove: &mut dyn FnMut(&Path) -> std::io::Result<()>,
+    done: &mut Applied,
+) {
     for row in rows {
         if let Err(r) = guard(rep, transcripts, class, &row.path) {
             done.denials.push(r);
@@ -1161,7 +1287,6 @@ pub fn apply(
                 .push(Refusal::RemoveFailed(row.path.clone(), e.to_string())),
         }
     }
-    done
 }
 
 // ---------------------------------------------------------------------------

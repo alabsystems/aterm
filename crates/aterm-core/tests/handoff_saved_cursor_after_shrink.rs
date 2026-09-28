@@ -26,7 +26,7 @@
 //! below pin the raw carry, the same-size parity AND the grow-back parity that
 //! draft would have failed.
 
-use aterm_core::terminal::{HostBindings, Terminal};
+use aterm_core::terminal::Terminal;
 
 const ROWS: u16 = 56;
 const COLS: u16 = 149;
@@ -115,7 +115,7 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_at_the_sam
     live.process(b"\x1b[?1049h");
     live.resize(ROWS - 1, COLS);
     let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-    let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+    let mut restored = Terminal::from_checkpoint(&cp);
 
     for t in [&mut live, &mut restored] {
         t.process(b"\x1b[?1049l");
@@ -136,7 +136,7 @@ fn a_restored_terminal_leaves_the_alternate_screen_onto_the_same_cell_after_grow
     live.process(b"\x1b[?1049h");
     live.resize(ROWS - 1, COLS);
     let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-    let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+    let mut restored = Terminal::from_checkpoint(&cp);
 
     for t in [&mut live, &mut restored] {
         t.resize(ROWS, COLS);
@@ -155,7 +155,7 @@ fn a_restored_terminal_restores_a_bare_decrc_onto_the_same_cell_as_the_live_one(
         live.process(b"\x1b7");
         live.resize(ROWS - 1, COLS);
         let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-        let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+        let mut restored = Terminal::from_checkpoint(&cp);
 
         for t in [&mut live, &mut restored] {
             if grow_back {
@@ -181,7 +181,7 @@ fn a_restored_terminal_keeps_the_deferred_wrap_the_live_one_keeps() {
     live.process(b"\x1b7");
     live.resize(ROWS, COLS - 10);
     let cp = live.checkpoint_carry(CARRY).expect("parser is Ground");
-    let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+    let mut restored = Terminal::from_checkpoint(&cp);
 
     for t in [&mut live, &mut restored] {
         t.resize(ROWS, COLS);
@@ -198,7 +198,7 @@ fn the_raw_checkpoint_is_a_fixed_point_of_restore_and_recapture() {
     t.process(b"\x1b[?1049h");
     t.resize(ROWS - 1, COLS);
     let first = t.checkpoint_carry(CARRY).expect("parser is Ground");
-    let restored = Terminal::from_checkpoint(&first, HostBindings::none());
+    let restored = Terminal::from_checkpoint(&first);
     let second = restored.checkpoint_carry(CARRY).expect("parser is Ground");
     assert_eq!(second.saved_cursor_main, first.saved_cursor_main);
     assert_eq!(second.saved_cursor_alt, first.saved_cursor_alt);

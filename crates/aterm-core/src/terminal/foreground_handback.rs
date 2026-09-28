@@ -135,6 +135,25 @@ pub mod evidence {
         | KITTY
         | MODIFY_OTHER_KEYS
         | FORMAT_OTHER_KEYS;
+
+    /// The evidence bit a DECSET (`set`) or DECRST of private mode `param`
+    /// ASSERTS — the sequence that turns that bit's condition on, whether or
+    /// not it was already on — or `0`. Read by the DEC mode dispatcher into
+    /// [`Terminal::take_evidence_asserted`](super::Terminal::take_evidence_asserted).
+    #[must_use]
+    pub const fn asserted_by_dec_mode(param: u16, set: bool) -> u16 {
+        match (param, set) {
+            (47 | 1047 | 1049, true) => ALT_SCREEN,
+            (2, false) => VT52,
+            (9 | 1000 | 1002 | 1003, true) => MOUSE,
+            (25, false) => CURSOR_HIDDEN,
+            (2026, true) => SYNC,
+            (2048, true) => SIZE_REPORTS,
+            (2031, true) => COLOR_SCHEME_REPORTS,
+            (1004, true) => FOCUS,
+            _ => 0,
+        }
+    }
 }
 
 /// What one [`Terminal::foreground_handback`] did.
@@ -216,6 +235,26 @@ impl Terminal {
                 self.xterm_keyboard.format_other_keys() != 0,
                 evidence::FORMAT_OTHER_KEYS,
             )
+    }
+
+    /// The evidence bits whose SETTER was parsed since the last call, and
+    /// clears them: a DECSET of mouse tracking, 1004, 2048, 2031, the alt
+    /// screen or 2026, a DECRST of 25 or of 2 (VT52), a kitty push or a kitty
+    /// set to non-zero flags, a non-zero modifyOtherKeys or formatOtherKeys.
+    /// A bit is asserted even when its condition was ALREADY on — that is the
+    /// point: [`Self::program_evidence`] cannot tell a program that re-arms a
+    /// mode from one that never touched it.
+    ///
+    /// Why (2026-09-27, the handback lane under load 59-65): the host gives
+    /// each evidence bit to the group whose bytes set it. A one-shot
+    /// `/usr/bin/printf '\e[?1000h'` whose bytes were read only after the shell
+    /// had taken the terminal back gave the MOUSE bit to the shell, and every
+    /// later job that armed mouse tracking found the bit already on, so it
+    /// never became the bit's owner, and its death handed nothing back — the
+    /// session never recovered. With the asserted bits the host gives a
+    /// re-armed bit to the group that re-armed it.
+    pub fn take_evidence_asserted(&mut self) -> u16 {
+        core::mem::take(&mut self.evidence_asserted)
     }
 
     /// Hand the terminal back after a foreground-process-group change:

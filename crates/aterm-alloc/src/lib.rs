@@ -3,7 +3,8 @@
 
 //! Inline-optimized collections for aterm.
 //!
-//! Zero external dependencies. Provides:
+//! Zero external dependencies, and `#![no_std]` (it needs only `core` and
+//! `alloc`). Provides:
 //!
 //! - [`SmallVec<T, N>`] — inline storage for up to N elements, heap fallback.
 //!   Replaces `smallvec::SmallVec<[T; N]>`.
@@ -27,11 +28,20 @@
 //! `array_vec.rs` is therefore load-bearing for third-party GPU code as well as
 //! for aterm's parser — read `crates/aterm-arrayvec/src/lib.rs` first.
 
+// `no_std` + `alloc`: `ArrayVec` names only `core`, and `SmallVec`'s heap
+// fallback needs only `alloc::vec::Vec`. That keeps the `arrayvec` shim's
+// `#![no_std]` true of its whole graph, not just of the shim. Tests link `std`
+// for the harness and name what they use from it explicitly.
+#![no_std]
 #![deny(clippy::all)]
 #![deny(unsafe_op_in_unsafe_fn)]
 // Trust tool-attribute plumbing (scrollback/lz4 pattern) for `#[trust::contract_panic]`.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod array_vec;
 mod small_vec;

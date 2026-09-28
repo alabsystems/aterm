@@ -43,66 +43,17 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-/// The FLOOR on the backoff ceiling — i.e. the ceiling that applies to a fast base
-/// interval. Fifteen minutes is long enough that an offline laptop costs ~4 log lines
-/// an hour instead of 48, and short enough that reconnecting still gets an update
-/// within a coffee break.
-pub(crate) const MAX_BACKOFF: Duration = Duration::from_secs(15 * 60);
-
-/// How many base intervals the backoff may grow to. The real ceiling is
-/// `max(MAX_BACKOFF, MAX_BACKOFF_INTERVALS × base)` — see [`Cadence::cap`].
-///
-/// The ceiling used to be [`MAX_BACKOFF`] alone, raised to the base so that an
-/// operator's long interval could never be silently SHORTENED by it:
-/// `min(MAX_BACKOFF.max(base))`. On the slow (then anonymous, now web) lane that
-/// expression was arithmetically inert — its base was 15 minutes, which IS
-/// `MAX_BACKOFF`, so the ceiling equalled the base and every doubling was clamped
-/// straight back down to it: the one lane that most needed to retreat while failing
-/// was the one lane with no backoff at all, and the same silent no-op applied to any
-/// operator interval at or above the cap.
-/// A ceiling expressed in INTERVALS is inert for no base: four of them is a real
-/// retreat (10 min → 20 → 40 at today's interval) while bounding the worst
-/// case at 4× the cadence — and a wake,
-/// or one healthy check, still snaps all the way back to the base, so recovery is
-/// never rate-limited by the cap.
-pub(crate) const MAX_BACKOFF_INTERVALS: u32 = 4;
-
-/// Jitter applied to every wait, as a percentage either side of the nominal delay.
-pub(crate) const JITTER_PCT: u64 = 20;
+pub(crate) use crate::cadence_bounds::{
+    INTERVAL_SECS, JITTER_PCT, MAX_BACKOFF, MAX_BACKOFF_INTERVALS, WAKE_SETTLE,
+};
 
 /// A wall-clock jump larger than the requested sleep by this much means the machine
 /// was not running: system sleep, hibernation, a suspended VM, or a large clock step.
 /// Well above any scheduling delay or routine NTP slew.
 pub(crate) const SLEEP_GAP: Duration = Duration::from_secs(90);
 
-/// How long to let the network come up after a detected wake before checking. A Mac
-/// takes a few seconds to associate Wi-Fi and re-resolve DNS; checking inside that
-/// window is a guaranteed failure that teaches the ledger nothing.
-pub(crate) const WAKE_SETTLE: Duration = Duration::from_secs(20);
-
 /// How long an unchanged failure message stays suppressed before being repeated.
 pub(crate) const STILL_FAILING_AFTER: Duration = Duration::from_secs(30 * 60);
-
-/// The base interval of the background check — one cadence, no knob.
-///
-/// A check spends ZERO metered requests: its steady state is one HEAD of
-/// `github.com/…/releases/latest/download/aterm-appcast.toml` (a 302 with no
-/// `x-ratelimit-*` header at all — measured 2026-09-03), and a moved pointer adds only
-/// tag-specific GETs on the same unmetered host. There is no per-IP budget to share,
-/// so the interval is a courtesy to the web host and a bound on how long a new release
-/// waits to be found: a release published now is STAGED by a running aterm within one
-/// interval (plus jitter, plus the download), and the in-session apply lane lands it
-/// within `aterm-gui`'s `LANDS_WITHIN` (and its switch, under a minute together) of
-/// that — so publish-to-applied on a healthy running window is bounded by
-/// `INTERVAL_SECS × 1.2 + download + LANDS_WITHIN`, about 13 minutes plus the
-/// download, not "a minute".
-///
-/// Ten minutes (2026-09-23; it was thirty) because a verified update installs by
-/// itself soon after it is staged, so the check is what decides how soon a release
-/// lands — and the owner wants it to land promptly. It stays one HEAD per machine per
-/// interval however many aterm processes run: `checker.lock` and the 70 % freshness
-/// window in the check loop dedupe every sibling.
-pub(crate) const INTERVAL_SECS: u64 = 10 * 60;
 
 /// The waits after a check that could not reach the network at all
 /// ([`is_network_unreachable`]): the first retry comes after 20 s, then 60 s, 2 min
@@ -242,6 +193,39 @@ impl Cadence {
         self.offline = 0;
         self.in_flight = 0;
         self.hold = None;
+    }
+
+    /// Note a DEFERRAL — the host asked this machine to slow down — as a failure (the
+    /// doubling ladder lengthens) whose next wait also ends no earlier than
+    /// `window_end`: the end of the machine-wide deferred window this very check
+    /// stamped on the receipt (`checker_skip_for` in the crate root; the caller
+    /// scatters it). `None` (no receipt could be read) is a plain [`Self::failed`].
+    ///
+    /// The ladder's first rung is ONE base interval (±[`JITTER_PCT`]%) and the
+    /// deferred window is 1.4 of them (`DEFERRED_WINDOW_INTERVALS`), so on
+    /// `failed` alone the deferring process always woke inside its own window, read
+    /// its own note as a sibling's and slept again to the window's end — measured
+    /// 2026-09-24: the 20:27:06 wake skipped on the deferral its own 19:54:42 check
+    /// wrote, logging "the shared update ledger records a deferred check". Held to the
+    /// window's end instead (un-jittered past it: the epoch carries the scatter), or to
+    /// the jittered ladder when that is later. A rung that can never wake inside the
+    /// window keeps its ordinary jittered wait.
+    pub(crate) fn deferred(&mut self, window_end: Option<Instant>, now: Instant, entropy: u8) {
+        self.failed();
+        let Some(end) = window_end else {
+            return;
+        };
+        let ladder = self.nominal_at(now);
+        let (Some(shortest), Some(drawn)) = (
+            now.checked_add(jitter(ladder, 0)),
+            now.checked_add(jitter(ladder, entropy)),
+        ) else {
+            return;
+        };
+        if shortest >= end {
+            return;
+        }
+        self.hold = Some(end.max(drawn));
     }
 
     /// Note a check that could not reach the network at all
@@ -421,8 +405,45 @@ pub(crate) fn sleep_watching_for_wake(total: Duration) -> Waited {
 
 /// Wait one cadence interval, jittered, watching for a wake.
 pub(crate) fn wait(cadence: &Cadence) -> (Duration, Waited) {
-    let delay = cadence.delay(entropy_byte());
-    (delay, sleep_watching_for_wake(delay))
+    wait_with(cadence, entropy_byte(), sleep_watching_for_wake)
+}
+
+/// [`wait`] over an injected sleep. The next check is published for exactly as long as
+/// the wait lasts: once it is over the loop is settling after a wake or checking, the
+/// instant it named is past, and `next_check=` says nothing until the next wait names
+/// another (review of 2026-09-26: it used to keep the past instant through the whole
+/// check and the wake settle).
+fn wait_with(
+    cadence: &Cadence,
+    entropy: u8,
+    sleep: impl FnOnce(Duration) -> Waited,
+) -> (Duration, Waited) {
+    let delay = cadence.delay(entropy);
+    note_next_check(SystemTime::now(), delay);
+    let waited = sleep(delay);
+    NEXT_CHECK_UNIX.store(0, std::sync::atomic::Ordering::Relaxed);
+    (delay, waited)
+}
+
+/// When this process's check loop looks next, as Unix seconds (`0`: no wait is under
+/// way — the loop has not started one, or is past it and checking) — set by [`wait`]
+/// as each wait starts and cleared as it ends, read by `crate::next_check_at` for
+/// `aterm ctl update status`'s `next_check=`. The loop's own schedule, not the
+/// machine's: a sibling process may check sooner, and this one then skips behind its
+/// receipt.
+static NEXT_CHECK_UNIX: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record that the loop's next check is `delay` after `now`.
+fn note_next_check(now: SystemTime, delay: Duration) {
+    let at = now
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.saturating_add(delay).as_secs());
+    NEXT_CHECK_UNIX.store(at, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The loop's next check ([`NEXT_CHECK_UNIX`]), `None` while no wait is under way.
+pub(crate) fn next_check_unix() -> Option<u64> {
+    Some(NEXT_CHECK_UNIX.load(std::sync::atomic::Ordering::Relaxed)).filter(|at| *at > 0)
 }
 
 /// What the loop should do about a check result's log line. Returned instead of
@@ -525,6 +546,36 @@ impl FailureLog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cadence_bounds::{LONGEST_WAIT, STALE_CHECK_AFTER};
+
+    /// [`LONGEST_WAIT`] bounds every wait the real schedule produces — through a
+    /// saturated failure ladder, every offline rung, every in-flight rung, a hold at its
+    /// ceiling, and every jitter byte — and the ladder really reaches it (minus the wake
+    /// settle), so the bound is tight rather than merely safe.
+    #[test]
+    fn no_wait_exceeds_the_longest_wait() {
+        let now = Instant::now();
+        let mut longest = Duration::ZERO;
+        let mut failing = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        let mut offline = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        let mut held = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        held.hold_until(now + Duration::from_secs(24 * 3600));
+        let mut in_flight = Cadence::new(Duration::from_secs(INTERVAL_SECS));
+        for round in 0..30 {
+            failing.failed();
+            offline.failed_offline();
+            in_flight.succeeded(round);
+            for entropy in 0..=u8::MAX {
+                for cadence in [&failing, &offline, &held, &in_flight] {
+                    let wait = cadence.delay_at(now, entropy);
+                    assert!(wait + WAKE_SETTLE <= LONGEST_WAIT, "{wait:?}");
+                    longest = longest.max(wait);
+                }
+            }
+        }
+        assert_eq!(longest + WAKE_SETTLE, LONGEST_WAIT, "the bound is reached");
+        assert!(STALE_CHECK_AFTER > LONGEST_WAIT * 4);
+    }
 
     const BASE: Duration = Duration::from_secs(75);
 
@@ -865,6 +916,78 @@ mod tests {
             anon,
             "past the epoch the base interval is back"
         );
+    }
+
+    /// A DEFERRAL HOLDS ITS OWN PROCESS TO THE WINDOW IT STAMPED (2026-09-24: the
+    /// first rung, one base ±20 %, woke the deferring process inside its own 1.4-base
+    /// window). Every entropy byte now waits at least to the window's end; a rung that
+    /// already outlasts the window keeps its ordinary jittered wait; no window known is
+    /// a plain failure. The count moves exactly as `failed` moves it.
+    #[test]
+    fn a_deferral_never_wakes_inside_its_own_window() {
+        let base = Duration::from_secs(INTERVAL_SECS);
+        let now = Instant::now();
+        let window_end = now + base * 14 / 10;
+        for entropy in [0u8, 1, 128, 254, 255] {
+            let mut c = Cadence::new(base);
+            c.deferred(Some(window_end), now, entropy);
+            assert_eq!(c.failures(), 1);
+            let wait = c.delay_at(now, entropy);
+            assert!(wait >= base * 14 / 10, "entropy {entropy}: {wait:?}");
+            // NEGATIVE CONTROL: the ladder alone wakes inside the window, every byte.
+            let mut ladder = Cadence::new(base);
+            ladder.failed();
+            assert!(ladder.delay_at(now, entropy) < base * 14 / 10);
+        }
+        // The second deferral in a row: the ladder's shortest wait (2 × base × 0.8)
+        // already outlasts the window, so the ordinary jittered ladder stands.
+        let mut c = Cadence::new(base);
+        c.failed();
+        c.deferred(Some(window_end), now, 255);
+        assert_eq!(c.failures(), 2);
+        assert_eq!(c.delay_at(now, 0), jitter(base * 2, 0));
+        assert_eq!(c.delay_at(now, 255), jitter(base * 2, 255));
+        // No window known (no readable receipt): exactly `failed`.
+        let mut c = Cadence::new(base);
+        c.deferred(None, now, 0);
+        assert_eq!(c.delay_at(now, 0), jitter(base, 0));
+        // And a success clears it like any hold.
+        let mut c = Cadence::new(base);
+        c.deferred(Some(window_end), now, 0);
+        c.succeeded(0);
+        assert_eq!(c.nominal_at(now), base);
+    }
+
+    /// The loop publishes when it looks next (`aterm ctl update status`'s
+    /// `next_check=`): now plus the wait it is about to start — for as long as that
+    /// wait lasts, and no longer. Once the wait is over (elapsed, or cut short by a
+    /// wake and its settle) the loop is checking, and a past instant is not shown.
+    #[test]
+    fn the_loop_publishes_its_next_check() {
+        let at = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_280_801);
+        note_next_check(at, Duration::from_secs(600));
+        assert_eq!(next_check_unix(), Some(1_790_281_401));
+
+        let base = Duration::from_secs(INTERVAL_SECS);
+        for waited in [Waited::Elapsed, Waited::Woke(Duration::from_secs(3600))] {
+            let mut during = None;
+            let before = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            let (delay, outcome) = wait_with(&Cadence::new(base), 0, |delay| {
+                during = next_check_unix();
+                assert_eq!(delay, jitter(base, 0));
+                waited
+            });
+            assert_eq!(outcome, waited);
+            let during = during.expect("published while the wait runs");
+            assert!(
+                (before + delay.as_secs()..=before + delay.as_secs() + 2).contains(&during),
+                "{during} vs {before} + {delay:?}"
+            );
+            assert_eq!(next_check_unix(), None, "cleared once the wait is over");
+        }
     }
 
     #[test]

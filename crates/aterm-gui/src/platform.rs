@@ -453,8 +453,9 @@ pub(crate) trait AppRt {
 
     /// Query the OS motion preference. macOS reads
     /// `NSWorkspace.accessibilityDisplayShouldReduceMotion`; Windows reads
-    /// `SPI_GETCLIENTAREAANIMATION`; platforms without an implemented query
-    /// return `false`. The explicit `motion = "reduced"` override works
+    /// `SPI_GETCLIENTAREAANIMATION`; Linux reads GNOME's `enable-animations`
+    /// through a bounded `gsettings get`, answering `false` wherever that key
+    /// cannot be read. The explicit `motion = "reduced"` override works
     /// everywhere. Feeds [`crate::motion::MotionPolicy`] (W11).
     fn reduce_motion(&self) -> bool;
 
@@ -1442,16 +1443,6 @@ mod user_input_probe_tests {
             assert!(a >= 0.0 && b >= 0.0, "idle ages are non-negative: {a} {b}");
         }
     }
-
-    /// The headless/test source is inert: what keeps a unit test's admission
-    /// decisions independent of the machine running it, and what keeps a test
-    /// binary off the platform input-activity path (2026-08-17).
-    #[test]
-    fn no_recent_user_input_event_is_never_recent() {
-        assert!(!super::no_recent_user_input_event(
-            std::time::Duration::from_secs(3600)
-        ));
-    }
 }
 
 /// The X11 twin of the macOS queue age: how long the key event being dispatched
@@ -1786,11 +1777,12 @@ impl AppRt for AppRtLinux {
         window.set_theme(window_theme_to_winit(theme));
     }
 
-    /// INTENTIONAL no-op: CAMetalLayer colour-space tagging is a CoreAnimation
-    /// concept. The Linux compositor path presents wgpu's Vulkan swapchain
-    /// directly; explicit surface colour management there (`VK_EXT_swapchain_
-    /// colorspace` / Wayland `color-management-v1`) is deferred with the rest of
-    /// the native chrome work. Documented rather than silently empty.
+    /// CAMetalLayer colour-space tagging is a CoreAnimation concept. Linux
+    /// presents SDR BY DESIGN (decided 2026-09-25 under the owner's standing
+    /// direction): wgpu's Vulkan swapchain is presented directly as sRGB, and
+    /// the extended-linear (EDR) tag is refused, so the aurora pass stays inert.
+    /// HDR there would need a Wayland `color-management-v1` client plus an
+    /// `Rgba16Float` swapchain — a lane nobody is building.
     fn window_set_surface_colorspace(
         &self,
         _window: &Window,
@@ -1831,10 +1823,9 @@ impl AppRt for AppRtLinux {
     ) {
     }
 
-    /// Linux has no portable EDR-headroom query yet (a Wayland `color-management-v1`
-    /// / `VK_EXT_hdr_metadata` read is the follow-up): `1.0` — no headroom, so the
-    /// aurora pass is provably inert. (The Windows EDR query lives in the dedicated
-    /// `platform_win::AppRtWindows`.)
+    /// Linux presents SDR by design (see `window_set_surface_colorspace`): `1.0`
+    /// — no headroom, so the aurora pass is provably inert. (The Windows EDR
+    /// query lives in the dedicated `platform_win::AppRtWindows`.)
     fn screen_edr_max(&self, _window: &Window) -> f32 {
         1.0
     }
@@ -1854,8 +1845,9 @@ impl AppRt for AppRtLinux {
     }
 
     // The branches below delegate to the `menu::`/`toolbar::` modules — the menu is
-    // still a `None` stub (a native Linux menu bar needs a GTK4 `gtk::PopoverMenuBar`
-    // / app-menu D-Bus export, deferred), while the toolbar now backs a REAL
+    // `None` on Linux by design (the own-rendered command palette + keybindings are
+    // the cross-platform command surface, docs/INTROSPECTABLE_SURFACES_DESIGN.md;
+    // the native macOS bar is a mirror of it), while the toolbar backs a REAL
     // in-memory tab-chrome model. One platform surface, no dead code on Linux.
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
         menu::install(proxy)
@@ -1895,11 +1887,12 @@ impl AppRt for AppRtLinux {
     /// No `terminate:`-style app-quit gesture to intercept off macOS: a no-op.
     fn install_quit_confirm(&self) {}
 
-    /// No portable OS reduce-motion query off macOS yet (see the trait doc):
-    /// `false`, so config `motion` alone decides. A GNOME
-    /// `enable-animations` D-Bus read is the documented follow-up.
+    /// The desktop's motion preference, read through GNOME's
+    /// `org.gnome.desktop.interface enable-animations` key (the key GTK desktops
+    /// share) with the `gsettings` CLI — see [`gnome_reduce_motion`]. Any failure
+    /// answers `false`, so config `motion` alone decides.
     fn reduce_motion(&self) -> bool {
-        false
+        gnome_reduce_motion()
     }
 
     /// No OS notification to observe off macOS: `None` (the caller keeps the
@@ -1950,6 +1943,132 @@ pub(crate) type ReduceMotionObserver = aterm_objc::Retained<reduce_motion::Reduc
 /// See the macOS variant above — nothing to retain off macOS.
 #[cfg(not(target_os = "macos"))]
 pub(crate) type ReduceMotionObserver = ();
+
+/// How long the Linux motion read may take. It runs once per window attach, on
+/// the main thread, so it is bounded well under a frame budget's worth of
+/// visible delay; a desktop whose `gsettings` is slower than this simply
+/// answers "not reduced" and config `motion` decides.
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
+const GSETTINGS_READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The GNOME motion preference, read the one dependency-free way: the
+/// `gsettings` CLI. (A D-Bus client is ruled out — the zbus graph was dropped
+/// on the owner's 2026-08-25 decision, see this crate's `Cargo.toml`.) A
+/// missing binary, a non-zero exit, a timeout or any value but `false` answers
+/// `false` (not reduced).
+#[cfg(all(not(target_os = "macos"), not(windows)))]
+fn gnome_reduce_motion() -> bool {
+    read_bounded_stdout(
+        "gsettings",
+        &["get", "org.gnome.desktop.interface", "enable-animations"],
+        GSETTINGS_READ_BOUND,
+    )
+    .is_some_and(|out| gnome_animations_disabled(&out))
+}
+
+/// `enable-animations` prints `true` or `false`; only `false` means the user
+/// asked for reduced motion. Empty or unexpected output is NOT a preference.
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
+fn gnome_animations_disabled(stdout: &str) -> bool {
+    stdout.trim() == "false"
+}
+
+/// Run `program args…` and return its stdout if it exits successfully within
+/// `bound`; otherwise kill it and answer `None`. The child's stdin is null and
+/// its stderr discarded, so nothing it does can reach the terminal.
+#[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
+fn read_bounded_stdout(program: &str, args: &[&str], bound: std::time::Duration) -> Option<String> {
+    use std::io::Read as _;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + bound;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
+        return None;
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    Some(out)
+}
+
+#[cfg(test)]
+mod linux_reduce_motion_tests {
+    use super::{gnome_animations_disabled, read_bounded_stdout};
+
+    #[test]
+    fn only_a_false_enable_animations_means_reduced() {
+        assert!(gnome_animations_disabled("false\n"));
+        assert!(gnome_animations_disabled("  false "));
+        for not_reduced in ["true\n", "", "\n", "garbage", "'false'", "No such key"] {
+            assert!(
+                !gnome_animations_disabled(not_reduced),
+                "{not_reduced:?} must not read as reduced motion"
+            );
+        }
+    }
+
+    #[test]
+    fn the_bounded_read_returns_stdout_of_a_successful_child() {
+        assert_eq!(
+            read_bounded_stdout(
+                "/bin/sh",
+                &["-c", "printf false"],
+                super::GSETTINGS_READ_BOUND
+            )
+            .as_deref(),
+            Some("false")
+        );
+        assert_eq!(
+            read_bounded_stdout(
+                "/bin/sh",
+                &["-c", "printf false; exit 3"],
+                super::GSETTINGS_READ_BOUND
+            ),
+            None,
+            "a failing exit is not a preference"
+        );
+        assert_eq!(
+            read_bounded_stdout(
+                "/nonexistent/wbgui-no-such-gsettings",
+                &[],
+                super::GSETTINGS_READ_BOUND
+            ),
+            None,
+            "a missing binary is not a preference"
+        );
+    }
+
+    #[test]
+    fn the_bounded_read_kills_a_child_that_outlives_the_bound() {
+        let started = std::time::Instant::now();
+        assert_eq!(
+            read_bounded_stdout("/bin/sleep", &["30"], std::time::Duration::from_millis(50)),
+            None
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the read must not wait for the child: took {:?}",
+            started.elapsed()
+        );
+    }
+}
 
 /// macOS "Reduce Motion" integration (W11): the one query + the one observer.
 /// Follows the [`crate::menu`] `MenuTarget` pattern — a declared `NSObject`
@@ -2992,7 +3111,7 @@ pub(crate) fn disable_press_and_hold() {
 }
 
 /// **PLATFORM `cfg` HYGIENE OVER THIS CRATE'S TEST CODE**, checked from here
-/// because the only other witness is a compiler nobody on this team runs. Two
+/// because the only other witness is `--full`'s cross-cell compile. Two
 /// laws, one on each side of the same coin:
 ///
 /// 1. UNIX-ONLY TEST CODE IS PLATFORM-GATED — a test that names an API Windows
@@ -3011,8 +3130,9 @@ pub(crate) fn disable_press_and_hold() {
 /// (`E0433` for the missing `unix` module, `E0425` for the `#[cfg(unix)]` pipe
 /// helper, `E0599` for the raw-fd constructor), so NONE of this crate's laws
 /// were pinned on Windows — not just the fixture's own. `xtask gate cells
-/// --cell win` cannot see it either: that gate checks the cell's ROOT package
-/// without `--all-targets`, so it never asks a compiler to read a test target.
+/// --cell win` reads test targets only since its `--all-targets` pass landed
+/// (2026-09-16), and that gate runs in `--full` alone; this law is the half
+/// every `--fast` run checks.
 ///
 /// THE LAW. Inside a `#[cfg(test)]` region of this crate, a line naming an API
 /// Windows has not got must sit under a platform `cfg` — its own, or one it
@@ -3502,6 +3622,16 @@ mod platform_cfg_hygiene_tests {
             "windows_ui_face_candidates_lead_with_segoe_ui_variable_over_a_static_semibold",
         ),
         ("lib.rs", "task_dialog_config_layout_matches_the_sdk"),
+        // The parent-console attach/release pair behind the two-image Windows
+        // front door (2026-09-22): real AttachConsole/FreeConsole state.
+        (
+            "lib.rs",
+            "attach_reports_no_attach_when_the_parent_supplied_every_handle",
+        ),
+        (
+            "lib.rs",
+            "an_attached_console_is_released_only_for_a_window",
+        ),
         (
             "input.rs",
             "wheel_scale_is_the_platform_distance_not_one_line",
@@ -3512,7 +3642,6 @@ mod platform_cfg_hygiene_tests {
             "ctrl_s_saves_on_windows_and_isearch_keeps_a_chord",
         ),
         // The `aterm windows …` verb family, which exists only on Windows.
-        ("cli.rs", "default_terminal_pair_dispatches"),
         ("cli.rs", "windows_help_advertises_every_windows_verb"),
         (
             "cli.rs",
@@ -3538,6 +3667,17 @@ mod platform_cfg_hygiene_tests {
             "exception_record_layout_matches_native_offsets",
         ),
         ("crash_signal.rs", "install_is_idempotent"),
+        // The Windows marker's owner lock is a share mode (no FILE_SHARE_DELETE)
+        // and its clean-exit release closes a raw HANDLE: both are Windows
+        // kernel semantics, with nothing portable to run elsewhere.
+        (
+            "crash_signal.rs",
+            "a_held_marker_survives_the_sweep_and_goes_once_released",
+        ),
+        (
+            "crash_signal.rs",
+            "the_clean_exit_takes_the_armed_marker_with_it",
+        ),
         // Windows path shapes: drive letters, UNC, and the file-URI rules.
         (
             "cwd_native.rs",
@@ -3608,13 +3748,17 @@ mod platform_cfg_hygiene_tests {
             "pinned_dir.rs",
             "windows_reparse_directory_is_never_followed_during_cleanup",
         ),
-        // Control-socket auth: Windows has no peer-cred primitive, and the
-        // token file is created with CREATE_NEW rather than O_EXCL|O_NOFOLLOW.
+        // Control-socket auth: the Windows peer check is afunix's
+        // SIO_AF_UNIX_GETPEERPID + a token-user compare, and the token file is
+        // created with CREATE_NEW rather than O_EXCL|O_NOFOLLOW.
         (
             "control_auth.rs",
             "provision_token_roundtrips_and_create_new_refuses_preexisting",
         ),
-        ("control_auth.rs", "peer_check_passes_on_windows"),
+        (
+            "control_auth.rs",
+            "peer_check_passes_a_same_user_peer_on_windows",
+        ),
         (
             "net_connections.rs",
             "windows_token_file_roundtrips_and_rejects_non_regular",
@@ -3663,9 +3807,8 @@ mod platform_cfg_hygiene_tests {
         assert!(
             unrostered.is_empty(),
             "these `#[test]`s are gated off BOTH macOS and Linux, so they run on no machine \
-             anyone here owns and — `xtask gate cells --cell win` checking its cell's root \
-             package without `--all-targets` — are read by no compiler in this repository \
-             either:\n{}\n\
+             anyone here owns and are read by a compiler only in `--full`'s cross-cell \
+             test pass:\n{}\n\
              FIRST ASK WHETHER THE GATE IS NEEDED. `keymap.rs`'s `windows_key_input` carried \
              one for a month over logic with no platform API in it at all, and its four \
              de-DE/AltGr laws — a German user's brace must not encode as a control byte — \

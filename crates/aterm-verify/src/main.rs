@@ -15,8 +15,10 @@
 //!
 //! The one exception is a run that could not get its SNAPSHOT (2026-09-13):
 //! it prints the `snapshot:` FAIL and COULD NOT RUN and exits `3` before any
-//! stage, because running in place instead would bring back the live-checkout
-//! hazards the snapshot exists to remove ([`aterm_verify::snapshot`]).
+//! stage, because running in the caller's checkout instead would bring back the
+//! live-checkout hazards the snapshot exists to remove
+//! ([`aterm_verify::snapshot`]). A root git cannot open, or one that is not a
+//! git checkout at all, is that case too: there is no HEAD to pin.
 
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -73,14 +75,6 @@ fn main() {
         }
     };
 
-    // Timings are a side channel: a file that cannot be opened is said on
-    // stderr and costs the TSV, never the run.
-    let timings = parsed.timings.as_deref().and_then(|p| {
-        exec::Timings::create(p)
-            .map_err(|e| eprintln!("verify: cannot open --timings {}: {e}", p.display()))
-            .ok()
-    });
-
     // What the claim above actually excluded, SAID rather than assumed: a run
     // whose ladder is being written into the tree it verifies should read that
     // on the ladder, not discover it in this source file.
@@ -90,22 +84,16 @@ fn main() {
 
     // ONE GATE PER MACHINE, before the source is chosen: a second gate waits for
     // the running one instead of running beside it (`snapshot::hold_machine` —
-    // two gates at once poison each other's evidence). The self-test verifies
-    // the gate itself and stays unserialized. Held until the process exits.
-    // A gate started BY the holding gate (a stage driving this binary) runs
-    // inside that hold instead of queueing on its own ancestor until the stage
-    // ceiling kills the stage.
+    // two gates at once poison each other's evidence). Held until the process
+    // exits. The gate's own tests, which run gates inside a gate's test stage,
+    // give each fixture a lock of its own (`--machine-lock-dir`).
     let machine_lock = snapshot::machine_lock_dir(parsed.machine_lock_dir.as_deref());
-    let _machine = if parsed.selftest || snapshot::inside_machine_holder(machine_lock.as_deref()) {
-        None
-    } else {
-        match snapshot::hold_machine(&root, machine_lock.as_deref()) {
-            Ok(hold) => Some(hold),
-            Err(why) => {
-                print!("{}", snapshot::machine_could_not_run_text(&why));
-                std::fs::remove_dir_all(&scratch).ok();
-                std::process::exit(exit::COULD_NOT_RUN);
-            }
+    let machine = match snapshot::hold_machine(&root, machine_lock.as_deref()) {
+        Ok(hold) => hold,
+        Err(why) => {
+            print!("{}", snapshot::machine_could_not_run_text(&why));
+            std::fs::remove_dir_all(&scratch).ok();
+            std::process::exit(exit::COULD_NOT_RUN);
         }
     };
 
@@ -118,17 +106,15 @@ fn main() {
 
     // THE SNAPSHOT, before anything reads the tree — `--changed` included, so
     // its selection is of the same tree the stages build.
-    let (snap, notes) = match choose_source(&parsed, &root, &env, &scratch, &tools) {
-        Ok(chosen) => chosen,
+    let snap = match choose_source(&parsed, &root, &env, &scratch, &tools) {
+        Ok(snap) => snap,
         Err(why) => {
             print!("{}", snapshot::could_not_run_text(&why));
             std::fs::remove_dir_all(&scratch).ok();
             std::process::exit(exit::COULD_NOT_RUN);
         }
     };
-    let run_root = snap
-        .as_ref()
-        .map_or_else(|| root.clone(), |s| s.root.clone());
+    let run_root = snap.root.clone();
 
     // `--changed` decides the scope BEFORE the ladder is planned, so it runs
     // here rather than as a stage: every header below names the scope it picks.
@@ -141,45 +127,21 @@ fn main() {
     // it off.
     let log = open_log(&parsed, &run_root);
 
-    let mut ctx = Ctx::new_with_tools(
-        run_root,
-        parsed.mode,
-        scope,
-        parsed.selftest,
-        env,
-        scratch.clone(),
-        tools,
-    )
-    .with_prelude(prelude)
-    .with_timings(timings)
-    .with_progress_log(log.as_ref().and_then(|(_, f)| f.try_clone().ok()))
-    .with_child_ceiling(
-        parsed
-            .stage_timeout
-            .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
-    )
-    .with_gui_smoke_skipped(parsed.skip_gui_smoke)
-    .with_notes(
-        identity::own_output_note(&excluded)
-            .into_iter()
-            .chain(notes)
-            .collect::<Vec<_>>(),
-    );
-    if let Some(s) = &snap {
-        ctx = ctx.in_snapshot_of(s.caller.clone(), s.tree.clone(), s.notes.clone());
-    }
-    // AFTER the snapshot is chosen, because the git stamp is resolved from the
-    // root this run will actually build — and BEFORE any stage runs, because the
-    // whole point is that every child of one run is given the same answer.
-    ctx = ctx.with_pinned_child_facts(parsed.test_threads);
-    // Every child learns which gate holds the machine, so a gate a stage
-    // starts is recognised as part of this run (`snapshot::inside_machine_holder`).
-    if _machine.is_some() {
-        ctx.child_env_add.push((
-            snapshot::MACHINE_HOLDER_ENV.into(),
-            std::process::id().to_string().into(),
-        ));
-    }
+    let mut ctx = Ctx::new_with_tools(run_root, parsed.mode, scope, env, scratch.clone(), tools)
+        .with_prelude(prelude)
+        .with_progress_log(log.as_ref().and_then(|(_, f)| f.try_clone().ok()))
+        .with_child_ceiling(
+            parsed
+                .stage_timeout
+                .unwrap_or(Some(exec::DEFAULT_CHILD_CEILING)),
+        )
+        .with_gui_smoke_skipped(parsed.skip_gui_smoke)
+        .with_notes(identity::own_output_note(&excluded))
+        .in_snapshot_of(snap.caller.clone(), snap.tree.clone(), snap.notes.clone())
+        // AFTER the snapshot is chosen, because the git stamp is resolved from the
+        // root this run will actually build — and BEFORE any stage runs, because the
+        // whole point is that every child of one run is given the same answer.
+        .with_pinned_child_facts(parsed.test_threads);
     if let Some(gib) = parsed.disk_floor_gib {
         ctx = ctx.with_disk_floor(gib * aterm_verify::disk::GIB);
     }
@@ -200,13 +162,11 @@ fn main() {
     let _ = out.flush();
     drop(out);
     std::fs::remove_dir_all(&scratch).ok();
-    if let Some(s) = snap {
-        s.finish();
-    }
+    snap.finish();
     // The kernel releases the machine lock when this process ends, however it
     // ends; release it now anyway, so a waiting gate starts while this one is
     // still printing its last lines.
-    drop(_machine);
+    drop(machine);
 
     if std::io::stderr().is_terminal() {
         let secs = started.elapsed().as_secs_f64();
@@ -246,42 +206,26 @@ fn resolve_scope(
     (scope, Some(report))
 }
 
-/// Where this run's stages execute: a prepared snapshot (the default), or the
-/// caller's checkout — for `--in-place`, for `--selftest` (it builds nothing, so
-/// there is nothing to protect), and for a root that is not a git checkout at
-/// all, which has no HEAD to pin and says so in the header. A root that holds a
-/// `.git` git cannot open is neither: it is an `Err`.
+/// The prepared snapshot this run's stages execute in — every run's.
 ///
 /// # Errors
-/// Why a snapshot that should have been had could not be.
+/// Why no snapshot could be had: above all a root git cannot open (a `.git` it
+/// cannot read names a checkout the run cannot pin, and naming it is the whole
+/// reason) or one that is not a git checkout at all.
 fn choose_source(
     parsed: &cli::Args,
     root: &Path,
     env: &EnvSnapshot,
     scratch: &Path,
     tools: &Toolchain,
-) -> Result<(Option<snapshot::Snapshot>, Vec<String>), String> {
-    if parsed.in_place || parsed.selftest {
-        return Ok((None, Vec::new()));
-    }
-    if !identity::is_git_toplevel(root, &env.path) {
-        // A `.git` git cannot open is a checkout the run cannot pin, not a root
-        // without one: falling back in place would run with no source tripwire.
-        if identity::has_git_entry(root) {
-            return Err(identity::unopenable_reason(root));
-        }
-        return Ok((
-            None,
-            vec![format!(
-                "verify: {} is not a git checkout, so there is no HEAD to snapshot — this run is IN PLACE",
-                root.display()
-            )],
-        ));
+) -> Result<snapshot::Snapshot, String> {
+    if !identity::is_git_toplevel(root, &env.path) && identity::has_git_entry(root) {
+        return Err(identity::unopenable_reason(root));
     }
     // The compiler's commit, for the lane stamps: the run's one toolchain,
     // the very one its stages run.
     let path_env = tools.path_with_stage2_first(&env.path);
-    let snap = snapshot::prepare(&snapshot::Options {
+    snapshot::prepare(&snapshot::Options {
         caller: root,
         snapshot: parsed
             .snapshot
@@ -290,14 +234,13 @@ fn choose_source(
         path_env: &path_env,
         lane_env: snapshot::lane_env_from_process(),
         trustc_commit: tools.identity(&path_env, scratch).commit,
-    })?;
-    Ok((Some(snap), Vec::new()))
+    })
 }
 
 /// stdout, and the gate's own copy of the ladder.
 ///
 /// A log write NEVER decides anything: a full disk costs the record, not the
-/// run, exactly as `--timings` does. `write` reports what reached
+/// run. `write` reports what reached
 /// STDOUT, so a short write on the log cannot be mistaken for a short write on
 /// the ladder.
 struct Tee<'a, W: Write> {

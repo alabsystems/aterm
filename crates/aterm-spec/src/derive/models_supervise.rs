@@ -154,8 +154,33 @@ pub fn supervisor_focus_choice_model() -> Model {
 /// has passed it is SUBMITTED where the policy would act (a continuation's
 /// place, or a retry's). Nothing is ESCALATED at a point the policy can
 /// answer: only past a cap the owner wrote (`Budget` acts in the window;
-/// `0`, the default, is none).
+/// `0`, the default, is none). And NOTHING — no continuation, no retry, no
+/// draft sent, no escalation — goes into a session nobody has asked anything
+/// (D1 of the live E2E of 2026-09-26): the harness's OWN typed turns (its
+/// upgrade notice, its carry-on, and what the supervisor itself typed, by
+/// its ledger) are no task, however much the agent works on them.
 ///
+/// `asked` 1 once a person or an orchestrator asked the session something
+/// and its agent answered (`HumanWork`: their turn of real work); `tasked`
+/// what the policy reads of it (`aterm_agent::harness::upgrade::TaskScan`
+/// over the conversation's record, beside the screen's launch card) — equal
+/// to `asked` in the shipped policy; `HarnessTurn` the harness's own turn —
+/// the upgrade's notice or its carry-on, typed by the session's host into a
+/// session with a task or without one (its record marked, beside the
+/// supervisor's own turns by its ledger) — answered SHORT: NO TASK, and NO
+/// SHORT TURN OF THE WORKER'S — the streak and its back-off stand as the
+/// worker's own turns left them (N1 of the live E2E of 2026-09-26: the READY
+/// answer and the carry-on's reply, read as someone else's short turns,
+/// backed a finished stage's continuation off 4 minutes); `HarnessTurnLong`
+/// the same turn answered with REAL WORK (a carry-on's answer is the
+/// worker's own work, resumed): still no task, and the streak ends as after
+/// any turn of real work (the review of the N1 fix: a 20-minute carry-on
+/// answer was backed off like the first point before it). `harness` counts
+/// those turns, up to the upgrade's two; `earned` is 1 while a back-off the
+/// WORKER's turns earned runs — the back-off's ghost, which no harness turn
+/// sets (`NeverBackOffForTheHarness`); `long` is 1 while the last turn
+/// answered did real work — anyone's, the harness's included — after which
+/// no back-off runs (`NeverBackOffAfterRealWork`).
 /// `box_up` a box on the screen; `wall` 0 none, 1 up with its wait running,
 /// 2 up with its wait over; `person` 1 while a person's keystroke is inside
 /// the grace; `used` the typed acts in the cap's window (`HourPasses`
@@ -171,14 +196,23 @@ pub fn supervisor_focus_choice_model() -> Model {
 /// took (the Tier-1 walks both). `draft` 1 while text stands in the composer
 /// (typing it is a person's keystroke: its grace runs). `Buggy = 1` ignores
 /// the box, the person, the draft and the back-off, escalates "worker
-/// reports done" after two short turns (the rule until 2026-09-24), and
-/// keeps awaiting an unseen point past its deadline (the silent latch lane
-/// B2's review found) — each caught. Tier-1
+/// reports done" after two short turns (the rule until 2026-09-24), keeps
+/// awaiting an unseen point past its deadline (the silent latch lane B2's
+/// review found), reads the harness's own turn as a task (the E2E's D1:
+/// `keep going` and `answer_text` into a session nobody had asked anything),
+/// as a short turn of the worker's (N1), and its answer of real work as no
+/// end of the streak (the N1 fix's review) — each caught. Tier-1
 /// (aterm-agent `tests/supervise_conformance_turn_end.rs`) drives the real
 /// decider along every reachable state of this model, with no cap and with
 /// one, and checks that it types exactly where the model allows it, waits
-/// where a wall, a person or a back-off holds it, and is never silent at a
-/// free point.
+/// where a wall, a person or a back-off holds it, is never silent at a free
+/// point of a session with a task, and types nothing into one without —
+/// its `tasked` the REAL `TaskScan`'s over the record the walk writes (a
+/// person's prompt for `HumanWork`, the harness's marked one and the
+/// supervisor's ledgered `keep going` for `HarnessTurn`) — and its streak
+/// the real one, a `HarnessTurn` the host's typed turn
+/// (`TurnEndState::host_typed`) answered short, a `HarnessTurnLong` the same
+/// answered with real work.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_turn_end_model() -> Model {
@@ -202,6 +236,12 @@ pub fn supervisor_turn_end_model() -> Model {
             var typed_early = 0;
             var escalated = 0;
             var latched = 0;
+            var asked = 0;
+            var tasked = 0;
+            var typed_taskless = 0;
+            var harness = 0;
+            var earned = 0;
+            var long = 0;
 
             action BoxAppears when (box_up == 0 && pending == 0) {
                 box_up = 1;
@@ -238,19 +278,49 @@ pub fn supervisor_turn_end_model() -> Model {
             }
             action BackoffDue when (backoff == 1 && pending == 0) {
                 backoff = 0;
+                earned = 0;
             }
             // Someone else's turn of real work (a draft among it sent): the
-            // streak ends.
+            // streak ends — and the session has a task (their prompt,
+            // answered).
             action HumanWork when (pending == 0 && box_up == 0 && wall == 0) {
                 short = 0;
                 backoff = 0;
+                earned = 0;
+                long = 1;
                 draft = 0;
+                asked = 1;
+                tasked = 1;
+            }
+            // The harness's own turn — its notice or its carry-on, the
+            // upgrade's two — answered short: NO task, and no short turn of
+            // the worker's: the streak and its back-off stand.
+            action HarnessTurn when (
+                harness <= 1 && pending == 0 && box_up == 0 && wall == 0 && draft == 0
+            ) {
+                harness = harness + 1;
+                short = if Buggy == 1 && short <= Streak - 1 { short + 1 } else { short };
+                backoff = if Buggy == 1 { 1 } else { backoff };
+                tasked = if Buggy == 1 { 1 } else { tasked };
+            }
+            // …answered with REAL WORK (a carry-on's answer is the worker's
+            // own work, resumed): still no task, and the streak ends.
+            action HarnessTurnLong when (
+                harness <= 1 && pending == 0 && box_up == 0 && wall == 0 && draft == 0
+            ) {
+                harness = harness + 1;
+                short = if Buggy == 1 { short } else { 0 };
+                backoff = if Buggy == 1 { backoff } else { 0 };
+                earned = if Buggy == 1 { earned } else { 0 };
+                long = 1;
+                tasked = if Buggy == 1 { 1 } else { tasked };
             }
             action Continue when (
-                pending == 0 && wall == 0 &&
+                pending == 0 && wall == 0 && (tasked == 1 || Buggy == 1) &&
                 ((box_up == 0 && person == 0 && draft == 0 && backoff == 0) || Buggy == 1) &&
                 (Budget == 0 || used <= Budget - 1)
             ) {
+                typed_taskless = if asked == 0 { 1 } else { typed_taskless };
                 typed_blocked = if box_up == 1 || person == 1 { 1 } else { typed_blocked };
                 typed_over = if draft == 1 { 1 } else { typed_over };
                 typed_early = if backoff == 1 { 1 } else { typed_early };
@@ -261,11 +331,15 @@ pub fn supervisor_turn_end_model() -> Model {
                 pending = 0;
                 short = if short <= Streak - 1 { short + 1 } else { short };
                 backoff = 1;
+                earned = 1;
+                long = 0;
             }
             action WorkedLong when (pending == 1) {
                 pending = 0;
                 short = 0;
                 backoff = 0;
+                earned = 0;
+                long = 1;
             }
             // The reply ends and no read saw the worker busy.
             action ReplyUnseen when (pending == 1) {
@@ -281,13 +355,16 @@ pub fn supervisor_turn_end_model() -> Model {
                 pending = if Buggy == 1 { 3 } else { 0 };
                 short = if Buggy == 1 || short == Streak { short } else { short + 1 };
                 backoff = if Buggy == 1 { backoff } else { 1 };
+                earned = if Buggy == 1 { earned } else { 1 };
+                long = if Buggy == 1 { long } else { 0 };
                 waited = 0;
             }
             action Retry when (
-                pending == 0 && wall == 2 &&
+                pending == 0 && wall == 2 && (tasked == 1 || Buggy == 1) &&
                 ((box_up == 0 && person == 0 && draft == 0) || Buggy == 1) &&
                 (Budget == 0 || used <= Budget - 1)
             ) {
+                typed_taskless = if asked == 0 { 1 } else { typed_taskless };
                 typed_blocked = if box_up == 1 || person == 1 { 1 } else { typed_blocked };
                 typed_over = if draft == 1 { 1 } else { typed_over };
                 used = if Budget == 0 { used } else { used + 1 };
@@ -297,7 +374,7 @@ pub fn supervisor_turn_end_model() -> Model {
             // continuation's turn, or at a wall whose wait is over its
             // retry's.
             action SubmitDraft when (
-                pending == 0 && draft == 1 && (wall == 0 || wall == 2) &&
+                pending == 0 && draft == 1 && (wall == 0 || wall == 2) && tasked == 1 &&
                 box_up == 0 && person == 0 && backoff == 0 &&
                 (Budget == 0 || used <= Budget - 1)
             ) {
@@ -316,7 +393,7 @@ pub fn supervisor_turn_end_model() -> Model {
             // A person is told only past the owner's cap — or, `Buggy`, of
             // a worker that "reports done".
             action Escalate when (
-                pending == 0 && box_up == 0 && person == 0 && (
+                pending == 0 && box_up == 0 && person == 0 && tasked == 1 && (
                     (Budget > 0 && used == Budget && backoff == 0 && (wall == 0 || wall == 2)) ||
                     (Buggy == 1 && short > 1)
                 )
@@ -330,6 +407,85 @@ pub fn supervisor_turn_end_model() -> Model {
             invariant NeverEscalateUnderFullPower: escalated == 0;
             invariant WithinTheCap: Budget == 0 || used <= Budget;
             invariant NoSilentLatch: latched == 0;
+            invariant NeverTypeIntoATasklessSession: typed_taskless == 0;
+            invariant NeverBackOffForTheHarness: backoff <= earned;
+            invariant NeverBackOffAfterRealWork: backoff == 0 || long == 0;
+        }
+    }
+}
+
+/// A TURN END THE HOST LET GO IS DECIDED AGAIN (aterm-agent
+/// `supervise/run.rs`, `Session::host_held` and `wait_for_next`; D3 of the
+/// live E2E of 2026-09-26). The loop decides each point once, as it comes;
+/// the session's host (the window's worker, `IdleHost`) may own the
+/// session's turn ends meanwhile (`IdleHost::owns_turn_end`: the live
+/// upgrade's wind-down) and may take its own step at the point, in the
+/// point's act's place. Once the host owns nothing any more, the point it was
+/// left to is DECIDED AGAIN — never waited on with nobody deciding it (the
+/// E2E's Stage-1 end sat five minutes after the upgrade's settle ownership
+/// lapsed).
+///
+/// `point` 0 while the agent works, 1 a turn end the loop decided (its act
+/// taken, or its wait running), 2 one left to the host — decided while it
+/// owned the turn ends (`TurnEnds` under `owns`), or passed over for a step
+/// that typed nothing and ended nothing (`HostKeeps`: one that owns the turn
+/// ends after it; `HostLetsGo`: one that owns nothing, a wait past its bound
+/// or a last word) — and 3 one a host step MOVED (`HostMoves`: it typed into
+/// the agent, a notice or a carry-on, or ended it; the screen may still show
+/// the old point until the agent draws its answer, but the point is gone and
+/// the turn it started is under way); `owns` the host owns the session's
+/// turn ends (`Lapse`: switched off, or let go with no step); `stranded` the
+/// loop waited on a point left to a host that owns nothing; `stale` the loop
+/// decided a point a host step had moved (the review of 2026-09-26: the
+/// point after a typed carry-on was decided again at once, while the agent
+/// began its answer). `Redecide` is the loop's decision again; `LoopWaits`
+/// its wait for the screen to move. `Buggy = 1` is the loop that decides
+/// each point once and waits on it whoever owns it, and that decides again
+/// whatever a step left behind — both caught. Tier-1 (aterm-agent
+/// `supervise/run_engine_tests.rs`, `a_turn_end_the_host_let_go_is_decided_again`)
+/// drives the real loop along the model's paths and checks it continues
+/// exactly where `Redecide` is enabled.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supervisor_host_turn_end_model() -> Model {
+    crate::ty_model! {
+        SupervisorHostTurnEnd {
+            const Buggy = 0;
+            var point = 0;
+            var owns = 0;
+            var stranded = 0;
+            var stale = 0;
+
+            action TurnEnds when (point == 0) {
+                point = if owns == 1 { 2 } else { 1 };
+            }
+            action HostKeeps when (point == 1 || point == 2) {
+                owns = 1;
+                point = 2;
+            }
+            action HostLetsGo when (point == 1 || point == 2) {
+                owns = 0;
+                point = 2;
+            }
+            action HostMoves when (point == 1 || point == 2) {
+                point = 3;
+            }
+            action Lapse when (owns == 1) {
+                owns = 0;
+            }
+            action Redecide when (owns == 0 && (point == 2 || (point == 3 && Buggy == 1))) {
+                stale = if point == 3 { 1 } else { stale };
+                point = 1;
+            }
+            action LoopWaits when (point > 0 && (point == 1 || point == 3 || owns == 1 || Buggy == 1)) {
+                stranded = if point == 2 && owns == 0 { 1 } else { stranded };
+            }
+            action TurnRuns when (point > 0) {
+                point = 0;
+            }
+
+            invariant NoTurnEndLeftToNobody: stranded == 0;
+            invariant NeverDecideAPointAStepMoved: stale == 0;
         }
     }
 }

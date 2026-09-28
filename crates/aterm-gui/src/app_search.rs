@@ -807,9 +807,7 @@ impl App {
             // an explicit no-op there.
             return;
         }
-        if self.front().is_some_and(|ws| ws.settings().is_some()) {
-            self.settings_search_begin();
-        } else if self.front_terminal(wid).is_some() {
+        if self.front_terminal(wid).is_some() {
             self.search_enter();
         }
     }
@@ -1804,7 +1802,7 @@ impl App {
                     && origin.history_renumber_epoch == terminal.grid().history_renumber_epoch();
                 if coherent {
                     if origin.was_live {
-                        terminal.scroll_to_bottom();
+                        terminal.return_to_live();
                     } else {
                         terminal.scroll_to_absolute_row(origin.top_visible_absolute_row);
                     }

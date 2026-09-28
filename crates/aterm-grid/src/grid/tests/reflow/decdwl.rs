@@ -9,7 +9,7 @@
 //!
 //! Regression tests for #7524.
 
-use crate::{Grid, LineSize};
+use crate::{CellFlags, Grid, LineSize, StyleId};
 
 #[test]
 fn decdwl_row_preserved_on_shrink() {
@@ -309,4 +309,44 @@ fn decdwl_continuation_row_not_merged_on_grow() {
     assert!(row1.is_wrapped(), "the continuation flag must survive too");
     assert_eq!(row1.get(0).unwrap().char_data(), 'K' as u16);
     assert_eq!(row1.get(1).unwrap().char_data(), 'L' as u16);
+}
+
+#[test]
+fn decdwl_shrink_blanks_a_wide_char_cut_at_the_new_edge() {
+    // The in-place DECDWL resize truncates rather than reflows, so a wide
+    // char whose head lands in the new last column loses its continuation.
+    // Found by the aterm-core no-panic fuzzer once it asserted
+    // WideCharConsistent: the head must be blanked (as `Row::resize` does),
+    // never left dangling in the last column.
+    //
+    // The row is 100 wide, so marking it DECDWL clears only `cells[50..]`
+    // and the pair at 39/40 is INTACT going into the resize — the state the
+    // real bytes reach (`ESC # 6` on a row, then a wide char near its middle).
+    // Resized to 40, the truncation cuts exactly that pair.
+    let mut grid = Grid::new(3, 100);
+    grid.row_mut(0)
+        .unwrap()
+        .set_line_size(LineSize::DoubleWidth);
+    for _ in 0..39 {
+        grid.write_char('a');
+    }
+    grid.write_wide_char_wrap_with_style_id('界', StyleId::default(), CellFlags::empty());
+    {
+        let row0 = grid.row(0).unwrap();
+        assert!(row0.get(39).unwrap().is_wide(), "head at col 39");
+        assert!(
+            row0.get(40).unwrap().is_wide_continuation(),
+            "continuation at col 40"
+        );
+    }
+    grid.assert_wide_char_consistent();
+
+    grid.resize(3, 40);
+    grid.assert_wide_char_consistent();
+
+    let row0 = grid.row(0).unwrap();
+    assert_eq!(row0.line_size(), LineSize::DoubleWidth);
+    assert_eq!(row0.get(38).unwrap().char_data(), 'a' as u16);
+    let edge = row0.get(39).unwrap();
+    assert!(!edge.is_wide(), "the cut wide head must be blanked");
 }

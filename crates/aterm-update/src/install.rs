@@ -1692,7 +1692,30 @@ fn checked_bundle_exchange(a: &Path, b: &Path, operation: &str) -> Result<(), St
     if !same_volume(a, b) {
         return Err(format!("{operation}: bundles are not on one volume"));
     }
-    rename_swap(a, b).map_err(|error| format!("{operation} failed: {error}"))
+    rename_swap(a, b).map_err(|error| format!("{operation} failed: {error}"))?;
+    sync_swap_parents(a, b);
+    Ok(())
+}
+
+/// Make a completed swap durable the way `manifest::write_durable` makes a
+/// ledger record durable: the exchange is a directory-entry change, so sync
+/// the directory holding each name (once when they share one). Best effort —
+/// the swap already happened, and a filesystem that cannot sync a directory
+/// degrades to the old non-durable behaviour rather than failing it.
+fn sync_swap_parents(a: &Path, b: &Path) {
+    let sync = |dir: &Path| {
+        let _ = std::fs::File::open(dir).and_then(|d| d.sync_all());
+    };
+    let parent_a = a.parent();
+    let parent_b = b.parent();
+    if let Some(dir) = parent_a {
+        sync(dir);
+    }
+    if let Some(dir) = parent_b
+        && parent_a != Some(dir)
+    {
+        sync(dir);
+    }
 }
 
 /// Read a bundle's SEALED identity (build + commit), refusing anything that is
@@ -3278,17 +3301,12 @@ fn apply_staged_if_ready_inner(
         return ApplyOutcome::NotApplicable;
     };
 
-    // 3. Quick pre-lock peek: skip locking entirely when nothing is staged (the
-    //    common case). Anything else — newer, not-newer, or corrupt — is decided
-    //    UNDER the lock in step 4, so retirement never races the stager's final
-    //    publication transaction (F15).
-    if matches!(read_ready(&staging, current_build), ReadyState::Absent)
-        && boot_sentinel(&staging).read_state().is_none()
-    {
-        return ApplyOutcome::NoUpdate;
-    }
-
-    // 4. Serialize the swap across concurrent launches.
+    // 3–4. The pre-lock peek, the lock, the work that must hold it, and the decision
+    //    made UNDER it — one function ([`apply_lock_then_ready`]) that the Tier-1
+    //    (`two_processes_arming_one_build_swap_it_once`) drives with a sibling's whole
+    //    apply injected while this launch waits for the lock.
+    //
+    //    Serializing the swap across concurrent launches:
     //
     // BOUNDED, unlike every other taker of this lock: we are before the window,
     // so waiting here is a terminal that has not appeared. Every legitimate
@@ -3297,86 +3315,80 @@ fn apply_staged_if_ready_inner(
     // ceiling). A holder that outlasts this one is wedged — SIGSTOPped, paused
     // under a debugger, stuck on a dead volume — and the right answer then is to
     // start on the build we already have, not to hang with nothing on screen.
-    let _lock = match FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT) {
-        Ok(l) => l,
-        Err(e) => return ApplyOutcome::Deferred(format!("lock: {e}")),
-    };
-    // Everything from here to the swap is verification work on the launch path.
-    // One ceiling over all of it (the guard restores any outer budget on drop).
-    let _budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
-    if !recover_abandoned_preswap_trial_if_exact(
+    let (_lock, _budget, ready) = match apply_lock_then_ready(
         &staging,
-        &b.app_root,
         current_build,
-        current_commit,
+        || {
+            FileLock::acquire_within(&staging.apply_lock, APPLY_LOCK_WAIT)
+                .map_err(|e| ApplyOutcome::Deferred(format!("lock: {e}")))
+        },
+        || {
+            // Everything from here to the swap is verification work on the launch path.
+            // One ceiling over all of it (the guard restores any outer budget on drop).
+            let budget = crate::verify::ApplyBudget::start(crate::verify::APPLY_BUDGET);
+            if !recover_abandoned_preswap_trial_if_exact(
+                &staging,
+                &b.app_root,
+                current_build,
+                current_commit,
+            ) {
+                let armed_build = boot_sentinel(&staging)
+                    .read_state()
+                    .map_or(0, |(build, _)| build);
+                // THE JUST-SWAPPED SHAPE (2026-09-14, audit BA-7): a sibling cold launch
+                // that lost the apply-lock race is still the OLD image, and the bundle
+                // under it now holds the NEW build mid-trial — installed == armed, both
+                // newer than this process. That is a healthy apply in progress, not a
+                // wedged trial: it must neither spend the foreign-trial budget (three such
+                // launches would disarm a live trial) nor be booked as a refusal. This
+                // image keeps running; the check lane's installed-bundle announcement
+                // activates it later. The plist read is bounded and the trial owner's
+                // sentinel keeps its authority either way.
+                if armed_build != 0
+                    && armed_build > current_build
+                    && crate::verify::bundle_build_number(&b.app_root).ok() == Some(armed_build)
+                {
+                    crate::log(&format!(
+                        "boot apply: build {armed_build} is already installed and mid-trial; this \
+                     launch is the previous build {current_build} and leaves the trial to its owner"
+                    ));
+                    return Err(ApplyOutcome::NoUpdate);
+                }
+                // A sentinel armed for a build that is not the running one can never be
+                // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
+                // future apply forever. Budget it — with its own counter, never the
+                // trial's. The SAME-build case that another install owns is the same
+                // wedge for THIS process (`check_boot_health` rightly does not count us,
+                // and the owner may never run again), so it takes the same budget.
+                if armed_build != 0
+                    && (armed_build != current_build || !trial_owned_by(&staging, &b.app_root))
+                {
+                    escape_wedged_foreign_trial(&staging, current_build, armed_build);
+                }
+                return Err(ApplyOutcome::Deferred(format!(
+                    "update trial for build {armed_build} is still unconfirmed"
+                )));
+            }
+            // The mismatched-sentinel lane is behind us for this launch, so no budget is
+            // outstanding; never let one accumulate across unrelated trials.
+            let _ = foreign_trial_counter(&staging).confirm();
+            // Under the lock no other swap is in flight, so it is safe to clear orphaned
+            // transient swap copies from a previously interrupted/completed swap.
+            if let ReadyState::Newer(orphaned_ready) = read_ready(&staging, current_build)
+                && let Err(error) = recover_orphaned_prepared_candidate(
+                    &staging,
+                    &b.app_root,
+                    current_build,
+                    &orphaned_ready,
+                )
+            {
+                return Err(ApplyOutcome::Deferred(error));
+            }
+            Ok(budget)
+        },
     ) {
-        let armed_build = boot_sentinel(&staging)
-            .read_state()
-            .map_or(0, |(build, _)| build);
-        // THE JUST-SWAPPED SHAPE (2026-09-14, audit BA-7): a sibling cold launch
-        // that lost the apply-lock race is still the OLD image, and the bundle
-        // under it now holds the NEW build mid-trial — installed == armed, both
-        // newer than this process. That is a healthy apply in progress, not a
-        // wedged trial: it must neither spend the foreign-trial budget (three such
-        // launches would disarm a live trial) nor be booked as a refusal. This
-        // image keeps running; the check lane's installed-bundle announcement
-        // activates it later. The plist read is bounded and the trial owner's
-        // sentinel keeps its authority either way.
-        if armed_build != 0
-            && armed_build > current_build
-            && crate::verify::bundle_build_number(&b.app_root).ok() == Some(armed_build)
-        {
-            crate::log(&format!(
-                "boot apply: build {armed_build} is already installed and mid-trial; this \
-                 launch is the previous build {current_build} and leaves the trial to its owner"
-            ));
-            return ApplyOutcome::NoUpdate;
-        }
-        // A sentinel armed for a build that is not the running one can never be
-        // cleared by the same-build lanes, so an unrecoverable one blocks EVERY
-        // future apply forever. Budget it — with its own counter, never the
-        // trial's. The SAME-build case that another install owns is the same
-        // wedge for THIS process (`check_boot_health` rightly does not count us,
-        // and the owner may never run again), so it takes the same budget.
-        if armed_build != 0
-            && (armed_build != current_build || !trial_owned_by(&staging, &b.app_root))
-        {
-            escape_wedged_foreign_trial(&staging, current_build, armed_build);
-        }
-        return ApplyOutcome::Deferred(format!(
-            "update trial for build {armed_build} is still unconfirmed"
-        ));
-    }
-    // The mismatched-sentinel lane is behind us for this launch, so no budget is
-    // outstanding; never let one accumulate across unrelated trials.
-    let _ = foreign_trial_counter(&staging).confirm();
-    if let ReadyState::Newer(orphaned_ready) = read_ready(&staging, current_build)
-        && let Err(error) = recover_orphaned_prepared_candidate(
-            &staging,
-            &b.app_root,
-            current_build,
-            &orphaned_ready,
-        )
-    {
-        return ApplyOutcome::Deferred(error);
-    }
-    // Under the lock no other swap is in flight, so it is safe to clear orphaned
-    // transient swap copies from a previously interrupted/completed swap.
-    // Re-read under the lock and act. A stage in flight may continue downloading
-    // under stage_lock, but its final publication takes this same apply_lock. Apply
-    // retirement touches only ready+staged_app, never that producer's scratch.
-    let ready = match read_ready(&staging, current_build) {
-        ReadyState::Newer(r) => r,
-        ReadyState::NotNewer => {
-            staging.retire_published();
-            return ApplyOutcome::NoUpdate;
-        }
-        ReadyState::Corrupt => {
-            crate::warn("ready.toml is unreadable; discarding staged update");
-            staging.retire_published();
-            return ApplyOutcome::NoUpdate;
-        }
-        ReadyState::Absent => return ApplyOutcome::NoUpdate,
+        Ok(held) => held,
+        Err(outcome) => return outcome,
     };
     if let Some(expected) = expected_artifact.as_ref()
         && !ready_matches_expected(&ready, expected)
@@ -4340,6 +4352,62 @@ enum ReadyState {
     Absent,
 }
 
+/// Steps 3–4 of the boot apply lane, as ONE function the lane and its Tier-1 both run.
+///
+/// 1. The pre-lock PEEK: nothing staged and no boot sentinel is the common case, and it
+///    skips the lock entirely (`NoUpdate`). The peek decides nothing else — newer,
+///    not-newer and corrupt are all decided UNDER the lock, so retirement never races
+///    the stager's final publication transaction (F15), and a sibling that swapped and
+///    retired the marker while this launch waited is seen (`NativeUpdateTwoProcessApply`).
+/// 2. `lock` takes `apply_lock` (the lane: bounded by `APPLY_LOCK_WAIT`).
+/// 3. `under_lock` is the work that must hold the lock before the decision — the
+///    lane's apply budget, trial and orphan recovery — and its value (the budget guard)
+///    is returned alongside the lock so both live until the swap.
+/// 4. The decision: [`ready_under_apply_lock`], the marker as it reads NOW.
+fn apply_lock_then_ready<L, U>(
+    staging: &Staging,
+    current_build: u64,
+    lock: impl FnOnce() -> Result<L, ApplyOutcome>,
+    under_lock: impl FnOnce() -> Result<U, ApplyOutcome>,
+) -> Result<(L, U, Ready), ApplyOutcome> {
+    if matches!(read_ready(staging, current_build), ReadyState::Absent)
+        && boot_sentinel(staging).read_state().is_none()
+    {
+        return Err(ApplyOutcome::NoUpdate);
+    }
+    let held = lock()?;
+    let work = under_lock()?;
+    // A stage in flight may continue downloading under stage_lock, but its final
+    // publication takes this same apply_lock. Apply retirement touches only
+    // ready+staged_app, never that producer's scratch.
+    let ready = ready_under_apply_lock(staging, current_build)?;
+    Ok((held, work, ready))
+}
+
+/// THE UNDER-LOCK RE-READ — what the apply lane acts on once `apply_lock` is held: the
+/// marker as it reads NOW, never as a pre-lock peek saw it. Two aterm processes arming
+/// the same build is the ordinary case (every window and session runs the lane), and
+/// one of them may finish its whole pre-lock preflight on that build while the other's
+/// successor holds the lock, swaps the bundle and retires the marker. The loser finds
+/// nothing left to apply and swaps nothing (`NativeUpdateTwoProcessApply`; Tier-1:
+/// `two_processes_arming_one_build_swap_it_once`). A marker that is not newer, or not
+/// readable, is retired here too.
+fn ready_under_apply_lock(staging: &Staging, current_build: u64) -> Result<Ready, ApplyOutcome> {
+    match read_ready(staging, current_build) {
+        ReadyState::Newer(ready) => Ok(ready),
+        ReadyState::NotNewer => {
+            staging.retire_published();
+            Err(ApplyOutcome::NoUpdate)
+        }
+        ReadyState::Corrupt => {
+            crate::warn("ready.toml is unreadable; discarding staged update");
+            staging.retire_published();
+            Err(ApplyOutcome::NoUpdate)
+        }
+        ReadyState::Absent => Err(ApplyOutcome::NoUpdate),
+    }
+}
+
 fn read_ready(staging: &Staging, current_build: u64) -> ReadyState {
     match Ready::read(&staging.ready) {
         Some(r) if !r.has_canonical_identity() => ReadyState::Corrupt,
@@ -4405,37 +4473,11 @@ pub(crate) fn unix_now_secs() -> u64 {
 
 /// Seconds between two of our own RFC3339 instants (`later - earlier`), or
 /// `None` when either string is not the exact `YYYY-MM-DDTHH:MM:SSZ` shape this
-/// module writes (e.g. the empty pre-epoch fallback). Lexicographic order on
-/// these strings IS chronological, so a plain component parse suffices — no
-/// calendar math is needed for a difference of epochs re-derived per component.
+/// module writes (e.g. the empty pre-epoch fallback) or `later` precedes
+/// `earlier`. The parse is the shared strict one, `aterm_types::rfc3339::parse_utc`.
 pub(crate) fn rfc3339_delta_secs(earlier: &str, later: &str) -> Option<u64> {
     fn epoch(s: &str) -> Option<u64> {
-        // YYYY-MM-DDTHH:MM:SSZ — 20 bytes, fixed layout.
-        if s.len() != 20 || !s.ends_with('Z') {
-            return None;
-        }
-        let (y, mo, d) = (
-            s.get(0..4)?.parse::<i64>().ok()?,
-            s.get(5..7)?.parse::<i64>().ok()?,
-            s.get(8..10)?.parse::<i64>().ok()?,
-        );
-        let (h, mi, sec) = (
-            s.get(11..13)?.parse::<u64>().ok()?,
-            s.get(14..16)?.parse::<u64>().ok()?,
-            s.get(17..19)?.parse::<u64>().ok()?,
-        );
-        // days_from_civil (the inverse of format_rfc3339's civil_from_days).
-        let y = if mo <= 2 { y - 1 } else { y };
-        let era = if y >= 0 { y } else { y - 399 } / 400;
-        let yoe = y - era * 400;
-        let mp = if mo > 2 { mo - 3 } else { mo + 9 };
-        let doy = (153 * mp + 2) / 5 + d - 1;
-        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-        let days = era * 146_097 + doe - 719_468;
-        u64::try_from(days)
-            .ok()?
-            .checked_mul(86_400)?
-            .checked_add(h * 3600 + mi * 60 + sec)
+        u64::try_from(aterm_types::rfc3339::parse_utc(s)?).ok()
     }
     epoch(later)?.checked_sub(epoch(earlier)?)
 }
@@ -4669,6 +4711,184 @@ mod tests {
             roster_seq: None,
         };
         std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
+    }
+
+    /// TWO PROCESSES ARMING ONE BUILD SWAP IT IN ONCE (Tier-1 of
+    /// `NativeUpdateTwoProcessApply`, auto-apply audit #8). Both run build 10 with build
+    /// 11 staged, and both run the lane's own steps 3–4 ([`apply_lock_then_ready`]). B
+    /// peeks, sees the stage and goes for the lock; while it waits (injected at B's `lock`),
+    /// A runs the same function, wins the REAL `apply_lock`, reads the marker under it and
+    /// swaps (the swap's marker effect: `retire_published`), and B's attempt on the lock
+    /// is refused until A lets go. Then B takes the lock and finds nothing to apply. Each
+    /// real step is projected onto the model and checked as one of its transitions — and
+    /// the other order (B wins) swaps once too.
+    ///
+    /// NEGATIVE CONTROL, in real code: the same race run through a lane that acts on its
+    /// pre-lock peek (the model's `Buggy = 1`, and the shape a regression of the lane would
+    /// take) swaps build 11 a second time, which the model's invariant refutes — so the
+    /// race this test stages is one a peek-trusting lane cannot pass. `the_boot_lane_decides
+    /// _through_apply_lock_then_ready` pins that the lane runs the function this drives.
+    #[test]
+    fn two_processes_arming_one_build_swap_it_once() {
+        use aterm_spec::interp::State;
+        type Lane = fn(
+            &Staging,
+            &mut dyn FnMut() -> Result<FileLock, ApplyOutcome>,
+        ) -> Result<Ready, ApplyOutcome>;
+        let model = aterm_spec::derive::native_update_two_process_apply_model();
+        let project = |ready: bool, a_done: bool, b_peeked: bool, b_done: bool, swaps: i64| {
+            State::from([
+                ("ready", i64::from(ready)),
+                ("a_done", i64::from(a_done)),
+                ("b_peeked", i64::from(b_peeked)),
+                ("b_done", i64::from(b_done)),
+                ("swaps", swaps),
+            ])
+        };
+        let marker_present = |s: &Staging| matches!(read_ready(s, 10), ReadyState::Newer(_));
+        let acquire = |s: &Staging| {
+            FileLock::acquire_within(&s.apply_lock, std::time::Duration::from_secs(5))
+                .map_err(|e| ApplyOutcome::Deferred(format!("lock: {e}")))
+        };
+        // THE LANE (steps 3–4, exactly as `apply_staged_if_ready_inner` runs them) and the
+        // peek-trusting one the negative control stages the same race through.
+        let shipped: Lane =
+            |s, lock| apply_lock_then_ready(s, 10, lock, || Ok(())).map(|(_lock, (), ready)| ready);
+        let peek_trusting: Lane = |s, lock| {
+            let peek = read_ready(s, 10);
+            let _lock = lock()?;
+            match peek {
+                ReadyState::Newer(ready) => Ok(ready),
+                _ => Err(ApplyOutcome::NoUpdate),
+            }
+        };
+        // A wins the lock while B waits; returns (B's swaps, the model states it walked).
+        let race = |b_lane: Lane| {
+            let (s, root) = temp_staging();
+            write_ready(&s, 11);
+            let init = project(true, false, false, false, 0);
+            let mut walked = vec![init.clone()];
+            let b_decision = b_lane(&s, &mut || {
+                // B got here only because its peek saw the stage.
+                let peeked = project(marker_present(&s), false, true, false, 0);
+                walked.push(peeked.clone());
+                // A's successor runs the SAME lane: it holds the real lock (B is refused
+                // it meanwhile), reads under it, swaps and retires.
+                let a_ready = shipped(&s, &mut || {
+                    let held = acquire(&s)?;
+                    assert!(
+                        FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).is_err(),
+                        "B waits behind A: the lock serializes the two processes"
+                    );
+                    Ok(held)
+                })
+                .expect("A finds the stage under the lock");
+                assert_eq!(a_ready.build_number, 11);
+                s.retire_published();
+                // A's lock went with `shipped`'s return: a `FileLock` drop is `LOCK_UN`
+                // (aterm-update-core `sys.rs`), a deterministic release, so B's one
+                // acquire below cannot meet a forked copy of A's descriptor.
+                walked.push(project(marker_present(&s), true, true, false, 1));
+                acquire(&s)
+            });
+            let b_swaps = i64::from(b_decision.is_ok());
+            walked.push(project(marker_present(&s), true, true, true, 1 + b_swaps));
+            let _ = std::fs::remove_dir_all(&root);
+            (b_swaps, walked)
+        };
+
+        let (b_swaps, walked) = race(shipped);
+        assert_eq!(
+            b_swaps, 0,
+            "B's under-lock re-read must find nothing left to apply"
+        );
+        let [init, peeked, swapped, done] = &walked[..] else {
+            panic!("the race walks four states: {walked:?}");
+        };
+        for (action, from, to) in [
+            ("BPeek", init, peeked),
+            ("ASwap", peeked, swapped),
+            ("BApply", swapped, done),
+        ] {
+            assert!(
+                model.successors(action, from).contains(to),
+                "{action}: the real step is not a model transition: {to:?}"
+            );
+        }
+        assert!(model.check_invariant("OneSwapPerBuild", done));
+
+        // NEGATIVE CONTROL: the peek-trusting lane, same race — a second swap.
+        let (b_swaps, walked) = race(peek_trusting);
+        assert_eq!(b_swaps, 1, "a lane acting on its peek swaps build 11 again");
+        let (swapped, second) = (&walked[2], &walked[3]);
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        assert!(
+            buggy.successors("BApply", swapped).contains(second),
+            "the peek-trusting lane is the model's Buggy = 1 step: {second:?}"
+        );
+        assert!(!model.check_invariant("OneSwapPerBuild", second));
+
+        // B wins the lock instead: B swaps, A finds nothing — still exactly one swap.
+        let (s, root) = temp_staging();
+        write_ready(&s, 11);
+        assert!(shipped(&s, &mut || acquire(&s)).is_ok());
+        s.retire_published();
+        assert!(matches!(
+            shipped(&s, &mut || acquire(&s)),
+            Err(ApplyOutcome::NoUpdate)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The boot lane decides through [`apply_lock_then_ready`] — the function the two-process
+    /// Tier-1 drives — and nothing else in this file's shipped code calls the under-lock
+    /// re-read: a lane that went back to its own peek, or re-read outside the lock, would
+    /// leave that Tier-1 green over code that no longer runs. Asserted as source because
+    /// the alternative is a packaged bundle and a second process.
+    #[test]
+    fn the_boot_lane_decides_through_apply_lock_then_ready() {
+        let src = include_str!("install.rs");
+        let shipped = &src[..src
+            .find(concat!("#[cfg(test)]\n", "mod tests {"))
+            .expect("the test module")];
+        let lane = &shipped[shipped
+            .find("fn apply_staged_if_ready_inner(")
+            .expect("the boot lane")..];
+        let lane = &lane[..lane.find("\n}\n").expect("end of the boot lane")];
+        // Split so these assertions do not match themselves.
+        assert_eq!(
+            lane.matches(concat!("apply_lock_then_ready", "(")).count(),
+            1,
+            "the boot lane decides through apply_lock_then_ready, once"
+        );
+        assert!(
+            lane.contains(concat!(
+                "let (_lock, _budget, ready) = match ",
+                "apply_lock_then_ready("
+            )),
+            "the `ready` the lane acts on is the one apply_lock_then_ready decided under the lock"
+        );
+        // Its one other marker read is the orphan recovery, inside `under_lock`; a second
+        // (a peek bound before the lock and acted on after) is the regression.
+        assert_eq!(lane.matches(concat!("read_ready", "(")).count(), 1);
+        assert!(!lane.contains(concat!("Ready::", "read(")));
+        assert_eq!(
+            shipped
+                .matches(concat!("ready_under_apply_lock", "("))
+                .count(),
+            2,
+            "ready_under_apply_lock: its definition and apply_lock_then_ready's one call"
+        );
+        let helper = &shipped[shipped
+            .find(concat!("fn apply_lock_then_ready", "<"))
+            .expect("the helper")..];
+        let (locked, decided) = (
+            helper.find("let held = lock()?;").expect("the lock"),
+            helper
+                .find(concat!("ready_under_apply_lock", "(staging"))
+                .expect("the decision"),
+        );
+        assert!(locked < decided, "the decision is made under the lock");
     }
 
     /// A `ready.toml` whose staged bundle is GONE must clear itself. This recovery runs

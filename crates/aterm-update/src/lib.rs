@@ -121,6 +121,8 @@
 mod bundle;
 #[cfg(target_os = "macos")]
 mod cadence;
+/// The schedule's constants and [`STALE_CHECK_AFTER`], compiled on every target.
+mod cadence_bounds;
 #[cfg(target_os = "macos")]
 mod check_lane;
 #[cfg(target_os = "macos")]
@@ -155,6 +157,11 @@ pub fn binary_identity_json(
 ) -> Result<String, String> {
     aterm_json::to_string(identity).map_err(|error| error.to_string())
 }
+/// How each run of the installed app ended — the PTY keeper's P0 census
+/// (`docs/DESIGN-pty-keeper-2026-09-26.md` §7). `aterm-gui` writes a row per windowed
+/// launch; `aterm doctor` reads them. Not macOS-only: the codec and the summary are
+/// portable, and a platform with no crash marker simply has no rows.
+pub mod recovery_ledger;
 // Not macOS-only: every platform relaunches aterm (see the module's own doc).
 mod relaunch;
 #[cfg(target_os = "macos")]
@@ -1804,6 +1811,10 @@ pub fn spawn_background_check_with_settings(
     }
 }
 
+/// Window launches a replaced Linux executable gets to confirm itself
+/// ([`LinuxUpdateStatus::trial_starts`]); the next launch restores the previous one.
+pub const LINUX_TRIAL_LAUNCHES: u32 = 3;
+
 /// Linux disk-stage/trial facts are not a macOS DMG or a live-session handoff.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LinuxUpdateStatus {
@@ -1859,10 +1870,9 @@ pub fn spawn_background_check_with_source(
             let interval = cadence::INTERVAL_SECS;
             let mut schedule = cadence::Cadence::new(std::time::Duration::from_secs(interval));
             let mut failures = cadence::FailureLog::default();
-            // Once per process: a channel this machine cannot read is a configuration
-            // defect, not an event, so it is announced once and then lives in
-            // `status.toml` (rewritten every check) rather than nagging.
-            let mut notified_unreadable = false;
+            // Once per strand (`unreadable::StrandNotice`): announced once, then it
+            // lives in `status.toml`; a readable check re-arms it.
+            let mut strand_notice = unreadable::StrandNotice::default();
             // Per-process dedup, seeded from the clock at thread start so history
             // never re-notifies on every launch: the persistent-failure notice
             // requires the streak's latest failure to postdate this thread (RFC3339
@@ -2006,7 +2016,7 @@ pub fn spawn_background_check_with_source(
                     }
                 }
                 match check_lane().try_lock() {
-                    Ok(mut lane) => {
+                    Some(mut lane) => {
                         // CROSS-PROCESS DEDUP. The lane mutex above is process-local
                         // (the module docs say so), and since the one-binary era every
                         // terminal SESSION runs this same loop — round-11 found that
@@ -2018,8 +2028,12 @@ pub fn spawn_background_check_with_source(
                         // "another process just completed this interval's check" into
                         // a quiet skip. The freshness window is 70% of the base —
                         // strictly below the jittered minimum wait (80%), so a
-                        // process can never mistake its OWN previous stamp for
-                        // another checker's and starve itself.
+                        // process cannot mistake its OWN previous healthy stamp for
+                        // another checker's and starve itself. A DEFERRED stamp's
+                        // window is wider than this process's own next wait, so the
+                        // deferring process points its timer at that window's end
+                        // itself (`Cadence::deferred`, the rate-limited arm below)
+                        // rather than waking inside it to skip its own note.
                         let checker_staging = paths::Staging::resolve();
                         let _checker_gate = checker_staging.as_ref().and_then(|s| {
                             aterm_update_core::FileLock::acquire(
@@ -2149,7 +2163,34 @@ pub fn spawn_background_check_with_source(
                                 // wait (the entire remedy) but emit no failure line and
                                 // no ledger entry, so a 429 never accrues the streak
                                 // that fires "your update pipeline is likely broken".
-                                schedule.failed();
+                                //
+                                // …and wake no earlier than the machine-wide window the
+                                // deferral just stamped (2026-09-24, measured: the
+                                // ladder's first rung, 24–36 min then, woke this very
+                                // process inside its own 42-minute window at 20:27:06,
+                                // and it logged the shared ledger's deferral — its own
+                                // — and slept to the window's end anyway).
+                                let now_unix = unix_now_secs();
+                                let now = std::time::Instant::now();
+                                let window_end = checker_staging
+                                    .as_ref()
+                                    .and_then(|s| {
+                                        checker_skip_for(
+                                            s,
+                                            current_build,
+                                            &source,
+                                            schedule.base(),
+                                            now_unix,
+                                        )
+                                    })
+                                    .map(|(_, expiry)| {
+                                        let until =
+                                            skip_timer_target(expiry, cadence::entropy_byte());
+                                        now + std::time::Duration::from_secs(
+                                            until.saturating_sub(now_unix),
+                                        )
+                                    });
+                                schedule.deferred(window_end, now, cadence::entropy_byte());
                             }
                             Ok(None) => {
                                 // A completed check that found nothing to do is a
@@ -2207,25 +2248,19 @@ pub fn spawn_background_check_with_source(
                             }
                         }
                     }
-                    Err(std::sync::TryLockError::WouldBlock) => {
+                    None => {
                         debug("update check already running; this cycle skips it");
-                    }
-                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                        drop(poisoned.into_inner());
-                        warn("update check lane recovered after a worker panic");
                     }
                 }
                 // A machine that cannot READ its release channel can never update, and
                 // nothing else in the updater will ever report a failure for it (this
                 // is deliberately not a health-ledger failure — a configuration state
                 // is not a transient fault). Raise it on the SAME channel the
-                // broken-pipeline notice uses, once, so the user actually learns that
-                // this Mac is stranded.
-                if unreadable::is_stranded()
-                    && !notified_unreadable
+                // broken-pipeline notice uses, once per strand, so the user actually
+                // learns that this Mac is stranded.
+                if strand_notice.due(unreadable::is_stranded())
                     && let Some(cb) = notify.as_ref()
                 {
-                    notified_unreadable = true;
                     let (title, body) = unreadable::notification();
                     cb(title, body);
                 }
@@ -2439,12 +2474,6 @@ pub struct UpdateStatus {
     /// Whether the ledger's `pipeline` streak crossed [`PERSISTENT_AFTER`] — the
     /// "this build cannot download while releases are right there" state.
     pub failing_persistent: bool,
-    /// Always 0 since v0.26: the independent RESCUE download path (a second fetch
-    /// implementation added after the build-826 brick) was deleted as a never-
-    /// executed lane. The field itself is retained so the control-socket protocol
-    /// line (`aterm-ctl update status` prints `rescues=`) and its consumers stay
-    /// byte-stable through the bridge release; it goes with the Phase-2 diet.
-    pub rescues: u64,
     /// The class of the STANDING acquisition streak — the one [`Self::failing_checks`]
     /// counts — or `""` when every acquisition streak is clear. Distinct from
     /// [`Self::failing_kind`] (the most recent failure of ANY class, apply included)
@@ -2529,7 +2558,6 @@ impl UpdateStatus {
             failing_applies: 0,
             failing_since: String::new(),
             failing_persistent: false,
-            rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
         }
@@ -2785,13 +2813,11 @@ pub fn commit_matches(a: &str, b: &str) -> bool {
 fn persisted_claims_stage(persisted: &str) -> bool {
     // Every phrasing that asserts "a build is staged" must be listed here, or a
     // stale line survives `reconcile_status_outcome` and keeps advertising a
-    // stage that no longer exists. "applies on next launch" is RETIRED wording
-    // and stays only because a status.toml written by an older build still says
-    // it; "ready to apply" is what the stage/backoff lanes write now.
+    // stage that no longer exists. "ready to apply" is what the stage/backoff
+    // lanes write now; the retired "— applies on next launch" lines an older
+    // build left in status.toml all begin "staged ", so the prefix covers them.
     let persisted = persisted.trim_start();
-    persisted.starts_with("staged ")
-        || persisted.contains("applies on next launch") // retired-wording detector, not a promise
-        || persisted.contains("ready to apply")
+    persisted.starts_with("staged ") || persisted.contains("ready to apply")
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -2979,8 +3005,12 @@ fn unreachable_before_the_channel(
 /// `Cadence::failed` lengthens the wait of the one process that saw it — but the
 /// receipt it leaves behind is judged against every sibling's own un-backed-off base,
 /// so without this siblings kept poking the host at full cadence for the whole backoff.
-/// One doubling mirrors the first rung of `Cadence`'s ladder, applied to every
-/// process rather than to one.
+/// Two intervals (a fresh window of 1.4 of them) outlast every sibling's own next wait
+/// (0.8–1.2 of the base) — and ALSO the first rung of the deferring process's own
+/// ladder, which is one base interval, not a doubling: so the deferring process points
+/// its own timer at this window's end (`Cadence::deferred`) instead of waking inside it
+/// and skipping its own note (measured 2026-09-24; the doc here used to say "one
+/// doubling mirrors the first rung", which it never did).
 #[cfg(target_os = "macos")]
 const DEFERRED_WINDOW_INTERVALS: u32 = 2;
 
@@ -2997,14 +3027,17 @@ const SKIP_JITTER_SECS: u64 = 60;
 /// interval's check.
 ///
 /// The window is 70% of the base interval: strictly below the jittered minimum
-/// wait (80% of nominal), so a process can never mistake its OWN previous
+/// wait (80% of nominal), so a process cannot mistake its OWN previous healthy
 /// cycle's stamp for another checker's and starve itself.
 ///
 /// Deferrals stamp the completed-check receipt and widen the window by
 /// [`DEFERRED_WINDOW_INTERVALS`]: a machine that was just told to slow down must not
-/// be re-poked by a sibling on the sibling's own faster timer. The widened window is
-/// still bounded — the next healthy check overwrites the receipt and the window returns
-/// to the base — so the retreat self-heals exactly as the per-process backoff does.
+/// be re-poked by a sibling on the sibling's own faster timer. That window outlasts the
+/// deferring process's own first backoff rung too, so that process holds its timer to
+/// the window's end (`Cadence::deferred`) rather than reading its own note here. The
+/// widened window is still bounded — the next healthy check overwrites the receipt and
+/// the window returns to the base — so the retreat self-heals exactly as the
+/// per-process backoff does.
 #[cfg(all(target_os = "macos", test))]
 fn checker_skip(staging: &paths::Staging, base: std::time::Duration) -> Option<String> {
     checker_skip_at(staging, base, unix_now_secs()).map(|(reason, _)| reason)
@@ -3086,7 +3119,7 @@ fn checker_skip_for(
     // backwards after the write (an NTP correction of a fast clock) used to hold every
     // checker on the machine for the skew plus the window, and because every loop
     // skipped, nothing overwrote it.
-    let checked_epoch = rfc3339_to_unix(checked)?;
+    let checked_epoch = u64::try_from(aterm_types::rfc3339::parse_utc(checked)?).ok()?;
     if checked_epoch > now.saturating_add(SKIP_JITTER_SECS) {
         return None;
     }
@@ -3232,8 +3265,6 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         failing_kind: h.kind,
         failing_applies: h.apply_failures,
         failing_since: h.failing_since,
-        // The rescue lane is gone (v0.26); the protocol field stays, pinned to 0.
-        rescues: 0,
         channel_unreadable: unreadable::is_stranded(),
     })
 }
@@ -3255,6 +3286,27 @@ pub fn last_check_at(current_build: u64, source: &Source) -> Option<String> {
         .and_then(aterm_toml::Value::as_str)
         .filter(|stamp| !stamp.is_empty())
         .map(str::to_owned)
+}
+
+/// When THIS process's background check loop looks at the channel next (RFC3339 UTC),
+/// or `None` while no wait is under way (no loop runs in this process, or it is past
+/// its wait — settling after a wake, or checking). The loop's own timer — the ladder,
+/// a hold to a sibling's window or to a deferral's, the quick in-flight rungs — so a
+/// sibling process may check sooner and this one then skips behind its receipt. Beside
+/// [`last_check_at`] it answers "when was the channel read, and when is it read next"
+/// on `aterm ctl update status` (2026-09-24: a 36-minute-old "deferred … will retry on
+/// the next check" carried neither).
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn next_check_at() -> Option<String> {
+    cadence::next_check_unix().map(aterm_types::rfc3339::format_rfc3339)
+}
+
+/// Non-macOS stub: the Linux updater keeps its own schedule in its state file.
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub fn next_check_at() -> Option<String> {
+    None
 }
 
 /// Non-macOS stub: no updater check receipts.
@@ -3285,6 +3337,12 @@ pub fn status(_current_build: u64) -> Option<UpdateStatus> {
     }
 }
 
+/// How old a completed check may be before `aterm ctl update status` flags the ledger
+/// as frozen (`stale_check=`). Derived from the check cadence's own constants
+/// (`cadence_bounds::STALE_CHECK_AFTER`): five of the longest waits the loop legitimately
+/// takes, about four hours.
+pub const STALE_CHECK_AFTER: std::time::Duration = cadence_bounds::STALE_CHECK_AFTER;
+
 /// Whether `stamp` — an RFC3339 UTC timestamp as this crate writes them
 /// ([`UpdateStatus::updated_at`], the health ledger) — is older than `secs` ago.
 ///
@@ -3305,43 +3363,6 @@ pub fn rfc3339_older_than(stamp: &str, secs: u64) -> bool {
         .unwrap_or(0);
     let threshold = aterm_types::rfc3339::format_rfc3339(now.saturating_sub(secs));
     !threshold.is_empty() && *stamp < *threshold
-}
-
-/// The unix epoch a ledger stamp names — the exact inverse of
-/// [`aterm_types::rfc3339::format_rfc3339`]'s fixed `YYYY-MM-DDTHH:MM:SSZ` shape, and
-/// nothing looser: an offset, a fraction or a missing `Z` is `None`. The ledger writes
-/// only that shape, and a hold epoch read from anything else would be a guess.
-#[must_use]
-#[cfg(target_os = "macos")]
-pub fn rfc3339_to_unix(stamp: &str) -> Option<u64> {
-    let bytes = stamp.as_bytes();
-    if bytes.len() != 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || bytes[19] != b'Z'
-    {
-        return None;
-    }
-    let field = |from: usize, to: usize| -> Option<i64> {
-        let text = std::str::from_utf8(&bytes[from..to]).ok()?;
-        if !text.bytes().all(|b| b.is_ascii_digit()) {
-            return None;
-        }
-        text.parse::<i64>().ok()
-    };
-    let (y, m, d) = (field(0, 4)?, field(5, 7)?, field(8, 10)?);
-    let (hh, mm, ss) = (field(11, 13)?, field(14, 16)?, field(17, 19)?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
-        return None;
-    }
-    let days = aterm_types::rfc3339::days_from_civil(y, m, d);
-    let secs = days
-        .checked_mul(86_400)?
-        .checked_add(hh * 3600 + mm * 60 + ss)?;
-    u64::try_from(secs).ok()
 }
 
 /// Run ONE update check + stage synchronously and return the resulting [`UpdateStatus`]
@@ -3639,6 +3660,46 @@ mod checker_skip_tests {
         let _ = std::fs::remove_dir_all(&s.root);
     }
 
+    /// A PROCESS NEVER SKIPS ITS OWN DEFERRED NOTE (measured 2026-09-24 on the owner's
+    /// machine: the check deferred at 19:54:42, the same process woke at 20:27:06 —
+    /// its first rung, inside the 42-minute window its own receipt had widened — logged
+    /// "the shared update ledger records a deferred check" about itself, and checked
+    /// at 20:37:33). The deferring process's timer now lands at or past the window it
+    /// stamped (scattered as a skip's is), so the check it wakes for is not skipped —
+    /// for every entropy byte. Negative control: the ladder alone (`failed`, the old
+    /// arm) wakes inside the window for every byte, and the gate skips it.
+    #[test]
+    fn the_deferring_process_wakes_past_its_own_deferred_window() {
+        use super::cadence::Cadence;
+        let s = staging("own-deferral");
+        write_receipt(&s, 0, "deferred");
+        let stamped = now();
+        let (_, expiry) = checker_skip_at(&s, BASE, stamped).expect("the deferral's window");
+        let at = std::time::Instant::now();
+        for entropy in [0u8, 128, 255] {
+            let until = skip_timer_target(expiry, entropy);
+            let window_end = at + Duration::from_secs(until - stamped);
+            let mut schedule = Cadence::new(BASE);
+            schedule.deferred(Some(window_end), at, entropy);
+            let wake = stamped + schedule.delay_at(at, entropy).as_secs();
+            assert!(
+                checker_skip_at(&s, BASE, wake).is_none(),
+                "entropy {entropy}: woke at +{}s, inside its own window",
+                wake - stamped
+            );
+            let mut ladder = Cadence::new(BASE);
+            ladder.failed();
+            let early = stamped + ladder.delay_at(at, entropy).as_secs();
+            assert!(
+                checker_skip_at(&s, BASE, early)
+                    .is_some_and(|(reason, _)| reason.contains("deferred")),
+                "entropy {entropy}: the ladder alone woke at +{}s",
+                early - stamped
+            );
+        }
+        let _ = std::fs::remove_dir_all(&s.root);
+    }
+
     #[test]
     fn a_missing_or_empty_ledger_never_defers_a_check() {
         let s = staging("missing");
@@ -3676,26 +3737,6 @@ mod checker_skip_tests {
             );
         }
     }
-
-    #[test]
-    fn rfc3339_round_trips_through_the_ledgers_own_shape_and_refuses_looser_ones() {
-        for secs in [0u64, 1_788_392_970, 4_102_444_800] {
-            let stamp = aterm_types::rfc3339::format_rfc3339(secs);
-            assert_eq!(super::rfc3339_to_unix(&stamp), Some(secs), "{stamp}");
-        }
-        for bad in [
-            "",
-            "2026-09-03T00:00:00",
-            "2026-09-03T00:00:00+00:00",
-            "2026-09-03T00:00:00.000Z",
-            "2026-13-03T00:00:00Z",
-            "2026-09-03T24:00:00Z",
-            "2026-09-0xT00:00:00Z",
-            "not a stamp at all!",
-        ] {
-            assert_eq!(super::rfc3339_to_unix(bad), None, "{bad:?}");
-        }
-    }
 }
 
 #[cfg(test)]
@@ -3706,8 +3747,7 @@ mod delivery_story_tests {
     /// show; the module doc is what the next edit copies from — and both said
     /// "swaps the .app on next launch" / "stages it for the *next* launch" /
     /// "at the top of the next `main()` (always works)" until 2026-08-30, over a
-    /// lane that had been the mechanism since Rung 1b. Twin of grep_guard's B11,
-    /// which sees the handbooks this file cannot.
+    /// lane that had been the mechanism since Rung 1b.
     #[test]
     fn the_crate_teaches_the_in_session_apply_lane_not_the_next_launch_swap() {
         let description = env!("CARGO_PKG_DESCRIPTION");

@@ -26,7 +26,7 @@
 //! | fish  | `XDG_DATA_DIRS` | Vendor conf.d auto-loading |
 //! | pwsh/powershell | `-NoExit -Command` | Argv override dot-sources our `.ps1` after profiles |
 //! | wsl   | `WSLENV` + `wsl.exe --exec` | `/p` path-translates our dir, then bash's `--rcfile` runs INSIDE the distro |
-//! | cmd   | `PROMPT` | `$e` OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
+//! | cmd   | `PROMPT` | `$e` OSC 0 title + OSC 133 A/B + OSC 633 `Cwd=` woven around the user's prompt |
 //!
 //! # Usage
 //!
@@ -328,7 +328,7 @@ pub fn generate_nonce() -> ShellNonce {
 /// no `aterm_uds::rand` gets no `generate_nonce` at all, so reaching for one is
 /// a name error at the call site that names this function — deliberate, and
 /// strictly louder than a nonce minted from an unaudited source. Adding a
-/// target means adding its CSPRNG here first. `tools/grep_guard.sh` B13 keeps
+/// target means adding its CSPRNG here first. `tools/grep_guard.sh` B18 keeps
 /// the shortcut closed: no shipped manifest may declare a third-party entropy
 /// crate.
 ///
@@ -872,22 +872,17 @@ fn injection_for(shell: ShellType, base: &Path) -> Option<InjectionEnv> {
 /// `$XDG_CACHE_HOME/aterm/shell-integration/` (default: `~/.cache/aterm/shell-integration/`).
 /// On Windows: `%LOCALAPPDATA%\aterm\shell-integration` (never a literal
 /// `/tmp`, which would resolve to the drive root — NTFS default ACLs let
-/// any authenticated user create `C:\tmp`).
+/// any authenticated user create `C:\tmp`). With no home at all, the per-user
+/// temp directory.
 ///
-/// In restricted containment modes (Containment/Safety), writes go to
-/// `/tmp/aterm-shell-integration` to comply with `FsCapability::TmpOnly`
-/// and `FsCapability::ProjectRW` policies. Part of #5575.
+/// The same in every containment mode. The aterm process writes these files and
+/// the shell only reads them, so they belong where a Containment shell cannot
+/// write: its Seatbelt profile confines its writes to the temp roots
+/// (`aterm_containment::sbpl`), and a script staged there — as `/tmp` staging for
+/// Containment and Safety once did — could be rewritten by the contained shell
+/// (or by another user, in the shared `/tmp`) and sourced by the next tab's
+/// unsandboxed shell.
 fn cache_dir() -> PathBuf {
-    // In restricted containment modes, use /tmp to comply with FS policy (#5575).
-    #[cfg(feature = "local-pty")]
-    {
-        use aterm_containment::{ContainmentPolicy, FsCapability, mode_or_containment};
-        let caps = ContainmentPolicy::capabilities(mode_or_containment());
-        if caps.fs <= FsCapability::ProjectReadWrite {
-            return PathBuf::from("/tmp/aterm-shell-integration");
-        }
-    }
-
     #[cfg(windows)]
     {
         match std::env::var_os("LOCALAPPDATA") {
@@ -906,7 +901,7 @@ fn cache_dir() -> PathBuf {
                 .join("aterm")
                 .join("shell-integration")
         } else {
-            PathBuf::from("/tmp/aterm-shell-integration")
+            std::env::temp_dir().join("aterm-shell-integration")
         }
     }
 }
@@ -1325,7 +1320,11 @@ fn prepare_wsl(base: &Path) -> InjectionEnv {
 /// The prompt cmd.exe renders when nothing else is configured (`C:\dir>`).
 const CMD_DEFAULT_PROMPT: &str = "$P$G";
 
-/// cmd.exe injection: prompt marks and cwd only, woven into `%PROMPT%`.
+/// The title cmd's injected prompt sets: `OSC 0` carrying `$P`, the live
+/// directory — see [`prepare_cmd`] for why and for what it measurably does.
+const CMD_PROMPT_TITLE: &str = "$e]0;$P$e\\";
+
+/// cmd.exe injection: a title, prompt marks and cwd, woven into `%PROMPT%`.
 ///
 /// cmd has no profile, no preexec hook and no scripting seam — so the honest
 /// ceiling here is a PARTIAL integration, and shipping it beats today's
@@ -1333,10 +1332,42 @@ const CMD_DEFAULT_PROMPT: &str = "$P$G";
 /// it understands `$E` (ESC) and `$P` (the live current directory), which is
 /// exactly enough for:
 ///
+/// * `OSC 0` — the title, set to the directory ([`CMD_PROMPT_TITLE`]), the way
+///   the pwsh/bash/zsh/fish prompts set theirs. Without it a cmd tab keeps the
+///   console's own title, cmd's program path, for its whole life — measured
+///   2026-09-27 on Windows 11 (26200): `status subject=`, `title` and the window
+///   caption all read `C:\WINDOWS\SYSTEM32\cmd.exe` before and after a `cd`,
+///   while a pwsh tab's followed the directory. One title the shell sets fixes
+///   every one of those readers at once; teaching each of them to skip the
+///   program path (as the tab strip and `ls` already do) would not. ConPTY does
+///   not pass the sequence through: conhost applies it to the console title and
+///   sends aterm the resulting title as its own OSC 0, one per frame, so a
+///   title changed and changed back within a frame never arrives. cmd builds
+///   a running command's title FROM the current console title, so while a
+///   command runs the tab reads `C:\Windows\Temp - ping -n 4 127.0.0.1` and
+///   the directory comes back after it (measured). A user's `title X` lasts
+///   until the next prompt, as a title set by hand does under every other
+///   integrated shell, and `title X & cmd` keeps `X` for the command it runs
+///   (measured: `X - ping ...`). It is written BEFORE the user's prompt, so a
+///   `PROMPT` that sets its own title is rendered later and still wins — that
+///   is how a cmd user keeps a title of their own. (The script-driven shells'
+///   `ATERM_DISABLE_PROMPT_TITLES` has no cmd counterpart: cmd cannot read a
+///   variable in `PROMPT`, and aterm's own run-time code reads no user knob
+///   from its environment — the owner's rule, `env_reads.rs`.) `$P`
+///   needs no sanitising, unlike the pwsh title: a Win32 file name cannot hold
+///   a character from 1 through 31, so no directory can end the OSC early. It
+///   is the full path, not `~\…` — cmd's prompt has no string operations.
+///   Windows Terminal, for comparison, leaves a cmd tab on the console's
+///   program-path title; its cmd prompt recipe uses `$P` only in an OSC 9;9
+///   for duplicating a tab, never in the title.
 /// * `OSC 633;P;Cwd=` — the cwd, so the tab label tracks `cd` and a new tab
 ///   opens where this one is. `$P` yields a native `C:\dir`, which the engine
 ///   stores verbatim; building a `file://` URI would need percent-encoding cmd
-///   cannot do.
+///   cannot do. It comes AFTER `133;A`: the engine files a `633;P;Cwd` under
+///   the block in progress, and before `A` opens the new one that is the
+///   PREVIOUS command's block — measured with the old order, the block for a
+///   `cd /d C:\Windows\Temp` typed in `C:\Users\m6-an\aterm` read
+///   `cwd=C:\Windows\Temp`, the directory the command moved TO.
 /// * `OSC 133;A` / `133;B` — prompt start/end, which is what jump-to-prompt
 ///   (Ctrl+Shift+Up/Down) navigates by.
 ///
@@ -1363,24 +1394,27 @@ const CMD_DEFAULT_PROMPT: &str = "$P$G";
 /// weaker guarantee than bash/zsh/fish/pwsh get, and it is the price of cmd
 /// having no code of its own to run.
 fn prepare_cmd() -> InjectionEnv {
-    let user = std::env::var("PROMPT")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| CMD_DEFAULT_PROMPT.to_string());
-    if user.contains("]133;A") {
-        // Already instrumented (nested aterm): leave it exactly as inherited.
-        return InjectionEnv {
-            env_add: vec![("PROMPT".to_string(), user)],
-            argv_override: None,
-        };
-    }
-    let id = NONCE_PLACEHOLDER;
-    let prompt =
-        format!("$e]633;P;Cwd=$P;id={id}$e\\$e]133;A;id={id}$e\\{user}$e]133;B;id={id}$e\\");
+    let inherited = std::env::var("PROMPT").ok();
     InjectionEnv {
-        env_add: vec![("PROMPT".to_string(), prompt)],
+        env_add: vec![("PROMPT".to_string(), cmd_prompt(inherited.as_deref()))],
         argv_override: None,
     }
+}
+
+/// The `%PROMPT%` a cmd tab starts with, from the one it inherited: the pure
+/// half of [`prepare_cmd`], so the wrapping is testable without touching the
+/// process environment.
+fn cmd_prompt(inherited: Option<&str>) -> String {
+    let user = inherited
+        .filter(|p| !p.is_empty())
+        .unwrap_or(CMD_DEFAULT_PROMPT);
+    if user.contains("]133;A") {
+        // Already instrumented (nested aterm): leave it exactly as inherited.
+        return user.to_string();
+    }
+    let title = CMD_PROMPT_TITLE;
+    let id = NONCE_PLACEHOLDER;
+    format!("{title}$e]133;A;id={id}$e\\$e]633;P;Cwd=$P;id={id}$e\\{user}$e]133;B;id={id}$e\\")
 }
 
 #[cfg(test)]

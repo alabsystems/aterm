@@ -19,142 +19,41 @@
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
 //! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance never reaches
-//! WindowServer. SKIP (not fail) when the instance cannot boot.
+//! (`support/launch_isolation.rs`). A headless instance opens no window. FAIL
+//! when the instance cannot boot; SKIP only on an environment refusal
+//! (`support/headless_boot.rs`).
 
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::path::PathBuf;
 use std::time::Duration;
 
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
-const REPLY_DEADLINE: Duration = Duration::from_secs(30);
-const MAX_SOCK_PATH: usize = 100;
+use headless_boot::Instance;
 
-/// One booted headless instance plus its scratch world, torn down on every
-/// exit path (Drop runs on panic too).
-struct Instance {
-    child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    tmp: PathBuf,
-    log: PathBuf,
-    sock: PathBuf,
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
-    }
-}
-
-fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(15);
-    lines[start..].join("\n")
-}
-
-fn is_socket_or_symlink(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_socket() || m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-fn scratch_root(tag: &str) -> Option<PathBuf> {
-    let name = format!("atms{tag}-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
-    }
-    None
-}
-
-/// Boot one headless instance, 40x120. `None` = an environmental refusal,
-/// announced as a SKIP with the log tail.
+/// Boot one headless instance, 40x120, ready once its owner token file is
+/// written ([`headless_boot::boot_with`]: `None` is an environment refusal; a
+/// product that cannot start fails the test).
 fn boot(tag: &str) -> Option<Instance> {
-    let Some(tmp) = scratch_root(tag) else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
-    let log = tmp.join("gui.log");
-    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, &tmp);
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .args(launch_isolation::control_sock(&tmp))
-        .args(["--lines", "40", "--columns", "120"])
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let sock = tmp.join("run/aterm/aterm.sock");
-    let mut inst = Instance {
-        child,
-        _lifeline: lifeline,
-        sock,
-        tmp,
-        log,
-    };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!(
-                "SKIP: aterm --headless exited before binding its socket; log tail:\n{}",
-                log_tail(&inst.log)
-            );
-            return None;
-        }
-        if is_socket_or_symlink(&inst.sock)
-            && token_path(&inst).is_file()
-            && launch_isolation::control_listening(&inst.sock)
-        {
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!(
-        "SKIP: control socket never started listening; log tail:\n{}",
-        log_tail(&inst.log)
-    );
-    None
+    headless_boot::boot_with(
+        &format!("atms{tag}"),
+        |_, cmd| {
+            cmd.args(["--lines", "40", "--columns", "120"]);
+        },
+        |inst| token_path(inst).is_file(),
+    )
 }
+
+const REPLY_DEADLINE: Duration = Duration::from_secs(30);
 
 fn token_path(inst: &Instance) -> PathBuf {
-    let mut p = inst.sock.clone().into_os_string();
+    let mut p = std::ffi::OsString::from(&inst.sock);
     p.push(".token");
     PathBuf::from(p)
 }

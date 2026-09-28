@@ -917,32 +917,46 @@ fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
 }
 
 // =========================================================================
-// Out-of-band truncation accounting (audit E10a): retention loss the user
-// did not ask for is COUNTED, never surfaced as sentinel content.
+// Truncation accounting: retention loss the user did not ask for is COUNTED
+// (out of band, for `metrics`/`lines`) AND marked in band by one row at the
+// cut naming the same count (2026-09-22: the count alone reached no surface,
+// and a 91k-line hole went unnoticed).
 // =========================================================================
 
 #[test]
-fn flood_backpressure_drops_are_counted_out_of_band() {
-    let scrollback = Scrollback::new(100, 1000, 100_000_000);
+fn flood_backpressure_drops_are_counted_and_marked() {
+    // A 2 MiB memory budget holds fewer staged `L<n>` rows (each weighed at
+    // its few occupied cells plus the deferred-line header) than the 20k
+    // floor, so the staging cap IS the floor; the store's 100k line limit is
+    // far away, so every drop is a real loss.
+    let scrollback = Scrollback::new(100, 1000, 2 * 1024 * 1024);
     let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
     // A compress worker owns the drain but never runs (the starved-worker
-    // flood): staged lines accumulate to the THRU-5 cap, then the oldest drop.
+    // flood): staged lines accumulate to the staging cap, then the oldest drop.
     grid.set_compress_offload_active(true);
     let over = 500;
     write_numbered_lines(&mut grid, 0, Grid::ASYNC_COMPRESS_BACKPRESSURE + over + 8);
+    let counted = grid.truncated_lines();
     assert!(
-        grid.truncated_lines() > 0,
+        counted > 0,
         "backpressure drops must register in the loss counter"
     );
-    // The retained set holds no sentinel — its lines are exactly the written
-    // content (check the oldest retained line's shape).
+    // The oldest retained row is the marker, and it names EXACTLY the counter;
+    // the first content row after it is the first line that survived.
     let oldest = history_text(&grid, 0);
-    assert!(
-        oldest.starts_with('L'),
-        "no sentinel content is ever injected (oldest retained: {oldest:?})"
+    let marked: u64 = oldest
+        .strip_prefix(crate::grid::scroll_convert::FLOOD_MARKER_PREFIX)
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("oldest retained row is the flood marker, got {oldest:?}"));
+    assert_eq!(marked, counted, "the marker and the counter are one number");
+    assert_eq!(
+        history_text(&grid, 1),
+        format!("L{counted}"),
+        "lines L0..L{} were dropped and nothing else",
+        counted - 1
     );
     // A user-requested shrink is NOT loss: the counter must not move.
-    let counted = grid.truncated_lines();
     grid.set_scrollback_line_limit(Some(5));
     assert_eq!(
         grid.truncated_lines(),
@@ -1037,4 +1051,96 @@ fn tiered_limit_none_is_unlimited_total() {
         "nothing evicted when unlimited"
     );
     grid.assert_invariants();
+}
+
+// ---------------------------------------------------------------------------
+// DENSE HISTORY WALK (`Grid::history_lines_from`) — conformance against the
+// per-line oracle `get_history_line`, across all three history sources
+// (tiered store, lazy buffer, ring), at every start, with and without a
+// corrupt tiered segment. Product readers key line `k` of the walk as
+// absolute row `oldest + start + k`, so item-for-item equality with the
+// oracle IS the absolute-coordinate guarantee.
+// ---------------------------------------------------------------------------
+
+/// A grid whose history spans every source: a pre-filled tiered store (cold +
+/// warm + hot, optionally with a corrupt warm block between cold and warm),
+/// then live output that stages lines in the lazy buffer and the ring.
+fn three_source_history_grid(corrupt_lines: usize) -> Grid {
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..40 {
+        sb.push_str(&format!("carried {i:03}"));
+    }
+    if corrupt_lines > 0 {
+        sb.inject_corrupted_warm_block(corrupt_lines);
+    }
+    let mut grid = Grid::with_tiered_scrollback(3, 24, 6, sb);
+    for i in 0..30 {
+        grid.carriage_return();
+        for c in format!("live {i:03}").chars() {
+            grid.write_char(c);
+        }
+        grid.line_feed();
+    }
+    let tiered = grid.scrollback().map_or(0, |sb| sb.line_count());
+    assert!(tiered > 0, "the fixture needs tiered lines");
+    assert!(
+        grid.storage.lazy_buffer_lines() > 0,
+        "the fixture needs staged lazy lines"
+    );
+    assert!(
+        grid.storage.ring_buffer_scrollback() > 0,
+        "the fixture needs ring lines"
+    );
+    grid
+}
+
+/// Lines compare by their full `Debug` rendering — text, attribute runs,
+/// hyperlinks, underline colours, image spans and the wrap flag (`Line` has no
+/// `PartialEq`, and its codec is test-private to its own crate).
+fn history_oracle(grid: &Grid, start: usize) -> Vec<Option<String>> {
+    (start..grid.scrollback_lines())
+        .map(|i| grid.get_history_line(i).map(|l| format!("{:?}", *l)))
+        .collect()
+}
+
+fn history_walk(grid: &Grid, start: usize) -> Vec<Option<String>> {
+    let walk = grid.history_lines_from(start);
+    assert_eq!(walk.len(), grid.scrollback_lines().saturating_sub(start));
+    walk.map(|l| l.map(|l| format!("{:?}", *l))).collect()
+}
+
+#[test]
+fn history_lines_from_matches_get_history_line_across_every_source() {
+    let grid = three_source_history_grid(0);
+    let total = grid.scrollback_lines();
+    for start in 0..=total + 1 {
+        assert_eq!(
+            history_walk(&grid, start),
+            history_oracle(&grid, start),
+            "start={start}"
+        );
+    }
+    assert!(
+        grid.history_lines_from(0).all(|l| l.is_some()),
+        "a healthy history has no placeholders"
+    );
+}
+
+#[test]
+fn history_lines_from_matches_get_history_line_over_a_corrupt_segment() {
+    let corrupt = 5;
+    let grid = three_source_history_grid(corrupt);
+    let total = grid.scrollback_lines();
+    for start in 0..=total {
+        assert_eq!(
+            history_walk(&grid, start),
+            history_oracle(&grid, start),
+            "start={start}"
+        );
+    }
+    let holes = grid.history_lines_from(0).filter(Option::is_none).count();
+    assert_eq!(
+        holes, corrupt,
+        "one placeholder per unreadable line, and every later line keeps its row"
+    );
 }

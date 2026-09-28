@@ -11,17 +11,10 @@
 //! Keystrokes arrive as `ReadConsoleInputW` records on an input thread, and
 //! `WINDOW_BUFFER_SIZE_EVENT` is the SIGWINCH analogue — it rides the same
 //! single input source the way SIGWINCH rides the unix poll loop: the ConPTY
-//! is resized promptly (it must repaint), and an ARMED engine applies the new
-//! size on the output loop's next wake (the unix drain-flag-then-apply shape).
-//! The ConPTY half is unconditional, exactly as the unix `TIOCSWINSZ` is: the
-//! session model is demand-driven and normally absent (`$ATERM_SESSION_MODEL`),
-//! and a console app must reflow either way.
+//! is resized promptly (it must repaint), exactly as the unix `TIOCSWINSZ` is.
+//! Nothing in this process models the screen.
 //! Direct `unsafe extern "system"` kernel32 FFI only — the approved std-only
 //! pattern; no ConPTY calls live here (those are aterm-pty's seam).
-
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-
-use aterm_core::terminal::Terminal;
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -120,13 +113,6 @@ struct InputRecord {
     event: EventUnion,
 }
 
-/// Set by the input thread on `WINDOW_BUFFER_SIZE_EVENT`; drained in the
-/// output loop before each blocking read (the unix GOT_WINCH shape). The
-/// dimensions ride alongside so the loop never re-queries the console.
-static GOT_WINCH: AtomicBool = AtomicBool::new(false);
-static WINCH_ROWS: AtomicU16 = AtomicU16::new(0);
-static WINCH_COLS: AtomicU16 = AtomicU16::new(0);
-
 /// Ask the console for its window size; fall back to 24x80 (same as unix).
 pub(crate) fn host_winsize() -> (u16, u16) {
     // SAFETY: out-param query on the process stdout handle; the zeroed struct
@@ -162,6 +148,173 @@ pub(crate) fn stdout_is_tty() -> bool {
 /// downgrade aterm-dev uses: the file must exist.
 pub(crate) fn shell_is_executable(path: &str) -> bool {
     std::path::Path::new(path).is_file()
+}
+
+/// The interactive shell the WINDOW spawns on this machine, and where it came
+/// from — what `aterm doctor` and `show-config` report on Windows.
+///
+/// Before 2026-09-22 both reported this PROCESS's `$SHELL`, falling back to
+/// `%COMSPEC%`: measured inside a pwsh 7 tab, `aterm doctor` said
+/// `shell: C:\WINDOWS\system32\cmd.exe (executable)` and from Git Bash it said
+/// `bash.exe` — the shell the CLI was typed into, never the one a tab gets.
+/// `aterm-pty`'s Windows spawn reads neither variable (`%SHELL%` is a POSIX
+/// path in MSYS shells; see its `windows::shell`), so the report is now the
+/// spawn's own resolver over the one input a CLI process can see: aterm.toml's
+/// `shell` (a window's per-launch `--shell` flag is invisible from here), and
+/// with none set the platform default applies — `pwsh`, then `powershell`,
+/// then `%COMSPEC%`, then `cmd.exe`.
+pub(crate) struct WindowShell {
+    /// The program `CreateProcessW` is handed: an absolute path when the name
+    /// resolved (or was given as one), the bare name verbatim when it did not —
+    /// which [`shell_is_executable`] then reports as missing, exactly as the
+    /// spawn would fail.
+    pub(crate) program: String,
+    /// Which input decided it.
+    pub(crate) source: ShellSource,
+}
+
+/// Which input decided the window's shell.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ShellSource {
+    /// aterm.toml's top-level `shell` key, carrying its value.
+    Config(String),
+    /// Nothing named one: the platform default, plus what aterm.toml said —
+    /// [`ConfigShell::Unusable`] is worth a word, because the window then runs
+    /// on defaults after logging a problem the user may not have seen.
+    Default(aterm_pty::ShellOrigin, ConfigShell),
+}
+
+/// What aterm.toml says about `shell`, read with the parser the window reads
+/// the file with.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConfigShell {
+    /// No file, no top-level `shell` key, or an empty one (the window's resolver
+    /// treats `""` as unset).
+    Absent,
+    /// `shell = "<name or path>"`.
+    Set(String),
+    /// The file exists but the window cannot take it — unreadable, not TOML, or
+    /// `shell` is not a string. The window logs the problem and runs on
+    /// defaults (`app_config::load_config` → `Config::stand_in`), so the default
+    /// is what this reports too. One case it cannot see: a value ANOTHER key's
+    /// type refuses (`tab_title_format = "title_only"` — the window's typed
+    /// `Config` rejects the whole file for it) also sends the window to
+    /// defaults, and only that `Config`, in a crate this one does not link,
+    /// knows every key's type. `aterm --window --validate-config` names it.
+    Unusable(String),
+}
+
+impl WindowShell {
+    /// The live answer: the two inputs the window reads, over the spawn's
+    /// resolver.
+    pub(crate) fn resolve() -> Self {
+        Self::resolve_with(config_shell())
+    }
+
+    /// The testable half: `config` is what aterm.toml said. Precedence is the
+    /// window's — config, then [`aterm_pty::select_shell_with_origin`]'s
+    /// defaults.
+    pub(crate) fn resolve_with(config: ConfigShell) -> Self {
+        let named: Option<(String, ShellSource)> = match &config {
+            ConfigShell::Set(v) => Some((v.clone(), ShellSource::Config(v.clone()))),
+            ConfigShell::Absent | ConfigShell::Unusable(_) => None,
+        };
+        let (name, source) = match named {
+            Some((name, source)) => (Some(name), Some(source)),
+            None => (None, None),
+        };
+        let (program, origin) =
+            aterm_pty::select_shell_with_origin(name.as_deref().map(std::ffi::OsStr::new));
+        Self {
+            program: program.to_string_lossy().into_owned(),
+            source: source.unwrap_or(ShellSource::Default(origin, config)),
+        }
+    }
+
+    /// `show-config`'s `shell_origin=` value: one token a script can switch on.
+    pub(crate) fn origin_token(&self) -> String {
+        match &self.source {
+            ShellSource::Config(_) => "aterm.toml".to_string(),
+            ShellSource::Default(origin, _) => format!("default:{}", default_word(*origin)),
+        }
+    }
+
+    /// `doctor`'s label after the verdict — a sentence naming the input, so the
+    /// row reads `shell: <program> (executable) — the window's shell, from …`.
+    pub(crate) fn origin_sentence(&self) -> String {
+        match &self.source {
+            ShellSource::Config(v) => {
+                format!("the window's shell, from aterm.toml shell = \"{v}\"")
+            }
+            ShellSource::Default(origin, config) => {
+                let arm = match origin {
+                    aterm_pty::ShellOrigin::Pwsh => "pwsh on PATH",
+                    aterm_pty::ShellOrigin::PowerShell => "powershell on PATH; no pwsh",
+                    aterm_pty::ShellOrigin::Comspec => "%COMSPEC%; no pwsh or powershell on PATH",
+                    aterm_pty::ShellOrigin::CmdLiteral => {
+                        "cmd.exe verbatim; no pwsh, powershell or %COMSPEC%"
+                    }
+                    // Unreachable through `resolve_with` (a named shell never
+                    // reaches the Default arm), spelled so a new variant cannot
+                    // render as nothing.
+                    aterm_pty::ShellOrigin::Override => "an override",
+                };
+                let why = match config {
+                    ConfigShell::Unusable(why) => {
+                        format!(
+                            "; aterm.toml is not usable ({why}), so the window runs on defaults"
+                        )
+                    }
+                    ConfigShell::Absent | ConfigShell::Set(_) => String::new(),
+                };
+                format!("the window's shell, the platform default ({arm}){why}")
+            }
+        }
+    }
+}
+
+/// The `default:<word>` token per platform-default arm.
+fn default_word(origin: aterm_pty::ShellOrigin) -> &'static str {
+    match origin {
+        aterm_pty::ShellOrigin::Override => "override",
+        aterm_pty::ShellOrigin::Pwsh => "pwsh",
+        aterm_pty::ShellOrigin::PowerShell => "powershell",
+        aterm_pty::ShellOrigin::Comspec => "COMSPEC",
+        aterm_pty::ShellOrigin::CmdLiteral => "cmd.exe",
+    }
+}
+
+/// aterm.toml's `shell`, from the file the window loads
+/// (`aterm_types::dirs::aterm_config_path`). A missing file is [`ConfigShell::Absent`];
+/// any other read failure is [`ConfigShell::Unusable`], as it is for the window.
+fn config_shell() -> ConfigShell {
+    let Some(path) = aterm_types::dirs::aterm_config_path() else {
+        return ConfigShell::Absent;
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) => config_shell_from_text(&text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ConfigShell::Absent,
+        Err(e) => ConfigShell::Unusable(format!("unreadable: {e}")),
+    }
+}
+
+/// The pure half of [`config_shell`]: the TOP-LEVEL `shell` key of one
+/// aterm.toml text, through `aterm_toml` — the parser the window loads the file
+/// with, so a duplicate key or a stray table is refused here exactly where the
+/// window refuses it. A key inside a table is not the key.
+pub(crate) fn config_shell_from_text(text: &str) -> ConfigShell {
+    let table: aterm_toml::Table = match text.parse() {
+        Ok(table) => table,
+        Err(e) => return ConfigShell::Unusable(format!("does not parse: {e}")),
+    };
+    match table.get("shell") {
+        None => ConfigShell::Absent,
+        Some(value) => match value.as_str() {
+            Some("") => ConfigShell::Absent,
+            Some(name) => ConfigShell::Set(name.to_string()),
+            None => ConfigShell::Unusable("`shell` is not a string".to_string()),
+        },
+    }
 }
 
 /// RAII console raw-mode guard: swaps stdin/stdout into the VT passthrough
@@ -298,8 +451,7 @@ fn push_utf16_unit(unit: u16, pending: &mut Option<u16>, out: &mut Vec<u8>) {
 }
 
 /// Console-input pump (input thread): KEY_EVENT characters → UTF-8 → the PTY
-/// input; WINDOW_BUFFER_SIZE_EVENT → prompt ConPTY resize + the drained
-/// resize flag for the output loop's `engine.resize`. Returns when the
+/// input; WINDOW_BUFFER_SIZE_EVENT → prompt ConPTY resize. Returns when the
 /// console goes away (the shell then runs to its own exit).
 fn pump_console_input(stdin: isize, master: i32) {
     // SAFETY: zeroed PODs — every field of every record arm is plain data.
@@ -333,14 +485,10 @@ fn pump_console_input(stdin: isize, master: i32) {
                     // The SIGWINCH analogue. Resize the ConPTY NOW — it must be
                     // resized promptly so it repaints — reading the live window
                     // rect (the event payload is the BUFFER size, not the
-                    // window); the engine applies it on the output loop's next
-                    // wake. `aterm_pty::resize` is thread-safe on Windows per
+                    // window). `aterm_pty::resize` is thread-safe on Windows per
                     // the seam contract.
                     let (rows, cols) = host_winsize();
                     aterm_pty::resize(master, rows, cols);
-                    WINCH_ROWS.store(rows, Ordering::Relaxed);
-                    WINCH_COLS.store(cols, Ordering::Relaxed);
-                    GOT_WINCH.store(true, Ordering::Release);
                 }
                 _ => {}
             }
@@ -373,18 +521,8 @@ fn pump_piped_input(master: i32) {
 /// Input runs on a detached thread (it parks in `ReadConsoleInputW`/`read`
 /// with no portable cancellation; process exit reclaims it — the same way the
 /// unix driver's blocked reader ends). Output runs here: blocking ConPTY
-/// reads → host stdout passthrough, plus the engine model when one is armed.
-///
-/// `engine` is `None` for an ordinary session (the demand-driven model, off by
-/// default — `$ATERM_SESSION_MODEL`). The unix twin's rule holds here: only the
-/// two `if let` arms below depend on it, and everything the CHILD can observe
-/// (the stdout passthrough, and the `aterm_pty::resize` the input thread
-/// already performed) is unconditional.
-pub(crate) fn run(
-    shell: aterm_pty::SpawnedShell,
-    mut engine: Option<&mut Terminal>,
-    verbose: bool,
-) -> i32 {
+/// reads → host stdout passthrough.
+pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let guard = RawGuard::install();
     let stdout = guard.stdout;
@@ -408,35 +546,14 @@ pub(crate) fn run(
     let mut bytes_in: u64 = 0;
     let mut buf = [0u8; 8192];
     loop {
-        // Apply a pending resize before blocking (the unix drain shape); the
-        // ConPTY itself was already resized promptly on the input thread, so
-        // geometry reaches the child whether or not a model exists here. The
-        // flag is DRAINED either way — the two arms differ only in what they do
-        // with the size, never in whether the event is consumed.
-        if GOT_WINCH.swap(false, Ordering::Acquire) {
-            let (rows, cols) = (
-                WINCH_ROWS.load(Ordering::Relaxed),
-                WINCH_COLS.load(Ordering::Relaxed),
-            );
-            if rows > 0
-                && cols > 0
-                && let Some(engine) = engine.as_deref_mut()
-            {
-                engine.resize(rows, cols);
-            }
-        }
-
-        // shell output -> host console (passthrough), and the engine (model)
-        // only when one is armed. The write comes FIRST either way.
+        // shell output -> host console (passthrough). The ConPTY was resized
+        // on the input thread; nothing here holds a size.
         let r = aterm_pty::read(master, &mut buf);
         if r <= 0 {
             break; // shell exited / ConPTY closed
         }
         let out = &buf[..r as usize];
         stdout_write_all(stdout, out);
-        if let Some(engine) = engine.as_deref_mut() {
-            engine.process(out);
-        }
         bytes_in += out.len() as u64;
     }
 
@@ -450,14 +567,143 @@ pub(crate) fn run(
     let code = aterm_pty::exit_code(shell.pid).unwrap_or(1);
     aterm_pty::close_master(master);
     if verbose {
-        // The unix twin's wording, for the same reason: the VT core clause only
-        // when the dev-only seam armed it.
-        let modelled = if engine.is_some() {
-            " and into the armed VT core"
-        } else {
-            ""
-        };
-        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through{modelled}.");
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through.");
     }
     code
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ends_with_exe(program: &str, exe: &str) -> bool {
+        program.to_ascii_lowercase().ends_with(exe)
+    }
+
+    /// The top-level `shell` key, and nothing that only looks like it: a
+    /// commented-out line, a key inside a table, an empty string (unset to the
+    /// window's resolver). A non-string or a file the window cannot parse is
+    /// UNUSABLE, because the window then runs on defaults — reporting the
+    /// configured name there would name a shell no tab gets.
+    #[test]
+    fn config_shell_reads_the_top_level_key_the_window_reads() {
+        assert_eq!(config_shell_from_text(""), ConfigShell::Absent);
+        assert_eq!(
+            config_shell_from_text("# shell = \"bash\"\nfont_px = 14\n"),
+            ConfigShell::Absent,
+            "the starter file's commented example is not a setting"
+        );
+        assert_eq!(
+            config_shell_from_text("[privacy]\nshell = \"bash\"\n"),
+            ConfigShell::Absent,
+            "a `shell` inside a table is not the top-level key"
+        );
+        assert_eq!(
+            config_shell_from_text("font_px = 14\nshell = \"bash\"\n"),
+            ConfigShell::Set("bash".to_string())
+        );
+        assert_eq!(
+            config_shell_from_text("shell = 'C:\\Program Files\\Git\\bin\\bash.exe'\n"),
+            ConfigShell::Set("C:\\Program Files\\Git\\bin\\bash.exe".to_string()),
+            "a literal string keeps its backslashes"
+        );
+        assert_eq!(
+            config_shell_from_text("shell = \"\"\n"),
+            ConfigShell::Absent,
+            "an empty shell is unset — select_shell filters it the same way"
+        );
+        assert!(matches!(
+            config_shell_from_text("shell = 5\n"),
+            ConfigShell::Unusable(why) if why.contains("not a string")
+        ));
+        assert!(
+            matches!(
+                config_shell_from_text("shell = \"a\"\nshell = \"b\"\n"),
+                ConfigShell::Unusable(why) if why.contains("does not parse")
+            ),
+            "a duplicate key is refused, as the window refuses it"
+        );
+        assert!(matches!(
+            config_shell_from_text("shell = [[\n"),
+            ConfigShell::Unusable(why) if why.contains("does not parse")
+        ));
+    }
+
+    /// The window's precedence, over the spawn's resolver: aterm.toml outranks
+    /// the platform default, and the program is what the spawn would run — an
+    /// absolute path for a name that resolves, the bare name verbatim (hence
+    /// `not executable or missing`) for one that does not.
+    #[test]
+    fn window_shell_follows_the_windows_precedence_and_names_its_source() {
+        let config = WindowShell::resolve_with(ConfigShell::Set("cmd".to_string()));
+        assert!(
+            ends_with_exe(&config.program, "cmd.exe"),
+            "{}",
+            config.program
+        );
+        assert_eq!(config.source, ShellSource::Config("cmd".to_string()));
+        assert_eq!(config.origin_token(), "aterm.toml");
+        assert_eq!(
+            config.origin_sentence(),
+            "the window's shell, from aterm.toml shell = \"cmd\""
+        );
+
+        let missing =
+            WindowShell::resolve_with(ConfigShell::Set("aterm-no-such-shell-xyz".to_string()));
+        assert_eq!(
+            missing.program, "aterm-no-such-shell-xyz",
+            "an unresolved name is reported verbatim, as CreateProcessW receives it"
+        );
+        assert!(
+            !shell_is_executable(&missing.program),
+            "…and the executable check then fails, so doctor says FAIL"
+        );
+
+        let unusable =
+            WindowShell::resolve_with(ConfigShell::Unusable("does not parse: x".to_string()));
+        assert!(
+            matches!(
+                unusable.source,
+                ShellSource::Default(_, ConfigShell::Unusable(_))
+            ),
+            "{:?}",
+            unusable.source
+        );
+        assert!(
+            unusable
+                .origin_sentence()
+                .contains("aterm.toml is not usable (does not parse: x)"),
+            "{}",
+            unusable.origin_sentence()
+        );
+    }
+
+    /// With nothing named, the report IS the spawn's default (`select_shell`'s
+    /// program, its origin arm named) — on this box pwsh on PATH.
+    #[test]
+    fn window_shell_default_is_the_spawns_default() {
+        let dflt = WindowShell::resolve_with(ConfigShell::Absent);
+        let (program, origin) = aterm_pty::select_shell_with_origin(None);
+        assert_eq!(dflt.program, program.to_string_lossy());
+        assert!(matches!(dflt.source, ShellSource::Default(o, ConfigShell::Absent) if o == origin));
+        assert!(
+            dflt.origin_token().starts_with("default:"),
+            "{}",
+            dflt.origin_token()
+        );
+        assert!(
+            dflt.origin_sentence()
+                .starts_with("the window's shell, the platform default ("),
+            "{}",
+            dflt.origin_sentence()
+        );
+        if matches!(
+            aterm_pty::classify_shell_name(std::ffi::OsStr::new("pwsh")),
+            aterm_pty::ShellResolution::Resolved(_)
+        ) {
+            assert_eq!(dflt.origin_token(), "default:pwsh");
+            assert!(ends_with_exe(&dflt.program, "pwsh.exe"), "{}", dflt.program);
+            assert!(shell_is_executable(&dflt.program));
+        }
+    }
 }

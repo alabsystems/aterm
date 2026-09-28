@@ -155,16 +155,27 @@ impl Drop for BootPermit {
 /// one: a run whose subject is not what it thinks is worth nothing, so refuse it loudly
 /// with the command that fixes it rather than producing a number nobody can trust.
 ///
-/// A STRAY IS A DAEMON OLDER THAN THIS PROCESS. That is the whole rule, and getting it
-/// wrong makes the guard worse than nothing: `--all-targets` runs each test binary as its
-/// own process, so a plain "is anything alive?" check fails binary two on binary one's
-/// daemons still winding down, and a guard that fails the suite it protects is one people
-/// learn to switch off. Comparing elapsed times separates them exactly — a daemon this
-/// run started cannot be older than this run.
+/// A STRAY IS A DAEMON OF THIS CHECKOUT OLDER THAN THIS PROCESS ([`is_stray`]). Getting
+/// it wrong makes the guard worse than nothing, in two ways measured here:
 ///
-/// `$ATERM_LINK_ALLOW_STRAYS=1` opts out, for the one honest case — a developer
-/// deliberately running two suites at once and willing to read the results with that in
-/// mind.
+/// * OLDER THAN THIS PROCESS: `--all-targets` runs each test binary as its own process,
+///   so a plain "is anything alive?" check fails binary two on binary one's daemons still
+///   winding down, and a guard that fails the suite it protects is one people learn to
+///   switch off. Comparing elapsed times separates them exactly — a daemon this run
+///   started cannot be older than this run.
+/// * OF THIS CHECKOUT ([`this_checkouts`]): every daemon this harness starts runs a
+///   binary of this checkout's own build ([`gui_binary`], cargo's `aterm-link`) — in any
+///   target dir of its tree (`target/`, `target-gui/`, …: a killed run of ANY lane
+///   leaves one behind), or out of tree where `$CARGO_TARGET_DIR` put this run's. Until
+///   2026-09-27 the rule read only the executable's NAME, so another worktree's live
+///   suite — its own `aterm-gui --headless`, from its own `target/` — answered COULD
+///   NOT RUN here, and parallel sessions (several work this repo at once, each in its
+///   own worktree) had to switch the guard off to run at all. A worktree NESTED in this
+///   checkout is another checkout, and its daemons are its own.
+///
+/// `$ATERM_LINK_ALLOW_STRAYS=1` opts out, for the one honest case left — a developer
+/// deliberately running two suites at once IN ONE CHECKOUT and willing to read the
+/// results with that in mind.
 fn refuse_a_dirty_machine() {
     // DECIDED ONCE PER PROCESS, at the FIRST world's boot, and then REFUSED AT
     // EVERY BOOT. This suite runs its tests in parallel and every world spawns its
@@ -184,12 +195,12 @@ fn refuse_a_dirty_machine() {
     // previous run's daemons is not a finding about this tree, and the gate
     // records a binary whose every red carries it as could-not-run.
     panic!(
-        "aterm-gate: COULD NOT RUN — a PREVIOUS run's daemons were already alive when this \
-         suite started ({strays}). This suite would measure them rather than itself, which \
-         reads as a flake and then as a regression. Reap them (`pkill -f 'aterm-gui \
-         --headless'; pkill -f 'aterm-link serve'`) and clear the scratch worlds (`rm -rf \
-         /private/tmp/a5-* /private/tmp/atl-*`), or set $ATERM_LINK_ALLOW_STRAYS=1 if the \
-         overlap is deliberate."
+        "aterm-gate: COULD NOT RUN — a PREVIOUS run's daemons, from this checkout's own \
+         builds, were already alive when this suite started ({strays}). This suite would \
+         measure them rather than itself, which reads as a flake and then as a regression. \
+         Reap them by the pids named here (`kill <pid>`; never `pkill` by name, which \
+         reaches every other checkout's live suite too) and remove the scratch worlds their \
+         command lines name, or set $ATERM_LINK_ALLOW_STRAYS=1 if the overlap is deliberate."
     );
 }
 
@@ -238,28 +249,105 @@ pub fn process_command(pid: &str) -> String {
         .unwrap_or_else(|| "<command unreadable>".to_string())
 }
 
-/// The file name of the executable a process runs (`ps -o comm=`: the path it was
-/// started from on macOS, the kernel's short name on Linux — its last component
-/// either way), or `None` when the process is gone.
-pub fn process_executable(pid: &str) -> Option<String> {
-    let out = std::process::Command::new("ps")
-        .args(["-o", "comm=", "-p", pid])
-        .output()
-        .ok()?;
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let name = std::path::Path::new(raw.trim()).file_name()?;
-    Some(name.to_string_lossy().into_owned())
+/// The executable a process runs, as an absolute path, or `None` when the process is
+/// gone (or not ours to read): the kernel's `/proc/<pid>/exe` on Linux — ` (deleted)`
+/// dropped, which it appends once cargo has relinked the binary under a daemon still
+/// running it — and elsewhere the first text mapping `lsof` names, the executable's own
+/// vnode. NOT `ps -o comm=`: on macOS that is the name the process was started BY — a
+/// bare `aterm-gui` when a PATH search found it, `target/debug/aterm-gui` when a
+/// relative path did — which says nothing of whose build it is (measured 2026-09-27: a
+/// stray started as `target-gui/…/aterm-gui` read as nobody's).
+pub fn process_exe(pid: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let text = exe.to_string_lossy();
+        Some(PathBuf::from(
+            text.strip_suffix(" (deleted)").unwrap_or(&text).to_string(),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // `-b`: no kernel call that can block (a hung mount); `-w`: no warnings.
+        let out = std::process::Command::new("lsof")
+            .args(["-b", "-w", "-a", "-p", pid, "-d", "txt", "-Fn"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix('n'))
+            .filter(|path| path.starts_with('/'))
+            .map(PathBuf::from)
+    }
 }
 
-/// The stray daemons alive RIGHT NOW, or `None` when the machine is clean (or when the
-/// question cannot be asked, in which case the harness says nothing rather than guessing).
+/// Whether `exe` is one of THIS checkout's builds — the only binaries this harness
+/// starts daemons from, in whichever target dir a run of this checkout built them:
+///
+/// * anywhere in this checkout's own tree whose nearest enclosing checkout is this one
+///   ([`checkout_of`]) — `target/`, and the per-lane `target-gui/`, `target-drivers/`
+///   and the like beside it — but not in a checkout NESTED in it (a linked worktree
+///   parked inside, as `.fabric-wt/` has held one), which is another checkout;
+/// * under a directory [`target_dirs`] names, which reaches an out-of-tree
+///   `$CARGO_TARGET_DIR` this run builds into;
+/// * or the `$ATERM_GUI_BIN` this run was told to drive.
+///
+/// Compared as written and as resolved, so a `/var` ↔ `/private/var` spelling or a
+/// symlinked target dir still matches.
+pub fn this_checkouts(exe: &std::path::Path) -> bool {
+    if std::env::var_os("ATERM_GUI_BIN").is_some_and(|bin| std::path::Path::new(&bin) == exe) {
+        return true;
+    }
+    let resolved = std::fs::canonicalize(exe).ok();
+    let spellings = || std::iter::once(exe).chain(resolved.as_deref());
+    let root = workspace_root();
+    let root = std::fs::canonicalize(&root).unwrap_or(root);
+    let in_tree = spellings()
+        .any(|p| checkout_of(p).is_some_and(|c| std::fs::canonicalize(&c).unwrap_or(c) == root));
+    in_tree
+        || target_dirs().iter().any(|dir| {
+            let dir_resolved = std::fs::canonicalize(dir).ok();
+            spellings().any(|p| {
+                p.starts_with(dir) || dir_resolved.as_ref().is_some_and(|d| p.starts_with(d))
+            })
+        })
+}
+
+/// The checkout `path` lies in: its nearest ancestor holding a `.git` — a repository's
+/// own directory, or a linked worktree's file naming it — or `None` outside every one.
+pub fn checkout_of(path: &std::path::Path) -> Option<PathBuf> {
+    path.ancestors()
+        .skip(1)
+        .find(|dir| dir.join(".git").exists())
+        .map(std::path::Path::to_path_buf)
+}
+
+/// THE STRAY RULE ([`refuse_a_dirty_machine`]), over one process `pgrep` matched: it
+/// runs `binary` itself (a shell whose script only NAMES the daemon is not one), that
+/// binary is one of THIS checkout's builds (`ours`, [`this_checkouts`]), and it is older
+/// than this process by more than `ps`'s whole-second rounding and the moment between
+/// our start and our first child's.
+pub fn is_stray(
+    binary: &str,
+    exe: Option<&std::path::Path>,
+    age: Option<i64>,
+    my_age: i64,
+    ours: impl Fn(&std::path::Path) -> bool,
+) -> bool {
+    exe.is_some_and(|exe| exe.file_name().is_some_and(|n| n == binary) && ours(exe))
+        && age.is_some_and(|age| age > my_age + 2)
+}
+
+/// The stray daemons alive RIGHT NOW ([`is_stray`]), or `None` when the machine is clean
+/// (or when the question cannot be asked, in which case the harness says nothing rather
+/// than guessing).
 ///
 /// A DAEMON IS THE BINARY, NOT A MENTION OF IT. `pgrep -f` matches the whole command
 /// line, so a shell whose script merely NAMES a pattern matched too: on 2026-09-26
 /// another session's `zsh -c '... pgrep -f 'aterm-gui --headless' ...'` wait loop read
 /// as three stray daemons, and every e2e suite here answered COULD NOT RUN on a
 /// machine running no daemon at all. So a candidate counts only when its executable is
-/// the pattern's own binary.
+/// the pattern's own binary — and, since 2026-09-27, THIS checkout's build of it.
 fn strays_now() -> Option<String> {
     if std::env::var_os("ATERM_LINK_ALLOW_STRAYS").is_some() {
         return None;
@@ -277,13 +365,19 @@ fn strays_now() -> Option<String> {
         else {
             return None;
         };
+        let binary = pattern.split(' ').next().unwrap_or(pattern);
         let older: Vec<String> = String::from_utf8_lossy(&out.stdout)
             .lines()
             .map(str::trim)
-            .filter(|pid| process_executable(pid).as_deref() == pattern.split(' ').next())
-            // A couple of seconds of slack: our own children are born a moment after we
-            // are, and ps reports whole seconds.
-            .filter(|pid| process_age_secs(pid).is_some_and(|age| age > my_age + 2))
+            .filter(|pid| {
+                is_stray(
+                    binary,
+                    process_exe(pid).as_deref(),
+                    process_age_secs(pid),
+                    my_age,
+                    this_checkouts,
+                )
+            })
             .map(|pid| format!("pid {pid}: {}", process_command(pid)))
             .collect();
         if !older.is_empty() {

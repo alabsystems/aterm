@@ -899,6 +899,11 @@ fn real_auto_intent_bounds_activity_deferral_instead_of_waiting_forever() {
 /// `PRELAUNCH_LAND_MAX_WAITS` times); an exited pane is never counted as
 /// output, and holds it only as what it is — a dead session — until its pane
 /// closes.
+///
+/// Unix-only like the gate it binds: the `app_update_handoff` items below
+/// are `#[cfg(unix)]` (the in-place handoff has no Windows lane yet), and an
+/// ungated import of them is what kept the whole `aterm-gui` lib test target
+/// from compiling on Windows. The model-side checks above run everywhere.
 #[cfg(unix)]
 #[test]
 fn real_park_gate_admits_exactly_the_model_s_reader_park() {
@@ -946,6 +951,13 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
             )
         };
         assert_eq!(opened, 0, "openpty");
+        // openpty(3) opens both ends inheritable: a child another test spawns
+        // meanwhile would keep the slave open past its exec, for its whole
+        // life, and a closed slave would never read as hung up (the fd-copy
+        // sweep of 2026-09-27).
+        for fd in [master, slave] {
+            aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+        }
         (master, slave)
     };
     let write_byte = |fd: i32| {
@@ -959,7 +971,10 @@ fn real_park_gate_admits_exactly_the_model_s_reader_park() {
     write_byte(exited_slave);
     aterm_pty::close_fd(exited_slave);
     let exited = vec![(3u64, exited_master, 4003i32)];
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    // 10 s, not 2: the hang-up waits for every copy of the slave, and a child
+    // another test is forking holds one until it execs (the fd-copy sweep of
+    // 2026-09-27). A slave that never closes still fails.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !handoff_masters_closed(&exited) {
         assert!(
             std::time::Instant::now() < deadline,

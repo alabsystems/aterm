@@ -19,8 +19,9 @@
 //!   timeline tail, then the actions (`Copy Session ID` / `Copy CWD` /
 //!   `Close Tab`, routed through the existing [`MenuAction`] tag dispatch).
 //!
-//! One composer feeding both surfaces is the point: the menu can never say
-//! something the tooltip doesn't, and the `chrome` introspection verb's
+//! One composer feeding both surfaces is the point: the tooltip can never say
+//! something the menu doesn't (the menu adds the recent timeline tail, a log
+//! rather than a glance), and the `chrome` introspection verb's
 //! [`tab_menu_chrome_line`] mirror (read off the live strip) is provably the
 //! same items a human sees, because there is exactly one place items are made.
 //!
@@ -486,7 +487,8 @@ fn connection_lines(input: &SessionChromeInput) -> Vec<String> {
 }
 
 /// The shared identity/timeline HEADER LINES (title, durable description,
-/// generated activity, cwd, state, then the newest-first timeline tail) — the
+/// generated activity, cwd, the lifecycle state when it is news — `exited`, not
+/// the `alive` every live tab is — then the newest-first timeline tail) — the
 /// one list both surfaces render. Authored and generated prose are labeled so
 /// transient model output can never masquerade as durable session metadata.
 /// Returns `(identity_lines, timeline_lines)` so the two consumers can place
@@ -519,7 +521,7 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
     if let Some(state) = input
         .state
         .as_deref()
-        .filter(|s| !s.is_empty() && *s != "-")
+        .filter(|s| !s.is_empty() && !matches!(*s, "-" | "alive" | "spawning"))
     {
         identity.push(format!("state: {state}"));
     }
@@ -534,25 +536,27 @@ fn header_lines(input: &SessionChromeInput) -> (Vec<String>, Vec<String>) {
 
 /// Compose the hover TOOLTIP for one terminal tab, or `None` when the session
 /// carries NOTHING beyond its bare label (no authored description, generated
-/// activity, icon, cwd, state, connection, or timeline) — the tab then keeps
-/// today's no-tooltip behavior instead of a tooltip that merely repeats the
-/// chip text. Shape: the identity lines, the per-connection lines (design §4:
-/// the mark is never visual-only), then a blank line, then the newest-first
-/// timeline tail (each `<kind> · <age>`).
+/// activity, icon, cwd, exited state or connection) — the tab then keeps its
+/// no-tooltip behavior instead of a tooltip that merely repeats the chip text.
+/// Shape: the identity lines, then the per-connection lines (design §4: the
+/// mark is never visual-only). The timeline tail is the context menu's alone:
+/// raw event kinds (`spawned`, `meta-change`) are a log, not a glance, and the
+/// strip joins the tooltip's lines into one help string.
 #[must_use]
 pub(crate) fn compose_tooltip(input: &SessionChromeInput) -> Option<String> {
-    let (identity, timeline) = header_lines(input);
+    let (identity, _timeline) = header_lines(input);
     let connections = connection_lines(input);
-    if identity.len() <= 1 && connections.is_empty() && timeline.is_empty() {
-        // Only the title line — nothing the chip doesn't already say.
+    let icon = input
+        .icon
+        .as_deref()
+        .and_then(|icon| crate::session_timeline::sanitize_metadata_value("icon", icon))
+        .is_some();
+    if identity.len() <= 1 && !icon && connections.is_empty() {
+        // Only the bare title line — nothing the chip doesn't already say.
         return None;
     }
     let mut lines = identity;
     lines.extend(connections);
-    if !timeline.is_empty() {
-        lines.push(String::new());
-        lines.extend(timeline);
-    }
     Some(lines.join("\n"))
 }
 
@@ -809,24 +813,39 @@ mod tests {
     }
 
     /// The tooltip renders identity lines in the pinned order (icon+title,
-    /// durable description, generated activity, ~-abbreviated cwd, state), a
-    /// blank line, then the newest-first timeline tail — one exact byte shape,
-    /// so surfaces never drift apart silently.
+    /// durable description, generated activity, ~-abbreviated cwd) — one exact
+    /// byte shape, so surfaces never drift apart silently. `alive` is every live
+    /// tab's state, so it is no line; the timeline tail is the menu's.
     #[test]
-    fn tooltip_orders_identity_then_timeline_with_home_abbreviation() {
+    fn tooltip_orders_identity_with_home_abbreviation() {
         let tip = compose_tooltip(&full_input()).expect("full metadata composes");
         assert_eq!(
             tip,
             "🤖 build agent\n\
              description: Rebuilds the docs site\n\
              activity: Building documentation\n\
-             cwd: ~/src/aterm\n\
-             state: alive\n\
-             \n\
-             meta-change · just now\n\
-             cwd-change · 2m ago\n\
-             spawned · 2h ago"
+             cwd: ~/src/aterm"
         );
+        // A state that IS news keeps its line.
+        let mut exited = full_input();
+        exited.state = Some("exited".to_string());
+        assert!(
+            compose_tooltip(&exited)
+                .unwrap()
+                .ends_with("\ncwd: ~/src/aterm\nstate: exited")
+        );
+        // A bare live session with a spawn event is only its label: no tooltip.
+        let bare = SessionChromeInput {
+            label: "zsh".to_string(),
+            state: Some("alive".to_string()),
+            has_session: true,
+            timeline: vec![TimelineNote {
+                kind: "spawned",
+                age_ms: 7_200_000,
+            }],
+            ..SessionChromeInput::default()
+        };
+        assert_eq!(compose_tooltip(&bare), None);
     }
 
     /// Generated activity is transient and therefore never overwrites durable
@@ -1009,7 +1028,7 @@ mod tests {
     }
 
     /// The timeline tail is capped to [`TIMELINE_TAIL`] defensively even when
-    /// the caller hands more.
+    /// the caller hands more — and it is the menu's: the tooltip carries none.
     #[test]
     fn timeline_tail_is_capped() {
         let mut input = full_input();
@@ -1024,7 +1043,7 @@ mod tests {
             .lines()
             .filter(|l| l.starts_with("state-change"))
             .count();
-        assert_eq!(events, TIMELINE_TAIL);
+        assert_eq!(events, 0, "the tooltip is no log: {tip:?}");
         let menu = compose_tab_menu(&input);
         let headers = menu
             .iter()
@@ -1072,14 +1091,22 @@ mod tests {
                 _ => None,
             })
             .collect();
-        // The tooltip orders identity → connections → timeline; the menu holds
-        // the connection line in its own section AFTER the timeline. Same
-        // facts, sorted per surface.
+        // The tooltip orders identity → connections; the menu adds the
+        // timeline tail and holds the connection line in its own section AFTER
+        // it. Same facts, sorted per surface.
         let mut tip_sorted = tip_lines.clone();
+        tip_sorted.extend([
+            "meta-change · just now",
+            "cwd-change · 2m ago",
+            "spawned · 2h ago",
+        ]);
         tip_sorted.sort_unstable();
         let mut menu_sorted = menu_headers.clone();
         menu_sorted.sort_unstable();
-        assert_eq!(menu_sorted, tip_sorted, "menu headers ARE the tooltip");
+        assert_eq!(
+            menu_sorted, tip_sorted,
+            "menu headers ARE the tooltip plus the timeline tail"
+        );
         assert!(tip_lines.contains(&"\u{21e5} pushes into \"build\""));
         let actions: Vec<(&str, MenuAction, bool)> = menu
             .iter()

@@ -725,7 +725,7 @@ pub enum SourceIdentity {
     /// listing and the hash — or a root with a `.git` git could not open at all
     /// ([`has_git_entry`]). NOT the same as [`SourceIdentity::Unavailable`]
     /// (2026-09-13): read as that, the run went ahead with no source tripwire
-    /// and no source line, and an `--in-place` run could go green on a tree
+    /// and no source line, and a run in the checkout could go green on a tree
     /// nothing was watching. [`crate::run`] runs no stage on it.
     Unreadable(String),
 }

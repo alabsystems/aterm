@@ -14,8 +14,10 @@
 //!
 //! When mode 2031 is set and the scheme CHANGES, `set_color_scheme` queues an
 //! unsolicited `CSI ? 997 ; Ps n` in the engine's response buffer; we drain that via
-//! [`Terminal::take_response`] and write it to the owning session's PTY sink so an
-//! app that subscribed live-updates its own theme. The first call after spawn (when
+//! [`Terminal::take_response`] and send it to the owning session by the route every
+//! UI-thread report takes (`app_input::write_ui_report`: queued behind earlier
+//! input, never a write that can park the event loop) so an app that subscribed
+//! live-updates its own theme. The first call after spawn (when
 //! the engine still holds its `Dark` default) is a real change iff the OS is Light,
 //! which is exactly when an app should be told.
 
@@ -61,10 +63,8 @@ impl App {
             let Some(session) = self.pool.get(id) else {
                 continue;
             };
-            // Take the per-session sink BEFORE locking the engine so we can flush the
-            // engine's queued report (if any) without holding the term lock across the
-            // PTY write.
-            let sink = session.ctx.sink.clone();
+            // Drain the engine's queued report (if any) under the term lock, and
+            // write it after releasing it.
             let response = {
                 let mut term = term_lock(&session.term);
                 term.set_color_scheme(appearance);
@@ -74,9 +74,20 @@ impl App {
                 term.take_response()
             };
             if let Some(resp) = response {
-                // Best-effort: a closed/half-open PTY just drops the report. The OS
-                // appearance is advisory; we never fail the GUI over it.
-                let _ = sink.write_frame(&resp);
+                // The route every report takes (`write_ui_report`): the UI thread
+                // only enqueues it behind earlier input, or writes it through the
+                // egress that never parks — never the blocking write, which would
+                // park this thread (and every window) on a program that has
+                // stopped reading, at the spill cap or on a parked paste's fd
+                // lock, the moment the OS flips to dark mode (2026-09-26). A
+                // refusal (a full queue) or a closed PTY just drops the report:
+                // the OS appearance is advisory, and the GUI never fails over it.
+                crate::app_input::write_ui_report(
+                    &session.term,
+                    &session.ctx.modes,
+                    &session.ctx.sink,
+                    &crate::input::InputEvent::KeySequence(resp),
+                );
             }
         }
     }

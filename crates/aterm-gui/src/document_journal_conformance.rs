@@ -112,7 +112,7 @@ fn production_serializer_conforms_and_negative_controls_are_rejected() {
         std::env::temp_dir().join(format!("aterm-journal-conformance-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
-    let mut store = DocumentStore::new();
+    let mut store = DocumentStore::for_test();
     let uri = "file:///tmp/journal-conformance.md";
     let document = store.open(uri.to_string(), "base".to_string());
     let disk = store.snapshot(document).unwrap();

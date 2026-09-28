@@ -22,6 +22,7 @@ mod builder;
 mod callback_setters;
 mod callbacks;
 mod checkpoint;
+mod checkpoint_state;
 pub(crate) mod clipboard_auth;
 pub mod color_resolve;
 mod colors_api;
@@ -129,8 +130,11 @@ pub use callbacks::{SshConductorCallbackEvent, TmuxCallbackEvent};
 #[cfg(feature = "serde")]
 pub use checkpoint::CheckpointMeta;
 pub use checkpoint::{
-    GridCursorRepr, HostBindings, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr,
-    TerminalCheckpoint,
+    GridCursorRepr, ShellIntegrationNonce, ShellIntegrationPosture, StyleRepr, TerminalCheckpoint,
+};
+pub use checkpoint_state::{
+    ColorRepr, ColorSlotRepr, ColorStackEntryRepr, OutputBlockRepr, PaletteOverrideRepr, ShellRepr,
+    ShellSpanRepr,
 };
 pub use custody::CustodyTransition;
 pub use foreground_handback::{ForegroundHandback, evidence as program_evidence};

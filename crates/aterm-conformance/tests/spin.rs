@@ -24,19 +24,29 @@
 //! the gate asserts — it is the contradiction itself, counted.
 //!
 //! THE MATRIX (each row a test):
-//!   1. a steady repainter arriving on the instance, 6 s → ~0 past_deadline_arms
-//!   2. a bare /bin/sh prompt, nothing running, 6 s   → ~0 past_deadline_arms
+//!   1. a steady repainter arriving on the instance, 10 s → ~0 past_deadline_arms
+//!      and at most 12 timer wakes
+//!   2. a bare /bin/sh prompt, nothing running, 6 s    → ~0 past_deadline_arms
 //!
 //! THE FIXTURE IS THE GATE. Row 1 does NOT reuse the paint matrix's
 //! `fake_claude.py`: that client's spinner glyph and counter change every
 //! frame, so every repaint is REAL grid movement and the movement clock never
 //! goes stale. Measured against a build with the fix reverted, `fake_claude.py`
 //! banked exactly 0 past-deadline arms — a green gate over a broken build.
-//! `tools/spin-conformance/idle_repainter.py` rewrites BYTE-IDENTICAL content
-//! ~6x/s forever: the bytes keep arriving (so `classify` sustains
-//! phase=Running) while honest damage accounting sees nothing change (so
-//! `owed_wake`'s movement clock goes stale), which is the two-clock split the
-//! spin was made of.
+//! `tools/spin-conformance/idle_repainter.py` warms for one second of real
+//! writes (so `classify` reaches phase=Running), then writes ~6x/s bytes that
+//! mark no cell — a DEC-2026 bracket around a bare cursor position — so output
+//! keeps `Running` alive while `owed_wake`'s movement clock goes stale, which is
+//! the two-clock split the spin was made of. The probe verifies it: `ctl status`
+//! must read `output_activity` at the end of the window.
+//!
+//! THE FIXTURE WAS WRONG A SECOND TIME, until 2026-09-25
+//! (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 4): its "byte-identical"
+//! repaint erased and rewrote the same text, and every content mark bumps the
+//! grid's content counter whether or not the bytes differ — so each repaint WAS
+//! movement (`reasons=fg_job,content_activity`), and against a build with both
+//! of 420e41648's defences reverted it banked 30 arms: green, under the 100
+//! ceiling.
 //!
 //! AND SO IS THE WINDOW'S PLACEMENT. The counter is zeroed BEFORE the client
 //! starts, and the measured window opens with its arrival. Headless, the whole
@@ -60,6 +70,18 @@
 //! rather than hidden: it is the FLOOR, not the regression's shape. Row 1 is
 //! the falsifiable row.
 //!
+//! PROVEN RED AGAIN, 2026-09-25, with the replacement fixture (RELEASE,
+//! headless, 10 s window, 3/3 identical takes per arm):
+//!
+//!   row 1  healthy HEAD                         0 arms,   5 timer wakes  PASS
+//!          owed_wake hunk of 420e41648 reverted 0 arms,  21 timer wakes  FAIL
+//!          ...and the structural clamp too    105 arms,  75 timer wakes  FAIL
+//!
+//! The middle line is why row 1 also bounds TIMER WAKES: the clamp in
+//! `StatusObserver::next_wake` turns a stale `owed_wake` into a poll at the
+//! observation rate, which arms nothing in the past, so `past_deadline_arms`
+//! alone is blind to that regression. The ceiling is 12 per window.
+//!
 //! WHAT THIS INSTRUMENT PERTURBS (docs/RELEASE-PROOF-DISCIPLINE.md, the
 //! OBSERVER RULE): during the measurement window the probe issues NO control
 //! verbs — the two `ctl metrics` calls bracket the window from outside it.
@@ -75,17 +97,10 @@
 //! infinitely above a healthy reading of zero, 79x below the measured
 //! regression, and far enough off both to survive a loaded machine.
 //!
-//! WIRING: `tools/spin_guard.sh`, in the `guards` lane of `xtask gate lint` —
-//! beside `paint_guard`, and fingerprinted the same way, so a run that does not
-//! touch the event loop costs one content hash. NOTHING RUNS THAT LANE
-//! AUTOMATICALLY: there is no git hook (the `.githooks/pre-push` that once ran
-//! it was demoted to advisory on 2026-08-24 and deleted on 2026-09-25, by the
-//! owner's no-hooks mandate), and `tools/verify.sh` — the
-//! merge contract — runs `grep_guard.sh` and the license sweep as stages of its
-//! own but never `run_repo_guards`, so it never reaches this script or
-//! `paint_guard`. So this guard runs when a human runs
-//! `cargo run -p xtask -- gate lint`, and at no other time. The fingerprint is
-//! still worth having, because that is the run it makes cheap.
+//! WIRING: the merge gate (`tools/verify.sh`) runs these rows in its exclusive
+//! `measuring tests` stage (see THE TESTS LIVE IN `measuring`, below). The
+//! fingerprinted `tools/spin_guard.sh` that once ran them from `gate lint`'s
+//! guards lane, which nothing ran automatically, was deleted on 2026-09-27.
 //!
 //! The binary under test is RELEASE profile. Without an override, the shared
 //! conformance helper freshens `target/conformance-release/release/aterm`, a

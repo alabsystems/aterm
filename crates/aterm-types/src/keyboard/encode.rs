@@ -38,6 +38,14 @@ pub fn encode_key(key: &Key, modifiers: Modifiers, mode: KeyboardMode) -> Vec<u8
 ///   parameter when a shifted alternate codepoint is known.
 /// - `REPORT_ASSOCIATED_TEXT` appends text-as-codepoints as the third CSI
 ///   parameter when paired with `REPORT_ALL_KEYS_AS_ESC`.
+///
+/// A MODIFIER key's own bit follows kitty, which reports the state the event
+/// leaves: a press or repeat sets it whatever `modifiers` says, and on a
+/// release `modifiers` IS that state — the bit set only while the key's other
+/// side is still held ([`NamedKey::modifier_twin`]; both Shifts down, one let
+/// go, `shift` is still in force). The window states it from its
+/// physical-press record; a controller's `key … type=release` names it with
+/// `mods=`.
 #[must_use]
 // Skip: the keyboard encoder family — byte-sequence building (Vec
 // push/extend) and key-table lookups over absent std bodies. The
@@ -123,6 +131,32 @@ pub fn encode_key_with_layout(
         None
     };
     let kitty_key = folded.as_ref().unwrap_or(key);
+
+    // ConPTY win32-input-mode (DEC 9001): an Enter CHORD goes out as the
+    // INPUT_RECORD pair conhost asked for, and it goes out FIRST — ahead of the
+    // kitty gate and of xterm modifyOtherKeys — because under ConPTY conhost is
+    // the only reader there is. Measured 2026-09-22 (scratch
+    // CreatePseudoConsole, conhost 10.0.26200): an application's `CSI > 1 u`
+    // push and its `CSI > 4;2 m` reach this terminal verbatim through the
+    // pipe, so the kitty flags and the xterm level really do get set here — but
+    // conhost's input parser then DROPS the `CSI 13;2 u` and the
+    // `CSI 27;2;13 ~` the terminal writes back (no INPUT_RECORD at all reached
+    // a `ReadKey` loop; a byte fed after them arrived fine), while the win32
+    // pair arrives as `Enter+Shift`. Letting the application's push outrank
+    // the record would therefore kill the chord for exactly the applications
+    // that asked for it (Claude Code pushes disambiguate). Unix is untouched:
+    // 9001 is never set there. The RELEASE of a chord encodes to nothing
+    // whatever the kitty flags say — the pair already carries its key-up, and
+    // a kitty release report would be dropped by conhost anyway.
+    if mode.contains(KeyboardMode::WIN32_INPUT)
+        && let Some(chord) = win32_enter_chord(key, modifiers)
+    {
+        return if event_type == KeyEventType::Release {
+            Vec::new()
+        } else {
+            encode_win32_enter_record_pair(&chord)
+        };
+    }
 
     if should_encode_kitty_event(kitty_key, modifiers, mode, event_type) {
         return encode_kitty(kitty_key, modifiers, mode, event_type, base_layout_key);
@@ -522,26 +556,25 @@ fn kitty_modifiers_for_event(
     modifiers: Modifiers,
     event_type: KeyEventType,
 ) -> Modifiers {
-    let modifier_flag = match key {
-        Key::Named(NamedKey::ShiftLeft) | Key::Named(NamedKey::ShiftRight) => Modifiers::SHIFT,
-        Key::Named(NamedKey::ControlLeft) | Key::Named(NamedKey::ControlRight) => Modifiers::CTRL,
-        Key::Named(NamedKey::AltLeft) | Key::Named(NamedKey::AltRight) => Modifiers::ALT,
-        Key::Named(NamedKey::SuperLeft) | Key::Named(NamedKey::SuperRight) => Modifiers::SUPER,
-        Key::Named(NamedKey::HyperLeft) | Key::Named(NamedKey::HyperRight) => Modifiers::HYPER,
-        Key::Named(NamedKey::MetaLeft) | Key::Named(NamedKey::MetaRight) => Modifiers::META,
-        _ => return modifiers,
+    let Some((modifier_flag, _)) = (match key {
+        Key::Named(named) => named.modifier_twin(),
+        Key::Character(_) => None,
+    }) else {
+        return modifiers;
     };
 
-    // Spec: the bit reflects the state INCLUDING the current event — set on
-    // press/repeat, cleared on release. Known limitation: when BOTH the left
-    // and right key of one kind are held and one is released, the spec keeps
-    // the bit set; the hosts deliver only an aggregated pre-event modifier
-    // state (winit canonicalizes to the *Left variants), so we cannot tell
-    // that case apart and clear unconditionally.
+    // Spec: the bit reflects the state INCLUDING the current event. A press or
+    // repeat sets it. A release leaves it as the caller states it, because only
+    // the caller can know the answer: kitty keeps the bit while the key's other
+    // side is still held (both Shifts down, one released) and clears it
+    // otherwise, and `modifiers` on a release is that post-event state — the
+    // window reads it from its physical-press record (`release_physical_press`),
+    // a controller names it. The SIDE is not lost either: the window maps a
+    // right-side press to the *Right key (`aterm_winit_keymap::sided_modifier`),
+    // whose code kitty reports.
     let mut adjusted = modifiers;
-    match event_type {
-        KeyEventType::Release => adjusted.remove(modifier_flag),
-        KeyEventType::Press | KeyEventType::Repeat => adjusted.insert(modifier_flag),
+    if event_type != KeyEventType::Release {
+        adjusted.insert(modifier_flag);
     }
     adjusted
 }
@@ -738,6 +771,139 @@ pub fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
         '/' => Some('?'),
         _ => Some(c),
     }
+}
+
+/// ConPTY win32-input-mode: `VK_RETURN` (13) and its PS/2 scan code (0x1C = 28)
+/// — the `wVirtualKeyCode` / `wVirtualScanCode` of BOTH Enter keys on a Windows
+/// keyboard. The keypad's Enter is the same pair behind the E0 prefix, which a
+/// real `INPUT_RECORD` reports as `ENHANCED_KEY` in `dwControlKeyState`.
+const WIN32_VK_RETURN: u32 = 13;
+const WIN32_SC_RETURN: u32 = 28;
+/// `dwControlKeyState` bits (wincon.h): `SHIFT_PRESSED`, `LEFT_CTRL_PRESSED`,
+/// `LEFT_ALT_PRESSED`, `ENHANCED_KEY`. The host cannot tell a left modifier
+/// from a right one once winit has canonicalized the chord, so the LEFT bits
+/// are reported — what conhost itself synthesizes for a modifier it cannot
+/// side-attribute.
+const WIN32_SHIFT_PRESSED: u32 = 0x10;
+const WIN32_LEFT_CTRL_PRESSED: u32 = 0x08;
+const WIN32_LEFT_ALT_PRESSED: u32 = 0x02;
+const WIN32_ENHANCED_KEY: u32 = 0x100;
+/// The `UnicodeChar` of an Enter-chord record: what a PHYSICAL chord carries
+/// under Windows Terminal, so every ReadConsoleInput reader (.NET `ReadKey`,
+/// libuv's `tty.c`, the MSYS runtime, cmd.exe's cooked reader) sees under aterm
+/// exactly the record it sees under WT, and every WT-tuned workaround an
+/// application ships keeps working. WT copies the field from the OS's own
+/// `ToUnicode` translation of the chord: Shift+Enter is CR, and Enter with
+/// CTRL held — with or without Shift — is LF (the same translation conhost
+/// applies in reverse when it reads a bare 0x0A as Ctrl+Enter). Measured
+/// 2026-09-22 (conhost 10.0.26200, records fed into a ConPTY tab):
+/// `[Console]::ReadKey` reports `Enter MODS=Shift CHAR=13` for the shift
+/// record and `Enter MODS=Control CHAR=10` / `MODS=Shift, Control CHAR=10` for
+/// the ctrl ones; PSReadLine, which binds by key and modifiers, runs AddLine on
+/// the shift record (`>>` continuation, both lines executed on the next
+/// Enter); cmd.exe's cooked reader runs the pending line on it, as it does
+/// under WT.
+///
+/// Deliberately NOT aterm's Unix Shift+Enter policy (`encode_legacy.rs`, the
+/// `Enter` arm: LF, so a LF-honouring reader gets a newline unnegotiated).
+/// Carrying that LF inside the shift record was tried and rejected: no Windows
+/// keyboard produces `Shift+Enter, UnicodeChar 10`, so a reader that keys on
+/// the char sees a chord that exists nowhere else — cmd.exe's cooked reader
+/// stayed inert on the LF record where it runs the line on the CR one (both
+/// measured), and a reader that emits the char gets a '\n' WT would never
+/// have sent it. The Unix policy is untouched, since 9001 is never set there.
+const WIN32_SHIFT_ENTER_CHAR: u32 = 13;
+const WIN32_CTRL_ENTER_CHAR: u32 = 10;
+
+/// The two record fields an Enter chord decides; the rest of the record is
+/// fixed (`VK_RETURN`, scan 28, repeat 1).
+struct Win32EnterChord {
+    /// [`WIN32_SHIFT_ENTER_CHAR`] or [`WIN32_CTRL_ENTER_CHAR`].
+    unicode_char: u32,
+    /// The `dwControlKeyState` word.
+    control_state: u32,
+}
+
+/// The win32-input-mode record fields for an Enter chord — `Some` only for an
+/// Enter (main block or keypad) with SHIFT and/or CTRL (ALT may ride along),
+/// `None` for everything else so the caller falls through to the legacy bytes:
+/// plain Enter stays CR and Alt+Enter stays `ESC CR`, both of which conhost
+/// already translates correctly (measured 2026-09-22). The keypad Enter is the
+/// same VK/scan pair flagged `ENHANCED_KEY`, as a real record for the
+/// E0-prefixed key is; it must be routed here too, because the legacy keypad
+/// arm falls back to the main Enter's bare LF, which is precisely the byte
+/// conhost reads as Ctrl+Enter. DECKPAM is not consulted: the record names the
+/// physical key, and conhost applies the application's keypad mode itself when
+/// the application reads in VT mode.
+// Skip: bitflags `contains` and a `match` over a table enum — absent std
+// bodies; the mapping is exhaustively unit-tested against the spec.
+#[cfg_attr(trust_verify, trust::skip)]
+fn win32_enter_chord(key: &Key, modifiers: Modifiers) -> Option<Win32EnterChord> {
+    let mut control_state = match key {
+        Key::Named(NamedKey::Enter) => 0u32,
+        Key::Named(NamedKey::NumpadEnter) => WIN32_ENHANCED_KEY,
+        _ => return None,
+    };
+    let shift = modifiers.contains(Modifiers::SHIFT);
+    let ctrl = modifiers.contains(Modifiers::CTRL);
+    if !shift && !ctrl {
+        return None;
+    }
+    if shift {
+        control_state |= WIN32_SHIFT_PRESSED;
+    }
+    if ctrl {
+        control_state |= WIN32_LEFT_CTRL_PRESSED;
+    }
+    if modifiers.contains(Modifiers::ALT) {
+        control_state |= WIN32_LEFT_ALT_PRESSED;
+    }
+    // CTRL decides the char, whatever else is held: Windows translates the
+    // chord's character before it looks at Shift.
+    let unicode_char = if ctrl {
+        WIN32_CTRL_ENTER_CHAR
+    } else {
+        WIN32_SHIFT_ENTER_CHAR
+    };
+    Some(Win32EnterChord {
+        unicode_char,
+        control_state,
+    })
+}
+
+/// The win32-input-mode `INPUT_RECORD` pair (key-down, then key-up) for an
+/// Enter chord.
+///
+/// Format (microsoft/terminal doc/specs/#4999-win32-input-mode.md):
+/// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`, every field spelled (Windows Terminal's
+/// own `_GenerateWin32KeySequence` writes all six). `Uc` and `Cs` come from the
+/// chord and are the SAME on both halves (the modifier is still held when Enter
+/// comes back up); `Kd` is 1 then 0; `Rc` is 1.
+///
+/// Both halves are emitted from the PRESS. Windows applications key on the
+/// key-down and the host keeps no per-key state, so a self-contained pair per
+/// press is what makes the chord atomic; the caller's release path emits
+/// nothing for this key, so no second key-up ever follows.
+// Skip: the key encoders build byte sequences via Vec push/extend and
+// table lookups — absent std bodies (alloc + iterator class). The encoded
+// bytes are exhaustively unit-tested against the win32-input-mode spec.
+#[cfg_attr(trust_verify, trust::skip)]
+fn encode_win32_enter_record_pair(chord: &Win32EnterChord) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(48);
+    for key_down in [1u32, 0u32] {
+        buf.extend_from_slice(b"\x1b[");
+        write_u32(&mut buf, WIN32_VK_RETURN);
+        buf.push(b';');
+        write_u32(&mut buf, WIN32_SC_RETURN);
+        buf.push(b';');
+        write_u32(&mut buf, chord.unicode_char);
+        buf.push(b';');
+        write_u32(&mut buf, key_down);
+        buf.push(b';');
+        write_u32(&mut buf, chord.control_state);
+        buf.extend_from_slice(b";1_");
+    }
+    buf
 }
 
 /// Encode using legacy terminal sequences.

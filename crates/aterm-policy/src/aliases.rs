@@ -3,10 +3,8 @@
 
 //! Named selector aliases (§3.4).
 //!
-//! These aliases are the human-readable names used in the TOML policy. The
-//! alias compiler (#7992) translates them to concrete
-//! `SequenceSelector` tokens. Phase 0 ships only the table + lookup so rule
-//! authors can reference them; compilation happens in the engine crate.
+//! These aliases are the human-readable names used in the TOML policy; the
+//! engine translates them to concrete `SequenceSelector` tokens.
 
 /// One row of the alias table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -990,14 +990,6 @@ mod tests {
         assert!(default > qos_class(Role::Background) as u32);
     }
 
-    /// Off macOS the call must still compile and do nothing, so call sites never
-    /// need a `cfg`.
-    #[test]
-    fn declaring_a_role_is_infallible_everywhere() {
-        set_self(Role::Background);
-        set_self(Role::Housekeeping);
-    }
-
     /// The Linux slice map keeps the enum's order: the keystroke path asks for
     /// the shortest slice, the PTY drain a longer one, and nothing below the
     /// UI thread asks at all (a Linux nice would be inherited by children).
@@ -1292,22 +1284,34 @@ mod tests {
     /// `set_self` on the spawning side would read as a fix and change nothing.
     #[test]
     fn every_control_plane_thread_declares_its_role_inside_its_closure() {
-        let source = include_str!("control.rs");
-        for (thread, anchor) in [
-            ("aterm-control-N (8 RPC lanes)", "fn spawn_control_workers("),
+        let control = include_str!("control.rs");
+        let lanes = include_str!("control_lanes.rs");
+        for (thread, source, anchor) in [
+            (
+                "aterm-control-N (8 request lanes)",
+                lanes,
+                "pub(super) fn start(self: &Arc<Self>)",
+            ),
+            (
+                "aterm-control-parker",
+                lanes,
+                "fn start_parker(self: &Arc<Self>)",
+            ),
             (
                 "aterm-subscribe-N (4 push lanes)",
+                control,
                 "fn spawn_subscription_workers(",
             ),
-            ("aterm-fabric-bridge", "fn attach_fabric_bridge("),
+            ("aterm-fabric-bridge", control, "fn attach_fabric_bridge("),
             (
                 "aterm-control-listener",
+                control,
                 ".name(\"aterm-control-listener\".into())",
             ),
         ] {
             let at = source
                 .find(anchor)
-                .unwrap_or_else(|| panic!("no `{anchor}` in control.rs"));
+                .unwrap_or_else(|| panic!("no `{anchor}` in its source"));
             let head = &source[at..source.len().min(at + 2000)];
             let spawn = head
                 .find(".spawn(")
@@ -1327,6 +1331,17 @@ mod tests {
                  role does not reach the thread that thread creates"
             );
         }
+        // The wait lanes are spawned by name (`.spawn(move || lanes.wait_lane())`,
+        // on demand), so their declaration belongs at the lane's entry, as the
+        // reflow worker's does.
+        let at = lanes
+            .find("fn wait_lane(self: &Arc<Self>) {")
+            .expect("no wait_lane in control_lanes.rs");
+        let head = &lanes[at..lanes.len().min(at + 200)];
+        assert!(
+            head.contains("qos::set_self(crate::qos::Role::Responsive)"),
+            "the aterm-control-wait-N lanes declare no role at their entry"
+        );
     }
 
     /// Every `atpkg` child the GUI launches takes the clamp. A bare

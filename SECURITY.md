@@ -61,10 +61,11 @@ Examples of issues that should be reported privately include:
   artifact a client accepts, or roll a client back to a lower build number (the
   roster, its deny-list, and the forward-only build rule are described in
   [README ▸ Security model](README.md#security-model));
-- escapes from the network and credential-directory sandbox profile that
-  `--sandbox` applies to session processes on macOS, or a containment gate on
-  any platform failing to enforce what it announces at startup (the platforms
-  differ by design, so a difference aterm discloses is not itself a finding);
+- escapes from the sandbox profile that `--sandbox` applies to session
+  processes on macOS (network, write confinement, credential and private-data
+  directories), a `containment` session starting on a platform with no OS
+  sandbox (it must refuse), or a containment gate on any platform failing to
+  enforce what it announces at startup;
 - capture-path escapes or unintended disclosure of terminal contents; and
 - committed or emitted credentials.
 

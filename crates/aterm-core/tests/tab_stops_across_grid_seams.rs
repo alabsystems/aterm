@@ -22,7 +22,7 @@
 //! correct. Without the control these would also pass on a terminal that had
 //! simply stopped seeding defaults at all.
 
-use aterm_core::terminal::{HostBindings, Terminal};
+use aterm_core::terminal::Terminal;
 
 /// The columns that currently carry a stop.
 fn stops(t: &Terminal) -> Vec<usize> {
@@ -84,7 +84,7 @@ fn tbc3_survives_the_seamless_update_checkpoint_and_a_widen_after_it() {
     let carry = source
         .checkpoint_carry(0)
         .expect("the terminal produces a carry checkpoint");
-    let mut restored = Terminal::from_checkpoint(&carry, HostBindings::none());
+    let mut restored = Terminal::from_checkpoint(&carry);
 
     // Both widen. The restored terminal must behave like the one that never
     // went through the handoff — that IS the seamless-update contract.
@@ -131,7 +131,7 @@ fn an_ordinary_terminal_still_seeds_defaults_into_the_columns_a_widen_adds() {
     );
     let src = Terminal::new(24, 80);
     let carry = src.checkpoint_carry(0).expect("carry");
-    let mut r = Terminal::from_checkpoint(&carry, HostBindings::none());
+    let mut r = Terminal::from_checkpoint(&carry);
     r.resize(24, 120);
     assert!(
         stops(&r).contains(&112),

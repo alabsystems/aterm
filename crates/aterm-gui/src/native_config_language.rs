@@ -704,8 +704,10 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
     // Manual must complete it, hover it, and flag a misspelled VALUE instead of
     // shrugging at an unknown key.
     // A LIVE KEY Manual used to call "unknown to this aterm build" — the exact
-    // false diagnostic audit-2 item 9 named, still open for this table because
-    // `[fabric]` landed after it. An operator who turns the fabric on writes
+    // false diagnostic audit-2 item 9 named, which `[fabric]` missed by landing
+    // after that fix; this row (and the table header below) closes it for the
+    // table, and `every_key_the_config_reader_accepts_is_known_to_manual` keeps
+    // it closed. An operator who turns the fabric on writes
     // this by hand, and being told the key does not exist is how they conclude
     // the bridge is not running when it is. Free-form: the value is a command
     // line (`aterm-link serve --fleet ... --broker ...`), whitespace-split and
@@ -1060,6 +1062,49 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         "Seconds the supervisor keeps off a session a person typed into",
         ConfigSchemaKind::Scalar(EditKind::Integer),
         &["supervisor", "human", "keyboard", "grace"],
+        true,
+    ),
+    // The `[disk]` table (design DESIGN-aterm-wrapper-2026-09-17 §5.5), read by
+    // the harness's disk verb and by this window's harness host
+    // (`harness_host::disk_look`, `aterm_agent::harness::cli::disk_config_at`).
+    // Known here so `auto_free_gib = 0` — the documented off switch of the
+    // automatic removal — is not reported "unknown to this aterm build", which
+    // told a person to delete the line and so turned the removal back on;
+    // `every_disk_key_is_known_to_the_config_language` pins the two lists.
+    // Written in Manual, like the supervisor's finer keys.
+    manual(
+        "disk",
+        "Disk watch",
+        ConfigSchemaKind::Table,
+        &["disk", "free space", "target", "cleanup"],
+        false,
+    ),
+    manual(
+        "disk.apply",
+        "Let `aterm harness disk --apply <class>` remove what it reports",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &["disk", "cleanup", "remove", "consent"],
+        true,
+    ),
+    manual(
+        "disk.warn_free_gib",
+        "Free GiB below which the disk report warns",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["disk", "free space", "warn"],
+        true,
+    ),
+    manual(
+        "disk.target_stale_days",
+        "Days before a build directory counts as stale",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["disk", "target", "stale", "cargo"],
+        true,
+    ),
+    manual(
+        "disk.auto_free_gib",
+        "Free GiB below which stale build directories are removed automatically (0: off)",
+        ConfigSchemaKind::Scalar(EditKind::Integer),
+        &["disk", "free space", "target", "cleanup", "automatic"],
         true,
     ),
     manual(
@@ -1593,6 +1638,12 @@ pub(crate) fn config_schema() -> &'static [ConfigSchemaEntry] {
                 .key
                 .strip_prefix("harness.")
                 .and_then(aterm_agent::supervise::SupervisorConfig::default_shown)
+                .or_else(|| {
+                    entry
+                        .key
+                        .strip_prefix("disk.")
+                        .and_then(aterm_agent::harness::disk::Config::default_shown)
+                })
                 .unwrap_or_default();
             schema.push(ConfigSchemaEntry {
                 key: entry.key,
@@ -2353,6 +2404,23 @@ fn validate_registered_values(
                     .as_float()
                     .or_else(|| item.as_integer().map(|value| value as f64));
                 let Some(number) = number else { continue };
+                // A `[disk]` knob has no upper bound to state, only a floor:
+                // the reader's own words for what a negative becomes.
+                if number < 0.0
+                    && let Some(reading) = setting
+                        .key
+                        .strip_prefix("disk.")
+                        .and_then(aterm_agent::harness::disk::Config::negative_reading)
+                {
+                    push_diagnostic(
+                        analysis,
+                        source,
+                        range,
+                        ConfigDiagnosticSeverity::Warning,
+                        format!("{} is negative; it is read as {reading}", setting.key),
+                    );
+                    continue;
+                }
                 if let Some((min, max)) = semantic_numeric_bounds(setting.key)
                     && !(min..=max).contains(&number)
                     && !runtime_semantics_owns_numeric_clamp(document, setting.key, number)
@@ -5673,163 +5741,6 @@ intensity = 0.25
         }
     }
 
-    /// THE RETIRED TYPING-WAKE KEY LOADS, AND IS TOLD THE TRUTH ABOUT.
-    /// `cursor_trail_wake_ms` shipped in the starter config for a year, so real
-    /// `aterm.toml` files on disk set it. Retiring it must therefore do three
-    /// things at once and not two: the file keeps loading byte-for-byte, the
-    /// key stops being an active control anywhere, and Manual gives it the
-    /// RETIRED story rather than the "unknown to this aterm build" typo story
-    /// a bare field deletion would have produced. The last is the whole reason
-    /// the `RETIRED_CONFIG_KEYS` row exists — a user who deliberately authored
-    /// this key is not a user who misspelled one.
-    #[test]
-    fn the_retired_typing_wake_key_loads_and_is_told_the_truth() {
-        const KEY: &str = "cursor_trail_wake_ms";
-        let source = "cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n";
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        assert_eq!(
-            document.to_string(),
-            source,
-            "Manual must not destructively rewrite a retired dial"
-        );
-        let parsed = aterm_toml::from_str::<crate::app_config::Config>(source)
-            .expect("a config authored against the old dial still loads");
-        assert_eq!(
-            parsed.cursor_trail_ms,
-            Some(260),
-            "the retired key must not swallow the keys around it"
-        );
-
-        let retired = retired_config_key(KEY).expect("typing-wake retirement metadata");
-        assert_eq!(retired.feature, "Rainbow kitty typing wake");
-        assert_eq!(retired.effect_label, "No effect");
-        assert!(is_compatibility_only_key(KEY));
-        assert!(
-            config_schema_entry(KEY).is_none(),
-            "a retired key is not an active Manual schema entry"
-        );
-        assert!(
-            crate::prefs::editable_fields(&crate::app_config::Config::default())
-                .iter()
-                .all(|field| field.key != KEY),
-            "a retired key must stay out of Settings and Advanced"
-        );
-
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-        let matching = analysis
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.message.contains(KEY))
-            .collect::<Vec<_>>();
-        assert_eq!(matching.len(), 1, "{:?}", analysis.diagnostics);
-        assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
-        assert!(
-            matching[0]
-                .message
-                .contains("Rainbow kitty typing wake was removed")
-        );
-        assert!(matching[0].message.contains("has no effect"));
-        assert!(matching[0].message.contains("will be preserved"));
-        assert!(
-            !matching[0].message.contains("unknown"),
-            "a deliberately authored key must never be answered as a typo: {}",
-            matching[0].message
-        );
-
-        // Never offered back: not as a completion, and not as the answer to a
-        // near-miss typo of its own spelling.
-        let key_source = "cursor_trail_wa";
-        let key_assist = assist(key_source, key_source.len());
-        assert!(
-            key_assist
-                .completions
-                .iter()
-                .all(|completion| !completion.insertion.contains(KEY)),
-            "a retired key is never completed: {key_assist:?}"
-        );
-        assert!(
-            !suggestable_config_paths().contains(&KEY),
-            "\"did you mean cursor_trail_wake_ms?\" would answer a typo with a dead key"
-        );
-    }
-
-    #[test]
-    fn retired_bottom_hud_keys_are_preserved_but_never_presented_as_active_settings() {
-        let keys = ["show_hud", "show_resources_hud", "show_engine_hud"];
-        let source = "show_hud = true\nshow_resources_hud = false\nshow_engine_hud = true\n";
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        assert_eq!(
-            document.to_string(),
-            source,
-            "Manual must not destructively rewrite retired configuration"
-        );
-        assert!(
-            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
-            "retired compatibility keys remain loadable while their values are inert"
-        );
-
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-        assert_eq!(
-            analysis.diagnostics.len(),
-            keys.len(),
-            "each authored retired key gets one precise warning"
-        );
-        let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
-        for key in keys {
-            assert!(is_compatibility_only_key(key));
-            let retired = retired_config_key(key).expect("retired HUD metadata");
-            assert_eq!(retired.key, key);
-            assert_eq!(retired.feature, "Bottom HUD");
-            assert_eq!(retired.effect_label, "No effect");
-            assert!(
-                config_schema_entry(key).is_none(),
-                "retired HUD keys are not active Manual schema entries"
-            );
-            assert!(
-                active_fields.iter().all(|field| field.key != key),
-                "retired HUD keys must stay out of Settings and Advanced"
-            );
-
-            let matching = analysis
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.message.contains(key))
-                .collect::<Vec<_>>();
-            assert_eq!(matching.len(), 1, "{key}: {:?}", analysis.diagnostics);
-            assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
-            assert!(matching[0].message.contains("Bottom HUD was removed"));
-            assert!(matching[0].message.contains("has no effect"));
-            assert!(matching[0].message.contains("will be preserved"));
-            assert!(!matching[0].message.contains("unknown"));
-            assert!(!matching[0].message.contains("forward compatibility"));
-
-            let value_source = format!("{key} = ");
-            let value = assist(&value_source, value_source.len());
-            assert!(
-                value.completions.is_empty(),
-                "retired values have no active runtime choices: {value:?}"
-            );
-            assert!(
-                value.help.as_deref().is_some_and(|help| {
-                    help.contains("Bottom HUD was removed") && help.contains("has no effect")
-                }),
-                "retired value help must tell the same precise story: {value:?}"
-            );
-        }
-
-        let key_source = "show_";
-        let key_assist = assist(key_source, key_source.len());
-        assert!(
-            key_assist.completions.iter().all(|completion| {
-                keys.iter()
-                    .all(|key| !completion.insertion.starts_with(key))
-            }),
-            "retired Bottom HUD keys must never be suggested: {key_assist:?}"
-        );
-    }
-
     /// The field list the config READER declares for the table at `path`: `T`'s
     /// own `Deserialize` is driven down `path` one key at a time, and the list
     /// serde's derive hands `deserialize_struct` at the end of it is recorded.
@@ -6080,89 +5991,6 @@ intensity = 0.25
         );
     }
 
-    /// A KEY FROM A DELETED FEATURE IS NOT A KEY FROM THE FUTURE. `show_scene_hud`
-    /// and its three siblings left with the Scenes / "Living Panels" band in
-    /// `6995b25ac`, but they were never registered as retired, so the unknown-key
-    /// walk fell through to the forward-compatibility sentence: the owner's own
-    /// `aterm.toml` was told the key "is unknown to this aterm build; it will be
-    /// preserved for forward compatibility". Both halves mislead — it is known, and
-    /// it is preserved for the PAST — and the reading has no recovery in it: it
-    /// invites the author to wait for a band that is never coming back. The sibling
-    /// `show_hud` has always said "was removed"; these four now say it too.
-    #[test]
-    fn retired_scene_keys_say_the_feature_was_removed_not_that_the_key_is_from_the_future() {
-        let source = concat!(
-            "show_scene_hud = true\n",
-            "scene_rows = 12\n",
-            "scene_skin = \"#AABBCC\"\n",
-            "scene_panels = [\"meadow\", \"cosmos\"]\n",
-        );
-        let document = source.parse::<aterm_toml::edit::DocumentMut>().unwrap();
-        assert_eq!(
-            document.to_string(),
-            source,
-            "Manual must not destructively rewrite retired configuration"
-        );
-        assert!(
-            aterm_toml::from_str::<crate::app_config::Config>(source).is_ok(),
-            "retired compatibility keys remain loadable while their values are inert"
-        );
-
-        let analysis = analyze(source);
-        assert!(!analysis.has_errors(), "{:?}", analysis.diagnostics);
-        let keys = ["show_scene_hud", "scene_rows", "scene_skin", "scene_panels"];
-        assert_eq!(
-            analysis.diagnostics.len(),
-            keys.len(),
-            "each authored retired key gets one precise warning: {:?}",
-            analysis.diagnostics
-        );
-        let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
-        for key in keys {
-            assert!(is_compatibility_only_key(key));
-            let retired = retired_config_key(key).expect("retired Scene HUD metadata");
-            assert_eq!(retired.feature, "Scene HUD");
-            assert_eq!(retired.effect_label, "No effect");
-            assert!(
-                config_schema_entry(key).is_none(),
-                "retired Scene keys are not active Manual schema entries"
-            );
-            assert!(
-                active_fields.iter().all(|field| field.key != key),
-                "retired Scene keys must stay out of Settings and Advanced"
-            );
-
-            let matching = analysis
-                .diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.message.contains(key))
-                .collect::<Vec<_>>();
-            assert_eq!(matching.len(), 1, "{key}: {:?}", analysis.diagnostics);
-            assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
-            assert_eq!(
-                matching[0].message,
-                format!(
-                    "Scene HUD was removed; {key} has no effect (the authored value will be preserved)"
-                ),
-            );
-            // THE TWO SENTENCES THIS BUG PUT ON SCREEN, named so they cannot come back.
-            assert!(!matching[0].message.contains("unknown"));
-            assert!(!matching[0].message.contains("forward compatibility"));
-        }
-
-        // A key that does nothing is never the answer to someone else's typo, and
-        // never an offer in its own right.
-        let key_source = "scene_";
-        let key_assist = assist(key_source, key_source.len());
-        assert!(
-            key_assist.completions.iter().all(|completion| {
-                keys.iter()
-                    .all(|key| !completion.insertion.starts_with(key))
-            }),
-            "retired Scene keys must never be suggested: {key_assist:?}"
-        );
-    }
-
     /// THE FAMILY INVARIANT, stated once over the whole registry rather than three
     /// times over three families. Every retired key is a key from the PAST, so the one
     /// sentence it must never be given is the one reserved for a key from the FUTURE:
@@ -6171,6 +5999,11 @@ intensity = 0.25
     /// three families that were each missed in turn — the Scene band, the floating
     /// progress card, the bottom HUD — all failed in exactly this way, so the check
     /// belongs to the list and not to any one of them.
+    ///
+    /// Then each family that real `aterm.toml` files still carry, as authored: it
+    /// loads byte-for-byte, every key warns once with its own feature's removal story,
+    /// stays out of the Manual schema, Settings and Advanced, and is never offered
+    /// back — a user who deliberately authored a key is not a user who misspelled one.
     #[test]
     fn every_retired_top_level_key_says_it_was_removed_and_never_that_it_is_from_the_future() {
         let top_level: Vec<&str> = RETIRED_CONFIG_KEYS
@@ -6204,6 +6037,140 @@ intensity = 0.25
             assert!(
                 !message.contains("forward compatibility"),
                 "{key}: {message}"
+            );
+        }
+
+        struct Family {
+            feature: &'static str,
+            keys: &'static [&'static str],
+            source: &'static str,
+            completion_prefix: &'static str,
+        }
+        let families = [
+            // `cursor_trail_wake_ms` shipped in the starter config for a year, so
+            // real files set it; the retirement deleted the field, not the tolerance.
+            Family {
+                feature: "Rainbow kitty typing wake",
+                keys: &["cursor_trail_wake_ms"],
+                source: "cursor_trail_wake_ms = 900\ncursor_trail_ms = 260\n",
+                completion_prefix: "cursor_trail_wa",
+            },
+            Family {
+                feature: "Bottom HUD",
+                keys: &["show_hud", "show_resources_hud", "show_engine_hud"],
+                source: "show_hud = true\nshow_resources_hud = false\nshow_engine_hud = true\n",
+                completion_prefix: "show_",
+            },
+            // `show_scene_hud` and its three siblings left with the Scenes / "Living
+            // Panels" band in `6995b25ac` but were never registered as retired, so the
+            // owner's own file was told they were from the future.
+            Family {
+                feature: "Scene HUD",
+                keys: &["show_scene_hud", "scene_rows", "scene_skin", "scene_panels"],
+                source: concat!(
+                    "show_scene_hud = true\n",
+                    "scene_rows = 12\n",
+                    "scene_skin = \"#AABBCC\"\n",
+                    "scene_panels = [\"meadow\", \"cosmos\"]\n",
+                ),
+                completion_prefix: "scene_",
+            },
+        ];
+        let active_fields = crate::prefs::editable_fields(&crate::app_config::Config::default());
+        for family in &families {
+            let feature = family.feature;
+            let document = family
+                .source
+                .parse::<aterm_toml::edit::DocumentMut>()
+                .unwrap();
+            assert_eq!(
+                document.to_string(),
+                family.source,
+                "{feature}: Manual must not destructively rewrite retired configuration"
+            );
+            let loaded = aterm_toml::from_str::<crate::app_config::Config>(family.source);
+            assert!(
+                loaded.is_ok(),
+                "{feature}: retired compatibility keys remain loadable while their values \
+                 are inert: {:?}",
+                loaded.err()
+            );
+            let analysis = analyze(family.source);
+            assert!(
+                !analysis.has_errors(),
+                "{feature}: {:?}",
+                analysis.diagnostics
+            );
+            assert_eq!(
+                analysis.diagnostics.len(),
+                family.keys.len(),
+                "{feature}: each authored retired key gets one precise warning: {:?}",
+                analysis.diagnostics
+            );
+            for &key in family.keys {
+                assert!(is_compatibility_only_key(key), "{key}");
+                let retired = retired_config_key(key).expect("retired metadata");
+                assert_eq!(retired.key, key);
+                assert_eq!(retired.feature, feature, "{key}");
+                assert_eq!(retired.effect_label, "No effect", "{key}");
+                assert!(
+                    config_schema_entry(key).is_none(),
+                    "{key}: a retired key is not an active Manual schema entry"
+                );
+                assert!(
+                    active_fields.iter().all(|field| field.key != key),
+                    "{key}: a retired key must stay out of Settings and Advanced"
+                );
+                assert!(
+                    !suggestable_config_paths().contains(&key),
+                    "\"did you mean {key}?\" would answer a typo with a dead key"
+                );
+                let matching = analysis
+                    .diagnostics
+                    .iter()
+                    .filter(|diagnostic| diagnostic.message.contains(key))
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 1, "{key}: {:?}", analysis.diagnostics);
+                assert_eq!(matching[0].severity, ConfigDiagnosticSeverity::Warning);
+                assert_eq!(
+                    matching[0].message,
+                    format!(
+                        "{feature} was removed; {key} has no effect (the authored value will be preserved)"
+                    ),
+                );
+            }
+            let key_assist = assist(family.completion_prefix, family.completion_prefix.len());
+            assert!(
+                key_assist.completions.iter().all(|completion| {
+                    family
+                        .keys
+                        .iter()
+                        .all(|key| !completion.insertion.starts_with(key))
+                }),
+                "{feature}: a retired key is never completed: {key_assist:?}"
+            );
+        }
+
+        // The typing wake's neighbour: the retired key must not swallow the keys
+        // around it.
+        let parsed = aterm_toml::from_str::<crate::app_config::Config>(families[0].source)
+            .expect("a config authored against the old dial still loads");
+        assert_eq!(parsed.cursor_trail_ms, Some(260));
+
+        // The Bottom HUD's values: no active runtime choices, and the help tells the
+        // same precise story.
+        for key in families[1].keys {
+            let value_source = format!("{key} = ");
+            let value = assist(&value_source, value_source.len());
+            assert!(
+                value.completions.is_empty(),
+                "retired values have no active runtime choices: {value:?}"
+            );
+            assert!(
+                value.help.as_deref().is_some_and(|help| {
+                    help.contains("Bottom HUD was removed") && help.contains("has no effect")
+                }),
+                "retired value help must tell the same precise story: {value:?}"
             );
         }
     }
@@ -8661,7 +8628,7 @@ sty"#;
         source: &str,
         mut inspect: impl FnMut(&EditorViewportProjection),
     ) {
-        let mut store = crate::document_store::DocumentStore::new();
+        let mut store = crate::document_store::DocumentStore::for_test();
         let document = store.open("mem://config-projection".to_string(), source.to_string());
         let mut workspace = crate::native_editor::EditorWorkspace::new();
         let mut view = workspace
@@ -9237,6 +9204,58 @@ sty"#;
         let typo = key_warnings("[harness]\ncontine = true\n");
         assert!(
             typo.ignored.iter().any(|l| l.contains("contine")),
+            "{:?}",
+            typo.ignored
+        );
+    }
+
+    /// The `[disk]` keys (`aterm_agent::harness::disk::KEYS`) are the config
+    /// language's. The window's harness host READS `auto_free_gib` — `0` is
+    /// the documented off switch of its automatic removal of stale build
+    /// directories — and this checker called it "unknown to this aterm build",
+    /// with an Open aterm.toml action: a person told the line does nothing
+    /// deletes it, and the removal is back on. Each key is served with its
+    /// default; a negative is warned with the reader's own reading.
+    #[test]
+    fn every_disk_key_is_known_to_the_config_language() {
+        for key in aterm_agent::harness::disk::KEYS {
+            let dotted = format!("disk.{key}");
+            let entry = config_schema()
+                .iter()
+                .find(|e| e.key == dotted)
+                .unwrap_or_else(|| panic!("{dotted} is not in the config language"));
+            assert!(
+                setting_help(entry).contains(" \u{b7} default "),
+                "{dotted}: {}",
+                setting_help(entry)
+            );
+        }
+        let off = key_warnings("[disk]\nauto_free_gib = 0\n");
+        assert!(off.ignored.is_empty(), "{:?}", off.ignored);
+        let all = "[disk]\napply = false\nwarn_free_gib = 40\ntarget_stale_days = 14\n\
+                   auto_free_gib = 10\n";
+        assert!(
+            analyze(all).diagnostics.is_empty(),
+            "{:?}",
+            analyze(all).diagnostics
+        );
+        let help = setting_help(config_schema_entry("disk.auto_free_gib").unwrap());
+        assert!(help.contains("default 10 (0: off)"), "{help}");
+        // A negative floor is OFF, and the line says so (the reader's words).
+        let negative = analyze("[disk]\nauto_free_gib = -1\n");
+        assert!(
+            negative
+                .diagnostics
+                .iter()
+                .any(|d| d.message.contains("disk.auto_free_gib is negative")
+                    && d.message.contains("off")),
+            "{:?}",
+            negative.diagnostics
+        );
+        // NEGATIVE CONTROL: a typo inside the table is still reported by name.
+        let typo = key_warnings("[disk]\nauto_free_gb = 0\n");
+        assert!(
+            typo.ignored.iter().any(|l| l.contains("auto_free_gb")),
             "{:?}",
             typo.ignored
         );

@@ -20,7 +20,7 @@
 //! `Terminal::process`/`cell_frame_into`/`take_damage`, `tick_cursor_fx`,
 //! `redraw_compose`, `App::input`, the `WindowState` engine fields — plus
 //! read-only probes of state the guards in the bench assert on. It contains NO
-//! logic of its own beyond the single-pane LOCK-A extraction shape
+//! logic of its own beyond the single-pane frame-hold extraction shape
 //! ([`BenchApp::present_frame`]), which mirrors `redraw_window`'s single-pane
 //! path because that path is inline in a function that BAILS headless (the
 //! present-target match requires an OS window), so a headless bench must model
@@ -460,7 +460,7 @@ impl BenchApp {
     }
 
     /// The session the active tab's layout tree has FOCUSED — the pane whose
-    /// extraction the compose path runs at LOCK A.
+    /// extraction the compose path runs under its frame hold.
     #[must_use]
     pub(crate) fn focus_session(&self) -> u64 {
         let ws = self.ws();
@@ -531,9 +531,11 @@ impl BenchApp {
     /// mapped `redraw_window`'s single-pane path (which bails headless at its
     /// present-target match, so it cannot be called directly):
     ///
-    ///   1. LOCK A: one coherent cursor snapshot + `cell_frame_into` +
+    ///   1. THE FRAME HOLD: one coherent cursor snapshot + `cell_frame_into` +
     ///      `take_damage` under the session lock (the compare-and-consume
-    ///      damage contract).
+    ///      damage contract). The FULL refill: the shipping hold's
+    ///      `cell_frame_damage_scoped_into` re-resolves only the damaged rows
+    ///      when its continuity proof holds, so this prices its upper bound.
     ///   2. EFFECTS: `tick_cursor_fx` — the extracted-verbatim shared driver.
     ///   3. RASTER: `Renderer::render_input_cached` over the refilled scratch
     ///      through the window's PERSISTENT `WindowCpu` damage cache on the
@@ -563,7 +565,7 @@ impl BenchApp {
             .clone();
         let (cur, cursor_visible, cursor_style);
         {
-            // LOCK A: snapshot + extract + consume under ONE lock, so the
+            // THE FRAME HOLD: snapshot + extract + consume under ONE lock, so the
             // cursor and the grid are one coherent observation — the same
             // etiquette the shipping path documents.
             let ws = self
@@ -643,8 +645,8 @@ impl BenchApp {
 
     /// THE TAB-STRIP FRAME (D-2 SPLICE / DMG-1 reach), modelled at exactly the
     /// three seams the strip-lane fix touches and in the shipping order —
-    /// `redraw_window`'s resident-scratch reclaim (hoisted ahead of LOCK A), the
-    /// damage-scoped re-extract under LOCK B, and `splice_tab_strip_with` — then
+    /// `redraw_window`'s resident-scratch reclaim (hoisted ahead of the frame
+    /// hold), the damage-scoped re-extract under that hold, and `splice_tab_strip_with` — then
     /// the same REAL CPU raster through the window's persistent damage cache that
     /// [`Self::present_frame`] uses.
     ///
@@ -796,8 +798,7 @@ impl BenchApp {
     /// number can contextualize but not resolve.
     pub fn pet_ink_feed(&mut self) {
         let ws = self.ws_mut();
-        let (spans, live) = ws.word_decos.pet_ink();
-        ws.cursor_pet.sense_ink(0, spans, live);
+        ws.companion.feed_ink(&mut ws.word_decos, None);
     }
 
     /// A glyph out of the window's render scratch (the extracted frame), for
@@ -1370,10 +1371,7 @@ pub enum ScreenFill {
 /// A `rows`x`cols` terminal with EVERY cell painted through the real parser, so
 /// a frame read sees a full screen rather than the implicit-blank fast path.
 ///
-/// Fixture data, not product logic — it lives here rather than in the bench
-/// because the allocation-count gate (`tests/styled_frame_alloc.rs`) has to
-/// price the SAME screen the bench times, and a second copy of the painter is
-/// how two targets come to measure two different things.
+/// Fixture data for `benches/styled_frame.rs`, not product logic.
 #[must_use]
 pub fn painted_screen(rows: u16, cols: u16, fill: ScreenFill) -> aterm_core::terminal::Terminal {
     let mut t = aterm_core::terminal::Terminal::new(rows, cols);

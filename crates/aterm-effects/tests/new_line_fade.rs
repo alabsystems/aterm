@@ -22,7 +22,7 @@
 //!
 //! Every law below runs at the HOST seam — a real `aterm_core::terminal::
 //! Terminal` driven byte for byte, its rows sampled exactly as `app_render.rs`'s
-//! LOCK A samples them, ticked through `CursorGlow::tick` — and reads the row's
+//! frame hold samples them, ticked through `CursorGlow::tick` — and reads the row's
 //! COVERAGE CENSUS frame by frame: the share of the row's pixel band the bed's
 //! quads cover, weighted by their opacity, the same number the on-glass
 //! measurement takes from `image` captures
@@ -118,7 +118,7 @@ impl Host {
         h
     }
 
-    /// EXACTLY LOCK A, then the tick: sample the cursor, the repaint blink,
+    /// EXACTLY the frame hold, then the tick: sample the cursor, the repaint blink,
     /// the caret row's probe, and the rows the resident ribbon occupies —
     /// all from the terminal AFTER the last `process` — then advance the
     /// engine one frame.

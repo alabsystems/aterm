@@ -84,8 +84,9 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         // The window's host: a restart the policy asks for can be made.
         restartable: true,
         upgrading: false,
-        fresh: false,
+        taskless: false,
         person: None,
+        login_back: false,
     }
 }
 
@@ -295,6 +296,114 @@ fn a_written_budget_stops_at_six_an_hour_and_the_default_has_none() {
         decide_turn_end(&st, &point, &capped, now),
         typed(RULE_CONTINUE)
     );
+}
+
+/// N1 OF THE LIVE E2E OF 2026-09-26: the harness's OWN turns are no work of
+/// the worker's. After a stage of real work (2m34s), the upgrade's notice
+/// was answered READY in 2.8 s and, once relaunched, its carry-on in 2.7 s:
+/// read as someone else's turns, the two were a short streak of two, and the
+/// stage's continuation waited a 4-minute back-off. Each is a turn the host
+/// typed ([`TurnEndState::host_typed`]): the streak stands as the stage left
+/// it, and the point after the carry-on's reply is continued at once — the
+/// act waited for until then (a point with no busy read after the typed
+/// turn is its answer's, not the worker's). NEGATIVE CONTROL: two genuinely
+/// short turns of the worker's still back off, 4 minutes after the second.
+#[test]
+fn the_harness_own_turns_are_no_short_turns_of_the_workers() {
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    let stage = idle("Stage 1 complete.", Some(154 * Duration::from_secs(1)));
+    // The stage's end: the upgrade's (no act here), its streak none.
+    st.observe(&stage, now);
+    assert_eq!(st.short_streak(), 0);
+    // The notice, typed by the host, and its READY answer.
+    now += Duration::from_secs(21);
+    st.host_typed(now);
+    assert!(
+        !st.act_in_flight(),
+        "the host's own next step is never held on it"
+    );
+    // Its echo before the spinner: not its answer — the policy's act waits.
+    assert!(awaits(
+        &at(&mut st, &idle("Stage 1 complete.", None), now),
+        now
+    ));
+    now += Duration::from_secs(3);
+    let ready = idle(
+        "ATERM-UPGRADE-READY-c3428058",
+        Some(Duration::from_millis(2_800)),
+    );
+    st.observe(&ready, now);
+    assert_eq!(st.short_streak(), 0, "READY is no short turn");
+    // Relaunched, the carry-on typed, and its short reply: continued at once.
+    now += Duration::from_secs(84);
+    st.host_typed(now);
+    now += Duration::from_secs(3);
+    let reply = idle(
+        "Waiting for Stage 2 instructions.",
+        Some(Duration::from_millis(2_700)),
+    );
+    assert_eq!(at(&mut st, &reply, now), typed(RULE_CONTINUE));
+    assert_eq!(st.short_streak(), 0);
+    assert!(!st.act_in_flight());
+
+    // NEGATIVE CONTROL: the same two short turns, the worker's own.
+    let mut now = t0();
+    let mut st = TurnEndState::default();
+    st.observe(&stage, now);
+    now += Duration::from_secs(24);
+    st.observe(&ready, now);
+    now += Duration::from_secs(87);
+    assert!(waits_until(&at(&mut st, &reply, now), now + 4 * MIN));
+    assert_eq!(st.short_streak(), 2);
+}
+
+/// THE ANSWER TO A HARNESS TURN THAT IS REAL WORK ENDS THE STREAK (review of
+/// the N1 fix, 2026-09-26): a supervisor that attaches to an idle session
+/// starts a streak of one (the first point, its work unknown); the upgrade
+/// is due at once, and its carry-on — "continue where you left off" — starts
+/// twenty minutes of the worker's own work. That answer is real work: the
+/// next point is continued at once, never backed off 2 minutes from the
+/// answer's end as the first point was. Answered SHORT, the harness's turn
+/// leaves the worker's back-off exactly as it stood — counted from the
+/// worker's own point, never pushed later by the harness's answer.
+/// NEGATIVE CONTROL: the same short answer read as the worker's own turn
+/// lengthens the streak.
+#[test]
+fn a_harness_turn_answered_with_real_work_ends_the_streak() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    // The first point, its work unknown: a streak of one, 2 min back-off.
+    assert!(waits_until(
+        &at(&mut st, &idle("Stage 1 complete.", None), t),
+        t + 2 * MIN
+    ));
+    assert_eq!(st.short_streak(), 1);
+    // The notice, answered READY (short): the back-off stands, from the
+    // worker's point.
+    let now = t + Duration::from_secs(20);
+    st.host_typed(now);
+    let ready = idle(
+        "ATERM-UPGRADE-READY-c3428058",
+        Some(Duration::from_millis(2_800)),
+    );
+    let now = now + Duration::from_secs(3);
+    assert!(waits_until(&at(&mut st, &ready, now), t + 2 * MIN));
+    assert_eq!(st.short_streak(), 1, "READY lengthens nothing");
+    // The carry-on, answered with twenty minutes of work: continued at once.
+    let now = now + Duration::from_secs(60);
+    st.host_typed(now);
+    let now = now + 20 * MIN;
+    let worked = idle("Stage 2 complete.", Some(20 * MIN));
+    assert_eq!(at(&mut st, &worked, now), typed(RULE_CONTINUE));
+    assert_eq!(st.short_streak(), 0, "the carry-on's work ends the streak");
+
+    // NEGATIVE CONTROL: the READY answer as the worker's own short turn.
+    let mut st = TurnEndState::default();
+    st.observe(&idle("Stage 1 complete.", None), t);
+    let now = t + Duration::from_secs(23);
+    assert!(waits_until(&at(&mut st, &ready, now), now + 4 * MIN));
+    assert_eq!(st.short_streak(), 2);
 }
 
 /// "Worker reports done" is no escalation any more: each short turn in a
@@ -830,6 +939,128 @@ fn a_full_context_is_compacted_then_continued_and_compacted_again_on_the_ladder(
             ..
         }
     ));
+}
+
+/// The reading of a real Claude Code screen, `worked` the busy work since
+/// the last point.
+fn read_screen(rows: &[String], worked: Option<Duration>) -> TurnEndReading {
+    let reading = aterm_phase::read(Some("claude"), rows, Some(2));
+    TurnEndReading {
+        restartable: true,
+        ..TurnEndReading::of(&reading, rows, false, worked, None, None)
+    }
+}
+
+/// The incident's screen (`⏺ Login expired · Please run /login`, the
+/// supervisor's `continue` answered by it) with its last rows replaced by
+/// `tail`.
+fn login_screen(tail: &[&str]) -> Vec<String> {
+    let mut r = screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
+    let at = r
+        .iter()
+        .position(|row| row.starts_with("⏺ Login expired"))
+        .expect("the wall row");
+    r.splice(at..=at, tail.iter().map(|s| (*s).to_string()));
+    r
+}
+
+/// THE LOGIN WALL OF 2026-09-27, over the real screens: the incident's
+/// point — the supervisor's own `continue` answered by `⏺ Login expired ·
+/// Please run /login` — types `/login` ONCE, escalated as it is typed (the
+/// owner told at once), and main's `keep going` there is gone (it read the
+/// screen idle with no wall, and continued it nine hours). The wall again —
+/// the `/login` dialog dismissed and the wall row back, or the dialog's
+/// `Login interrupted` under it — types nothing more: no second `/login`, no
+/// continuation into a login the policy saw gone. The person's `/login`
+/// done (`⎿  Login successful`) is continued at once; the worker working
+/// ends the track, and a later lost login gets its `/login` again. A draft
+/// standing at the wall is never sent into it: the point is escalated.
+/// NEGATIVE CONTROLS: the dismissed dialog's screen with no lost login seen
+/// is an ordinary point and continued; and the text under the gutter reads
+/// the same wall.
+#[test]
+fn the_login_expired_row_types_login_once_and_holds_until_the_login_is_back() {
+    let t = t0();
+    let walled = login_screen(&["⏺ Login expired · Please run /login"]);
+    let r = read_screen(&walled, Some(3 * MIN));
+    assert_eq!(r.wall, Some(WallKind::Auth), "read as the auth wall");
+    assert_eq!(r.wall_message, "Login expired · Please run /login");
+    assert!(!r.login_back);
+    let mut st = TurnEndState::default();
+    let login = TurnEndAction::TypeCommand {
+        command: "/login".to_string(),
+        rule_id: RULE_LOGIN,
+        then: Then::Escalate("finish sign-in in the browser".to_string()),
+    };
+    assert_eq!(act(&mut st, &r, t), login);
+    assert_eq!(st.login_track(), Some(1));
+    // The wall again (a person's Esc on the dialog, a turn someone else
+    // began): nothing — the same wall's `/login` is never typed twice.
+    let again = read_screen(&walled, None);
+    for k in 1..=3 {
+        assert_eq!(act(&mut st, &again, t + k * MIN), TurnEndAction::Nothing);
+    }
+    // The dialog gone with no login: the wall's row is history, and still
+    // nothing is typed.
+    let interrupted = login_screen(&[
+        "⏺ Login expired · Please run /login",
+        "",
+        "❯ /login",
+        "  ⎿  Login interrupted",
+    ]);
+    let off = read_screen(&interrupted, None);
+    assert_eq!(off.wall, None);
+    assert!(!off.login_back);
+    assert_eq!(act(&mut st, &off, t + 5 * MIN), TurnEndAction::Nothing);
+    assert_eq!(st.login_track(), Some(1), "the track stands with no work");
+    // The login back: continued at once.
+    let back = read_screen(
+        &login_screen(&[
+            "⏺ Login expired · Please run /login",
+            "",
+            "❯ /login",
+            "  ⎿  Login successful",
+        ]),
+        None,
+    );
+    assert!(back.login_back);
+    assert_eq!(act(&mut st, &back, t + 6 * MIN), typed(RULE_CONTINUE));
+    // The worker works: the track ends, and a later lost login is told of
+    // and typed `/login` again.
+    let worked = idle("Back at it: the suites are running.", Some(3 * MIN));
+    st.observe(&worked, t + 10 * MIN);
+    assert_eq!(st.login_track(), None);
+    assert_eq!(act(&mut st, &r, t + 60 * MIN), login);
+
+    // A draft at the wall: escalated, never submitted into it.
+    let mut st = TurnEndState::default();
+    let drafted = TurnEndReading {
+        composer: Composer::Typed,
+        ..r.clone()
+    };
+    st.observe(&drafted, t);
+    let a = decide_turn_end(&st, &drafted, &cfg(), t);
+    assert!(is_escalate(&a, "a draft stands in the composer"), "{a:?}");
+
+    // NEGATIVE CONTROLS: the same dismissed-dialog screen where no lost
+    // login was seen is an ordinary point — continued — so it is the track
+    // that holds it above; and the wall's words under the gutter are the
+    // same wall.
+    let mut fresh = TurnEndState::default();
+    assert_eq!(
+        act(
+            &mut fresh,
+            &read_screen(&interrupted, Some(3 * MIN)),
+            t + 5 * MIN
+        ),
+        typed(RULE_CONTINUE)
+    );
+    let gutter = read_screen(
+        &login_screen(&["⏺ Pushing.", "  ⎿  Login expired · Please run /login"]),
+        Some(3 * MIN),
+    );
+    assert_eq!(gutter.wall, Some(WallKind::Auth));
+    assert_eq!(act(&mut TurnEndState::default(), &gutter, t), login);
 }
 
 #[test]
@@ -1772,7 +2003,7 @@ fn a_fresh_session_is_no_turn_end_and_starts_no_streak() {
     let mut st = TurnEndState::default();
     let fresh = TurnEndReading {
         said_tail: None,
-        fresh: true,
+        taskless: true,
         ..idle("", None)
     };
     assert_eq!(at(&mut st, &fresh, now), TurnEndAction::Nothing);
@@ -1797,6 +2028,65 @@ fn a_fresh_session_is_no_turn_end_and_starts_no_streak() {
     let a = at(&mut st, &idle("Stage 1 landed.", None), now);
     assert!(matches!(a, TurnEndAction::WaitUntil { .. }), "{a:?}");
     assert_eq!(st.short_streak(), 1);
+}
+
+/// D1 OF THE LIVE E2E OF 2026-09-26: a session whose only turns are the
+/// HARNESS'S OWN — its upgrade notice, its carry-on, each answered by the
+/// agent, so the screen shows messages and work — has no task, and gets NO
+/// ACT of any kind at its turn ends: not `keep going` after a report (the
+/// E2E's B 1a5299ab got one after the notice, READY, restart and carry-on,
+/// and its agent asked what it should help with), not `answer_text` after a
+/// question or a stop, not a wall's retry, not a draft's submit — however
+/// long it sits. NEGATIVE CONTROL: the same points
+/// once a person or an orchestrator has asked it something (`taskless`
+/// false) get the ordinary policy — continued, answered, retried, submitted.
+#[test]
+fn a_session_only_the_harness_has_typed_into_gets_no_act() {
+    let now = t0();
+    let worked = Some(Duration::from_secs(4 * 60));
+    let points = [
+        (
+            "a report",
+            idle("Upgrade complete, ready to continue.", worked),
+        ),
+        (
+            "a question",
+            idle("What would you like me to help you with?", worked),
+        ),
+        (
+            "a choice",
+            idle("Should I rewrite the parser or patch the lexer?", worked),
+        ),
+        (
+            "a wall",
+            walled(WallKind::Overloaded, "API Error: 529 Overloaded.", worked),
+        ),
+        (
+            "a draft",
+            TurnEndReading {
+                composer: Composer::Typed,
+                ..idle("Done.", worked)
+            },
+        ),
+    ];
+    for (what, point) in &points {
+        let taskless = TurnEndReading {
+            taskless: true,
+            ..point.clone()
+        };
+        let mut st = TurnEndState::default();
+        for later in [0, 10, 120] {
+            let a = at(&mut st, &taskless, now + later * MIN);
+            assert_eq!(a, TurnEndAction::Nothing, "{what} at +{later} min");
+        }
+        // NEGATIVE CONTROL: asked something, the same point is acted on
+        // (at once, or once its wait is over).
+        let mut st = TurnEndState::default();
+        let acted = [0, 2, 10, 120]
+            .iter()
+            .any(|later| at(&mut st, point, now + *later * MIN).rule_id().is_some());
+        assert!(acted, "{what}: the ordinary policy acts on it");
+    }
 }
 
 /// A CHOICE ASKED IN PROSE is ANSWERED (owner directive of 2026-09-25: "the

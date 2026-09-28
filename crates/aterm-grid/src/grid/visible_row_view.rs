@@ -186,6 +186,28 @@ impl<'a> VisibleRowView<'a> {
             && self.cell(col - 1).is_some_and(|c| c.is_wide())
     }
 
+    /// The PER-COLUMN char at `col` — the one projection
+    /// [`Grid::row_cols_into`] builds a whole row from, for a caller that
+    /// needs a single column without the row: the resolved LEAD char at its
+    /// own column (a complex cell contributes its base codepoint), `'\0'` at
+    /// a wide continuation, `' '` for a blank or a column past the row.
+    #[must_use]
+    #[inline]
+    pub fn col_char(&self, col: u16) -> char {
+        match self.cell(col) {
+            None => ' ',
+            Some(_) if self.is_wide_continuation(col) => '\0',
+            Some(cell) if cell.is_complex() => self
+                .cell_data(col, cell)
+                .complex_base()
+                .unwrap_or('\u{FFFD}'),
+            Some(cell) => {
+                let c = cell.char();
+                if c == '\0' { ' ' } else { c }
+            }
+        }
+    }
+
     /// The coordinated extras view for `col`. `cell` is passed so the live probe
     /// can flag-gate (and the history arm can assert its invariants).
     #[must_use]

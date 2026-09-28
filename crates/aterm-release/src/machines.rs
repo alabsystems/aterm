@@ -20,8 +20,9 @@
 //! ratchets from every generation it has ever observed. Only the first is knowable from a
 //! local file. The floor is channel state, so it belongs to — and is enforced by —
 //! `publish::roster_floor_covered`, which reads it out of the published head's own
-//! manifest, pre-claim and again under the release lease at lock, selfcheck, preflip and
-//! flip. The two together are the client's chain; either alone is weaker than the fleet.
+//! manifest, pre-claim and again under the release lease at lock, selfcheck and both
+//! ratchets of `publish`. The two together are the client's chain; either alone is
+//! weaker than the fleet.
 //!
 //! # Why the identity file holds no secret
 //!
@@ -53,8 +54,9 @@
 //! * [`verify_published_roster`] runs from `publish::recover_published_cut`, in the
 //!   opposite direction: it proves a roster DOWNLOADED from an already-published release
 //!   is the one that release's signed manifest names, so recovery can reconstruct
-//!   `dist/` completely enough for the mirror to serve the public channel the same bytes
-//!   `verify` proved live.
+//!   `dist/` completely enough for `publish` to converge on the bytes the channel already
+//!   serves — and from `publish::step_publish`, where it proves the pair `dist/` is about
+//!   to upload is one the signed appcast names.
 //!
 //! # The tier is ARMED in this tree (2026-08-15)
 //!
@@ -242,8 +244,9 @@ pub const MIN_REMAINING_WINDOW_SECS: i64 = 6 * 60 * 60;
 /// — it is a statement that this function does not own that question, exactly as
 /// `ledger::next_build` does not own the channel's `min_build` floor. The owner is
 /// [`crate::publish::roster_floor_covered`], which reads the floor out of the published
-/// channel head and is called pre-claim and again under the lease at lock, selfcheck,
-/// preflip and flip — the same four places `channel_floor_covered` guards `min_build`.
+/// channel head and is called pre-claim and again under the lease at lock, selfcheck and
+/// both ratchets of `publish` — the same places `channel_floor_covered` guards
+/// `min_build`.
 /// A producer-side gate that read a floor of 0 and claimed to be the whole client chain
 /// would be the more dangerous arrangement, because the claim would be false.
 ///
@@ -445,9 +448,10 @@ pub fn roster_pubkey_for(
 /// Prove that a roster downloaded from an ALREADY PUBLISHED release is the document that
 /// release's manifest is attributed under.
 ///
-/// Recovery reconstructs `dist/` from remotely validated bytes so the mirror can serve the
-/// public channel exactly what `verify` proved live on the private repo. The two roster
-/// assets are part of that set on the armed path, and they are the one part with no
+/// Recovery reconstructs `dist/` from remotely validated bytes so `publish` converges on
+/// exactly what the channel already serves, and `publish` itself proves the pair it is
+/// about to upload. The two roster assets are part of that set on the armed path, and
+/// they are the one part with no
 /// SHA-256 in the manifest to check them against — the manifest's signature does not cover
 /// them, the MASTER's does. So they are bound cryptographically instead, which is
 /// strictly stronger than a digest: the master signature proves authorship, and the two
@@ -459,8 +463,8 @@ pub fn roster_pubkey_for(
 /// admitted by [`authorize_cut`] when the cut was made, and no local verdict can change
 /// them now. Re-judging them would make recovery — the path taken when something has
 /// ALREADY gone wrong — fail for a condition it cannot fix, and the only alternative
-/// available to it would be to mirror DIFFERENT bytes, which is the one thing the mirror
-/// step exists to prevent. The client will judge freshness and revocation for itself, as
+/// available to it would be to publish DIFFERENT bytes, which is the one thing a recovery
+/// exists to prevent. The client will judge freshness and revocation for itself, as
 /// it always does, against exactly these bytes.
 pub fn verify_published_roster(
     master_pubkeys: &[&str],
@@ -691,7 +695,7 @@ mod tests {
         let (bytes, sig, master) = roster(&[]);
         verify_published_roster(&[&master], bytes.clone(), &sig, "m3", Some(6))
             .expect("the roster this manifest names");
-        // A LAPSED roster still recovers: the bytes already shipped, and mirroring
+        // A LAPSED roster still recovers: the bytes already shipped, and publishing
         // different ones is the failure this whole step exists to prevent.
         let lapsed = Roster::parse(&verify_roster(&[&master], bytes.clone(), &sig).unwrap())
             .unwrap()

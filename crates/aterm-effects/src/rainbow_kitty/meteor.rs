@@ -4868,8 +4868,8 @@ fn segments_cross(a0: (f32, f32), a1: (f32, f32), b0: (f32, f32), b1: (f32, f32)
     (d1 * d2 < 0.0) && (d3 * d4 < 0.0)
 }
 
-/// `lowbias32` — the crate's own integer mixer (`cursor_glow.rs`'s spawn
-/// hashes and `stardust.rs`'s deals use this exact pair of constants; the
+/// `lowbias32` — the crate's own integer mixer (`cursor_glow/emit.rs`'s
+/// water-bead deal and `stardust.rs`'s deals use this exact pair of constants; the
 /// sky's copy is private to its module, so this is the meteor's spelling of
 /// the same function, not a second hash). Deterministic, cheap, and with no
 /// per-frame RNG anywhere near it (§18). This file hashes only what the

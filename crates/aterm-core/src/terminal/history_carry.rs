@@ -56,8 +56,12 @@ impl Terminal {
 
     /// Reserve absolute-row keys below the oldest history line for `lines`
     /// that will be imported later ([`Grid::reserve_older_history_keys`]).
-    /// Only right after [`Self::restore_checkpoint`], before anything has read
-    /// an absolute row — the adopt path, ahead of the session's reader.
+    /// Only right after [`Self::restore_checkpoint`], before anything but the
+    /// restore has read an absolute row — the adopt path, ahead of the
+    /// session's reader. The restore continues the source's numbering, so the
+    /// imported lines' own keys are already free below the oldest row and the
+    /// reserve moves nothing: the shell marks the restore installed keep
+    /// naming their lines.
     /// Returns the claim the import presents ([`OlderHistoryClaim`]).
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {

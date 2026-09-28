@@ -116,10 +116,6 @@ const INTERNAL_PROTOCOL: &[&str] = &[
     "ATERM_MUX_BASE",
     "ATERM_MUX_NOTICE",
     "ATERM_MUX_OUTER_SESSION_ID",
-    // The verify gate holding this machine's lock → every child it runs, so a gate a
-    // stage starts runs inside that hold instead of queueing on its own ancestor
-    // (`snapshot::MACHINE_HOLDER_ENV`; nothing but the holding gate sets it).
-    "ATERM_VERIFY_MACHINE_HOLDER",
 ];
 
 /// Compile-time values (`env!` / `option_env!`) the build derives or the cutter sets.
@@ -167,9 +163,10 @@ const DEV_SEAMS: &[&str] = &[
     // The Paste gesture's file-fed clipboard (lib.rs `debug_paste_text`), for live
     // checks of a large paste without touching the owner's clipboard.
     "ATERM_DEBUG_PASTE_FILE",
+    // Every clipboard read and write goes to this file (clipboard.rs `route`), not the OS.
+    "ATERM_DEBUG_CLIPBOARD_FILE",
     "ATERM_HANDOFF_READY_TIMEOUT_MS",
     "ATERM_HANDOFF_PROOF_TIMEOUT_MS",
-    "ATERM_SESSION_MODEL",
     // The fabric push lane's step hold (subscribe.rs `push_held`): the bridge race
     // test in aterm-link parks the lane between adoption and drain to force the
     // interleaving deterministically.
@@ -305,6 +302,10 @@ const RETIRED: &[&str] = &[
     "ATERM_VERIFY_TIMINGS",
     "ATERM_SKIP_GUI_SMOKE",
     "ATERM_VERIFY_MACHINE_LOCK_DIR",
+    // 2026-09-25: the session's VT-model seam, deleted with the model it armed — the one
+    // consumer on the books (`apply_policy_engine` on the CLI engine,
+    // docs/HARDCORE_BACKLOG.md §4 P0) could never read it.
+    "ATERM_SESSION_MODEL",
 ];
 
 fn workspace_root() -> PathBuf {

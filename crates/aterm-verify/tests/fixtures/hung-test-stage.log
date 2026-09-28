@@ -3,8 +3,7 @@
 # screen. It is NOT a verbatim excerpt: an excerpt of that log cannot be, because a child
 # section's `running 1 test` and its `test result:` line sit thousands of lines apart and
 # four of them are open at once. What each block below reproduces is named in
-# libtest.rs's `the_real_logs_shapes_name_exactly_the_hung_test`; the whole 6,023-line
-# section is checked by the opt-in test beside it (ATERM_VERIFY_HUNG_LOG).
+# libtest.rs's `the_real_logs_shapes_name_exactly_the_hung_test`.
 #
 # Lines beginning with `#` are this note; libtest writes none, and the parser ignores
 # them because they carry no shape it reads.

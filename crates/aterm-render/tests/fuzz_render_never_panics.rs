@@ -101,6 +101,7 @@ fn render_adversarial_engine_states_never_panics() {
         "█▀▄▌▐░▒▓".as_bytes(),                  // blocks/shades
         "⠀⡀⣿⠿".as_bytes(),                      // braille
         "\u{1fb00}\u{1fb1e}\u{1fb3b}".as_bytes(), // sextants
+        "\u{1cd00}\u{1cd73}\u{1cde5}".as_bytes(), // octants
         "\u{e0b0}\u{e0b1}\u{e0b2}\u{e0bc}".as_bytes(), // Powerline
         // W8 (g)/(h): symbol-tier glyphs whose raster overruns their cell and
         // is CONDENSED + column-clamped — the new slicing/re-pack arithmetic.

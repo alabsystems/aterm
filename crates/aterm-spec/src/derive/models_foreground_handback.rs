@@ -252,3 +252,108 @@ pub fn foreground_handback_model() -> Model {
         }
     }
 }
+
+/// Who owns an INPUT mode the handback may have to hand back — the parse
+/// stage's `FgOwners` (`aterm-gui/src/foreground_handback.rs`) — across
+/// several jobs under one shell, when the reader can MISS a job.
+///
+/// 2026-09-27, the handback lane at load 59-65: a starved gather read a
+/// one-shot `/usr/bin/printf '\e[?1000h'` only after zsh had taken the
+/// terminal back (residuals R1/R3 of [`foreground_handback_model`]), so its
+/// bytes were parsed as the SHELL's and the mouse bit's owner became the
+/// shell. Losing that one handback is the documented residual. What was not:
+/// `FgOwners::observe` moved a bit's owner only when the bit came ON, so every
+/// later job that armed mouse tracking over the stale bit (`?1003h`: the
+/// evidence stays "mouse on") never owned it, the only owner was the shell —
+/// the new holder at every death edge, and alive — and no later death in that
+/// session was ever handed back again (ten lane rows, the holder's SIGKILL
+/// included). zsh's builtin `printf '\e[?1000h'` reached the same state with
+/// no load at all. The rule now: a bit whose SETTER the holder's bytes carry
+/// is that holder's, whether or not it was already on
+/// (`Terminal::take_evidence_asserted`).
+///
+/// State:
+/// * `n` — jobs launched so far (at most `Jobs`); `life` — 0 the shell holds
+///   the terminal, 1 a job holds it, 2 the job is dead and the shell has not
+///   reclaimed yet.
+/// * `seen` — the reader has sampled the current job holding the terminal: its
+///   bytes are parsed as its own. A job the reader never sees is residual R3
+///   (its whole life between two samples) or R1 (its bytes read after the
+///   reclaim): its bytes are parsed as the shell's.
+/// * `bit` — the input mode (mouse tracking) is in force; `owner` — who
+///   `FgOwners` says armed it: 0 nobody, 1 the shell, 2 the current job.
+/// * `obs` — the current job armed the mode in bytes parsed as its own;
+///   `done` — HISTORY: the job the shell just reclaimed from did (reset when
+///   the shell or the next job arms anything); `backs` — handbacks so far.
+///
+/// Actions: `Launch` (the shell gives a job the terminal), `Sample` (the
+/// gather sees it), `Arm` (the job's `?1000h`/`?1003h` is parsed: as the
+/// job's once seen, as the shell's before), `Die`, `Reclaim` (the shell takes
+/// the terminal back: the edge exists only when the job was seen, and the
+/// handback runs when the dead job owns the input mode), `ShellArm` (the shell
+/// arms the mode itself: zsh's builtin `printf`).
+///
+/// Invariant: `ObservedArmIsHandedBack` — at the prompt after a job that
+/// armed the mode in its OWN bytes, the mode is not in force. A missed job
+/// (`obs == 0`) loses its handback — the residual — and only its own: the
+/// next job that arms is handed back.
+///
+/// `Buggy = 1` is the rule this replaced: a bit that stayed on keeps its
+/// owner. Caught after one missed job (the lane's ten FAILs) and after the
+/// shell's own `printf`.
+///
+/// Tier-1 (`aterm-gui/src/foreground_handback_conformance.rs`, the
+/// `ownership_*` rows) drives the real PTY reader with a scripted probe that
+/// never shows the missed one-shot, projects `bit` (mouse tracking on),
+/// `life`, `n` and `backs` (the timeline's `modes-restored` events) at every
+/// checkpoint, and checks that the real end state is NOT the `Buggy = 1`
+/// replay's.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn foreground_handback_ownership_model() -> Model {
+    crate::ty_model! {
+        ForegroundHandbackOwnership {
+            const Buggy = 0;
+            const Jobs = 2;
+            var n = 0;
+            var life = 0;
+            var seen = 0;
+            var bit = 0;
+            var owner = 0;
+            var obs = 0;
+            var done = 0;
+            var backs = 0;
+
+            action Launch when (life == 0 && n <= Jobs - 1) {
+                life = 1;
+                n = n + 1;
+                seen = 0;
+                obs = 0;
+                done = 0;
+            }
+            action Sample when (life == 1 && seen == 0) { seen = 1; }
+            action Arm when (life == 1) {
+                owner = if Buggy == 1 && bit == 1 { owner } else {
+                    if seen == 1 { 2 } else { 1 }
+                };
+                bit = 1;
+                obs = if seen == 1 { 1 } else { obs };
+            }
+            action Die when (life == 1) { life = 2; }
+            action Reclaim when (life == 2) {
+                bit = if seen == 1 && owner == 2 { 0 } else { bit };
+                owner = if seen == 1 && owner == 2 { 0 } else { owner };
+                backs = if seen == 1 && owner == 2 { backs + 1 } else { backs };
+                done = obs;
+                life = 0;
+            }
+            action ShellArm when (life == 0) {
+                owner = if Buggy == 1 && bit == 1 { owner } else { 1 };
+                bit = 1;
+                done = 0;
+            }
+
+            invariant ObservedArmIsHandedBack: life > 0 || done == 0 || bit == 0;
+        }
+    }
+}

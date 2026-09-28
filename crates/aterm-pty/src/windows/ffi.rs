@@ -276,6 +276,12 @@ unsafe extern "system" {
         dwProcessId: u32,
     ) -> HANDLE;
     pub(crate) fn GetCurrentProcessId() -> u32;
+    /// `SetConsoleCtrlHandler(NULL, FALSE)` restores normal CTRL+C processing
+    /// for THIS process — the state a child inherits at `CreateProcessW`. It
+    /// is the only public switch for the inherited "Ctrl+C ignored" flag that
+    /// `CREATE_NEW_PROCESS_GROUP` sets on a launched process (see the spawn's
+    /// comment). `HandlerRoutine` is `PHANDLER_ROUTINE`; passed as NULL here.
+    pub(crate) fn SetConsoleCtrlHandler(HandlerRoutine: *const c_void, Add: i32) -> i32;
     /// The pid behind a process HANDLE — the DefTerm adoption path's only way to
     /// learn the client's pid, since a handoff hands over a handle and never a
     /// pid. Returns 0 on failure (documented as a tolerated miss by the caller).

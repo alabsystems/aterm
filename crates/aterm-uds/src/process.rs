@@ -80,6 +80,74 @@ pub fn pid_alive(pid: u32) -> bool {
     alive
 }
 
+/// End this process by `SIGKILL`, here: no destructor, exit handler or buffered
+/// flush runs. For fault injection that must die at one exact point (aterm-link's
+/// `ATERM_LINK_FAULT` and `ATERM_LINK_NOTIFY_FAULT`), which used
+/// `std::process::abort` — but abort dies by `SIGABRT`, a core-dump signal, so
+/// macOS wrote a crash report for every fault a test fired (26 `aterm-link`
+/// reports on the owner's machine by 2026-09-27). `SIGKILL` writes none.
+#[cfg(unix)]
+// Skip: signals this process via the `getpid`/`kill` syscalls (FFI, unverifiable body).
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn kill_self_now() -> ! {
+    unsafe extern "C" {
+        fn getpid() -> i32;
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    // SIGKILL is 9 on every supported Unix.
+    const SIGKILL: i32 = 9;
+    // SAFETY: neither call takes a pointer, and `getpid` cannot fail.
+    let sent = unsafe { kill(getpid(), SIGKILL) };
+    if sent == 0 {
+        // SIGKILL cannot be caught, blocked or ignored, but its delivery is
+        // asynchronous: in a multithreaded process this thread can return from
+        // `kill` before the kernel ends the process. Falling through to `abort`
+        // let SIGABRT win that race in 2 of 5 runs of the test below (measured
+        // 2026-09-27), so wait here, running nothing, until the kernel is done.
+        loop {
+            std::thread::park();
+        }
+    }
+    // Only if the kernel refused our own pid, which it does not; keeps the `!`.
+    std::process::abort()
+}
+
+/// End this process here, running nothing (see the Unix twin): Windows has no
+/// `SIGKILL`, and its `abort` writes no macOS crash report.
+#[cfg(windows)]
+pub fn kill_self_now() -> ! {
+    std::process::abort()
+}
+
+#[cfg(all(test, unix))]
+mod kill_self_tests {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+
+    const CHILD_ENV: &str = "ATERM_UDS_TEST_KILL_SELF_CHILD";
+
+    /// `kill_self_now` ends the process by SIGKILL: what the fault-injection
+    /// callers rely on (the process stops at the call, nothing of it runs), and a
+    /// signal that, unlike abort's SIGABRT, leaves no macOS crash report.
+    #[test]
+    fn kill_self_now_dies_by_sigkill() {
+        if std::env::var_os(CHILD_ENV).is_some() {
+            super::kill_self_now();
+        }
+        let status = Command::new(std::env::current_exe().expect("the test binary"))
+            .arg("process::kill_self_tests::kill_self_now_dies_by_sigkill")
+            .arg("--exact")
+            .arg("--test-threads=1")
+            .env(CHILD_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("re-exec this test binary as the child");
+        assert_eq!(status.signal(), Some(9), "the child's end: {status}");
+    }
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     /// The documented Win32 footgun this predicate must dodge: a process that

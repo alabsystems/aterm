@@ -190,11 +190,19 @@ pub struct AtermGpuTerminal {
     text_shaping: aterm_render::TextShapingConfig,
     // Reused per-frame engine snapshot for the present/offscreen paths. `render`
     // (the rAF present path) and `render_offscreen` refill this in place via
-    // `cell_frame_into` instead of allocating a fresh `RenderInput` (the outer
-    // container Vecs + a per-row inner Vec for each row) every frame — mirrors the
+    // `cell_frame_damage_scoped_into` (only the damaged rows under the DMG-1
+    // continuity proof, the full refill otherwise) instead of allocating a
+    // fresh `RenderInput` (the outer container Vecs + a per-row inner Vec for
+    // each row) every frame — mirrors the
     // native windowed frontend's kept `input_scratch`. On the native verification
     // target the present paths are unused, so the field is stored-but-unread.
     frame_scratch: RenderInput,
+    // TEST BUILDS ONLY: which arm the last `refill_frame_scratch` took (DMG-1)
+    // — `Scoped` on an ordinary echo frame, `Full` (with the refusing clause)
+    // otherwise, `None` before the first refill — for the reach tests. The
+    // shipped build neither stores nor returns it.
+    #[cfg(test)]
+    last_refill: Option<aterm_core::render::FrameRefill>,
     // The shared visual-effects pipeline (cursor aurora/trail + sparkle words) —
     // the SAME state machines the native app drives, host-clocked via
     // `advance_effects`. Defaults OFF: `apply` then only clears the (already
@@ -452,20 +460,18 @@ impl AtermGpuTerminal {
     /// `open_frame`, which runs them on every tick including gated ones.
     fn build_frame(&mut self) {
         // Refill the kept scratch in place rather than allocating a fresh snapshot
-        // each rAF frame; `term`, `frame_scratch`, and `gpu` are disjoint fields, so
-        // the fill borrow ends before any `gpu` borrow in the callers.
+        // each rAF frame — re-resolving only the damaged rows when the DMG-1
+        // continuity proof holds; `term`, `frame_scratch`, and `gpu` are disjoint
+        // fields, so the fill borrow ends before any `gpu` borrow in the callers.
+        // The refill also CONSUMES the damage session (WF-1), so the NEXT
+        // net-new grid change opens a fresh session and advances the epoch
+        // `open_frame` compares. Safe for the same reason it is safe in the
+        // twin: aterm-gpu diffs SNAPSHOTS rather than reading the tracker, this
+        // loop is the engine's only damage consumer in this crate, and
+        // consuming does not change the epoch VALUE — so the
+        // `term.damage_epoch() == input.snapshot_seq` identity the effects
+        // pipeline checks still holds.
         self.refill_frame_scratch();
-        // WF-1: consume the damage session the snapshot above just captured, so
-        // the NEXT net-new grid change opens a fresh session and advances the
-        // epoch `open_frame` compares. Before the gate existed nothing on this
-        // path called `take_damage`, so the epoch advanced exactly once per
-        // instance lifetime and could not serve as a change detector at all.
-        // Safe here for the same reason it is safe in the twin: aterm-gpu
-        // diffs SNAPSHOTS rather than reading the tracker, this loop is the
-        // engine's only damage consumer in this crate, and `take_damage` does
-        // not change the epoch VALUE — so the `term.damage_epoch() ==
-        // input.snapshot_seq` identity the effects pipeline checks still holds.
-        self.term.take_damage();
         let rows = self.rows;
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant; with every effect off this only clears the channels a reused
@@ -485,12 +491,26 @@ impl AtermGpuTerminal {
         self.spill.update(&self.cpu, &self.frame_scratch);
     }
 
-    /// Refill every engine-owned frame channel. `cell_frame_into` includes the
-    /// live implicit background and cursor colour, so sparse tails, OSC
-    /// 10/11/12 resets, and DECSCNM remain one coherent terminal snapshot.
+    /// Refill every engine-owned frame channel AND consume the frame's damage
+    /// session, through the engine's ONE damage consumer,
+    /// [`Terminal::cell_frame_damage_scoped_into`] — the aterm-wasm twin's and
+    /// the native GUI's extraction. Under its continuity proof only the damage
+    /// tracker's rows re-resolve; any break falls back to the full refill. The
+    /// unconditional restamp covers the live implicit background, cursor and
+    /// selection colours, so sparse tails, OSC 10/11/12 resets, and DECSCNM
+    /// remain one coherent terminal snapshot either way. The effects pipeline
+    /// closes a damage session only when one is still open, so it does not
+    /// re-take this one (which would force the full arm every frame).
     fn refill_frame_scratch(&mut self) {
-        self.term
-            .cell_frame_into(&mut self.frame_scratch, self.rows, self.cols);
+        let refill =
+            self.term
+                .cell_frame_damage_scoped_into(&mut self.frame_scratch, self.rows, self.cols);
+        #[cfg(test)]
+        {
+            self.last_refill = Some(refill);
+        }
+        #[cfg(not(test))]
+        let _ = refill;
     }
 
     /// WF-1 (twin readiness): record a host-visible visual change the engine's
@@ -616,6 +636,8 @@ impl AtermGpuTerminal {
             line_height: 1.0,
             text_shaping: aterm_render::TextShapingConfig::default(),
             frame_scratch: RenderInput::empty(),
+            #[cfg(test)]
+            last_refill: None,
             effects: EffectsPipeline::new(),
             theme_cursor: cursor & 0x00FF_FFFF,
             theme_fg: fg & 0x00FF_FFFF,
@@ -3127,6 +3149,8 @@ impl AtermGpuTerminal {
             line_height: 1.0,
             text_shaping: aterm_render::TextShapingConfig::default(),
             frame_scratch: RenderInput::empty(),
+            #[cfg(test)]
+            last_refill: None,
             effects: EffectsPipeline::new(),
             theme_cursor: theme.cursor & 0x00FF_FFFF,
             theme_fg: theme.fg & 0x00FF_FFFF,
@@ -3152,6 +3176,8 @@ impl AtermGpuTerminal {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+    use aterm_core::render::FrameRefill;
+
     use super::*;
 
     /// The bundled face, injected the way a JS host injects a fetched one. A
@@ -3983,6 +4009,98 @@ mod tests {
                 "instance and stateless encoders must agree on {key:?} mods={mods} type={event_type}"
             );
         }
+    }
+
+    /// DMG-1 ON THE GPU WEB PATH: `build_frame` — the engine-side half every
+    /// present shares — re-resolves ONE row per echo with the damage-reading
+    /// effects on. The refill consumes the damage session and the effects
+    /// pipeline no longer re-takes it (the aterm-wasm twin's reach test).
+    #[test]
+    fn build_frame_echo_refills_one_row_with_sparkle_and_rain_on() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(8, 40, 16.0) else {
+            return;
+        };
+        t.set_sparkle_words_enabled(true);
+        t.set_matrix_rain_enabled(true);
+        t.process(b"$ ");
+        t.build_frame();
+        assert!(
+            matches!(t.last_refill, Some(FrameRefill::Full { .. })),
+            "the first fill is full by construction"
+        );
+        for (i, ch) in b"hello world".iter().enumerate() {
+            t.process(std::slice::from_ref(ch));
+            t.advance_effects(16.0);
+            t.build_frame();
+            assert_eq!(
+                t.last_refill,
+                Some(FrameRefill::Scoped { rows_refilled: 1 }),
+                "echo #{i} must refill exactly its one row"
+            );
+        }
+    }
+
+    /// DMG-1 ON THE GPU WEB PATH, EQUALITY: every built frame's engine
+    /// channels equal a FULL extraction of the same terminal across a
+    /// mutation stream with the damage-reading effects on, and both refill
+    /// arms are reached (the aterm-wasm twin's differential).
+    #[test]
+    fn build_frame_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
+        let Some(mut t) = AtermGpuTerminal::new_from_system(8, 40, 16.0) else {
+            return;
+        };
+        t.set_sparkle_words_enabled(true);
+        t.set_matrix_rain_enabled(true);
+        let steps: &[&[u8]] = &[
+            b"$ ",
+            b"e",
+            b"cho hello cat",
+            b"\r\n",
+            b"\x1b[31mred\x1b[0m and plain",
+            b"\x1b[2K\rerased and retyped",
+            b"\x1b]11;#102030\x07",
+            b"a line long enough to wrap past the forty column edge of this grid",
+            b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+            b"\x1b[?1049h",
+            b"alt screen text",
+            b"\x1b[?1049l",
+            b"x",
+        ];
+        let (mut scoped, mut full) = (0usize, 0usize);
+        let mut check = |t: &mut AtermGpuTerminal, what: &str| {
+            let (rows, cols) = (t.rows, t.cols);
+            let mut oracle = t.frame_scratch.clone();
+            t.term.cell_frame_into(&mut oracle, rows, cols);
+            assert!(
+                t.frame_scratch == oracle,
+                "the built frame diverged from a full extraction after: {what}"
+            );
+            match t.last_refill {
+                Some(FrameRefill::Scoped { .. }) => scoped += 1,
+                Some(FrameRefill::Full { .. }) => full += 1,
+                None => panic!("build_frame must refill"),
+            }
+        };
+        for step in steps {
+            t.process(step);
+            t.advance_effects(16.0);
+            t.build_frame();
+            check(&mut t, &String::from_utf8_lossy(step));
+        }
+        t.scroll_lines(3);
+        t.build_frame();
+        check(&mut t, "history viewport");
+        t.scroll_lines(-3);
+        t.build_frame();
+        check(&mut t, "back to the live bottom");
+        t.resize(10, 30);
+        t.build_frame();
+        check(&mut t, "resize");
+        t.process(b"after resize");
+        t.build_frame();
+        check(&mut t, "echo after resize");
+        assert!(scoped >= 5, "the scoped arm must be reached ({scoped})");
+        assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
     /// Native stand-in for the effects render path (GPU init is wasm-only):

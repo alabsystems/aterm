@@ -4,18 +4,13 @@
 //! `aterm` — a transparent, introspecting terminal (U1).
 //!
 //! It spawns your `$SHELL` in a PTY and passes I/O through **unchanged**, so it
-//! looks and behaves exactly like your shell. It does NOT model the screen by
-//! default: the host terminal draws the bytes and NOTHING in this process reads
-//! them back. The VT engine is DEMAND-DRIVEN — `$ATERM_SESSION_MODEL`, a development
-//! seam no shipped binary reads (`aterm_types::dev_seam!`), builds a
-//! [`Terminal`] and feeds it every output byte; unarmed (the default) the model
-//! is never constructed, so there is no VT parse, no grid mutation and no
-//! scrollback growth on the passthrough path. See [`session_model_armed`].
-//! The arming path is kept, not deleted, for the ONE consumer on the books:
-//! `apply_policy_engine` on the CLI engine (docs/HARDCORE_BACKLOG.md §4 P0,
-//! deferred sub-item). Until that lands, an armed model is a model nothing in
-//! the process can read — aterm-cli links no control, uds or session crate.
-//! This passthrough binary serves NO control socket either way; the
+//! looks and behaves exactly like your shell. It does NOT model the screen: the
+//! host terminal draws the bytes and NOTHING in this process reads them back —
+//! no VT parse, no grid, no scrollback on the passthrough path. (A development
+//! seam once armed an in-process model for `apply_policy_engine` on this engine,
+//! docs/HARDCORE_BACKLOG.md §4 P0; nothing could read that model, so the sub-item
+//! was closed and the seam deleted on 2026-09-25.)
+//! This passthrough binary serves NO control socket; the
 //! out-of-process, introspectable surface an AI reads and drives (via
 //! `aterm ctl`) is the WINDOW mode of the one binary — `aterm --window`,
 //! or `--headless` for an engine + socket with no window.
@@ -27,9 +22,8 @@
 //! (safety/containment; see `session_limits`), and OS-sandbox-wrapped when the
 //! containment mode demands it (P0) — exactly like `aterm-gui`, NOT raw
 //! `forkpty`/`execvp`. Daily-driver essentials are handled: window resize is
-//! forwarded (SIGWINCH / console resize event -> PTY, and the engine too when
-//! one is armed — the PTY half is unconditional, so a full-screen app reflows
-//! identically with the model off), the loop is signal-robust (EINTR), and
+//! forwarded (SIGWINCH / console resize event -> PTY), the loop is
+//! signal-robust (EINTR), and
 //! aterm exits with the shell's own status.
 //!
 //! Containment mode is launcher-owned (`--containment`, ATERM_DESIGN §5):
@@ -39,10 +33,9 @@
 //! applies at its own spawn — see `session_limits`; on Windows, where the same
 //! `Limits` go onto the child's Job Object, that means no job caps); Safety /
 //! Containment keep the hardened caps. `--sandbox` (`--containment containment`) opts
-//! into the macOS Seatbelt sandbox (deny network + credential/private-data reads); a
+//! into the macOS Seatbelt sandbox (no network, writes only to the temp roots, no
+//! credential/private-data access) and is REFUSED where no OS sandbox exists; a
 //! malformed value fails CLOSED to Containment.
-
-use aterm_core::terminal::Terminal;
 
 // The macOS consent tier (docs/DESIGN-macos-tcc-prompts-2026-08-30.md §3.3): the
 // ONE module that owns the prompt-free Full Disk Access probe, the in-bundle
@@ -90,9 +83,44 @@ pub use windowing::{
 /// Mirrors `aterm-gui`'s `parse_cli()` help in tone and layout, scoped to what the
 /// daily-driver CLI actually does (transparent passthrough of `$SHELL`).
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
+/// What a plain `aterm` session runs, per platform — the ONE phrase `--help`
+/// ([`HELP_SESSION_LINE`]) and the `aterm help aterm` page both splice in, so
+/// the two cannot name two shells (they did: the page kept "your $SHELL" on
+/// Windows after `--help` stopped saying it). Unix: `$SHELL`. Windows: the
+/// passthrough reads no `$SHELL` (a POSIX path in MSYS shells) and no
+/// aterm.toml — it spawns `aterm-pty`'s platform default (`shell_override`
+/// `None` in [`session_main`]), so "your $SHELL" there named a shell it never
+/// runs (audit 2026-09-22). A macro, not a `const`: both sites are
+/// `concat!`-built constants, and `concat!` takes only literals.
+#[cfg(not(windows))]
+macro_rules! session_shell {
+    () => {
+        "your $SHELL in a PTY"
+    };
+}
+/// See the Unix twin above.
+#[cfg(windows)]
+macro_rules! session_shell {
+    () => {
+        "pwsh (else Windows PowerShell, else %COMSPEC%) in a ConPTY"
+    };
+}
+pub(crate) use session_shell;
+/// The `--help` line under the origin line, built on [`session_shell!`].
+#[cfg(not(windows))]
+const HELP_SESSION_LINE: &str = concat!(
+    "Runs ",
+    session_shell!(),
+    " and passes its bytes through unchanged.\n"
+);
+/// See the Unix twin above; only the wrap differs.
+#[cfg(windows)]
+const HELP_SESSION_LINE: &str = concat!(
+    "Runs ",
+    session_shell!(),
+    " and passes its\nbytes through unchanged.\n"
+);
 const HELP_HEAD: &str = concat!(
-    "\n",
-    "Runs your $SHELL in a PTY and passes its bytes through unchanged.\n",
     "\n",
     "`aterm ctl` reads and drives the window (`aterm --window`; `--headless` runs\n",
     "it with no window); a plain `aterm` shell session serves no control socket.\n",
@@ -112,8 +140,9 @@ const HELP_HEAD: &str = concat!(
     "        --containment <MODE>  master, user (the default), safety or containment;\n",
     "        --containment=<MODE>  the last containment flag given wins. An invalid\n",
     "                              value fails closed to containment.\n",
-    "        --sandbox             Shorthand for --containment containment (deny\n",
-    "                              network + credential reads via the macOS sandbox).\n",
+    "        --sandbox             Shorthand for --containment containment (the macOS\n",
+    "                              sandbox: no network, writes only to temp dirs, no\n",
+    "                              credential reads; refused where no OS sandbox exists).\n",
     "        --no-sandbox          Shorthand for --containment user (no OS sandbox;\n",
     "                              full network/credential access — the default).\n",
     "        --no-reroute          Restore the upstream Rust names (cargo, rustc, …) in\n",
@@ -134,6 +163,17 @@ const HELP_HEAD: &str = concat!(
     "    list-kitty-commands       List the words the cursor cat obeys, by language.\n",
     "\n",
 );
+
+/// How a Windows install is updated while no Windows updater exists — the ONE
+/// spelling `aterm update status|check`, `aterm help update` and the manual's
+/// header share, so the three cannot name three lanes. There is no `aterm.app`
+/// on Windows and nothing checks, stages or applies a build there (design §7,
+/// W8 open); until that lands the lane is the build scripts, or the MSIX
+/// (`apps\aterm-win\msix\build-msix.ps1`). Measured 2026-09-22 on 0.90.0: the
+/// verb answered with the macOS sentence and the header claimed a signed
+/// appcast, so a reader waited for an update that could never arrive.
+pub const WINDOWS_UPDATE_LANE: &str =
+    "git pull, then apps\\aterm-win\\build.ps1 and apps\\aterm-win\\install.ps1";
 
 /// THE front-door verb roster — the ONE place a verb exists.
 ///
@@ -337,7 +377,10 @@ impl Verb {
                 "push each other (ls | add | set | rm | spawn | show | map).",
             ],
             Verb::Pkg => &["Install / update / verify the toolchain (the package manager)."],
-            Verb::Fleet => &["Federate many sessions' events; dispatch commands back."],
+            Verb::Fleet => &[
+                "Watch and drive the sessions of every aterm window",
+                "on this machine.",
+            ],
             Verb::Link => {
                 &["The fabric bridge: carry inbox/post between this instance and the bus."]
             }
@@ -374,8 +417,9 @@ impl Verb {
                 "running instance whatever windowing_behavior says.",
             ],
             Verb::SplitPane => &[
-                "Split the focused pane in the running aterm",
-                "(-H stacked, -V side-by-side, the default).",
+                "Split the focused pane — a new window by default",
+                "(`windowing_behavior`). -V side by side (default),",
+                "-H stacked.",
             ],
         }
     }
@@ -413,7 +457,7 @@ fn help_text() -> String {
     // Title, then WHO MAKES IT (`by Andrew Yates · ALab · alab.systems`) — the one
     // origin line every surface prints, from `aterm_types::identity`.
     let mut out = format!(
-        "{HELP_TITLE}{}\n{HELP_HEAD}",
+        "{HELP_TITLE}{}\n\n{HELP_SESSION_LINE}{HELP_HEAD}",
         aterm_types::identity::ORIGIN_LINE
     );
     out.push_str("VERBS (`aterm help <verb>` has each one's page):\n");
@@ -434,8 +478,9 @@ const HELP_TAIL: &str = concat!(
     "\n",
     "EXAMPLES:\n",
     "    aterm                              Start an interactive shell (mode: user).\n",
-    "    aterm --sandbox                    No network, no secret-dir reads (macOS;\n",
-    "                                       elsewhere a notice says what stays open).\n",
+    "    aterm --sandbox                    No network, writes only to temp dirs, no\n",
+    "                                       secret-dir reads (macOS; refused where\n",
+    "                                       there is no OS sandbox).\n",
     "    aterm --containment safety         Capped limits, no OS sandbox.\n",
 );
 
@@ -507,40 +552,37 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
 /// `aterm show-config` — aterm's effective runtime configuration as stable
 /// `key=value` lines (one per line, scriptable). Reports the containment DEFAULT a
 /// launch with no containment flag takes, NOT an actuated mode — `show-config`
-/// never actuates or spawns.
+/// never actuates or spawns. `shell=` is `$SHELL` on Unix and, on Windows, the
+/// shell a new WINDOW tab spawns (with `shell_origin=` naming the input that
+/// chose it).
 fn show_config_report() -> String {
     let (rows, cols) = driver::host_winsize();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     let or = |s: String, dflt: &str| if s.is_empty() { dflt.to_string() } else { s };
     let mut out = String::new();
     out.push_str(&format!("version={}\n", aterm_types::version::APP_VERSION));
-    // Shell resolution: $SHELL everywhere; on Windows (where $SHELL is rarely
-    // set outside MSYS shells) fall back to %COMSPEC%, the value the console
-    // world actually launches — an honest report of the origin, not a fake
-    // $SHELL. Unix output is byte-identical.
+    // Shell: `$SHELL` on Unix — the program this passthrough session spawns.
+    // On Windows the spawn reads neither `$SHELL` (a POSIX path in MSYS shells)
+    // nor `%COMSPEC%` first, and reporting them here named cmd.exe from inside
+    // a pwsh 7 tab and bash.exe from Git Bash (measured 2026-09-22) — the shell
+    // the CLI was typed into, never the one a tab gets. So the row is the shell
+    // a new WINDOW tab spawns, from the spawn's own resolver, and `shell_origin=`
+    // says which input chose it (aterm.toml | default:<arm>; the per-launch
+    // spelling is the window's own --shell flag, which no CLI process can see —
+    // the retired environment twin is not an input).
+    // Unix output is byte-identical.
     #[cfg(not(windows))]
-    let shell = or(env("SHELL"), "(unset)");
+    out.push_str(&format!("shell={}\n", or(env("SHELL"), "(unset)")));
     #[cfg(windows)]
-    let shell = or(or(env("SHELL"), &env("COMSPEC")), "(unset)");
-    out.push_str(&format!("shell={shell}\n"));
+    {
+        let window_shell = driver::WindowShell::resolve();
+        out.push_str(&format!("shell={}\n", window_shell.program));
+        out.push_str(&format!("shell_origin={}\n", window_shell.origin_token()));
+    }
     out.push_str(&format!("term={}\n", or(env("TERM"), "(unset)")));
     out.push_str(&format!("rows={rows}\n"));
     out.push_str(&format!("cols={cols}\n"));
     out.push_str("containment_default=user\n");
-    // The session model is a development seam (`session_model_seam`): a shipped
-    // binary cannot arm it, so the row — which answers "is the engine running?",
-    // the question that changes what a session COSTS (an O(bytes) VT parse and
-    // O(scrollback) memory) — exists only in a build that can, the rule the
-    // 2026-09-24 env audit applied to `verbose=` and `containment_mode_env=`.
-    #[cfg(any(debug_assertions, feature = "dev-seams"))]
-    out.push_str(&format!(
-        "session_model={}\n",
-        if session_model_armed_from_env() {
-            "on"
-        } else {
-            "off"
-        }
-    ));
     out
 }
 
@@ -560,8 +602,8 @@ fn explain_config_report() -> String {
     );
     out.push_str("Containment modes (least → most capability):\n");
     out.push_str(
-        "  containment  No network, no secret-dir reads (macOS; elsewhere a notice says what\n\
-         \x20              stays open).\n",
+        "  containment  No network, writes only to temp dirs, no secret-dir reads (macOS;\n\
+         \x20              refused where there is no OS sandbox).\n",
     );
     out.push_str("  safety       Capped limits, no OS sandbox.\n");
     out.push_str("  user         Normal usage: standard safeguards (the default).\n");
@@ -570,9 +612,41 @@ fn explain_config_report() -> String {
         "No environment variable changes what aterm does: every choice is a flag or an\n\
          aterm.toml key.\n",
     );
+    #[cfg(windows)]
+    out.push_str(&windows_config_paragraph());
     out.push_str(PRIVACY_CONFIG_PARAGRAPH);
     out.push_str(MACHINE_CONFIG_PARAGRAPH);
     out
+}
+
+/// The Windows paragraph of `explain-config` (2026-09-22): where aterm.toml
+/// lives on THIS machine — the path resolved by the same rule the window loads
+/// it by (`aterm_types::dirs::aterm_config_path`), never a literal — and the two
+/// keys a Windows daily driver asks about first, `shell` and `font_px`, which
+/// the page never mentioned. Windows only, so the Unix report is byte-identical.
+#[cfg(windows)]
+fn windows_config_paragraph() -> String {
+    let path = match aterm_types::dirs::aterm_config_path() {
+        Some(path) => path.display().to_string(),
+        None => "(unresolved: XDG_CONFIG_HOME, APPDATA and HOME are all unset)".to_string(),
+    };
+    format!(
+        "\n\
+         aterm.toml — the window's settings file on this machine:\n\
+         \x20 {path}\n\
+         \x20 (%APPDATA%\\aterm\\aterm.toml; a set XDG_CONFIG_HOME wins. The file need not\n\
+         \x20 exist — every key has a default. `aterm --window --write-config` writes a\n\
+         \x20 documented starter; `aterm help config` has the precedence rules.)\n\
+         \x20 shell                   the interactive shell a new tab spawns: a bare name — \"pwsh\",\n\
+         \x20                         \"cmd\", \"wsl\", \"nu\", or \"bash\", which finds Git Bash even off\n\
+         \x20                         PATH — or an absolute path used verbatim. A window launched\n\
+         \x20                         with --shell uses that instead; with neither, the default is\n\
+         \x20                         pwsh, then powershell, then %COMSPEC%, then cmd.exe. `aterm\n\
+         \x20                         doctor` names the program this machine resolves it to.\n\
+         \x20 font_px                 glyph size in physical pixels (6..=200). A window launched\n\
+         \x20                         with --font-px uses that instead; unset, the size follows\n\
+         \x20                         the display scale.\n"
+    )
 }
 
 /// The `[machine]` paragraph of `explain-config`. Hand-written like the rest.
@@ -944,30 +1018,84 @@ fn privacy_row(facts: &PrivacyFacts) -> (Mark, String) {
     }
 }
 
-/// `aterm doctor` — an aggregate pre-flight health check ($SHELL
-/// set+executable, stdout is a tty, the macOS consent posture, the aterm
-/// instances no control socket reaches, plus version/size). Reads env/fs/tty + the consent tier, then delegates to the
-/// pure [`doctor_checks`]. Exit 0 = nothing FAILED; non-zero = a problem.
-/// Scriptable: `aterm doctor && aterm`.
+/// `aterm doctor` — an aggregate pre-flight health check (the shell
+/// set+executable — `$SHELL` on Unix, the shell a new WINDOW tab spawns on
+/// Windows — stdout is a tty, the macOS consent posture, the aterm instances no
+/// control socket reaches, the recovery ledger, plus version/size). Reads
+/// env/fs/tty + the consent tier, then delegates to the pure
+/// [`doctor_checks_with_origin`] (through `doctor_checks` off Windows). Exit 0 =
+/// nothing FAILED; non-zero = a problem. Scriptable: `aterm doctor && aterm`.
 fn doctor_report() -> (String, i32) {
-    let shell = std::env::var("SHELL").ok();
-    // Windows: $SHELL is rarely set outside MSYS shells; %COMSPEC% (cmd.exe)
-    // is the honest spawn fallback, so consult it before declaring the shell
-    // check failed. Unix behavior unchanged (incl. the set-but-empty case).
-    #[cfg(windows)]
-    let shell = shell.or_else(|| std::env::var("COMSPEC").ok());
-    let shell_exec = shell.as_deref().is_some_and(driver::shell_is_executable);
     let is_tty = driver::stdout_is_tty();
     let (rows, cols) = driver::host_winsize();
-    doctor_checks(
-        shell.as_deref(),
-        shell_exec,
-        is_tty,
-        rows,
-        cols,
-        &privacy_facts(),
-        &aterm_ctl::census::window_census(),
-    )
+    let privacy = privacy_facts();
+    let instances = aterm_ctl::census::window_census();
+    let recovery = recovery_facts();
+    // Unix: `$SHELL`, the program this passthrough session spawns.
+    #[cfg(not(windows))]
+    {
+        let shell = std::env::var("SHELL").ok();
+        let shell_exec = shell.as_deref().is_some_and(driver::shell_is_executable);
+        doctor_checks(
+            shell.as_deref(),
+            shell_exec,
+            is_tty,
+            rows,
+            cols,
+            &privacy,
+            &instances,
+            &recovery,
+        )
+    }
+    // Windows: the shell a new WINDOW tab spawns, from the spawn's own resolver
+    // over the window's inputs, and labelled as such — the row used to report
+    // this process's `$SHELL`, then `%COMSPEC%`, and said `cmd.exe` from inside
+    // a pwsh 7 tab and `bash.exe` from Git Bash (measured 2026-09-22): the shell
+    // the CLI was typed into, which the spawn never reads. See
+    // `driver::WindowShell`.
+    #[cfg(windows)]
+    {
+        let window_shell = driver::WindowShell::resolve();
+        let shell_exec = driver::shell_is_executable(&window_shell.program);
+        doctor_checks_with_origin(
+            Some(&window_shell.program),
+            shell_exec,
+            Some(&window_shell.origin_sentence()),
+            is_tty,
+            rows,
+            cols,
+            &privacy,
+            &instances,
+            &recovery,
+        )
+    }
+}
+
+/// The recovery ledger as `doctor` reads it: its rows and its path, or `None` when
+/// no log directory resolves (`aterm_update::recovery_ledger`).
+type RecoveryFacts = Option<(Vec<aterm_update::recovery_ledger::Row>, std::path::PathBuf)>;
+
+/// Read the recovery ledger — the rows the window's recovery census writes at each
+/// windowed launch of the installed app. Read-only and bounded.
+fn recovery_facts() -> RecoveryFacts {
+    let path = aterm_update::recovery_ledger::default_ledger_path()?;
+    Some((aterm_update::recovery_ledger::read_rows(&path), path))
+}
+
+/// The `recovery:` row, pure over the ledger: how the runs before each recorded
+/// windowed launch ended, and the last unexpected end in detail. A NOTE when any run
+/// ended unexpectedly (a kill, a fatal signal, a panic) — a past crash is a fact to
+/// report, never a reason for `doctor` to fail — and OK otherwise.
+fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
+    let Some((rows, path)) = facts else {
+        return (
+            Mark::Note,
+            "not measured (no log directory resolves, so there is no ledger)".to_string(),
+        );
+    };
+    let (lines, unexpected) = aterm_update::recovery_ledger::doctor_lines(rows, path);
+    let mark = if unexpected { Mark::Note } else { Mark::Ok };
+    (mark, lines.join("\n"))
 }
 
 /// The `instances:` row, pure over the census ([`aterm_ctl::census`]): the aterm
@@ -1022,6 +1150,15 @@ fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, S
 /// The verdict is three-valued: `health`/the exit code are computed from `Fail`
 /// ALONE, so a `Note` row — the macOS consent posture is the first — reports a
 /// fact without making `aterm doctor && aterm` refuse to launch.
+///
+/// The `shell:` row is unlabelled here: this is the Unix report, byte for byte.
+/// [`doctor_checks_with_origin`] is the same report with the row labelled — the
+/// live Windows path, which is why this shape is test-only there.
+#[cfg(any(not(windows), test))]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one gathered fact; passing them in is what keeps the report pure"
+)]
 fn doctor_checks(
     shell: Option<&str>,
     shell_executable: bool,
@@ -1030,12 +1167,51 @@ fn doctor_checks(
     cols: u16,
     privacy: &PrivacyFacts,
     instances: &Result<aterm_ctl::census::Census, String>,
+    recovery: &RecoveryFacts,
+) -> (String, i32) {
+    doctor_checks_with_origin(
+        shell,
+        shell_executable,
+        None,
+        is_tty,
+        rows,
+        cols,
+        privacy,
+        instances,
+        recovery,
+    )
+}
+
+/// [`doctor_checks`] with the `shell:` row labelled by WHERE the shell came from
+/// (`shell_origin`, appended after the fact as ` — <label>`). Windows passes
+/// `driver::WindowShell::origin_sentence`, so the row says it names the window's
+/// shell and which input chose it — a reader who sees `pwsh.exe` from inside a
+/// Git Bash tab must not have to guess whether doctor looked at `$SHELL`. `None`
+/// renders exactly the unlabelled row.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is one gathered fact; passing them in is what keeps the report pure"
+)]
+fn doctor_checks_with_origin(
+    shell: Option<&str>,
+    shell_executable: bool,
+    shell_origin: Option<&str>,
+    is_tty: bool,
+    rows: u16,
+    cols: u16,
+    privacy: &PrivacyFacts,
+    instances: &Result<aterm_ctl::census::Census, String>,
+    recovery: &RecoveryFacts,
 ) -> (String, i32) {
     let (shell_ok, shell_fact) = match shell {
         None => (false, "$SHELL unset".to_string()),
         Some("") => (false, "$SHELL is empty".to_string()),
         Some(p) if shell_executable => (true, format!("{p} (executable)")),
         Some(p) => (false, format!("{p} (not executable or missing)")),
+    };
+    let shell_fact = match shell_origin {
+        Some(origin) => format!("{shell_fact} — {origin}"),
+        None => shell_fact,
     };
 
     // A NOTE, never a FAIL, and this is the row that made `doctor` unusable as
@@ -1071,6 +1247,7 @@ fn doctor_checks(
 
     let (privacy_mark, privacy_fact) = privacy_row(privacy);
     let (instances_mark, instances_fact) = instances_row(instances);
+    let (recovery_mark, recovery_fact) = recovery_row(recovery);
     let checks = [
         DoctorRow {
             label: "shell:",
@@ -1091,6 +1268,11 @@ fn doctor_checks(
             label: "instances:",
             mark: instances_mark,
             fact: instances_fact,
+        },
+        DoctorRow {
+            label: "recovery:",
+            mark: recovery_mark,
+            fact: recovery_fact,
         },
     ];
 
@@ -1646,7 +1828,9 @@ const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 /// atpkg re-lays the twins in place under the directory that is already on PATH); on a
 /// machine whose rc does not yet carry it, the entry handed here survives (once, behind
 /// `path_helper`'s list) and `. ~/.aterm/shell.d/00-atpkg.<shell>` moves it first.
-/// Pinned by `a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_leads_agents_only_inside_aterm`.
+/// Since 2026-09-27 the hook does the same for `reroute/`, inside aterm only, one step
+/// ahead of `agents/` (the order this lane hands), so a bare `cargo` meets the signpost.
+/// Pinned by `a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_puts_reroute_first_in_aterm`.
 ///
 /// WHICH DIRECTORY, in order (the precedence is pinned by
 /// `managed_agents_dir_prefers_the_front_doors_handoff_then_the_sibling_then_the_hook`):
@@ -1884,56 +2068,6 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
     }
 }
 
-/// The DEVELOPMENT SEAM that ARMS the in-process VT model of a session
-/// (`aterm_types::dev_seam!`: a shipped binary does not read it, and `aterm --help` does
-/// not teach it — 2026-09-23, the owner's rule that environment variables are for
-/// development).
-///
-/// DEMAND-DRIVEN, DEFAULT OFF. A session is a passthrough: `write_all(stdout)`
-/// runs BEFORE the engine ever sees a byte, and this crate depends on no
-/// control, uds or session crate — so a model built here is readable by
-/// NOTHING, in this process or outside it, while costing the daily driver an
-/// O(bytes) VT parse plus O(scrollback) resident memory for no reader. The
-/// engine is therefore only constructed when this variable asks for it.
-///
-/// The arming path is deliberately KEPT rather than deleted: `apply_policy_engine`
-/// on the CLI engine is the one consumer on the books (docs/HARDCORE_BACKLOG.md
-/// section 4, P0 "Remaining sub-item"). When that lands it wants exactly this
-/// engine — constructed here, fed in the driver loop — so the wiring stays
-/// usable instead of having to be reinvented.
-const SESSION_MODEL_ENV: &str = "ATERM_SESSION_MODEL";
-
-/// Whether a raw `$ATERM_SESSION_MODEL` value arms the session model
-/// (`None` = unset). Pure, so the rule is testable without a process
-/// environment.
-///
-/// Presence is NOT enough — `0`, `off` (any case) and the empty string leave it
-/// off. One workspace should have ONE answer to "what does this switch-shaped
-/// variable mean"; a knob that armed on `=0` would be a trap for exactly the
-/// scripts that set it explicitly to turn the thing off.
-fn session_model_armed(value: Option<&str>) -> bool {
-    match value {
-        None => false,
-        Some(v) => !(v.is_empty() || v == "0" || v.eq_ignore_ascii_case("off")),
-    }
-}
-
-/// [`session_model_armed`] over the live environment. A non-UTF-8 value is read
-/// lossily rather than dropped, so `ATERM_SESSION_MODEL=<garbage>` arms (it is not
-/// one of the three disabling spellings) instead of silently reading as unset.
-fn session_model_armed_from_env() -> bool {
-    let raw = session_model_seam();
-    session_model_armed(raw.as_ref().map(|v| v.to_string_lossy()).as_deref())
-}
-
-/// The raw [`SESSION_MODEL_ENV`] seam — `None` in every shipped binary, whatever the
-/// environment holds. The front door reads its PRESENCE too: a launch carrying it is a
-/// harness's child, never a person's terminal, so it provisions nothing.
-#[must_use]
-pub fn session_model_seam() -> Option<std::ffi::OsString> {
-    aterm_types::dev_seam!(SESSION_MODEL_ENV)
-}
-
 /// The [`aterm_sandbox::Limits`] the SESSION hands the protected spawn seam,
 /// chosen by containment mode — the rule `aterm-gui` applies at ITS spawn
 /// (`spawn.rs`), the one [`aterm_sandbox::Limits::inherit`]'s doc states, and the
@@ -2029,45 +2163,19 @@ pub fn session_main(quiet: bool) -> ! {
 
     // Ask the actuator whether the shell may spawn for this mode and, for
     // Containment on macOS, the SBPL profile the spawn must be wrapped in. A `Deny`
-    // (or any future variant) fails closed: no unconfined shell.
+    // — Containment on a platform with no OS sandbox, or any future variant —
+    // fails closed: no shell, and the reason on stderr.
     let sandbox_wrap: Option<String> = match aterm_containment::decide_spawn(mode) {
         aterm_containment::SpawnDecision::Permit { sbpl, .. } => sbpl,
-        other => {
-            debug_assert!(matches!(
-                other,
-                aterm_containment::SpawnDecision::Deny { .. }
-            ));
-            eprintln!(
-                "aterm: containment mode {mode} denies spawning a shell (fail-closed); \
-                 refusing to start an unconfined child"
-            );
+        aterm_containment::SpawnDecision::Deny { reason, .. } => {
+            eprintln!("aterm: containment mode {mode}: {reason}");
+            std::process::exit(1);
+        }
+        _ => {
+            eprintln!("aterm: containment mode {mode} denies spawning a shell (fail-closed)");
             std::process::exit(1);
         }
     };
-
-    // HONESTY (mirrors aterm-gui's startup line): in a CONFINEMENT mode whose OS
-    // sandbox is not actuated on this platform — today every non-macOS target, which
-    // has no Landlock/seccomp lane yet — say so on stderr. Otherwise a user invoking
-    // `aterm --sandbox` to cage a (possibly hostile) agent shell would be silently
-    // unprotected and uninformed: only the rlimit + capability gate apply, NOT the
-    // network/filesystem confinement the mode name implies.
-    if !aterm_containment::os_sandbox_actuated()
-        && matches!(
-            mode,
-            aterm_containment::ContainmentMode::Containment
-                | aterm_containment::ContainmentMode::Safety
-        )
-    {
-        // One line on every such platform: what stays open. The resource caps
-        // (rlimits; on Windows the child's Job Object, filled from the same
-        // `Limits`) still apply and the line does not deny them; it names the
-        // mode as the flag spells it.
-        let mode_word = mode.to_string().to_ascii_lowercase();
-        eprintln!(
-            "aterm: {mode_word} mode has no OS sandbox on this platform; network and files \
-             stay open"
-        );
-    }
 
     // The SINGLE `unsafe` root-authority mint in this binary (CAP-1): trusted
     // launcher, before any PTY bytes flow. Grants the spawn + sandbox capabilities
@@ -2173,31 +2281,10 @@ pub fn session_main(quiet: bool) -> ! {
         std::process::exit(1);
     });
 
-    // THE SESSION MODEL — demand-driven, and OFF unless `$ATERM_SESSION_MODEL`
-    // asks for it (see [`SESSION_MODEL_ENV`]). Unarmed, the `Terminal` is never
-    // CONSTRUCTED, which is the whole point: `None` cannot be parsed into, cannot
-    // grow a grid, and cannot accumulate scrollback, so the passthrough pays for
-    // exactly what a passthrough does. Byte-transparency is untouched either way —
-    // both drivers write the bytes to stdout BEFORE the engine is offered them.
-    //
-    // An armed launch SAYS SO on stderr, before the shell spawns and outside the
-    // PTY stream. Arming is an explicit act by whoever set the variable, and the
-    // one thing they cannot check from the outside is whether it took: a session
-    // serves no control socket, so an armed model looks exactly like an unarmed
-    // one from every other vantage point.
-    let mut engine = if session_model_armed_from_env() {
-        eprintln!("aterm: session model on (${SESSION_MODEL_ENV})");
-        Some(Terminal::new(rows, cols))
-    } else {
-        None
-    };
-
     // PARENT: the platform driver owns raw mode, the passthrough loop, resize
-    // forwarding, terminal restore, and the reap — and returns the shell's own
-    // exit status (non-exit → 1). Resize forwarding to the PTY is the driver's
-    // job and is NOT conditional on the model: `None` here means nothing models
-    // the new geometry, not that anything reports a stale one.
-    let code = driver::run(shell, engine.as_mut(), flags.verbose);
+    // forwarding to the PTY, terminal restore, and the reap — and returns the
+    // shell's own exit status (non-exit → 1).
+    let code = driver::run(shell, flags.verbose);
     std::process::exit(code);
 }
 
@@ -2205,12 +2292,15 @@ pub fn session_main(quiet: bool) -> ! {
 mod tests {
     use super::{
         AGENTS_DIR_ENV, CliAction, DIAG_COMMANDS, DrClass, FdaState, HOOK_AGENTS_ENV, Mark,
-        PASSTHROUGH_ENV, PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, SESSION_MODEL_ENV,
+        PASSTHROUGH_ENV, PrivacyFacts, ProbeLabel, REROUTE_DIR_ENV, RecoveryFacts,
         VERB_BLURB_COLUMN, Verb, agents_dir_mode, decide_args, diag_report, doctor_checks,
-        doctor_report, help_text, is_tool_candidate, list_fonts_report, list_themes_report,
-        managed_agents_dir, prepend_path, reroute_dir_from_values, session_limits,
-        session_model_armed, session_path_env, show_face_report, verb_help_block, version_text,
+        doctor_checks_with_origin, doctor_report, help_text, is_tool_candidate, list_fonts_report,
+        list_themes_report, managed_agents_dir, prepend_path, reroute_dir_from_values,
+        session_limits, session_path_env, show_face_report, verb_help_block, version_text,
     };
+    // The Windows-only tests read the window's shell and the Windows paragraphs.
+    #[cfg(windows)]
+    use super::{driver, explain_config_report, show_config_report};
 
     fn decide(args: &[&str]) -> CliAction {
         decide_args(args.iter().map(|s| s.to_string()))
@@ -2221,6 +2311,15 @@ mod tests {
     /// that is not about the `privacy:` row itself.
     fn unmeasured() -> PrivacyFacts {
         PrivacyFacts::not_measured(ProbeLabel::RefusedOutOfBundle)
+    }
+
+    /// An empty recovery ledger: the default for every doctor test that is not
+    /// about the `recovery:` row itself.
+    fn no_recovery() -> RecoveryFacts {
+        Some((
+            Vec::new(),
+            std::path::PathBuf::from("/logs/recovery-ledger.log"),
+        ))
     }
 
     /// A census with nothing running: the default for every doctor test that is
@@ -2244,41 +2343,6 @@ mod tests {
             },
             dr,
             responsible: Some(who.to_string()),
-        }
-    }
-
-    /// THE default: an unset `$ATERM_SESSION_MODEL` leaves the session model
-    /// OFF. This is the whole point of the demand-driven change — a daily-driver
-    /// session must not pay an O(bytes) VT parse and O(scrollback) memory for a
-    /// model nothing in the process can read — so it is pinned rather than left
-    /// to a code reading.
-    #[test]
-    fn the_session_model_is_off_unless_asked_for() {
-        assert!(!session_model_armed(None));
-    }
-
-    /// The disabling spellings are `aterm-gui`'s (`headless_arming`): presence is
-    /// not arming. A knob that armed on `=0` would ambush exactly the operator who
-    /// set it to turn the engine off.
-    #[test]
-    fn zero_off_and_empty_do_not_arm_the_session_model() {
-        for v in ["0", "off", "OFF", "Off", ""] {
-            assert!(
-                !session_model_armed(Some(v)),
-                "{SESSION_MODEL_ENV}={v:?} must NOT arm the session model"
-            );
-        }
-    }
-
-    /// Anything else arms it — the `=1` an operator writes, and the other truthy
-    /// spellings people reach for.
-    #[test]
-    fn ordinary_truthy_values_arm_the_session_model() {
-        for v in ["1", "yes", "true", "on", "policy"] {
-            assert!(
-                session_model_armed(Some(v)),
-                "{SESSION_MODEL_ENV}={v:?} must arm the session model"
-            );
         }
     }
 
@@ -2504,6 +2568,33 @@ mod tests {
         );
         // aterm's own `help` must never be shadowed by a co-distributed tool named `help`.
         assert!(!is_tool_candidate(Some("help")));
+    }
+
+    /// `--help` names the shell the session RUNS: `$SHELL` on Unix, the
+    /// platform default on Windows, whose passthrough never reads `$SHELL`
+    /// (audit 2026-09-22: "Runs your $SHELL" there named a shell it never ran).
+    /// The line sits right under the origin line, where it always sat.
+    #[test]
+    fn help_names_the_shell_the_session_runs() {
+        let help = help_text();
+        let after_origin = format!("{}\n\n", aterm_types::identity::ORIGIN_LINE);
+        let session = help
+            .split_once(after_origin.as_str())
+            .map(|(_, rest)| rest.split("\n\n").next().unwrap_or_default())
+            .unwrap_or_else(|| panic!("no origin line in\n{help}"));
+        if cfg!(windows) {
+            assert_eq!(
+                session,
+                "Runs pwsh (else Windows PowerShell, else %COMSPEC%) in a ConPTY and passes its\n\
+                 bytes through unchanged."
+            );
+            assert!(!help.contains("$SHELL"), "{help}");
+        } else {
+            assert_eq!(
+                session,
+                "Runs your $SHELL in a PTY and passes its bytes through unchanged."
+            );
+        }
     }
 
     #[test]
@@ -2864,6 +2955,7 @@ mod tests {
         let hooks = atpkg::hooks::hook_files(
             std::path::Path::new("/p/bin"),
             std::path::Path::new("/p/agents"),
+            std::path::Path::new("/p/reroute"),
         );
         let zsh = hooks
             .iter()
@@ -2874,6 +2966,39 @@ mod tests {
             zsh.contains(&format!("export {HOOK_AGENTS_ENV}=")),
             "the hook exports {HOOK_AGENTS_ENV}: {zsh}"
         );
+        // THE REROUTE ORDER (owner ruling 2026-09-27): inside aterm the hook's gated arm
+        // puts the reroute dir FIRST and agents/ second — this lane has no shell
+        // integration to re-assert it past path_helper — and reads `--no-reroute`'s marker
+        // by THIS crate's spelling of it, never setting it or the seam's handle. Same-day
+        // review: it also READS this lane's `$ATERM_REROUTE_DIR` as a marker for the
+        // reroute dir, because a launch whose front door handed no agents dir carries no
+        // other marker at all (this lane sets neither ATERM_CHILD nor ATERM_SESSION_ID).
+        assert!(
+            zsh.contains("__atpkg_reroute=\"/p/reroute\"")
+                && zsh.contains(&format!(
+                    "case \"${{{PASSTHROUGH_ENV}-}}\" in \"\"|0) case \"${{{AGENTS_DIR_ENV}-}}${{ATERM_CHILD-}}${{ATERM_SESSION_ID-}}${{{REROUTE_DIR_ENV}-}}\" in \"\") ;; *) __atpkg_front=\"$__atpkg_reroute${{__atpkg_front:+:}}$__atpkg_front\" ;;"
+                )),
+            "the gated arm leads reroute:agents unless {PASSTHROUGH_ENV} is engaged: {zsh}"
+        );
+        for (name, body) in &hooks {
+            assert!(
+                body.contains(PASSTHROUGH_ENV),
+                "{name} reads the --no-reroute marker: {body}"
+            );
+            for write in [
+                format!("export {PASSTHROUGH_ENV}="),
+                format!("set -gx {PASSTHROUGH_ENV}"),
+                format!("$env:{PASSTHROUGH_ENV} ="),
+                format!("{REROUTE_DIR_ENV}="),
+                format!("set -gx {REROUTE_DIR_ENV}"),
+                format!("$env:{REROUTE_DIR_ENV} ="),
+            ] {
+                assert!(
+                    !body.contains(&write),
+                    "{name} never sets the marker or the seam's handle ({write}): {body}"
+                );
+            }
+        }
         for (name, body) in &hooks {
             for marker in [AGENTS_DIR_ENV, "ATERM_CHILD", "ATERM_SESSION_ID"] {
                 assert!(
@@ -3256,14 +3381,21 @@ mod tests {
     ///    survive, exactly once. Elsewhere only survival is asserted.
     /// 2. a `.zshrc` sourcing atpkg's REAL `00-atpkg.zsh` hook body (the crate is a
     ///    test-only dependency here), the block atpkg wires into `~/.zshrc`, measured
-    ///    twice: with none of the agents gate's markers the hook DEMOTES `agents/` —
-    ///    it leaves the prompt's PATH — and with `ATERM_CHILD` set it is FIRST, exactly
-    ///    once; the reroute dir is present either way, because the bin half is
+    ///    twice: with none of the agents gate's markers the hook DEMOTES `agents/` AND
+    ///    the reroute dir — both leave the prompt's PATH (session-scoped: aterm only) —
+    ///    and with `ATERM_CHILD` set the reroute dir is FIRST and `agents/` second, each
+    ///    exactly once (owner ruling 2026-09-27: in aterm hosted shells a bare `cargo` is
+    ///    announced; measured 2026-09-24, before this, the reroute dir sat behind
+    ///    `/usr/local/bin` and `/opt/homebrew/bin` at the prompt). The managed bin/ is
     ///    unconditional (03513b5d7: the managed `claude`/`codex` lead inside aterm only,
-    ///    the Trust toolchain in every terminal).
+    ///    the Trust toolchain in every terminal). The same order with THIS lane's own
+    ///    pair (`$ATERM_AGENTS_DIR` + `$ATERM_REROUTE_DIR`, no `ATERM_CHILD`), added by
+    ///    the same day's review.
+    /// 3. the DEGRADED launch (same review): the agents handoff blank, the reroute handle
+    ///    the one marker left — the reroute dir still first, `agents/` out.
     #[cfg(unix)]
     #[test]
-    fn a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_leads_agents_only_inside_aterm() {
+    fn a_login_zsh_demotes_the_seams_front_insert_and_the_rc_hook_puts_reroute_first_in_aterm() {
         let zsh = std::path::Path::new("/bin/zsh");
         if !zsh.exists() {
             eprintln!("/bin/zsh not installed; skipping the login-zsh PATH measurement");
@@ -3288,7 +3420,7 @@ mod tests {
         )
         .expect("injects");
         assert!(seam_path.starts_with(&format!("{reroute}:{agents}:")));
-        let prompt_path = |rc: &str, inside_aterm: bool| -> Vec<String> {
+        let prompt_path = |rc: &str, markers: &[(&str, &str)]| -> Vec<String> {
             std::fs::write(zdotdir.join(".zshrc"), rc).unwrap();
             let mut cmd = std::process::Command::new(zsh);
             cmd.args(["-l", "-i", "-c", "print -r -- $PATH"])
@@ -3298,8 +3430,8 @@ mod tests {
                 .env("TERM", "dumb")
                 .env("PATH", &seam_path)
                 .stdin(std::process::Stdio::null());
-            if inside_aterm {
-                cmd.env("ATERM_CHILD", "1");
+            for (key, value) in markers {
+                cmd.env(key, value);
             }
             let out = cmd.output().expect("spawn /bin/zsh");
             assert!(
@@ -3314,7 +3446,7 @@ mod tests {
                 .collect()
         };
         // 1. The pre-rc front-insert alone.
-        let bare = prompt_path("", false);
+        let bare = prompt_path("", &[]);
         assert_eq!(bare.iter().filter(|e| **e == agents).count(), 1, "{bare:?}");
         assert_eq!(
             bare.iter().filter(|e| **e == reroute).count(),
@@ -3332,35 +3464,77 @@ mod tests {
             assert_eq!(bare[0], "/usr/local/bin", "/etc/paths leads: {bare:?}");
         }
         // 2. The rc-sourced atpkg hook, the block atpkg wires into ~/.zshrc.
-        let hook = atpkg::hooks::hook_files(&prefix.join("bin"), std::path::Path::new(&agents))
-            .into_iter()
-            .find(|(name, _)| name.ends_with(".zsh"))
-            .map(|(_, body)| body)
-            .expect("the zsh hook");
+        let hook = atpkg::hooks::hook_files(
+            &prefix.join("bin"),
+            std::path::Path::new(&agents),
+            std::path::Path::new(&reroute),
+        )
+        .into_iter()
+        .find(|(name, _)| name.ends_with(".zsh"))
+        .map(|(_, body)| body)
+        .expect("the zsh hook");
         let shell_d = home.join(".aterm/shell.d");
         std::fs::create_dir_all(&shell_d).unwrap();
         std::fs::write(shell_d.join("00-atpkg.zsh"), hook).unwrap();
         let rc = "[ -f \"$HOME/.aterm/shell.d/00-atpkg.zsh\" ] && . \"$HOME/.aterm/shell.d/00-atpkg.zsh\"\n";
-        let outside = prompt_path(rc, false);
+        let outside = prompt_path(rc, &[]);
         assert!(
             !outside.contains(&agents),
             "outside aterm the hook demotes agents/: {outside:?}"
         );
         assert!(
-            outside.contains(&reroute),
+            !outside.contains(&reroute),
+            "outside aterm the hook takes the reroute dir out too: {outside:?}"
+        );
+        assert_eq!(
+            outside.last().map(String::as_str),
+            Some(prefix.join("bin").to_str().unwrap()),
             "the bin half is unconditional: {outside:?}"
         );
-        let inside = prompt_path(rc, true);
-        assert_eq!(
-            inside[0], agents,
-            "inside aterm the hook moves agents/ first: {inside:?}"
+        // Inside: a window tab's marker, and THIS lane's own pair (the front door's
+        // agents handoff and the reroute handle — never ATERM_CHILD, `session_main`).
+        for markers in [
+            &[("ATERM_CHILD", "1")][..],
+            &[
+                (AGENTS_DIR_ENV, agents.as_str()),
+                (REROUTE_DIR_ENV, reroute.as_str()),
+            ][..],
+        ] {
+            let inside = prompt_path(rc, markers);
+            assert_eq!(
+                inside[..2],
+                [reroute.as_str(), agents.as_str()],
+                "inside aterm ({markers:?}) the hook moves the reroute dir first and agents/ second: {inside:?}"
+            );
+            for dir in [&reroute, &agents] {
+                assert_eq!(
+                    inside.iter().filter(|e| *e == dir).count(),
+                    1,
+                    "{dir} once: {inside:?}"
+                );
+            }
+        }
+        // 3. THE DEGRADED LAUNCH (review finding 2026-09-27): the front door handed no
+        // agents dir (a file or a link at `agents/`) and this lane blanked the inherited
+        // handoff, so the reroute handle is the one marker left. The hook still puts the
+        // reroute dir first — a bare `cargo` is still announced — and leaves agents/ out.
+        let degraded = prompt_path(
+            rc,
+            &[(AGENTS_DIR_ENV, ""), (REROUTE_DIR_ENV, reroute.as_str())],
         );
         assert_eq!(
-            inside.iter().filter(|e| **e == agents).count(),
+            degraded[0], reroute,
+            "no agents handoff: the reroute dir still leads: {degraded:?}"
+        );
+        assert_eq!(
+            degraded.iter().filter(|e| **e == reroute).count(),
             1,
-            "{inside:?}"
+            "{degraded:?}"
         );
-        assert!(inside.contains(&reroute), "{inside:?}");
+        assert!(
+            !degraded.contains(&agents),
+            "no agents marker, so agents/ stays out: {degraded:?}"
+        );
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
@@ -3421,6 +3595,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(code, 0, "{r}");
         assert!(r.contains("health: OK"), "{r}");
@@ -3449,6 +3624,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(code, 1);
         assert!(
@@ -3457,7 +3633,16 @@ mod tests {
         );
 
         // $SHELL unset → fail.
-        let (r, code) = doctor_checks(None, false, true, 24, 80, &unmeasured(), &no_census());
+        let (r, code) = doctor_checks(
+            None,
+            false,
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
         assert_eq!(code, 1);
         assert!(r.contains("$SHELL unset"), "{r}");
 
@@ -3475,6 +3660,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(code, 0, "a piped healthy machine is healthy: {r}");
         // The fact alone — the mark column and `health: OK` carry the verdict; and no
@@ -3493,6 +3679,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(code, 1, "a real failure still fails without a tty: {r}");
 
@@ -3506,6 +3693,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert!(!r.contains("containment"), "{r}");
 
@@ -3518,6 +3706,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         for key in ["shell: ", "tty: ", "privacy: ", "version: "] {
             assert!(
@@ -3546,6 +3735,7 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(mark_of(&r, "shell:"), "ok", "{r}");
         assert_eq!(mark_of(&r, "tty:"), "ok", "{r}");
@@ -3557,9 +3747,163 @@ mod tests {
             80,
             &unmeasured(),
             &no_census(),
+            &no_recovery(),
         );
         assert_eq!(mark_of(&r, "shell:"), "FAIL", "{r}");
         assert_eq!(mark_of(&r, "tty:"), "note", "{r}");
+    }
+
+    /// The `shell:` row can carry WHERE the shell came from — the Windows report
+    /// names the window's shell and must say so — and without a label the row
+    /// is byte-identical to before, which is what keeps the Unix report fixed.
+    #[test]
+    fn doctor_shell_row_carries_an_origin_label_only_when_given() {
+        let shell_row = |report: &str| -> String {
+            report
+                .lines()
+                .find(|l| l.starts_with("shell:"))
+                .unwrap_or_else(|| panic!("no shell: row in\n{report}"))
+                .to_string()
+        };
+        let (plain, _) = doctor_checks(
+            Some("/bin/sh"),
+            true,
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
+        let (unlabelled, _) = doctor_checks_with_origin(
+            Some("/bin/sh"),
+            true,
+            None,
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
+        assert_eq!(plain, unlabelled, "no label, no change");
+
+        let (labelled, code) = doctor_checks_with_origin(
+            Some(r"C:\Program Files\PowerShell\7\pwsh.exe"),
+            true,
+            Some("the window's shell, the platform default (pwsh on PATH)"),
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
+        assert_eq!(code, 0);
+        assert_eq!(mark_of(&labelled, "shell:"), "ok", "{labelled}");
+        assert!(
+            shell_row(&labelled).ends_with(
+                r" C:\Program Files\PowerShell\7\pwsh.exe (executable) — the window's shell, the platform default (pwsh on PATH)"
+            ),
+            "{labelled}"
+        );
+
+        // The label rides on a FAILING row too: the reader needs to know which
+        // input named the missing shell before they can fix it.
+        let (failed, code) = doctor_checks_with_origin(
+            Some("nosuch"),
+            false,
+            Some("the window's shell, from aterm.toml shell = \"nosuch\""),
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
+        assert_eq!(code, 1);
+        assert_eq!(mark_of(&failed, "shell:"), "FAIL", "{failed}");
+        assert!(
+            shell_row(&failed).ends_with(
+                " nosuch (not executable or missing) — the window's shell, from aterm.toml shell = \"nosuch\""
+            ),
+            "{failed}"
+        );
+    }
+
+    /// Windows: the live `doctor` and `show-config` report the WINDOW's shell,
+    /// labelled, never this process's `$SHELL`/`%COMSPEC%` (measured 2026-09-22:
+    /// `cmd.exe` from inside a pwsh 7 tab, `bash.exe` from Git Bash — the shell
+    /// the CLI was typed into, which the spawn never reads).
+    #[cfg(windows)]
+    #[test]
+    fn windows_doctor_and_show_config_report_the_windows_shell() {
+        let window_shell = driver::WindowShell::resolve();
+        let (doctor, _) = doctor_report();
+        let shell_line = doctor
+            .lines()
+            .find(|l| l.starts_with("shell: "))
+            .expect("a shell row");
+        assert!(shell_line.contains(&window_shell.program), "{shell_line}");
+        assert!(shell_line.contains("the window's shell"), "{shell_line}");
+        assert!(
+            shell_line.contains(&window_shell.origin_sentence()),
+            "{shell_line}"
+        );
+        let show = show_config_report();
+        assert!(
+            show.contains(&format!("shell={}\n", window_shell.program)),
+            "{show}"
+        );
+        assert!(
+            show.contains(&format!("shell_origin={}\n", window_shell.origin_token())),
+            "{show}"
+        );
+        // Never the CLI process's own POSIX `$SHELL` (Git Bash exports
+        // `/usr/bin/bash`, a path CreateProcessW could not run).
+        if let Ok(posix_shell) = std::env::var("SHELL")
+            && posix_shell.starts_with('/')
+        {
+            assert!(!doctor.contains(&posix_shell), "{doctor}");
+            assert!(!show.contains(&posix_shell), "{show}");
+        }
+    }
+
+    /// Windows `explain-config` names where aterm.toml lives on THIS machine —
+    /// the resolved path, from the rule the window loads by — and the two keys
+    /// the page never mentioned, `shell` and `font_px`.
+    #[cfg(windows)]
+    #[test]
+    fn windows_explain_config_names_the_config_path_shell_and_font_px() {
+        let r = explain_config_report();
+        let path = aterm_types::dirs::aterm_config_path()
+            .expect("APPDATA or HOME is set on a test box")
+            .display()
+            .to_string();
+        assert!(
+            r.contains(&format!("\n  {path}\n")),
+            "explain-config missing the resolved path {path:?}\n{r}"
+        );
+        for needle in [
+            "aterm.toml — the window's settings file on this machine:",
+            "%APPDATA%\\aterm\\aterm.toml",
+            "\n  shell ",
+            "\n  font_px ",
+            "with --shell uses that instead",
+            "with --font-px uses that instead",
+            "pwsh, then powershell, then %COMSPEC%, then cmd.exe",
+            // The console image's spelling: `aterm-gui` is the GUI-subsystem
+            // image, which a pwsh prompt does not wait for.
+            "`aterm --window --write-config`",
+            "aterm help config",
+            "doctor` names the program this machine resolves it to",
+        ] {
+            assert!(r.contains(needle), "explain-config missing {needle:?}\n{r}");
+        }
+        assert!(
+            !r.contains("~/.config/aterm"),
+            "no Unix literal for the Windows config path:\n{r}"
+        );
     }
 
     /// §3.8's four `privacy:` states, and the property the whole three-valued
@@ -3569,7 +3913,16 @@ mod tests {
     #[test]
     fn the_privacy_row_is_a_note_and_never_moves_the_exit_code() {
         let ok = |privacy: &PrivacyFacts| {
-            doctor_checks(Some("/bin/sh"), true, true, 24, 80, privacy, &no_census())
+            doctor_checks(
+                Some("/bin/sh"),
+                true,
+                true,
+                24,
+                80,
+                privacy,
+                &no_census(),
+                &no_recovery(),
+            )
         };
 
         // 1. granted, on a build whose identity is stable → the one `ok` arm.
@@ -3618,10 +3971,86 @@ mod tests {
         );
 
         // And a genuine Fail still fails, with the note alongside it.
-        let (r, code) = doctor_checks(None, false, true, 24, 80, &unmeasured(), &no_census());
+        let (r, code) = doctor_checks(
+            None,
+            false,
+            true,
+            24,
+            80,
+            &unmeasured(),
+            &no_census(),
+            &no_recovery(),
+        );
         assert_eq!(code, 1, "{r}");
         assert!(r.contains("health: FAIL"), "{r}");
         assert_eq!(mark_of(&r, "privacy:"), "note", "{r}");
+    }
+
+    /// The `recovery:` row: an empty ledger is OK and says where the census will
+    /// write; a recorded kill is a NOTE that names it — never a FAIL, so a past crash
+    /// does not make `aterm doctor && aterm` refuse to launch; no log directory is
+    /// "not measured", never "none".
+    #[test]
+    fn the_recovery_row_reports_the_ledger_and_never_fails() {
+        use aterm_update::recovery_ledger::{
+            EndClass, LaunchKind, Pressure, PrevRun, Row, Tri, Uptime,
+        };
+        let check = |recovery: RecoveryFacts| {
+            doctor_checks(
+                Some("/bin/sh"),
+                true,
+                true,
+                24,
+                80,
+                &unmeasured(),
+                &no_census(),
+                &recovery,
+            )
+        };
+        let (r, code) = check(no_recovery());
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "recovery:"), "ok", "{r}");
+        assert!(r.contains("no windowed launch of the installed app"), "{r}");
+
+        let killed = Row {
+            at: 1_790_500_000,
+            pid: 2,
+            started: 1_790_499_990,
+            build: 1_790_400_000,
+            version: "0.94.0".into(),
+            launch: LaunchKind::Cold,
+            prev: PrevRun {
+                pid: Some(1),
+                build: Some(1_790_305_290),
+                version: Some("0.93.0".into()),
+                class: EndClass::Killed,
+                uptime: Some(Uptime {
+                    secs: 7200,
+                    at_least: true,
+                }),
+                stall: Tri::Yes,
+                pressure: Pressure::Normal,
+                trial: 0,
+            },
+        };
+        let path = std::path::PathBuf::from("/logs/recovery-ledger.log");
+        let (r, code) = check(Some((vec![killed], path)));
+        assert_eq!(code, 0, "a past kill never fails doctor: {r}");
+        assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
+        assert!(r.contains("1 killed"), "{r}");
+        assert!(r.contains("build 1790305290 (0.93.0)"), "{r}");
+        assert!(r.contains("up 2 h 0 min or more"), "{r}");
+        assert!(r.contains("stalled at its end"), "{r}");
+        // One row, several lines: the label once, the later lines under the fact
+        // column, as every multi-line row prints.
+        assert_eq!(r.matches("recovery:").count(), 1, "{r}");
+
+        let (r, code) = check(None);
+        assert_eq!(code, 0, "{r}");
+        assert_eq!(mark_of(&r, "recovery:"), "note", "{r}");
+        assert!(r.contains("not measured"), "{r}");
+        // The label is said once, by the row: the fact under it does not repeat it.
+        assert_eq!(r.matches("recovery:").count(), 1, "{r}");
     }
 
     /// The `instances:` row, every state, and the property it shares with
@@ -3631,7 +4060,16 @@ mod tests {
     fn the_instances_row_names_what_nothing_reaches_and_never_fails() {
         use aterm_ctl::census::{Census, Unreached};
         let check = |census: Result<Census, String>| {
-            doctor_checks(Some("/bin/sh"), true, true, 24, 80, &unmeasured(), &census)
+            doctor_checks(
+                Some("/bin/sh"),
+                true,
+                true,
+                24,
+                80,
+                &unmeasured(),
+                &census,
+                &no_recovery(),
+            )
         };
         let census = |instances: usize, unreached: Vec<Unreached>| {
             Ok(Census {
@@ -3719,6 +4157,7 @@ mod tests {
             80,
             &measured(FdaState::Denied, DrClass::Unknown, "Terminal"),
             &no_census(),
+            &no_recovery(),
         );
         assert!(!r.contains("dev build"), "{r}");
     }
@@ -4162,7 +4601,7 @@ mod tests {
         if cfg!(target_os = "macos") {
             assert_eq!(
                 hardened.address_space, None,
-                "macOS accepts no finite RLIMIT_AS"
+                "a 16 GiB RLIMIT_AS is below what every macOS process already maps"
             );
         } else {
             assert_eq!(hardened.address_space, Some(16 * 1024 * 1024 * 1024));

@@ -65,8 +65,10 @@
 //! two ABIs this file mirrors field-for-field below. Every other target
 //! (Windows, and any Unix whose `msghdr`/socket-option numbering this file
 //! does not vouch for) gets the same entry points returning
-//! [`io::ErrorKind::Unsupported`]. Honest refusal, never a silent success:
-//! there is no emulation of `SCM_RIGHTS`, and afunix on Windows has none.
+//! [`io::ErrorKind::Unsupported`] for descriptor passing. Honest refusal,
+//! never a silent success: there is no emulation of `SCM_RIGHTS`, and afunix
+//! on Windows has none. [`peer_pid`] alone is wired on Windows too
+//! (`SIO_AF_UNIX_GETPEERPID`).
 
 use std::io;
 
@@ -190,7 +192,8 @@ pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::
 }
 
 /// The connected peer's pid as the KERNEL recorded it at `connect(2)` /
-/// `socketpair(2)` — `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux.
+/// `socketpair(2)` — `LOCAL_PEERPID` on Darwin, `SO_PEERCRED` on Linux,
+/// `SIO_AF_UNIX_GETPEERPID` on Windows.
 ///
 /// This is identity a peer cannot assert for itself, which is what makes it
 /// worth having: the handoff's parent attestation otherwise rests on a
@@ -205,10 +208,11 @@ pub fn recv_with_fds(stream: &CtlStream, buf: &mut [u8], max_fds: usize) -> io::
 /// * `InvalidData` — the kernel answered with a pid that cannot name a process
 ///   (zero or negative); refused rather than returned, because a caller
 ///   comparing pids must never be handed a plausible-looking zero.
-/// * `Unsupported` — this platform has no peer-pid primitive wired here. On
-///   Windows that is the same reduced posture the control channel already
-///   discloses at startup (afunix has no `SO_PEERCRED` analog); on a Unix this
-///   file does not vouch for, it is a refusal to guess a socket-option number
+/// * On Windows, whatever the ioctl reports — an afunix without it answers an
+///   error, and the control channel then keeps its directory-ACL + token
+///   posture.
+/// * `Unsupported` — on a Unix this file does not vouch for: a refusal to
+///   guess a socket-option number
 ///   (`SO_PEERCRED` is not 17 everywhere — sparc and mips renumber it, and
 ///   sparc renumbers `SOL_SOCKET` too, so a wrong guess would read some
 ///   unrelated option and answer confidently).
@@ -1019,6 +1023,12 @@ mod scm {
         Err(unsupported("descriptor passing"))
     }
 
+    #[cfg(windows)]
+    pub fn peer_pid(stream: &CtlStream) -> io::Result<u32> {
+        stream.peer_pid()
+    }
+
+    #[cfg(not(windows))]
     pub fn peer_pid(_stream: &CtlStream) -> io::Result<u32> {
         Err(unsupported("the peer pid"))
     }

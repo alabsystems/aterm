@@ -61,16 +61,23 @@ use winit::window::Window;
 
 #[cfg(target_os = "macos")]
 pub(crate) mod mac;
+#[cfg(test)]
+pub(crate) mod scripted;
 #[cfg(not(target_os = "macos"))]
 pub(crate) mod softbuffer_surface;
 
 /// The CPU present backend for THIS cell. macOS gets the first-party
 /// CoreGraphics presenter; every other cell keeps `softbuffer`.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 pub(crate) type CpuSurface = mac::MacCpuPresenter;
 /// The CPU present backend for THIS cell — see the macOS twin above.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(test)))]
 pub(crate) type CpuSurface = softbuffer_surface::SoftbufferPresenter;
+/// The TEST build's CPU surface: the platform presenter above, or a scripted
+/// one a headless test installs to drive the real present path end to end
+/// ([`scripted`]).
+#[cfg(test)]
+pub(crate) type CpuSurface = scripted::TestCpuSurface;
 
 /// One damaged region of a presented frame, in surface pixels with the origin
 /// at the top-left.

@@ -486,7 +486,9 @@ impl Intent {
             Self::StopPaste { .. } => "Stop",
             Self::ShowTab { tab, .. } => TAB_N[usize::from(*tab).min(10) % 10],
             Self::AgentUpgrade { word, .. } => match word {
-                UpgradeWord::Now => "Now",
+                // What the press does, not when (round 18, day four, D6: a
+                // bare `Now` beside `Tomorrow` said neither what nor to whom).
+                UpgradeWord::Now => "Upgrade",
                 // A day off, in the eight cells a short form has.
                 UpgradeWord::NotToday => "Tomorrow",
                 UpgradeWord::Skip => "Skip",

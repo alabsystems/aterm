@@ -3,8 +3,10 @@
 
 //! Background discovery of SIBLING aterm instances for the menu-bar status
 //! item: enumerate the live control sockets the shared control-socket dir
-//! knows about, dial each peer's `sessions` roster (with typed-meta
-//! follow-ups so a sibling's `role`/`attention` state travels), classify with
+//! knows about, dial each peer's `sessions` roster (whose rows carry the typed
+//! `role=`/`attention=`/`user_title=`, so a sibling's escalation state travels in
+//! that one read — with an `@sid meta` follow-up only for a sibling on an older
+//! build, whose rows lack them), classify with
 //! the SAME pure classifier — and the same live-session universe (`exited`
 //! rows excluded) — as the local glance, and post the summarized rows back to
 //! the event loop as a `Wake`.
@@ -37,18 +39,20 @@ use crate::Wake;
 use crate::status_item::{InstanceRow, SessionRow};
 
 /// Per-peer WALL-CLOCK budget covering the whole dial (connect, auth, roster,
-/// meta follow-ups). Every read/write re-arms the socket timeout with the
-/// remainder, so this is a hard bound, not a per-syscall idle window.
+/// an older sibling's meta follow-ups). Every read/write re-arms the socket
+/// timeout with the remainder, so this is a hard bound, not a per-syscall idle
+/// window.
 const PEER_BUDGET: Duration = Duration::from_secs(2);
-/// Hard cap on one reply line — roster lines and meta readouts are short;
-/// a newline-less flood hits this long before the budget matters.
+/// Hard cap on one reply line — roster lines and meta readouts are short; a
+/// newline-less flood hits this long before the budget matters.
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 /// Roster line-count cap: a header claiming more is REFUSED (not clamped —
 /// a clamp would leave unread lines desyncing every later reply).
 const MAX_SESSIONS_PER_PEER: usize = 1024;
-/// How many `meta=1` sessions per peer get the typed-meta follow-up read.
-/// Generous because the peer budget bounds the true cost; past the cap a
-/// session's escalation still surfaces via the `⚠`-title fallback.
+/// How many `meta=1` sessions of an OLDER sibling (a roster without the typed
+/// tokens) get the `@sid meta` follow-up. Generous because the peer budget
+/// bounds the true cost; past the cap a session's escalation still surfaces
+/// through the `⚠`-title fallback. A current sibling needs none.
 const MAX_META_LOOKUPS: usize = 256;
 
 /// One scan at a time: menu-open spam coalesces onto the in-flight scan (its
@@ -153,12 +157,20 @@ fn scan_siblings() -> Vec<InstanceRow> {
     rows
 }
 
-/// One roster line: `<local> <sid> <parent|-> <state> <title-pct> meta=<0|1>`.
+/// One roster line: `<local> <sid> <parent|-> <state> <title-pct> meta=<0|1>
+/// …`, with the typed `role=`/`attention=`/`user_title=` read from its keyed
+/// tokens (`None` when `-`). A sibling on a build before the roster carried
+/// them sends none (`typed` false): its `meta=1` sessions are read with an
+/// `@sid meta` follow-up instead, as every sibling's were before.
 struct PeerSession {
     id: u64,
     sid: String,
     title: String,
+    role: Option<String>,
+    attention: Option<String>,
     has_meta: bool,
+    /// The row carried the typed `attention=` key (a current sibling).
+    typed: bool,
 }
 
 /// Parse one `sessions` roster line, tolerantly: a malformed line reads as
@@ -167,7 +179,9 @@ struct PeerSession {
 /// running operator), so the sibling summary must count by the same rule.
 /// Fields split POSITIONALLY on single spaces (the wire format), so an
 /// empty pct-encoded title survives as an empty token instead of collapsing
-/// the field count; tokens after `meta=` are additive-tolerated.
+/// the field count; the keyed tokens after `meta=` are read by key, and any
+/// other is additive-tolerated. A `user_title=` overrides the title, as the
+/// local glance's tab label does.
 fn parse_roster_line(line: &str) -> Option<PeerSession> {
     let mut f = line.trim_end_matches(['\r', '\n']).split(' ');
     let (id, sid, _parent, state, title, meta) = (
@@ -181,11 +195,27 @@ fn parse_roster_line(line: &str) -> Option<PeerSession> {
     if state == "exited" {
         return None;
     }
+    let (mut role, mut attention, mut user_title, mut typed) = (None, None, None, false);
+    for tok in f {
+        let Some((key, value)) = tok.split_once('=') else {
+            continue;
+        };
+        let value = (value != "-").then(|| aterm_control::wire::pct_decode(value));
+        match key {
+            "role" => role = value,
+            "attention" => (attention, typed) = (value, true),
+            "user_title" => user_title = value,
+            _ => {}
+        }
+    }
     Some(PeerSession {
         id: id.parse::<u64>().ok()?,
         sid: sid.to_string(),
-        title: aterm_control::wire::pct_decode(title),
+        title: user_title.unwrap_or_else(|| aterm_control::wire::pct_decode(title)),
+        role,
+        attention,
         has_meta: meta == "meta=1",
+        typed,
     })
 }
 
@@ -205,11 +235,12 @@ fn arm(stream: &aterm_uds::CtlStream, deadline: Instant) -> Option<()> {
     Some(())
 }
 
-/// Dial one sibling, read its roster (+ typed-meta follow-ups), classify.
-/// A refusal, budget exhaustion, or malformed frame in the ROSTER phase skips
-/// the peer silently (the `run_discovery` posture); an anomaly in the META
-/// phase only STOPS the follow-ups — the roster rows still classify, with
-/// title conventions carrying any escalation the typed read didn't reach.
+/// Dial one sibling, read its roster (+ an older sibling's typed-meta
+/// follow-ups), classify. A refusal, budget exhaustion, or malformed frame in
+/// the ROSTER phase skips the peer silently (the `run_discovery` posture); an
+/// anomaly in the META phase only STOPS the follow-ups — the roster rows still
+/// classify, with title conventions carrying any escalation the typed read
+/// didn't reach.
 fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
     let deadline = Instant::now() + PEER_BUDGET;
     let token = crate::proxy::read_sibling_token(sock)?;
@@ -235,20 +266,20 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
         }
     }
 
-    // Typed-meta follow-ups on the SAME authenticated connection: only
-    // sessions flagged meta=1, capped — the roster line carries no role/
-    // attention, and typed escalation state is the point of the exercise.
-    // Any failure here stops the phase (nothing further is read from the
+    // An OLDER sibling's typed-meta follow-ups, on the SAME authenticated
+    // connection: only its `meta=1` sessions, capped — its roster rows carry
+    // no role/attention, and typed escalation state is the point of the
+    // exercise. A current sibling's rows carry them, so it is asked nothing
+    // more. Any failure here stops the phase (nothing further is read from the
     // stream, so sync no longer matters) and the rows classify as-is.
     let mut rows: Vec<SessionRow> = Vec::with_capacity(sessions.len());
-    let mut lookups = 0usize;
-    let mut meta_alive = true;
-    for s in &sessions {
+    let (mut lookups, mut meta_alive) = (0_usize, true);
+    for s in sessions {
         let mut row = SessionRow {
             id: s.id,
-            title: s.title.clone(),
-            role: None,
-            attention: None,
+            title: s.title,
+            role: s.role,
+            attention: s.attention,
             // A sibling's verdict is not read over this scan: its own menu
             // and notifications carry it; this row only counts `⚠`s.
             agent: None,
@@ -256,7 +287,7 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
             // Likewise its input stall: the sibling's own menu raises it.
             input_stall: None,
         };
-        if meta_alive && s.has_meta && lookups < MAX_META_LOOKUPS {
+        if meta_alive && !s.typed && s.has_meta && lookups < MAX_META_LOOKUPS {
             lookups += 1;
             match read_peer_meta(&stream, &mut reader, &s.sid, deadline) {
                 Some(Some((user_title, role, attention))) => {
@@ -284,9 +315,10 @@ fn summarize_peer(pid: u32, sock: &str) -> Option<InstanceRow> {
     })
 }
 
-/// `@<sid> meta` on the open connection. Outer `None` = stream/budget anomaly
-/// (caller must stop reading); `Some(None)` = clean non-OK reply (in sync);
-/// `Some(Some((user_title, role, attention)))` = parsed, each `None` if unset.
+/// `@<sid> meta` on the open connection, for an older sibling. Outer `None` =
+/// stream/budget anomaly (caller must stop reading); `Some(None)` = clean
+/// non-OK reply (in sync); `Some(Some((user_title, role, attention)))` =
+/// parsed, each `None` if unset.
 type PeerMeta = (Option<String>, Option<String>, Option<String>);
 fn read_peer_meta(
     stream: &aterm_uds::CtlStream,
@@ -348,7 +380,8 @@ mod tests {
         let s = parse_roster_line("3 s-abc - alive vim%20main.rs meta=1\n").expect("well-formed");
         assert_eq!((s.id, s.sid.as_str()), (3, "s-abc"));
         assert_eq!(s.title, "vim main.rs");
-        assert!(s.has_meta);
+        assert_eq!((s.role, s.attention), (None, None), "a pre-token sibling");
+        assert!(s.has_meta && !s.typed, "…whose meta is read by a follow-up");
         assert!(
             parse_roster_line("4 s-dead - exited zsh meta=0").is_none(),
             "a dead session is not a fleet fact"
@@ -360,15 +393,30 @@ mod tests {
         );
         let empty = parse_roster_line("5 s-e - alive  meta=1").expect("empty title survives");
         assert_eq!(empty.title, "");
-        assert!(empty.has_meta);
         // Additive trailing tokens after meta= are tolerated.
         assert!(parse_roster_line("6 s-f - alive zsh meta=0 future=x").is_some());
+        // The typed metadata is read by key; `-` is unset; a user title wins.
+        let typed = parse_roster_line(
+            "7 s-g - alive zsh meta=1 nonce=ab supervisor=- role=operator \
+             attention=stuck%20on%20CI user_title=my%20build\n",
+        )
+        .expect("typed");
+        assert_eq!(typed.role.as_deref(), Some("operator"));
+        assert_eq!(typed.attention.as_deref(), Some("stuck on CI"));
+        assert_eq!(typed.title, "my build");
+        assert!(typed.typed, "a current sibling needs no follow-up");
+        let unset = parse_roster_line("8 s-h - alive zsh meta=0 role=- attention=- user_title=-")
+            .expect("unset");
+        assert_eq!((unset.role, unset.attention), (None, None));
+        assert_eq!(unset.title, "zsh");
     }
 
-    /// A scripted fake peer over a real Unix socket serving AUTH, the
-    /// `sessions` roster, and one `@sid meta` follow-up — proving the whole
-    /// dial path end-to-end: typed attention travels, warnings and the
-    /// operator mark land in the summarized row, exited rows are excluded.
+    /// A scripted fake peer over a real Unix socket serving AUTH and the
+    /// `sessions` roster — proving the whole dial path end-to-end in ONE read:
+    /// typed attention travels in the roster row, warnings and the operator mark
+    /// land in the summarized row, exited rows are excluded. The peer answers
+    /// nothing else, and a follow-up request fails the test (the old `@sid
+    /// meta` hop, one per session, is gone).
     #[cfg(unix)]
     #[test]
     fn summarize_peer_reads_a_scripted_sibling() {
@@ -392,18 +440,20 @@ mod tests {
             let mut w = conn.try_clone().unwrap();
             w.write_all(
                 b"OK 3\n\
-                  0 s-op - alive operator%3A%20busy meta=1\n\
-                  1 s-w - alive zsh meta=0\n\
-                  2 s-x - exited gone meta=0\n",
+                  0 s-op - alive zsh meta=1 nonce=aa supervisor=- role=operator attention=stuck%20on%20CI user_title=-\n\
+                  1 s-w - alive zsh meta=0 nonce=bb supervisor=- role=- attention=- user_title=-\n\
+                  2 s-x - exited gone meta=0 nonce=cc supervisor=- role=- attention=- user_title=-\n",
             )
             .unwrap();
+            // Held open until the client hangs up, as a live sibling holds it:
+            // macOS refuses a socket option on a socket whose peer has closed,
+            // and the client re-arms its timeout before every line.
             line.clear();
-            reader.read_line(&mut line).unwrap();
-            assert_eq!(line, "@s-op meta\n");
-            w.write_all(
-                b"OK title=zsh user_title=- description=- icon=- role=operator attention=stuck%20on%20CI cwd=- state=alive\n",
-            )
-            .unwrap();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "no follow-up: {line:?}"
+            );
         });
         let row = super::summarize_peer(4242, sock.to_str().unwrap()).expect("summarized");
         server.join().unwrap();
@@ -411,5 +461,59 @@ mod tests {
         assert_eq!(row.sessions, 2, "exited row excluded");
         assert_eq!(row.warnings, 1, "typed attention travels");
         assert!(row.operator, "typed role travels");
+    }
+
+    /// A sibling on an OLDER build, whose roster rows carry no typed tokens,
+    /// still shows its typed escalation and operator role in the menu: its
+    /// `meta=1` session is read with an `@sid meta` follow-up on the same
+    /// connection (dropping that hop for every sibling left such a peer with
+    /// the `⚠`-title fallback alone). Its `meta=0` session is asked nothing.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_sibling_is_read_with_a_meta_follow_up() {
+        use std::io::{BufRead, BufReader, Write};
+        let dir = std::env::temp_dir().join(format!("aterm-fleet-old-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("peer.sock");
+        let _ = std::fs::remove_file(&sock);
+        std::fs::write(dir.join("aterm.token"), "feedbeef\n").unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(conn.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "AUTH feedbeef\n");
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "sessions\n");
+            let mut w = conn.try_clone().unwrap();
+            w.write_all(
+                b"OK 2\n\
+                  0 s-op - alive zsh meta=1\n\
+                  1 s-w - alive zsh meta=0\n",
+            )
+            .unwrap();
+            line.clear();
+            reader.read_line(&mut line).unwrap();
+            assert_eq!(line, "@s-op meta\n");
+            w.write_all(
+                b"OK title=zsh user_title=- description=- icon=- role=operator \
+                  attention=stuck%20on%20CI cwd=- state=alive\n",
+            )
+            .unwrap();
+            line.clear();
+            assert_eq!(
+                reader.read_line(&mut line).unwrap(),
+                0,
+                "one follow-up, for the meta=1 session only: {line:?}"
+            );
+        });
+        let row = super::summarize_peer(4243, sock.to_str().unwrap()).expect("summarized");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(row.sessions, 2);
+        assert_eq!(row.warnings, 1, "the older sibling's typed attention shows");
+        assert!(row.operator, "…and its operator role");
     }
 }

@@ -36,6 +36,31 @@
 //! `Buggy` model escalates a worker that "reports done", which the real
 //! decider never does — so a green walk is not vacuous.
 //!
+//! THE TASK (D1 of the live E2E of 2026-09-26): the walk WRITES the
+//! conversation's record as it goes — a person's prompt and its answer for
+//! `HumanWork`; for `HarnessTurn` the harness's own marked turn and a
+//! `keep going` of the supervisor's own (unmarked, known from its loop's
+//! ledger), each answered — and the reading's `taskless` is the REAL
+//! `harness::upgrade::transcript_tasked` over it and that ledger, checked
+//! against the model's `tasked` at every state: the harness's own turns
+//! never make a task, and at a state with none the real decider does
+//! nothing at all.
+//!
+//! THE HARNESS'S TURNS ARE NO SHORT TURNS OF THE WORKER'S (N1 of the live
+//! E2E of 2026-09-26): a `HarnessTurn` is the turn the session's host typed
+//! (`TurnEndState::host_typed`), answered short, in a session with a task
+//! or without; the real streak and its wait are checked against the model's
+//! at every state after it — unmoved — and the decider continues at once
+//! where the worker's own work earned no back-off. A `HarnessTurnLong` is
+//! the same turn answered with real work (a carry-on's answer is the
+//! worker's own work, resumed): the real streak ends with the model's, and
+//! a back-off the worker's short turn had started is over. NEGATIVE
+//! CONTROLS: the same short answer read as someone else's turn (the host's
+//! turn not registered, the regression) backs a free point off where the
+//! model continues, and the `Buggy` model that counts it so is caught by
+//! `NeverBackOffForTheHarness`; the `Buggy` model whose long answer leaves
+//! the streak standing is caught by `NeverBackOffAfterRealWork`.
+//!
 //! Every walk runs twice more over what the turn ends on: a report (`Stage
 //! done.`), whose `Continue` is `continue@v1`'s `keep going`, and a CHOICE
 //! asked in prose (`Should I rewrite the parser or patch the lexer?`), whose
@@ -48,6 +73,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::upgrade::transcript_tasked;
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
@@ -92,9 +118,29 @@ fn continue_rule() -> &'static str {
     }
 }
 
+/// A person's prompt, the harness's own turn, the supervisor's own
+/// continuation (no mark: its words are the owner's), and an answer, as the
+/// conversation's record holds them.
+const PERSON: &str = r#"{"type":"user","message":{"role":"user","content":"Stage the parser."}}"#;
+const HARNESS: &str = r#"{"type":"user","message":{"role":"user","content":"[aterm harness] Upgraded: this session was restarted on Claude Code 2.1.283."}}"#;
+const SUPERVISOR: &str = r#"{"type":"user","message":{"role":"user","content":"keep going"}}"#;
+const ANSWER: &str = r#"{"type":"assistant","message":{"model":"claude-haiku-4-5","content":[{"type":"text","text":"ok"}]}}"#;
+
+/// What the session's supervisor typed, as its ledger records it
+/// (`supervise::approvals::typed_texts`).
+fn ours() -> Vec<String> {
+    vec![SupervisorConfig::default().continue_text]
+}
+
 /// The screen the model state stands for; `unanswered`: the act's `❯` row
-/// is last on it, never taken.
-fn reading(st: &State, worked: Option<Duration>, unanswered: bool) -> TurnEndReading {
+/// is last on it, never taken; `taskless`: what the conversation's record
+/// says (the real `TaskScan`'s word).
+fn reading(
+    st: &State,
+    worked: Option<Duration>,
+    unanswered: bool,
+    taskless: bool,
+) -> TurnEndReading {
     let phase = if st["pending"] == 1 || st["pending"] == 2 {
         Phase::Busy
     } else if st["box_up"] == 1 {
@@ -129,18 +175,28 @@ fn reading(st: &State, worked: Option<Duration>, unanswered: bool) -> TurnEndRea
         // The window's host: its walls here are retried, never restarted.
         restartable: true,
         upgrading: false,
-        fresh: false,
+        taskless,
         person: (st["person"] == 1).then_some(JUST_TYPED),
+        login_back: false,
     }
 }
 
-/// The real side of one walk: the decider's state, the loop's clock, and
-/// whether the act's `❯` row stands unanswered on the screen.
+/// The real side of one walk: the decider's state, the loop's clock,
+/// whether the act's `❯` row stands unanswered on the screen, and the
+/// conversation's record as the walk wrote it.
 #[derive(Clone)]
 struct Real {
     st: TurnEndState,
     now: Instant,
     unanswered: bool,
+    record: String,
+}
+
+impl Real {
+    /// No task, by the real scan over the record and the loop's ledger.
+    fn taskless(&self) -> bool {
+        !transcript_tasked(&self.record, &ours())
+    }
 }
 
 /// What the real decider says at `st`, as one of the model's words.
@@ -182,6 +238,10 @@ fn expected(m: &Model, st: &State) -> Verdict {
         let mut judged = st.clone();
         assert!(m.fire("DeadlineUnseen", &mut judged), "{st:?}");
         return expected(m, &judged);
+    }
+    // No task: nothing ended here, and nothing is done.
+    if st["tasked"] == 0 {
+        return Verdict::Nothing;
     }
     if m.action_enabled("SubmitDraft", st) {
         return Verdict::Submit;
@@ -227,15 +287,30 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
     // The worker answered: no row of the act's stands unanswered.
     if matches!(
         action,
-        "WorkedShort" | "WorkedLong" | "RetryTaken" | "RetryHitsTheWall" | "HumanWork"
+        "WorkedShort"
+            | "WorkedLong"
+            | "RetryTaken"
+            | "RetryHitsTheWall"
+            | "HumanWork"
+            | "HarnessTurn"
+            | "HarnessTurnLong"
     ) {
         real.unanswered = false;
     }
     if action == "ReplyUnseen" {
         real.unanswered = variant;
     }
+    // The record gains the turn: a person's prompt, or the harness's own.
+    match action {
+        "HumanWork" => real.record.push_str(&format!("{PERSON}\n{ANSWER}\n")),
+        "HarnessTurn" | "HarnessTurnLong" => real
+            .record
+            .push_str(&format!("{HARNESS}\n{ANSWER}\n{SUPERVISOR}\n{ANSWER}\n")),
+        _ => {}
+    }
     let unanswered = real.unanswered;
-    let seen = |st: &State, worked| reading(st, worked, unanswered);
+    let taskless = real.taskless();
+    let seen = |st: &State, worked| reading(st, worked, unanswered, taskless);
     match action {
         "BoxAppears" | "BoxLeaves" | "PersonTypes" | "GraceEnds" | "DraftLeft" => {}
         "WallAppears" => real.st.observe(&seen(after, Some(SHORT)), real.now),
@@ -249,6 +324,17 @@ fn mirror(action: &str, before: &State, after: &State, real: &mut Real, take: i6
             real.now += wait;
         }
         "HumanWork" => real.st.observe(&seen(after, Some(LONG)), real.now),
+        // The host typed it (its notice, its carry-on), and it was answered
+        // short: the harness's own turn.
+        "HarnessTurn" => {
+            real.st.host_typed(real.now);
+            real.st.observe(&seen(after, Some(SHORT)), real.now);
+        }
+        // …and answered with real work: the worker's own, resumed.
+        "HarnessTurnLong" => {
+            real.st.host_typed(real.now);
+            real.st.observe(&seen(after, Some(LONG)), real.now);
+        }
         "Continue" | "Retry" | "SubmitDraft" => {
             let r = seen(before, None);
             let cfg = SupervisorConfig::default();
@@ -289,10 +375,13 @@ fn walk(
         st: TurnEndState::new(timing()),
         now: base,
         unanswered: false,
+        record: String::new(),
     };
-    // The walk starts at a point that ended a turn of real work.
+    // The walk starts at a point that ended a turn of real work, in a
+    // session nobody has asked anything yet.
     let s0 = m.init_state();
-    init.st.observe(&reading(&s0, Some(LONG), false), init.now);
+    init.st
+        .observe(&reading(&s0, Some(LONG), false, true), init.now);
     let streak = cnst(m, "Streak");
     let take = cnst(m, "Take");
 
@@ -314,8 +403,10 @@ fn walk(
             "the streak at {st:?}"
         );
         assert_eq!(real.st.short_wait(), ladder(&real.st, short), "{st:?}");
+        // The record's task is the model's: the harness's own turns are none.
+        assert_eq!(real.taskless(), st["tasked"] == 0, "the task at {st:?}");
         let mut at = real.st.clone();
-        let here = reading(&st, None, real.unanswered);
+        let here = reading(&st, None, real.unanswered, real.taskless());
         at.observe(&here, real.now);
         let got = verdict(&decide_turn_end(&at, &here, cfg, real.now));
         assert_eq!(
@@ -323,8 +414,9 @@ fn walk(
             expected(m, &st),
             "the real decider disagrees at {st:?}"
         );
-        // No silent latch: at a free point the real decider says something.
-        if st["box_up"] == 0 && (st["pending"] == 0 || st["pending"] == 3) {
+        // No silent latch: at a free point of a session with a task the
+        // real decider says something.
+        if st["tasked"] == 1 && st["box_up"] == 0 && (st["pending"] == 0 || st["pending"] == 3) {
             assert_ne!(got, Verdict::Nothing, "a silent point at {st:?}");
         }
         *acts
@@ -359,7 +451,13 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
         // unseen reply, and with an act never taken.
         for variant in [false, true] {
             let (states, acts) = walk(&m, &SupervisorConfig::default(), variant);
-            assert_eq!(states, 160, "the reachable space changed: {states}");
+            // 184 before any turn of the harness's (160 with a task), and
+            // after each of its two the same 184 again — a short answer
+            // moves nothing but their count, a long one only what any turn
+            // of real work moves — plus the 24 states of a session with no
+            // task whose last turn answered was real work (a long answer to
+            // the harness's).
+            assert_eq!(states, 600, "the reachable space changed: {states}");
             for word in ["continue", "retry", "submit", "wait", "nothing"] {
                 assert!(
                     acts.get(word).copied().unwrap_or(0) > 0,
@@ -387,15 +485,20 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
     // model would; and the Buggy model escalates "reports done".
     let base = Instant::now() + Duration::from_secs(3600);
     let mut real = TurnEndState::default();
-    real.observe(&reading(&m.init_state(), Some(LONG), false), base);
+    real.observe(&reading(&m.init_state(), Some(LONG), false, false), base);
     let buggy = aterm_spec::interp::with_buggy(&m, 1);
+    let asked = |mut st: State| {
+        st.insert("asked", 1);
+        st.insert("tasked", 1);
+        st
+    };
     for var in ["box_up", "person", "draft"] {
-        let mut held = m.init_state();
+        let mut held = asked(m.init_state());
         held.insert(var, 1);
         assert_ne!(
             verdict(&decide_turn_end(
                 &real,
-                &reading(&held, None, false),
+                &reading(&held, None, false, false),
                 &SupervisorConfig::default(),
                 base
             )),
@@ -408,9 +511,119 @@ fn tier1_the_real_decider_types_exactly_where_the_model_allows() {
             "{var}: the Buggy model types over it — the walk would have caught a real one"
         );
     }
-    let mut done = m.init_state();
+    let mut done = asked(m.init_state());
     done.insert("short", 2);
     done.insert("backoff", 1);
     assert!(!m.action_enabled("Escalate", &done));
     assert!(buggy.action_enabled("Escalate", &done));
+
+    // D1: after the harness's own turn — its record the harness's alone —
+    // the real decider does nothing, however long the point stands, while
+    // the Buggy model (a reader that takes the harness's turn for a task)
+    // types into it and is caught.
+    let record = format!("{HARNESS}\n{ANSWER}\n{SUPERVISOR}\n{ANSWER}\n");
+    assert!(
+        !transcript_tasked(&record, &ours()),
+        "the harness's own turns are no task"
+    );
+    // NEGATIVE CONTROL: without the loop's ledger, its `keep going` reads as
+    // someone's — the ledger is what keeps the walk's record taskless.
+    assert!(transcript_tasked(&record, &[]));
+    let mut after = m.init_state();
+    assert!(m.fire("HarnessTurn", &mut after));
+    let mut real = TurnEndState::default();
+    real.observe(&reading(&after, Some(SHORT), false, true), base);
+    let later = base + Duration::from_secs(24 * 3600);
+    assert_eq!(
+        verdict(&decide_turn_end(
+            &real,
+            &reading(&after, None, false, true),
+            &SupervisorConfig::default(),
+            later
+        )),
+        Verdict::Nothing
+    );
+    let mut wrong = m.init_state();
+    assert!(buggy.fire("HarnessTurn", &mut wrong));
+    assert!(buggy.fire("BackoffDue", &mut wrong));
+    assert!(buggy.fire("Continue", &mut wrong));
+    assert!(!buggy.check_invariant("NeverTypeIntoATasklessSession", &wrong));
+    // …and a person's prompt, answered, is one.
+    assert!(transcript_tasked(
+        &format!("{record}{PERSON}\n{ANSWER}\n"),
+        &ours()
+    ));
+
+    // N1: after the worker's real work, the upgrade's two turns — its
+    // notice's READY and its carry-on's reply, each short — leave the point
+    // free: the model continues, and so does the real decider, the host's
+    // turns registered as typed. NEGATIVE CONTROL: the same answers read as
+    // someone else's turns back the point off, and the Buggy model that
+    // counts them so is caught.
+    let mut st = asked(m.init_state());
+    for action in ["HarnessTurn", "HarnessTurn"] {
+        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(m.action_enabled("Continue", &st), "{st:?}");
+    let busy = |real: &mut TurnEndState, host: bool| {
+        let mut now = base;
+        real.observe(&reading(&st, Some(LONG), false, false), now);
+        for _ in 0..2 {
+            now += Duration::from_secs(30);
+            if host {
+                real.host_typed(now);
+            }
+            real.observe(&reading(&st, Some(SHORT), false, false), now);
+        }
+        verdict(&decide_turn_end(
+            real,
+            &reading(&st, None, false, false),
+            &SupervisorConfig::default(),
+            now,
+        ))
+    };
+    assert_eq!(
+        busy(&mut TurnEndState::new(timing()), true),
+        Verdict::Continue
+    );
+    assert_eq!(busy(&mut TurnEndState::new(timing()), false), Verdict::Wait);
+    let mut wrong = asked(m.init_state());
+    assert!(buggy.fire("HarnessTurn", &mut wrong));
+    assert!(!buggy.check_invariant("NeverBackOffForTheHarness", &wrong));
+
+    // The answer that is real work: after the worker's short turn started a
+    // back-off, the carry-on's long answer ends it — the model continues,
+    // and so does the real decider; the Buggy model that leaves the streak
+    // standing is caught.
+    let mut st = asked(m.init_state());
+    for action in ["Continue", "WorkedShort", "HarnessTurnLong"] {
+        assert!(m.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(m.action_enabled("Continue", &st), "{st:?}");
+    let mut real = TurnEndState::new(timing());
+    let mut now = base;
+    real.observe(&reading(&st, Some(LONG), false, false), now);
+    let r = reading(&st, None, false, false);
+    let a = decide_turn_end(&real, &r, &SupervisorConfig::default(), now);
+    real.acted(&a, &r, now);
+    now += Duration::from_secs(30);
+    real.observe(&reading(&st, Some(SHORT), false, false), now);
+    assert_eq!(real.short_streak(), 1);
+    now += Duration::from_secs(30);
+    real.host_typed(now);
+    real.observe(&reading(&st, Some(LONG), false, false), now);
+    assert_eq!(
+        verdict(&decide_turn_end(
+            &real,
+            &reading(&st, None, false, false),
+            &SupervisorConfig::default(),
+            now
+        )),
+        Verdict::Continue
+    );
+    let mut wrong = asked(m.init_state());
+    for action in ["Continue", "WorkedShort", "HarnessTurnLong"] {
+        assert!(buggy.fire(action, &mut wrong), "{action} at {wrong:?}");
+    }
+    assert!(!buggy.check_invariant("NeverBackOffAfterRealWork", &wrong));
 }

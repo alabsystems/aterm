@@ -2031,7 +2031,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
 /// the notice seen, and escalate; and the physical keyboard is not on this seam
 /// at all, so a human at the glass keeps typing. A halt stops DRIVERS.
 ///
-/// SIX MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
+/// SEVEN MEMBERS ARE NOT `Target::Session` ROWS, and each has its own seam.
 ///
 /// THE COUNT IN THIS SENTENCE IS NO LONGER PROSE. It said THREE and then named
 /// FOUR (`operator-propose-bin`, `hwkey`, `invoke`, `tab`) while the set held
@@ -2048,7 +2048,7 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
 /// the old set.
 ///
 /// `operator-propose-bin` is Owner-only `Meta` and gates at its proposal frame.
-/// The other five — `hwkey`, `invoke`, `pane`, `pointer` and `tab` — are
+/// The other six — `confirm`, `hwkey`, `invoke`, `pane`, `pointer` and `tab` — are
 /// `Target::App`: they are answered in `dispatch_before_session`, before any
 /// session exists, so the session gate is structurally unreachable for their
 /// bare forms and [`app_halt_refusal`] is where they are refused instead.
@@ -2096,6 +2096,12 @@ pub(crate) fn bridge_lost(store: &Store, generation: BridgeGeneration) -> usize 
 ///   tabs over the socket while a halt stands — `app_halt_refusal`'s own "fail
 ///   closed, and cheap in the case it exists for" argument — and the human at
 ///   the glass switches tabs from the keyboard as always.
+/// * `confirm` belongs here for `tab`'s clause: `confirm yes` runs the close or
+///   quit that a control client's `invoke` parked in the window
+///   (`close_confirm`), retiring every session it closes. A question parked
+///   BEFORE the halt would otherwise be the one close a halted driver could
+///   still finish. `confirm no` closes nothing and is refused with it, one verb
+///   one answer, and the person at the glass answers the question as always.
 ///
 /// TWO SEAMS FOR THE APP LANE, NOT ONE. `spawn` and `tab` also have an AIMED
 /// form (`@<sid> tab …`, design S3) which `control::aimed_app_lane` routes PAST
@@ -2145,6 +2151,7 @@ pub(crate) fn is_pty_reaching(verb: &str) -> bool {
             | "hwkey"
             | "pane"
             | "tab"
+            | "confirm"
             | "operator-propose-bin"
     )
 }
@@ -2168,9 +2175,10 @@ pub(crate) fn halt_refusal(ctx: &SessionCtx, verb: &str) -> Option<String> {
 
 /// [`halt_refusal`] for an APP-TARGET verb, which has no session to check.
 ///
-/// `invoke <action>`, `hwkey <key>`, `pane <dir>`, `pointer <move|leave>` and
-/// `tab <sub-form>` — the five `Target::App` members of [`is_pty_reaching`] — are
-/// answered in `dispatch_before_session`, BEFORE any session is resolved, and
+/// `invoke <action>`, `hwkey <key>`, `pane <dir>`, `pointer <move|leave>`,
+/// `tab <sub-form>` and `confirm yes|no` — the six `Target::App` members of
+/// [`is_pty_reaching`] — are answered in `dispatch_before_session`, BEFORE any
+/// session is resolved, and
 /// what they touch is whatever window is frontmost at the time — which this thread cannot learn
 /// without a main-thread hop, and which can change between the check and the
 /// action anyway. So the question asked here is the only one that is both
@@ -2361,11 +2369,13 @@ fn reason_token(raw: &str) -> String {
 
 const HOLD_USAGE: &str = "ERR usage: hold <sid> on|off [reason=<pct>] [origin=fleet|local]\n";
 
-/// The refusal an Owner-issued `hold` gets for a fleet-origin act: the same
-/// `ERR denied` every scope gate answers, so a caller learns nothing it could
-/// not learn from `status hold=`. Named so the dispatch can audit-log exactly
-/// this refusal without matching prose.
-pub(crate) const HOLD_DENIED: &str = "ERR denied\n";
+/// The refusal an Owner-issued `hold` gets for a fleet-origin act — naming
+/// `origin=fleet`, or setting, replacing or lifting a standing fleet hold. It
+/// says whose hold it is, which tells a caller nothing it could not learn from
+/// `status hold=`. Named so the dispatch can audit-log exactly this refusal
+/// without matching prose, and so the menu can tell it from the bare `ERR
+/// denied` of an edge token or a selector.
+pub(crate) const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet hold\n";
 
 /// Who is issuing a `hold` — the whole of what the two owner-class scopes that
 /// may run it differ in. The dispatch maps `Scope::Bridge` to [`Self::Bridge`]
@@ -3945,7 +3955,9 @@ fn inbox_get_at(ctx: &SessionCtx, off: u64) -> String {
             }
             evict_answered_fetch(&mut inbox);
             if inbox.fetches.len() >= FETCH_SLOTS {
-                return format!("ERR busy: {FETCH_SLOTS} reads already parked\n");
+                return format!(
+                    "ERR busy: {FETCH_SLOTS} inbox reads already waiting; retry when one answers\n"
+                );
             }
             inbox.fetches.push_back((off, FetchSlot::Pending));
             // The bridge's idle outbox poll is gone. A parked fetch is work
@@ -4101,6 +4113,27 @@ const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say[:<
                           [via=<p>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
                           (<text> | len=<n> + <n> raw bytes)\n";
 
+/// The answer to a `post … len=` value that is not a byte count.
+const POST_LEN_USAGE: &str = "ERR usage: post len=<n> must be a byte count\n";
+
+/// Parse a `post` `len=` value: a byte count up to [`BODY_MAX`], or the whole
+/// refusal line. A count over the cap and a value that is no count at all answer
+/// differently, so a typo never reads as a size problem. Shared by the framed
+/// detector (`control::post_frame_len`) and [`cmd_post`], so the two cannot
+/// answer the same `len=` two ways.
+pub(crate) fn post_len(v: &str) -> Result<usize, String> {
+    match v.parse::<usize>() {
+        Ok(n) if n <= BODY_MAX => Ok(n),
+        _ if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => Err(post_body_too_large()),
+        _ => Err(POST_LEN_USAGE.to_string()),
+    }
+}
+
+/// The refusal for a post body over [`BODY_MAX`].
+fn post_body_too_large() -> String {
+    format!("ERR too large: a post body is capped at {BODY_MAX} bytes\n")
+}
+
 /// Whether `tok` is one of `post`'s leading OPTION tokens. Shared with the serve
 /// loop's length-prefixed-frame detector so the two parsers cannot disagree about
 /// where the options end and the body begins — a detector that saw a frame the
@@ -4196,9 +4229,9 @@ pub(crate) fn cmd_post_waking(
             }
             key = Some(v.to_string());
         } else if let Some(v) = kv(tok, "len") {
-            match v.parse::<usize>() {
-                Ok(n) if n <= BODY_MAX => declared_len = Some(n),
-                _ => return "ERR too large\n".to_string(),
+            match post_len(v) {
+                Ok(n) => declared_len = Some(n),
+                Err(reply) => return reply,
             }
         } else if tok == "--wait" {
             wait = Some(None);
@@ -4278,13 +4311,16 @@ pub(crate) fn cmd_post_waking(
                 return POST_USAGE.to_string();
             }
             if text.len() > POST_INLINE_MAX {
-                return "ERR too large\n".to_string();
+                return format!(
+                    "ERR too large: inline post text is capped at {POST_INLINE_MAX} bytes; send it \
+                     with len=<n>\n"
+                );
             }
             text.into_bytes()
         }
     };
     if body.len() > BODY_MAX {
-        return "ERR too large\n".to_string();
+        return post_body_too_large();
     }
     // LOSSY FOR NON-UTF-8, and said out loud: the control reply plane is
     // `String`-typed end to end, so a body that is not UTF-8 is replaced here
@@ -6924,7 +6960,15 @@ mod inbox_hold {
         let long = "x".repeat(POST_INLINE_MAX + 1);
         assert_eq!(
             cmd_post(&ctx, &format!("to=h-a kind=note {long}"), None),
-            "ERR too large\n"
+            "ERR too large: inline post text is capped at 4096 bytes; send it with len=<n>\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=h-a kind=note len=abc", None),
+            "ERR usage: post len=<n> must be a byte count\n"
+        );
+        assert_eq!(
+            cmd_post(&ctx, "to=h-a kind=note len=262145", None),
+            "ERR too large: a post body is capped at 262144 bytes\n"
         );
         assert_eq!(
             cmd_post(&ctx, "to=h-a kind=note len=4", None),
@@ -8815,6 +8859,14 @@ mod inbox_hold {
                 "moves the SELECTION to the OS clipboard; it types nothing. It is \
                  half of the screen-to-PTY chain, and the halt cuts that chain at \
                  the other half, `invoke Paste`, which IS refused",
+            ),
+            (
+                "mainscreen",
+                "leaves an alternate screen a killed app left up: it puts no bytes \
+                 on a PTY, signals nothing and retires no session, and the modes it \
+                 releases (mouse reporting, application cursor keys and keypad) \
+                 send the program LESS, never more. Aimed at a LIVE full-screen app \
+                 it misplaces that app's frame, which is display, not driving",
             ),
             // The bridge plane. Halting these would halt the only party that can
             // lift a halt, and the only path by which a halted agent is TOLD.

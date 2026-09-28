@@ -387,6 +387,33 @@ pub fn unavailable(target: &str, hint: &str) -> String {
     s
 }
 
+/// The head of a member HELD after a failed stage: `held: last attempt failed with
+/// <why>; <how to retry>` ([`held_failed`]). A sub-family of [`HELD_PREFIX`] with its
+/// own head, because the two mean opposite things to a reader: the group hold keeps an
+/// INSTALLED member on a build that works ("nothing to do here"), this keeps a member
+/// that is NOT installed off a stage that would fail again ("here is the retry"). Doctor
+/// counts it as a problem and names the retry; the pending stub says it instead of
+/// promising the next pass; `which` quotes it. Written by the pass whose digest-refusal
+/// memo bound ([`crate::store::StageRefusal`]), 2026-09-22.
+pub const HELD_FAILED_PREFIX: &str = "held: last attempt failed with ";
+
+/// `held: last attempt failed with <why>; <how>` — `why` is the stage's own sentence
+/// (the `StageError` Display, digests and all, so the row IS the ledger entry) and `how`
+/// names the retry: the explicit door, and `aterm pkg update --retry`.
+///
+/// The FIRST `; ` of the row is the seam between the two, by construction: a `; ` inside
+/// `why` (a signer's free text can carry one) is written `, `. The pending stub splits
+/// there to cap the failure and print the retry whole; a seam inside the `why` would hand
+/// it half a failure as the retry. `how` is atpkg's own words and may carry its own `; `.
+#[must_use]
+pub fn held_failed(why: &str, how: &str) -> String {
+    let mut s = String::from(HELD_FAILED_PREFIX);
+    s.push_str(&why.replace("; ", ", "));
+    s.push_str("; ");
+    s.push_str(how);
+    s
+}
+
 /// `deferred: build <N> is staged and installs when nothing is using the toolchain, by
 /// <time> at the latest while an aterm window or terminal session is open; staying on build
 /// <current>` — the row of a Trust toolchain member whose flip waits for quiet
@@ -615,6 +642,29 @@ fn is_refusal(reason: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first `; ` of a held row is the seam between the failure and the retry, even
+    /// when the failure's own words carry one (a signer's free text): the pending stub
+    /// splits there, and a seam inside the failure would print half of it as the retry.
+    #[test]
+    fn a_held_rows_first_seam_is_between_the_failure_and_the_retry() {
+        let how = "retried when the pin changes; now: aterm pkg install claude";
+        let row = held_failed("signer refused: not signed; team X", how);
+        assert_eq!(
+            row,
+            "held: last attempt failed with signer refused: not signed, team X; retried \
+             when the pin changes; now: aterm pkg install claude"
+        );
+        let (why, rest) = row
+            .strip_prefix(HELD_FAILED_PREFIX)
+            .and_then(|held| held.split_once("; "))
+            .unwrap();
+        assert_eq!(
+            (why, rest),
+            ("signer refused: not signed, team X", how),
+            "the retry comes back whole, its own `; ` and all"
+        );
+    }
 
     /// Phase 4's two words per row: where the builds come from, and why a row is not
     /// current — read off the canonical spellings, so the package log, the Activity list

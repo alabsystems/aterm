@@ -9,12 +9,7 @@ license.workspace = true
 repository.workspace = true
 description = "Shell integration (OSC 7/133/633) — extracted from aterm-core for independent verification"
 
-[features]
-default = []
-local-pty = ["dep:aterm-containment"]
-
 [dependencies]
-aterm-containment = { workspace = true, optional = true }
 # First-party, dependency-free SHA-256: the NAME of the per-build script folder
 # (`prepare`'s content address, 2026-09-24). Not a security boundary — a same-user
 # writer can do anything — but a collision-free one, so two builds whose scripts
@@ -36,9 +31,12 @@ aterm-uds = { workspace = true }
 # `getrandom = { version = "0.2", features = ["js"] }` row holding an entropy
 # bridge nothing could reach. The mint is `cfg(any(unix, windows))` now — it
 # exists exactly where `aterm_uds::rand` does, and adding a target means adding
-# its audited CSPRNG here first. Guarded by tools/grep_guard.sh B13.
+# its audited CSPRNG here first. Guarded by tools/grep_guard.sh B18.
 
 [dev-dependencies]
+# The Containment write roots, which the script cache must lie outside
+# (`test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots`).
+aterm-containment = { workspace = true }
 aterm-tempfile = { workspace = true }
 # The workspace's one lock-scoped process-environment helper (`aterm_log::env`):
 # the two single-test-per-binary integration tests here must clear a shell var

@@ -5,85 +5,58 @@
 //! `TerminalCheckpoint` — a scoped, round-trippable projection of a live
 //! [`Terminal`] (GREEN-ORDER step 4 / design `HIERARCHICAL_SESSIONS.md` B.3.2).
 //!
-//! The live [`Terminal`] is **neither `Clone` nor `Serialize`**: it holds five
-//! `Box<dyn FnMut>` callbacks, two `Instant`s, four host-auth state machines, an
-//! `Option<PolicyEngine>`, and a live `Parser`. A byte-identical clone is
-//! impossible by construction. A [`TerminalCheckpoint`] is therefore a *precise
-//! projection with a documented exclusion list*, not a clone — see the EXCLUDED
-//! and DEFERRED blocks below.
+//! The live [`Terminal`] is **neither `Clone` nor `Serialize`**: it holds host
+//! callbacks (`Box<dyn FnMut>`: bell, window, colour change/query,
+//! notifications, clipboard), three host-auth gates (clipboard,
+//! shell-integration, hyperlink), a policy engine, and a live `Parser`. A
+//! byte-identical clone is impossible by construction. A [`TerminalCheckpoint`]
+//! is therefore a *precise projection with a documented exclusion list*, not a
+//! clone — see the EXCLUDED block below.
 //!
-//! This increment captures the buffer-state core: both grid bodies (full cell
-//! fidelity via the `Line` codec), per-grid cursor / scroll-region / pending-wrap
-//! / tab-stops, size, and a set of cheap `Copy`/snapshot leaf fields. The
-//! round-trip is proven by the in-module property test (`mod tests`), which is
-//! the ship gate for this step.
+//! It captures both grid bodies (full cell fidelity via the `Line` codec) with
+//! their absolute row numbering, per-grid cursor / scroll-region / pending-wrap
+//! / tab-stops, size, modes, style, charsets, keyboard state, the colours an
+//! application set and the shell-integration state (`checkpoint_state.rs`).
+//! The round-trip is proven by the in-module property test (`mod tests`), which
+//! is the ship gate.
 //
 // ===========================================================================
-// EXCLUDED (host bindings, re-bound here):
-//   - the two callbacks (bell, window)
-//   - policy (PolicyState: the installed PolicyEngine + its compiled gate table)
-//   - live auth nonces / capabilities (clipboard_auth, shell_integration_auth,
-//     hyperlink_auth)
-// These are HOST effects, not buffer state. They are re-bound by the host on
-// `from_checkpoint` via `HostBindings`. For this increment `HostBindings::none()`
-// installs the same defaults `Terminal::new` does; real callbacks/policy/auth
-// rebinding lands in later work. Callback-driven side effects (OSC 9/99
-// notifications, OSC 52 clipboard writes, window ops, bell fires) are NOT
-// replayed — they are host effects, not state.
+// EXCLUDED (and why):
+//   - host effects: the callbacks, the policy engine, and the live auth gates
+//     (the shell-integration nonce travels only on the seamless carry, and the
+//     adopting host authorizes it). A restore never replays a host effect
+//     (bell, notification, clipboard write, window op). `from_checkpoint`
+//     gives `Terminal::new`'s defaults; a host installs its own through the
+//     ordinary setters, or adopts into a configured terminal with
+//     `restore_checkpoint`.
+//   - in-flight and session-only state: `transient` (the response buffer and
+//     rate limiter, the REP character, an open OSC 8 hyperlink or SGR 58
+//     underline colour, a synchronized-update window — a carried session
+//     resumes with none of them open), `vi` mode, `text_selection`, the
+//     observation watchers and `last_custody` (see `state.rs`), which
+//     describe the person's interaction with THIS process, not the screen.
+//   - `marks_state` (OSC 1337 SetMark/AddAnnotation), `semantic` zones and
+//     `iterm2` image placements: iTerm2-protocol extras with no consumer that
+//     survives an update; OSC 133/633 blocks, which the product does read,
+//     ARE carried.
+//   - sixel and other decoded images: priced out of the handoff (megabytes
+//     per screen); the cells they covered carry.
+//   - the bell and response-rate clocks (`last_bell_time`, `bell_total`, the
+//     response rate limiter): live supervision state that reads real time on
+//     purpose (`state.rs`, `processing.rs`).
 //
-// DEFERRED (later stages — NOT captured in this increment, and why):
-//   - grouped sub-projections: color, transient, shell, marks,
-//     semantic, iterm2, vi, text_selection — each needs its own per-field Repr
-//     (palette stacks, SGR stack, DECSC slots, OSC133 blocks, …) and is out of
-//     scope for the buffer-core increment.
-//   - sixel: the decoded image store needs a lossy-edge Repr (B.4).
-//   - clock-domain fields: bell_ticks (last_bell_time), sync_ticks (sync_start),
-//     and rate_limiter (token bucket) — these require a Clock seam mapping
-//     Instant -> Ticks that does not exist yet; capturing them faithfully on a
-//     forked timeline is the explicit B.4 must-fix, separate from this step.
-//   - serde: the checkpoint stores leaf engine types BY VALUE and relies on
-//     `PartialEq` for the round-trip gate; on-the-wire serialization (the
-//     `grid: Vec<u8>` bytes are already serde-ready) is a later concern.
-//   - there is no style-id to carry: `CurrentStyle`'s four semantic fields are
-//     the whole rendition, and the writers read colours inline. On restore we set
-//     `style` and call `apply_style_change()`, which refreshes the writer caches
-//     and re-arms the rebuilt grid's BCE cursor template (see `from_checkpoint`).
+// The seamless-handoff wire form is `CheckpointMeta` (serde, every scalar
+// field) plus the grid blobs as sidecars.
 // ===========================================================================
 
 use aterm_types::charset::CharacterSetState;
 use aterm_types::{KittyKeyboardStateSnapshot, TaskbarProgress, XtermKeyboardState};
 
 use super::Terminal;
+use super::checkpoint_state::{ColorRepr, ShellRepr};
 use super::types::{CurrentStyle, TerminalModes};
 use crate::grid::{CellFlags, Cursor, Grid, PackedColor, SavedCursorState};
 use crate::scrollback::{Scrollback, deserialize_lines, serialize_lines};
-
-/// Host-side bindings re-installed on `from_checkpoint`.
-///
-/// A checkpoint deliberately omits the live `Terminal`'s callbacks, policy
-/// engine, and auth nonces (see the EXCLUDED block at the top of this module).
-/// `HostBindings` is where the host re-supplies them. For this increment it is
-/// intentionally empty (all `None`); real fields are added as the rebinding
-/// work lands. `HostBindings::none()` is enough to hydrate a fully-living,
-/// introspectable `Terminal` whose buffer state matches the source exactly.
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct HostBindings {
-    // Placeholder for the five callbacks / policy engine / auth state that a
-    // host re-binds. All `None`/empty in this increment; documented as deferred.
-    _private: (),
-}
-
-impl HostBindings {
-    /// A null/empty set of host bindings.
-    ///
-    /// Installs the same host-effect defaults as `Terminal::new` (no callbacks,
-    /// no policy engine, default auth posture).
-    #[must_use]
-    pub fn none() -> Self {
-        Self::default()
-    }
-}
 
 /// Per-grid cursor + region + wrap + tab-stop projection.
 ///
@@ -415,6 +388,16 @@ pub struct TerminalCheckpoint {
     /// adopting host authorizes it explicitly (auth is a host binding, see the
     /// EXCLUDED block).
     pub shell_integration_nonce: Option<ShellIntegrationNonce>,
+    /// The absolute row counter of the grid in `grid`. A restore continues it
+    /// (`Grid::continue_absolute_numbering`), so the absolute rows `shell`
+    /// carries name the same lines on the restored grid.
+    pub absolute_row_counter: u64,
+    /// The same for the grid in `alt_grid` (`0` when there is none).
+    pub alt_absolute_row_counter: u64,
+    /// Application-set colours, as a diff from the configured baseline.
+    pub color: ColorRepr,
+    /// Shell-integration (OSC 133/633) state.
+    pub shell: ShellRepr,
     /// The integration BODY the shell last signed that it runs
     /// ([`Terminal::shell_integration_rev`], the LOADER / BODY split of
     /// 2026-09-26) — set, like the nonce, ONLY by the seamless-handoff carry
@@ -637,6 +620,19 @@ impl Terminal {
         let grid_bytes = serialize_lines(&grid_lines);
         let cursor = GridCursorRepr::capture(&self.grid);
 
+        // The oldest line of the PRIMARY lineage this projection carries, which
+        // is where readable shell marks end. The primary is `alt_grid` while the
+        // alternate screen is up (see `from_checkpoint`), carried to its own bound.
+        let (primary, primary_bound) = if self.modes.alternate_screen {
+            (self.alt_grid.as_ref(), inactive_max_history)
+        } else {
+            (Some(&self.grid), max_history)
+        };
+        let oldest_carried_row = primary.map_or(0, |g| {
+            let carried = g.scrollback_lines().min(primary_bound) as u64;
+            g.visible_to_absolute(0).saturating_sub(carried)
+        });
+
         let (alt_grid, alt_cursor) = match &self.alt_grid {
             Some(inactive) => (
                 // `alt_grid` is the INACTIVE grid, NOT "the alternate screen":
@@ -683,30 +679,24 @@ impl Terminal {
             current_working_directory: self.current_working_directory.clone(),
             parser_ground,
             shell_integration_nonce: None,
+            absolute_row_counter: self.grid.absolute_row_counter(),
+            alt_absolute_row_counter: self.alt_grid.as_ref().map_or(0, Grid::absolute_row_counter),
+            color: self.capture_color_repr(),
+            shell: self.capture_shell_repr(oldest_carried_row),
             shell_integration_rev: None,
         }
     }
 
-    /// Rebuild a fully-living [`Terminal`] from a checkpoint, re-binding host
-    /// effects via `host` (B.3.2).
+    /// Rebuild a fully-living [`Terminal`] from a checkpoint (B.3.2).
     ///
     /// The rebuilt terminal's *buffer state* matches the source exactly (proven
-    /// by the round-trip test); host bindings (callbacks/policy/auth) are NOT
-    /// from the checkpoint — they come from `host` (see the EXCLUDED block).
+    /// by the round-trip test). It has `Terminal::new`'s host effects — no
+    /// callbacks, no policy engine, default auth — because those are not in the
+    /// checkpoint (see the EXCLUDED block); a host that wants its own installs
+    /// them through the ordinary setters, or adopts into a configured terminal
+    /// with [`Self::restore_checkpoint`].
     #[must_use]
-    #[allow(
-        clippy::needless_pass_by_value,
-        reason = "from_checkpoint takes ownership of host bindings (callbacks/policy/auth) \
-                  and installs them; this increment's HostBindings is empty, but the \
-                  by-value signature is the stable rebinding seam (B.3.2) and must not \
-                  churn when real Box<dyn FnMut> fields land"
-    )]
-    pub fn from_checkpoint(c: &TerminalCheckpoint, host: HostBindings) -> Terminal {
-        // `host` is intentionally consumed even though this increment's
-        // HostBindings is empty: it pins the API so callers wire rebinding here
-        // and the signature does not churn when real fields land.
-        let _ = host;
-
+    pub fn from_checkpoint(c: &TerminalCheckpoint) -> Terminal {
         // Which slot holds the ALTERNATE buffer (→ no scrollback ring) is NOT
         // fixed: `grid` is the *active* buffer and `alt_grid` is the *saved* one.
         // The active grid is the alt buffer iff we are on the alt screen; the
@@ -716,12 +706,15 @@ impl Terminal {
         // (alternate_screen == true), discarding its scrollback and breaking the
         // re-checkpoint identity.
         let on_alt = c.modes.alternate_screen;
-        let active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
+        let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
+        active_grid.continue_absolute_numbering(c.absolute_row_counter);
         let mut terminal = Terminal::with_grid(active_grid);
 
         // Saved grid (same restore path; alt buffer ⟺ we are NOT on alt), if present.
         if let (Some(alt_bytes), Some(alt_cursor)) = (&c.alt_grid, &c.alt_cursor) {
-            terminal.alt_grid = Some(restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt));
+            let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
+            saved.continue_absolute_numbering(c.alt_absolute_row_counter);
+            terminal.alt_grid = Some(saved);
         }
 
         // Leaf fields by value.
@@ -748,6 +741,8 @@ impl Terminal {
             let (_parser, mut handler) = terminal.split_for_process();
             handler.sgr_style().apply_style_change();
         }
+        terminal.apply_color_repr(&c.color);
+        terminal.apply_shell_repr(&c.shell);
         // `modes`/kitty/xterm were assigned by value above, after `with_grid`
         // published the fresh fold — republish for the hydrated state.
         terminal.refresh_mode_mirror();
@@ -793,9 +788,13 @@ impl Terminal {
         self.release_search_index();
         let on_alt = c.modes.alternate_screen;
         self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt);
+        self.grid
+            .continue_absolute_numbering(c.absolute_row_counter);
         self.alt_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
-                Some(restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt))
+                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt);
+                saved.continue_absolute_numbering(c.alt_absolute_row_counter);
+                Some(saved)
             }
             _ => None,
         };
@@ -831,8 +830,14 @@ impl Terminal {
         // Style: semantic value, then re-arm the REBUILT grid's BCE cursor
         // template from it (see `from_checkpoint`).
         self.style = c.style.into_style();
-        let (_parser, mut handler) = self.split_for_process();
-        handler.sgr_style().apply_style_change();
+        {
+            let (_parser, mut handler) = self.split_for_process();
+            handler.sgr_style().apply_style_change();
+        }
+        // The application's colours go over THIS process's configured theme,
+        // and its shell-integration state (running command included) resumes.
+        self.apply_color_repr(&c.color);
+        self.apply_shell_repr(&c.shell);
         // In-place hydration swaps the entire coordinate lineage underneath
         // existing host consumers. Preserve the cumulative clocks but publish
         // one fail-closed epoch edge so cursor effects/search-adjacent caches
@@ -945,18 +950,47 @@ pub struct CheckpointMeta {
     /// The authorized shell-integration nonce as 64 hex digits
     /// ([`TerminalCheckpoint::shell_integration_nonce`]). ADDITIVE and absent
     /// when there is none, so a parent without the field, and a session without
-    /// integration, write the wire they always wrote; a value that is not 64
+    /// integration, add no key for it; a value that is not 64
     /// hex digits reassembles as `None` (the successor reports the session
     /// `integration=degraded` rather than trusting a partial nonce).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_integration_nonce: Option<String>,
+    /// [`TerminalCheckpoint::absolute_row_counter`]. ADDITIVE: `0` (a parent
+    /// without the field) restores the fresh numbering, which is what every
+    /// earlier handoff did. Unlike the keys below it is written for EVERY live
+    /// session — a grid's counter is at least its rows, never `0` — so no
+    /// session's meta is byte-identical to what an older parent wrote; an
+    /// older child ignores the key, and the screen digest hashes the bytes
+    /// as sent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub absolute_row_counter: u64,
+    /// [`TerminalCheckpoint::alt_absolute_row_counter`]. ADDITIVE, as above.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub alt_absolute_row_counter: u64,
+    /// [`TerminalCheckpoint::color`]. ADDITIVE and absent when nothing is
+    /// overridden, so a session with the host's colours adds no key for it.
+    #[serde(default, skip_serializing_if = "ColorRepr::is_default")]
+    pub color: ColorRepr,
+    /// [`TerminalCheckpoint::shell`]. ADDITIVE and absent for a session that
+    /// never saw a mark.
+    #[serde(default, skip_serializing_if = "ShellRepr::is_default")]
+    pub shell: ShellRepr,
     /// The integration body the shell last signed that it runs, 16 hex digits
     /// ([`TerminalCheckpoint::shell_integration_rev`], 2026-09-26). ADDITIVE and
     /// absent when there is none (a parent without the field, a shell whose
-    /// script predates loaders), so the wire is what it always was; a value that
+    /// script predates loaders), so it adds no key; a value that
     /// is not a folder address reassembles as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shell_integration_rev: Option<String>,
+}
+
+#[cfg(feature = "serde")]
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde's skip_serializing_if hands the predicate a reference"
+)]
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[cfg(feature = "serde")]
@@ -991,6 +1025,10 @@ impl CheckpointMeta {
             // reassembly rather than trusted from the wire.
             parser_ground: _,
             shell_integration_nonce,
+            absolute_row_counter,
+            alt_absolute_row_counter,
+            color,
+            shell,
             shell_integration_rev,
         } = c;
         Self {
@@ -1013,6 +1051,10 @@ impl CheckpointMeta {
             secure_keyboard_entry: *secure_keyboard_entry,
             current_working_directory: current_working_directory.clone(),
             shell_integration_nonce: shell_integration_nonce.map(|n| n.to_hex()),
+            absolute_row_counter: *absolute_row_counter,
+            alt_absolute_row_counter: *alt_absolute_row_counter,
+            color: color.clone(),
+            shell: shell.clone(),
             shell_integration_rev: shell_integration_rev.clone(),
         }
     }
@@ -1056,6 +1098,10 @@ impl CheckpointMeta {
                 .shell_integration_nonce
                 .as_deref()
                 .and_then(ShellIntegrationNonce::from_hex),
+            absolute_row_counter: self.absolute_row_counter,
+            alt_absolute_row_counter: self.alt_absolute_row_counter,
+            color: self.color,
+            shell: self.shell,
             shell_integration_rev: self
                 .shell_integration_rev
                 .filter(|rev| crate::shell_integration::is_integration_rev(rev)),
@@ -1149,6 +1195,20 @@ mod tests {
         // --- OSC 7 cwd ---
         t.process(b"\x1b]7;file://host/tmp/work\x07");
 
+        // --- colours: an OSC 4 palette override, OSC 10/12 dynamic colours,
+        //     and one XTPUSHCOLORS entry holding the overridden state. OSC 4
+        //     SET is a host opt-in (`allow_palette_reconfigure`), and `modes`
+        //     round-trips with it on. ---
+        t.modes.allow_palette_reconfigure = true;
+        t.process(b"\x1b]4;1;rgb:12/34/56\x07\x1b]10;rgb:aa/bb/cc\x07\x1b]12;rgb:01/02/03\x07");
+        t.process(b"\x1b]30001\x07");
+        t.process(b"\x1b]4;2;rgb:65/43/21\x07");
+
+        // --- shell integration: one finished command, then one RUNNING (C
+        //     without D), so phase, marks, blocks and counters all carry ---
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07true\r\n\x1b]133;C\x07\x1b]133;D;0\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07sleep 9\r\n\x1b]133;C\x07");
+
         // --- alt screen: enter 1049, write into alt, then we keep alt active ---
         t.process(b"\x1b[?1049h");
         t.process(b"ALT-SCREEN-CONTENT\r\n");
@@ -1195,7 +1255,17 @@ mod tests {
         );
 
         let c0 = t.checkpoint();
-        let h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        // Sanity: the colour and shell projections are non-trivial.
+        assert_eq!(c0.color.palette.len(), 2, "two OSC 4 overrides");
+        assert!(c0.color.foreground.is_some() && c0.color.cursor.is_some());
+        assert_eq!(c0.color.stack.len(), 1, "one XTPUSHCOLORS entry");
+        assert_eq!(c0.shell.command_marks.len(), 1, "one finished command");
+        assert!(
+            c0.shell.current_block.is_some(),
+            "a running command's block"
+        );
+        assert_eq!(c0.shell.completed_seq, 1);
+        let h = Terminal::from_checkpoint(&c0);
         let c1 = h.checkpoint();
 
         // (A) re-checkpoint equality — the ship gate.
@@ -1267,7 +1337,7 @@ mod tests {
             assert_eq!(deserialize_lines(alt).len(), rows as usize);
         }
 
-        let restored = Terminal::from_checkpoint(&visible, HostBindings::none());
+        let restored = Terminal::from_checkpoint(&visible);
         assert_eq!(t.visible_content(), restored.visible_content());
         assert_eq!(t.cursor(), restored.cursor());
         assert_eq!(
@@ -1310,7 +1380,7 @@ mod tests {
             "viewport navigation cannot replace the PTY's live continuation frame"
         );
 
-        let mut restored = Terminal::from_checkpoint(&scrolled, HostBindings::none());
+        let mut restored = Terminal::from_checkpoint(&scrolled);
         terminal.process(b"tail");
         restored.process(b"tail");
         assert_eq!(
@@ -1327,7 +1397,7 @@ mod tests {
         terminal.process(b"\x1b[H\x1b[0mchanged");
         let checkpoint = terminal.checkpoint_visible().expect("Ground after DECSC");
         assert!(checkpoint.saved_cursor_main.is_some());
-        let mut restored = Terminal::from_checkpoint(&checkpoint, HostBindings::none());
+        let mut restored = Terminal::from_checkpoint(&checkpoint);
 
         let continuation = b"\x1b8X";
         terminal.process(continuation);
@@ -1353,7 +1423,7 @@ mod tests {
         let (rows, cols) = (10u16, 30u16);
         let mut t = build_rich_terminal(rows, cols);
         let c0 = t.checkpoint();
-        let mut h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let mut h = Terminal::from_checkpoint(&c0);
 
         // Same styled write to both (move home, set a fresh distinctive style).
         let seq = b"\x1b[H\x1b[1;3;38;2;1;2;3;48;5;9mQ\x1b[0m";
@@ -1385,7 +1455,7 @@ mod tests {
         let (rows, cols) = (10u16, 30u16);
         let mut t = build_rich_terminal(rows, cols);
         let c0 = t.checkpoint();
-        let mut h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let mut h = Terminal::from_checkpoint(&c0);
 
         // Exit alt screen on both.
         t.process(b"\x1b[?1049l");
@@ -1422,7 +1492,7 @@ mod tests {
         assert!(c0.alt_grid.is_none(), "no alt grid captured");
         assert!(c0.alt_cursor.is_none());
 
-        let h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let h = Terminal::from_checkpoint(&c0);
         assert_eq!(c0, h.checkpoint(), "re-checkpoint equal (no alt)");
         assert_eq!(t.visible_content(), h.visible_content());
         assert!(h.alt_grid.is_none(), "hydrated has no alt grid");
@@ -1456,7 +1526,7 @@ mod tests {
             "margins captured into the checkpoint projection"
         );
 
-        let h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let h = Terminal::from_checkpoint(&c0);
         let restored = h.grid().horizontal_margins();
         assert_eq!(
             (restored.left, restored.right),
@@ -1499,7 +1569,7 @@ mod tests {
 
         let c0 = t.checkpoint();
         assert!(c0.alt_grid.is_some(), "retained alt buffer captured");
-        let h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let h = Terminal::from_checkpoint(&c0);
         assert!(!h.modes.alternate_screen, "hydrated stays on main");
         assert!(h.alt_grid.is_some(), "hydrated retains the alt buffer");
         assert_eq!(
@@ -1529,7 +1599,7 @@ mod tests {
         assert!(t.parser_is_ground() && t.modes.alternate_screen);
 
         let c0 = t.checkpoint();
-        let mut h = Terminal::from_checkpoint(&c0, HostBindings::none());
+        let mut h = Terminal::from_checkpoint(&c0);
         assert!(h.modes.alternate_screen, "hydrated is on the alt screen");
 
         // Scroll BOTH well past `rows` lines.
@@ -1607,7 +1677,7 @@ mod tests {
         );
         // Grown back before the slot is read, the cursor lands where it was
         // saved — on the live engine and on one restored from that wire alike.
-        let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+        let mut restored = Terminal::from_checkpoint(&cp);
         for terminal in [&mut t, &mut restored] {
             terminal.resize(56, 149);
             terminal.process(b"\x1b[?1049l");
@@ -1648,7 +1718,7 @@ mod tests {
         assert_eq!(t.title(), "x", "the live partial OSC survived the capture");
 
         // The restored engine starts in Ground and takes new text normally.
-        let mut restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+        let mut restored = Terminal::from_checkpoint(&cp);
         assert!(restored.parser_is_ground());
         restored.process(b" world");
         assert_eq!(
@@ -1700,7 +1770,7 @@ mod tests {
             assert_eq!(cp.history_lines, 5, "the history bound still applies");
             assert_eq!(t.parser.state(), live_state, "live parser untouched");
 
-            let restored = Terminal::from_checkpoint(&cp, HostBindings::none());
+            let restored = Terminal::from_checkpoint(&cp);
             assert!(restored.parser_is_ground(), "{partial:?}");
             assert_eq!(restored.visible_content(), t.visible_content());
         }

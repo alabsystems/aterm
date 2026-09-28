@@ -81,8 +81,7 @@ pub struct Receipt {
     pub verdict: String,
     /// Did this run discharge the WHOLE merge contract? The one predicate a
     /// commit is counted as gated on, and it is [`crate::verdict::claims_contract`]'s,
-    /// not a second opinion: whole tree, nothing skipped, nothing failed, not a
-    /// selftest.
+    /// not a second opinion: whole tree, nothing skipped, nothing failed.
     pub merge_contract: bool,
     /// What this run SKIPPED, in the verdict's own words (at most a handful,
     /// then a count) — never part of the decision, which `merge_contract`

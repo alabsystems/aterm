@@ -51,6 +51,7 @@ fn emit_adversarial(s: &mut u64, buf: &mut Vec<u8>) {
         "\u{2500}\u{2502}\u{250c}\u{2510}".as_bytes(), // box
         "\u{2588}\u{2580}\u{2584}\u{2591}".as_bytes(), // blocks
         "\u{1fb00}".as_bytes(),                        // sextant
+        "\u{1cd4e}".as_bytes(),                        // octant
         "\u{e0b0}\u{e0b2}".as_bytes(),                 // Powerline
         b"\xf0",                                       // truncated UTF-8
         b"\xff",                                       // invalid byte

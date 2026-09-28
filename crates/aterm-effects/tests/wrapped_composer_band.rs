@@ -15,7 +15,7 @@
 //!
 //! Reproduced at the HOST seam, like `scrub_gaps.rs`: a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled
-//! exactly as `app_render.rs`'s LOCK A samples them, its content-scroll clock
+//! exactly as `app_render.rs`'s frame hold samples them, its content-scroll clock
 //! read exactly as `app_render::sync_cursor_effect_scroll` reads it, fed to
 //! `CursorGlow` and ticked on a frame train. The program is
 //! `scratch/composer.py`'s BOTTOM-PINNED WRAPPING BOX — the shape of Claude

@@ -56,6 +56,11 @@ fn is_problem_state(state: &str) -> bool {
         || state.starts_with("blocked:")
         || state.starts_with("aborted:")
         || state.starts_with("tombstoned:")
+        // A member HELD after a failed stage (`held: last attempt failed with …; <retry>`)
+        // is not installed and will not be by any unattended pass — a problem, and one
+        // whose row already names the act. The group hold (`held: pinned build …`) is
+        // the benign state the allow-list keeps.
+        || state.starts_with(crate::state::HELD_FAILED_PREFIX)
 }
 
 /// Where the per-problem listing should START — or `None` when no verdict owns it.
@@ -191,6 +196,127 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The toolset-wide "no build for this architecture" verdict, on the ONE platform where
+/// it is a state and not a fault: WINDOWS. `Some(names)` — the programs whose own rows
+/// say `unavailable on <target>: …` — when the `*toolset*` row reads that verdict here;
+/// `None` on every other platform, whatever the row says, so macOS/Linux reports are
+/// byte-identical to what they were.
+///
+/// Why the platform split. On an Intel Mac the absence of an x86_64 build is a
+/// publishing gap the report is right to call a PROBLEM and to answer with `aterm pkg
+/// install --default-set`: the seal serves that machine the day it is cut. On Windows
+/// (measured 2026-09-22, index build 44) every ALab row is `policy = "prebuilt-only"`
+/// with no `x86_64-pc-windows-msvc` artifact, and the only members published for this
+/// target are the agents. `install --default-set` cannot change that — it skips every
+/// unserved member "not failed" and installs the served ones, which the six-hourly pass
+/// already does — so a PROBLEM line that recommends it, and an exit 1 for it, sent every
+/// Windows user to run a command that could not do what the line implied. The row is
+/// also STALE by construction: it is written when a pass installs nothing on an empty
+/// store and cleared only by a clean pass with something installed, so it outlives the
+/// day the agents became servable here.
+fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let s = status?;
+    // The members whose OWN rows say the index publishes nothing for this target — the
+    // durable signal. The toolset-wide row is written only by a pass that installed
+    // nothing on an empty store and is cleared by the first clean pass with something
+    // installed, so after `claude`/`codex` land here it is gone while the ten unserved
+    // members are exactly as unserved as before.
+    let names: Vec<String> = s
+        .programs
+        .iter()
+        .filter(|(name, p)| {
+            !name.starts_with('*') && p.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
+        })
+        .map(|(name, _)| name.clone())
+        .collect();
+    let toolset_row_says = s
+        .programs
+        .get("*toolset*")
+        .is_some_and(|row| crate::state::is_unserved_toolset(&row.state));
+    if names.is_empty() && !toolset_row_says {
+        return None;
+    }
+    Some(names)
+}
+
+/// [`split_missing`]'s "unexplained" list with the unserved members taken out: on an
+/// unserved platform each of them IS explained — by its own `unavailable on <target>` row,
+/// which the note names — and counting them made the report call the toolset "incomplete:
+/// 10 of 12 program(s) the signed index serves are not installed" right after the two
+/// served members had installed (measured 2026-09-22). Identity when `unserved` is `None`
+/// (every platform but Windows), so the list is byte-identical there.
+fn drop_unserved(missing: Vec<String>, unserved: Option<&[String]>) -> Vec<String> {
+    match unserved {
+        Some(unserved) => missing
+            .into_iter()
+            .filter(|p| !unserved.contains(p))
+            .collect(),
+        None => missing,
+    }
+}
+
+/// Whether a recorded problem (`"<program>: <state>"`) is the toolset-wide
+/// "no build for this architecture" verdict ([`crate::state::is_unserved_toolset`]) — the
+/// ONE `*toolset*` row [`toolset_unserved_here`] turns into a note. Every other
+/// `*toolset*` verdict (`unavailable: index unreachable`, `unavailable: every published
+/// build was refused`, `unavailable: [packages].exclude leaves nothing to install`, …) is
+/// a fault about THIS machine and stays a problem on every platform.
+fn is_unserved_toolset_problem(why: &str) -> bool {
+    why.strip_prefix("*toolset*: ")
+        .is_some_and(crate::state::is_unserved_toolset)
+}
+
+/// Whether a recorded problem is a member HELD after a failed stage
+/// ([`crate::state::HELD_FAILED_PREFIX`]) — a problem no unattended pass moves.
+fn is_held_problem(why: &str) -> bool {
+    why.split_once(": ")
+        .is_some_and(|(_, state)| state.starts_with(crate::state::HELD_FAILED_PREFIX))
+}
+
+/// The first member the recorded problems say is HELD ([`is_held_problem`]), by name —
+/// wherever it sorts: a `*toolset*` row precedes every program in `BTreeMap` order, so on
+/// an empty store the held member is never the first problem.
+fn first_held_member(recorded_problems: &[String]) -> Option<&str> {
+    recorded_problems
+        .iter()
+        .filter(|why| is_held_problem(why))
+        .find_map(|why| why.split_once(": ").map(|(program, _)| program))
+}
+
+/// Whether an EMPTY store on an unserved platform is the quiet state — the note, "none is
+/// missing", healthy: only when nothing is recorded against a member the index serves
+/// here AND no served member is missing without a row. A network failure writes no
+/// per-program row by design (`failed_install_state`), so an empty problem list alone
+/// does not prove every served member arrived; the index's own list has to agree.
+fn unserved_store_is_quiet(
+    unserved: bool,
+    recorded_problems: &[String],
+    missing_unexplained: &[String],
+) -> bool {
+    unserved && recorded_problems.is_empty() && missing_unexplained.is_empty()
+}
+
+/// The one act for an empty store on an unserved platform: the explicit door of the
+/// first member whose row records a failure or a hold (`aterm pkg install <p>` — which
+/// also forgets a digest refusal), else of the first served member missing without a
+/// row. `None` when the verdict is a toolset-wide fault (`*toolset*: unavailable: index
+/// unreachable`), which is not about this platform: the caller's ordinary act answers it.
+/// Never the whole-set install for the unserved condition itself, which cannot serve what
+/// is not published.
+fn unserved_platform_next(
+    recorded_problems: &[String],
+    missing_unexplained: &[String],
+) -> Option<String> {
+    let program = match recorded_problems.first() {
+        Some(first) => first.split_once(": ")?.0,
+        None => missing_unexplained.first()?.as_str(),
+    };
+    (!program.starts_with('*')).then(|| format!("aterm pkg install {program}"))
+}
+
 /// The ONE doctor line for installed files that still carry `com.apple.provenance` — the
 /// files every package pass and `aterm pkg repair` clear ([`crate::provenance::heal_store`])
 /// and could not: how many, what that breaks, and the verb that tries again. At most 160
@@ -290,6 +416,9 @@ pub struct Probes {
     /// answer back and says whether a newer index is published. Default `false` — a
     /// private or repointed registry has no probe, so there is nothing to report.
     pub index_head: bool,
+    /// The C toolchain's verdict ([`crate::prereq::probe`]), or `None` when this report
+    /// does not probe it (the default: a fixture never meets the machine's compiler).
+    pub cc: Option<crate::prereq::CcVerdict>,
 }
 
 impl Default for Probes {
@@ -305,6 +434,7 @@ impl Default for Probes {
             retired_env: Vec::new(),
             stub_env: crate::reroute::StubEnv::default(),
             index_head: false,
+            cc: None,
         }
     }
 }
@@ -605,6 +735,7 @@ pub fn run(layout: &Layout, prefix: &str, detail: Detail) -> bool {
         retired_env: retired_opt_outs_exported(),
         stub_env: crate::reroute::StubEnv::of_process(),
         index_head: crate::index_probe::probes_this_source(),
+        cc: Some(crate::prereq::probe(path.as_deref())),
     };
     let mut report = Vec::new();
     let mut faults = Vec::new();
@@ -1466,23 +1597,23 @@ pub fn run_with(
     }
 
     let live = crate::gc::live_builds(layout);
-    // A shim/channel divergence's repair is a re-run of `update` — remembered for the
+    // A shim/link divergence's repair is a re-run of `update` — remembered for the
     // verdict tail's single `next` act.
     let mut next_update_divergence = false;
     for d in live.diverged() {
         match &d.reason {
-            crate::gc::Diverged::ChannelShimMismatch {
-                channel_says,
+            crate::gc::Diverged::LinkShimMismatch {
+                link_says,
                 shims_say,
             } => {
                 fails += 1;
                 next_update_divergence = true;
                 let _ = writeln!(
                     err,
-                    "{p}: FAIL — {}: the channel selects {} but its bin/ shims run {} — fix: \
+                    "{p}: FAIL — {}: its `current` link selects {} but its bin/ shims run {} — fix: \
                      aterm pkg update {}",
                     d.program,
-                    crate::vendor_direct::build_words(*channel_says),
+                    crate::vendor_direct::build_words(*link_says),
                     crate::vendor_direct::build_words(*shims_say),
                     d.program
                 );
@@ -1494,18 +1625,6 @@ pub fn run_with(
                     err,
                     "{p}: FAIL — {}: its bin/ shims are split across builds {} — fix: aterm \
                      pkg repair, then aterm pkg update {}",
-                    d.program,
-                    build_list(builds),
-                    d.program
-                );
-            }
-            crate::gc::Diverged::ChannelsDisagree { builds } => {
-                fails += 1;
-                next_update_divergence = true;
-                let _ = writeln!(
-                    err,
-                    "{p}: FAIL — {}: two channels select different builds {} — fix: aterm pkg \
-                     update {}",
                     d.program,
                     build_list(builds),
                     d.program
@@ -1964,10 +2083,13 @@ pub fn run_with(
     let rustup = rustup_binary(home);
     let rustup_answers = rustup.as_deref().is_some_and(rustup_present);
     if rustup.is_none() {
+        // A NOTE, not a warn: the product's own shape has no rustup — the managed Trust
+        // toolchain runs as `targo`/`trustc` from the store — so its absence is a fact
+        // about this machine, never something to fix.
         let _ = writeln!(
             out,
-            "{p}: warn — rustup not found on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin \
-             (self-contained bundles are portable)"
+            "{p}: note — no rustup on PATH, in $CARGO_HOME/bin or in ~/.cargo/bin; the \
+             managed toolchain runs without it (`targo`, `trustc`)"
         );
     } else if !rustup_answers {
         let _ = writeln!(
@@ -2102,7 +2224,12 @@ pub fn run_with(
     // Intel Mac, 2026-09-15: trust-cg/-ir/-vc "pinned by index 15" beside index 32).
     if let Some(s) = status.as_ref() {
         for (program, row) in &s.programs {
-            if row.state.starts_with(crate::state::HELD_PREFIX) {
+            // Only the GROUP hold. A member held after a failed stage (`held: last attempt
+            // failed with …`) is the opposite verdict — not installed, and no pass moves
+            // it — and it is listed with the problems, retry and all (`is_problem_state`).
+            if row.state.starts_with(crate::state::HELD_PREFIX)
+                && !row.state.starts_with(crate::state::HELD_FAILED_PREFIX)
+            {
                 let _ = writeln!(
                     out,
                     "{p}: ok — {program}: {} (nothing to do here; the next pass moves the \
@@ -2261,6 +2388,20 @@ pub fn run_with(
     // findings one per repair cycle is not triage, it is a guessing game, and `status.toml`
     // is a `BTreeMap` so which one won was alphabetical accident.
     let recorded_problems = recorded_problems(status.as_ref());
+    // (11a) AN UNSERVED PLATFORM IS A STATE, NOT A FAULT — Windows only, see
+    // `toolset_unserved_here`. The `*toolset*` row's "no build for this architecture"
+    // verdict leaves the problem list (it is said below, as a note) — that one verdict and
+    // no other: an unreachable index or a refused publish is a fault on every platform,
+    // and masking it made an empty store read "healthy" (review, 2026-09-27).
+    let toolset_unserved = toolset_unserved_here(status.as_ref());
+    let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
+        recorded_problems
+            .into_iter()
+            .filter(|why| !is_unserved_toolset_problem(why))
+            .collect()
+    } else {
+        recorded_problems
+    };
     let declined = layout.declined().is_file();
     // (11) COMPLETENESS AGAINST THE SIGNED INDEX — the check that was missing.
     //
@@ -2290,12 +2431,48 @@ pub fn run_with(
         .len();
     let (missing_unexplained, missing_on_purpose, _indexed_dev_linked) =
         missing_against_index(layout, &installed, &dev_linked);
+    // (11b) An unserved member is explained by its own row, not missing without a reason
+    // (`drop_unserved`; identity everywhere but Windows).
+    let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
     let mut toolset_problem = false;
+    if let Some(unserved) = &toolset_unserved {
+        // Said once, as what it is: a fact about the index and this target, which no
+        // command on this machine changes — the state, and no act. The members it names
+        // are the ones whose own rows say so; the served members (the agents) are
+        // reported like any other — their per-program lines print ABOVE this note (the
+        // program loop runs first), so the note does not point "below".
+        let _ = writeln!(
+            out,
+            "{p}: note — the ALab toolset is unavailable on this platform: no build is \
+             published for this target{}; nothing on this machine changes that",
+            if unserved.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", unserved.join(", "))
+            }
+        );
+    }
     if declined {
         // Intended emptiness. Say so, so it does not read as a fault.
         let _ = writeln!(
             out,
             "{p}: {DECLINED_LINE} (`aterm pkg install --default-set` reinstalls it)"
+        );
+    } else if active_count == 0
+        && unserved_store_is_quiet(
+            toolset_unserved.is_some(),
+            &recorded_problems,
+            &missing_unexplained,
+        )
+    {
+        // Nothing active because nothing published for this target is missing: the note
+        // above is the whole story, and it is not a problem to count or to exit 1 for.
+        // (A served member that failed, is held, or is missing without a row takes the
+        // branch below instead.)
+        let _ = writeln!(
+            out,
+            "{p}: 0 program(s) active — none is published for this platform, so none is \
+             missing"
         );
     } else if active_count == 0 {
         toolset_problem = true;
@@ -2385,6 +2562,34 @@ pub fn run_with(
         }
     }
 
+    // (11) THE C TOOLCHAIN — a prerequisite, probed and never shipped (`crate::prereq`).
+    // Only where a toolset is installed: that is what it stops from building. A verdict
+    // that is an ANSWER (no toolchain, or one that refuses) is a FAIL — "healthy" over a
+    // machine whose first `targo build` dies in a build script is the vacuous pass (10)
+    // was written against; an unknown is a warn; a target it does not apply to, a note.
+    let mut next_prereq = false;
+    if active_count > 0
+        && let Some(verdict) = probes.cc.as_ref()
+    {
+        let line = verdict.line();
+        match verdict {
+            crate::prereq::CcVerdict::Ready { .. } => {
+                let _ = writeln!(out, "{p}: ok — {line}");
+            }
+            crate::prereq::CcVerdict::NotProbed => {
+                let _ = writeln!(out, "{p}: note — {line}");
+            }
+            crate::prereq::CcVerdict::Unanswered { .. } => {
+                let _ = writeln!(out, "{p}: warn — {line}");
+            }
+            _ => {
+                fails += 1;
+                next_prereq = true;
+                let _ = writeln!(err, "{p}: FAIL — {line}");
+            }
+        }
+    }
+
     if fails == 0 && !toolset_problem && tools_cannot_run == 0 && tools_unproven == 0 {
         let _ = writeln!(out, "{p}: healthy");
         true
@@ -2409,13 +2614,38 @@ pub fn run_with(
         // re-flips diverged shims), then the structural repair of one named program.
         // Failures with their remedy already inline (a stray .sh — "remove it") add no
         // line here rather than a second, vaguer act.
-        let next = if toolset_problem && active_count == 0 {
-            Some(String::from("aterm pkg install --default-set"))
+        // The whole-set install cannot serve an unserved platform (the note above); there
+        // the act is the explicit door of the served member the verdict is about — unless
+        // the verdict is toolset-wide (an unreachable index), which the ordinary act below
+        // answers exactly as it does elsewhere.
+        let unserved_door = if toolset_problem && active_count == 0 && toolset_unserved.is_some() {
+            unserved_platform_next(&recorded_problems, &missing_unexplained)
+        } else {
+            None
+        };
+        let next = if unserved_door.is_some() {
+            unserved_door
+        } else if toolset_problem && active_count == 0 {
+            // …but never over a HELD member: the whole-set pass honours the hold and
+            // repeats it (`skip_held_member`), so the act is that member's explicit door,
+            // which forgets its memo before it stages (review, 2026-09-27).
+            Some(first_held_member(&recorded_problems).map_or_else(
+                || String::from("aterm pkg install --default-set"),
+                |program| format!("aterm pkg install {program}"),
+            ))
+        } else if next_prereq {
+            // No amount of updating installs a C compiler: the prerequisite outranks it.
+            Some(String::from(crate::prereq::act()))
         } else if next_publish {
             Some(format!(
                 "publish the newer Trust coherence group ({PUBLISH_RUSTC_GROUP} on a \
                  rostered machine holding the seal), then aterm pkg update trust"
             ))
+        } else if !declined && recorded_problems.iter().any(|why| is_held_problem(why)) {
+            // A HELD member is the one recorded problem a plain `update` cannot move: the
+            // pass honours the hold and repeats it. `--retry` is that same pass after
+            // forgetting the holds, so it answers every other recorded fault too.
+            Some(String::from("aterm pkg update --retry"))
         } else if (!recorded_problems.is_empty() && !declined) || next_update_divergence {
             Some(String::from("aterm pkg update"))
         } else {
@@ -3132,21 +3362,35 @@ fn replaced_seam_line(layout: &Layout, rustup_home: &Path) -> Option<String> {
 /// rustup-init lays it, which an app-spawned pass (no rc file read) does not
 /// have on its PATH. Existence only; whether it answers is [`rustup_present`].
 fn rustup_binary(home: Option<&Path>) -> Option<std::path::PathBuf> {
+    // The platform's EXECUTABLE spelling: `rustup.exe` on Windows. A bare `rustup` is
+    // never a file there, so this report said "rustup not found" two lines after
+    // "rustup's trust channel resolves to a LOCAL toolchain" — both about the same
+    // `~/.cargo/bin/rustup.exe` (measured 2026-09-22; the seam probe reads
+    // `~/.rustup` and never needed the binary, which is how the two lines disagreed).
+    let file = rustup_file_name();
     let on_path = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
-            .map(|dir| dir.join("rustup"))
+            .map(|dir| dir.join(&file))
             .find(|candidate| candidate.is_file())
     });
     on_path
         .or_else(|| {
             std::env::var_os("CARGO_HOME")
-                .map(|cargo_home| Path::new(&cargo_home).join("bin").join("rustup"))
+                .map(|cargo_home| Path::new(&cargo_home).join("bin").join(&file))
                 .filter(|candidate| candidate.is_file())
         })
         .or_else(|| {
-            let candidate = home?.join(".cargo").join("bin").join("rustup");
+            let candidate = home?.join(".cargo").join("bin").join(&file);
             candidate.is_file().then_some(candidate)
         })
+}
+
+/// `rustup` with the platform's executable suffix (`rustup.exe` on Windows, `rustup`
+/// elsewhere) — the file name [`rustup_binary`] looks for.
+fn rustup_file_name() -> String {
+    let mut name = String::from("rustup");
+    name.push_str(crate::platform::EXE_SUFFIX);
+    name
 }
 
 /// Whether the `rustup` at `bin` answers `--version` inside [`PROBE_TIMEOUT`].
@@ -3172,7 +3416,7 @@ fn rustup_trust_channel_resolves(bin: &Path) -> bool {
 /// `rustup`, so one wedged binary — a stale NFS mount, a `rustup` shim waiting
 /// on a network toolchain fetch, a program stopped on a debugger — hung the
 /// whole report with no output and no way to tell what it was waiting for.
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PROBE_TIMEOUT: std::time::Duration = crate::prereq::PROBE_TIMEOUT;
 
 /// Poll interval while waiting for a probe to exit.
 const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
@@ -3188,15 +3432,37 @@ const PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(10);
 /// the verdict. A timed-out probe reads `unknown`, exactly like a binary that
 /// will not run.
 pub(crate) fn output_bounded(cmd: &mut std::process::Command) -> Option<std::process::Output> {
+    bounded(cmd, false, PROBE_TIMEOUT)
+}
+
+/// [`output_bounded`] that keeps stderr too, within `within` — for a probe whose refusal
+/// is the answer (`crate::prereq`: a broken compiler's first stderr line, verbatim). Both
+/// pipes are read after exit, so it is for probes whose output is a line or two.
+pub(crate) fn output_bounded_capturing(
+    cmd: &mut std::process::Command,
+    within: std::time::Duration,
+) -> Option<std::process::Output> {
+    bounded(cmd, true, within)
+}
+
+fn bounded(
+    cmd: &mut std::process::Command,
+    keep_stderr: bool,
+    within: std::time::Duration,
+) -> Option<std::process::Output> {
     use std::io::Read as _;
     use std::process::Stdio;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(if keep_stderr {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    let deadline = std::time::Instant::now() + within;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -3219,10 +3485,14 @@ pub(crate) fn output_bounded(cmd: &mut std::process::Command) -> Option<std::pro
     if let Some(mut pipe) = child.stdout.take() {
         let _ = pipe.read_to_end(&mut stdout);
     }
+    let mut stderr = Vec::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_end(&mut stderr);
+    }
     Some(std::process::Output {
         status,
         stdout,
-        stderr: Vec::new(),
+        stderr,
     })
 }
 
@@ -3524,7 +3794,7 @@ fn spotlight_reach(in_repo: usize, free: &[&crate::noindex::Target]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activate::{activate_channel, install_shims};
+    use crate::activate::{activate_build, install_shims};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -3575,7 +3845,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        activate_channel(layout, "stable", &dir).unwrap();
+        activate_build(layout, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
     }
 
@@ -4107,6 +4377,73 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// (11) THE C TOOLCHAIN. On an otherwise healthy install, a verdict that is an
+    /// answer — no toolchain, or one that refuses — is a FAIL whose next act is the
+    /// platform's installer, outranking `update`; a toolchain that answers is an `ok`
+    /// line and the report stays healthy; an unknown warns and stays healthy; and the
+    /// rustup-absent line is a note, never a warn (the product has no rustup).
+    #[test]
+    fn doctor_fails_when_the_c_toolchain_cannot_build() {
+        let l = layout("cc-prereq");
+        install(&l, "ay", 18);
+        let home = synthetic_home("cc-prereq");
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let report = |cc: crate::prereq::CcVerdict| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let healthy = run_with(
+                &l,
+                Some(&home),
+                Some(&path),
+                0,
+                None,
+                "doctor",
+                &Probes {
+                    cc: Some(cc),
+                    ..Probes::default()
+                },
+                &mut out,
+                &mut err,
+            );
+            (
+                healthy,
+                String::from_utf8_lossy(&out).into_owned(),
+                String::from_utf8_lossy(&err).into_owned(),
+            )
+        };
+        let (healthy, out, err) = report(crate::prereq::CcVerdict::NoDriver);
+        assert!(!healthy, "{out}{err}");
+        assert!(err.contains("FAIL — no C compiler (`cc`) on PATH"), "{err}");
+        assert!(out.contains("found 1 problem(s)"), "{out}");
+        assert!(
+            out.contains(&format!("next — {}", crate::prereq::act())),
+            "the prerequisite's act, not `update`: {out}"
+        );
+        let (healthy, out, _) = report(crate::prereq::CcVerdict::Ready {
+            driver: PathBuf::from("/opt/cc/bin/clang"),
+        });
+        assert!(healthy, "{out}");
+        assert!(
+            out.contains("ok — C toolchain: /opt/cc/bin/clang answers"),
+            "{out}"
+        );
+        let (healthy, out, _) = report(crate::prereq::CcVerdict::Unanswered {
+            driver: PathBuf::from("/opt/cc/bin/cc"),
+        });
+        assert!(healthy, "an unknown is not a problem: {out}");
+        assert!(
+            out.contains("warn — the C compiler at /opt/cc/bin/cc did not answer"),
+            "{out}"
+        );
+        if rustup_binary(Some(&home)).is_none() {
+            assert!(
+                out.contains("note — no rustup") && !out.contains("warn — rustup not found"),
+                "{out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[cfg(unix)]
     #[test]
     fn dev_link_only_toolset_is_healthy_but_deleted_tool_is_not() {
@@ -4323,6 +4660,397 @@ mod tests {
             "a store with no ALab programs must report a problem, not health"
         );
         let _ = std::fs::remove_dir_all(&l.prefix);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A store with nothing installed, a `*toolset*` row reading "no build for this
+    /// architecture", per-program `unavailable on <target>` rows, and optionally one
+    /// served member HELD after a failed stage — the Windows box of 2026-09-22.
+    fn unserved_platform_store(label: &str, with_held_claude: bool) -> Layout {
+        let l = layout(label);
+        let mut programs = std::collections::BTreeMap::new();
+        let row = |state: &str| crate::ProgramStatus {
+            installed_build: None,
+            state: state.to_string(),
+            tree_root: String::new(),
+        };
+        programs.insert(
+            "*toolset*".to_string(),
+            row("unavailable: no build for this architecture"),
+        );
+        for p in ["ay", "trust", "ty"] {
+            programs.insert(
+                p.to_string(),
+                row(&crate::state::unavailable("x86_64-pc-windows-msvc", "")),
+            );
+        }
+        if with_held_claude {
+            programs.insert(
+                "claude".to_string(),
+                row(&crate::state::held_failed(
+                    "tree_root mismatch: expected 15c4, got 3a44",
+                    "retry now: aterm pkg install claude (or aterm pkg update --retry)",
+                )),
+            );
+        }
+        crate::status::write(
+            &l,
+            &crate::Status {
+                schema: 1,
+                programs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        l
+    }
+
+    /// The whole report over an [`unserved_platform_store`]: `(healthy, stdout)`.
+    fn report_over(l: &Layout, label: &str) -> (bool, String) {
+        let home = synthetic_home(label);
+        let path = std::env::join_paths([l.bin_dir()]).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let mut err: Vec<u8> = Vec::new();
+        let healthy = run_with(
+            l,
+            Some(&home),
+            Some(&path),
+            0,
+            None,
+            "doctor",
+            &Probes::default(),
+            &mut out,
+            &mut err,
+        );
+        let _ = std::fs::remove_dir_all(&home);
+        (healthy, String::from_utf8(out).unwrap())
+    }
+
+    /// AN UNSERVED PLATFORM IS A STATE, NOT A FAULT — on Windows. Measured 2026-09-22:
+    /// with nothing installable but the agents, `doctor` said "PROBLEM — no ALab programs
+    /// are installed (*toolset*: unavailable: no build for this architecture)", exited 1,
+    /// and recommended `aterm pkg install --default-set`, which by the report's own words
+    /// cannot install what is not published. Now: a note naming the unserved members,
+    /// no problem counted for them, exit 0 — unless a SERVED member's row records a real
+    /// failure, which is then the problem and whose own door is the next act.
+    ///
+    /// On macOS/Linux every line is what it was: the split lives in
+    /// [`toolset_unserved_here`], and this test pins BOTH sides so neither drifts.
+    #[test]
+    fn an_unserved_platform_is_a_note_not_a_problem_on_windows_and_unchanged_elsewhere() {
+        // Nothing served is missing: healthy on Windows, the old PROBLEM elsewhere.
+        let l = unserved_platform_store("unserved-quiet", false);
+        let (healthy, out) = report_over(&l, "unserved-quiet");
+        if cfg!(windows) {
+            assert!(healthy, "an unserved platform is not a fault: {out}");
+            assert!(
+                out.contains(
+                    "note — the ALab toolset is unavailable on this platform: no build is \
+                     published for this target (ay, trust, ty)"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("0 program(s) active — none is published for this platform"),
+                "{out}"
+            );
+            assert!(!out.contains("PROBLEM"), "{out}");
+            assert!(
+                !out.contains("next — "),
+                "nothing to do, nothing recommended: {out}"
+            );
+            assert!(!out.contains("--default-set"), "nothing impossible: {out}");
+            assert!(out.contains("doctor: healthy"), "{out}");
+        } else {
+            assert!(!healthy, "{out}");
+            assert!(
+                out.contains(
+                    "PROBLEM — no ALab programs are installed (*toolset*: unavailable: no \
+                     build for this architecture)"
+                ),
+                "{out}"
+            );
+            assert!(
+                out.contains("next — aterm pkg install --default-set"),
+                "{out}"
+            );
+            assert!(!out.contains("unavailable on this platform"), "{out}");
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+
+        // A served member HELD after a failed stage IS the problem, and its own door is
+        // the act — never the whole-set install, on any platform: that pass honours the
+        // hold and repeats it.
+        let l = unserved_platform_store("unserved-held", true);
+        let (healthy, out) = report_over(&l, "unserved-held");
+        assert!(!healthy, "a held member is a problem everywhere: {out}");
+        assert!(
+            out.contains("claude: held: last attempt failed with tree_root mismatch"),
+            "the held row is listed with its retry: {out}"
+        );
+        assert!(
+            !out.contains("ok — claude: held:"),
+            "a digest hold is never the benign group hold: {out}"
+        );
+        assert!(out.contains("next — aterm pkg install claude"), "{out}");
+        assert!(
+            !out.contains("next — aterm pkg install --default-set"),
+            "a pass that repeats the hold is not the act: {out}"
+        );
+        if cfg!(windows) {
+            assert!(
+                out.contains(
+                    "PROBLEM — no ALab programs are installed (claude: held: last attempt \
+                     failed with"
+                ),
+                "{out}"
+            );
+            assert!(!out.contains("--default-set"), "nothing impossible: {out}");
+        } else {
+            // Off Windows the architecture row is still the first problem named; the held
+            // member, listed below it, is what decides the act.
+            assert!(
+                out.contains(
+                    "PROBLEM — no ALab programs are installed (*toolset*: unavailable: no \
+                     build for this architecture)"
+                ),
+                "{out}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+
+        // The box after the served members installed: the `*toolset*` row is gone (a
+        // clean pass clears it), the unserved members' own rows remain, and one program
+        // is active. The note still stands on Windows — it keys on the rows that last —
+        // and the report is healthy; elsewhere nothing is said about the platform.
+        let l = unserved_platform_store("unserved-after", false);
+        clear_row(&l, "*toolset*");
+        install(&l, "claude", 2026092201);
+        let (healthy, out) = report_over(&l, "unserved-after");
+        assert!(healthy, "{out}");
+        assert!(out.contains("1 program(s) active"), "{out}");
+        assert!(!out.contains("PROBLEM"), "{out}");
+        assert_eq!(
+            out.contains("unavailable on this platform"),
+            cfg!(windows),
+            "the note is Windows-only: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+
+        // …and with codex HELD beside the installed claude: the held row is the problem,
+        // and the one act is the pass that forgets the hold — a plain `aterm pkg update`
+        // would honour the hold and repeat it. The same on every platform: a publish-side
+        // `tree_root` mismatch is held on macOS too.
+        let l = unserved_platform_store("unserved-codex-held", false);
+        clear_row(&l, "*toolset*");
+        install(&l, "claude", 2026092201);
+        let mut s = crate::status::read(&l).unwrap_or_default();
+        s.programs.insert(
+            "codex".to_string(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::held_failed(
+                    "tree_root mismatch: expected e498, got 6576",
+                    "retry now: aterm pkg install codex (or aterm pkg update --retry)",
+                ),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(&l, &s).unwrap();
+        let (healthy, out) = report_over(&l, "unserved-codex-held");
+        assert!(!healthy, "{out}");
+        assert!(
+            out.contains("PROBLEM — the toolset is incomplete; 1 program(s) active"),
+            "{out}"
+        );
+        assert!(
+            out.contains("  codex: held: last attempt failed with tree_root mismatch"),
+            "the held row is listed with its retry: {out}"
+        );
+        assert!(out.contains("next — aterm pkg update --retry"), "{out}");
+        assert!(!out.contains("next — aterm pkg update\n"), "{out}");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// THE NOTE MASKS ONE VERDICT, NOT EVERY `*toolset*` ROW (review, 2026-09-27). On an
+    /// unserved platform the toolset-wide "no build for this architecture" row becomes the
+    /// note; an UNREACHABLE INDEX on the same empty store is a fault about this machine and
+    /// stays one — `PROBLEM`, unhealthy, and the ordinary act — exactly as on every other
+    /// platform. Before the fix the Windows filter dropped every `*toolset*: …` row, and
+    /// this store read "0 program(s) active — none is published for this platform, so none
+    /// is missing", healthy, exit 0.
+    #[test]
+    fn an_unreachable_index_is_a_problem_on_an_unserved_platform_too() {
+        let l = unserved_platform_store("unserved-offline", false);
+        let mut s = crate::status::read(&l).unwrap_or_default();
+        s.programs.insert(
+            "*toolset*".to_string(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: crate::state::TOOLSET_INDEX_UNREACHABLE.to_string(),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(&l, &s).unwrap();
+        let (healthy, out) = report_over(&l, "unserved-offline");
+        assert!(
+            !healthy,
+            "an unreachable index is a fault everywhere: {out}"
+        );
+        assert!(
+            out.contains(
+                "PROBLEM — no ALab programs are installed (*toolset*: unavailable: index \
+                 unreachable)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("none is missing"), "{out}");
+        assert!(
+            out.contains("next — aterm pkg install --default-set"),
+            "the ordinary act, on every platform: {out}"
+        );
+        // The per-member rows still say what they say: on Windows, the note.
+        assert_eq!(
+            out.contains("unavailable on this platform"),
+            cfg!(windows),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The empty-store verdict on an unserved platform, decided without a signed index:
+    /// quiet ONLY when nothing is recorded against a served member AND the index lists no
+    /// served member missing without a row — a network failure writes no row, so an empty
+    /// problem list alone proves nothing. Where it is not quiet, the act is the door of
+    /// the member the verdict is about, and a toolset-wide fault gets the ordinary act.
+    #[test]
+    fn an_unserved_store_is_quiet_only_when_no_served_member_is_missing() {
+        let v = |items: &[&str]| items.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(unserved_store_is_quiet(true, &[], &[]));
+        assert!(
+            !unserved_store_is_quiet(true, &[], &v(&["claude"])),
+            "a served member missing with no row is not 'none is missing'"
+        );
+        assert!(!unserved_store_is_quiet(
+            true,
+            &v(&["codex: error: x"]),
+            &[]
+        ));
+        assert!(
+            !unserved_store_is_quiet(false, &[], &[]),
+            "never off an unserved platform"
+        );
+
+        assert_eq!(
+            unserved_platform_next(&[], &v(&["claude", "codex"])).as_deref(),
+            Some("aterm pkg install claude")
+        );
+        assert_eq!(
+            unserved_platform_next(&v(&["codex: held: last attempt failed with x; y"]), &[])
+                .as_deref(),
+            Some("aterm pkg install codex")
+        );
+        assert_eq!(
+            unserved_platform_next(&v(&["*toolset*: unavailable: index unreachable"]), &[]),
+            None,
+            "a toolset-wide fault is not this platform's: the ordinary act answers it"
+        );
+        assert_eq!(unserved_platform_next(&[], &[]), None);
+
+        // The filter's predicate: exactly the two unserved spellings, nothing else.
+        assert!(is_unserved_toolset_problem(
+            "*toolset*: unavailable: no build for this architecture"
+        ));
+        assert!(is_unserved_toolset_problem(
+            "*toolset*: blocked: no build for this architecture"
+        ));
+        for other in [
+            "*toolset*: unavailable: index unreachable",
+            "*toolset*: unavailable: every published build was refused",
+            "*toolset*: unavailable: [packages].exclude leaves nothing to install",
+            "*toolset*: unavailable: running under Rosetta translation",
+            "ay: unavailable: no build for this architecture",
+        ] {
+            assert!(!is_unserved_toolset_problem(other), "{other}");
+        }
+        assert!(is_held_problem(
+            "codex: held: last attempt failed with x; y"
+        ));
+        assert!(!is_held_problem(
+            "trust: held: pinned build 7 is not published"
+        ));
+        assert!(!is_held_problem(
+            "codex: error: held: last attempt failed with"
+        ));
+        // The held member is found wherever it sorts — behind a `*toolset*` row too.
+        assert_eq!(
+            first_held_member(&v(&[
+                "*toolset*: unavailable: no build for this architecture",
+                "ay: error: stage failed",
+                "codex: held: last attempt failed with x; y",
+            ])),
+            Some("codex")
+        );
+        assert_eq!(
+            first_held_member(&v(&["*toolset*: unavailable: index unreachable"])),
+            None
+        );
+    }
+
+    /// Remove one row from the record (the toolset-wide verdict a clean pass clears).
+    fn clear_row(l: &Layout, program: &str) {
+        let mut s = crate::status::read(l).unwrap_or_default();
+        s.programs.remove(program);
+        crate::status::write(l, &s).unwrap();
+    }
+
+    /// The unexplained-missing list loses exactly the unserved members, and only when
+    /// there are any to lose (`None` — every platform but Windows — is the identity).
+    #[test]
+    fn drop_unserved_removes_only_the_unserved_members() {
+        let missing = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            drop_unserved(missing(&["ay", "claude", "trust"]), None),
+            missing(&["ay", "claude", "trust"])
+        );
+        assert_eq!(
+            drop_unserved(
+                missing(&["ay", "claude", "trust"]),
+                Some(&missing(&["ay", "trust"]))
+            ),
+            missing(&["claude"])
+        );
+        assert_eq!(
+            drop_unserved(missing(&["ay"]), Some(&missing(&[]))),
+            missing(&["ay"])
+        );
+    }
+
+    /// The rustup the report looks for is the platform's executable spelling: `rustup.exe`
+    /// on Windows, where a bare `rustup` is never a file — the "rustup not found" line
+    /// that contradicted "rustup's trust channel resolves to a LOCAL toolchain" two lines
+    /// above it (2026-09-22).
+    #[test]
+    fn the_rustup_probe_uses_the_platform_executable_spelling() {
+        assert_eq!(
+            rustup_file_name(),
+            format!("rustup{}", crate::platform::EXE_SUFFIX)
+        );
+        let home = synthetic_home("rustup-exe");
+        let bin = home.join(".cargo").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join(rustup_file_name()), b"").unwrap();
+        // `PATH` and `CARGO_HOME` are process-global and unsafe to set in edition 2024;
+        // the `~/.cargo/bin` fallback is the arm the app-spawned pass takes, and it is
+        // the one that was silently empty on Windows.
+        let found = rustup_binary(Some(&home));
+        assert!(
+            found
+                .as_deref()
+                .is_some_and(|p| p.ends_with(rustup_file_name()))
+                || std::env::var_os("PATH").is_some_and(|_| found.is_some()),
+            "the fallback must find the platform's rustup file: {found:?}"
+        );
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -5879,7 +6607,7 @@ mod tests {
             &env,
         )
         .unwrap();
-        activate_channel(&l, "stable", &dir).unwrap();
+        activate_build(&l, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         let mut programs = std::collections::BTreeMap::new();
         programs.insert(
@@ -6053,7 +6781,7 @@ mod tests {
             crate::activate::Aliases::Alab,
         )
         .unwrap();
-        activate_channel(&l, "stable", &dir).unwrap();
+        activate_build(&l, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         let homebrew = l
             .prefix
@@ -7352,7 +8080,7 @@ mod tests {
         ] {
             write_plain_shim(&l, name, &bin.join(file));
         }
-        activate_channel(&l, "stable", &dir).unwrap();
+        activate_build(&l, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         let home = synthetic_home(label);
         let path = std::env::join_paths([l.bin_dir()]).unwrap();

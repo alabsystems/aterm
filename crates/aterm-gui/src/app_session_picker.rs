@@ -19,7 +19,9 @@ use aterm_session::SessionId;
 
 use crate::App;
 use crate::WindowId;
-use crate::session_picker::{PickerIntent, PickerRow, SessionPickerState};
+use crate::session_picker::{
+    PickerChoice, PickerIntent, PickerRow, SessionPickerState, SessionRow,
+};
 
 impl App {
     /// Gather the picker's choosable rows for `subject` under `intent`:
@@ -49,17 +51,53 @@ impl App {
                     .get("title")
                     .map(str::to_string)
                     .unwrap_or_else(|| h.title.clone());
-                PickerRow {
+                PickerRow::Session(SessionRow {
                     connected: peers.contains(h.sid.as_str()),
                     sid: h.sid,
                     local_id: h.local_id,
                     title,
-                }
+                })
             })
             .collect();
         // Stable listing (the connection_facts BTreeMap discipline): by sid.
-        rows.sort_by(|a, b| a.sid.as_str().cmp(b.sid.as_str()));
+        rows.sort_by(|a, b| {
+            a.sid()
+                .map(SessionId::as_str)
+                .cmp(&b.sid().map(SessionId::as_str))
+        });
         rows
+    }
+
+    /// The identity picker's rows: every identity on disk by name (the
+    /// `identities` roster), each with the number of live sessions wearing it,
+    /// then the row that creates the identity the filter names.
+    fn identity_picker_rows(&self) -> Vec<PickerRow> {
+        let live: Vec<String> = {
+            let g = self.store.read().unwrap_or_else(|p| p.into_inner());
+            g.snapshot()
+                .into_iter()
+                .filter_map(|h| h.identity.as_deref().map(str::to_string))
+                .collect()
+        };
+        let mut rows: Vec<PickerRow> = crate::agent_identity::roster()
+            .into_iter()
+            .map(|name| PickerRow::Identity {
+                sessions: live.iter().filter(|n| **n == name).count(),
+                name,
+            })
+            .collect();
+        rows.push(PickerRow::NewIdentity);
+        rows
+    }
+
+    /// Open the identity picker on `wid` for File ▸ New Window / New Tab With
+    /// Identity… (`intent` must be one of the two identity intents). Always
+    /// opens: an empty roster still offers the new-identity row.
+    pub(crate) fn open_identity_picker(&mut self, wid: WindowId, intent: PickerIntent) -> bool {
+        debug_assert!(intent.picks_identity());
+        let rows = self.identity_picker_rows();
+        let state = SessionPickerState::new(wid, None, String::new(), intent, rows);
+        self.install_session_picker(wid, state)
     }
 
     /// Open the session picker on `wid` for `subject` under `intent`. Returns
@@ -82,7 +120,13 @@ impl App {
             aterm_log::info!("session picker: no connected peer to act on");
             return false;
         }
-        let state = SessionPickerState::new(wid, subject, subject_title, intent, rows);
+        let state = SessionPickerState::new(wid, Some(subject), subject_title, intent, rows);
+        self.install_session_picker(wid, state)
+    }
+
+    /// Put `state` in `wid`'s one overlay slot and arm the pointer, as every
+    /// picker intent opens.
+    fn install_session_picker(&mut self, wid: WindowId, state: SessionPickerState) -> bool {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return false;
         };
@@ -176,7 +220,8 @@ impl App {
             .and_then(|ws| ws.session_picker())
             .and_then(|p| {
                 p.selected_row()
-                    .map(|row| (p.subject.clone(), p.intent, row.sid.clone()))
+                    .and_then(|row| p.choice_for(row))
+                    .map(|choice| (p.subject.clone(), p.intent, choice))
             })
         else {
             return;
@@ -189,17 +234,72 @@ impl App {
     fn settle_picker_choice(
         &mut self,
         wid: WindowId,
-        subject: SessionId,
+        subject: Option<SessionId>,
         intent: PickerIntent,
-        chosen: SessionId,
+        chosen: PickerChoice,
     ) {
-        match intent {
-            PickerIntent::Connect | PickerIntent::Configure => {
+        match (intent, chosen, subject) {
+            (
+                PickerIntent::Connect | PickerIntent::Configure,
+                PickerChoice::Session(chosen),
+                Some(subject),
+            ) => {
                 let _ = self.open_confirm_card(wid, subject, chosen, None, "menu");
             }
-            PickerIntent::Disconnect => {
+            (PickerIntent::Disconnect, PickerChoice::Session(chosen), Some(subject)) => {
                 self.disconnect_pair(&subject, &chosen, "menu");
             }
+            (
+                PickerIntent::NewWindowWithIdentity | PickerIntent::NewTabWithIdentity,
+                PickerChoice::Identity { name, create },
+                _,
+            ) => {
+                self.spawn_with_identity(
+                    wid,
+                    intent == PickerIntent::NewWindowWithIdentity,
+                    &name,
+                    create,
+                );
+            }
+            // Rows are built per intent, so a session row never reaches an
+            // identity intent (or the reverse); nothing to do if one did.
+            _ => {}
+        }
+    }
+
+    /// Spawn under identity `name` — a new WINDOW (through the event loop, which
+    /// owns window creation) or a new TAB in `wid`. `create` is the picker's
+    /// new-identity row: the only menu path that may provision one, exactly as
+    /// `spawn identity=` is on the wire. A failure is posted, never silent.
+    pub(crate) fn spawn_with_identity(
+        &mut self,
+        wid: WindowId,
+        window: bool,
+        name: &str,
+        create: bool,
+    ) {
+        let fail = |app: &mut Self, error: String| {
+            let _ = app.post_message(if window {
+                crate::message_reporters::new_window_failed(&error)
+            } else {
+                crate::message_reporters::new_tab_failed(&error)
+            });
+        };
+        if let Err(e) = crate::agent_identity::ensure(name, create) {
+            fail(self, format!("identity {name}: {e}"));
+            return;
+        }
+        if window {
+            match self.proxy.as_ref() {
+                Some(proxy) => {
+                    let _ = proxy.send_event(crate::Wake::CreateWindowWithIdentity {
+                        identity: name.to_string(),
+                    });
+                }
+                None => fail(self, "no event loop to host the new window".to_string()),
+            }
+        } else if let Err(e) = self.spawn_tab_session(Some(wid), None, None, Some(name)) {
+            fail(self, e);
         }
     }
 
@@ -424,7 +524,8 @@ impl App {
             .and_then(|ws| ws.session_picker())
             .and_then(|p| {
                 hit.and_then(|idx| p.row_at_filtered(idx))
-                    .map(|row| (p.subject.clone(), p.intent, row.sid.clone()))
+                    .and_then(|row| p.choice_for(row))
+                    .map(|choice| (p.subject.clone(), p.intent, choice))
             })
         else {
             return;
@@ -564,6 +665,100 @@ mod tests {
             ConnectionKind::Both,
             "test",
         ));
+    }
+
+    /// ROUND 18'S IDENTITY ROWS, through the one picker surface: New Tab /
+    /// Window With Identity… lists every identity on disk by name (with how
+    /// many live sessions wear it) and a last row that creates the identity the
+    /// FILTER names. A name that does not parse, or one already listed, chooses
+    /// nothing and keeps the picker open; a valid new name provisions it (the
+    /// menu's one create path, as `spawn identity=` is the wire's) and closes.
+    /// A scratch state root (`ATERM_STATE_HOME`, under the env module's lock, as
+    /// the restore identity test does): no test touches the machine's real one.
+    #[test]
+    fn the_identity_picker_lists_the_roster_and_creates_the_named_one() {
+        let state = aterm_tempfile::tempdir().expect("scratch state root");
+        crate::test_env::scoped("ATERM_STATE_HOME", state.path(), || {
+            identity_picker_body(&state.path().join("identities"));
+        });
+    }
+
+    fn identity_picker_body(root: &std::path::Path) {
+        for name in ["alpha", "beta"] {
+            crate::agent_identity::ensure(name, true).expect("provision a fixture identity");
+        }
+        let (mut app, wid, _sids) = app_with_three();
+        assert!(app.open_identity_picker(wid, PickerIntent::NewWindowWithIdentity));
+        let lines = |app: &App| {
+            app.windows[&wid]
+                .session_picker()
+                .expect("the picker is open")
+                .controls_lines()
+        };
+        let listed = lines(&app);
+        assert!(
+            listed[0].contains("intent=new-window-identity") && listed[0].contains("subject=-")
+        );
+        assert!(listed[1].contains("identity=alpha") && listed[2].contains("identity=beta"));
+        assert!(listed[3].contains("identity=+new"), "{listed:?}");
+
+        // An EXISTING name typed in the filter: its own row is chosen, and the
+        // new-identity row refuses to recreate it.
+        for c in "beta".chars() {
+            app.session_picker_filter_push(wid, c);
+        }
+        let picker = app.windows[&wid].session_picker().unwrap();
+        assert_eq!(picker.new_identity_name(), None, "beta already exists");
+        assert_eq!(
+            picker.selected_row().and_then(|row| picker.choice_for(row)),
+            Some(crate::session_picker::PickerChoice::Identity {
+                name: "beta".to_string(),
+                create: false,
+            })
+        );
+
+        // A name the grammar refuses chooses nothing: Enter keeps the picker.
+        for _ in 0..4 {
+            app.session_picker_backspace(wid);
+        }
+        for c in "Bad Name".chars() {
+            app.session_picker_filter_push(wid, c);
+        }
+        app.session_picker_activate(wid);
+        assert!(
+            app.windows[&wid].session_picker().is_some(),
+            "an invalid name chooses nothing and the picker stays open"
+        );
+
+        // A valid NEW name: the new-identity row provisions it and closes.
+        for _ in 0.."Bad Name".len() {
+            app.session_picker_backspace(wid);
+        }
+        for c in "Gamma".chars() {
+            app.session_picker_filter_push(wid, c);
+        }
+        assert_eq!(
+            app.windows[&wid]
+                .session_picker()
+                .unwrap()
+                .new_identity_name(),
+            Some("gamma".to_string()),
+            "the typed name is folded, as `parse_name` folds it"
+        );
+        app.session_picker_activate(wid);
+        assert!(
+            app.windows[&wid].session_picker().is_none(),
+            "choosing closes"
+        );
+        assert!(
+            root.join("gamma").is_dir(),
+            "the new identity was provisioned under the (scratch) identities root"
+        );
+        assert_eq!(
+            crate::agent_identity::roster(),
+            ["alpha", "beta", "gamma"],
+            "and the roster now lists it"
+        );
     }
 
     /// The Connect picker lists every OTHER live session (never the subject),

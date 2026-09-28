@@ -272,11 +272,11 @@ pub const ROBI_TIPS: &[RobiTip] = &[
     // ── starters ──────────────────────────────────────────────────────────
     RobiTip {
         kind: TipKind::Starter,
-        text: "Welcome to aterm! Press Cmd+, any time — Settings has a tour.",
+        text: "Welcome to aterm! Press Cmd+, any time to open Settings.",
     },
     RobiTip {
         kind: TipKind::Starter,
-        text: "Pick a cursor trail in Settings > Cursor: phaser, fire, water, comet, beam...",
+        text: "Pick a cursor trail in Settings > Top Settings: phaser, fire, water, comet, beam...",
     },
     RobiTip {
         kind: TipKind::Starter,
@@ -301,11 +301,11 @@ pub const ROBI_TIPS: &[RobiTip] = &[
     // ── deeper aterm ──────────────────────────────────────────────────────
     RobiTip {
         kind: TipKind::Aterm,
-        text: "Every cursor trail has its own sound. Settings > Cursor toggles them.",
+        text: "Each cursor trail has its own sound. Settings > Top Settings > Music effects toggles them.",
     },
     RobiTip {
         kind: TipKind::Aterm,
-        text: "Feeling blocky? Set game_font = \"minecraft\" in aterm.toml.",
+        text: "Feeling blocky? Set display_font = \"pixel\" in aterm.toml.",
     },
     RobiTip {
         kind: TipKind::Aterm,
@@ -367,7 +367,7 @@ pub const ROBI_TIPS: &[RobiTip] = &[
     },
     RobiTip {
         kind: TipKind::Claude,
-        text: "claude --resume picks your last conversation right back up.",
+        text: "claude --continue picks your last conversation right back up.",
     },
     RobiTip {
         kind: TipKind::Claude,

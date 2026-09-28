@@ -27,7 +27,31 @@ const ROSTER: &str = "aterm-machines.toml";
 const ROSTER_SIG: &str = "aterm-machines.toml.sig";
 const POLICY: &str = "aterm-policy-appcast.toml";
 const POLICY_SIG: &str = "aterm-policy-appcast.toml.sig";
-const MAX_TRIAL_STARTS: u32 = 3;
+const MAX_TRIAL_STARTS: u32 = crate::LINUX_TRIAL_LAUNCHES;
+/// What a copy that is not enrolled, or whose enrollment never finished, says.
+const ENABLE_REMEDY: &str = "Run `aterm update enable` to turn on updates for this copy";
+
+/// A replaced executable waits for one window launch to confirm it ([`confirm`]).
+fn installed_pending(version: &str) -> String {
+    format!(
+        "aterm {version} is installed \u{2014} launch an aterm window once to finish; existing \
+         sessions continue unchanged"
+    )
+}
+
+/// The refusal while a replaced executable still waits for that window launch.
+fn awaiting_window(state: &State) -> Option<String> {
+    state
+        .trial
+        .as_ref()
+        .filter(|trial| trial.phase == Phase::Installed && !trial.healthy)
+        .map(|_| {
+            format!(
+                "aterm {} is installed \u{2014} launch an aterm window once to finish",
+                state.installed.version
+            )
+        })
+}
 
 #[derive(Clone, Debug)]
 struct Context {
@@ -158,10 +182,16 @@ impl Context {
                 || ![0, uid()].contains(&md.uid())
                 || (!private_ancestor && md.mode() & 0o022 != 0)
             {
-                return Err(format!(
-                    "unsafe update path component: {}",
-                    ancestor.display()
-                ));
+                let why = if md.file_type().is_symlink() {
+                    "is a symlink"
+                } else if !md.is_dir() {
+                    "isn\u{2019}t a directory"
+                } else if ![0, uid()].contains(&md.uid()) {
+                    "belongs to another user"
+                } else {
+                    "is writable by other users"
+                };
+                return Err(format!("{} {why}", ancestor.display()));
             }
             private_ancestor |= md.uid() == uid() && md.mode() & 0o077 == 0;
         }
@@ -187,7 +217,10 @@ impl Context {
         if let Ok(md) = fs::symlink_metadata(&self.dir)
             && (!md.is_dir() || md.uid() != uid() || md.mode() & 0o077 != 0)
         {
-            return Err("Linux update directory must be a real, owner-only directory".into());
+            return Err(format!(
+                "{} isn\u{2019}t a private directory of yours (mode 0700, not a symlink)",
+                self.dir.display()
+            ));
         }
         aterm_update_core::ensure_private_dir(&self.dir).map_err(|e| e.to_string())
     }
@@ -198,8 +231,14 @@ impl Context {
         if path.try_exists().map_err(|e| e.to_string())? {
             checked_file(&path, RECORD_LIMIT, false)?;
         }
-        FileLock::acquire_within(&path, Duration::from_millis(500))
-            .map_err(|e| format!("Linux update transaction is unavailable: {e}"))
+        FileLock::acquire_within(&path, Duration::from_millis(500)).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                "Another aterm is updating this copy right now; try again when it finishes"
+                    .to_string()
+            } else {
+                format!("can\u{2019}t lock {}: {e}", path.display())
+            }
+        })
     }
 
     /// The durable state record. Not named `read`: the lock-order census knows a
@@ -214,8 +253,15 @@ impl Context {
         let text = String::from_utf8(read_small(&path)?).map_err(|e| e.to_string())?;
         let state: State =
             aterm_toml::from_str(&text).map_err(|e| format!("invalid Linux update state: {e}"))?;
-        if state.schema != 1 || state.target != self.target {
-            return Err("Linux update state belongs to a different install or schema".into());
+        if state.schema != 1 {
+            return Err(format!("{} was written by a newer aterm", path.display()));
+        }
+        if state.target != self.target {
+            return Err(format!(
+                "{} belongs to the copy at {}",
+                path.display(),
+                state.target.display()
+            ));
         }
         Ok(Some(state))
     }
@@ -566,10 +612,12 @@ fn install_locked(
         }
     }
     state.enabled = true;
-    state.outcome = format!(
-        "authenticated Linux release {} (build {}) installed and enrolled; existing sessions continue unchanged",
-        state.installed.version, state.installed.build
-    );
+    // A first install's version and path are the installer's own line.
+    state.outcome = if state.trial.as_ref().is_some_and(|trial| !trial.healthy) {
+        installed_pending(&state.installed.version)
+    } else {
+        "Updates are on for this copy".into()
+    };
     context.save(&state)?;
     Ok(state.outcome)
 }
@@ -769,8 +817,17 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
     }
     state.enabled = true;
     state.high_water = state.high_water.max(current_build);
-    state.outcome =
-        "automatic signed Linux updates enabled; existing sessions are never restarted".into();
+    state.outcome = if !crate::automatic() {
+        "Updates are on for this copy \u{2014} automatic checks are off, so `aterm update check` \
+         looks for a new release"
+    } else if aterm_update_core::settings::update_auto_apply() {
+        "Updates are on for this copy \u{2014} new releases install by themselves; running \
+         sessions are never restarted"
+    } else {
+        "Updates are on for this copy \u{2014} new releases download by themselves and `aterm \
+         update apply` installs them"
+    }
+    .into();
     context.save(&state)?;
     Ok(state.outcome)
 }
@@ -786,6 +843,7 @@ fn recover(context: &Context, state: &mut State) -> Result<(), String> {
             state.installed = trial.new.clone();
             state.high_water = state.high_water.max(trial.new.build);
             state.staged = None;
+            state.outcome = installed_pending(&trial.new.version);
             context.save(state)
         }
         Phase::Prepared if digest == trial.old.sha256 => {
@@ -858,12 +916,8 @@ fn apply_with_checkpoints(
     {
         return Err("Linux candidate is not newer than the durable build/failure floor".into());
     }
-    if state
-        .trial
-        .as_ref()
-        .is_some_and(|trial| trial.phase == Phase::Installed && !trial.healthy)
-    {
-        return Err("the installed update still awaits a healthy ordinary launch".into());
+    if let Some(pending) = awaiting_window(state) {
+        return Err(pending);
     }
     if hash_file(&context.target)? != state.installed.sha256 {
         return Err("the installed rollback source changed; refusing to replace it".into());
@@ -920,10 +974,7 @@ fn apply_with_checkpoints(
     state.installed = identity;
     state.staged = None;
     state.high_water = state.high_water.max(state.installed.build);
-    state.outcome = format!(
-        "installed {} (build {}) on disk; existing sessions continue unchanged; new launches use it",
-        state.installed.version, state.installed.build
-    );
+    state.outcome = installed_pending(&state.installed.version);
     state.failing_checks = 0;
     state.failing_kind.clear();
     context.save(state)?;
@@ -985,13 +1036,25 @@ fn rollback_with_checkpoint(
             .parent()
             .ok_or("missing executable directory")?,
     )?;
+    state.outcome = format!(
+        "{} is back; aterm {} won\u{2019}t install again; existing sessions were not restarted",
+        restored_name(&trial.old),
+        trial.new.version
+    );
     state.installed = trial.old;
     state.rejected_build = state.rejected_build.max(trial.new.build);
     state.trial = None;
-    state.outcome =
-        "restored the exact previous executable on disk; existing sessions were not restarted"
-            .into();
     context.save(state)
+}
+
+/// The executable a rollback restores, as a person names it: build 0 is the
+/// un-enrolled local baseline `install_locked` records, which has no version.
+fn restored_name(old: &Identity) -> String {
+    if old.build == 0 {
+        "the previous copy".into()
+    } else {
+        format!("aterm {}", old.version)
+    }
 }
 
 pub fn rollback() -> Result<String, String> {
@@ -1008,11 +1071,27 @@ pub fn rollback() -> Result<String, String> {
 pub fn apply() -> Result<String, String> {
     let context = context()?;
     let _lock = context.lock()?;
-    let mut state = context
-        .read_state()?
-        .ok_or("this executable is not enrolled for Linux updates")?;
-    if !crate::enabled() || !state.enabled {
-        return Err("Linux self-update enrollment is disabled".into());
+    let mut state = context.read_state()?.ok_or(ENABLE_REMEDY)?;
+    if !state.enabled {
+        return Err(ENABLE_REMEDY.into());
+    }
+    // The last replacement renamed its candidate onto the executable: until a window
+    // confirms it, that install is the answer, not an empty download slot.
+    recover(context, &mut state)?;
+    if let Some(pending) = awaiting_window(&state) {
+        return Err(pending);
+    }
+    if !context
+        .dir
+        .join("candidate")
+        .try_exists()
+        .map_err(|e| e.to_string())?
+    {
+        return Err(
+            "Nothing is downloaded to install \u{2014} `aterm update check` looks for a newer \
+             release"
+                .into(),
+        );
     }
     let proof = Proof::read(&context.dir)?;
     apply_locked(context, &mut state, &proof, PRODUCTION_PINS)
@@ -1069,12 +1148,18 @@ fn boot_locked(
     }
     trial.starts = trial.starts.saturating_add(1);
     context.save(state)?;
-    if state
+    let failed = state
         .trial
         .as_ref()
-        .is_some_and(|trial| trial.starts > MAX_TRIAL_STARTS)
-    {
+        .filter(|trial| trial.starts > MAX_TRIAL_STARTS)
+        .map(|trial| (restored_name(&trial.old), trial.new.version.clone()));
+    if let Some((restored, new)) = failed {
         rollback_locked(context, state)?;
+        state.outcome = format!(
+            "aterm {new} didn\u{2019}t open a window in {MAX_TRIAL_STARTS} launches, so \
+             {restored} is back and aterm {new} won\u{2019}t install again"
+        );
+        context.save(state)?;
     }
     Ok(())
 }
@@ -1128,6 +1213,7 @@ fn confirm_locked(
         return Ok(false);
     }
     trial.healthy = true;
+    state.outcome = format!("aterm {} is installed", trial.new.version);
     context.save(state)?;
     Ok(true)
 }
@@ -1224,7 +1310,8 @@ fn check_locked(
         .is_some_and(|trial| trial.phase == Phase::Installed && !trial.healthy)
     {
         state.outcome = format!(
-            "installed {} on disk; awaiting a healthy new launch; existing sessions remain unchanged",
+            "aterm {} is installed \u{2014} launch an aterm window once to finish; update checks \
+             wait until then",
             state.installed.version
         );
         return context.save(state);
@@ -1273,10 +1360,24 @@ fn check_locked(
         return Err("the published Linux build is below the signed minimum-build floor; no install permitted".into());
     }
     if manifest.build_number <= state.high_water || manifest.build_number <= state.rejected_build {
-        state.outcome = format!(
-            "no newer admissible Linux build (published {}, high-water {})",
-            manifest.build_number, state.high_water
-        );
+        // A rollback leaves `high_water` at the refused build, so "up to date" is
+        // measured against what is installed.
+        state.outcome = if manifest.build_number <= state.installed.build {
+            format!(
+                "Up to date \u{2014} the newest release is aterm {}",
+                manifest.version
+            )
+        } else if manifest.build_number == state.rejected_build {
+            format!(
+                "aterm {} was rolled back on this copy, so it won\u{2019}t install again",
+                manifest.version
+            )
+        } else {
+            format!(
+                "aterm {} is older than a release this copy rolled back, so it won\u{2019}t install",
+                manifest.version
+            )
+        };
         return context.save(state);
     }
     let url = aterm_update_core::cdn::release_download_url(
@@ -1355,14 +1456,24 @@ fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-fn held_stage(context: &Context, state: &mut State) -> Result<String, String> {
+/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider.
+fn apply_held_reason(source: &Source, provider: &crate::CheckSettingsProvider) -> &'static str {
+    match provider() {
+        None => "the update settings couldn\u{2019}t be confirmed",
+        Some(current) if current.source != *source => "the update channel changed during the check",
+        Some(current) if !current.auto_apply => "`[update] auto_apply` is off",
+        Some(_) => "the update settings changed during the check",
+    }
+}
+
+fn held_stage(context: &Context, state: &mut State, why: &str) -> Result<String, String> {
     let stage = state
         .staged
         .as_ref()
         .ok_or("missing verified Linux stage")?;
     state.outcome = format!(
-        "verified Linux {} (build {}) staged; automatic application is held by current policy or changed/unavailable settings; run aterm update apply; installed build {} is unchanged",
-        stage.version, stage.build, state.installed.build
+        "aterm {} is downloaded \u{2014} `aterm update apply` installs it ({why})",
+        stage.version
     );
     context.save(state)?;
     Ok(state.outcome.clone())
@@ -1398,7 +1509,7 @@ fn finish_candidate(
     state.staged = Some(identity);
     context.save(state)?;
     if !automatic_apply_allowed(source, provider) {
-        return held_stage(context, state);
+        return held_stage(context, state, apply_held_reason(source, provider));
     }
     let mut held = false;
     let result = apply_with_checkpoints(context, state, proof, pins, &mut probe, |at| {
@@ -1414,7 +1525,7 @@ fn finish_candidate(
         // installed. Ordinary recovery abandons that intent without dropping
         // any policy floor or authenticated candidate.
         recover(context, state)?;
-        return held_stage(context, state);
+        return held_stage(context, state, apply_held_reason(source, provider));
     }
     result
 }
@@ -1450,9 +1561,9 @@ pub(crate) fn check_with_settings(
         let settings = provider().ok_or("current update settings could not be read")?;
         let source = &settings.source;
         let context = context()?;
-        let mut state = context.read_state()?.ok_or("Linux self-update is not enrolled; run aterm update enable explicitly for this installed copy")?;
-        if !crate::enabled() || !state.enabled {
-            return Err("Linux self-update enrollment is disabled".into());
+        let mut state = context.read_state()?.ok_or(ENABLE_REMEDY)?;
+        if !state.enabled {
+            return Err(ENABLE_REMEDY.into());
         }
         let _lock = context.lock()?;
         state = context.read_state()?.ok_or("missing enrollment")?;
@@ -1495,6 +1606,11 @@ pub(crate) fn check_with_settings(
     })();
     let mut status = status(current_build);
     if let Err(error) = attempt {
+        // A typed check's reason reaches the log its trouble line points at; the
+        // background loop logs each changed outcome itself.
+        if force {
+            aterm_log::warn!("aterm-update: manual update check failed: {error}");
+        }
         status.outcome = error;
         status.failing_checks = status.failing_checks.max(1);
         status.failing_kind = "linux-update".into();
@@ -1503,8 +1619,8 @@ pub(crate) fn check_with_settings(
 }
 
 pub fn status(current_build: u64) -> crate::UpdateStatus {
-    let mut output = crate::UpdateStatus::empty(crate::enabled(), current_build,
-        "Linux self-update is not enrolled; run aterm update enable explicitly for this installed copy".into());
+    let mut output =
+        crate::UpdateStatus::empty(crate::enabled(), current_build, ENABLE_REMEDY.into());
     match context().and_then(|context| context.read_state().map(|state| (context, state))) {
         Ok((context, Some(state))) => {
             let linux = linux_status(context, &state);
@@ -1512,13 +1628,24 @@ pub fn status(current_build: u64) -> crate::UpdateStatus {
                 .staged
                 .as_ref()
                 .filter(|_| linux.staged_build.is_none())
-                .map(|stage| stage.build);
+                .map(|stage| (stage.version.clone(), stage_admissible(&state, stage)));
             output.linux = Some(linux);
             output.enabled &= state.enabled;
             output.installable = true;
             output.outcome = state.outcome;
-            if let Some(build) = rejected_stage {
-                output.outcome.push_str(&format!("; recorded Linux stage {build} is unavailable or no longer admissible under the current build/revocation policy"));
+            // The outcome that announced the stage no longer holds; a failure's own
+            // sentence stays.
+            if let Some((version, admissible)) = rejected_stage
+                && state.failing_checks == 0
+            {
+                output.outcome = if admissible {
+                    format!(
+                        "The downloaded aterm {version} is missing or changed \u{2014} the next \
+                         check downloads it again"
+                    )
+                } else {
+                    format!("The downloaded aterm {version} is no longer allowed to install")
+                };
             }
             output.updated_at = state.updated_at;
             output.failing_checks = state.failing_checks;
@@ -1532,7 +1659,7 @@ pub fn status(current_build: u64) -> crate::UpdateStatus {
                 ));
             }
             if !output.enabled {
-                output.outcome = format!("automatic updates disabled; {}", output.outcome);
+                output.outcome = ENABLE_REMEDY.into();
             }
         }
         Ok((_, None)) => output.enabled = false,

@@ -2632,8 +2632,9 @@ pub(crate) struct WgpuFrameRes<'a> {
 }
 
 /// One backend's resolution of the plan's keys — the enum twin of the device
-/// layer's handle pairs. Production constructs only the Wgpu arm; the Metal
-/// arm is the W4 differential's replay rig (and W6's flip site).
+/// layer's handle pairs. Production constructs the Metal arm on macOS (the
+/// armed encode, since THE FLIP) and the Wgpu arm everywhere else; the W4
+/// full-frame differential constructs both.
 #[allow(
     clippy::large_enum_variant,
     reason = "one FrameRes lives on the stack per encoded frame (the 864-byte \
@@ -5573,7 +5574,8 @@ pub struct GpuRenderer {
     /// W4 — the most recent frame's [`DrawItem`] plan, retained across frames
     /// both to reuse the Vec's capacity (the plan is rebuilt every encode) and
     /// as THE SEAM ARTIFACT: the full-frame differential replays exactly this
-    /// list through the Metal arm, and W6's flip drives production from it.
+    /// list through the Metal arm, and the macOS production encode drives the
+    /// Metal arm from it.
     frame_plan: Vec<DrawItem>,
     /// W4 — the pass-0 load op the most recent frame opened with (the replay's
     /// Clear colour / Load decision, recorded verbatim).
@@ -24099,8 +24101,8 @@ mod tests {
     /// reaching the other backend's frame encoder (pass target, uniform set,
     /// pipeline, copy texture) must panic BY NAME — "device layer" — never
     /// misbehave silently. These panics are unreachable from production
-    /// (which constructs matched Wgpu arms only) and are the W6 flip's honest
-    /// error surface.
+    /// (which constructs matched arms of ONE backend) and are the oracle
+    /// build's honest error surface.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_frame_seam_refuses_cross_backend_handles_by_name() {
@@ -25952,13 +25954,6 @@ ab\r\n",
         );
     }
 
-    /// G-1 fix gate: the glyph atlas is PERSISTED across frames. Two consecutive
-    /// `render_input` calls with an UNCHANGED glyph set must NOT create a new
-    /// atlas texture (the steady state — incl. idle cursor-blink ticks — reuses
-    /// the resident textures + bind groups untouched). Asserted two ways: the
-    /// texture-creation counter does not advance, and the resident texture dims
-    /// are byte-identical between the frames (same textures, not recreated ones).
-    /// Gated: no GPU/font -> skip cleanly.
     #[test]
     fn set_font_theme_keeps_configured_family() {
         // Regression (the multi-window/splits merge LOST this): the in-place GPU
@@ -25967,8 +25962,9 @@ ab\r\n",
         // `set_font_theme` called the family-LESS `from_system`, so a configured
         // family was silently dropped on the first Retina-forced rebuild. Construct
         // WITH a family, rebuild via set_font_theme, and confirm the family is wired
-        // onto GpuRenderer and the rebuild leaves a valid renderer. (A face-name
-        // assertion would need a Renderer resolved-family accessor — a follow-up.)
+        // onto GpuRenderer, the rebuilt FACE is the one the family resolved to
+        // (`primary_source_path`, the admitted file behind the primary face), and
+        // the rebuild leaves a valid renderer.
         let theme = Theme::default();
         let mut gpu = match GpuRenderer::new_with_family(Some("Menlo"), 16.0, theme) {
             Ok(g) => g,
@@ -25982,12 +25978,25 @@ ab\r\n",
             Some("Menlo"),
             "family wired at construction"
         );
+        let before = gpu.primary_source_path().map(str::to_owned);
+        if let Some(menlo) = aterm_render::resolve_font_family("Menlo") {
+            assert_eq!(
+                before.as_deref(),
+                Some(menlo.as_str()),
+                "the configured family is the face that was built"
+            );
+        }
         gpu.set_font_theme(24.0, theme)
             .expect("in-place rebuild succeeds with a configured family");
         assert_eq!(
             gpu.font_family.as_deref(),
             Some("Menlo"),
             "family retained across rebuild"
+        );
+        assert_eq!(
+            gpu.primary_source_path(),
+            before.as_deref(),
+            "the rebuild re-resolved the CONFIGURED face, not the system monospace"
         );
         let (cw, ch) = gpu.cell_size();
         assert!(
@@ -26013,6 +26022,7 @@ ab\r\n",
             }
         };
         assert_eq!(gpu.font_family.as_deref(), Some("Menlo"));
+        let before = gpu.primary_source_path().map(str::to_owned);
         // The fix: resolve and commit the new family + face as one operation.
         gpu.set_font_family_theme(None, 16.0, theme)
             .expect("rebuild succeeds with the updated family");
@@ -26021,6 +26031,16 @@ ab\r\n",
             None,
             "the changed family is adopted, not the frozen construction-time one"
         );
+        // …and the FACE moved with it: where Menlo resolved, the default face is
+        // a different file (the control that keeps the keep-family test's
+        // path equality from being vacuous).
+        if aterm_render::resolve_font_family("Menlo").is_some() {
+            assert_ne!(
+                gpu.primary_source_path(),
+                before.as_deref(),
+                "the family change must reach the primary face"
+            );
+        }
         let (cw, ch) = gpu.cell_size();
         assert!(cw > 0 && ch > 0, "renderer valid after the family change");
     }
@@ -26206,6 +26226,13 @@ ab\r\n",
         );
     }
 
+    /// G-1 fix gate: the glyph atlas is PERSISTED across frames. Two consecutive
+    /// `render_input` calls with an UNCHANGED glyph set must NOT create a new
+    /// atlas texture (the steady state — incl. idle cursor-blink ticks — reuses
+    /// the resident textures + bind groups untouched). Asserted two ways: the
+    /// texture-creation counter does not advance, and the resident texture dims
+    /// are byte-identical between the frames (same textures, not recreated ones).
+    /// Gated: no GPU/font -> skip cleanly.
     #[test]
     fn atlas_persists_across_unchanged_frames() {
         let theme = Theme::default();

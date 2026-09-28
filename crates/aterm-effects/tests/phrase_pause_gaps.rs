@@ -14,7 +14,7 @@
 //!
 //! This is `scrub_gaps.rs`'s host-seam harness — a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled
-//! exactly as `app_render.rs`'s LOCK A samples them, fed to `CursorGlow` and
+//! exactly as `app_render.rs`'s frame hold samples them, fed to `CursorGlow` and
 //! ticked on a 16 ms frame train — pointed at that gesture: the owner's four
 //! phrases typed at 12 cps with a pause of 0.3–3 s between them, the
 //! boundary space placed either as the LAST key before the pause or the
@@ -43,7 +43,7 @@
 //! between them; a key's frame SPLIT from its key by up to half a second
 //! (so the engine HOLDS the key and its cell comes from the echo alone) —
 //! and, with the spinner on, spinner frames landing between a key and its
-//! frame. The host's present rule is `app_render.rs`'s own: LOCK A runs
+//! frame. The host's present rule is `app_render.rs`'s own: the frame hold runs
 //! when a bracket closes, when one has stayed open past `SYNC_HOLD_CAP`
 //! (150 ms — the partial state sampled as it stands, the caret hidden and
 //! parked wherever the bytes so far left it), and every 16 ms while no
@@ -432,7 +432,7 @@ struct Host {
     sync_was_active: bool,
     sync_hold_until: Option<Instant>,
     sync_armed_seq: u64,
-    /// Presents the hold skipped (LOCK A never ran).
+    /// Presents the hold skipped (the frame hold never ran).
     held_frames: usize,
     /// Presents that sampled a bracket still open (past the cap).
     mid_bracket_frames: usize,
@@ -526,7 +526,7 @@ impl Host {
         );
     }
 
-    /// EXACTLY LOCK A, then the tick: sample the cursor, the repaint blink,
+    /// EXACTLY the frame hold, then the tick: sample the cursor, the repaint blink,
     /// the caret row's probe and the rows the resident ribbon occupies —
     /// all from the terminal AFTER the last `process` — then advance the
     /// engine one frame.
@@ -558,10 +558,10 @@ impl Host {
     }
 
     /// THE HOST'S PRESENT RULE (`app_render.rs`, SYNC-1): read the pane's
-    /// sync level, close counter and open-dirty bit under LOCK A's lock,
+    /// sync level, close counter and open-dirty bit under the frame hold,
     /// run the hold machine, and either skip this present entirely — a
-    /// held frame runs no probe and no tick — or run LOCK A on the terminal
-    /// as it stands, bracket open or not. For the composers that never
+    /// held frame runs no probe and no tick — or run the frame hold on the
+    /// terminal as it stands, bracket open or not. For the composers that never
     /// bracket, this is exactly `frame`.
     fn present(&mut self) {
         let active = self.term.modes().synchronized_output();

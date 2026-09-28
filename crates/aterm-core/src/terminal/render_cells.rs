@@ -1051,11 +1051,16 @@ impl Terminal {
         cols: usize,
     ) -> crate::render::FrameRefill {
         let Some(cause) = self.damage_scoped_refill_refusal(scratch, rows, cols) else {
-            // Copy the tracker's row bits into an owned mask BEFORE the fill:
-            // the tracker read borrows `&self`, the fill needs `&mut self`.
-            // O(rows/64) words; `damaged_rows` skips clear words via
-            // trailing_zeros, so an idle-grid frame costs the iterator setup.
-            let mut mask = vec![0u64; rows.div_ceil(64)];
+            // Copy the tracker's row bits into the resident mask BEFORE the
+            // fill: the tracker read borrows `&self`, the fill needs `&mut
+            // self`, so the mask is taken out of `self` for the fill and put
+            // back — the capacity survives, and a steady-state echo frame
+            // allocates nothing here. O(rows/64) words; `damaged_rows` skips
+            // clear words via trailing_zeros, so an idle-grid frame costs the
+            // iterator setup.
+            let mut mask = std::mem::take(&mut self.refill_mask_scratch);
+            mask.clear();
+            mask.resize(rows.div_ceil(64), 0);
             let mut rows_refilled = 0usize;
             for r in self.grid().damage().damaged_rows(self.rows()) {
                 let r = usize::from(r);
@@ -1065,6 +1070,7 @@ impl Terminal {
                 }
             }
             self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            self.refill_mask_scratch = mask;
             self.take_damage();
             // The fill stamped the PRE-take generation; `take_damage` just
             // bumped it. Restamp: THIS scratch is the consumer that closed the
@@ -1090,8 +1096,10 @@ impl Terminal {
         if cause == crate::render::FullRefillCause::EngineScrolled
             && let Some(delta) = self.scrolled_scoped_refill_delta(scratch, rows)
         {
-            let mask = Self::rotate_scrolled_scratch(scratch, rows, delta);
+            let mut mask = std::mem::take(&mut self.refill_mask_scratch);
+            Self::rotate_scrolled_scratch(scratch, rows, delta, &mut mask);
             self.cell_frame_fill(scratch, rows, cols, Some(&mask));
+            self.refill_mask_scratch = mask;
             // SCR-2 DEBUG NET (the SCR-1 memo's pattern, viewport_row_cache.rs
             // "The debug net"). The scrolled proof reads no tracker bit, so a
             // future mutator that rewrites a cell and marks only partial damage
@@ -1349,8 +1357,9 @@ impl Terminal {
     /// per-row content channels (`cells`, `clusters`, `combining` — the three
     /// a scoped refill retains, and the only per-row channels the fill does
     /// not rebuild unconditionally: `line_sizes`, `images`, the pane span
-    /// lists and `row_rev` are rewritten whole on every fill) and return the
-    /// refill mask of the exposed strip.
+    /// lists and `row_rev` are rewritten whole on every fill) and write the
+    /// refill mask of the exposed strip into `mask` (the terminal's resident
+    /// `refill_mask_scratch`, so the step allocates nothing once warm).
     ///
     /// `delta > 0`: the viewport moved UP by `delta` rows, so what row `r`
     /// showed is now at row `r + delta` (`rotate_right`) and rows `0..delta`
@@ -1366,7 +1375,8 @@ impl Terminal {
         scratch: &mut crate::render::RenderInput,
         rows: usize,
         delta: isize,
-    ) -> Vec<u64> {
+        mask: &mut Vec<u64>,
+    ) {
         let n = delta.unsigned_abs();
         let exposed = match delta.cmp(&0) {
             std::cmp::Ordering::Greater => {
@@ -1383,11 +1393,11 @@ impl Terminal {
             }
             std::cmp::Ordering::Equal => 0..0,
         };
-        let mut mask = vec![0u64; rows.div_ceil(64)];
+        mask.clear();
+        mask.resize(rows.div_ceil(64), 0);
         for r in exposed {
             mask[r / 64] |= 1u64 << (r % 64);
         }
-        mask
     }
 
     /// M1b INCOMING-ROW APRON: fill `scratch.apron_row` with the row just below a

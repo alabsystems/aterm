@@ -74,7 +74,6 @@ fn utf8_continuation_safe() {
 ///
 /// This covers valid continuations, malformed interruptions, and replay of
 /// ASCII/control bytes through the normal parser state machine.
-// TODO(#7932): non-substantive classification [type_construction] Body only constructs a value; no behavioral assertion on it.
 #[kani::proof]
 #[kani::unwind(8)]
 fn utf8_malformed_sequences_preserve_decoder_invariants() {

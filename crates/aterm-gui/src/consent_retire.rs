@@ -433,16 +433,27 @@ mod tests {
         assert_eq!(trash_refusal("Code=4 \"\""), None);
     }
 
-    /// No control module can start a move: the entry points appear in none of
-    /// them. `app act` is generic, so its refusal is pinned by behaviour in
-    /// `app_control`'s tests; this pins the vocabulary.
+    /// NO CONTROL MODULE CAN RAISE A CONSENT SURFACE. Starting the warm-up puts a
+    /// system modal on the owner's screen, the observer is off unless the owner
+    /// enables it, and retiring a claimant moves a copy of the app: a program
+    /// inside a session must reach none of them, so none of their entry points
+    /// may appear in any control module. Reading the warm-up's rows is harmless
+    /// and deliberately not listed. `app act` is generic, so its refusal is
+    /// pinned by behaviour in `app_control`'s tests; this pins the vocabulary.
     #[test]
-    fn no_control_module_names_the_retire_entry_points() {
-        // What STARTS a move, including the App's worker field itself
-        // (`self.claimant_retire.start(…)` would skip `begin_claimant_retire`'s
-        // gates). Reading whether the trash tool exists (`trash_tool_present`,
-        // used by the `privacy` verb's note) is not one.
+    fn no_control_module_names_a_consent_raising_entry_point() {
         const ENTRY_POINTS: &[&str] = &[
+            // the warm-up (design §3.5)
+            "begin_consent_warmup",
+            "WarmupState::start",
+            "consent_warmup::WarmupProbe",
+            // the observer
+            "consent_observer",
+            // the claimant retire: what STARTS a move, including the App's worker
+            // field itself (`self.claimant_retire.start(…)` would skip
+            // `begin_claimant_retire`'s gates). Reading whether the trash tool
+            // exists (`trash_tool_present`, used by the `privacy` verb's note) is
+            // not one.
             "begin_claimant_retire",
             "retire_claimants",
             "RetireState",
@@ -466,8 +477,8 @@ mod tests {
             for token in ENTRY_POINTS {
                 assert!(
                     !src.contains(token),
-                    "{name} names `{token}`: a program in a session must not be able to move \
-                     a copy of the app"
+                    "{name} names `{token}`: a consent-raising action reachable from inside \
+                     a session is a consent surface an agent controls"
                 );
             }
         }
@@ -475,12 +486,16 @@ mod tests {
             scanned >= 3,
             "scanned {scanned} control modules: the fence matched nothing"
         );
+        // …and the entry points really are spelled that way, so a rename cannot
+        // silently defang the scan above.
         let lib = include_str!("lib.rs");
-        assert!(
-            lib.contains("fn begin_claimant_retire")
-                && lib.contains("claimant_retire: consent_retire::RetireState,"),
-            "the entry point moved; update ENTRY_POINTS"
-        );
+        for entry in [
+            "fn begin_consent_warmup",
+            "fn begin_claimant_retire",
+            "claimant_retire: consent_retire::RetireState,",
+        ] {
+            assert!(lib.contains(entry), "`{entry}` moved; update ENTRY_POINTS");
+        }
     }
 
     /// The live tool, on a path that is not there: it runs, moves nothing, and

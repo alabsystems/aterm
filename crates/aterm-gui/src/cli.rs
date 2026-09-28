@@ -177,7 +177,7 @@ const HELP_HEAD: &str = concat!(
     "                                   0 if valid (non-zero if not).\n",
     "        --list-fonts               List the font search dirs and discoverable\n",
     "                                   font families, then exit.\n",
-    "        --show-config              Print the effective resolved config (env >\n",
+    "        --show-config              Print the effective resolved config (flag >\n",
     "                                   config > default) and exit.\n",
     "        --write-config             Write a documented starter aterm.toml (every\n",
     "                                   key commented) if absent, then exit.\n",
@@ -270,7 +270,7 @@ const HELP_TAIL: &str = concat!(
     "    a session spawned with `aterm ctl spawn identity=<name>` gets each agent's home\n",
     "    variable (CLAUDE_CONFIG_DIR, CODEX_HOME) pointed into <state>/identities/<name>/ —\n",
     "    set AFTER the strip, so neither your login nor the identity's leaks into the other.\n\n",
-    "CONFIG:  ~/.config/aterm/aterm.toml  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
+    "CONFIG:  <aterm.toml>  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground,\n",
@@ -323,6 +323,41 @@ const HELP_TAIL: &str = concat!(
     "  Keys        [keybindings] \"chord\"=\"action\"; [key_sequences] \"chord\"=raw bytes.\n",
 );
 
+/// The slot [`HELP_TAIL`]'s CONFIG line and [`STARTER_CONFIG`]'s header carry
+/// where the config path goes, filled at print/write time with the path the
+/// loader ACTUALLY resolves (`app_config::config_path`, the rule the window
+/// loads and hot-reloads by). A literal there was wrong on every Windows box:
+/// measured 2026-09-22 on 0.90.0, `aterm-gui --help` said
+/// `CONFIG:  ~/.config/aterm/aterm.toml` and the `--write-config` starter was
+/// headed the same, while the window they describe read
+/// `%APPDATA%\aterm\aterm.toml`.
+const CONFIG_PATH_SLOT: &str = "<aterm.toml>";
+
+/// The variables the loader resolves the config path from, for the one message
+/// that has to name them: none of them is set.
+#[cfg(windows)]
+const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME, APPDATA and HOME";
+#[cfg(not(windows))]
+const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME and HOME";
+
+/// The resolved config path as `--help` prints it, or why there is none.
+fn config_path_display() -> String {
+    match crate::app_config::config_path() {
+        Some(path) => path.display().to_string(),
+        None => format!("(unresolved: {CONFIG_PATH_VARS} unset)"),
+    }
+}
+
+/// [`HELP_TAIL`] with the config path filled in — what `--help` prints.
+fn help_tail() -> String {
+    HELP_TAIL.replacen(CONFIG_PATH_SLOT, &config_path_display(), 1)
+}
+
+/// [`STARTER_CONFIG`] headed by the path it is being written to.
+fn starter_config_for(path: &std::path::Path) -> String {
+    STARTER_CONFIG.replacen(CONFIG_PATH_SLOT, &path.display().to_string(), 1)
+}
+
 /// Windows-only verbs, appended to `--help` on Windows alone.
 ///
 /// `--unset-default-terminal` is here because it is the ESCAPE HATCH: a machine
@@ -345,9 +380,11 @@ const WINDOWS_HELP_TAIL: &str = concat!(
 /// A documented starter config written by `--write-config`. Linux-tuned (real
 /// key names, sensible non-macOS defaults); EVERY line is commented, so writing it
 /// changes nothing — it just makes the settings surface
-/// DISCOVERABLE for a new user who has no `aterm.toml` yet.
+/// DISCOVERABLE for a new user who has no `aterm.toml` yet. The header's
+/// [`CONFIG_PATH_SLOT`] is filled with the path the file is written to
+/// ([`starter_config_for`]).
 const STARTER_CONFIG: &str = "\
-# aterm — ~/.config/aterm/aterm.toml
+# aterm — <aterm.toml>
 # Every setting is optional; uncomment to override. Live settings reload on save;
 # renderer/initial-grid settings require relaunch, and session settings require a new session.
 # Launch flags (aterm-gui --help) take precedence over this file for that launch.
@@ -356,8 +393,9 @@ const STARTER_CONFIG: &str = "\
 # shell = \"bash\"        # interactive shell. Discovery-resolved: \"bash\" finds Git
 #                       # Bash even if it is not on PATH; \"pwsh\", \"cmd\", \"wsl\",
 #                       # \"nu\", or an absolute path also work. Unset = platform
-#                       # default (Windows: pwsh > powershell > cmd). Override at
-#                       # launch with --shell.
+#                       # default (Windows: pwsh > powershell > %COMSPEC% > cmd;
+#                       # `aterm doctor` names the one this machine gets). Override
+#                       # at launch with --shell.
 #                       # Shell integration (prompt marks, jump-to-prompt, command
 #                       # blocks, cwd tracking) is injected automatically for zsh,
 #                       # bash, fish, pwsh/powershell and \"wsl\" (whose distro must
@@ -505,7 +543,9 @@ const STARTER_CONFIG: &str = "\
 #                                  # position and screen size stay unanswered); Linux also applies window
 #                                  # manipulations (move stays denied)
 # allow_notifications = false      # OSC 9/99/777 desktop notifications; macOS delivers through terminal-notifier
-#                                  # if installed, else osascript — a subprocess under aterm's identity
+#                                  # if installed, else osascript — a subprocess under aterm's identity; Windows
+#                                  # shows a notification-area balloon/toast from aterm itself (Shell_NotifyIcon,
+#                                  # no subprocess); Linux has no delivery yet — the request is dropped
 # allow_palette_reconfigure = false
 # allow_kitty_file_transfer = false
 # allow_osc52_query = false        # programs may READ the clipboard (OSC 52); answered only when on. On macOS 26 that
@@ -696,9 +736,10 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 // Title, then the origin line (`by Andrew Yates · ALab ·
                 // alab.systems`), then the body.
                 print!(
-                    "{HELP_TITLE}{}\n{HELP_HEAD}{}{HELP_TAIL}",
+                    "{HELP_TITLE}{}\n{HELP_HEAD}{}{}",
                     aterm_types::identity::ORIGIN_LINE,
-                    keys_help()
+                    keys_help(),
+                    help_tail()
                 );
                 // Windows-only verbs, printed here rather than folded into the
                 // cross-platform HELP_TAIL so no Unix build advertises a flag it
@@ -760,7 +801,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                         if let Some(dir) = path.parent() {
                             let _ = std::fs::create_dir_all(dir);
                         }
-                        match std::fs::write(&path, STARTER_CONFIG) {
+                        match std::fs::write(&path, starter_config_for(&path)) {
                             Ok(()) => {
                                 println!("wrote a documented starter config: {}", path.display());
                             }
@@ -771,7 +812,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                         }
                     }
                     None => {
-                        eprintln!("could not resolve the config path ($HOME/$XDG_CONFIG_HOME)");
+                        eprintln!("could not resolve the config path ({CONFIG_PATH_VARS} unset)");
                         std::process::exit(1);
                     }
                 }
@@ -1096,6 +1137,17 @@ mod tests {
                 "{flag} must be advertised in the help text"
             );
         }
+        // No environment rung in any precedence the help states: the env
+        // overrides were retired 2026-09-24, and the CONFIG line already reads
+        // `flag > config > default`.
+        assert!(
+            HELP_HEAD.contains("(flag >\n                                   config > default)"),
+            "--show-config states the precedence the build has"
+        );
+        assert!(
+            !HELP_HEAD.contains("(env >"),
+            "no retired env rung in --help"
+        );
     }
 
     /// Off macOS the KEYS section is generated from the platform seed table, so
@@ -1306,21 +1358,6 @@ mod tests {
         }
     }
 
-    /// The DefTerm pair must both dispatch. (Behaviour is asserted below and in
-    /// `defterm_win`'s own tests — this one only proves the flags are wired.)
-    #[cfg(windows)]
-    #[test]
-    fn default_terminal_pair_dispatches() {
-        let src = include_str!("cli.rs");
-        for flag in ["--set-default-terminal", "--unset-default-terminal"] {
-            let arm = format!("\"{flag}\" =>");
-            assert!(
-                src.contains(&arm),
-                "{flag} must have a dispatch arm ({arm})"
-            );
-        }
-    }
-
     /// An escape hatch nobody can find is not an escape hatch. Every Windows
     /// verb must be advertised in the Windows help block, that block must
     /// actually reach `--help`, and each verb must have a dispatch arm.
@@ -1406,6 +1443,102 @@ mod tests {
                 "the env-hygiene note must name the {prefix} deny prefix"
             );
         }
+    }
+
+    /// `--help`'s CONFIG line and the starter's header name the path the loader
+    /// resolves on THIS machine, never a literal: measured 2026-09-22 on 0.90.0,
+    /// both printed the Unix `~/.config/aterm/aterm.toml` on a Windows box
+    /// whose window was reading `%APPDATA%\aterm\aterm.toml`.
+    #[test]
+    fn help_and_starter_name_the_resolved_config_path() {
+        assert!(
+            super::HELP_TAIL.contains("CONFIG:  <aterm.toml>  (live settings reload"),
+            "the CONFIG line carries the slot, not a literal path"
+        );
+        assert!(
+            super::STARTER_CONFIG.starts_with("# aterm — <aterm.toml>\n"),
+            "the starter's header carries the slot, not a literal path"
+        );
+        let tail = super::help_tail();
+        assert!(!tail.contains(super::CONFIG_PATH_SLOT), "{tail}");
+        let shown = super::config_path_display();
+        assert!(
+            tail.contains(&format!("CONFIG:  {shown}  (live settings reload")),
+            "{tail}"
+        );
+        let Some(path) = crate::app_config::config_path() else {
+            assert!(shown.starts_with("(unresolved: "), "{shown}");
+            return;
+        };
+        assert_eq!(shown, path.display().to_string());
+        assert!(path.ends_with("aterm.toml"), "{}", path.display());
+        let starter = super::starter_config_for(&path);
+        assert_eq!(
+            starter.lines().next(),
+            Some(format!("# aterm — {}", path.display()).as_str())
+        );
+        assert!(!starter.contains(super::CONFIG_PATH_SLOT), "{starter}");
+        assert_eq!(
+            starter.lines().count(),
+            super::STARTER_CONFIG.lines().count(),
+            "only the header changes"
+        );
+    }
+
+    /// The `allow_notifications` comment says where delivery happens on each
+    /// platform that delivers — macOS by subprocess, Windows in-process
+    /// (notify.rs's `Shell_NotifyIcon` balloon) — and that Linux has none. It
+    /// used to name macOS alone, as if the other platforms dropped the request.
+    #[test]
+    fn starter_config_says_where_notifications_are_delivered_per_platform() {
+        let block: Vec<&str> = super::STARTER_CONFIG
+            .lines()
+            .skip_while(|l| !l.starts_with("# allow_notifications ="))
+            .take_while(|l| {
+                l.starts_with("# allow_notifications =")
+                    || l.starts_with("#                                  #")
+            })
+            .collect();
+        let text = block.join("\n");
+        assert!(block.len() >= 3, "{text}");
+        for needle in [
+            "terminal-notifier",
+            "osascript",
+            "Windows",
+            "notification-area balloon/toast",
+            "Shell_NotifyIcon",
+            "Linux has no delivery",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?} in:\n{text}");
+        }
+        // The prose is the code's claim: the platforms it says deliver are the
+        // ones `notify` builds a delivery host for.
+        assert_eq!(
+            crate::notify::delivery_available(),
+            cfg!(any(target_os = "macos", windows))
+        );
+    }
+
+    /// The `shell` comment names the Windows default in the order the spawn
+    /// takes it (`aterm-pty`'s `select_shell`: pwsh, powershell, `%COMSPEC%`,
+    /// then cmd) — it used to skip `%COMSPEC%` — and where to see the one this
+    /// machine resolves.
+    #[test]
+    fn starter_config_names_the_windows_default_shell_order() {
+        let shell_block: String = super::STARTER_CONFIG
+            .lines()
+            .skip_while(|l| !l.starts_with("# shell = "))
+            .take(6)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            shell_block.contains("(Windows: pwsh > powershell > %COMSPEC% > cmd;"),
+            "{shell_block}"
+        );
+        assert!(
+            shell_block.contains("`aterm doctor` names the one this machine gets"),
+            "{shell_block}"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! had left was renewed by every key typed below it and kept full light for
 //! as long as the hand typed. Four mechanisms, each closed here at the HOST
 //! seam — a real `aterm_core::terminal::Terminal` driven byte for byte, its
-//! rows sampled exactly as `app_render.rs`'s LOCK A samples them
+//! rows sampled exactly as `app_render.rs`'s frame hold samples them
 //! (`row_cols_into` under the term lock, after the batch is applied), fed to
 //! `CursorGlow::observe_row` / `observe_ribbon_row` and ticked through
 //! `CursorGlow::tick` — the seam `tick_cursor_fx` drives:
@@ -145,7 +145,7 @@ impl Host {
         h
     }
 
-    /// EXACTLY LOCK A, then the tick: the host's scroll sync
+    /// EXACTLY the frame hold, then the tick: the host's scroll sync
     /// (`sync_cursor_effect_scroll`, as `tests/codex_particle_replay.rs`
     /// drives it), then sample the cursor, the repaint blink, the caret
     /// row's probe, and the rows the resident ribbon occupies — all from

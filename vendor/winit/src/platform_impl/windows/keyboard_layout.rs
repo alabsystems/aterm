@@ -40,7 +40,6 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_SCROLL, VK_SELECT, VK_SEPARATOR, VK_SHIFT, VK_SLEEP, VK_SNAPSHOT, VK_SPACE, VK_SUBTRACT,
     VK_TAB, VK_UP, VK_VOLUME_DOWN, VK_VOLUME_MUTE, VK_VOLUME_UP, VK_XBUTTON1, VK_XBUTTON2, VK_ZOOM,
 };
-use windows_sys::Win32::UI::TextServices::HKL;
 
 use crate::keyboard::{Key, KeyCode, ModifiersState, NamedKey, NativeKey, PhysicalKey};
 use crate::platform_impl::{loword, primarylangid, scancode_to_physicalkey};
@@ -262,7 +261,7 @@ impl LayoutCache {
     /// prepares the layout if it isn't known.
     /// The current layout is then returned.
     pub fn get_current_layout(&mut self) -> (u64, &Layout) {
-        let locale_id = unsafe { GetKeyboardLayout(0) } as u64;
+        let locale_id = super::handle::to_usize(unsafe { GetKeyboardLayout(0) }) as u64;
         match self.layouts.entry(locale_id) {
             Entry::Occupied(entry) => (locale_id, entry.into_mut()),
             Entry::Vacant(entry) => {
@@ -311,7 +310,7 @@ impl LayoutCache {
         // map_value: Key  <-  map_vkey: VK
         layout.numlock_off_keys.reserve(NUMPAD_KEYCODES.len());
         for vk in 0..256 {
-            let scancode = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, locale_id as HKL) };
+            let scancode = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, super::handle::from_usize(locale_id as usize)) };
             if scancode == 0 {
                 continue;
             }
@@ -338,7 +337,7 @@ impl LayoutCache {
         layout.numlock_on_keys.reserve(NUMPAD_VKEYS.len());
         for vk in NUMPAD_VKEYS.iter() {
             let vk = (*vk) as u32;
-            let scancode = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, locale_id as HKL) };
+            let scancode = unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, super::handle::from_usize(locale_id as usize)) };
             let unicode = Self::to_unicode_string(&key_state, vk, scancode, locale_id);
             if let ToUnicodeResult::Str(s) = unicode {
                 layout.numlock_on_keys.insert(vk as VIRTUAL_KEY, Key::Character(SmolStr::new(s)));
@@ -359,7 +358,7 @@ impl LayoutCache {
             // giving the key state for the virtual key used for indexing.
             for vk in 0..256 {
                 let scancode =
-                    unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, locale_id as HKL) };
+                    unsafe { MapVirtualKeyExW(vk, MAPVK_VK_TO_VSC_EX, super::handle::from_usize(locale_id as usize)) };
                 if scancode == 0 {
                     continue;
                 }
@@ -458,7 +457,7 @@ impl LayoutCache {
                 (&mut label_wide[0]) as *mut _,
                 label_wide.len() as i32,
                 0,
-                locale_id as HKL,
+                super::handle::from_usize(locale_id as usize),
             );
             if wide_len < 0 {
                 // If it's dead, we run `ToUnicode` again to consume the dead-key
@@ -469,7 +468,7 @@ impl LayoutCache {
                     (&mut label_wide[0]) as *mut _,
                     label_wide.len() as i32,
                     0,
-                    locale_id as HKL,
+                    super::handle::from_usize(locale_id as usize),
                 );
                 if wide_len > 0 {
                     let os_string = OsString::from_wide(&label_wide[0..wide_len as usize]);

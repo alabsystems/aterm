@@ -332,7 +332,9 @@ fn kitty_event_type_encodings() {
             RELEASE,
             b"",
         ),
-        // The bit reflects the state INCLUDING the current event: set on press.
+        // The bit reflects the state INCLUDING the current event: set on press;
+        // on release it is the state the release leaves, as the caller states it
+        // — clear for a lone Shift, set while the other Shift is still held.
         (
             "report-all shift press",
             named(NamedKey::ShiftLeft),
@@ -344,10 +346,18 @@ fn kitty_event_type_encodings() {
         (
             "report-all shift release",
             named(NamedKey::ShiftLeft),
-            Modifiers::SHIFT,
+            NO_MODS,
             KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_EVENT_TYPES,
             RELEASE,
             b"\x1b[57441;1:3u",
+        ),
+        (
+            "report-all shift release, the other Shift held",
+            named(NamedKey::ShiftLeft),
+            Modifiers::SHIFT,
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_EVENT_TYPES,
+            RELEASE,
+            b"\x1b[57441;2:3u",
         ),
     ]);
 }

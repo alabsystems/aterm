@@ -211,10 +211,17 @@ pub(crate) const fn menu_command(action: menu::MenuAction) -> CommandSpec {
         // Same identity as the pin's face, one field over: the role is session
         // metadata written through the same typed API (`meta set role`).
         M::SetRole => spec("session.set_role", S::Tab, A::LocalUi, C::Terminal),
+        // Round 18's identity rows. Showing a session's identity discloses the
+        // same roster row the `identities` verb does (Owner-only on the wire);
+        // the two spawns may CREATE an identity, which only `spawn identity=`
+        // (Owner) may do. Neither spawn needs a focused session.
+        M::ShowIdentity => spec("session.identity.show", S::Tab, A::Owner, C::Terminal),
+        M::NewWindowWithIdentity => spec("window.new_with_identity", S::App, A::Owner, C::Any),
+        M::NewTabWithIdentity => spec("tab.new_with_identity", S::Window, A::Owner, C::Any),
         M::Help => spec("app.help.open", S::App, A::ExternalOpen, C::Any),
-        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet… is the map's twin until
-        // the fleet screen lands (round 20) — Owner for the same aggregated
-        // disclosure reason as `view.connections`.
+        // THE FABRIC MENU (round 19, SPEC19 §9). Fleet… is the map's twin (the
+        // Fabric menu's route to it) — Owner for the same aggregated disclosure
+        // reason as `view.connections`.
         M::Fleet => spec("view.fleet", S::App, A::Owner, C::Any),
         // A session's mail metadata on the human's screen: Owner (the same
         // class as the map), terminal content (the inbox is a session's).

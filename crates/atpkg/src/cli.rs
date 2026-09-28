@@ -126,7 +126,11 @@ const VERB_USAGE: &[(&str, &str)] = &[
          atpkg install --default-set    — the whole ALab toolset",
     ),
     ("seed", "atpkg seed"),
-    ("update", "atpkg update [program]"),
+    (
+        "update",
+        "atpkg update [program] [--retry]  (--retry forgets a held/cooled-down digest \
+         refusal first)",
+    ),
     ("rollback", "atpkg rollback <program>"),
     ("pin", "atpkg pin <program>"),
     ("unpin", "atpkg unpin <program>"),
@@ -171,8 +175,10 @@ const VERB_USAGE: &[(&str, &str)] = &[
     ),
 ];
 
-/// The usage line for `verb`, if it has one.
-fn usage_of(verb: &str) -> Option<&'static str> {
+/// The usage line for `verb`, if it has one. Public so the long-form manual
+/// (`aterm-cli`'s `manual.rs`) can be held to the grammar the binary parses.
+#[must_use]
+pub fn verb_usage(verb: &str) -> Option<&'static str> {
     VERB_USAGE
         .iter()
         .find(|(name, _)| *name == verb)
@@ -199,7 +205,7 @@ fn help_flag_addresses_atpkg(verb: &str, rest: &[String]) -> bool {
 /// Answer `<verb> --help` from [`VERB_USAGE`]: the verb's own grammar, then the one
 /// pointer to the long-form manual. Exit 0 — asking a question is not an error.
 fn cmd_verb_help(verb: &str) -> ExitCode {
-    match usage_of(verb) {
+    match verb_usage(verb) {
         Some(usage) => {
             println!("usage: {usage}");
             println!("atpkg: full manual for this verb: aterm help pkg");
@@ -478,7 +484,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     // one dispatch edge closes that class for every verb at once, including ones nobody
     // thought to probe.
     if let Some(v) = verb
-        && usage_of(v).is_some()
+        && verb_usage(v).is_some()
         && help_flag_addresses_atpkg(v, &args[1..])
     {
         return cmd_verb_help(v);
@@ -508,7 +514,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
         // conclude the flag did not exist. One of this project's own audits concluded
         // exactly that and wrote it down.
         eprintln!("atpkg {v}: unknown option {operand:?} for `atpkg {v}`");
-        if let Some(usage) = usage_of(v) {
+        if let Some(usage) = verb_usage(v) {
             eprintln!("usage: {usage}");
         }
         if !allowed.is_empty() {
@@ -665,7 +671,7 @@ fn run_verb(verb: Option<&str>, args: &[String]) -> ExitCode {
         Some("verify-pkg") => return cmd_verify_pkg(args.get(1..).unwrap_or(&[])),
         Some("install") => return cmd_install_argv(&args[1..]),
         Some("seed") => return cmd_seed(&args[1..]),
-        Some("update") => return cmd_update(args.get(1)),
+        Some("update") => return cmd_update_argv(&args[1..]),
         Some("rollback") => return cmd_rollback(args.get(1)),
         Some("pin") => return cmd_pin(args.get(1), true),
         Some("unpin") => return cmd_pin(args.get(1), false),
@@ -893,14 +899,15 @@ fn not_installed_fix(name: &str) -> String {
     format!("atpkg: {name} is not installed (fix: aterm pkg install {name})")
 }
 
-/// A LIVE build of a program whose OWN-NAME shim is gone — see [`live_without_shim`].
+/// A LIVE build of a program one of whose shims is gone — see [`live_without_shim`] (its
+/// own-name shim) and [`live_without_shim_of`] (any tool it ships).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LostShim {
     /// The build `store/<program>/current` selects.
     pub build: u64,
-    /// Where the missing shim belongs: `<prefix>/bin/<program>`.
+    /// Where the missing shim belongs: `<prefix>/bin/<tool>`.
     pub shim: std::path::PathBuf,
-    /// The build's own binary, `store/<program>/<build>/bin/<program>`, which stands.
+    /// The build's own binary, `store/<program>/<build>/bin/<tool>`, which stands.
     pub binary: std::path::PathBuf,
 }
 
@@ -982,6 +989,19 @@ fn agents_dir_ahead_of_bin(
 ///   — or a tombstone over any name its build ships).
 #[must_use]
 pub fn live_without_shim(layout: &crate::store::Layout, tool: &str) -> Option<LostShim> {
+    live_without_shim_of(layout, tool, tool)
+}
+
+/// [`live_without_shim`] for `tool`, one of the binaries `program` ships: the reroute's
+/// question for a branded tool (`trustfmt`, shipped by `trust`), whose table names the
+/// owning program. The conditions above read `store/<program>/current` and `program`'s
+/// state; the shim and the binary are `tool`'s.
+#[must_use]
+pub fn live_without_shim_of(
+    layout: &crate::store::Layout,
+    program: &str,
+    tool: &str,
+) -> Option<LostShim> {
     let name = crate::store::ToolName::new(tool)?;
     if name.is_alias() {
         return None;
@@ -990,9 +1010,9 @@ pub fn live_without_shim(layout: &crate::store::Layout, tool: &str) -> Option<Lo
     if !std::fs::symlink_metadata(&shim).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
         return None;
     }
-    let build = match std::fs::read_link(layout.program_current(tool)) {
+    let build = match std::fs::read_link(layout.program_current(program)) {
         Ok(target) => match crate::ops::store_build_of(&layout.prefix, &target) {
-            Some((owner, build)) if owner == tool => build,
+            Some((owner, build)) if owner == program => build,
             // A link that names something else is not ours to reinterpret.
             _ => return None,
         },
@@ -1003,29 +1023,29 @@ pub fn live_without_shim(layout: &crate::store::Layout, tool: &str) -> Option<Lo
         // at one `stat` instead.
         Err(_) => {
             if !layout
-                .program_current(tool)
+                .program_current(program)
                 .parent()
                 .is_some_and(std::path::Path::is_dir)
             {
                 return None;
             }
-            crate::active_builds(layout).get(tool).copied()?
+            crate::active_builds(layout).get(program).copied()?
         }
     };
     if !crate::list_installed(layout)
         .iter()
-        .any(|(program, b)| program == tool && *b == build)
+        .any(|(p, b)| p == program && *b == build)
     {
         return None;
     }
     let binary = layout
-        .build_dir(tool, build)
+        .build_dir(program, build)
         .join("bin")
         .join(format!("{tool}{}", std::env::consts::EXE_SUFFIX));
     if !binary.is_file()
-        || layout.removed_programs().contains(tool)
-        || crate::linkmode::is_linked(layout, tool)
-        || program_disabled_here(layout, crate::status::read(layout).as_ref(), tool)
+        || layout.removed_programs().contains(program)
+        || crate::linkmode::is_linked(layout, program)
+        || program_disabled_here(layout, crate::status::read(layout).as_ref(), program)
     {
         return None;
     }
@@ -1035,7 +1055,7 @@ pub fn live_without_shim(layout: &crate::store::Layout, tool: &str) -> Option<Lo
     // is a tombstone and whose `bin/ty` is gone would pass it. A tombstone does not name
     // its program, so this is conservative: a same-named tombstone of another program
     // keeps the old answer here.
-    let shipped = std::fs::read_dir(layout.build_dir(tool, build).join("bin")).ok()?;
+    let shipped = std::fs::read_dir(layout.build_dir(program, build).join("bin")).ok()?;
     for entry in shipped.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else {
@@ -2135,10 +2155,12 @@ fn cmd_reroute(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = layout() else {
-        // No resolvable store (no `HOME`, an `env -i` wrapper): the same
-        // fail-closed answer the stub gives when atpkg is unreachable — the
-        // escape named, exit 2 — never an unexplained 1.
-        eprintln!("{}", crate::reroute::unreachable_message(upstream));
+        // No resolvable store (no `HOME`, an `env -i` wrapper): `layout` has said why,
+        // so this line says only what the stub's fail-closed answer says — nothing ran,
+        // and the escape — with its exit 2, never an unexplained 1.
+        eprintln!(
+            "aterm: '{upstream}' did not run (`aterm --no-reroute` restores upstream '{upstream}')"
+        );
         return ExitCode::from(crate::reroute::REFUSAL_EXIT);
     };
     crate::reroute::run(&layout, upstream, args)
@@ -2527,6 +2549,40 @@ fn wait_then_run(layout: &crate::store::Layout, tool: &str, passthrough: &[Strin
 /// for every honest FlowError, finite against a hostile record.
 const PENDING_ERROR_CAP: usize = 300;
 
+/// How much of a HELD row's failure (`why`) the pending stub echoes: the longest
+/// digest-pair sentence a memo records whole (`asset sha256 mismatch: expected <64 hex>,
+/// got <64 hex>` is 166 characters, the `tree_root` one 163), so the reader can hold it
+/// against the ledger; a longer signer sentence is elided.
+const HELD_WHY_CAP: usize = 200;
+
+/// …and how much of its retry (`how`). Whole for every row atpkg writes — at most about
+/// 240 characters of its own words plus a signed asset name and a program name
+/// (`flow::digest_refusal_note`) — and still finite against a hostile record.
+const HELD_HOW_CAP: usize = 2 * PENDING_ERROR_CAP;
+
+/// The pending stub's line for a member HELD after a failed stage — `held` is the row
+/// after [`crate::state::HELD_FAILED_PREFIX`]: `<why>; <how>`. The two halves are capped
+/// APART so the retry always survives. One 300-character cap over the whole row cut it
+/// off: a real row is 31 characters of head, 163 of `tree_root` digests and 89 of
+/// explanation plus the asset name before `aterm pkg install <p>` begins, so any asset
+/// name of 17 characters or more (`codex-package-x86_64-pc-windows-msvc.tar.gz` is 43)
+/// printed `… — retry now: …` with both doors gone. The first `; ` is the seam by
+/// construction ([`crate::state::held_failed`] keeps it out of the `why`).
+fn held_stub_line(name: &str, held: &str) -> String {
+    let (why, how) = held.split_once("; ").unwrap_or((held, ""));
+    let mut line = format!(
+        "atpkg: {name} is {}{}",
+        crate::state::HELD_FAILED_PREFIX,
+        crate::progress::sanitize_for_tty(why, HELD_WHY_CAP)
+    );
+    if !how.is_empty() {
+        line.push_str("; ");
+        line.push_str(&crate::progress::sanitize_for_tty(how, HELD_HOW_CAP));
+    }
+    line.push_str(" — Settings ▸ Packages shows details.");
+    line
+}
+
 /// The `__pending` state machine's I/O seam, so every state is exercisable without a
 /// process, a TTY or an environment variable: `say` receives each honest line in order
 /// (production prints it; tests collect it).
@@ -2726,6 +2782,18 @@ fn pending_state(layout: &crate::store::Layout, tool: &str, io: &mut PendingIo<'
     // only not-running states may render, whatever the snapshot claims. A recorded
     // failure outranks the generic line — every failure names its next act.
     if let Some(status) = crate::status::read(layout) {
+        // A member HELD after a failed stage (`held: last attempt failed with …`): the
+        // row already names the failure and the retry, so say it and claim nothing —
+        // no "the next pass retries it" (it does not: the hold is the point) and no
+        // bump (a pass can only repeat the hold). Before the `error` arm, which used to
+        // catch this row and promise exactly that (41 failed passes on one Windows box,
+        // 2026-09-14..22).
+        if let Some(row) = status.programs.get(name)
+            && let Some(held) = row.state.strip_prefix(crate::state::HELD_FAILED_PREFIX)
+        {
+            (io.say)(held_stub_line(name, held));
+            return PendingNext::Done;
+        }
         if let Some(row) = status.programs.get(name)
             && row.state.starts_with("error")
         {
@@ -2846,7 +2914,7 @@ fn doctor_detail(rest: &[String], verb: &str) -> Result<crate::doctor::Detail, E
                 .find(|a| *a != "--verbose" && *a != "-v")
                 .unwrap_or(&rest[0]);
             eprintln!("atpkg {verb}: unknown argument {stray:?} — the one it takes is --verbose");
-            if let Some(usage) = usage_of(verb) {
+            if let Some(usage) = verb_usage(verb) {
                 eprintln!("usage: {usage}");
             }
             Err(ExitCode::from(2))
@@ -2886,7 +2954,7 @@ fn doctor_detail(rest: &[String], verb: &str) -> Result<crate::doctor::Detail, E
 fn zero_arity(rest: &[String], verb: &str) -> Option<ExitCode> {
     let stray = rest.first()?;
     eprintln!("atpkg {verb}: unknown argument {stray:?} — this verb takes none");
-    if let Some(usage) = usage_of(verb) {
+    if let Some(usage) = verb_usage(verb) {
         eprintln!("usage: {usage}");
     }
     Some(ExitCode::from(2))
@@ -2894,13 +2962,13 @@ fn zero_arity(rest: &[String], verb: &str) -> Option<ExitCode> {
 
 /// The verbs whose whole grammar is at most ONE operand — each dispatch arm reads
 /// `args.get(1)` and nothing after it. Every other [`NAME_TAKING_VERBS`] entry parses its
-/// own argv: `install` (it refuses a second program itself), `link` (`<program>
+/// own argv: `install` (it refuses a second program itself), `update` (one operand and
+/// `--retry` in either order, [`ONE_OPERAND_FLAGGED_VERBS`]), `link` (`<program>
 /// <checkout> [rel-bin…]`) and `refresh` (`[program…]`).
-const ONE_OPERAND_VERBS: [&str; 9] = [
+const ONE_OPERAND_VERBS: [&str; 8] = [
     "which",
     "uninstall",
     "tree-root",
-    "update",
     "rollback",
     "pin",
     "unpin",
@@ -2908,8 +2976,16 @@ const ONE_OPERAND_VERBS: [&str; 9] = [
     "unlink",
 ];
 
-/// Refuse a second operand to a [`ONE_OPERAND_VERBS`] verb — `Some(usage error)` when
-/// one was given, `None` to proceed (and for every other verb).
+/// One-operand verbs whose arm parses its own argv because it also takes FLAGS in any
+/// position — the flags are not operands, so the gate counts what is left:
+/// `update [program] [--retry]` ([`cmd_update_argv`], which refuses a second program
+/// itself too, for a direct caller). The gate still refuses `update ta tb` at the edge,
+/// before the store lock, exactly as it did before `--retry` existed.
+const ONE_OPERAND_FLAGGED_VERBS: &[(&str, &[&str])] = &[("update", &["--retry"])];
+
+/// Refuse a second operand to a [`ONE_OPERAND_VERBS`] (or [`ONE_OPERAND_FLAGGED_VERBS`])
+/// verb — `Some(usage error)` when one was given, `None` to proceed (and for every other
+/// verb).
 ///
 /// THE REST WERE DROPPED WITHOUT A WORD. Measured on m3 (2026-09-23): `aterm pkg
 /// uninstall ty ay clean` removed `ty`, printed `atpkg: uninstalled ty` and exited 0,
@@ -2921,10 +2997,19 @@ const ONE_OPERAND_VERBS: [&str; 9] = [
 /// runs: acting on the first name and refusing the rest would leave the reader to work
 /// out which half happened.
 fn at_most_one_operand(rest: &[String], verb: &str) -> Option<ExitCode> {
-    if !ONE_OPERAND_VERBS.contains(&verb) || rest.len() < 2 {
+    let flags: &[&str] = match ONE_OPERAND_FLAGGED_VERBS.iter().find(|(v, _)| *v == verb) {
+        Some((_, flags)) => flags,
+        None if ONE_OPERAND_VERBS.contains(&verb) => &[],
+        None => return None,
+    };
+    let operands: Vec<&String> = rest
+        .iter()
+        .filter(|a| !flags.contains(&a.as_str()))
+        .collect();
+    if operands.len() < 2 {
         return None;
     }
-    let got = rest
+    let got = operands
         .iter()
         .map(|a| format!("{a:?}"))
         .collect::<Vec<_>>()
@@ -2932,9 +3017,9 @@ fn at_most_one_operand(rest: &[String], verb: &str) -> Option<ExitCode> {
     eprintln!(
         "atpkg {verb}: one operand at a time (got {}: {got}) — nothing was done; \
          run `aterm pkg {verb}` once per name",
-        rest.len()
+        operands.len()
     );
-    if let Some(usage) = usage_of(verb) {
+    if let Some(usage) = verb_usage(verb) {
         eprintln!("usage: {usage}");
     }
     Some(ExitCode::from(2))
@@ -2943,7 +3028,7 @@ fn at_most_one_operand(rest: &[String], verb: &str) -> Option<ExitCode> {
 const NAME_TAKING_VERBS: &[(&str, &[&str])] = &[
     ("install", &["--default-set"]),
     ("uninstall", &["--all"]),
-    ("update", &[]),
+    ("update", &["--retry"]),
     ("rollback", &[]),
     ("which", &[]),
     ("tree-root", &[]),
@@ -3376,7 +3461,7 @@ fn which_line_in(
     // cargo` refused the name and `which rustfmt` promised an install; neither said
     // what runs.
     if let Some(row) = crate::reroute::row_for(tool) {
-        return Ok(reroute_which_line(layout, row));
+        return Ok(reroute_which_line(layout, row, path_var));
     }
     let Some(tn) = crate::store::ToolName::new(tool) else {
         return Err(format!("atpkg: {tool:?} is not a tool name"));
@@ -3631,9 +3716,12 @@ fn which_line_in(
     // 3. A pending stub in the managed bin/: typing the name waits — and a recorded row
     //    that says WHY it waits (unserved here) outranks the generic promise.
     if stubbed {
-        let waiting = row_of(tool)
-            .map(|r| r.state)
-            .filter(|st| st.starts_with(crate::state::UNAVAILABLE_PREFIX));
+        // …and a HELD row (`held: last attempt failed with …; <retry>`): the stub is
+        // waiting on a person, not on the next pass, and the row says which act.
+        let waiting = row_of(tool).map(|r| r.state).filter(|st| {
+            st.starts_with(crate::state::UNAVAILABLE_PREFIX)
+                || st.starts_with(crate::state::HELD_FAILED_PREFIX)
+        });
         return Ok(match waiting {
             Some(st) => format!("{tool} → {} (pending stub) — {st}", shim.display()),
             None => format!(
@@ -3643,9 +3731,11 @@ fn which_line_in(
             ),
         });
     }
-    // 4. A recorded state that names no shim: a target the pinned build does not serve.
+    // 4. A recorded state that names no shim: a target the pinned build does not serve,
+    //    or a member HELD after a failed stage (the row names the retry).
     if let Some(row) = row_of(tool)
-        && row.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
+        && (row.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
+            || row.state.starts_with(crate::state::HELD_FAILED_PREFIX))
     {
         return Ok(format!("{tool} → (nothing runs) — {}", row.state));
     }
@@ -3798,7 +3888,11 @@ fn version_from_components(path: &std::path::Path) -> Option<String> {
 /// inside a session, its state (`laid` / `missing` / `foreign`, [`crate::reroute::states`]),
 /// and the row's policy in the stub's own words ([`crate::reroute::policy_summary`]) —
 /// `<args>` standing for the caller's arguments, since `which` has none to fill in.
-fn reroute_which_line(layout: &crate::store::Layout, row: &crate::reroute::Row) -> String {
+fn reroute_which_line(
+    layout: &crate::store::Layout,
+    row: &crate::reroute::Row,
+    path_var: Option<&std::ffi::OsStr>,
+) -> String {
     use crate::reroute::StubState;
     let stub = crate::reroute::stub_path(layout, row.upstream);
     let state = crate::reroute::states(layout)
@@ -3813,7 +3907,10 @@ fn reroute_which_line(layout: &crate::store::Layout, row: &crate::reroute::Row) 
         "{} → {} (reroute stub, {state}) — rerouted inside aterm sessions: {}",
         row.upstream,
         stub.display(),
-        crate::reroute::policy_summary(row)
+        crate::reroute::policy_summary(
+            row,
+            crate::reroute::upstream_on_path(layout, row.upstream, path_var).is_some()
+        )
     )
 }
 
@@ -4161,7 +4258,7 @@ fn cmd_lease(rest: &[String]) -> ExitCode {
         Ok(args) => args,
         Err(why) => {
             eprintln!("atpkg lease: {why}");
-            if let Some(usage) = usage_of("lease") {
+            if let Some(usage) = verb_usage("lease") {
                 eprintln!("usage: {usage}");
             }
             return ExitCode::from(2);
@@ -4326,7 +4423,7 @@ enum NoindexJob {
 /// line, never a panic on the error path.
 fn noindex_usage_error(problem: &str) -> ExitCode {
     eprintln!("atpkg noindex: {problem}");
-    eprintln!("usage: {}", usage_of("noindex").unwrap_or_default());
+    eprintln!("usage: {}", verb_usage("noindex").unwrap_or_default());
     ExitCode::from(2)
 }
 
@@ -5376,7 +5473,7 @@ fn relay_shims(layout: &crate::store::Layout) -> (usize, Vec<String>, Vec<String
         };
         // The build ACTIVATION selects (`store/<program>/current`), not the highest on disk:
         // `rollback` keeps the build it rolled off until gc, and re-laying that one silently
-        // undid the rollback and minted a ChannelShimMismatch (audit K2, 2026-09-12). With no
+        // undid the rollback and minted a LinkShimMismatch (audit K2, 2026-09-12). With no
         // usable link — a prefix older than it, or one naming a build that is gone — the
         // newest complete build, as before.
         let build = std::fs::read_link(layout.program_current(program))
@@ -5492,7 +5589,7 @@ fn program_disabled_here(
 
 /// Whether `bin/<tool>` is a tombstone: a shim that forwards nowhere and carries the
 /// notice `activate::install_tombstone_shim` writes.
-fn is_tombstone_shim(layout: &crate::store::Layout, tool: &str) -> bool {
+pub(crate) fn is_tombstone_shim(layout: &crate::store::Layout, tool: &str) -> bool {
     let Some(tool) = crate::store::ToolName::new(tool) else {
         return false;
     };
@@ -6594,6 +6691,11 @@ fn failed_install_state(e: &crate::FlowError) -> Option<String> {
 fn canonical_non_error_state(e: &crate::FlowError) -> Option<String> {
     match e {
         crate::FlowError::NoArtifact(t) => Some(crate::state::unavailable(t, "")),
+        // A member the digest-refusal memo HELD off a stage that would fail again: the
+        // flow already rendered the canonical `held: last attempt failed with …; <retry>`
+        // row ([`crate::state::held_failed`]), and an `error:` head on it would say this
+        // pass staged something — it staged nothing, and the row names the retry.
+        crate::FlowError::StageRefused(row) => Some(row.clone()),
         _ => None,
     }
 }
@@ -7548,6 +7650,33 @@ pub(crate) fn alias_fix(
     Some(crate::state::alias_hint(alias.as_str()))
 }
 
+/// The fix-line for `program`'s SHADOWED row where the shadow is the foreign copy at
+/// `shadow` — [`alias_fix`] for the tool that copy stands in for, so the Packages page
+/// says what `which`, `doctor` and the pass log say after the same row: `type alab-<tool>
+/// for the managed one`, and nothing when no alias is laid or it would run someone
+/// else's copy too. Never part of the canonical state (`state::alias_hint`).
+#[must_use]
+pub fn shadowed_fix(
+    layout: &crate::store::Layout,
+    program: &str,
+    shadow: &std::path::Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<String> {
+    let name = shadow.file_name()?.to_str()?;
+    // A Windows copy is `<tool>.exe`; the tool is the name without it.
+    let name = if cfg!(windows) {
+        name.strip_suffix(".exe").unwrap_or(name)
+    } else {
+        name
+    };
+    alias_fix(
+        layout,
+        &crate::store::ToolName::new(name)?,
+        program,
+        path_var,
+    )
+}
+
 /// ALIAS reconcile (owner decision 2026-08-27): for every installed, non-dev-linked
 /// program, bring its `alab-<tool>` aliases in line with the signed index's verdict on
 /// whether it is ALab's own ([`crate::activate::Aliases::for_program`]) — laid when
@@ -8362,7 +8491,7 @@ fn machine_refusal(cfg: &crate::config::MachineConfig) -> Option<String> {
     if cfg.unreadable {
         return Some(
             "aterm.toml does not parse, so the [machine] opt-outs could not be read — fix the \
-             file (`aterm --validate-config`), then `aterm pkg machine apply`"
+             file (`aterm --window --validate-config`), then `aterm pkg machine apply`"
                 .to_string(),
         );
     }
@@ -8689,7 +8818,7 @@ fn cmd_machine(rest: &[String]) -> ExitCode {
                     other.len()
                 ),
             }
-            eprintln!("usage: {}", usage_of("machine").unwrap_or_default());
+            eprintln!("usage: {}", verb_usage("machine").unwrap_or_default());
             ExitCode::from(2)
         }
     }
@@ -10081,7 +10210,7 @@ fn rollback_in(
     fetcher: &dyn Fn() -> Box<dyn crate::flow::Fetcher>,
 ) -> ExitCode {
     if let Some(spec) = crate::vendor_direct::spec(program) {
-        return cmd_rollback_vendor(layout, channel, spec);
+        return cmd_rollback_vendor(layout, spec);
     }
     let floor = build_floor(layout);
     let fetcher = fetcher();
@@ -10158,12 +10287,11 @@ fn rollback_in(
 /// what runs, and the next update returns it to the head unless it is pinned.
 fn cmd_rollback_vendor(
     layout: &crate::store::Layout,
-    channel: &str,
     spec: &'static crate::vendor_direct::VendorSpec,
 ) -> ExitCode {
     let program = spec.program;
     let policy = crate::vendor_direct::policy::Policy::current(layout, None);
-    match crate::vendor_direct::lane::roll_back_by_hand(layout, channel, &policy, spec) {
+    match crate::vendor_direct::lane::roll_back_by_hand(layout, &policy, spec) {
         Ok(moved) => {
             let build = moved.to_build;
             // A vendor build's root is its `.vendor` record's; a legacy build's is the
@@ -10283,6 +10411,131 @@ fn cmd_pin(program: Option<&String>, pinned: bool) -> ExitCode {
             eprintln!("atpkg: {verb} {program} failed: {e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// `atpkg update [program] [--retry]`: the operand and the one flag, in either order.
+///
+/// `--retry` FORGETS THE DIGEST-REFUSAL MEMOS FIRST — every program's, or the named
+/// program's — and then runs the pass exactly as it always did. A held row (a `tree_root`
+/// mismatch, [`crate::store::StageRefusal::held`]) never lapses on its own, so a person
+/// who believes the publish is fixed, or who simply wants the pass to try again now,
+/// needs a door that is not "install one program by name"; this is it. The explicit
+/// `install <p>` door clears the same memos ([`do_install_with`]) — the store's
+/// `<build>.refused` memo and, for a vendor-direct program, the refusal its stamp keeps
+/// ([`forget_vendor_refusal`]) — so the two spellings agree on what "try again" means.
+fn cmd_update_argv(rest: &[String]) -> ExitCode {
+    let mut retry = false;
+    let mut operands: Vec<&String> = Vec::new();
+    for arg in rest {
+        if arg == "--retry" {
+            retry = true;
+        } else if arg.starts_with('-') {
+            // Unreachable through the dispatch edge: its unknown-flag check takes the
+            // FIRST position, and its one-operand gate counts a flag anywhere else as an
+            // operand ([`at_most_one_operand`]). Kept so the grammar is total for a direct
+            // caller.
+            eprintln!("atpkg update: unknown option {arg:?} for `atpkg update`");
+            if let Some(usage) = verb_usage("update") {
+                eprintln!("usage: {usage}");
+            }
+            return ExitCode::from(2);
+        } else {
+            operands.push(arg);
+        }
+    }
+    // A SECOND NAME IS REFUSED, in the one-operand gate's own words
+    // ([`at_most_one_operand`]). The dispatch edge already refused it before the store
+    // lock ([`ONE_OPERAND_FLAGGED_VERBS`]); this keeps the grammar total for a direct
+    // caller — before anything is forgotten or run.
+    if operands.len() > 1 {
+        let got = operands
+            .iter()
+            .map(|a| format!("{a:?}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "atpkg update: one operand at a time (got {}: {got}) — nothing was done; run \
+             `aterm pkg update` once per name",
+            operands.len()
+        );
+        if let Some(usage) = verb_usage("update") {
+            eprintln!("usage: {usage}");
+        }
+        return ExitCode::from(2);
+    }
+    let program = operands.first().copied();
+    // THE NAME IS ADMITTED BEFORE ANYTHING IS FORGOTTEN. `--retry` deletes `*.refused`
+    // files under `store/<program>/`, and nothing between the dispatch edge (which refuses
+    // only flags) and this line asks whether `<program>` is one directory name — so
+    // `update --retry ..\..\x` read and emptied a directory outside the store before
+    // `update` got to refuse the name (and on Windows `update --retry C:` the current
+    // directory of drive C: a drive prefix replaces the base in `Path::join`). The
+    // store's own shape rule ([`crate::ops::uninstall_name_shape`]: one normal path
+    // component — no separator, drive prefix, `.`, `..` or NUL) is the question;
+    // `clear_stage_refusals` asks it too, for every other door.
+    if retry && let Some(refusal) = program.and_then(|p| refuse_retry_operand(p)) {
+        return refusal;
+    }
+    if retry && let Some(layout) = layout() {
+        let mut forgotten = match program {
+            Some(p) => crate::store::clear_stage_refusals(&layout, p),
+            None => crate::store::clear_all_stage_refusals(&layout),
+        };
+        // …and the vendor lane's own memo: a vendor-direct program's signer verdict is
+        // kept in its stamp, not beside a build, and a bare `update` pass honours it.
+        let named = program.map(String::as_str);
+        for vendor in crate::vendor_direct::VENDORS
+            .iter()
+            .map(|spec| spec.program)
+            .filter(|v| named.is_none_or(|p| p == *v))
+        {
+            if forget_vendor_refusal(&layout, vendor) {
+                forgotten = forgotten.saturating_add(1);
+            }
+        }
+        println!("{}", retry_line(forgotten));
+    }
+    cmd_update(program)
+}
+
+/// `update --retry <program>`'s name gate: `Some(usage exit)`, said on stderr, for an
+/// operand that is not one directory name ([`crate::ops::uninstall_name_shape`]); `None`
+/// to proceed. Pure, so the refusal is testable without a store or a pass.
+fn refuse_retry_operand(program: &str) -> Option<ExitCode> {
+    crate::ops::uninstall_name_shape(program).err()?;
+    eprintln!("atpkg update: {program:?} is not a program name — nothing was forgotten or run");
+    if let Some(usage) = verb_usage("update") {
+        eprintln!("usage: {usage}");
+    }
+    Some(ExitCode::from(2))
+}
+
+/// Forget the stage refusal a vendor-direct `program`'s stamp records
+/// ([`crate::vendor_direct::ProgramStamp`]), as the install door does: whether one was
+/// recorded and is now gone. `false` for a program that is not vendor-direct.
+fn forget_vendor_refusal(layout: &crate::store::Layout, program: &str) -> bool {
+    crate::vendor_direct::is_vendor(program)
+        && crate::vendor_direct::ProgramStamp::read(layout, program)
+            .is_some_and(|stamp| stamp.refused.is_some())
+        && crate::vendor_direct::ProgramStamp::clear_refusal(layout, program).is_ok()
+}
+
+/// What `--retry` says about the memos it forgot: how many, and that the pass follows.
+fn retry_line(forgotten: usize) -> String {
+    match forgotten {
+        0 => String::from(
+            "atpkg: --retry — no held or cooled-down digest refusal was recorded; running \
+             the pass",
+        ),
+        1 => String::from(
+            "atpkg: --retry — forgot 1 digest refusal; the pass below stages that build \
+             again (its verified archive is reused when it was kept)",
+        ),
+        n => format!(
+            "atpkg: --retry — forgot {n} digest refusals; the pass below stages those builds \
+             again (verified archives are reused where they were kept)"
+        ),
     }
 }
 
@@ -10664,8 +10917,8 @@ fn has_work(
 /// the next-index probe asks before it spends a HEAD (`index_probe::successor`, audit PK-7):
 /// a published index can wake nothing on a store whose `update` would answer
 /// [`EMPTY_UPDATE`]. Read-only: the dev links are read, never reconciled. A probe
-/// asks this every 30 seconds, so do not enumerate the shim and dev-link trees
-/// once the cheap set-completion predicate already answers yes.
+/// asks this every five seconds while the store is empty, so do not enumerate
+/// the shim and dev-link trees once the cheap set-completion predicate answers yes.
 pub(crate) fn update_pass_has_work(layout: &crate::store::Layout) -> bool {
     let cfg = crate::config::cached();
     probe_has_work_lazily(
@@ -12301,7 +12554,8 @@ fn bootstrap_group(
 /// its signed `requires` dependency resolution (§17). Re-reads the durable floor so a
 /// floor advance recorded earlier in the pass is never undercut by the entry-time
 /// snapshot. Returns the hard-failure count (0 or 1); the correct non-failure states
-/// (dev-link, missing triple, app-bundle, tombstoned pin) are skips.
+/// (dev-link, missing triple, app-bundle, tombstoned pin, a held digest verdict) are
+/// skips.
 fn bootstrap_singleton(
     layout: &crate::store::Layout,
     fetcher: &dyn crate::flow::Fetcher,
@@ -12382,6 +12636,10 @@ fn bootstrap_singleton(
             note_finished(program, crate::progress::Phase::Skipped, Some(state));
             0
         }
+        // A member its digest-refusal memo HELD off a stage that would fail again
+        // (`held: last attempt failed with …; <retry>`, [`crate::store::StageRefusal`]):
+        // a skip, not a failure — see [`skip_held_member`].
+        Err(crate::FlowError::StageRefused(row)) => skip_held_member(layout, program, row),
         Err(e) => {
             eprintln!("atpkg: bootstrap install {program} failed: {e} (continuing)");
             record_bootstrap_error(layout, program, &e);
@@ -12389,6 +12647,35 @@ fn bootstrap_singleton(
             1
         }
     }
+}
+
+/// The bootstrap lane's answer for a member whose digest-refusal memo HELD it off this
+/// pass ([`crate::FlowError::StageRefused`]): the canonical `held: last attempt failed
+/// with <why>; <retry>` row, recorded and carried as the member's SKIP — never a
+/// failure. Returns the hard-failure count this contributes, which is 0.
+///
+/// Why a skip. This pass moved no bytes and staged nothing, and no unattended pass will
+/// — the hold binds until the pin's signed digests change or a person asks — so the row
+/// already says everything the pass could add, with the door. The generic `Err` arm
+/// used to take this: `bootstrap install claude failed: … (continuing)`, `Phase::Failed`,
+/// and a hard failure, so the whole pass exited FAILED — and the window re-runs a failed
+/// pass on a backoff, not on the 6-hour cadence of a clean one: 10 minutes, doubling to a
+/// 2-hour cap (aterm-gui's `FAILURE_BACKOFF_FIRST`/`_CAP`). That is how one deterministic
+/// verdict became 41 failed passes on one Windows box between 2026-09-14 and 09-22 (its
+/// log: 3 × `next try in 10 min`, 2 × 20, 2 × 40, 2 × 80, 28 × `2 h`, and 4 from a build
+/// that logged no backoff). The hold itself made each re-run cheap; this makes it quiet.
+/// The row still counts as a PROBLEM in `doctor` ([`crate::doctor`]'s `is_problem_state`),
+/// where the retry is named, and `which` and the pending stub quote it.
+fn skip_held_member(layout: &crate::store::Layout, program: &str, row: String) -> u32 {
+    println!("atpkg: {program}: {row} — skipped, not staged");
+    record_status(
+        layout,
+        program,
+        failure_row(layout, program, row.clone()),
+        format!("bootstrap install {program}: {row}"),
+    );
+    note_finished(program, crate::progress::Phase::Skipped, Some(row));
+    0
 }
 
 /// Record one hard bootstrap failure for `program` into `status.toml` — shared by the
@@ -12598,6 +12885,12 @@ fn install_toolset(
                     skipped.join(", ")
                 );
             }
+            if let Some(line) = default_set_prereq_line(
+                seams.path.as_deref(),
+                &crate::prereq::CcHost::this_machine(),
+            ) {
+                println!("{line}");
+            }
             print_managed_current(layout, &vendor.unchecked, now);
             record_index_freshness(layout, now, None);
             return 0;
@@ -12622,9 +12915,31 @@ fn install_toolset(
             skipped.join(", ")
         );
     }
+    if let Some(line) = default_set_prereq_line(
+        seams.path.as_deref(),
+        &crate::prereq::CcHost::this_machine(),
+    ) {
+        println!("{line}");
+    }
     print_managed_current(layout, &vendor.unchecked, now);
     record_index_freshness(layout, now, None);
     0
+}
+
+/// The sentence a finished default set adds when the machine cannot BUILD with it: the
+/// C toolchain's verdict ([`crate::prereq`]) against the `PATH` the pass ran with, in
+/// `doctor`'s own words, when it is an answer that blocks builds. The install did what
+/// was asked, so the exit code stays; the set simply stops claiming a capability it did
+/// not prove. `None` when a toolchain answers, or the probe cannot tell. `host` is
+/// [`crate::prereq::CcHost::this_machine`] in the verb; a test widens its bound.
+fn default_set_prereq_line(
+    path: Option<&std::ffi::OsStr>,
+    host: &crate::prereq::CcHost,
+) -> Option<String> {
+    let verdict = crate::prereq::probe_with(path, host);
+    verdict
+        .blocks_builds()
+        .then(|| format!("atpkg: {}", verdict.line()))
 }
 
 /// `atpkg seed` — the first-launch bootstrap (§9.1/§11), the verb the GUI spawns once per
@@ -13153,16 +13468,16 @@ fn says_not_installed_yet(store_empty: bool, window_pass: bool) -> bool {
 /// the index's answer ([`IndexServes`]), or `None` when the index never resolved.
 ///
 /// THE CHEAP QUESTION FIRST. A store that holds any build is served by definition, so
-/// `resolve` — a fetcher, a metered `api.github.com` releases listing, the index-cache
+/// `resolve` — a fetcher, the index discovery walk on the download host, the index-cache
 /// parse, the roster/index verification and a `roster.floor` record, all under the store
 /// lock `seed` holds — is never run for it. It used to run first on every GUI launch of a
 /// provisioned Mac (no release since v0.63.0 seals a seed, so every launch takes this
 /// lane), and its answer could not change the output: `Ok` became "served" through the
 /// `active_builds` disjunct, `Err` became `None`, and both print the same generic line.
-/// Offline, that was up to three 30 s `api_get` attempts holding `store.lock` (a typed
+/// Offline, that was up to three 30 s network attempts holding `store.lock` (a typed
 /// `aterm pkg install` exits 75 meanwhile), followed seconds later by the update pass
-/// listing the identical releases again (2026-09-15 audit). Only an EMPTY store — where the
-/// unserved-architecture verdict is the whole point — pays for the resolve.
+/// discovering the identical index again (2026-09-15 audit). Only an EMPTY store — where
+/// the unserved-architecture verdict is the whole point — pays for the resolve.
 fn seedless_serves_us(
     store_holds_builds: bool,
     resolve: impl FnOnce() -> Option<IndexServes>,
@@ -13557,7 +13872,6 @@ fn update_vendor(
     let lane = crate::vendor_direct::lane::Lane {
         layout,
         fetcher,
-        channel: crate::config::CHANNEL,
         triple: current_triple(),
         policy: &policy,
         trust: seams.trust,
@@ -13713,7 +14027,6 @@ fn vendor_pass(
     let lane = lane::Lane {
         layout,
         fetcher,
-        channel: crate::config::CHANNEL,
         triple: current_triple(),
         policy: &policy,
         trust: seams.trust,
@@ -14949,6 +15262,292 @@ fn cmd_refresh(rest: &[String]) -> ExitCode {
     }
 }
 
+/// The held-row surfaces, on EVERY platform: the main `tests` module below is Unix-only
+/// (its source scans and shell fixtures are), and the row these pin was first met on
+/// Windows — a test that could not run there would pin nothing about it.
+#[cfg(test)]
+mod held_row_tests {
+    use super::*;
+
+    fn temp_layout(label: &str) -> crate::store::Layout {
+        let p = std::env::temp_dir().join(format!("atpkg-held-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::create_dir_all(&p).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        crate::store::Layout { prefix: p }
+    }
+
+    /// The row a real hold writes: the measured `tree_root` pair of claude build
+    /// 2026092601 on this Windows box (the GUI log, 2026-09-27 — full 64-hex digests)
+    /// and the real asset name, so the pending stub is tested at the length it prints.
+    fn real_held_row() -> String {
+        crate::state::held_failed(
+            "tree_root mismatch: expected \
+             4f28d8d2926c281a46b2a5658cd455801f9f35c92de9a69d6f1e0d8000393478, got \
+             d94ed3b079308667f51ac04350908bcc8e0f7c3a38d7cdc384f0c66bd8340075",
+            "the verified claude-2.1.283-win32-x64 is kept and the row is held until its \
+             signed digests change — retry now: aterm pkg install claude (or aterm pkg \
+             update --retry)",
+        )
+    }
+
+    /// A HELD row (`held: last attempt failed with …; <retry>`) is quoted by `which` as
+    /// the reason nothing runs — the row already names the failure and the retry — and
+    /// said by the pending stub WITHOUT the "the next pass installs it" promise the
+    /// `error` arm makes (41 failed passes behind that promise on one Windows box,
+    /// 2026-09-14..22) and without a bump, which could only make a pass repeat the hold.
+    /// With the real digests and asset name the row is 361 characters, and the stub's
+    /// old single 300-character cap printed `— retr…` with both doors cut off.
+    #[test]
+    fn a_held_row_is_quoted_by_which_and_said_by_the_pending_stub_without_a_promise() {
+        let layout = temp_layout("row");
+        let row = real_held_row();
+        assert!(
+            row.chars().count() > PENDING_ERROR_CAP,
+            "the fixture must be long enough to have lost the retry under one cap"
+        );
+        record_status(
+            &layout,
+            "claude",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: row.clone(),
+                tree_root: String::new(),
+            },
+            "bootstrap install claude: held".into(),
+        );
+        // `which`: arm 4 (a recorded row with no shim) quotes the row.
+        let line = which_line(&layout, "claude", None).unwrap();
+        assert_eq!(line, format!("claude → (nothing runs) — {row}"));
+        assert!(!line.contains("next pass"), "{line}");
+
+        // The pending stub: the row, verbatim, and nothing promised.
+        let mut said: Vec<String> = Vec::new();
+        let mut sink = |l: String| said.push(l);
+        let mut io = PendingIo {
+            say: &mut sink,
+            wait: false,
+        };
+        assert_eq!(pending_state(&layout, "claude", &mut io), PendingNext::Done);
+        let all = said.join("\n");
+        // The last line is the hold (the program's own introduction comes first).
+        assert_eq!(
+            said.last().map(String::as_str),
+            Some(format!("atpkg: claude is {row} — Settings ▸ Packages shows details.").as_str()),
+            "a real row fits both caps: the failure, digests whole, and the retry whole"
+        );
+        assert!(
+            all.contains(
+                "retry now: aterm pkg install claude (or aterm pkg update --retry) — Settings"
+            ),
+            "both retries survive: {all}"
+        );
+        assert!(
+            !all.contains("FAILED") && !all.contains("next pass") && !all.contains("retries it"),
+            "no promise a pass cannot keep: {all}"
+        );
+        assert!(
+            !layout.prefix.join("bump").exists(),
+            "no bump: a pass can only repeat the hold"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// The stub caps the failure and never the retry: a failure longer than its cap is
+    /// elided, and the retry after it still prints whole.
+    #[test]
+    fn the_held_stub_line_caps_the_failure_and_prints_the_retry_whole() {
+        let how = "the verified claude-2.1.283-win32-x64 is kept and the row is held until its \
+                   signed digests change — retry now: aterm pkg install claude (or aterm pkg \
+                   update --retry)";
+        let long_why = "signer refused: ".to_string() + &"x".repeat(3 * HELD_WHY_CAP);
+        let row = crate::state::held_failed(&long_why, how);
+        let held = row.strip_prefix(crate::state::HELD_FAILED_PREFIX).unwrap();
+        let line = held_stub_line("claude", held);
+        let why_shown: String = long_why.chars().take(HELD_WHY_CAP).collect();
+        assert_eq!(
+            line,
+            format!(
+                "atpkg: claude is held: last attempt failed with {why_shown}…; {how} — \
+                 Settings ▸ Packages shows details."
+            )
+        );
+        // A row with no seam at all (not one atpkg writes): the failure half, capped.
+        let bare = held_stub_line("claude", &"y".repeat(3 * HELD_WHY_CAP));
+        assert!(
+            bare.ends_with("y… — Settings ▸ Packages shows details."),
+            "{bare}"
+        );
+    }
+
+    /// A member the memo HELD is the bootstrap lane's SKIP, not its failure: the
+    /// canonical row lands in the record (with the pass outcome naming it), no `error:`
+    /// head is put on it, and the hard-failure count it contributes is 0 — so a pass
+    /// that met a hold exits clean and the window waits its 6 hours instead of re-running
+    /// a "failed" pass on its failure backoff, 10 minutes doubling to 2 hours (41 of
+    /// those, 2026-09-14..22). `doctor` still counts the row as a problem, which is where
+    /// the retry belongs.
+    #[test]
+    fn a_held_member_is_the_bootstrap_lanes_skip_not_its_failure() {
+        let layout = temp_layout("skip");
+        let row = crate::state::held_failed(
+            "tree_root mismatch: expected 15c4, got 3a44",
+            "retry now: aterm pkg install claude (or aterm pkg update --retry)",
+        );
+        assert_eq!(skip_held_member(&layout, "claude", row.clone()), 0);
+        let status = crate::status::read(&layout).expect("the row was recorded");
+        let recorded = status.programs.get("claude").expect("claude's row");
+        assert_eq!(recorded.state, row, "the canonical row, verbatim");
+        assert_eq!(recorded.installed_build, None, "nothing was installed");
+        assert!(
+            !recorded.state.starts_with("error"),
+            "no `error:` head on a hold: {}",
+            recorded.state
+        );
+        assert!(
+            status
+                .outcome
+                .contains("bootstrap install claude: held: last attempt failed with"),
+            "the pass outcome names the hold: {}",
+            status.outcome
+        );
+        assert!(
+            crate::doctor::recorded_problems(Some(&status))
+                .iter()
+                .any(|p| p.starts_with("claude: held: last attempt failed with")),
+            "doctor still counts the held member as a problem"
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// `update --retry` forgets the digest-refusal memos — the named program's, or every
+    /// program's — and says how many; a bare `--retry` with none recorded says so too.
+    #[test]
+    fn update_retry_forgets_the_memos_and_says_how_many() {
+        let layout = temp_layout("retry");
+        for (program, build) in [("claude", 2026092201u64), ("codex", 2026092201)] {
+            crate::store::record_held_refusal(
+                &layout.build_dir(program, build),
+                "aa",
+                "bb",
+                "tree_root mismatch: expected bb, got cc",
+                1_000,
+            )
+            .unwrap();
+        }
+        assert_eq!(crate::store::clear_stage_refusals(&layout, "claude"), 1);
+        assert_eq!(crate::store::clear_stage_refusals(&layout, "claude"), 0);
+        assert_eq!(crate::store::clear_all_stage_refusals(&layout), 1);
+        assert_eq!(crate::store::clear_all_stage_refusals(&layout), 0);
+        // …and the vendor lane's own memo, the refusal a vendor-direct program's stamp
+        // keeps, which the install door forgets too.
+        crate::vendor_direct::ProgramStamp::record_refusal(
+            &layout,
+            "claude",
+            "signer refused: bin/claude is not signed",
+            crate::vendor_direct::Version::parse("2.1.280").unwrap(),
+            &"a".repeat(64),
+        )
+        .unwrap();
+        assert!(
+            forget_vendor_refusal(&layout, "claude"),
+            "a recorded one goes"
+        );
+        assert!(
+            !forget_vendor_refusal(&layout, "claude"),
+            "and says so once"
+        );
+        assert!(
+            !forget_vendor_refusal(&layout, "ay"),
+            "an index program keeps no stamp"
+        );
+        assert!(retry_line(0).contains("no held or cooled-down digest refusal"));
+        assert!(retry_line(1).contains("forgot 1 digest refusal;"));
+        assert!(retry_line(2).contains("forgot 2 digest refusals;"));
+        // The flag is admitted at the dispatch edge and named by the usage line.
+        let (_, allowed) = NAME_TAKING_VERBS
+            .iter()
+            .find(|(v, _)| *v == "update")
+            .unwrap();
+        assert!(allowed.contains(&"--retry"));
+        assert!(verb_usage("update").unwrap().contains("--retry"));
+        // The one-operand gate counts the flag out, in either position, and still
+        // refuses a second NAME at the edge, before the store lock.
+        let argv = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(at_most_one_operand(&argv(&["claude", "--retry"]), "update").is_none());
+        assert!(at_most_one_operand(&argv(&["--retry", "claude"]), "update").is_none());
+        assert!(at_most_one_operand(&argv(&["--retry"]), "update").is_none());
+        assert_eq!(
+            at_most_one_operand(&argv(&["ta", "tb", "--retry"]), "update"),
+            Some(ExitCode::from(2))
+        );
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+
+    /// `update --retry <operand>` admits the name BEFORE it forgets anything: an operand
+    /// that is not one directory name is refused (exit 2) with nothing forgotten or run,
+    /// and the store's clear refuses it too, so a memo outside `store/` — reached as
+    /// `store/../outside`, or on Windows as a drive-relative `C:x` — survives every door
+    /// that clears by name.
+    #[test]
+    fn update_retry_refuses_a_path_before_forgetting_anything() {
+        let layout = temp_layout("retry-path");
+        // `store/` exists, so `store/../outside` resolves on Unix too — without the gate
+        // the clear below WOULD reach the memo, which is what makes this pass mean it.
+        std::fs::create_dir_all(layout.prefix.join("store")).unwrap();
+        let outside = layout.prefix.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let memo = outside.join("2026092201.refused");
+        std::fs::write(&memo, b"not the store's\n").unwrap();
+        for traversal in ["../outside", "..\\outside", "..", "", "."] {
+            assert_eq!(
+                refuse_retry_operand(traversal),
+                Some(ExitCode::from(2)),
+                "{traversal:?} is not a program name"
+            );
+            assert_eq!(
+                crate::store::clear_stage_refusals(&layout, traversal),
+                0,
+                "{traversal:?}"
+            );
+        }
+        assert!(memo.is_file(), "the memo outside the store survives");
+        // A drive-relative operand carries no separator, yet on Windows the join leaves the
+        // store (`store.join("C:")` IS `C:`, the current directory of drive C), so it is
+        // refused there with nothing forgotten; on Unix it is a directory name inside the
+        // store. The first assertion is what makes the Windows refusal mean it.
+        let store = layout.prefix.join("store");
+        for drive in ["C:", "C:x", "C:.."] {
+            let escapes = !store.join(drive).starts_with(&store);
+            assert_eq!(
+                escapes,
+                cfg!(windows),
+                "{drive:?}: the join leaves the store"
+            );
+            assert_eq!(
+                refuse_retry_operand(drive).is_some(),
+                escapes,
+                "{drive:?} is a program name only where it stays in the store"
+            );
+            if escapes {
+                assert_eq!(
+                    crate::store::clear_stage_refusals(&layout, drive),
+                    0,
+                    "{drive:?}"
+                );
+            }
+        }
+        for name in ["claude", "trust-cg", "alab-ty"] {
+            assert_eq!(refuse_retry_operand(name), None, "{name} is a program name");
+        }
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     /// THE PRODUCTION HALF of this file, for the source scans below.
@@ -15994,7 +16593,7 @@ mod tests {
         // verbs unable to), and the usage table names no verb that does not dispatch.
         for verb in VERBS {
             assert!(
-                usage_of(verb).is_some(),
+                verb_usage(verb).is_some(),
                 "verb `{verb}` has no VERB_USAGE entry, so `atpkg {verb} --help` \
                  cannot say what it accepts"
             );
@@ -16012,7 +16611,7 @@ mod tests {
         // NAME is checked, not the whole spelling: a usage line may collapse values into
         // one `--opt=a|b|c`.
         for (verb, allowed) in NAME_TAKING_VERBS {
-            let Some(usage) = usage_of(verb) else {
+            let Some(usage) = verb_usage(verb) else {
                 panic!("{verb} takes flags but has no usage line");
             };
             for flag in *allowed {
@@ -16035,7 +16634,7 @@ mod tests {
             // belongs to `scan` learns it from a usage error instead.
             ("noindex", &["--depth", "--dry-run", "--all"][..]),
         ] {
-            let usage = usage_of(verb).expect("visible option parser has usage");
+            let usage = verb_usage(verb).expect("visible option parser has usage");
             for flag in flags {
                 assert!(
                     usage.contains(flag),
@@ -16202,7 +16801,7 @@ mod tests {
         // usage error for a verb the roster itself just offered them.
         for verb in dispatch_roster() {
             assert!(
-                usage_of(verb).is_some(),
+                verb_usage(verb).is_some(),
                 "`atpkg help {verb}` would now exit 2 for a verb atpkg dispatches"
             );
         }
@@ -16923,7 +17522,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        crate::activate::activate_channel(&layout, "stable", &build).unwrap();
+        crate::activate::activate_build(&layout, &build).unwrap();
         crate::store::mark_build_ready(&build).unwrap();
         record_status(
             &layout,
@@ -17737,7 +18336,13 @@ mod tests {
         // The hooks written (what every pass does): the source line, and the rc's wiring
         // makes no difference — an rc block is never written here, and the remedy is the
         // same one the block itself runs.
-        crate::hooks::write_hooks(&shell_d, &layout.bin_dir(), &layout.agents_dir()).unwrap();
+        crate::hooks::write_hooks(
+            &shell_d,
+            &layout.bin_dir(),
+            &layout.agents_dir(),
+            &layout.reroute_dir(),
+        )
+        .unwrap();
         assert_eq!(
             crate::hooks::rc_hook_wired(&home, "zsh"),
             Some((false, "00-atpkg.zsh"))
@@ -18282,20 +18887,31 @@ mod tests {
     }
 
     /// `aterm pkg which` for a REROUTED upstream name (design S6, philosophy §4): the
-    /// answer is the row — the branded command(s) with `<args>`, the escape variable —
-    /// and the stub's state, for a name the deny-list refuses (`cargo`) and one it admits
-    /// (`rustfmt`) alike; a foreign occupant is named, never claimed; every other name
-    /// keeps its behaviour (`rustup` is not a row and stays refused as a tool name).
+    /// answer is the row — the branded command(s) with `<args>`, the escape where an
+    /// upstream copy on PATH makes it reach something — and the stub's state, for a name
+    /// the deny-list refuses (`cargo`) and one it admits (`rustfmt`) alike; a foreign
+    /// occupant is named, never claimed; every other name keeps its behaviour (`rustup` is
+    /// not a row and stays refused as a tool name).
     #[cfg(unix)]
     #[test]
     fn which_answers_a_rerouted_name_from_the_table() {
         let layout = temp_layout("which-reroute");
         let empty = std::ffi::OsString::new();
+        // Upstream copies outside the prefix: the escape reaches them.
+        let upstream = layout.prefix.with_extension("upstream");
+        let _ = std::fs::remove_dir_all(&upstream);
+        std::fs::create_dir_all(&upstream).unwrap();
+        for name in ["cargo", "rustfmt"] {
+            let exe = upstream.join(name);
+            std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let with_upstream = upstream.clone().into_os_string();
         // Before any stub is laid the row still answers, and says so.
         let line = which_line(&layout, "cargo", Some(&empty)).unwrap();
         assert!(line.contains("(reroute stub, missing)"), "{line}");
         crate::reroute::lay(&layout).unwrap();
-        let cargo = which_line(&layout, "cargo", Some(&empty)).unwrap();
+        let cargo = which_line(&layout, "cargo", Some(&with_upstream)).unwrap();
         assert_eq!(cargo.lines().count(), 1, "{cargo}");
         assert!(
             cargo.starts_with(&format!(
@@ -18316,11 +18932,23 @@ mod tests {
             assert!(!cargo.contains("refused"), "{cargo}");
             assert!(cargo.contains(needle), "{needle:?} missing from {cargo}");
         }
-        let rustfmt = which_line(&layout, "rustfmt", Some(&empty)).unwrap();
+        let rustfmt = which_line(&layout, "rustfmt", Some(&with_upstream)).unwrap();
         assert!(rustfmt.contains("runs 'trustfmt <args>'"), "{rustfmt}");
         assert!(
             rustfmt.contains("`aterm --no-reroute` restores upstream 'rustfmt'"),
             "{rustfmt}"
+        );
+        // No upstream copy on PATH: an `aterm --no-reroute` session has none either, so
+        // no escape is promised — as the stub's own line withholds it.
+        for name in ["rustfmt", "clippy", "cargo"] {
+            let line = which_line(&layout, name, Some(&empty)).unwrap();
+            assert!(!line.contains("aterm --no-reroute"), "{line}");
+        }
+        assert!(
+            which_line(&layout, "rustfmt", Some(&empty))
+                .unwrap()
+                .ends_with("runs 'trustfmt <args>' with one stderr line"),
+            "the clause ends where the escape would have been"
         );
         // A foreign occupant of a row's name: named as such, never claimed as ours.
         std::fs::write(
@@ -18337,6 +18965,7 @@ mod tests {
             "atpkg: \"rustup\" is not a tool name"
         );
         let _ = std::fs::remove_dir_all(&layout.prefix);
+        let _ = std::fs::remove_dir_all(&upstream);
     }
 
     /// A dev-linked program whose own name is not a tool: `which trust` names the checkout
@@ -18731,7 +19360,7 @@ mod tests {
         // 7. The verb is machinery, not vocabulary, and takes no lock of its own.
         assert!(!dispatch_roster().contains(&selfupdate::HIDDEN_VERB));
         assert!(!verb_mutates_store(selfupdate::HIDDEN_VERB));
-        assert_eq!(usage_of(selfupdate::HIDDEN_VERB), None);
+        assert_eq!(verb_usage(selfupdate::HIDDEN_VERB), None);
         assert!(
             !layout.store_lock().exists() && !other.store_lock().exists(),
             "no ending above touches the store lock — only the child does"
@@ -19429,7 +20058,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        crate::activate::activate_channel(layout, "stable", &dir).unwrap();
+        crate::activate::activate_build(layout, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
     }
 
@@ -19461,7 +20090,7 @@ mod tests {
             )
             .unwrap();
             crate::store::mark_build_ready(&dir).unwrap();
-            crate::activate::activate_channel(&layout, "stable", &dir).unwrap();
+            crate::activate::activate_build(&layout, &dir).unwrap();
         };
         flip_only("claude", v282);
         flip_only("ay", 19);
@@ -19510,7 +20139,7 @@ mod tests {
         )
         .unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
-        crate::activate::activate_channel(layout, "stable", &dir).unwrap();
+        crate::activate::activate_build(layout, &dir).unwrap();
     }
 
     /// THE ROW FOLLOWS THE ROLL-FORWARD, AND AN OLD ROOT NEVER ATTESTS A NEW BUILD. ay 18 was
@@ -19777,7 +20406,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        crate::activate::activate_channel(layout, "stable", dir).unwrap();
+        crate::activate::activate_build(layout, dir).unwrap();
     }
 
     /// REPAIR NEVER REVIVES A REVOKED BUILD (audit K2, 2026-09-12).
@@ -20020,7 +20649,7 @@ mod tests {
             crate::activate::Aliases::Alab,
         )
         .unwrap();
-        crate::activate::activate_channel(&l, "stable", &d).unwrap();
+        crate::activate::activate_build(&l, &d).unwrap();
         let ty = crate::store::ToolName::new("ty").unwrap();
         std::fs::remove_file(l.shim(&ty)).unwrap();
         std::fs::remove_file(l.shim(&ty.alias().unwrap())).unwrap();
@@ -20078,7 +20707,7 @@ mod tests {
             crate::activate::Aliases::Alab,
         )
         .unwrap();
-        crate::activate::activate_channel(&l, "stable", &d).unwrap();
+        crate::activate::activate_build(&l, &d).unwrap();
         let lost: &[&str] = if all { &["ty", "tla"] } else { &["ty"] };
         for name in lost {
             let tool = crate::store::ToolName::new(name).unwrap();
@@ -20121,6 +20750,32 @@ mod tests {
         assert_eq!(live_without_shim(&l, "no-such-tool"), None);
     }
 
+    /// A tool a program ships under ANOTHER name (`tla`, shipped by `ty`) answers for its
+    /// lost shim when the caller names the program — the reroute's question for `trustfmt`
+    /// — and only then: a standing shim, a build that does not ship it, or the wrong
+    /// program answers nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_shim_of_a_shipped_tool_answers_for_the_program_that_ships_it() {
+        let (l, d) = seed_ty_with_lost_shim("lost-shim-of", true);
+        let found = live_without_shim_of(&l, "ty", "tla").expect("ty 3007 ships tla");
+        assert_eq!(
+            (found.build, found.binary),
+            (3007, d.join("bin").join("tla"))
+        );
+        assert_eq!(live_without_shim_of(&l, "ty", "trustfmt"), None);
+        assert_eq!(live_without_shim_of(&l, "trust", "tla"), None);
+        assert_eq!(live_without_shim(&l, "tla"), None, "tla is not a program");
+        let _ = std::fs::remove_dir_all(&l.prefix);
+        let (l, _) = seed_ty_with_lost_shim("lost-shim-of-standing", false);
+        assert_eq!(
+            live_without_shim_of(&l, "ty", "tla"),
+            None,
+            "tla's shim stands"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     /// AN AGENT PROGRAM'S LOST `bin/` SHIM IS NOT "NOTHING RUNS" WHERE ITS TWIN LEADS
     /// (review, 2026-09-24). The `agents/` twin execs the store build, not `bin/claude`,
     /// so with `agents/` ahead on PATH the managed copy still runs and `which` names the
@@ -20143,7 +20798,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        crate::activate::activate_channel(&l, "stable", &d).unwrap();
+        crate::activate::activate_build(&l, &d).unwrap();
         let claude = crate::store::ToolName::new("claude").unwrap();
         let twin = l.agent_shim(&claude);
         assert!(
@@ -20386,7 +21041,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        crate::activate::activate_channel(&l, "stable", &trust).unwrap();
+        crate::activate::activate_build(&l, &trust).unwrap();
         assert!(
             matches!(run_target(&l, "ty"), RunTarget::NotInstalled),
             "a bundle's ty is not program ty"
@@ -20738,7 +21393,7 @@ mod tests {
     /// REPAIR RESPECTS A ROLLBACK (audit K2, 2026-09-12). `rollback` keeps the build it
     /// rolled off until gc; repair must re-lay the build `current` selects, not the highest
     /// one on disk — or it silently undoes the rollback and mints the very
-    /// `ChannelShimMismatch` doctor then reports.
+    /// `LinkShimMismatch` doctor then reports.
     #[test]
     fn repair_respects_rollback() {
         let l = temp_layout("repair-rollback");
@@ -20788,7 +21443,7 @@ mod tests {
         std::fs::write(bin.join("rustc"), b"frontend / signature: rustc_").unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         crate::activate::atomic_symlink(&dir, &layout.program_current("trust")).unwrap();
-        crate::activate::activate_channel(layout, "stable", &dir).unwrap();
+        crate::activate::activate_build(layout, &dir).unwrap();
         layout.ensure_dir(&layout.bin_dir()).unwrap();
         for (name, tool) in [
             ("trustc", "trustc"),
@@ -21626,7 +22281,7 @@ mod tests {
         );
         assert_eq!(cmd_machine(&argv("apply --dry-run")), ExitCode::from(2));
         assert_eq!(cmd_machine(&argv("apply extra")), ExitCode::from(2));
-        assert!(usage_of("machine").is_some_and(|u| u.contains("apply")));
+        assert!(verb_usage("machine").is_some_and(|u| u.contains("apply")));
     }
 
     /// The `noindex` grammar, as a table: the default subcommand (`scan`), the default
@@ -23301,8 +23956,17 @@ mod tests {
         let archive = make_archive(dir, prog, build);
         let sha = crate::tree::file_sha256(&archive).unwrap();
         let probe = dir.join(format!("probe-{prog}"));
-        crate::extract::extract_tar_zst(&archive, &probe, 10_000_000, 10_000).unwrap();
-        let root = crate::tree::tree_root(&probe).unwrap();
+        // The extractor's own fold — what a producer signs; on Windows it folds the
+        // declared modes the plain walk cannot read (`crate::tree`'s module docs).
+        let root = crate::extract::extract_tar_zst_tree(
+            &archive,
+            &probe,
+            10_000_000,
+            10_000,
+            crate::extract::ExtractOptions::default(),
+        )
+        .unwrap()
+        .root();
         let _ = std::fs::remove_dir_all(&probe);
         let body = format!(
             "schema = 2\nprogram = \"{prog}\"\nversion = \"0.1\"\nbuild_number = {build}\n\
@@ -24507,7 +25171,6 @@ mod tests {
             [
                 std::fs::read_link(layout.program_current("ta")).unwrap(),
                 std::fs::read_link(layout.program_current("tb")).unwrap(),
-                std::fs::read_link(layout.channel_current("stable")).unwrap(),
             ]
         };
         let before = links(&layout);
@@ -28434,6 +29097,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
+    /// THE DEFAULT SET NAMES A MISSING C TOOLCHAIN, over the `PATH` it ran with: a stubbed
+    /// PATH with no `cc` adds `doctor`'s own sentence and its one act; one whose `cc`
+    /// answers adds nothing; one whose `cc` refuses names what it said. (Before, the set
+    /// said "complete" over a machine whose first `targo build` died in a build script.)
+    /// The probe's bound is widened the way `prereq`'s answering tests widen it: the
+    /// first exec of a script this test just wrote waits on the system's code
+    /// assessment, which a loaded machine stretches past the production 5 s — and an
+    /// unanswered probe names nothing, so the refusal case would fail and the answering
+    /// one pass vacuously.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_set_tail_names_a_missing_c_toolchain() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let host = crate::prereq::CcHost {
+            bound: std::time::Duration::from_secs(120),
+            ..crate::prereq::CcHost::this_machine()
+        };
+        let root =
+            std::env::temp_dir().join(format!("atpkg-default-set-cc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let bare = root.join("bare");
+        std::fs::create_dir_all(&bare).unwrap();
+        let line = default_set_prereq_line(Some(bare.as_os_str()), &host).expect("no cc is named");
+        assert_eq!(
+            line,
+            format!("atpkg: {}", crate::prereq::CcVerdict::NoDriver.line())
+        );
+        assert!(
+            line.ends_with(&format!("fix: {}", crate::prereq::act())),
+            "{line}"
+        );
+        let stub = |dir: &str, body: &str| {
+            let dir = root.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("cc"), format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(dir.join("cc"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            dir
+        };
+        let good = stub("good", "echo cc 1");
+        assert_eq!(default_set_prereq_line(Some(good.as_os_str()), &host), None);
+        let bad = stub("bad", "echo 'cc: cannot find crt1.o' >&2; exit 1");
+        let line =
+            default_set_prereq_line(Some(bad.as_os_str()), &host).expect("a refusal is named");
+        assert!(line.contains("(cc: cannot find crt1.o)"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// NOT COMPLETE WHILE A VENDOR PROGRAM IS STILL TO COME: the explicit toolset verb
     /// over a vendor that did not serve its head exits 1 naming it — never "already
     /// complete" — and still adopts the set its index lane completed.
@@ -28570,7 +29281,6 @@ mod tests {
             let lane = lane::Lane {
                 layout: &layout,
                 fetcher: &f,
-                channel: "stable",
                 triple: world::triple(),
                 policy: &none,
                 trust: &trust,
@@ -28585,12 +29295,12 @@ mod tests {
         };
         let rollback = || rollback_in(&layout, "stable", "claude", &no_index);
         let active = || crate::active_builds(&layout).get("claude").copied();
-        let err = lane::roll_back_by_hand(&layout, "stable", &none, spec).unwrap_err();
+        let err = lane::roll_back_by_hand(&layout, &none, spec).unwrap_err();
         assert!(err.contains("not installed"), "{err}");
         assert_eq!(rollback(), ExitCode::from(1));
         f.publish_claude("2.1.281", &native_exe("claude 2.1.281"));
         assert!(matches!(install().verdict, Verdict::Installed { .. }));
-        let err = lane::roll_back_by_hand(&layout, "stable", &none, spec).unwrap_err();
+        let err = lane::roll_back_by_hand(&layout, &none, spec).unwrap_err();
         assert_eq!(
             err,
             "no retained claude build below 2.1.281 — claude 2.1.281 stays"
@@ -28601,7 +29311,7 @@ mod tests {
         // The retained build is yanked by the latch the verb reads: refused by version,
         // and nothing moves.
         let yanked = Policy::from_entries(["claude@2.1.281"]);
-        let err = lane::roll_back_by_hand(&layout, "stable", &yanked, spec).unwrap_err();
+        let err = lane::roll_back_by_hand(&layout, &yanked, spec).unwrap_err();
         assert_eq!(
             err,
             "claude 2.1.281 is yanked and no older build is retained — claude 2.1.282 stays"
@@ -28692,7 +29402,6 @@ mod tests {
             let lane = lane::Lane {
                 layout: &layout,
                 fetcher: &f,
-                channel: "stable",
                 triple: world::triple(),
                 policy: &none,
                 trust: &trust,
@@ -28756,7 +29465,6 @@ mod tests {
         let lane = lane::Lane {
             layout: &layout,
             fetcher: &f,
-            channel: "stable",
             triple: world::triple(),
             policy: &none,
             trust: &trust,
@@ -28773,7 +29481,7 @@ mod tests {
         };
         // A signed yank on the legacy number refuses it, and nothing moves.
         let yanked = Policy::from_entries(["claude@2026091901"]);
-        let err = lane::roll_back_by_hand(&layout, "stable", &yanked, spec).unwrap_err();
+        let err = lane::roll_back_by_hand(&layout, &yanked, spec).unwrap_err();
         assert_eq!(
             err,
             "claude build 2026091901 is yanked and no older build is retained — claude \
@@ -28849,7 +29557,6 @@ mod tests {
             let lane = lane::Lane {
                 layout,
                 fetcher: f,
-                channel: "stable",
                 triple: world::triple(),
                 policy: &none,
                 trust: &trust,
@@ -29049,7 +29756,6 @@ mod tests {
                 let lane = lane::Lane {
                     layout: &layout,
                     fetcher: &f,
-                    channel: "stable",
                     triple: world::triple(),
                     policy: &none,
                     trust: &trust,

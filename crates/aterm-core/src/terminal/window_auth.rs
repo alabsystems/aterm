@@ -24,11 +24,16 @@
 //! # The structural gate
 //!
 //! [`WindowOpsCapability`] is a zero-sized token whose only constructor
-//! is [`WindowMintAuthority::try_mint`], a `pub(super)`-scoped function
-//! that returns `Some(WindowOpsCapability)` iff the caller passed
-//! `allow_window_ops = true`. The minting authority is itself a
-//! zero-sized unit struct and has no runtime state — it exists solely
-//! to funnel the bool through a single typed choke-point.
+//! is [`WindowMintAuthority::try_mint_with_engine`], a `pub(super)`-scoped
+//! function that returns `Some(WindowOpsCapability)` iff the POLICY GATE it
+//! is handed resolves open: an installed policy's verdict for the `CSI Ps t`
+//! probe decides first (a sequence-specific `Execute` rule mints even with
+//! `allow_window_ops` false; a rule with any other response refuses even with
+//! it true), and `allow_window_ops` decides only when no rule matched, when
+//! only a universal wildcard `Execute` rule did, or when no policy is
+//! installed. The minting authority is itself a zero-sized unit struct and
+//! has no runtime state — it exists solely to funnel that decision through a
+//! single typed choke-point.
 //!
 //! Every call site that reaches
 //! [`super::handler::TerminalHandler::invoke_window_callback`] must
@@ -36,20 +41,28 @@
 //! is private and the constructor is `pub(super)`, no code outside the
 //! terminal module can name — much less construct — a capability. The
 //! parser data path (`ActionSink` trait in [`crate::parser`]) cannot
-//! reach [`WindowMintAuthority::try_mint`]: the trait only gives access
+//! reach [`WindowMintAuthority::try_mint_with_engine`]: the trait only gives access
 //! to `&mut dyn ActionSink`, which does not expose this type.
 //!
-//! # Semantics preserved
+//! # Semantics
 //!
-//! This is a refactor, not a behavior change. The existing
-//! `allow_window_ops` boolean remains authoritative and is the only
-//! input to [`WindowMintAuthority::try_mint`]. When the flag is true,
-//! a capability is minted and XTWINOPS subcommands 1–21 proceed per
-//! the existing handler logic. When the flag is false,
-//! [`WindowMintAuthority::try_mint`] returns `None` and the capability-
-//! gated code paths (the `invoke_window_callback` call sites) are
-//! structurally unreachable. The title-stack sub-operations (22/23),
-//! which do not invoke the callback, continue to run regardless.
+//! The mint takes two inputs: the policy gate for the dispatched `Ps`
+//! ([`super::policy_gates::PolicyState::xtwinops_gate`], resolved once per
+//! installed policy) and the host's `allow_window_ops` boolean, which is the
+//! fallback the gate resolves to when policy does not decide (see
+//! [`WindowMintAuthority::try_mint_with_engine`] for the full table). With no
+//! policy installed — the shipping default — the capability exists iff
+//! `allow_window_ops` is true. When it is minted, XTWINOPS subcommands 1–21
+//! proceed per the handler logic; when it is not, the capability-gated code
+//! paths (the `invoke_window_callback` call sites) are structurally
+//! unreachable. The title-stack sub-operations (22/23), which do not invoke
+//! the callback, run regardless.
+//!
+//! Two consumers mint: the XTWINOPS dispatch itself (`handler_window.rs`,
+//! gate for the dispatched `Ps`), and the XTSMGRAPHICS sixel-geometry read
+//! (`Pi=2, Pa=1`, `handler_xtsmgraphics.rs`), which reports the same text-area
+//! pixel size `CSI 14 t` does and so rides the `Ps = 14` gate: without the
+//! capability it answers the maximum dimension.
 //!
 //! # Relation to other capabilities
 //!
@@ -65,9 +78,10 @@
 /// Zero-sized proof that the calling context is authorized to invoke
 /// the window callback for an XTWINOPS dispatch.
 ///
-/// Minted only by [`WindowMintAuthority::try_mint`] when
-/// `allow_window_ops = true`. Consumers outside the terminal module
-/// cannot construct one; the type's internal field is private.
+/// Minted only by [`WindowMintAuthority::try_mint_with_engine`] when the
+/// policy gate resolves open (`allow_window_ops` when policy does not
+/// decide). Consumers outside the terminal module cannot construct one; the
+/// type's internal field is private.
 ///
 /// Required by [`super::handler::TerminalHandler::invoke_window_callback`]
 /// (after the CF-008 refactor). Passed by shared reference so multiple
@@ -88,14 +102,14 @@ pub(super) struct WindowOpsCapability {
 ///
 /// Held implicitly by the terminal module (no field on
 /// [`super::Terminal`] is required since the authority has no state).
-/// Its [`Self::try_mint`] is the single entry point through which a
+/// Its [`Self::try_mint_with_engine`] is the single entry point through which a
 /// capability can come into existence; by limiting the constructors
 /// to this location, the audit surface for "who can talk to the
 /// window callback" collapses to one function.
 ///
 /// The authority is itself a ZST to emphasize that it does not hold
-/// policy — it *consults* policy (the `allow_window_ops` bool passed
-/// in) and produces a capability iff that policy says yes.
+/// policy — it *consults* policy (the gate and the `allow_window_ops`
+/// fallback passed in) and produces a capability iff that policy says yes.
 #[derive(Debug, Default)]
 pub(super) struct WindowMintAuthority {
     _seal: (),
@@ -114,34 +128,9 @@ impl WindowMintAuthority {
         Self { _seal: () }
     }
 
-    /// Attempt to mint a [`WindowOpsCapability`] given the current value
-    /// of the host's `allow_window_ops` policy bit.
-    ///
-    /// Returns `Some` iff `allow_window_ops` is `true`. The bool is the
-    /// one authoritative input: preserving CF-008's refactor contract,
-    /// this function does not introduce any additional policy logic.
-    ///
-    /// # Structural guarantee
-    ///
-    /// Because this is the only public constructor of
-    /// [`WindowOpsCapability`] and it is `pub(super)` (reachable only
-    /// from the terminal module), no PTY-origin byte and no external
-    /// crate can produce a capability. The parser's `ActionSink` trait
-    /// does not expose this method; adding a new XTWINOPS handler that
-    /// forgets to consult [`Self::try_mint`] produces a compile error
-    /// at the `invoke_window_callback` call site.
-    #[inline]
-    #[must_use]
-    pub(super) fn try_mint(&self, allow_window_ops: bool) -> Option<WindowOpsCapability> {
-        let _ = self;
-        if allow_window_ops {
-            Some(WindowOpsCapability { _seal: () })
-        } else {
-            None
-        }
-    }
-
-    /// Engine-consulting variant of [`Self::try_mint`] (#7994).
+    /// Mint a [`WindowOpsCapability`] (#7994) — the one mint, so a new
+    /// XTWINOPS-class handler that forgets to consult it has no capability to
+    /// hand `invoke_window_callback` and does not compile.
     ///
     /// Consults the [`aterm_policy::engine::PolicyEngine`] first with a
     /// `CSI t` (XTWINOPS) probe at the given `origin`. Behavior:
@@ -159,7 +148,7 @@ impl WindowMintAuthority {
     ///   backward-compat guarantee.
     ///
     /// With no policy installed, `gate` is [`super::policy_bridge::BridgeDecision::Fallback`]
-    /// and behavior is identical to [`Self::try_mint`].
+    /// and the capability exists iff `allow_window_ops` is `true`.
     ///
     /// # Why the caller passes a decision instead of an engine
     ///
@@ -202,6 +191,7 @@ pub(super) fn probe_xtwinops(ps: u16) -> aterm_policy::selector::DispatchedSeque
 
 #[cfg(test)]
 mod tests {
+    use super::super::policy_bridge::BridgeDecision::Fallback;
     use super::*;
     use aterm_policy::engine::PolicyEngine;
     use aterm_policy::{
@@ -227,7 +217,7 @@ mod tests {
         }
     }
 
-    /// `try_mint(false)` returns `None`. This is the structural mirror
+    /// With no policy rule, `allow_window_ops = false` mints nothing. This is the structural mirror
     /// of the existing `if !self.modes.allow_window_ops { return ... }`
     /// deny branch in [`super::handler_window`]: without the policy bit,
     /// no capability exists, so no call site can reach
@@ -235,17 +225,17 @@ mod tests {
     #[test]
     fn disallowed_policy_mints_no_capability() {
         let auth = WindowMintAuthority::new();
-        assert!(auth.try_mint(false).is_none());
+        assert!(auth.try_mint_with_engine(Fallback, false).is_none());
     }
 
-    /// `try_mint(true)` returns `Some`. When the host has opted into
+    /// With no policy rule, `allow_window_ops = true` mints. When the host has opted into
     /// window operations, the capability is freely constructible — the
     /// gate is strictly an encoding of the existing boolean, not an
     /// additional runtime check.
     #[test]
     fn allowed_policy_mints_capability() {
         let auth = WindowMintAuthority::new();
-        assert!(auth.try_mint(true).is_some());
+        assert!(auth.try_mint_with_engine(Fallback, true).is_some());
     }
 
     /// The capability and authority are both zero-sized, so the
@@ -257,19 +247,21 @@ mod tests {
         assert_eq!(std::mem::size_of::<WindowMintAuthority>(), 0);
     }
 
-    /// Minting is a pure function of the policy bit: repeated calls
-    /// with the same input produce the same outcome (either both
-    /// `Some` or both `None`). This documents that
-    /// [`WindowMintAuthority`] holds no hidden state — the only input
-    /// is the explicit `allow_window_ops` argument.
+    /// Minting is a pure function of its explicit inputs (the policy gate
+    /// and the `allow_window_ops` fallback): repeated calls with the same
+    /// inputs produce the same outcome (either both `Some` or both `None`).
+    /// This documents that [`WindowMintAuthority`] holds no hidden state.
     #[test]
     fn minting_is_deterministic_in_policy_bit() {
         let auth = WindowMintAuthority::new();
         assert_eq!(
-            auth.try_mint(false).is_some(),
-            auth.try_mint(false).is_some()
+            auth.try_mint_with_engine(Fallback, false).is_some(),
+            auth.try_mint_with_engine(Fallback, false).is_some()
         );
-        assert_eq!(auth.try_mint(true).is_some(), auth.try_mint(true).is_some());
+        assert_eq!(
+            auth.try_mint_with_engine(Fallback, true).is_some(),
+            auth.try_mint_with_engine(Fallback, true).is_some()
+        );
     }
 
     #[test]

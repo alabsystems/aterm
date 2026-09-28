@@ -3482,27 +3482,25 @@ enum ParentWitness {
 /// strictly before the pid can be recycled — and on macOS its only replacement
 /// value is 1, permanently (2). But it provides both ONLY to a fork child.
 ///
-/// BLOCKER B1 (see the KNOWN DEFECT note at the `spawn` in
-/// `app_update_handoff::run_handoff_worker`): a successor launched through
-/// LaunchServices has ppid 1 from birth, so `getppid()` cannot name its parent
-/// and the old predicate refused it at admission and then fail-stopped it.
-/// The repair is to stop conflating the two properties:
+/// B1 (closed by this function; see "WHY THIS `spawn` IS STILL HERE" at the
+/// `spawn` in `app_update_handoff::run_handoff_worker`): a successor launched
+/// through LaunchServices has ppid 1 from birth, so `getppid()` cannot name its
+/// parent, and the old predicate refused it at admission and then fail-stopped
+/// it. The repair is to stop conflating the two properties:
 ///
 /// * LIVENESS moves to the birth record, which is transport-independent. It
 ///   discriminates by a kernel-assigned microsecond stamp rather than by a pid,
 ///   so a recycled pid fails it, and it treats a zombie as dead, so its edge is
 ///   still the parent's `exit`.
 ///
-///   ONE PLACE IT IS GENUINELY WEAKER, stated because the alternative is a
-///   comment that lies about a security property: the LEGACY-CAPTURE arm
-///   (`creator == pid`, i.e. today's fork transport) reads `getppid()` and then
-///   `read_process_birth(pid)` as TWO calls, where the predicate it replaces
-///   was a single kernel-atomic comparison. That is a TOCTOU window. Exploiting
-///   it needs the parent to exit, be reaped, and the pid space to wrap ~100k
-///   sequential allocations onto that exact number, all between two adjacent
-///   syscalls — and the commit-pipe EOF backstops it independently. Small, but
-///   not zero, and it is the same race the earlier attempt cited when it
-///   refused to touch B1 at all.
+///   The LEGACY-CAPTURE arm (`creator == pid`, a parent too old to publish its
+///   birth record, on the fork transport) reads `getppid()` and then
+///   `read_process_birth(pid)` as two calls, where the predicate it replaces
+///   was one kernel-atomic comparison. The window between them is closed by
+///   RE-READING the parent link after the birth read (`creator_after`): the
+///   link flips inside the parent's `exit(2)` — before reap, so before the pid
+///   can be recycled — so a link that still names `pid` after the read proves
+///   the record came from the live parent. A link that moved refuses.
 /// * IDENTITY stays with the strongest primitive the successor's actual birth
 ///   situation offers. With a live creator that is still the parent link, and
 ///   the published claim must AGREE with it — unchanged, and unchanged
@@ -3525,13 +3523,17 @@ enum ParentWitness {
 /// function's shape is what B4 extends, not something B4 replaces.
 ///
 /// `creator` is the kernel parent link, taken by the caller so the decision is
-/// testable at both of its arms without needing a ppid-1 process.
+/// testable at both of its arms without needing a ppid-1 process, and
+/// `creator_after` re-reads that link once the birth record is in hand (the
+/// legacy-capture arm's race closure; a test stub can simulate the parent
+/// exiting between the two reads).
 #[cfg(unix)]
 #[must_use]
 fn attest_handoff_parent_from(
     pid: libc::pid_t,
     published: Option<ProcessBirth>,
     creator: libc::pid_t,
+    creator_after: impl FnOnce() -> libc::pid_t,
 ) -> Option<AttestedParent> {
     // pid 1 is never a real handoff parent: it is what reparenting produces.
     if pid <= 1 {
@@ -3552,10 +3554,17 @@ fn attest_handoff_parent_from(
         // reason to fall back to something weaker.
         (Some(_), _) => return None,
         // Legacy outgoing build: it published no birth record, but the parent
-        // link proves this pid is our creator, so the record we read now is
-        // provably the parent's own. Capturing it here is what lets the watch
-        // below stop consulting the process tree.
-        (None, Some(live)) if creator == pid => ParentWitness::Birth(live),
+        // link proves this pid is our creator — and still names it AFTER the
+        // birth read, so the record we read is provably the live parent's own
+        // (the link flips at the parent's exit, before its pid can recycle).
+        // Capturing it here is what lets the watch below stop consulting the
+        // process tree.
+        (None, Some(live)) if creator == pid => {
+            if creator_after() != pid {
+                return None;
+            }
+            ParentWitness::Birth(live)
+        }
         (None, None) if creator == pid => {
             // On macOS a live same-uid process with no readable birth record is
             // a real anomaly (libproc answers for other processes here — the
@@ -3583,7 +3592,8 @@ fn attest_handoff_parent(
     published: Option<ProcessBirth>,
 ) -> Option<AttestedParent> {
     // SAFETY: `getppid` is a side-effect-free libc getter.
-    attest_handoff_parent_from(pid, published, unsafe { libc::getppid() })
+    let parent_link = || unsafe { libc::getppid() };
+    attest_handoff_parent_from(pid, published, parent_link(), parent_link)
 }
 
 /// A handoff parent whose identity was proven at admission. Its fields are
@@ -3796,18 +3806,20 @@ fn parse_named_fd_bytes(entry: &[u8]) -> Option<i32> {
 ///   has members, `kill(-pid)` reaches strangers — the same pid-reuse hazard
 ///   [`AttestedParent`] closes for the parent's identity, except that a process
 ///   GROUP has no kernel birth record to attest.
-/// * THE PARENT CANNOT LEARN THE GROUP EXISTS. The readiness wire is a fixed
+/// * THE PARENT LEARNS THE GROUP ONLY BY ASKING. The readiness wire is a fixed
 ///   proof record the parent computes for itself, so the successor has nowhere
-///   to report its pgid. Until B4's control socket carries that attestation the
-///   parent must treat `kill(pid)` as its only sound signal and `kill(-pid)` as
-///   an unproven optimization — which is precisely the helper sweep B3 exists
-///   for, and it also costs `emergency_kill_and_reap_handoff_child` its
-///   "signal the group before any wait" ordering, whose whole point is that
-///   reaping the leader releases the pid.
+///   to report its pgid; the parent reads it instead, at the moment of use,
+///   against an identity-corroborated pid: `getpgid(pid) == pid`
+///   (`app_update_handoff::candidate_leads_its_own_group`, used by
+///   `kill_corroborated_candidate`). The group SIGKILL is sent only when that
+///   read (or the fork lane's unreaped-child pin) proves `-pid` is the
+///   candidate's own group; otherwise `kill(pid)` alone, and the log says so.
+///   What stays unrecoverable on this lane is the "signal the group before any
+///   wait" ordering `emergency_kill_and_reap_handoff_child` has for a fork
+///   child, whose whole point is that reaping the leader releases the pid.
 ///
-/// So B3 is achievable but not equivalent, and closing the difference is B2/B4
-/// work (name the non-child successor, then carry its attested pgid), not a
-/// local edit to this function.
+/// So B3 is achievable but not equivalent: the ordering window above is the
+/// difference, and it is inherent to a successor the parent did not fork.
 #[cfg(unix)]
 pub(crate) fn prearm_incoming_fds() -> PrearmedIncomingFds {
     let manifest_present = std::env::var_os(ENV_MANIFEST).is_some();
@@ -4410,11 +4422,14 @@ pub(crate) fn commit_and_exit(
             // ON macOS THIS EXIT ALSO ENDS A LAUNCHD JOB. This process is the
             // process of the `application.com.aterm.aterm.*` job LaunchServices
             // created for the instance, so `_exit` makes launchd tear that job
-            // down. That is correct only when the successor owns a job of its
-            // own; while it is a fork child of ours (see the KNOWN DEFECT note
-            // at the `spawn` call in `app_update_handoff::run_handoff_worker`)
-            // it survives as a pid-1 orphan holding this dead job's bootstrap
-            // context. Guarded by `tests/handoff_launchd_job.rs`.
+            // down. On the default out-of-band lane the successor was launched
+            // through LaunchServices and owns a job of its own, so nothing is
+            // lost. Only on the fork FALLBACK lane (taken for the refusals in
+            // `app_update_handoff::out_of_band_lane_refusal`; see "WHY THIS
+            // `spawn` IS STILL HERE" in `run_handoff_worker`) is the successor a
+            // fork child of ours, which survives as a pid-1 orphan holding this
+            // dead job's bootstrap context. Guarded by
+            // `tests/handoff_launchd_job.rs`.
             //
             // This is the protocol's point of no return. `_exit` skips every
             // App/Session destructor that could SIGHUP the handed-off PTYs; the
@@ -5257,6 +5272,7 @@ mod tests {
                         attention: None,
                         questions: None,
                         identity: None,
+                        agent: None,
                     })),
                     focused_path: Vec::new(),
                     zoomed: false,
@@ -5399,8 +5415,7 @@ mod tests {
         ));
 
         // THE POINT: restoring a carried checkpoint really does bring history back.
-        let restored =
-            Terminal::from_checkpoint(&carried, aterm_core::terminal::HostBindings::none());
+        let restored = Terminal::from_checkpoint(&carried);
         assert_eq!(
             restored.grid().scrollback_lines(),
             MAX_HANDOFF_HISTORY_LINES as usize,
@@ -5419,7 +5434,7 @@ mod tests {
     /// before the aterm-scrollback fix.
     #[test]
     fn a_full_styled_row_with_a_combining_mark_or_zwj_is_canonical_on_both_grids() {
-        use aterm_core::terminal::{HostBindings, Terminal};
+        use aterm_core::terminal::Terminal;
 
         for cluster in ["e\u{301}", "\u{1F468}\u{200D}\u{1F4BB}"] {
             let mut t = Terminal::new(55, 149);
@@ -5440,7 +5455,7 @@ mod tests {
                 screen_digest(&[(0, main.clone())]).is_ok(),
                 "{cluster:?}: the wire admits the main grid"
             );
-            let restored = Terminal::from_checkpoint(&main, HostBindings::none());
+            let restored = Terminal::from_checkpoint(&main);
             assert_eq!(restored.row_text(0), Some(row.clone()), "{cluster:?}");
 
             // The same row on the SAVED PRIMARY while an alt-screen app runs.
@@ -5497,10 +5512,7 @@ mod tests {
         };
         let parsed = parse_checkpoint_meta(&carry).expect("modern strict meta");
         let rebuilt_checkpoint = parsed.into_checkpoint(checkpoint.grid.clone(), None);
-        let mut restored = aterm_core::terminal::Terminal::from_checkpoint(
-            &rebuilt_checkpoint,
-            aterm_core::terminal::HostBindings::none(),
-        );
+        let mut restored = aterm_core::terminal::Terminal::from_checkpoint(&rebuilt_checkpoint);
         source.resize(6, 120);
         restored.resize(6, 120);
         for terminal in [&mut source, &mut restored] {
@@ -6374,17 +6386,17 @@ mod tests {
         let ours = libc::pid_t::try_from(std::process::id()).expect("our own pid");
 
         assert!(
-            attest_handoff_parent_from(creator, None, creator).is_some(),
+            attest_handoff_parent_from(creator, None, creator, || creator).is_some(),
             "the live creator itself is always attestable"
         );
         assert_eq!(
-            attest_handoff_parent_from(ours, None, creator),
+            attest_handoff_parent_from(ours, None, creator, || creator),
             None,
             "a live creator that is not the claimed pid refuses the claim"
         );
         for claimed in [0, 1] {
             assert_eq!(
-                attest_handoff_parent_from(claimed, None, claimed),
+                attest_handoff_parent_from(claimed, None, claimed, || claimed),
                 None,
                 "pid {claimed} is what reparenting produces, never a parent"
             );
@@ -6424,7 +6436,7 @@ mod tests {
         );
 
         assert_eq!(
-            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR),
+            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR, || NO_LIVE_CREATOR),
             Some(AttestedParent {
                 pid,
                 witness: ParentWitness::Birth(birth),
@@ -6432,12 +6444,14 @@ mod tests {
             "a published record the kernel corroborates is a complete witness"
         );
         assert_eq!(
-            attest_handoff_parent_from(pid, None, NO_LIVE_CREATOR),
+            attest_handoff_parent_from(pid, None, NO_LIVE_CREATOR, || NO_LIVE_CREATOR),
             None,
             "with no creator and nothing published there is no witness at all"
         );
         assert_eq!(
-            attest_handoff_parent_from(pid, Some(not_its_birth), NO_LIVE_CREATOR),
+            attest_handoff_parent_from(pid, Some(not_its_birth), NO_LIVE_CREATOR, || {
+                NO_LIVE_CREATOR
+            }),
             None,
             "a live pid carrying the WRONG birth record is the pid-reuse case, \
              and it must refuse rather than fall back to something weaker"
@@ -6446,10 +6460,48 @@ mod tests {
         stand_in.kill().expect("kill the stand-in parent");
         stand_in.wait().expect("reap the stand-in parent");
         assert_eq!(
-            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR),
+            attest_handoff_parent_from(pid, Some(birth), NO_LIVE_CREATOR, || NO_LIVE_CREATOR),
             None,
             "a dead parent is not admissible however well it was described"
         );
+    }
+
+    /// The LEGACY-CAPTURE arm's race: a parent too old to publish its birth
+    /// record is attested by the parent link, and the birth record read next is
+    /// trusted as ITS record. If the parent exits between those two reads, the
+    /// record at that pid may belong to whatever recycled it — so the link is
+    /// re-read after the birth read, and a link that moved refuses. The control
+    /// (the link unchanged) admits with the record as the witness.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn legacy_capture_refuses_a_parent_that_exits_between_link_and_birth_reads() {
+        let mut stand_in = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in parent");
+        let pid = libc::pid_t::try_from(stand_in.id()).expect("stand-in pid");
+        let birth = read_process_birth(pid).expect("a live process has a birth record");
+
+        assert_eq!(
+            attest_handoff_parent_from(pid, None, pid, || pid),
+            Some(AttestedParent {
+                pid,
+                witness: ParentWitness::Birth(birth),
+            }),
+            "control: a parent link that still names pid after the read admits"
+        );
+        // The parent exited between the two reads: the link now says 1.
+        assert_eq!(
+            attest_handoff_parent_from(pid, None, pid, || 1),
+            None,
+            "a parent link that moved during the birth read must refuse"
+        );
+
+        stand_in.kill().expect("kill the stand-in parent");
+        stand_in.wait().expect("reap the stand-in parent");
     }
 
     /// LIVENESS, the half that runs for the whole overlap and whose false
@@ -8497,7 +8549,7 @@ mod tests {
             // `fd` is a live descriptor the caller holds across the whole call.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             let rc = unsafe { libc::fstat(fd, &mut st) };
-            assert_eq!(rc, 0, "fstat on a live PTY master");
+            assert_eq!(rc, 0, "fstat on a live PTY descriptor");
             st.st_rdev & 0x00ff_ffff
         }
 
@@ -8528,14 +8580,26 @@ mod tests {
         // AND THE MINOR IDENTIFIES THE PTY, which is the half that makes it a term
         // at all rather than a distinct counter: it is the number in the
         // `/dev/ttysNNN` the SLAVE answers to. The doc above claimed this from
-        // recollection; measure it.
-        for (i, &slave) in slaves.iter().enumerate() {
+        // recollection; measure it. The name comes from the KERNEL
+        // (`TIOCPTYGNAME` on the master, the call `ptsname` makes), and the
+        // slave's own device minor is read from the slave: libc's `ttyname_r`
+        // finds the name by looking the slave's device number up in devfs, and
+        // under a whole-suite run's PTY churn that lookup missed once (`ERANGE`,
+        // 2026-09-26) — a flake of the lookup, not a fact about the PTY.
+        for (i, (&master, &slave)) in masters.iter().zip(slaves.iter()).enumerate() {
             let mut name = [0i8; 128];
-            // SAFETY: `slave` is a live descriptor this test owns and `name` is a
-            // 128-byte buffer whose length is passed alongside it.
-            let rc = unsafe { libc::ttyname_r(slave, name.as_mut_ptr(), name.len()) };
-            assert_eq!(rc, 0, "ttyname_r on a live PTY slave");
-            // SAFETY: ttyname_r NUL-terminates on success.
+            // SAFETY: `master` is a live PTY master this test owns, and
+            // `TIOCPTYGNAME` writes at most 128 bytes, NUL-terminated, into the
+            // 128-byte buffer it is handed.
+            let rc = unsafe {
+                libc::ioctl(
+                    master,
+                    libc::c_ulong::from(libc::TIOCPTYGNAME),
+                    name.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0, "TIOCPTYGNAME on a live PTY master");
+            // SAFETY: TIOCPTYGNAME NUL-terminates on success.
             let path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
                 .to_str()
                 .expect("a device path is ASCII");
@@ -8547,6 +8611,11 @@ mod tests {
             assert_eq!(
                 n, minors[i],
                 "the master's device minor IS the slave's /dev/ttysNNN ({path})"
+            );
+            assert_eq!(
+                pty_device_minor(slave),
+                n,
+                "…and the slave's own device minor is that NNN ({path})"
             );
         }
 
@@ -8650,6 +8719,7 @@ mod f4_adoption_proof_asymmetry {
                             attention: None,
                             questions: None,
                             identity: None,
+                            agent: None,
                         },
                     ))),
                     second: Box::new(RestoredSplitTree::leaf(RestoredView::Terminal(
@@ -8665,6 +8735,7 @@ mod f4_adoption_proof_asymmetry {
                             attention: None,
                             questions: None,
                             identity: None,
+                            agent: None,
                         },
                     ))),
                 },
@@ -8908,6 +8979,76 @@ mod f4_adoption_proof_asymmetry {
         assert_eq!(
             parent, child,
             "same-build screen round trip is a fixed point"
+        );
+    }
+
+    /// The colour and shell-integration carry crosses the REAL wire: the meta
+    /// JSON the parent writes, parsed by the strict child parser, reassembled,
+    /// and adopted. A session with neither writes no `color` or `shell` key;
+    /// it does write `absolute_row_counter` — a live grid's counter is never
+    /// 0 (it is at least its rows), so every session carries it, and an older
+    /// child ignores the key (no `deny_unknown_fields`). The untouched
+    /// session's key set is pinned exactly below. A session with both carries
+    /// them intact, and the screen digest stays a fixed point.
+    #[test]
+    fn colour_and_shell_state_cross_the_meta_wire() {
+        let plain = live_checkpoint();
+        let plain_json =
+            aterm_json::to_string(&CheckpointMeta::from_checkpoint(&plain)).expect("meta");
+        let plain_value: aterm_json::Value = aterm_json::from_str(&plain_json).expect("json");
+        let mut keys: Vec<&str> = plain_value
+            .as_object()
+            .expect("an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected: Vec<&str> = CHECKPOINT_META_REQUIRED_KEYS.to_vec();
+        expected.extend(["history_lines", "absolute_row_counter"]);
+        expected.sort_unstable();
+        assert_eq!(
+            keys, expected,
+            "an untouched session writes the frozen keys, its history depth and its \
+             row counter — no colour, shell, nonce or alt-counter key: {plain_json}"
+        );
+
+        let mut t = aterm_core::terminal::Terminal::new(24, 80);
+        t.modes_mut().allow_palette_reconfigure = true;
+        t.process(b"\x1b]4;3;rgb:11/22/33\x07\x1b]11;rgb:05/06/07\x07");
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07");
+        let cp = t.checkpoint_carry(64).expect("parser is Ground");
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta"),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+            repaint: false,
+        };
+        let meta = parse_checkpoint_meta(&carry).expect("child parses meta");
+        let rebuilt = meta.into_checkpoint(cp.grid.clone(), None);
+        assert_eq!(rebuilt.color, cp.color, "the colour diff crosses intact");
+        assert_eq!(rebuilt.shell, cp.shell, "the shell state crosses intact");
+        assert_eq!(
+            screen_digest(&[(0, cp.clone())]).expect("parent digest"),
+            screen_digest_refs(vec![(0, &rebuilt)]).expect("child digest"),
+            "the screen digest is still a fixed point"
+        );
+
+        let mut adopted = aterm_core::terminal::Terminal::new(24, 80);
+        adopted.restore_checkpoint(&rebuilt);
+        assert_eq!(
+            adopted.palette_color(3),
+            aterm_core::terminal::Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33
+            }
+        );
+        adopted.process(b"\x1b]133;D;0\x07");
+        assert_eq!(
+            adopted.completed_command_seq(),
+            1,
+            "the running command completes"
         );
     }
 

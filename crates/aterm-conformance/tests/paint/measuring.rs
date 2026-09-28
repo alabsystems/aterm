@@ -74,7 +74,7 @@ fn paint_probe_starvation_label_keeps_its_calibration_and_its_unknown() {
 /// trail row since the 2026-08-30 key-length recalibration.
 ///
 /// The shipped traverse is PER-MARK (`RAINBOW_TRAVERSE_MIN_CELLS = 26` in
-/// crates/aterm-effects/src/cursor_glow.rs): the arc spreads over the mark
+/// crates/aterm-effects/src/cursor_glow/raster.rs): the arc spreads over the mark
 /// being typed, so a 10-key mark spans ~2-3 of 12 hue buckets BY DESIGN and
 /// the historical 10-11-key rows sat exactly on the `union_hues >= 4` /
 /// `ribbon_window_hues >= 4` cliff — the same cliff the release smoke was
@@ -258,6 +258,20 @@ fn probe_with_companion_style(
     companion: Option<Companion>,
     style: Option<&str>,
 ) {
+    probe_row(shape, keys, expect, capture, companion, style, None);
+}
+
+/// The one row runner. `split` (`v`/`h`) splits the window before the shape
+/// runs, so the take goes through the COMPOSED path (`--split` in the probe).
+fn probe_row(
+    shape: &str,
+    keys: &str,
+    expect: Expect,
+    capture: Capture,
+    companion: Option<Companion>,
+    style: Option<&str>,
+    split: Option<&str>,
+) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -329,6 +343,9 @@ fn probe_with_companion_style(
     }
     if !keys.is_empty() {
         cmd.args(["--keys", keys]);
+    }
+    if let Some(split) = split {
+        cmd.args(["--split", split]);
     }
     // RE-TAKE AN UNPROVED ROW — bounded, and only where a re-take can differ.
     //
@@ -466,7 +483,7 @@ fn main_screen_prompt_typing_paints_trail_ink() {
 /// pixels while producing no ribbon witness, so the scanner cannot pass row 1
 /// merely by counting cursor motion or echoed text.
 ///
-/// IGNORED 2026-09-18, and the reason is measured, not guessed. Since the
+/// IGNORED from 2026-09-18 to 2026-09-26, for a measured reason. Since the
 /// capture-cadence rule landed (457dbf4af, 2026-09-10) this take has never
 /// once produced a sound reading, and since exit 3 stopped printing PASS
 /// (301c19eb9, 2026-09-17) it has failed every run: `starved=yes
@@ -483,16 +500,37 @@ fn main_screen_prompt_typing_paints_trail_ink() {
 /// with nothing to present under `video … pace` presents on a timer beating
 /// against vsync, and a missed beat is a "hole" to a rule that reads frame
 /// gaps as scheduling. The rule is right to disown the take; the take is
-/// wrong to be measured this way. The fix belongs in the instrument — pace
-/// presents at cadence on a static window, or the cadence rule reads the
-/// present ledger instead of frame gaps — and until it lands this control is
-/// reported as IGNORED by the harness rather than printed as a PASS it never
-/// earned. What is lost meanwhile: row 1 keeps its ink floors and its
-/// alt-screen effect-off twins (`focused_typed_window_with_effect_off…`,
-/// `unfocused_typed_window_with_effect_off…`), but no video take currently
-/// witnesses "effect off paints no ribbon" on the MAIN screen.
+/// wrong to be measured this way.
+///
+/// THE INSTRUMENT IS FIXED (2026-09-25, tightened 2026-09-27): the recording
+/// loop publishes its sampling ledger — index.json `ticks[]`, every tick whose
+/// redraw PROVED the screen unchanged (the RepaintKey early-out), so it minted
+/// no frame — and scan.py reads `sampling_hole_us` from ticks and frames
+/// together, so a static window's honest frame gaps are no longer a hole
+/// (scan_test.py
+/// `test_a_static_windows_frame_gap_is_not_a_hole_when_the_ledger_ticked`,
+/// with the no-ledger and starved-ledger controls). The first cut booked every
+/// tick BEFORE its redraw ran, which would also have read a stalled render as
+/// a quiet screen; since 2026-09-27 a tick that neither presented nor proved
+/// the screen unchanged is not booked, so a stall is still a hole
+/// (`test_a_render_stall_under_a_live_loop_is_still_a_hole`).
+///
+/// RE-ENABLED 2026-09-26 on that evidence, measured on m7 (an 18-core
+/// M5 Max, shared with other agents): three runs of this row on the release
+/// binary (headless, default backend `gpu`, host load 40-80) each read
+/// `verdict=PASS evidence=sound starved=no` with `ribbon_claimed=0`,
+/// `rainbow_frames=0`, and a `sampling_hole_us` of 20.8-21.1 ms against a
+/// `nominal_dt_us` of 19.9-20.4 ms — one interval, where the frame-gap rule
+/// had read 2-3 on every take. RE-MEASURED 2026-09-27 on m7 with the
+/// tightened ledger (load 52-55): three runs, each `verdict=PASS
+/// evidence=sound starved=no`, `ribbon_claimed=0`, `rainbow_frames=0`,
+/// `sampling_hole_us` 21.4 / 26.1 / 33.5 ms against `nominal_dt_us`
+/// 20.4-20.6 ms — every hole under the 2x rule. m3, where the two gate runs
+/// read the hole, has NOT been re-measured. It is row 1's matched effect-off
+/// control on the MAIN screen, beside the alt-screen twins
+/// (`focused_typed_window_with_effect_off…`,
+/// `unfocused_typed_window_with_effect_off…`).
 #[test]
-#[ignore = "the present-driven recorder drops ticks on this matrix's one static window (measured 2026-09-18 with ATERM_PAINT_KEEP=1: 2x gaps only outside the driven keys, a 53 ms gap at the first key, clean 17.7 ms cadence while typing, on a quiet machine) so the cadence rule disowns every take; fix the pace present or the rule, then re-enable — see the doc comment"]
 fn main_screen_prompt_with_effect_off_has_no_ribbon() {
     probe_with_style(
         "prompt",
@@ -1066,7 +1104,7 @@ fn the_owners_rainbow_kitty_spelling_carries_the_resident_pet() {
 /// and the three final cleared-plane stills) carrying two or more
 /// companion-shaped components, and this row — like rows 7, 8 and 10 — demands
 /// zero. It is deliberately a PIXEL obligation: `cursor_cat.is_active() &&
-/// cursor_pet.is_active()` is legal engine state that several unit tests pin on
+/// companion.brain().is_active()` is legal engine state that several unit tests pin on
 /// purpose, so a `pet_claimed`/`cat_claimed` conjunction would be asking the
 /// wrong question. Active is not drawn. The rest of the pet obligations ride
 /// along unchanged, so the row cannot go green by losing the resident either.
@@ -1084,5 +1122,48 @@ fn the_owners_spelling_never_draws_two_companions_in_one_frame() {
         Expect::Ink,
         Capture::UnpinnedFocused,
         Some(Companion::PetOwnerSpelling),
+    );
+}
+
+/// Matrix row 12 — A SPLIT WINDOW BEING TYPED INTO
+/// (`docs/EFFECTS-AND-WAKE-FOLLOWUPS-2026-08-24.md` item 9, added 2026-09-25).
+/// The split ruling (the focused pane keeps the rainbow body, `643b417df`) was
+/// pinned only by a scheduler unit test; no take proved the pixels of the
+/// COMPOSED path. `--split v` splits the headless window before the shape, so
+/// the prompt and every driven key land in the new, focused pane and each
+/// captured frame is composed (`redraw_compose`). Unpinned focused image
+/// capture, so the row pairs with its effect-off twin below (a video take of
+/// the static off window is disowned by the cadence rule — see row 1's twin).
+///
+/// MEASURED 2026-09-25 (RELEASE, headless, GPU): total_ink=95,592
+/// union_hues=11 rainbow_frames=65 ribbon_bound=49 ribbon_dark=0 PASS; the
+/// twin total_ink=6,468 union_hues=2 rainbow_frames=0 PASS. (The pinned-video
+/// take of the same row: total_ink=325,796 union_hues=11 rainbow_frames=235.)
+#[test]
+fn split_window_typing_paints_the_rainbow_body_in_the_focused_pane() {
+    probe_row(
+        "prompt",
+        MATURE_RUN,
+        Expect::Ink,
+        Capture::UnpinnedFocused,
+        None,
+        Some("flying"),
+        Some("v"),
+    );
+}
+
+/// Row 12's matched effect-off twin: the same split, keys and capture with
+/// the canonical `off` style — typed cursor/text pixels, no ribbon — so the
+/// row cannot pass on the divider, the second pane or echoed text.
+#[test]
+fn split_window_typing_with_effect_off_has_no_ribbon() {
+    probe_row(
+        "prompt",
+        MATURE_RUN,
+        Expect::EffectOff,
+        Capture::UnpinnedFocused,
+        None,
+        Some("off"),
+        Some("v"),
     );
 }

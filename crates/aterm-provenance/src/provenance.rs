@@ -13,8 +13,8 @@ use crate::origin::{Host, Origin, OriginTag, Pty};
 ///
 /// `#[repr(transparent)]` is a load-bearing guarantee:
 /// `size_of::<Provenance<T, O>>() == size_of::<T>()` and the layout is
-/// identical to `T`. Phase 1 will exploit this to let the parser hand out
-/// `&Provenance<[u8], Pty>` references over PTY byte slices without copying.
+/// identical to `T`. The parser relies on it: [`crate::pty_wrap_ref`] hands
+/// out `&Provenance<[u8], Pty>` over PTY byte slices without copying.
 ///
 /// `O` is `PhantomData<fn() -> O>` so the struct is *invariant* in `O`.
 /// This prevents accidental variance-driven `Provenance<T, Pty>` →
@@ -23,6 +23,34 @@ use crate::origin::{Host, Origin, OriginTag, Pty};
 /// `Provenance` does not implement `Deref` or any auto-converting trait;
 /// consumers must call [`Provenance::as_ref`] or one of the
 /// `authorize_*` ceremonies explicitly.
+///
+/// # Origins do not convert
+///
+/// `From<T>` exists for the `Host` origin only, so a value that is already
+/// tagged cannot be relabelled with `.into()`. PTY bytes, for a start:
+///
+/// ```
+/// use aterm_provenance::{Host, Provenance, Pty};
+/// // Control: the constructors and paths below are valid; only the forge is not.
+/// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
+/// let host: Provenance<Vec<u8>, Host> = b"ls".to_vec().into();
+/// # let _ = (pty, host);
+/// ```
+///
+/// ```compile_fail,E0277
+/// use aterm_provenance::{Host, Provenance, Pty};
+/// let pty = Provenance::<_, Pty>::from_pty(b"rm -rf /".to_vec());
+/// let _host: Provenance<Vec<u8>, Host> = pty.into();
+/// ```
+///
+/// ```compile_fail,E0277
+/// use aterm_provenance::{Provenance, Pty, User};
+/// let pty = Provenance::<_, Pty>::from_pty(String::from("sudo"));
+/// let _user: Provenance<String, User> = pty.into();
+/// ```
+///
+/// (The token that [`crate::authorize_pty_to_host`] consumes is feature-sealed
+/// behind `internal-mint`; `aterm-core/tests/capability_ceremony.rs` gates that.)
 #[repr(transparent)]
 pub struct Provenance<T: ?Sized, O: Origin> {
     // `_origin` is placed before `value` so the unsized-trailing layout works

@@ -12,7 +12,7 @@
 //!
 //! The **Windows backend** is the honest analogue of each primitive:
 //!
-//! * **Activation** — the `channels/<ch>/current` indirection is a directory
+//! * **Activation** — the `store/<program>/current` indirection is a directory
 //!   **junction** (`mklink /J`, no admin required, unlike a symlink), not a POSIX
 //!   symlink. [`atomic_symlink`] creates it (used for `current` and the sysroot
 //!   sysroot/toolchain dir links).

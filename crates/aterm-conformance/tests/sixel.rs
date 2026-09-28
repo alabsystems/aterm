@@ -252,9 +252,11 @@ fn xtsmgraphics_color_registers_read_and_read_max() {
 
 #[test]
 fn xtsmgraphics_sixel_geometry_read_falls_back_to_max_without_window_callback() {
-    // Pi=2 Pa=1 reads the current text-area pixel size via the host window
-    // callback (#7470); the conformance harness registers none, so the
-    // engine's documented fallback is the max dimension on both axes.
+    // Pi=2 Pa=1 reads the current text-area pixel size (#7470) behind the
+    // same window-ops capability as CSI 14 t; the conformance harness grants
+    // no window ops and reports no cell box, so the engine's documented
+    // fallback is the max dimension on both axes. The granted case is pinned
+    // in aterm-core's handler_xtsmgraphics tests.
     assert_eq!(run(b"\x1b[?2;1S").response_string(), "\x1b[?2;0;4096;4096S");
 }
 

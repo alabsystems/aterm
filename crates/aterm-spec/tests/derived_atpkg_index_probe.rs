@@ -4,10 +4,39 @@
 use aterm_spec::{
     derive::{
         atpkg_index_probe_completion_cadence_model, atpkg_index_probe_cooldown_model,
-        atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
+        atpkg_index_shared_handoff_model, atpkg_index_successor_selection_model,
+        atpkg_index_wake_highwater_model,
     },
     interp, verify,
 };
+
+#[test]
+fn a_suppressed_host_rechecks_when_the_shared_stamp_expires() {
+    let model = atpkg_index_shared_handoff_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name)
+    );
+    verify::prove_and_catch_scalar(&model, "atpkg index shared handoff");
+
+    let buggy = interp::with_buggy(&model, 1);
+    let mut fixed = model.init_state();
+    let mut old = buggy.init_state();
+    assert!(model.fire("Stamp", &mut fixed));
+    assert!(buggy.fire("Stamp", &mut old));
+    for _ in 0..5 {
+        assert!(model.fire("TickBeforeHandoff", &mut fixed));
+        assert!(buggy.fire("TickBeforeHandoff", &mut old));
+    }
+    for action in ["Handoff", "TickAfterHandoff", "AtExpiry"] {
+        assert!(model.fire(action, &mut fixed));
+        assert!(buggy.fire(action, &mut old));
+    }
+    assert_eq!(fixed["requests"], 1);
+    assert_eq!(old["requests"], 0);
+    assert!(!buggy.check_invariant("NoSecondLocalCooldown", &old));
+}
 
 #[test]
 fn the_next_probe_uses_the_shared_stamps_completion_clock() {

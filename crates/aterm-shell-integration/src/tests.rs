@@ -2838,24 +2838,42 @@ fn test_cache_dir_windows_uses_localappdata() {
     }
 }
 
+/// The scripts are staged in the per-user cache in every containment mode, and
+/// that lies outside every root a Containment shell may write
+/// (`aterm_containment::sbpl::WRITABLE_ROOTS`): a contained shell reads the
+/// scripts the next tab's shell sources and cannot rewrite them. Staging them in
+/// `/tmp` for Containment and Safety (#5575) let it.
+#[cfg(unix)]
 #[test]
-#[cfg(feature = "local-pty")]
-fn test_containment_modes_require_tmp_cache() {
-    use aterm_containment::{ContainmentMode, ContainmentPolicy, FsCapability};
-
-    for mode in [ContainmentMode::Containment, ContainmentMode::Safety] {
-        let caps = ContainmentPolicy::capabilities(mode);
-        assert!(
-            caps.fs <= FsCapability::ProjectReadWrite,
-            "{mode:?} should require /tmp path for shell integration"
+fn test_cache_dir_is_the_per_user_cache_outside_the_containment_write_roots() {
+    let (base, tail) = match (std::env::var_os("XDG_CACHE_HOME"), std::env::var_os("HOME")) {
+        (Some(cache), _) => (PathBuf::from(cache), "aterm/shell-integration"),
+        (None, Some(home)) => (PathBuf::from(home), ".cache/aterm/shell-integration"),
+        (None, None) => (std::env::temp_dir(), "aterm-shell-integration"),
+    };
+    assert_eq!(
+        cache_dir(),
+        base.join(tail),
+        "the per-user cache, whatever the mode"
+    );
+    // Resolved as Seatbelt resolves it.
+    let Ok(base) = std::fs::canonicalize(&base) else {
+        return;
+    };
+    let dir = std::fs::canonicalize(base.join(tail)).unwrap_or_else(|_| base.join(tail));
+    let roots = aterm_containment::sbpl::WRITABLE_ROOTS;
+    if roots.iter().any(|root| base.starts_with(root)) {
+        eprintln!(
+            "this run's cache base is itself under a temp root: {}",
+            base.display()
         );
+        return;
     }
-
-    for mode in [ContainmentMode::User, ContainmentMode::Master] {
-        let caps = ContainmentPolicy::capabilities(mode);
+    for root in roots {
         assert!(
-            caps.fs > FsCapability::ProjectReadWrite,
-            "{mode:?} should allow ~/.cache path for shell integration"
+            !dir.starts_with(root),
+            "{} lies under the Containment write root {root}",
+            dir.display()
         );
     }
 }
@@ -3047,6 +3065,68 @@ fn test_prepare_cmd_wraps_the_prompt_with_marks_and_cwd() {
     // executing", and the engine's phase machine needs A→B→C→D in order.
     assert!(!prompt.contains("]133;C"), "{prompt}");
     assert!(!prompt.contains("]133;D"), "{prompt}");
+    // The directory title rides every cmd prompt; a user's own PROMPT that
+    // sets a title is the later write and wins (the test below).
+    assert!(
+        prompt.contains(CMD_PROMPT_TITLE),
+        "the directory title: {prompt}"
+    );
+}
+
+/// A cmd tab's title follows the directory: `OSC 0` with `$P`, rendered
+/// BEFORE the user's own prompt so a prompt that sets its own title is the
+/// later write and wins. Without it the tab keeps cmd's program path
+/// (`C:\WINDOWS\SYSTEM32\cmd.exe`) as its title for its whole life.
+#[test]
+fn test_cmd_prompt_titles_the_tab_with_the_directory() {
+    assert_eq!(CMD_PROMPT_TITLE, "$e]0;$P$e\\");
+    let at = |prompt: &str, needle: &str| {
+        prompt
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} missing from {prompt:?}"))
+    };
+    let prompt = cmd_prompt(None);
+    let title = at(&prompt, CMD_PROMPT_TITLE);
+    let start = at(&prompt, "]133;A");
+    let user = at(&prompt, "$P$G");
+    assert!(
+        title < start && start < user,
+        "the title precedes the marks and the user's prompt: {prompt}"
+    );
+
+    // A user's own prompt that sets a title is kept whole, after ours.
+    let own = "$e]0;build box$e\\$P$G";
+    let prompt = cmd_prompt(Some(own));
+    assert!(
+        at(&prompt, CMD_PROMPT_TITLE) < at(&prompt, own),
+        "the user's title must be the later write: {prompt}"
+    );
+
+    // An empty inherited PROMPT is cmd's default, not an empty prompt.
+    assert_eq!(cmd_prompt(Some("")), cmd_prompt(None));
+}
+
+/// The cwd mark comes AFTER the prompt-start mark. The engine files an OSC
+/// 633 `P;Cwd` under the block in progress, so reported before `133;A` the NEW
+/// directory lands on the PREVIOUS command's block — the block for `cd /d X`
+/// said it ran in `X`. (The engine half of this is pinned in aterm-gui's
+/// `a_cmd_block_cwd_is_where_its_command_ran`.)
+#[test]
+fn test_cmd_prompt_reports_the_cwd_after_the_prompt_start() {
+    let prompt = cmd_prompt(None);
+    let start = prompt.find("]133;A").expect("prompt-start mark");
+    let cwd = prompt.find("]633;P;Cwd=$P").expect("cwd mark");
+    let user = prompt.find("$P$G").expect("cmd's default prompt");
+    assert!(start < cwd && cwd < user, "{prompt}");
+}
+
+/// A PROMPT that already carries our marks came from an outer aterm: it is
+/// returned byte-identical, so nesting neither double-wraps nor stacks a
+/// second title.
+#[test]
+fn test_cmd_prompt_leaves_a_nested_prompt_untouched() {
+    let outer = cmd_prompt(None);
+    assert_eq!(cmd_prompt(Some(&outer)), outer);
 }
 
 #[test]
@@ -3153,6 +3233,26 @@ fn test_cmd_prompt_emits_real_osc_133_marks() {
     );
     // `$P` must have expanded to a real directory, not stayed literal.
     assert!(!text.contains("Cwd=$P"), "got {text:?}");
+    // And the title is that same directory, in a real ESC-framed OSC 0 — the
+    // bytes conhost turns into the console title ConPTY hands aterm. (Absent
+    // exactly when the runner exported ATERM_DISABLE_PROMPT_TITLES.)
+    let titled = injection
+        .env_add
+        .iter()
+        .any(|(k, v)| k == "PROMPT" && v.contains(CMD_PROMPT_TITLE));
+    if titled {
+        let cwd = text
+            .split_once("\x1b]633;P;Cwd=")
+            .and_then(|(_, rest)| rest.split_once(";id="))
+            .map(|(cwd, _)| cwd)
+            .expect("the cwd mark carries the nonce after the path");
+        assert!(
+            text.contains(&format!("\x1b]0;{cwd}\x1b\\")),
+            "cmd must title the tab with its directory {cwd:?}; got {text:?}"
+        );
+    } else {
+        assert!(!text.contains("\x1b]0;"), "opted out, no title: {text:?}");
+    }
 }
 
 /// Functional proof on the real thing: the WSL launcher, run through the
@@ -4161,7 +4261,7 @@ fn test_fish_marks_a_multiplexer_pane_and_clears_a_stale_marker() {
 // ---------------------------------------------------------------------------
 
 /// The atpkg hook in `crates/atpkg/src/hooks.rs`'s EXACT format — a golden of
-/// `hook_files()` for two fixture paths, pinned to that function from atpkg's side
+/// `hook_files()` for three fixture paths, pinned to that function from atpkg's side
 /// (`crates/atpkg/tests/shell_integration_hook_pin.rs`), with the fixture paths
 /// substituted here. `aterm-shell-integration` cannot depend on `atpkg`.
 #[cfg(unix)]
@@ -4178,6 +4278,8 @@ const ATPKG_HOOK_FISH_GOLDEN: &str = include_str!(concat!(
 const ATPKG_HOOK_FIXTURE_AGENTS: &str = "/opt/aterm-si fixture/pkg/agents";
 #[cfg(unix)]
 const ATPKG_HOOK_FIXTURE_BIN: &str = "/opt/aterm-si fixture/pkg/bin";
+#[cfg(unix)]
+const ATPKG_HOOK_FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 
 /// The name the reroute stubs' directory carries (`atpkg::reroute::DIR_MARKER_FILE`).
 #[cfg(unix)]
@@ -4422,6 +4524,10 @@ impl LiveFixture {
                 self.agents.to_str().expect("UTF-8"),
             )
             .replace(ATPKG_HOOK_FIXTURE_BIN, self.bin.to_str().expect("UTF-8"))
+            .replace(
+                ATPKG_HOOK_FIXTURE_REROUTE,
+                self.reroute.to_str().expect("UTF-8"),
+            )
     }
 
     /// atpkg's pass, as the running shell sees it: agents/ + reroute/ (+ its

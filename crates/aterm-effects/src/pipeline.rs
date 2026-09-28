@@ -131,6 +131,25 @@ fn terminal_cursor_color(term: &Terminal) -> u32 {
     aterm_render::rgb_to_u32([c.r, c.g, c.b])
 }
 
+/// Close the terminal's damage session IF it is still open — the pipeline's
+/// half of the web path's single damage consumer.
+///
+/// The word and rain rescans key off `damage_epoch`, which advances once per
+/// session and is re-armed only by `take_damage`, so a session a host leaves
+/// open would freeze them. But both web hosts extract through
+/// `Terminal::cell_frame_damage_scoped_into`, which consumes the session
+/// itself; an unconditional `take_damage` here would bump the extraction
+/// generation again and refuse the host's NEXT frame its damage-scoped arm
+/// (`FullRefillCause` "extract gen"), costing a full `rows × cols` refill on
+/// every frame with sparkle words or rain on. With no open session there is
+/// nothing to close, so this is a no-op; a host that never consumes still has
+/// its session closed exactly as before.
+fn close_open_damage_session(term: &mut Terminal) {
+    if term.has_damage() {
+        term.take_damage();
+    }
+}
+
 /// Brighten a packed `0x00RRGGBB` by `f` (the native accent derivation).
 fn brighten(c: u32, f: f32) -> u32 {
     let m = |sh: u32| ((((c >> sh) & 0xff) as f32) * f).min(255.0) as u32;
@@ -1684,8 +1703,8 @@ impl EffectsPipeline {
             //
             // Owner ruling, 2026-08-31: this called `retire_owner()`, whose
             // native warrant (`app_render.rs`
-            // `sync_cursor_effect_coordinate_space`, which nulls
-            // `pet_last_cmd` / `pet_content_seq` beside its retire) is keyed
+            // `sync_cursor_effect_coordinate_space`, which calls
+            // `CompanionOwner::retire_owner` beside its retire) is keyed
             // on `(terminal_id, alternate_screen)` — the OWNER, not the
             // geometry. Wired to this GEOMETRY fence it swallowed a pending
             // completion whenever the browser resized or the font size
@@ -2039,7 +2058,9 @@ impl EffectsPipeline {
             cols: cols as u16,
         };
         let mut facts = TerminalFacts::read(term, term.render_identity(), scrolled);
-        facts.caret = cur;
+        // The snapshot's caret, hidden or not (`TerminalFacts::caret`): a pet
+        // must keep chasing a caret a TUI hid for its repaint.
+        facts.caret = live_viewport.then_some((input.cursor_row as u16, input.cursor_col as u16));
         facts.cursor_visible = cur.is_some();
         facts.live_viewport = live_viewport;
         facts.display_offset = if cursor_snapshot_coherent {
@@ -2054,11 +2075,13 @@ impl EffectsPipeline {
                 RainVisibility::VisibleUnfocused => Visibility::VisibleUnfocused,
                 RainVisibility::Hidden => Visibility::Hidden,
             },
-            // THE MOTION POLICY ONLY — the host's stable preference; the
-            // owner folds focus in itself. Never a load term.
-            reduced_motion: self.deco_cfg.reduced_motion,
+            // THE MOTION POLICY ONLY — the host's stable preference, with
+            // focus folded in (an unfocused page is a still, as an unfocused
+            // native window is). Never a load term.
+            reduced_motion: self.deco_cfg.reduced_motion || !self.focused,
             serious: false,
             shed_envelope: 1.0,
+            shed_active: false,
             // The owner holds the pointer it was handed through
             // `note_pointer_px`; the per-frame field is for hosts that feed
             // it with the frame.
@@ -2077,13 +2100,14 @@ impl EffectsPipeline {
         };
         if self.pet_style_named && self.glow_cfg.enabled && self.companion.enabled() {
             let pet_world = crate::pet_world::PetWorldFacts::read(term, term.render_identity());
-            self.companion.observe_console(
+            let _ = self.companion.observe_console(
                 input,
                 &pet_world,
                 crate::pet_world::PetPane::full(input),
+                &[],
             );
         }
-        let pet = self.companion.sense(
+        let pet = self.companion.prepare(
             PetFacts {
                 facts: &facts,
                 host: &host,
@@ -2096,37 +2120,27 @@ impl EffectsPipeline {
                 // frame it is admitted to.
                 sing: SingFacts::default(),
                 focused: self.focused,
+                // No app surface ever covers the page's grid, no pane is
+                // composed, and the page has no room to tell the pet about.
+                obscured: false,
+                pane: None,
+                room: None,
             },
             &mut self.decos,
         );
-        // THE GRIEF GATE (gauntlet F4a; the native single-pane block's
-        // `if ws.cursor_pet.grieving() { ws.cursor_glow.hush_fanfare(..) }`):
-        // a failed command's droop window hushes the caret-jump fanfare —
-        // no party ring at a failure. Every frame the brain grieves the
-        // rainbow momentum is zeroed. The glow ticked ABOVE, as it does
-        // natively (its tick precedes the pet block there too), so the hush
-        // lands on the next tick's momentum read — the one-tick latency the
-        // native frame has too, and the droop lasts many frames.
-        //
-        // WHERE THIS READ SITS, exactly (owner ruling, 2026-08-31 — the
-        // comment above used to claim the native ordering and had it
-        // inverted). Native reads `grieving()` BETWEEN the completion note
-        // (`app_render.rs:26190-26197`) and the brain tick (`:26254`); this
-        // pipeline reads it AFTER [`CompanionOwner::sense`], which FUSES
-        // those two — the latch and the unconditional tick are one call, and
-        // native's read point is not reachable from outside it. The LEADING
-        // edge is therefore identical: `note_command_done` sets
-        // `pending_sulk` inside `sense`, so the failure's own frame hushes
-        // in both, which is the whole of F4a (the fanfare fires on the
-        // failure prompt). Only the TRAILING edge differs, and this side is
-        // one frame EARLY, never late: the tick that ends the droop is
-        // already applied when this reads, so the hush is released on the
-        // frame native spends hushing its last. Moving the read above
-        // `sense` would trade that harmless frame for a harmful one — the
-        // hush would then miss the failure frame itself.
+        // THE GRIEF GATE (gauntlet F4a): a failed command's droop window
+        // hushes the caret-jump fanfare — no party ring at a failure. Every
+        // frame the brain grieves the rainbow momentum is zeroed. The glow
+        // ticked ABOVE, as it does natively (its tick precedes the pet block
+        // there too), so the hush lands on the next tick's momentum read — the
+        // one-tick latency the native frame has too, and the droop lasts many
+        // frames. Read BETWEEN `prepare` (which notes the completion) and
+        // `tick`, the one order every host runs: the failure's own frame
+        // hushes, and the hush is released on the frame the droop ends.
         if self.companion.grieving() {
             self.glow.hush_fanfare(now);
         }
+        let pet = self.companion.tick(pet);
 
         // Sparkle words: rescan only when the grid changed (damage epoch),
         // animate every applied frame. Alt-screen handling mirrors native:
@@ -2177,11 +2191,15 @@ impl EffectsPipeline {
                             .rescan(term, rows, cols, &rs.lexicon, &rs.cfg, epoch, now);
                     }
                 }
-                // Consume the damage session: `damage_epoch` counts once per
-                // session and is re-armed only by `take_damage`, which nothing
-                // else calls on the web path (the headless-capture lesson —
-                // without this the epoch freezes and stale occurrences stick).
-                term.take_damage();
+                // Close the damage session if the host left it open:
+                // `damage_epoch` counts once per session and is re-armed only
+                // by `take_damage` (the headless-capture lesson — without it
+                // the epoch freezes and stale occurrences stick). Both web
+                // hosts now extract through `cell_frame_damage_scoped_into`,
+                // which already consumed this frame's session; re-taking it
+                // would bump the extraction generation and force their NEXT
+                // frame onto the full-refill arm.
+                close_open_damage_session(term);
                 damage_consumed = true;
                 let sel_view = SelView {
                     sel: term.text_selection(),
@@ -2308,11 +2326,12 @@ impl EffectsPipeline {
                     rain.sample_material(&input.cells, rows, cur, &[]);
                 }
             }
-            // The web path's single damage consumer must still run when rain
-            // is on while sparkle is off or suppressed (else the epoch
-            // freezes); never consume twice per apply.
+            // The damage session must still be closed when rain is on while
+            // sparkle is off or suppressed (else the epoch freezes on a host
+            // that does not consume it); never twice per apply, and never a
+            // session the host's extraction already consumed.
             if !damage_consumed {
-                term.take_damage();
+                close_open_damage_session(term);
             }
             if torn {
                 self.rain_scratch.clear();

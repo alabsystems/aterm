@@ -5,9 +5,9 @@
 //! live one, plus the `bin/` shim installation.
 //!
 //! Activation is **not** the app updater's in-session handoff (that is aterm-gui/
-//! aterm-update's `.app` path). A CLI program's active build is selected by a symlink: `channels/<name>/current`
-//! points at the chosen `store/<program>/<build>/`, and one `bin/<tool>` symlink per
-//! exposed binary points into it. Each flip is an **atomic replace** — write a sibling
+//! aterm-update's `.app` path). A CLI program's active build is selected by a symlink:
+//! `store/<program>/current` points at the chosen `store/<program>/<build>/`, and one
+//! `bin/<tool>` symlink per exposed binary points into it. Each flip is an **atomic replace** — write a sibling
 //! temp symlink, then `rename(2)` it over the target — so a reader never sees a missing or
 //! half-written link, and a concurrent run (under `apply.lock`) cannot observe a torn
 //! state. Every shim name is gated through [`crate::store::shim_allowed`]: a tool named
@@ -109,47 +109,28 @@ pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     platform::atomic_symlink(target, link)
 }
 
-/// Make `build_dir` the active build: atomically flip BOTH pointers that select it —
-/// `store/<program>/current → build_dir` and `channels/<channel>/current → build_dir`. The
-/// channel directory is created hardened (`0700`, owned-by-uid) first. Idempotent —
-/// re-activating the same build is a no-op-ish re-point.
+/// Make `build_dir` the active build: atomically flip `store/<program>/current` to it —
+/// the per-program link [`crate::gc::live_builds`] reads as the liveness witness.
+/// Idempotent — re-activating the same build is a no-op-ish re-point.
 ///
-/// **Two links, because one of them cannot answer the question GC asks.**
-/// `channels/<channel>/current` is one symlink per channel and every program shares a channel
-/// name (`[packages].channel`, default `stable`; a coherence group flips all its members
-/// through the same one), so it holds only the LAST activation — `atpkg install ny` erases
-/// `ay`'s pointer. That is fine for its actual job (`uninstall`'s dangling-link sweep), and
-/// unusable as the per-program liveness witness [`crate::gc::live_builds`] needs: with the
-/// channel link as the sole authority, every program but the most recently activated one has
-/// no witness, GC abstains on it forever, and the store grows without bound. So the
-/// per-program link is written too, and it is the one GC reads.
+/// The program name comes from the build dir's own place in the store, so the link can
+/// never name a different program than the build; a `build_dir` that is not a store build
+/// dir is refused (`InvalidInput`) rather than activated with no witness.
 ///
-/// The per-program link goes FIRST. If it fails, nothing has flipped and the caller's "the
-/// atomic activate didn't flip — nothing to undo" (`flow::flip_member`) still holds; if the
-/// channel link then fails, the caller aborts and discards the staged build, leaving the
-/// program link dangling — which resolves to no witness, so GC abstains rather than acting on
-/// a half-activation.
-pub fn activate_channel(layout: &Layout, channel: &str, build_dir: &Path) -> io::Result<()> {
-    // The program name comes from the build dir's own place in the store, not from a
-    // parameter, so the two links can never name different programs. A `build_dir` that is
-    // not a store build dir (a synthetic fixture) simply gets no per-program link — and
-    // therefore no GC witness, which is the fail-closed direction.
-    if let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) {
-        atomic_symlink(build_dir, &layout.program_current(&program))?;
-    }
-    let current = layout.channel_current(channel);
-    let parent = current
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "channel path has no parent"))?;
-    // THROUGH THE LAYOUT, so a root-owned SYSTEM prefix gets 0755 rather than 0700.
-    // `Layout::ensure_dir` exists for exactly this and documents the failure it
-    // prevents as observed: an unconditional 0700 installs a toolchain only root can
-    // run, and it fails at the only moment that matters — the first non-root
-    // invocation, with a bare "Permission denied". These three call sites were
-    // reverted to the unconditional helper as collateral in a large rebase
-    // (2026-08-20 round-8 audit).
-    layout.ensure_dir(parent)?;
-    atomic_symlink(build_dir, &current)
+/// **One link.** A second, `channels/<channel>/current`, used to be flipped beside it: one
+/// symlink per channel NAME, which every program shares (`[packages].channel`, default
+/// `stable`), so it held only the last activation — useless as a per-program witness, and
+/// read by nothing but a GC migration path and `uninstall`'s sweep of it. It was deleted
+/// end to end on 2026-09-25; a prefix that still carries the directory has it swept by
+/// [`crate::gc::sweep_retired_channel_links`].
+pub fn activate_build(layout: &Layout, build_dir: &Path) -> io::Result<()> {
+    let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a store build directory",
+        ));
+    };
+    atomic_symlink(build_dir, &layout.program_current(&program))
 }
 
 /// Install `bin/` shims for the manifest's raw `exposes` list, each pointing at the tool's
@@ -728,30 +709,26 @@ fn prune_stale_shims(layout: &Layout, build_dir: &Path, installed: &[ToolName], 
     }
 }
 
-/// Best-effort undo of [`activate_channel`] plus a partial [`install_tools`] pass, for a
+/// Best-effort undo of [`activate_build`] plus a partial [`install_tools`] pass, for a
 /// build that is about to be DISCARDED. An abort path that deletes a build AFTER activation
 /// succeeded (the sysroot resolve-check discard in `flow::install_program`) must call this
 /// first, or the deleted tree
-/// stays live everywhere that matters: both `current` links dangle into it (and a broken
+/// stays live everywhere that matters: its `current` link dangles into it (and a broken
 /// per-program link makes GC abstain on the program until the next activation), and any
 /// shims already written this pass point at nothing.
 ///
-/// Scoped strictly to THIS build: each `current` link is removed only if it names
+/// Scoped strictly to THIS build: the `current` link is removed only if it names
 /// `build_dir` (one that points elsewhere — a prior build, a concurrent flip — is left
 /// alone), and only `bin/` entries resolving INTO `build_dir` are dropped. Removal goes
-/// through [`platform::remove_link`] for the links (a Windows junction refuses
+/// through [`platform::remove_link`] for the link (a Windows junction refuses
 /// `remove_file`) and `remove_file` for the shims (a Windows shim is a `.cmd` regular
 /// file).
-pub(crate) fn undo_activation(layout: &Layout, channel: &str, build_dir: &Path) {
+pub(crate) fn undo_activation(layout: &Layout, build_dir: &Path) {
     if let Some((program, _)) = crate::ops::store_build_of(&layout.prefix, build_dir) {
         let own = layout.program_current(&program);
         if std::fs::read_link(&own).is_ok_and(|t| t == build_dir) {
             platform::remove_link(&own);
         }
-    }
-    let chan = layout.channel_current(channel);
-    if std::fs::read_link(&chan).is_ok_and(|t| t == build_dir) {
-        platform::remove_link(&chan);
     }
     if let Ok(entries) = crate::ops::read_bin_dir(layout) {
         for e in entries.flatten() {
@@ -900,11 +877,11 @@ mod tests {
         let layout = temp_prefix("stale-shim");
         let b18 = make_build(&layout, "ay", 18, &["ay", "aylint"]);
         install_shims(&layout, &b18, &["ay".into(), "aylint".into()], Aliases::Off).unwrap();
-        activate_channel(&layout, "stable", &b18).unwrap();
+        activate_build(&layout, &b18).unwrap();
 
         let b19 = make_build(&layout, "ay", 19, &["ay"]);
         install_shims(&layout, &b19, &["ay".into()], Aliases::Off).unwrap();
-        activate_channel(&layout, "stable", &b19).unwrap();
+        activate_build(&layout, &b19).unwrap();
 
         assert!(
             !shim_of(&layout, "aylint").exists(),
@@ -1075,48 +1052,50 @@ mod tests {
     }
 
     #[test]
-    fn activate_channel_points_current_at_build_and_re_flips() {
+    fn activate_build_points_current_at_build_and_re_flips() {
         let layout = temp_prefix("chan");
         let b18 = make_build(&layout, "ay", 18, &["ay"]);
-        activate_channel(&layout, "stable", &b18).unwrap();
-        let cur = layout.channel_current("stable");
+        activate_build(&layout, &b18).unwrap();
+        let cur = layout.program_current("ay");
         assert_eq!(std::fs::read_link(&cur).unwrap(), b18);
         // It resolves to a real directory.
         assert!(std::fs::metadata(&cur).unwrap().is_dir());
 
         // Re-flip to a newer build — atomic re-point, no leftover temp.
         let b19 = make_build(&layout, "ay", 19, &["ay"]);
-        activate_channel(&layout, "stable", &b19).unwrap();
+        activate_build(&layout, &b19).unwrap();
         assert_eq!(std::fs::read_link(&cur).unwrap(), b19);
-        // No stray temp symlinks left in the channel dir.
+        // No stray temp symlinks left beside the link.
         let leftovers: Vec<_> = std::fs::read_dir(cur.parent().unwrap())
             .unwrap()
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
             .collect();
         assert!(leftovers.is_empty(), "no temp symlink should remain");
+        // Activation writes ONE link: the retired per-channel family is never recreated.
+        assert!(!layout.prefix.join("channels").exists());
+        // A directory that is not a store build is refused, not activated witness-less.
+        let elsewhere = layout.prefix.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert_eq!(
+            activate_build(&layout, &elsewhere).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        assert_eq!(std::fs::read_link(&cur).unwrap(), b19);
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The regression for the reason the per-program link exists: two programs share one
-    /// channel name, so the channel link only ever remembers the last activation. Each
-    /// program must still be able to say which of ITS builds is live — otherwise
-    /// `gc::live_builds` proves nothing about `ay` and its superseded builds are never
-    /// reclaimed.
+    /// Two programs activated one after the other each keep their own `current` — the
+    /// per-program witness `gc::live_builds` reads. (The retired per-channel link was
+    /// shared, so it only ever remembered the last activation.)
     #[test]
     fn two_programs_on_one_channel_each_keep_their_own_current() {
         let layout = temp_prefix("two-progs");
         let ay19 = make_build(&layout, "ay", 19, &["ay"]);
-        activate_channel(&layout, "stable", &ay19).unwrap();
+        activate_build(&layout, &ay19).unwrap();
         let ny7 = make_build(&layout, "ny", 7, &["ny"]);
-        activate_channel(&layout, "stable", &ny7).unwrap();
+        activate_build(&layout, &ny7).unwrap();
 
-        // The shared channel link holds only the LAST activation — this is not a bug in
-        // activation, it is what one-link-per-channel means.
-        assert_eq!(
-            std::fs::read_link(layout.channel_current("stable")).unwrap(),
-            ny7
-        );
         // Both per-program links survive.
         assert_eq!(
             std::fs::read_link(layout.program_current("ay")).unwrap(),
@@ -1129,7 +1108,7 @@ mod tests {
 
         // And it re-points, rather than accumulating.
         let ay20 = make_build(&layout, "ay", 20, &["ay"]);
-        activate_channel(&layout, "stable", &ay20).unwrap();
+        activate_build(&layout, &ay20).unwrap();
         assert_eq!(
             std::fs::read_link(layout.program_current("ay")).unwrap(),
             ay20
@@ -1322,7 +1301,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// The mode `bin/` and `channels/<ch>/` come out at is a property of the PREFIX SHAPE,
+    /// The mode `bin/` comes out at is a property of the PREFIX SHAPE,
     /// and activation is where it was easiest to get wrong: these three entry points
     /// chmod'd their directory to `0700` unconditionally, so every install and update
     /// re-hardened the ONE directory on the user's PATH (undoing a correct `atpkg link`
@@ -1334,7 +1313,7 @@ mod tests {
     /// whatever shape the layout turns out to be.
     #[cfg(unix)]
     #[test]
-    fn a_home_shaped_prefix_keeps_bin_and_channels_private() {
+    fn a_home_shaped_prefix_keeps_bin_private() {
         let layout = temp_prefix("mode-home");
         assert!(
             !layout.is_system_prefix(),
@@ -1344,13 +1323,7 @@ mod tests {
         install_tools(&layout, &b18, &[tool("ay")], Aliases::Off).unwrap();
         assert_eq!(mode_of(&layout.bin_dir()), 0o700, "bin/ stays private");
 
-        activate_channel(&layout, "stable", &b18).unwrap();
-        let chan = layout.channel_current("stable");
-        assert_eq!(
-            mode_of(chan.parent().unwrap()),
-            0o700,
-            "channels/<ch>/ stays private"
-        );
+        activate_build(&layout, &b18).unwrap();
 
         install_tombstone_shim(&layout, &tool("ay")).unwrap();
         let probe = layout.prefix.join("mode-probe");
@@ -1364,7 +1337,7 @@ mod tests {
     }
 
     /// The regression, and the only assertion that can tell the two shapes apart: under a
-    /// root-owned SYSTEM prefix, activation must publish `bin/` and `channels/<ch>/` at
+    /// root-owned SYSTEM prefix, activation must publish `bin/` at
     /// `0755`. Nothing upstream objects to `0700` — it satisfies `dir_safe_for_private_write`
     /// and Trust's launcher predicate alike — so the break surfaces only as a bare
     /// `Permission denied` at the first non-root invocation of an installed tool.
@@ -1392,14 +1365,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_system_shaped_prefix_publishes_bin_and_channels_traversable() {
+    fn a_system_shaped_prefix_publishes_bin_traversable() {
         let Some(layout) = system_prefix_fixture("mode-sys") else {
             // Not root: the shape is genuinely unbuildable here, and
             // `system_fixture_is_available_when_this_process_could_build_one` keeps that
             // excuse honest. Say so — this is the only assertion that tells the two prefix
             // shapes apart, so a silent `ok` would misreport it as covered.
             eprintln!(
-                "SKIP: a_system_shaped_prefix_publishes_bin_and_channels_traversable \
+                "SKIP: a_system_shaped_prefix_publishes_bin_traversable \
                  needs a root-owned system prefix (run as root to gate it)"
             );
             return;
@@ -1412,13 +1385,7 @@ mod tests {
             "a system prefix's bin/ must be traversable by every user, not root-only"
         );
 
-        activate_channel(&layout, "stable", &b18).unwrap();
-        let chan = layout.channel_current("stable");
-        assert_eq!(
-            mode_of(chan.parent().unwrap()),
-            0o755,
-            "channels/<ch>/ belongs to the same prefix and must not disagree"
-        );
+        activate_build(&layout, &b18).unwrap();
 
         install_tombstone_shim(&layout, &tool("ay")).unwrap();
         assert_eq!(
@@ -1429,25 +1396,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
-    /// `undo_activation` unwinds exactly the DOOMED build's footprint and nothing wider.
-    /// The channel link here has already moved on to another program's build, so it must
-    /// SURVIVE the undo — the link-removal guard is "names this build", not "names this
-    /// channel" — while the doomed build's witness link and shim both go. Without the
+    /// `undo_activation` unwinds exactly the DOOMED build's footprint and nothing wider:
+    /// the doomed build's witness link and shim both go, a bystander program activated
+    /// afterwards keeps both. Without the
     /// undo, the sysroot resolve-check discard (`flow::install_program`) left both `current` links and
     /// the written shims dangling into a deleted tree.
     #[test]
     fn undo_activation_unwinds_only_the_doomed_build() {
         let layout = temp_prefix("undo");
         let doomed = make_build(&layout, "ay", 19, &["ay"]);
-        activate_channel(&layout, "stable", &doomed).unwrap();
+        activate_build(&layout, &doomed).unwrap();
         install_tools(&layout, &doomed, &[tool("ay")], Aliases::Off).unwrap();
-        // A second program activates on the SAME channel afterwards: `channels/stable`
-        // now names ny's build; ay keeps its own witness link and shim.
+        // A second program activates afterwards; ay keeps its own witness link and shim.
         let other = make_build(&layout, "ny", 7, &["ny"]);
-        activate_channel(&layout, "stable", &other).unwrap();
+        activate_build(&layout, &other).unwrap();
         install_tools(&layout, &other, &[tool("ny")], Aliases::Off).unwrap();
 
-        undo_activation(&layout, "stable", &doomed);
+        undo_activation(&layout, &doomed);
 
         // The doomed build's whole footprint is gone...
         assert!(
@@ -1458,12 +1423,7 @@ mod tests {
             crate::platform::resolve_shim(&layout.shim(&tool("ay"))).is_none(),
             "ay's shim is removed"
         );
-        // ...and nothing else is: the channel link names ANOTHER build and survives,
-        // as does the bystander program entirely.
-        assert_eq!(
-            std::fs::read_link(layout.channel_current("stable")).expect("channel link survives"),
-            other
-        );
+        // ...and nothing else is: the bystander program survives entirely.
         assert_eq!(
             std::fs::read_link(layout.program_current("ny")).expect("ny's witness survives"),
             other
@@ -1547,12 +1507,12 @@ mod tests {
             env
         );
         // `undo_activation` unwinds an env-carrying shim by where it resolves.
-        activate_channel(&layout, "stable", &b19).unwrap();
-        undo_activation(&layout, "stable", &b19);
+        activate_build(&layout, &b19).unwrap();
+        undo_activation(&layout, &b19);
         assert!(crate::platform::resolve_shim(&shim_of(&layout, "claude")).is_none());
         // `ops::uninstall` sweeps the wrapper the same way.
         install_tools_env(&layout, &b19, &[tool("claude")], Aliases::Off, &env).unwrap();
-        activate_channel(&layout, "stable", &b19).unwrap();
+        activate_build(&layout, &b19).unwrap();
         crate::store::mark_build_ready(&b19).unwrap();
         assert!(crate::which(&layout, "claude").is_some());
         crate::ops::uninstall(&layout, "claude").unwrap();
@@ -1813,7 +1773,7 @@ mod tests {
         .unwrap();
         assert!(twin.exists());
         // … undoing that activation drops it again …
-        undo_activation(&layout, "stable", &c2);
+        undo_activation(&layout, &c2);
         assert!(!twin.exists(), "undo sweeps the twin of the doomed build");
         // … and an uninstall leaves nothing under agents/ at all.
         install_tools_env(
@@ -2387,14 +2347,14 @@ mod tests {
             Aliases::Alab,
         )
         .unwrap();
-        activate_channel(&layout, "stable", &b18).unwrap();
+        activate_build(&layout, &b18).unwrap();
         let ny7 = make_build(&layout, "ny", 7, &["ny"]);
         install_shims(&layout, &ny7, &["ny".into()], Aliases::Alab).unwrap();
 
         // Build 19 drops aylint: its shim AND its alias go; ay's alias moves to 19.
         let b19 = make_build(&layout, "ay", 19, &["ay"]);
         install_shims(&layout, &b19, &["ay".into()], Aliases::Alab).unwrap();
-        activate_channel(&layout, "stable", &b19).unwrap();
+        activate_build(&layout, &b19).unwrap();
         assert!(std::fs::symlink_metadata(shim_of(&layout, "aylint")).is_err());
         assert!(
             std::fs::symlink_metadata(shim_of(&layout, "alab-aylint")).is_err(),
@@ -2423,7 +2383,7 @@ mod tests {
         // Back to Alab; then undo_activation unwinds the alias with the build.
         install_shims(&layout, &b19, &["ay".into()], Aliases::Alab).unwrap();
         assert!(crate::platform::resolve_shim(&shim_of(&layout, "alab-ay")).is_some());
-        undo_activation(&layout, "stable", &b19);
+        undo_activation(&layout, &b19);
         assert!(std::fs::symlink_metadata(shim_of(&layout, "ay")).is_err());
         assert!(
             std::fs::symlink_metadata(shim_of(&layout, "alab-ay")).is_err(),

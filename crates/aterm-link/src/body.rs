@@ -22,6 +22,16 @@
 
 use std::collections::BTreeMap;
 
+#[cfg(test)]
+thread_local! {
+    static DECODE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn decode_calls() -> usize {
+    DECODE_CALLS.with(std::cell::Cell::get)
+}
+
 /// The kinds an `in` record may carry (§4.2). CLOSED: a kind outside this set is
 /// refused at the subject, so nothing an agent reads carries a token the bridge
 /// never classified. This is the same list the endpoint's `deliver` accepts.
@@ -231,6 +241,8 @@ impl Body {
     /// encoding bug rather than on a policy.
     #[must_use]
     pub fn decode(bytes: &[u8]) -> (Self, Option<Vec<u8>>) {
+        #[cfg(test)]
+        DECODE_CALLS.with(|calls| calls.set(calls.get() + 1));
         let split = bytes.iter().position(|b| *b == b'\n');
         let (head, tail) = match split {
             Some(i) => (&bytes[..i], Some(&bytes[i + 1..])),

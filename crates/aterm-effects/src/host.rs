@@ -36,14 +36,22 @@ pub enum Visibility {
     Hidden,
 }
 
-/// `Present` ticks the live brain; `StaticCapture` selects
-/// [`crate::kitty_pet::PetBrain::tick_static_capture`] and the converged-capture
-/// discipline — a capture never advances a walk, and the first windowless
-/// still materialises the resident at full opacity instead of catching the
-/// `dt == 0` first fade-in tick.
+/// What kind of frame this is. A capture never reads or spends the
+/// frame-over-frame diffs a present owns (the output burst, the wrap fact, the
+/// completion latch, the Execute level) and never sees a pointer: it is one
+/// isolated frame, and charging those would steal the next present's baseline.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CaptureMode {
+    /// A drawn present: the live tick, and the diffs are read and spent.
     Present,
+    /// A capture on a surface that also presents (a windowed instance): the
+    /// live tick, so the capture shows the pet where the glass has it.
+    LiveCapture,
+    /// A windowless still:
+    /// [`crate::kitty_pet::PetBrain::tick_static_capture`] and the
+    /// converged-capture discipline. A capture never advances a walk, and the
+    /// first still materialises the resident at full opacity instead of
+    /// catching the `dt == 0` first fade-in tick.
     StaticCapture,
 }
 
@@ -75,6 +83,10 @@ pub struct HostFrameInput {
     /// The adaptive load-shed envelope `0..=1`. It attenuates trails and
     /// flying heads; the full resident retains its alpha and becomes static.
     pub shed_envelope: f32,
+    /// The load-shed latch itself is engaged. The resident goes static on the
+    /// latch edge, before the envelope has begun to fall. A host with no shed
+    /// passes `false`.
+    pub shed_active: bool,
     /// The pointer in FRAME px; `None` = it left the surface — or, for a host
     /// that pushes pointer events BETWEEN frames instead, "not fed with the
     /// frame". THE PRECEDENCE (`CompanionOwner::sense`): a `Some` here wins
@@ -99,8 +111,9 @@ pub struct BlockIdentity {
 }
 
 /// Facts read from the [`Terminal`] ONCE per frame under whatever lock the
-/// host holds (LOCK A natively; `&mut Terminal` on the web). One reader for
-/// every host, so no two drivers can disagree about what the emulator said.
+/// host holds (the frame's one terminal hold natively; `&mut Terminal` on the
+/// web). One reader for every host, so no two drivers can disagree about what
+/// the emulator said.
 ///
 /// Carries NO text: typed witnesses enter only through each host's real
 /// input path (the provenance law), and the facts here are the ones a
@@ -112,11 +125,17 @@ pub struct TerminalFacts {
     /// on it, so a tab or pane switch re-baselines SILENTLY: a session change
     /// is never a wrap, never a burst, never a finished command.
     pub session: u64,
-    /// The visible caret cell `(row, col)`, or `None` when the cursor is
-    /// hidden (DECTCEM) or the viewport is scrolled into history. A host
-    /// holding a coherent `RenderInput` snapshot may substitute the
-    /// snapshot's caret so the cell plane and the caret agree.
+    /// The caret cell `(row, col)`, or `None` when the viewport is scrolled
+    /// into history, which is a real coordinate-space boundary. A HIDDEN
+    /// caret (DECTCEM) is still a caret and still travels here: every
+    /// progress bar, spinner, pager, editor and LLM console hides the cursor,
+    /// and a pet fed `None` for the hide froze where it stood and then crossed
+    /// the screen in one frame when the cursor came back. Whether the caret is
+    /// PAINTED is [`Self::cursor_visible`]. A host holding a coherent
+    /// `RenderInput` snapshot may substitute the snapshot's caret so the cell
+    /// plane and the caret agree.
     pub caret: Option<(u16, u16)>,
+    /// The emulator is painting the caret (DECTCEM shown).
     pub cursor_visible: bool,
     pub display_offset: i32,
     /// `display_offset == 0`: the viewport is at the live bottom.
@@ -144,7 +163,7 @@ impl TerminalFacts {
         let display_offset = term.grid().display_offset() as i32;
         let live_viewport = display_offset == 0;
         let cursor_visible = term.cursor_visible();
-        let caret = (live_viewport && cursor_visible).then(|| {
+        let caret = live_viewport.then(|| {
             let c = term.cursor();
             (c.row, c.col)
         });
@@ -257,21 +276,32 @@ mod tests {
         assert!(seq >= 1, "the completion seq counts once per D");
     }
 
-    /// DECTCEM withholds the caret while every other fact keeps reporting; the
-    /// alternate screen reads as such.
+    /// DECTCEM hides the caret without withdrawing it: the caret keeps
+    /// travelling and `cursor_visible` carries the hide. Scrolling into
+    /// history is the boundary that withdraws it. The alternate screen reads
+    /// as such.
     #[test]
-    fn a_hidden_cursor_withholds_the_caret_and_alt_screen_reads_true() {
+    fn a_hidden_cursor_keeps_its_caret_and_history_withdraws_it() {
         let mut term = Terminal::new(5, 20);
-        term.process(b"\x1b[?25l");
+        term.process(b"\x1b[3;7H\x1b[?25l");
         let hidden = TerminalFacts::read(&term, 1, false);
-        assert_eq!(hidden.caret, None);
-        assert!(!hidden.cursor_visible);
+        assert_eq!(hidden.caret, Some((2, 6)), "a hidden caret still travels");
+        assert!(!hidden.cursor_visible, "…and is reported unpainted");
         assert!(hidden.live_viewport, "hidden is not scrolled");
 
+        for _ in 0..12 {
+            term.process(b"line\r\n");
+        }
+        term.scroll_display(2);
+        let history = TerminalFacts::read(&term, 1, false);
+        assert!(!history.live_viewport);
+        assert_eq!(history.caret, None, "history withdraws the caret");
+
+        term.scroll_display(-2);
         term.process(b"\x1b[?25h\x1b[?1049h");
         let alt = TerminalFacts::read(&term, 1, false);
         assert!(alt.alt_screen);
-        assert!(alt.caret.is_some(), "the caret returns with DECTCEM");
+        assert!(alt.caret.is_some() && alt.cursor_visible);
     }
 
     /// The pointer-free defaults and the `u8` face of a press outcome — what

@@ -27,6 +27,7 @@ fn opts(dir: &std::path::Path) -> Opts {
         human_grace_s: 120,
         hand_back: true,
         background: false,
+        aterm_state: None,
     }
 }
 
@@ -89,7 +90,7 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
     let measured = pending(8 * 3_600 + 22 * 60);
     assert_eq!(
         measured.stall_words(NOW).as_deref(),
-        Some("behind for 8h22m, waiting (not-idle:busy)")
+        Some("behind for 8h22m: its turn is still running")
     );
     let tmux = Row {
         wait: "terminal:tmux".to_string(),
@@ -97,7 +98,6 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
     };
     assert_eq!(tmux.stall(NOW).as_deref(), Some("held-back:tmux"));
     for (why, stall) in [
-        ("unanswered", "gave-up"),
         ("not-a-shell-job", "refused:not-a-shell-job"),
         ("argv:--print", "refused:argv:--print"),
         ("no-resume", "failed:no-resume"),
@@ -108,6 +108,29 @@ fn only_an_upgrade_that_will_not_move_on_its_own_is_stalled() {
         };
         assert_eq!(stopped.stall(NOW).as_deref(), Some(stall), "{why}");
         assert!(stopped.stall_words(NOW).is_some());
+    }
+    // A ROUND THAT GAVE UP IS NO STALL OF ITS OWN (the owner, 2026-09-27: "you
+    // should NEVER have upgrades stalled"): it rests, and the next round asks
+    // again on its own. Its age still reads `overdue`, as every round's does,
+    // so a long-behind tab (1d22h, the owner's) says the same word through
+    // every round rather than flapping between them. Resting, it is not
+    // `moving`: it moves only after the rest, a notice and a READY.
+    for (behind, stall) in [(60, None), (46 * 3_600, Some("overdue"))] {
+        let gave_up = Row {
+            phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+            retry_at: NOW + 3_600,
+            ..pending(behind)
+        };
+        assert_eq!(gave_up.stall(NOW).as_deref(), stall, "{behind}");
+        assert_eq!(
+            gave_up.stall_words(NOW).is_some(),
+            stall.is_some(),
+            "{behind}"
+        );
+        assert!(
+            !gave_up.moving(NOW),
+            "resting, it does not move at a turn end"
+        );
     }
     // The owner's word holds it: no stall while it holds.
     let old = pending(9 * 3_600);
@@ -157,7 +180,7 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
     );
     assert_eq!(
         pending(8 * 3_600 + 22 * 60).column(NOW),
-        "stalled/2.1.282/overdue/8h22m"
+        "stalled/2.1.282/overdue:not-idle:busy/8h22m"
     );
     let asked = Row {
         phase: Phase::Announced { at_s: NOW, asks: 1 },
@@ -194,6 +217,95 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
         assert!(!col.contains(char::is_whitespace), "{col}");
         assert_eq!(col.split('/').count(), 4, "{col}");
     }
+}
+
+/// N2 OF THE LIVE RE-TEST OF 2026-09-26: A RESTART WHOSE CARRY-ON IS TYPED
+/// IS RESTARTING WHILE ITS MODEL IS WAITED FOR — the column read blank for
+/// the 24 s between the carry-on and its answer: the typed path saves the
+/// record DONE with no `done_at` (set once the model is read), and the view
+/// dropped a done row that old. It reads `restarting/<to>/continued/<behind>`
+/// until `confirm_by` (the model's wait), and is handed over. PAST IT, the
+/// model still unread — it is read at the next idle point, after the
+/// carry-on's answer, which may run forty minutes (the review of the N2
+/// fix) — the row is `done`, aged from `confirm_by`, and the view names the
+/// instant it turns; the model read, `done` from then. NEGATIVE CONTROL: a
+/// done record with no `done_at` that owes nothing (an older build's) is
+/// dropped, as before.
+#[test]
+fn a_carried_on_restart_reads_restarting_while_its_model_is_waited_for() {
+    let carried = Row {
+        phase: Phase::Done,
+        confirm_by: NOW + 60,
+        ..pending(120)
+    };
+    assert_eq!(carried.column(NOW), "restarting/2.1.282/continued/2m");
+    assert_eq!(carried.column(NOW + 60), "restarting/2.1.282/continued/3m");
+    assert_eq!(carried.column(NOW + 61 + 40 * 60), "done/2.1.282/-/40m");
+    let dir = scratch("confirming");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let now = now_s();
+    let st = St {
+        phase: Phase::Done,
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now - 150,
+        confirm_by: now + 120,
+        resumed_on: "2.1.282".to_string(),
+        ..St::default()
+    };
+    save(&o, "aaa", &st);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let held = behind_in(TAB);
+    let mut view = View::default();
+    let mut sent: Vec<Vec<Row>> = Vec::new();
+    let next = view.refresh_with(&o, &tabs, now, &held, &mut |rows| sent.push(rows.to_vec()));
+    let row = &sent.last().expect("handed over")[0];
+    assert_eq!(row.column(now), "restarting/2.1.282/continued/2m");
+    assert_eq!(next, Some(now + 121), "the view looks again as it turns");
+    // Past the model's wait, the carry-on's answer still running: done.
+    view.refresh_with(&o, &tabs, now + 125, &held, &mut |rows| {
+        sent.push(rows.to_vec())
+    });
+    assert_eq!(
+        sent.last().expect("sent")[0].column(now + 125),
+        "done/2.1.282/-/5s"
+    );
+    // Its model read: done, from then.
+    save(
+        &o,
+        "aaa",
+        &St {
+            confirm_by: 0,
+            done_at: now + 130,
+            ..st.clone()
+        },
+    );
+    view.refresh_with(&o, &tabs, now + 135, &held, &mut |rows| {
+        sent.push(rows.to_vec())
+    });
+    assert_eq!(
+        sent.last().expect("sent")[0].column(now + 135),
+        "done/2.1.282/-/5s"
+    );
+    // NEGATIVE CONTROL: done, no `done_at`, nothing owed.
+    save(
+        &o,
+        "aaa",
+        &St {
+            confirm_by: 0,
+            ..st.clone()
+        },
+    );
+    view.refresh_with(&o, &tabs, now + 136, &held, &mut |rows| {
+        sent.push(rows.to_vec())
+    });
+    assert!(sent.last().expect("sent").is_empty(), "{sent:?}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `--status` reads every state file, filtered to one tab when asked, and
@@ -235,7 +347,7 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
         only[0].line(NOW),
         format!(
             "upgrade tab={TAB} session=aaa from=2.1.281 to=2.1.282(managed) phase=pending \
-             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- stalled=overdue"
+             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- stalled=overdue"
         )
     );
     let json = only[0].to_json(NOW);
@@ -313,7 +425,14 @@ fn an_ask_writes_the_owners_word_under_the_lock_and_refuses_what_it_cannot_hold(
         };
         save(&o, "aaa", &stopped);
         let e = ask(&o, TAB, Ask::Now).expect_err("not re-armed");
-        assert!(e.contains("stopped for good"), "{why}: {e}");
+        assert!(e.contains(&format!("stopped ({why})")), "{why}: {e}");
+        // Never "for good": it starts a new round on its own (2026-09-27),
+        // at its next look — a stop older than the stamp is due at once.
+        assert!(!e.contains("for good"), "{why}: {e}");
+        assert!(
+            e.contains("starts a new round on its own at its next look"),
+            "{why}: {e}"
+        );
         assert!(e.contains("--skip"), "{why}: {e}");
         assert_eq!(load(&o, "aaa"), Some(stopped), "{why}: nothing written");
         let row = ask(&o, TAB, Ask::Skip).expect("a skip ends it");
@@ -784,8 +903,10 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
         pending_since: now_s() - 60,
         ..St::default()
     };
+    // A refusal: a stall a new round meets again. (A round that gave up is
+    // none: `a_give_up_rests_unmarked_and_now_re_arms_it_at_once`.)
     let stalled = St {
-        phase: Phase::Failed("unanswered".to_string()),
+        phase: Phase::Failed("not-a-shell-job".to_string()),
         ..waiting.clone()
     };
     save(&o, "aaa", &waiting);
@@ -817,7 +938,10 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
         )),
         "{marked:?}"
     );
-    assert!(marked[0].contains("no READY answer"), "{marked:?}");
+    assert!(
+        marked[0].contains("not its shell's foreground job"),
+        "{marked:?}"
+    );
     save(
         &o,
         "aaa",
@@ -837,8 +961,8 @@ fn only_a_stalled_tab_is_marked_and_its_mark_is_lowered_when_it_recovers() {
 }
 
 /// WHAT A ROW SAYS IT MOVES: a build upgrade names both builds (and the
-/// model once the announcement named one); a same-build restart for the
-/// priority list's model names the model, never `2.1.282 → 2.1.282`.
+/// model once the announcement named one); a same-build restart for a model
+/// move names the model, never `2.1.282 → 2.1.282`.
 #[test]
 fn a_row_names_the_move_a_model_restart_included() {
     let row = pending(60);
@@ -855,10 +979,7 @@ fn a_row_names_the_move_a_model_restart_included() {
         from: "2.1.282".to_string(),
         ..row.clone()
     };
-    assert_eq!(
-        same.move_words(),
-        "Claude Code 2.1.282 → the priority list's model"
-    );
+    assert_eq!(same.move_words(), "Claude Code 2.1.282 → another model");
     let named = Row {
         model: "claude-opus-5-5".to_string(),
         ..same
@@ -910,7 +1031,7 @@ fn a_row_stands_only_while_its_conversation_is_live_and_behind_in_its_tab() {
     let unproven = [holder(s, "2.1.281", None)];
     assert!(!row.standing(&unproven, false), "the host proves the tab");
     assert!(row.standing(&unproven, true), "the CLI cannot disprove it");
-    // A SAME-BUILD restart (the priority list's model, the build current)
+    // A SAME-BUILD restart (a model move, the build current)
     // waits on a holder still ON its build — and, like any other, not on one
     // past it or in another tab.
     let model = Row {
@@ -1024,7 +1145,7 @@ fn an_overdue_tab_is_marked_once_not_once_a_minute() {
         &o,
         "aaa",
         &St {
-            phase: Phase::Failed("unanswered".to_string()),
+            phase: Phase::Failed("not-a-shell-job".to_string()),
             ..overdue
         },
     );
@@ -1032,7 +1153,10 @@ fn an_overdue_tab_is_marked_once_not_once_a_minute() {
     view.refresh_with(&o, &tabs, now + 300, &held, &mut |_| {});
     let marked = sets(&asked);
     assert_eq!(marked.len(), 2, "{marked:?}");
-    assert!(marked[1].contains("no READY answer"), "{marked:?}");
+    assert!(
+        marked[1].contains("not its shell's foreground job"),
+        "{marked:?}"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1073,7 +1197,9 @@ fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
         hurried.column(NOW)
     );
     assert!(
-        hurried.line(NOW).ends_with(" request=now stalled=-"),
+        hurried
+            .line(NOW)
+            .ends_with(" request=now next_round=- stalled=-"),
         "{}",
         hurried.line(NOW)
     );
@@ -1207,16 +1333,20 @@ fn an_owners_now_quiets_an_overdue_stall_only_for_a_bounded_time() {
     assert_eq!(untimed.stall(NOW).as_deref(), Some("overdue"));
 }
 
-/// A GAVE-UP UPGRADE RE-ARMED BY `--now` IS NOT STALLED AGAIN AT ONCE (review
-/// of 2026-09-25): the band's own remedy for a give-up is `--now`, and a
-/// session six hours behind re-armed by it kept its age and read `overdue`
-/// at once — the gave-up row resolved, a NEW Warn row naming `--now` again
-/// posted, and the tab's mark re-sent under new words, taking the tab's
-/// attention back. Now the mark is lowered and nothing new is raised; the
-/// summary row reads pending. NEGATIVE CONTROL: the give-up itself is marked.
+/// A GAVE-UP UPGRADE IS NOT STALLED, BEFORE OR AFTER `--now` RE-ARMS IT. The
+/// review of 2026-09-25 found a session six hours behind re-armed by `--now`
+/// reading `overdue` at once — the gave-up row resolved, a NEW Warn row
+/// naming `--now` again posted, the tab's mark re-sent under new words — and
+/// the fix left the give-up itself a stall (`stalled=gave-up`, a band row and
+/// the tab's mark), for good: the owner's tab of 2026-09-27 read it for
+/// 1d22h ("you should NEVER have upgrades stalled"). Now a round that gave up
+/// rests until its next one, which `--status` names (`next_round=`), and is
+/// never marked; the owner's `--now` re-arms it at once, as its remedy says,
+/// and nothing is marked then either. NEGATIVE CONTROL: the same row as a
+/// refusal (`not-a-shell-job`, which a new round meets again) is marked.
 #[cfg(unix)]
 #[test]
-fn a_give_up_re_armed_by_now_is_moving_not_stalled_again() {
+fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
     let dir = scratch("re-armed");
     let (sock, asked) = recording_socket(&dir);
     let o = Opts {
@@ -1225,18 +1355,16 @@ fn a_give_up_re_armed_by_now_is_moving_not_stalled_again() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let now = now_s();
-    save(
-        &o,
-        "aaa",
-        &St {
-            phase: Phase::Failed("unanswered".to_string()),
-            from: "2.1.281".to_string(),
-            to: "2.1.282".to_string(),
-            tab: TAB.to_string(),
-            pending_since: now - 7 * 3_600,
-            ..St::default()
-        },
-    );
+    let gave_up = St {
+        phase: Phase::Failed("unanswered".to_string()),
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        tab: TAB.to_string(),
+        pending_since: now - 5 * 3_600,
+        failed_at: now - 60,
+        ..St::default()
+    };
+    save(&o, "aaa", &gave_up);
     let tabs = [LiveTab {
         sid: TAB.to_string(),
         fgpgid: Some(7),
@@ -1245,24 +1373,55 @@ fn a_give_up_re_armed_by_now_is_moving_not_stalled_again() {
     let mut view = View::default();
     let mut last = Vec::new();
     view.refresh_with(&o, &tabs, now, &held, &mut |rows| last = rows.to_vec());
-    assert_eq!(last[0].stall(now).as_deref(), Some("gave-up"));
+    assert_eq!(last[0].stall(now), None, "resting, not stalled");
+    assert_eq!(last[0].retry_at, now - 60 + upgrade::RETRY_S);
+    assert_eq!(
+        last[0].next_round_in(now),
+        Some(upgrade::RETRY_S - 60),
+        "{:?}",
+        last[0]
+    );
+    assert!(
+        last[0].line(now).ends_with(" next_round=1h59m stalled=-"),
+        "{}",
+        last[0].line(now)
+    );
+    assert_eq!(last[0].column(now), "pending/2.1.282/next-round:1h59m/5h");
+    assert_eq!(
+        last[0].remedy(now),
+        Some(Remedy::AskAgain),
+        "--now asks at once"
+    );
     let row = ask(&o, TAB, Ask::Now).expect("--now re-arms a give-up");
     assert_eq!(row.phase, Phase::Pending);
     assert_eq!(row.stall(now), None, "{row:?}");
     view.refresh_with(&o, &tabs, now + 60, &held, &mut |rows| last = rows.to_vec());
     assert_eq!(last.len(), 1);
-    assert_eq!(last[0].stall(now + 60), None, "not stalled again");
-    let meta: Vec<String> = asked
-        .lock()
-        .map(|a| a.iter().filter(|l| l.contains(" meta ")).cloned().collect())
-        .unwrap_or_default();
-    assert_eq!(meta.len(), 2, "{meta:?}");
-    assert!(meta[0].contains("no READY answer"), "{meta:?}");
-    assert_eq!(
-        meta[1],
-        format!("@{TAB} meta unset attention owner=upgrade"),
-        "lowered, never re-sent: {meta:?}"
+    assert_eq!(last[0].stall(now + 60), None, "not stalled");
+    let meta = |asked: &std::sync::Mutex<Vec<String>>| -> Vec<String> {
+        asked
+            .lock()
+            .map(|a| a.iter().filter(|l| l.contains(" meta ")).cloned().collect())
+            .unwrap_or_default()
+    };
+    assert!(meta(&asked).is_empty(), "never marked: {:?}", meta(&asked));
+    // NEGATIVE CONTROL: a refusal a new round meets again is a stall.
+    save(
+        &o,
+        "aaa",
+        &St {
+            phase: Phase::Failed("not-a-shell-job".to_string()),
+            ..gave_up
+        },
     );
+    view.refresh_with(&o, &tabs, now + 120, &held, &mut |rows| {
+        last = rows.to_vec()
+    });
+    assert_eq!(
+        last[0].stall(now + 120).as_deref(),
+        Some("refused:not-a-shell-job")
+    );
+    assert_eq!(meta(&asked).len(), 1, "{:?}", meta(&asked));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1745,6 +1904,92 @@ fn a_codex_move_in_flight_refuses_the_owners_word_in_its_own_terms() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A CLAUDE CODE WAITING ON ITS OWN WORK IS WORDED FOR THE OWNER (2026-09-26:
+/// two poll loops that could never end held a tab four days behind, and the
+/// row read a bare `waiting (background)`). The words fit the band's first
+/// line (64 characters) at any age below 100 days, and `--now` is not
+/// offered: it cannot move a session past its own work.
+#[test]
+fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
+    for wait in ["background", "not-idle:shell"] {
+        let row = Row {
+            wait: wait.to_string(),
+            ..pending(10 * 86_400 + 23 * 3_600)
+        };
+        let words = row.stall_words(NOW).expect("overdue");
+        assert!(words.ends_with("its own work runs"), "{wait}: {words}");
+        assert!(words.chars().count() <= 64, "{wait}: {words}");
+        assert_eq!(row.remedy(NOW), Some(Remedy::Waits), "{wait}");
+    }
+    // A turn in progress has no such words: its wait word says it.
+    let busy = Row {
+        wait: "not-idle:busy".to_string(),
+        ..pending(7 * 3_600)
+    };
+    assert!(!busy.stall_words(NOW).expect("overdue").contains("own work"));
+}
+
+/// NO RAW WAIT WORD IN A PERSON'S WORDS (round 18, day four, D3: `waiting
+/// (not-idle:busy)`, `waiting (background)`): every wait a Claude step
+/// records reads as words, a wait with none is left out, and the words fit
+/// the band's first line. An ANNOUNCED move on its own work is still asking
+/// by itself (D5): it marks no tab. NEGATIVE CONTROL: the same wait before
+/// any notice, and a turn still running, do.
+#[test]
+fn a_claude_stall_never_prints_its_wait_word() {
+    for wait in [
+        "",
+        "busy",
+        "not-idle:busy",
+        "not-idle:waiting",
+        "not-idle",
+        "not-idle:shell",
+        "background",
+        "settling",
+        "attended",
+        "awaiting-ready",
+        "not-ready",
+        "draft",
+        "box",
+        "held",
+        "limited",
+        "login",
+        "in-flight",
+        "something-new",
+    ] {
+        let row = Row {
+            wait: wait.to_string(),
+            ..pending(10 * 86_400 + 23 * 3_600)
+        };
+        let words = row.stall_words(NOW).expect("overdue");
+        assert!(!words.contains('('), "{wait}: {words}");
+        // A machine word (`not-idle:busy`, `awaiting-ready`) never reads.
+        assert!(
+            !wait.contains([':', '-']) || !words.contains(wait),
+            "{wait}: {words}"
+        );
+        assert!(words.chars().count() <= 64, "{wait}: {words}");
+    }
+    let asked = |wait: &str| Row {
+        phase: Phase::Announced { at_s: NOW, asks: 1 },
+        wait: wait.to_string(),
+        ..pending(7 * 3_600)
+    };
+    assert!(asked("background").asks_on_its_own(NOW));
+    assert_eq!(asked("background").badge(NOW), None);
+    assert!(!pending_with("background").asks_on_its_own(NOW));
+    assert!(pending_with("background").badge(NOW).is_some());
+    assert!(!asked("not-idle:busy").asks_on_its_own(NOW));
+    assert!(asked("not-idle:busy").badge(NOW).is_some());
+}
+
+fn pending_with(wait: &str) -> Row {
+    Row {
+        wait: wait.to_string(),
+        ..pending(7 * 3_600)
+    }
+}
+
 #[test]
 fn a_codex_wait_on_its_daemon_is_worded_for_the_owner() {
     let row = |wait: &str| Row {
@@ -1837,4 +2082,126 @@ fn a_held_back_agent_without_an_owner_name_reads_as_a_sentence() {
     }
     assert_eq!(runs_under("?"), "a terminal that is not the tab's");
     assert_eq!(runs_under("screen"), "screen");
+}
+
+/// WHEN THE NEXT ROUND STARTS, instead of a permanent `gave-up` (the owner,
+/// 2026-09-27: `--status` read `stalled=gave-up` for 1d22h): every stopped
+/// round's row says it — `next_round=<span>` on the line, `next_round_s` and
+/// `retry_at` in the JSON, `next-round:<span>` in the column of a round that
+/// is no stall — and `due` once it has rested (a stop an older build
+/// recorded, with no stamp, is due at once). A round the owner's skip holds
+/// has no next round (`-`). A REFUSAL — which a new round meets again unless
+/// something changed — stays a stall, and keeps it through the re-armed
+/// round's first look (`last_stop`) until its first notice goes: without
+/// that its band row resolved at every re-arm and a new one was posted a
+/// minute later, every two hours.
+#[test]
+fn a_stopped_round_says_when_its_next_round_starts() {
+    let base = St {
+        from: "2.1.281".to_string(),
+        to: "2.1.282".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        pending_since: NOW - 46 * 3_600,
+        ..St::default()
+    };
+    let gave_up = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        failed_at: NOW - 3_600,
+        ..base.clone()
+    };
+    let row = Row::of("aaa", &gave_up, NOW);
+    // 46 hours behind (the owner's tab): the rest is no stall of its own, and its
+    // age reads `overdue` as every round's does.
+    assert_eq!(row.stall(NOW).as_deref(), Some("overdue"));
+    assert_eq!(row.next_round_in(NOW), Some(upgrade::RETRY_S - 3_600));
+    assert!(
+        row.line(NOW)
+            .ends_with(" request=- next_round=1h stalled=overdue"),
+        "{}",
+        row.line(NOW)
+    );
+    // The column says the stall, as every overdue session's does; the line keeps
+    // `next_round=`.
+    assert_eq!(row.column(NOW), "stalled/2.1.282/overdue/1d22h");
+    let json = row.to_json(NOW);
+    assert_eq!(
+        json.get("retry_at").and_then(Value::as_u64),
+        Some(NOW - 3_600 + upgrade::RETRY_S)
+    );
+    assert_eq!(
+        json.get("next_round_s").and_then(Value::as_u64),
+        Some(upgrade::RETRY_S - 3_600)
+    );
+    assert_eq!(json.get("stalled").and_then(Value::as_str), Some("overdue"));
+    // Unstamped (an older build's): due at once.
+    let old = Row::of(
+        "aaa",
+        &St {
+            failed_at: 0,
+            ..gave_up.clone()
+        },
+        NOW,
+    );
+    assert_eq!(old.next_round_in(NOW), Some(0));
+    assert!(
+        old.line(NOW).contains(" next_round=due "),
+        "{}",
+        old.line(NOW)
+    );
+    assert_eq!(old.column(NOW), "stalled/2.1.282/overdue/1d22h");
+    // The owner's skip: no next round, and no stall.
+    let skipped = Row::of(
+        "aaa",
+        &St {
+            request: Request::Skip("2.1.282".to_string()),
+            request_tab: TAB.to_string(),
+            ..gave_up.clone()
+        },
+        NOW,
+    );
+    assert_eq!(skipped.next_round_in(NOW), None);
+    assert!(
+        skipped.line(NOW).contains(" next_round=- "),
+        "{}",
+        skipped.line(NOW)
+    );
+    // Nothing else stopped has a next round.
+    assert_eq!(Row::of("aaa", &base, NOW).next_round_in(NOW), None);
+
+    // A refusal: a stall, with its next round; re-armed, the same stall
+    // until the new round's first notice. (An hour behind: past six hours a
+    // pending round reads `overdue` whatever it waits on.)
+    let young = St {
+        pending_since: NOW - 3_600,
+        ..base.clone()
+    };
+    let refused = St {
+        phase: Phase::Failed("not-a-shell-job".to_string()),
+        failed_at: NOW - upgrade::RETRY_S,
+        ..young.clone()
+    };
+    let row = Row::of("aaa", &refused, NOW);
+    assert_eq!(row.stall(NOW).as_deref(), Some("refused:not-a-shell-job"));
+    assert!(
+        row.line(NOW).contains(" next_round=due "),
+        "{}",
+        row.line(NOW)
+    );
+    let mut st = refused.clone();
+    assert_eq!(st.rearm(NOW), "not-a-shell-job");
+    assert_eq!(
+        Row::of("aaa", &st, NOW).stall(NOW).as_deref(),
+        Some("refused:not-a-shell-job"),
+        "no flap at the re-arm"
+    );
+    st.announced("ATERM-UPGRADE-READY-0badf00d".to_string(), NOW, 1);
+    assert_eq!(Row::of("aaa", &st, NOW).stall(NOW), None, "met no refusal");
+    // A give-up re-armed is no stall at any look.
+    let mut st = St {
+        phase: Phase::Failed(upgrade::GAVE_UP.to_string()),
+        ..young
+    };
+    let _ = st.rearm(NOW);
+    assert_eq!(Row::of("aaa", &st, NOW).stall(NOW), None);
 }

@@ -52,8 +52,6 @@ pub(crate) struct Lane<'a> {
     pub layout: &'a Layout,
     /// Every vendor fetch goes through its `vendor_*` methods.
     pub fetcher: &'a dyn Fetcher,
-    /// The channel whose `current` link names an activated build.
-    pub channel: &'a str,
     /// The client's own triple: it, never a document, picks the platform.
     pub triple: &'a str,
     /// The signed yanks ([`Policy::current`]).
@@ -813,7 +811,6 @@ fn land(
     let landed = crate::flow::land_artifact(
         lane.layout,
         &Landing {
-            channel: lane.channel,
             program,
             build: c.version.build_id(),
             artifact: art,
@@ -891,7 +888,7 @@ fn roll_back(
     let exposes: Vec<String> = super::spec(program)
         .map(|s| s.exposes.iter().map(|t| (*t).to_string()).collect())
         .unwrap_or_default();
-    match crate::flow::roll_back_to(lane.layout, lane.channel, program, to, &exposes) {
+    match crate::flow::roll_back_to(lane.layout, program, to, &exposes) {
         Ok(()) => Verdict::RolledBack {
             from,
             to: target.version,
@@ -1035,7 +1032,6 @@ pub(crate) struct HandRollback {
 /// laid.
 pub(crate) fn roll_back_by_hand(
     layout: &Layout,
-    channel: &str,
     policy: &Policy,
     spec: &'static VendorSpec,
 ) -> Result<HandRollback, String> {
@@ -1091,7 +1087,7 @@ pub(crate) fn roll_back_by_hand(
     crate::shim_env::write_sidecar(&layout.build_dir(program, to_build), &spec.shim_env())
         .map_err(|e| format!("the rollback could not be laid: {e}"))?;
     let exposes: Vec<String> = spec.exposes.iter().map(|t| (*t).to_string()).collect();
-    crate::flow::roll_back_to(layout, channel, program, to_build, &exposes)
+    crate::flow::roll_back_to(layout, program, to_build, &exposes)
         .map_err(|e| format!("the rollback could not be laid: {e}"))?;
     let verdict = format!("{program} rolled back from {from} to {to} by hand");
     let _ =
@@ -1911,7 +1907,6 @@ mod tests {
         let lane = Lane {
             layout,
             fetcher,
-            channel: "stable",
             triple: world::triple(),
             policy,
             trust,
@@ -1927,7 +1922,6 @@ mod tests {
         let lane = Lane {
             layout,
             fetcher,
-            channel: "stable",
             triple: world::triple(),
             policy: &Policy::default(),
             trust: &world::trust(),

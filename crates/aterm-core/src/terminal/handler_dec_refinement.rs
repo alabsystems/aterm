@@ -632,6 +632,7 @@ impl TerminalHandler<'_> {
             2048 => self.modes.in_band_size_reports,
             2500 => self.modes.bidi_box_mirroring,
             2501 => self.modes.bidi_autodetection,
+            9001 => self.modes.win32_input_mode,
             _ => return None,
         })
     }

@@ -12,8 +12,9 @@
 //! after another, waits for ONE key after each — one byte, or an escape and
 //! the two bytes after it, so an arrow is one key — and appends it to a key
 //! log (`1`, `enter`, `up`, `down`: [`keys`]); a screen named `*.hold` is
-//! shown for a few seconds and reads nothing. The key log is the ground truth
-//! of what the host typed.
+//! shown for a few seconds and reads nothing, and one named `*.late` is not
+//! drawn at all: the fake waits [`LATE_S`] first, an agent still starting.
+//! The key log is the ground truth of what the host typed.
 //!
 //! * THE HOST ATTACHES: its claim (`meta-change field=supervisor`) is on the
 //!   session's timeline within 2 s of the server's first agent verdict for
@@ -59,7 +60,9 @@
 //! * THE LIVE UPGRADE IS A STEP OF THE WORKER: atpkg's activation notice
 //!   (a push, no sweep) asks the loop for its next idle point, where the worker
 //!   announces, reads READY, ends the agent and relaunches it on the new
-//!   build on its conversation, and carries it on.
+//!   build on its conversation, and carries it on — and the tab's `upgrade=`
+//!   says so on this headless instance. A session nobody has asked anything
+//!   is restarted on the new build afresh instead, nothing typed into it.
 //!
 //! * AN AGENT WHOSE EXIT WAS ITS OWN END IS LEFT ALONE: every fake above
 //!   exits when its screens are done, under the full-power default
@@ -69,162 +72,94 @@
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
 //! every automatic lane off but the supervisor under test (its `[harness]`
 //! at the full-power default, the host's own acts included), `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance never reaches
-//! WindowServer, and the fake is typed by its absolute path so no real agent
+//! (`support/launch_isolation.rs`). A headless instance opens no window, and
+//! the fake is typed by its absolute path so no real agent
 //! on the machine's PATH can start.
 
 #![cfg(unix)]
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
+use headless_boot::log_tail;
+
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
-const MAX_SOCK_PATH: usize = 100;
 /// How long a `*.hold` screen stays up: long enough for the supervisor to
 /// read it settled (its footer is what says bypass).
 const HOLD_S: u32 = 5;
+/// How long a `*.late` scene keeps the screen blank: longer than the
+/// supervisor's idle window (`aterm_agent::supervise`'s `IDLE_MS`, 2 s), so
+/// its first look settles on the blank screen as an idle point — as it does
+/// on a real Claude Code whose first frame comes seconds after its exec (its
+/// own start-up, a loaded machine).
+const LATE_S: u32 = 3;
 /// How long "nothing typed" is watched for after the escalation showed.
 const QUIET: Duration = Duration::from_secs(3);
 
-/// One booted headless instance plus its scratch world, torn down on every
-/// exit path (Drop runs on panic too).
+/// One booted headless instance ([`headless_boot::Instance`], torn down on every
+/// exit path) and the sid of its one session.
 struct Instance {
-    child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    tmp: PathBuf,
-    log: PathBuf,
-    sock: String,
+    live: headless_boot::Instance,
     sid: String,
 }
 
-impl Drop for Instance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
+impl std::ops::Deref for Instance {
+    type Target = headless_boot::Instance;
+    fn deref(&self) -> &Self::Target {
+        &self.live
     }
 }
 
-fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(15);
-    lines[start..].join("\n")
-}
-
-fn is_socket_or_symlink(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_socket() || m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-fn scratch_root(tag: &str) -> Option<PathBuf> {
-    let name = format!("athh{tag}-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
+impl std::ops::DerefMut for Instance {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.live
     }
-    None
 }
 
-/// Boot one headless instance, 40x200, its `[harness]` table the keys
-/// `harness` in place of the isolation config's (which switches the
-/// supervisor off). `None` = an environmental refusal, announced as a SKIP
-/// with the log tail.
+/// Boot one headless instance under `harness` config, 40 rows: its `[harness]`
+/// table the keys `harness` in place of the isolation config's (which switches
+/// the supervisor off).
 fn boot(tag: &str, harness: &str) -> Option<Instance> {
     boot_sized(tag, harness, 40)
 }
 
-/// [`boot`] with `lines` rows.
+/// Boot one headless instance with `harness` appended to its config and the
+/// fixture world written ([`headless_boot::boot_with`]: `None` is an
+/// environment refusal; a product that cannot start fails the test), and read
+/// its one session's sid.
 fn boot_sized(tag: &str, harness: &str, lines: u16) -> Option<Instance> {
-    let Some(tmp) = scratch_root(tag) else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
-    let cfg = tmp.join("cfg/aterm/aterm.toml");
-    let base = std::fs::read_to_string(&cfg).expect("the isolation config");
-    assert!(base.contains(launch_isolation::HARNESS_OFF), "{base}");
-    let base = base.replace(launch_isolation::HARNESS_OFF, "");
-    std::fs::write(&cfg, format!("{base}[harness]\n{harness}")).expect("write the config");
-    write_world(&tmp);
-    let log = tmp.join("gui.log");
-    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, &tmp);
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .args(launch_isolation::control_sock(&tmp))
-        // The supervisor's lines (`harness @<sid>: …`) are the diagnosis a
-        // failed assertion prints ([`harness_lines`]).
-        // (A development seam: this is a debug build.)
-        .env("ATERM_LOG", "info")
-        // The fixtures are 120-140 columns wide; Claude Code lays out its own
-        // rows, so a terminal wrap is not a shape it draws.
-        .args(["--lines", &lines.to_string(), "--columns", "200"])
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let sock_path = tmp.join("run/aterm/aterm.sock");
+    let live = headless_boot::boot_with(
+        &format!("athh{tag}"),
+        |tmp, cmd| {
+            let cfg = tmp.join("cfg/aterm/aterm.toml");
+            let base = std::fs::read_to_string(&cfg).expect("the isolation config");
+            assert!(base.contains(launch_isolation::HARNESS_OFF), "{base}");
+            let base = base.replace(launch_isolation::HARNESS_OFF, "");
+            std::fs::write(&cfg, format!("{base}[harness]\n{harness}")).expect("write the config");
+            write_world(tmp);
+            // The supervisor's lines (`harness @<sid>: …`) are the diagnosis a
+            // failed assertion prints ([`harness_lines`]).
+            // (A development seam: this is a debug build.)
+            cmd.env("ATERM_LOG", "info")
+                // The fixtures are 120-140 columns wide; Claude Code lays out its
+                // own rows, so a terminal wrap is not a shape it draws.
+                .args(["--lines", &lines.to_string(), "--columns", "200"]);
+        },
+        |_| true,
+    )?;
     let mut inst = Instance {
-        child,
-        _lifeline: lifeline,
-        sock: sock_path.to_string_lossy().into_owned(),
-        tmp,
-        log,
+        live,
         sid: String::new(),
     };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!(
-                "SKIP: aterm --headless exited before binding its socket; log tail:\n{}",
-                log_tail(&inst.log)
-            );
-            return None;
-        }
-        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
-            inst.sid = boot_session(&inst);
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!(
-        "SKIP: control socket never started listening; log tail:\n{}",
-        log_tail(&inst.log)
-    );
-    None
+    inst.sid = boot_session(&inst);
+    Some(inst)
 }
 
 fn client_command(inst: &Instance, args: &[&str]) -> Command {
@@ -558,6 +493,26 @@ fn fake_path(tmp: &Path) -> PathBuf {
     atpkg::store::default_prefix(&tmp.join("home")).join("agents/claude")
 }
 
+/// Run a fake this test just wrote, once and unbounded, before the product
+/// meets it. The FIRST exec of a new file waits on the system's check of it —
+/// 0.2 s on an idle machine, seconds under a loaded gate (6.6 s measured
+/// 2026-09-26) — and every later exec, from any program, takes milliseconds
+/// (measured 2026-09-27: the check is the file's, not the caller's). The
+/// host's version probe of the twin is bounded at 5 s
+/// (`aterm_agent::harness::upgrade_drive`'s `VERSION_WAIT`): a probe that
+/// paid the check read as a build that did not answer, and the attach it
+/// runs in and the upgrade it decides waited on it. That time is the file's,
+/// not the product's. Every fake here answers `--version` at once, or ends
+/// at once with nothing to draw.
+fn first_run(fake: &Path) {
+    let _ = Command::new(fake)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Write the fake `claude` and every screen under `tmp`.
 fn write_world(tmp: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -571,13 +526,16 @@ fn write_world(tmp: &Path) {
         "#!/bin/sh\n\
          # A fake Claude Code: draws each screen file given, reads ONE key after\n\
          # each into the key log ($1) -- one byte, or ESC and the two after it --\n\
-         # as `od -c` spells it; a *.hold screen is shown and nothing read.\n\
+         # as `od -c` spells it; a *.hold screen is shown and nothing read, and\n\
+         # a *.late one is a wait with nothing drawn.\n\
          log=$1; shift\n\
          old=$(stty -g)\n\
          stty -icanon -echo min 1\n\
          for scene in \"$@\"; do\n\
+         \x20 case \"$scene\" in *.late) sleep {LATE_S}; continue ;; esac\n\
          \x20 printf '\\033[2J\\033[H'\n\
          \x20 cat \"$scene\"\n\
+         \x20 r=$(grep -n '^❯' \"$scene\" | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          \x20 case \"$scene\" in *.hold) sleep {HOLD_S}; continue ;; esac\n\
          \x20 k=$(dd bs=1 count=1 2>/dev/null | od -An -c | tr -d ' ')\n\
          \x20 case \"$k\" in 033) k=\"$k$(dd bs=1 count=2 2>/dev/null | od -An -c | tr -d ' ')\" ;; esac\n\
@@ -588,6 +546,7 @@ fn write_world(tmp: &Path) {
     );
     std::fs::write(&claude, fake).expect("write the fake");
     std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    first_run(&claude);
     // The measured touch box draws its third option garbled (`3. Nooject`,
     // aterm-phase's `the_touch_box_is_bash_whatever_its_description_says`),
     // and decision 1's rules press a one-shot `Yes` only on a box that also
@@ -993,13 +952,22 @@ fn the_host_answers_what_the_policy_proves_safe() {
 
 /// Under the owner's `approve = "safe"` (full power, the default, answers
 /// these boxes: aterm's `supervise_turn_end_live_headless.rs`).
+///
+/// THE FAKE STARTS LATE ([`LATE_S`]), so the supervisor's first idle point is
+/// the blank screen before its first frame, and that frame — the footer that
+/// says bypass — moves no verdict (idle to idle). The bypass proof below
+/// holds only because a point read before any footer is waited on by its
+/// content (`aterm_agent::supervise`'s `agent_wake`): a loop that waited on
+/// the verdict slept through the footer and handed the box over as `the rm
+/// circuit breaker outside a bypass session` — this test's red under a
+/// loaded gate (2026-09-26/27), where the late start came from the load.
 #[test]
 fn the_host_hands_over_what_it_cannot_prove_and_types_nothing() {
     let Some(inst) = boot("e", "approve = \"safe\"\n") else {
         return;
     };
     // The same breaker over /usr: escalated, naming the command.
-    run_fake(&inst, "k1", &["bypass.hold", "rm-usr.txt"]);
+    run_fake(&inst, "k1", &["start.late", "bypass.hold", "rm-usr.txt"]);
     let text = escalated_and_quiet(&inst, "k1", "S=/usr; rm -rf $S/a");
     // Refused on WHERE it points — the scratch box of the first test was
     // answered under the same bypass start — not on the session's mode.
@@ -1195,7 +1163,10 @@ const CONVERSATION: &str = "0badf00d-1111-2222-3333-444455556666";
 /// Replace the world's fake with one that registers itself as Claude Code
 /// does (`~/.claude/sessions/<pid>.json`: its conversation — the one it was
 /// resumed on, else [`CONVERSATION`] — its kernel start as Claude renders it,
-/// idle), logs its argv to `launches.log`, draws an idle composer, and dies
+/// idle), logs its argv to `launches.log`, draws an idle composer — on the
+/// alternate screen with focus reports on and the cursor on its caret row, as
+/// Claude Code's fullscreen renderer does, so a crash is handed back to a clean
+/// shell prompt — and dies
 /// by SIGKILL once `die` exists (a crash: its record stays behind). It
 /// answers `--version` as the managed twin is asked.
 fn write_relaunch_fake(inst: &Instance) {
@@ -1215,8 +1186,9 @@ fn write_relaunch_fake(inst: &Instance) {
          \"status\":\"idle\",\"statusUpdatedAt\":%s000,\"procStart\":\"%s\",\
          \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}' \
          $$ \"$sid\" \"$PWD\" \"$(date +%s)\" \"$start\" > \"$HOME/.claude/sessions/$$.json\"\n\
-         printf '\\033[2J\\033[H'\n\
+         printf '\\033[?1049h\\033[?1004h\\033[2J\\033[H'\n\
          cat {tmp}/sc/idle.txt\n\
+         r=$(grep -n '^❯' {tmp}/sc/idle.txt | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          while :; do\n\
          \x20 if [ -e {tmp}/die ]; then rm -f {tmp}/die; kill -KILL $$; fi\n\
          \x20 sleep 0.2\n\
@@ -1225,6 +1197,7 @@ fn write_relaunch_fake(inst: &Instance) {
     let path = fake_path(&inst.tmp);
     std::fs::write(&path, fake).expect("write the fake");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    first_run(&path);
 }
 
 /// Each launch of the relaunch fake: `(pid, args)`.
@@ -1237,6 +1210,23 @@ fn launches(inst: &Instance) -> Vec<(u32, String)> {
             Some((pid.parse().ok()?, args.to_string()))
         })
         .collect()
+}
+
+/// The fake's launches once the FIRST one is logged. `program=claude` is the
+/// exec, not the fake's first line: under load the interpreter can reach that
+/// line seconds later (measured 2026-09-26 at a load average of ~80 on 18
+/// cores: nothing logged 2 s after `program=claude`, and an upgrade test's
+/// first launch read the twin that replaced it 3 s later), so a test that
+/// times its next step from `program=claude` races the fake it launched.
+fn first_launch(inst: &Instance) -> Vec<(u32, String)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let got = launches(inst);
+        if !got.is_empty() || Instant::now() >= deadline {
+            return got;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// RELAUNCH ON EXIT, live: the tab's shell is bash (a job-control shell the
@@ -1273,10 +1263,23 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
         || status(&inst),
         |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
     );
-    // Let the worker read the agent it would relaunch, then crash it.
-    std::thread::sleep(Duration::from_secs(2));
-    let first = launches(&inst);
-    assert_eq!(first.len(), 1, "{first:?}");
+    // Let the worker read the agent it would relaunch — the fake launched
+    // and registered ([`first_launch`]), and the worker's loop at the agent's
+    // first idle point, where it reads the record a relaunch needs — then
+    // crash it. (Waited for as events: a fixed two seconds read an empty
+    // launch log under a loaded machine, the fake's first line not run yet.)
+    let first = first_launch(&inst);
+    assert_eq!(
+        first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        ["--model opus"],
+        "{first:?}"
+    );
+    until(
+        Duration::from_secs(30),
+        "the worker at the agent's first idle point",
+        || harness_lines(&inst),
+        |l| l.contains("EVENT idle"),
+    );
     std::fs::write(inst.tmp.join("die"), "").expect("crash");
     let deadline = Instant::now() + Duration::from_secs(60);
     let got = loop {
@@ -1358,10 +1361,21 @@ fn an_agent_that_exits_unasked_is_relaunched_on_its_conversation() {
 /// replaced by a rename, as atpkg re-renders the twin, so a running copy
 /// keeps the file it was started from. It registers itself as Claude does
 /// (its status settled a minute ago), draws an idle composer, and reads each
-/// line typed into it: an announcement's READY marker is answered in its
-/// transcript, the carry-on with a turn of the running build's own. SIGTERM
-/// ends it as Claude's graceful shutdown does, its record removed.
-fn write_upgrade_fake(inst: &Instance, version: &str) {
+/// line typed into it — logged to `typed.log` as `<its pid> <line>` — an
+/// announcement's READY marker answered in its transcript, the carry-on with
+/// a turn of the running build's own, and any other line recorded there as
+/// the prompt it is (Claude Code writes a prompt's row as it is submitted).
+/// One started on a terminal while `hold-idle-<its version>` stands draws its
+/// composer only once the test removes it: an agent still booting, as long
+/// as the test needs (a probe of the build — no terminal — is never held,
+/// and neither is a build the test does not name).
+/// `asked`: a new conversation's transcript opens with a person's prompt and
+/// its answer (a session someone asked something); without it the record
+/// holds nothing of anyone's. SIGTERM ends it as Claude's graceful shutdown
+/// does, its record removed. macOS only, as every caller is (each writes
+/// atpkg's activation notice, which is macOS-only).
+#[cfg(target_os = "macos")]
+fn write_upgrade_fake(inst: &Instance, version: &str, asked: bool) {
     use std::os::unix::fs::PermissionsExt;
     let tmp = inst.tmp.display();
     std::fs::write(inst.tmp.join("sc/idle.txt"), bypass_start()).expect("idle screen");
@@ -1382,6 +1396,7 @@ fn write_upgrade_fake(inst: &Instance, version: &str) {
          start=$(LC_ALL=C TZ=UTC ps -o lstart= -p $$ | awk '{{$1=$1; print}}')\n\
          mkdir -p \"$HOME/.claude/sessions\" \"$HOME/.claude/projects/-w\"\n\
          T=\"$HOME/.claude/projects/-w/$sid.jsonl\"\n\
+         {ask}\n\
          printf '{{\"pid\":%s,\"sessionId\":\"%s\",\"cwd\":\"%s\",\"version\":\"%s\",\
          \"status\":\"idle\",\"statusUpdatedAt\":%s000,\"procStart\":\"%s\",\
          \"kind\":\"interactive\",\"entrypoint\":\"cli\"}}' \
@@ -1389,21 +1404,67 @@ fn write_upgrade_fake(inst: &Instance, version: &str) {
          > \"$HOME/.claude/sessions/$$.json\"\n\
          trap 'rm -f \"$HOME/.claude/sessions/$$.json\"; exit 0' TERM\n\
          stty -echo 2>/dev/null\n\
+         [ -t 0 ] && while [ -e {tmp}/hold-idle-$VERSION ]; do sleep 0.05; done\n\
          printf '\\033[2J\\033[H'\n\
          cat {tmp}/sc/idle.txt\n\
+         r=$(grep -n '^❯' {tmp}/sc/idle.txt | tail -n 1 | cut -d: -f1); [ -n \"$r\" ] && printf '\\033[%s;3H' \"$r\"\n\
          while IFS= read -r line; do\n\
+         \x20 printf '%s %s\\n' $$ \"$line\" >> {tmp}/typed.log\n\
          \x20 m=$(printf '%s' \"$line\" | grep -o 'ATERM-UPGRADE-READY-[0-9a-f]*' | head -1)\n\
          \x20 [ -n \"$m\" ] && {ready}\n\
-         \x20 case \"$line\" in *Upgraded*) {carry} ;; esac\n\
+         \x20 case \"$line\" in *Upgraded*) {carry} ;; \"[aterm harness]\"*) ;; *) {prompt} ;; esac\n\
          done\n",
         ready = row("\"$m\""),
         carry = row("'carrying on'"),
+        prompt = "printf '{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"%s\"}}\\n' \"$line\" >> \"$T\"",
+        ask = if asked {
+            format!(
+                "[ -e \"$T\" ] || {{ printf '{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\
+                 \"content\":\"Fix the parser.\"}}}}\\n' > \"$T\"; {}; }}",
+                row("'On it.'")
+            )
+        } else {
+            ":".to_string()
+        },
     );
     let path = fake_path(&inst.tmp);
     let next = path.with_extension("next");
     std::fs::write(&next, fake).expect("write the fake");
     std::fs::set_permissions(&next, std::fs::Permissions::from_mode(0o755)).expect("chmod");
     std::fs::rename(&next, &path).expect("replace the twin");
+    first_run(&path);
+}
+
+/// How long the live upgrade has to relaunch the agent on the new build —
+/// its announcement, the agent's READY, its end and its relaunch — from the
+/// notice, or from the host's latest look that could not read that build
+/// ([`version_waits`]).
+const UPGRADE_WITHIN: Duration = Duration::from_secs(150);
+
+/// How far those looks may carry the deadline. The version cache asks a
+/// build that did not answer again two minutes later, and the host looks
+/// at least once a minute meanwhile, so a build that answers its second
+/// probe is upgraded to within [`UPGRADE_WITHIN`] of a look five minutes
+/// after the notice at the latest; this bounds a product that looks for ever.
+const UPGRADE_CEILING: Duration = Duration::from_secs(10 * 60);
+
+/// How many looks the loop journaled (`<sid>.journal.jsonl`; a host's step
+/// is a journal line, never a log line) as `upgrade step=wait:no-version`:
+/// a build the session could move to did not answer its `--version` within
+/// the product's bound (`aterm_agent::harness::upgrade_drive`'s
+/// `VERSION_WAIT`), so the look decided nothing and the host looks again on
+/// its own short ladder until the version cache asks again
+/// (`UNREAD_VERSION`) — the product's own retry, which a fixed deadline
+/// cannot know. [`first_run`] keeps the fakes' probes inside the bound; this
+/// is what a probe that still missed it is waited by.
+fn version_waits(inst: &Instance) -> usize {
+    ["state", "home"]
+        .iter()
+        .find_map(|root| find_file(&inst.tmp.join(root), &format!("{}.journal.jsonl", inst.sid)))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+        .matches("step=wait:no-version")
+        .count()
 }
 
 /// THE LIVE UPGRADE AS A STEP OF THE WORKER, live: a fake Claude Code at
@@ -1420,7 +1481,7 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
     let Some(inst) = boot("u", "relaunch = false\n") else {
         return;
     };
-    write_upgrade_fake(&inst, "2.1.281");
+    write_upgrade_fake(&inst, "2.1.281", true);
     let sel = format!("@{}", inst.sid);
     let tmp = inst.tmp.display();
     ctl_ok(&inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
@@ -1439,6 +1500,14 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         || status(&inst),
         |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
     );
+    // The CURRENT build is what ran — the twin is replaced below, and a fake
+    // whose interpreter reached its file after that would start on 2.1.282.
+    let first = first_launch(&inst);
+    assert_eq!(
+        first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        ["2.1.281 --model opus"],
+        "{first:?}"
+    );
     // NEGATIVE CONTROL: current, so nothing is announced.
     std::thread::sleep(Duration::from_secs(3));
     assert!(
@@ -1447,7 +1516,7 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         harness_lines(&inst)
     );
     // A newer build lands, and atpkg says so.
-    write_upgrade_fake(&inst, "2.1.282");
+    write_upgrade_fake(&inst, "2.1.282", true);
     let prefix = atpkg::store::default_prefix(&inst.tmp.join("home"));
     let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
     std::fs::create_dir_all(&notices).expect("notice dir");
@@ -1457,10 +1526,28 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
         notices.join(atpkg::activation_notice::CLAUDE_MARKER),
     )
     .expect("the activation notice");
-    let deadline = Instant::now() + Duration::from_secs(150);
+    // Within UPGRADE_WITHIN of the notice — or of the host's latest look
+    // that could not read the new build: one whose `--version` did not answer
+    // within the product's bound decides nothing and is looked at again
+    // ([`version_waits`]), and an upgrade taken later is the product working,
+    // not a red. The deadline moves with each such look the host journals,
+    // never on a guess, and never past UPGRADE_CEILING.
+    let noticed = Instant::now();
+    let mut waits = version_waits(&inst);
+    let mut deadline = noticed + UPGRADE_WITHIN;
     let got = loop {
         let got = launches(&inst);
-        if got.len() >= 2 || Instant::now() >= deadline {
+        if got.len() >= 2 {
+            break got;
+        }
+        let now = version_waits(&inst);
+        if now > waits {
+            waits = now;
+            deadline = deadline
+                .max(Instant::now() + UPGRADE_WITHIN)
+                .min(noticed + UPGRADE_CEILING);
+        }
+        if Instant::now() >= deadline {
             break got;
         }
         std::thread::sleep(Duration::from_millis(200));
@@ -1488,4 +1575,330 @@ fn an_activation_notice_upgrades_the_session_at_its_idle_point() {
     );
     assert!(!log.contains("minute"), "{log}");
     program_is(&inst, "claude", Duration::from_secs(10));
+    // D6 of the live E2E of 2026-09-26: the owner's view is published on a
+    // headless instance too — the tab's `upgrade=` names the finished move
+    // (it read `-` headless, the view handed to no loop).
+    until(
+        Duration::from_secs(30),
+        "the tab's upgrade= column, headless",
+        || status(&inst),
+        |s| field(s, "upgrade").is_some_and(|v| v.starts_with("done/2.1.282/")),
+    );
+}
+
+/// D1 OF THE LIVE E2E OF 2026-09-26, live: A SESSION NOBODY HAS ASKED
+/// ANYTHING is restarted onto the newer build AFRESH, with nothing typed into
+/// it. The fake's conversation holds no prompt of anyone's; the newer build
+/// lands and atpkg says so; at the loop's idle point the worker ends the
+/// agent and starts the new build in the same tab — its flags kept, NO
+/// `--resume` — and types nothing into either process: no notice, no
+/// carry-on, through the restart and the five seconds after it. (The E2E's
+/// fresh sessions each got the notice, which started a conversation nobody
+/// asked for.) What this run cannot observe — the turn ends after: the
+/// continue policy's first back-off is two minutes, and the fresh screen
+/// already holds it — is pinned by aterm-agent's unit tests of the policy
+/// and the loop (`a_session_only_the_harness_has_typed_into_gets_no_act`,
+/// and the loop's test that a session its host says nobody asked anything
+/// gets nothing typed). NEGATIVE CONTROL: the test above — the same fake
+/// with a person's prompt in its record — is announced to and resumed.
+#[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
+#[test]
+fn a_session_nobody_asked_anything_is_restarted_afresh_with_nothing_typed() {
+    let Some(inst) = boot("k", "relaunch = false\n") else {
+        return;
+    };
+    write_upgrade_fake(&inst, "2.1.281", false);
+    let sel = format!("@{}", inst.sid);
+    let tmp = inst.tmp.display();
+    ctl_ok(&inst, &[&sel, "send", "/bin/bash --norc --noprofile -i"]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, "bash", Duration::from_secs(10));
+    let line = format!(
+        "cd {tmp}/work && '{}' --model opus",
+        fake_path(&inst.tmp).display()
+    );
+    ctl_ok(&inst, &[&sel, "send", &line]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, "claude", Duration::from_secs(10));
+    until(
+        Duration::from_secs(5),
+        "the host attached",
+        || status(&inst),
+        |s| field(s, "supervisor").is_some_and(|v| v.starts_with("aterm-harness")),
+    );
+    // The running copy has read its script (a rename before `sh` opened it
+    // would start the newer build instead).
+    let first = first_launch(&inst);
+    assert_eq!(
+        first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        ["2.1.281 --model opus"],
+        "{first:?}"
+    );
+    write_upgrade_fake(&inst, "2.1.282", false);
+    let prefix = atpkg::store::default_prefix(&inst.tmp.join("home"));
+    let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
+    std::fs::create_dir_all(&notices).expect("notice dir");
+    std::fs::write(notices.join(".m.tmp"), "1\n").expect("marker");
+    std::fs::rename(
+        notices.join(".m.tmp"),
+        notices.join(atpkg::activation_notice::CLAUDE_MARKER),
+    )
+    .expect("the activation notice");
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let got = loop {
+        let got = launches(&inst);
+        if got.len() >= 2 || Instant::now() >= deadline {
+            break got;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert_eq!(
+        got.len(),
+        2,
+        "restarted once: {got:?}\nharness log:\n{}",
+        harness_lines(&inst)
+    );
+    assert_ne!(got[0].0, got[1].0, "a new process");
+    assert_eq!(
+        got[1].1, "2.1.282 --model opus",
+        "the new build, its flags kept, nothing resumed"
+    );
+    let log = until(
+        Duration::from_secs(60),
+        "restarted afresh",
+        || harness_lines(&inst),
+        |l| l.contains("step=done:fresh"),
+    );
+    assert!(!log.contains("announced"), "no notice: {log}");
+    program_is(&inst, "claude", Duration::from_secs(10));
+    // Nothing typed into either process through the restart and the 5 s
+    // after it (the turn ends after are the unit tests': see above).
+    std::thread::sleep(Duration::from_secs(5));
+    let typed = std::fs::read_to_string(inst.tmp.join("typed.log")).unwrap_or_default();
+    assert!(typed.is_empty(), "typed into the agent: {typed:?}");
+    until(
+        Duration::from_secs(30),
+        "the tab's upgrade= column, headless",
+        || status(&inst),
+        |s| field(s, "upgrade").is_some_and(|v| v.starts_with("done/2.1.282/")),
+    );
+}
+
+/// A fake Claude Code at 2.1.281 in `shell` (`bash` or `zsh`), its
+/// supervisor attached, nobody having asked it anything — and 2.1.282
+/// installed, atpkg having said so: the upgrade is due before anyone's first
+/// prompt (the D1 E2E's order).
+#[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
+fn a_fresh_session_behind(tag: &str, shell: &str) -> Option<Instance> {
+    let inst = boot(tag, "relaunch = false\n")?;
+    write_upgrade_fake(&inst, "2.1.281", false);
+    let sel = format!("@{}", inst.sid);
+    let tmp = inst.tmp.display();
+    let interactive = match shell {
+        "zsh" => "/bin/zsh -f -i",
+        _ => "/bin/bash --norc --noprofile -i",
+    };
+    ctl_ok(&inst, &[&sel, "send", interactive]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, shell, Duration::from_secs(10));
+    let line = format!(
+        "cd {tmp}/work && '{}' --model opus",
+        fake_path(&inst.tmp).display()
+    );
+    ctl_ok(&inst, &[&sel, "send", &line]);
+    ctl_ok(&inst, &[&sel, "key", "enter"]);
+    program_is(&inst, "claude", Duration::from_secs(10));
+    let first = first_launch(&inst);
+    assert_eq!(
+        first.iter().map(|(_, a)| a.as_str()).collect::<Vec<_>>(),
+        ["2.1.281 --model opus"],
+        "{first:?}"
+    );
+    write_upgrade_fake(&inst, "2.1.282", false);
+    let prefix = atpkg::store::default_prefix(&inst.tmp.join("home"));
+    let notices = prefix.join(atpkg::activation_notice::NOTICE_DIR);
+    std::fs::create_dir_all(&notices).expect("notice dir");
+    std::fs::write(notices.join(".m.tmp"), "1\n").expect("marker");
+    std::fs::rename(
+        notices.join(".m.tmp"),
+        notices.join(atpkg::activation_notice::CLAUDE_MARKER),
+    )
+    .expect("the activation notice");
+    Some(inst)
+}
+
+/// The lines each process of the upgrade fake read, by pid.
+#[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
+fn typed_by(inst: &Instance) -> Vec<(u32, String)> {
+    std::fs::read_to_string(inst.tmp.join("typed.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| {
+            let (pid, line) = l.split_once(' ')?;
+            Some((pid.parse().ok()?, line.to_string()))
+        })
+        .collect()
+}
+
+/// ND1 OF THE LIVE RE-TEST OF 2026-09-26, live, five times over: A FIRST
+/// PROMPT SENT AT THE FIRST IDLE VERDICT IS THE AGENT'S. An orchestrator
+/// `await`s `agent idle` on a session nobody has asked anything, whose
+/// upgrade is due, and sends its first prompt at once as orchestrators do
+/// (`send`, then `key enter`) — the moment the fresh restart used to fire
+/// (1.3 s after that verdict, the tab then a bare shell). Its words carry a
+/// shell command (`touch`): run by the shell, they would leave a file. Each
+/// time the prompt reaches the agent it was sent to and is recorded as its
+/// conversation's first task, the session is never restarted afresh, and
+/// the upgrade announces to it instead, the one launch still running.
+#[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
+#[test]
+fn a_first_prompt_sent_at_the_first_idle_is_the_agents_never_the_shells() {
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = (0..5)
+            .map(|i| {
+                scope.spawn(move || {
+                    let Some(inst) = a_fresh_session_behind(&format!("q{i}"), "bash") else {
+                        return;
+                    };
+                    let sel = format!("@{}", inst.sid);
+                    let pwned = inst.tmp.join(format!("work/pwned-{i}"));
+                    let prompt = format!("Fix the parser; touch {}", pwned.display());
+                    ctl_ok(&inst, &[&sel, "await", "agent", "idle", "timeout=20000"]);
+                    ctl_ok(&inst, &[&sel, "send", &prompt]);
+                    ctl_ok(&inst, &[&sel, "key", "enter"]);
+                    let log = until(
+                        Duration::from_secs(120),
+                        "announced to: the prompt made a task",
+                        || harness_lines(&inst),
+                        |l| l.contains("step=announced:1") || l.contains("step=done:fresh"),
+                    );
+                    assert!(
+                        !log.contains("done:fresh"),
+                        "run {i}: restarted afresh: {log}"
+                    );
+                    assert!(!pwned.exists(), "run {i}: the shell ran the prompt");
+                    let first = launches(&inst)[0].0;
+                    assert!(
+                        typed_by(&inst)
+                            .iter()
+                            .any(|(pid, line)| *pid == first && *line == prompt),
+                        "run {i}: the prompt never reached the agent: {:?}",
+                        typed_by(&inst)
+                    );
+                    assert_eq!(launches(&inst).len(), 1, "run {i}: {:?}", launches(&inst));
+                })
+            })
+            .collect();
+        for run in runs {
+            run.join().expect("a run");
+        }
+    });
+}
+
+/// ND1, live: THE RESTART HOLDS THE TAB. A session nobody has asked anything
+/// is restarted afresh; from its last look to the relaunched agent's first
+/// idle — which the test holds back until the orchestrator has met the hold
+/// once (`hold-idle-2.1.282`, the relaunched build's), so the window is the
+/// test's, not a race — the
+/// harness's HARD hand is on the tab
+/// (`hand=lease:aterm-harness@<pid>`) — between the signal and the relaunch
+/// the tab is a bare shell. An orchestrator that sends its first prompt
+/// meanwhile is refused (`ERR busy lease=…`) and retries — as a `turn`, and
+/// as the RAW `send` and `key enter` the first cut's cooperative lease let
+/// through into the bare shell (the review of it) — and the prompt lands in
+/// the RELAUNCHED agent: never run by the shell (its `touch` leaves no
+/// file), never read by the old process. Once at a bash prompt (the line a
+/// raw `send`), once at zsh (the line the harness's own fenced `turn`,
+/// typed under its own hold).
+#[cfg(target_os = "macos")] // atpkg::activation_notice is macOS-only
+#[test]
+fn a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent() {
+    std::thread::scope(|scope| {
+        let runs: Vec<_> = [("hb", "bash", true), ("hz", "zsh", false)]
+            .into_iter()
+            .map(|(tag, shell, turn)| scope.spawn(move || prompt_meets_the_hand(tag, shell, turn)))
+            .collect();
+        for run in runs {
+            run.join().expect("a run");
+        }
+    });
+}
+
+/// One run of [`a_prompt_sent_while_the_restart_holds_the_tab_lands_in_the_new_agent`]:
+/// the relaunch line typed at `shell`, the orchestrator's prompt sent as a
+/// `turn` or as a raw `send` and `key enter`.
+#[cfg(target_os = "macos")] // only the macOS-only upgrade tests use it
+fn prompt_meets_the_hand(tag: &str, shell: &str, turn: bool) {
+    let Some(inst) = a_fresh_session_behind(tag, shell) else {
+        return;
+    };
+    let sel = format!("@{}", inst.sid);
+    let pwned = inst.tmp.join("work/pwned");
+    let prompt = format!("Fix the parser; touch {}", pwned.display());
+    // The relaunched agent comes up idle only once the orchestrator has met
+    // the hold.
+    let gate = inst.tmp.join("hold-idle-2.1.282");
+    std::fs::write(&gate, "").expect("the gate");
+    until(
+        Duration::from_secs(120),
+        &format!("{shell}: the restart's hand on the tab"),
+        || status(&inst),
+        |s| field(s, "hand").is_some_and(|h| h.starts_with("lease:aterm-harness@")),
+    );
+
+    // The orchestrator's retry loop: refused while the hand is on the tab —
+    // `ERR busy lease=aterm-harness@…`, or `ERR busy turn=…` while the
+    // harness's own relaunch line types under it — and typed once it is not
+    // (the fake echoes nothing, so a typed turn's submit reads unverified —
+    // typed all the same).
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut held = 0;
+    let mut until_taken = |args: &[&str]| loop {
+        let out = ctl(&inst, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        if !stderr.contains("ERR busy") {
+            assert!(
+                out.status.success() || args.contains(&"turn"),
+                "{shell}: {args:?}: {out:?}"
+            );
+            break;
+        }
+        if stderr.contains("ERR busy lease=aterm-harness@") {
+            held += 1;
+            let _ = std::fs::remove_file(&gate);
+        }
+        assert!(Instant::now() < deadline, "{shell}: never let in");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if turn {
+        until_taken(&[&sel, "turn", "idle=1", "timeout=10000", &prompt]);
+    } else {
+        until_taken(&[&sel, "send", &prompt]);
+        until_taken(&[&sel, "key", "enter"]);
+    }
+    assert!(held >= 1, "{shell}: the hand held the tab");
+    let log = until(
+        Duration::from_secs(30),
+        "restarted afresh",
+        || harness_lines(&inst),
+        |l| l.contains("step=done:fresh"),
+    );
+    let got = launches(&inst);
+    assert_eq!(got.len(), 2, "{shell}: {got:?}\n{log}");
+    until(
+        Duration::from_secs(10),
+        "the prompt in the relaunched agent",
+        || format!("{:?}", typed_by(&inst)),
+        |_| {
+            typed_by(&inst)
+                .iter()
+                .any(|(pid, line)| *pid == got[1].0 && *line == prompt)
+        },
+    );
+    assert!(!pwned.exists(), "{shell}: the shell ran the prompt");
+    assert!(
+        !typed_by(&inst).iter().any(|(pid, _)| *pid == got[0].0),
+        "{shell}: the old process read nothing: {:?}",
+        typed_by(&inst)
+    );
 }

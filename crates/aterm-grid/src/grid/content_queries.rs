@@ -142,18 +142,7 @@ impl Grid {
         out.reserve(len as usize);
         let mut fill = 0u16;
         for col in 0..len {
-            let ch = match view.cell(col) {
-                None => ' ',
-                Some(_) if view.is_wide_continuation(col) => '\0',
-                Some(cell) if cell.is_complex() => view
-                    .cell_data(col, cell)
-                    .complex_base()
-                    .unwrap_or('\u{FFFD}'),
-                Some(cell) => {
-                    let c = cell.char();
-                    if c == '\0' { ' ' } else { c }
-                }
-            };
+            let ch = view.col_char(col);
             out.push(ch);
             if ch != ' ' {
                 // A wide continuation ('\0') counts as filled: its lead glyph

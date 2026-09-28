@@ -30,8 +30,9 @@
 //!     the bytes, not when the glyph is on glass. The remaining parse → compose
 //!     → present tail is `present_latency`'s slice, deliberately not folded in
 //!     here: mixing them back together is exactly what made "is it us or them?"
-//!     unanswerable. Tier (ii) of the audit item closes the last gap — see the
-//!     TIER (ii) note below.
+//!     unanswerable. The echo → present remainder is read as `input_present`
+//!     minus `echo_rtt` — see the TIER (ii) note below for why it has no
+//!     instrument of its own.
 //!   * IT ARMS ONLY ON A REAL WRITE. The probe brackets input dispatch and arms
 //!     only when the target session's sink INPUT EPOCH advanced, i.e. bytes
 //!     actually entered that PTY. A UI shortcut, a bare modifier, a key an
@@ -51,17 +52,28 @@
 //!     (a spinner, a build log) can close the clock early. This is a round-trip
 //!     LOWER bound, not a causal one; the sample count, the coalesced count and
 //!     the expired count are all published so a reader can see the shape of the
-//!     evidence. A causally-proven variant needs tier (ii)'s content proof.
-//!   * WHAT IT DOES NOT SEE, SAID PLAINLY. Two write paths do not arm it, by
-//!     construction rather than by oversight: a PASTE deferred to the per-session
-//!     ordered-egress writer bumps the sink epoch on THAT thread, after the
-//!     bracket has already closed; and a CROSS-session (`@other`) control verb
-//!     writes straight from the control thread with no App seam to bracket. Both
-//!     are absences (no sample), never wrong samples — the instrument under-counts
-//!     rather than lying. A flagless `key`/`send` at the front tab DOES arm: it
-//!     posts `Wake::Input` through the App seam, which is what makes this metric
-//!     drivable by a proof harness instead of readable only by a human at the
-//!     glass.
+//!     evidence. A causally-proven variant would need a content proof, which
+//!     is retired (TIER (ii) note below).
+//!   * A KEY THAT WAITED BEHIND A PASTE ARMS AT ITS OWN WRITE. A key queued on
+//!     the per-session ordered-egress writer is written on THAT thread, after the
+//!     UI thread's bracket has closed, so the bracket cannot see it — and must
+//!     not guess: the enqueue marks the dispatch deferred
+//!     ([`note_deferred_write`]) and the bracket arms nothing for it. The writer
+//!     arms instead ([`arm_deferred`]) once the key's receipt carries an accepted
+//!     order — the same "bytes really entered this PTY" gate, proven by the sink
+//!     rather than inferred from an epoch — for visible presses only, so a key
+//!     the tty swallows (a password prompt) never arms a clock that could only
+//!     expire. Before 2026-09-25 such a key was simply never measured, in exactly
+//!     the case the user feels as the worst (typing while a paste drains).
+//!   * WHAT IT DOES NOT SEE, SAID PLAINLY. Two writes do not arm it, by
+//!     construction rather than by oversight: a PASTE (its "echo" is the paste's
+//!     own redraw, not a round trip), and a CROSS-session (`@other`) control verb,
+//!     which writes straight from the control thread with no App seam to bracket.
+//!     Both are absences (no sample), never wrong samples — the instrument
+//!     under-counts rather than lying. A flagless `key`/`send` at the front tab
+//!     DOES arm: it posts `Wake::Input` through the App seam, which is what makes
+//!     this metric drivable by a proof harness instead of readable only by a
+//!     human at the glass.
 //!   * WINDOWED, AND SAID SO. The percentiles are exact order statistics over
 //!     the last [`WINDOW`] samples (published as `n_echo`), not the all-time
 //!     distribution: what the owner asks is "how does it feel NOW", and an
@@ -92,17 +104,15 @@ pub const WINDOW: usize = 1024;
 /// better explanation.
 const ARM_TTL_US: u64 = 2_000_000;
 
-// TIER (ii), DESIGNED, NOT WIRED — key-arrival → typed-echo-present.
-//
-// This once pointed at the cursor-glow content proof
-// (`ContentCandidateDecision::Confirmed { at, .. }`) as a ready-made source
-// for "this keystroke's GLYPH is proven on the cursor row". That whole seam is
-// gone (docs/design/EFFECTS-LICENSE-REDESIGN.md): the effects engines no
-// longer prove echoes, they ask whether a keypress licensed the move, and a
-// licence is not a measurement. Tier (ii) therefore needs its OWN observation
-// if it is ever wired — the cheapest honest one being the frame that first
-// presents a cell change on the armed keystroke's row, taken in the render
-// path, with no dependency on the effects engines at all.
+// TIER (ii) — key-arrival → typed-echo-present — is RETIRED, not owed.
+// Decided 2026-09-25 under the owner's standing direction: the existing
+// instruments already bracket that slice (`input_present` is key → next
+// content present, the aterm-owned end to end; this module is the child's
+// share), so the remainder reads as `input_present` minus `echo_rtt`. Its
+// planned data source, the cursor-glow content proof, is gone
+// (docs/design/EFFECTS-LICENSE-REDESIGN.md), and a content-matched echo tail
+// is tail-biased by no-echo prompts and TUI redraws, which is why the perf-gym
+// review (the since-deleted PERF_GYM_DESIGN.md) kept it unpublishable.
 
 // ---------------------------------------------------------------------------
 // The single arm slot.
@@ -271,6 +281,56 @@ pub(crate) fn note_output_burst(session: u64) {
     let _ = close_at(session, crate::metrics::now_us());
 }
 
+/// A key queued behind a paste has just been ACCEPTED by `session`'s `sink`
+/// on the ordered-egress writer thread: start the clock there (see the module
+/// note). Keep-oldest like every arm.
+pub(crate) fn arm_deferred(session: u64, sink: &aterm_session::sink::SinkWriter) {
+    #[cfg(test)]
+    if DEFERRED_ARM_SINK.load(Ordering::Acquire) != std::ptr::from_ref(sink).addr() {
+        return;
+    }
+    #[cfg(not(test))]
+    let _ = sink;
+    arm_at(session, crate::metrics::now_us());
+}
+
+/// Tests: the one sink whose ordered-writer arms may reach the process-global
+/// statics. Every other test's writer threads write keys too, and must not
+/// perturb the tests that read these counters exactly (this module's own).
+#[cfg(test)]
+static DEFERRED_ARM_SINK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Let `sink`'s deferred arms through for as long as the guard lives. Take
+/// [`fresh_for_test`] first: the guard is only meaningful under that lock.
+#[cfg(test)]
+pub(crate) fn deferred_arms_for_test(sink: &aterm_session::sink::SinkWriter) -> impl Drop + use<> {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DEFERRED_ARM_SINK.store(0, Ordering::Release);
+        }
+    }
+    DEFERRED_ARM_SINK.store(std::ptr::from_ref(sink).addr(), Ordering::Release);
+    Guard
+}
+
+thread_local! {
+    /// This thread's current input dispatch handed a write to the ordered
+    /// egress writer. Set by the enqueue ([`note_deferred_write`]), cleared by
+    /// [`crate::App::echo_probe_open`], read by the close — all on the UI
+    /// thread, so no dispatch can see another's mark.
+    static DEFERRED_IN_BRACKET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The dispatch in progress on this thread queued a write for the ordered
+/// egress writer: the bracket must not arm for it (the writer arms at the
+/// write, [`arm_deferred`]). An epoch that moved during such a bracket moved
+/// for THAT thread's writes — the queued key's, or an older job's — and
+/// arming on it would start the clock for bytes this dispatch did not write.
+pub(crate) fn note_deferred_write() {
+    DEFERRED_IN_BRACKET.with(|deferred| deferred.set(true));
+}
+
 /// Zero every counter and the window. Wired to `metrics reset` so the echo
 /// facts obey the same window semantics as the rest of the verb.
 pub(crate) fn reset() {
@@ -415,6 +475,7 @@ impl crate::App {
         wid: WindowId,
         session: Option<u64>,
     ) -> Option<EchoWriteProbe> {
+        DEFERRED_IN_BRACKET.with(|deferred| deferred.set(false));
         let session = session.or_else(|| self.focused_session_id(wid))?;
         let epoch = self.session_by_id(session)?.ctx.sink.input_epoch();
         Some(EchoWriteProbe { session, epoch })
@@ -422,29 +483,40 @@ impl crate::App {
 
     /// Close the bracket. Arms the echo clock only if the sink's input epoch
     /// advanced — see the module note on why an ungated arm would make this
-    /// instrument flatter itself exactly when the terminal is worst.
+    /// instrument flatter itself exactly when the terminal is worst — and only
+    /// if the dispatch wrote INLINE: a dispatch that queued its write on the
+    /// ordered egress writer leaves the arm to that writer ([`arm_deferred`]).
     pub(crate) fn echo_probe_close(&self, probe: Option<EchoWriteProbe>) {
+        let deferred = DEFERRED_IN_BRACKET.with(|deferred| deferred.replace(false));
         let Some(probe) = probe else { return };
         let Some(session) = self.session_by_id(probe.session) else {
             return;
         };
-        if session.ctx.sink.input_epoch() != probe.epoch {
+        if !deferred && session.ctx.sink.input_epoch() != probe.epoch {
             arm_at(probe.session, crate::metrics::now_us());
         }
     }
+}
+
+/// The statics are process-global, so every test that reads them takes turns
+/// — this module's own and the ordered writer's (`app_input`).
+#[cfg(test)]
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Take the echo statics for one test, zeroed.
+#[cfg(test)]
+pub(crate) fn fresh_for_test() -> std::sync::MutexGuard<'static, ()> {
+    let g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    reset();
+    g
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The statics are process-global, so these tests take turns.
-    static SERIAL: Mutex<()> = Mutex::new(());
-
     fn fresh() -> std::sync::MutexGuard<'static, ()> {
-        let g = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
-        reset();
-        g
+        fresh_for_test()
     }
 
     /// The basic contract: a write arms, that session's next burst closes, and

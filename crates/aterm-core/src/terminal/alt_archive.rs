@@ -1025,6 +1025,24 @@ impl AltArchive {
         }
     }
 
+    /// Commit `grid`'s screen rows (the ACTIVE alt grid) as the next frame,
+    /// keyed by its content generation so a redundant ESU does no work. The
+    /// one commit the `Terminal` hook and the handler's orphaned-screen leave
+    /// share.
+    fn commit_grid(&mut self, grid: &Grid) {
+        let rows = grid.rows();
+        let cols = grid.cols();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+        let key = grid.content_gen();
+        if self.is_unchanged(key, usize::from(rows), cols) {
+            return;
+        }
+        self.fill_from_grid(grid);
+        self.commit_prepared(cols, Some(key));
+    }
+
     /// Commit the frame in `cur` (filled through [`frame_buffers`]).
     fn commit_prepared(&mut self, cols: u16, key: Option<u64>) {
         // A shared budget's share falls when another session opens a tab, and
@@ -1650,6 +1668,32 @@ impl AltArchive {
         self.floor = self.last() + 1;
     }
 
+    /// [`leave`](Self::leave) for a screen NO APP IS BEHIND any more: a shell
+    /// prompt arrived on it, or the host forced the primary screen. Flush the
+    /// WHOLE last committed frame, chrome included.
+    ///
+    /// The chrome rule exists for a live app's composer and footer, which a
+    /// normal exit leaves out because the app re-shows them. Here the app is
+    /// dead (measured 2026-09-22, Windows: `less` killed from another tab; conhost
+    /// sent no `?1049l`, so the pwsh prompt and four commands were typed onto
+    /// the pager screen), and the rows the differ measured as chrome — the
+    /// pager's `:` line, a status bar — are where the shell's own rows now are.
+    /// Losing those rows is the defect; an extra `:` row is a duplicate, which
+    /// this archive prefers to a loss everywhere else too.
+    pub fn leave_whole(&mut self) {
+        if !self.enabled {
+            return;
+        }
+        if self.have_prev {
+            let t = self.prev.rows();
+            self.flush_prev_rows(0, t);
+        }
+        self.push_gap(AltArchiveGapKind::Leave);
+        self.epoch = self.epoch.wrapping_add(1);
+        self.drop_prev();
+        self.floor = self.last() + 1;
+    }
+
     /// The app entered the alternate screen: a new baseline (no rows), and a
     /// new run — nothing archived before it is this screen's to re-show.
     pub fn enter(&mut self) {
@@ -2162,6 +2206,23 @@ fn find_byte(hay: &[u8], needle: u8) -> Option<usize> {
     tail.iter().position(|&b| b == needle).map(|i| base + i)
 }
 
+/// Whether `input` holds conhost's alt-screen enter, `ESC [ ? 1049 h`. It runs
+/// over every read while `TransientState::conhost_alt_screen_left_up` is set —
+/// for a cmd.exe session that never starts another full-screen app, the rest of
+/// the session — so it hops from ESC to ESC with [`find_byte`] instead of
+/// comparing a window at every byte.
+fn has_alt_1049_enter(input: &[u8]) -> bool {
+    const ENTER: &[u8] = b"\x1b[?1049h";
+    let mut rest = input;
+    while let Some(at) = find_byte(rest, 0x1b) {
+        if rest[at..].starts_with(ENTER) {
+            return true;
+        }
+        rest = &rest[at + 1..];
+    }
+    false
+}
+
 // =====================================================================
 // The streaming DEC-mode matcher (A2): finds the `CSI ? Pm <final>` sequences
 // that end a frame or switch screens, across read boundaries.
@@ -2369,9 +2430,17 @@ impl DecModeMatcher {
 // =====================================================================
 
 /// The archive plus the hook's bookkeeping — ONE `Terminal` field, session-only,
-/// never forwarded to the handler, never checkpointed. A self-update handoff
-/// carries the archive apart from the checkpoint ([`AltArchiveCarry`]); the
-/// matcher and the commit bookkeeping start afresh in the adopting process.
+/// never checkpointed. A self-update handoff carries the archive apart from the
+/// checkpoint ([`AltArchiveCarry`]); the matcher and the commit bookkeeping
+/// start afresh in the adopting process.
+///
+/// The handler borrows it for exactly ONE call, [`Self::leave_orphaned`]: the
+/// alternate screen is left from INSIDE the parser's dispatch (an OSC 133 `A`
+/// arriving on it), where no stream split can put a commit point one byte
+/// ahead of the swap the way `advance_parser_archiving` does for `?1049l`. The
+/// commit still happens before the grid it reads is swapped away; it is only
+/// the caller that moved. Every other commit point stays on the `Terminal`
+/// side, and the fields stay private to this file.
 #[derive(Debug)]
 pub(super) struct AltArchiveState {
     archive: AltArchive,
@@ -2400,6 +2469,26 @@ impl AltArchiveState {
             esu_seen: false,
             last_fallback: None,
         }
+    }
+
+    /// The handler's one entry point (see the struct doc): the alternate screen
+    /// is about to be left although no app asked for it — a shell prompt
+    /// (OSC 133/633 `A`) arrived on it, or the host forced the primary screen.
+    /// `grid` is the ALT grid, still active. Commit it and flush it WHOLE
+    /// ([`AltArchive::leave_whole`]), then account the screen as left, so the
+    /// epilogue's boundary — which finds the modes already on the main screen —
+    /// does not `leave` a second time. `sync_end_seq` is the batch's current
+    /// value: a close the dead app never finished is not this run's to commit.
+    pub(super) fn leave_orphaned(&mut self, grid: &Grid, sync_end_seq: u64) {
+        if !self.archive.enabled {
+            return;
+        }
+        self.archive.commit_grid(grid);
+        self.archive.leave_whole();
+        self.on_alt = false;
+        self.esu_seen = false;
+        self.last_fallback = None;
+        self.seen_sync_seq = sync_end_seq;
     }
 }
 
@@ -2478,6 +2567,30 @@ impl Terminal {
     /// parser is a streaming state machine, so the grid is identical
     /// (`alt_archive_claude_like` proves it at 1..17-byte chunks).
     pub(super) fn advance_parser_archiving(&mut self, input: &[u8]) {
+        // A host-forced primary screen (`Terminal::leave_alternate_screen`) runs
+        // HERE, inside the batch and before its bytes, so `post_process` and the
+        // epilogue treat the swap exactly as a `?1049l` that arrived in the read.
+        if std::mem::take(&mut self.transient.host_leave_alternate_screen) {
+            let (_, mut handler) = self.split_for_process();
+            handler.leave_orphaned_alternate_screen();
+        }
+        // conhost, still on the alternate buffer an orphaned leave left it on,
+        // enters a new one: its blank repaint of the viewport arrives AHEAD of the
+        // `?1049h`, in the same read (measured; see
+        // `TransientState::conhost_alt_screen_left_up`), so the rows have to be
+        // kept before this read's bytes run, not when the enter is parsed. conhost
+        // spelled every switch measured `?1049h` (less, cmd's echo, .NET's
+        // Console.Out). An enter split across two reads degrades to the loss this
+        // exists to prevent, and no carried tail could catch it: the repaint that
+        // does the damage comes BEFORE the `?1049h`, so by the time a split one
+        // completes, the read that painted over the rows has already run.
+        if self.transient.conhost_alt_screen_left_up
+            && !self.modes.alternate_screen
+            && has_alt_1049_enter(input)
+        {
+            let (_, mut handler) = self.split_for_process();
+            handler.keep_screen_from_conhost_repaint();
+        }
         if !self.alt_archive.archive.enabled {
             self.advance_parser_raw(input);
             return;
@@ -2607,18 +2720,7 @@ impl Terminal {
         if !st.archive.enabled {
             return;
         }
-        let grid = &self.grid;
-        let rows = grid.rows();
-        let cols = grid.cols();
-        if rows == 0 || cols == 0 {
-            return;
-        }
-        let key = grid.content_gen();
-        if st.archive.is_unchanged(key, usize::from(rows), cols) {
-            return; // a redundant ESU does no work
-        }
-        st.archive.fill_from_grid(grid);
-        st.archive.commit_prepared(cols, Some(key));
+        st.archive.commit_grid(&self.grid);
     }
 
     /// `restore_checkpoint` replaced the grids and modes wholesale: flush, gap,

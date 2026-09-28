@@ -741,13 +741,18 @@ impl UpdateState {
     /// status` and the log, which the page links to (Settings ▸ Messages).
     fn detail(&self) -> Option<String> {
         if self.linux_host {
-            // ONE next step, and only where there is one: the idle copy's headline is
-            // the whole fact, and that terminals keep running is the page subtitle's.
-            // A copy that cannot update gets none either: the outcome (joined below) is
-            // the whole of it — a copy simply not enrolled names `aterm update enable`
-            // in the ledger's own sentence, and every other cause there (an unsafe
-            // install prefix, a worker that did not start) is one `enable` cannot fix.
-            let direction = if self.installable
+            // The ledger's own sentence names the version and the one next step — a
+            // download and the verb that installs it, an install and the window launch
+            // that finishes it, `aterm update enable` for a copy not enrolled — so a
+            // healthy page shows it alone. A failure's sentence names neither: only
+            // beside one (or where there is no sentence) does the page add what the
+            // headline names and the one step, and a copy that cannot update gets no
+            // step (every cause there, an unsafe install prefix or a worker that did not
+            // start, is one `enable` cannot fix).
+            let outcome = self.outcome.trim().trim_end_matches('.');
+            let own_facts = self.linux_error || outcome.is_empty();
+            let direction = if own_facts
+                && self.installable
                 && self
                     .linux
                     .as_ref()
@@ -761,6 +766,7 @@ impl UpdateState {
             let identity = self
                 .linux
                 .as_ref()
+                .filter(|_| own_facts)
                 .map(|status| {
                     let mut facts = Vec::new();
                     if let Some(build) = status.staged_build {
@@ -785,7 +791,7 @@ impl UpdateState {
                     facts.join(". ")
                 })
                 .unwrap_or_default();
-            let detail = [identity.as_str(), self.outcome.trim(), direction]
+            let detail = [identity.as_str(), outcome, direction]
                 .into_iter()
                 .filter(|part| !part.is_empty())
                 .collect::<Vec<_>>()
@@ -963,18 +969,23 @@ mod tests {
         }
     }
 
+    /// The held download's ledger sentence (`aterm_update::linux`).
+    const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it (`[update] \
+         auto_apply` is off)";
+    /// A replaced executable's ledger sentence while it waits for its first window.
+    const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} launch an aterm window once \
+                                 to finish; existing sessions continue unchanged";
+
     #[test]
     fn linux_update_status_download_is_read_only_and_directs_manual_apply() {
-        let state = linux_state(Some(linux_facts()), 0);
+        let mut state = linux_state(Some(linux_facts()), 0);
+        state.outcome = LINUX_HELD.into();
         let projection = state.projection();
         assert!(projection.headline.contains("downloaded"));
         let detail = projection.detail.as_deref().unwrap();
-        // The version is the fact; build numbers are About's.
-        assert!(
-            detail.starts_with("Version 0.5.15 is downloaded"),
-            "{detail}"
-        );
-        assert!(detail.contains("aterm update apply"), "{detail}");
+        // The ledger's sentence names the version and the verb, once each; build
+        // numbers are About's.
+        assert_eq!(detail, LINUX_HELD);
         assert!(!detail.contains("build 8"), "{detail}");
         assert!(projection.staged.is_none());
         assert_eq!(projection.linux.as_ref().unwrap().staged_build, Some(830));
@@ -993,27 +1004,29 @@ mod tests {
         facts.installed_build = 830;
         facts.trial_phase = Some("Installed".into());
         facts.trial_starts = 1;
-        let state = linux_state(Some(facts), 0);
+        let mut state = linux_state(Some(facts), 0);
+        state.outcome = LINUX_PENDING.into();
         let projection = state.projection();
         assert_eq!(projection.headline, "Startup pending.");
-        assert!(
-            projection
-                .detail
-                .as_deref()
-                .unwrap()
-                .starts_with("Build 830 waits for a clean launch."),
-            "{:?}",
-            projection.detail
-        );
+        assert_eq!(projection.detail.as_deref(), Some(LINUX_PENDING));
         assert_eq!(
             crate::native_settings::compact_update_headline(&projection),
             "Awaiting startup"
         );
-        // Mid-install and mid-rollback nothing waits for a launch yet.
+        // Beside a failure the page names the pending install itself; mid-install and
+        // mid-rollback nothing waits for a launch yet.
+        let failing = linux_state(state.linux.clone(), 1).projection().detail;
+        assert!(
+            failing
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Build 830 waits for a clean launch."),
+            "{failing:?}"
+        );
         for phase in ["Prepared", "RollbackPrepared"] {
             let mut facts = state.linux.clone().expect("the Linux facts");
             facts.trial_phase = Some(phase.into());
-            let detail = linux_state(Some(facts), 0).projection().detail;
+            let detail = linux_state(Some(facts), 1).projection().detail;
             assert!(
                 !detail
                     .as_deref()
@@ -1030,12 +1043,18 @@ mod tests {
         state.outcome = "signature verification refused the new manifest".into();
         let projection = state.projection();
         assert!(projection.headline.contains("attention"));
+        let detail = projection.detail.as_deref().unwrap();
+        // The failure names neither the download nor the step: the page adds both.
+        assert_eq!(
+            detail,
+            "Version 0.5.15 is downloaded. signature verification refused the new manifest. \
+             Run `aterm update apply` to install it."
+        );
+        // A sentence that ends itself is not ended twice.
+        state.outcome = "Another aterm is updating this copy right now.".into();
         assert!(
-            projection
-                .detail
-                .as_deref()
-                .unwrap()
-                .contains("signature verification refused")
+            !state.projection().detail.unwrap().contains(".."),
+            "one sentence ends once"
         );
         assert!(projection.linux_attention);
         assert_eq!(
@@ -1167,15 +1186,17 @@ mod tests {
         let mut installed = idle;
         installed.installed_build = 830;
         for (facts, headline, fact) in [
+            (trial, "Startup pending.", LINUX_PENDING),
             (
-                trial,
-                "Startup pending.",
-                "Build 830 waits for a clean launch",
+                installed,
+                "New build installed.",
+                "aterm 0.5.15 is installed",
             ),
-            (installed, "New build installed.", "Build 830 is installed"),
         ] {
             for (running, saved) in [(false, false), (false, true), (true, false)] {
-                let projection = page(facts.clone(), 0, running, saved);
+                let mut state = linux_state(Some(facts.clone()), 0);
+                state.outcome = fact.into();
+                let projection = state.with_automatic_checks(running, saved).projection();
                 assert_eq!(projection.headline, headline);
                 let detail = projection.detail.expect("the Linux detail");
                 assert!(detail.starts_with(fact), "{headline} {detail}");
@@ -1226,7 +1247,6 @@ mod tests {
             installable: true,
             failing_since: String::new(),
             failing_persistent: false,
-            rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
         }

@@ -122,9 +122,24 @@ fn verb_command(exe: &str, token: &str) -> String {
 }
 
 /// Install the "Open aterm here" verb on directories, directory backgrounds, and
-/// drives, pointing at the CURRENT `aterm-gui.exe` with `-d <path>`.
+/// drives, pointing at THIS install's windowed image with `-d <path>`.
+///
+/// The windowed image, not `current_exe()`: `aterm --install-context-menu` typed
+/// at a prompt runs in the CONSOLE image `aterm.exe`, and a verb registered on
+/// it made Explorer start a console-subsystem exe — a new console window
+/// running the transparent session, not an aterm window (review 2026-09-27).
+/// [`crate::win32::windowed_front_door_beside`] is the one rule the console
+/// image's window handoff and the jump list use too (`aterm-gui.exe` in an
+/// install, `aterm-windowed.exe` in a build tree). No such image beside this
+/// one: refused, and nothing is written.
 pub(crate) fn install() -> io::Result<()> {
-    let exe = std::env::current_exe()?;
+    let current = std::env::current_exe()?;
+    let Some(exe) = crate::win32::windowed_front_door_beside(&current) else {
+        return Err(io::Error::other(format!(
+            "no windowed aterm image (aterm-gui.exe) beside {} for Explorer to start",
+            current.display()
+        )));
+    };
     let exe_s = exe.to_string_lossy();
     for (base, arg) in VERBS {
         let hk = create_key(base)?;

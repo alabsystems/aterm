@@ -14,9 +14,10 @@
 //! and scanner the release cut's paint smoke uses, so the two gates cannot
 //! drift apart.
 //!
-//! THE MATRIX has 21 live-artifact rows plus the scanner's own semantic
+//! THE MATRIX has 23 live-artifact rows plus the scanner's own semantic
 //! negative controls. It covers prompt, fake-Claude, ESC7/ESC8 streamer and
-//! cold-output shapes; pinned video and unpinned focused/unfocused images;
+//! cold-output shapes; a single pane and a two-pane split (row 12 and its
+//! off twin, the composed path); pinned video and unpinned focused/unfocused images;
 //! shipped-default resident pet, earned flying cat and owner-spelling overlap;
 //! and four matched typed `off` twins. Those off twins preserve cursor/text
 //! deltas while requiring zero ribbon geometry and a quiet effect ledger, so a
@@ -106,10 +107,10 @@
 //! under every healthy arm on both axes, and the controls still measure 0-766
 //! total with 0-3 hue buckets (the pet's coat, when one is minted saturated).
 //!
-//! WIRING: the `guards` lane of `xtask gate lint` covers this matrix —
-//! `tools/paint_guard.sh` nonce-relinks this test and the release app, then runs
-//! a private copy directly whenever Cargo's derived artifact/test source closure
-//! or this gate's own machinery differs from the last take it proved green.
+//! WIRING: the merge gate (`tools/verify.sh`) runs this matrix in its exclusive
+//! `measuring tests` stage. The fingerprinted `tools/paint_guard.sh` that once
+//! ran it from `gate lint`'s guards lane, which nothing ran automatically, was
+//! deleted on 2026-09-27.
 //!
 //! RUNTIME, and why it moved: the probe's whole-run watchdog used to sleep out
 //! the full `--budget` and be killed on exit, which orphaned its `sleep` — and
@@ -126,8 +127,8 @@
 //! macOS-ONLY LANE, honestly: the scanner decodes frames by shelling to
 //! `sips`, and the artifact under judgment is the macOS bundle's binary, so the
 //! whole file is `#![cfg(target_os = "macos")]` and this target holds no tests
-//! elsewhere. The matrix runs on the mac that cuts releases, via
-//! tools/paint_guard.sh and the release smoke.
+//! elsewhere. The matrix runs on the mac that cuts releases, in the merge
+//! gate's measuring stage and the release smoke.
 //!
 //! QUIET-MACHINE LANE, too: the video rows audit a real-time pipeline, and
 //! one sweep run beside a full workspace compile charged row 1 with a

@@ -21,135 +21,37 @@
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private control socket, a config with
 //! every automatic lane off, `--no-reroute`, `SHELL=/bin/sh`
-//! (`support/launch_isolation.rs`). A headless instance never reaches
-//! WindowServer.
+//! (`support/launch_isolation.rs`). A headless instance opens no window.
 
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader, Read};
-use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
-const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
-const MAX_SOCK_PATH: usize = 100;
+use headless_boot::Instance;
 
-/// One booted headless instance plus its scratch world, torn down on every
-/// exit path (Drop runs on panic too).
-struct Instance {
-    child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    tmp: PathBuf,
-    log: PathBuf,
-    sock: String,
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
-    }
-}
-
-fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(15);
-    lines[start..].join("\n")
-}
-
-fn is_socket_or_symlink(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_socket() || m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-fn scratch_root(tag: &str) -> Option<PathBuf> {
-    let name = format!("atav{tag}-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
-    }
-    None
-}
-
-/// Boot one headless instance, 40x120. `None` = an environmental refusal,
-/// announced as a SKIP with the log tail.
+/// Boot one headless instance, 40x120 ([`headless_boot::boot`]: `None` is an
+/// environment refusal; a product that cannot start fails the test).
 fn boot(tag: &str) -> Option<Instance> {
-    let Some(tmp) = scratch_root(tag) else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
-    let log = tmp.join("gui.log");
-    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    launch_isolation::apply(&mut cmd, &tmp);
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .args(launch_isolation::control_sock(&tmp))
-        .args(["--lines", "40", "--columns", "120"])
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let sock_path = tmp.join("run/aterm/aterm.sock");
-    let mut inst = Instance {
-        child,
-        _lifeline: lifeline,
-        sock: sock_path.to_string_lossy().into_owned(),
-        tmp,
-        log,
-    };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!(
-                "SKIP: aterm --headless exited before binding its socket; log tail:\n{}",
-                log_tail(&inst.log)
-            );
-            return None;
-        }
-        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!(
-        "SKIP: control socket never started listening; log tail:\n{}",
-        log_tail(&inst.log)
-    );
-    None
+    boot_rows(tag, 40)
 }
+
+/// [`boot`] with `lines` rows.
+fn boot_rows(tag: &str, lines: u16) -> Option<Instance> {
+    headless_boot::boot(
+        &format!("atav{tag}"),
+        &["--lines", &lines.to_string(), "--columns", "120"],
+    )
+}
+
+const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
 fn client_command(inst: &Instance, args: &[&str]) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
@@ -632,13 +534,15 @@ fn a_shell_that_cats_a_claude_capture_is_not_an_agent() {
     );
 }
 
-/// A fake Claude Code that draws its idle frame, waits for `die` to exist,
+/// A fake Claude Code that draws its idle frame — the cursor on its caret
+/// row at column 2, where Claude Code keeps it — waits for `die` to exist,
 /// then clears the screen (as Claude restores the terminal) and exits.
 const FAKE_EXIT: &str = r#"#!/bin/sh
 die="$1"
 rule=$(printf '%120s' '' | sed 's/ /─/g')
 printf '\033[2J\033[H'
 printf '⏺ Done.\n\n%s\n❯ \n%s\n  ? for shortcuts\n' "$rule" "$rule"
+printf '\033[3A\033[3G'
 while [ ! -e "$die" ]; do sleep 0.05; done
 rm -f "$die"
 printf '\033[2J\033[H'
@@ -786,6 +690,222 @@ fn settled_agent_rev(inst: &Instance, sid: &str) -> u64 {
         );
         last = now;
     }
+}
+
+/// A fake Claude Code LAUNCH, drawn as 2.1.283 draws one (measured frame by
+/// frame on 2026-09-26: aterm-phase's `LAUNCH_*` fixtures): nothing of it on
+/// the screen — the shell's rows stand, as they do between the launch (or
+/// the folder-trust dialog, which it erases) and the REPL — until `go`
+/// exists; then its REPL on the alternate screen: the banner, the composer
+/// between its two rules, the mode footer, drawn from the top row down, and
+/// the terminal's cursor on the caret row at column 2, where Claude Code
+/// keeps it (measured with the cursor on 2026-09-27).
+const FAKE_LAUNCH: &str = r#"#!/bin/sh
+go="$1"
+rule=$(printf '%120s' '' | sed 's/ /─/g')
+while [ ! -e "$go" ]; do sleep 0.05; done
+printf '\033[?1049h\033[2J\033[H'
+printf ' Claude Code v2.1.283\n\n%s\n❯ \n%s\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n' "$rule" "$rule"
+printf '\033[4;3H'
+while :; do sleep 1; done
+"#;
+
+/// The same launch under Claude Code's INLINE renderer (its classic
+/// main-screen one, measured on 2.1.283 on 2026-09-26: aterm-phase's
+/// `INLINE_*` fixtures): the REPL drawn on the MAIN grid under the launch
+/// line, the rows below it left blank, the cursor on the caret row at column
+/// 2. Once `quit` exists it exits as Claude Code does: its prompt box left
+/// on the main grid, the cursor on the row under its footer, where the
+/// shell's prompt comes back (measured, 2026-09-27).
+const FAKE_INLINE_LAUNCH: &str = r#"#!/bin/sh
+go="$1"
+quit="$2"
+rule=$(printf '%120s' '' | sed 's/ /─/g')
+while [ ! -e "$go" ]; do sleep 0.05; done
+printf ' Claude Code v2.1.283\n\n%s\n❯ \n%s\n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n' "$rule" "$rule"
+printf '\033[3A\033[3G'
+while [ ! -e "$quit" ]; do sleep 0.05; done
+printf '\033[3B\r'
+"#;
+
+/// NEW-1 of the live e2e (2026-09-26), live: `await agent idle` on a Claude
+/// Code that has started but not drawn its REPL PARKS — the server reads
+/// the shell's rows under Claude Code's reader as `agent=unknown`, not
+/// `idle` — and latches only once the composer is on the screen. On the old
+/// reader those rows read idle, the wait answered at once, and a first
+/// prompt typed then into Claude Code 2.1.283 was lost (measured: 5 of 5
+/// after the trust dialog). THE CONTROL: the REPL drawn, the same wait
+/// latches, and the screen it answered on holds the composer.
+#[test]
+fn await_agent_idle_waits_for_claude_codes_composer() {
+    waits_for_the_composer("l", 40, FAKE_LAUNCH);
+}
+
+/// The same in a pane TALLER than the verdict's 40 rows (the review of
+/// 2026-09-26): the REPL drawn from the top row down on the alternate
+/// screen, and under the launch line on the main grid (the inline
+/// renderer), leaves blank rows below it, and the server read the grid's
+/// last 40 rows — the prompt box's caret above them — so the wait answered
+/// `OK timeout` (8 of 8 live inline launches at 150x50). The verdict reads
+/// the last 40 DRAWN rows: the wait latches on the REPL at 50 rows and at
+/// 80.
+#[test]
+fn await_agent_idle_waits_for_a_composer_above_the_last_40_rows() {
+    waits_for_the_composer("t", 50, FAKE_LAUNCH);
+    waits_for_the_composer("i", 50, FAKE_INLINE_LAUNCH);
+    waits_for_the_composer("j", 80, FAKE_INLINE_LAUNCH);
+}
+
+/// Launch `fake` as `claude` in a `lines`-row instance: `await agent idle`
+/// parks while nothing of the REPL is drawn (`agent=unknown`), and latches
+/// on the REPL once it is.
+fn waits_for_the_composer(tag: &str, lines: u16, fake: &str) {
+    let Some(inst) = boot_rows(tag, lines) else {
+        return;
+    };
+    let (_, sid) = boot_session(&inst);
+    let script = inst.tmp.join("fake-launch.sh");
+    std::fs::write(&script, fake).expect("write the fake");
+    let go = inst.tmp.join("go");
+    launch_fake(&inst, &sid, &script, &go, &inst.tmp.join("quit"));
+    let screen = parks_then_latches(&inst, &sid, &go, &format!("{lines} rows"));
+    // The geometry under test: in a pane taller than 40 rows, the caret sits
+    // above the grid's last 40 rows (40 or more rows below it).
+    let below = screen
+        .lines()
+        .rev()
+        .position(|r| r.starts_with('❯'))
+        .expect("the caret");
+    if lines > 40 {
+        assert!(
+            below >= 40,
+            "{lines} rows: {below} rows under the caret: {screen}"
+        );
+    }
+}
+
+/// THE SAME TAB, RELAUNCHED (the review of 2026-09-26): Claude Code's
+/// inline renderer run again in the tab it exited in leaves the previous
+/// run's prompt box on the main grid above the new launch line, and the
+/// server — reading that box by its frame alone — published `agent=idle`
+/// before the new REPL was drawn: `await agent idle` answered at once, and
+/// a draft typed then was lost (3 of 3 after the folder-trust dialog, 1 of
+/// 3 without it, on 2.1.283). Live, in a 50-row pane: a first fake run
+/// draws its REPL and exits, its box left on the grid; the second launch in
+/// the same tab reads `agent=unknown` — the cursor under its launch line,
+/// in no prompt box — and the wait parks until the new REPL is drawn, then
+/// latches on it: the caret it answered on is under the SECOND launch line.
+/// THE CONTROL: the first run in the fresh tab latches the same way.
+#[test]
+fn await_agent_idle_waits_for_the_relaunched_repl_in_the_same_tab() {
+    let Some(inst) = boot_rows("r", 50) else {
+        return;
+    };
+    let (_, sid) = boot_session(&inst);
+    let script = inst.tmp.join("fake-inline.sh");
+    std::fs::write(&script, FAKE_INLINE_LAUNCH).expect("write the fake");
+    let (go1, quit1) = (inst.tmp.join("go1"), inst.tmp.join("quit1"));
+    launch_fake(&inst, &sid, &script, &go1, &quit1);
+    parks_then_latches(&inst, &sid, &go1, "the first run");
+    std::fs::write(&quit1, b"").expect("the first run's exit");
+    status_until(
+        &inst,
+        &sid,
+        Duration::from_secs(10),
+        "the first run exited to its shell",
+        |s| field(s, "program") != Some("claude") && field(s, "agent") == Some("-"),
+    );
+    let between = ctl_ok(&inst, &[&format!("@{sid}"), "text"]);
+    assert_eq!(
+        between.lines().filter(|r| r.starts_with('❯')).count(),
+        1,
+        "the first run's prompt box is left on the grid: {between}"
+    );
+    let (go2, quit2) = (inst.tmp.join("go2"), inst.tmp.join("quit2"));
+    launch_fake(&inst, &sid, &script, &go2, &quit2);
+    let screen = parks_then_latches(&inst, &sid, &go2, "the relaunch");
+    let rows: Vec<&str> = screen.lines().collect();
+    let launches: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].contains("exec -a claude"))
+        .collect();
+    let carets: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].starts_with('❯'))
+        .collect();
+    assert_eq!(
+        (launches.len(), carets.len()),
+        (2, 2),
+        "two launches, two prompt boxes: {screen}"
+    );
+    assert!(
+        carets[0] < launches[1] && launches[1] < carets[1],
+        "the old box above the second launch line, the new one under it: {screen}"
+    );
+}
+
+/// Type the launch of `script` as `claude` (`exec -a`), its go-file `go` and
+/// quit-file `quit`.
+fn launch_fake(inst: &Instance, sid: &str, script: &Path, go: &Path, quit: &Path) {
+    type_line(
+        inst,
+        sid,
+        &format!(
+            "/bin/bash -c 'exec -a claude /bin/sh {} {} {}'",
+            script.display(),
+            go.display(),
+            quit.display()
+        ),
+    );
+}
+
+/// With a fake launched and nothing of its REPL drawn: once the server names
+/// it an agent, `await agent idle` PARKS (`agent=unknown`) for 1.5 s; then
+/// `go` is created, the REPL is drawn, and the wait latches on it. Returns
+/// the screen it answered on, which holds the REPL.
+fn parks_then_latches(inst: &Instance, sid: &str, go: &Path, what: &str) -> String {
+    let named = status_until(
+        inst,
+        sid,
+        Duration::from_secs(10),
+        "program=claude, read as an agent",
+        |s| field(s, "program") == Some("claude") && field(s, "agent") != Some("-"),
+    );
+    // A waiter parked on idle while nothing of the REPL is drawn.
+    let waiter = std::thread::spawn({
+        let mut cmd = client_command(
+            inst,
+            &[
+                &format!("@{sid}"),
+                "await",
+                "agent",
+                "idle",
+                "timeout=15000",
+            ],
+        );
+        move || cmd.output().expect("await agent idle")
+    });
+    std::thread::sleep(Duration::from_millis(1500));
+    let before = status(inst, sid);
+    assert!(
+        !waiter.is_finished(),
+        "{what}: `await agent idle` answered before the REPL was drawn: {before} \
+         (named: {named})\n{}",
+        ctl_ok(inst, &[&format!("@{sid}"), "text"])
+    );
+    assert_eq!(field(&before, "program"), Some("claude"), "{before}");
+    assert_eq!(field(&before, "agent"), Some("unknown"), "{what}: {before}");
+    std::fs::write(go, b"").expect("create the go file");
+    let waited = waiter.join().expect("await thread");
+    let waited = String::from_utf8_lossy(&waited.stdout).into_owned();
+    assert!(
+        waited.contains("OK agent idle rev="),
+        "{what}: await agent: {waited}"
+    );
+    let screen = ctl_ok(inst, &[&format!("@{sid}"), "text"]);
+    assert!(
+        screen.lines().any(|r| r.starts_with('❯')) && screen.contains("Claude Code v2.1.283"),
+        "{what}: the wait answered on the REPL: {screen}"
+    );
+    screen
 }
 
 /// From the SERVER's wake stamps on one `screen,events,ts` stream: the first

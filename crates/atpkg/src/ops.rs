@@ -444,6 +444,13 @@ pub fn list_installed(layout: &Layout) -> Vec<(String, u64)> {
 /// Its own function so a caller that records an intent BEFORE the destructive steps (the
 /// CLI's removed marker) can ask, first, the one question that makes `uninstall` fail
 /// without having deleted anything.
+///
+/// The last clause — the name must parse as exactly ONE normal path component — is the
+/// Windows half: `C:`, `C:x` and `C:..` carry no separator, yet a component with a drive
+/// prefix and no root REPLACES the whole base in `Path::join` (measured with rustc
+/// 1.97.1 on Windows 11: `…\pkg\store`.join("C:x") is `C:x`), so `store/C:` named the
+/// current directory of drive C. On Unix every name the clauses before it admit is one
+/// normal component already, so the rule there is unchanged.
 pub(crate) fn uninstall_name_shape(program: &str) -> io::Result<()> {
     if program.is_empty()
         || program == "."
@@ -451,6 +458,13 @@ pub(crate) fn uninstall_name_shape(program: &str) -> io::Result<()> {
         || program.contains('/')
         || program.contains('\\')
         || program.contains('\0')
+        || !matches!(
+            Path::new(program)
+                .components()
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [std::path::Component::Normal(_)]
+        )
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -500,24 +514,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
     // primary in it.)
     crate::activate::sweep_agents_dir(layout);
 
-    // 2. Drop channel `current` links that point into this program's store tree (so no
-    //    dangling active-set link remains after the builds are gone). Removal goes through
-    //    platform::remove_link, not std::fs::remove_file: on Windows `current` is a directory
-    //    JUNCTION and remove_file fails on it (ERROR_ACCESS_DENIED), which would leave the
-    //    junction dangling into a deleted tree. remove_link unlinks the junction itself
-    //    (remove_dir), never touching the target's contents.
-    if let Ok(channels) = std::fs::read_dir(layout.prefix.join("channels")) {
-        for ch in channels.flatten() {
-            let cur = ch.path().join("current");
-            if let Ok(target) = std::fs::read_link(&cur)
-                && target.starts_with(&prog_store)
-            {
-                crate::platform::remove_link(&cur);
-            }
-        }
-    }
-
-    // 3. Reclaim the store tree — but only after confirming it is inside the prefix, and
+    // 2. Reclaim the store tree (its `store/<program>/current` link goes with it) — but only after confirming it is inside the prefix, and
     //    only after every build under it has been UNMARKED.
     //
     //    The unmark is not tidiness, it is the ordering that makes an interrupted uninstall
@@ -550,7 +547,7 @@ pub fn uninstall(layout: &Layout, program: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activate::{activate_channel, install_shims};
+    use crate::activate::{activate_build, install_shims};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -584,7 +581,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        activate_channel(layout, "stable", &dir).unwrap();
+        activate_build(layout, &dir).unwrap();
         // A real install marks the build complete as its last step (verify_and_stage).
         crate::store::mark_build_ready(&dir).unwrap();
         dir
@@ -872,8 +869,8 @@ mod tests {
             !l.prefix.join("store/ay").exists(),
             "program store dir removed"
         );
-        // The channel `current` (which pointed into ay's store) is gone, not dangling.
-        assert!(std::fs::read_link(l.channel_current("stable")).is_err());
+        // The program's `current` link went with its store tree, not left dangling.
+        assert!(std::fs::symlink_metadata(l.program_current("ay")).is_err());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -928,6 +925,19 @@ mod tests {
                 uninstall(&l, bad).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput
             );
+        }
+
+        // A drive-relative name carries no separator, yet on Windows the join leaves the
+        // prefix (`store.join("C:x")` IS `C:x`), so the shape rule refuses it there. On Unix
+        // it is an ordinary directory name inside the store, admitted as before.
+        for drive in ["C:", "C:x", "C:.."] {
+            let escapes = !l.prefix.join("store").join(drive).starts_with(&l.prefix);
+            assert_eq!(
+                escapes,
+                cfg!(windows),
+                "{drive:?}: the join leaves the prefix"
+            );
+            assert_eq!(uninstall_name_shape(drive).is_err(), escapes, "{drive:?}");
         }
 
         let _ = std::fs::remove_dir_all(&victim);

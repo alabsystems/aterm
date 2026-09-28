@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! PolicyEngine hot-path benchmark for #7998.
+//! PolicyEngine hot-path benchmark.
 //!
 //! This bench measures the per-evaluation cost of `PolicyEngine::evaluate`
-//! across the three built-in profiles. It is the bench gate referenced by
-//! #7998's acceptance criteria and is the authoritative source of the
-//! ">5% overhead is a regression" guardrail for the policy handoff on
-//! the PTY -> handler path.
+//! across the three built-in profiles — the ">5% overhead is a regression"
+//! guardrail for the policy handoff on the PTY -> handler path.
 //!
 //! Run with:
 //!
@@ -97,8 +95,7 @@ fn bench_hardened(c: &mut Criterion) {
 
 fn bench_construction(c: &mut Criterion) {
     // Engine construction cost — called once at session start and on
-    // policy hot-swap. We measure it here so the #7998 gate sees any
-    // regression in rule precompilation.
+    // policy hot-swap. Measured so a regression in rule precompilation shows.
     c.bench_function("policy/construct/hardened", |b| {
         b.iter(|| {
             black_box(PolicyEngine::new(profiles::hardened()));

@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CLAUDE CODE FOOTER, host side: aterm paints `◆ Opus 5.5 xhigh   ⌂ aterm
-//! ⎇ main` over Claude Code's permission-mode row (owner direction,
+//! THE CLAUDE CODE FOOTER, host side: aterm paints `◆ Opus 5.5 xhigh   ⌂
+//! ~/aterm   ⎇ main` over Claude Code's permission-mode row (owner direction,
 //! 2026-09-24). What the footer says and which row it replaces are decided in
 //! `aterm_agent::harness::footer`; this module gets the facts off the event
 //! loop and puts the row on the glass.
 //!
-//! * FACTS. One background thread ([`request`]) reads them — the
+//! * FACTS. One background thread ([`request_footer`]) reads them — the
 //!   process's `sessions/<pid>.json`, its transcript tail, `.git/HEAD` — and
 //!   publishes them on the session's timeline
 //!   (`SessionTimeline::set_claude_footer`), exactly as `session_program`'s
@@ -97,7 +97,6 @@ struct SeenPaneText {
     leaf_index: usize,
     session: u64,
     texts: Arc<Vec<String>>,
-    thinking: Option<bool>,
 }
 
 /// Screen text is an input to the footer and lights readers, not a separate
@@ -170,23 +169,32 @@ impl PaneTextCache {
         {
             return Arc::clone(&cached.rows);
         }
-        let text = Arc::new(
-            (0..region.rows)
-                .map(|r| {
-                    scratch
-                        .cells
-                        .get(region.strip + region.row_off + r)
-                        .map(|row| {
-                            row.iter()
-                                .skip(region.col_off)
-                                .take(region.cols)
-                                .map(|c| c.ch)
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect(),
-        );
+        // A typed echo changes the scratch revision even when nearly every row
+        // keeps the same shape. Once the last frame's readers have gone, reuse
+        // their row buffers instead of allocating one String per row again.
+        // A still-held Arc remains an immutable snapshot; a different session
+        // or pane region also gets fresh storage rather than retaining its old
+        // transcript in the new pane's spare String capacities.
+        let mut rows = self
+            .panes
+            .get_mut(leaf_index)
+            .and_then(Option::take)
+            .filter(|cached| cached.key.session == session && cached.key.region == region)
+            .and_then(|cached| Arc::try_unwrap(cached.rows).ok())
+            .unwrap_or_default();
+        rows.resize_with(region.rows, String::new);
+        for (r, text) in rows.iter_mut().enumerate() {
+            text.clear();
+            if let Some(row) = scratch.cells.get(region.strip + region.row_off + r) {
+                text.extend(
+                    row.iter()
+                        .skip(region.col_off)
+                        .take(region.cols)
+                        .map(|c| c.ch),
+                );
+            }
+        }
+        let text = Arc::new(rows);
         if self.panes.len() <= leaf_index {
             self.panes.resize_with(leaf_index + 1, || None);
         }
@@ -238,26 +246,41 @@ struct Job {
     pgid: i32,
 }
 
+enum Command {
+    Request(Job),
+    /// `None` retires the session; a group-specific stop cannot erase a
+    /// replacement Claude process that was requested before it arrived.
+    Stop {
+        session: u64,
+        pgid: Option<i32>,
+    },
+}
+
 /// The one background thread footer facts are read on, started on first use
 /// and shared by both askers (the status sweep, and `session_program`'s
 /// resolver the moment it names Claude Code). An answer for a group that has
 /// left the foreground is dropped by `SessionTimeline::set_claude_footer`.
-static RESOLVER: Mutex<Option<Sender<Job>>> = Mutex::new(None);
+static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
 /// Read `pgid`'s footer facts off-thread into `timeline` now, and again at
 /// each of [`FOLLOW_UPS`]. A newer request for the same session replaces the
 /// follow-ups still owed for it. If the thread cannot be started the footer
 /// simply does not appear.
-pub(crate) fn request(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pgid: i32) {
+pub(crate) fn request_footer(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pgid: i32) {
     if pgid <= 0 {
         return;
     }
     let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
     if slot.is_none() {
-        let (tx, rx) = channel::<Job>();
+        let (tx, rx) = channel::<Command>();
         let spawned = std::thread::Builder::new()
             .name("aterm-claude-footer".into())
-            .spawn(move || run(&rx));
+            .spawn(move || {
+                // It takes the session timeline lock the UI thread contends,
+                // so the lock-holder floor applies.
+                crate::qos::set_self(crate::qos::Role::Responsive);
+                run(&rx);
+            });
         match spawned {
             Ok(_) => *slot = Some(tx),
             Err(e) => {
@@ -271,34 +294,151 @@ pub(crate) fn request(session: u64, timeline: &Arc<Mutex<SessionTimeline>>, pgid
         timeline: Arc::clone(timeline),
         pgid,
     };
-    if slot.as_ref().is_some_and(|tx| tx.send(job).is_err()) {
+    if slot
+        .as_ref()
+        .is_some_and(|tx| tx.send(Command::Request(job)).is_err())
+    {
         // The thread is gone (it ends only when the channel closes, so this is
         // a panic in a read); start a fresh one next time.
         *slot = None;
     }
 }
 
-/// The resolver thread: each request is read at once and again at each
-/// follow-up, and the thread sleeps exactly until the next one is owed.
-fn run(rx: &std::sync::mpsc::Receiver<Job>) {
-    // It takes the session timeline lock the UI thread contends, so the
-    // lock-holder floor applies.
-    crate::qos::set_self(crate::qos::Role::Responsive);
-    let mut owed: Vec<(std::time::Instant, Job)> = Vec::new();
-    let mut known: HashMap<u64, Identity> = HashMap::new();
-    // Per session: its latest job, when it was last ASKED for, and when it
-    // was last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this.
-    let mut watched: HashMap<u64, (Job, std::time::Instant, std::time::Instant)> = HashMap::new();
-    loop {
-        let now = std::time::Instant::now();
-        watched.retain(|_, (_, asked, _)| now.saturating_duration_since(*asked) < WATCH_FOR);
-        known.retain(|session, _| watched.contains_key(session));
-        let next = owed
+/// Stop refreshing the old foreground group. The sender lock serializes this
+/// with requests; the resolver also matches `pgid`, so a late stop for an old
+/// group cannot cancel a newer group's watch.
+pub(crate) fn stop(session: u64, pgid: i32) {
+    if pgid <= 0 {
+        return;
+    }
+    send_stop(session, Some(pgid));
+}
+
+/// A retired session or a disabled status sweep has no live footer watch.
+pub(crate) fn stop_session(session: u64) {
+    send_stop(session, None);
+}
+
+fn send_stop(session: u64, pgid: Option<i32>) {
+    let mut slot = RESOLVER.lock().unwrap_or_else(|p| p.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|tx| tx.send(Command::Stop { session, pgid }).is_err())
+    {
+        *slot = None;
+    }
+}
+
+#[derive(Default)]
+struct WatchSchedule {
+    owed: Vec<(std::time::Instant, Job)>,
+    watched: HashMap<u64, (Job, std::time::Instant, std::time::Instant)>,
+}
+
+impl WatchSchedule {
+    fn prune(&mut self, now: std::time::Instant) {
+        self.watched
+            .retain(|_, (_, asked, _)| now.saturating_duration_since(*asked) < WATCH_FOR);
+    }
+
+    fn next(&self) -> Option<std::time::Instant> {
+        self.owed
             .iter()
             .map(|(at, _)| *at)
-            .chain(watched.values().map(|(_, _, read)| *read + IDLE_RECHECK))
-            .min();
-        let first = match next {
+            .chain(
+                self.watched
+                    .values()
+                    .map(|(_, _, read)| *read + IDLE_RECHECK),
+            )
+            .min()
+    }
+
+    fn matches(job: &Job, session: u64, pgid: Option<i32>) -> bool {
+        job.session == session && pgid.is_none_or(|pgid| job.pgid == pgid)
+    }
+
+    /// Collapse queued requests while respecting a stop's position in the
+    /// channel. Returns the jobs to read now and the watched ids it retired.
+    fn accept(&mut self, commands: impl IntoIterator<Item = Command>) -> (Vec<Job>, Vec<u64>) {
+        let mut latest: HashMap<u64, Job> = HashMap::new();
+        let mut stopped = Vec::new();
+        for command in commands {
+            match command {
+                Command::Request(job) => {
+                    latest.insert(job.session, job);
+                }
+                Command::Stop { session, pgid } => {
+                    if latest
+                        .get(&session)
+                        .is_some_and(|job| Self::matches(job, session, pgid))
+                    {
+                        latest.remove(&session);
+                    }
+                    if self.stop(session, pgid) {
+                        stopped.push(session);
+                    }
+                }
+            }
+        }
+        (latest.into_values().collect(), stopped)
+    }
+
+    fn stop(&mut self, session: u64, pgid: Option<i32>) -> bool {
+        if !self
+            .watched
+            .get(&session)
+            .is_some_and(|(job, _, _)| Self::matches(job, session, pgid))
+        {
+            return false;
+        }
+        self.watched.remove(&session);
+        self.owed.retain(|(_, job)| job.session != session);
+        true
+    }
+
+    fn watch(&mut self, job: Job, asked: std::time::Instant) {
+        self.owed
+            .retain(|(_, pending)| pending.session != job.session);
+        for delay in FOLLOW_UPS {
+            self.owed.push((asked + delay, job.clone()));
+        }
+        self.watched.insert(job.session, (job, asked, asked));
+    }
+
+    fn due_followups(&mut self, now: std::time::Instant) -> Vec<Job> {
+        let (due, later): (Vec<_>, Vec<_>) = self.owed.drain(..).partition(|(at, _)| *at <= now);
+        self.owed = later;
+        due.into_iter().map(|(_, job)| job).collect()
+    }
+
+    fn due_idle(&self, now: std::time::Instant) -> Option<Job> {
+        self.watched
+            .values()
+            .find(|(_, _, read)| now >= *read + IDLE_RECHECK)
+            .map(|(job, _, _)| job.clone())
+    }
+
+    fn read(&mut self, session: u64, at: std::time::Instant) {
+        if let Some((_, _, read)) = self.watched.get_mut(&session) {
+            *read = at;
+        }
+    }
+}
+
+/// The resolver thread: each request is read at once and again at each
+/// follow-up, and the thread sleeps exactly until the next one is owed.
+fn run(rx: &std::sync::mpsc::Receiver<Command>) {
+    let mut schedule = WatchSchedule::default();
+    let mut known: HashMap<u64, Identity> = HashMap::new();
+    let mut tails: HashMap<u64, footer::TailCache> = HashMap::new();
+    // Per session: its latest job, when it was last ASKED for, and when it
+    // was last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this.
+    loop {
+        let now = std::time::Instant::now();
+        schedule.prune(now);
+        known.retain(|session, _| schedule.watched.contains_key(session));
+        tails.retain(|session, _| schedule.watched.contains_key(session));
+        let first = match schedule.next() {
             Some(at) => match rx.recv_timeout(at.saturating_duration_since(now)) {
                 Ok(job) => Some(job),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
@@ -312,36 +452,28 @@ fn run(rx: &std::sync::mpsc::Receiver<Job>) {
         // Everything already queued, collapsed to the newest ask per session:
         // a slow read (a stalled mount under one session's cwd) is paid once,
         // not once per ask that piled up behind it.
-        let mut latest: HashMap<u64, Job> = HashMap::new();
-        for job in first
-            .into_iter()
-            .chain(std::iter::from_fn(|| rx.try_recv().ok()))
-        {
-            latest.insert(job.session, job);
+        let (latest, stopped) = schedule.accept(
+            first
+                .into_iter()
+                .chain(std::iter::from_fn(|| rx.try_recv().ok())),
+        );
+        for session in stopped {
+            known.remove(&session);
+            tails.remove(&session);
         }
-        for (_, job) in latest {
-            owed.retain(|(_, pending)| pending.session != job.session);
-            resolve_and_post(&mut known, job.session, &job.timeline, job.pgid);
+        for job in latest {
+            resolve_and_post(&mut known, &mut tails, job.session, &job.timeline, job.pgid);
             let asked = std::time::Instant::now();
-            for delay in FOLLOW_UPS {
-                owed.push((asked + delay, job.clone()));
-            }
-            watched.insert(job.session, (job, asked, asked));
+            schedule.watch(job, asked);
         }
         let now = std::time::Instant::now();
-        let (due, later): (Vec<_>, Vec<_>) = owed.into_iter().partition(|(at, _)| *at <= now);
-        owed = later;
-        for (_, job) in due {
-            resolve_and_post(&mut known, job.session, &job.timeline, job.pgid);
-            if let Some((_, _, read)) = watched.get_mut(&job.session) {
-                *read = std::time::Instant::now();
-            }
+        for job in schedule.due_followups(now) {
+            resolve_and_post(&mut known, &mut tails, job.session, &job.timeline, job.pgid);
+            schedule.read(job.session, std::time::Instant::now());
         }
-        for (job, _, read) in watched.values_mut() {
-            if now >= *read + IDLE_RECHECK {
-                resolve_and_post(&mut known, job.session, &job.timeline, job.pgid);
-                *read = std::time::Instant::now();
-            }
+        while let Some(job) = schedule.due_idle(now) {
+            resolve_and_post(&mut known, &mut tails, job.session, &job.timeline, job.pgid);
+            schedule.read(job.session, std::time::Instant::now());
         }
     }
 }
@@ -387,9 +519,13 @@ fn claude_dir_of_pid(pid: i32) -> Option<PathBuf> {
     }
 }
 
-/// [`resolve_into`], then wake the loop when the facts moved.
+/// [`resolve_into`], then wake the loop when the facts moved — and, when the
+/// moved facts carry a repository read the kernel refused with `EPERM`, post that
+/// too, so the App can raise its consent attention for this session
+/// (`Wake::ProtectedRead`; the App decides whether the path is protected).
 fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
+    tails: &mut HashMap<u64, footer::TailCache>,
     session: u64,
     timeline: &Arc<Mutex<SessionTimeline>>,
     pgid: i32,
@@ -415,18 +551,29 @@ fn resolve_and_post(
         }
         fresh
     });
-    if resolve_into(timeline, &identity) {
+    if let Some(denied) = resolve_into(timeline, &identity, tails.entry(session).or_default()) {
         post_changed(session);
+        if let Some(path) = denied
+            && let Some(proxy) = PROXY.get()
+        {
+            let _ = proxy.send_event(Wake::ProtectedRead { session, path });
+        }
     }
 }
 
-/// Read `identity`'s facts and publish them on `timeline`; whether they
-/// MOVED. The file reads run before the (leaf) timeline lock is taken.
-fn resolve_into(timeline: &Arc<Mutex<SessionTimeline>>, identity: &Identity) -> bool {
+/// Read `identity`'s facts and publish them on `timeline`. `Some` when they
+/// MOVED, carrying the working directory whose repository read was refused, if
+/// one was. The file reads run before the (leaf) timeline lock is taken.
+fn resolve_into(
+    timeline: &Arc<Mutex<SessionTimeline>>,
+    identity: &Identity,
+    tail: &mut footer::TailCache,
+) -> Option<Option<PathBuf>> {
     let facts = u32::try_from(identity.pid)
         .ok()
         .zip(identity.dir.as_deref())
-        .and_then(|(pid, dir)| footer::facts_for_pid(dir, pid, identity.started));
+        .and_then(|(pid, dir)| footer::facts_for_pid_cached(dir, pid, identity.started, tail));
+    let denied = facts.as_ref().and_then(|f| f.repo_read_denied.clone());
     let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
     // One unreadable read of the SAME process — Claude rewrites its sessions
     // file on every status change, and a read can land mid-write — keeps the
@@ -439,9 +586,11 @@ fn resolve_into(timeline: &Arc<Mutex<SessionTimeline>>, identity: &Identity) -> 
         && identity.started.is_some()
         && timeline.claude_footer_identity() == Some((identity.pid, identity.started))
     {
-        return false;
+        return None;
     }
-    timeline.set_claude_footer(identity.pid, identity.started, facts)
+    timeline
+        .set_claude_footer(identity.pid, identity.started, facts)
+        .then_some(denied)
 }
 
 /// A fingerprint of `facts` for the repaint key: `0` when there are none, so a
@@ -486,8 +635,9 @@ fn plan_beside_lights(vendor: &[RenderCell], plan: &[Piece]) -> Vec<Piece> {
 /// THE VENDOR'S PIECES ARE NEVER CUT FOR THE FOOTER. They are live status
 /// (`esc to interrupt`, a non-bypass mode, `/rc active`) and the original row
 /// held them in `width` already, so when the row runs short the footer gives
-/// way instead: its values are dropped whole from the back — branch, then
-/// repository, then model — until the row fits. Nothing is ever joined by a
+/// way instead: the path is cut from the front to its last directory
+/// (`footer::elide_path`), then its values are dropped whole from the back —
+/// branch, then path, then model — until the row fits. Nothing is ever joined by a
 /// separator that has nothing before it.
 pub(crate) fn paint_row(
     vendor: &[RenderCell],
@@ -498,11 +648,29 @@ pub(crate) fn paint_row(
     width: usize,
 ) -> Vec<RenderCell> {
     let segments = footer::segments(facts);
+    // The same values with the path cut short, tried before the branch goes.
+    let short: Option<Vec<footer::Segment>> = segments
+        .iter()
+        .any(|s| s.mark == footer::PATH_MARK)
+        .then(|| {
+            segments
+                .iter()
+                .map(|s| match footer::elide_path(&s.text) {
+                    Some(text) if s.mark == footer::PATH_MARK => {
+                        footer::Segment { mark: s.mark, text }
+                    }
+                    _ => s.clone(),
+                })
+                .collect()
+        });
     let mut row = Vec::new();
-    for keep in (0..=segments.len()).rev() {
-        row = lay_out(vendor, plan, &segments[..keep], blank, mark_fg, width);
-        if row.len() <= width {
-            break;
+    'fit: for keep in (0..=segments.len()).rev() {
+        let has_path = segments[..keep].iter().any(|s| s.mark == footer::PATH_MARK);
+        for set in std::iter::once(&segments).chain(short.as_ref().filter(|_| has_path)) {
+            row = lay_out(vendor, plan, &set[..keep], blank, mark_fg, width);
+            if row.len() <= width {
+                break 'fit;
+            }
         }
     }
     if row.len() > width {
@@ -974,7 +1142,6 @@ impl App {
                     leaf_index,
                     session,
                     texts,
-                    thinking: facts.thinking,
                 });
                 let Some((frame_row, term_row, vendor, plan)) = row else {
                     continue;
@@ -996,7 +1163,7 @@ impl App {
                 .retain_active(|index| seen.iter().any(|pane| pane.leaf_index == index));
         }
         for pane in seen {
-            self.observe_claude_lights(wid, pane.session, &pane.texts, pane.thinking);
+            self.observe_claude_lights(wid, pane.session, &pane.texts);
         }
         if panes.is_empty() {
             return;
@@ -1184,6 +1351,104 @@ fn read_footer(
 mod tests {
     use super::*;
 
+    fn watch_model_projection(schedule: &WatchSchedule) -> i64 {
+        match schedule.watched.get(&7).map(|(job, _, _)| job.pgid) {
+            None => 0,
+            Some(42) => 1,
+            Some(43) => 2,
+            other => panic!("unexpected foreground group: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stopped_footer_watch_has_no_followup_or_idle_reads() {
+        // Tier-1 for ClaudeFooterWatch: the real scheduler's retained job and
+        // idle-read guard agree with the derived model before and after stop.
+        let model = aterm_spec::derive::claude_footer_watch_model();
+        let mut state = model.init_state();
+        let now = std::time::Instant::now();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        let weak = Arc::downgrade(&timeline);
+        let mut schedule = WatchSchedule::default();
+        schedule.watch(
+            Job {
+                session: 7,
+                timeline,
+                pgid: 42,
+            },
+            now,
+        );
+        assert!(model.fire("AskOld", &mut state));
+        assert_eq!(state["watch"], watch_model_projection(&schedule));
+        assert_eq!(
+            model.action_enabled("IdleRead", &state),
+            schedule.due_idle(now + IDLE_RECHECK).is_some()
+        );
+        let (immediate, stopped) = schedule.accept([Command::Stop {
+            session: 7,
+            pgid: None,
+        }]);
+        assert!(model.fire("StopSession", &mut state));
+        assert!(immediate.is_empty());
+        assert_eq!(stopped, [7]);
+        assert_eq!(state["watch"], watch_model_projection(&schedule));
+        assert!(schedule.next().is_none());
+        assert!(schedule.due_followups(now + FOLLOW_UPS[1]).is_empty());
+        assert_eq!(
+            model.action_enabled("IdleRead", &state),
+            schedule.due_idle(now + IDLE_RECHECK).is_some()
+        );
+        assert!(weak.upgrade().is_none(), "the watch released its timeline");
+    }
+
+    #[test]
+    fn stale_group_stop_preserves_replacement_footer_watch() {
+        let model = aterm_spec::derive::claude_footer_watch_model();
+        let mut state = model.init_state();
+        let now = std::time::Instant::now();
+        let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
+        let mut schedule = WatchSchedule::default();
+        schedule.watch(
+            Job {
+                session: 7,
+                timeline: Arc::clone(&timeline),
+                pgid: 42,
+            },
+            now,
+        );
+        assert!(model.fire("AskOld", &mut state));
+        let (mut immediate, stopped) = schedule.accept([
+            Command::Request(Job {
+                session: 7,
+                timeline,
+                pgid: 43,
+            }),
+            Command::Stop {
+                session: 7,
+                pgid: Some(42),
+            },
+        ]);
+        assert!(model.fire("AskNew", &mut state));
+        assert!(model.fire("StopOld", &mut state));
+        assert_eq!(stopped, [7]);
+        assert_eq!(immediate.len(), 1);
+        let replacement = immediate.pop().unwrap();
+        assert_eq!(replacement.pgid, 43);
+        schedule.watch(replacement, now);
+        assert_eq!(state["watch"], watch_model_projection(&schedule));
+        let (immediate, stopped) = schedule.accept([Command::Stop {
+            session: 7,
+            pgid: Some(42),
+        }]);
+        assert!(immediate.is_empty());
+        assert!(stopped.is_empty());
+        let due = schedule
+            .due_idle(now + IDLE_RECHECK)
+            .expect("active Claude keeps its idle refresh");
+        assert_eq!(due.pgid, 43);
+        assert!(model.action_enabled("IdleRead", &state));
+    }
+
     #[test]
     fn pane_text_reuses_only_the_same_scratch_revision_and_pane() {
         let mut scratch = RenderInput::empty();
@@ -1241,6 +1506,44 @@ mod tests {
         assert_eq!(cache.panes.len(), 1);
         cache.trim(0);
         assert!(cache.panes.is_empty());
+    }
+
+    #[test]
+    fn changed_claude_frame_reuses_free_row_buffers_but_preserves_held_snapshots() {
+        let mut scratch = RenderInput::empty();
+        scratch.rows = 2;
+        scratch.cols = 4;
+        scratch.cells = vec![row_of("abcd", [0, 0, 0]), row_of("efgh", [0, 0, 0])];
+        scratch.snapshot_seq = 1;
+        let region = PaneTextRegion {
+            strip: 0,
+            row_off: 0,
+            col_off: 0,
+            rows: 2,
+            cols: 4,
+        };
+        let mut cache = PaneTextCache::default();
+        let first = cache.rows(0, 7, &scratch, region);
+        let vec_ptr = first.as_ref().as_ptr();
+        let row_ptrs = [first[0].as_ptr(), first[1].as_ptr()];
+        drop(first);
+
+        scratch.cells[0][0].ch = 'z';
+        scratch.snapshot_seq += 1;
+        let reused = cache.rows(0, 7, &scratch, region);
+        assert_eq!(&**reused, &["zbcd", "efgh"]);
+        assert_eq!(reused.as_ref().as_ptr(), vec_ptr);
+        assert_eq!([reused[0].as_ptr(), reused[1].as_ptr()], row_ptrs);
+
+        // A reader still using that exact frame must keep its old text while
+        // the next echo builds a new snapshot from fresh storage.
+        let held = Arc::clone(&reused);
+        scratch.cells[0][1].ch = 'y';
+        scratch.snapshot_seq += 1;
+        let next = cache.rows(0, 7, &scratch, region);
+        assert_eq!(&**held, &["zbcd", "efgh"]);
+        assert_eq!(&**next, &["zycd", "efgh"]);
+        assert!(!Arc::ptr_eq(&held, &next));
     }
 
     /// Manual cost diagnostic for a long Claude transcript with an unchanged
@@ -1321,9 +1624,9 @@ mod tests {
         FooterFacts {
             model: Some("Opus 5.5".into()),
             effort: Some("xhigh".into()),
-            repo: Some("aterm".into()),
+            path: Some("~/aterm".into()),
             branch: Some("main".into()),
-            thinking: None,
+            repo_read_denied: None,
             version: None,
         }
     }
@@ -1360,7 +1663,7 @@ mod tests {
         assert_eq!(row.len(), 60, "exactly the pane's width");
         assert_eq!(
             text_of(&row).trim_end(),
-            "  \u{25C6} Opus 5.5 xhigh   \u{2302} aterm   \u{2387} main"
+            "  \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main"
         );
         assert_eq!(row[2].fg, [0, 128, 255], "the mark takes the accent");
         assert_eq!(
@@ -1414,6 +1717,41 @@ mod tests {
         assert_eq!(row.len(), 12);
     }
 
+    /// A deep path is cut to its last directory before the branch gives way,
+    /// and only then dropped.
+    #[test]
+    fn a_long_path_is_cut_short_before_the_branch_goes() {
+        let vendor_text = "  \u{23F5}\u{23F5} bypass permissions on";
+        let plan = footer::plan_row(vendor_text).unwrap();
+        let blank = cell(' ', [1, 1, 1]);
+        let deep = FooterFacts {
+            path: Some("~/src/github.com/someone/aterm".into()),
+            ..facts()
+        };
+        let paint = |width| {
+            text_of(&paint_row(
+                &row_of(vendor_text, [5, 5, 5]),
+                &plan,
+                &deep,
+                blank,
+                [2, 2, 2],
+                width,
+            ))
+        };
+        assert_eq!(
+            paint(70).trim_end(),
+            "  \u{25C6} Opus 5.5 xhigh   \u{2302} ~/src/github.com/someone/aterm   \u{2387} main"
+        );
+        assert_eq!(
+            paint(50).trim_end(),
+            "  \u{25C6} Opus 5.5 xhigh   \u{2302} \u{2026}/aterm   \u{2387} main"
+        );
+        assert_eq!(
+            paint(33).trim_end(),
+            "  \u{25C6} Opus 5.5 xhigh   \u{2302} \u{2026}/aterm"
+        );
+    }
+
     /// A recorded busy row (`context-low.txt`) at 80 columns: every piece of
     /// live status survives whole, and the footer gives way from the back.
     #[test]
@@ -1436,7 +1774,7 @@ mod tests {
             !text.contains("\u{2387}"),
             "the branch goes first: {text:?}"
         );
-        assert!(!text.contains("\u{2302}"), "then the repository: {text:?}");
+        assert!(!text.contains("\u{2302}"), "then the path: {text:?}");
         let plan_mode = "  \u{23F8} plan mode on (shift+tab to cycle)";
         let plan = footer::plan_row(plan_mode).unwrap();
         let text = text_of(&paint_row(
@@ -1449,7 +1787,7 @@ mod tests {
         ));
         assert_eq!(
             text.trim_end(),
-            "  \u{25C6} Opus 5.5 xhigh   \u{2302} aterm   \u{23F8} plan mode on"
+            "  \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{23F8} plan mode on"
         );
     }
 

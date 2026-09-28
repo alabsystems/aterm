@@ -111,8 +111,14 @@
 //! `PROC_PIDT_SHORTBSDINFO`, which answers for another user's process (a
 //! stopped `producer | sudo tui`), where `PROC_PIDTBSDINFO` is refused;
 //! nested programs' modes cannot be told apart (a TUI inferior under
-//! `gdb -tui` that dies takes gdb's modes with it); a restarted reader
-//! attributes the modes already in force to the carried holder; a one-shot
+//! `gdb -tui` that dies takes gdb's modes with it, and so does one that arms
+//! gdb's mode again); a restarted reader attributes the modes already in
+//! force to the carried holder, until a program arms one again; a job whose
+//! bytes were all parsed as the shell's (the whole life of `printf
+//! '\e[?1000h'` between two samples, or read after the reclaim) loses its
+//! own handback — only its own: the next program that arms that mode again
+//! owns it ([`FgOwners`], 2026-09-27); a mode the shell arms again over a
+//! stopped job's is the shell's from then on; a one-shot
 //! that arms an INPUT mode on purpose and exits is handed back, and a program
 //! killed with only DISPLAY modes armed (a SIGKILLed `less`) is not; on Linux
 //! a stopped member outside the session leader's process tree (reparented
@@ -168,6 +174,14 @@ impl FgCutter {
     /// Returns `true` when the batch must be delivered NOW (it carries an
     /// edge): bytes read after this point belong to the new holder and must not
     /// join the batch the edge cuts — the next batch starts at the new holder.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "foreground_handback_ownership",
+            action = "Sample",
+            project = "spawn::foreground_handback_conformance::project_ownership"
+        )
+    )]
     pub(crate) fn sample(&mut self, fg: i32, filled: usize) -> bool {
         if self.edge.is_some() {
             return true;
@@ -211,10 +225,23 @@ impl FgCutter {
 ///
 /// [`Self::observe`] is called after each run of bytes one holder wrote, with
 /// the engine's [`program_evidence`](aterm_core::terminal::Terminal::program_evidence)
-/// reading: a bit that came on is that holder's, a bit that went off belongs to
-/// nobody, a bit that stayed on keeps its owner. Bits already in force at the
-/// first observation (an adopted screen, a restarted reader) are the first
-/// holder's. `0` is "unknown" (no probe answer) and is never reported gone.
+/// reading and the bits whose setters those bytes carried
+/// ([`take_evidence_asserted`](aterm_core::terminal::Terminal::take_evidence_asserted)):
+/// a bit that came on, or that the holder's bytes armed again, is that
+/// holder's; a bit that went off belongs to nobody; any other bit that stayed
+/// on keeps its owner. Bits already in force at the first observation (an
+/// adopted screen, a restarted reader) are the first holder's. `0` is
+/// "unknown" (no probe answer) and is never reported gone.
+///
+/// Why a re-arm moves the owner (2026-09-27, the lane at load 59-65): a
+/// starved gather read a one-shot `/usr/bin/printf '\e[?1000h'` only after
+/// zsh had taken the terminal back, so its mouse bit was the SHELL's. Losing
+/// that one handback is residual R1/R3. But when only a bit that CAME ON moved
+/// its owner, every later job that armed mouse tracking over it (`?1003h`: the
+/// bit stays on) never owned it, the shell — the new holder at every death
+/// edge, and alive — was its only owner, and no later death in that session
+/// was handed back again (ten lane rows). zsh's builtin `printf` reached it
+/// with no load. The derived model is `ForegroundHandbackOwnership`.
 #[derive(Debug, Default)]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) struct FgOwners {
@@ -224,12 +251,29 @@ pub(crate) struct FgOwners {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 impl FgOwners {
-    /// `holder`'s bytes were just parsed; the engine's evidence is now `evidence`.
-    pub(crate) fn observe(&mut self, holder: i32, evidence: u16) {
-        let added = evidence & !self.last;
+    /// `holder`'s bytes were just parsed; the engine's evidence is now
+    /// `evidence`, and those bytes carried the setters of `asserted`.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "foreground_handback_ownership",
+            action = "Arm",
+            project = "spawn::foreground_handback_conformance::project_ownership"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "foreground_handback_ownership",
+            action = "ShellArm",
+            project = "spawn::foreground_handback_conformance::project_ownership"
+        )
+    )]
+    pub(crate) fn observe(&mut self, holder: i32, evidence: u16, asserted: u16) {
+        let taken = evidence & (!self.last | asserted);
         for (bit, owner) in self.owner.iter_mut().enumerate() {
             let mask = 1u16 << bit;
-            if added & mask != 0 {
+            if taken & mask != 0 {
                 *owner = holder.max(0);
             } else if evidence & mask == 0 {
                 *owner = 0;
@@ -280,6 +324,14 @@ impl FgOwners {
     /// `tput smcup; cmd; tput rmcup` wrapper depends on the alt screen
     /// outliving `tput`. A gone group that owns an input bit takes its
     /// display bits with it — the handback restores every mode.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "foreground_handback_ownership",
+            action = "Reclaim",
+            project = "spawn::foreground_handback_conformance::project_ownership"
+        )
+    )]
     pub(crate) fn orphaned_by(&self, to: i32, mut gone: impl FnMut(i32) -> bool) -> Option<i32> {
         self.suspects(to).find(|&owner| gone(owner))
     }
@@ -938,43 +990,83 @@ mod tests {
         // gdb -tui arms the alt screen and mouse; its inferior writes text
         // and exits.
         let mut o = FgOwners::default();
-        o.observe(SHELL, 0);
-        o.observe(GDB, ALT_SCREEN | MOUSE);
-        o.observe(INFERIOR, ALT_SCREEN | MOUSE);
+        o.observe(SHELL, 0, 0);
+        o.observe(GDB, ALT_SCREEN | MOUSE, 0);
+        o.observe(INFERIOR, ALT_SCREEN | MOUSE, 0);
         assert_eq!(
             o.orphaned_by(GDB, dead(&[INFERIOR])),
             None,
             "the alt screen and mouse are gdb's, and gdb lives"
         );
         // The inferior arms focus reports and dies with them on: orphaned.
-        o.observe(INFERIOR, ALT_SCREEN | MOUSE | FOCUS);
+        o.observe(INFERIOR, ALT_SCREEN | MOUSE | FOCUS, 0);
         assert_eq!(o.orphaned_by(GDB, dead(&[INFERIOR])), Some(INFERIOR));
         // It turns them off first: nothing of its own is left.
-        o.observe(INFERIOR, ALT_SCREEN | MOUSE);
+        o.observe(INFERIOR, ALT_SCREEN | MOUSE, 0);
         assert_eq!(o.orphaned_by(GDB, dead(&[INFERIOR])), None);
         // gdb is killed: its modes are orphaned.
         assert_eq!(o.orphaned_by(SHELL, dead(&[GDB, INFERIOR])), Some(GDB));
 
         // The new holder's own bits never count, whatever `gone` says.
         let mut o = FgOwners::default();
-        o.observe(JOB, MOUSE);
+        o.observe(JOB, MOUSE, 0);
         assert_eq!(o.orphaned_by(JOB, |_| true), None);
         assert_eq!(o.orphaned_by(SHELL, |_| true), Some(JOB));
         // Every bit cleared: nobody owns anything.
-        o.observe(JOB, 0);
+        o.observe(JOB, 0, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), None);
 
         // Bits already in force at the first observation are its holder's
         // (an adopted screen, a restarted reader).
         let mut o = FgOwners::default();
-        o.observe(JOB, ALT_SCREEN | MOUSE);
+        o.observe(JOB, ALT_SCREEN | MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), Some(JOB));
         // An unknown holder (no probe answer) is never reported gone.
         let mut o = FgOwners::default();
-        o.observe(0, MOUSE);
+        o.observe(0, MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), None);
-        o.observe(-1, MOUSE | ALT_SCREEN);
+        o.observe(-1, MOUSE | ALT_SCREEN, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), None);
+    }
+
+    /// The 2026-09-27 lane at load 59-65: a one-shot's `?1000h` parsed as the
+    /// SHELL's bytes (the reader never saw the one-shot hold the terminal),
+    /// then a job that arms mouse tracking over it and dies. RED on the
+    /// replaced rule (a bit that stayed on kept its owner): the shell stayed
+    /// the owner, and at every death edge the shell is `to` and alive.
+    #[test]
+    fn foreground_handback_owners_give_a_re_armed_bit_to_its_re_armer() {
+        let dead = |pids: &'static [i32]| move |p: i32| pids.contains(&p);
+        let mut o = FgOwners::default();
+        o.observe(SHELL, MOUSE, MOUSE);
+        assert_eq!(o.orphaned_by(SHELL, |_| true), None, "the shell's own");
+        // The job's `?1003h`: the evidence stays MOUSE, the assertion moves it.
+        o.observe(JOB, MOUSE, MOUSE);
+        assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), Some(JOB));
+        // A kitty push over the shell's kitty flags: the same.
+        let mut o = FgOwners::default();
+        o.observe(SHELL, KITTY, KITTY);
+        o.observe(JOB, KITTY | ALT_SCREEN, KITTY | ALT_SCREEN);
+        assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), Some(JOB));
+        // An asserted bit that is not in force (armed and cleared in one
+        // slice) is nobody's.
+        let mut o = FgOwners::default();
+        o.observe(JOB, 0, MOUSE);
+        assert_eq!(o.orphaned_by(SHELL, |_| true), None);
+        // The shell re-arming a bit over a stopped job's takes it: the value in
+        // force is the shell's (fish's kitty push at its prompt), and the
+        // job's later death does not strip it.
+        let mut o = FgOwners::default();
+        o.observe(JOB, KITTY, KITTY);
+        o.observe(SHELL, KITTY, KITTY);
+        assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), None);
+
+        // NEGATIVE CONTROL, and the residual: a job that never re-arms the
+        // shell's bit does not own it — its death hands back nothing of it.
+        let mut o = FgOwners::default();
+        o.observe(SHELL, MOUSE, MOUSE);
+        o.observe(JOB, MOUSE | ALT_SCREEN, ALT_SCREEN);
+        assert_eq!(o.orphaned_by(SHELL, dead(&[JOB])), None);
     }
 
     /// The second 2026-09-25 review's live probe: `tput civis`, `tput smcup`
@@ -1004,8 +1096,8 @@ mod tests {
             ALT_SCREEN | CURSOR_HIDDEN,
         ] {
             let mut o = FgOwners::default();
-            o.observe(SHELL, 0);
-            o.observe(TPUT, display);
+            o.observe(SHELL, 0, 0);
+            o.observe(TPUT, display, 0);
             assert_eq!(
                 o.orphaned_by(SHELL, |_| true),
                 None,
@@ -1014,28 +1106,28 @@ mod tests {
         }
         // `tput smcup; cmd`: the edge is tput → cmd, and the alt screen stays.
         let mut o = FgOwners::default();
-        o.observe(SHELL, 0);
-        o.observe(TPUT, ALT_SCREEN);
+        o.observe(SHELL, 0, 0);
+        o.observe(TPUT, ALT_SCREEN, 0);
         assert_eq!(o.orphaned_by(CMD, |p| p == TPUT), None);
         // `cmd` arms mouse tracking and is killed: it is orphaned, and the
         // handback (which restores every mode) takes tput's alt screen too.
-        o.observe(CMD, ALT_SCREEN | MOUSE);
+        o.observe(CMD, ALT_SCREEN | MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |p| p == TPUT || p == CMD), Some(CMD));
         // A one-shot that arms an input bit on purpose is handed back: the
         // documented residual (`/usr/bin/printf '\e[?1000h'`).
         let mut o = FgOwners::default();
-        o.observe(TPUT, MOUSE);
+        o.observe(TPUT, MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), Some(TPUT));
         // The incident: an input owner with display bits of its own.
         let mut o = FgOwners::default();
-        o.observe(JOB, ALT_SCREEN | CURSOR_HIDDEN | SYNC | KITTY | MOUSE);
+        o.observe(JOB, ALT_SCREEN | CURSOR_HIDDEN | SYNC | KITTY | MOUSE, 0);
         assert_eq!(o.orphaned_by(SHELL, |_| true), Some(JOB));
     }
 
     #[test]
     fn foreground_handback_owners_ask_about_each_owner_once() {
         let mut o = FgOwners::default();
-        o.observe(JOB, ALT_SCREEN | MOUSE | CURSOR_HIDDEN | KITTY);
+        o.observe(JOB, ALT_SCREEN | MOUSE | CURSOR_HIDDEN | KITTY, 0);
         let mut asked = Vec::new();
         assert_eq!(
             o.orphaned_by(SHELL, |p| {
@@ -1056,8 +1148,8 @@ mod tests {
     fn foreground_handback_probe_edge_asks_each_group_once_before_the_lock() {
         const TPUT: i32 = 500;
         let mut o = FgOwners::default();
-        o.observe(TPUT, ALT_SCREEN);
-        o.observe(JOB, ALT_SCREEN | MOUSE | KITTY);
+        o.observe(TPUT, ALT_SCREEN, 0);
+        o.observe(JOB, ALT_SCREEN | MOUSE | KITTY, 0);
         let mut asked = Vec::new();
         let v = o.probe_edge(JOB, SHELL, |p, role| {
             asked.push((p, role));
@@ -1077,8 +1169,8 @@ mod tests {
         // `from` owns nothing; an older holder owns an input bit (a bit that
         // stays on keeps its owner), and the new holder owns one of its own.
         let mut o = FgOwners::default();
-        o.observe(JOB, MOUSE);
-        o.observe(TPUT, MOUSE | FOCUS);
+        o.observe(JOB, MOUSE, 0);
+        o.observe(TPUT, MOUSE | FOCUS, 0);
         let mut asked = Vec::new();
         let v = o.probe_edge(SHELL, TPUT, |p, _| {
             asked.push(p);
@@ -1106,9 +1198,9 @@ mod tests {
         // the TUI after the leader still runs (the group is not empty).
         let (mut members_left, stopped) = (true, false);
         let mut o = FgOwners::default();
-        o.observe(SHELL, 0);
-        o.observe(JOB, MOUSE | ALT_SCREEN);
-        o.observe(SHELL, MOUSE | ALT_SCREEN);
+        o.observe(SHELL, 0, 0);
+        o.observe(JOB, MOUSE | ALT_SCREEN, 0);
+        o.observe(SHELL, MOUSE | ALT_SCREEN, 0);
         let shipping = |p: i32, role: FgRole, members_left: bool| {
             owner_gone(role, || p == JOB, || stopped, || !members_left)
         };

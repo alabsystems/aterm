@@ -4,7 +4,7 @@
 
 //! Regression tests for keyboard encoding internals (write_u32), plus the
 //! KEYBOARD-SHIFT REFINEMENT obligation (the always-on twin of the Trust
-//! `a7_keyboard_shift` SMT bundle / `clean/keyboard_shift.lean`).
+//! `a7_keyboard_shift` SMT bundle).
 
 use super::{
     Key, KeyEventType, KeyboardMode, Modifiers, NamedKey, encode_key, encode_key_with_event,
@@ -464,6 +464,51 @@ fn kitty_text_events_encode_exactly_like_legacy() {
             }
         }
     }
+}
+
+// =========================================================================
+// A MODIFIER KEY's own bit: a press sets it whatever the caller's state; a
+// release reports the state it LEAVES, which only the caller knows — set
+// while the other side is still held (kitty keeps `shift` when one of two held
+// Shifts is let go), clear otherwise.
+// =========================================================================
+
+#[test]
+fn a_modifier_release_carries_its_bit_only_as_the_caller_states_it() {
+    let mode = KeyboardMode::REPORT_ALL_KEYS_AS_ESC | KeyboardMode::REPORT_EVENT_TYPES;
+    for (key, flag, code) in [
+        (NamedKey::ShiftLeft, Modifiers::SHIFT, 57441u32),
+        (NamedKey::ShiftRight, Modifiers::SHIFT, 57447),
+        (NamedKey::ControlRight, Modifiers::CTRL, 57448),
+        (NamedKey::AltLeft, Modifiers::ALT, 57443),
+        (NamedKey::SuperRight, Modifiers::SUPER, 57450),
+    ] {
+        let k = Key::Named(key);
+        let bit = flag.kitty_encoded();
+        // A press sets its own bit from nothing.
+        assert_eq!(
+            encode_key_with_event(&k, Modifiers::empty(), mode, KeyEventType::Press),
+            format!("\x1b[{code};{bit}u").into_bytes(),
+            "{key:?} press"
+        );
+        // A release with the other side held: the bit the caller states stays.
+        assert_eq!(
+            encode_key_with_event(&k, flag, mode, KeyEventType::Release),
+            format!("\x1b[{code};{bit}:3u").into_bytes(),
+            "{key:?} release, other side held"
+        );
+        // A lone release: clear.
+        assert_eq!(
+            encode_key_with_event(&k, Modifiers::empty(), mode, KeyEventType::Release),
+            format!("\x1b[{code};1:3u").into_bytes(),
+            "{key:?} release, nothing left held"
+        );
+        assert_eq!(key.modifier_twin().map(|(f, _)| f), Some(flag));
+        let (_, twin) = key.modifier_twin().expect("sided");
+        assert_eq!(twin.modifier_twin(), Some((flag, key)), "the twin's twin");
+    }
+    assert_eq!(NamedKey::CapsLock.modifier_twin(), None);
+    assert_eq!(NamedKey::Enter.modifier_twin(), None);
 }
 
 // =========================================================================
@@ -1152,5 +1197,363 @@ fn a_modified_keypad_key_never_composes_the_main_rows_glyph() {
         ),
         b"\x1bOu",
         "only SHIFT cancels application keypad mode; CTRL leaves the SS3 form"
+    );
+}
+
+// =========================================================================
+// ConPTY win32-input-mode (DEC 9001) — the INPUT_RECORD pair for Enter chords.
+//
+// Spec: microsoft/terminal doc/specs/#4999-win32-input-mode.md,
+// `CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`. Bytes here are pinned EXACTLY, because
+// conhost's input parser is the consumer and it is not forgiving: a field out
+// of place is a different key.
+// =========================================================================
+
+/// The key-down/key-up pair for `VK_RETURN` with `UnicodeChar = uc` and
+/// `dwControlKeyState = cs` — the oracle the assertions below compare against,
+/// written out from the spec rather than from the encoder's own builder.
+fn win32_enter_pair(uc: u32, cs: u32) -> Vec<u8> {
+    format!("\x1b[13;28;{uc};1;{cs};1_\x1b[13;28;{uc};0;{cs};1_").into_bytes()
+}
+
+const WIN32: KeyboardMode = KeyboardMode::WIN32_INPUT;
+
+#[test]
+fn win32_input_is_not_a_kitty_flag() {
+    // The bit exists so the encoder can read one word; it must never count as
+    // "the app negotiated kitty semantics" anywhere the aggregate is consulted.
+    assert!(!KeyboardMode::KITTY_PROTOCOL_FLAGS.contains(WIN32));
+    assert!(!WIN32.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS));
+    // …and it fits the u16 word the lock-free mode mirror publishes.
+    assert_eq!(WIN32.bits(), 1 << 15);
+}
+
+#[test]
+fn win32_shift_enter_is_a_record_pair_with_cr() {
+    // Shift+Enter: SHIFT_PRESSED (0x10), UnicodeChar CR (13) — the record a
+    // physical Shift+Enter carries under Windows Terminal, NOT aterm's Unix
+    // Shift+Enter LF policy. Measured 2026-09-22: `[Console]::ReadKey` reports
+    // `Enter MODS=Shift CHAR=13` for these bytes, PSReadLine runs AddLine on
+    // them, and cmd.exe's cooked reader runs the pending line on them (as it
+    // does under WT) where it stayed inert on an LF record no Windows keyboard
+    // produces.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, WIN32),
+        win32_enter_pair(13, 0x10)
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, WIN32),
+        b"\x1b[13;28;13;1;16;1_\x1b[13;28;13;0;16;1_"
+    );
+}
+
+#[test]
+fn win32_ctrl_enter_and_ctrl_shift_enter_carry_lf() {
+    // CTRL decides the char: LF (10), Windows' own translation of Ctrl+Enter
+    // (the one conhost applies in reverse to a bare 0x0A), with or without
+    // Shift held beside it.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::CTRL, WIN32),
+        win32_enter_pair(10, 0x08)
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CTRL | Modifiers::SHIFT,
+            WIN32
+        ),
+        win32_enter_pair(10, 0x18)
+    );
+}
+
+#[test]
+fn win32_alt_rides_along_on_a_shift_or_ctrl_chord() {
+    // ALT adds LEFT_ALT_PRESSED (0x02) and changes nothing else: the char
+    // still follows CTRL alone (CR without it, LF with it).
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT | Modifiers::ALT,
+            WIN32
+        ),
+        win32_enter_pair(13, 0x12)
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CTRL | Modifiers::ALT,
+            WIN32
+        ),
+        win32_enter_pair(10, 0x0a)
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
+            WIN32
+        ),
+        win32_enter_pair(10, 0x1a)
+    );
+}
+
+#[test]
+fn win32_plain_and_alt_enter_stay_legacy() {
+    // Both measured working through conhost's legacy translation: plain Enter
+    // is CR, Alt+Enter is Meta-Enter. Neither needs — or gets — a record.
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::empty(), WIN32),
+        b"\r"
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::ALT, WIN32),
+        b"\x1b\r"
+    );
+}
+
+#[test]
+fn win32_lock_bits_do_not_make_a_chord() {
+    // CapsLock/NumLock are lock state, not chord modifiers: a plain Enter with
+    // CapsLock lit is still a plain Enter.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CAPS_LOCK | Modifiers::NUM_LOCK,
+            WIN32
+        ),
+        b"\r"
+    );
+}
+
+#[test]
+fn win32_release_emits_nothing_and_repeat_emits_the_pair() {
+    // The pair is self-contained (key-down AND key-up from the press), so a
+    // Release must add no second key-up — conhost would see Enter released
+    // twice. Repeat is a press to Windows (another key-down record).
+    assert!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            WIN32,
+            KeyEventType::Release,
+        )
+        .is_empty()
+    );
+    assert!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CTRL,
+            WIN32,
+            KeyEventType::Release,
+        )
+        .is_empty()
+    );
+    assert_eq!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            WIN32,
+            KeyEventType::Repeat,
+        ),
+        win32_enter_pair(13, 0x10)
+    );
+}
+
+#[test]
+fn win32_outranks_a_negotiated_kitty_mode() {
+    // An application under ConPTY can push kitty flags — conhost forwards the
+    // `CSI > 1 u` verbatim — but conhost stays the reader, and its input parser
+    // DROPS the `CSI 13;2 u` the terminal would write back (measured
+    // 2026-09-22: no record reached a `ReadKey` loop, while the win32 pair
+    // arrived as Enter+Shift). So with 9001 set the record is the only
+    // spelling of the chord that reaches the application that asked for
+    // kitty; the kitty flags stay set for everything the record does not cover.
+    let disambiguate = WIN32 | KeyboardMode::DISAMBIGUATE_ESC_CODES;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, disambiguate),
+        win32_enter_pair(13, 0x10)
+    );
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::CTRL, disambiguate),
+        win32_enter_pair(10, 0x08)
+    );
+    let report_all = WIN32 | KeyboardMode::REPORT_ALL_KEYS_AS_ESC;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, report_all),
+        win32_enter_pair(13, 0x10)
+    );
+    let events_only = WIN32 | KeyboardMode::REPORT_EVENT_TYPES;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, events_only),
+        win32_enter_pair(13, 0x10)
+    );
+    // The chord's Release stays silent even where kitty would report one: the
+    // pair already carried its key-up, and conhost would drop the report.
+    assert!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            events_only,
+            KeyEventType::Release,
+        )
+        .is_empty()
+    );
+    // …while a key the record does not cover follows the kitty flags exactly
+    // as it did without 9001: the plain Enter release is whatever kitty says.
+    assert_eq!(
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+            events_only,
+            KeyEventType::Release,
+        ),
+        encode_key_with_event(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+            KeyboardMode::REPORT_EVENT_TYPES,
+            KeyEventType::Release,
+        )
+    );
+    // The same kitty modes without 9001 are byte-identical to before (Unix).
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            KeyboardMode::DISAMBIGUATE_ESC_CODES
+        ),
+        b"\x1b[13;2u"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            KeyboardMode::REPORT_EVENT_TYPES
+        ),
+        b"\n"
+    );
+}
+
+#[test]
+fn win32_outranks_xterm_modify_other_keys() {
+    // conhost negotiated 9001 and conhost consumes the bytes; its input parser
+    // has no `CSI 27 ; m ; 13 ~` dialect, so the record it asked for wins.
+    let l2 = WIN32 | KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2;
+    assert_eq!(
+        encode_key(&Key::Named(NamedKey::Enter), Modifiers::SHIFT, l2),
+        win32_enter_pair(13, 0x10)
+    );
+    // …and without 9001 the xterm form is exactly what it was.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            KeyboardMode::XTERM_MODIFY_OTHER_KEYS_LEVEL2
+        ),
+        b"\x1b[27;2;13~"
+    );
+}
+
+#[test]
+fn win32_touches_only_enter_chords() {
+    // Everything that is not an Enter chord is byte-identical with 9001 on:
+    // the mode is a narrow fix for the one key legacy VT cannot spell.
+    let cases: &[(Key, Modifiers)] = &[
+        (Key::Named(NamedKey::Tab), Modifiers::SHIFT),
+        (Key::Named(NamedKey::Tab), Modifiers::CTRL),
+        (Key::Named(NamedKey::Backspace), Modifiers::CTRL),
+        (Key::Named(NamedKey::Space), Modifiers::CTRL),
+        (Key::Named(NamedKey::ArrowUp), Modifiers::SHIFT),
+        (Key::Named(NamedKey::F5), Modifiers::CTRL),
+        (Key::Character('a'), Modifiers::CTRL),
+        (Key::Character('a'), Modifiers::SHIFT),
+        (Key::Character('c'), Modifiers::CTRL),
+        (Key::Named(NamedKey::NumpadEnter), Modifiers::empty()),
+        (Key::Named(NamedKey::NumpadEnter), Modifiers::ALT),
+        (Key::Named(NamedKey::Numpad5), Modifiers::SHIFT),
+    ];
+    for (key, mods) in cases {
+        assert_eq!(
+            encode_key(key, *mods, WIN32),
+            encode_key(key, *mods, KeyboardMode::empty()),
+            "{key:?}+{mods:?} must not change under win32-input-mode"
+        );
+    }
+    // Ctrl+C in particular: the byte the shell's Ctrl+C handling keys on.
+    assert_eq!(
+        encode_key(&Key::Character('c'), Modifiers::CTRL, WIN32),
+        b"\x03"
+    );
+}
+
+#[test]
+fn win32_numpad_enter_chord_is_an_enhanced_key_record() {
+    // The keypad's Enter is VK_RETURN / scan 28 behind the E0 prefix: a real
+    // record flags it ENHANCED_KEY (0x100). Without a record the legacy keypad
+    // arm falls back to the main Enter's bare LF — the byte conhost reads as
+    // Ctrl+Enter — so Shift+KP_Enter in a PowerShell tab ran InsertLineAbove.
+    let kp = Key::Named(NamedKey::NumpadEnter);
+    assert_eq!(
+        encode_key(&kp, Modifiers::SHIFT, WIN32),
+        win32_enter_pair(13, 0x110)
+    );
+    assert_eq!(
+        encode_key(&kp, Modifiers::SHIFT, WIN32),
+        b"\x1b[13;28;13;1;272;1_\x1b[13;28;13;0;272;1_"
+    );
+    assert_eq!(
+        encode_key(&kp, Modifiers::CTRL, WIN32),
+        win32_enter_pair(10, 0x108)
+    );
+    assert_eq!(
+        encode_key(
+            &kp,
+            Modifiers::CTRL | Modifiers::SHIFT | Modifiers::ALT,
+            WIN32
+        ),
+        win32_enter_pair(10, 0x11a)
+    );
+    // DECKPAM does not change the record: it names the physical key, and
+    // conhost applies the application's keypad mode itself. (In legacy, SHIFT
+    // cancels application keypad mode → bare LF, and CTRL keeps SS3 M.)
+    let app = WIN32 | KeyboardMode::APP_KEYPAD;
+    assert_eq!(
+        encode_key(&kp, Modifiers::SHIFT, app),
+        win32_enter_pair(13, 0x110)
+    );
+    assert_eq!(
+        encode_key(&kp, Modifiers::CTRL, app),
+        win32_enter_pair(10, 0x108)
+    );
+    // Plain and Alt+KP_Enter stay legacy in and out of DECKPAM — conhost
+    // translates CR, SS3 M and ESC CR itself.
+    for mods in [Modifiers::empty(), Modifiers::ALT] {
+        assert_eq!(
+            encode_key(&kp, mods, app),
+            encode_key(&kp, mods, KeyboardMode::APP_KEYPAD),
+            "{mods:?} KP_Enter under DECKPAM must not change under 9001"
+        );
+    }
+    assert_eq!(encode_key(&kp, Modifiers::empty(), app), b"\x1bOM");
+    // The release stand-down covers the keypad chord too.
+    assert!(encode_key_with_event(&kp, Modifiers::SHIFT, WIN32, KeyEventType::Release).is_empty());
+}
+
+#[test]
+fn without_win32_input_shift_enter_is_still_the_lf_policy() {
+    // The Unix contract is untouched: no 9001, no records, LF for Shift+Enter.
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::SHIFT,
+            KeyboardMode::empty()
+        ),
+        b"\n"
+    );
+    assert_eq!(
+        encode_key(
+            &Key::Named(NamedKey::Enter),
+            Modifiers::CTRL,
+            KeyboardMode::empty()
+        ),
+        b"\r"
     );
 }

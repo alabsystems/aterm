@@ -927,6 +927,14 @@ pub(crate) struct MarkdownBlockSpec {
     /// or reparsing document bytes in the renderer.
     pub(crate) visual_row: usize,
     pub(crate) total_visual_rows: usize,
+    /// Styled spans of `text` (byte ranges, disjoint, in order) — bold, emphasis,
+    /// strikethrough, inline code, links — recorded by the lowering that
+    /// produced `text` ([`crate::native_markdown::lower_inline_text_styled`]) and
+    /// handed out per block by
+    /// [`crate::native_markdown::MarkdownDocument::block_styles`]. PAINT only: semantics,
+    /// accessibility and copy keep reading the flat `text`. Empty for a block
+    /// with no inline markup, and for code/table blocks, which paint verbatim.
+    pub(crate) inline: Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2920,6 +2928,11 @@ fn markdown_paint_fingerprint(node: &PaintNode, spec: &MarkdownBlockSpec) -> u64
     spec.estimated_height.to_bits().hash(&mut hash);
     spec.visual_row.hash(&mut hash);
     spec.total_visual_rows.hash(&mut hash);
+    for (span, style) in &spec.inline {
+        span.start.hash(&mut hash);
+        span.end.hash(&mut hash);
+        style.hash(&mut hash);
+    }
     hash.finish() | 1
 }
 
@@ -3969,7 +3982,12 @@ fn visual_text_width(value: &str, px: f32, face: crate::widget::TextFace) -> f32
     }
 }
 
-fn elide_text_label(value: &str, max_width: f32, px: f32, face: crate::widget::TextFace) -> String {
+pub(crate) fn elide_text_label(
+    value: &str,
+    max_width: f32,
+    px: f32,
+    face: crate::widget::TextFace,
+) -> String {
     const MAX_VISUAL_GRAPHEMES: usize = 256;
 
     if max_width <= 0.0 {
@@ -4398,6 +4416,20 @@ fn paint_markdown_block(
             rgba(roles.accent, 255),
         ));
     }
+    if !spec.inline.is_empty() && !preserve_lines {
+        let base = StyledBase {
+            x: text_x,
+            y: text_y,
+            bottom: rect.bottom(),
+            line_h,
+            size,
+            face,
+            weight,
+            color,
+        };
+        paint_styled_markdown_rows(prims, spec, &base, max_columns, lines.len(), roles);
+        return;
+    }
     for (line_index, line) in lines.into_iter().enumerate() {
         let y = text_y + line_index as f32 * line_h;
         if y >= rect.bottom() {
@@ -4416,6 +4448,203 @@ fn paint_markdown_block(
             face,
             rgba(color, 255),
         ));
+    }
+}
+
+/// The unstyled look of a prose block's rows, which styled spans modify.
+struct StyledBase {
+    x: f32,
+    y: f32,
+    bottom: f32,
+    line_h: f32,
+    size: crate::type_scale::StepPx,
+    face: crate::widget::TextFace,
+    weight: crate::widget::TextWeight,
+    color: [u8; 3],
+}
+
+/// For each wrapped prose row, its space-separated pieces with the byte range of
+/// `text` each came from — the words (or chunks of an over-long word) the wrap
+/// placed on the row, in order. A piece the walk cannot place (the tail
+/// ellipsis row's truncated word) carries `None` and paints unstyled.
+fn wrapped_piece_ranges(
+    text: &str,
+    rows: &[String],
+) -> Vec<Vec<(String, Option<std::ops::Range<usize>>)>> {
+    let mut words: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, ch) in text.char_indices() {
+        match (ch.is_whitespace(), start) {
+            (true, Some(s)) => {
+                words.push(s..i);
+                start = None;
+            }
+            (false, None) => start = Some(i),
+            _ => {}
+        }
+    }
+    if let Some(s) = start {
+        words.push(s..text.len());
+    }
+    let (mut wi, mut at) = (0usize, words.first().map_or(0, |w| w.start));
+    rows.iter()
+        .map(|row| {
+            row.split(' ')
+                .filter(|piece| !piece.is_empty())
+                .map(|piece| {
+                    let Some(word) = words.get(wi) else {
+                        return (piece.to_string(), None);
+                    };
+                    let end = text[at..word.end]
+                        .char_indices()
+                        .nth(piece.chars().count())
+                        .map_or(word.end, |(offset, _)| at + offset);
+                    if &text[at..end] != piece {
+                        return (piece.to_string(), None);
+                    }
+                    let range = at..end;
+                    if end >= word.end {
+                        wi += 1;
+                        at = words.get(wi).map_or(text.len(), |w| w.start);
+                    } else {
+                        at = end;
+                    }
+                    (piece.to_string(), Some(range))
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Paint a prose block's visible rows with its inline styles: strong spans in the
+/// bold face, inline code in the mono face on a tinted chip, links in the accent
+/// with an underline, strikethrough with a line through, emphasis tinted toward
+/// the accent (the raster path has no italic UI face). Each segment advances by
+/// its measured width in the face it is drawn with. Wrapping is exactly the flat
+/// path's (`wrap_markdown_text`), so rows and scrolling do not move.
+fn paint_styled_markdown_rows(
+    prims: &mut Vec<crate::widget::DrawPrim>,
+    spec: &MarkdownBlockSpec,
+    base: &StyledBase,
+    max_columns: usize,
+    visible_rows: usize,
+    roles: crate::settings::Roles,
+) {
+    use crate::tray_raster::{measure_text, row_baseline, ui_text_width_for};
+    use crate::widget::{DrawPrim, TextFace, rgba, text_prim};
+
+    let px = base.size.get();
+    let measure = |face: TextFace, weight, s: &str| match face {
+        TextFace::Mono => measure_text(s, px, weight),
+        TextFace::Ui | TextFace::UiBold => ui_text_width_for(face, s, px),
+    };
+    let requested = spec
+        .visual_row
+        .saturating_add(visible_rows.max(1))
+        .clamp(1, 131_072);
+    let rows = wrap_markdown_text(&spec.text, max_columns, 0, requested, false);
+    let pieces = wrapped_piece_ranges(&spec.text, &rows);
+    let space = measure(base.face, base.weight, " ");
+    for (line_index, row) in pieces
+        .into_iter()
+        .skip(spec.visual_row)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let y = base.y + line_index as f32 * base.line_h;
+        if y >= base.bottom {
+            break;
+        }
+        let baseline = row_baseline(y, base.line_h, px);
+        let mut x = base.x;
+        for (piece_index, (piece, range)) in row.into_iter().enumerate() {
+            if piece_index > 0 {
+                x += space;
+            }
+            // The piece split at every style boundary inside it.
+            let mut segments: Vec<(String, crate::native_markdown::InlineStyle)> = Vec::new();
+            match range {
+                None => segments.push((piece, Default::default())),
+                Some(range) => {
+                    let mut at = range.start;
+                    for (span, style) in spec
+                        .inline
+                        .iter()
+                        .filter(|(span, _)| span.start < range.end && range.start < span.end)
+                    {
+                        let from = span.start.max(range.start);
+                        let to = span.end.min(range.end);
+                        if at < from {
+                            segments.push((spec.text[at..from].to_string(), Default::default()));
+                        }
+                        segments.push((spec.text[from..to].to_string(), *style));
+                        at = to;
+                    }
+                    if at < range.end {
+                        segments.push((spec.text[at..range.end].to_string(), Default::default()));
+                    }
+                }
+            }
+            for (s, style) in segments {
+                let face = if style.code {
+                    TextFace::Mono
+                } else if style.strong {
+                    TextFace::UiBold
+                } else {
+                    base.face
+                };
+                let color = if style.link {
+                    roles.accent
+                } else if style.emphasis {
+                    mix_rgb(base.color, roles.accent, 0.35)
+                } else {
+                    base.color
+                };
+                let w = measure(face, base.weight, &s);
+                if style.code {
+                    prims.push(DrawPrim::Panel {
+                        x: x - 2.0,
+                        y: baseline - px * 0.95,
+                        w: w + 4.0,
+                        h: px * 1.3,
+                        radius: 4.0,
+                        fill: rgba(mix_rgb(roles.elevated, roles.surface, 0.20), 255),
+                    });
+                }
+                if style.strike {
+                    prims.push(DrawPrim::Stroke {
+                        x,
+                        y: baseline - px * 0.32,
+                        w,
+                        h: 1.0,
+                        radius: 0.5,
+                        width: 1.0,
+                        color: rgba(color, 220),
+                    });
+                }
+                if style.link {
+                    prims.push(DrawPrim::Stroke {
+                        x,
+                        y: baseline + 2.0,
+                        w,
+                        h: 1.0,
+                        radius: 0.5,
+                        width: 1.0,
+                        color: rgba(roles.accent, 200),
+                    });
+                }
+                prims.push(text_prim(
+                    x,
+                    baseline,
+                    s,
+                    base.size,
+                    base.weight,
+                    face,
+                    rgba(color, 255),
+                ));
+                x += w;
+            }
+        }
     }
 }
 
@@ -6625,6 +6854,185 @@ mod tests {
         );
     }
 
+    /// A prose block over the 128 KiB paint bound whose `**bold**` run straddles
+    /// the cut paints its LAST row: the spans the view hands the painter
+    /// (`native_app::bounded_markdown_block_paint`) are clipped to the block's own
+    /// text, never into the three-byte `…` the cut appends. Clipped to the display
+    /// length (the pre-fix call site), the bold span ended at byte 131_070 —
+    /// inside the ellipsis at 131_069..131_072 — and the painter's slice panicked
+    /// when the reader scrolled to the end of the block.
+    #[test]
+    fn a_cut_block_whose_span_straddles_the_cut_paints_its_last_row() {
+        // 131_066 plain bytes, then the bold run: the cut lands at 131_069
+        // (128 KiB minus the ellipsis), three bytes into "bbbb".
+        let source = format!("{}**bbbb** tail", "a".repeat(131_066));
+        let document = crate::native_markdown::parse(&source);
+        let block = &document.blocks[0];
+        assert!(
+            matches!(
+                block,
+                crate::native_markdown::MarkdownBlock::Paragraph { .. }
+            ),
+            "one paragraph: {block:?}"
+        );
+        let (text, inline) = crate::native_app::bounded_markdown_block_paint(&document, 0, block);
+        assert!(
+            text.ends_with('…') && text.len() <= 128 * 1024,
+            "the block was cut"
+        );
+        let own = text.len() - '…'.len_utf8();
+        assert!(
+            inline
+                .iter()
+                .any(|(span, style)| style.strong && span.start < own),
+            "the straddling bold run survives the cut: {inline:?}"
+        );
+        for (span, _) in &inline {
+            assert!(
+                span.end <= own && text.is_char_boundary(span.end),
+                "a span ends in the block's own text, not the ellipsis: {span:?}"
+            );
+        }
+        let max_columns = 80;
+        let rows = wrap_markdown_text(&text, max_columns, 0, 131_072, false);
+        let spec = MarkdownBlockSpec {
+            text: text.clone(),
+            kind: MarkdownBlockKind::Paragraph,
+            dense: false,
+            selectable: true,
+            action: None,
+            selected: false,
+            source: 0..source.len(),
+            visual_row: rows.len() - 1,
+            total_visual_rows: rows.len(),
+            estimated_height: 48.0,
+            inline,
+        };
+        let base = StyledBase {
+            x: 0.0,
+            y: 0.0,
+            bottom: 1_000.0,
+            line_h: 18.0,
+            size: native_type_px(TypeStep::Body),
+            face: crate::widget::TextFace::Ui,
+            weight: crate::widget::TextWeight::Regular,
+            color: [0, 0, 0],
+        };
+        let mut prims = Vec::new();
+        paint_styled_markdown_rows(
+            &mut prims,
+            &spec,
+            &base,
+            max_columns,
+            1,
+            crate::settings::Roles::from_theme(aterm_render::Theme::default()),
+        );
+        let painted: String = prims
+            .iter()
+            .filter_map(|p| match p {
+                crate::widget::DrawPrim::Text { s, .. } => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.ends_with('…'),
+            "the last row ends in the cut's ellipsis: {painted:?}"
+        );
+        assert!(
+            prims.iter().any(|p| matches!(
+                p,
+                crate::widget::DrawPrim::Text { s, face: crate::widget::TextFace::UiBold, .. }
+                    if s.starts_with('b')
+            )),
+            "the bold run's kept bytes paint bold on the last row: {painted:?}"
+        );
+    }
+
+    /// A prose block's inline spans PAINT: the strong word in the bold UI face,
+    /// inline code in the mono face on a chip, a link in the accent with an
+    /// underline, strikethrough with a line through — each segment advancing by
+    /// its measured width so nothing overlaps — while the semantic label stays
+    /// the flat text. The control: the same block with no spans paints one prim
+    /// per row, exactly as before.
+    #[test]
+    fn a_markdown_paragraph_paints_its_inline_spans() {
+        let source = "plain **bold** `code` ~~gone~~ [site](https://x.example)";
+        let document = crate::native_markdown::parse(source);
+        let crate::native_markdown::MarkdownBlock::Paragraph { text, .. } = &document.blocks[0]
+        else {
+            panic!("one paragraph");
+        };
+        let block = |inline| {
+            UiTree::new(UiNode::new(
+                "markdown/block/0",
+                UiContent::MarkdownBlock(MarkdownBlockSpec {
+                    text: text.clone(),
+                    kind: MarkdownBlockKind::Paragraph,
+                    dense: false,
+                    selectable: true,
+                    action: None,
+                    selected: false,
+                    source: 0..source.len(),
+                    visual_row: 0,
+                    total_visual_rows: 1,
+                    estimated_height: 48.0,
+                    inline,
+                }),
+            ))
+            .compile(LogicalRect::new(0.0, 0.0, 900.0, 48.0))
+            .unwrap()
+        };
+        let styled = block(document.block_styles(0, text.len()));
+        let prims = styled.tray(aterm_render::Theme::default(), 13.0).prims;
+        let texts: Vec<(&str, crate::widget::TextFace, f32)> = prims
+            .iter()
+            .filter_map(|p| match p {
+                crate::widget::DrawPrim::Text { s, face, x, .. } => Some((s.as_str(), *face, *x)),
+                _ => None,
+            })
+            .collect();
+        let face_of = |word: &str| {
+            texts
+                .iter()
+                .find(|(s, _, _)| *s == word)
+                .map(|(_, face, _)| *face)
+                .unwrap_or_else(|| panic!("{word} painted: {texts:?}"))
+        };
+        assert_eq!(face_of("bold"), crate::widget::TextFace::UiBold);
+        assert_eq!(face_of("code"), crate::widget::TextFace::Mono);
+        assert_eq!(face_of("plain"), crate::widget::TextFace::Ui);
+        assert!(
+            texts.windows(2).all(|pair| pair[0].2 < pair[1].2),
+            "segments advance left to right: {texts:?}"
+        );
+        let strokes = prims
+            .iter()
+            .filter(|p| matches!(p, crate::widget::DrawPrim::Stroke { h, .. } if *h <= 1.0))
+            .count();
+        assert!(strokes >= 2, "a strike line and a link underline");
+        assert!(
+            styled
+                .semantics
+                .iter()
+                .any(|n| n.label.contains("plain bold code gone site"))
+                || styled.semantics.iter().all(|n| !n.label.contains("**")),
+            "semantics keep the flat text"
+        );
+
+        // Control: no spans — the pre-existing one-prim-per-row paint.
+        let flat = block(Vec::new());
+        let flat_texts = flat
+            .tray(aterm_render::Theme::default(), 13.0)
+            .prims
+            .iter()
+            .filter(|p| matches!(p, crate::widget::DrawPrim::Text { .. }))
+            .count();
+        assert_eq!(
+            flat_texts, 1,
+            "an unstyled one-row paragraph is one text prim"
+        );
+    }
+
     #[test]
     fn clip_introspection_ignores_subpixel_intersection_noise_only() {
         let rect = LogicalRect::new(12.0, 76.0, 172.0, 28.3);
@@ -6839,6 +7247,7 @@ mod tests {
                 visual_row: 0,
                 total_visual_rows: 3,
                 estimated_height: 96.0,
+                inline: Vec::new(),
             }),
         ))
         .compile(LogicalRect::new(0.0, 0.0, 180.0, 96.0))

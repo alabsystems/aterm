@@ -7,7 +7,11 @@
 //! at the committed configuration; ONE KNOB PER DEFECT, each caught on its own
 //! by the invariant it breaks; the last word (`Look`) checked, state by state,
 //! to be exactly the reducer's own guards negated; the incident of 2026-09-25/26
-//! walked as the schedule the model was written for. Tier-1 is aterm-agent's
+//! walked as the schedule the model was written for; and NO STOP IS FOR GOOD
+//! (2026-09-27): every stopped round whose rest has run out has a way on at
+//! every reachable state, and the owner's stall of that day — a gave-up round
+//! whose late READY was voided, then `failed` for good — walked to its new
+//! round, the terminal reducer caught. Tier-1 is aterm-agent's
 //! `harness::upgrade_drive` tests (`upgrade_stall_tests.rs`), over the real
 //! reducer, gates, record transitions and the host's reading of each word.
 
@@ -54,7 +58,8 @@ fn reachable(m: &Model) -> Vec<S> {
 
 /// The defects the fix and its reviews found, one knob each, and the
 /// invariant that catches each alone.
-const KNOBS: [(&str, &str); 9] = [
+const KNOBS: [(&str, &str); 10] = [
+    ("Terminal", "NeverStalls"),
     ("NoF1", "NoNoticeWhileLimited"),
     ("NoF2", "NeverStranded"),
     ("NoOwe", "NeverStranded"),
@@ -86,8 +91,9 @@ fn the_upgrade_never_strands_the_agent_it_asked() {
         "harness upgrade never strands: no notice while limited, and every agent asked is \
          restarted or released",
     );
-    // Each invariant is load-bearing on its own: the pre-fix reducer breaks both.
-    for invariant in ["NoNoticeWhileLimited", "NeverStranded"] {
+    // Each invariant is load-bearing on its own: the pre-fix reducer breaks
+    // every one of these.
+    for invariant in ["NoNoticeWhileLimited", "NeverStranded", "NeverStalls"] {
         let alone = only(&model, invariant);
         assert!(
             interp::bmc(&interp::with_buggy(&alone, 0)).is_ok(),
@@ -138,11 +144,12 @@ fn each_defect_is_caught_on_its_own() {
 
 /// THE LAST WORD IS THE REDUCER'S OWN GUARDS NEGATED: on every reachable state
 /// of the upgrade's last phases (gave up, stopped) at a point the agent can
-/// read, `Look` is enabled exactly where none of `Restart`, `Release` and
-/// `DropRelease` is —
+/// read, `Look` is enabled exactly where none of `Restart`, `Release`,
+/// `DropRelease` and `Rearm` is —
 /// at the committed configuration and under every knob but `LastWhileOwed`,
 /// whose defect IS a last word said over a release (there it fires where
-/// `Release` also does, at a stop). No `Buggy` disjunct redefines it.
+/// `Release` also does, at a stop — never over a new round). No `Buggy`
+/// disjunct redefines it.
 #[test]
 fn the_last_word_is_derived_from_the_reducers_guards() {
     let model = harness_upgrade_never_strands_model();
@@ -163,12 +170,15 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
             }
             let last = !m.action_enabled("Restart", &s)
                 && !m.action_enabled("Release", &s)
-                && !m.action_enabled("DropRelease", &s);
+                && !m.action_enabled("DropRelease", &s)
+                && !m.action_enabled("Rearm", &s);
             let look = m.action_enabled("Look", &s);
             if *name == "LastWhileOwed" {
                 assert_eq!(
                     look,
-                    last || (s["phase"] == 4 && !m.action_enabled("Restart", &s)),
+                    last || (s["phase"] == 4
+                        && !m.action_enabled("Restart", &s)
+                        && !m.action_enabled("Rearm", &s)),
                     "{name}: {s:?}"
                 );
             } else {
@@ -352,4 +362,118 @@ fn the_incident_as_it_ran_is_the_caught_negative_control() {
     assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
     let fixed = run(&m, &["LimitHits"]);
     assert!(!m.action_enabled("Announce", &fixed));
+}
+
+/// NO REACHABLE STATE IS A PERMANENT WAIT (the owner, 2026-09-27: "you should
+/// NEVER have upgrades stalled"). At EVERY reachable state of the committed
+/// model, a stopped round (gave up, or stopped otherwise) whose rest has run
+/// out has a way on: the new round (`Rearm`), or — a gave-up round's late
+/// READY in hand — the restart it still takes, or the environment's hold on
+/// it (the limit, which a restart waits out; a person or the agent's own work
+/// past the drain, which voids the answer). A stopped round still resting has
+/// its clock (`Rests`). And a re-armed round is asked: its first notice is
+/// enabled wherever the session can read. None of it holds at `Terminal = 1`
+/// (or `Buggy = 1`), where the same states sit at the quiet word for good.
+#[test]
+fn no_reachable_state_is_a_permanent_wait() {
+    let m = harness_upgrade_never_strands_model();
+    let mut rested = 0;
+    for s in reachable(&m) {
+        if !(s["phase"] == 2 || s["phase"] == 4) {
+            continue;
+        }
+        if s["rest"] == 0 {
+            assert!(m.action_enabled("Rests", &s), "{s:?}");
+            continue;
+        }
+        rested += 1;
+        let late = s["phase"] == 2 && s["ready"] == 1 && s["live"] == 1;
+        if late {
+            // The answer is acted on — or the environment holds it: the
+            // limit (the restart waits it out), or the drain's void.
+            assert!(
+                m.action_enabled("Restart", &s)
+                    || s["limited"] == 1
+                    || m.action_enabled("Void", &s),
+                "{s:?}"
+            );
+        } else {
+            assert!(m.action_enabled("Rearm", &s), "{s:?}");
+            let mut next = s.clone();
+            assert!(m.fire("Rearm", &mut next));
+            assert_eq!(
+                (next["phase"], next["asks"], next["live"], next["rest"]),
+                (0, 0, 0, 0),
+                "a fresh round: {next:?}"
+            );
+            if next["limited"] == 0 {
+                assert!(m.action_enabled("Announce", &next), "asked: {next:?}");
+            } else {
+                // A limited session is re-armed but never asked.
+                assert!(!m.action_enabled("Announce", &next), "{next:?}");
+            }
+        }
+        assert!(!m.action_enabled("Look", &s) || late, "{s:?}");
+    }
+    assert!(rested > 0, "a rested round is reached");
+    for (name, dead) in [
+        ("Terminal", interp::with_consts(&m, &[("Terminal", 1)])),
+        ("Buggy", interp::with_buggy(&m, 1)),
+    ] {
+        let stuck = reachable(&dead).into_iter().any(|s| {
+            (s["phase"] == 2 || s["phase"] == 4)
+                && s["rest"] == 1
+                && s["limited"] == 0
+                && !dead.action_enabled("Rearm", &s)
+                && dead.action_enabled("Look", &s)
+        });
+        assert!(stuck, "{name}: a rested round sits at the quiet word");
+    }
+}
+
+/// THE OWNER'S STALL OF 2026-09-27 (tab `s-d3346b29dd236432b852`: `phase=
+/// failed:unanswered pending_for=1d22h wait=background … stalled=gave-up`),
+/// walked. Four notices unanswered, the give-up; the agent's late READY; its
+/// own background work outliving the answer past the drain, which voids it;
+/// the release; then — the rest run out — a NEW ROUND, asked at once, and
+/// the restart on its READY. The same walk under `Terminal` (the reducer as
+/// it ran) reaches the rest and has nothing left but the quiet word:
+/// `NeverStalls` catches it.
+#[test]
+fn the_owners_stall_rearms_and_the_terminal_reducer_is_caught() {
+    let m = harness_upgrade_never_strands_model();
+    let walk = [
+        "Announce",
+        "Elapse",
+        "Announce",
+        "Elapse",
+        "GiveUp",
+        "AgentReady",
+        "Void",
+        "Release",
+        "Rests",
+    ];
+    let mut s = run(&m, &walk);
+    assert_eq!(
+        (s["phase"], s["rest"], s["owed"], s["holding"]),
+        (2, 1, 0, 0)
+    );
+    assert!(!m.action_enabled("Look", &s), "no quiet word past the rest");
+    for action in ["Rearm", "Announce", "AgentReady", "Restart"] {
+        assert!(m.fire(action, &mut s), "{action}: {s:?}");
+    }
+    assert_eq!((s["phase"], s["holding"], s["stalled"]), (3, 0, 0));
+    for invariant in ["NeverStalls", "NeverStranded", "NoNoticeWhileLimited"] {
+        assert!(m.check_invariant(invariant, &s), "{invariant}");
+    }
+
+    let terminal = interp::with_consts(&m, &[("Terminal", 1)]);
+    let mut s = run(&terminal, &walk);
+    assert!(!terminal.action_enabled("Rearm", &s), "{s:?}");
+    assert!(terminal.fire("Look", &mut s), "{s:?}");
+    assert!(!terminal.check_invariant("NeverStalls", &s), "{s:?}");
+    assert!(
+        terminal.check_invariant("NeverStranded", &s),
+        "the agent was released: stalled, not stranded"
+    );
 }

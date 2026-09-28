@@ -330,6 +330,30 @@ pub struct Turn {
     pub timed_out: bool,
 }
 
+/// What a host's step at an idle point did ([`IdleHost::at_idle`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostStep {
+    /// The step as the journal carries it: `HOST seq=<n> <line>`.
+    pub line: String,
+    /// The step MOVED the session: it typed into the agent — a notice, a
+    /// carry-on — or ended it, so the point it was taken at is gone, and the
+    /// turn it started (or the new agent's first point) is the loop's next.
+    /// The screen may still show the old point for a moment — the typed line
+    /// echoed under the agent's last words before its spinner is drawn —
+    /// and the point is not decided again on it (the review of 2026-09-26).
+    /// `false`: it typed nothing and ended nothing — a wait, a last word —
+    /// and the point still stands, the loop's to decide once the host owns
+    /// nothing.
+    pub moved: bool,
+    /// The step TYPED A TURN into the agent — the upgrade's notice, a
+    /// carry-on (it moved the session, too) — whose answer is the loop's next
+    /// point: awaited as the policy's own acts are, and the harness's own, so
+    /// no work of the worker's for the continue back-off
+    /// ([`super::policy::turn_end::TurnEndState::host_typed`]). `false` for a
+    /// step that ended the agent and typed nothing into it.
+    pub typed: bool,
+}
+
 /// A HOST'S PART AT THE LOOP'S IDLE POINTS ([`SuperviseOpts::idle_host`]):
 /// the window's host takes the live upgrade's step, and a relaunched agent's
 /// owed continuation, at an authoritative idle point — IN the loop, which
@@ -349,8 +373,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// before the turn-end policy acts on the point. The loop reads the
     /// screen afresh after it, and journals the step's word when there was
     /// one (`HOST <what> step=<word>`), so the session's journal carries the
-    /// upgrade's and the relaunch's acts beside its own.
-    fn at_idle(&self) -> Option<String>;
+    /// upgrade's and the relaunch's acts beside its own. Whether the step
+    /// MOVED the session ([`HostStep::moved`]) says what becomes of the
+    /// point: one it left standing is decided again once the host owns
+    /// nothing ([`Session::host_held`]); one it moved is gone.
+    fn at_idle(&self) -> Option<HostStep>;
     /// The host owns the session's turn ends for now — the live upgrade's
     /// wind-down, from the state of the upgrade itself, never from the
     /// screen: the turn-end policy types nothing ([`TurnEndReading::upgrading`]).
@@ -361,11 +388,14 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// ([`aterm_phase::ScreenReader::background_wait`]) — the break stood
     /// [`BACKGROUND_SETTLE`], with no wall, no limit episode, no stall and no
     /// act of the loop's own in flight. Offered only while the host
-    /// [`Self::wants`] a point. The host may take ONE kind of step here —
-    /// the live upgrade's NOTICE, which interrupts the agent's orchestration
-    /// once and ends nothing — and says it (`Some`, journaled `HOST seq=<n>
-    /// background <word>`), or none (the default). Anything that ends the
-    /// agent is an idle point's alone.
+    /// [`Self::wants`] a point. The host may take ONE kind of step here: the
+    /// live upgrade's NOTICE, which interrupts the agent's orchestration and
+    /// ends nothing. That is the first notice, or a re-ask once
+    /// `upgrade::REASK_S` has passed with the work still running. The upgrade
+    /// may also give up asking. The host says what it took (`Some`, journaled
+    /// `HOST seq=<n> background <word>`: a turn it typed, awaited as
+    /// [`HostStep::typed`] says), or nothing (the default). Anything that
+    /// ends the agent is an idle point's alone.
     fn at_background(&self) -> Option<String> {
         None
     }
@@ -373,9 +403,11 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// `why` ([`super::policy::turn_end::TurnEndAction::Restart`]: a point
     /// nothing typed can answer) — the step's one word
     /// ([`crate::harness::relaunch::restart_here`]: `adopted` once the new
-    /// process is the loop's, `wait:…` for later, `refused:…`/`failed:…`
-    /// for never), or `None` where this host makes no restart: then the
-    /// point is the person's. The default makes none.
+    /// process is the loop's, `continued` when the host typed its carry-on
+    /// too — a turn of its own, awaited as [`HostStep::typed`] says —
+    /// `wait:…` for later, `refused:…`/`failed:…` for never), or `None`
+    /// where this host makes no restart: then the point is the person's.
+    /// The default makes none.
     fn restart(&self, why: &super::policy::turn_end::Restart) -> Option<String> {
         let _ = why;
         None
@@ -396,6 +428,25 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn stalled(&self, held: bool) {
         let _ = held;
     }
+    /// NOBODY HAS ASKED THE SESSION ANYTHING, by the host's evidence: its
+    /// conversation's own record holds no prompt of a person's or an
+    /// orchestrator's — the harness's own notices and carry-ons, and what
+    /// this loop typed by its ledger, are none
+    /// (`crate::harness::upgrade::TaskScan`). Read at every turn end, beside
+    /// the screen's launch card ([`TurnEndReading::taskless`]): the turn-end
+    /// policy types nothing into such a session. The default (a host that
+    /// cannot say) leaves it to the screen.
+    fn taskless(&self) -> bool {
+        false
+    }
+    /// A read since the last point saw the session BUSY: a turn ran — the
+    /// agent's own, a person's, an orchestrator's, or one the host typed
+    /// ([`Self::at_idle`] returns once its text is submitted, and the loop
+    /// sees the turn it started come and end — the harness's own, never the
+    /// worker's work: [`HostStep::typed`]). What the host counted of the
+    /// points before — its looks, the pauses between them — starts over at
+    /// this one. The default ignores it.
+    fn turn_ran(&self) {}
     /// A LIMIT EPISODE opened (`true`, [`Session::open_episode`]) or closed
     /// (`false`, the worker works again): while one stands the loop offers
     /// the host no point, so what the host keeps on its own clock — the live
@@ -535,8 +586,9 @@ const STOPPED_WAIT: &str = "the supervisor was stopped: no wait begins after the
 pub const UNBOUNDED: Duration = Duration::MAX;
 /// The hosted loop's `context_warn` (the CLI's default).
 const DEFAULT_CONTEXT_WARN: u8 = 10;
-/// How many rows a screen read asks for when the server can tail.
-const TAIL_ROWS: &str = "40";
+/// How many rows a screen read asks for when the server can tail — the
+/// server's own agent-verdict cut (aterm-gui's `presence::CLASSIFY_ROWS`).
+const TAIL_ROWS: usize = 40;
 
 /// Whether a `tail=` read cannot stand for the screen, and is taken again
 /// whole. The grid must be taller than the tail (`first > 0`: there are rows
@@ -562,8 +614,10 @@ const TAIL_ROWS: &str = "40";
 ///   test reads the reply alone, no grammar: a tail with no box in it has
 ///   no head for the first test to find cut.
 ///
-/// Every other read keeps the tail: a box or a composer at the foot of the
-/// pane, the cursor on it, is read once.
+/// Every other read keeps the tail — a box or a composer at the foot of the
+/// pane, the cursor on it, is read once — unless it ends on a blank row
+/// under drawn rows and its reader decides nothing from it
+/// ([`drawn_above_tail`]).
 fn tail_misses_the_live_rows(reader: &dyn ScreenReader, screen: &Screen) -> bool {
     screen.first > 0
         && (screen.cursor_row < screen.first
@@ -572,6 +626,35 @@ fn tail_misses_the_live_rows(reader: &dyn ScreenReader, screen: &Screen) -> bool
                 .prompt(&screen.rows)
                 .is_some_and(|p| p.head_off_screen))
 }
+
+/// Whether a `tail=` read that ends on a BLANK row under drawn rows cannot
+/// stand for the screen: rows above it (`first > 0`), its last row blank —
+/// so what is drawn ends above the grid's last row and the screen's live
+/// zone, its last [`TAIL_ROWS`] drawn rows ([`aterm_phase::live_zone_start`],
+/// the zone the server's agent verdict reads), begins above the tail — and
+/// the session's reader, handed the tail and the cursor on it
+/// ([`ScreenReader::read_at`]), reads no phase from it with authority. Such
+/// a read is taken again whole and cut to the live zone
+/// ([`Session::live_zone`]).
+///
+/// Claude Code's inline renderer draws its REPL at the top of the pane and
+/// leaves the rows below it blank until the transcript fills it: on a pane
+/// taller than the tail, the tail can hold the prompt box's bottom rule, its
+/// footer and blank rows, or its caret row under a top rule the tail cut, and
+/// its `idle` was no evidence, so the host's idle-point step never ran (the
+/// review of 2026-09-26: 150x50, the REPL on rows 8-11). A tail its reader
+/// decides — a box read whole with the cursor on it, a prompt box that holds
+/// the cursor — stands, and is read once ([`tail_misses_the_live_rows`]: the
+/// live subagent rm box of 2026-09-26 in the tail of a fresh 62-row pane,
+/// blank rows under it).
+fn drawn_above_tail(reader: &dyn ScreenReader, screen: &Screen) -> bool {
+    screen.first > 0
+        && screen.rows.last().is_some_and(|r| r.trim().is_empty())
+        && !reader
+            .read_at(&screen.rows, screen.cursor_index(), None)
+            .phase_authoritative
+}
+
 /// The longest single wait, so the budget — and the host's request for an
 /// idle point ([`IdleHost::wants`]) — is re-checked between waits.
 const WAIT_STEP: Duration = Duration::from_secs(20);
@@ -1520,6 +1603,11 @@ pub struct Session<'a, C: Ctl> {
     /// 2.1.280 draws a box where the footer was, so the box's own read
     /// cannot say whether the session bypasses permissions.
     footer: Option<FooterMode>,
+    /// A busy frame of this session was read. Its footer names any mode but
+    /// the default, so after one a mode still unread ([`Self::footer`]) is
+    /// no race of the agent's start, and the verdict wait is back
+    /// ([`Self::agent_wake`]). Read only while no footer has been.
+    busy_read: bool,
     /// Where the approval ledger goes ([`Self::set_approval_ledger`]);
     /// `None` keeps none.
     ledger_path: Option<PathBuf>,
@@ -1584,6 +1672,10 @@ pub struct Session<'a, C: Ctl> {
     /// (read for every box the policy decides and every point it acts on;
     /// `None` from a host that does not publish it).
     program: Option<String>,
+    /// The session's id as that same `status` read named it (`sid=`, the
+    /// instance's local id): which `who` row is the session's
+    /// ([`Self::worker_env`]).
+    status_sid: Option<String>,
     /// When a PERSON last typed into the session, as that status read said
     /// (`human_ms=`; `None`: none, or a server that does not say).
     person: Option<Instant>,
@@ -1599,6 +1691,15 @@ pub struct Session<'a, C: Ctl> {
     /// The deadline of a held act ran out: the next look judges the point
     /// on the screen again, as a new one.
     rejudge: bool,
+    /// The point showing was LEFT TO THE HOST: decided while it owned the
+    /// session's turn ends ([`IdleHost::owns_turn_end`]), or passed over for
+    /// a step of its that typed nothing and ended nothing
+    /// ([`Self::host_steps_here`], [`HostStep::moved`]). The moment the host
+    /// owns nothing the point is decided again ([`Self::wait_for_next`]) —
+    /// D3 of the live E2E of 2026-09-26: an upgrade whose settle ownership
+    /// lapsed left its turn end sitting, neither continued nor upgraded, for
+    /// six minutes. A point a step moved is not held: it is gone.
+    host_held: bool,
     /// The box on the screen (its review key) and when a read first showed
     /// it: judged only once it has shown [`Self::box_settle`].
     box_first_seen: Option<(String, Instant)>,
@@ -1648,22 +1749,48 @@ pub struct ApprovalEnv {
     pub home: Option<PathBuf>,
     pub uid: u32,
     pub tmpdir: Option<PathBuf>,
+    /// Where the WORKER's environment comes from: the environment a git
+    /// read's configuration is read with (`policy::git_config`), and whose
+    /// `CLAUDE_CONFIG_DIR` (else `$HOME/.claude`) holds the session files and
+    /// transcripts that say where its Bash tool stands
+    /// ([`crate::harness::footer::shell_cwds`]).
+    pub worker: WorkerSource,
+}
+
+/// Where [`ApprovalEnv::worker`] comes from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerSource {
+    /// The session's own foreground process, read for every box that may run
+    /// git ([`Session::worker_env`]).
+    Session,
+    /// This environment, as though read from the session — `Err` as though it
+    /// could not be (a test's).
+    Fixed(Result<super::policy::WorkerEnv, String>),
 }
 
 impl ApprovalEnv {
-    /// This process's: `$HOME`, the real uid, `$TMPDIR`.
+    /// This process's `$HOME`, real uid and `$TMPDIR`, and the worker read
+    /// from the session ([`WorkerSource::Session`]) — in this crate's own
+    /// unit-test build a hermetic stand-in with no Claude Code directory, so
+    /// no test's verdict depends on the developer's git config or live
+    /// Claude Code sessions.
     pub fn of_process() -> Self {
         #[cfg(unix)]
         // SAFETY: getuid(2) cannot fail and touches no memory.
         let uid = unsafe { libc::getuid() };
         #[cfg(not(unix))]
         let uid = 0;
+        #[cfg(test)]
+        let worker = WorkerSource::Fixed(Ok(super::policy::WorkerEnv::hermetic(None)));
+        #[cfg(not(test))]
+        let worker = WorkerSource::Session;
         Self {
             home: aterm_types::dirs::home_dir(),
             uid,
             tmpdir: std::env::var_os("TMPDIR")
                 .map(PathBuf::from)
                 .filter(|p| p.is_absolute()),
+            worker,
         }
     }
 }
@@ -1704,6 +1831,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             approval_env: ApprovalEnv::of_process(),
             cwd: None,
             footer: None,
+            busy_read: false,
             ledger_path: None,
             ledger: Ledger::off(),
             turn_end_seeded: false,
@@ -1723,10 +1851,12 @@ impl<'a, C: Ctl> Session<'a, C> {
             adopted_limit: false,
             adopted_box: false,
             program: None,
+            status_sid: None,
             person: None,
             draft_seen: None,
             held: false,
             rejudge: false,
+            host_held: false,
             agent_woke: None,
             box_first_seen: None,
             box_settle: BOX_SETTLE,
@@ -2019,6 +2149,8 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.survey_gone |= !reader.survey(&screen.rows);
         if let Some(mode) = footer_mode(&screen.rows) {
             self.footer = Some(mode);
+        } else if self.footer.is_none() && !self.busy_read {
+            self.busy_read = reader.phase(&screen.rows) == Phase::Busy;
         }
         // Every read clocks the draft: one that changed is a person typing.
         let draft = typed_draft(reader, &screen)
@@ -2038,6 +2170,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     }
 
     fn read_once(&mut self) -> Result<Screen, Fail> {
+        let mut zone = false;
         if self.caps.tail != Some(false) {
             let tail = format!("tail={TAIL_ROWS}");
             let r = self.call(&["text", "--json", &tail])?;
@@ -2046,11 +2179,17 @@ impl<'a, C: Ctl> Session<'a, C> {
             } else if r.ok() {
                 self.caps.tail = Some(true);
                 let screen = parse_text_json(&r.stdout).map_err(Fail::Hard)?;
-                if !tail_misses_the_live_rows(self.reader(&screen.rows), &screen) {
+                let reader = self.reader(&screen.rows);
+                if !tail_misses_the_live_rows(reader, &screen) && !drawn_above_tail(reader, &screen)
+                {
                     return Ok(screen);
                 }
-                // The tail cut a box's head off, or holds none of the live
-                // rows: the full read below.
+                // The tail cut a box's head off, holds none of the live
+                // rows, or ends on a blank row under drawn rows and decides
+                // nothing: the full read below — cut to the live zone, the
+                // rows the server's verdict reads, where the tail ended on a
+                // blank row, unless that zone misses the live rows too.
+                zone = screen.rows.last().is_some_and(|r| r.trim().is_empty());
             } else {
                 return Err(self.fault(
                     &r,
@@ -2062,7 +2201,28 @@ impl<'a, C: Ctl> Session<'a, C> {
         if !r.ok() {
             return Err(self.fault(&r, format!("text --json failed: {}", r.stderr.trim())));
         }
-        parse_text_json(&r.stdout).map_err(Fail::Hard)
+        let whole = parse_text_json(&r.stdout).map_err(Fail::Hard)?;
+        Ok(if zone { self.live_zone(whole) } else { whole })
+    }
+
+    /// A whole read cut to the screen's LIVE ZONE — its last [`TAIL_ROWS`]
+    /// drawn rows and the blank rows under them
+    /// ([`aterm_phase::live_zone_start`]), the rows the server's agent verdict
+    /// reads — or left whole where that cut would miss the live rows as a
+    /// tail can ([`tail_misses_the_live_rows`]): it takes a box's head off
+    /// (the server reads that box whole too), or the cursor's row is above it.
+    fn live_zone(&self, whole: Screen) -> Screen {
+        let first = aterm_phase::live_zone_start(&whole.rows, TAIL_ROWS);
+        let zone = Screen {
+            rows: whole.rows[first..].to_vec(),
+            first,
+            ..whole.clone()
+        };
+        if tail_misses_the_live_rows(self.reader(&zone.rows), &zone) {
+            whole
+        } else {
+            zone
+        }
     }
 
     /// One `await <cond> timeout <step>`. A request not served is told apart
@@ -2858,6 +3018,9 @@ impl<'a, C: Ctl> Session<'a, C> {
         let worked = std::mem::take(&mut state.moved);
         if worked {
             state.handed = None;
+            if let Some(host) = opts.idle_host.as_ref() {
+                host.turn_ran();
+            }
             // A question dialog the loop answered has been submitted: what
             // it remembered of it is done — and, when the loop's own keys
             // answered it and no person took part, told ONCE.
@@ -3784,8 +3947,10 @@ impl<C: Ctl> Session<'_, C> {
     /// an idle point or a question with nothing of the loop's in flight,
     /// the server's own agent verdict MOVING off it ([`Self::agent_wake`]:
     /// one parked request, pushed by the server, no screen read — a footer's
-    /// clock or a person's draft wakes nothing); anything else, the content
-    /// moving (`await seq`).
+    /// clock or a person's draft wakes nothing) — save while the agent is
+    /// STARTING (no mode and no busy frame read yet), when the frame that
+    /// draws its footer must be read and the content is waited on; anything
+    /// else, the content moving (`await seq`).
     fn wait_for_next(
         &mut self,
         seen: Turn,
@@ -3808,7 +3973,18 @@ impl<C: Ctl> Session<'_, C> {
                 .is_some_and(|p| p.kind == aterm_phase::PromptKind::Question);
         let step_cap = if held { HANDBACK_POLL } else { WAIT_STEP };
         loop {
-            if self.stopped() || self.host_steps_here(&seen, opts, review) {
+            if self.stopped() {
+                return Ok(None);
+            }
+            if self.host_steps_here(&seen, opts, review) {
+                return Ok(None);
+            }
+            // The host let the point go — its step owns nothing, its
+            // ownership lapsed, `[harness] upgrade` was switched off: the
+            // point is decided again now, as at its deadline.
+            if self.host_held && !opts.idle_host.as_ref().is_some_and(|h| h.owns_turn_end()) {
+                self.host_held = false;
+                self.turn_end_now(&seen, opts, allow, review)?;
                 return Ok(None);
             }
             // A look owed at the point still showing (a survey's `0` to try
@@ -3879,12 +4055,52 @@ impl<C: Ctl> Session<'_, C> {
     /// the one the point reads as — or `None` where that wait cannot stand
     /// for the content moving: a host without it, an act of the loop's own
     /// in flight (a `/model` answers idle to idle), a point that is neither
-    /// idle nor a question, one on a wall (its own deadline wakes it), or
-    /// the point the last such wait woke the loop from, read again
-    /// unchanged — there the server's verdict and the loop's reading
-    /// disagree, and the content is what is waited on.
+    /// idle nor a question, one on a wall (its own deadline wakes it), the
+    /// point the last such wait woke the loop from, read again unchanged —
+    /// there the server's verdict and the loop's reading disagree, and the
+    /// content is what is waited on — and a point the loop's own reader
+    /// does not VOUCH for (not [`aterm_phase::Reading::phase_authoritative`],
+    /// or another phase): a screen read before the agent drew itself (its
+    /// launch line still at a shell's prompt, the program not named yet),
+    /// whose verdict — already `idle` — never moves as the agent's composer
+    /// comes up, so a host that waits for an idle point it can act on waited
+    /// for ever (the harness's live tests of 2026-09-26, under load: a fresh
+    /// session's upgrade never taken). Its content moving is the wake. So it
+    /// is for a point of an agent still STARTING — read before the session
+    /// showed its mode or a busy frame, unless it is Codex's (whose footer
+    /// names none) — even one its reader vouches for.
+    ///
+    /// THE MODE IS READ OFF A FRAME THE VERDICT DOES NOT MOVE ON. The
+    /// approval policy's bypass proof is the footer an earlier read showed
+    /// ([`Self::footer`]: a 2.1.280 box is drawn where it was), and the frame
+    /// that first draws it is idle like the one before it. A point read
+    /// before it was on the screen — an agent whose first frame came after
+    /// the loop's idle window, or a frame caught between the composer and
+    /// its footer row, which the reader vouches for as idle — waited on the
+    /// verdict slept through that frame, and a box drawn before any later
+    /// frame was read was judged with no mode known: a scratch removal
+    /// handed to a person as `outside a bypass session` (host_live, under a
+    /// loaded gate, 2026-09-26/27). So until a footer has been read, the
+    /// content is what is waited on, and the frame that draws it is read.
+    ///
+    /// THAT WINDOW IS THE START'S ALONE: it closes at the first busy frame
+    /// read ([`Self::busy_read`]) as well as at the first footer. A busy
+    /// footer names every mode but the default, so a session read busy with
+    /// no mode named runs the default mode (or draws no footer at all — a
+    /// program that is not Claude Code), and past the start every idle point
+    /// is reached by a verdict that moves (busy to idle) and read. Without
+    /// the busy bound, a session that never shows a mode word — a
+    /// default-mode Claude Code whose `? for shortcuts` hint is not drawn, a
+    /// program that is not Claude Code — would be read on every screen change
+    /// (a person's every keystroke) for its whole life.
     fn agent_wake(&self, seen: &Turn, allow: &[String]) -> Option<String> {
         if self.caps.await_agent != Some(true) || self.turn_end.act_in_flight() {
+            return None;
+        }
+        if self.footer.is_none()
+            && !self.busy_read
+            && self.reader(&seen.screen.rows).program() != aterm_phase::Program::Codex
+        {
             return None;
         }
         let ours = match seen.phase {
@@ -3894,6 +4110,8 @@ impl<C: Ctl> Session<'_, C> {
         };
         let reading = aterm_phase::read(self.program.as_deref(), &seen.screen.rows, None);
         if reading.wall.is_some()
+            || !reading.phase_authoritative
+            || reading.phase != seen.phase
             || self.agent_woke.as_deref() == Some(review_key(seen, allow).as_str())
         {
             return None;
@@ -3944,21 +4162,37 @@ impl<C: Ctl> Session<'_, C> {
         }
         if let Some(line) = host.at_background() {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
+            // The notice is a turn the host typed: its answer is the
+            // harness's, never the worker's work.
+            self.turn_end.host_typed(Instant::now());
             *since = None;
         }
     }
 
     /// The host's step at `point` ([`IdleHost::at_idle`]), taken when the
     /// host asks for one ([`IdleHost::wants`]) and the point is idle as the
-    /// session's reader vouches for, with no box, no wall, no limit episode
-    /// open and no act of the loop's own in flight; `true` when it was taken
-    /// (the loop then reads again). The host's step is the loop's while it
-    /// runs: the loop is still, and asks nothing of the server.
-    fn host_steps_here(&self, point: &Turn, opts: &SuperviseOpts, review: &mut dyn Review) -> bool {
+    /// session's reader vouches for — read with the terminal's cursor
+    /// ([`aterm_phase::read_at`]: Claude Code's `idle` only at the prompt box
+    /// that holds it, never at a box an earlier run left above the launch
+    /// line of a relaunch in the same tab) — with no box, no wall, no limit
+    /// episode open and no act of the loop's own in flight; `true` when it
+    /// was taken (the loop then reads again). The host's step is the loop's
+    /// while it runs: the loop is still, and asks nothing of the server.
+    fn host_steps_here(
+        &mut self,
+        point: &Turn,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> bool {
         let Some(host) = opts.idle_host.as_ref().filter(|h| h.wants()) else {
             return false;
         };
-        let reading = aterm_phase::read(self.program.as_deref(), &point.screen.rows, None);
+        let reading = aterm_phase::read_at(
+            self.program.as_deref(),
+            &point.screen.rows,
+            point.screen.cursor_index(),
+            None,
+        );
         let idle = point.phase == Phase::Idle
             && reading.phase == Phase::Idle
             && reading.phase_authoritative
@@ -3966,8 +4200,20 @@ impl<C: Ctl> Session<'_, C> {
             && reading.prompt.is_none()
             && self.limit.is_none()
             && !self.turn_end.act_in_flight();
-        if idle && let Some(line) = host.at_idle() {
-            review.note(&format!("HOST seq={} {line}", point.screen.seq));
+        if idle {
+            let step = host.at_idle();
+            if let Some(step) = &step {
+                review.note(&format!("HOST seq={} {}", point.screen.seq, step.line));
+                // A turn the host typed is awaited as the policy's own acts
+                // are, and its answer is no work of the worker's.
+                if step.typed {
+                    self.turn_end.host_typed(Instant::now());
+                }
+            }
+            // Passed over for the step: decided again once the host owns
+            // nothing — unless the step moved the session, and the point
+            // with it.
+            self.host_held = !step.is_some_and(|s| s.moved);
         }
         idle
     }
@@ -4490,10 +4736,11 @@ fn append_note(path: Option<&Path>, line: &str) -> Result<(), String> {
         .map_err(|e| format!("cannot append to notes file {}: {e}", path.display()))
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time: the crate's one civil-from-days,
-/// [`crate::harness::usage::rfc3339_utc`], at an unsigned instant.
+/// `YYYY-MM-DDTHH:MM:SSZ` for a Unix time — `aterm_types::rfc3339`'s
+/// formatter, the workspace's one copy of the calendar.
+#[must_use]
 pub fn utc_stamp(secs: u64) -> String {
-    crate::harness::usage::rfc3339_utc(i64::try_from(secs).unwrap_or(i64::MAX))
+    aterm_types::rfc3339::format_rfc3339(secs)
 }
 
 #[path = "answer.rs"]
@@ -4636,6 +4883,10 @@ mod tests {
         /// opens), where a real agent parks it, rather than on row 10: for
         /// a tall screen whose row 10 is the transcript.
         cursor_on_caret: bool,
+        /// The cursor's row on the screen of this index, over
+        /// [`Self::cursor_row`] and `cursor_on_caret` (a measured frame's own
+        /// cursor).
+        screen_cursors: BTreeMap<usize, usize>,
         /// A `turn` was sent.
         turned: bool,
         /// How many `turn`s were sent.
@@ -4773,6 +5024,11 @@ mod tests {
         /// move. `None`: the whole screen, as the verdict's live zone now
         /// reaches it.
         agent_zone: Option<usize>,
+        /// `status sid=`: the session's local id (`-`: none named).
+        status_sid: &'static str,
+        /// The `who` roster's rows, answered to every `who` (`None`: the
+        /// built-in answer).
+        who: Option<String>,
     }
 
     /// A worker reading its input: nothing unread.
@@ -4859,6 +5115,7 @@ mod tests {
                 turn_gates: Vec::new(),
                 screen_cols: BTreeMap::new(),
                 cursor_on_caret: false,
+                screen_cursors: BTreeMap::new(),
                 turned: false,
                 turns: 0,
                 stall_sleep: None,
@@ -4866,7 +5123,11 @@ mod tests {
                 cursor_col: None,
                 attention: None,
                 foreign_attention: None,
-                cwd: None,
+                // A real directory outside any repository: a git read is
+                // judged in the session's cwd (`policy::git_config`).
+                cwd: std::fs::canonicalize(std::env::temp_dir())
+                    .ok()
+                    .map(|d| d.to_string_lossy().into_owned()),
                 agent_cwd: None,
                 help: "key [id=<key>] [if=<re>] <name>: send a named key\n".to_string(),
                 hold: "0",
@@ -4901,6 +5162,8 @@ mod tests {
                 cursor_row: None,
                 tail_replies: VecDeque::new(),
                 agent_zone: None,
+                status_sid: "-",
+                who: None,
             }
         }
         /// The bare `meta` reply, `attention=` pct-encoded as the server
@@ -4964,9 +5227,15 @@ mod tests {
                 human.push_str(" agent_rev=1");
             }
             format!(
-                "OK schema=1 sid=- phase=running hold={} fabric={} program={} agent={}{input} \
+                "OK schema=1 sid={} phase=running hold={} fabric={} program={} agent={}{input} \
                  seq={} hand={}{human}\n",
-                self.hold, self.fabric, self.program, self.agent, self.seq, self.hand
+                self.status_sid,
+                self.hold,
+                self.fabric,
+                self.program,
+                self.agent,
+                self.seq,
+                self.hand
             )
         }
         fn last_served(&self) -> &[String] {
@@ -5025,7 +5294,9 @@ mod tests {
             } else {
                 String::new()
             };
-            let cursor_row = if let Some(row) = self.cursor_row {
+            let cursor_row = if let Some(&row) = self.screen_cursors.get(&i) {
+                row
+            } else if let Some(row) = self.cursor_row {
                 row
             } else if self.cursor_on_caret {
                 self.screens[i]
@@ -5316,6 +5587,7 @@ mod tests {
                     Ok(ok(&line))
                 }
                 "help" => Ok(ok(&self.help.clone())),
+                "who" if self.who.is_some() => Ok(ok(self.who.as_deref().unwrap_or_default())),
                 // The composer's column-2 cell: dim (the placeholder) unless
                 // a test says the text there was typed.
                 "cell" => Ok(ok(&format!("OK %20 d0d0d0 111318 {}\n", self.cell_attrs))),
@@ -5865,6 +6137,7 @@ mod tests {
                 "@s-9 await gone esc.to.interrupt timeout 20000",
                 "@s-9 text --json tail=40",
                 "@s-9 status",
+                "@s-9 meta",
                 "@s-9 help key",
                 "@s-9 key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "@s-9 await seq 101 timeout 20000",
@@ -5924,6 +6197,7 @@ mod tests {
                 "text --json tail=40",
                 "text --json",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json",
@@ -6153,6 +6427,7 @@ mod tests {
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "await seq 101 timeout 20000",
@@ -6565,6 +6840,7 @@ mod tests {
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 // The box must leave — a read that shows it gone, not
@@ -7113,9 +7389,9 @@ mod tests {
         // with it: the approval stands, and the box that did not move is the
         // TIMEOUT, not an EVENT printed after the deadline.
         let mut m = Mock::new(true, vec![bash_one_row()]);
-        // 0 the wait, 1 the read, 2 `help key`, 3 the press, 4 the wait for
-        // the box to leave.
-        m.delay.insert(4, Duration::from_millis(200));
+        // 0 the wait, 1 the read, 2 `status`, 3 the cwd `meta` a git read is
+        // judged in, 4 `help key`, 5 the press, 6 the wait for the box to leave.
+        m.delay.insert(6, Duration::from_millis(200));
         let opts = SuperviseOpts {
             max: Duration::from_millis(100),
             ..auto(0, None)
@@ -7131,9 +7407,9 @@ mod tests {
                 EXIT_TIMEOUT
             )
         );
-        // The start-up `meta`, then the five (the box's `status` among
-        // them); nothing read after.
-        assert_eq!(m.requests.len(), 7, "nothing read after: {:?}", m.requests);
+        // The start-up `meta`, then the seven (the box's `status` and cwd
+        // `meta` among them); nothing read after.
+        assert_eq!(m.requests.len(), 8, "nothing read after: {:?}", m.requests);
     }
 
     #[test]
@@ -7919,6 +8195,7 @@ mod tests {
                 "text --json tail=40",
                 "text --json",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json",
@@ -9044,7 +9321,7 @@ mod tests {
     fn a_press_in_flight_is_decided_again_from_a_fresh_read() {
         let (dir, notes) = notes_file("inflight");
         let mut m = Mock::new(true, vec![bash_one_row(), write_prompt()]);
-        m.by_index.insert(4, closed());
+        m.by_index.insert(5, closed());
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick_with(
             &mut m,
@@ -9101,7 +9378,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(4, closed());
+        m.by_index.insert(5, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick(&mut m, Duration::from_secs(5));
         assert_eq!(
@@ -9113,12 +9390,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            m.requests[..12],
+            m.requests[..14],
             [
                 "meta",
                 "await gone esc.to.interrupt timeout 20000",
                 "text --json tail=40",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
                 "text --json tail=40",
@@ -9127,6 +9405,7 @@ mod tests {
                 // the instance that answers now), then pressed.
                 "text --json tail=40",
                 "status",
+                "meta",
                 "help key",
                 "key if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             ],
@@ -9159,7 +9438,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(9, closed());
+        m.by_index.insert(10, closed());
         m.vanish_after = Some(0);
         let (lines, code) = watch_quick_with(
             &mut m,
@@ -9213,7 +9492,7 @@ mod tests {
             false,
             vec![bash_one_row(), bash_one_row(), busy_screen(), idle_screen()],
         );
-        m.by_index.insert(10, closed());
+        m.by_index.insert(11, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick_with(
             &mut m,
@@ -9254,7 +9533,7 @@ mod tests {
                 idle_screen(),
             ],
         );
-        m.by_index.insert(8, closed());
+        m.by_index.insert(9, closed());
         m.vanish_after = Some(0);
         let (lines, _) = watch_quick_with(
             &mut m,

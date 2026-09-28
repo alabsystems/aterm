@@ -50,52 +50,53 @@
 //! and there are exactly three — cargo's own sparse-index cache
 //! ([`RowAnchor`], byte equality, wherever a cache exists), `Cargo.lock`'s
 //! resolved dependency edges ([`judge_row_against_lock_edges`], which travel
-//! with the delivery but record NO features), and the owner's signature over
-//! `bundle-sha256`, which is the only one left on a machine with neither cache
-//! nor network and is deliberately outside this crate. [`verify`] and
+//! with the delivery but record NO features), and a signature over
+//! `bundle-sha256` (a signed atpkg pkg manifest pinning it, once delivery
+//! ships — deferred, and none exists today), which would be the only one left
+//! on a machine with neither cache nor network and is deliberately outside
+//! this crate. Until it exists, such a machine has nothing that anchors a
+//! row's `features`, and the verdicts say so. [`verify`] and
 //! `check-bundle` both apply the first two and both print how many rows they
 //! could anchor, so a run that proved nothing about row content never reads as
 //! one that did.
 //!
-//! # Seams, and what has closed
+//! # Seams
 //!
-//! - `TODO(mirror-config-split)` — CLOSED (2026-09-01), [`crate::mirror_config`]:
-//!   `cargo forge mirror config [--write]` renders the shippable
-//!   `[source.crates-io] replace-with` fragment at
-//!   `tools/cargo-mirror-config.toml`, which now has a `publish/manifest.txt`
-//!   row. It flips no default — cargo does not read that path.
-//! - `TODO(mirror-gate-wiring)` — CLOSED (2026-09-01), `[OB-16]` in
-//!   [`crate::check`]: the fragment must agree with `Cargo.lock` about what is
-//!   mirrored, and a mirror directory that IS present must cover every registry
-//!   lock entry with every cksum agreeing.
-//! - `TODO(mirror-stale-out)` — CLOSED as already-correct (2026-09-01). It was
-//!   not a gap: `emit` never deletes, and both stale shapes come back from
-//!   [`verify`] as drift — a departed package as a stale index row, a
-//!   superseded version as a stray `.crate` whose row was rewritten away. Armed
-//!   by `a_second_emit_over_a_moved_lock_leaves_stale_rows_that_verify_names`,
-//!   which drives two real `emit` calls rather than planting files.
-//! - `TODO(mirror-row-manifest-anchor)` — OPEN, and named rather than assumed.
-//!   A fourth anchor on row CONTENT exists and is not taken here: each `.crate`
-//!   carries the package's own packaged `Cargo.toml`, and the row's `deps` and
-//!   `features` are crates.io's rendering OF THAT FILE. It is the only anchor
-//!   that would reach features on a machine with neither cache nor network,
-//!   because the tarball travels with the delivery and is cksum-pinned.
-//!   MEASURED that the disagreement is real and visible: over a mirror with one
-//!   row's `"default"` emptied, `cargo metadata --locked --offline` still prints
-//!   the CORRECT feature table for that package (it reads the tarball's
-//!   manifest) while RESOLVING it as `['default']` (it uses the row). Taking it
-//!   means a gzip and tar reader inside this crate — the one first-party
-//!   inflate lives privately inside `aterm-png` and is zlib-framed — plus a
-//!   re-implementation of crates.io's index generation, which is exactly what
-//!   the section above refuses to do because every mistake in it would surface
-//!   as a false RED on a legitimate delivery. Costed, refused for now, written
-//!   down.
-//! - `TODO(mirror-delivery-atpkg)` — STILL OPEN, and it stops at a KEY. The
-//!   bundle format and its verification path are done
-//!   ([`crate::mirror_bundle`]: `mirror bundle`, `check-bundle`, `unbundle`),
-//!   including the `bundle-sha256` a signature would cover. Signing that digest
-//!   with the release key, and publishing the atpkg index row, are the owner's
-//!   ceremony; nothing in this crate performs either, by design.
+//! Closed (2026-09-01): the config split is [`crate::mirror_config`]
+//! (`cargo forge mirror config [--write]` renders the shippable
+//! `[source.crates-io] replace-with` fragment at
+//! `tools/cargo-mirror-config.toml`, which flips no default — cargo does not
+//! read that path); the gate is `[OB-16]` in [`crate::check`]; and stale output
+//! was never a gap — `emit` never deletes, and [`verify`] reports a departed
+//! package as a stale index row and a superseded version as a stray `.crate`,
+//! armed by `a_second_emit_over_a_moved_lock_leaves_stale_rows_that_verify_names`.
+//!
+//! Delivery — decided 2026-09-25 under the owner's standing direction: the
+//! bundle format and its verification path are done ([`crate::mirror_bundle`]:
+//! `mirror bundle`, `check-bundle`, `unbundle`), including the `bundle-sha256`
+//! an outside signature covers. Delivery is DEFERRED until a build consumes the
+//! mirror (the `[patch.crates-io]` fork migration, build-order step 4 of
+//! docs/THIRD_PARTY_SURFACE_PLAN.md Lane 1): publishing now would ship a large
+//! public asset per lock change that no build reads. When it ships it rides
+//! atpkg's signed pkg manifest — signed by a rostered machine key under the
+//! paper master, the one signing tier atpkg has (the release-key tier is
+//! retired) — which pins the bundle's sha256, every index row included. So no
+//! bundle-specific signing or verification code is owed in this crate; the
+//! in-repo remainder at that point is a data-artifact kind in atpkg and
+//! `atpkg-pack` (today both know only binaries and app bundles).
+//!
+//! Not taken, by design (2026-09-25): a fourth anchor on row CONTENT from each
+//! `.crate`'s packaged `Cargo.toml`. It would reach features only on a machine
+//! with neither cache nor network receiving an UNSIGNED bundle — and the signed
+//! pkg manifest above pins every row on exactly that machine, so the anchor is
+//! redundant there, while re-implementing crates.io's index rendering would
+//! turn every mistake in it into a false RED on a legitimate delivery. (The
+//! disagreement it would catch is real: over a mirror with one row's
+//! `"default"` emptied, `cargo metadata --locked --offline` prints the correct
+//! feature table from the tarball while RESOLVING the package as the row says.
+//! The parts it would need exist first-party — raw RFC 1951
+//! `aterm_codec::inflate::inflate` plus `crc32` for gzip framing, and a USTAR
+//! reader in `atpkg` — so the cost is the rendering, not the codecs.)
 //!
 //! # Filesystem race boundary
 //!
@@ -104,9 +105,13 @@
 //! output. The cache and directory walks still use path-based standard-library
 //! calls, however: they are a fail-closed snapshot, not fd-anchored confinement
 //! against a same-uid process replacing an intermediate component between the
-//! check and open. Run the generator over a private cargo home and output
-//! directory. Moving these walks onto retained directory descriptors is the
-//! follow-up required before claiming adversarial TOCTOU resistance.
+//! check and open. That race is out of scope rather than pending: such a
+//! process can already write every file these verbs read or produce (the
+//! cargo cache, `Cargo.lock`, the output tree), and every `.crate` is
+//! sha256-checked against `Cargo.lock` whatever path it arrived through, so
+//! fd anchoring would add this crate's first unsafe FFI and remove no
+//! capability. Run the generator over a private cargo home and output
+//! directory.
 
 use crate::Outcome;
 use std::collections::{BTreeMap, BTreeSet};
@@ -804,9 +809,12 @@ pub(crate) enum RowProvenance {
 ///    Travels with the delivery, so it works with no cache and no network, but
 ///    a lock records dependency NAMES and nothing else: it cannot anchor
 ///    features at all.
-/// 3. A signature over `bundle-sha256`. The only anchor left on a machine with
-///    neither cache nor network, and deliberately OUTSIDE this crate: signing
-///    is the owner's ceremony (`TODO(mirror-delivery-atpkg)`).
+/// 3. A signature over `bundle-sha256`. The only anchor that would be left on
+///    a machine with neither cache nor network, and deliberately OUTSIDE this
+///    crate: a signed atpkg pkg manifest pinning that digest once delivery
+///    ships. Delivery is deferred and no such manifest exists today (the
+///    module's "Delivery" note), so on that machine nothing anchors row
+///    content now.
 ///
 /// A run that has none of the three has not proven the rows are upstream's and
 /// says so in its own verdict text.
@@ -1622,8 +1630,10 @@ pub fn verify(root: &Path, dir: &Path, anchor: &RowAnchor) -> Result<Outcome, St
             "    {unanchored} row(s) NOT anchored — {why}. For those rows this run proves \
              INTEGRITY and SHAPE only: that their `deps` and `features` are upstream's is NOT \
              proven here. What is left anchoring them is Cargo.lock's resolved dependency \
-             edges (checked above, and a lock records no features at all) and the owner's \
-             signature over `bundle-sha256`."
+             edges (checked above, and a lock records no features at all). A signed atpkg \
+             pkg manifest pinning `bundle-sha256` would anchor them once delivery ships; \
+             delivery is deferred and none exists today, so nothing outside this directory \
+             anchors their features now."
         );
     }
     if ok {
@@ -2327,7 +2337,7 @@ mod tests {
         assert!(v.log.contains("drifted"), "{}", v.log);
     }
 
-    /// `TODO(mirror-stale-out)`, ARMED. `emit` never deletes, so a second emit
+    /// `emit` never deletes, so a second emit
     /// over a moved lock leaves the old bytes behind in two distinct shapes,
     /// and BOTH have to come back as drift rather than as a quietly larger
     /// mirror. Driven through two real `emit` calls, not by planting files:
@@ -2645,6 +2655,10 @@ mod tests {
             "{}",
             blind.log
         );
+        // The signature that would anchor these rows does not exist yet, and
+        // the verdict never names it as if it did (2026-09-27).
+        assert!(blind.log.contains("none exists today"), "{}", blind.log);
+        assert!(!blind.log.contains("manifest that pins"), "{}", blind.log);
 
         // And it is refused the moment upstream's own row is consulted.
         let v = verify(&fx.root(), &fx.out(), &anchor).unwrap();

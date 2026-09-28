@@ -27,7 +27,7 @@
 //! follows on the next frame.
 //!
 //! Every law runs at the HOST seam, GUI-faithfully (`trail_host::Core`: the
-//! content-scroll seam, then LOCK A's rows, then the tick; a frame that
+//! content-scroll seam, then the frame hold's rows, then the tick; a frame that
 //! scrolled samples nothing). Each names its reading on 0.93.0, and the
 //! mechanism that holds it.
 
@@ -39,7 +39,7 @@ use std::time::Duration;
 use trail_host::{Core, Opts, Theme};
 
 /// The GUI's frame seam (`trail_host::Core`): the content-scroll seam (a
-/// frame that scrolled samples nothing), LOCK A's rows — the caret row's
+/// frame that scrolled samples nothing), the frame hold's rows — the caret row's
 /// probe, then every row the witness names — then the tick.
 const SEAM: Opts = Opts {
     scroll_seam: true,

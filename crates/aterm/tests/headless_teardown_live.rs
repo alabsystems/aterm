@@ -16,20 +16,22 @@
 //!   names SIGTERM).
 //!
 //! ISOLATION: scratch HOME/XDG roots, a private socket, every automatic lane
-//! off (`support/launch_isolation.rs`), `--no-reroute`, `SHELL=/bin/sh`.
+//! off (`support/launch_isolation.rs`), `--no-reroute`, `SHELL=/bin/sh`. An
+//! instance that cannot start FAILS the test (`support/headless_boot.rs`
+//! `await_ready`); SKIP only on a scratch, log or spawn refusal.
 
 #![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
 
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
-const MAX_SOCK_PATH: usize = 100;
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
+
+use headless_boot::{POLL_GAP, SOCKET_POLLS};
 
 struct Instance {
     child: Child,
@@ -50,25 +52,9 @@ impl Instance {
     }
 }
 
+/// A scratch world of its own for the launch tagged `tag`.
 fn scratch_root(tag: &str) -> Option<PathBuf> {
-    let name = format!("atht{tag}-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        if tmp.join("run/aterm/aterm.sock").as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
-    }
-    None
-}
-
-fn is_socket(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket())
+    headless_boot::scratch_root(&format!("atht{tag}"))
 }
 
 /// One isolated headless launch, its log at `info`, not yet spawned.
@@ -87,13 +73,24 @@ fn headless(tmp: &Path) -> Command {
 }
 
 /// Boot one headless instance with `state` as its `$ATERM_STATE_HOME` when
-/// given. `None` = an environmental refusal, a SKIP.
+/// given. `None` = an environmental refusal (scratch, log, spawn), a SKIP; an
+/// instance that exits or never listens PANICS (`headless_boot::await_ready`).
 fn boot(tag: &str, state: Option<&str>) -> Option<Instance> {
     let Some(tmp) = scratch_root(tag) else {
         eprintln!("SKIP: no scratch base with a short enough socket path");
         return None;
     };
+    let log = tmp.join("gui.log");
+    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok(pair) => pair,
+        Err(e) => {
+            eprintln!("SKIP: cannot open the instance log ({e})");
+            let _ = std::fs::remove_dir_all(&tmp);
+            return None;
+        }
+    };
     let mut cmd = headless(&tmp);
+    cmd.stdout(out).stderr(err);
     if let Some(state) = state {
         cmd.env("ATERM_STATE_HOME", tmp.join(state));
     }
@@ -106,18 +103,8 @@ fn boot(tag: &str, state: Option<&str>) -> Option<Instance> {
         }
     };
     let mut inst = Instance { child, tmp };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!("SKIP: aterm --headless exited before binding its socket");
-            return None;
-        }
-        if is_socket(&inst.sock()) {
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!("SKIP: control socket never appeared");
-    None
+    let sock = inst.sock();
+    headless_boot::await_ready(&mut inst, |i| &mut i.child, &sock, &log, |_| true).then_some(inst)
 }
 
 /// Where `aterm.log` lands for this instance's `$HOME` with no override —
@@ -225,7 +212,9 @@ fn a_refused_state_root_is_said_not_silent() {
     let mut inst = Instance { child, tmp };
     // The words come first thing in startup; the bound socket is well after.
     for _ in 0..SOCKET_POLLS {
-        if is_socket(&inst.sock()) || !matches!(inst.child.try_wait(), Ok(None)) {
+        if headless_boot::is_socket_or_symlink(&inst.sock())
+            || !matches!(inst.child.try_wait(), Ok(None))
+        {
             break;
         }
         std::thread::sleep(POLL_GAP);

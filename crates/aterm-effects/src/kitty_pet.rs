@@ -944,9 +944,10 @@ const MIN_HERO: f32 = 0.048;
 /// `PetHop` frame at its apex instead of the pounce's stretched hero. A
 /// step down is not a pounce, and the schedule above cannot tell them
 /// apart: it deals by DURATION, and a two-cell hop and a twenty-cell
-/// pounce are both `HOP_DUR`-ish. The bar is unfrozen until the owner sees
-/// it on a real pane (design §6); at 4.0 the reference eight-cell Enter
-/// still wears the pounce schedule.
+/// pounce are both `HOP_DUR`-ish. At 4.0 the reference eight-cell Enter
+/// still wears the pounce schedule. Decided 2026-09-25 under the owner's
+/// standing direction: 4.0 is the shipped bar, frozen; a retune is this one
+/// constant.
 const HOP_TIGHT: f32 = 4.0;
 /// A tucked hop keeps its on-axis stretch under this — and none at all on
 /// the tuck frame itself, because the tuck IS the shape. Under
@@ -3223,8 +3224,9 @@ pub struct PetBrain {
     room_unseen: u64,
     room_overdue: bool,
     /// The turn and inbox detectors have been SEEDED: a fresh brain's first
-    /// note of either is a watermark, not an event (`pet_last_cmd`'s silent
-    /// re-baseline), and this is what tells the first note from the second.
+    /// note of either is a watermark, not an event (the companion owner's
+    /// completion latch re-baselines the same silent way), and this is what
+    /// tells the first note from the second.
     room_turn_seeded: bool,
     room_inbox_seeded: bool,
     /// The one latched room cue and when it was noted (its
@@ -4654,8 +4656,8 @@ impl PetBrain {
     /// ground under every caret intent and retire at [`ROOM_CUE_TTL`].
     pub fn note_room_turn(&mut self, now: Instant, id: u64, settled: bool) {
         // A fresh brain on an old ledger is not an ending: the first note
-        // only seeds the watermark, exactly like `pet_last_cmd`'s silent
-        // re-baseline on a tab switch.
+        // only seeds the watermark, exactly like the companion owner's
+        // completion latch re-baselining silently on a tab switch.
         let seeded = core::mem::replace(&mut self.room_turn_seeded, true);
         if id == self.room_turn || !seeded {
             self.room_turn = id;

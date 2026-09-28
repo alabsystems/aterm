@@ -287,7 +287,7 @@ mod tests {
         let mut source = Terminal::new(24, 80);
         source.process(b"\x1b[>1u\x1b[?1002h\x1b[?1h\x1b[?1004h");
         let cp = source.checkpoint();
-        let fresh = Terminal::from_checkpoint(&cp, super::super::HostBindings::default());
+        let fresh = Terminal::from_checkpoint(&cp);
         assert_in_sync(&fresh, "from_checkpoint");
         assert_eq!(fresh.mode_mirror().mouse_mode(), MouseMode::ButtonEvent);
         assert!(

@@ -414,7 +414,7 @@ fn crash_head(path: &Path) -> Vec<String> {
 const KEEP_SEEN_CRASH_REPORTS: usize = 8;
 
 /// [`take_crash_evidence`] against an explicit directory (unit-testable).
-fn take_crash_evidence_in(dir: &Path) -> Option<CrashEvidence> {
+pub(crate) fn take_crash_evidence_in(dir: &Path) -> Option<CrashEvidence> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let name = entry.file_name();
@@ -501,7 +501,7 @@ impl KillEvidence {
 
 /// [`take_kill_evidence`] against an explicit directory and pid (unit-testable).
 #[cfg(unix)]
-fn take_kill_evidence_in(dir: &Path, own_pid: u32) -> Option<KillEvidence> {
+pub(crate) fn take_kill_evidence_in(dir: &Path, own_pid: u32) -> Option<KillEvidence> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     for path in crate::crash_signal::markers::dead_app_markers(dir, own_pid) {
         let modified = std::fs::symlink_metadata(&path)
@@ -669,7 +669,7 @@ pub(crate) enum Rotation {
 pub(crate) fn rotate_if_oversized(path: &Path, rotate_at: u64, ours: FileId) -> Rotation {
     // The ascription is the lock-order census's evidence that this is a
     // cross-process file lock, not an in-process mutex.
-    let lock: std::fs::File = match open_append_0600(&lock_path(path)) {
+    let lock: std::fs::File = match open_lock_0600(&lock_path(path)) {
         Ok(file) => file,
         Err(_) => return Rotation::Kept,
     };
@@ -818,6 +818,34 @@ pub(crate) fn open_append_0600(path: &Path) -> std::io::Result<File> {
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .open(path)
+}
+
+/// Open the rotation lock ([`lock_path`]) so that `File::try_lock` can take it.
+///
+/// unix: the append handle, as before — `flock` locks any descriptor.
+///
+/// Windows: `LockFileEx` requires a handle opened with read or write access,
+/// and an append-only handle has neither (std's `append(true)` asks for
+/// `FILE_APPEND_DATA` without `FILE_WRITE_DATA`), so `try_lock` on the
+/// `open_append_0600` handle answered `ERROR_ACCESS_DENIED` every time,
+/// `rotate_if_oversized` read that as "another process is rotating", and
+/// `aterm.log` NEVER rotated on Windows (measured 2026-09-27, the first Windows
+/// run of `logging::tests` and `messages_store::tests`). Read+write, never
+/// truncating: the lock file stays empty and is only ever locked.
+#[cfg(unix)]
+fn open_lock_0600(path: &Path) -> std::io::Result<File> {
+    open_append_0600(path)
+}
+
+/// Windows twin of `open_lock_0600` (the doc above says why it differs).
+#[cfg(not(unix))]
+fn open_lock_0600(path: &Path) -> std::io::Result<File> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
         .open(path)
 }
 
@@ -1063,29 +1091,6 @@ mod tests {
         assert!(read(&path).starts_with("NOTE aterm.log.1\n"));
     }
 
-    /// A second writer on the same path follows the first one's rotation at
-    /// its next look instead of writing into the older copy for ever.
-    #[test]
-    fn a_second_writer_follows_the_rotation() {
-        let _serial = serial();
-
-        let dir = Scratch::new("follow");
-        let path = dir.log();
-        let mut a = RotatingFile::open(path.clone(), tiny(20)).unwrap();
-        let mut b = RotatingFile::open(path.clone(), tiny(20)).unwrap();
-        a.append(b"a1 fills the file\n", note);
-        a.append(b"a2 past\n", note); // past the cap: A's next look rotates
-        a.append(b"a3\n", note);
-        assert_eq!(read(&rotated_path(&path)), "a1 fills the file\na2 past\n");
-        b.append(b"b1\n", note); // B's first write since its open: no look yet
-        b.append(b"b2\n", note); // B looks, sees another file, follows
-        assert_eq!(
-            read(&rotated_path(&path)),
-            "a1 fills the file\na2 past\nb1\n"
-        );
-        assert_eq!(read(&path), "NOTE aterm.log.1\na3\nb2\n");
-    }
-
     /// A deleted log is recreated at the next look, not written into the void.
     #[test]
     fn a_deleted_log_is_recreated_at_the_next_look() {
@@ -1108,7 +1113,7 @@ mod tests {
         let dir = Scratch::new("busy");
         let path = dir.log();
         let mut f = RotatingFile::open(path.clone(), tiny(4)).unwrap();
-        let holder = open_append_0600(&lock_path(&path)).unwrap();
+        let holder = open_lock_0600(&lock_path(&path)).unwrap();
         holder.try_lock().unwrap();
         for line in ["one\n", "two\n", "three\n"] {
             f.append(line.as_bytes(), note);

@@ -80,6 +80,13 @@ pub(crate) type SparseBitmapIntoIter = std::vec::IntoIter<u32>;
 #[cfg(test)]
 pub(crate) type SparseBitmapRange = std::vec::IntoIter<u32>;
 
+#[cfg(test)]
+std::thread_local! {
+    /// Full decodes performed ([`SparseBitmap::to_vec`]). Unit tests use it as a
+    /// deterministic work counter; thread-local keeps parallel tests apart.
+    static DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Append `value` to `buf` as an unsigned LEB128 varint (7 data bits per byte,
 /// high bit continues). Push-only, so the Trust L0 gate carries no slice-bounds
 /// obligation.
@@ -107,6 +114,8 @@ impl SparseBitmap {
     /// overflow obligation — gaps sum back to the original ascending ids by
     /// construction.
     pub(crate) fn to_vec(&self) -> Vec<u32> {
+        #[cfg(test)]
+        DECODES.with(|n| n.set(n.get() + 1));
         let mut out = Vec::with_capacity(self.count as usize);
         if self.count == 0 {
             return out;
@@ -200,15 +209,21 @@ impl SparseBitmap {
 
     /// Remove a value. Returns `true` if the value was present.
     ///
-    /// Decode-modify-encode: re-index (the only non-eviction caller) removes
-    /// recently-appended rows, and bulk prefix eviction uses [`drop_below`]
-    /// instead of one-at-a-time front removals.
+    /// Removing the maximum — the re-index of the newest row, the dominant
+    /// caller — truncates the final varint gap in `O(1)`, the mirror of
+    /// `insert`'s append path. Any other value decodes, splices and re-encodes;
+    /// bulk prefix eviction uses [`drop_below`] instead of one-at-a-time front
+    /// removals. Both paths leave the same canonical encoding.
     ///
     /// [`drop_below`]: Self::drop_below
     #[inline]
     pub(crate) fn remove(&mut self, value: u32) -> bool {
         if self.count == 0 || value < self.first || value > self.last {
             return false;
+        }
+        if value == self.last {
+            self.remove_last();
+            return true;
         }
         let mut values = self.to_vec();
         match values.binary_search(&value) {
@@ -219,6 +234,32 @@ impl SparseBitmap {
             }
             Err(_) => false,
         }
+    }
+
+    /// Drop the maximum without decoding: the final varint is the trailing run
+    /// of bytes after the last earlier byte whose continuation bit is clear.
+    /// Spelled over iterators (no indexing), like [`to_vec`](Self::to_vec).
+    fn remove_last(&mut self) {
+        if self.count <= 1 {
+            self.rebuild_from_sorted(&[]);
+            return;
+        }
+        let body_len = self.deltas.len().saturating_sub(1);
+        let start = self
+            .deltas
+            .iter()
+            .take(body_len)
+            .rposition(|&b| b & 0x80 == 0)
+            .map_or(0, |i| i.saturating_add(1));
+        let mut gap = 0u32;
+        let mut shift = 0u32;
+        for byte in self.deltas.iter().skip(start) {
+            gap |= u32::from(byte & 0x7f) << shift;
+            shift = shift.saturating_add(7);
+        }
+        self.deltas.truncate(start);
+        self.last = self.last.wrapping_sub(gap);
+        self.count = self.count.saturating_sub(1);
     }
 
     /// Drop every value strictly below `watermark` in a single front trim.
@@ -620,5 +661,37 @@ mod tests {
         bm.insert(42);
         assert_eq!(bm.deltas.len(), 0);
         assert_eq!(bm.into_iter().collect::<Vec<_>>(), vec![42]);
+    }
+
+    fn decodes() -> usize {
+        DECODES.with(std::cell::Cell::get)
+    }
+
+    /// Removing the maximum truncates the final gap without a decode, and it
+    /// leaves exactly the canonical encoding a rebuild would (checked across
+    /// one-byte and multi-byte final gaps, down to empty).
+    #[test]
+    fn remove_last_is_o1_and_canonical() {
+        let values = [3u32, 4, 200, 70_000, 70_001, 5_000_000];
+        let mut bm = SparseBitmap::new();
+        for &v in &values {
+            bm.insert(v);
+        }
+        for keep in (0..values.len()).rev() {
+            let before = decodes();
+            assert!(bm.remove(values[keep]));
+            assert_eq!(decodes(), before, "tail removal must not decode");
+            let expect = SparseBitmap::from_sorted(&values[..keep]);
+            assert_eq!(bm.deltas, expect.deltas, "canonical deltas at keep={keep}");
+            assert_eq!(bm.len(), keep as u64);
+            if keep > 0 {
+                assert_eq!((bm.first, bm.last), (expect.first, expect.last));
+            }
+            assert_eq!(bm.to_vec(), values[..keep].to_vec());
+        }
+        assert!(bm.is_empty());
+        assert!(!bm.remove(3), "removing from an emptied bitmap is a miss");
+        assert!(bm.insert(9), "an emptied bitmap takes a fresh first value");
+        assert_eq!(bm.to_vec(), vec![9]);
     }
 }

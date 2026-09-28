@@ -102,10 +102,12 @@ pub(crate) fn resolved_terminal_title_rung(
     live_cwd: Option<&str>,
 ) -> Option<String> {
     // A stock prompt's `user@host:` says only where the user already is, and
-    // it says it identically in every tab. Dropped here (never for another
-    // host), an OSC title that carried NOTHING else is now empty and falls
-    // through to the cwd rung below — the rung that actually tells tabs apart.
-    let live_title = crate::tab_label::without_local_identity(live_title);
+    // it says it identically in every tab; ConPTY's program-path title says
+    // only which shell was launched. Dropped here (never for another host, and
+    // never a title a program chose), an OSC title that carried NOTHING else is
+    // now empty and falls through to the cwd rung below — the rung that
+    // actually tells tabs apart.
+    let live_title = crate::tab_label::informative(live_title);
     user_title
         .filter(|title| !title.is_empty())
         .map(str::to_owned)
@@ -227,6 +229,33 @@ mod background_title_tests {
         }
 
         assert_eq!(refreshes, 0, "hidden spinner phases must cost no refresh");
+    }
+
+    /// The strip's title rung never paints ConPTY's program path (audit
+    /// 2026-09-22: a fresh split pane's chip read the full `pwsh.exe` path):
+    /// the path falls through to the cwd rung, `cmd.exe`'s running command
+    /// survives it, and a title a program chose is untouched.
+    #[test]
+    fn a_console_program_path_falls_through_to_the_cwd() {
+        let pwsh = "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\\pwsh.exe";
+        assert_eq!(
+            resolved_terminal_title_rung(None, pwsh, Some("/srv/demo-cwd")).as_deref(),
+            Some("/srv/demo-cwd")
+        );
+        assert_eq!(resolved_terminal_title_rung(None, pwsh, None), None);
+        assert_eq!(
+            resolved_terminal_title_rung(
+                None,
+                "C:\\Windows\\system32\\cmd.exe - ping build-01",
+                Some("/srv/demo-cwd")
+            )
+            .as_deref(),
+            Some("ping build-01")
+        );
+        assert_eq!(
+            resolved_terminal_title_rung(None, "~\\aterm", Some("/srv/demo-cwd")).as_deref(),
+            Some("~\\aterm")
+        );
     }
 
     #[test]
@@ -370,6 +399,13 @@ pub(crate) enum CloseProgress {
     /// it is looking at the second.
     Deferred(WindowId),
 }
+
+/// The wire refusal of a busy PANE close — a pane whose close would hang up its
+/// own foreground job, in a tab that survives it. Its own sentence, not
+/// [`crate::app_window::WIRE_CLOSE_REFUSED`], because that one names the
+/// last-tab confirm and there is no last tab here: the tab stands, the sibling
+/// panes stand, only the aimed pane's job stood in the way.
+pub(crate) const WIRE_PANE_CLOSE_REFUSED: &str = "close refused (a running job in that pane)";
 
 /// One canonical terminal-view occurrence.  `layouts` is deliberately absent:
 /// heterogeneous tabs have no terminal-only projection, so session lifecycle
@@ -581,12 +617,28 @@ impl App {
         window: WindowId,
     ) -> Option<crate::closed_recovery::ClosedView> {
         let tab = self.windows.get(&window)?.tab_set.active()?;
+        self.closed_view_record_for(window, tab.id, tab.focus)
+    }
+
+    /// The reopen record for closing leaf `view` of tab `tab_id` in `window`: what
+    /// Cmd-W keeps for the FOCUSED leaf of the ACTIVE tab, for ANY leaf — the wire
+    /// `close` aims by session at a pane that need not be focused nor in the
+    /// active tab, and a pane it closes must be as reopenable as one Cmd-W closed.
+    /// `None` for a single-leaf tab (that close is a whole-tab record,
+    /// `retain_closed_tab`) and for a leaf the tab does not hold.
+    fn closed_view_record_for(
+        &self,
+        window: WindowId,
+        tab_id: crate::tab_model::TabId,
+        view: crate::tab_model::ViewId,
+    ) -> Option<crate::closed_recovery::ClosedView> {
+        let tab = self.windows.get(&window)?.tab_set.get(tab_id)?;
         if crate::closed_recovery::leaf_close_record_kind(tab.root.len())
             != crate::closed_recovery::LeafCloseRecordKind::ClosedView
         {
             return None;
         }
-        let (parent, branch, axis, ratio) = tab.root.leaf_placement(tab.focus)?;
+        let (parent, branch, axis, ratio) = tab.root.leaf_placement(view)?;
         let parent_path = parent
             .branches()
             .iter()
@@ -610,7 +662,7 @@ impl App {
         Some(crate::closed_recovery::ClosedView {
             original_window: window,
             original_tab: tab.id,
-            view: self.view_restore_descriptor(tab.focus)?,
+            view: self.view_restore_descriptor(view)?,
             placement,
         })
     }
@@ -2441,7 +2493,7 @@ impl App {
         match place {
             crate::connections::ConnectedSpawnPlace::Window => {
                 if self.headless {
-                    return Err("headless".to_string());
+                    return Err("headless: use place=tab".to_string());
                 }
                 Ok((origin_local, None))
             }
@@ -3073,19 +3125,43 @@ impl App {
         }
     }
 
-    /// Close the tab (or the single terminal leaf) showing `session`, reporting
-    /// how far the close got.
+    /// Close the PANE showing `session` — its tab only when that pane was the
+    /// tab's last — reporting how far the close got.
+    ///
+    /// ONE PANE, NOT THE TAB. Measured 2026-09-22 (audit): in a tab split three
+    /// ways, `@<pane> close` answered `OK closed s-…` and the WHOLE tab went —
+    /// `panes` lost the tab (15 → 14), both siblings answered `ERR no such
+    /// session`, and `exits` had three `ctl-close` rows within 4 ms. One close on
+    /// one pane killed three shells: the verb ran the tab strip's ✕
+    /// (`close_tab_at`, every pane as a unit — right when a tab had one pane, and
+    /// never revisited once it could hold three), and because that close never
+    /// exits a window with other tabs, no busy guard stood between it and the
+    /// siblings' jobs. A split pane now takes the Cmd-W collapse
+    /// ([`Self::close_split_pane_by_id`]), which retires that pane alone; the
+    /// whole-tab path is kept for the tab whose ONE pane this is, where the two
+    /// closes are the same close and the last-tab deferral below lives.
+    ///
+    /// THE GUARD IS THE PANE'S. Every close here that leaves its window standing
+    /// — a split collapse, a terminal leaf beside a native view, the one pane of
+    /// a tab that is not the window's last — reads the job of the pane being
+    /// closed ([`Self::pane_close_hangs_up_a_job`]) and nothing else, before
+    /// anything moves. The close that exits the window keeps the window-exit
+    /// confirm inside `close_tab_at`, which reads a window holding exactly this
+    /// pane: the same guard, in the last-tab confirm's words.
     ///
     /// DIFF (like spawn): the store is the evidence — if the session is gone
-    /// afterward the close happened; if it survives, the last-tab confirm
-    /// refused it and we say so. The one case that diff cannot read is a LAST-tab
+    /// afterward the close happened; if it survives, a guard refused it and we
+    /// say so. The one case that diff cannot read is a LAST-tab
     /// close: it is DEFERRED (the window teardown that retires the session needs
     /// an `ActiveEventLoop` the close paths do not hold), so the session is still
     /// registered here through no fault of its own. That is
     /// [`CloseProgress::Deferred`], not a refusal — answer it with
     /// [`Self::close_session_verdict`] after running the escalation, or an idle
     /// session gets `ERR close refused (a running job armed the last-tab
-    /// confirm)` for a close that had simply not happened yet.
+    /// confirm)` for a close that had simply not happened yet. A session that
+    /// survives a pane that DID go is held by another view of it, and the reply
+    /// names that viewer ([`Self::surviving_session_reason`]) rather than a
+    /// refusal nothing raised.
     pub(crate) fn close_session_by_id(&mut self, session: u64) -> Result<CloseProgress, String> {
         let found = self.windows.keys().find_map(|wid| {
             self.terminal_view_location(*wid, session)
@@ -3094,23 +3170,201 @@ impl App {
         let Some((wid, location)) = found else {
             return Err("no such session".to_string());
         };
+        let split = location.terminal_only && self.tab_has_sibling_panes(wid, location.tab_id);
+        let exits_window = location.terminal_only
+            && !split
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.tab_set.len() <= 1);
+        if !exits_window && !self.pane_close_allowed(self.pane_close_hangs_up_a_job(session)) {
+            return Err(WIRE_PANE_CLOSE_REFUSED.to_string());
+        }
         let mut deferred = None;
-        if location.terminal_only {
-            if self.close_tab_at(wid, location.canonical_index)
-                && let Some(ws) = self.windows.get_mut(&wid)
-            {
-                ws.pending_close = true; // last tab → the window closes with it
-                deferred = Some(wid);
+        if !location.terminal_only {
+            if !self.close_heterogeneous_terminal_view(wid, location) {
+                return Err("session view changed during close".to_string());
             }
-        } else if !self.close_heterogeneous_terminal_view(wid, location) {
-            return Err("session view changed during close".to_string());
+        } else if split {
+            self.close_split_pane_by_id(wid, location, session)?;
+        } else if self.close_tab_at(wid, location.canonical_index)
+            && let Some(ws) = self.windows.get_mut(&wid)
+        {
+            // The tab's one pane: closing it IS closing the tab.
+            ws.pending_close = true; // last tab → the window closes with it
+            deferred = Some(wid);
         }
         if !self.session_registered(session) {
             Ok(CloseProgress::Retired)
         } else if let Some(wid) = deferred {
             Ok(CloseProgress::Deferred(wid))
+        } else if self.view_store.get(location.view).is_none() {
+            // The pane's view was retired, and its session with it only if this
+            // was the last view: another viewer keeps it (one close per viewer).
+            Err(self.surviving_session_reason(wid, session))
         } else {
-            Err("close refused (a running job armed the last-tab confirm)".to_string())
+            Err(crate::app_window::WIRE_CLOSE_REFUSED.to_string())
+        }
+    }
+
+    /// Whether tab `tab_id` of window `wid` holds more than one leaf — read from
+    /// the canonical tree, the fact that makes a pane close a collapse (Cmd-W's)
+    /// rather than the tab's close (the strip ✕'s).
+    fn tab_has_sibling_panes(&self, wid: WindowId, tab_id: crate::tab_model::TabId) -> bool {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.get(tab_id))
+            .is_some_and(|tab| tab.root.len() > 1)
+    }
+
+    /// The wire `close` of one pane of a SPLIT terminal tab: the Cmd-W collapse
+    /// ([`Self::close_active_tab`]) aimed by session instead of by focus, so the
+    /// pane need not be focused nor its tab active. It shares the gesture's code
+    /// path — [`pane::PaneTree::close_pane`], then [`Self::apply_close_outcome`]
+    /// (the sibling grows into the space with its shell untouched; the view, the
+    /// pool and the registry retire in that order) — and its reopen record, so a
+    /// pane the wire closed collapses, tears down and comes back exactly as one
+    /// Cmd-W closed. The tab survives by construction (a sibling remains), so
+    /// nothing here can exit the window; the busy guard is the PANE's own and
+    /// ran in the caller before this. `Ok(())` = the pane collapsed; whether its
+    /// session then left the registry is the caller's diff. `Err` = it did not,
+    /// and why.
+    fn close_split_pane_by_id(
+        &mut self,
+        wid: WindowId,
+        location: TerminalViewLocation,
+        session: u64,
+    ) -> Result<(), String> {
+        if self.defer_pending_update_handoff_teardown(crate::DeferredHandoffTeardown::mutation(
+            crate::DeferredHandoffMutation::CloseView {
+                window: wid,
+                tab: location.tab_id,
+                view: location.view,
+            },
+        )) {
+            // QUEUED onto the pending handoff's teardown and applied once that
+            // cancellation lands; the pane is still here right now, so the reply
+            // must not read as "closed" (`close_tab_at` says the same of a tab).
+            return Err(
+                "close deferred (a pending update handoff is being cancelled first)".to_string(),
+            );
+        }
+        let Some(tab) = self.windows.get(&wid).and_then(|ws| {
+            terminal_projection_index(&ws.tab_set, &self.view_store, location.tab_id)
+        }) else {
+            return Err("session view changed during close".to_string());
+        };
+        let recovery = self.closed_view_record_for(wid, location.tab_id, location.view);
+        // `close_pane` falls back to the FOCUSED pane when the session it is handed
+        // is not in the tree. Aimed by session, a projection that has lost this
+        // session must close nothing, never whichever pane happens to have focus.
+        let outcome = self.windows.get_mut(&wid).and_then(|ws| {
+            let tree = ws.layouts.get_mut(tab)?;
+            tree.contains(session).then(|| tree.close_pane(session))
+        });
+        // A `LastPane` here would mean the projection lost its siblings between
+        // the canonical check and this collapse; `close_pane` mutates nothing on
+        // that path, so nothing happened and the reply says so.
+        let Some(outcome @ pane::CloseOutcome::Collapsed { .. }) = outcome else {
+            return Err("session view changed during close".to_string());
+        };
+        // `Collapsed` never closes the window: the bool is the `LastPane` arm's.
+        let _ = self.apply_close_outcome(wid, tab, outcome);
+        // The arm REFUSES the retirement when the closed leaf survived the
+        // re-projection (the ownership-order seam it documents): the pane, its
+        // view and its PTY are all still here, so say so rather than leave the
+        // caller's diff to blame a co-viewer. It is the same `ViewId` the close
+        // aimed at — a Cmd-Shift-O twin of the session is a different view.
+        if self.view_store.get(location.view).is_some() {
+            return Err("close refused (the pane is still open)".to_string());
+        }
+        if let Some(recovery) = recovery {
+            self.retain_closed_view(recovery);
+        }
+        Ok(())
+    }
+
+    /// Whether closing the pane showing `session` would hang up a foreground JOB:
+    /// the session is busy by the one predicate every close path reads
+    /// (`session_foreground_busy`: the PTY's foreground pgrp, or the shell's open
+    /// 133;C block) AND this pane holds its last pool view, so the collapse drops
+    /// the `Session` and its PTY master with it. A Cmd-Shift-O co-viewed session
+    /// keeps running in its other viewer — closing this pane only detaches a
+    /// view — so it never counts, exactly as `window_has_foreground_job` counts
+    /// only the sessions a window close would actually SIGHUP.
+    fn pane_close_hangs_up_a_job(&self, session: u64) -> bool {
+        self.pool.views(session).is_some_and(|views| views <= 1)
+            && self.session_foreground_busy(session)
+    }
+
+    /// [`Self::pane_close_hangs_up_a_job`] for every pane of window `wid`'s tab
+    /// `i` at once — the whole-tab close `tab close` makes. Read from the
+    /// canonical tree, so a terminal leaf beside a native view counts as well.
+    /// A session is at risk when this tab holds ALL its pool views (a twin in
+    /// another tab or window keeps it alive), the rule `window_has_foreground_job`
+    /// applies to a window. An index no tab holds hangs up nothing.
+    fn tab_close_hangs_up_a_job(&self, wid: WindowId, i: usize) -> bool {
+        let Some(tab) = self.windows.get(&wid).and_then(|ws| ws.tab_set.tab_at(i)) else {
+            return false;
+        };
+        let sessions: Vec<u64> = tab
+            .root
+            .leaves()
+            .into_iter()
+            .filter_map(|view| {
+                self.view_store
+                    .get(view)
+                    .copied()
+                    .and_then(crate::tab_model::View::terminal_session)
+            })
+            .collect();
+        sessions.iter().any(|&session| {
+            let here = sessions.iter().filter(|&&s| s == session).count() as u32;
+            self.pool.views(session).is_some_and(|views| views <= here)
+                && self.session_foreground_busy(session)
+        })
+    }
+
+    /// Quit-safety for a PANE close that leaves its window standing: a split
+    /// collapse, a terminal leaf beside a native view, or the one pane of a tab
+    /// that is not the window's last. No UI
+    /// gesture confirms such a close (`close_active_tab`'s `exits_window = false`
+    /// short-circuit: a human is watching), a `--headless` instance never
+    /// confirms anything, and `Programmatic` (the operator's typed Stop) is an
+    /// explicit instruction, busy or not. The wire `close` is the one policy that
+    /// REFUSES instead of asking (`WireRefuseBusy`, `confirm_destructive_close`),
+    /// and it used to reach a pane only through the whole-tab close, whose guard
+    /// read the WINDOW — every pane's job, or none at all when the tab was not
+    /// the last. With the pane close its own gesture the guard is the pane's:
+    /// `busy` is [`Self::pane_close_hangs_up_a_job`] of the pane being closed,
+    /// never a sibling's job, which the collapse leaves running.
+    fn pane_close_allowed(&self, busy: bool) -> bool {
+        if self.headless {
+            return true;
+        }
+        !(busy && self.close_confirm == crate::app_window::CloseConfirm::WireRefuseBusy)
+    }
+
+    /// Why a close that DID retire its pane in window `wid` left `session`
+    /// registered: another pool view still holds it (one close per viewer).
+    /// Another WINDOW is worded as the last-tab path words it
+    /// ([`Self::deferred_close_reason`]), so a driver matching on the reply
+    /// meets one spelling of that fact. A view in the SAME window is the one
+    /// the wire cannot otherwise tell apart — a Cmd-Shift-O share moved back
+    /// with Cmd-Shift-M leaves two tabs of one window on one session — and "another
+    /// window" would send the caller looking for a window that is not there.
+    /// The last arm is that path's last arm for a pane: registered, shown nowhere.
+    fn surviving_session_reason(&self, wid: WindowId, session: u64) -> String {
+        if self
+            .windows
+            .keys()
+            .any(|other| *other != wid && self.window_contains_session(*other, session))
+        {
+            "close deferred (another window still displays this session)".to_string()
+        } else if self.window_contains_session(wid, session) {
+            "close deferred (another tab still displays this session)".to_string()
+        } else {
+            "close deferred (the session outlived its pane)".to_string()
         }
     }
 
@@ -3442,7 +3696,7 @@ impl App {
         let Some(count) = self.windows.get(&wid).map(|ws| ws.tab_set.len()) else {
             return Ok((0, 0));
         };
-        let no_such = |i: usize| format!("no tab at index {i}: this window has {count}");
+        let no_such = |i: usize| crate::control::no_such_tab(i, count);
         // A refusal raised anywhere beneath this action lands in the same channel
         // the menu `invoke` seam uses; clear it first so an EARLIER action's
         // refusal is never reported against this one.
@@ -3496,9 +3750,19 @@ impl App {
     /// the window's LAST tab it flags THAT window's `pending_close` so the `Wake`
     /// handler's `escalate_pending_close(el)` tears the window down (the verb /
     /// button paths have no `ActiveEventLoop`), exactly like a tab-strip close.
+    ///
+    /// A tab that is NOT the window's last gets the `close` verb's pane guard
+    /// first ([`Self::pane_close_allowed`] over [`Self::tab_close_hangs_up_a_job`]):
+    /// `close_tab_at` guards only the close that exits the window, so on a busy
+    /// non-last tab `tab close N` answered `OK` and hung up the job that `close`
+    /// of the same pane refuses (review of the 2026-09-22 guard). Refused, it
+    /// answers [`crate::app_window::WIRE_TAB_CLOSE_REFUSED`] and nothing moves.
     pub(crate) fn close_tab_via_verb(&mut self, wid: WindowId, which: Option<usize>) {
-        // Exit-ledger attribution: a control-socket `tab close` (the wake carries
-        // no caller, so `by=-`); the native ✕'s `Wake::CloseTab` takes `close_tab_at`.
+        // Exit-ledger attribution: a control-socket `tab close`. The wire bracket
+        // (`App::tab_cmd_bracketed`) has already opened the scope with the
+        // caller, and the outermost scope wins, so this `by=-` stands only for a
+        // caller that brought none; the native ✕'s `Wake::CloseTab` takes
+        // `close_tab_at`.
         let _closing = session_store::CloseAttribution::enter(
             session_store::ExitReason::CtlClose,
             session_store::ExitActor::Unknown,
@@ -3511,6 +3775,15 @@ impl App {
                 .and_then(|ws| ws.tab_set.active_index())
                 .unwrap_or(0),
         };
+        let exits_window = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.tab_set.len() <= 1);
+        if !exits_window && !self.pane_close_allowed(self.tab_close_hangs_up_a_job(wid, i)) {
+            self.pending_action_refusal =
+                Some(crate::app_window::WIRE_TAB_CLOSE_REFUSED.to_string());
+            return;
+        }
         if self.close_tab_at(wid, i)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
@@ -7081,6 +7354,7 @@ mod mixed_tab_tests {
                     attention: None,
                     questions: None,
                     identity: None,
+                    agent: None,
                 },
             )),
             focused_path: Vec::new(),
@@ -7328,28 +7602,21 @@ mod session_chrome_app_tests {
     use crate::menu::MenuAction;
     use crate::session_chrome::TabMenuEntry;
 
-    /// The composed chrome reflects live session facts (registry state +
-    /// `spawned` timeline event exist for every registered session), the menu
-    /// carries the pinned actions with honest enabled bits (a stub has no cwd
-    /// ⇒ `Copy CWD` greys), and the composed tooltip is FED THROUGH the tab's
-    /// presentation — terminal tabs stop being the tooltip-less kind.
+    /// The composed chrome reflects live session facts, the menu carries the
+    /// pinned actions with honest enabled bits (a stub has no cwd ⇒ `Copy CWD`
+    /// greys), a bare live session composes no tooltip (its `alive` state and
+    /// `spawned` event are no news), and one fact beyond the label composes a
+    /// tooltip that is FED THROUGH the tab's presentation.
     #[test]
     fn composed_chrome_reaches_presentation_and_menu_actions_are_honest() {
         let mut app = App::headless_for_test();
         let titles = app.tab_titles(WindowId(0));
         let ext = app.tab_chrome_ext(WindowId(0), &titles);
         assert_eq!(ext.len(), 1);
-        let tooltip = ext[0]
-            .tooltip
-            .as_deref()
-            .expect("a registered session always has state + a spawned event, so chrome composes");
-        assert!(
-            tooltip.contains("state: ") && tooltip.contains("spawned · "),
-            "tooltip carries registry state + the spawn event: {tooltip:?}"
-        );
-        assert!(
-            tooltip.starts_with(&titles[0]),
-            "tooltip opens with the exact chip label"
+        assert_eq!(
+            ext[0].tooltip, None,
+            "a bare live session says nothing its chip does not: `alive` and a spawn \
+             event are no tooltip"
         );
         // Fed through the presentation (the cross-platform tooltip slot).
         assert_eq!(
@@ -7370,6 +7637,30 @@ mod session_chrome_app_tests {
         assert_eq!(action(MenuAction::CopySessionId), Some(true));
         assert_eq!(action(MenuAction::CopyCwd), Some(false), "stub has no cwd");
         assert_eq!(action(MenuAction::CloseTab), Some(true));
+        // A description is a fact the chip does not carry: it composes, and
+        // the tooltip reaches the presentation opening with the chip label.
+        {
+            let ctx = &app.pool.get(0).expect("session 0").ctx;
+            ctx.meta
+                .lock()
+                .unwrap()
+                .set("description", Some("purpose text".into()));
+            ctx.timeline.lock().unwrap().record(
+                "meta-change",
+                "field=description value=purpose%20text".into(),
+            );
+        }
+        app.refresh_window_tabs(WindowId(0));
+        let label = app.tab_titles(WindowId(0)).remove(0);
+        let tip = app.windows[&WindowId(0)].tab_set.tabs()[0]
+            .presentation
+            .tooltip
+            .clone()
+            .expect("a description composes a tooltip");
+        assert!(
+            tip.starts_with(&label) && tip.contains("description: purpose text"),
+            "{tip:?}"
+        );
     }
 
     /// The epoch cache honours its contract: an input mutated WITHOUT a
@@ -7418,8 +7709,8 @@ mod session_chrome_app_tests {
         let fresh = app.tab_chrome_ext(WindowId(0), &titles);
         let tip = fresh[0].tooltip.as_deref().unwrap();
         assert!(
-            tip.contains("purpose text") && tip.contains("meta-change · just now"),
-            "recomposed with the new description + event: {tip:?}"
+            tip.contains("purpose text") && !tip.contains("meta-change"),
+            "recomposed with the new description, and no raw event kinds: {tip:?}"
         );
     }
 
@@ -8311,15 +8602,33 @@ mod tab_context_menu_tests {
     }
 }
 
-/// Whether the operator agent CLI (`claude`) is launchable from a fresh shell:
-/// a file by that name in some `PATH` entry. A handful of stat calls — cheap
-/// enough to run per glance refresh, and deliberately uncached so an install
-/// or uninstall mid-run is noticed on the next refresh.
+/// Whether the operator agent CLI (`claude`) is launchable from a new tab: a
+/// file by that name on the PATH that tab's shell starts from — this process's
+/// PATH (launchd's four dirs, for a Finder or Dock launch) plus aterm's managed
+/// `agents/` and `bin/` and the places a foreign `claude` measurably lives
+/// ([`crate::spawn::fallback_child_path`]). Reading the process PATH alone
+/// greyed Start out on every Finder launch with `claude` installed. A handful
+/// of stat calls — cheap enough to run per glance refresh, and uncached so an
+/// install or uninstall mid-run is noticed on the next refresh; only the
+/// managed layout is resolved once.
 fn operator_cli_on_path() -> bool {
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path)
-            .any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
-    })
+    static MANAGED: std::sync::OnceLock<Option<(String, String)>> = std::sync::OnceLock::new();
+    let managed = MANAGED.get_or_init(|| {
+        let layout = atpkg::store::resolve_configured()?;
+        Some((
+            layout.agents_dir().to_str()?.to_owned(),
+            layout.bin_dir().to_str()?.to_owned(),
+        ))
+    });
+    let path = crate::spawn::fallback_child_path(
+        std::env::var("PATH").ok().as_deref(),
+        aterm_types::dirs::home_dir().as_deref(),
+        managed
+            .as_ref()
+            .map(|(agents, bin)| (agents.as_str(), bin.as_str())),
+    );
+    std::env::split_paths(&path)
+        .any(|dir| !dir.as_os_str().is_empty() && dir.join("claude").is_file())
 }
 
 #[cfg(test)]
@@ -8351,7 +8660,7 @@ mod connected_spawn_tests {
 
     /// The §6 precheck contract: `place=window` under headless is the NEW
     /// `ERR headless` refusal (checked BEFORE any create — the wire wrapper
-    /// formats this exact `Err` body as `ERR headless`); `place=tab` stays
+    /// formats this exact `Err` body as `ERR headless: use place=tab`); `place=tab` stays
     /// headless-legal and resolves the window hosting the origin; an unknown
     /// or Exited `of=` fails closed.
     #[test]
@@ -8360,7 +8669,7 @@ mod connected_spawn_tests {
         let sid0 = session0_sid(&app);
         assert_eq!(
             app.connected_spawn_precheck(ConnectedSpawnPlace::Window, &sid0),
-            Err("headless".to_string()),
+            Err("headless: use place=tab".to_string()),
             "place=window under headless refuses BEFORE any create (design §1.4#7)"
         );
         assert_eq!(
@@ -8461,6 +8770,422 @@ mod exit_attribution_tests {
             .last()
             .expect("one exit record after the close");
         (rec.reason, rec.actor.as_wire().to_string())
+    }
+
+    /// How many sessions a close retired: the `Exited` journal rows.
+    fn exit_rows(app: &App) -> usize {
+        let g = app.store.read().unwrap_or_else(|p| p.into_inner());
+        g.roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .count()
+    }
+
+    /// `close_session_by_id` the way the `Wake::CloseSession` arm runs it: under
+    /// its attribution scope (dropped at the end of that turn) and its wire
+    /// policy, which the arm restores to `Interactive` after the escalation.
+    fn ctl_close(app: &mut App, session: u64) -> Result<CloseProgress, String> {
+        let _closing = session_store::CloseAttribution::enter(
+            ExitReason::CtlClose,
+            session_store::ExitActor::Unknown,
+        );
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        let progress = app.close_session_by_id(session);
+        app.close_confirm = CloseConfirm::Interactive;
+        progress
+    }
+
+    /// The `Start-Sleep 60` shape (`wire_tab_close_guard_tests` stages the same
+    /// bytes): a command the shell reports running — OSC 133;C opened, no 133;D
+    /// — with no child process, so on a stub session (`master`/`pid` = -1) only
+    /// the block state can arm the guard.
+    fn start_in_shell_job(app: &App, session: u64) {
+        feed(
+            app,
+            session,
+            b"\x1b]133;A\x07PS> \x1b]133;B\x07Start-Sleep 60\n\x1b]133;C\x07",
+        );
+    }
+
+    fn finish_job(app: &App, session: u64) {
+        feed(app, session, b"\x1b]133;D;0\x07");
+    }
+
+    fn feed(app: &App, session: u64, bytes: &[u8]) {
+        let term = app.pool.get(session).expect("live session").term.clone();
+        term.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .process(bytes);
+    }
+
+    /// **ONE PANE, NOT THE TAB.** Measured 2026-09-22 (audit): `@<pane> close` on
+    /// one pane of a three-pane tab answered `OK closed s-…` and the whole tab
+    /// went — `panes` lost the tab, both siblings answered `ERR no such session`,
+    /// `exits` had three `ctl-close` rows within 4 ms. The verb now runs the Cmd-W
+    /// collapse: the aimed pane retires, its siblings keep their sessions, their
+    /// PTYs and their tab, and the ledger has exactly one row, the wire's.
+    #[test]
+    fn a_ctl_close_on_one_pane_of_a_split_retires_only_that_pane() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid);
+        let b = app.split_active_stub_tab_dir(wid, pane::SplitDir::Horizontal);
+        assert_eq!(app.windows[&wid].layouts[0].sessions(), vec![0, a, b]);
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            1,
+            "one tab, split three ways"
+        );
+
+        let progress = ctl_close(&mut app, a).expect("the close proceeds");
+        assert_eq!(
+            progress,
+            CloseProgress::Retired,
+            "a pane close retires inside the call: the tab stands, nothing defers"
+        );
+        assert_eq!(app.close_session_verdict(a, progress), Ok(()));
+
+        assert_eq!(app.windows[&wid].tab_set.len(), 1, "the tab is still there");
+        assert!(
+            !app.windows[&wid].pending_close,
+            "…and its window is not closing"
+        );
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0, b],
+            "the aimed pane went; both siblings stayed"
+        );
+        assert!(
+            !app.session_registered(a),
+            "the aimed session left the registry"
+        );
+        assert!(
+            app.session_registered(0) && app.session_registered(b),
+            "the siblings' sessions still answer"
+        );
+        assert!(
+            app.pool.get(0).is_some() && app.pool.get(b).is_some(),
+            "…with their PTYs: nothing else was hung up"
+        );
+        assert_eq!(exit_rows(&app), 1, "one close, ONE exit row — not three");
+        let (reason, _by) = sole_exit(&app);
+        assert_eq!(reason, ExitReason::CtlClose);
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// The aim is the SESSION, not the focus: a pane that is neither focused nor
+    /// in the active tab closes in place — its tab's projection is found by
+    /// stable id, as the EOF path finds it — the keyboard stays on the pane it
+    /// had, and the active tab does not move.
+    #[test]
+    fn a_ctl_close_aims_at_the_pane_not_at_the_focus_or_the_active_tab() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid); // tab 0: [0 | a], focus on a
+        assert_eq!(app.windows[&wid].layouts[0].focus(), a);
+        let c = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(c)); // tab 1: [c], now active
+        assert_eq!(app.windows[&wid].tab_set.active_index(), Some(1));
+
+        let progress = ctl_close(&mut app, 0).expect("the close proceeds");
+        assert_eq!(progress, CloseProgress::Retired);
+
+        assert_eq!(
+            app.windows[&wid].tab_set.len(),
+            2,
+            "the background tab survives its collapse"
+        );
+        assert_eq!(app.windows[&wid].layouts[0].sessions(), vec![a]);
+        assert_eq!(
+            app.windows[&wid].layouts[0].focus(),
+            a,
+            "focus stays on the survivor it already had"
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.active_index(),
+            Some(1),
+            "the active tab did not move"
+        );
+        assert!(!app.session_registered(0));
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// THE GUARD IS THE PANE'S. A `close` on a split pane running a job is
+    /// refused on the wire, in a sentence that names the pane and not a last-tab
+    /// confirm the tab never armed; the pane, its session and its sibling stay.
+    /// A SIBLING's job never refuses a close: the collapse leaves it running, so
+    /// the idle pane beside it closes. Once that pane is alone in the window's
+    /// last tab the same job is the last-tab confirm's — `close`'s other
+    /// sentence — and the close proceeds (defers, being a last tab) the moment
+    /// the job finishes. WINDOWED (`headless = false`): the headless
+    /// short-circuit never confirms and would keep a dead guard green.
+    #[test]
+    fn a_ctl_close_of_a_busy_pane_is_refused_and_a_busy_sibling_never_refuses_one() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid); // [0 | a]
+        start_in_shell_job(&app, a);
+        assert!(app.pane_close_hangs_up_a_job(a));
+        assert!(
+            !app.pane_close_hangs_up_a_job(0),
+            "the idle sibling is idle"
+        );
+
+        assert_eq!(
+            ctl_close(&mut app, a),
+            Err(WIRE_PANE_CLOSE_REFUSED.to_string()),
+            "the busy pane is refused in the pane's words"
+        );
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0, a],
+            "nothing collapsed"
+        );
+        assert!(
+            app.session_registered(a) && app.pool.get(a).is_some(),
+            "the busy session was not retired"
+        );
+        assert_eq!(exit_rows(&app), 0);
+
+        assert_eq!(
+            ctl_close(&mut app, 0),
+            Ok(CloseProgress::Retired),
+            "the idle pane closes although its neighbour is busy"
+        );
+        assert_eq!(app.windows[&wid].layouts[0].sessions(), vec![a]);
+
+        // `a` is now the last tab's only pane: the same job, the last-tab confirm.
+        assert_eq!(
+            ctl_close(&mut app, a),
+            Err(crate::app_window::WIRE_CLOSE_REFUSED.to_string()),
+            "alone in the last tab, the refusal is the last-tab confirm's"
+        );
+        finish_job(&app, a);
+        assert!(!app.pane_close_hangs_up_a_job(a));
+        assert_eq!(
+            ctl_close(&mut app, a),
+            Ok(CloseProgress::Deferred(wid)),
+            "idle again, the last-tab close defers as it always did"
+        );
+        assert!(app.windows[&wid].pending_close);
+    }
+
+    /// The pane guard covers the one pane of a tab that is NOT the window's
+    /// last: that close is the tab's, it never exits the window, so the
+    /// window-exit confirm inside `close_tab_at` never reads it — and before the
+    /// pane guard nothing did, so a busy background tab's job was hung up with
+    /// `OK closed`. Refused in the pane's words, nothing moves; the same close
+    /// retires the tab once the job is done.
+    #[test]
+    fn a_ctl_close_of_a_busy_tab_that_is_not_the_last_is_refused() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        let c = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(c));
+        start_in_shell_job(&app, c);
+
+        assert_eq!(
+            ctl_close(&mut app, c),
+            Err(WIRE_PANE_CLOSE_REFUSED.to_string())
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), 2, "both tabs stand");
+        assert!(app.pool.get(c).is_some(), "the job's PTY was not hung up");
+        assert_eq!(exit_rows(&app), 0);
+
+        finish_job(&app, c);
+        assert_eq!(ctl_close(&mut app, c), Ok(CloseProgress::Retired));
+        assert_eq!(app.windows[&wid].tab_set.len(), 1);
+        assert!(!app.windows[&wid].pending_close);
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// A terminal leaf beside a native view is a pane too: its close leaves the
+    /// tab (and so the window) standing, and the pane's own job refuses it.
+    #[test]
+    fn a_ctl_close_of_a_busy_terminal_leaf_in_a_mixed_tab_is_refused() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::About));
+        let (_instance, native_view) = app.active_native_view(wid).unwrap();
+        let (session, terminal_view) =
+            app.split_active_with_stub_terminal(wid, crate::tab_model::SplitAxis::Horizontal);
+        let tab_id = app.windows[&wid].tab_set.active_id().unwrap();
+        start_in_shell_job(&app, session);
+
+        assert_eq!(
+            ctl_close(&mut app, session),
+            Err(WIRE_PANE_CLOSE_REFUSED.to_string())
+        );
+        assert_eq!(
+            app.windows[&wid].tab_set.get(tab_id).unwrap().root.leaves(),
+            vec![native_view, terminal_view],
+            "nothing collapsed"
+        );
+        assert!(app.pool.get(session).is_some());
+
+        finish_job(&app, session);
+        assert_eq!(ctl_close(&mut app, session), Ok(CloseProgress::Retired));
+        assert_eq!(
+            app.windows[&wid].tab_set.get(tab_id).unwrap().root.leaves(),
+            vec![native_view]
+        );
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// The pane guard's policy matrix, beside `confirm_destructive_close`'s: only
+    /// the wire policy refuses, and only a busy pane. Cmd-W (`Interactive`) never
+    /// confirms a collapse — a human is watching — the operator's typed Stop
+    /// (`Programmatic`) is an instruction, and a `--headless` instance never
+    /// confirms anything (the catalog's promise for the last-tab guard, kept for
+    /// the pane's).
+    #[test]
+    fn the_pane_guard_refuses_only_under_the_wire_policy() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        assert!(app.pane_close_allowed(false), "an idle pane closes at once");
+        assert!(
+            !app.pane_close_allowed(true),
+            "a busy pane is refused, never asked"
+        );
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(app.pane_close_allowed(true), "Stop is an instruction");
+        app.close_confirm = CloseConfirm::Interactive;
+        assert!(
+            app.pane_close_allowed(true),
+            "Cmd-W never confirms a collapse"
+        );
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        app.headless = true;
+        assert!(app.pane_close_allowed(true), "headless never confirms");
+    }
+
+    /// A Cmd-Shift-O co-viewed pane: its collapse detaches THIS window's view,
+    /// the other window's keeps the session registered, and the reply names that
+    /// viewer in the last-tab path's own words — one close per viewer. Such a
+    /// pane is never busy either: the collapse hangs nothing up, its job runs on
+    /// in the other viewer.
+    #[test]
+    fn a_ctl_close_of_a_co_viewed_pane_collapses_it_and_names_the_other_viewer() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid); // focus on a
+        let second = app
+            .open_active_session_in_new_window_logical()
+            .expect("Cmd-Shift-O opens a second viewer");
+        assert!(app.window_contains_session(second, a));
+        start_in_shell_job(&app, a);
+        assert!(
+            !app.pane_close_hangs_up_a_job(a),
+            "a job with another viewer is not this pane's to hang up"
+        );
+
+        assert_eq!(
+            ctl_close(&mut app, a),
+            Err("close deferred (another window still displays this session)".to_string())
+        );
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0],
+            "the pane collapsed here"
+        );
+        assert!(
+            app.session_registered(a),
+            "…and the co-viewer keeps the session"
+        );
+        assert!(app.window_contains_session(second, a));
+        assert_eq!(
+            exit_rows(&app),
+            0,
+            "nothing exited: a view was detached, not a shell"
+        );
+    }
+
+    /// The same fact for a co-viewed tab that is not its window's last: the
+    /// tab went, the other window's view keeps the session, and the reply says
+    /// so. It used to blame a last-tab confirm that never fired — `close
+    /// refused (a running job armed the last-tab confirm)` over an idle tab
+    /// that had in fact closed.
+    #[test]
+    fn a_ctl_close_of_a_co_viewed_tab_names_the_other_viewer_not_a_refusal() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let c = app.next_session_id;
+        app.push_stub_tab(wid, crate::stub_session(c)); // tab 1: [c], active
+        let second = app
+            .open_active_session_in_new_window_logical()
+            .expect("Cmd-Shift-O opens a second viewer");
+        assert!(app.window_contains_session(second, c));
+
+        let result = ctl_close(&mut app, c);
+        assert_eq!(
+            result,
+            Err("close deferred (another window still displays this session)".to_string())
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), 1, "the tab went here");
+        assert!(app.window_contains_session(second, c));
+        assert!(app.session_registered(c));
+    }
+
+    /// Two tabs of ONE window can show one session (a Cmd-Shift-O share moved
+    /// back with Cmd-Shift-M). Closing the pane in one leaves the session in the
+    /// other, and the reply names a tab, not "another window" that is not there.
+    #[test]
+    fn a_ctl_close_of_a_pane_twinned_in_the_same_window_names_the_other_tab() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid); // tab 0: [0 | a], focus on a
+        let shared = app
+            .open_active_session_in_new_window_logical()
+            .expect("Cmd-Shift-O shares a");
+        assert!(app.window_contains_session(shared, a));
+        let _ = app.migrate_active_tab_to_next_window();
+        assert_eq!(app.windows.len(), 1, "the share window emptied and closed");
+        assert_eq!(app.windows[&wid].tab_set.len(), 2, "tab 1 is a's twin");
+
+        assert_eq!(
+            ctl_close(&mut app, a),
+            Err("close deferred (another tab still displays this session)".to_string())
+        );
+        assert_eq!(
+            app.windows[&wid].layouts[0].sessions(),
+            vec![0],
+            "the split pane collapsed"
+        );
+        assert!(
+            app.window_contains_session(wid, a),
+            "its twin still shows it"
+        );
+        assert!(app.session_registered(a));
+        assert!(app.structural_invariants_ok());
+    }
+
+    /// A pane the wire closed is as reopenable as one Cmd-W closed: the collapse
+    /// keeps the same closed-view record (`closed_view_record_for`, the FOCUSED
+    /// leaf's record generalised to the aimed one) — for a pane that was not
+    /// even focused.
+    #[test]
+    fn a_ctl_closed_pane_leaves_the_reopen_record_cmd_w_leaves() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let a = app.split_active_stub_tab(wid);
+        app.focus_pane(pane::FocusDir::Left);
+        assert_eq!(
+            app.windows[&wid].layouts[0].focus(),
+            0,
+            "the aim is unfocused"
+        );
+        assert!(!app.can_reopen_closed_view(), "nothing closed yet");
+
+        assert_eq!(ctl_close(&mut app, a), Ok(CloseProgress::Retired));
+
+        assert!(
+            app.can_reopen_closed_view(),
+            "the unfocused pane's record was kept"
+        );
     }
 
     /// A ctl `tab close` of a SINGLE-tab window defers the window teardown

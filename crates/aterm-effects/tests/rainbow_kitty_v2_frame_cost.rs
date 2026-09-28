@@ -835,7 +835,7 @@ struct Host {
     geom: Geom,
     quads: Vec<GlowQuad>,
     last_fp: u64,
-    /// THE CONTENT WITNESS's row, as LOCK A hands it over (2026-09-13): one
+    /// THE CONTENT WITNESS's row, as the frame hold hands it over (2026-09-13): one
     /// resident per-column sample the host captures under its terminal lock
     /// and feeds before the tick. Every column carries a glyph, which is the
     /// witness's WORST case — every ribbon cell arms a record and every
@@ -908,7 +908,7 @@ impl Driver for Host {
     }
 
     fn tick(&mut self, now: Instant, caret: (u16, u16)) -> Wrote {
-        // LOCK A's witness feed, in LOCK A's order: the caret row rides the
+        // the frame hold's witness feed, in its order: the caret row rides the
         // probe the host already holds, then the rows the resident ribbon
         // names are read beside it. The engine consumes them inside the tick
         // below and takes the count to zero.

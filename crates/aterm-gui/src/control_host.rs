@@ -289,6 +289,13 @@ impl SessionHost for GuiHost<'_> {
     fn clipboard_set(&self, text: &str) -> bool {
         crate::control::pbcopy(text)
     }
+
+    /// The GUI's one conversion ([`crate::cwd_native::native_path`]), so a
+    /// block's `cwd=` names the directory exactly as `cwd`, `meta` and the tab
+    /// strip do. The identity off Windows.
+    fn native_cwd<'p>(&self, reported: &'p str) -> std::borrow::Cow<'p, str> {
+        crate::cwd_native::native_path(reported)
+    }
 }
 
 /// Phase 1a's exit criterion: `aterm-control`'s verb matrix runs against THIS
@@ -563,6 +570,88 @@ mod tests {
         // The served sid still works, so the refusal is the sid check and not a
         // dead host.
         assert!(cmd_selection(&host, 0).starts_with("OK "));
+    }
+
+    /// `blocks` names a block's directory the way `cwd` does. Measured on
+    /// Windows before this host converted it: a pwsh block printed
+    /// `cwd=/C:/Users//m6-an` (OSC 7's RFC 8089 path) while a cmd block in the
+    /// same window printed `cwd=C:\Windows\Temp`. A native cmd path, and a
+    /// POSIX path from a WSL or SSH shell, must come through untouched — and on
+    /// Unix nothing is converted at all (`/C:/` is a legal directory there).
+    #[test]
+    fn a_block_cwd_is_the_native_path_the_cwd_verb_prints() {
+        use aterm_control::selection::{cmd_blocks, cmd_blocks_json};
+        let blocks_cwd = |osc: &[u8]| {
+            let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            term_lock(&term).process(osc);
+            term_lock(&term).process(b"\x1b]133;A\x07$ ");
+            let reg = crate::subscribe::new_registry();
+            let host = GuiHost::new(0, &term, None, &reg);
+            (cmd_blocks(&host, 0, ""), cmd_blocks_json(&host, 0, ""))
+        };
+
+        let (listed, json) = blocks_cwd(b"\x1b]7;file:///C:/Users//m6-an\x07");
+        #[cfg(windows)]
+        {
+            assert!(listed.contains(r" cwd=C:\Users\m6-an "), "{listed}");
+            assert!(json.contains(r#""cwd":"C:\\Users\\m6-an""#), "{json}");
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(listed.contains(" cwd=/C:/Users//m6-an "), "{listed}");
+            assert!(json.contains(r#""cwd":"/C:/Users//m6-an""#), "{json}");
+        }
+
+        // cmd's `633;P;Cwd=$P` is native already: idempotent.
+        let (listed, _) = blocks_cwd(b"\x1b]633;P;Cwd=C:\\Windows\\Temp\x07");
+        assert!(listed.contains(r" cwd=C:\Windows\Temp "), "{listed}");
+
+        // A WSL/SSH shell's POSIX cwd is nobody's drive path.
+        let (listed, _) = blocks_cwd(b"\x1b]7;file:///home/user/proj\x07");
+        assert!(listed.contains(" cwd=/home/user/proj "), "{listed}");
+    }
+
+    /// A cmd block's cwd is the directory its command RAN in. cmd reports its
+    /// cwd from the prompt (`633;P;Cwd=$P`), and the engine files that report
+    /// under the block in progress — so the injection sends it after `133;A`
+    /// has opened the new block (`aterm-shell-integration` pins that order in
+    /// `test_cmd_prompt_reports_the_cwd_after_the_prompt_start`). Here the
+    /// order is shown to MATTER: the shipped order labels each block with its
+    /// own directory; the order it replaced labelled the block of a `cd` with
+    /// the directory the `cd` went to — measured live on a cmd tab.
+    #[test]
+    fn a_cmd_block_cwd_is_where_its_command_ran() {
+        use aterm_control::selection::cmd_blocks;
+        let cwds = |cwd_after_start: bool| {
+            // One rendered cmd prompt, as cmd writes it for `$e]…$e\`.
+            let prompt = |dir: &str| {
+                let start = "\x1b]133;A\x1b\\";
+                let cwd = format!("\x1b]633;P;Cwd={dir}\x1b\\");
+                let marks = if cwd_after_start {
+                    format!("{start}{cwd}")
+                } else {
+                    format!("{cwd}{start}")
+                };
+                format!("{marks}{dir}>\x1b]133;B\x1b\\")
+            };
+            let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+            term_lock(&term).process(prompt(r"C:\Users\m6-an\aterm").as_bytes());
+            term_lock(&term).process(b"cd /d C:\\Windows\\Temp\r\n");
+            term_lock(&term).process(prompt(r"C:\Windows\Temp").as_bytes());
+            let reg = crate::subscribe::new_registry();
+            let host = GuiHost::new(0, &term, None, &reg);
+            cmd_blocks(&host, 0, "")
+                .lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let (_, rest) = line.split_once(" cwd=")?;
+                    rest.split(' ').next().map(str::to_owned)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(cwds(true), [r"C:\Users\m6-an\aterm", r"C:\Windows\Temp"]);
+        // Negative control: the order the injection used to send.
+        assert_eq!(cwds(false), [r"C:\Windows\Temp", r"C:\Windows\Temp"]);
     }
 
     /// The roster is the REGISTRY's, ascending by sid, carrying each session's

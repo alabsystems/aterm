@@ -1921,3 +1921,372 @@ fn the_bands_walk_is_the_hands_whatever_the_echos_lag() {
         );
     }
 }
+
+// ──────── the minibuffer glyph gate ────────
+
+/// The gate refuses only on a KNOWN foreign glyph: the run's last cell is
+/// foreign when every live press carries its exact glyph and none of them
+/// is it. Any live press may own the run's end (typeahead), and an empty
+/// pool, a glyph-less press (a wide glyph, an IME commit, a count-only host)
+/// or presses past their patience make the judgment unknown — the lane then
+/// lays exactly as it did before the gate. RED with "the newest press's
+/// glyph" instead: the typeahead line reads `Some(true)`.
+#[test]
+fn the_glyph_gate_refuses_only_a_known_foreign_glyph() {
+    let t0 = Instant::now();
+    let mut p = PressCredits::default();
+    assert_eq!(p.foreign_to_live(t0, '_'), None, "an empty pool is unknown");
+    p.bank(t0, 1, Some('c'));
+    assert_eq!(p.foreign_to_live(t0, '_'), Some(true), "zle's fake cursor");
+    assert_eq!(
+        p.foreign_to_live(t0, 'c'),
+        Some(false),
+        "the key's own glyph"
+    );
+    p.bank(t0 + ms(5), 1, Some('l'));
+    assert_eq!(
+        p.foreign_to_live(t0 + ms(5), 'c'),
+        Some(false),
+        "typeahead: the older press still owns its echo"
+    );
+    p.bank(t0 + ms(10), 2, None);
+    assert_eq!(
+        p.foreign_to_live(t0 + ms(10), '_'),
+        None,
+        "a glyph-less press makes the run unknown"
+    );
+    let late = t0 + Duration::from_secs_f32(IN_FLIGHT_PATIENCE_S + 1.0);
+    assert_eq!(p.foreign_to_live(late, '_'), None, "no live press: unknown");
+}
+
+/// The run's last glyph is the host's only for the very anchor it was handed
+/// over with; an anchor handed over WITHOUT one ([`CursorGlow::observe_print_anchor`],
+/// every host but the GUI) forgets it, and a `None` anchor keeps the previous
+/// pair. Otherwise the glyph is this frame's probe of the caret's row or a
+/// flanking row — never a probe from another frame, never two rows away.
+#[test]
+fn the_glyph_before_a_cell_is_the_host_s_for_its_own_anchor_else_this_frame_s_probe() {
+    let t0 = Instant::now();
+    let mut glow = CursorGlow::default();
+    glow.observe_print_anchor_glyph(Some((7, 12, 1)), Some('_'));
+    assert_eq!(glow.glyph_before(7, 12, t0), Some('_'), "the host's glyph");
+    assert_eq!(glow.glyph_before(7, 13, t0), None, "not another run's end");
+    glow.observe_print_anchor_glyph(None, Some('x'));
+    assert_eq!(
+        glow.glyph_before(7, 12, t0),
+        Some('_'),
+        "a `None` anchor keeps the pair"
+    );
+    glow.observe_print_anchor(Some((7, 13, 2)));
+    assert_eq!(
+        glow.glyph_before(7, 13, t0),
+        None,
+        "an anchor handed over alone carries no glyph"
+    );
+    let status: Vec<char> = "search: c_".chars().collect();
+    glow.observe_row(6, 3, &['p', '%', ' '], t0);
+    glow.observe_neighbor_rows(Some(&[]), Some(&status));
+    assert_eq!(glow.glyph_before(7, 10, t0), Some('_'), "the row below");
+    assert_eq!(glow.glyph_before(6, 2, t0), Some('%'), "the caret's row");
+    assert_eq!(
+        glow.glyph_before(7, 40, t0),
+        Some(' '),
+        "blank past the row"
+    );
+    assert_eq!(
+        glow.glyph_before(7, 10, t0 + ms(16)),
+        None,
+        "a probe from another frame"
+    );
+    assert_eq!(glow.glyph_before(8, 10, t0), None, "two rows down: unknown");
+    assert_eq!(glow.glyph_before(7, 0, t0), None, "a run with no last cell");
+}
+
+/// THE TYPED RE-ANCHOR LAYS ITS LANDING ONLY UNDER A LIVE PRESS'S GLYPH
+/// (zsh's Ctrl-R whose match hops, 2026-09-23). One `l` press, and the
+/// visible caret hops twelve cells along its row — zle walking the caret to
+/// the match's newest place — with the row probe of that frame holding `-`
+/// at the landing cell (15). The hop is declined `program-row`, nothing is
+/// laid, and the press is forgotten rather than spent (the in-flight law: its
+/// echo went elsewhere). RED without the witness: `("no-credits", "none",
+/// (3, 4), (3, 16))` and the landing cell 15 lit under `-`, the press spent
+/// on it. The controls keep the landing law: the same hop landing on the
+/// key's own glyph lays exactly its landing, and a press banked by count
+/// alone (no glyph to judge) lays it as before.
+#[test]
+fn a_typed_re_anchor_lays_its_landing_only_under_a_live_press_s_glyph() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut row: Vec<char> = "p% ".chars().collect();
+    row.resize(16, 'x');
+    for (label, landing, glyph, laid) in [
+        ("foreign", '-', true, false),
+        ("the key's own glyph", 'l', true, true),
+        ("a count-only press", '-', false, true),
+    ] {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 4)), t0, &c, g, &mut out);
+        let key = t0 + ms(100);
+        if glyph {
+            glow.note_typed_expected(key, 1, false, rk::TypedClass::Glyph, 'l');
+        } else {
+            glow.note_typed(key);
+        }
+        let echo = key + ms(8);
+        row[15] = landing;
+        glow.observe_row(3, 16, &row, echo);
+        glow.tick(Some((3, 16)), echo, &c, g, &mut out);
+        let cols: Vec<u16> = v2_cols(&glow, 3).into_iter().collect();
+        if laid {
+            assert_eq!(
+                last_row(&glow),
+                Some(("no-credits", "none", (3, 4), (3, 16))),
+                "{label}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(cols, vec![15], "{label}: the landing and nothing else");
+        } else {
+            assert_eq!(
+                last_row(&glow),
+                Some((
+                    CursorGlow::DECLINE_PROGRAM_ROW,
+                    AdmissionRecord::LICENCE_NONE,
+                    (3, 4),
+                    (3, 16)
+                )),
+                "{label}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(cols, Vec::<u16>::new(), "{label}: nothing laid");
+            assert_eq!(
+                glow.in_flight_tally().forgotten,
+                1,
+                "{label}: the press is forgotten, not spent"
+            );
+        }
+        assert_eq!(glow.typed_credits_within(echo), 0, "{label}");
+    }
+}
+
+// ──────── the landing gate meets the composer's re-wraps (fix/trail-land) ────────
+
+/// **THE LANDING GATE WITNESSES THE CELL A SOFT-WRAPPED CARET LAYS**
+/// (fix/trail-land: zsh's Ctrl-R landing gate meets Claude Code 2.1.280's
+/// soft-wrapped caret). One `a`, after no typing (a typed RE-ANCHOR, not
+/// the coalesced fold): the key's glyph is drawn at the origin (3, 17),
+/// the row's last text column, and the caret ALONE wraps to the
+/// continuation row's indent (4, 2), whose `landing − 1` is blank. The
+/// re-anchor lays the ORIGIN ([`CursorGlow::soft_wrapped_caret`]), so the
+/// gate reads the origin: the key's own glyph there lays exactly (3, 17)
+/// and nothing on the indent; a glyph no press typed there is still
+/// refused `program-row`, nothing laid, the press forgotten — the soft
+/// wrap cannot carry a zle-drawn glyph past the gate; a count-only press is
+/// unknown and lays the origin. RED with the witness read at the landing
+/// (the plain union of the two fixes): the key's own glyph is refused
+/// `program-row`, nothing is laid and the press is forgotten, because the
+/// blank indent is foreign to `a`.
+///
+/// …and only a key that went in AT the fold (fix/trail-land review): the
+/// same move with the origin row rewritten left of the origin — zle's
+/// Ctrl-R switching to an older two-line entry that holds the key's glyph
+/// at the old caret column — is no soft wrap, so the witness stays at the
+/// landing, the blank indent, and it is refused. RED before
+/// `soft_wrapped_caret` read that prefix: `licensed key`, (3, 17) laid.
+#[test]
+fn a_soft_wrapped_re_anchor_is_witnessed_at_the_origin_it_lays() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut before: Vec<char> = "> ".chars().collect();
+    before.resize(17, 'x');
+    before.push(' ');
+    for (label, origin, glyph, rewritten, laid) in [
+        ("the key's own glyph", 'a', true, false, true),
+        ("foreign", '_', true, false, false),
+        ("a count-only press", 'a', false, false, true),
+        ("the prefix rewritten", 'a', true, true, false),
+    ] {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.observe_row(3, 17, &before, t0);
+        glow.observe_neighbor_rows(Some(&[]), Some(&[]));
+        glow.tick(Some((3, 17)), t0, &c, g, &mut out);
+        let key = t0 + ms(100);
+        if glyph {
+            glow.note_typed_expected(key, 1, false, rk::TypedClass::Glyph, 'a');
+        } else {
+            glow.note_typed(key);
+        }
+        let echo = key + ms(8);
+        let mut after = before.clone();
+        after[17] = origin;
+        if rewritten {
+            after[5] = 'y';
+        }
+        glow.observe_row(4, 2, &[' ', ' '], echo);
+        glow.observe_neighbor_rows(Some(&after), Some(&[]));
+        glow.tick(Some((4, 2)), echo, &c, g, &mut out);
+        let row3: Vec<u16> = v2_cols(&glow, 3).into_iter().collect();
+        let row4: Vec<u16> = v2_cols(&glow, 4).into_iter().collect();
+        let refused = last_row(&glow).is_some_and(|r| r.0 == CursorGlow::DECLINE_PROGRAM_ROW);
+        if laid {
+            assert!(!refused, "{label}: {:?}", ring_rows(&glow));
+            assert_eq!(row3, vec![17], "{label}: the key's own cell, at the origin");
+            assert_eq!(row4, Vec::<u16>::new(), "{label}: nothing on the indent");
+            assert_eq!(glow.in_flight_tally().forgotten, 0, "{label}: spent");
+        } else {
+            assert_eq!(
+                last_row(&glow),
+                Some((
+                    CursorGlow::DECLINE_PROGRAM_ROW,
+                    AdmissionRecord::LICENCE_NONE,
+                    (3, 17),
+                    (4, 2)
+                )),
+                "{label}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(
+                (row3, row4),
+                (Vec::new(), Vec::new()),
+                "{label}: nothing laid"
+            );
+            assert_eq!(
+                glow.in_flight_tally().forgotten,
+                1,
+                "{label}: the press is forgotten, not spent"
+            );
+        }
+        assert_eq!(glow.typed_credits_within(echo), 0, "{label}");
+    }
+}
+
+/// **A LIFTED WORD LAYS NO LANDING, SO THE LANDING GATE STANDS DOWN**
+/// (fix/trail-land). A bordered composer: `│the text` on row 3 and
+/// `│already[Image #1]` on row 4, the caret after `already` (4, 8). The
+/// Space lets `already` fit row 3 again: the composer rewrites it at row 3's
+/// end and the caret stays before `[Image`, at the word's old first column
+/// (4, 1) — a same-row typed retreat, a typed re-anchor whose `landing − 1`
+/// is the border `│`, a glyph no press typed. The lift lays no landing (the
+/// seam's landing sweep stands down on `lift`), so there is no laid cell for
+/// the gate to witness: the move is judged, not refused, its one press
+/// spent rather than forgotten, and nothing is laid under the caret. RED
+/// with the gate reading the landing for a lift: `program-row`, the Space's
+/// press forgotten, and the engine never told of the `Lift`.
+#[test]
+fn a_lifted_word_is_not_refused_by_the_landing_gate() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let text = |s: &str| -> Vec<char> { s.chars().collect() };
+    let row3_before = text("│the text");
+    let row4_before = text("│already[Image #1]");
+    let row3_after = text("│the text already");
+    let row4_after = text("│[Image #1]");
+    let mut out = Vec::new();
+    let mut glow = CursorGlow::default();
+    let t0 = Instant::now();
+    glow.observe_row(4, 8, &row4_before, t0);
+    glow.observe_neighbor_rows(Some(&row3_before), Some(&[]));
+    glow.tick(Some((4, 8)), t0, &c, g, &mut out);
+    let key = t0 + ms(100);
+    glow.note_typed_expected(key, 1, false, rk::TypedClass::Space, ' ');
+    let echo = key + ms(8);
+    glow.observe_row(4, 1, &row4_after, echo);
+    glow.observe_neighbor_rows(Some(&row3_after), Some(&[]));
+    glow.tick(Some((4, 1)), echo, &c, g, &mut out);
+    let rows = ring_rows(&glow);
+    assert!(
+        rows.last()
+            .is_some_and(|r| r.0 != CursorGlow::DECLINE_PROGRAM_ROW
+                && r.2 == (4, 8)
+                && r.3 == (4, 1)),
+        "the lift is judged, not refused: {rows:?}"
+    );
+    assert_eq!(glow.in_flight_tally().forgotten, 0, "spent, not forgotten");
+    assert_eq!(glow.typed_credits_within(echo), 0, "the Space is paid");
+    assert!(
+        !v2_cols(&glow, 4).contains(&0),
+        "nothing under the border left of the caret"
+    );
+}
+
+/// **A FLUSHED PARK IS WITNESSED BY THE GLYPH IT WAS HELD OVER**
+/// (fix/trail-land review: zsh's Ctrl-R match walking BACK along its row).
+/// One `o` press, and the visible caret retreats six cells along its row,
+/// (3, 20) -> (3, 14) — zle moving the caret from `world`'s `l` back to
+/// `hello`'s `lo` — with that frame's probe holding `l` at the landing cell
+/// (13). A same-row retreat with a press in flight is HELD as Ink's park,
+/// and past the window it is flushed at its own clock, where no probe is
+/// that frame's; the landing gate reads the glyph the park was held over
+/// ([`HeldPark::landing_cell`]). A glyph no live press typed: declined
+/// `program-row`, nothing laid, the press forgotten. The controls keep the
+/// park's verdict: the key's own glyph there lays exactly its landing; a
+/// blank there (Ink's park to the input's start, beside the prompt) is
+/// licensed as before, its landing withheld ([`HeldPark::landing_glyph`])
+/// and its press spent; a count-only press is unknown and lays the landing.
+/// RED without the held glyph: the foreign landing is `licensed key` and
+/// (3, 13) is lit under `l`, the press spent on it.
+#[test]
+fn a_flushed_park_is_witnessed_by_the_glyph_it_was_held_over() {
+    let g = wide_geom();
+    let c = cfg(GlowStyle::RainbowKitty, true);
+    let mut row: Vec<char> = "p% ".chars().collect();
+    row.resize(24, 'x');
+    for (label, landing, glyph, refused, laid) in [
+        ("foreign", 'l', true, true, false),
+        ("the key's own glyph", 'o', true, false, true),
+        ("a blank", ' ', true, false, false),
+        ("a count-only press", 'l', false, false, true),
+    ] {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        let t0 = Instant::now();
+        glow.tick(Some((3, 20)), t0, &c, g, &mut out);
+        let key = t0 + ms(100);
+        if glyph {
+            glow.note_typed_expected(key, 1, false, rk::TypedClass::Glyph, 'o');
+        } else {
+            glow.note_typed(key);
+        }
+        let echo = key + ms(8);
+        row[13] = landing;
+        glow.observe_row(3, 14, &row, echo);
+        glow.tick(Some((3, 14)), echo, &c, g, &mut out);
+        assert!(glow.held_park.is_some(), "{label}: held as a park");
+        let quiet = echo + past_park_window();
+        glow.tick(Some((3, 14)), quiet, &c, g, &mut out);
+        assert_eq!(glow.in_flight_tally().park_flushed, 1, "{label}: flushed");
+        let cols: Vec<u16> = v2_cols(&glow, 3).into_iter().collect();
+        if refused {
+            assert_eq!(
+                last_row(&glow),
+                Some((
+                    CursorGlow::DECLINE_PROGRAM_ROW,
+                    AdmissionRecord::LICENCE_NONE,
+                    (3, 20),
+                    (3, 14)
+                )),
+                "{label}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(
+                glow.in_flight_tally().forgotten,
+                1,
+                "{label}: the press is forgotten, not spent"
+            );
+        } else {
+            assert_eq!(
+                last_row(&glow).map(|r| (r.1, r.2, r.3)),
+                Some((AdmissionRecord::LICENCE_KEY, (3, 20), (3, 14))),
+                "{label}: {:?}",
+                ring_rows(&glow)
+            );
+            assert_eq!(glow.in_flight_tally().forgotten, 0, "{label}: spent");
+        }
+        let want: Vec<u16> = if laid { vec![13] } else { Vec::new() };
+        assert_eq!(cols, want, "{label}: the landing, or nothing");
+        assert_eq!(glow.typed_credits_within(quiet), 0, "{label}");
+    }
+}

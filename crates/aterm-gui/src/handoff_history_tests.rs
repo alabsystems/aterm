@@ -692,3 +692,61 @@ fn the_parks_stop_is_answered_and_hands_over_only_whole_exports() {
     drop(results);
     assert!(dir_entries(dir.path()).is_empty());
 }
+
+/// The finished command whose rows `t` retains, found by the command it ran.
+fn finished_output(t: &Terminal, command: &str) -> Option<String> {
+    t.all_blocks()
+        .filter(|b| b.is_complete())
+        .find(|b| t.block_command(b).is_some_and(|c| c.ends_with(command)))
+        .and_then(|b| t.block_output(b))
+}
+
+/// THE SHELL CARRY MEETS THE HISTORY CARRY (2026-09-27 review). The adopt
+/// restores the checkpoint — its OSC 133 marks and blocks at the source's
+/// absolute rows — then reserves the sidecar's keys, then imports after
+/// Commit. When the reserve raised the counter by the whole sidecar, every
+/// restored row moved up by it and the marks did not: a finished block read
+/// nothing, and a command running across the update completed with the old
+/// history as its output. Through the real seam (`hydrate_adopted_engine`)
+/// and the real import, both read exactly what the parent's do.
+#[test]
+fn command_blocks_read_their_own_lines_after_the_history_import() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let term = live(8, 40);
+    {
+        let mut t = term.lock().unwrap();
+        write_lines(&mut t, "old", 0, 600);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07pwd\r\n\x1b]133;C\x07FINISHED\r\n");
+        t.process(b"\x1b]133;D;0\x07");
+        write_lines(&mut t, "tail", 0, 20);
+        t.process(b"\x1b]133;A\x07$ \x1b]133;B\x07make\r\n\x1b]133;C\x07building\r\n");
+    }
+    let crossed = cross(dir.path(), &term, |_| {});
+    assert_eq!(crossed.joined.fallback, None);
+    assert!(crossed.joined.take > 0, "a sidecar crosses");
+    let (successor, report) = receive(dir.path(), &crossed);
+    assert_eq!((report.imported, report.lost()), (crossed.joined.take, 0));
+    let mut parent = term.lock().unwrap();
+    let mut successor = successor.lock().unwrap();
+    assert_eq!(history(&successor), crossed.parent_history);
+    let finished = finished_output(&parent, "pwd");
+    assert!(
+        finished
+            .as_deref()
+            .is_some_and(|o| o.starts_with("FINISHED"))
+    );
+    assert_eq!(finished_output(&successor, "pwd"), finished);
+
+    for t in [&mut *parent, &mut *successor] {
+        t.process(b"done\r\n\x1b]133;D;0\x07\x1b]133;A\x07$ ");
+    }
+    assert_eq!(
+        finished_output(&parent, "make").as_deref(),
+        Some("building\ndone")
+    );
+    assert_eq!(
+        finished_output(&successor, "make"),
+        finished_output(&parent, "make"),
+        "the command that ran across the update completes with its own output"
+    );
+}

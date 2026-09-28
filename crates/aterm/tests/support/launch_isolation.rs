@@ -62,6 +62,10 @@ pub const HARNESS_OFF: &str = "[harness]\nenabled = false\n";
 /// # Panics
 /// The lifeline's FIFO could not be made in `root`: a scratch world this test
 /// cannot write to is a broken fixture, not a reason to boot an unwatched instance.
+///
+/// Unix only, like `aterm_uds::lifeline`: this file is also included by a Windows
+/// test twin (`protected_spawn.rs`), and `gate cells-foreign` compiles it there.
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline {
     aterm_uds::lifeline::Lifeline::arm(cmd, root)
@@ -75,14 +79,13 @@ pub fn lifeline(cmd: &mut Command, root: &Path) -> aterm_uds::lifeline::Lifeline
 /// is refused (`ECONNREFUSED`). Boots that read the file as readiness failed
 /// their first `aterm ctl` call, "Connection refused", about once in ten runs
 /// of the supervise suite at a load average near 40 (2026-09-24).
+#[cfg(unix)]
 #[allow(dead_code)]
 pub fn control_listening(sock: impl AsRef<Path>) -> bool {
     std::os::unix::net::UnixStream::connect(sock).is_ok()
 }
 
 pub fn prepare(root: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-
     for relative in [
         "",
         "home",
@@ -94,10 +97,16 @@ pub fn prepare(root: &Path) -> std::io::Result<()> {
         "data",
         "state",
         "tmp",
+        "local",
+        "roaming",
     ] {
         let path = root.join(relative);
         std::fs::create_dir_all(&path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     std::fs::write(
         root.join("cfg/aterm/aterm.toml"),
@@ -136,6 +145,16 @@ pub fn apply(cmd: &mut Command, root: &Path) {
         // (macOS's per-user runtime dir): a live aterm's socket must not be findable.
         .env("TMPDIR", root.join("tmp"))
         // A development seam (these are debug builds): nothing to log.
-        .env("ATERM_LOG", "off")
-        .env("SHELL", "/bin/sh");
+        .env("ATERM_LOG", "off");
+    #[cfg(unix)]
+    cmd.env("SHELL", "/bin/sh");
+    // Windows reads the home, the package prefix and the fallback config from
+    // these instead (`aterm_types::dirs`, `atpkg::config::config_path` — though
+    // `XDG_CONFIG_HOME` above still wins for the config).
+    #[cfg(windows)]
+    cmd.env("USERPROFILE", root.join("home"))
+        .env("LOCALAPPDATA", root.join("local"))
+        .env("APPDATA", root.join("roaming"))
+        .env("TEMP", root.join("tmp"))
+        .env("TMP", root.join("tmp"));
 }

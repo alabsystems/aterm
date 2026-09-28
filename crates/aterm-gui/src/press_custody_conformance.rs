@@ -12,7 +12,7 @@
 //! invalidated coordinate space may not leave a selection dangling. None of that
 //! ties the model to the shipping engine. This closes that gap.
 //!
-//! WHY THIS COULD NOT BE WRITTEN BEFORE. Three of the eleven actions — `RepeatPress`,
+//! WHY THIS COULD NOT BE WRITTEN BEFORE. Three of the (then) eleven actions — `RepeatPress`,
 //! `InertPress`, `ReleaseEvent` — are IDENTICAL in every observable variable. All
 //! three leave offset, ownership and the selection exactly as they found them; the
 //! model gives all three the same body; and all three used to reach
@@ -69,7 +69,7 @@
 //!    named, so a seam that classified correctly and then moved something it may not
 //!    fails here.
 //!
-//! THE SEAMS DRIVEN (all eleven actions are anchored; see each `#[refines]`):
+//! THE SEAMS DRIVEN (all sixteen actions are anchored; see each `#[refines]`):
 //!
 //! * `app_input::note_press_custody`, through the real `App::input` key seam and the
 //!   `apply_press_custody` authority under it — `TypingPress`, `RepeatPress`,
@@ -77,13 +77,16 @@
 //! * `app_mouse::note_selection_custody`, through the real
 //!   `begin_selection` → `drag_selection` → `finish_selection` gesture —
 //!   `UserSelect` and `UserClear`.
-//! * `Terminal::note_scroll_custody` — in aterm-core, inside the three primitives
-//!   that can RAISE `display_offset` — through the real `App::input` →
-//!   `InputEvent::ScrollView` seam AND through a real `InputEvent::Wheel` notch on
-//!   both of `input_wheel`'s motion routes — `UserScroll`.
+//! * `Terminal::note_scroll_custody` — in aterm-core, inside the primitives that
+//!   move `display_offset` for a user (`scroll_display`, `scroll_to_top`,
+//!   `scroll_to_absolute_row`, `return_to_live`) — through the real `App::input` →
+//!   `InputEvent::ScrollView` seam, a real `InputEvent::Wheel` notch on both of
+//!   `input_wheel`'s motion routes, and the ⌘-V / IME snap (`App::snap_to_bottom`) —
+//!   `UserScroll`, `UserScrollTowardLive`, `SnapToLive`.
 //! * `Terminal::note_output_custody`, through real `Terminal::process` batches —
 //!   `OutputAtLive`, `OutputWhileReading`, `OutputDamagesTheSelectedRows` (from BOTH
-//!   ownerships), `OutputInvalidatesTheCoordinateSpace`.
+//!   ownerships) and its in-place twin, `OutputTookTheSelectionUnattributed` and its
+//!   in-place twin, `OutputInvalidatesTheCoordinateSpace`.
 //!
 //! WHAT AN ANCHOR PROVES, AND WHAT IT DOES NOT — the CURRENT state, which is not what
 //! this paragraph used to say. It used to say the gate "does NOT check that the
@@ -103,9 +106,10 @@
 //! fire.
 //!
 //! THE SURVIVING LIMIT, in numbers rather than adjectives. The evidence is
-//! FUNCTION-ENTRY, not branch-entry. Ten of the eleven actions sit on a function
-//! carrying more than one of them — `Terminal::note_output_custody` carries four,
-//! `app_input::note_press_custody` four, `app_mouse::note_selection_custody` two — so
+//! FUNCTION-ENTRY, not branch-entry. Every one of the sixteen actions sits on a
+//! function carrying more than one of them — `Terminal::note_output_custody` carries
+//! seven, `app_input::note_press_custody` four, `Terminal::note_scroll_custody` three,
+//! `app_mouse::note_selection_custody` two — so
 //! one entry marks every anchor on that function and NOTHING here separates those
 //! siblings: permuting their labels changes no observable. `note_output_custody` is
 //! called on EVERY non-screen-switching `Terminal::process` batch, so its entry is not
@@ -151,34 +155,15 @@
 //! * the `prev_*` shadows are the harness's own projection of the pre-state, so they
 //!   are real observations, re-read from the terminal at every step.
 //!
-//! KNOWN GAPS, stated rather than papered over:
+//! COVERAGE NOTES — no open gap remains. The three shapes this header once listed
+//! as gaps are modelled (2026-09-25) and each has a driven step below: output that
+//! took the highlight for a reason that is not damage overlap is the model action
+//! `OutputTookTheSelectionUnattributed` (+ its in-place twin); a damaging batch that
+//! advanced no rows under a reader is `OutputDamagesTheSelectedRowsInPlace`; and a
+//! return toward live that is not typing — End, a downward scroll, the ⌘-V / IME
+//! snaps — is `SnapToLive` / `UserScrollTowardLive`. What remains is how two seams
+//! are observed and how far the abstraction reaches:
 //!
-//! * A batch that destroyed the selection for a reason that is NOT damage overlap —
-//!   `post_process`'s fail-closed splice arm and its four siblings — is unmodelled.
-//!   The engine records it as `OutputTookTheSelectionUnattributed`, which is not a
-//!   model action and carries `last_event() == -1`, outside the model's tag space, so
-//!   it can never be handed to `validate_transition` as if it were one
-//!   (`Model::successors` panics on an unknown action name, so an attempt would be
-//!   loud rather than quiet). It is a real answer for the `custody` verb and a
-//!   deliberate non-step for the trace.
-//! * A DAMAGING batch that ADVANCED NO ROWS while the user is reading is unmodelled:
-//!   `OutputDamagesTheSelectedRows` mandates `offset' = offset + 1` at `owner == 1`,
-//!   and an offset that did not move cannot satisfy it. An earlier draft of this
-//!   bullet named only ONE way to reach that state — an SCR-1 re-pin saturated at the
-//!   history floor, the user parked at the top of a full scrollback — but the
-//!   condition is simply `lines_added == 0`, which ALSO covers the commonest shape by
-//!   far: an in-place rewrite. `\r` plus EL over the selected row, a DECERA, a status
-//!   line repainting itself — none of them scroll, all of them damage. The narrower
-//!   sentence made a routine case sound exotic. It is recorded anyway, because
-//!   `OutputDamagesTheSelectedRows` is a TRUE statement about what happened and only
-//!   the offset arithmetic is out of range; the undamaged twin of the same shape
-//!   records NOTHING, because its only alternative name (`OutputAtLive`) would be a
-//!   false statement about where the view is. `Terminal::note_output_custody` carries
-//!   the argument.
-//! * Offset-to-zero WITHOUT a selection clear — the paste / IME `snap_to_bottom`, and
-//!   `ScrollIntent::Bottom`/`Down` — is likewise unmodelled: `TypingPress` is the only
-//!   action that lands at live and it clears on the way. Those sites record nothing,
-//!   so they are absent from the trace instead of mislabelled.
 //! * `drag_selection` now records the 0 -> 1 EDGE at its own seam. Its gesture arms
 //!   re-issue `start_selection` on every pointer move with no state test, so a drag
 //!   DOES turn `has_selection()` on from off when something cleared it mid-gesture —
@@ -524,7 +509,201 @@ fn damaged_rows_case(validated: &mut usize, ev: &mut StepEvidence) {
     );
 }
 
+/// THE IN-PLACE AND UNATTRIBUTED TAKES — the shapes that used to be KNOWN GAPS.
+///
+/// (a) An in-place rewrite over the selected rows under a READER: EL over the live
+/// top with no line feed, so no row enters scrollback and the view stays exactly
+/// where it was — `OutputDamagesTheSelectedRowsInPlace`, `[1, 1, 0]`.
+///
+/// (b) The oldest retained row, selected, EVICTED at the history floor by output at
+/// LIVE — no damage band names it, so `post_process` fails closed —
+/// `OutputTookTheSelectionUnattributed` at the tail, `[0, 0, 0]`.
+///
+/// (c) The same eviction under a reader parked at the TOP of a full two-line
+/// history: the re-pin saturates, the view does not move —
+/// `OutputTookTheSelectionUnattributedInPlace`, `[1, 2, 0]`.
+fn in_place_and_unattributed_takes(validated: &mut usize, ev: &mut StepEvidence) {
+    // (a)
+    let term = Arc::new(Mutex::new(engine_fixture(6, 4)));
+    {
+        let mut t = term_lock(&term);
+        t.scroll_display(1);
+        arm_selection(&mut t, 0, 1);
+    }
+    let mut c = Press::new();
+    let next = step(
+        &term,
+        &mut c,
+        CustodyTransition::OutputDamagesTheSelectedRowsInPlace,
+        "an in-place rewrite (EL, no line feed) over the selected rows while reading",
+        || {
+            term_lock(&term).process(b"\x1b[1;1H\x1b[Knew text");
+        },
+        validated,
+        ev,
+    );
+    assert_eq!(
+        [next[0], next[1], next[2]],
+        [1, 1, 0],
+        "the highlight over rewritten text goes; the reader does not move"
+    );
+
+    // (b) and (c) share the two-line history floor.
+    let floor = |read_top: bool| {
+        let mut t = Terminal::new(4, 20);
+        t.set_scrollback_line_limit(Some(2));
+        for i in 0..8 {
+            t.process(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(t.grid().scrollback_lines(), 2, "a two-line history floor");
+        if read_top {
+            t.scroll_display(2);
+            assert_eq!(t.grid().display_offset(), 2, "parked at the top of history");
+        }
+        let sel = t.text_selection_mut();
+        sel.start_selection(-2, 0, SelectionSide::Left, SelectionType::Simple);
+        sel.update_selection(-2, 5, SelectionSide::Right);
+        sel.complete_selection();
+        assert!(sel.has_selection(), "the oldest retained row is selected");
+        Arc::new(Mutex::new(t))
+    };
+    for (read_top, expect, bytes, projected, what) in [
+        (
+            false,
+            CustodyTransition::OutputTookTheSelectionUnattributed,
+            &b"a\r\nb\r\nc\r\n"[..],
+            [0, 0, 0],
+            "output at live evicting the selected row off the history floor",
+        ),
+        (
+            true,
+            CustodyTransition::OutputTookTheSelectionUnattributedInPlace,
+            &b"a\r\n"[..],
+            [1, 2, 0],
+            "output evicting the selected row under a reader parked at the floor",
+        ),
+    ] {
+        let term = floor(read_top);
+        let mut c = Press::new();
+        let next = step(
+            &term,
+            &mut c,
+            expect,
+            what,
+            || {
+                term_lock(&term).process(bytes);
+            },
+            validated,
+            ev,
+        );
+        assert_eq!([next[0], next[1], next[2]], projected, "{what}");
+    }
+}
+
+/// BACK TOWARD LIVE WITHOUT TYPING — the gestures that used to record nothing.
+///
+/// A one-row scroll down that stops short of the tail is `UserScrollTowardLive`
+/// (the user still owns the view); End (`ScrollIntent::Bottom`), a page down that
+/// lands at the tail, and the ⌘-V / IME snap (`App::snap_to_bottom`) are
+/// `SnapToLive`. Every one runs with a live highlight to take, and keeps it.
+fn toward_live_seams(validated: &mut usize, ev: &mut StepEvidence) {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.copy_on_select = false;
+    let term = app
+        .front_terminal(wid)
+        .expect("headless_for_test seeds one window with one terminal")
+        .term
+        .clone();
+    {
+        let mut t = term_lock(&term);
+        let rows = t.grid().rows();
+        for i in 0..(u32::from(rows) + 4) {
+            t.process(format!("row{i}\r\n").as_bytes());
+        }
+    }
+    let mut c = Press::new();
+    let scroll = |app: &mut App, intent: ScrollIntent| {
+        app.input(wid, InputEvent::ScrollView(intent), Source::Human);
+    };
+    for _ in 0..2 {
+        step(
+            &term,
+            &mut c,
+            CustodyTransition::UserScroll,
+            "one-row scroll back into history",
+            || scroll(&mut app, ScrollIntent::By(1)),
+            validated,
+            ev,
+        );
+    }
+    step(
+        &term,
+        &mut c,
+        CustodyTransition::UserSelect,
+        "Select All, so the trip down has a highlight to keep",
+        || app.select_all(),
+        validated,
+        ev,
+    );
+    let next = step(
+        &term,
+        &mut c,
+        CustodyTransition::UserScrollTowardLive,
+        "one row back down, stopping short of the tail",
+        || scroll(&mut app, ScrollIntent::By(-1)),
+        validated,
+        ev,
+    );
+    assert_eq!(
+        [next[0], next[1], next[2]],
+        [1, 1, 1],
+        "still the user's view"
+    );
+    for (what, gesture) in [
+        (
+            "End (ScrollIntent::Bottom)",
+            Box::new(|app: &mut App| scroll(app, ScrollIntent::Bottom)) as Box<dyn Fn(&mut App)>,
+        ),
+        (
+            "a page down that lands at the tail",
+            Box::new(|app: &mut App| scroll(app, ScrollIntent::Down)),
+        ),
+        (
+            "the ⌘-V / IME snap",
+            Box::new(|app: &mut App| app.snap_to_bottom(wid)),
+        ),
+    ] {
+        if c.state(&term_lock(&term))[1] == 0 {
+            step(
+                &term,
+                &mut c,
+                CustodyTransition::UserScroll,
+                "one-row scroll back into history",
+                || scroll(&mut app, ScrollIntent::By(1)),
+                validated,
+                ev,
+            );
+        }
+        let next = step(
+            &term,
+            &mut c,
+            CustodyTransition::SnapToLive,
+            what,
+            || gesture(&mut app),
+            validated,
+            ev,
+        );
+        assert_eq!(
+            [next[0], next[1], next[2]],
+            [0, 0, 1],
+            "{what}: at live, tail-owned, and the highlight kept"
+        );
+    }
+}
+
 /// The GUI half: one real `App`, one real terminal, eleven validated transitions
+/// (the downward gestures have their own fixture in [`toward_live_seams`])
 /// driven through the genuine scroll, gesture and press seams.
 fn gui_gesture_chain(validated: &mut usize, ev: &mut StepEvidence) {
     let mut app = App::headless_for_test();
@@ -1076,18 +1255,20 @@ pub(crate) fn run_conformance() -> StepEvidence {
     let mut validated = 0usize;
     // EXECUTION EVIDENCE. `step` drives each seam inside a one-step-wide window, so
     // the gate can require this action's anchored function to have been entered by
-    // THIS action's step rather than somewhere in a run that drives eleven of them.
+    // THIS action's step rather than somewhere in a run that drives sixteen of them.
     let mut ev = StepEvidence::new("PressCustody");
 
     gui_gesture_chain(&mut validated, &mut ev);
     wheel_seams(&mut validated, &mut ev);
     silent_select_seams(&mut validated, &mut ev);
+    toward_live_seams(&mut validated, &mut ev);
     // Everything counted so far came through the App's real input seams; the rest is
     // the engine's own output path. Derived rather than hardcoded, so a step added to
     // either half cannot make the summary line lie.
     let gui = validated;
     output_batches(&mut validated, &mut ev);
     damaged_rows_case(&mut validated, &mut ev);
+    in_place_and_unattributed_takes(&mut validated, &mut ev);
 
     // ---- NEGATIVE CONTROLS (non-vacuity). ----
     // Each is a regression the model must REFUSE. If ANY were admitted, a real
@@ -1163,6 +1344,39 @@ pub(crate) fn run_conformance() -> StepEvidence {
             [1, 1, 0, 1, 1, 1, 1],
             "typing means take me to the prompt, so it lands at live or it is not typing",
         ),
+        // (f2) The in-place twins and the unattributed take snap the reader — the
+        // same licence (f) refuses, on the shapes that used to be unmodelled.
+        (
+            "OutputDamagesTheSelectedRowsInPlace",
+            read_low,
+            [0, 0, 0, 1, 1, 1, 6],
+            "an in-place rewrite is not a licence to move the view",
+        ),
+        (
+            "OutputTookTheSelectionUnattributed",
+            read_low,
+            [0, 0, 0, 1, 1, 1, 6],
+            "a fail-closed take is not a licence to move the view",
+        ),
+        (
+            "OutputTookTheSelectionUnattributedInPlace",
+            read_low,
+            [0, 0, 0, 1, 1, 1, 6],
+            "a fail-closed take in place is not a licence to move the view",
+        ),
+        // (f3) A return toward live that deselects — typing's job, not End's.
+        (
+            "SnapToLive",
+            read_low,
+            [0, 0, 0, 1, 1, 1, 8],
+            "End or a ⌘-V snap brings the view home and leaves the highlight alone",
+        ),
+        (
+            "UserScrollTowardLive",
+            [1, 2, 1, 0, 0, 0, 0],
+            [1, 1, 0, 1, 2, 1, 8],
+            "a scroll down is not a deselect",
+        ),
         // (i) A GUARD, not an update: `UserScroll` is disabled at the abstract
         // ceiling, so this control proves the guards bite and not merely the update
         // expressions.
@@ -1226,7 +1440,8 @@ pub(crate) fn run_conformance() -> StepEvidence {
          batches), every one of them named by the ENGINE's own custody record rather than \
          by the harness, and {} negative controls (inert press disturbs, repeat disturbs, \
          release disturbs, output snaps, output takes an undamaged highlight, damaging \
-         output snaps, invalidation leaves a dangling selection, typing without a snap, \
+         output snaps — in place and unattributed too — a return to live that deselects, \
+         invalidation leaves a dangling selection, typing without a snap, \
          scroll past the cap, a scroll that does not take ownership, a deselect that \
          scrolls, a projection that left `0..=MaxOffset`) all rejected — the last of those \
          rejectable only by the invariant evaluation this module performs on top of the \

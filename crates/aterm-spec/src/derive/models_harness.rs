@@ -245,18 +245,42 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
     }
 }
 
-/// THE UPGRADE DRAIN'S BOUND AGAINST A PERSON (`aterm_agent::harness::upgrade`,
-/// `DRAIN_S`, `HOLD_S`). After the announcement, each look takes one of three
-/// steps — wait, void the READY answer, or end the agent — and between looks a
-/// person (a box nobody answers, a draft nobody sends, standing `HOLD_S`) and the
-/// agent's own work come and go as they please. `waited` counts looks since the
-/// announcement, saturating at `Bound`, the drain bound. The property is the one
-/// the bound exists for: the agent is never ended on an answer a look saw a person
-/// hold at or past the bound (`stale`) — the person who answered the box hours
-/// later and had the agent ended under them on the strength of the old answer. The
-/// agent's own work is waited for however long it lasts: nothing voids or ends for
-/// it. `Buggy=1` is the drain before the bound: no void, so it waits on the person
-/// for good, and the end comes the moment they let go.
+/// THE UPGRADE DRAIN'S BOUNDS (`aterm_agent::harness::upgrade`, `DRAIN_S`,
+/// `HOLD_S`, `REASK_S`, `MAX_ASKS`). After a notice, each look takes one step:
+/// wait, void the READY answer, end the agent, ask again, or give up. Between
+/// looks, a person (a box nobody answers, a draft nobody sends, standing
+/// `HOLD_S`), the agent's own work, its READY answer, and a break of its
+/// background work come and go as they please. `waited` counts looks since
+/// the latest notice and `aged` looks since its READY answer. Both saturate at
+/// `Bound`, the drain and re-ask bound (`DRAIN_S == REASK_S`). `asks` counts
+/// notices, up to `MaxAsks`. A break (`brk`) is a turn end with only the
+/// agent's own work running. There the upgrade takes only a notice, a
+/// give-up, or a void of an answer a person held, and never ends the agent.
+///
+/// Four properties.
+/// - `NoEndOnAHeldAnswer`: the agent is never ended on an answer that a look
+///   saw a person hold at or past the bound (`stale`). That is the person who
+///   answered the box hours later and had the agent ended under them on the
+///   strength of the old answer.
+/// - `NoSilentWait`, about the agent's own work: it is waited for and never
+///   ended, but once the re-ask clock has run out only a PERSON makes the
+///   upgrade wait without a word. Otherwise it asks again, naming what runs,
+///   or gives up (`silent`). That is the tab of 2026-09-26: an old Claude Code
+///   sat four days behind two poll loops that could never end, told once and
+///   never again.
+/// - `NeverEndsRunningWork`: aterm never ends the agent while its own work
+///   runs, or at a break (`cut`).
+/// - `NoHastySupersede`: a READY answer gets a whole bound of its own before
+///   work it outlives supersedes it, by a re-ask or a give-up (`hasty`). The
+///   review of 2026-09-26 found that a notice's clock alone gave up on a READY
+///   answered seconds before.
+///
+/// `Buggy=1` is the drain before these bounds. It never voids, so it waits on
+/// the person for good and ends the agent the moment they let go. At a break,
+/// or under work that a READY answer did not end, it waits for good and says
+/// nothing. It also carries the two tempting wrong fixes for that silence:
+/// ending the agent once the bound is past, work or no work, and superseding
+/// a READY answer on the notice's clock alone.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_drain_bound_model() -> Model {
@@ -264,36 +288,97 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
         HarnessUpgradeDrainBound {
             const Buggy = 0;
             const Bound = 2;
+            const MaxAsks = 2;
             var waited = 0;
+            var aged = 0;
+            var asks = 1;
             var ready = 1;
             var person = 0;
             var agent = 0;
+            var brk = 0;
             var stale = 0;
+            var silent = 0;
+            var cut = 0;
+            var hasty = 0;
             var ended = 0;
+            var gaveup = 0;
 
-            action PersonHolds when (ended == 0 && person == 0) { person = 1; }
-            action PersonLets when (ended == 0 && person == 1) { person = 0; }
-            action AgentWorks when (ended == 0 && agent == 0) { agent = 1; }
-            action AgentRests when (ended == 0 && agent == 1) { agent = 0; }
+            action PersonHolds when (ended == 0 && gaveup == 0 && person == 0) { person = 1; }
+            action PersonLets when (ended == 0 && gaveup == 0 && person == 1) { person = 0; }
+            action AgentWorks when (ended == 0 && gaveup == 0 && agent == 0) { agent = 1; }
+            action AgentRests when (ended == 0 && gaveup == 0 && agent == 1) { agent = 0; }
+            action Answers when (ended == 0 && gaveup == 0 && ready == 0) {
+                ready = 1;
+                aged = 0;
+            }
+            action AtBreak when (ended == 0 && gaveup == 0 && brk == 0) { brk = 1; }
+            action AtIdle when (ended == 0 && gaveup == 0 && brk == 1) { brk = 0; }
 
             action Wait when (
-                ended == 0 &&
-                (ready == 0 || person == 1 || agent == 1) &&
-                (ready == 0 || person == 0 || waited <= Bound - 1 || Buggy == 1)
+                ended == 0 && gaveup == 0 &&
+                ((Buggy == 1 && (brk == 1 || (ready == 1 && (person == 1 || agent == 1)))) ||
+                 (brk == 1 && Buggy == 0 &&
+                  ((ready == 0 && waited <= Bound - 1) ||
+                   (ready == 0 && person == 1 && asks <= MaxAsks - 1) ||
+                   (ready == 1 && aged <= Bound - 1 && (person == 0 || waited <= Bound - 1)))) ||
+                 (brk == 0 && ready == 0 &&
+                  (waited <= Bound - 1 || (person == 1 && asks <= MaxAsks - 1))) ||
+                 (brk == 0 && ready == 1 && Buggy == 0 && (person == 1 || agent == 1) &&
+                  (person == 0 || waited <= Bound - 1) &&
+                  (agent == 0 || person == 1 || aged <= Bound - 1)))
             ) {
                 stale = if ready == 1 && person == 1 && waited > Bound - 1 { 1 } else { stale };
+                silent = if person == 0 &&
+                    ((ready == 0 && waited > Bound - 1) || (ready == 1 && aged > Bound - 1))
+                    { 1 } else { silent };
                 waited = if waited <= Bound - 1 { waited + 1 } else { waited };
+                aged = if aged <= Bound - 1 { aged + 1 } else { aged };
             }
             action Void when (
-                ended == 0 && ready == 1 && person == 1 && waited > Bound - 1 && Buggy == 0
+                ended == 0 && gaveup == 0 && ready == 1 && person == 1 &&
+                waited > Bound - 1 && Buggy == 0
             ) {
                 ready = 0;
             }
-            action Terminate when (ended == 0 && ready == 1 && person == 0 && agent == 0) {
+            action ReAsk when (
+                ended == 0 && gaveup == 0 && asks <= MaxAsks - 1 && person == 0 &&
+                ((brk == 0 && ready == 0 && waited > Bound - 1) ||
+                 (Buggy == 0 && brk == 1 &&
+                  ((ready == 0 && waited > Bound - 1) || (ready == 1 && aged > Bound - 1))) ||
+                 (Buggy == 0 && brk == 0 && ready == 1 && agent == 1 && aged > Bound - 1) ||
+                 (Buggy == 1 && ready == 1 && agent == 1 && waited > Bound - 1))
+            ) {
+                hasty = if ready == 1 && aged <= Bound - 1 { 1 } else { hasty };
+                asks = asks + 1;
+                waited = 0;
+                aged = 0;
+                ready = 0;
+            }
+            action GiveUp when (
+                ended == 0 && gaveup == 0 && asks > MaxAsks - 1 &&
+                ((brk == 0 && ready == 0 && waited > Bound - 1) ||
+                 (Buggy == 0 && brk == 1 &&
+                  ((ready == 0 && waited > Bound - 1) ||
+                   (ready == 1 && aged > Bound - 1 && person == 0))) ||
+                 (Buggy == 0 && brk == 0 && ready == 1 && agent == 1 && aged > Bound - 1 &&
+                  person == 0) ||
+                 (Buggy == 1 && ready == 1 && agent == 1 && person == 0 && waited > Bound - 1))
+            ) {
+                hasty = if ready == 1 && aged <= Bound - 1 { 1 } else { hasty };
+                gaveup = 1;
+            }
+            action Terminate when (
+                ended == 0 && gaveup == 0 && ready == 1 && person == 0 &&
+                ((brk == 0 && agent == 0) || (Buggy == 1 && waited > Bound - 1))
+            ) {
+                cut = if brk == 1 || agent == 1 { 1 } else { cut };
                 ended = 1;
             }
 
             invariant NoEndOnAHeldAnswer: ended == 0 || stale == 0;
+            invariant NoSilentWait: silent == 0;
+            invariant NeverEndsRunningWork: cut == 0;
+            invariant NoHastySupersede: hasty == 0;
         }
     }
 }
@@ -329,6 +414,13 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// acted on a READY someone had spoken after; `dropheld`, a release was
 /// dropped while the agent held for the restart.
 ///
+/// THE AGENT'S OWN WORK UNDER A READY (composed with the drain bound's
+/// re-ask, `HarnessUpgradeDrainBound`, 2026-09-27): past the bound an
+/// announced upgrade asks again (`Supersede`) — or, its asks spent, gives up
+/// over the answer (`GiveUpOutlived`) — and a gave-up one voids it (`Void`),
+/// owing the release. A person's hold voids in either phase. Both are the
+/// environment's holds; Tier-1 checks each where the model allows it.
+///
 /// `Look` is DERIVED FROM THE REDUCER'S OWN GUARDS (the review of
 /// 2026-09-26): enabled exactly where neither `Restart` nor `Release` nor
 /// `DropRelease` is — the guards spelled again inside it (the release's
@@ -337,6 +429,23 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// replaces ("a restart it would take", "the release will come") assumed
 /// what was to be proved: with F2 reverted, or the release never typed, or
 /// both, `NeverStranded` still held.
+///
+/// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
+/// upgrades stalled" — tab `s-d3346b29dd236432b852` sat `failed:unanswered`
+/// for 1d22h, its late READY voided under the background gate it always
+/// runs, and `Phase::Failed(_) => Wait("failed")` was terminal for the
+/// target). `rest`: the stopped round (gave up, or stopped otherwise) has
+/// rested the real `RETRY_S` — the environment's clock (`Rests`), begun again
+/// by every stop and by the void of a gave-up round's late READY, and not
+/// held at a limit (the round it starts types nothing there). `Rearm`: the
+/// reducer's new round — pending again, its asks, window and markers reset —
+/// taken wherever the rest has run out, except over a gave-up round's late
+/// READY, which is still acted on (`Restart`, or voided). The release still
+/// owed is carried: the new round's first notice supersedes it. The last
+/// word (`Look`) is now the upgrade's QUIET word — nothing it would do for
+/// the agent at this look: a stopped round's `wait:failed` while it rests,
+/// which the host looks at again, is one. A fifth ghost, `stalled`: the quiet
+/// word said at a stopped round whose rest has run out — a permanent wait.
 ///
 /// `DropRelease` is the driver's own rule (`release_void`, `directed`),
 /// never the property it must keep: its guard is the direction the real code
@@ -350,9 +459,13 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// `Elapse`, `LimitResets`); `NeverStranded` — an agent the upgrade asked is
 /// restarted and carried on, or released, never left holding under the
 /// upgrade's last word; `NoDropOverAHold` — a release is dropped only for an
-/// agent that took up direction given after its last answer; and
+/// agent that took up direction given after its last answer;
 /// `NoRestartOverDirection` — a restart never acts on a READY someone spoke
-/// after. ONE KNOB PER DEFECT, each caught on its own: `NoF1` (notices and
+/// after; and `NeverStalls` — no reachable state is a permanent wait: a
+/// stopped round whose rest has run out always has a new round (or its late
+/// READY's restart) enabled, so the quiet word is never said past it. ONE
+/// KNOB PER DEFECT, each caught on its own: `Terminal` (a stopped round is
+/// for good: no `Rearm`, today's terminal `failed`), `NoF1` (notices and
 /// the clock at a limit), `NoF2` (a gave-up upgrade deaf to a late READY),
 /// `NoOwe` (nothing abandoned owes a release), `NoType` (a release owed,
 /// never typed), `KeepReady` (a stop keeps the round's markers, and the
@@ -365,7 +478,8 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// READY it then gives needed), `ReadyOverDirection` (a READY stays the last
 /// word past a direction the agent never answered — an Esc, a message met by
 /// a `<synthetic>` row). `Buggy = 1` is the reducer before the fix, the
-/// incident's three at once (`NoF1`, `NoF2`, `NoOwe`). Tier-1 in
+/// incident's three at once (`NoF1`, `NoF2`, `NoOwe`), and the terminal
+/// `failed` of 2026-09-27 (`Terminal`). Tier-1 in
 /// aterm-agent's `harness::upgrade_drive` tests drives the real reducer,
 /// gates, record transitions, transcript readers and the host's reading of
 /// each step's word over every reachable state, and replays the incident,
@@ -391,6 +505,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             const StaleDirection = 0;
             const UnansweredDirection = 0;
             const ReadyOverDirection = 0;
+            const Terminal = 0;
             const MaxAsks = 2;
             var limited = 0;
             var phase = 0;
@@ -407,6 +522,8 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             var stuck = 0;
             var overrode = 0;
             var dropheld = 0;
+            var rest = 0;
+            var stalled = 0;
 
             // The account and the agent, as they please.
             action LimitHits when (limited == 0 && (phase <= 2 || phase == 4)) {
@@ -447,6 +564,11 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             ) {
                 window = 1;
             }
+            // A stopped round's rest runs out (`RETRY_S` since it stopped),
+            // limited or not: the round it lets start types nothing there.
+            action Rests when ((phase == 2 || phase == 4) && rest == 0) {
+                rest = 1;
+            }
 
             // The upgrade's steps.
             action Announce when (
@@ -470,6 +592,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             ) {
                 phase = 2;
                 owed = if NoOwe == 1 { owed } else { 1 };
+                rest = 0;
             }
             action Restart when (
                 ready == 1 && live == 1 && limited == 0 &&
@@ -483,10 +606,38 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 overrode = if told == 1 { 1 } else { overrode };
                 told = 0;
                 directed = 0;
+                rest = 0;
             }
-            // A person, or the agent's own background work, held the READY
-            // answer past the drain's bound — an announced upgrade's, or the
-            // late answer a gave-up one hears.
+            // The agent's own background work outlived the READY answer past
+            // the bound (the environment's hold, as `Void`'s is): an
+            // announced upgrade asks again, naming what runs, and the new
+            // notice supersedes the answer — its READY is no longer the last
+            // word after the latest notice (the four-day tab of 2026-09-26).
+            action Supersede when (
+                ready == 1 && live == 1 && limited == 0 && phase == 1 &&
+                window == 1 && asks <= MaxAsks - 1
+            ) {
+                asks = asks + 1;
+                window = 0;
+                ready = 0;
+                owed = 0;
+                holding = 1;
+                told = 0;
+                directed = 0;
+            }
+            // Its asks spent, it gives up over the answer the work outlived:
+            // the answer stands, and the gave-up arm's `Void` releases it.
+            action GiveUpOutlived when (
+                ready == 1 && live == 1 && limited == 0 && phase == 1 &&
+                window == 1 && asks == MaxAsks
+            ) {
+                phase = 2;
+                owed = if NoOwe == 1 { owed } else { 1 };
+                rest = 0;
+            }
+            // A person held the READY answer past the drain's bound — an
+            // announced upgrade's, or the late answer a gave-up one hears —
+            // or the agent's own background work held a gave-up one's.
             action Void when (
                 ready == 1 && live == 1 && limited == 0 &&
                 ((phase == 1 && window == 1) || (phase == 2 && Buggy == 0 && NoF2 == 0))
@@ -495,6 +646,9 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 live = 0;
                 owed = if NoOwe == 1 { owed } else { 1 };
                 window = if (phase == 1 && Buggy == 0 && NoOwe == 0) { 0 } else { window };
+                // A gave-up round's rest begins again at the void: the release
+                // it owes stands a whole rest before a new round's notice.
+                rest = 0;
             }
             // The owner's hold, a refused plan or signal: the round is
             // abandoned — the markers with it, unless `KeepReady`.
@@ -503,6 +657,23 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 ready = if KeepReady == 1 { ready } else { 0 };
                 live = if KeepReady == 1 { live } else { 0 };
                 owed = if NoOwe == 1 { owed } else { 1 };
+                rest = 0;
+            }
+            // NO STOP IS FOR GOOD: a stopped round that has rested starts a
+            // new one — pending, its asks, window and markers reset — unless
+            // it gave up with a late READY in hand, which is still acted on.
+            // A release still owed is carried: the new round's first notice
+            // supersedes it (`Terminal`: never — today's terminal `failed`).
+            action Rearm when (
+                (phase == 2 || phase == 4) && rest == 1 && Buggy == 0 && Terminal == 0 &&
+                (phase == 4 || ready == 0 || live == 0)
+            ) {
+                phase = 0;
+                asks = 0;
+                window = 0;
+                ready = 0;
+                live = 0;
+                rest = 0;
             }
             // The release's point: it waits behind a READY only where the
             // phase acts on it (`KeepReady` waits behind any), and is typed
@@ -512,7 +683,8 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 owed == 1 && limited == 0 && NoType == 0 &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                 (phase == 2 || phase == 4 || (phase == 1 && window == 0)) &&
-                directed == 0 && ((UnansweredDirection == 0 && Buggy == 0) || told == 0)
+                directed == 0 && ((UnansweredDirection == 0 && Buggy == 0) || told == 0) &&
+                (rest == 0 || Buggy == 1 || Terminal == 1 || (phase == 2 && ready == 1 && live == 1))
             ) {
                 owed = 0;
                 holding = 0;
@@ -528,17 +700,19 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 owed == 1 && NoType == 0 &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                 (phase == 2 || phase == 4 || (phase == 1 && window == 0 && limited == 0)) &&
-                (directed == 1 || ((UnansweredDirection == 1 || Buggy == 1) && told == 1))
+                (directed == 1 || ((UnansweredDirection == 1 || Buggy == 1) && told == 1)) &&
+                (rest == 0 || Buggy == 1 || Terminal == 1 || (phase == 2 && ready == 1 && live == 1))
             ) {
                 owed = 0;
                 live = 0;
                 ready = 0;
                 dropheld = if holding == 1 { 1 } else { dropheld };
             }
-            // THE LAST WORD at a point the agent can read: nothing left the
-            // upgrade would do — no restart, no release typed or dropped
-            // (`LastWhileOwed`: a stop's own word said over a release still
-            // owed).
+            // THE QUIET WORD at a point the agent can read: nothing left the
+            // upgrade would do now — no restart, no release typed or dropped,
+            // no new round (`LastWhileOwed`: a stop's own word said over a
+            // release still owed). Said past a stopped round's rest, it is a
+            // permanent wait (`stalled`).
             action Look when (
                 (phase == 2 || phase == 4) && limited == 0 && stuck == 0 &&
                 (if (
@@ -549,15 +723,244 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                     owed == 1 && limited == 0 && NoType == 0 &&
                     (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                     (phase == 2 || phase == 4 || (phase == 1 && window == 0))
+                ) { 1 } else { 0 }) +
+                (if (
+                    (phase == 2 || phase == 4) && rest == 1 && Buggy == 0 && Terminal == 0 &&
+                    (phase == 4 || ready == 0 || live == 0)
                 ) { 1 } else { 0 }) == 0
             ) {
                 stuck = holding;
+                stalled = if rest == 1 { 1 } else { stalled };
             }
 
             invariant NoNoticeWhileLimited: blind == 0;
             invariant NeverStranded: stuck == 0;
             invariant NoDropOverAHold: dropheld == 0;
             invariant NoRestartOverDirection: overrode == 0;
+            invariant NeverStalls: stalled == 0;
+        }
+    }
+}
+
+/// THE LOGIN WALL (`aterm_agent::harness::upgrade`: `gate_announce`,
+/// `next_step`, `announce_asks`, `transcript_login`, `clock_held` and the
+/// driver's `login_facts`; `aterm_agent::supervise::policy::turn_end`:
+/// `decide_turn_end`'s auth arm and its login hold; both over `aterm_phase`'s
+/// wall reader). The incident it is written for (2026-09-27, tab
+/// `s-b5cf2faabac5ce5127bd`, Claude Code 2.1.281): the login expired, and
+/// every turn after it ended in milliseconds on Claude Code's synthetic
+/// `authentication_failed` row, drawn `⏺ Login expired · Please run
+/// /login`, which the reader read as idle with no wall. The supervisor typed
+/// `continue` and `keep going` into it and told nobody; the live upgrade typed
+/// four notices into it half an hour apart — each answered by the wall, none
+/// read by the model — counted them, and gave up at 07:03; the READY the
+/// agent gave once the owner logged in at 14:33 answered an upgrade that had
+/// stopped.
+///
+/// The session: `login` (signed in), `wall` (its last turn ended on the wall,
+/// whose row the screen shows), `stood` (the transcript's last word on the
+/// login is the wall: every turn the wall answers sets it, the person's
+/// `Login successful` or an answer of the model clears it), `back` (the
+/// screen says `Login successful`). The supervisor: `track` (its lost
+/// login's track: `/login` typed), `told` (the owner told of it). The
+/// upgrade: `phase` 0 pending, 1 announced, 2 gave up, 3 restarted; `asks`
+/// counted to `MaxAsks` (the real `MAX_ASKS` scaled down); `window` (the
+/// re-ask window has run out); `unread` (the latest notice's own turn was the
+/// wall's: it never reached the model); `got` (asks whose notice the model
+/// received); `dark` (the wall stood in the running window); `holding` (the
+/// agent read a notice and winds down); `ready` (its READY is its last
+/// word); `inherited` (the state is a build's before the fix, `Inherit`).
+/// Four ghosts: `blind`, the upgrade typed where the wall showed or stood;
+/// `spent`, a give-up with fewer than `MaxAsks` notices received, or over a
+/// window the wall darkened; `futile`, a continuation typed into a login the
+/// loop saw gone and has not seen back; `untold`, the supervisor acted at a
+/// wall before the owner was told of it.
+///
+/// `Inherit` is the state a build before the fix left — it gave up on
+/// `MaxAsks` notices the wall answered (the owner's `failed:unanswered`) —
+/// which the fixed build reads and takes back (`Announce` from phase 2).
+/// Outside the model: the upgrade's ownership of the turn ends after an
+/// announcement (the supervisor types nothing there; here it may), and the
+/// release line an abandoned notice owes (`harness_upgrade_never_strands_model`).
+///
+/// Properties: `NoNoticeAtTheWall`, `NoGiveUpUnread`, `NoFutileContinue`,
+/// `TheOwnerIsToldFirst`. ONE KNOB PER DEFECT, each caught on its own:
+/// `NoGate` (the upgrade's gate misses the wall: the reader's error row, the
+/// transcript's word), `NoRefund` (a notice the wall answered is counted and
+/// given up on), `ClockAtWall` (the re-ask window runs at the wall and the
+/// lift does not start it again), `NoSee` (the supervisor's reader misses the
+/// wall), `NoHold` (a lost login is continued once its row leaves the
+/// screen). `Buggy = 1` is 0.93.0 and main before the fix, all five at once:
+/// the incident — notices typed into the wall and spent into a give-up, the
+/// supervisor's continuations into it, nobody told. Tier-0 in aterm-spec's
+/// `derived_harness_login_wall`; Tier-1 in aterm-agent's
+/// `conformance_login_wall`, over the real readers, reducer and turn-end
+/// decider on every reachable state.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_login_wall_model() -> Model {
+    crate::ty_model! {
+        HarnessLoginWall {
+            const Buggy = 0;
+            const NoGate = 0;
+            const NoRefund = 0;
+            const ClockAtWall = 0;
+            const NoSee = 0;
+            const NoHold = 0;
+            const MaxAsks = 2;
+            var login = 1;
+            var wall = 0;
+            var stood = 0;
+            var back = 0;
+            var track = 0;
+            var told = 0;
+            var phase = 0;
+            var asks = 0;
+            var window = 0;
+            var unread = 0;
+            var got = 0;
+            var dark = 0;
+            var holding = 0;
+            var ready = 0;
+            var inherited = 0;
+            var blind = 0;
+            var spent = 0;
+            var futile = 0;
+            var untold = 0;
+
+            // The account and the session, as they please: the login goes;
+            // a turn someone else began (a background completion, a /loop
+            // wakeup) is answered by the wall; the person's `/login` is done
+            // (`Login successful`), and the upgrade's window starts again
+            // from the lift (`ClockAtWall`: it does not); a `/login` dialog
+            // is dismissed with no login, its wall's row now history.
+            action Expire when (login == 1) {
+                login = 0;
+            }
+            action WallHit when (login == 0 && wall == 0) {
+                wall = 1;
+                stood = 1;
+                back = 0;
+                dark = if (phase == 1 && window == 0) { 1 } else { dark };
+            }
+            action LoginBack when (login == 0 && stood == 1) {
+                login = 1;
+                wall = 0;
+                stood = 0;
+                back = 1;
+                window = if (phase == 1 && Buggy == 0 && ClockAtWall == 0) { 0 } else { window };
+                dark = if (Buggy == 0 && ClockAtWall == 0) { 0 } else { dark };
+            }
+            action Dismiss when (track == 1 && wall == 1 && login == 0) {
+                wall = 0;
+            }
+            // A build before the fix gave up on every notice, each answered
+            // by the wall.
+            action Inherit when (phase == 0 && asks == 0 && inherited == 0 && stood == 1) {
+                phase = 2;
+                asks = MaxAsks;
+                unread = 1;
+                window = 1;
+                inherited = 1;
+            }
+
+            // The supervisor. At a point it reads the wall at: `/login`,
+            // once, the owner told as it is typed.
+            action TypeLogin when (wall == 1 && track == 0 && Buggy == 0 && NoSee == 0) {
+                track = 1;
+                told = 1;
+            }
+            // At a point it reads no wall at, a continuation — never while a
+            // lost login's track stands and the screen does not say it is
+            // back (`NoHold`: it does). Answered by the model: the login is
+            // back, the track ends, the notices typed are read. Answered by
+            // the wall: its row, and the transcript's word.
+            action Continue when (
+                (wall == 0 || Buggy == 1 || NoSee == 1) &&
+                (track == 0 || back == 1 || Buggy == 1 || NoHold == 1)
+            ) {
+                futile = if (login == 0 && stood == 1) { 1 } else { futile };
+                untold = if (stood == 1 && told == 0) { 1 } else { untold };
+                wall = if (login == 1) { 0 } else { 1 };
+                stood = if (login == 1) { 0 } else { 1 };
+                back = 0;
+                track = if (login == 1) { 0 } else { track };
+                told = if (login == 1) { 0 } else { told };
+                holding = if (login == 1 && (phase == 1 || phase == 2)) { 1 } else { holding };
+                dark = if (login == 0 && phase == 1 && window == 0) { 1 } else { dark };
+            }
+
+            // The upgrade. A notice: never where the wall shows or stands
+            // (`NoGate`: it is); a notice the wall answered is typed again
+            // as the same ask, and a give-up spent on such notices is taken
+            // back — its next notice the next ask the model has not had
+            // (`NoRefund`: neither). Typed with the login gone, its own turn
+            // is the wall's.
+            action Announce when (
+                ready == 0 &&
+                ((wall == 0 && stood == 0) || Buggy == 1 || NoGate == 1) &&
+                (phase == 0 ||
+                    (phase == 1 &&
+                        ((unread == 1 && Buggy == 0 && NoRefund == 0) ||
+                            (window == 1 && asks <= MaxAsks - 1))) ||
+                    (phase == 2 && unread == 1 && Buggy == 0 && NoRefund == 0))
+            ) {
+                blind = if (wall == 1 || stood == 1) { 1 } else { blind };
+                asks = if (phase == 1 && unread == 1 && Buggy == 0 && NoRefund == 0) {
+                    asks
+                } else if (phase == 2) {
+                    got + 1
+                } else {
+                    asks + 1
+                };
+                got = if (login == 1) { got + 1 } else { got };
+                unread = if (login == 1) { 0 } else { 1 };
+                holding = if (login == 1) { 1 } else { holding };
+                wall = if (login == 1) { wall } else { 1 };
+                stood = if (login == 1) { stood } else { 1 };
+                back = if (login == 1) { back } else { 0 };
+                phase = 1;
+                window = 0;
+                dark = 0;
+            }
+            // The re-ask window runs only where the agent can answer.
+            action Elapse when (
+                phase == 1 && window == 0 &&
+                ((wall == 0 && stood == 0) || Buggy == 1 || ClockAtWall == 1)
+            ) {
+                window = 1;
+            }
+            action GiveUp when (
+                phase == 1 && window == 1 && asks == MaxAsks && ready == 0 &&
+                ((wall == 0 && stood == 0) || Buggy == 1 || NoGate == 1) &&
+                (unread == 0 || Buggy == 1 || NoRefund == 1)
+            ) {
+                phase = 2;
+                spent = if (got <= MaxAsks - 1 || dark == 1) { 1 } else { spent };
+            }
+            // The agent answers READY (its own turn: the login must hold),
+            // and the restart acts on it — an announced upgrade's, or the
+            // late answer one that gave up still hears — never into the
+            // wall.
+            action AgentReady when (
+                holding == 1 && login == 1 && ready == 0 && (phase == 1 || phase == 2)
+            ) {
+                ready = 1;
+            }
+            action Restart when (
+                ready == 1 && (phase == 1 || phase == 2) &&
+                ((wall == 0 && stood == 0) || Buggy == 1 || NoGate == 1)
+            ) {
+                blind = if (wall == 1 || stood == 1) { 1 } else { blind };
+                phase = 3;
+                ready = 0;
+                holding = 0;
+            }
+
+            invariant NoNoticeAtTheWall: blind == 0;
+            invariant NoGiveUpUnread: spent == 0;
+            invariant NoFutileContinue: futile == 0;
+            invariant TheOwnerIsToldFirst: untold == 0;
         }
     }
 }
@@ -900,6 +1303,89 @@ pub fn harness_model_priority_model() -> Model {
                     (p_b1 == 0 || av_b1 == 0 || (pick > 0 && pick <= p_b1)) &&
                     (p_b2 == 0 || av_b2 == 0 || (pick > 0 && pick <= p_b2))
                 );
+        }
+    }
+}
+
+/// **THE MODEL LADDER** — WHEN the live upgrade takes a DUE model move
+/// (`aterm_agent::harness::upgrade_models::model_moves_now`; WHICH model is
+/// [`harness_model_priority_model`]'s).
+///
+/// The incident (2026-09-25): a warm conversation on `claude-opus-5` was
+/// restarted 2.1.282 -> 2.1.283 while the managed 2.1.283 offered
+/// `claude-opus-5-5`, and came back on Opus 5. The rule then took a due move
+/// only when the prompt cache was COLD — an hour without an answer — which a
+/// conversation in active use never reaches, so the move waited for as long as
+/// anyone used the session. The owner had to type `/model`.
+///
+/// The ladder, every due move landing: move at once when `cold`; move at once
+/// when a newer BUILD `restart`s the session anyway (the model rides it); else
+/// wait, at most `Warm` readable visits of being due, then move. `clock` is
+/// those visits. A visit that cannot read the live model (`unknown`: a
+/// transcript tail with no answer in it) decides nothing and LEAVES the clock
+/// — an unknown read that reset it would restart the bound on every flicker.
+///
+/// `NeverPastTheBound` is the landing law as a safety property: while the move
+/// is due and readable, no visit waits past `Warm`. The environment may keep
+/// the session warm forever (`Answer`) and may never let it go quiet — that is
+/// exactly the case the law must hold in. `Buggy = 1` is the incident's rule
+/// (cold is a CONDITION, so a warm session waits every visit) and walks `clock`
+/// past the bound.
+///
+/// Tier-1: `aterm-agent/tests/conformance_upgrade_models/ladder.rs` drives the
+/// REAL `model_moves_now` over every reachable state and requires
+/// `VisitMoves` to be enabled exactly where it answers a move, with the
+/// pre-fix rule as the caught negative control.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_model_ladder_model() -> Model {
+    crate::ty_model! {
+        HarnessModelLadder {
+            const Buggy = 0;
+            // MODEL_WARM_MAX_S, in readable visits of being due.
+            const Warm = 3;
+            var cold = 0;
+            var restart = 0;
+            var unknown = 0;
+            var clock = 0;
+            var moved = 0;
+
+            // -- the environment ------------------------------------------
+            // An answer keeps (or makes) the cache warm; nothing stops a
+            // session in active use from answering forever.
+            action Answer when (moved == 0) {
+                cold = 0;
+            }
+            action GoQuiet when (moved == 0 && cold == 0) {
+                cold = 1;
+            }
+            // A newer Claude Code build is installed: the session will be
+            // restarted onto it whatever the model does.
+            action BuildArrives when (moved == 0 && restart == 0) {
+                restart = 1;
+            }
+            action Flicker when (moved == 0 && unknown == 0) {
+                unknown = 1;
+            }
+            action Readable when (moved == 0 && unknown == 1) {
+                unknown = 0;
+            }
+
+            // -- the harness's visit (readable only) -----------------------
+            action VisitMoves when (
+                moved == 0 && unknown == 0 &&
+                (cold == 1 || (Buggy == 0 && (restart == 1 || clock > Warm - 1)))
+            ) {
+                moved = 1;
+            }
+            action VisitWaits when (
+                moved == 0 && unknown == 0 && cold == 0 && clock <= Warm &&
+                (Buggy == 1 || (restart == 0 && clock <= Warm - 1))
+            ) {
+                clock = clock + 1;
+            }
+
+            invariant NeverPastTheBound: clock <= Warm;
         }
     }
 }

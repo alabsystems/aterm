@@ -527,9 +527,9 @@ pub fn disabled_line(row: &Row, build: Option<u64>) -> String {
 
 /// The epilogue for a child that exited 1 (offline, disabled inside the child, any flow
 /// error), stderr, after the child's own failure line: the version you have stays, and how
-/// to retry. (The typed lane's offline sentence — `no signature-valid index at/above the
-/// floor` — is pre-existing and reads as a trust problem; this line is what says what
-/// actually happened to the copy.)
+/// to retry. (The child's own line says WHY — an unreached index reads "could not reach the
+/// toolchain index (…) — this is a network problem"; this line is what says what happened
+/// to the copy.)
 #[must_use]
 pub fn incomplete_line(row: &Row, build: Option<u64>) -> String {
     let p = row.program;

@@ -66,10 +66,11 @@ use std::path::Path;
 /// (Re-exported from the crate root so cross-platform status consumers share the
 /// one threshold.)
 ///
-/// The threshold means "three checks in a row". At the one 30-minute cadence
-/// (`cadence::INTERVAL_SECS`, `spawn_background_check_with_settings`) — doubling while checks fail —
-/// that is two to three hours of one failure class, long enough that a flaky network
-/// blip never escalates and short enough that a broken pipeline is named the same day.
+/// The threshold means "three checks in a row". At the ten-minute cadence
+/// (`cadence::INTERVAL_SECS`, `spawn_background_check_with_settings`) — doubling while
+/// checks fail, so the waits are 10 and then 20 minutes — that is about half an hour of
+/// one failure class, long enough that a flaky network blip never escalates and short
+/// enough that a broken pipeline is named within the hour.
 pub use crate::PERSISTENT_AFTER;
 
 /// The durable health record. All fields default so an absent/corrupt file reads as

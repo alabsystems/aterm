@@ -50,7 +50,7 @@ use crate::extract::{
     extract_zip_tree,
 };
 use crate::manifest::Artifact;
-use crate::tree::{file_sha256, tree_root};
+use crate::tree::{DeclaredModes, file_sha256, tree_root, tree_root_declared};
 
 /// Opt-in belt-and-suspenders, a DEVELOPMENT SEAM (`aterm_types::dev_seam!` — a shipped
 /// binary does not read it): when this is set to a non-empty value, [`verify_and_stage`]
@@ -163,6 +163,20 @@ impl StageHooks<'_> {
     };
 }
 
+/// A [`StageError::Io`] that names the STEP it came from: `io: <step>: <error>`.
+///
+/// `std::io::Error` carries no path and no verb, so a stage that died of
+/// `io: Access is denied. (os error 5)` said nothing about WHERE — and on Windows that
+/// one sentence covered the tree flush (`FlushFileBuffers` on a read-only handle), a
+/// directory rename with a handle open inside it, and a scratch sweep, each with a
+/// different fix (2026-09-22). The kind is kept, so every `matches!` on it still holds.
+fn io_step(step: &str, e: std::io::Error) -> StageError {
+    let mut m = String::from(step);
+    m.push_str(": ");
+    m.push_str(&e.to_string());
+    StageError::Io(std::io::Error::new(e.kind(), m))
+}
+
 /// Uncompressed-size cap for extraction: twice the signed `disk_installed` (tolerating
 /// block-rounding) but at least 1 MiB, so a decompression bomb is bounded by the *signed*
 /// size, never an attacker-chosen tar header. A `disk_installed` of 0 (older/loose
@@ -219,7 +233,7 @@ pub fn verify_and_stage(
 ) -> Result<String, StageError> {
     // 1. Download integrity — the compressed asset's sha256 must match the signed value,
     //    BEFORE we spend any work extracting it.
-    let got = file_sha256(archive).map_err(StageError::Io)?;
+    let got = file_sha256(archive).map_err(|e| io_step("read the archive", e))?;
     if !got.eq_ignore_ascii_case(&artifact.sha256) {
         return Err(StageError::Sha256Mismatch {
             expected: artifact.sha256.clone(),
@@ -237,14 +251,16 @@ pub fn verify_and_stage(
             "build dir has no name",
         ))
     })?;
-    std::fs::create_dir_all(&incoming).map_err(StageError::Io)?;
+    std::fs::create_dir_all(&incoming).map_err(|e| io_step("create the staging scratch", e))?;
     //    The stage hands back the `tree_root` of what it wrote, folded from the bytes
     //    as they went past (see [`crate::extract::extract_tar_zst_rooted`]). This is
     //    the ONE pass over the uncompressed payload: the digest step 3 compares is a
     //    by-product of the writing, not a second reading of it. (The `dmg` lane is
     //    the exception — `ditto` wrote its bytes, so it walks them once.)
-    let extracted_root = match stage_payload(artifact, archive, &incoming) {
-        Ok(root) => root,
+    //    It also hands back the modes it DECLARED per regular file, which step 4c records
+    //    beside the build for the on-disk walk on a filesystem with no POSIX bits.
+    let (extracted_root, modes) = match stage_payload_modes(artifact, archive, &incoming) {
+        Ok(staged) => staged,
         Err(e) => {
             let _ = std::fs::remove_dir_all(&incoming);
             return Err(e);
@@ -281,11 +297,11 @@ pub fn verify_and_stage(
     let root = if artifact.tree_root.is_empty() {
         extracted_root
     } else {
-        let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed()) {
+        let got = match reverified_root(&incoming, extracted_root, disk_reverify_armed(), &modes) {
             Ok(r) => r,
             Err(e) => {
                 let _ = std::fs::remove_dir_all(&incoming);
-                return Err(StageError::Io(e));
+                return Err(io_step("re-walk the staged tree", e));
             }
         };
         if !got.eq_ignore_ascii_case(&artifact.tree_root) {
@@ -338,14 +354,14 @@ pub fn verify_and_stage(
     //     names that vouch for them only afterwards.
     if let Err(e) = crate::store::sync_tree(&incoming) {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(StageError::Io(e));
+        return Err(io_step("flush the staged tree", e));
     }
 
     // 4. SWAP. Marker down first (mid-swap, the build is honestly not complete), then the
     //    old tree aside, then the verified tree into place, then the old tree reclaimed.
     if let Err(e) = swap_into_place(build_dir, &incoming) {
         let _ = std::fs::remove_dir_all(&incoming);
-        return Err(StageError::Io(e));
+        return Err(io_step("swap the staged tree into place", e));
     }
 
     // 4b. THE CALLER'S SIDECARS, durably, then the directory that names them: `.ready`
@@ -354,11 +370,21 @@ pub fn verify_and_stage(
     if !sidecars.is_empty() {
         for (suffix, bytes) in &sidecars {
             crate::store::write_sidecar_durably(build_dir, suffix, bytes)
-                .map_err(StageError::Io)?;
+                .map_err(|e| io_step("record a sidecar beside the build", e))?;
         }
         if let Some(parent) = build_dir.parent() {
             crate::store::sync_dir(parent);
         }
+    }
+
+    // 4c. THE DECLARED-MODE RECORD (`<build>.modes`, a sibling like `.ready`, outside
+    //     the hashed tree) — on a filesystem that stores no permission bits, the only way
+    //     a later on-disk walk (`atpkg verify`) can fold the mode slot the signed root
+    //     was folded with; a no-op where the inode stores them (Unix). Before the marker,
+    //     like the sidecars above: a build whose record could not be written is left
+    //     unmarked and re-stageable rather than marked complete and unverifiable.
+    if let Err(e) = crate::store::write_declared_modes(build_dir, &modes) {
+        return Err(io_step("record the declared modes beside the build", e));
     }
 
     // 5. Mark the build COMPLETE — the last step, written atomically AFTER the tree_root
@@ -386,7 +412,7 @@ pub fn verify_and_stage(
         // unmarked leftover is never extracted over. It is also fully reclaimable: the next
         // stage renames it aside and deletes it, and `gc`'s partial arm sweeps it once
         // nothing claims it.
-        return Err(StageError::Io(e));
+        return Err(io_step("mark the build complete", e));
     }
     if let Some(parent) = build_dir.parent() {
         crate::store::sync_dir(parent);
@@ -562,6 +588,24 @@ pub fn stage_payload(
     archive: &Path,
     dest: &Path,
 ) -> Result<String, StageError> {
+    stage_payload_modes(artifact, archive, dest).map(|(root, _)| root)
+}
+
+/// [`stage_payload`], also handing back the permission bits the stage DECLARED per
+/// regular file ([`TreeAccumulator::declared_modes`]): the mode slot a walk on a
+/// filesystem with no POSIX bits (Windows) must fold to reproduce the same root
+/// ([`crate::tree::tree_root_declared`]). The body of [`stage_payload`], for the caller
+/// that also records the declared modes beside the build ([`verify_and_stage`]). Empty
+/// for the `dmg` lane, whose tree `ditto` laid and this process walked (macOS only,
+/// where the inode answers).
+///
+/// # Errors
+/// As [`stage_payload`].
+pub(crate) fn stage_payload_modes(
+    artifact: &Artifact,
+    archive: &Path,
+    dest: &Path,
+) -> Result<(String, DeclaredModes), StageError> {
     let cap = size_cap(artifact);
     let vendor = ExtractOptions {
         strip_components: artifact.strip_components,
@@ -593,8 +637,14 @@ pub fn stage_payload(
     };
     apply_links(dest, &artifact.links, folded.as_mut())?;
     match folded {
-        Some(tree) => Ok(tree.root()),
-        None => tree_root(dest).map_err(StageError::Io),
+        Some(tree) => {
+            let modes = tree.declared_modes();
+            Ok((tree.root(), modes))
+        }
+        None => Ok((
+            tree_root(dest).map_err(StageError::Io)?,
+            DeclaredModes::new(),
+        )),
     }
 }
 
@@ -1208,7 +1258,8 @@ fn disk_reverify_armed() -> bool {
 
 /// The root step 3 compares against the signed value: the one the extractor folded, or —
 /// when [`DISK_REVERIFY_ENV`] is armed — that root AND a full on-disk
-/// [`crate::tree::tree_root`] walk, which must agree.
+/// [`crate::tree::tree_root_declared`] walk (over the stage's declared `modes`, which
+/// only a filesystem without POSIX bits folds), which must agree.
 ///
 /// Disagreement is an ERROR, never a silent preference for one of them: two producers of a
 /// cross-version byte contract that differ over the same tree is exactly the condition a
@@ -1218,11 +1269,12 @@ fn reverified_root(
     incoming: &Path,
     extracted_root: String,
     armed: bool,
+    modes: &DeclaredModes,
 ) -> std::io::Result<String> {
     if !armed {
         return Ok(extracted_root);
     }
-    let walked = tree_root(incoming)?;
+    let walked = tree_root_declared(incoming, modes)?;
     if !walked.eq_ignore_ascii_case(&extracted_root) {
         let mut msg = String::from("staged tree_root disagreement: the extraction folded ");
         msg.push_str(&extracted_root);
@@ -1313,7 +1365,6 @@ fn restore_outgoing(old: &Path, build_dir: &Path, was_complete: bool) -> bool {
 mod tests {
     use super::*;
     use crate::manifest::{Artifact, Cost};
-    use crate::tree::tree_root;
     use std::io::Write;
     use std::path::PathBuf;
 
@@ -1423,9 +1474,20 @@ mod tests {
         // `verify_and_stage` compares against the root the extractor FOLDS as it writes.
         // Every staging test below therefore fails the moment the two producers of that
         // cross-version byte contract disagree over this bundle — hardlinks, modes, empty
-        // files and all — on top of the exhaustive corpus in `extract.rs`.
-        crate::extract::extract_tar_zst(&archive, &probe, 1 << 20, 1000).unwrap();
-        let root = tree_root(&probe).unwrap();
+        // files and all — on top of the exhaustive corpus in `extract.rs`. The walk is
+        // given the fold's DECLARED modes, which only a filesystem without permission
+        // bits (Windows) consults: there the plain walk folds `0` and could agree with
+        // nothing, so it would be a differential against the wrong producer.
+        let modes = crate::extract::extract_tar_zst_tree(
+            &archive,
+            &probe,
+            1 << 20,
+            1000,
+            ExtractOptions::default(),
+        )
+        .unwrap()
+        .declared_modes();
+        let root = tree_root_declared(&probe, &modes).unwrap();
         std::fs::remove_dir_all(&probe).unwrap();
         assert_eq!(root.len(), 64, "the fixture must carry a real tree_root");
         Bundle {
@@ -1800,8 +1862,12 @@ mod tests {
         verify_and_stage(&b.art, &b.archive, &build, &StageHooks::NONE).unwrap();
 
         assert!(crate::store::build_is_complete(&build));
+        // The walk `atpkg verify` runs: over the declared-mode record the stage left
+        // beside the build (consulted only where the inode stores no bits — Windows —
+        // and empty, never read, on Unix).
+        let modes = crate::store::declared_modes(&build).unwrap();
         assert_eq!(
-            tree_root(&build).unwrap(),
+            tree_root_declared(&build, &modes).unwrap(),
             b.art.tree_root,
             "the marker must not have moved the tree_root — it is not inside the tree"
         );
@@ -2183,9 +2249,20 @@ mod tests {
     fn the_armed_disk_reverify_agrees_or_fails_closed() {
         let b = bundle("armed-reverify");
         let probe = b.dir.join("armed-probe");
-        let fused =
-            crate::extract::extract_tar_zst_rooted(&b.archive, &probe, 1 << 20, 1000).unwrap();
-        let walked = tree_root(&probe).unwrap();
+        // The declared modes ride along: on Windows the armed walk folds them (the
+        // plain walk folds `0` there and could agree with nothing); on Unix they are
+        // not consulted, so this is the same walk it always was.
+        let tree = crate::extract::extract_tar_zst_tree(
+            &b.archive,
+            &probe,
+            1 << 20,
+            1000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let modes = tree.declared_modes();
+        let fused = tree.root();
+        let walked = tree_root_declared(&probe, &modes).unwrap();
         // Reach guard: the corpus must be non-empty, or "they agree" is vacuous.
         assert_eq!(fused.len(), 64);
         assert_eq!(
@@ -2195,14 +2272,17 @@ mod tests {
 
         // Disarmed: the fused root is returned verbatim, no walk.
         assert_eq!(
-            reverified_root(&probe, fused.clone(), false).unwrap(),
+            reverified_root(&probe, fused.clone(), false, &modes).unwrap(),
             fused
         );
         // Armed and agreeing: still the same 64 characters.
-        assert_eq!(reverified_root(&probe, fused.clone(), true).unwrap(), fused);
+        assert_eq!(
+            reverified_root(&probe, fused.clone(), true, &modes).unwrap(),
+            fused
+        );
         // Armed and DISAGREEING: fail closed, and say which two roots disagreed.
         let bogus = "0".repeat(64);
-        let err = reverified_root(&probe, bogus.clone(), true).unwrap_err();
+        let err = reverified_root(&probe, bogus.clone(), true, &modes).unwrap_err();
         let text = err.to_string();
         assert!(
             text.contains(&bogus),
@@ -2222,13 +2302,21 @@ mod tests {
     fn the_armed_walk_still_catches_a_post_extraction_mutation() {
         let b = bundle("armed-mutation");
         let probe = b.dir.join("mut-probe");
-        let fused =
-            crate::extract::extract_tar_zst_rooted(&b.archive, &probe, 1 << 20, 1000).unwrap();
+        let tree = crate::extract::extract_tar_zst_tree(
+            &b.archive,
+            &probe,
+            1 << 20,
+            1000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let modes = tree.declared_modes();
+        let fused = tree.root();
         // Mutate one extracted file in place, exactly as a TOCTOU attacker would.
         let victim = first_regular_file(&probe).expect("the fixture bundle has a file");
         std::fs::write(&victim, b"swapped after extraction").unwrap();
         assert!(
-            reverified_root(&probe, fused, true).is_err(),
+            reverified_root(&probe, fused, true, &modes).is_err(),
             "an armed re-verify must refuse a tree mutated after the write"
         );
         let _ = std::fs::remove_dir_all(&b.dir);

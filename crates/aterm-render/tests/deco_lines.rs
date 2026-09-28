@@ -494,13 +494,16 @@ fn intersect_rect_spans_is_exact() {
 // level, byte-identical for descender-free cells.
 // ---------------------------------------------------------------------------
 
-fn fixture_renderer() -> Option<Renderer> {
+/// The tracked fixture face at 18px. The file is in the tree and the build is
+/// the product, so neither failing is a missing precondition: both FAIL.
+fn fixture_renderer() -> Renderer {
     const FIXTURE: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/jetbrains-mono.ttf"
     );
-    let bytes = std::fs::read(FIXTURE).ok()?;
-    Renderer::from_bytes(&bytes, 18.0, Theme::default()).ok()
+    let bytes = std::fs::read(FIXTURE).expect("the tracked fixture font must be readable");
+    Renderer::from_bytes(&bytes, 18.0, Theme::default())
+        .expect("the tracked fixture font must build an 18px renderer")
 }
 
 fn render(r: &mut Renderer, bytes: &[u8]) -> aterm_render::Frame {
@@ -518,10 +521,7 @@ fn render(r: &mut Renderer, bytes: &[u8]) -> aterm_render::Frame {
 /// the knob on or off (the no-ink identity, i.e. the same code path as off).
 #[test]
 fn ink_skip_is_coverage_monotone_end_to_end() {
-    let Some(mut r) = fixture_renderer() else {
-        eprintln!("SKIP: missing test fixture font");
-        return;
-    };
+    let mut r = fixture_renderer();
     assert!(r.underline_skip_descenders(), "W7 ships DEFAULT ON");
 
     // Descender text, underlined: A (skip off) / B (skip on) / C (no underline).
@@ -583,10 +583,8 @@ fn baseline_bottoms_keep_the_underline_at_12px() {
         eprintln!("SKIP: embedded font unavailable");
         return;
     };
-    let Ok(mut r) = Renderer::from_bytes(&bytes, 12.0, Theme::default()) else {
-        eprintln!("SKIP: 12px renderer failed to build");
-        return;
-    };
+    let mut r = Renderer::from_bytes(&bytes, 12.0, Theme::default())
+        .expect("the embedded font must build a 12px renderer");
     // Descender-free letters, underlined: skip on == skip off, byte for byte —
     // the underline must survive continuously under baseline-sitting bottoms.
     let flat_txt = b"\x1b[4mnnaeuu\x1b[0m";
@@ -952,9 +950,8 @@ fn cjk_composition_underline_is_continuous() {
     // 12px is the live desktop size the Latin ink-skip was tuned at; the rest
     // span the sizes where the fragmentation was measured.
     for px in [12.0f32, 13.0, 14.0, 16.0, 18.0, 24.0, 32.0] {
-        let Ok(mut r) = Renderer::from_bytes(&bytes, px, Theme::default()) else {
-            continue;
-        };
+        let mut r = Renderer::from_bytes(&bytes, px, Theme::default())
+            .unwrap_or_else(|e| panic!("the embedded font must build a {px}px renderer: {e}"));
         assert!(r.underline_skip_descenders(), "W7 ships DEFAULT ON");
         let (cw, _) = r.cell_size();
         let pad = r.pad();
@@ -1030,9 +1027,8 @@ fn latin_descender_skip_survives_the_wide_glyph_exemption() {
     };
     let mut fired = 0usize;
     for px in [12.0f32, 14.0, 18.0, 24.0, 32.0] {
-        let Ok(mut r) = Renderer::from_bytes(&bytes, px, Theme::default()) else {
-            continue;
-        };
+        let mut r = Renderer::from_bytes(&bytes, px, Theme::default())
+            .unwrap_or_else(|e| panic!("the embedded font must build a {px}px renderer: {e}"));
         r.set_underline_skip_descenders(false);
         let off = preedit_frame(&mut r, "gy");
         r.set_underline_skip_descenders(true);

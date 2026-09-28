@@ -68,9 +68,15 @@ pub(super) fn deterministic_description(snapshot: &Snapshot) -> String {
                 running_description(&snapshot.command)
             } else if !place.is_empty() {
                 ready_description(&place)
-            } else if !snapshot.title.is_empty() {
-                "Active terminal session".to_string()
             } else {
+                // Nothing is known: no command, no cwd. This arm used to say
+                // "Active terminal session" whenever a title was set — which
+                // is every fresh Windows pane, whose first title is ConPTY's
+                // program path before the cwd arrives — and the sentence stuck
+                // to the chip as `~\aterm · Active terminal session` beside
+                // siblings reading `~\aterm` (measured, audit 2026-09-22). It
+                // says nothing the title does not, so it is the bare state
+                // word, which the composer sheds whole beside any title.
                 READY.to_string()
             }
         }

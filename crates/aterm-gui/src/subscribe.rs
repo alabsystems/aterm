@@ -88,7 +88,7 @@ pub(crate) struct TargetStreams {
     /// TIMELINE's `meta-change` row), `EVENT <sid> title <pct>` when the window
     /// title changes (OSC 0/2 — often the cwd/command via shell integration),
     /// `EVENT <sid> bell total=<n>` on a BEL/alert, and — as the session is
-    /// retired — `EVENT <sid> closing reason=<token> by=<sid|human|->` (the exit
+    /// retired — `EVENT <sid> closing reason=<token> by=<sid|human|ctl|bridge|->` (the exit
     /// ledger's row, read from the timeline's `closing` record by the one wire
     /// path that still holds that timeline once the sid no longer resolves)
     /// followed once by `EVENT <sid> exited`.
@@ -1125,17 +1125,18 @@ fn drain_title_event(
 ///   own pre-pct-encoded `field=<f> value=<pct|->` tail.
 /// * `EVENT <sid> agent <word> rev=<n> gen=<e.s> fp=<hex16>` for an
 ///   `agent-change` — the server's agent verdict moved (`status agent=`),
-///   with the screen generation and hash it was read from. A client can
-///   park on it instead of re-reading the screen; the in-GUI supervisor's
-///   loop does not yet — it reads `text --json` and classifies with
-///   aterm-phase itself, the verdict used only for one bounded `await agent
-///   prompt` (the laws review of 2026-09-24).
+///   with the screen generation and hash it was read from — for clients that
+///   do not need the rows. The in-GUI supervisor classifies by design (decided
+///   2026-09-25 under the owner's standing direction): it parks server-side on
+///   `await seq|idle|gone`, and it must read the rows anyway to parse the
+///   approval box, so it classifies those rows with aterm-phase itself and uses
+///   the verdict only for one bounded `await agent prompt`.
 /// * `EVENT <sid> human` for a `human` row — a person started typing,
 ///   clicking or scrolling in the session through a window after at least
 ///   [`crate::session_timeline::HUMAN_BURST_GAP_MS`] without (the burst edge;
 ///   `status human_ms=` is the running age).
 /// * `EVENT <sid> closing <payload>` for the `closing` row the store writes as
-///   it retires the session — the `reason=<token> by=<sid|human|->` the `exits`
+///   it retires the session — the `reason=<token> by=<sid|human|ctl|bridge|->` the `exits`
 ///   ledger holds. This watch's own `Arc` is the ONLY wire path that can still
 ///   read that row: the `timeline` verb resolves its target through the
 ///   registry, and the sid stops resolving in the same store write that records
@@ -1180,7 +1181,11 @@ fn drain_timeline_events(
                 // whole retained ring, so this costs O(log n + matched).
                 let fresh: Vec<(&'static str, String)> = tl
                     .since(last_id)
-                    .filter_map(|e| timeline_wire_kind(e.kind).map(|k| (k, e.payload.clone())))
+                    .filter_map(|e| {
+                        #[cfg(test)]
+                        crate::work_counts::retained_record_touched();
+                        timeline_wire_kind(e.kind).map(|k| (k, e.payload.clone()))
+                    })
                     .collect();
                 (missed, fresh, Some(hi))
             }
@@ -1211,8 +1216,8 @@ fn timeline_wire_kind(kind: &str) -> Option<&'static str> {
         "closing" => Some("closing"),
         // The server's agent verdict moved (`SessionTimeline::publish_agent`):
         // `EVENT <local> agent <word> rev=<n> gen=<e.s> fp=<hex16>`, the push
-        // face of `status agent=` — a client may park on it instead of
-        // re-reading screens (the in-GUI supervisor does not yet).
+        // face of `status agent=` — a client that does not need the rows may
+        // park on it instead of re-reading screens.
         "agent-change" => Some("agent"),
         // A PERSON started typing, clicking or scrolling in the session through
         // a window after ≥ 30 s without (`crate::app_input::note_person`): `EVENT <local>
@@ -1450,7 +1455,11 @@ fn drain_turn_events(
             // `since` SEEKS now (partition_point), so this is O(log n + matched).
             Some(_) => l
                 .since(last_turn_id)
-                .map(|r| (r.id, r.submitted, r.status, r.dur_ms))
+                .map(|r| {
+                    #[cfg(test)]
+                    crate::work_counts::retained_record_touched();
+                    (r.id, r.submitted, r.status, r.dur_ms)
+                })
                 .collect(),
         }
     };
@@ -1616,6 +1625,8 @@ fn sample_engine_events(
         Some(_) => {
             let mut v: Vec<(u64, Option<i32>)> = Vec::new();
             for b in t.all_blocks().rev() {
+                #[cfg(test)]
+                crate::work_counts::retained_record_touched();
                 if last_block_id.is_some_and(|h| b.id <= h) {
                     break;
                 }
@@ -2637,9 +2648,11 @@ fn prune_closed(store: &Store, watches: &mut Vec<Watch>) -> Vec<Closing> {
 /// the per-target per-wake body the push loop runs, and the [`Watch`] it mutates
 /// — both module-private, as they should be. A bench is an EXTERNAL target and
 /// sees neither. This module is the one seam they are driven through; it is
-/// gated on the `bench-support` feature, which no shipping build enables, and it
-/// contains NO logic of its own beyond fixture construction: `wake` calls the
-/// shipping function directly, in the same loop shape `pump` uses.
+/// gated on the `bench-support` feature (and on `test`, where
+/// `work_count_tests` drives the same digest fixture for the idle-wake COUNT),
+/// which no shipping build enables, and it contains NO logic of its own beyond
+/// fixture construction: `wake` calls the shipping function directly, in the
+/// same loop shape `pump` uses.
 ///
 /// WHAT THE FIXTURE HAS TO GET RIGHT. A `Watch` seeded with `None` watermarks
 /// would emit the entire retained backlog on its first wake and then be silent —
@@ -2648,7 +2661,7 @@ fn prune_closed(store: &Store, watches: &mut Vec<Watch>) -> Vec<Closing> {
 /// stream and never a replay), and the bench PROVES that with a two-sided guard:
 /// an idle wake must produce zero bytes, and a wake after a real ledger append
 /// must produce a frame.
-#[cfg(feature = "bench-support")]
+#[cfg(any(test, feature = "bench-support"))]
 pub(crate) mod bench_seam {
     use super::{TargetStreams, Watch, frames_for_watch};
     use crate::session_timeline::SessionTimeline;
@@ -2862,6 +2875,7 @@ pub(crate) mod bench_seam {
     /// `#[cfg(test)]` and would have to be duplicated here to be reachable, at
     /// which point it could drift from the real handle shape. Naming the gap is
     /// the more honest trade.
+    #[cfg(feature = "bench-support")]
     pub(crate) struct RosterRebuild {
         /// The set as the subscriber last saw it (its watermark, pre-journal).
         known: std::collections::HashSet<String>,
@@ -2871,6 +2885,7 @@ pub(crate) mod bench_seam {
         next: u64,
     }
 
+    #[cfg(feature = "bench-support")]
     impl RosterRebuild {
         /// An instance with `sessions` live sessions, and a subscriber already
         /// caught up to them (so the first tick is an UNCHANGED one).
@@ -2917,6 +2932,7 @@ pub(crate) mod bench_seam {
 
     /// A stable sid string of the shipped width (`s-` + 16 lowercase hex), so the
     /// modelled rebuild allocates and hashes the same bytes the real one does.
+    #[cfg(feature = "bench-support")]
     fn sid_string(i: u64) -> String {
         format!("s-{:016x}", i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }

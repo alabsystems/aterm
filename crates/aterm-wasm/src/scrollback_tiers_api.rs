@@ -20,10 +20,15 @@
 //! it has a frame boundary: the ctor arms `set_compress_offload_active(true)`
 //! (ingest only STAGES scrolled-off lines — O(cells) snapshot, no codec) and
 //! `render()` drains a bounded batch per frame. Staged lines remain readable
-//! and retention-accounted; under a sustained flood past the engine's ~20k
-//! staged-line cap the OLDEST staged lines are dropped O(1) — the same
-//! deliberate throughput-over-depth trade the native session makes (surfaced
-//! out-of-band, audit E10a).
+//! and retention-accounted; under a sustained flood past the engine's staging
+//! cap (what the store's memory budget has left, never under ~20k lines) the
+//! OLDEST staged lines are dropped O(1) — the same deliberate
+//! throughput-over-depth trade the native session makes, counted out of band
+//! and marked in the history by one dim row at the cut. The per-frame drain
+//! is a trickle OPPORTUNITY (`Terminal::trickle_lazy_bounded`): while the
+//! flood is cutting and still delivering a batch or more per frame it skips,
+//! since promoting the marker would only open a new cut behind it — one flood,
+//! one marker.
 //!
 //! GLUE CONTRACT (for the embedding host): a pane that keeps processing while
 //! its `render()` is throttled (hidden pane, occluded window) should call
@@ -100,7 +105,7 @@ impl AtermTerminal {
             let _ = self.term.set_memory_budget(bytes);
         }
         if self.term.lazy_backlog_len() > 0 {
-            self.term.drain_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
+            self.term.trickle_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
         }
     }
 }
@@ -147,7 +152,9 @@ impl AtermTerminal {
     /// (`0` = the render-frame batch size) and apply any pending global-share
     /// change. Returns the lines STILL staged. For hosts draining a pane
     /// whose `render()` is throttled — see the glue contract in the module
-    /// docs.
+    /// docs. Like the frame drain it is a trickle opportunity: it skips while
+    /// a flood is cutting and delivered a batch or more since the previous
+    /// call, so a host looping until `0` promotes on its next call.
     pub fn drain_scrollback_backlog(&mut self, max_lines: u32) -> u32 {
         if let Some(bytes) = self.budget_share.pending_effective() {
             let _ = self.term.set_memory_budget(bytes);
@@ -157,7 +164,7 @@ impl AtermTerminal {
         } else {
             max_lines as usize
         };
-        u32::try_from(self.term.drain_lazy_bounded(batch)).unwrap_or(u32::MAX)
+        u32::try_from(self.term.trickle_lazy_bounded(batch)).unwrap_or(u32::MAX)
     }
 
     /// Lines currently staged for promotion (the compress backlog).
@@ -166,12 +173,14 @@ impl AtermTerminal {
     }
 
     /// Monotonic count of history lines LOST to non-user-requested truncation
-    /// (audit E10a): flood-backpressure staged-line drops, reflow-window cap
-    /// drops, and memory-pressure store evictions. The OUT-OF-BAND truncation
-    /// signal — the engine never injects a sentinel line into content; the
-    /// host polls this (e.g. per frame settle) and surfaces the loss in its
-    /// own chrome. `f64` because a sustained flood can outgrow `u32` (exact
-    /// to 2^53).
+    /// (audit E10a): flood-backpressure staged-line drops the configured limit
+    /// would have kept, reflow-window cap drops, and memory-pressure store
+    /// evictions. The OUT-OF-BAND truncation signal: the host polls this (e.g.
+    /// per frame settle) and surfaces the loss in its own chrome. A flood cut
+    /// is ALSO marked in content, by one dim `— aterm dropped N lines here …`
+    /// row where the lines are missing; store-pressure evictions take the
+    /// oldest lines and leave no mark. `f64` because a sustained flood can
+    /// outgrow `u32` (exact to 2^53).
     pub fn scrollback_truncated_lines(&self) -> f64 {
         self.term.scrollback_truncated_lines() as f64
     }
@@ -265,6 +274,30 @@ mod tests {
                 > 0,
             "drained lines landed in the tiered store"
         );
+    }
+
+    #[test]
+    fn a_flood_between_frames_leaves_one_marker() {
+        // A memory-bound pane (2 MB holds fewer staged rows than the engine's
+        // 20k floor) fed 10k lines a frame: a plain per-frame drain promotes
+        // the cut's marker and 2047 rows, and the next frame's lines open a
+        // new cut behind them — one marker per frame. As a trickle
+        // opportunity the frame drain skips while the flood outruns it, and
+        // the drains after the flood promote ONE marker.
+        let Some(mut t) = term() else { return };
+        t.set_scrollback_budget(2_000_000);
+        for _ in 0..8 {
+            feed_lines(&mut t, 10_000);
+            t.drain_compress_backlog_on_render();
+        }
+        while t.drain_scrollback_backlog(0) > 0 {}
+        assert!(t.scrollback_truncated_lines() > 0.0, "the flood cut");
+        let grid = t.term.grid();
+        let markers = (0..grid.scrollback_lines())
+            .filter_map(|i| grid.get_history_line(i))
+            .filter(|line| line.to_string().starts_with("— aterm dropped "))
+            .count();
+        assert_eq!(markers, 1, "one flood, one marker");
     }
 
     #[test]

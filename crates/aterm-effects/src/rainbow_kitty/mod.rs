@@ -1242,6 +1242,16 @@ pub struct Engine {
     /// A held park's clock while its flush is being judged
     /// ([`Engine::set_flush_clock`], [`Engine::on_event`]).
     flush_clock: Option<Instant>,
+    /// **THE SOFT-WRAPPED CARET** the seam judged this frame, with its key's
+    /// clock ([`Engine::note_soft_wrap`]): taken by the replay.
+    soft_wrap: Option<(ribbon::SoftWrap, Option<Instant>)>,
+    /// **THE LIFTED WORD** the seam judged this frame, with its key's
+    /// clock ([`Engine::note_lift`]): taken by the replay.
+    lift: Option<(ribbon::Lift, Option<Instant>)>,
+    /// **THE SOFT-WRAPPED WORD CAME DOWN** — the seam's verdict for the
+    /// `Move` from the carry's landing to `.1` ([`Engine::note_reflow`]):
+    /// taken by the replay.
+    reflow: Option<(ribbon::SoftWrap, (u16, u16))>,
     /// **HIDDEN FOR ONE FRAME** ([`Engine::hide_next_frame`]): the next
     /// tick runs every clock and writes nothing — the viewport is showing
     /// history (Rainbow Path v3 §2.8, D-4, law A4). Taken by the tick.
@@ -1308,6 +1318,9 @@ impl Engine {
             withheld_n: 0,
             grid_rows: 0,
             flush_clock: None,
+            soft_wrap: None,
+            lift: None,
+            reflow: None,
             hidden: false,
         }
     }
@@ -1466,6 +1479,54 @@ impl Engine {
         self.flush_clock = at;
     }
 
+    /// **THE SOFT-WRAPPED CARET** ([`ribbon::SoftWrap`]): the seam's content
+    /// verdict that the licensed typed `Move` it is about to push, `origin →
+    /// landing` one row down, is a key whose glyph was drawn AT the origin
+    /// while the caret alone wrapped to the continuation row's indent.
+    /// `key_at` is that key's clock. The replay lays the key's own `Typed`
+    /// at the origin when it is in the same frame, and the ribbon keeps the
+    /// word the key ends for the next key, which reflows it down.
+    pub fn note_soft_wrap(&mut self, sw: ribbon::SoftWrap, key_at: Option<Instant>) {
+        if self.engaged {
+            self.soft_wrap = Some((sw, key_at));
+        }
+    }
+
+    /// **THE LIFTED WORD** ([`ribbon::Lift`]): the seam's content verdict
+    /// that the licensed typed `Move` it is about to push, `origin →
+    /// landing` backward on one row, is the composer re-wrapping the word
+    /// between them UP onto the end of the row above. `key_at` is the clock
+    /// of the key whose echo it is — the Space that split the word from the
+    /// text after it. The replay hands the verdict to the ribbon with that
+    /// one `Move`, and holds a same-frame key with no cell: its glyph is
+    /// the blank the wrap ate at the end of the row above, and the frame's
+    /// caret is the word's old first column, not a cell right of it.
+    pub fn note_lift(&mut self, lift: ribbon::Lift, key_at: Option<Instant>) {
+        if self.engaged {
+            self.lift = Some((lift, key_at));
+        }
+    }
+
+    /// The soft-wrapped word the ribbon keeps for the key that reflows it
+    /// ([`ribbon::SoftWrap`]), if any: what the seam reads the glass for
+    /// before it names a reflow ([`Engine::note_reflow`]).
+    #[must_use]
+    pub fn soft_wrap_carry(&self) -> Option<ribbon::SoftWrap> {
+        self.ribbon.carry()
+    }
+
+    /// **THE SOFT-WRAPPED WORD CAME DOWN**: the seam's content verdict that
+    /// the licensed forward `Move` it is about to push, from `sw`'s landing
+    /// to `to`, is the echo that carried `sw`'s word off its row — the
+    /// word's columns there are blank on the glass now. Without it the
+    /// ribbon relays nothing: a hop past the word is also what a burst
+    /// after a short word looks like.
+    pub fn note_reflow(&mut self, sw: ribbon::SoftWrap, to: (u16, u16)) {
+        if self.engaged {
+            self.reflow = Some((sw, to));
+        }
+    }
+
     /// **A LICENSED MOVE** — seam point 1's own event. The ledger reads the
     /// mirror BEFORE the move lands on it (the hop between the two is what it
     /// exists to explain) and the mirror follows the landing at the end. In
@@ -1563,9 +1624,12 @@ impl Engine {
     /// after the last echo in the frame it is HELD — its cell comes with its
     /// echo, from the seam's sweep, at the mirror advanced past the keys
     /// held before it; before the frame's first one-shot move it is
-    /// replayed at the caret it was typed at ([`Engine::pre_move`]);
-    /// otherwise at the frame's caret. A key typed at a caret the engine
-    /// never learned is held with no cell. Per-EVENT it is state-free — no
+    /// replayed at the caret it was typed at ([`Engine::pre_move`]); the
+    /// key a SOFT-WRAPPED CARET echoed, at its glyph on the origin row
+    /// ([`Engine::note_soft_wrap`]), and a key typed after it but before
+    /// that move, HELD at the landing (the reflow lays it); otherwise at
+    /// the frame's caret. A key typed at a caret the engine never learned
+    /// is held with no cell. Per-EVENT it is state-free — no
     /// mirror of its own to translate on a scroll or a band move — but the
     /// frame's one record, [`Engine::pre_move`], holds a cell and rides both
     /// seams ([`Engine::translate_pre_move`]).
@@ -1578,10 +1642,61 @@ impl Engine {
         self.ribbon.set_pane_rows(self.pane_rows);
         let pre_move = self.pre_move.take();
         let tail_start = self.events.len() - self.unechoed_tail().len();
+        // THE SOFT-WRAPPED CARET the seam named ([`Engine::note_soft_wrap`]):
+        // its `Move`, and the key whose echo it is, matched by the key's own
+        // clock — the FIRST key on it: the seam's stamp is the oldest in
+        // flight, so of two presses stamped on one instant the wrap key is
+        // the earlier and the other its typeahead. A key HELD on an earlier
+        // frame is not in this buffer; the seam's sweep lays its cell at the
+        // origin.
+        let soft = self.soft_wrap.take().and_then(|(sw, key_at)| {
+            let at_move = self.events.iter().position(|(e, _)| {
+                matches!(*e, Event::Move { from, to, .. } if from == sw.origin && to == sw.landing)
+            })?;
+            let at_key = key_at.and_then(|key| {
+                self.events[..at_move]
+                    .iter()
+                    .position(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key)
+            });
+            Some((sw, at_move, at_key))
+        });
+        // THE LIFTED WORD the seam named ([`Engine::note_lift`]): its `Move`
+        // and its key, matched the same way.
+        let lift = self.lift.take().and_then(|(lift, key_at)| {
+            let at_move = self.events.iter().position(|(e, _)| {
+                matches!(*e, Event::Move { from, to, .. } if from == lift.origin && to == lift.landing)
+            })?;
+            let at_key = key_at.and_then(|key| {
+                self.events[..at_move]
+                    .iter()
+                    .rposition(|&(e, at)| matches!(e, Event::Typed { .. }) && at == key)
+            });
+            Some((lift, at_move, at_key))
+        });
+        // THE REFLOW the seam saw on the glass ([`Engine::note_reflow`]): its
+        // `Move`, matched the same way.
+        let reflow = self.reflow.take().and_then(|(sw, to)| {
+            let at_move = self.events.iter().position(|(e, _)| {
+                matches!(*e, Event::Move { from, to: t, .. } if from == sw.landing && t == to)
+            })?;
+            Some((sw, at_move))
+        });
         let mut held_cells: u16 = 0;
+        let mut soft_held: u16 = 0;
         for (index, &(ev, at)) in self.events.iter().enumerate() {
             let Event::Typed { cells, .. } = ev else {
-                self.ribbon.on_event(&ev, at, ctx);
+                match (soft, lift, reflow) {
+                    (Some((sw, at_move, _)), _, _) if at_move == index => {
+                        self.ribbon.soft_wrap_move(&ev, at, ctx, sw);
+                    }
+                    (_, Some((lift, at_move, _)), _) if at_move == index => {
+                        self.ribbon.lift_move(&ev, at, ctx, lift);
+                    }
+                    (_, _, Some((sw, at_move))) if at_move == index => {
+                        self.ribbon.reflow_move(&ev, at, ctx, sw);
+                    }
+                    _ => self.ribbon.on_event(&ev, at, ctx),
+                }
                 if matches!(ev, Event::Sweep { .. })
                     && let Some((row, col)) = swept_space_cell(&self.events, index)
                 {
@@ -1606,6 +1721,35 @@ impl Engine {
                     Some(caret) => self.ribbon.on_event(&ev, at, &Ctx { caret, ..*ctx }),
                     None => self.ribbon.hold_typed(&ev, at, ctx, None),
                 }
+            } else if let Some((sw, _, Some(at_key))) = soft
+                && at_key == index
+            {
+                // The key's glyph stands at the origin, not left of the
+                // frame's caret (the blank indent): replayed as if the
+                // caret had advanced past the origin on its row.
+                let caret = (sw.origin.0, sw.origin.1.saturating_add(cells));
+                self.ribbon.on_event(&ev, at, &Ctx { caret, ..*ctx });
+            } else if let Some((sw, at_move, Some(at_key))) = soft
+                && at_key < index
+                && index < at_move
+            {
+                // TYPEAHEAD ACROSS THE WRAP: a key pressed after the wrap
+                // key and before its `Move` (a lagging composer, a fast
+                // hand) has no echo yet — its glyph comes with the reflow
+                // that carries the word down, which lays it. Replayed at the
+                // frame's caret it laid `landing − 1`, the blank indent: the
+                // owner's stub again. Held at the landing, advanced past the
+                // keys held there before it.
+                let cell = (sw.landing.0, sw.landing.1.saturating_add(soft_held));
+                self.ribbon.hold_typed(&ev, at, ctx, Some(cell));
+                soft_held = soft_held.saturating_add(cells);
+            } else if let Some((_, _, Some(at_key))) = lift
+                && at_key == index
+            {
+                // The Space that lifted the word: its blank was eaten at the
+                // end of the row above, and left of the frame's caret is the
+                // blank indent — held, with no cell.
+                self.ribbon.hold_typed(&ev, at, ctx, None);
             } else {
                 self.ribbon.on_event(&ev, at, ctx);
             }
@@ -2470,6 +2614,9 @@ impl Engine {
         if !self.engaged {
             self.events.clear();
             self.pre_move = None;
+            self.soft_wrap = None;
+            self.lift = None;
+            self.reflow = None;
             self.earned.clear();
             // A bar banked while the style was live is a fact about a surface
             // that is gone: dropped with the events, so re-engaging can never
@@ -3190,6 +3337,9 @@ impl Engine {
         // takes at the coordinate-space seams: tab switch, pane focus move,
         // session migration, alt-screen enter and exit.
         self.pre_move = None;
+        self.soft_wrap = None;
+        self.lift = None;
+        self.reflow = None;
         self.earned.clear();
         self.party = None;
         self.pending_cues.clear();
@@ -3259,6 +3409,9 @@ impl Engine {
         self.events.clear();
         // …with the record that indexed them.
         self.pre_move = None;
+        self.soft_wrap = None;
+        self.lift = None;
+        self.reflow = None;
         self.earned.clear();
         // …and a banked bar, for the SAME reason this seam forgets the caret
         // two lines up: `reset` is the coordinate-space cut, so a party held
@@ -8309,7 +8462,7 @@ mod tests {
 
         // The offer is the ROUTER's answer, not a second one: the same
         // impulse, routed with `Body::Pet`, must say the same thing — and
-        // must still refuse to relocate the cat (open question 14).
+        // must still refuse to relocate the cat (owner Q14: no teleport).
         assert_eq!(
             companion::impulse_for(companion::Body::Pet, imp),
             companion::BodyImpulse::Perk { at: arrival }

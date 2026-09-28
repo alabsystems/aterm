@@ -310,6 +310,59 @@ fn ss2_single_shifts_exactly_one_char_from_g2() {
     assert_eq!(s.row(0), "\u{2500}q");
 }
 
+/// SO + DECSTBM + truecolor on the same cells (REARCH B-5): a region scroll
+/// moves the shifted glyphs with their colour, leaves rows outside the region
+/// alone, and leaves the locking shift in force for new output. The two
+/// controls make each half non-vacuous: without SO the moved row reads `qqq`,
+/// and with SI before the scroll the new output reads `qq`.
+#[test]
+fn so_shift_and_truecolor_survive_a_scroll_region_scroll() {
+    const FG: [u8; 3] = [10, 200, 30];
+    fn row(t: &Terminal, r: usize) -> String {
+        t.row_text(r).unwrap_or_default().trim_end().to_string()
+    }
+    fn scenario(shift: &[u8], before_new_output: &[u8]) -> Terminal {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"\x1b[1;1Htop\x1b[5;1Hbelow");
+        // G1 = DEC line drawing; region = rows 2..4; truecolor foreground.
+        bytes.extend_from_slice(b"\x1b)0\x1b[2;4r\x1b[38;2;10;200;30m");
+        bytes.extend_from_slice(shift);
+        bytes.extend_from_slice(b"\x1b[4;1Hqqq");
+        // Two LFs at the bottom margin scroll the region up twice.
+        bytes.extend_from_slice(b"\n\n");
+        bytes.extend_from_slice(before_new_output);
+        bytes.extend_from_slice(b"qq");
+        term_24x80(&bytes)
+    }
+
+    let t = scenario(b"\x0e", b"");
+    // The shifted row moved from row 4 to row 2 with its glyphs and colour.
+    assert_eq!(row(&t, 1), "\u{2500}\u{2500}\u{2500}");
+    let cells = t.render_row(1);
+    for (i, cell) in cells.iter().take(3).enumerate() {
+        assert_eq!(cell.fg, FG, "moved cell {i} keeps its truecolor foreground");
+    }
+    assert_eq!(row(&t, 2), "", "the row scrolled in between is blank");
+    // Rows outside the region are untouched.
+    assert_eq!(row(&t, 0), "top");
+    assert_eq!(row(&t, 4), "below");
+    // SO still holds for output written after the scroll.
+    assert_eq!(row(&t, 3), "   \u{2500}\u{2500}");
+    assert_eq!(t.render_row(3)[3].fg, FG);
+
+    // Controls.
+    assert_eq!(
+        row(&scenario(b"", b""), 1),
+        "qqq",
+        "without SO the glyphs are ASCII"
+    );
+    assert_eq!(
+        row(&scenario(b"\x0e", b"\x0f"), 3),
+        "   qq",
+        "SI before the new output re-invokes G0"
+    );
+}
+
 // =========================================================================
 // 7. DECALN
 // =========================================================================

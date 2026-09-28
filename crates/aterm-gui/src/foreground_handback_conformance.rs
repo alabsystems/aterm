@@ -37,6 +37,13 @@
 //! carried holder cleared (a reader seeded from a fresh probe, as the reviewed
 //! design did) lands exactly where the `Carry = 0` replay does.
 //!
+//! The 2026-09-27 schedules (`ForegroundHandbackOwnership`, the lane at load
+//! 59-65): a one-shot the reader never saw, whose `?1000h` is parsed as the
+//! shell's, and zsh's builtin `printf '\e[?1000h'`, each followed by a job
+//! that arms mouse tracking again and is killed — handed back, with the
+//! `Buggy = 1` replay (a bit that stayed on kept its owner) as the negative
+//! control.
+//!
 //! The 2026-09-25 review's schedules: Ctrl-Z of a job that armed its modes
 //! and then `fg` (`STOP_FG`: nothing is handed back until the job dies), the
 //! same for a pipeline whose first stage (its group leader) already exited,
@@ -67,7 +74,7 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use aterm_core::terminal::Terminal;
-use aterm_spec::derive::{Model, foreground_handback_model};
+use aterm_spec::derive::{Model, foreground_handback_model, foreground_handback_ownership_model};
 use aterm_spec::interp;
 
 use super::{attach_reader_inner, park_reader};
@@ -1746,5 +1753,235 @@ fn foreground_handback_a_one_shot_input_mode_is_handed_back_at_its_exit() {
                 .find_map(|f| f.strip_prefix("reverted="))
                 .is_some_and(|r| r.split(',').any(|x| x == "mouse")),
         "handed back at the one-shot's exit: {events:?}"
+    );
+}
+
+// ---- ForegroundHandbackOwnership (2026-09-27, the lane at load 59-65) ------
+//
+// Tier-1 for `aterm_spec::derive::foreground_handback_ownership_model`: who
+// owns an input mode across jobs when the reader MISSES one. The scripted
+// probe never shows the missed one-shot (its whole life fell between two
+// samples, or its bytes were read after the shell's reclaim — the starved
+// gather under load), so its `?1000h` is parsed as the SHELL's. Projection:
+// `life` and `n` (the script's position), `bit` (mouse tracking in force) and
+// `backs` (the timeline's `modes-restored` events), at every checkpoint.
+//
+// NEGATIVE CONTROL: the same schedule replayed on the model at `Buggy = 1` —
+// the rule this replaced, where a bit that stayed on kept its owner — lands at
+// `bit = 1, backs = 0` (the lane's stuck session), and the real reader must
+// not.
+
+const OWNERSHIP_PROJECTED: [&str; 4] = ["life", "n", "bit", "backs"];
+
+// The machine's other four actions carry `#[refines]` anchors on the shipping
+// code: `Arm` and `ShellArm` on `FgOwners::observe` (whose slice holder decides
+// which), `Reclaim` on `FgOwners::orphaned_by`, `Sample` on `FgCutter::sample`.
+#[aterm_spec::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Launch",
+    reason = "The shell's `tcsetpgrp` giving a job the terminal: an environment step. The \
+              Tier-1 rows move the scripted foreground probe exactly there."
+)]
+#[aterm_spec::spec_unmodeled(
+    machine = "foreground_handback_ownership",
+    action = "Die",
+    reason = "A process's death: an environment step. The Tier-1 rows add the job to the \
+              scripted liveness probe's dead set exactly there."
+)]
+#[expect(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it"
+)]
+fn ownership_scope_waivers() {}
+
+/// The real reader's ownership projection once `backs` events are recorded
+/// (the reader records an event just after it releases the term lock), or
+/// after the patience runs out — the comparison then says what differs.
+fn project_ownership(rig: &Rig, n: i64, backs: i64) -> State {
+    let deadline = Instant::now() + PATIENCE;
+    while (rig.restored().len() as i64) < backs && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    // An expectation of NO new event: give a late one the time to show.
+    std::thread::sleep(Duration::from_millis(30));
+    let term = rig.term();
+    let t = term.lock().expect("terminal lock");
+    [
+        ("life", rig.life),
+        ("n", n),
+        (
+            "bit",
+            i64::from(t.modes().mouse_mode != aterm_types::mouse::MouseMode::None),
+        ),
+        ("backs", rig.restored().len() as i64),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn ownership_projected(state: &State) -> State {
+    OWNERSHIP_PROJECTED.iter().map(|k| (*k, state[k])).collect()
+}
+
+fn check_ownership(rig: &Rig, s: &State, at: &str) {
+    assert_eq!(
+        project_ownership(rig, s["n"], s["backs"]),
+        ownership_projected(s),
+        "{at}: {:?}",
+        rig.restored()
+    );
+}
+
+/// After the prompt (and whatever `before` did at it), a job that arms mouse
+/// tracking in its own bytes, is killed and is reclaimed by the shell.
+fn run_ownership_job(rig: &mut Rig, model: &Model, s: &mut State, job: i32) {
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.set_fg(job);
+    rig.life = 1;
+    fire(model, s, &["Launch", "Sample"]);
+    check_ownership(rig, s, "Launch: the job holds the terminal");
+    rig.write(b"\x1b[?1003harmed\r\n", "the job's re-arm", |t| {
+        t.modes().mouse_mode == aterm_types::mouse::MouseMode::AnyEvent && screen_has(t, "armed")
+    });
+    fire(model, s, &["Arm"]);
+    check_ownership(rig, s, "Arm: the job's ?1003h over the stale ?1000h");
+    rig.kill(job);
+    rig.life = 2;
+    fire(model, s, &["Die"]);
+    rig.set_fg(SHELL);
+    rig.write(RECLAIM, "zsh's reclaim output", |t| {
+        screen_has(t, "zsh: killed") && t.modes().bracketed_paste
+    });
+    rig.life = 0;
+    fire(model, s, &["Reclaim"]);
+    check_ownership(rig, s, "Reclaim: the job's death");
+}
+
+/// The schedule's end state must not be the replaced rule's.
+fn assert_not_the_replaced_rule(rig: &Rig, model: &Model, schedule: &[&str]) {
+    let buggy = interp::with_buggy(model, 1);
+    let mut b = buggy.init_state();
+    fire(&buggy, &mut b, schedule);
+    assert_eq!(
+        (b["bit"], b["backs"]),
+        (1, 0),
+        "the replaced rule strands the mode: {b:?}"
+    );
+    assert!(!model.check_invariant("ObservedArmIsHandedBack", &b));
+    assert_ne!(
+        project_ownership(rig, b["n"], 0),
+        ownership_projected(&b),
+        "the real reader is not where the replaced rule lands"
+    );
+}
+
+static FG_OWN_MISSED: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_own_missed(_master: i32) -> i32 {
+    FG_OWN_MISSED.load(Ordering::SeqCst)
+}
+static DEAD_OWN_MISSED: Dead = Mutex::new(Vec::new());
+fn gone_own_missed(_master: i32, pgid: i32, _role: FgRole) -> bool {
+    is_dead(&DEAD_OWN_MISSED, pgid)
+}
+
+/// THE LANE'S STUCK SESSION (2026-09-27, load 59-65, three runs): a one-shot
+/// `/usr/bin/printf '\e[?1000h'` the reader never saw holding the terminal,
+/// then a job that re-arms mouse tracking and is killed. The one-shot's own
+/// handback is lost (the documented residual); the job's is not. Before the
+/// asserted-evidence rule the job's death recorded nothing and its mouse
+/// stayed on, as did every later death in the session.
+#[test]
+fn foreground_handback_ownership_a_missed_one_shot_loses_only_its_own_handback() {
+    const ONE_SHOT: i32 = 4500;
+    let model = foreground_handback_ownership_model();
+    FG_OWN_MISSED.store(SHELL, Ordering::SeqCst);
+    let mut rig = Rig::attach(
+        101,
+        (probe_own_missed, &FG_OWN_MISSED),
+        (gone_own_missed, &DEAD_OWN_MISSED),
+        b"",
+    );
+    let mut s = model.init_state();
+    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
+    check_ownership(&rig, &s, "Init: the prompt");
+
+    // The one-shot: the scripted foreground never leaves the shell.
+    rig.write(ZLE_EXEC, "zle's 2004l", |t| !t.modes().bracketed_paste);
+    rig.life = 1;
+    fire(&model, &mut s, &["Launch"]);
+    check_ownership(&rig, &s, "Launch: the one-shot, never sampled");
+    rig.write(b"\x1b[?1000h", "the one-shot's mouse", |t| {
+        t.modes().mouse_mode == aterm_types::mouse::MouseMode::Normal
+    });
+    fire(&model, &mut s, &["Arm"]);
+    check_ownership(&rig, &s, "Arm: parsed as the shell's bytes");
+    rig.kill(ONE_SHOT);
+    rig.life = 2;
+    fire(&model, &mut s, &["Die"]);
+    rig.write(b"one-shot-done\r\n% \x1b[?2004h", "the prompt again", |t| {
+        screen_has(t, "one-shot-done") && t.modes().bracketed_paste
+    });
+    rig.life = 0;
+    fire(&model, &mut s, &["Reclaim"]);
+    check_ownership(&rig, &s, "Reclaim: no edge, the residual");
+    assert_eq!(
+        (s["bit"], s["backs"]),
+        (1, 0),
+        "the one-shot's mode is lost"
+    );
+
+    run_ownership_job(&mut rig, &model, &mut s, JOB);
+    assert_eq!((s["done"], s["bit"], s["backs"]), (1, 0, 1), "{s:?}");
+    let events = rig.restored();
+    assert!(
+        events[0].starts_with(&format!("from={JOB} to={SHELL} ")),
+        "the job's own death: {events:?}"
+    );
+    assert_not_the_replaced_rule(
+        &rig,
+        &model,
+        &[
+            "Launch", "Arm", "Die", "Reclaim", "Launch", "Sample", "Arm", "Die", "Reclaim",
+        ],
+    );
+}
+
+static FG_OWN_SHELL: AtomicI32 = AtomicI32::new(SHELL);
+fn probe_own_shell(_master: i32) -> i32 {
+    FG_OWN_SHELL.load(Ordering::SeqCst)
+}
+static DEAD_OWN_SHELL: Dead = Mutex::new(Vec::new());
+fn gone_own_shell(_master: i32, pgid: i32, _role: FgRole) -> bool {
+    is_dead(&DEAD_OWN_SHELL, pgid)
+}
+
+/// The same stuck state with no load at all: zsh's BUILTIN `printf
+/// '\e[?1000h'` arms mouse tracking in the shell's own bytes. The next job
+/// that re-arms it and is killed is handed back.
+#[test]
+fn foreground_handback_ownership_the_shells_own_mouse_does_not_hide_a_jobs_death() {
+    let model = foreground_handback_ownership_model();
+    FG_OWN_SHELL.store(SHELL, Ordering::SeqCst);
+    let mut rig = Rig::attach(
+        102,
+        (probe_own_shell, &FG_OWN_SHELL),
+        (gone_own_shell, &DEAD_OWN_SHELL),
+        b"",
+    );
+    let mut s = model.init_state();
+    rig.write(ZLE_PROMPT, "the prompt", |t| t.modes().bracketed_paste);
+    check_ownership(&rig, &s, "Init: the prompt");
+    rig.write(b"\x1b[?1000h\r\n% ", "the shell's own mouse", |t| {
+        t.modes().mouse_mode == aterm_types::mouse::MouseMode::Normal
+    });
+    fire(&model, &mut s, &["ShellArm"]);
+    check_ownership(&rig, &s, "ShellArm");
+
+    run_ownership_job(&mut rig, &model, &mut s, JOB);
+    assert_eq!((s["done"], s["bit"], s["backs"]), (1, 0, 1), "{s:?}");
+    assert_not_the_replaced_rule(
+        &rig,
+        &model,
+        &["ShellArm", "Launch", "Sample", "Arm", "Die", "Reclaim"],
     );
 }

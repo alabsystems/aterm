@@ -10,10 +10,9 @@
 //! Three consequences, and all three are decisions, not formatting:
 //!  * the driver flags and the ladder label are derived from ONE value, so a
 //!    stage can never claim `--workspace` in its label while running `-p`;
-//!  * the regex search lane is the one stage a scope can switch OFF (it is a
-//!    second, feature-enabled run of `aterm-search`), so scoping away from that
-//!    crate removes the stage entirely rather than skipping it — matching the
-//!    script, where the stage's header was never even printed;
+//!  * a stage that is one crate's feature-enabled run (the sealed fabric lane,
+//!    `aterm-link --features sealed`) is switched OFF by a scope without that
+//!    crate: removed entirely rather than skipped, because it has nothing to run;
 //!  * EVERY narrowing forfeits the merge contract. [`Scope::narrowing`] returns
 //!    the sentence the verdict prints instead of the claim, and it is `Some` for
 //!    exactly the variants [`Scope::is_workspace`] rejects — a new narrowing that
@@ -180,17 +179,6 @@ impl Scope {
         }
     }
 
-    /// The regex search lane runs whole-tree or when the selection CONTAINS
-    /// `aterm-search`.
-    ///
-    /// Without it the whole regex battery compiles out to zero cases and the
-    /// suite stays green with no regex coverage, so the lane exists; but under a
-    /// scope that excludes `aterm-search` there is nothing for it to run.
-    #[must_use]
-    pub fn includes_regex_lane(&self) -> bool {
-        self.includes_crate("aterm-search")
-    }
-
     /// Whether the sealed fabric lane has anything to run: it tests
     /// `aterm-link` under `--features sealed`, so a scope without that crate
     /// has nothing for it.
@@ -307,16 +295,15 @@ mod tests {
     }
 
     #[test]
-    fn the_regex_lane_follows_aterm_search_only() {
-        assert!(Scope::workspace().includes_regex_lane());
-        assert!(Scope::crate_only("aterm-search").includes_regex_lane());
-        assert!(!Scope::crate_only("aterm-grid").includes_regex_lane());
-        assert!(!Scope::crate_only("aterm-gui").includes_regex_lane());
+    fn the_sealed_lane_follows_aterm_link_only() {
+        assert!(Scope::workspace().includes_sealed_lane());
+        assert!(Scope::crate_only("aterm-link").includes_sealed_lane());
+        assert!(!Scope::crate_only("aterm-grid").includes_sealed_lane());
         // …and a change scope narrows it the same way, which is the point of
         // asking the SCOPE rather than asking `--scope`.
-        assert!(changed(&["aterm-grid", "aterm-search"]).includes_regex_lane());
-        assert!(!changed(&["aterm-grid", "aterm-gui"]).includes_regex_lane());
-        assert!(!changed(&[]).includes_regex_lane());
+        assert!(changed(&["aterm-grid", "aterm-link"]).includes_sealed_lane());
+        assert!(!changed(&["aterm-grid", "aterm-gui"]).includes_sealed_lane());
+        assert!(!changed(&[]).includes_sealed_lane());
     }
 
     #[test]

@@ -67,6 +67,7 @@ impl Terminal {
             transient: TransientState::new(),
             watchers: super::observe::WatcherSet::default(),
             row_text_scratch: Vec::new(),
+            refill_mask_scratch: Vec::new(),
             alt_archive: super::alt_archive::AltArchiveState::new(),
             current_working_directory: None,
             color: ColorState::new(),
@@ -107,6 +108,7 @@ impl Terminal {
             budgeted_search: None,
             absolute_row_revision: 0,
             repaint_blink_epoch: 0,
+            evidence_asserted: 0,
             content_scroll_state: super::ContentScrollState::default(),
         };
 

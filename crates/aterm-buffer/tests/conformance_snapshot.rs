@@ -12,9 +12,11 @@
 //! observed no-leak state is checked against the model's own `SnapshotIsolated`
 //! invariant. Pure Rust + real code, so it always runs.
 
-use aterm_buffer::{Edit, LineId, Range, ReadCap, Surface, WriteCap};
+use aterm_buffer::{Edit, LineId, Range, Surface};
+mod support;
 use aterm_spec::derive::snapshot_model;
 use std::collections::BTreeMap;
+use support::{read_cap, write_cap};
 
 fn full_range() -> Range {
     Range {
@@ -27,18 +29,18 @@ fn full_range() -> Range {
 fn real_snapshot_isolated_from_later_writes() {
     let m = snapshot_model();
     let mut s = Surface::new();
-    s.apply(&WriteCap, Edit::AppendLine("a".into()));
-    s.apply(&WriteCap, Edit::AppendLine("b".into()));
+    s.apply(&write_cap(), Edit::AppendLine("a".into()));
+    s.apply(&write_cap(), Edit::AppendLine("b".into()));
 
-    let snap = s.snapshot(&ReadCap); // capture the frozen world at seq = 2
+    let snap = s.snapshot(&read_cap()); // capture the frozen world at seq = 2
     let snap_at = snap.at.0;
-    let captured = snap.read_text(&ReadCap, full_range()).text;
+    let captured = snap.read_text(&read_cap(), full_range()).text;
 
     // A later write advances the surface and changes its content.
-    s.apply(&WriteCap, Edit::AppendLine("c".into()));
+    s.apply(&write_cap(), Edit::AppendLine("c".into()));
 
-    let snap_after = snap.read_text(&ReadCap, full_range()).text;
-    let surface_now = s.read_text(&ReadCap, full_range()).text;
+    let snap_after = snap.read_text(&read_cap(), full_range()).text;
+    let surface_now = s.read_text(&read_cap(), full_range()).text;
 
     // Isolation: the snapshot's view is unchanged by the later write, and differs
     // from the surface's new view. In the derived model this is exactly `leaked = 0`.

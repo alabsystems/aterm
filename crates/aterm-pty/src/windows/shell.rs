@@ -237,27 +237,57 @@ fn discover_git_bash() -> Option<OsString> {
     None
 }
 
+/// WHICH arm of [`select_shell_with_origin`] chose the shell — published so
+/// `aterm doctor` / `show-config` can name the program a new tab will run AND
+/// say why this machine gets it, instead of reporting the CLI process's own
+/// `$SHELL`/`%COMSPEC%` (measured 2026-09-22: inside a pwsh 7 tab `doctor` said
+/// `cmd.exe`, from Git Bash it said `bash.exe` — neither the shell a tab
+/// spawns, which this resolver never reads from either variable).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellOrigin {
+    /// The caller's `override_shell` (the window passes config `shell`, with
+    /// `--shell` already collapsed over it), through [`resolve_shell_name`].
+    /// (`%ATERM_SHELL%` is retired — the launch knob is the `--shell` flag — so
+    /// no environment arm exists to name.)
+    Override,
+    /// `pwsh.exe` on PATH — the first platform default.
+    Pwsh,
+    /// `powershell.exe` on PATH — no pwsh.
+    PowerShell,
+    /// `%COMSPEC%` — neither PowerShell on PATH.
+    Comspec,
+    /// The literal `cmd.exe`: nothing else resolved and COMSPEC is unset/empty.
+    CmdLiteral,
+}
+
 /// Select the interactive shell. Precedence: the caller's `override_shell`
 /// (config `shell` / `--shell`) → `pwsh.exe` → `powershell.exe` → `%COMSPEC%` →
 /// literal `cmd.exe`. See the module docs for the deliberate `%SHELL%` omission;
 /// `override_shell` goes through [`resolve_shell_name`] (path-like verbatim, else
 /// alias discovery, else PATH).
 pub(crate) fn select_shell(override_shell: Option<&OsStr>) -> OsString {
+    select_shell_with_origin(override_shell).0
+}
+
+/// [`select_shell`] with the arm that decided attached — the SAME resolution
+/// (the spawn calls this through `select_shell`), so a diagnostic built on it
+/// cannot name a shell the spawn would not run.
+pub fn select_shell_with_origin(override_shell: Option<&OsStr>) -> (OsString, ShellOrigin) {
     if let Some(ov) = override_shell.filter(|o| !o.is_empty()) {
-        return resolve_shell_name(ov);
+        return (resolve_shell_name(ov), ShellOrigin::Override);
     }
     if let Some(p) = search_path("pwsh") {
-        return p;
+        return (p, ShellOrigin::Pwsh);
     }
     if let Some(p) = search_path("powershell") {
-        return p;
+        return (p, ShellOrigin::PowerShell);
     }
     if let Some(c) = std::env::var_os("COMSPEC")
         && !c.is_empty()
     {
-        return c;
+        return (c, ShellOrigin::Comspec);
     }
-    OsString::from("cmd.exe")
+    (OsString::from("cmd.exe"), ShellOrigin::CmdLiteral)
 }
 
 /// Resolve the spawn target: `(program, argv)`. Precedence is identical to the
@@ -723,6 +753,51 @@ mod tests {
                 resolve_shell_name(OsStr::new(name)),
                 expected,
                 "resolve_shell_name must not drift from classify_shell_name for {name:?}"
+            );
+        }
+    }
+
+    /// `select_shell_with_origin` IS `select_shell` with the deciding arm named:
+    /// the program never differs, an override is always `Override`, and with
+    /// nothing named the origin is one of the platform-default arms — `Pwsh`
+    /// whenever pwsh is on PATH, as it is on the owner's box. (The resolver
+    /// reads no aterm environment variable: `%ATERM_SHELL%` is retired.)
+    #[test]
+    fn select_shell_with_origin_names_the_arm_select_shell_took() {
+        let (program, origin) = select_shell_with_origin(Some(OsStr::new("cmd")));
+        assert_eq!(origin, ShellOrigin::Override);
+        assert_eq!(program, select_shell(Some(OsStr::new("cmd"))));
+        assert!(
+            program
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with("cmd.exe"),
+            "an override resolves exactly as select_shell resolves it: {program:?}"
+        );
+        // An unresolvable override is still the override, verbatim (CreateProcessW
+        // then fails cleanly) — the origin says where the bad name came from.
+        assert_eq!(
+            select_shell_with_origin(Some(OsStr::new("aterm-no-such-shell-xyz"))),
+            (
+                OsString::from("aterm-no-such-shell-xyz"),
+                ShellOrigin::Override
+            )
+        );
+        // An empty override is no override.
+        let (program, origin) = select_shell_with_origin(Some(OsStr::new("")));
+        assert_eq!((program.clone(), origin), select_shell_with_origin(None));
+        assert_eq!(program, select_shell(None));
+        match origin {
+            ShellOrigin::Override => panic!("no override was passed"),
+            ShellOrigin::Pwsh => assert!(search_path("pwsh").is_some()),
+            ShellOrigin::PowerShell => assert!(search_path("powershell").is_some()),
+            ShellOrigin::Comspec | ShellOrigin::CmdLiteral => {}
+        }
+        if search_path("pwsh").is_some() {
+            assert_eq!(
+                origin,
+                ShellOrigin::Pwsh,
+                "pwsh on PATH is the first default"
             );
         }
     }

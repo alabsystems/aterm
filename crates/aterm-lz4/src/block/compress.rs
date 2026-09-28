@@ -246,8 +246,8 @@ fn backtrack_match(
 ) {
     // Note: Even if iterator version of this loop has less branches inside the loop it has more
     // branches before the loop. That in practice seems to make it slower than the while version
-    // bellow. TODO: It should be possible remove all bounds checks, since we are walking
-    // backwards
+    // below. The bounds checks stay: the crate is `forbid(unsafe_code)`, so there is no
+    // unchecked index to trade them for (see the loop body for why each one is spelled as it is).
     while *candidate > 0 && *cur > literal_start {
         // `*cur <= input.len()` and `*candidate <= source.len()` are cursor
         // invariants of the compression loop the verifier cannot carry across

@@ -15,6 +15,8 @@ struct Host {
     now: Instant,
     blink: u64,
     buf: Vec<char>,
+    above: Vec<char>,
+    below: Vec<char>,
     out: Vec<GlowQuad>,
 }
 
@@ -26,6 +28,8 @@ impl Host {
             now: Instant::now(),
             blink: 0,
             buf: Vec::new(),
+            above: Vec::new(),
+            below: Vec::new(),
             out: Vec::new(),
         };
         h.term.process(b"\x1b[21;3H");
@@ -44,6 +48,22 @@ impl Host {
         self.glow.observe_print_anchor(self.term.print_anchor());
         self.term.row_cols_into(usize::from(c.row), &mut self.buf);
         self.glow.observe_row(c.row, c.col, &self.buf, self.now);
+        // The caret row's two neighbours, as the host feeds them
+        // (`app_render.rs` `tick_cursor_fx`): the content classifiers that
+        // read the row above (a soft-wrapped caret, a lifted word) are only
+        // exercised — and their refusals only pinned — with them.
+        let r = usize::from(c.row);
+        let rows = usize::from(self.term.rows());
+        if r > 0 {
+            self.term.row_cols_into(r - 1, &mut self.above);
+        }
+        if r + 1 < rows {
+            self.term.row_cols_into(r + 1, &mut self.below);
+        }
+        self.glow.observe_neighbor_rows(
+            (r > 0).then_some(self.above.as_slice()),
+            (r + 1 < rows).then_some(self.below.as_slice()),
+        );
         self.glow.observe_ribbon_row(c.row, &self.buf);
         let mut rows = [0; WITNESS_ROWS];
         let n = self.glow.ribbon_rows(&mut rows);
@@ -285,6 +305,34 @@ fn a_real_return_and_natural_wrap_keep_their_immediate_row_move() {
         "the pending-margin wrap stays immediate"
     );
     assert_eq!(h.glow.in_flight_tally().park_returns, 0);
+}
+
+/// A shell fold is not a soft-wrapped caret (`CursorGlow::soft_wrapped_caret`)
+/// even when two keys cross it in ONE echo: `b` fills the pane's last column
+/// over what was a blank in the last probe, exactly as a soft-wrapped key
+/// does, but `c` stands on the landing row left of the caret. A frame falls
+/// between the presses and the echo, so both keys are HELD and their cells
+/// come from the seam's sweep alone. Both glyphs are lit. RED if the
+/// classifier stopped reading the landing row: the move then sweeps only
+/// the origin's cell and `c` at (21, 0) stays dark.
+#[test]
+fn a_coalesced_pair_across_the_pending_margin_wrap_lights_both_glyphs() {
+    let mut h = Host::new();
+    h.program(b"\x1b[21;79H");
+    h.key(b'a');
+    h.now += Duration::from_millis(90);
+    h.glow.note_typed_cells(h.now, 1);
+    h.now += Duration::from_millis(4);
+    h.glow.note_typed_cells(h.now, 1);
+    h.program(b"");
+    h.program(b"bc");
+    h.program(b"");
+    assert!(
+        h.live(20).contains(&79) && h.live(21).contains(&0),
+        "the pair across the fold: row 20 live {:?}, row 21 live {:?}",
+        h.live(20),
+        h.live(21)
+    );
 }
 
 #[test]

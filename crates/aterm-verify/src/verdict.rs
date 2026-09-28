@@ -20,7 +20,7 @@
 //! merge-contract sentence for any narrowed run. This module is where that lives.
 //! [`MERGE_CONTRACT_SENTENCE`] is the ONE place the words exist, [`verdict`] is
 //! the ONE function that may emit them, and it is exhaustively tested over the
-//! whole (mode × scope × skips × failures × selftest) space below — including the
+//! whole (mode × scope × skips × failures) space below — including the
 //! explicit property that a scoped or skipped run CANNOT print it.
 //!
 //! The scope axis is the SCOPE KIND, not a flag: `--scope`, a `--changed` cone
@@ -51,7 +51,7 @@ pub struct Verdict {
 /// Is this run entitled to the merge-contract sentence?
 ///
 /// The contract is the WHOLE-TREE run with nothing skipped and nothing failed.
-/// Five independent ways to lose it, and the caller cannot forget one because
+/// Four independent ways to lose it, and the caller cannot forget one because
 /// this is the only predicate [`verdict`] consults:
 ///  * the run was NARROWED — `--scope` to one crate, or `--changed` to the
 ///    diff's reverse-dependency cone. The question is the SCOPE KIND, never the
@@ -59,144 +59,18 @@ pub struct Verdict {
 ///    rather than by remembering to;
 ///  * a stage was skipped, so nothing is claimed about it;
 ///  * a gate failed;
-///  * the environment was broken (nothing was decided);
-///  * `--selftest` ran no gate at all.
+///  * the environment was broken (nothing was decided).
 #[must_use]
-pub fn discharges_merge_contract(scope: &Scope, selftest: bool, t: &Tally) -> bool {
-    !selftest && scope.is_workspace() && t.skipped() == 0 && !t.failed()
-}
-
-/// The six states the `--selftest` ladder walks, in the order the bash gate
-/// printed them. Each pairs a (scope, tally) with whether the merge-contract
-/// sentence is EARNED there — expressed as data, so the case list is reviewable
-/// next to the predicate it exercises rather than buried in control flow.
-struct SelftestCase {
-    scope: Scope,
-    tally: Tally,
-    claims: bool,
-}
-
-fn selftest_verdict_cases() -> Vec<(&'static str, SelftestCase)> {
-    let clean = || Tally::default();
-    let skipped = || Tally {
-        skips: vec!["a stage".to_string()],
-        ..Tally::default()
-    };
-    let failed = || Tally {
-        gate_failures: vec!["a gate".to_string()],
-        ..Tally::default()
-    };
-    let narrowed = || Scope::crate_only("aterm-grid");
-    vec![
-        (
-            "whole tree, nothing skipped",
-            SelftestCase {
-                scope: Scope::workspace(),
-                tally: clean(),
-                claims: true,
-            },
-        ),
-        (
-            "a stage was skipped",
-            SelftestCase {
-                scope: Scope::workspace(),
-                tally: skipped(),
-                claims: false,
-            },
-        ),
-        (
-            "narrowed (--scope/--changed)",
-            SelftestCase {
-                scope: narrowed(),
-                tally: clean(),
-                claims: false,
-            },
-        ),
-        (
-            "narrowed AND skipped",
-            SelftestCase {
-                scope: narrowed(),
-                tally: skipped(),
-                claims: false,
-            },
-        ),
-        (
-            "a stage FAILED",
-            SelftestCase {
-                scope: Scope::workspace(),
-                tally: failed(),
-                claims: false,
-            },
-        ),
-        (
-            "FAILED while narrowed",
-            SelftestCase {
-                scope: narrowed(),
-                tally: failed(),
-                claims: false,
-            },
-        ),
-    ]
+pub fn discharges_merge_contract(scope: &Scope, t: &Tally) -> bool {
+    scope.is_workspace() && t.skipped() == 0 && !t.failed()
 }
 
 /// Render the verdict block and decide the exit code.
 #[must_use]
-pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict {
+pub fn verdict(mode: Mode, scope: &Scope, t: &Tally) -> Verdict {
     let mut text = String::from("\n=== verdict ===\n");
     let scope_word = scope.desc();
     let mode = mode.as_str();
-
-    // --selftest proves the driver executes and runs nothing heavy. It never
-    // claims anything about the tree, so it never reaches the sentence below.
-    if selftest {
-        let exit = failure_exit(t);
-        if exit != exit::PASS {
-            text.push_str("  VERIFY: SELFTEST FAIL\n");
-            return Verdict {
-                text,
-                exit,
-                claims_merge_contract: false,
-            };
-        }
-        // Drive the REAL predicate through the states whose distinction is the
-        // whole point of this file, and show the result in the ladder. The
-        // exhaustive matrix in the tests below is a far stronger check, but it
-        // runs under `cargo test`; a human running --selftest sees only what the
-        // ladder prints, and "the strongest claim shrinks with the run" is the
-        // property they most need to see confirmed. Reported per case for the
-        // same reason the ladder names skips: an unnamed check is an invisible one.
-        let mut narrowed = false;
-        for (name, want) in selftest_verdict_cases() {
-            let got = discharges_merge_contract(&want.scope, false, &want.tally);
-            if got == want.claims {
-                text.push_str(&format!("  ok    verdict[{name}]\n"));
-            } else {
-                text.push_str(&format!(
-                    "  FAIL  verdict[{name}]: {} the merge contract and must {}\n",
-                    if got { "claimed" } else { "did NOT claim" },
-                    if want.claims { "have" } else { "not" }
-                ));
-                narrowed = true;
-            }
-        }
-        if narrowed {
-            text.push_str("  VERIFY: SELFTEST FAIL (the verdict does not narrow with the run)\n");
-            return Verdict {
-                text,
-                exit: exit::FAILED,
-                claims_merge_contract: false,
-            };
-        }
-        text.push_str(
-            "  VERIFY: SELFTEST OK (driver executes; verdict claim narrows with the run;\n\
-             \x20         no heavy gates run — this is NOT a verification of anything)\n",
-        );
-        return Verdict {
-            text,
-            exit,
-            claims_merge_contract: false,
-        };
-    }
 
     // NAMED, for the reason `Tally` gives: the ladder row that decided the run is
     // one line in tens of thousands, and the verdict is the line a reader quotes.
@@ -265,7 +139,7 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
     // run with nothing skipped; anything narrower proved something real and
     // something smaller, and printing the same sentence for both is how a scoped
     // run gets mistaken for a landing licence.
-    if !discharges_merge_contract(scope, selftest, t) {
+    if !discharges_merge_contract(scope, t) {
         let n = t.skipped();
         text.push_str(&format!(
             "  VERIFY: PASS (mode={mode} scope={scope_word}, {n} skipped) —\n"
@@ -307,21 +181,6 @@ pub fn verdict(mode: Mode, scope: &Scope, selftest: bool, t: &Tally) -> Verdict 
     }
 }
 
-/// A finding outranks a broken environment: if any gate actually decided against
-/// the tree, that is the news, and `1` is the code `tools/verify.sh` hands back
-/// as FAILED. `3` is reserved for a run where nothing was decided at all. The
-/// release cutter's receipt report reads neither: it reads the RECEIPT this run
-/// wrote, whose `merge-contract` line is false for both.
-fn failure_exit(t: &Tally) -> i32 {
-    if !t.gate_failures.is_empty() {
-        exit::FAILED
-    } else if !t.could_not_run.is_empty() {
-        exit::COULD_NOT_RUN
-    } else {
-        exit::PASS
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,8 +195,8 @@ mod tests {
         }
     }
 
-    /// THE property. Over the whole cross product of (mode, scope KIND, selftest,
-    /// gate failures, could-not-runs, skips), the merge-contract sentence appears
+    /// THE property. Over the whole cross product of (mode, scope KIND, gate
+    /// failures, could-not-runs, skips), the merge-contract sentence appears
     /// if and only if the run was whole-tree, complete and green.
     ///
     /// Every narrowing this gate can express is a column here — `--scope`, a
@@ -360,40 +219,35 @@ mod tests {
         let mut total = 0;
         for mode in modes {
             for scope in &scopes {
-                for selftest in [false, true] {
-                    for fails in [0usize, 1] {
-                        for cnr in [0usize, 1] {
-                            for skips in skipsets {
-                                total += 1;
-                                let t = tally(fails, cnr, skips);
-                                let v = verdict(mode, scope, selftest, &t);
-                                let earned = !selftest
-                                    && scope.is_workspace()
-                                    && fails == 0
-                                    && cnr == 0
-                                    && skips.is_empty();
-                                assert_eq!(
-                                    v.claims_merge_contract, earned,
-                                    "claim bit wrong for scope={scope:?} selftest={selftest} \
-                                     fails={fails} cnr={cnr} skips={skips:?}"
-                                );
-                                assert_eq!(
-                                    v.text.contains(MERGE_CONTRACT_SENTENCE),
-                                    earned,
-                                    "sentence leaked/missing for scope={scope:?} \
-                                     selftest={selftest} fails={fails} cnr={cnr} skips={skips:?}\n{}",
-                                    v.text
-                                );
-                                if earned {
-                                    claimed += 1;
-                                }
+                for fails in [0usize, 1] {
+                    for cnr in [0usize, 1] {
+                        for skips in skipsets {
+                            total += 1;
+                            let t = tally(fails, cnr, skips);
+                            let v = verdict(mode, scope, &t);
+                            let earned =
+                                scope.is_workspace() && fails == 0 && cnr == 0 && skips.is_empty();
+                            assert_eq!(
+                                v.claims_merge_contract, earned,
+                                "claim bit wrong for scope={scope:?} fails={fails} cnr={cnr} \
+                                 skips={skips:?}"
+                            );
+                            assert_eq!(
+                                v.text.contains(MERGE_CONTRACT_SENTENCE),
+                                earned,
+                                "sentence leaked/missing for scope={scope:?} fails={fails} \
+                                 cnr={cnr} skips={skips:?}\n{}",
+                                v.text
+                            );
+                            if earned {
+                                claimed += 1;
                             }
                         }
                     }
                 }
             }
         }
-        assert_eq!(total, 2 * 4 * 2 * 2 * 2 * 3);
+        assert_eq!(total, 2 * 4 * 2 * 2 * 3);
         assert_eq!(
             claimed, 2,
             "exactly the two whole-tree green runs (fast, full)"
@@ -407,11 +261,10 @@ mod tests {
         let scoped = verdict(
             Mode::Fast,
             &Scope::crate_only("aterm-grid"),
-            false,
             &Tally::default(),
         );
         let cone = Scope::changed("main", vec!["aterm-grid".into(), "aterm-gui".into()], true);
-        let v = verdict(Mode::Fast, &cone, false, &Tally::default());
+        let v = verdict(Mode::Fast, &cone, &Tally::default());
 
         assert!(!v.claims_merge_contract);
         assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
@@ -428,7 +281,6 @@ mod tests {
         let nothing = verdict(
             Mode::Fast,
             &Scope::changed("origin/main", vec![], true),
-            false,
             &Tally::default(),
         );
         assert!(!nothing.claims_merge_contract);
@@ -447,7 +299,7 @@ mod tests {
         // which is the only reason this is reachable — and the reason widening is
         // safe: the verdict cannot tell it from a plain whole-tree run because
         // there is nothing to tell apart.
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &Tally::default());
+        let v = verdict(Mode::Fast, &Scope::workspace(), &Tally::default());
         assert!(v.claims_merge_contract);
         assert!(v.text.contains("scope=workspace"));
     }
@@ -459,7 +311,6 @@ mod tests {
         let v = verdict(
             Mode::Fast,
             &Scope::crate_only("aterm-grid"),
-            false,
             &Tally::default(),
         );
         assert!(!v.claims_merge_contract);
@@ -485,7 +336,7 @@ mod tests {
                 "gui smoke (macOS only)",
             ],
         );
-        let v = verdict(Mode::Full, &Scope::workspace(), false, &t);
+        let v = verdict(Mode::Full, &Scope::workspace(), &t);
         assert!(!v.claims_merge_contract);
         assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
         assert!(v.text.contains("(mode=full scope=workspace, 2 skipped) —"));
@@ -513,7 +364,7 @@ mod tests {
             "license_check.sh".to_string(),
         ];
         t.could_not_run = vec!["libc-oracle/run.sh (no cc)".to_string()];
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+        let v = verdict(Mode::Fast, &Scope::workspace(), &t);
         assert_eq!(v.exit, exit::FAILED);
         assert!(!v.claims_merge_contract);
         assert!(
@@ -537,7 +388,7 @@ mod tests {
             "targo not found".to_string(),
             "gui smoke (no WindowServer session)".to_string(),
         ];
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &t);
+        let v = verdict(Mode::Fast, &Scope::workspace(), &t);
         assert_eq!(v.exit, exit::COULD_NOT_RUN);
         assert!(v.text.contains("      - targo not found"));
         assert!(
@@ -548,7 +399,7 @@ mod tests {
 
     #[test]
     fn the_whole_green_run_is_the_only_claim_and_says_so_exactly() {
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &Tally::default());
+        let v = verdict(Mode::Fast, &Scope::workspace(), &Tally::default());
         assert!(v.claims_merge_contract);
         assert_eq!(
             v.text,
@@ -559,7 +410,7 @@ mod tests {
 
     #[test]
     fn a_gate_finding_exits_one_and_outranks_a_broken_environment() {
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &tally(1, 4, &[]));
+        let v = verdict(Mode::Fast, &Scope::workspace(), &tally(1, 4, &[]));
         assert_eq!(v.exit, exit::FAILED);
         assert!(
             v.text
@@ -570,7 +421,7 @@ mod tests {
 
     #[test]
     fn a_broken_environment_alone_exits_three_and_claims_no_finding() {
-        let v = verdict(Mode::Fast, &Scope::workspace(), false, &tally(0, 2, &[]));
+        let v = verdict(Mode::Fast, &Scope::workspace(), &tally(0, 2, &[]));
         assert_eq!(v.exit, exit::COULD_NOT_RUN);
         assert!(
             v.text
@@ -581,44 +432,12 @@ mod tests {
     }
 
     #[test]
-    fn selftest_never_claims_anything_about_the_tree() {
-        let green = verdict(
-            Mode::Fast,
-            &Scope::workspace(),
-            true,
-            &tally(0, 0, &["everything (selftest)"]),
-        );
-        assert_eq!(green.exit, exit::PASS);
-        // Assert the PROPERTY this test is named for, not the exact prose: a
-        // selftest says nothing about the tree, so the sentence must be absent
-        // however the block is worded. Pinning the literal made this fail when
-        // the per-case verdict rows were added, which is a test that guards its
-        // own formatting rather than its subject.
-        assert!(!green.text.contains(MERGE_CONTRACT_SENTENCE));
-        assert!(green.text.contains("VERIFY: SELFTEST OK"));
-        assert!(!green.claims_merge_contract);
-        // The six per-case rows ARE the selftest's evidence — a run that prints
-        // none of them has stopped checking that the claim narrows with the run.
-        for (name, _) in selftest_verdict_cases() {
-            assert!(
-                green.text.contains(&format!("verdict[{name}]")),
-                "selftest ladder is missing the `{name}` case"
-            );
-        }
-
-        let broken = verdict(Mode::Fast, &Scope::workspace(), true, &tally(1, 0, &[]));
-        assert_eq!(broken.exit, exit::FAILED);
-        assert!(broken.text.contains("VERIFY: SELFTEST FAIL"));
-    }
-
-    #[test]
     fn a_skip_is_never_silently_a_pass() {
         // Green-but-skipped and green-and-complete must not render the same.
-        let complete = verdict(Mode::Fast, &Scope::workspace(), false, &Tally::default());
+        let complete = verdict(Mode::Fast, &Scope::workspace(), &Tally::default());
         let skipped = verdict(
             Mode::Fast,
             &Scope::workspace(),
-            false,
             &tally(0, 0, &["one (absent)"]),
         );
         assert_ne!(complete.text, skipped.text);

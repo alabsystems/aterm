@@ -85,11 +85,10 @@ impl TerminalCapabilities {
             shell_integration: true,
             synchronized_output: true,
             kitty_keyboard: true,
-            // Soft fonts (DRCS/DECDLD) are "permanently compiled out; consume
-            // and ignore" in handler_dcs.rs — the DCS `{` payload is dropped.
-            // Advertise false until a real DRCS implementation lands, so we do
-            // not claim a capability that silently discards its data. Enforced
-            // by `gate drift`. See docs/EXCEED_GHOSTTY_PLAN.md.
+            // Soft fonts (DRCS/DECDLD) are not supported: the integration was
+            // permanently removed (dd8061b06) and the DCS `{` payload is consumed
+            // and discarded (handler_dcs.rs), so the capability is advertised
+            // false. `gate drift` keeps it false unless `fn handle_decdld` exists.
             soft_fonts: false,
             unicode: true,
             bracketed_paste: true,

@@ -236,7 +236,7 @@ impl EscalationKind {
             Self::Attention => "aterm · needs you",
             Self::Prompt => "aterm · approval waiting",
             Self::Question => "aterm · question waiting",
-            Self::Wall => "aterm · agent stopped at a wall",
+            Self::Wall => "aterm · agent stopped",
             Self::Title => "aterm",
         }
     }
@@ -356,8 +356,8 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
         )),
         word => {
             // `wall:usage-session` → `usage-session`, the kind aterm-phase
-            // names; a reset time rides it.
-            let kind = word.strip_prefix("wall:").filter(|k| !k.is_empty())?;
+            // names, said in a person's words; a reset time rides it.
+            let kind = wall_words(word.strip_prefix("wall:").filter(|k| !k.is_empty())?);
             Some((
                 EscalationKind::Wall,
                 match fact.detail.as_deref().filter(|d| !d.is_empty()) {
@@ -366,6 +366,22 @@ fn agent_escalation(fact: &AgentFact) -> Option<(EscalationKind, String)> {
                 },
             ))
         }
+    }
+}
+
+/// A wall kind (`aterm_phase::WallKind::name`) in the words the menu row and
+/// the notification say; a kind this build does not know stays as it came.
+fn wall_words(kind: &str) -> &str {
+    match kind {
+        "usage-session" => "session usage limit",
+        "usage-weekly" => "weekly usage limit",
+        "model-bucket" => "model usage limit",
+        "spend" => "spend limit",
+        "context" => "context full",
+        "auth" => "logged out",
+        "api-error" => "API error",
+        "overloaded" => "service overloaded",
+        other => other,
     }
 }
 
@@ -1002,7 +1018,7 @@ pub(crate) fn compose_status_menu(glance: &FleetGlance) -> Vec<StatusRow> {
             });
             if !glance.start_available {
                 rows.push(StatusRow::Info(
-                    "(claude CLI not found on PATH)".to_string(),
+                    "(claude not found \u{2014} aterm pkg install claude)".to_string(),
                 ));
             }
         }
@@ -1632,38 +1648,6 @@ mod macos {
                 }
             });
         }
-
-        /// The generated `-dealloc` drops the Rust ivars, on an ivar SHAPE that
-        /// owns something with a `Drop` — which the real site's
-        /// `EventLoopProxy<Wake>` is.
-        #[test]
-        fn dropping_a_declared_instance_drops_its_ivars() {
-            static DROPS: AtomicUsize = AtomicUsize::new(0);
-            struct Spy;
-            impl Drop for Spy {
-                fn drop(&mut self) {
-                    DROPS.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            aterm_objc::declare_class! {
-                struct StatusDropProbe: NSObject {
-                    const NAME: &str = "ATermStatusDropProbe";
-                    type Ivars = Spy;
-
-                    @sel(ping)
-                    fn ping(&self) {}
-                }
-            }
-            DROPS.store(0, Ordering::SeqCst);
-            let t = StatusDropProbe::alloc_init(crate::appkit::test_witness(), Spy).expect("probe");
-            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-            drop(t);
-            assert_eq!(
-                DROPS.load(Ordering::SeqCst),
-                1,
-                "the generated -dealloc did not drop the ivars"
-            );
-        }
     }
 }
 
@@ -1716,7 +1700,7 @@ mod tests {
                 (5, "\u{26a0} deploy needs a human".to_string()),
                 (4, "\u{26a0} builder: bash rm -rf build".to_string()),
                 (3, "\u{26a0} asker: question".to_string()),
-                (1, "\u{26a0} limits: usage-session".to_string()),
+                (1, "\u{26a0} limits: session usage limit".to_string()),
             ]
         );
         assert_eq!(g.button_title(), "\u{276f}\u{26a0}");
@@ -1725,7 +1709,7 @@ mod tests {
         limited.agent.as_mut().unwrap().detail = Some("7:30pm".into());
         assert_eq!(
             escalation(&limited).unwrap().label,
-            "\u{26a0} limits: usage-session until 7:30pm"
+            "\u{26a0} limits: session usage limit until 7:30pm"
         );
         // Every wall kind raises a row; `unknown` (no evidence) and a bare
         // `wall:` raise none.
@@ -2451,7 +2435,7 @@ mod tests {
                     action: OperatorAction::Start,
                     enabled: false,
                 },
-                StatusRow::Info("(claude CLI not found on PATH)".into()),
+                StatusRow::Info("(claude not found \u{2014} aterm pkg install claude)".into()),
             ]
         );
     }

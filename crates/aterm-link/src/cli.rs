@@ -23,7 +23,9 @@
 //! The one exception is `hook`, removed in round 25: a hook entry that survived the
 //! removal still runs it on every prompt, and an exit 2 there is Claude Code's BLOCKING
 //! error, so it answers exit 0 with nothing on stdout and one line on stderr
-//! (`retired_hook`) for a deprecation window.
+//! (`retired_hook`), and keeps answering that way permanently (decided 2026-09-25 under
+//! the owner's standing direction: a stale project-level hook entry must never block a
+//! prompt, and no cleanup pass can reach every project's settings file).
 //!
 //! ## `ls` PRINTS §7'S COLUMNS, AND SAYS WHICH OF THEM HAVE NO WRITER
 //!
@@ -235,14 +237,15 @@ pub fn dispatch(args: &[String]) -> ExitCode {
     }
 }
 
-/// The one line `aterm link hook …` prints, on stderr, during the deprecation window
-/// ([`retired_hook`]).
+/// The one line `aterm link hook …` prints, on stderr ([`retired_hook`]).
 pub const RETIRED_HOOK_LINE: &str = "aterm-link: `hook` was removed (round 25: aterm installs \
      nothing into the agent) — this hook entry does nothing; delete it from the settings \
      file that runs it";
 
 /// `aterm link hook …`, any arguments: EXIT 0, NOTHING ON STDOUT, one stderr line
-/// ([`RETIRED_HOOK_LINE`]) — for a deprecation window whose end is the owner's call.
+/// ([`RETIRED_HOOK_LINE`]) — KEPT PERMANENTLY. Decided 2026-09-25 under the owner's
+/// standing direction: the tombstone is fifteen lines, and removing it would bring back
+/// the blocking-hook failure below for every project-level entry still out there.
 ///
 /// Round 25 cut the vendor hooks (59c3bee59), and the agents pass takes the entries aterm
 /// wrote out of `~/.claude/settings.json` — but never out of a PROJECT's

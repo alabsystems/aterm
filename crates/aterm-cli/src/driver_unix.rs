@@ -10,8 +10,6 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aterm_core::terminal::Terminal;
-
 /// Set by the SIGWINCH handler; drained in the main loop.
 static GOT_WINCH: AtomicBool = AtomicBool::new(false);
 
@@ -100,18 +98,9 @@ const fn poll_must_read(revents: libc::c_short) -> bool {
 
 /// Raw mode, the passthrough `poll(2)` loop, resize forwarding, restore, reap:
 /// returns the shell's exit status (non-exit or a failed wait → 1). The body is the parent-side
-/// session loop moved verbatim from `main()`.
-///
-/// `engine` is `None` for an ordinary session — the VT model is demand-driven
-/// and off by default (`$ATERM_SESSION_MODEL`, `aterm_cli::session_model_armed`).
-/// Only the two `if let` arms below depend on it; everything the SHELL can
-/// observe — the stdout passthrough and the `TIOCSWINSZ` forwarded to the PTY —
-/// is unconditional, so a session behaves identically with the model absent.
-pub(crate) fn run(
-    shell: aterm_pty::SpawnedShell,
-    mut engine: Option<&mut Terminal>,
-    verbose: bool,
-) -> i32 {
+/// session loop moved verbatim from `main()`. Nothing here models the screen: the
+/// host terminal draws the bytes, and the PTY is the one thing told the geometry.
+pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
     let master = shell.master;
     let shell_pid = shell.pid;
 
@@ -149,17 +138,12 @@ pub(crate) fn run(
     let mut buf = [0u8; 8192];
 
     loop {
-        // Apply a pending resize before blocking: tell the PTY (so full-screen
-        // apps reflow) and, when one is armed, the engine model. The ioctl is
-        // NOT inside the `if let`: the PTY is what every full-screen app reads
-        // its geometry from, and it must be told whether or not anything is
-        // modelling the screen. Nothing else in this process holds a size.
+        // Apply a pending resize before blocking: tell the PTY, which is what
+        // every full-screen app reads its geometry from. Nothing else in this
+        // process holds a size.
         if GOT_WINCH.swap(false, Ordering::Relaxed) {
             let mut nws = host_winsize_raw();
             unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &mut nws) };
-            if let Some(engine) = engine.as_deref_mut() {
-                engine.resize(nws.ws_row, nws.ws_col);
-            }
         }
 
         let n = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
@@ -188,9 +172,7 @@ pub(crate) fn run(
             }
         }
 
-        // shell output -> host terminal (passthrough), and the engine (model)
-        // only when one is armed. The write comes FIRST either way, so the
-        // bytes are out the door before anything else touches them.
+        // shell output -> host terminal (passthrough).
         if poll_must_read(fds[1].revents) {
             let r = unsafe { libc::read(master, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
             if r < 0 && eintr() {
@@ -201,9 +183,6 @@ pub(crate) fn run(
             }
             let out = &buf[..r as usize];
             write_all(libc::STDOUT_FILENO, out);
-            if let Some(engine) = engine.as_deref_mut() {
-                engine.process(out);
-            }
             bytes_in += out.len() as u64;
         }
     }
@@ -230,16 +209,7 @@ pub(crate) fn run(
         }
     };
     if verbose {
-        // Say which session this was. The VT core clause appears only when the
-        // dev-only seam (`ATERM_SESSION_MODEL=1`) armed it: a shipped binary cannot,
-        // so a constant "session model off" clause was a fact about nothing a
-        // person could change.
-        let modelled = if engine.is_some() {
-            " and into the armed VT core"
-        } else {
-            ""
-        };
-        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through{modelled}.");
+        eprintln!("\r\n[aterm] session ended — {bytes_in} bytes passed through.");
     }
     // A failed wait has no status to report: treat it like a non-exit.
     if reaped && libc::WIFEXITED(status) {
@@ -331,7 +301,7 @@ mod tests {
             aterm_sandbox::Limits::shell_default(),
         )
         .expect("protected shell spawn");
-        let code = run(shell, None, false);
+        let code = run(shell, false);
         let mut status = 0;
         unsafe { libc::waitpid(decoy_pid, &mut status, libc::WNOHANG) };
         assert_eq!(code, 3, "the session took another child's exit status");
@@ -359,6 +329,16 @@ mod tests {
     fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
         let mut raw = [-1; 2];
         assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
+        // pipe(2) opens both ends inheritable: a child another test in this
+        // binary spawns meanwhile would keep the write end open past its exec,
+        // for its whole life, and the hang-up below would never come.
+        for fd in raw {
+            // SAFETY: `fd` is a live descriptor `pipe` just returned.
+            assert_eq!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
         // SAFETY: `pipe` returned two fresh owned descriptors above; each is
         // transferred exactly once into a `File` and closed by that owner.
         let mut reader = unsafe { std::fs::File::from_raw_fd(raw[0]) };
@@ -377,7 +357,11 @@ mod tests {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            assert_eq!(unsafe { libc::poll(&mut event, 1, 1_000) }, 1);
+            // 10 s, not 1: the hang-up comes only once every copy of the write
+            // end is closed, and a child another test is forking holds one until
+            // it execs (the fd-copy sweep of 2026-09-27). A ready pipe answers at
+            // once either way.
+            assert_eq!(unsafe { libc::poll(&mut event, 1, 10_000) }, 1);
             assert!(
                 poll_must_read(event.revents),
                 "revents={:#x}",

@@ -114,8 +114,38 @@ pub struct BuildOutput {
     /// `dist/aterm.dSYM` — present iff dsymutil produced a non-empty DWARF
     /// whose UUIDs match the binary (see the exit-code caveat on [`extract_dsym`]).
     pub dsym: Option<PathBuf>,
-    /// `dist/aterm-<ver>-dSYM.zip` — the archive attached to the release.
+    /// `dist/aterm-<ver>-dSYM.zip` — the owner's symbolication archive, kept in `dist/`
+    /// and never published (its DWARF names this machine's paths).
     pub dsym_zip: Option<PathBuf>,
+    /// `dist/aterm-<ver>-x86_64-probe.txt` — the x86_64 slice's `--diagnose` report
+    /// under Rosetta ([`x86_64_probe_transcript`]), the record that a universal cut RAN
+    /// its Intel slice (docs/DESIGN-intel-just-works-2026-09-14.md §3.1). `None` on an
+    /// `--arm64-only` cut, which runs no slice. The site's `data-intel-proof`
+    /// (`publish/site-sync.py`) links it once the public release carries it.
+    pub x86_64_probe: Option<PathBuf>,
+}
+
+/// The file name of a universal cut's x86_64 execution record.
+#[must_use]
+pub fn x86_64_probe_asset_name(version: &str) -> String {
+    format!("aterm-{version}-x86_64-probe.txt")
+}
+
+/// The x86_64 execution record's text: what ran, what was checked, and the slice's own
+/// `--diagnose` report verbatim.
+#[must_use]
+pub fn x86_64_probe_transcript(version: &str, report: &str) -> String {
+    let mut text = format!(
+        "# aterm {version}: the universal binary's x86_64 slice, RUN under Rosetta by the\n\
+         # release cut (`arch -x86_64 aterm --diagnose`) before it shipped. Its updater pin\n\
+         # and app version were checked against the release's; its report follows verbatim.\n\
+         # docs/DESIGN-intel-just-works-2026-09-14.md section 3.1\n\n"
+    );
+    text.push_str(report);
+    if !report.ends_with('\n') {
+        text.push('\n');
+    }
+    text
 }
 
 #[cfg(unix)]
@@ -1458,25 +1488,38 @@ fn publish_verified_symbols(
         output.dsym = Some(published);
     }
     if let Some(staged) = output.dsym_zip.take() {
-        let name = staged
-            .file_name()
-            .ok_or("staged dSYM zip has no file name")?;
-        let published = out_dir.join(name);
-        match std::fs::remove_file(&published) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(format!("replace {}: {error}", published.display())),
-        }
-        std::fs::rename(&staged, &published).map_err(|error| {
-            format!(
-                "publish verified dSYM zip {} -> {}: {error}",
-                staged.display(),
-                published.display()
-            )
-        })?;
-        output.dsym_zip = Some(published);
+        output.dsym_zip = Some(publish_staged_file(&staged, out_dir, "verified dSYM zip")?);
+    }
+    if let Some(staged) = output.x86_64_probe.take() {
+        output.x86_64_probe = Some(publish_staged_file(
+            &staged,
+            out_dir,
+            "x86_64 slice record",
+        )?);
     }
     Ok(output)
+}
+
+/// Move one staged release file into `out_dir` under its own name, replacing a stale
+/// copy from an earlier cut.
+fn publish_staged_file(staged: &Path, out_dir: &Path, what: &str) -> Result<PathBuf, String> {
+    let name = staged
+        .file_name()
+        .ok_or_else(|| format!("staged {what} has no file name"))?;
+    let published = out_dir.join(name);
+    match std::fs::remove_file(&published) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("replace {}: {error}", published.display())),
+    }
+    std::fs::rename(staged, &published).map_err(|error| {
+        format!(
+            "publish {what} {} -> {}: {error}",
+            staged.display(),
+            published.display()
+        )
+    })?;
+    Ok(published)
 }
 
 fn run_with_take(
@@ -1672,12 +1715,47 @@ fn run_with_take(
         .unwrap_or("(no objc: line in --diagnose — binary predates the probe)");
     println!("    objc: {objc_line}");
 
+    // --- THE x86_64 SLICE MUST RUN BEFORE A UNIVERSAL CUT SHIPS -------------
+    // (docs/DESIGN-intel-just-works-2026-09-14.md §3.1.) Every Intel-only fault
+    // the port found sat where an x86_64 EXECUTION differs from an arm64 one —
+    // ObjC encodings, stret sends, `BOOL` width — which no build, type-check,
+    // lint or structural pin proof can see. Rosetta reproduces that ABI exactly,
+    // so the universal binary's x86_64 slice answers `--diagnose` under it, and
+    // its updater pin and app version are cross-checked like the native one's.
+    // No Rosetta is a refusal naming the remedy, never an unexecuted slice.
+    let mut x86_64_probe = None;
+    if !plan.arm64_only {
+        let report = x86_64_slice_runs(&shipped[0], &plan.repo_root, &mut |command| {
+            command.output()
+        })?;
+        let label = "x86_64 slice under Rosetta";
+        if let Some(expected) = &plan.expected_update_pin_sha256 {
+            validate_slice_update_pin_reports(expected, &[(label, &report)])?;
+        }
+        validate_app_version_reports(&plan.short_version, &[(label, &report)])?;
+        // The record of the run, staged beside the dSYM and published into `dist/`
+        // with it: the proof §3.1 promises the site gate, not a line that scrolled by.
+        let record = symbol_out.join(x86_64_probe_asset_name(&plan.short_version));
+        std::fs::write(
+            &record,
+            x86_64_probe_transcript(&plan.short_version, &report),
+        )
+        .map_err(|error| format!("write {}: {error}", record.display()))?;
+        println!(
+            "    x86_64 slice: ran under Rosetta — --diagnose answered, pin and version agree \
+             (record: {})",
+            x86_64_probe_asset_name(&plan.short_version)
+        );
+        x86_64_probe = Some(record);
+    }
+
     Ok(BuildOutput {
         aterm: shipped[0].clone(),
         archs,
         compiler_line,
         dsym,
         dsym_zip,
+        x86_64_probe,
     })
 }
 
@@ -2523,6 +2601,37 @@ fn verify_built_slice_update_pins(
     validate_slice_update_pin_reports(expected, &[("native architecture slice", &report)])
 }
 
+/// Run the x86_64 slice of `universal` under Rosetta (`/usr/bin/arch -x86_64 … --diagnose`)
+/// and return its report. `run` spawns, injected so the refusal paths are testable without
+/// Rosetta. `Err` when Rosetta cannot run a trivial x86_64 program
+/// ([`crate::gates::ROSETTA_REFUSAL`] — the pre-claim [`crate::gates::universal_gate`] asks
+/// the same probe first, so on a real cut this arm is Rosetta vanishing mid-build), or the
+/// slice does not answer.
+fn x86_64_slice_runs(
+    universal: &Path,
+    repo_root: &Path,
+    run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
+) -> Result<String, String> {
+    crate::gates::rosetta_runs(run)?;
+    let mut probe = Command::new("/usr/bin/arch");
+    probe
+        .arg("-x86_64")
+        .arg(universal)
+        .arg("--diagnose")
+        .current_dir(repo_root);
+    let out =
+        run(&mut probe).map_err(|error| format!("run the x86_64 slice under Rosetta: {error}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "the x86_64 slice did not run under Rosetta: `--diagnose` exited {} ({})",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    String::from_utf8(out.stdout)
+        .map_err(|_| "the x86_64 slice's diagnostics are not UTF-8".to_string())
+}
+
 /// Combine slices into one fat binary, or pass a single slice through
 /// (build-app.sh's lipo step, incl. the single-arch copy branch).
 fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
@@ -2713,8 +2822,79 @@ mod tests {
         resolve_release_rustup_shim_dir, validate_app_version_reports, validate_cli_app_version,
         validate_embedded_update_pin, validate_final_slice_records, validate_lipo_architectures,
         validate_named_cli_app_version, validate_slice_update_pin_reports,
-        write_release_target_owner,
+        write_release_target_owner, x86_64_probe_asset_name, x86_64_probe_transcript,
+        x86_64_slice_runs,
     };
+
+    /// §3.1 of DESIGN-intel-just-works: a universal cut RUNS its x86_64 slice. A builder
+    /// without Rosetta is refused with the remedy (and the escape) named, before the slice
+    /// is ever tried; a slice that does not answer is refused; one that answers returns
+    /// its report — and every spawn goes through `arch -x86_64`.
+    #[test]
+    fn the_universal_cut_runs_its_x86_64_slice_under_rosetta() {
+        use std::os::unix::process::ExitStatusExt as _;
+        let output = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: b"bad CPU type in executable".to_vec(),
+        };
+        let bin = std::path::Path::new("/stage/ship/aterm");
+        let root = std::path::Path::new("/repo");
+        let argv = |command: &std::process::Command| -> Vec<String> {
+            std::iter::once(command.get_program())
+                .chain(command.get_args())
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let mut seen = Vec::new();
+        let err = x86_64_slice_runs(bin, root, &mut |command| {
+            seen.push(argv(command));
+            Ok(output(1, ""))
+        })
+        .unwrap_err();
+        assert_eq!(err, crate::gates::ROSETTA_REFUSAL);
+        assert!(err.contains("softwareupdate --install-rosetta") && err.contains("--arm64-only"));
+        assert_eq!(
+            seen,
+            vec![vec!["/usr/bin/arch", "-x86_64", "/usr/bin/true"]]
+        );
+
+        let mut calls = 0;
+        let err = x86_64_slice_runs(bin, root, &mut |_| {
+            calls += 1;
+            Ok(output(if calls == 1 { 0 } else { 134 }, ""))
+        })
+        .unwrap_err();
+        assert!(err.contains("did not run under Rosetta"), "{err}");
+
+        let mut seen = Vec::new();
+        let report = x86_64_slice_runs(bin, root, &mut |command| {
+            seen.push(argv(command));
+            Ok(output(0, "app-version: 0.93.0\n"))
+        })
+        .unwrap();
+        assert_eq!(report, "app-version: 0.93.0\n");
+        assert_eq!(
+            seen[1],
+            vec![
+                "/usr/bin/arch",
+                "-x86_64",
+                "/stage/ship/aterm",
+                "--diagnose"
+            ]
+        );
+        // The record a universal cut keeps of that run: a header saying what ran and
+        // what was checked, then the slice's own report verbatim, newline-terminated.
+        assert_eq!(
+            x86_64_probe_asset_name("0.93.0"),
+            "aterm-0.93.0-x86_64-probe.txt"
+        );
+        let record = x86_64_probe_transcript("0.93.0", &report);
+        assert!(record.starts_with("# aterm 0.93.0: the universal binary's x86_64 slice, RUN"));
+        assert!(record.ends_with("\n\napp-version: 0.93.0\n"), "{record}");
+        assert!(x86_64_probe_transcript("0.93.0", "no newline").ends_with("no newline\n"));
+    }
 
     /// The release proof's Python runs isolated (`-I`), and isolated mode ignores
     /// PYTHONDONTWRITEBYTECODE — so without `-B` an import writes `__pycache__` into
@@ -3676,6 +3856,8 @@ mod tests {
         std::fs::create_dir_all(&dsym).unwrap();
         std::fs::write(dsym.join("symbol"), "verified").unwrap();
         std::fs::write(&zip, "archive").unwrap();
+        let probe = stage.join(x86_64_probe_asset_name("0.67.0"));
+        std::fs::write(&probe, x86_64_probe_transcript("0.67.0", "version=0.67.0")).unwrap();
 
         let published = publish_verified_symbols(
             BuildOutput {
@@ -3684,6 +3866,7 @@ mod tests {
                 compiler_line: "trust".into(),
                 dsym: Some(dsym),
                 dsym_zip: Some(zip),
+                x86_64_probe: Some(probe),
             },
             &out,
             current_release_uid().unwrap(),
@@ -3692,6 +3875,16 @@ mod tests {
 
         assert_eq!(published.dsym, Some(out.join("aterm.dSYM")));
         assert_eq!(published.dsym_zip, Some(out.join("aterm-0.67.0-dSYM.zip")));
+        assert_eq!(
+            published.x86_64_probe,
+            Some(out.join("aterm-0.67.0-x86_64-probe.txt")),
+            "a universal cut's x86_64 record lands in dist beside the dSYM"
+        );
+        assert!(
+            std::fs::read_to_string(out.join("aterm-0.67.0-x86_64-probe.txt"))
+                .unwrap()
+                .ends_with("version=0.67.0\n")
+        );
         assert_eq!(
             std::fs::read_to_string(out.join("aterm.dSYM/symbol")).unwrap(),
             "verified"
@@ -3730,6 +3923,7 @@ mod tests {
                 compiler_line: "trust".into(),
                 dsym: Some(dsym.clone()),
                 dsym_zip: None,
+                x86_64_probe: None,
             },
             &out,
             current_release_uid().unwrap(),

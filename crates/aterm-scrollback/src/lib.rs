@@ -139,7 +139,7 @@ pub use disk_backed::{DiskBackedScrollback, DiskBackedScrollbackConfig};
 pub(crate) use disk_format::DiskColdConfig;
 pub use error::ScrollbackError;
 pub(crate) use hot_tier::HotTier;
-pub use iter::ScrollbackIter;
+pub use iter::{DenseScrollbackIter, ScrollbackIter};
 pub use line::{AttrRunCursor, CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
 // Block codec, public for `TerminalCheckpoint` grid-body encode/decode (B.3.2).
 pub use line::{

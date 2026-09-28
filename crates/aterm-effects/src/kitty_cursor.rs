@@ -815,8 +815,8 @@ impl CursorCat {
         }
     }
 
-    /// Retire only renderer-coordinate continuity. A LOCK A/B cursor/style/
-    /// scroll divergence may not carry an in-flight edge fold or a palette
+    /// Retire only renderer-coordinate continuity. A cursor/style/scroll
+    /// coordinate-space change may not carry an in-flight edge fold or a palette
     /// sampled under the old footprint into the next coordinate space, but a
     /// collection hello or singing appearance remains a presentation promise:
     /// its identity and lifecycle continue settled at the live caret, and the

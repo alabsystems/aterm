@@ -73,7 +73,7 @@ pub fn dpi_to_scale_factor(dpi: u32) -> f64 {
 
 pub unsafe fn hwnd_dpi(hwnd: HWND) -> u32 {
     let hdc = unsafe { GetDC(hwnd) };
-    if hdc == 0 {
+    if hdc == std::ptr::null_mut() {
         panic!("[winit] `GetDC` returned null!");
     }
     if let Some(GetDpiForWindow) = *GET_DPI_FOR_WINDOW {
@@ -85,7 +85,7 @@ pub unsafe fn hwnd_dpi(hwnd: HWND) -> u32 {
     } else if let Some(GetDpiForMonitor) = *GET_DPI_FOR_MONITOR {
         // We are on Windows 8.1 or later.
         let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-        if monitor == 0 {
+        if monitor == std::ptr::null_mut() {
             return BASE_DPI;
         }
 

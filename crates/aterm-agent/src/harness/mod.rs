@@ -30,10 +30,10 @@
 //!   was the packaging contract and the alignment verdict; that part is
 //!   deleted (the module doc says why) and the name stays for its caller.
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
-//!   permission-mode row: model + effort, repository, branch, read from the
-//!   files Claude Code already keeps (owner direction, 2026-09-24).
+//!   permission-mode row: model + effort, working directory, branch, read
+//!   from the files Claude Code already keeps (owner direction, 2026-09-24).
 //! * [`lights`] — the row of lights at the footer's end (auto-approve, auto
-//!   mode, fast mode, thinking): read from what Claude Code draws,
+//!   mode, fast mode): read from what Claude Code draws,
 //!   toggled through its own inputs, read back after every toggle.
 //! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
 //!   read views, `upgrade` (one hand-run pass of the live upgrade) and
@@ -53,8 +53,9 @@
 //! * [`upgrade_models`], [`upgrade_catalog`] — THE MODEL HALF of the live
 //!   upgrade: the priority list (grown from Claude Code's own
 //!   recommendations), the managed build's baked catalog, and THE MODEL
-//!   LADDER that moves a session onto the list's best available model on its
-//!   relaunch line (`--model`, never `/model`).
+//!   LADDER that moves a session onto the newest model of ITS OWN family the
+//!   build offers — and only with none newer, up the list for a model nobody
+//!   chose; never down — on its relaunch line (`--model`, never `/model`).
 //! * [`relaunch`] — THE RELAUNCH PRIMITIVE both the upgrade and relaunch on
 //!   exit use: an agent that no longer runs started again in its own tab, on
 //!   its own conversation (Claude Code's `--resume`, Codex's `resume`), and
@@ -75,7 +76,7 @@
 //! and it duplicated the engine in [`crate::supervise`], which is the one
 //! supervisor now. Design §0.4 is the record.
 //!
-//! STATUS (docs/README.md honesty ratchet): unit-tested; NINE bounded
+//! STATUS (docs/README.md honesty ratchet): unit-tested; TEN bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
 //! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
 //! in its tests), `harness_upgrade_notice_owner_model` ([`upgrade_drive`]'s
@@ -84,16 +85,30 @@
 //! a session at its usage limit, a late READY honoured, every agent asked
 //! restarted or released — a release dropped only once the agent took up
 //! direction given after its last READY, never a restart over direction given
-//! after it; one stated exception, an agent no job of a job-control shell,
+//! after it, and no stopped round a permanent wait — each re-armed once it
+//! has rested `upgrade::RETRY_S`; one stated exception, an agent no job of a job-control shell,
 //! refused and owed no line: [`upgrade_drive`]'s tests, over the real reducer,
 //! gates, record transitions, READY, direction and release rules and the
 //! window's reading of each step's word), `harness_worker_lifecycle_model` and
 //! `harness_relaunch_on_exit_model` ([`relaunch`]'s and the window host's
-//! tests), `harness_exit_record_model` (what an exit left of Claude's own
+//! tests), `harness_upgrade_look_model` (the window host's looks at a
+//! session over [`upgrade_drive::due`] — never let go for what a look could
+//! not read — and its note behind over [`upgrade_drive::note_behind`], the
+//! state behind from the worker's attach: the host's reaction in the window
+//! host's tests, the classifier's reads in [`upgrade_drive`]'s),
+//! `harness_exit_record_model` (what an exit left of Claude's own
 //! record, read as it is seen: [`upgrade_drive`]'s tests, over the real
 //! [`relaunch::exit_record`] and [`relaunch::after_exit`]),
 //! `harness_model_priority_model` ([`upgrade_models`], in
-//! `aterm-agent/tests/conformance_upgrade_models/priority.rs`), and
+//! `aterm-agent/tests/conformance_upgrade_models/priority.rs`),
+//! `harness_model_ladder_model` (WHEN a due model move is taken —
+//! [`upgrade_models::model_moves_now`] over every reachable state, in
+//! `aterm-agent/tests/conformance_upgrade_models/ladder.rs`),
+//! `harness_login_wall_model` (nothing of the upgrade's typed at the login
+//! wall, no give-up spent on a notice it answered, no continuation into a
+//! login the supervisor saw gone, the owner told first: in
+//! `aterm-agent/tests/conformance_login_wall.rs`, over the real readers,
+//! reducer and turn-end decider on every reachable state), and
 //! `harness_codex_daemon_update_model` ([`upgrade_codex::daemon_step`] over
 //! every reachable state, in [`upgrade_codex`]'s tests). The Codex branch
 //! has run end to end against a REAL Codex (0.157.0 → 0.157.1, a private
@@ -109,6 +124,15 @@
 //! against a REAL exhausted
 //! window: the `/usage` panel reader is exercised against captured and
 //! hand-built fixtures.
+
+/// The harness's mark as a literal ([`upgrade::HARNESS_MARK`] is this), for
+/// the texts `concat!` builds on it: every turn the harness types into an
+/// agent's conversation begins with it.
+macro_rules! harness_mark {
+    () => {
+        "[aterm harness]"
+    };
+}
 
 pub mod align;
 pub mod cli;

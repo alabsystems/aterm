@@ -108,10 +108,23 @@ pub struct Row {
     pub outcome: String,
     /// When the restart finished (`0`: not done).
     pub done_at: u64,
+    /// Until when the model its typed carry-on's answer names is waited for
+    /// ([`St::confirming`], `relaunch::MODEL_WAIT` after the carry-on; `0`:
+    /// nothing owed). A done row with no `done_at` reads
+    /// `restarting/<to>/continued/<age>` UNTIL THEN, and `done` aged from
+    /// then after it ([`Self::restarting`], [`Self::finished_at`]) — N2 of
+    /// the live re-test of 2026-09-26: such a row was dropped as a move
+    /// finished long ago, and the column read blank for the 24 s between the
+    /// carry-on and its answer; and the model is read at the next idle point
+    /// after the answer, so "until it is read" held `restarting` through a
+    /// whole carry-on turn — forty minutes of one read forty minutes of a
+    /// restart the new build had finished in its first seconds (the review
+    /// of the N2 fix).
+    pub confirm_by: u64,
     /// [`Row::stall`] at the moment the row was read — carried so a summary
     /// that crosses [`STALLED_AFTER_S`] differs from the last one and is sent.
     pub stalled: Option<String>,
-    /// The model the announcement asked for from the priority list
+    /// The model the announcement asked for by the model rule
     /// ([`crate::harness::upgrade_models`]), empty when it asked for none or
     /// has not been typed yet — what [`Row::move_words`] names.
     pub model: String,
@@ -126,6 +139,20 @@ pub struct Row {
     /// failure was dropped from `--status`, the band and the `upgrade=`
     /// column, and the owner learned of it from the ledger alone.
     pub exited_at: u64,
+    /// When a STOPPED round starts the next one (unix seconds): the stop's
+    /// stamp plus [`upgrade::RETRY_S`] (`St::failed_at`; the owner,
+    /// 2026-09-27: "you should NEVER have upgrades stalled"). `0` for a round
+    /// that has not stopped. A stop an older build recorded carries no stamp
+    /// and is due at once. What `--status` says as `next_round=` instead of a
+    /// permanent `gave-up`.
+    pub retry_at: u64,
+    /// Why the round before this one stopped, while this one — started by a
+    /// re-arm — has typed no notice yet (`St::last_stop`). A REFUSAL there
+    /// (not a shell job, flags that cannot be carried, a line that cannot be
+    /// typed) keeps its stall through the new round's first look, where it is
+    /// met again or not: without it the band row resolved at every re-arm and
+    /// a new one was posted a minute later, every [`upgrade::RETRY_S`].
+    pub last_stop: String,
 }
 
 impl Row {
@@ -144,13 +171,49 @@ impl Row {
             request_at: st.request_at,
             outcome: st.outcome.clone(),
             done_at: st.done_at,
+            confirm_by: if st.confirming() { st.confirm_by } else { 0 },
             stalled: None,
             model: st.model_list.clone(),
             agent: st.agent,
             exited_at: st.exited_at,
+            retry_at: if matches!(st.phase, Phase::Failed(_)) {
+                st.failed_at.saturating_add(upgrade::RETRY_S)
+            } else {
+                0
+            },
+            last_stop: st.last_stop.clone(),
         };
         row.stalled = row.stall(now);
         row
+    }
+
+    /// Seconds until this stopped round's next one ([`Self::retry_at`]):
+    /// `Some(0)` when it is due, `None` for a round that has not stopped or
+    /// that the owner's word holds (a skip is not re-armed; a deferral is,
+    /// once it runs out).
+    #[must_use]
+    pub fn next_round_in(&self, now: u64) -> Option<u64> {
+        if !matches!(self.phase, Phase::Failed(_)) || self.owner_holds(now) {
+            return None;
+        }
+        Some(self.retry_at.saturating_sub(now))
+    }
+
+    /// A restart whose carry-on is typed, with the model its answer names
+    /// still waited for at `now` ([`Self::confirm_by`]): `restarting` to the
+    /// owner.
+    fn restarting(&self, now: u64) -> bool {
+        self.phase == Phase::Done && self.done_at == 0 && now <= self.confirm_by
+    }
+
+    /// When the move finished for the owner: [`Self::done_at`], or — its
+    /// carry-on's model not read by then — the end of the wait for it.
+    fn finished_at(&self) -> u64 {
+        if self.done_at == 0 {
+            self.confirm_by
+        } else {
+            self.done_at
+        }
     }
 
     /// Whether the owner's word holds this upgrade still: a skip of this
@@ -166,7 +229,10 @@ impl Row {
     /// Whether the upgrade will move this session onto the target at a turn end
     /// with nobody's help: under way or waiting, not held by the owner's word,
     /// and not stalled by anything but its age (an `overdue` session still
-    /// moves at its next turn end; a held-back or stopped one does not).
+    /// moves at its next turn end; a held-back, refused or failed one does
+    /// not). A round that stopped and rests until its next
+    /// ([`Self::retry_at`]) is NOT moving: it moves only after that rest, a
+    /// new notice and a READY — never "at its next turn end".
     #[must_use]
     pub fn moving(&self, now: u64) -> bool {
         matches!(
@@ -180,9 +246,10 @@ impl Row {
     }
 
     /// WHY THIS UPGRADE WILL NOT MOVE ON ITS OWN, one word, or `None` while it
-    /// is healthy or the owner holds it: `gave-up` (no READY answer after the
-    /// last notice), `refused:<what>` (a launch that cannot be resumed, or not
-    /// its shell's job), `failed:<why>` (a restart that stopped),
+    /// is healthy or the owner holds it: `refused:<what>` (a launch that cannot be resumed, or not
+    /// its shell's job — while it is stopped, and through the first look of
+    /// the round a re-arm starts after it, [`Self::last_stop`]),
+    /// `failed:<why>` (a restart that stopped),
     /// `held-back:<owner>` (the agent runs under a multiplexer or another pty
     /// the tab's typing does not reach), and `overdue` — behind for
     /// [`STALLED_AFTER_S`] or more, whatever it waits on, UNLESS the owner's
@@ -193,31 +260,35 @@ impl Row {
     /// row and a new badge). BOUNDED: a `--now` that has not moved the session
     /// by then reads `overdue` again — the word never lapses, and an
     /// ineffective one hid the stall for good. Pending by itself is NOT
-    /// stalled: waiting for a turn end is the upgrade working.
+    /// stalled: waiting for a turn end is the upgrade working. NOR IS A ROUND
+    /// THAT GAVE UP (the owner, 2026-09-27: "you should NEVER have upgrades
+    /// stalled"): it rests until its next round ([`Self::retry_at`],
+    /// `next_round=`), and the round after it asks again on its own — until
+    /// that day `gave-up` was reported here as a stall, for good. It still
+    /// reads `overdue` once it is that far behind, as every round does.
     #[must_use]
     pub fn stall(&self, now: u64) -> Option<String> {
         if self.owner_holds(now) {
             return None;
         }
+        // Behind for STALLED_AFTER_S or more, whatever it waits on — a round
+        // resting after it gave up included, so a long-behind session reads the
+        // same word through every round and the band row does not flap.
+        let overdue = (now.saturating_sub(self.behind_since) >= STALLED_AFTER_S
+            && !self.hurried(now))
+        .then(|| "overdue".to_string());
         match &self.phase {
-            Phase::Failed(why) if why == "unanswered" => Some("gave-up".to_string()),
-            Phase::Failed(why)
-                if why == "not-a-shell-job"
-                    || why.starts_with("argv:")
-                    || why.starts_with("line:") =>
-            {
-                Some(format!("refused:{}", word(why)))
-            }
+            Phase::Failed(why) if why == upgrade::GAVE_UP => overdue,
+            Phase::Failed(why) if refusal(why) => Some(format!("refused:{}", word(why))),
             Phase::Failed(why) => Some(format!("failed:{}", word(why))),
+            Phase::Pending if refusal(&self.last_stop) => {
+                Some(format!("refused:{}", word(&self.last_stop)))
+            }
             Phase::Pending | Phase::Announced { .. } => {
                 if let Some(owner) = self.wait.strip_prefix("terminal:") {
                     Some(format!("held-back:{}", word(owner)))
-                } else if now.saturating_sub(self.behind_since) >= STALLED_AFTER_S
-                    && !self.hurried(now)
-                {
-                    Some("overdue".to_string())
                 } else {
-                    None
+                    overdue
                 }
             }
             Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => None,
@@ -233,19 +304,36 @@ impl Row {
     /// What the stall means, in a person's words ([`Self::stall`]); `None`
     /// while it is not stalled. An `overdue` stall says how long and what it
     /// waits on — words that move with every step, so they are for a record
-    /// read once, never for the tab's mark ([`Self::badge`]).
+    /// read once, never for the tab's mark ([`Self::badge`]). NEVER THE WAIT'S
+    /// OWN WORD (round 18, day four, D3: the band read `waiting
+    /// (not-idle:busy)` and `waiting (background)`): a wait with no words of
+    /// its own is left out here — `--status` and the `upgrade=` column carry
+    /// the word for a reader who wants it.
     #[must_use]
     pub fn stall_words(&self, now: u64) -> Option<String> {
         let stall = self.stall(now)?;
         let behind = upgrade::span(now.saturating_sub(self.behind_since));
         Some(match stall.as_str() {
-            "overdue" if self.wait.is_empty() => format!("behind for {behind}"),
             "overdue" => match self.wait_words() {
-                Some(what) => format!("behind for {behind}, waiting ({}): {what}", self.wait),
-                None => format!("behind for {behind}, waiting ({})", self.wait),
+                Some(what) => format!("behind for {behind}: {what}"),
+                None => format!("behind for {behind}"),
             },
             kind => stall_reason(self.agent, kind),
         })
+    }
+
+    /// WHETHER THE UPGRADE IS STILL ASKING ON ITS OWN: an overdue move whose
+    /// agent was told and is asked again every half hour
+    /// ([`Phase::Announced`]), waiting on what the owner's `--now` does not
+    /// waive ([`Remedy::Waits`]). It moves once that ends; a round whose asking
+    /// goes unanswered rests and the next round asks again ([`Self::retry_at`])
+    /// — so it is the upgrade working, not a thing for the owner to move (round
+    /// 18, day four, D5:
+    /// it stood as a warn row with a tab mark beside it). The window records
+    /// it and marks nothing ([`Self::badge`]).
+    #[must_use]
+    pub fn asks_on_its_own(&self, now: u64) -> bool {
+        matches!(self.phase, Phase::Announced { .. }) && self.remedy(now) == Some(Remedy::Waits)
     }
 
     /// What a Codex wait the owner cannot move by `--now` stands for, in a
@@ -256,8 +344,11 @@ impl Row {
     /// left running, the lane's own text in the composer. `None` for every
     /// other wait, whose word says it.
     fn wait_words(&self) -> Option<&'static str> {
-        if self.agent != upgrade::Agent::Codex {
+        if self.wait.is_empty() {
             return None;
+        }
+        if self.agent != upgrade::Agent::Codex {
+            return claude_wait_words(&self.wait);
         }
         Some(match self.wait.as_str() {
             "daemon-first:busy-thread" => {
@@ -312,9 +403,18 @@ impl Row {
     /// it moves at ([`now_moves_past`]); one waiting on the agent's READY
     /// answer, a draft, a box, a hold or work under it is told what it waits
     /// on instead ([`Remedy::Waits`]).
+    ///
+    /// A ROUND THAT GAVE UP is no stall — it rests until its next round — but
+    /// the owner's `--now` still re-arms it AT ONCE rather than at
+    /// [`Self::retry_at`]: [`Remedy::AskAgain`] is its remedy all the same, so
+    /// the words the window offers for it keep `Upgrade now`.
     #[must_use]
     pub fn remedy(&self, now: u64) -> Option<Remedy> {
-        let stall = self.stall(now)?;
+        let Some(stall) = self.stall(now) else {
+            return (matches!(&self.phase, Phase::Failed(why) if why == upgrade::GAVE_UP)
+                && !self.owner_holds(now))
+            .then_some(Remedy::AskAgain);
+        };
         Some(match stall.as_str() {
             "overdue" if now_moves_past(&self.wait) => Remedy::Now,
             "overdue" => Remedy::Waits,
@@ -382,8 +482,8 @@ impl Row {
     }
 
     /// The live holders of this conversation on a build older than its target
-    /// — or, for a SAME-BUILD restart (`from == to`: the build current, the
-    /// model priority list's model behind, [`crate::harness::upgrade_models`]),
+    /// — or, for a SAME-BUILD restart (`from == to`: the build current, a model
+    /// move due, [`crate::harness::upgrade_models`]),
     /// on that build: a relaunch with `--model` moves the conversation without
     /// moving its build, so a holder still on it is exactly what it waits for.
     fn behind_holders<'a>(&'a self, holders: &'a [Holder]) -> impl Iterator<Item = &'a Holder> {
@@ -408,10 +508,11 @@ impl Row {
         let to = word(&self.to);
         let behind = upgrade::span(now.saturating_sub(self.behind_since));
         let (state, why, age) = match &self.phase {
+            Phase::Done if self.restarting(now) => ("restarting", "continued".to_string(), behind),
             Phase::Done => (
                 "done",
                 "-".to_string(),
-                upgrade::span(now.saturating_sub(self.done_at)),
+                upgrade::span(now.saturating_sub(self.finished_at())),
             ),
             Phase::Exiting { .. } | Phase::Relaunched { .. } => {
                 ("restarting", self.phase.word(), behind)
@@ -425,8 +526,18 @@ impl Row {
                 self.request.word(),
                 behind,
             ),
+            // An OVERDUE stall names what it waits on (round 18, day four,
+            // D17: two tabs, one mid-turn and one on its own work, both read
+            // a bare `overdue`).
             _ => match self.stall(now) {
+                Some(stall) if stall == "overdue" && !self.wait.is_empty() => {
+                    ("stalled", format!("overdue:{}", self.wait), behind)
+                }
                 Some(stall) => ("stalled", stall, behind),
+                // A round that gave up rests until its next: pending on that.
+                None if matches!(self.phase, Phase::Failed(_)) => {
+                    ("pending", self.next_round_word(now), behind)
+                }
                 None => (
                     if matches!(self.phase, Phase::Announced { .. }) {
                         "announced"
@@ -445,6 +556,16 @@ impl Row {
         format!("{state}/{to}/{}/{age}", word(&why))
     }
 
+    /// `next-round:<span>` until a stopped round's next one, `next-round:due`
+    /// once it is due (the next look re-arms it); `-` for any other row.
+    fn next_round_word(&self, now: u64) -> String {
+        match self.next_round_in(now) {
+            Some(0) => "next-round:due".to_string(),
+            Some(secs) => format!("next-round:{}", upgrade::span(secs)),
+            None => "-".to_string(),
+        }
+    }
+
     /// One `--status` line.
     #[must_use]
     pub fn line(&self, now: u64) -> String {
@@ -460,9 +581,14 @@ impl Row {
         } else {
             upgrade::span(now.saturating_sub(self.wait_since))
         };
+        let next_round = match self.next_round_in(now) {
+            Some(0) => "due".to_string(),
+            Some(secs) => upgrade::span(secs),
+            None => "-".to_string(),
+        };
         format!(
             "upgrade tab={} session={} from={} to={}({}) phase={} pending_for={} wait={} \
-             wait_for={wait_for} request={} stalled={}",
+             wait_for={wait_for} request={} next_round={next_round} stalled={}",
             dash(&self.tab),
             dash(&self.session),
             dash(&self.from),
@@ -510,6 +636,10 @@ impl Row {
                 },
             ),
             ("done_at", self.done_at),
+            // When a stopped round's next one starts (0: not stopped), and
+            // the seconds until then (0: due, or not stopped).
+            ("retry_at", self.retry_at),
+            ("next_round_s", self.next_round_in(now).unwrap_or(0)),
         ] {
             o.insert(k.into(), Value::from(v));
         }
@@ -519,8 +649,8 @@ impl Row {
     /// What the upgrade moves the session onto, in the owner's words:
     /// `Claude Code <from> → <to>` (`Codex <from> → <to>` for a Codex row), `… with <model>` once the announcement
     /// named a model, and — for a SAME-BUILD restart (`from == to`: the build
-    /// current, the priority list's model behind) — `Claude Code <to> → <model>`,
-    /// or `→ the priority list's model` before one is named. A same-build move
+    /// current, a model move due) — `Claude Code <to> → <model>`, or `→ another
+    /// model` before one is named. A same-build move
     /// spelled `2.1.282 → 2.1.282` named no change at all.
     #[must_use]
     pub fn move_words(&self) -> String {
@@ -530,7 +660,7 @@ impl Row {
                 "{} {} → {}",
                 self.agent.product(),
                 word(&self.to),
-                model.unwrap_or_else(|| "the priority list's model".to_string())
+                model.unwrap_or_else(|| "another model".to_string())
             );
         }
         let with = model.map_or_else(String::new, |m| format!(" with {m}"));
@@ -550,6 +680,9 @@ impl Row {
     /// one shown, the upgrade took the tab's attention back from any owner
     /// that raised it later. Neither the age nor the wait is in it now.
     fn badge(&self, now: u64) -> Option<String> {
+        if self.asks_on_its_own(now) {
+            return None;
+        }
         let words = match self.stall(now)?.as_str() {
             "overdue" => format!("behind for more than {}", upgrade::span(STALLED_AFTER_S)),
             kind => stall_reason(self.agent, kind),
@@ -609,6 +742,39 @@ fn now_moves_past(wait: &str) -> bool {
     )
 }
 
+/// What a Claude Code wait the owner cannot move by `--now` stands for, in a
+/// person's words ([`Row::wait_words`]): work of the agent's own under it (a
+/// break of its background work, or Claude's own `shell` status at an idle
+/// point). Until 2026-09-26 a Claude row had no words at all. The owner read
+/// "waiting (background)" beside a promise that the move comes "once that
+/// ends", while two poll loops that could never end held a tab for four days.
+/// The words are SHORT: the band's first line holds 64 characters, so what
+/// the upgrade does about the wait is on its remedy line
+/// (`message_reporters::agent_upgrade_stalled`). They say only what is true
+/// before a notice too (`not-idle:shell` is also a pending wait). `None` for
+/// every other wait, whose word says it.
+///
+/// Round 18, day four (D3): EVERY wait a Claude step records has words now —
+/// the band read `waiting (not-idle:busy)` for a turn still running.
+fn claude_wait_words(wait: &str) -> Option<&'static str> {
+    Some(match wait {
+        "background" | "not-idle:shell" => "its own work runs",
+        "busy" | "not-idle:busy" => "its turn is still running",
+        "not-idle:waiting" => "it asked a question and waits",
+        "settling" => "waiting for the tab to settle",
+        "attended" => "someone is typing in its tab",
+        "awaiting-ready" | "not-ready" => "waiting for it to answer READY",
+        "draft" => "a draft waits in its prompt",
+        "box" => "a box on its screen waits for a choice",
+        "held" => "its tab is held",
+        "limited" => "it is at a usage limit",
+        "login" => "it is not logged in",
+        "in-flight" => "a step is under way",
+        w if w.starts_with("not-idle") => "it has not gone idle",
+        _ => return None,
+    })
+}
+
 /// Why a stall of `kind` ([`Row::stall`], every kind but `overdue`) will not
 /// move on its own — words that depend on the kind alone, so the tab's mark
 /// built from them is sent once per stall. A Codex move that stopped after
@@ -620,7 +786,10 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
         return words.to_string();
     }
     match kind {
-        "gave-up" => format!("no READY answer after {} notices", upgrade::MAX_ASKS),
+        "gave-up" => format!(
+            "no READY answer it could act on after {} notices",
+            upgrade::MAX_ASKS
+        ),
         "refused:not-a-shell-job" => {
             "it is not its shell's foreground job, so nothing brings it back on the new build"
                 .to_string()
@@ -683,6 +852,15 @@ pub(in crate::harness) fn runs_under(owner: &str) -> &str {
     }
 }
 
+/// Whether a stop's reason is a REFUSAL — the upgrade would not type or
+/// signal at all: not the shell's job, launch flags that cannot be carried
+/// into a resume (`argv:`), a relaunch line that cannot be typed (`line:`).
+/// A re-armed round meets it again unless something changed, so it stays a
+/// stall the owner is shown ([`Row::stall`]).
+fn refusal(why: &str) -> bool {
+    why == "not-a-shell-job" || why.starts_with("argv:") || why.starts_with("line:")
+}
+
 /// A third party's or a derived word, cut to what a roster token may carry.
 fn word(s: &str) -> String {
     let w: String = s
@@ -715,8 +893,11 @@ fn rows_at(opts: &Opts, now: u64) -> Vec<Row> {
             let session = path.file_stem()?.to_string_lossy().into_owned();
             // The relaunch files its records beside the upgrade's
             // (`St::cause`): an agent relaunched after an exit, a memory or a
-            // model restart is no upgrade of the tab.
-            let st = load(opts, &session).filter(|st| st.cause.is_empty())?;
+            // model restart is no upgrade of the tab — the upgrade's own
+            // restart of a conversation with no task is.
+            let st = load(opts, &session).filter(|st| {
+                st.cause.is_empty() || st.cause == super::super::relaunch::CAUSE_UPGRADE_FRESH
+            })?;
             let ours = opts.only_sid.as_ref().is_none_or(|s| *s == st.tab);
             ours.then(|| Row::of(&session, &st, now))
         })
@@ -851,10 +1032,12 @@ fn holders(
 pub enum Ask {
     /// Restart at the next turn end ([`Request::Now`]): the settling window
     /// and the attended-tab guard waived. An upgrade that GAVE UP (no READY
-    /// answer after its last notice) is re-armed — the one
+    /// answer after its last notice) is re-armed AT ONCE — the one
     /// place the owner's word adds an act: the notice is typed again, and
-    /// after its READY answer the agent is restarted. A refused or failed
-    /// upgrade is NOT re-armed ([`ask`] refuses): what stopped it still holds.
+    /// after its READY answer the agent is restarted — rather than at its
+    /// next round ([`upgrade::RETRY_S`]). A refused or failed upgrade is NOT
+    /// re-armed by the word ([`ask`] refuses: what stopped it may still hold);
+    /// it starts its next round on its own once it has rested.
     Now,
     /// Not for this many seconds ([`Request::DeferUntil`]).
     Defer(u64),
@@ -1005,7 +1188,7 @@ fn ask_within(
     match what {
         Ask::Now => {
             match &st.phase {
-                // GAVE UP — no READY answer after the last notice
+                // GAVE UP — no READY answer it could act on after the last notice
                 // (`Step::GiveUp`): re-armed, every gate asked again from the
                 // notice. Nothing is ever killed to pass them, so asking again
                 // can only ask.
@@ -1030,10 +1213,16 @@ fn ask_within(
                     ));
                 }
                 Phase::Failed(why) => {
+                    let row = Row::of(&session, &st, now);
+                    let next = match row.next_round_in(now) {
+                        Some(0) | None => "at its next look".to_string(),
+                        Some(secs) => format!("in {}", upgrade::span(secs)),
+                    };
                     return Err(format!(
-                        "the upgrade in tab {sid} stopped for good ({}): `--now` re-arms only one \
-                         that gave up (no READY answer after its last notice) — `--skip` keeps \
-                         it on {}, or quit it and resume it by hand",
+                        "the upgrade in tab {sid} stopped ({}): `--now` re-arms only one that gave \
+                         up (no READY answer it could act on after its last notice) — this one \
+                         starts a new round on its own {next}; `--skip` keeps it on {}, or quit \
+                         it and resume it by hand",
                         word(why),
                         word(&st.from)
                     ));
@@ -1206,7 +1395,11 @@ impl View {
         let mut mine: Vec<Row> = rows_at(opts, now)
             .into_iter()
             .filter(|r| tab_is_live(tabs, &r.tab))
-            .filter(|r| r.phase != Phase::Done || now.saturating_sub(r.done_at) <= DONE_SHOWN_S)
+            .filter(|r| {
+                r.phase != Phase::Done
+                    || r.restarting(now)
+                    || now.saturating_sub(r.finished_at()) <= DONE_SHOWN_S
+            })
             .filter(|r| {
                 !r.failed_after_exit() || now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S
             })
@@ -1249,6 +1442,7 @@ impl View {
                 human_grace_s: 0,
                 hand_back: true,
                 background: false,
+                aterm_state: None,
             };
             self.mark(&opts, &BTreeMap::new());
         }
@@ -1297,7 +1491,9 @@ impl View {
 /// by time alone — nothing else moves a row but a step, a word or a process:
 /// a pending or announced upgrade turning `overdue` ([`STALLED_AFTER_S`]),
 /// the owner's `--now` no longer quieting it ([`NOW_QUIETS_S`]), a `--defer`
-/// running out, a finished move leaving the summary ([`DONE_SHOWN_S`]), and
+/// running out, a restart's carry-on no longer waited on for its model
+/// ([`Row::confirm_by`]: `restarting` turns `done`), a finished move leaving
+/// the summary ([`DONE_SHOWN_S`]), and
 /// a Codex move that failed after its `/exit` leaving it
 /// ([`EXITED_FAILURE_SHOWN_S`]).
 fn next_change(rows: &[Row], now: u64) -> Option<u64> {
@@ -1312,7 +1508,8 @@ fn next_change(rows: &[Row], now: u64) -> Option<u64> {
                     Request::DeferUntil(t) if waiting => Some(t),
                     _ => None,
                 },
-                (r.phase == Phase::Done).then(|| r.done_at.saturating_add(DONE_SHOWN_S + 1)),
+                r.restarting(now).then(|| r.confirm_by.saturating_add(1)),
+                (r.phase == Phase::Done).then(|| r.finished_at().saturating_add(DONE_SHOWN_S + 1)),
                 r.failed_after_exit()
                     .then(|| r.exited_at.saturating_add(EXITED_FAILURE_SHOWN_S + 1)),
             ]

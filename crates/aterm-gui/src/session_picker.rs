@@ -12,6 +12,11 @@
 //!   pre-filled (§2.5 — the sheet when one peer, this picker when several).
 //! * **Disconnect** — `session.disconnect` with several peers: connected
 //!   peers; choosing dissolves both directions (never guesses, §2.3).
+//! * **New Window / New Tab With Identity** — File ▸ `…With Identity…` (round
+//!   18's identity rows): every agent identity by name, plus a last row that
+//!   creates the identity the FILTER names; choosing opens the window or tab
+//!   under it. One picker surface for sessions and identities alike, so the
+//!   identity rows are introspectable (`controls`) on every platform.
 //!
 //! Reuses the palette machinery deliberately: the SAME fuzzy filter
 //! ([`crate::palette::fuzzy_subsequence`]), the same cursor/scroll/pointer
@@ -46,6 +51,10 @@ pub(crate) enum PickerIntent {
     Configure,
     /// Dissolve both directions of subject ⇄ chosen.
     Disconnect,
+    /// Open a new WINDOW whose first shell runs under the chosen identity.
+    NewWindowWithIdentity,
+    /// Open a new TAB (front window) under the chosen identity.
+    NewTabWithIdentity,
 }
 
 impl PickerIntent {
@@ -55,6 +64,27 @@ impl PickerIntent {
             PickerIntent::Connect => "Connect to Session",
             PickerIntent::Configure => "Configure Connection",
             PickerIntent::Disconnect => "Disconnect",
+            PickerIntent::NewWindowWithIdentity => "New Window With Identity",
+            PickerIntent::NewTabWithIdentity => "New Tab With Identity",
+        }
+    }
+
+    /// Whether this intent picks an IDENTITY rather than a session.
+    pub(crate) fn picks_identity(self) -> bool {
+        matches!(
+            self,
+            PickerIntent::NewWindowWithIdentity | PickerIntent::NewTabWithIdentity
+        )
+    }
+
+    /// The `controls` spelling.
+    fn wire(self) -> &'static str {
+        match self {
+            PickerIntent::Connect => "connect",
+            PickerIntent::Configure => "configure",
+            PickerIntent::Disconnect => "disconnect",
+            PickerIntent::NewWindowWithIdentity => "new-window-identity",
+            PickerIntent::NewTabWithIdentity => "new-tab-identity",
         }
     }
 }
@@ -62,7 +92,7 @@ impl PickerIntent {
 /// One choosable session, snapshotted at open (registry facts; a session that
 /// exits while the picker is open is re-checked at dispatch, never trusted).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PickerRow {
+pub(crate) struct SessionRow {
     pub sid: SessionId,
     /// Registry local id (the tab model's addressing grain) — lets activation
     /// raise/resolve without another sid scan.
@@ -72,6 +102,53 @@ pub(crate) struct PickerRow {
     /// Whether the subject already has any connection with this session —
     /// listed honestly beside the title (`· connected`).
     pub connected: bool,
+}
+
+/// One choosable row: a live session (the connection intents), an existing
+/// agent identity, or the row that creates the identity the filter names.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PickerRow {
+    Session(SessionRow),
+    /// An identity on disk, by (folded) name, with how many live sessions wear it.
+    Identity {
+        name: String,
+        sessions: usize,
+    },
+    /// The last row of an identity picker: create the identity the QUERY names.
+    /// It never filters out, and activating it with a query that is not a valid,
+    /// new name is a no-op.
+    NewIdentity,
+}
+
+/// What activating a row chooses — resolved against the live query, so the
+/// new-identity row yields the name typed into the filter.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PickerChoice {
+    Session(SessionId),
+    /// An identity to spawn under; `create` only for the new-identity row.
+    Identity {
+        name: String,
+        create: bool,
+    },
+}
+
+impl PickerRow {
+    /// The session this row picks, if it is a session row.
+    pub(crate) fn sid(&self) -> Option<&SessionId> {
+        match self {
+            PickerRow::Session(row) => Some(&row.sid),
+            PickerRow::Identity { .. } | PickerRow::NewIdentity => None,
+        }
+    }
+
+    /// The stable key `controls` and the a11y epoch identify a row by.
+    fn key(&self) -> String {
+        match self {
+            PickerRow::Session(row) => format!("sid={}", row.sid.as_str()),
+            PickerRow::Identity { name, .. } => format!("identity={name}"),
+            PickerRow::NewIdentity => "identity=+new".to_string(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,9 +163,9 @@ struct PickerLayout {
 pub(crate) struct SessionPickerState {
     /// The hosting window.
     pub(crate) window: crate::WindowId,
-    /// The SUBJECT session ("S" — `@self` of the §2.3 ids) every intent acts
-    /// from.
-    pub(crate) subject: SessionId,
+    /// The SUBJECT session ("S" — `@self` of the §2.3 ids) every connection
+    /// intent acts from; `None` for the identity intents, which act from none.
+    pub(crate) subject: Option<SessionId>,
     subject_title: String,
     pub(crate) intent: PickerIntent,
     rows: Vec<PickerRow>,
@@ -105,7 +182,7 @@ pub(crate) struct SessionPickerState {
 impl SessionPickerState {
     pub(crate) fn new(
         window: crate::WindowId,
-        subject: SessionId,
+        subject: Option<SessionId>,
         subject_title: String,
         intent: PickerIntent,
         rows: Vec<PickerRow>,
@@ -125,17 +202,43 @@ impl SessionPickerState {
     }
 
     /// One row's display line — what the filter matches and the card paints.
-    fn row_line(row: &PickerRow) -> String {
-        let mut title = crate::session_timeline::sanitize_presentation_line(&row.title, 64);
-        if title.is_empty() {
-            title = "(untitled)".to_string();
+    /// The new-identity row reads the live query, so it is a method of the state.
+    fn row_line(&self, row: &PickerRow) -> String {
+        match row {
+            PickerRow::Session(row) => {
+                let mut title = crate::session_timeline::sanitize_presentation_line(&row.title, 64);
+                if title.is_empty() {
+                    title = "(untitled)".to_string();
+                }
+                let connected = if row.connected {
+                    " \u{00b7} connected"
+                } else {
+                    ""
+                };
+                format!("\"{title}\"  @{}{connected}", row.sid.as_str())
+            }
+            PickerRow::Identity { name, sessions } => match sessions {
+                0 => name.clone(),
+                1 => format!("{name}  \u{00b7} 1 session"),
+                n => format!("{name}  \u{00b7} {n} sessions"),
+            },
+            PickerRow::NewIdentity => match self.new_identity_name() {
+                Some(name) => format!("+ New identity \u{201c}{name}\u{201d}"),
+                None => "+ New identity\u{2026} (type its name)".to_string(),
+            },
         }
-        let connected = if row.connected {
-            " \u{00b7} connected"
-        } else {
-            ""
-        };
-        format!("\"{title}\"  @{}{connected}", row.sid.as_str())
+    }
+
+    /// The identity the new-identity row would create: the query, when it parses
+    /// as a name ([`crate::agent_identity::parse_name`], folded) that is not
+    /// already listed. `None` otherwise — activating the row is then a no-op.
+    pub(crate) fn new_identity_name(&self) -> Option<String> {
+        let name = crate::agent_identity::parse_name(self.query.trim()).ok()?;
+        let listed = self
+            .rows
+            .iter()
+            .any(|row| matches!(row, PickerRow::Identity { name: n, .. } if *n == name));
+        (!listed).then_some(name)
     }
 
     /// Append a filter character, resetting the cursor (the palette's rule).
@@ -167,10 +270,10 @@ impl SessionPickerState {
         (0..self.rows.len()).filter(move |&i| {
             // Opening the picker shows every session. No display-string formatting
             // or title sanitization is needed to answer an empty filter.
-            if q.is_empty() {
+            if q.is_empty() || matches!(self.rows[i], PickerRow::NewIdentity) {
                 return true;
             }
-            let hay = Self::row_line(&self.rows[i]);
+            let hay = self.row_line(&self.rows[i]);
             fuzzy_subsequence(&q, hay.chars().map(|c| c.to_ascii_lowercase()))
         })
     }
@@ -299,6 +402,21 @@ impl SessionPickerState {
         }
     }
 
+    /// What activating `row` chooses, or `None` when it chooses nothing yet
+    /// (the new-identity row before a valid, new name is typed).
+    pub(crate) fn choice_for(&self, row: &PickerRow) -> Option<PickerChoice> {
+        match row {
+            PickerRow::Session(row) => Some(PickerChoice::Session(row.sid.clone())),
+            PickerRow::Identity { name, .. } => Some(PickerChoice::Identity {
+                name: name.clone(),
+                create: false,
+            }),
+            PickerRow::NewIdentity => self
+                .new_identity_name()
+                .map(|name| PickerChoice::Identity { name, create: true }),
+        }
+    }
+
     /// The cursor's row, or `None` when the filter matches nothing.
     pub(crate) fn selected_row(&self) -> Option<&PickerRow> {
         self.row_at_filtered(self.selected)
@@ -318,17 +436,12 @@ impl SessionPickerState {
     /// the card paints, so screen == introspection.
     pub(crate) fn controls_lines(&self) -> Vec<String> {
         let vis = self.filtered();
-        let intent = match self.intent {
-            PickerIntent::Connect => "connect",
-            PickerIntent::Configure => "configure",
-            PickerIntent::Disconnect => "disconnect",
-        };
         let mut out = Vec::with_capacity(vis.len() + 1);
         out.push(format!(
             "session-picker window={} intent={} subject={} rows={} shown={} selected={} query={:?}",
             self.window.0,
-            intent,
-            self.subject.as_str(),
+            self.intent.wire(),
+            self.subject.as_ref().map_or("-", SessionId::as_str),
             self.rows.len(),
             vis.len(),
             self.selected,
@@ -336,10 +449,10 @@ impl SessionPickerState {
         ));
         for (slot, &i) in vis.iter().enumerate() {
             out.push(format!(
-                "session-picker row sid={} selected={} text={:?}",
-                self.rows[i].sid.as_str(),
+                "session-picker row {} selected={} text={:?}",
+                self.rows[i].key(),
                 slot == self.selected,
-                Self::row_line(&self.rows[i]),
+                self.row_line(&self.rows[i]),
             ));
         }
         out
@@ -350,16 +463,14 @@ impl SessionPickerState {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.window.0.hash(&mut h);
-        self.subject.as_str().hash(&mut h);
+        self.subject.as_ref().map(SessionId::as_str).hash(&mut h);
         std::mem::discriminant(&self.intent).hash(&mut h);
         self.query.hash(&mut h);
         self.selected.hash(&mut h);
         self.scroll.hash(&mut h);
         self.rows.len().hash(&mut h);
         for row in &self.rows {
-            row.sid.as_str().hash(&mut h);
-            row.title.hash(&mut h);
-            row.connected.hash(&mut h);
+            self.row_line(row).hash(&mut h);
         }
         h.finish() | 1
     }
@@ -371,7 +482,7 @@ impl SessionPickerState {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.query.hash(&mut h);
         for i in self.filtered() {
-            self.rows[i].sid.as_str().hash(&mut h);
+            self.rows[i].key().hash(&mut h);
         }
         let epoch = h.finish() as u32;
         if epoch == u32::MAX {
@@ -527,20 +638,24 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
         ));
     };
 
-    // Title row: the intent + the subject it acts from.
+    // Title row: the intent + the subject it acts from (identity intents act
+    // from no session, so they carry the intent alone).
     {
         let subject_title =
             crate::session_timeline::sanitize_presentation_line(&state.subject_title, 48);
-        let title = format!(
-            "{} \u{2014} @{} \"{}\"",
-            state.intent.title(),
-            state.subject.as_str(),
-            if subject_title.is_empty() {
-                "(untitled)"
-            } else {
-                subject_title.as_str()
-            },
-        );
+        let title = match &state.subject {
+            Some(subject) => format!(
+                "{} \u{2014} @{} \"{}\"",
+                state.intent.title(),
+                subject.as_str(),
+                if subject_title.is_empty() {
+                    "(untitled)"
+                } else {
+                    subject_title.as_str()
+                },
+            ),
+            None => state.intent.title().to_string(),
+        };
         text_at(
             &mut prims,
             card_x + cw,
@@ -623,7 +738,7 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
             card_x + cw * 2.0,
             y0,
             TypeStep::Body,
-            SessionPickerState::row_line(row),
+            state.row_line(row),
             rgba(r.text_primary, 0xFF),
         );
     }
@@ -634,7 +749,11 @@ pub(crate) fn picker_tray(state: &SessionPickerState, g: &SettingsGeom, theme: T
             card_y + 2.0 * ch,
             TypeStep::Body,
             if state.rows.is_empty() {
-                "no other sessions".to_string()
+                if state.intent.picks_identity() {
+                    "no identities yet".to_string()
+                } else {
+                    "no other sessions".to_string()
+                }
             } else {
                 "no match".to_string()
             },
@@ -679,7 +798,7 @@ pub(crate) fn picker_a11y(state: &SessionPickerState) -> accesskit::TreeUpdate {
     for (slot, &i) in vis.iter().enumerate() {
         let id = a11y_node_id_for(epoch, slot);
         let mut node = Node::new(Role::MenuItem);
-        node.set_label(SessionPickerState::row_line(&state.rows[i]));
+        node.set_label(state.row_line(&state.rows[i]));
         node.add_action(Action::Focus);
         node.add_action(Action::Click);
         nodes.push((id, node));
@@ -721,31 +840,31 @@ mod tests {
 
     fn rows() -> Vec<PickerRow> {
         vec![
-            PickerRow {
+            PickerRow::Session(SessionRow {
                 sid: SessionId::new("s-alpha"),
                 local_id: 1,
                 title: "build worker".to_string(),
                 connected: false,
-            },
-            PickerRow {
+            }),
+            PickerRow::Session(SessionRow {
                 sid: SessionId::new("s-beta"),
                 local_id: 2,
                 title: "operator".to_string(),
                 connected: true,
-            },
-            PickerRow {
+            }),
+            PickerRow::Session(SessionRow {
                 sid: SessionId::new("s-gamma"),
                 local_id: 3,
                 title: "scratch".to_string(),
                 connected: false,
-            },
+            }),
         ]
     }
 
     fn picker() -> SessionPickerState {
         SessionPickerState::new(
             crate::WindowId(0),
-            SessionId::new("s-self"),
+            Some(SessionId::new("s-self")),
             "me".to_string(),
             PickerIntent::Connect,
             rows(),
@@ -770,12 +889,12 @@ mod tests {
         let mut p = picker();
         assert_eq!(p.filtered().len(), 3);
         p.move_selection(2);
-        assert_eq!(p.selected_row().unwrap().sid.as_str(), "s-gamma");
+        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-gamma");
         for c in "oper".chars() {
             p.push_char(c);
         }
         assert_eq!(p.filtered().len(), 1);
-        assert_eq!(p.selected_row().unwrap().sid.as_str(), "s-beta");
+        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-beta");
         // Sid text matches too (the row line carries `@<sid>`).
         p.backspace();
         p.backspace();
@@ -784,7 +903,7 @@ mod tests {
         for c in "s-alp".chars() {
             p.push_char(c);
         }
-        assert_eq!(p.selected_row().unwrap().sid.as_str(), "s-alpha");
+        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-alpha");
         // Nothing matches: selection is honestly None.
         for c in "zzz".chars() {
             p.push_char(c);
@@ -799,9 +918,9 @@ mod tests {
     fn selection_wraps_and_survives_scroll() {
         let mut p = picker();
         p.move_selection(-1);
-        assert_eq!(p.selected_row().unwrap().sid.as_str(), "s-gamma");
+        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-gamma");
         p.move_selection(1);
-        assert_eq!(p.selected_row().unwrap().sid.as_str(), "s-alpha");
+        assert_eq!(p.selected_row().unwrap().sid().unwrap().as_str(), "s-alpha");
         assert_eq!(p.scroll_extent(), (0, 3, 3));
     }
 
@@ -816,7 +935,10 @@ mod tests {
         assert!(p.pointer_press(Some(1)));
         let (_, activate) = p.pointer_release(Some(1));
         assert!(activate);
-        assert_eq!(p.row_at_filtered(1).unwrap().sid.as_str(), "s-beta");
+        assert_eq!(
+            p.row_at_filtered(1).unwrap().sid().unwrap().as_str(),
+            "s-beta"
+        );
     }
 
     /// Painter and hit-test share one row rectangle; the connected annotation

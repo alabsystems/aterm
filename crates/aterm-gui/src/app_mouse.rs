@@ -358,27 +358,12 @@ pub(crate) fn right_press_plan(
     }
 }
 
-/// How far outside the pet's drawn body (frame px, each side) a click still
-/// counts as petting. A cat is not a checkbox: the target moves, so a few
-/// pixels of grace keeps an honest aim from sliding off a paw mid-walk.
-pub(crate) const PET_HIT_SLOP_PX: i32 = 4;
-
 /// How far outside Robi's drawn body (frame px, each side) a click still
-/// counts as a dismissal. The pet's grace, for the pet's reason: a strolling
-/// robot is not a checkbox.
+/// counts as a dismissal. The pet's grace
+/// ([`aterm_effects::companion::PET_HIT_SLOP_PX`]), for the pet's reason: a
+/// strolling robot is not a checkbox. Hit-tested by the pet's own
+/// [`aterm_effects::companion::pet_rect_hit`].
 pub(crate) const ROBI_HIT_SLOP_PX: i32 = 4;
-
-/// Whether a pointer at `(x, y)` (frame px) lands on the pet's drawn body
-/// `rect` (`(x0, x1, y0, y1)`, right/bottom exclusive), padded by `slop` on
-/// every side. Pure — the petting seam's hit test, unit-testable without a
-/// window.
-pub(crate) fn pet_rect_hit(rect: (i32, i32, i32, i32), x: f64, y: f64, slop: i32) -> bool {
-    let (x0, x1, y0, y1) = rect;
-    x >= f64::from(x0.saturating_sub(slop))
-        && x < f64::from(x1.saturating_add(slop))
-        && y >= f64::from(y0.saturating_sub(slop))
-        && y < f64::from(y1.saturating_add(slop))
-}
 
 /// Audit M6: selection kind for a single left press. Option+drag is the rectangular
 /// [`SelectionType::Block`] ONLY when the press was local anyway (tracking OFF);
@@ -1424,7 +1409,9 @@ impl App {
     /// FAIL-CLOSED (design §3.4): the multi-line-paste confirmation OVERWRITES
     /// the top composed rows in place — the band's own rows — so while it is
     /// up in this window a press inside its band is its answer (cancel; the
-    /// parked text is dropped), never a capsule press underneath it.
+    /// parked text is dropped), never a capsule press underneath it. The
+    /// close/quit confirmation (Windows, [`crate::close_confirm`]) takes the
+    /// same band and the same fail-closed reading of a press: cancel.
     fn press_band_at(&mut self, wid: WindowId, px: f64, py: f64) -> bool {
         // THE PASTE QUESTION IS ANSWERED FIRST, and exactly once. It overwrites
         // the top composed rows of THIS window whether or not the band has a
@@ -1433,12 +1420,22 @@ impl App {
         // band's hit test is asked at all: a press on a modal security question
         // is its FAIL-CLOSED answer (cancel — the parked text is dropped), never
         // a confirm, and never the capsule underneath it.
-        if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
+        let paste_up = self.paste_banner.as_ref().is_some_and(|p| p.wid == wid);
+        // The close/quit confirm (Windows) shares the paste banner's slot and
+        // floor (`splice_close_banner`); the two are never up together on one
+        // window, and the paste question keeps the band when both could be.
+        let close_up = self.close_banner.as_ref().is_some_and(|p| p.wid == wid);
+        if paste_up || close_up {
             let floor = self.paste_banner_tray_floor_y(wid);
             let (_, fy) = self.window_to_frame(wid, px, py);
             let top = (self.win_pad_top(wid) + self.win_head(wid)) as f64;
             if floor > 0 && fy >= top && fy < f64::from(floor) {
-                self.answer_paste_banner(false);
+                if paste_up {
+                    self.answer_paste_banner(false);
+                } else {
+                    // Nothing closes on a press that named no answer.
+                    self.answer_close_banner(false);
+                }
                 self.request_redraw_all_windows();
                 return true;
             }
@@ -1568,7 +1565,8 @@ impl App {
 
     /// PETTING THE PET (wave 1): if the last pointer position lands on the
     /// pet's drawn body (the rect the redraw stashed post-tick, padded by
-    /// [`PET_HIT_SLOP_PX`]), stroke the cat and CONSUME the press. Returns
+    /// [`aterm_effects::companion::PET_HIT_SLOP_PX`]), stroke the cat and
+    /// CONSUME the press. Returns
     /// whether it did — the caller stops routing on `true`.
     ///
     /// POLICY: chrome wins, like the tab strip. The pet is host chrome you
@@ -1585,25 +1583,25 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return false;
         };
-        let Some(rect) = ws.pet_hit_rect else {
-            return false;
-        };
         let (px, py) = ws.last_cursor_px;
         let (fx, fy) = self.window_to_frame(wid, px, py);
-        if !pet_rect_hit(rect, fx, fy, PET_HIT_SLOP_PX) {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return false;
+        };
+        // The owner hit-tests this frame's drawn body (padded by
+        // `PET_HIT_SLOP_PX`) and, on a hit, latches the stroke (note, never
+        // act); the redraw consumes it on the ground: a purr-flavored hold, a
+        // heart per queued pet, and contentment toward the real purr.
+        if ws.companion.press(Instant::now(), (fx as f32, fy as f32))
+            != aterm_effects::host::PressOutcome::Pet
+        {
             return false;
         }
-        if let Some(ws) = self.windows.get_mut(&wid) {
-            // Latch only (`kitty_pet::note_petted` — note, never act); the
-            // redraw consumes it on the ground: a purr-flavored hold, a
-            // heart per queued pet, and contentment toward the real purr.
-            ws.cursor_pet.note_petted(Instant::now());
-            // The pet may be settled with the frame lane released — the
-            // latch re-arms `needs_frames`, but only a tick reads it, so
-            // ask for the frame that runs one.
-            if let Some(w) = ws.os_window.as_ref() {
-                w.request_redraw();
-            }
+        // The pet may be settled with the frame lane released — the latch
+        // re-arms `needs_frames`, but only a tick reads it, so ask for the
+        // frame that runs one.
+        if let Some(w) = ws.os_window.as_ref() {
+            w.request_redraw();
         }
         true
     }
@@ -1714,7 +1712,7 @@ impl App {
         };
         let (px, py) = ws.last_cursor_px;
         let (fx, fy) = self.window_to_frame(wid, px, py);
-        if !pet_rect_hit(rect, fx, fy, ROBI_HIT_SLOP_PX) {
+        if !aterm_effects::companion::pet_rect_hit(rect, fx, fy, ROBI_HIT_SLOP_PX) {
             return false;
         }
         if let Some(ws) = self.windows.get_mut(&wid) {
@@ -1781,7 +1779,7 @@ impl App {
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     self.robi_dismissal = None;
                     self.surface_native_config_lane_error(
-                        "Robi was not dismissed: the settings lane dropped the request".to_string(),
+                        "Robi was not dismissed: the setting was not saved".to_string(),
                     );
                 }
             }
@@ -2109,302 +2107,6 @@ impl App {
         (gx / cw) < cols
     }
 
-    /// Convert a raw window-space pointer to Settings-card-local pixels through
-    /// the same frame remainder, asymmetric top inset, and chrome headroom used
-    /// by the compositor. Press and drag must share this seam or the colour wheel
-    /// visibly jumps as soon as the pointer moves.
-    fn settings_card_point(&self, wid: WindowId, x: f64, y: f64) -> (f32, f32) {
-        let Some(transform) = self.overlay_coordinate_transform(wid) else {
-            return (-1.0, -1.0);
-        };
-        let (x, y) = self.window_to_frame(wid, x, y);
-        (
-            ((x - transform.origin_x) / f64::from(transform.scale)) as f32,
-            ((y - transform.origin_y) / f64::from(transform.scale)) as f32,
-        )
-    }
-
-    /// Resolve a raw window point only when it lies inside the exact Settings
-    /// card rectangle the compositor publishes. Unlike `pixel_to_cell`, this is
-    /// deliberately unclamped: the four remainder/padding bands surrounding the
-    /// card are modal chrome, never aliases for sidebar rows or right-edge widgets.
-    fn settings_card_point_if_inside(&self, wid: WindowId, x: f64, y: f64) -> Option<(f32, f32)> {
-        let ws = self.windows.get(&wid)?;
-        ws.settings()?;
-        let transform = self.overlay_coordinate_transform(wid)?;
-        let (origin_x, origin_y) = self.frame_origin(wid);
-        let left = origin_x as f64 + transform.origin_x;
-        let top = origin_y as f64 + transform.origin_y;
-        let right =
-            left + f64::from(ws.cols) * f64::from(transform.geom.cw) * f64::from(transform.scale);
-        let bottom = top
-            + ws.settings_panel_rows() as f64
-                * f64::from(transform.geom.ch)
-                * f64::from(transform.scale);
-        (x >= left && x < right && y >= top && y < bottom).then_some((
-            ((x - left) / f64::from(transform.scale)) as f32,
-            ((y - top) / f64::from(transform.scale)) as f32,
-        ))
-    }
-
-    /// While window `wid`'s Settings overlay is open, map pixel `(x, y)` to the CONTROL
-    /// INDEX under the pointer in the CONTENT pane's group band. The band's placement
-    /// comes from the same [`crate::settings::pane_geom_cells`] the painter uses, and
-    /// the row walk is the SAME layout (grouped, or the flat search list while
-    /// filtering) — so a click maps to exactly the control drawn there. `None` in the
-    /// sidebar, on captions/footnotes/gaps, on the title/preview/footer, or when closed.
-    pub(crate) fn settings_row_at(&self, wid: WindowId, x: f64, y: f64) -> Option<usize> {
-        let ws = self.windows.get(&wid)?;
-        let s = ws.settings()?;
-        let (cw, ch) = self.win_cell_size(wid);
-        let panel_rows = ws.settings_panel_rows(); // single source (C2)
-        if panel_rows < 2 {
-            return None;
-        }
-        let (cx, cy) = self.settings_card_point_if_inside(wid, x, y)?;
-        let pg = crate::settings::pane_geom_cells(ws.cols as usize, panel_rows);
-        if cx < pg.sidebar_w_cells * cw as f32 {
-            return None; // the sidebar is not a control row (settings_click routes it)
-        }
-        let frame_row = cy as usize / ch.max(1);
-        let rel = frame_row.checked_sub(pg.groups.0)?;
-        let band = pg.group_band();
-        if s.filtering() {
-            // The flat search list: the SAME masked layout the painter renders.
-            let mask = s.visible_mask();
-            match crate::settings::body_layout_masked(&s.fields, mask.as_deref(), s.scroll, band)
-                .get(rel)
-            {
-                Some(&crate::settings::BodyRow::Control(idx)) => Some(idx),
-                _ => None,
-            }
-        } else {
-            // The SAME wrap width the painter laid the band out with, so a click
-            // under a wrapped footnote resolves the row actually drawn there.
-            let wrap = crate::settings::footnote_wrap_chars(ws.cols as usize);
-            let rows = crate::settings::category_layout(&s.fields, s.category, wrap);
-            match crate::settings::group_row_at(&rows, s.scroll, band, rel) {
-                Some(crate::settings::GroupRow::Control(idx)) => Some(idx),
-                _ => None, // caption / footnote / gap / past the painted window
-            }
-        }
-    }
-
-    /// A LEFT PRESS inside the open Settings overlay, x-aware and non-destructive:
-    ///
-    /// - popup menu open → a press on an option COMMITS it; anywhere else closes the
-    ///   menu with no change (the gesture is still swallowed — the panel stays modal);
-    /// - a row that is NOT selected → only SELECT it (no mutation on first click; an
-    ///   in-flight free-form edit on another row is abandoned first, exactly like Esc);
-    /// - the already-selected row → activate ONLY in its widget region (open menu /
-    ///   toggle / cycle / begin edit); a press on the label region is a no-op.
-    ///
-    /// Pixel→geometry uses the SAME card placement as the painter (`splice_settings_panel`
-    /// composites the card at `(pad, pad_top + head)`) and the same [`crate::settings::menu_geom`] /
-    /// [`crate::settings::widget_hit_left`] the pixels come from, so click == pixels.
-    pub(crate) fn settings_click(&mut self, wid: WindowId, x: f64, y: f64) {
-        let (window_x, window_y) = (x, y);
-        let (cx, cy) = self.settings_card_point(wid, window_x, window_y);
-        let card_point = self.settings_card_point_if_inside(wid, window_x, window_y);
-
-        // The open COLOUR WHEEL captures every press (mutually exclusive with the
-        // menu below): a press on the disk/slider scrubs it and ARMS a drag (motion
-        // keeps scrubbing until release), the hex readout takes focus, the popover
-        // chrome swallows, and a click-away cancels with NO change — all resolved
-        // through the same pure `wheel_hit` the painter's geometry comes from.
-        let wheel_up = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| s.wheel.is_some());
-        if wheel_up {
-            let hit = self.settings_geom_front().and_then(|geom| {
-                self.windows
-                    .get(&wid)
-                    .and_then(|ws| ws.settings())
-                    .and_then(|s| crate::settings::wheel_hit(s, &geom, cx, cy))
-            });
-            match hit {
-                Some(crate::settings::WheelHit::Disk { h, s }) => {
-                    self.settings_wheel_press_disk(h, s);
-                }
-                Some(crate::settings::WheelHit::Slider { v }) => {
-                    self.settings_wheel_press_slider(v);
-                }
-                Some(crate::settings::WheelHit::Hex) => self.settings_wheel_focus_hex(),
-                Some(crate::settings::WheelHit::Body) => {} // swallowed; stays modal
-                None => self.settings_wheel_cancel(),
-            }
-            return;
-        }
-
-        // The open popup menu captures every press.
-        let menu_open = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| s.menu.is_some());
-        if menu_open {
-            let hit = self.settings_geom_front().and_then(|geom| {
-                self.windows
-                    .get(&wid)
-                    .and_then(|ws| ws.settings())
-                    .and_then(|s| crate::settings::menu_hit(s, &geom, cx, cy))
-            });
-            match hit {
-                Some(oi) => {
-                    // Land the highlight on the pressed option, then commit through the
-                    // one shared seam (an already-current option closes with no change).
-                    if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.settings_mut())
-                        && let Some(m) = s.menu.as_mut()
-                    {
-                        m.highlighted = oi;
-                    }
-                    self.settings_menu_commit();
-                }
-                None => self.settings_menu_cancel(),
-            }
-            return;
-        }
-
-        // Popup click-away handling above intentionally observes outside-card
-        // presses. Ordinary landing/sidebar/control activation never does: an
-        // exterior band must remain inert instead of clamping onto a card edge.
-        let Some((cx, cy)) = card_point else {
-            return;
-        };
-
-        // The §L landing page captures every press: the send bubble mails the
-        // suggestion, the Get-started bubble enters the panel, anything else is
-        // swallowed (the hero is modal like the rest of the card). Geometry from
-        // the SAME pure `landing_geom` the painter placed the bubbles with.
-        let landing = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .is_some_and(|s| s.landing);
-        if landing {
-            if let Some(geom) = self.settings_geom_front() {
-                let lg = crate::settings::landing_geom(&geom);
-                let (scx, scy, sr) = lg.send;
-                let (bx, by, bw, bh) = lg.btn;
-                if (cx - scx).powi(2) + (cy - scy).powi(2) <= sr * sr {
-                    self.settings_comment_send();
-                } else if cx >= bx && cx < bx + bw && cy >= by && cy < by + bh {
-                    self.settings_landing_get_started();
-                }
-            }
-            return;
-        }
-
-        // SIDEBAR clicks: the search field focuses search; a category row selects that
-        // category (pane → sidebar). Same pure row map the painter placed them with.
-        let sidebar = self.windows.get(&wid).and_then(|ws| {
-            ws.settings()?;
-            let (cw, ch) = self.win_cell_size(wid);
-            let pg = crate::settings::pane_geom_cells(ws.cols as usize, ws.settings_panel_rows());
-            (cx < pg.sidebar_w_cells * cw as f32).then(|| {
-                let row = (cy / ch.max(1) as f32).max(0.0) as usize;
-                crate::settings::sidebar_hit(row, ws.settings_panel_rows())
-            })
-        });
-        match sidebar {
-            Some(Some(crate::settings::SidebarHit::Search)) => {
-                // An in-flight edit is abandoned, like Esc — a pending buffer must
-                // never survive the focus move into the search bar (both key paths
-                // check `editing` before `searching`, so a surviving buffer would
-                // swallow every keystroke the user thinks is typing a query).
-                self.settings_edit_cancel();
-                self.settings_search_begin();
-                return;
-            }
-            Some(Some(crate::settings::SidebarHit::Category(sec))) => {
-                // An in-flight edit is abandoned, like Esc — a pending buffer must
-                // never commit against a row of the newly-selected category.
-                self.settings_edit_cancel();
-                self.settings_set_category(sec);
-                return;
-            }
-            Some(None) => return, // sidebar margin — swallowed, panel stays modal
-            None => {}
-        }
-
-        let Some(idx) = self.settings_row_at(wid, window_x, window_y) else {
-            return; // title / preview / caption / footer — swallowed, nothing to do
-        };
-        let (selected, editing) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .map_or((false, false), |s| {
-                (s.action_target() == Some(idx), s.editing.is_some())
-            });
-        if !selected {
-            // First click only selects; a live edit on the old row is abandoned so the
-            // pending buffer can never commit against the newly-selected row.
-            if editing {
-                self.settings_edit_cancel();
-            }
-            self.settings_select(idx);
-            return;
-        }
-        // Second click, on the selected row: activate only in the widget region.
-        let in_widget = self.settings_geom_front().is_some_and(|geom| {
-            self.windows
-                .get(&wid)
-                .and_then(|ws| ws.settings())
-                .and_then(|s| crate::settings::widget_hit_left(s, &geom, idx))
-                .is_some_and(|left| cx >= left)
-        });
-        if in_widget && !editing {
-            self.settings_activate();
-        }
-    }
-
-    /// Mid-drag of the colour wheel's disk/slider (armed by [`Self::settings_click`]):
-    /// map the pointer through the SAME [`crate::settings::wheel_geom`] +
-    /// [`crate::settings::disk_hs_at`]/[`crate::settings::slider_v_at`] the press
-    /// hit-test used and scrub h/s or v (both clamp, so a drag past the rim/track
-    /// pins rather than jumps). Returns whether a wheel drag consumed the motion.
-    fn settings_wheel_drag_motion(&mut self, wid: WindowId, x: f64, y: f64) -> bool {
-        let drag = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .and_then(|s| s.wheel.as_ref())
-            .and_then(|w| w.drag);
-        let Some(drag) = drag else { return false };
-        // Held but unresolvable geometry (mid-resize): still swallow the motion —
-        // the overlay is modal while the wheel is up.
-        let Some(geom) = self.settings_geom_front() else {
-            return true;
-        };
-        let Some(wg) = self
-            .windows
-            .get(&wid)
-            .and_then(|ws| ws.settings())
-            .and_then(|s| crate::settings::wheel_geom(s, &geom))
-        else {
-            return true;
-        };
-        let (cx, cy) = self.settings_card_point(wid, x, y);
-        if let Some(st) = self.windows.get_mut(&wid).and_then(|ws| ws.settings_mut()) {
-            match drag {
-                crate::settings::WheelDrag::Disk => {
-                    let (h, s) = crate::settings::disk_hs_at(&wg, cx, cy);
-                    st.wheel_set_hs(h, s);
-                }
-                crate::settings::WheelDrag::Slider => {
-                    st.wheel_set_v(crate::settings::slider_v_at(&wg, cx));
-                }
-            }
-        }
-        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
-            w.request_redraw();
-        }
-        true
-    }
-
     /// Resolve the OS cursor for the pointer's CURRENT location. Called on every
     /// `CursorMoved` (via the `_with` twin, which reuses the motion path's derived
     /// geometry) AND on every modifier change, so the link hand tracks a bare
@@ -2437,7 +2139,7 @@ impl App {
     /// the frame-time half of the memoised hover ([`HoverMemo`]), run UNDER THE
     /// FRAME'S OWN HOLD. Called from every engine-fill site the moment the fill
     /// lands and while the guard that produced it is still held (`t`): the
-    /// single-pane LOCK B and its rescan LOCK A, the composed route's focused
+    /// single-pane frame's one hold, the composed route's focused
     /// pane, and the headless capture's twins of both. When the pointer is
     /// known, the last resolution reached the grid, and the frame's ENGINE FILL
     /// has moved since that resolution ([`HoverFrame`]: output rewrote the row,
@@ -3083,13 +2785,6 @@ impl App {
             self.connection_map_pointer_motion(wid, x, y);
             return;
         }
-        // SETTINGS COLOUR-WHEEL DRAG: while the popover's disk or value slider is
-        // held, motion scrubs the working colour continuously — the overlay is
-        // modal, so the gesture stops here (no hover/selection path below runs).
-        if self.settings_wheel_drag_motion(wid, x, y) {
-            self.clear_move_license(wid);
-            return;
-        }
         // Native tabs own the full content region below host tab chrome. Track
         // hover in the view-local controller so the same typed tree drives the
         // visual wash, pointer cursor, semantics, and later press activation;
@@ -3245,11 +2940,11 @@ impl App {
         // motion alone never produced one, so the pet could not see a toy
         // waved at it until an unrelated repaint. This asks for that frame on
         // the EDGE the design needs and nowhere else (`pet_wake_wanted`): a
-        // visible pet (`pet_hit_rect` is Some exactly when one was drawn last
-        // frame), whose brain is NOT already running its own cadence, and a
+        // visible pet (the owner's `hit_rect` is Some exactly when one was drawn
+        // last frame), whose brain is NOT already running its own cadence, and a
         // pointer at least one cell away from the position the brain last
-        // consumed. A request per event was a full attempt (LOCK A + the effect
-        // tick + LOCK B) at device rate — 90-125/s on a trackpad — all
+        // consumed. A request per event was a full attempt (the frame hold + the
+        // effect tick) at device rate — 90-125/s on a trackpad — all
         // duplicates once the brain's heat had armed the 60 Hz lane, which
         // samples `last_cursor_px` on its own ticks; and the brain needs
         // ≥ 6.7 cells/s of travel to notice anything, so sub-cell motion never
@@ -3258,8 +2953,8 @@ impl App {
         // off the grid).
         if let Some(ws) = self.windows.get_mut(&wid)
             && pet_wake_wanted(
-                ws.pet_hit_rect.is_some(),
-                ws.cursor_pet.needs_frames(),
+                ws.companion.hit_rect().is_some(),
+                ws.companion.needs_frames(),
                 ws.pet_pointer_sampled_px,
                 (x, y),
                 geom.cell,
@@ -3603,10 +3298,9 @@ impl App {
             let mut term = term_lock(&term);
             let before = term.grid().display_offset();
             // PRESS CUSTODY: the one gesture that both raises the offset AND grows
-            // the selection. `Terminal::scroll_display` records the `UserScroll`
-            // itself, and only on a RISE, so the downward half of an autoscroll
-            // (dragging back toward live) records nothing rather than claiming a
-            // transition the model does not admit.
+            // the selection. `Terminal::scroll_display` records it itself — a
+            // `UserScroll` on a rise, and on the downward half of an autoscroll
+            // (dragging back toward live) `UserScrollTowardLive` / `SnapToLive`.
             term.scroll_display(lines);
             term.grid().display_offset() != before
         };
@@ -4423,36 +4117,6 @@ impl App {
                         view,
                         crate::native_app::DamageRegion::All,
                     );
-                }
-            }
-            return;
-        }
-        // SETTINGS MODAL: while the overlay is open, a left press drives the panel
-        // ([`Self::settings_click`]: select on first click, activate on the selected
-        // row's widget region, commit/dismiss the open popup menu); EVERY mouse gesture
-        // is then swallowed (no tab-strip switch, no divider drag, no pane focus, no
-        // selection, no PTY mouse report) so the panel is truly modal. Checked first,
-        // before any other mouse layer.
-        if self
-            .windows
-            .get(&wid)
-            .is_some_and(|ws| ws.settings().is_some())
-        {
-            if button == WinitMouseButton::Left {
-                if pressed {
-                    let (px, py) = self
-                        .windows
-                        .get(&wid)
-                        .map_or((0.0, 0.0), |ws| ws.last_cursor_px);
-                    self.settings_click(wid, px, py);
-                } else {
-                    // Release ends an in-flight colour-wheel scrub (the working
-                    // colour keeps its last dragged value; ↵ commits, Esc discards).
-                    self.settings_wheel_drag_end();
-                    // A swallowed left RELEASE still settles an in-flight drag, or a
-                    // divider/selection drag begun before the panel opened would keep
-                    // dragging on every pointer motion under (and after) the modal.
-                    self.settle_pointer_drags(wid);
                 }
             }
             return;
@@ -5377,7 +5041,9 @@ impl App {
             // history away (ruling 238): typing is them coming back to the live
             // bottom, and the re-attach must not land them on the old aim.
             if term.grid().display_offset() != 0 || term.grid().reader_aim_held() {
-                term.scroll_to_bottom();
+                // A non-typing snap (⌘-V, a composing IME key): the press path
+                // records no class for it, so this records `SnapToLive` itself.
+                term.return_to_live();
                 true
             } else {
                 false
@@ -5566,9 +5232,10 @@ fn bank_scroll_lines(residual: &mut f64, delta: f64) -> Option<(bool, i32)> {
 /// Whether ONE pointer-motion event should ask for a frame so the pet brain can
 /// sample the pointer — the wake's EDGE, in one pure function.
 ///
-/// * `pet_visible` — a pet body was drawn last frame (`pet_hit_rect.is_some()`);
-///   a petless window never pays.
-/// * `brain_running` — `PetBrain::needs_frames()`: the brain already owns a
+/// * `pet_visible` — a pet body was drawn last frame
+///   (`ws.companion.hit_rect().is_some()`); a petless window never pays.
+/// * `brain_running` — `CompanionOwner::needs_frames()` (the brain's own
+///   answer, withheld while the resident is static): the brain already owns a
 ///   frame cadence (heat, pursuit, pounce, a fade…), and that lane samples the
 ///   pointer itself, so a request here would only duplicate a frame it has
 ///   already scheduled. A chase cannot stall on this gate: pursuit/pounce keep
@@ -6978,239 +6645,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// REGRESSION (audit): a sidebar SEARCH click during a live free-form edit
-    /// must cancel the edit BEFORE focusing the search — the one arm of the
-    /// edit+search dual-state fix that shipped without a test. A surviving
-    /// buffer would swallow every "query" keystroke (both key paths check
-    /// `editing` before `searching`) and ↵ would commit it against the row —
-    /// with the whole suite green. Pins the mutual exclusion through the REAL
-    /// click path (`settings_click` → `SidebarHit::Search`).
-    #[test]
-    fn search_click_during_edit_cancels_the_edit() {
-        use crate::{App, WindowId};
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        // `settings_panel_rows` mins against the composed frame height; a headless
-        // window never rendered, so seed the frame rows the live path would have.
-        if let Some(ws) = app.windows.get_mut(&wid) {
-            ws.input_scratch.cells = vec![Vec::new(); 24];
-        }
-        app.settings_enter();
-        // Begin a live free-form edit (font_family) and type into it.
-        let idx = app
-            .front()
-            .and_then(|ws| ws.settings())
-            .and_then(|s| {
-                s.fields
-                    .iter()
-                    .position(|f| f.key == crate::prefs::EDIT_FONT_FAMILY)
-            })
-            .expect("font_family row");
-        app.settings_select(idx);
-        app.settings_edit_begin();
-        app.settings_edit_push('M');
-        assert_eq!(
-            app.front()
-                .and_then(|ws| ws.settings())
-                .and_then(|s| s.editing.clone()),
-            Some("M".to_string()),
-            "a free-form edit is live"
-        );
-        // Click the sidebar SEARCH field (rows 1-2, x inside the sidebar) through
-        // the same pixel path a real press takes.
-        let (cw, ch) = app.cell_size();
-        let pad = app.backend.pad() as f64;
-        let (x, y) = (pad + 2.0 * cw as f64, pad + 1.5 * ch as f64);
-        {
-            // Sanity: the point resolves the Search row, not a category/margin.
-            let ws = app.windows.get(&wid).expect("window 0");
-            let row = ((y - pad) / ch as f64) as usize;
-            assert_eq!(
-                crate::settings::sidebar_hit(row, ws.settings_panel_rows()),
-                Some(crate::settings::SidebarHit::Search),
-            );
-        }
-        app.settings_click(wid, x, y);
-        let s = app
-            .front()
-            .and_then(|ws| ws.settings())
-            .expect("settings open");
-        assert_eq!(
-            s.editing, None,
-            "the search click abandons the pending edit"
-        );
-        assert!(
-            s.searching,
-            "…and focuses the search bar — never both at once"
-        );
-    }
-
-    #[test]
-    fn settings_click_rejects_all_four_card_exterior_bands() {
-        use crate::{App, WindowId};
-        use winit::dpi::PhysicalSize;
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.backend.set_pad(12);
-        app.backend.set_pad_top(4);
-        app.backend.set_head(3);
-        if let Some(ws) = app.windows.get_mut(&wid) {
-            ws.metrics.pad = 12;
-            ws.metrics.pad_top = 4;
-            ws.input_scratch.cells = vec![Vec::new(); 24];
-        }
-        app.settings_enter();
-
-        let (cw, ch) = app.win_cell_size(wid);
-        let (rows, cols) = {
-            let ws = &app.windows[&wid];
-            (ws.rows as usize, ws.cols as usize)
-        };
-        app.windows.get_mut(&wid).unwrap().win_px = Some(PhysicalSize::new(
-            (cols * cw + 24 + cw.saturating_sub(1).max(2)) as u32,
-            (rows * ch + 4 + 12 + 3 + ch.saturating_sub(1).max(2)) as u32,
-        ));
-        let (origin_x, origin_y) = app.frame_origin(wid);
-        assert!(origin_x > 0, "fixture needs a horizontal remainder band");
-        if cfg!(target_os = "linux") {
-            // The vertical axis is top-pinned there: all slack below the frame.
-            assert_eq!(origin_y, 0, "Linux pins the frame top");
-        } else {
-            assert!(origin_y > 0, "fixture needs a vertical remainder band");
-        }
-        let panel_rows = app.windows[&wid].settings_panel_rows();
-        let left = (origin_x + 12) as f64;
-        let top = (origin_y + 4 + 3) as f64;
-        let right = left + (cols * cw) as f64;
-        let bottom = top + (panel_rows * ch) as f64;
-        let points = [
-            ("left", left - 0.5, top + 1.5 * ch as f64),
-            ("right", right + 0.5, top + 1.5 * ch as f64),
-            ("top", left + 2.0 * cw as f64, top - 0.5),
-            ("bottom", left + 2.0 * cw as f64, bottom + 0.5),
-        ];
-        let before = app.windows[&wid].settings().unwrap().fingerprint();
-        for (band, x, y) in points {
-            assert_eq!(
-                app.settings_card_point_if_inside(wid, x, y),
-                None,
-                "{band} band is outside the canonical card"
-            );
-            assert_eq!(
-                app.settings_row_at(wid, x, y),
-                None,
-                "{band} band cannot alias a settings row"
-            );
-            app.settings_click(wid, x, y);
-            assert_eq!(
-                app.windows[&wid].settings().unwrap().fingerprint(),
-                before,
-                "{band} band cannot focus sidebar or activate a widget"
-            );
-        }
-    }
-
-    /// The retired compatibility card still shares production pointer seams.
-    /// A nonzero compositor remainder plus asymmetric top padding/headroom must
-    /// be removed exactly once: click selection and colour-wheel drag see the
-    /// same card-local point the painter sees.
-    #[test]
-    fn settings_pointer_is_frame_local_once_and_drag_matches_press_geometry() {
-        use crate::{App, WindowId};
-        use winit::dpi::PhysicalSize;
-
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        app.backend.set_pad(12);
-        app.backend.set_pad_top(4);
-        app.backend.set_head(3);
-        if let Some(ws) = app.windows.get_mut(&wid) {
-            ws.metrics.pad = 12;
-            ws.metrics.pad_top = 4;
-            ws.input_scratch.cells = vec![Vec::new(); 24];
-        }
-        app.settings_enter();
-
-        let (cw, ch) = app.win_cell_size(wid);
-        let (rows, cols) = {
-            let ws = &app.windows[&wid];
-            (ws.rows as usize, ws.cols as usize)
-        };
-        // A strict sub-cell remainder produces a nonzero leading frame band.
-        let rw = cw.saturating_sub(1).max(2);
-        let rh = ch.saturating_sub(1).max(2);
-        app.windows.get_mut(&wid).unwrap().win_px = Some(PhysicalSize::new(
-            (cols * cw + 24 + rw) as u32,
-            (rows * ch + 4 + 12 + 3 + rh) as u32,
-        ));
-        let (ox, oy) = app.frame_origin(wid);
-        assert!(ox > 0, "fixture needs the horizontal remainder band");
-        if cfg!(target_os = "linux") {
-            // Top-pinned vertical placement: the origin is 0 by policy, and the
-            // origin-stripping seam is still exercised through the X axis.
-            assert_eq!(oy, 0, "Linux pins the frame top");
-        } else {
-            assert!(oy > 0, "fixture needs the vertical remainder band");
-        }
-
-        let panel_rows = app.windows[&wid].settings_panel_rows();
-        let pane = crate::settings::pane_geom_cells(cols, panel_rows);
-        let card_x = pane.sidebar_w_cells * cw as f32 + cw as f32 * 0.5;
-        let raw_x = ox as f64 + 12.0 + f64::from(card_x);
-        let current = app.windows[&wid]
-            .settings()
-            .and_then(crate::settings::SettingsState::action_target);
-        let (raw_y, wanted) = (0..panel_rows)
-            .find_map(|row| {
-                let y = oy as f64 + 4.0 + 3.0 + (row * ch + ch / 2) as f64;
-                app.settings_row_at(wid, raw_x, y)
-                    .filter(|idx| Some(*idx) != current)
-                    .map(|idx| (y, idx))
-            })
-            .expect("a second painted Settings control");
-        assert_eq!(
-            app.settings_card_point(wid, raw_x, raw_y),
-            (card_x, (raw_y - oy as f64 - 4.0 - 3.0) as f32),
-            "frame remainder and asymmetric top origin are each stripped once"
-        );
-        app.settings_click(wid, raw_x, raw_y);
-        assert_eq!(
-            app.windows[&wid]
-                .settings()
-                .and_then(crate::settings::SettingsState::action_target),
-            Some(wanted),
-            "click uses raw window coordinates when resolving the row"
-        );
-
-        let color = app.windows[&wid]
-            .settings()
-            .unwrap()
-            .fields
-            .iter()
-            .position(|field| field.key == crate::prefs::EDIT_FOREGROUND)
-            .expect("foreground colour row");
-        app.settings_select(color);
-        app.settings_wheel_open();
-        app.settings_wheel_press_disk(0.0, 0.0);
-        let geom = app.settings_geom_front().expect("settings geometry");
-        let wheel_geom = crate::settings::wheel_geom(app.windows[&wid].settings().unwrap(), &geom)
-            .expect("wheel geometry");
-        let target_cx = wheel_geom.disk_cx + wheel_geom.disk_r * 0.55;
-        let target_cy = wheel_geom.disk_cy;
-        let expected = crate::settings::disk_hs_at(&wheel_geom, target_cx, target_cy);
-        let drag_x = ox as f64 + 12.0 + f64::from(target_cx);
-        let drag_y = oy as f64 + 4.0 + 3.0 + f64::from(target_cy);
-        assert!(app.settings_wheel_drag_motion(wid, drag_x, drag_y));
-        let wheel = app.windows[&wid]
-            .settings()
-            .and_then(|settings| settings.wheel.as_ref())
-            .expect("wheel remains open");
-        assert!((wheel.h - expected.0).abs() < 1.0e-6);
-        assert!((wheel.s - expected.1).abs() < 1.0e-6);
-    }
-
     /// Audit I7 — the axis table. The VERTICAL column is the regression fence:
     /// it must accept exactly what the old `y == 0.0 || y.abs() <= x.abs()`
     /// early-return accepted, no more, so tracking-off scrolling is untouched.
@@ -7844,8 +7278,8 @@ mod tests {
     /// has never sampled ⇒ once; thereafter only when the pointer is a full cell
     /// (either axis) away from the position the brain last consumed — so a
     /// trackpad's ~7 events per cell (or a 1 kHz mouse's dozens) cost ONE
-    /// attempt per cell of travel instead of one full LOCK A + effect tick +
-    /// LOCK B attempt each, and none at all once heat has armed the 60 Hz lane.
+    /// attempt per cell of travel instead of one full frame hold + effect tick
+    /// attempt each, and none at all once heat has armed the 60 Hz lane.
     #[test]
     fn pet_wake_is_edge_gated_on_cell_displacement_and_the_brains_own_cadence() {
         use super::pet_wake_wanted;
@@ -7895,39 +7329,17 @@ mod tests {
             .expect("the grid cell walk");
         assert!(walk < gate, "the gated wake sits below the cell walk");
         assert_eq!(
-            route.matches("ws.pet_hit_rect.is_some()").count(),
+            route.matches("ws.companion.hit_rect().is_some()").count(),
             1,
             "exactly one pet-visibility read in the routing: the gated one"
         );
     }
 
-    /// PETTING (wave 1): the hit test is pure and pads by the slop on every
-    /// side, with the body's own edges staying right/bottom-exclusive.
-    #[test]
-    fn pet_rect_hit_pads_by_the_slop_on_every_side() {
-        use super::{PET_HIT_SLOP_PX, pet_rect_hit};
-        let r = (10, 20, 30, 40);
-        assert!(pet_rect_hit(r, 10.0, 30.0, 0), "top-left corner is inside");
-        assert!(!pet_rect_hit(r, 20.0, 30.0, 0), "right edge is exclusive");
-        assert!(!pet_rect_hit(r, 10.0, 40.0, 0), "bottom edge is exclusive");
-        assert!(
-            pet_rect_hit(r, 6.0, 26.0, PET_HIT_SLOP_PX),
-            "the slop reaches out past the body"
-        );
-        assert!(
-            pet_rect_hit(r, 23.9, 43.9, PET_HIT_SLOP_PX),
-            "on every side"
-        );
-        assert!(
-            !pet_rect_hit(r, 5.9, 30.0, PET_HIT_SLOP_PX),
-            "and no further"
-        );
-    }
-
     /// PETTING (wave 1), the chrome-wins policy end to end: a left press
-    /// inside the stashed pet rect strokes the cat and is CONSUMED — it
-    /// never starts a selection — while the same press outside the rect
-    /// still runs the ordinary selection gesture.
+    /// inside the drawn pet's body strokes the cat and is CONSUMED — it
+    /// never starts a selection — while the same press outside the body
+    /// still runs the ordinary selection gesture. (The pure hit test and its
+    /// slop are pinned in `aterm_effects::companion`.)
     #[test]
     fn a_click_on_the_pet_pets_and_never_starts_a_selection() {
         use crate::{App, WindowId};
@@ -7935,15 +7347,45 @@ mod tests {
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        // Stash a drawn-pet rect the way the redraw does (frame px,
-        // right/bottom exclusive).
-        app.windows.get_mut(&wid).unwrap().pet_hit_rect = Some((100, 200, 100, 160));
-        app.on_cursor_moved(wid, 150.0, 130.0);
+        // Draw the resident the way a frame does: its owner stashes the body
+        // it drew (frame px, right/bottom exclusive) as the hit target.
+        let (x0, x1, y0, y1) = {
+            let ws = app.windows.get_mut(&wid).unwrap();
+            let pet = crate::app_render::pet_owner_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::StaticCapture,
+                aterm_effects::kitty_pet::PetSense {
+                    caret_drawn: true,
+                    now: std::time::Instant::now(),
+                    caret: Some((4, 12)),
+                    rows: 24,
+                    cols: 80,
+                    cell_w: 8,
+                    cell_h: 16,
+                    reduced_motion: false,
+                    output_burst: false,
+                    pointer: None,
+                    wrapped: false,
+                },
+            );
+            assert!(pet.on_glass, "fixture: the resident is drawn");
+            ws.companion
+                .hit_rect()
+                .expect("the drawn body is the hit target")
+        };
+        let (fx, fy) = (f64::from(x0 + x1) / 2.0, f64::from(y0 + y1) / 2.0);
+        let (wx, wy) = {
+            // `on_cursor_moved` takes window px: the frame origin plus the
+            // body's centre in frame px (the inverse of `window_to_frame`).
+            let (ox, oy) = app.frame_origin(wid);
+            (fx + ox as f64, fy + oy as f64)
+        };
+        app.on_cursor_moved(wid, wx, wy);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
         {
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.cursor_pet.pending_pets(),
+                ws.companion.brain().pending_pets(),
                 1,
                 "the press latched a pet (note, never act)"
             );
@@ -7960,7 +7402,7 @@ mod tests {
         {
             let ws = app.windows.get(&wid).unwrap();
             assert_eq!(
-                ws.cursor_pet.pending_pets(),
+                ws.companion.brain().pending_pets(),
                 1,
                 "no second pet off the body"
             );
@@ -7978,11 +7420,11 @@ mod tests {
 
         let mut app = App::headless_for_test();
         let wid = WindowId(0);
-        assert_eq!(app.windows.get(&wid).unwrap().pet_hit_rect, None);
+        assert_eq!(app.windows.get(&wid).unwrap().companion.hit_rect(), None);
         app.on_cursor_moved(wid, 150.0, 130.0);
         app.on_mouse_input(wid, ElementState::Pressed, WinitMouseButton::Left);
         let ws = app.windows.get(&wid).unwrap();
-        assert_eq!(ws.cursor_pet.pending_pets(), 0, "nothing to pet");
+        assert_eq!(ws.companion.brain().pending_pets(), 0, "nothing to pet");
         assert!(ws.selecting, "the press reached the selection layer");
     }
 

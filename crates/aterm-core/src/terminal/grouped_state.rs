@@ -550,18 +550,13 @@ pub(super) struct BidiScratch {
     pub(super) inv: Vec<usize>,
     /// Holds the reordered (visual-order) row while it is swapped into the frame.
     pub(super) row_tmp: Vec<crate::terminal::RenderCell>,
-    /// Working buffers threaded into [`aterm_bidi::reorder_cells_with_classes_into`]
-    /// so the per-row UAX #9 resolution reuses these instead of heap-allocating ~7
-    /// transient `Vec`s per RTL row per frame. `cell_order` holds the resulting
-    /// visual→logical CELL permutation; the rest are inner scratch (logical-char
-    /// classes, lead-cell map, wide-pair flags, resolved types, embedding levels,
-    /// and the logical-char order).
-    pub(super) logical: Vec<aterm_bidi::BidiClass>,
-    pub(super) lead_cell: Vec<usize>,
-    pub(super) has_cont: Vec<bool>,
-    pub(super) types: Vec<aterm_bidi::BidiClass>,
-    pub(super) levels: Vec<u8>,
-    pub(super) char_order: Vec<usize>,
+    /// Per-cell paired-bracket properties for the current row (UAX #9 N0).
+    pub(super) brackets: Vec<aterm_bidi::Bracket>,
+    /// The UAX #9 working memory threaded into
+    /// [`aterm_bidi::reorder_cells_with_classes_into`], so the per-row resolution
+    /// reuses it instead of heap-allocating per RTL row per frame.
+    pub(super) bidi: aterm_bidi::Scratch,
+    /// The resulting visual→logical CELL permutation.
     pub(super) cell_order: Vec<usize>,
 }
 
@@ -573,12 +568,8 @@ impl BidiScratch {
             wide: Vec::new(),
             inv: Vec::new(),
             row_tmp: Vec::new(),
-            logical: Vec::new(),
-            lead_cell: Vec::new(),
-            has_cont: Vec::new(),
-            types: Vec::new(),
-            levels: Vec::new(),
-            char_order: Vec::new(),
+            brackets: Vec::new(),
+            bidi: aterm_bidi::Scratch::default(),
             cell_order: Vec::new(),
         }
     }

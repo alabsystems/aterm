@@ -219,14 +219,24 @@ fn modifier_key_encodings() {
         ("bare shift release", named(NamedKey::ShiftLeft), Modifiers::SHIFT, events, RELEASE, b""),
         ("bare ctrl release", named(NamedKey::ControlLeft), Modifiers::CTRL, events, RELEASE, b""),
         ("bare alt release", named(NamedKey::AltLeft), Modifiers::ALT, events, RELEASE, b""),
-        // ControlLeft=57442; release removes CTRL → mod=1; event=3(release)
+        // ControlLeft=57442; a release carries the state it leaves: a lone
+        // Control's has no CTRL → mod=1, and with the other Control still held
+        // CTRL stays → mod=5; event=3(release).
         (
             "report-all ctrl release",
+            named(NamedKey::ControlLeft),
+            NO_MODS,
+            KeyboardMode::REPORT_ALL_KEYS_AS_ESC | events,
+            RELEASE,
+            b"\x1b[57442;1:3u",
+        ),
+        (
+            "report-all ctrl release, the other Control held",
             named(NamedKey::ControlLeft),
             Modifiers::CTRL,
             KeyboardMode::REPORT_ALL_KEYS_AS_ESC | events,
             RELEASE,
-            b"\x1b[57442;1:3u",
+            b"\x1b[57442;5:3u",
         ),
         // Modifier press has no legacy escape sequence; REPORT_EVENT_TYPES-only
         // does not promote press events to Kitty encoding.

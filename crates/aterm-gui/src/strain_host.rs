@@ -37,7 +37,12 @@
 //! an episode opens under a finger — for captures and demos, never a user
 //! setting. The live gate drives real keys with `aterm ctl hwkey`, whose
 //! `NSEvent` takes the same `KeyboardInput` arm a physical key does; no test
-//! seam makes a control `send` count.
+//! seam makes a control `send` count. Under the same seam, and only there,
+//! a window with no focused window in the app counts as the one typed into
+//! once a hardware key lands in it (`StrainHost::focus_seam`, ruling 272):
+//! macOS refuses key status to an isolated instance launched in the
+//! background, and `hwkey` reaches its window all the same. A shipped build
+//! never samples an unfocused window's keys.
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -214,6 +219,13 @@ pub(crate) struct StrainHost {
     last_hw_key: Option<Instant>,
     /// Freezes waiting for a hardware key near their end: `(end, ms, owner)`.
     freezes: Vec<(Instant, u32, &'static str)>,
+    /// The dev seam is on (`ATERM_DEBUG_STRAIN`, read through `dev_seam!`:
+    /// always `false` in a shipped build): while no window is focused, the
+    /// window the last hardware key landed in stands in for the focused one
+    /// ([`App::strain_typing_window`], ruling 272).
+    focus_seam: bool,
+    /// That window, recorded only while `focus_seam` is on.
+    seam_window: Option<WindowId>,
 }
 
 impl std::fmt::Debug for StrainHost {
@@ -239,6 +251,8 @@ impl StrainHost {
             row: None,
             last_hw_key: None,
             freezes: Vec::new(),
+            focus_seam: debug_load().is_some(),
+            seam_window: None,
         };
         host.publish();
         host
@@ -460,15 +474,43 @@ fn spawn_probe(proxy: EventLoopProxy<Wake>) -> std::io::Result<Sender<bool>> {
 }
 
 impl App {
-    /// The gate: the switch is on and some focused window's band is on screen.
+    /// The gate: the switch is on and some focused window's band is on screen
+    /// (under the dev seam, the stand-in's: [`Self::strain_typing_window`]).
     pub(crate) fn strain_gate(&self) -> Gate {
         Gate {
             enabled: self.strain.enabled(),
             focused_on_screen: self
                 .windows
                 .values()
-                .any(|ws| ws.focused && band_on_screen(ws)),
+                .any(|ws| ws.focused && band_on_screen(ws))
+                || self
+                    .strain_seam_window()
+                    .and_then(|wid| self.windows.get(&wid))
+                    .is_some_and(band_on_screen),
         }
+    }
+
+    /// The window the person types into, for the sampler and the sweep: the
+    /// focused one. With no focused window, and only under the dev seam
+    /// (`focus_seam`, never in a shipped build), the window the last hardware
+    /// key landed in (ruling 272).
+    fn strain_typing_window(&self) -> Option<WindowId> {
+        self.windows
+            .iter()
+            .find(|(_, ws)| ws.focused)
+            .map(|(wid, _)| *wid)
+            .or_else(|| self.strain_seam_window())
+    }
+
+    /// The dev seam's stand-in, while no window is focused and it still
+    /// exists; `None` in a shipped build (the seam never records one).
+    fn strain_seam_window(&self) -> Option<WindowId> {
+        if !self.strain.focus_seam || self.windows.values().any(|ws| ws.focused) {
+            return None;
+        }
+        self.strain
+            .seam_window
+            .filter(|wid| self.windows.contains_key(wid))
     }
 
     /// The loop's turn (`about_to_wait`, before the fold): take the watchdog's
@@ -520,7 +562,9 @@ impl App {
 
     /// One hardware key's closed, untainted input→present slice in window
     /// `wid`: a sample only when that window is focused with its band on
-    /// screen and its focused session is not running a remote program.
+    /// screen and its focused session is not running a remote program. Under
+    /// the dev seam only, a key into an unfocused window while NO window is
+    /// focused counts too, and makes that window the stand-in (ruling 272).
     pub(crate) fn note_strain_key(&mut self, wid: WindowId, slice_ns: u64) {
         if !self.strain.enabled() {
             return;
@@ -528,8 +572,14 @@ impl App {
         let Some(ws) = self.windows.get(&wid) else {
             return;
         };
-        if !ws.focused || !band_on_screen(ws) {
+        if !band_on_screen(ws) {
             return;
+        }
+        if !ws.focused {
+            if !self.strain.focus_seam || self.windows.values().any(|w| w.focused) {
+                return;
+            }
+            self.strain.seam_window = Some(wid);
         }
         if self
             .strain_focused_program(wid)
@@ -556,11 +606,7 @@ impl App {
     /// program, its tab, whether the person types into it, whether it is in
     /// another window.
     fn strain_sessions(&self) -> Vec<SessionRef> {
-        let focused = self
-            .windows
-            .iter()
-            .find(|(_, ws)| ws.focused)
-            .map(|(wid, _)| *wid);
+        let focused = self.strain_typing_window();
         let receiving = focused.and_then(|wid| self.focused_session_id(wid));
         let mut out = Vec::new();
         for (wid, ws) in &self.windows {
@@ -745,6 +791,9 @@ mod tests {
         let ws = app.windows.get_mut(&WID).expect("window 0");
         ws.band_on_screen_for_test = true;
         ws.focused = true;
+        // The dev seam off whatever the test's environment says: the shipped
+        // arm unless a test turns it on.
+        app.strain.focus_seam = false;
         app
     }
 
@@ -1151,6 +1200,61 @@ mod tests {
             .find(|l| l.starts_with("shown for "))
             .expect("the shown-for line");
         assert!(glass.ends_with(" s"), "seconds, not the hour away: {glass}");
+    }
+
+    /// SHIPPED BEHAVIOUR (ruling 272): without the dev seam a person's keys
+    /// to an unfocused window are never samples — even when NO window of the
+    /// app is focused, which is exactly the case the seam changes — and no
+    /// stand-in window is ever recorded, so the gate and the sweep's
+    /// receiving session follow focus alone.
+    #[test]
+    fn without_the_seam_an_unfocused_window_is_never_typed_into() {
+        let mut app = on_screen_app();
+        app.strain.focus_seam = false;
+        app.windows.get_mut(&WID).unwrap().focused = false;
+        slow_keys(&mut app);
+        assert_eq!(app.strain.engine.state_word(), "calm", "no sample");
+        assert_eq!(app.strain.seam_window, None, "no stand-in recorded");
+        assert_eq!(app.strain_typing_window(), None, "nobody types");
+        assert!(!app.strain_gate().focused_on_screen);
+    }
+
+    /// THE SEAM'S ARM (ruling 272): under `ATERM_DEBUG_STRAIN` a hardware key
+    /// into an unfocused on-screen window, while no window is focused, is a
+    /// sample and makes that window the one typed into — for the gate and the
+    /// sweep's receiving session — so `ctl hwkey` drives an episode in an
+    /// isolated instance macOS will not make key. It stays inside the idle
+    /// law's other halves: an occluded window takes no sample, and a stand-in
+    /// that no longer exists (or a focused window) wins nothing.
+    #[test]
+    fn the_seam_lets_an_unfocused_window_take_hardware_keys() {
+        let mut app = on_screen_app();
+        app.strain.focus_seam = true;
+        app.windows.get_mut(&WID).unwrap().focused = false;
+
+        app.windows.get_mut(&WID).unwrap().occluded = true;
+        slow_keys(&mut app);
+        assert_eq!(app.strain.engine.state_word(), "calm", "occluded: none");
+        assert_eq!(app.strain.seam_window, None);
+        app.windows.get_mut(&WID).unwrap().occluded = false;
+
+        slow_keys(&mut app);
+        assert_eq!(app.strain.engine.state_word(), "suspect", "sampled");
+        assert_eq!(app.strain.seam_window, Some(WID));
+        assert_eq!(app.strain_typing_window(), Some(WID));
+        assert!(app.strain_gate().focused_on_screen, "the gate opens");
+        assert!(app.strain_deadline_if(Instant::now(), true).is_some());
+
+        // A focused window is the one typed into, whatever the stand-in.
+        app.windows.get_mut(&WID).unwrap().focused = true;
+        assert_eq!(app.strain_seam_window(), None, "focus wins");
+        assert_eq!(app.strain_typing_window(), Some(WID));
+        app.windows.get_mut(&WID).unwrap().focused = false;
+
+        // A stand-in whose window closed is nobody.
+        app.strain.seam_window = Some(WindowId(99));
+        assert_eq!(app.strain_typing_window(), None);
+        assert!(!app.strain_gate().focused_on_screen);
     }
 
     /// Only the six remote programs are exempt, by exact name.

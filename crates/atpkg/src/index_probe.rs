@@ -82,6 +82,9 @@ pub fn is_release_asset_host(host: &str) -> bool {
 pub enum Probe {
     Published(u64),
     Missing,
+    /// Another process already asked this range. The shared stamp's remaining
+    /// cooldown is the next local deadline; no HEAD ran on this attempt.
+    Suppressed(Duration),
     Deferred,
 }
 
@@ -179,8 +182,8 @@ fn probe_next(
     let Some(mut file) = take_probe_lock(&layout.prefix.join(NEAR_LOCK)) else {
         return Probe::Deferred;
     };
-    if stamped_recently(&mut file, floor, now) {
-        return Probe::Deferred;
+    if let Some(remaining) = stamp_remaining(&mut file, floor, now) {
+        return Probe::Suppressed(remaining);
     }
     let mut answer = Probe::Missing;
     for offset in OFFSETS {
@@ -202,7 +205,7 @@ fn probe_next(
     let marker = match answer {
         Probe::Published(_) => 'P',
         Probe::Missing => 'M',
-        Probe::Deferred => 'E',
+        Probe::Deferred | Probe::Suppressed(_) => 'E',
     };
     let _ = stamp(&mut file, floor, marker);
     answer
@@ -255,30 +258,30 @@ fn open_probe_lock(path: &Path) -> Option<File> {
     Some(file)
 }
 
-fn stamped_recently(file: &mut File, floor: u64, now: SystemTime) -> bool {
-    let Some((recorded, marker, modified)) = read_stamp(file) else {
-        return false;
-    };
+fn stamp_remaining(file: &mut File, floor: u64, now: SystemTime) -> Option<Duration> {
+    let (recorded, marker, modified) = read_stamp(file)?;
     if recorded != floor {
-        return false;
+        return None;
     }
     let lifetime = match marker {
         'M' | 'P' => INTERVAL,
         'E' => RETRY_AFTER_ERROR,
-        _ => return false,
+        _ => return None,
     };
     match now.duration_since(modified) {
-        Ok(age) => age < lifetime,
+        Ok(age) => (age < lifetime).then(|| lifetime - age),
         // A small clock correction still honours the stamp. A far-future mtime
         // is treated as damaged state so it cannot suppress the probe forever.
         Err(_) => modified
             .duration_since(now)
-            .is_ok_and(|ahead| ahead < lifetime),
+            .ok()
+            .filter(|ahead| *ahead < lifetime)
+            .map(|ahead| lifetime + ahead),
     }
 }
 
 /// The ONE parser of the probe's stamp — `"{floor} {marker}\n"` plus the file's mtime, the
-/// instant the answer was written — shared by the cooldown ([`stamped_recently`]) and the
+/// instant the answer was written — shared by the cooldown ([`stamp_remaining`]) and the
 /// report ([`cached_answer`]), so what the doctor shows is exactly what the probe reads.
 /// Anything else (oversized, a third field, an unknown marker, a non-number) is `None`.
 fn read_stamp(file: &mut File) -> Option<(u64, char, SystemTime)> {
@@ -505,7 +508,7 @@ mod tests {
             );
             stamped_at(layout, at);
         } else {
-            assert_eq!(observed, Probe::Deferred);
+            assert_eq!(observed, Probe::Suppressed(Duration::from_secs(1)));
             assert!(model.fire("SkipFresh", state));
         }
         assert!(model.fire("Release", state));
@@ -533,6 +536,66 @@ mod tests {
             .open(layout.prefix.join(NEAR_LOCK))
             .and_then(|file| file.set_modified(at))
             .unwrap();
+    }
+
+    /// A second host takes the shared stamp's remaining wait, not another
+    /// complete local interval. Missing/published and error stamps keep their
+    /// different limits, including a small clock correction into the future.
+    #[test]
+    fn a_suppressed_probe_reports_the_exact_shared_cooldown_without_a_head() {
+        for (marker, lifetime) in [('M', INTERVAL), ('P', INTERVAL), ('E', RETRY_AFTER_ERROR)] {
+            let layout = layout(&format!("shared-handoff-{marker}"));
+            std::fs::write(layout.floor(), "43").unwrap();
+            std::fs::write(layout.prefix.join(NEAR_LOCK), format!("43 {marker}\n")).unwrap();
+            let stamped = SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000);
+            stamped_at(&layout, stamped);
+            let requests = Cell::new(0);
+            let mut head = |_: &str| {
+                requests.set(requests.get() + 1);
+                Ok(HeadAnswer {
+                    code: 404,
+                    location: None,
+                })
+            };
+            assert_eq!(
+                successor_with(
+                    &layout,
+                    "alabsystems",
+                    "aterm",
+                    stamped + lifetime - Duration::from_secs(5),
+                    &mut head,
+                ),
+                Probe::Suppressed(Duration::from_secs(5))
+            );
+            assert_eq!(requests.get(), 0);
+            assert_eq!(
+                successor_with(
+                    &layout,
+                    "alabsystems",
+                    "aterm",
+                    stamped - Duration::from_secs(5),
+                    &mut head,
+                ),
+                Probe::Suppressed(lifetime + Duration::from_secs(5))
+            );
+            assert_eq!(requests.get(), 0);
+            assert_eq!(
+                successor_with(
+                    &layout,
+                    "alabsystems",
+                    "aterm",
+                    stamped + lifetime,
+                    &mut head,
+                ),
+                Probe::Missing
+            );
+            assert_eq!(
+                requests.get(),
+                2,
+                "only the stamp expiry spends a HEAD pair"
+            );
+            std::fs::remove_dir_all(layout.prefix).unwrap();
+        }
     }
 
     #[test]
@@ -659,7 +722,7 @@ mod tests {
                 t0 + INTERVAL - Duration::from_secs(1),
                 &mut head
             ),
-            Probe::Deferred,
+            Probe::Suppressed(Duration::from_secs(1)),
             "a second process reuses the shared stamp"
         );
         assert_eq!(asked(), 2);
@@ -838,7 +901,10 @@ mod tests {
         };
         assert_eq!(at(t0, 2), Probe::Missing);
         stamped_at(&layout, t0);
-        assert_eq!(at(t0 + Duration::from_secs(15), 0), Probe::Deferred);
+        assert_eq!(
+            at(t0 + Duration::from_secs(15), 0),
+            Probe::Suppressed(Duration::from_secs(15))
+        );
         assert_eq!(at(t0 + Duration::from_secs(31), 2), Probe::Missing);
         stamped_at(&layout, t0 + Duration::from_secs(31));
         std::fs::write(layout.floor(), "45").unwrap();

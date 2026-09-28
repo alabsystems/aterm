@@ -45,6 +45,13 @@ pub const STALE_WAIT: Duration = Duration::from_secs(30);
 
 /// The paste row's words while it runs: `Pasting`, and its finished words.
 pub const PASTING: &str = "Pasting";
+
+/// How long a paste's program may take none of it before the row says so
+/// (round 18, day four, D8: `Pasting 12 MB 0%` stood 37 s with no word that
+/// it waited on the program, which had stopped reading). A few of the
+/// paste's own samples: a program that reads in bursts is never called
+/// stopped between two of them.
+pub(crate) const PASTE_UNREAD_AFTER: Duration = Duration::from_secs(3);
 /// The rewrap row's title before it knows how many lines it rewraps
 /// ([`rewrap_title`] says them once it does).
 pub const REWRAPPING: &str = "Rewrapping scrollback";
@@ -312,6 +319,10 @@ pub struct SessionWait {
     /// base its own pace is measured from (a rewrap is watched from the ask,
     /// long after its work began).
     first: Option<(u64, Duration)>,
+    /// The last sample whose `done` moved: its `done` and elapsed time —
+    /// how long the program has taken none of a paste
+    /// ([`PASTE_UNREAD_AFTER`]).
+    moved: Option<(u64, Duration)>,
 }
 
 impl SessionWait {
@@ -326,6 +337,7 @@ impl SessionWait {
             posted: false,
             held: false,
             first: None,
+            moved: None,
         }
     }
 
@@ -339,6 +351,7 @@ impl SessionWait {
             posted: false,
             held: false,
             first: None,
+            moved: None,
         }
     }
 
@@ -354,19 +367,43 @@ impl SessionWait {
         self.posted
     }
 
-    /// The row's words for `s`.
+    /// The row's words for `s`. A paste whose program has taken none of it
+    /// for [`PASTE_UNREAD_AFTER`] says so, and for how long, as its excerpt
+    /// — what it waits on, so the person knows the wait is the program's and
+    /// that `Stop paste` ends it.
     #[must_use]
     pub fn row(&self, s: &WaitSample) -> Message {
         let grace_left = PROGRESS_GRACE.saturating_sub(s.elapsed);
         match self.kind {
-            WaitKind::Paste => paste_row(self.session, self.series, s.done, s.total, grace_left),
+            WaitKind::Paste => {
+                let row = paste_row(self.session, self.series, s.done, s.total, grace_left);
+                match self.unread_for(s) {
+                    Some(stuck) => {
+                        let mut row = row.line(unread_words(stuck));
+                        row.excerpt = true;
+                        row
+                    }
+                    None => row,
+                }
+            }
             WaitKind::Rewrap => rewrap_row(self.session, s.done, s.total, grace_left),
         }
+    }
+
+    /// How long the program has taken none of this paste, once that is
+    /// [`PASTE_UNREAD_AFTER`] or more and some of it is still unsent.
+    fn unread_for(&self, s: &WaitSample) -> Option<Duration> {
+        let (done, at) = self.moved?;
+        let stuck = s.elapsed.saturating_sub(at);
+        (s.done <= done && s.done < s.total && stuck >= PASTE_UNREAD_AFTER).then_some(stuck)
     }
 
     /// The one thing to do with sample `s`.
     pub fn step(&mut self, s: &WaitSample) -> WaitStep {
         let first = *self.first.get_or_insert((s.done, s.elapsed));
+        if self.moved.is_none_or(|(done, _)| s.done > done) {
+            self.moved = Some((s.done, s.elapsed));
+        }
         if let Some(end) = s.end {
             return if std::mem::take(&mut self.posted) {
                 WaitStep::End(end.echo())
@@ -418,6 +455,16 @@ fn ends_unread((done0, at0): (u64, Duration), s: &WaitSample) -> bool {
     left < PROGRESS_GRACE.saturating_sub(s.elapsed) + REVEAL_MIN_LEFT
 }
 
+/// A paste's excerpt while its program takes none of it: `program not
+/// reading for 37 s` — short enough that its figure survives at 100 columns
+/// (live, the longer `the program has read nothing for 13…` lost it).
+fn unread_words(stuck: Duration) -> String {
+    format!(
+        "program not reading for {}",
+        crate::strain::span_words(stuck)
+    )
+}
+
 /// Whether a paste of `bytes` is watched at all ([`LARGE_PASTE_BYTES`]).
 #[must_use]
 pub const fn paste_is_watched(bytes: u64) -> bool {
@@ -436,6 +483,45 @@ mod tests {
             elapsed: Duration::from_millis(ms),
             asked,
             end: None,
+        }
+    }
+
+    /// A PASTE THE PROGRAM IS NOT READING SAYS SO (round 18, day four, D8:
+    /// `Pasting 12 MB 0%` for 37 s, no word of what it waited on). Once the
+    /// program has taken none of it for [`PASTE_UNREAD_AFTER`], the row's
+    /// excerpt names the program and how long; the words go as soon as it
+    /// reads again. NEGATIVE CONTROL: a paste that keeps moving, and one
+    /// stuck for less than the bound, carry no excerpt.
+    #[test]
+    fn a_paste_the_program_does_not_read_says_what_it_waits_on() {
+        let mut w = SessionWait::paste(3, 1);
+        let total = 12_000_000;
+        let WaitStep::Post(row) = w.step(&sample(0, total, 2_000, true)) else {
+            panic!("posted");
+        };
+        assert!(!row.excerpt && row.detail.is_empty(), "{row:?}");
+        let WaitStep::Restate(row) = w.step(&sample(0, total, 4_900, true)) else {
+            panic!("restated");
+        };
+        assert!(!row.excerpt, "under the bound: {row:?}");
+        let WaitStep::Restate(row) = w.step(&sample(0, total, 39_000, true)) else {
+            panic!("restated");
+        };
+        assert!(row.excerpt);
+        assert_eq!(row.detail, ["program not reading for 37 s"]);
+        assert_eq!(row.title, "Pasting 12 MB", "the title is the job's");
+        // It reads again: the words go at once.
+        let WaitStep::Restate(row) = w.step(&sample(1_000_000, total, 39_250, true)) else {
+            panic!("restated");
+        };
+        assert!(!row.excerpt && row.detail.is_empty(), "{row:?}");
+        // A steady paste never says it.
+        let mut steady = SessionWait::paste(3, 2);
+        for i in 0..40u64 {
+            let step = steady.step(&sample(i * 100_000, total, 2_000 + i * 250, true));
+            if let WaitStep::Post(row) | WaitStep::Restate(row) = step {
+                assert!(!row.excerpt, "{i}: {row:?}");
+            }
         }
     }
 

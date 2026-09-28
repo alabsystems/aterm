@@ -12,7 +12,7 @@
 //! Method: byte-for-byte Ink repaint bursts are fed through a REAL
 //! `aterm_core::terminal::Terminal` running on the ALT SCREEN (Claude Code's
 //! live-verified surface); after each burst the cursor is sampled EXACTLY
-//! like `aterm-gui/src/app_render.rs`'s LOCK A:
+//! like `aterm-gui/src/app_render.rs`'s frame hold:
 //!     let cur = cursor_visible.then_some((cpos.row, cpos.col));
 //! the REPAINT-BLINK is derived from the same terminal exactly as the host
 //! does per frame (`repaint_blink_epoch()` diffed against a last-seen value →
@@ -103,16 +103,16 @@ fn cfg(style: GlowStyle) -> GlowConfig {
     }
 }
 
-/// A cursor sample `(row, col)` as LOCK A reports it (`None` = hidden).
+/// A cursor sample `(row, col)` as the frame hold reports it (`None` = hidden).
 type Cur = Option<(u16, u16)>;
 
-/// EXACTLY app_render's LOCK A — the per-frame cursor sample.
+/// EXACTLY app_render's frame hold — the per-frame cursor sample.
 fn sample(term: &Terminal) -> Cur {
     let c = term.cursor();
     term.cursor_visible().then_some((c.row, c.col))
 }
 
-/// EXACTLY app_render's LOCK A repaint-blink derivation, run once per frame
+/// EXACTLY app_render's frame hold repaint-blink derivation, run once per frame
 /// immediately before the tick: diff the REAL terminal's monotonic
 /// `repaint_blink_epoch` against the window's last-seen value — an advance is
 /// the hide-inside-DEC-2026 repaint bracket, so note the blink — and stamp

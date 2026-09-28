@@ -39,10 +39,12 @@
 //! The agent PHASE (busy / prompt / question / limited / idle / survey) is the
 //! SERVER'S published verdict ([`agent_verdict`], run by the status sweep in
 //! `session_status.rs`): `aterm_phase`'s readers over the [`live_zone`] (the
-//! last [`CLASSIFY_ROWS`] rows of the screen's content), applied only to a
-//! session identified as an agent, and re-run only when the content moved
-//! AND those rows changed — at most 4 Hz per session, never per frame; the
-//! test-only [`classifier_calls`] counter is the gate's proof. This module
+//! last [`CLASSIFY_ROWS`] rows of the screen's content, and the blank rows
+//! under it) with the terminal's cursor ([`Cursor`]: Claude Code's `idle` is
+//! the prompt box that holds it), applied only to a session identified as an
+//! agent, and re-run only when the content or the cursor moved AND those rows
+//! or the cursor's row changed — at most 4 Hz per session, never per frame;
+//! the test-only [`classifier_calls`] counter is the gate's proof. This module
 //! only folds that verdict in.
 
 use std::collections::{HashMap, VecDeque};
@@ -120,21 +122,54 @@ pub(crate) const CLASSIFY_ROWS: usize = 40;
 /// THE LIVE ZONE the agent verdict reads ([`agent_verdict`]) and the status
 /// sweep's classifier gate hashes (`session_status`'s `agent_observe`): the
 /// last [`CLASSIFY_ROWS`] rows of the screen's content — up to its last
-/// non-blank row — and the blank rows under it. The live run of 2026-09-26
-/// (Claude Code 2.1.283 in a fresh 149x62 pane whose shell prompt sat at the
-/// top) drew the folder-trust dialog on rows 5-20: the last 40 rows of the
-/// SCREEN were blank, the dialog wholly above them, and `status` published
+/// non-blank row — and the blank rows under it
+/// ([`aterm_phase::live_zone_start`], the one cut: a supervisor whose tail
+/// read ends on a blank row cuts there too). Counted from the grid's last
+/// row, the cut missed whatever was drawn wholly above a blank foot: the
+/// live run of 2026-09-26 (Claude Code 2.1.283 in a fresh 149x62 pane whose
+/// shell prompt sat at the top) drew the folder-trust dialog on rows 5-20,
+/// the last 40 rows of the SCREEN were blank, and `status` published
 /// `agent=idle` for 3+ minutes while the hosted loop, which waits on that
-/// verdict at an idle point (`await agent`), slept. The zone never shrinks:
-/// on a screen whose last row has content it is the last 40 rows, as
-/// before; it reaches up only by as many rows as the screen's foot is blank,
-/// so a reader is handed the same rows under the content it always was.
+/// verdict at an idle point (`await agent`), slept; and Claude Code's inline
+/// renderer draws its REPL at the top of a pane taller than the cut, blank
+/// rows below it (the review of 2026-09-26, 150x50: `agent=unknown`, `await
+/// agent idle` timed out). The zone never shrinks: on a screen whose last row
+/// has content it is the last 40 rows, as before; it reaches up only by as
+/// many rows as the screen's foot is blank, so a reader is handed the same
+/// rows under the content it always was.
 pub(crate) fn live_zone(rows: &[String]) -> &[String] {
-    let content = rows
-        .iter()
-        .rposition(|r| !r.trim().is_empty())
-        .map_or(0, |last| last + 1);
-    &rows[content.saturating_sub(CLASSIFY_ROWS)..]
+    &rows[aterm_phase::live_zone_start(rows, CLASSIFY_ROWS)..]
+}
+
+/// The TERMINAL'S CURSOR as the verdict reads a screen: Claude Code's `idle`
+/// is its prompt box's only where that box holds the cursor
+/// ([`aterm_phase::ScreenReader::read_at`], `aterm_phase::phase::
+/// prompt_box_holds`) — never a box an earlier run left on the screen. The
+/// inline renderer relaunched in the SAME tab keeps the previous run's box
+/// above the new launch line, and the server published `agent=idle` from it
+/// before the new REPL was drawn (the review of 2026-09-26: a draft typed on
+/// `await agent idle` lost 3 of 3 after the folder-trust dialog, 1 of 3
+/// without it); the cursor sits under the new launch line there (measured).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Cursor {
+    /// Its row among the rows the verdict is handed (`None`: on none of
+    /// them). The sweep reads it under the same terminal guard as the rows.
+    At(Option<usize>),
+    /// Not given: a test's bare screen, read by its frame alone
+    /// ([`aterm_phase::ScreenReader::read`]). Nothing that ships reads one.
+    #[cfg(test)]
+    Unknown,
+}
+
+impl Cursor {
+    /// The same cursor on the rows from `start` on (`rows[start..]`).
+    fn on_rows_from(self, start: usize) -> Self {
+        match self {
+            Self::At(row) => Self::At(row.and_then(|r| r.checked_sub(start))),
+            #[cfg(test)]
+            Self::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,8 +225,11 @@ pub(crate) enum AgentPhase {
     Survey,
     /// An identified agent whose reader has no EVIDENCE for a phase
     /// ([`aterm_phase::Reading::phase_authoritative`] false — a Codex screen
-    /// outside its choice box): its default `idle` is not published as idle,
-    /// since whatever acts on an idle worker would act on a guess.
+    /// outside its choice box, a Claude Code screen with no prompt box that
+    /// holds the terminal's cursor: its launch, before the REPL is up, an
+    /// earlier run's box above a same-tab relaunch included): its default
+    /// `idle` is not published as idle, since whatever acts on an idle worker
+    /// would act on a guess — a first prompt typed there is lost.
     Unknown,
 }
 
@@ -331,11 +369,14 @@ impl AgentVerdict {
 /// the generic reader gets, is [`AgentVerdict::NotAgent`] — a shell never
 /// reads as a question, not even one that has just `cat`-ed a captured
 /// Claude screen.
+///
+/// `cursor` is the terminal's cursor on `rows`, the WHOLE screen ([`Cursor`]).
 pub(crate) fn agent_verdict(
     program: Option<&str>,
     program_pending: bool,
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
+    cursor: Cursor,
     now: Instant,
 ) -> AgentVerdict {
     use aterm_phase::{Program, ScreenReader};
@@ -375,13 +416,13 @@ pub(crate) fn agent_verdict(
     // (the E2E probe of 2026-09-25: a trust dialog at the top of a 45-row
     // pane was published `agent_detail=other`, and the menu bar said "other
     // approval").
-    let rows = if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen)
-    {
-        whole
-    } else {
-        rows
-    };
-    let (reading, subject) = classify(reader, rows, now);
+    let (rows, cursor) =
+        if whole.len() > rows.len() && reader.prompt(rows).is_some_and(|p| p.head_off_screen) {
+            (whole, cursor)
+        } else {
+            (rows, cursor.on_rows_from(whole.len() - rows.len()))
+        };
+    let (reading, subject) = classify(reader, rows, cursor, now);
     AgentVerdict::Agent {
         reading,
         by_frame,
@@ -401,10 +442,11 @@ pub(crate) fn agent_verdict_guarded(
     program_pending: bool,
     known_agent: Option<aterm_phase::Program>,
     rows: &[String],
+    cursor: Cursor,
     now: Instant,
 ) -> AgentVerdict {
     fenced_verdict(session, program, program_pending, known_agent, rows, || {
-        agent_verdict(program, program_pending, known_agent, rows, now)
+        agent_verdict(program, program_pending, known_agent, rows, cursor, now)
     })
 }
 
@@ -462,9 +504,12 @@ fn unreadable_verdict(
 /// box's command or path for the host's menu row ([`AgentVerdict::Agent`]).
 /// The ONLY caller of `aterm_phase`'s readers in this crate, so the test
 /// counter is total; `rows` is the [`live_zone`] (or the whole screen, for a
-/// box whose head it cuts). Callers go through [`agent_verdict`].
+/// box whose head it cuts), `cursor` the terminal's cursor on them. Callers
+/// go through [`agent_verdict`].
 ///
-/// A reading that is not [`aterm_phase::Reading::phase_authoritative`] is
+/// A reading that is not [`aterm_phase::Reading::phase_authoritative`] — read
+/// with the cursor ([`aterm_phase::ScreenReader::read_at`]: Claude Code's
+/// `idle` only at the prompt box that holds it) — is
 /// [`AgentPhase::Unknown`], whatever its default phase. A wall
 /// ([`aterm_phase::Reading::wall`], which the reader leaves `None` under a
 /// box, and under a hard busy keeps only Claude Code's critical-memory
@@ -474,11 +519,16 @@ fn unreadable_verdict(
 pub(crate) fn classify(
     reader: &dyn aterm_phase::ScreenReader,
     rows: &[String],
+    cursor: Cursor,
     now: Instant,
 ) -> (AgentReading, Option<String>) {
     #[cfg(test)]
     CLASSIFIER_CALLS.with(|c| c.set(c.get() + 1));
-    let r = reader.read(rows, None);
+    let r = match cursor {
+        Cursor::At(row) => reader.read_at(rows, row, None),
+        #[cfg(test)]
+        Cursor::Unknown => reader.read(rows, None),
+    };
     let wall = |kind: aterm_phase::WallKind, reset: Option<String>| {
         let until = reset
             .as_deref()
@@ -762,6 +812,12 @@ pub(crate) struct TurnFact {
 pub(crate) struct Facts {
     pub(crate) role: Option<String>,
     pub(crate) attention: Option<String>,
+    /// `attention` is told ELSEWHERE, in full (ruling 270, "one place tells
+    /// it"): its only owner is the agent upgrade, whose stall is the message
+    /// band's row and the log's record. The level, `status why=`, the tab
+    /// chip and the rim still read `attention`; only the presence line's
+    /// phase slot does not repeat its words.
+    pub(crate) attention_told_elsewhere: bool,
     /// The shell status word (`running`, `idle`, `quiet`, …) and when it was
     /// published — the phase the band shows when no agent reading exists.
     pub(crate) shell: Option<(&'static str, Instant)>,
@@ -794,6 +850,7 @@ impl Default for Facts {
         Self {
             role: None,
             attention: None,
+            attention_told_elsewhere: false,
             shell: None,
             agent_seq: 0,
             agent: None,
@@ -963,6 +1020,8 @@ pub(crate) struct Slot {
     pub(crate) agent_seq_seen: Option<u64>,
     pub(crate) role: Option<String>,
     pub(crate) attention: Option<String>,
+    /// [`Facts::attention_told_elsewhere`].
+    pub(crate) attention_told_elsewhere: bool,
     pub(crate) shell: Option<(&'static str, Instant)>,
     pub(crate) agent: Option<AgentReading>,
     /// When the AGENT phase word last changed — the band's `since` for it.
@@ -1009,6 +1068,7 @@ impl Slot {
             agent_seq_seen: None,
             role: None,
             attention: None,
+            attention_told_elsewhere: false,
             shell: None,
             agent: None,
             agent_since: now,
@@ -1079,6 +1139,10 @@ impl Slot {
         }
         if self.attention != facts.attention {
             self.attention = facts.attention;
+            changed = true;
+        }
+        if self.attention_told_elsewhere != facts.attention_told_elsewhere {
+            self.attention_told_elsewhere = facts.attention_told_elsewhere;
             changed = true;
         }
         if self.shell.map(|s| s.0) != facts.shell.map(|s| s.0) {
@@ -1177,8 +1241,44 @@ impl Slot {
         changed
     }
 
-    /// The severity this slot stands at (the rim and the chip follow it).
+    /// The tab chip's mark: a hollow diamond to wait, a filled one at a stop
+    /// (with why it stopped, which the hover names), a dot for a story.
+    pub(crate) fn chip(&self, watermark: u64) -> ChipLevel {
+        match self.level(watermark) {
+            Level::Quiet | Level::Note | Level::Driving | Level::Driven => ChipLevel::Off,
+            Level::Story => ChipLevel::Story,
+            Level::Attention => ChipLevel::Wait,
+            Level::Hold => ChipLevel::Stop(StopCause::Hold),
+            // `level` ranks a stall ahead of a wall, and so does this.
+            Level::Limited => ChipLevel::Stop(match &self.input_stall {
+                Some(stall) if stall.stopped => StopCause::Suspended,
+                Some(_) => StopCause::Frozen,
+                None => StopCause::Wall,
+            }),
+        }
+    }
+
+    /// The severity this slot stands at (`status level=`, `why=` and the
+    /// tab chip follow it).
     pub(crate) fn level(&self, watermark: u64) -> Level {
+        self.level_counting(watermark, true)
+    }
+
+    /// The level the window's OWN chrome shows — the rim and the band row's
+    /// existence: [`Self::level`], except that an attention another place
+    /// already tells ([`Facts::attention_told_elsewhere`]: a stalled agent
+    /// upgrade, whose row and record are the message band's) is not counted.
+    /// Round 18, day four (D1): a Claude stall raised an EMPTY presence line
+    /// (`— quiet 8s — ✉0 ·`) and an orange rim beside its band row, because
+    /// the level stood at attention while the line had no words for it — a
+    /// colour with no words, which [`Level::rim`]'s own rule forbids. The
+    /// fact stays where it is read on purpose: `status level=attention
+    /// why=escalation` and the tab's wait mark.
+    pub(crate) fn shown_level(&self, watermark: u64) -> Level {
+        self.level_counting(watermark, !self.attention_told_elsewhere)
+    }
+
+    fn level_counting(&self, watermark: u64, attention: bool) -> Level {
         if self.hold.is_some() {
             return Level::Hold;
         }
@@ -1193,7 +1293,7 @@ impl Slot {
         ) {
             return Level::Limited;
         }
-        if self.attention.is_some()
+        if (attention && self.attention.is_some())
             || matches!(
                 self.agent.as_ref().map(|a| &a.phase),
                 Some(AgentPhase::Prompt { .. } | AgentPhase::Question)
@@ -1282,9 +1382,12 @@ impl Slot {
     }
 
     /// The tone the band paints in: Warn while a human should look, Success for
-    /// [`SETTLED_GLOW`] after a settled turn, else Info.
+    /// [`SETTLED_GLOW`] after a settled turn, else Info. It follows the level
+    /// the row is SHOWN at ([`Self::shown_level`], ruling 280): an attention
+    /// the message band already tells painted the row Warn with no words
+    /// for it.
     pub(crate) fn tone(&self, now: Instant, watermark: u64) -> Tone {
-        if self.level(watermark) >= Level::Attention {
+        if self.shown_level(watermark) >= Level::Attention {
             return Tone::Warn;
         }
         if self
@@ -1348,17 +1451,6 @@ impl Level {
             Self::Attention => Rim::Wait,
             Self::Limited => Rim::Stop { hold: false },
             Self::Hold => Rim::Stop { hold: true },
-        }
-    }
-
-    /// The tab chip's mark: a hollow diamond to wait, a filled one at a stop, a
-    /// dot for a story.
-    pub(crate) const fn chip(self) -> ChipLevel {
-        match self {
-            Self::Quiet | Self::Note | Self::Driving | Self::Driven => ChipLevel::Off,
-            Self::Story => ChipLevel::Story,
-            Self::Attention => ChipLevel::Wait,
-            Self::Limited | Self::Hold => ChipLevel::Stop,
         }
     }
 
@@ -1437,7 +1529,22 @@ pub(crate) enum ChipLevel {
     Off,
     Story,
     Wait,
-    Stop,
+    Stop(StopCause),
+}
+
+/// Why a chip stands at a stop: what decides the remedy (lift a hold, restart
+/// or resume the program, see the agent's wall). Ascending as
+/// [`Slot::level`] ranks them, so a tab's `max` over its panes keeps a hold.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) enum StopCause {
+    /// An agent at a wall ([`AgentPhase::Wall`]).
+    Wall,
+    /// The program has stopped reading its input.
+    Frozen,
+    /// The foreground job is stopped with input queued.
+    Suspended,
+    /// A hold.
+    Hold,
 }
 
 impl ChipLevel {
@@ -1447,7 +1554,7 @@ impl ChipLevel {
             Self::Off => &[],
             Self::Story => &["story"],
             Self::Wait => &["attention"],
-            Self::Stop => &["attention", "stop"],
+            Self::Stop(_) => &["attention", "stop"],
         }
     }
 
@@ -1458,7 +1565,10 @@ impl ChipLevel {
             Self::Off => None,
             Self::Story => Some("Something happened while you were away"),
             Self::Wait => Some("Needs attention"),
-            Self::Stop => Some("Stopped — held or at a limit"),
+            Self::Stop(StopCause::Hold) => Some("Held"),
+            Self::Stop(StopCause::Frozen) => Some("Frozen, not reading input"),
+            Self::Stop(StopCause::Suspended) => Some("Stopped with input queued"),
+            Self::Stop(StopCause::Wall) => Some("Agent can't continue"),
         }
     }
 }
@@ -1799,7 +1909,9 @@ pub(crate) fn trust_glyph(trust: &str) -> char {
 /// watermark is `watermark`. Pure; allocates (it is called on CHANGE, never per
 /// frame).
 pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
-    let level = slot.level(watermark);
+    // The row's words follow the level it is shown at (ruling 280): an
+    // attention another place tells must not hide the story under it.
+    let level = slot.shown_level(watermark);
     let tone = slot.tone(now, watermark);
     let role = slot
         .role
@@ -1827,7 +1939,11 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
         (format!("{glyph} {word}"), since, spoken)
     } else if let Some(fact) = &slot.input_stall {
         crate::input_stall::band_phase(fact, now)
-    } else if let Some(text) = &slot.attention {
+    } else if let Some(text) = slot
+        .attention
+        .as_ref()
+        .filter(|_| !slot.attention_told_elsewhere)
+    {
         let t = sanitize_token(text, 48);
         (t.clone(), Vec::new(), format!("attention, {t}"))
     } else if level == Level::Story {
@@ -2344,6 +2460,118 @@ mod tests {
         }
     }
 
+    /// RULING 270, "ONE PLACE TELLS IT": an attention whose only owner is
+    /// the agent upgrade is still a FACT — `level=attention`, `why=escalation`,
+    /// the tab chip's wait mark and the rim all keep it, so the stall shows at
+    /// the top after its band row folds — but the presence line's phase slot
+    /// does not repeat words the message band already says. NEGATIVE CONTROL:
+    /// the same text from any other owner reads on the line.
+    #[test]
+    fn an_upgrade_only_attention_keeps_its_level_and_chip_but_not_its_words() {
+        let now = t0();
+        let text = "Codex 0.157.0 \u{2192} 0.157.1 stalled";
+        let mut s = Slot::new(now);
+        s.absorb(
+            Facts {
+                attention: Some(text.into()),
+                attention_told_elsewhere: true,
+                ..Facts::default()
+            },
+            now,
+        );
+        assert_eq!(s.level(0), Level::Attention);
+        assert_eq!(s.why(0), "escalation");
+        assert_eq!(s.chip(0), ChipLevel::Wait);
+        // Round 18 (D1): the window's own chrome shows nothing for it — no
+        // rim and no presence row, since the line has no words to say.
+        assert_eq!(s.shown_level(0), Level::Quiet);
+        assert_eq!(s.shown_level(0).rim(), Rim::None);
+        assert!(!s.shown_level(0).shows_row());
+        assert!(!s.calm(), "the stall is not folded by a keystroke");
+        let w = words(&s, now, 0);
+        assert!(
+            !w.phase.contains("Codex") && !w.sentence.contains("Codex"),
+            "the line repeats the band's words: {:?} / {:?}",
+            w.phase,
+            w.sentence
+        );
+        // NEGATIVE CONTROL: another owner's attention is the line's phase.
+        let mut other = Slot::new(now);
+        other.absorb(
+            Facts {
+                attention: Some(text.into()),
+                ..Facts::default()
+            },
+            now,
+        );
+        assert_eq!(other.level(0), Level::Attention);
+        assert_eq!(other.shown_level(0), Level::Attention);
+        assert_eq!(other.shown_level(0).rim(), Rim::Wait);
+        assert!(words(&other, now, 0).phase.contains("Codex"));
+        // The flag moving alone is a change the view must re-read.
+        assert!(other.absorb(
+            Facts {
+                attention: Some(text.into()),
+                attention_told_elsewhere: true,
+                ..Facts::default()
+            },
+            now,
+        ));
+        assert!(!words(&other, now, 0).phase.contains("Codex"));
+    }
+
+    /// AN ATTENTION TOLD ELSEWHERE NEVER TAKES THE ROW'S WORDS OR COLOUR
+    /// (ruling 280): with a Claude upgrade stall standing (its row and record
+    /// are the band's) and a story since the watermark, the row is shown at
+    /// the story's level — and its words are the story's summary, its tone
+    /// not Warn. Before 280 the row was shown but `words` and `tone` read the
+    /// full level: no summary, painted Warn — a colour with no words.
+    /// NEGATIVE CONTROL: the same story beside another owner's attention is
+    /// that attention's words, in Warn.
+    #[test]
+    fn a_story_beside_an_attention_told_elsewhere_keeps_its_words_and_tone() {
+        let now = t0();
+        let text = "Claude 2.1.281 \u{2192} 2.1.282 stalled";
+        let slot = |elsewhere: bool| {
+            let mut s = Slot::new(now);
+            for (id, at) in [(1, 5), (2, 70)] {
+                s.absorb(
+                    Facts {
+                        turn: Some(TurnFact {
+                            id,
+                            settled: true,
+                            dur_ms: 10,
+                            carried: false,
+                        }),
+                        attention: Some(text.into()),
+                        attention_told_elsewhere: elsewhere,
+                        ..Facts::default()
+                    },
+                    now + Duration::from_secs(at),
+                );
+            }
+            s
+        };
+        let later = now + Duration::from_secs(130);
+        let s = slot(true);
+        assert_eq!(s.level(0), Level::Attention, "the fact stands");
+        assert_eq!(s.shown_level(0), Level::Story);
+        let w = words(&s, later, 0);
+        assert!(
+            w.since.iter().any(|c| c.ends_with("turns")),
+            "the story's summary: {:?}",
+            w.since
+        );
+        assert_ne!(w.tone, Tone::Warn);
+        assert_ne!(s.tone(later, 0), Tone::Warn);
+
+        let other = slot(false);
+        assert_eq!(other.shown_level(0), Level::Attention);
+        let w = words(&other, later, 0);
+        assert!(w.phase.contains("stalled"), "{:?}", w.phase);
+        assert_eq!(w.tone, Tone::Warn);
+    }
+
     /// Severity: hold > limited > attention > driven > story > quiet, and the
     /// rim follows the level exactly — a colour with no words is unreachable.
     #[test]
@@ -2398,6 +2626,7 @@ mod tests {
         );
         assert_eq!(s.level(0), Level::Limited);
         assert_eq!(s.level(0).rim(), Rim::Stop { hold: false });
+        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Wall));
         s.absorb(
             Facts {
                 hold: Some(HoldFact {
@@ -2489,6 +2718,7 @@ mod tests {
         assert!(s.absorb(facts(Some(fact.clone())), now));
         assert_eq!(s.level(0), Level::Limited);
         assert_eq!(s.level(0).rim(), Rim::Stop { hold: false });
+        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Frozen));
         assert!(!s.calm());
         assert_eq!(s.why(0), "-");
         let later = now + Duration::from_secs(123);
@@ -2529,6 +2759,7 @@ mod tests {
             w.sentence
         );
         assert_eq!(s.level(0), Level::Limited);
+        assert_eq!(s.chip(0), ChipLevel::Stop(StopCause::Suspended));
         // NEGATIVE CONTROL: the stall clears — the box's attention is back.
         assert!(s.absorb(facts(None), later));
         assert_eq!(s.level(0), Level::Attention);
@@ -2637,7 +2868,7 @@ mod tests {
             now + Duration::from_secs(70),
         );
         assert_eq!(s.level(0), Level::Story);
-        assert_eq!(s.level(0).chip(), ChipLevel::Story);
+        assert_eq!(s.chip(0), ChipLevel::Story);
         let w = words(&s, now + Duration::from_secs(130), 0);
         assert_eq!(w.phase, "\u{25c7} quiet");
         assert_eq!(
@@ -2833,17 +3064,23 @@ mod tests {
         assert!(v.ripple_deadline(now).is_some());
     }
 
-    /// The classifier is `aterm-phase`'s Claude reader, word for word, and its
-    /// count moves once per call (the gate test in `session_status` compares
-    /// it with screen changes). The screens are judged by `aterm_phase`
-    /// itself, so the mapping — not the composer geometry — is what this pins.
+    /// The classifier is `aterm-phase`'s Claude reader, word for word — a
+    /// reading that is not evidence ([`aterm_phase::Reading::
+    /// phase_authoritative`]: Claude Code's idle with no composer drawn) is
+    /// `unknown` — and its count moves once per call (the gate test in
+    /// `session_status` compares it with screen changes). The screens are
+    /// judged by `aterm_phase` itself, so the mapping — not the composer
+    /// geometry — is what this pins.
     #[test]
     fn classify_is_aterm_phases_verdict_and_counts_once_per_call() {
         let before = classifier_calls();
         let rows = |body: &[&str]| body.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let mut done_at_composer = rows(&["\u{23fa} Done.", ""]);
+        done_at_composer.extend(aterm_phase::prompt::fixtures::composer("  ? for shortcuts"));
         let screens = [
             rows(&["\u{23fa} Which do you prefer?", ""]),
             rows(&["\u{23fa} Done.", ""]),
+            done_at_composer,
             rows(&[
                 "\u{23fa} Running the tests.",
                 "",
@@ -2851,12 +3088,29 @@ mod tests {
             ]),
             rows(&[]),
         ];
+        let mut words = Vec::new();
         for screen in &screens {
             let verdict = aterm_phase::read(Some("claude"), screen, None);
-            let (ours, _) = classify(&aterm_phase::ClaudeReader, screen, Instant::now());
-            assert_eq!(ours.phase.word(), verdict.phase.name(), "{screen:?}");
+            let (ours, _) = classify(
+                &aterm_phase::ClaudeReader,
+                screen,
+                Cursor::Unknown,
+                Instant::now(),
+            );
+            let want = if verdict.phase_authoritative {
+                verdict.phase.name()
+            } else {
+                "unknown"
+            };
+            assert_eq!(ours.phase.word(), want, "{screen:?}");
             assert_eq!(ours.context_pct, verdict.context_left);
+            words.push(ours.phase.word());
         }
+        assert_eq!(
+            words,
+            ["question", "unknown", "idle", "busy", "unknown"],
+            "both halves of the mapping are exercised"
+        );
         assert_eq!(classifier_calls() - before, screens.len() as u64);
         // The never-shown law at the classifier's own edge: a limit notice
         // keeps only its kind and its reset, never its message.
@@ -2866,6 +3120,7 @@ mod tests {
                 "\u{23fa} You've hit your weekly limit \u{00b7} resets Sep 19 at 11am (America/Los_Angeles)",
                 "",
             ]),
+            Cursor::Unknown,
             Instant::now(),
         );
         if let AgentPhase::Wall { reset, .. } = &limited.phase {
@@ -2939,8 +3194,16 @@ mod tests {
             let v = fenced_verdict(9_001, program, pending, known, &rows, boom);
             assert_eq!(v, AgentVerdict::NotAgent, "{program:?} {pending} {known:?}");
         }
-        let guarded = agent_verdict_guarded(9_001, Some("claude"), false, None, &rows, t0());
-        let plain = agent_verdict(Some("claude"), false, None, &rows, t0());
+        let guarded = agent_verdict_guarded(
+            9_001,
+            Some("claude"),
+            false,
+            None,
+            &rows,
+            Cursor::Unknown,
+            t0(),
+        );
+        let plain = agent_verdict(Some("claude"), false, None, &rows, Cursor::Unknown, t0());
         assert_eq!(guarded, plain);
         assert_eq!(guarded.word(), "prompt");
         assert!(guarded.subject().is_some());
@@ -3030,17 +3293,250 @@ mod tests {
             ("quoted 529", quoted, "idle"),
         ];
         for (name, rows, want) in &cases {
-            let v = agent_verdict(Some("claude"), false, None, rows, t0());
+            let v = agent_verdict(Some("claude"), false, None, rows, Cursor::Unknown, t0());
             assert_eq!(v.word(), *want, "{name}");
-            let shell = agent_verdict(Some("zsh"), false, None, rows, t0());
+            let shell = agent_verdict(Some("zsh"), false, None, rows, Cursor::Unknown, t0());
             assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
         }
         // The detail is the reset the notice named, nothing of its text.
-        let session = agent_verdict(Some("claude"), false, None, &cases[1].1, t0());
+        let session = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &cases[1].1,
+            Cursor::Unknown,
+            t0(),
+        );
         assert_eq!(
             session.detail().as_deref(),
             Some("3pm (America/Los_Angeles)")
         );
+    }
+
+    /// THE SERVER PUBLISHES CLAUDE CODE IDLE ONLY AT ITS COMPOSER (the live
+    /// e2e of 2026-09-26, NEW-1: `agent=idle` went out 72-248 ms after the
+    /// harness pressed the folder-trust dialog, `await agent idle` returned,
+    /// and the first prompt sent then was lost or left unsent). The screens
+    /// Claude Code 2.1.283 showed between its launch and its REPL (measured
+    /// frame by frame: the shell's rows with the dialog erased, then the
+    /// alternate screen half drawn) publish `unknown` — an agent whose
+    /// screen is no evidence, never acted on as idle — and the REPL drawn
+    /// whole publishes `idle` (the control), in shell mode too (`!` typed
+    /// into the empty prompt box: its caret `!`, the REPL up and taking keys
+    /// — `idle`, as every build before this rule published it). The dialog
+    /// itself is still a prompt, and the same rows under a shell are no
+    /// agent.
+    #[test]
+    fn claude_code_is_published_idle_only_at_its_composer() {
+        use aterm_phase::prompt::fixtures::{
+            LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN, LAUNCH_REPL_READY, SHELL_MODE,
+            SHELL_MODE_DRAFT, TRUST, screen,
+        };
+        for (name, text) in [
+            ("before the REPL", LAUNCH_BEFORE_REPL),
+            ("the REPL half drawn", LAUNCH_REPL_HALF_DRAWN),
+        ] {
+            let v = agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &screen(text),
+                Cursor::Unknown,
+                t0(),
+            );
+            assert_eq!(v.word(), "unknown", "{name}: {v:?}");
+            assert_eq!(v.program(), Some(aterm_phase::Program::Claude), "{name}");
+            let shell = agent_verdict(
+                Some("zsh"),
+                false,
+                None,
+                &screen(text),
+                Cursor::Unknown,
+                t0(),
+            );
+            assert_eq!(shell.word(), "-", "{name}: a shell is never an agent");
+        }
+        let ready = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(LAUNCH_REPL_READY),
+            Cursor::Unknown,
+            t0(),
+        );
+        assert_eq!(ready.word(), "idle", "the control: {ready:?}");
+        for (name, text) in [
+            ("shell mode", SHELL_MODE),
+            ("shell mode, a command typed", SHELL_MODE_DRAFT),
+        ] {
+            let v = agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &screen(text),
+                Cursor::Unknown,
+                t0(),
+            );
+            assert_eq!(v.word(), "idle", "{name}: {v:?}");
+        }
+        let dialog = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(TRUST),
+            Cursor::Unknown,
+            t0(),
+        );
+        assert_eq!(
+            (dialog.word(), dialog.detail().as_deref()),
+            ("prompt", Some("trust"))
+        );
+    }
+
+    /// CLAUDE CODE'S INLINE REPL IS PUBLISHED IDLE WHERE IT IS DRAWN (the
+    /// review of 2026-09-26): its inline renderer drew the REPL at the top of
+    /// a 150x50 pane, blank rows below it, and the server read the grid's
+    /// last 40 rows — the prompt box's bottom rule and footer, never its
+    /// caret — so `agent=` stayed `unknown` and `await agent idle` timed out
+    /// (measured on 2.1.283, 8 of 8 launches). The verdict reads the last 40
+    /// DRAWN rows ([`live_zone`]): the REPL is `idle` at 50 rows and in any
+    /// taller pane, and under `node` (identified by its frame, which the old
+    /// cut never showed it). The inline launch's other frames keep their
+    /// words: the dialog is `prompt trust`, the half-drawn REPL and the
+    /// shell's rows `unknown`; the same rows under a shell are no agent. The
+    /// fullscreen REPL, drawn to its last row, is `idle` as it was.
+    #[test]
+    fn an_inline_repl_at_the_top_of_a_tall_pane_is_published_idle() {
+        use aterm_phase::prompt::fixtures::{
+            INLINE_REPL_HALF_DRAWN, INLINE_REPL_READY, INLINE_TRUST, LAUNCH_BEFORE_REPL,
+            LAUNCH_REPL_READY, screen,
+        };
+        let pad = |text: &str, rows: usize| {
+            let mut r = screen(text);
+            r.resize(rows.max(r.len()), String::new());
+            r
+        };
+        for rows in [50, 51, 80, 200] {
+            let ready = pad(INLINE_REPL_READY, rows);
+            for program in ["claude", "node"] {
+                let v = agent_verdict(Some(program), false, None, &ready, Cursor::Unknown, t0());
+                assert_eq!(v.word(), "idle", "{program} at {rows} rows: {v:?}");
+                assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+            }
+            let shell = agent_verdict(Some("zsh"), false, None, &ready, Cursor::Unknown, t0());
+            assert_eq!(shell.word(), "-", "a shell is never an agent");
+            let dialog = agent_verdict(
+                Some("claude"),
+                false,
+                None,
+                &pad(INLINE_TRUST, rows),
+                Cursor::Unknown,
+                t0(),
+            );
+            assert_eq!(
+                (dialog.word(), dialog.detail().as_deref()),
+                ("prompt", Some("trust")),
+                "{rows} rows"
+            );
+            for (name, text) in [
+                ("the REPL half drawn", INLINE_REPL_HALF_DRAWN),
+                ("the shell's rows", LAUNCH_BEFORE_REPL),
+            ] {
+                let v = agent_verdict(
+                    Some("claude"),
+                    false,
+                    None,
+                    &pad(text, rows),
+                    Cursor::Unknown,
+                    t0(),
+                );
+                assert_eq!(v.word(), "unknown", "{name} at {rows} rows: {v:?}");
+            }
+        }
+        let full = screen(LAUNCH_REPL_READY);
+        assert_eq!(full.len(), 50);
+        let v = agent_verdict(Some("claude"), false, None, &full, Cursor::Unknown, t0());
+        assert_eq!(v.word(), "idle", "the fullscreen REPL: {v:?}");
+    }
+
+    /// CLAUDE CODE IS PUBLISHED IDLE AT THE PROMPT BOX THAT HOLDS THE CURSOR
+    /// (the review of 2026-09-26): its inline renderer relaunched in the SAME
+    /// tab leaves the previous run's prompt box on the main grid above the
+    /// new launch line, and the server — reading the box by its frame alone
+    /// — published `agent=idle` from it 187-352 ms before the new REPL was
+    /// drawn; a draft typed on `await agent idle` was lost 3 of 3 (RED: the
+    /// first assertion, the cursor not given). The sweep reads the verdict
+    /// with the terminal's cursor, measured under the new launch line there:
+    /// `unknown`, in the measured 50-row pane and padded to 80 rows. The
+    /// relaunch's other frames keep their words with their measured cursors:
+    /// the dialog `prompt trust`, the new REPL half drawn `unknown`, whole
+    /// `idle`. NEGATIVE CONTROLS: the whole new REPL with the cursor moved
+    /// one row under its box, or into the OLD box's rows, is not idle the
+    /// first way and is idle the second (a box holds its rows: the cursor is
+    /// what Claude Code keeps in the box that is running); the cursor on no
+    /// row read is not idle.
+    #[test]
+    fn a_relaunched_inline_repl_is_published_idle_only_at_the_box_that_holds_the_cursor() {
+        use aterm_phase::prompt::fixtures::{
+            INLINE_RELAUNCH_BEFORE_REPL, INLINE_RELAUNCH_REPL_HALF_DRAWN,
+            INLINE_RELAUNCH_REPL_READY, INLINE_RELAUNCH_TRUST, cursor, screen,
+        };
+        let at = |text: &str| Cursor::At(cursor(text).map(|(row, _)| row));
+        let stale = screen(INLINE_RELAUNCH_BEFORE_REPL);
+        let v = agent_verdict(Some("claude"), false, None, &stale, Cursor::Unknown, t0());
+        assert_eq!(v.word(), "idle", "RED: the old box by its frame alone");
+        for rows in [50, 80] {
+            let pad = |text: &str| {
+                let mut r = screen(text);
+                r.resize(rows, String::new());
+                r
+            };
+            for (name, text, word, detail) in [
+                (
+                    "before the new REPL",
+                    INLINE_RELAUNCH_BEFORE_REPL,
+                    "unknown",
+                    None,
+                ),
+                ("the dialog", INLINE_RELAUNCH_TRUST, "prompt", Some("trust")),
+                (
+                    "the new REPL half drawn",
+                    INLINE_RELAUNCH_REPL_HALF_DRAWN,
+                    "unknown",
+                    None,
+                ),
+                ("the new REPL", INLINE_RELAUNCH_REPL_READY, "idle", None),
+            ] {
+                let v = agent_verdict(Some("claude"), false, None, &pad(text), at(text), t0());
+                assert_eq!(
+                    (v.word(), v.detail().as_deref()),
+                    (word, detail),
+                    "{name} at {rows} rows: {v:?}"
+                );
+                assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
+            }
+        }
+        // NEGATIVE CONTROLS on the whole new REPL.
+        let ready = screen(INLINE_RELAUNCH_REPL_READY);
+        let (caret, _) = cursor(INLINE_RELAUNCH_REPL_READY).expect("measured");
+        let bottom = (caret..ready.len())
+            .find(|&i| ready[i].starts_with('─'))
+            .expect("the new bottom rule");
+        let old_caret = ready
+            .iter()
+            .position(|r| r.starts_with('❯'))
+            .expect("the old caret");
+        assert!(old_caret < caret, "the old box is above the new one");
+        for (name, cursor, word) in [
+            ("on the new caret", Cursor::At(Some(caret)), "idle"),
+            ("on the new bottom rule", Cursor::At(Some(bottom)), "idle"),
+            ("under the new box", Cursor::At(Some(bottom + 1)), "unknown"),
+            ("on no row read", Cursor::At(None), "unknown"),
+            ("in the old box", Cursor::At(Some(old_caret)), "idle"),
+        ] {
+            let v = agent_verdict(Some("claude"), false, None, &ready, cursor, t0());
+            assert_eq!(v.word(), word, "the cursor {name}: {v:?}");
+        }
     }
 
     /// Claude Code's critical-memory banner under a RUNNING spinner (the
@@ -3073,7 +3569,7 @@ mod tests {
         };
         // Right-aligned, ending two columns short of the 120-column rule.
         let live = screen(&format!("{banner:>118}"), "");
-        let v = agent_verdict(Some("claude"), false, None, &live, t0());
+        let v = agent_verdict(Some("claude"), false, None, &live, Cursor::Unknown, t0());
         assert_eq!(v.word(), "wall:memory");
         assert_eq!(v.detail(), None);
         match &v {
@@ -3085,12 +3581,12 @@ mod tests {
         assert!(!aterm_phase::WallKind::Memory.reads_limited());
         let quoted = screen("", &banner);
         assert_eq!(
-            agent_verdict(Some("claude"), false, None, &quoted, t0()).word(),
+            agent_verdict(Some("claude"), false, None, &quoted, Cursor::Unknown, t0()).word(),
             "busy",
             "the draft's quote"
         );
         assert_eq!(
-            agent_verdict(Some("zsh"), false, None, &live, t0()).word(),
+            agent_verdict(Some("zsh"), false, None, &live, Cursor::Unknown, t0()).word(),
             "-"
         );
     }
@@ -3102,14 +3598,21 @@ mod tests {
     fn a_reading_without_evidence_is_unknown_not_idle() {
         use aterm_phase::prompt::fixtures::{CODEX_TRUST, screen};
         let idle = screen("\u{203a} ready\n\n  gpt-5 \u{00b7} 100% context left\n");
-        match agent_verdict(Some("codex"), false, None, &idle, t0()) {
+        match agent_verdict(Some("codex"), false, None, &idle, Cursor::Unknown, t0()) {
             AgentVerdict::Agent { reading, .. } => {
                 assert_eq!(reading.phase, AgentPhase::Unknown);
                 assert_eq!(reading.phase.word(), "unknown");
             }
             AgentVerdict::NotAgent => panic!("codex is an agent by name"),
         }
-        let gate = agent_verdict(Some("codex"), false, None, &screen(CODEX_TRUST), t0());
+        let gate = agent_verdict(
+            Some("codex"),
+            false,
+            None,
+            &screen(CODEX_TRUST),
+            Cursor::Unknown,
+            t0(),
+        );
         assert_eq!(gate.word(), "prompt");
     }
 
@@ -3118,12 +3621,26 @@ mod tests {
     #[test]
     fn the_prompt_subject_comes_from_the_reading() {
         use aterm_phase::prompt::fixtures::{BOX_RM, END_529, screen};
-        let rm = agent_verdict(Some("claude"), false, None, &screen(BOX_RM), t0());
+        let rm = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(BOX_RM),
+            Cursor::Unknown,
+            t0(),
+        );
         assert_eq!(rm.word(), "prompt");
         let subject = rm.subject().expect("the rm box names its command");
         assert!(subject.contains("rm"), "{subject}");
         assert!(!subject.contains('\n'));
-        let wall = agent_verdict(Some("claude"), false, None, &screen(END_529), t0());
+        let wall = agent_verdict(
+            Some("claude"),
+            false,
+            None,
+            &screen(END_529),
+            Cursor::Unknown,
+            t0(),
+        );
         assert_eq!(wall.subject(), None);
     }
 
@@ -3139,10 +3656,18 @@ mod tests {
     /// the top of the pane, likewise (its command the subject, clipped). NEGATIVE
     /// CONTROLS: an idle Claude composer at the top of the same pane, blank
     /// rows under it, stays idle; and a screen whose last row has content
-    /// keeps its last 40 rows as its zone, unchanged.
+    /// keeps its last 40 rows as its zone, unchanged. Each screen is read with
+    /// the cursor where Claude Code parks it ([`Cursor`]): on the focused
+    /// option of a box (the measured row 17 of the dialog), on the caret row
+    /// of its prompt box.
     #[test]
     fn a_box_above_the_last_rows_of_a_mostly_blank_pane_is_classified() {
         use aterm_phase::prompt::fixtures::{self as f, composer, screen};
+        let on = |rows: &[String], row: fn(&str) -> bool| {
+            Cursor::At(Some(
+                rows.iter().position(|r| row(r)).expect("the cursor's row"),
+            ))
+        };
         let blank_foot = |rows: &[String]| {
             rows[rows.len() - CLASSIFY_ROWS..]
                 .iter()
@@ -3159,8 +3684,10 @@ mod tests {
             &trust[..],
             "21 rows of content: all of it"
         );
+        let focus = on(&trust, |r| r == " ❯ No, exit");
+        assert_eq!(focus, Cursor::At(Some(17)), "the measured cursor");
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &trust, t0());
+            let v = agent_verdict(program, false, None, &trust, focus, t0());
             assert_eq!(v.word(), "prompt", "{program:?}");
             assert_eq!(v.detail().as_deref(), Some("trust"), "{program:?}");
             assert_eq!(v.program(), Some(aterm_phase::Program::Claude));
@@ -3171,8 +3698,9 @@ mod tests {
         boxed.extend_from_slice(&live[22..=40]);
         boxed.resize(62, String::new());
         assert!(blank_foot(&boxed));
+        let focus = on(&boxed, |r| r == " ❯ 1. Yes");
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &boxed, t0());
+            let v = agent_verdict(program, false, None, &boxed, focus, t0());
             assert_eq!(v.word(), "prompt", "{program:?}");
             assert_eq!(
                 v.detail().as_deref(),
@@ -3196,8 +3724,9 @@ mod tests {
         idle.extend(composer("  ? for shortcuts"));
         idle.resize(62, String::new());
         assert!(blank_foot(&idle));
+        let caret = on(&idle, |r| r.starts_with('❯'));
         for program in [Some("claude"), None] {
-            let v = agent_verdict(program, false, None, &idle, t0());
+            let v = agent_verdict(program, false, None, &idle, caret, t0());
             assert_eq!(v.word(), "idle", "{program:?}");
         }
 
@@ -3431,7 +3960,10 @@ mod tests {
     }
 
     fn detail_of(rows: &[String]) -> Option<String> {
-        match classify(&aterm_phase::ClaudeReader, rows, t0()).0.phase {
+        match classify(&aterm_phase::ClaudeReader, rows, Cursor::Unknown, t0())
+            .0
+            .phase
+        {
             AgentPhase::Prompt { detail } => detail,
             other => panic!("not a prompt: {other:?}"),
         }
@@ -3510,7 +4042,14 @@ mod tests {
         use aterm_phase::Program;
         use aterm_phase::codex::fixtures as cx;
         use aterm_phase::prompt::fixtures::screen;
-        match agent_verdict(Some("node"), false, None, &screen(cx::IDLE), t0()) {
+        match agent_verdict(
+            Some("node"),
+            false,
+            None,
+            &screen(cx::IDLE),
+            Cursor::Unknown,
+            t0(),
+        ) {
             AgentVerdict::Agent {
                 by_frame, program, ..
             } => assert!(by_frame && program == Program::Codex, "{program:?}"),
@@ -3519,12 +4058,19 @@ mod tests {
         let draft = screen(cx::DRAFT);
         assert!(
             matches!(
-                agent_verdict(Some("node"), false, None, &draft, t0()),
+                agent_verdict(Some("node"), false, None, &draft, Cursor::Unknown, t0()),
                 AgentVerdict::NotAgent
             ),
             "NEGATIVE CONTROL: a draft alone names nothing"
         );
-        match agent_verdict(Some("node"), false, Some(Program::Codex), &draft, t0()) {
+        match agent_verdict(
+            Some("node"),
+            false,
+            Some(Program::Codex),
+            &draft,
+            Cursor::Unknown,
+            t0(),
+        ) {
             AgentVerdict::Agent { program, .. } => assert_eq!(program, Program::Codex),
             AgentVerdict::NotAgent => panic!("the job's identity is kept"),
         }
@@ -3545,7 +4091,7 @@ mod tests {
             for known in [None, Some(aterm_phase::Program::Claude)] {
                 assert!(
                     matches!(
-                        agent_verdict(Some(program), false, known, &rows, t0()),
+                        agent_verdict(Some(program), false, known, &rows, Cursor::Unknown, t0()),
                         AgentVerdict::NotAgent
                     ),
                     "{program} (known={known:?}) is not an agent"
@@ -3555,11 +4101,11 @@ mod tests {
         // A group whose name is still being resolved identifies nothing yet
         // (the shell's own group is re-named after every job).
         assert!(matches!(
-            agent_verdict(None, true, None, &rows, t0()),
+            agent_verdict(None, true, None, &rows, Cursor::Unknown, t0()),
             AgentVerdict::NotAgent
         ));
         for program in [None, Some("node")] {
-            match agent_verdict(program, false, None, &rows, t0()) {
+            match agent_verdict(program, false, None, &rows, Cursor::Unknown, t0()) {
                 AgentVerdict::Agent {
                     reading, by_frame, ..
                 } => {

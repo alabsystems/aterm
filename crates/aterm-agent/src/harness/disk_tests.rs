@@ -725,3 +725,76 @@ fn scan_reads_the_versions_dir_and_resolves_the_live_link() {
     }
     let _ = &versions;
 }
+
+// -- the automatic floor --------------------------------------------------------
+
+/// THE AUTOMATIC GRANT: below `auto_free_gib` the stale build directory goes
+/// — with `disk.apply` OFF, since the floor is its own grant — and nothing of
+/// another class does; at the floor, above it, or on an unknown free figure,
+/// nothing is planned and the remover is never called. Before the floor
+/// existed nothing removed anything until a person named a class (the
+/// 21.8 h full-disk stall of the harness audit).
+#[test]
+fn below_the_floor_the_stale_target_goes_and_nothing_else_does() {
+    let tmp = Tmp::new("auto-floor");
+    let dir = synthetic_target(&tmp, "target");
+    let now = now_after_write(DEFAULT_TARGET_STALE_DAYS + 1);
+    let config = Config::default();
+    assert!(!config.apply, "the floor does not need the verb's switch");
+    let survey_at = |free: Option<u64>| {
+        let mut survey = Survey::new(now);
+        survey.free_bytes = free;
+        survey
+            .targets
+            .push(scan_target(&dir, now, config.target_stale_days).expect("the target"));
+        // Another class's stale row, which the floor must never reach.
+        let versions = tmp.path().join("versions");
+        std::fs::create_dir_all(versions.join("2.1.1")).expect("old version");
+        survey.versions.push(VersionDir {
+            path: versions.join("2.1.1"),
+            bytes: 4096,
+            bytes_partial: false,
+        });
+        survey.live_version = Some(versions.join("2.1.2"));
+        survey
+    };
+
+    // At and above the floor, and unknown: nothing.
+    for free in [Some(DEFAULT_AUTO_FREE_GIB * GIB), Some(500 * GIB), None] {
+        let rep = report(&survey_at(free), config);
+        assert_eq!(auto_plan(&rep), None, "free={free:?}");
+        let mut called = false;
+        let done = apply_auto(&rep, None, &mut |_| {
+            called = true;
+            Ok(())
+        });
+        assert_eq!(done, None);
+        assert!(!called, "free={free:?}: the remover was called");
+    }
+    // Off: nothing, however low.
+    let off = Config {
+        auto_free_gib: 0,
+        ..config
+    };
+    assert_eq!(auto_plan(&report(&survey_at(Some(GIB)), off)), None);
+
+    // Below it: the stale target, and only it.
+    let rep = report(&survey_at(Some(GIB)), config);
+    let rows = auto_plan(&rep).expect("below the floor");
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].class, Class::CargoTargets);
+    assert!(
+        rep.rows
+            .iter()
+            .any(|r| r.class == Class::ClaudeStaleVersions && r.removable),
+        "the other class had a removable row the floor left alone: {rep:?}"
+    );
+    let done = apply_auto(&rep, None, &mut remove_tree).expect("applied");
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(done.denials.is_empty(), "{done:?}");
+    assert!(!dir.exists(), "the stale target is gone");
+    assert!(
+        tmp.path().join("versions/2.1.1").exists(),
+        "the other class's directory stayed"
+    );
+}

@@ -25,7 +25,7 @@
 //!
 //! Each test that kills a specific mutation says which one.
 
-use crate::{machines, manifest_out, mirror, publish, sign};
+use crate::{channel, machines, manifest_out, publish, sign};
 
 use std::path::{Path, PathBuf};
 
@@ -367,7 +367,7 @@ fn an_unattributed_cut_stages_byte_identical_manifest_bytes() {
 #[test]
 fn an_unattributed_release_carries_no_roster_assets() {
     assert_eq!(
-        mirror::required_asset_names("0.5.0", true, false),
+        channel::required_asset_names("0.5.0", true, false),
         vec![
             "aterm-0.5.0-mac.zip".to_string(),
             "aterm-0.5.0-mac.zip.sha256".to_string(),
@@ -383,48 +383,42 @@ fn an_unattributed_release_carries_no_roster_assets() {
         // WRONG BEFORE: "while the master is unpinned" — armed since 2026-08-15. What
         // keeps this set frozen is that the CUT is unattributed, which is what the
         // `rostered: false` argument above asks for.
-        "the mirrored set must not grow for an unattributed cut \
+        "the published set must not grow for an unattributed cut \
          (the stable download twins and their alias sidecars are \
           version-independent, not roster growth)"
     );
-    let manifest = manifest_out::build(&inputs("0.5.0", 500));
-    assert_eq!(manifest.machine_id, None, "precondition: unattributed");
-    let names = draft_names(&manifest, true, &[]);
-    publish::validate_draft_asset_set(&names, &manifest, true, PROVENANCE, None)
+    let names = channel::required_asset_names("0.5.0", true, false);
+    channel::validate_channel_asset_set(&names, "0.5.0", true, false, &[])
         .expect("today's exact set is accepted");
-    let smuggled = draft_names(&manifest, true, &["aterm-machines.toml"]);
-    let err = publish::validate_draft_asset_set(&smuggled, &manifest, true, PROVENANCE, None)
+    let mut smuggled = names;
+    smuggled.push("aterm-machines.toml".to_string());
+    let err = channel::validate_channel_asset_set(&smuggled, "0.5.0", true, false, &[])
         .expect_err("a roster on an unattributed release is not part of the exact set");
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
 }
 
 /// THE INTEL DMG PAIR IS RETIRED (2026-08-26). A manifest that still names
 /// `dmg_x86_64` was staged by a previous cutter under a container contract
-/// this one neither produces nor mirrors, so the draft gate refuses it BY
-/// NAME — before judging the asset set — rather than half-honouring a pair
-/// the exact set no longer carries. And a smuggled `-x86_64.dmg` under a
-/// manifest that (correctly) names none is a foreign object, as it always was.
+/// this one neither produces nor publishes, so every gate that reads a manifest
+/// refuses it BY NAME ([`publish::refuse_retired_intel_dmg`]) rather than
+/// half-honouring a pair the exact set no longer carries. And a smuggled
+/// `-x86_64.dmg` on a release is a foreign object, as it always was.
 #[test]
 fn a_manifest_naming_the_retired_intel_dmg_is_refused_and_a_smuggled_one_too() {
     let plain = manifest_out::build(&inputs("0.5.0", 500));
     assert_eq!(plain.dmg_x86_64, None, "this cutter never emits the pair");
     assert_eq!(plain.dmg_x86_64_sha256, None);
-    let smuggled = draft_names(&plain, true, &["aterm-0.5.0-x86_64.dmg"]);
-    let err = publish::validate_draft_asset_set(&smuggled, &plain, true, PROVENANCE, None)
+    let mut smuggled = channel::required_asset_names("0.5.0", true, false);
+    smuggled.push("aterm-0.5.0-x86_64.dmg".to_string());
+    let err = channel::validate_channel_asset_set(&smuggled, "0.5.0", true, false, &[])
         .expect_err("an Intel DMG the manifest never named must be refused");
     assert!(err.to_string().contains("x86_64"), "{err}");
 
     let mut named = manifest_out::build(&inputs("0.5.0", 500));
     named.dmg_x86_64 = Some("aterm-0.5.0-x86_64.dmg".to_string());
     named.dmg_x86_64_sha256 = Some("ab".repeat(32));
-    // Even a draft that DOES carry the pair is refused: the contract is gone.
-    let mut names = draft_names(&named, true, &[]);
-    names.push("aterm-0.5.0-x86_64.dmg".to_string());
-    names.push("aterm-0.5.0-x86_64.dmg.sha256".to_string());
-    let err = publish::validate_draft_asset_set(&names, &named, true, PROVENANCE, None)
+    let err = publish::refuse_retired_intel_dmg(&named)
         .expect_err("a manifest naming the retired pair is refused by name");
-    assert!(err.to_string().contains("retired"), "{err}");
-    let err = publish::refuse_retired_intel_dmg(&named).expect_err("same rule, directly");
     assert!(err.to_string().contains("aterm-0.5.0-x86_64.dmg"), "{err}");
     // A digest without a name is the same retired shape.
     let mut half = manifest_out::build(&inputs("0.5.0", 500));
@@ -748,8 +742,8 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         document.signature
     );
 
-    // The mirrored set the client elects grows by exactly those two names.
-    let names = mirror::required_asset_names("0.5.0", true, true);
+    // The published set the client elects grows by exactly those two names.
+    let names = channel::required_asset_names("0.5.0", true, true);
     assert!(
         names.contains(&"aterm-machines.toml".to_string()),
         "{names:?}"
@@ -758,36 +752,12 @@ fn an_armed_cut_stages_and_requires_both_roster_assets() {
         names.contains(&"aterm-machines.toml.sig".to_string()),
         "{names:?}"
     );
-    mirror::validate_mirror_asset_set_with_linux(&names, "0.5.0", true, true, &[])
-        .expect("the exact set");
-    // ...and a mirror that forgets the roster is refused rather than published: the
-    // armed client refuses such a head structurally, before any artifact crypto.
-    let forgotten = mirror::required_asset_names("0.5.0", true, false);
-    let err = mirror::validate_mirror_asset_set_with_linux(&forgotten, "0.5.0", true, true, &[])
+    channel::validate_channel_asset_set(&names, "0.5.0", true, true, &[]).expect("the exact set");
+    // ...and a release that forgets the roster is refused rather than made the head:
+    // the armed client refuses such a head structurally, before any artifact crypto.
+    let forgotten = channel::required_asset_names("0.5.0", true, false);
+    let err = channel::validate_channel_asset_set(&forgotten, "0.5.0", true, true, &[])
         .expect_err("a rostered channel head without its roster is unelectable");
-    assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
-
-    // The DRAFT set is judged by what the manifest says about itself: an attributed
-    // manifest requires both assets, and their absence is named.
-    let mut manifest = manifest_out::build(&inputs("0.5.0", 500));
-    machines::attribute(
-        &mut manifest,
-        &Attribution {
-            machine_id: "m3".into(),
-            pubkey_b64: pk(&M3),
-            roster_seq: 4,
-        },
-    );
-    let complete = draft_names(
-        &manifest,
-        true,
-        &["aterm-machines.toml", "aterm-machines.toml.sig"],
-    );
-    publish::validate_draft_asset_set(&complete, &manifest, true, PROVENANCE, None)
-        .expect("an attributed draft carrying its roster is the exact set");
-    let missing = draft_names(&manifest, true, &[]);
-    let err = publish::validate_draft_asset_set(&missing, &manifest, true, PROVENANCE, None)
-        .expect_err("an attributed draft without its roster must not flip visible");
     assert!(err.to_string().contains("aterm-machines.toml"), "{err}");
     clean(&dir);
 }
@@ -1061,8 +1031,6 @@ fn the_declared_machine_id_prefers_the_profile_and_falls_back_to_the_mint_record
 // helpers
 // ---------------------------------------------------------------------------
 
-const PROVENANCE: &str = "aterm-0.5.0-build.txt";
-
 fn tempdir(label: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "aterm-machine-roster-{label}-{}",
@@ -1148,24 +1116,6 @@ const DMG_SHA: &str = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34e
 const ZIP_SHA: &str = "cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34";
 
 /// The exact asset names a draft carries for `manifest`, plus whatever `extra` adds.
-fn draft_names(manifest: &Manifest, signed: bool, extra: &[&str]) -> Vec<String> {
-    let mut names = vec![
-        "aterm-appcast.toml".to_string(),
-        manifest.dmg.clone(),
-        format!("{}.sha256", manifest.dmg),
-        PROVENANCE.to_string(),
-    ];
-    if let Some(zip) = manifest.zip.as_deref() {
-        names.push(zip.to_string());
-        names.push(format!("{zip}.sha256"));
-    }
-    if signed {
-        names.push("aterm-appcast.toml.sig".to_string());
-    }
-    names.extend(extra.iter().map(|name| (*name).to_string()));
-    names
-}
-
 /// Does the roster BODY list this public key? Read out of the serialized document rather
 /// than out of the fixture builder's arguments, so the preconditions above are checked
 /// against the bytes the gate will actually see.

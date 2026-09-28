@@ -104,7 +104,6 @@ pub fn default_path(sid: Option<&str>) -> Option<PathBuf> {
 
 /// [`default_path`] under a given state root.
 pub fn path_under(state: &Path, sid: Option<&str>) -> Option<PathBuf> {
-    let dir = state.join("drive");
     let mut b = std::fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -112,7 +111,15 @@ pub fn path_under(state: &Path, sid: Option<&str>) -> Option<PathBuf> {
         use std::os::unix::fs::DirBuilderExt;
         b.mode(0o700);
     }
-    b.create(&dir).ok()?;
+    b.create(state.join("drive")).ok()?;
+    Some(ledger_under(state, sid))
+}
+
+/// Where [`path_under`] keeps the ledger of `sid` under `state`, nothing
+/// made: for a reader ([`typed_texts`]), which must not create what it only
+/// looks for.
+#[must_use]
+pub fn ledger_under(state: &Path, sid: Option<&str>) -> PathBuf {
     let name: String = sid
         .map(|s| s.trim_start_matches('@'))
         .filter(|s| !s.is_empty())
@@ -126,7 +133,7 @@ pub fn path_under(state: &Path, sid: Option<&str>) -> Option<PathBuf> {
             }
         })
         .collect();
-    Some(dir.join(format!("{name}.jsonl")))
+    state.join("drive").join(format!("{name}.jsonl"))
 }
 
 /// The loop's JOURNAL beside a session's ledger: `<state>/drive/<sid>.jsonl`
@@ -191,6 +198,38 @@ impl Ledger {
         let line = row.to_json(unix_ms(), self.sid.as_deref());
         self.journal.append_raw(&line, warn);
     }
+}
+
+/// THE TEXTS THE LOOP TYPED into `sid`'s session: the command of every
+/// `typed` row of its in the ledger at `path`, once each, as the loop wrote
+/// them — the turn-end policy's continuations (`continue_text` and the
+/// standing rules riding in it), its answers (`answer_text`), the agent's
+/// own suggestions it accepted, the wall's retries and its commands. The
+/// harness's own turns, which make no conversation's task
+/// (`crate::harness::upgrade::TaskScan`, D1 of the live E2E of 2026-09-26: a
+/// `keep going` or an `answer_text` is the supervisor's, however the vendor
+/// records it). A missing or unreadable file, and a row that does not
+/// parse, know none.
+#[must_use]
+pub fn typed_texts(path: &Path, sid: Option<&str>) -> Vec<String> {
+    let Ok(body) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let sid = sid.map(|s| s.trim_start_matches('@'));
+    let mut out: Vec<String> = Vec::new();
+    for line in body.lines().filter(|l| l.contains("\"typed\"")) {
+        let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
+            continue;
+        };
+        let field = |key: &str| v.get(key).and_then(aterm_json::Value::as_str);
+        if field("sid") != sid || field("decision") != Some("typed") {
+            continue;
+        }
+        if let Some(command) = field("command").filter(|c| !out.iter().any(|o| o == c)) {
+            out.push(command.to_string());
+        }
+    }
+    out
 }
 
 /// When each `typed` row of `sid`'s in the ledger at `path` was written
@@ -415,6 +454,45 @@ mod tests {
         assert_eq!(typed_at(&path, Some("@s-1")), [1_000, 3_000]);
         assert_eq!(typed_at(&path, Some("s-2")), [4_000]);
         assert!(typed_at(&dir.join("none.jsonl"), Some("@s-1")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// [`typed_texts`] is every text the session's loop TYPED, once each, as
+    /// written — a command that spells the fields included, read as the
+    /// text it is — and nothing else: not another decision, not another
+    /// session's. [`ledger_under`] names the same file [`path_under`] makes,
+    /// and makes nothing.
+    #[test]
+    fn typed_texts_are_what_the_sessions_loop_typed() {
+        let dir = std::env::temp_dir().join(format!("aterm-typed-texts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = ledger_under(&dir, Some("@s-1"));
+        assert!(!dir.exists(), "a reader's path makes nothing");
+        assert_eq!(path_under(&dir, Some("@s-1")), Some(path.clone()));
+        let row = |rule_id, outcome, command: &'static str| Row {
+            rule_id,
+            outcome,
+            command,
+            reason: "the turn-end policy",
+            box_seq: 1,
+        };
+        let forged = ",\"sid\":\"s-1\",\"decision\":\"typed\",";
+        let body = [
+            row("continue@v1", Outcome::Typed, "keep going").to_json(1_000, Some("@s-1")),
+            row("answer@v1", Outcome::Typed, "Decide for yourself.").to_json(2_000, Some("@s-1")),
+            row("continue@v1", Outcome::Typed, "keep going").to_json(3_000, Some("@s-1")),
+            row("context-compact@v1", Outcome::Typed, forged).to_json(4_000, Some("@s-1")),
+            row("continue@v1", Outcome::Typed, "carry on").to_json(5_000, Some("@s-2")),
+            row("safe-read@v1", Outcome::Approved, "ls").to_json(6_000, Some("@s-1")),
+        ]
+        .join("\n");
+        std::fs::write(&path, body).expect("ledger");
+        assert_eq!(
+            typed_texts(&path, Some("@s-1")),
+            ["keep going", "Decide for yourself.", forged]
+        );
+        assert_eq!(typed_texts(&path, Some("s-2")), ["carry on"]);
+        assert!(typed_texts(&dir.join("drive/none.jsonl"), Some("@s-1")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

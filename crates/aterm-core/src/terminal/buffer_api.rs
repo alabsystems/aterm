@@ -273,11 +273,14 @@ impl Terminal {
     }
 
     /// Monotonic count of history lines LOST to non-user-requested truncation
-    /// across the main and alternate grids (audit E10a): flood-backpressure
-    /// staged-line drops, detached-reflow-window cap drops, and
-    /// memory-pressure store evictions. The OUT-OF-BAND truncation signal —
-    /// content never carries a sentinel line; hosts poll this and surface the
-    /// loss in their own UI chrome.
+    /// across the main and alternate grids: flood-backpressure staged-line
+    /// drops, detached-reflow-window cap drops, and memory-pressure store
+    /// evictions. The OUT-OF-BAND truncation signal, for hosts to surface in
+    /// their own chrome (`metrics`, `lines`). The grid's flood drops are ALSO
+    /// marked in band — one dim `— aterm dropped N lines here …` row stands at
+    /// each cut, naming the lines missing there that the configured limit
+    /// would still hold — so a reader scrolling past the hole is told about it
+    /// too; see [`Grid::truncated_lines`](aterm_grid::Grid::truncated_lines).
     #[must_use]
     pub fn scrollback_truncated_lines(&self) -> u64 {
         let mut total = self.grid.truncated_lines();
@@ -352,9 +355,9 @@ impl Terminal {
     ///
     /// PRESS CUSTODY: this is one of the three entry points that can RAISE
     /// `display_offset`, so it samples the offset around the move and records
-    /// [`crate::terminal::CustodyTransition::UserScroll`] on a rise
-    /// (`Terminal::note_scroll_custody`). A negative delta lowers the offset and
-    /// records nothing. Recording here rather than at the GUI seams is what makes the
+    /// [`crate::terminal::CustodyTransition::UserScroll`] on a rise and `SnapToLive`
+    /// / `UserScrollTowardLive` on a fall (`Terminal::note_scroll_custody`).
+    /// Recording here rather than at the GUI seams is what makes the
     /// wheel — which reaches this function directly from `input_wheel`'s instant arm
     /// and from its glide tick, and used to record nothing at all — impossible to
     /// bypass.
@@ -377,23 +380,32 @@ impl Terminal {
 
     /// Scroll to bottom (live content).
     ///
-    /// PRESS CUSTODY: deliberately NOT a recording site. This can only LOWER the
-    /// offset, and no `PressCustody` action admits a move toward live except
-    /// `TypingPress`, which clears the selection on the way and is recorded by the
-    /// press seam that called this. In particular `apply_press_custody`'s snap runs
-    /// through here, and must not file a `UserScroll` on top of its own record.
+    /// PRESS CUSTODY: deliberately NOT a recording site. `apply_press_custody`'s
+    /// typing snap runs through here and records its own `TypingPress`, which a
+    /// `SnapToLive` must not overwrite. A NON-typing return to live — End /
+    /// `ScrollToBottom`, the ⌘-V and IME snaps — is [`Self::return_to_live`].
     pub fn scroll_to_bottom(&mut self) {
         self.grid.scroll_to_bottom();
+    }
+
+    /// Scroll to bottom as a USER gesture that is not typing — End /
+    /// `ScrollToBottom`, the ⌘-V and IME snaps, the find bar's restore to a live
+    /// view — recording [`crate::terminal::CustodyTransition::SnapToLive`] when the
+    /// view actually moved. The highlight is left alone.
+    pub fn return_to_live(&mut self) {
+        let before = self.grid.display_offset();
+        self.grid.scroll_to_bottom();
+        self.note_scroll_custody(before);
     }
 
     /// Scroll the viewport so `target_abs_row` (an absolute row number, e.g. a
     /// command mark's `prompt_start_row`) sits at the top visible line, clamped
     /// to the retained history — the primitive behind prompt-to-prompt navigation.
     ///
-    /// PRESS CUSTODY: records `UserScroll` on a rise — see [`Self::scroll_display`].
-    /// A jump back DOWN toward live (a search hit below the current view, the find
-    /// bar's ⎋ restore landing lower than the current position) lowers the offset and
-    /// records nothing.
+    /// PRESS CUSTODY: records `UserScroll` on a rise and `SnapToLive` /
+    /// `UserScrollTowardLive` on a fall (a search hit below the current view, the
+    /// find bar's ⎋ restore landing lower than the current position) — see
+    /// [`Self::scroll_display`].
     pub fn scroll_to_absolute_row(&mut self, target_abs_row: u64) {
         let before = self.grid.display_offset();
         self.grid.scroll_to_absolute_row(target_abs_row);
@@ -970,5 +982,68 @@ mod tests {
             Some((2, 10)),
             "the anchor is the last PRINT's, not the cursor's"
         );
+    }
+
+    /// THE ANCHOR'S GLYPH IS THE RUN'S LAST CELL (2026-09-23): the cell just
+    /// left of the echo anchor, read live, in `row_cols_into`'s per-column
+    /// convention — the witness that tells a key's echo (`…c`) from zsh's
+    /// i-search minibuffer, whose `<glyph>_` run ends on its fake cursor and
+    /// whose caret climbs back onto the match row.
+    #[test]
+    fn print_anchor_glyph_is_the_run_s_last_cell() {
+        let mut t = Terminal::new(6, 10);
+        assert_eq!(t.print_anchor_glyph(), None, "nothing printed yet");
+        t.process(b"p% ab");
+        assert_eq!(t.print_anchor_glyph(), Some('b'));
+        // zle's i-search refresh: down a row, `c_`, back up onto the match.
+        t.process(b"\x1b[1B\r bck: c_\x1b[A\x1b[3G");
+        assert_eq!(
+            t.print_anchor().map(|(r, c, _)| (r, c)),
+            Some((1, 8)),
+            "the run ended one past the fake cursor"
+        );
+        assert_eq!((t.cursor().row, t.cursor().col), (0, 2));
+        assert_eq!(t.print_anchor_glyph(), Some('_'), "…on the fake cursor");
+        // The last column with the wrap deferred: the anchor is one past the
+        // row, its glyph the one the caret stays parked on.
+        t.process(b"\x1b[3;1H0123456789");
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((2, 10)));
+        assert_eq!(t.print_anchor_glyph(), Some('9'));
+        // A wide glyph's run ends on its continuation column.
+        t.process("\x1b[4;1H中".as_bytes());
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((3, 2)));
+        assert_eq!(t.print_anchor_glyph(), Some('\0'));
+        // Erased after the print: the grid's truth now, a blank.
+        t.process(b"\x1b[5;1Hxy\x1b[2K");
+        assert_eq!(t.print_anchor_glyph(), Some(' '));
+        // Scrolled back: the anchor is an ACTIVE-grid coordinate, and so is
+        // its glyph — never the history row the viewport shows there.
+        t.process(b"\x1b[6;1H");
+        for i in 0..12 {
+            t.process(format!("\r\nline{i}").as_bytes());
+        }
+        t.process(b"\x1b[6;1Hzz");
+        t.scroll_display(3);
+        assert!(t.grid().display_offset() > 0, "the viewport scrolled back");
+        let mut shown = Vec::new();
+        t.row_cols_into(5, &mut shown);
+        assert_ne!(
+            shown.get(1),
+            Some(&'z'),
+            "non-vacuity: the viewport shows history on that row"
+        );
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((5, 2)));
+        assert_eq!(t.print_anchor_glyph(), Some('z'));
+        // A shrink since the print leaves the anchor off the grid: unknown.
+        t.scroll_display(-3);
+        t.resize(3, 10);
+        assert_eq!(t.print_anchor().map(|(r, c, _)| (r, c)), Some((5, 2)));
+        assert_eq!(t.print_anchor_glyph(), None);
+        // A reset has no anchor, and so no glyph.
+        let mut u = Terminal::new(2, 4);
+        u.process(b"ab");
+        u.process(b"\x1bc");
+        assert_eq!(u.print_anchor(), None);
+        assert_eq!(u.print_anchor_glyph(), None);
     }
 }

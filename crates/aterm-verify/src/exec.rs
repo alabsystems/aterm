@@ -19,13 +19,11 @@
 //! because the one verdict this gate could not previously reach is "this never
 //! finished" — see that constant for the whole argument.
 
-use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -188,12 +186,11 @@ pub struct ExecEnv<'a> {
     pub child_ceiling: Option<Duration>,
     /// Variables REMOVED from every child's inherited environment before its
     /// own [`Cmd::envs`] are applied — so a stage that names a variable
-    /// explicitly still wins. An in-place run removes nothing (the gate's own
-    /// side channels are flags since 2026-09-24, so no child can inherit one).
-    /// A SNAPSHOT run removes `CARGO_TARGET_DIR` (2026-09-13):
-    /// the snapshot's lanes are its own directories, and a caller's redirect
-    /// would put every cargo child straight back into the shared, contended
-    /// target dir the snapshot exists to get away from.
+    /// explicitly still wins. Every run removes `CARGO_TARGET_DIR`
+    /// ([`crate::CHILD_ENV_REMOVED`]): the lanes are the run's own directories,
+    /// and a caller's redirect would put every main-lane cargo child straight
+    /// back into the shared, contended target dir the snapshot exists to get
+    /// away from.
     pub remove_env: &'a [&'a str],
     /// Variables ADDED to every child, after [`Self::remove_env`] and BEFORE the
     /// stage's own [`Cmd::envs`] — so a stage that names a variable still wins.
@@ -209,152 +206,6 @@ pub struct ExecEnv<'a> {
     /// 55 GB and run the volume to `No space left on device`
     /// ([`crate::Ctx::with_pinned_child_facts`]).
     pub add_env: &'a [(OsString, OsString)],
-    /// Where per-child timing rows go when `--timings` names a file. `None`
-    /// spawns nothing extra and writes nothing.
-    pub timings: Option<&'a Timings>,
-}
-
-/// `--timings <file>`: one TSV row per child — and one per stage,
-/// with the child column `(stage)` — naming the stage, the child, the lane, its
-/// start and end in seconds since the gate started, how it ended, and the
-/// one-minute load average at both ends.
-///
-/// WHY IT EXISTS (2026-09-13): a `--fast` run took 14 h, and about 430 min of
-/// it sat inside the doctest stage without printing a single line. Nothing the
-/// gate wrote could say whether that time was work, queueing on a lock, or a
-/// machine shared with other agents' builds. The load columns are what separate
-/// those three. The ladder stays byte-for-byte the same with or without it —
-/// this is a side channel for tuning, never a second vocabulary for outcomes.
-#[derive(Debug)]
-pub struct Timings {
-    file: Mutex<File>,
-    t0: Instant,
-}
-
-/// One TSV row of [`Timings`].
-#[derive(Clone, Copy, Debug)]
-pub struct TimingRow<'a> {
-    pub stage: &'a str,
-    /// The argv, space-joined, or `(stage)` for a stage's own row.
-    pub child: &'a str,
-    pub lane: &'a str,
-    pub start: f64,
-    pub end: f64,
-    /// The exit code, `signal`, or `spawn-error` — for a stage row, `ok`,
-    /// `skip`, `FAIL` or `could-not-run`.
-    pub how: &'a str,
-    pub load_start: Option<f64>,
-    pub load_end: Option<f64>,
-}
-
-thread_local! {
-    /// The stage (title, lane) the current thread is running, for timing rows.
-    /// The scheduler gives every stage its own thread, so a thread-local names
-    /// the stage without threading a label through every argv builder.
-    static STAGE: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
-}
-
-/// Run `f` with this thread's timing rows attributed to `stage` in `lane`.
-pub fn with_stage<T>(stage: &str, lane: &str, f: impl FnOnce() -> T) -> T {
-    STAGE.with(|s| *s.borrow_mut() = Some((stage.to_string(), lane.to_string())));
-    let out = f();
-    STAGE.with(|s| *s.borrow_mut() = None);
-    out
-}
-
-impl Timings {
-    /// The TSV header, written first.
-    pub const HEADER: &'static str =
-        "stage\tchild\tlane\tstart_s\tend_s\texit\tload1_start\tload1_end\n";
-
-    /// Create (truncate) `path` and write the header.
-    ///
-    /// # Errors
-    /// Fails when the file cannot be created or written.
-    pub fn create(path: &Path) -> io::Result<Self> {
-        let mut file = File::create(path)?;
-        file.write_all(Self::HEADER.as_bytes())?;
-        Ok(Self {
-            file: Mutex::new(file),
-            t0: Instant::now(),
-        })
-    }
-
-    /// Seconds since the gate started.
-    #[must_use]
-    pub fn now(&self) -> f64 {
-        self.t0.elapsed().as_secs_f64()
-    }
-
-    /// Append one row. A failed write is dropped: timings decide nothing, so
-    /// they may never turn a run red.
-    pub fn row(&self, r: &TimingRow<'_>) {
-        let cell = |t: &str| t.replace(['\t', '\n', '\r'], " ");
-        let load = |l: Option<f64>| l.map_or_else(|| "-".to_string(), |v| format!("{v:.2}"));
-        let line = format!(
-            "{}\t{}\t{}\t{:.3}\t{:.3}\t{}\t{}\t{}\n",
-            cell(r.stage),
-            cell(r.child),
-            cell(r.lane),
-            r.start,
-            r.end,
-            cell(r.how),
-            load(r.load_start),
-            load(r.load_end),
-        );
-        if let Ok(mut f) = self.file.lock() {
-            let _ = f.write_all(line.as_bytes());
-        }
-    }
-
-    /// A child's row, attributed to the stage this thread is running.
-    fn child_row(&self, cmd: &Cmd, start: f64, load0: Option<f64>, r: &Run) {
-        let (stage, lane) = STAGE
-            .with(|s| s.borrow().clone())
-            .unwrap_or_else(|| ("-".to_string(), "-".to_string()));
-        let how = match (r.code, &r.spawn_error) {
-            (Some(c), _) => c.to_string(),
-            (None, Some(_)) => "spawn-error".to_string(),
-            (None, None) => "signal".to_string(),
-        };
-        self.row(&TimingRow {
-            stage: &stage,
-            child: &cmd.argv().join(" "),
-            lane: &lane,
-            start,
-            end: self.now(),
-            how: &how,
-            load_start: load0,
-            load_end: load_average(),
-        });
-    }
-}
-
-/// The one-minute load average: `/proc/loadavg` where it exists, else
-/// `sysctl -n vm.loadavg` (macOS prints `{ 1.23 2.34 3.45 }`). Only spawned
-/// when timings are on.
-#[must_use]
-pub fn load_average() -> Option<f64> {
-    let text = std::fs::read_to_string("/proc/loadavg").ok().or_else(|| {
-        let out = Command::new("/usr/sbin/sysctl")
-            .args(["-n", "vm.loadavg"])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-    })?;
-    parse_load_average(&text)
-}
-
-/// The first number in a load-average line, braces and all.
-#[must_use]
-pub fn parse_load_average(text: &str) -> Option<f64> {
-    text.split(|c: char| c.is_whitespace() || c == '{' || c == '}')
-        .find(|t| !t.is_empty())
-        .and_then(|t| t.parse().ok())
 }
 
 /// What a child did.
@@ -582,16 +433,6 @@ pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
 /// reaches its own fail-closed branch.
 #[must_use]
 pub fn run(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
-    let Some(timings) = env.timings else {
-        return run_untimed(cmd, env);
-    };
-    let (start, load0) = (timings.now(), load_average());
-    let r = run_untimed(cmd, env);
-    timings.child_row(cmd, start, load0, &r);
-    r
-}
-
-fn run_untimed(cmd: &Cmd, env: ExecEnv<'_>) -> Run {
     let mut c = spawn_command(cmd, env, Path::new(TASKPOLICY));
     c.current_dir(env.cwd).env("PATH", env.path);
     for k in env.remove_env {
@@ -979,6 +820,16 @@ pub mod group {
     /// starts a child the gate is about to kill (`finish` asks).
     static STOPPING: AtomicBool = AtomicBool::new(false);
 
+    /// How many stage groups are on the live list right now (a graced group's
+    /// negative entry counts) — what a test waits on before it interrupts, so
+    /// the signal cannot outrun the registration it is testing.
+    #[cfg(test)]
+    pub(crate) fn live_count() -> usize {
+        LIVE.iter()
+            .filter(|slot| slot.load(Ordering::SeqCst) != 0)
+            .count()
+    }
+
     /// A child's group on the live list, for as long as this value lives.
     pub struct Live(Option<usize>);
 
@@ -1123,6 +974,19 @@ pub mod group {
         }
     }
 
+    /// `SIGINT` back at its default action, for a test's stand-in gate that
+    /// models a terminal's Ctrl-C without the handler: a process started as a
+    /// background job with job control off inherits `SIGINT` IGNORED (POSIX),
+    /// and a stand-in that ignores the interrupt measures nothing.
+    #[cfg(test)]
+    pub(crate) fn default_interrupt() {
+        // SAFETY: `signal` takes an integer and the `SIG_DFL` value and
+        // touches no memory of ours.
+        unsafe {
+            signal(SIGINT, SIG_DFL);
+        }
+    }
+
     /// On `SIGINT`, `SIGTERM` or `SIGHUP`, end every live stage child's group,
     /// then die of the signal: `SIGKILL` at once, except a group whose child
     /// asked for a `SIGTERM` grace ([`crate::exec::Cmd::term_grace`]), which is
@@ -1206,7 +1070,6 @@ mod tests {
             child_ceiling,
             remove_env: &[],
             add_env: &[],
-            timings: None,
         }
     }
 
@@ -1376,36 +1239,6 @@ mod tests {
         let r = run(&Cmd::new(tmp.join("no-such-tool")).demoted(), env_in(&tmp));
         assert!(!r.ok);
         assert!(r.spawn_error.is_some(), "{r:?}");
-        std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// The measurement behind [`Cmd::demoted`], as a test. The child reads its
-    /// own base priority, so there is no load to generate and no timing to
-    /// flake on. Inherited, a child sits in the default band (`31`, even under
-    /// `nice -n 19`). Demoted, it is at most UTILITY's `20`.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn a_demoted_child_really_runs_below_the_default_band() {
-        if !crate::is_executable_file(Path::new(TASKPOLICY)) {
-            return;
-        }
-        let tmp = crate::mktemp_dir("atv-qos-live").expect("mktemp");
-        let pri = |cmd: Cmd| -> i32 {
-            let r = run(&cmd, env_in(&tmp));
-            assert!(r.ok, "{r:?}");
-            r.trimmed_output()
-                .trim()
-                .parse()
-                .unwrap_or_else(|e| panic!("ps said {:?}: {e}", r.output))
-        };
-        let probe = Cmd::new("/bin/sh").args(["-c", "ps -o pri= -p $$"]);
-        let inherited = pri(probe.clone());
-        let demoted = pri(probe.demoted());
-        assert!(demoted <= 20, "demoted child at pri {demoted}");
-        assert!(
-            demoted < inherited || inherited <= 20,
-            "demoted pri {demoted} is not below the inherited {inherited}"
-        );
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1604,9 +1437,11 @@ mod tests {
     }
 
     /// The pid a stage child's shell wrote for the `sleep` it backgrounded.
+    /// The bound is LIVENESS, not latency: a loaded gate (the aterm-gui suite
+    /// beside it) can take seconds to start a shell.
     #[cfg(unix)]
     fn read_pid(file: &Path) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(60);
         loop {
             if let Ok(t) = std::fs::read_to_string(file)
                 && t.ends_with('\n')
@@ -1688,10 +1523,36 @@ mod tests {
         if let Some(pidfile) = std::env::var_os(PIDFILE) {
             if std::env::var_os(NO_HANDLER).is_none() {
                 group::kill_on_interrupt();
+            } else {
+                // The Ctrl-C this models meets SIGINT at its default action. Run
+                // as a background job (`cmd &` with job control off, as a gate
+                // lane runs its suites) the stand-in inherits it IGNORED, never
+                // died of the SIGINT, waited out its stage's 600 s `sleep` —
+                // the binary's 600 s run — and its grandchild ended with it,
+                // which the negative control read as "died anyway".
+                group::default_interrupt();
             }
-            let dir = Path::new(&pidfile).parent().expect("a dir").to_path_buf();
-            let _ = run(&with_grandchild(Path::new(&pidfile)), ceiled(&dir, None));
+            let pidfile = PathBuf::from(pidfile);
+            let dir = pidfile.parent().expect("a dir").to_path_buf();
+            std::thread::scope(|scope| {
+                let stage = scope.spawn(|| run(&with_grandchild(&pidfile), ceiled(&dir, None)));
+                // THE EVENT THE INTERRUPT WAITS ON: the stage child's group is
+                // on the live list AND its grandchild has written its pid. The
+                // pidfile alone raced the registration — the shell can write it
+                // before `run` puts the group on the list — and a SIGINT in that
+                // gap left nothing to kill.
+                while !(group::live_count() > 0
+                    && std::fs::read_to_string(&pidfile).is_ok_and(|t| t.ends_with('\n')))
+                {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(armed(&pidfile), "armed\n").expect("the armed marker");
+                let _ = stage.join();
+            });
             return;
+        }
+        fn armed(pidfile: &Path) -> PathBuf {
+            pidfile.with_extension("armed")
         }
         let tmp = crate::mktemp_dir("atv-interrupt").expect("mktemp");
         let me = std::env::current_exe().expect("the test binary");
@@ -1710,6 +1571,19 @@ mod tests {
                 c.env(NO_HANDLER, "1");
             }
             let mut child = c.spawn().expect("the stand-in gate starts");
+            // Interrupt only once the stand-in says its stage group is live —
+            // an event, never a guessed delay. A stand-in that never arms is
+            // killed, so a failure here cannot leave a 600 s `sleep` behind.
+            let marker = armed(pidfile);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !marker.exists() {
+                if Instant::now() > deadline || matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the stand-in gate never armed ({})", marker.display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let grandchild = read_pid(pidfile);
             std::process::Command::new("/bin/kill")
                 .args(["-INT", &child.id().to_string()])

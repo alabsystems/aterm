@@ -436,11 +436,12 @@ pub(crate) fn dial_relay(
         .try_clone()
         .map_err(|e| format!("clone client socket: {e}"))?;
     // Session rebind pin (OPTIONAL). Only `expect_nonce` arms the guard: the cert
-    // fingerprint is already TLS-enforced above, and `sid` is a record field the
-    // `matches` check does not consult. Absent ⇒ `None` ⇒ a byte-identical un-pinned
-    // dial. Present ⇒ `dial_and_relay_pinned` enforces the launch-nonce rebind guard
-    // before relaying (and, until the wire echoes the remote's launch identity, fails
-    // closed rather than relay unverified).
+    // fingerprint is already TLS-enforced above, and `sid` names which remote
+    // session's live nonce is compared (absent: any session carrying the nonce).
+    // Absent ⇒ `None` ⇒ a byte-identical un-pinned dial. Present ⇒
+    // `dial_and_relay_pinned` reads the remote's `sessions bridge` roster and
+    // enforces the launch-nonce rebind guard before relaying, failing closed when
+    // the pinned session is not reported.
     let endpoint = conn
         .expect_nonce
         .as_ref()

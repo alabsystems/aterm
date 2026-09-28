@@ -36,6 +36,17 @@ use crate::subscribe::{SubscriberSet, Subscribers, Subscription};
 /// Maximum delay before a newly-created/removed session is reconciled even when no
 /// watched terminal produces output. Output wakes usually make the loop run sooner.
 const RECONCILE_INTERVAL: Duration = Duration::from_millis(250);
+/// How often a parked `next` asks whether its client is still connected. A
+/// client that died mid-`next` (a crash, a SIGKILL, a restart) releases the
+/// one waiter slot within this, rather than holding it to its timeout (RFC §9.1:
+/// crash cycles leave no server-side waiter behind).
+const NEXT_PEER_PROBE: Duration = Duration::from_millis(250);
+/// How long a `next` waits for the previous waiter to leave before refusing
+/// with "already waiting": longer than [`NEXT_PEER_PROBE`], so a restarted
+/// client's first `next` is served once its dead predecessor's is released.
+/// A predecessor that is still connected keeps the slot, and the second
+/// caller is refused after this bound.
+const NEXT_HANDOVER_GRACE: Duration = Duration::from_secs(1);
 /// A changed surface must remain stable for this long before a prompt-shaped screen
 /// becomes a busy-to-attention transition candidate.
 const ATTENTION_SETTLE: Duration = Duration::from_millis(750);
@@ -977,21 +988,33 @@ impl ControlHandle {
         self.surface_notice(local_id, body);
     }
 
-    /// Block without polling the control socket. A one-second ceiling on each
-    /// condition wait lets expired claims be reclaimed even when no new screen
-    /// transition signals the queue.
+    /// Block without polling the control socket. A [`NEXT_PEER_PROBE`] ceiling
+    /// on each condition wait lets expired claims be reclaimed even when no new
+    /// screen transition signals the queue, and asks `peer_gone` — the
+    /// requesting connection's hangup, peeked, never read — so a client that
+    /// died mid-wait frees the one waiter slot at once and is never handed a
+    /// claim it cannot receive (the check runs BEFORE every claim). A second
+    /// caller waits [`NEXT_HANDOVER_GRACE`] for the slot before it is refused.
     pub(crate) fn wait_claim(
         &self,
         store: &Store,
         timeout: Duration,
+        peer_gone: &mut dyn FnMut() -> bool,
     ) -> Result<Option<Claim>, String> {
-        if self
+        let handover = Instant::now() + NEXT_HANDOVER_GRACE;
+        while self
             .shared
             .claim_waiter_active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return Err("another operator next call is already waiting".to_string());
+            if Instant::now() >= handover {
+                return Err("another operator next call is already waiting".to_string());
+            }
+            if peer_gone() {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
         let _waiter = ClaimWaiterGuard(&self.shared.claim_waiter_active);
         // This call occupies one ordinary control-plane worker. Keep the only
@@ -1000,6 +1023,11 @@ impl ControlHandle {
         let timeout = timeout.min(Duration::from_secs(30));
         let deadline = Instant::now() + timeout;
         loop {
+            // Nobody to deliver to: claim nothing (a claim is durable, and one
+            // made for a dead client would sit out its whole visibility window).
+            if peer_gone() {
+                return Ok(None);
+            }
             let fault_guard = self.accepting_guard()?;
             let claim = self.queue()?.claim().map_err(|error| error.to_string())?;
             drop(fault_guard);
@@ -1014,9 +1042,7 @@ impl ControlHandle {
             if now >= deadline {
                 return Ok(None);
             }
-            let wait_for = deadline
-                .saturating_duration_since(now)
-                .min(Duration::from_secs(1));
+            let wait_for = deadline.saturating_duration_since(now).min(NEXT_PEER_PROBE);
             let serial = self
                 .shared
                 .wake_serial
@@ -1057,14 +1083,33 @@ impl ControlHandle {
 
     /// Owner-only text command adapter used by the control socket. Keeping queue
     /// mutation here gives both the CLI and the guarded actuator one API surface.
-    pub(crate) fn command(&self, store: &Store, rest: &str) -> String {
-        match self.try_command(store, rest) {
+    ///
+    /// `peer_gone` says whether the requesting client has hung up; only a
+    /// parked `next` asks it ([`Self::wait_claim`]).
+    pub(crate) fn command_for_peer(
+        &self,
+        store: &Store,
+        rest: &str,
+        peer_gone: &mut dyn FnMut() -> bool,
+    ) -> String {
+        match self.try_command(store, rest, peer_gone) {
             Ok(reply) => reply,
             Err(error) => format!("ERR {error}\n"),
         }
     }
 
-    fn try_command(&self, store: &Store, rest: &str) -> Result<String, String> {
+    /// [`Self::command_for_peer`] for a client that never hangs up.
+    #[cfg(test)]
+    pub(crate) fn command(&self, store: &Store, rest: &str) -> String {
+        self.command_for_peer(store, rest, &mut || false)
+    }
+
+    fn try_command(
+        &self,
+        store: &Store,
+        rest: &str,
+        peer_gone: &mut dyn FnMut() -> bool,
+    ) -> Result<String, String> {
         let mut words = rest.split_whitespace();
         let Some(command) = words.next() else {
             return Err(operator_usage().to_string());
@@ -1102,7 +1147,7 @@ impl ControlHandle {
             }
             "next" => {
                 let timeout = parse_next_timeout(words)?;
-                match self.wait_claim(store, timeout)? {
+                match self.wait_claim(store, timeout, peer_gone)? {
                     Some(claim) => Ok(format_claim(self, store, &claim)),
                     None => Ok("OK timeout\n".to_string()),
                 }
@@ -3077,56 +3122,6 @@ mod tests {
     /// phrase heuristic alone missed (no "do you want to proceed"): typing
     /// over it would answer it. NEGATIVE CONTROLS: the same transcript with
     /// the box gone, and an idle end of turn, are not approvals.
-    /// The cost of [`looks_like_approval`] (the phase parser, the reader,
-    /// then the phrase shape) beside the phrase shape alone, per screen, over
-    /// 400 calls: p50/p99/max in µs. It runs on every observed generation and
-    /// once under the terminal lock in the operator's actuation fence
-    /// (`control::operator_input_if_epoch`). A measurement, not a gate:
-    /// `targo --unverified test -p aterm-gui --lib measure_looks_like_approval
-    /// -- --ignored --nocapture`.
-    #[test]
-    #[ignore = "a measurement, run by name"]
-    fn measure_looks_like_approval() {
-        use aterm_phase::prompt::fixtures;
-        let mut screens: Vec<(String, String)> = [
-            ("trust", fixtures::TRUST),
-            ("box-rm", fixtures::BOX_RM),
-            ("box-edit", fixtures::BOX_EDIT),
-            ("end-offer", fixtures::END_OFFER),
-        ]
-        .iter()
-        .map(|(name, f)| (name.to_string(), fixtures::screen(f).join("\n")))
-        .collect();
-        // A busy Claude screen at the evidence bound: rows of transcript.
-        let busy: Vec<String> = (0..EVIDENCE_ROWS)
-            .map(|i| {
-                format!(
-                    "  ⎿  line {i} of a long tool output with some words in it and a path /x/y/z"
-                )
-            })
-            .collect();
-        screens.push(("busy-evidence-bound".into(), busy.join("\n")));
-        for (name, text) in &screens {
-            let t = |f: &dyn Fn(&str) -> bool| {
-                let mut ns: Vec<u128> = (0..400)
-                    .map(|_| {
-                        let at = std::time::Instant::now();
-                        std::hint::black_box(f(std::hint::black_box(text)));
-                        at.elapsed().as_nanos()
-                    })
-                    .collect();
-                ns.sort_unstable();
-                (ns[200] / 1000, ns[396] / 1000, ns[399] / 1000)
-            };
-            let new = t(&looks_like_approval);
-            let old = t(&generic_choice_box);
-            eprintln!(
-                "{name} ({} B): looks_like_approval p50/p99/max {new:?} µs; generic_choice_box {old:?} µs",
-                text.len()
-            );
-        }
-    }
-
     #[test]
     fn the_approval_check_is_the_phase_parser_or_the_generic_shape() {
         use aterm_phase::prompt::fixtures;
@@ -4311,6 +4306,91 @@ mod tests {
         let _ = std::fs::remove_dir_all(directory);
     }
 
+    /// RFC §9.1, the waiter half: an operator client that dies mid-`next`
+    /// (crash, SIGKILL, restart) leaves no waiter behind. Before the peer
+    /// probe the dead client's `next` held the one waiter slot to its own
+    /// timeout (up to 30 s), and the restarted client's first `next` was
+    /// refused `already waiting` — measured live. Now the dead waiter lets go
+    /// within one probe and the successor is served. Controls: a predecessor
+    /// that is still connected keeps the slot, and the successor is refused
+    /// after the handover grace; and a hung-up client is never handed a claim
+    /// (the event stays queued for the next one, undelivered).
+    #[test]
+    fn a_dead_next_client_frees_its_waiter_and_is_never_handed_a_claim() {
+        use std::sync::atomic::AtomicBool;
+        let directory = operator_test_directory("next-peer");
+        let _ = std::fs::remove_dir_all(&directory);
+        let queue = operator_test_queue(&directory, 4, 3);
+        queue.manage_sid("s-a").unwrap();
+        let (notify_tx, _notify_rx) = std::sync::mpsc::sync_channel(8);
+        let control = Arc::new(ControlHandle::new("test-next-peer".to_string(), notify_tx));
+        {
+            let mut slot = control.shared.slot.lock().unwrap();
+            slot.queue = Some(queue.clone());
+            slot.retry_after = None;
+        }
+        let store = crate::session_store::new_store();
+        let park = |gone: Arc<AtomicBool>| {
+            let (waiter, store) = (Arc::clone(&control), store.clone());
+            let handle = std::thread::spawn(move || {
+                waiter.wait_claim(&store, Duration::from_secs(20), &mut || {
+                    gone.load(Ordering::SeqCst)
+                })
+            });
+            let parked = Instant::now() + Duration::from_secs(5);
+            while !control.shared.claim_waiter_active.load(Ordering::SeqCst) {
+                assert!(Instant::now() < parked, "the first next never parked");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            handle
+        };
+
+        // A LIVE predecessor keeps the slot: the successor is refused, after
+        // the grace and not before.
+        let live = Arc::new(AtomicBool::new(false));
+        let first = park(Arc::clone(&live));
+        let asked = Instant::now();
+        let refused = control.wait_claim(&store, Duration::ZERO, &mut || false);
+        assert_eq!(
+            refused.map(|c| c.is_some()),
+            Err("another operator next call is already waiting".to_string())
+        );
+        assert!(
+            asked.elapsed() >= NEXT_HANDOVER_GRACE,
+            "{:?}",
+            asked.elapsed()
+        );
+
+        // The predecessor hangs up: its slot is free within the grace, so the
+        // successor's `next` is served (here: nothing queued, a timeout).
+        live.store(true, Ordering::SeqCst);
+        let asked = Instant::now();
+        let served = control.wait_claim(&store, Duration::ZERO, &mut || false);
+        assert!(matches!(served, Ok(None)), "{served:?}");
+        assert!(
+            asked.elapsed() < NEXT_HANDOVER_GRACE,
+            "{:?}",
+            asked.elapsed()
+        );
+        assert!(matches!(first.join().unwrap(), Ok(None)));
+
+        // A hung-up client is handed nothing, and the event it would have
+        // taken is still there, undelivered, for the next client.
+        let event_id = enqueue_operator_test_event(&queue, "s-a", 1);
+        let gone = control.wait_claim(&store, Duration::from_secs(5), &mut || true);
+        assert!(matches!(gone, Ok(None)), "{gone:?}");
+        let claim = control
+            .wait_claim(&store, Duration::ZERO, &mut || false)
+            .unwrap()
+            .expect("the event is still claimable");
+        assert_eq!(claim.event.id, event_id);
+        assert_eq!(claim.event.redelivery_count, 0, "it was never delivered");
+
+        drop(control);
+        drop(queue);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     #[test]
     fn next_surfaces_a_cap_converted_escalation_before_returning_it() {
         let directory = operator_test_directory("next-escalation");
@@ -4331,7 +4411,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let store = crate::session_store::new_store();
         let escalation = control
-            .wait_claim(&store, Duration::ZERO)
+            .wait_claim(&store, Duration::ZERO, &mut || false)
             .unwrap()
             .expect("expired cap conversion must be claimable");
         assert_eq!(escalation.event.id, event_id);

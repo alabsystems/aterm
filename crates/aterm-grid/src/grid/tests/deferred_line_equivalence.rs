@@ -601,13 +601,75 @@ fn flood_backpressure_drop_recycles_bodies() {
     for _ in 0..5 {
         buf.push_row(&row, ScrolledRowExtras::default());
     }
-    buf.drop_oldest(3);
-    assert_eq!(buf.len(), 2, "drop_oldest still drops the staged lines");
+    assert_eq!(
+        buf.drop_oldest(3),
+        3,
+        "every dropped line is counted into the cut"
+    );
+    // Two staged lines remain, plus the marker row the cut now presents ahead
+    // of them — dropped lines are never silently gone.
+    assert_eq!(buf.len(), 3, "drop_oldest still drops the staged lines");
+    assert_eq!(buf.cut_dropped(), 3, "the cut remembers what it lost");
+    assert_eq!(
+        buf.staged_bytes(),
+        2 * (std::mem::size_of::<crate::grid::scroll_convert::DeferredLine>()
+            + b"dropped under flood".len() * std::mem::size_of::<Cell>()),
+        "two staged rows remain, each weighed at its OCCUPIED cells, not the width"
+    );
     assert_eq!(
         buf.pooled_bodies(),
         3,
         "dropped lines' bodies must be recycled, not freed"
     );
+}
+
+#[test]
+fn front_rows_over_sheds_the_fewest_rows_that_fit_and_keeps_the_floor() {
+    use crate::grid::scroll_convert::LazyBuffer;
+
+    // Rows of three widths, so no row count can stand in for bytes; the
+    // running sum must match a fresh walk after every kind of removal.
+    let mut rb = RowBuilder::new();
+    let fill = |buf: &mut LazyBuffer, rb: &mut RowBuilder| {
+        for i in 0..30 {
+            let cells: Vec<Cell> = std::iter::repeat_n(b'x', [2, 40, 200][i % 3])
+                .map(Cell::from_ascii_fast)
+                .collect();
+            buf.push_row(&rb.build(&cells, 200, false), ScrolledRowExtras::default());
+        }
+    };
+    let mut buf = LazyBuffer::new();
+    fill(&mut buf, &mut rb);
+    let total = buf.staged_bytes();
+    assert_eq!(buf.front_rows_over(total, 0), 0, "it fits: nothing to shed");
+
+    // `n` is the FEWEST front rows whose going brings it under the budget.
+    let budget = total * 2 / 3;
+    let n = buf.front_rows_over(budget, 0);
+    assert!(n > 0);
+    let mut probe = LazyBuffer::new();
+    fill(&mut probe, &mut rb);
+    probe.shed_oldest(n - 1, 0);
+    assert!(probe.staged_bytes() > budget, "one row fewer would not fit");
+    probe.shed_oldest(1, 0);
+    assert!(probe.staged_bytes() <= budget, "`n` rows do");
+
+    // Never below `keep`, however far over budget — an open cut's marker
+    // counts as one of the kept rows, as it does in `len`.
+    assert_eq!(buf.front_rows_over(0, 25), 5);
+    assert_eq!(buf.front_rows_over(0, 40), 0);
+    assert_eq!(buf.drop_oldest(2), 2);
+    assert_eq!(
+        buf.front_rows_over(0, 25),
+        4,
+        "28 rows + the marker, keep 25"
+    );
+
+    // The drains keep the sum honest too.
+    assert_eq!(buf.drain_front(7).count(), 7);
+    assert!(buf.staged_bytes() > 0);
+    assert_eq!(buf.drain_all().count(), 22);
+    assert_eq!(buf.staged_bytes(), 0);
 }
 
 #[test]

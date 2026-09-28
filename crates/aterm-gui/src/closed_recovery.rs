@@ -232,6 +232,7 @@ mod tests {
             attention: None,
             questions: None,
             identity: None,
+            agent: None,
         })
     }
 

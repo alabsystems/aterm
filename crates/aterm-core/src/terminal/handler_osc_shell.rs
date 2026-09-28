@@ -26,7 +26,12 @@ impl TerminalHandler<'_> {
 
     /// Shell mark A: Prompt starting — create mark, finalize previous block, start new block.
     fn shell_prompt_start(&mut self, row: u64, col: u16) {
+        // Every mark time comes from the batch's pipeline clock (`process_at`),
+        // like B/C/D below — not from the constructors' own wall-clock read,
+        // which made a replayed or re-chunked byte log stamp a different
+        // prompt time (a checkpoint that was not a function of its input).
         let mut mark = CommandMark::new(row, col);
+        mark.prompt_time_ms = self.transient.process_wall_ms;
         if let Some(ref cwd) = *self.current_working_directory {
             mark.working_directory = Some(cwd.as_str().into());
         }
@@ -45,6 +50,7 @@ impl TerminalHandler<'_> {
 
         // Start new block
         let mut block = OutputBlock::new(self.shell.next_block_id, row, col);
+        block.prompt_time_ms = self.transient.process_wall_ms;
         self.shell.next_block_id += 1;
         if let Some(ref cwd) = *self.current_working_directory {
             block.working_directory = Some(cwd.as_str().into());
@@ -191,6 +197,41 @@ impl TerminalHandler<'_> {
             .verify_nonce_with_engine(gate, params)
     }
 
+    /// A shell PROMPT (OSC 133/633 `A`) on the ALTERNATE screen: the full-screen
+    /// app the shell ran is dead and its `?1049l` never came, so leave the screen
+    /// for it before the prompt is placed — a prompt on the alt screen is never
+    /// intended; the shell believes it is on the main screen.
+    ///
+    /// MEASURED (2026-09-22, Windows 11, the `cast` tap): `less` killed from
+    /// another tab; the bytes after the kill were pwsh's `133;D;-1`, `133;A`, the
+    /// prompt and `133;B`, and nothing else — conhost never sends the `l` for a
+    /// client it outlived (`handler_dec.rs`, `leave_orphaned_alternate_screen`,
+    /// has the ConPTY probe). The same bytes follow a SIGKILLed pager on unix.
+    ///
+    /// Only `A` is a trigger, and only past the nonce gate: `A` is the one mark
+    /// that says the shell is drawing its prompt, while `B`/`C`/`D` only open or
+    /// close a block; and a forged `133;A` an unauthorized writer prints must not
+    /// yank a running app off its screen when the host demands the nonce. (A
+    /// multiplexer on the alt screen passes no pane's marks outward: screen and
+    /// tmux forward no unknown OSC, and aterm's scripts install none in a pane.)
+    /// The phase before the `A` is deliberately not consulted: pwsh's prompt
+    /// sends `D` first (CommandFinished), a shell whose prompt sends no `D`
+    /// arrives from CommandExec, and an app a key binding launched from the
+    /// prompt (`fzf` on Ctrl-R) arrives from PromptStart/CommandStart — all the
+    /// same fact. Runs BEFORE `parse_shell_osc` reads the cursor, so the mark's
+    /// row is the main-grid row the prompt actually paints on. What the alt
+    /// screen showed, including anything typed onto it while stuck, is flushed to
+    /// the archive first (`offscreen`).
+    fn prompt_leaves_orphaned_alt_screen(&mut self, params: &[&[u8]]) {
+        if !self.modes.alternate_screen {
+            return;
+        }
+        if params.get(1).and_then(|p| p.first()) != Some(&b'A') {
+            return;
+        }
+        self.leave_orphaned_alternate_screen();
+    }
+
     /// Handle OSC 133 - Shell integration (FinalTerm/Terminal protocol).
     ///
     /// Marks: A (prompt start), B (command input), C (execution start), D (finished).
@@ -201,6 +242,7 @@ impl TerminalHandler<'_> {
         if !self.shell_nonce_gate_ok(133, params) {
             return;
         }
+        self.prompt_leaves_orphaned_alt_screen(params);
         let Some((cmd, row, col)) = self.parse_shell_osc(params) else {
             return;
         };
@@ -227,6 +269,7 @@ impl TerminalHandler<'_> {
         if !self.shell_nonce_gate_ok(633, params) {
             return;
         }
+        self.prompt_leaves_orphaned_alt_screen(params);
         let Some((cmd, row, col)) = self.parse_shell_osc(params) else {
             return;
         };
@@ -372,5 +415,163 @@ impl TerminalHandler<'_> {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod prompt_on_alt_screen_tests {
+    //! The measured stream of a killed pager (2026-09-22, ConPTY `cast` tap):
+    //! `?1049h`, the pager's frames, then — no `?1049l` anywhere — the shell's
+    //! `133;D;-1`, `133;A`, its prompt and `133;B`. The host's own recovery is
+    //! tested beside the exit paths in `handler_dec.rs`; the archive's share of
+    //! both is in `alt_archive_tests.rs`.
+    use crate::terminal::Terminal;
+
+    /// Eight lines of history, a marked `less` command, and the pager on the alt
+    /// screen — the screen the audit's tab A was left with.
+    fn stuck_pager() -> Terminal {
+        let mut term = Terminal::new(5, 40);
+        term.set_alt_archive_enabled(true);
+        for i in 0..8 {
+            term.process(format!("main line {i}\r\n").as_bytes());
+        }
+        term.process(b"\x1b]133;A\x07$ \x1b]133;B\x07less file\r\n\x1b]133;C\x07");
+        term.process(b"\x1b[?1049h\x1b[H\x1b[2Jpager row 1\r\npager row 2\r\npager row 3\r\n:");
+        assert!(term.modes().alternate_screen);
+        term
+    }
+
+    /// What pwsh sent after `Stop-Process`, byte for byte in shape.
+    const PROMPT_AFTER_KILL: &[u8] = b"\r\n\x1b]133;D;-1\x07\x1b]133;A\x07PS> \x1b]133;B\x07";
+
+    /// The visible rows, trailing blanks trimmed (a prompt's `PS> ` reads `PS>`).
+    fn screen(term: &Terminal) -> Vec<String> {
+        (0..5)
+            .map(|r| term.row_text(r).unwrap().trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_prompt_on_the_alt_screen_leaves_it_and_paints_on_the_main_grid() {
+        let mut term = stuck_pager();
+        term.process(PROMPT_AFTER_KILL);
+        assert!(
+            !term.modes().alternate_screen,
+            "the prompt left the alt screen"
+        );
+        // 8 lines, the command line and the empty row its `\r\n` opened = 10 rows
+        // on a 5-row grid: 5 in scrollback, reachable again (the audit measured
+        // `lines` = 0 while stuck).
+        assert_eq!(term.grid().scrollback_lines(), 5);
+        let rows = screen(&term);
+        assert_eq!(rows[3], "$ less file");
+        assert_eq!(rows[4], "PS>", "the prompt is on the row after the command");
+        assert!(rows.iter().all(|r| !r.contains("pager")), "{rows:?}");
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (4, 4));
+    }
+
+    #[test]
+    fn the_prompt_mark_names_the_main_grid_row_it_painted_on() {
+        let mut term = stuck_pager();
+        term.process(PROMPT_AFTER_KILL);
+        let mark = term
+            .shell
+            .current_mark
+            .as_ref()
+            .expect("the prompt opened a mark");
+        // Absolute row 9 = 5 scrolled off + visible row 4: the row `PS> ` is on,
+        // not the alt-grid row the cursor was on when the `A` arrived.
+        assert_eq!(mark.prompt_start_row, 9);
+        assert_eq!(mark.prompt_start_col, 0);
+        assert_eq!(mark.command_start_col, Some(4));
+        // The killed command's mark closed with the exit code pwsh reported.
+        let done = term.command_marks().last().expect("the less mark closed");
+        assert_eq!(done.exit_code, Some(-1));
+    }
+
+    #[test]
+    fn what_the_stuck_screen_showed_is_in_the_archive_whole() {
+        let mut term = stuck_pager();
+        term.process(PROMPT_AFTER_KILL);
+        let rows = term.alt_archive().texts();
+        for want in ["pager row 1", "pager row 2", "pager row 3", ":"] {
+            assert!(
+                rows.iter().any(|r| r == want),
+                "{want:?} was on the stuck screen and must be readable: {rows:?}"
+            );
+        }
+        let gaps: Vec<_> = term.alt_archive().gaps().collect();
+        assert_eq!(
+            gaps.len(),
+            1,
+            "one leave, not one from the handler and one from the epilogue"
+        );
+        assert_eq!(gaps[0].kind, crate::terminal::AltArchiveGapKind::Leave);
+        // A later main-screen batch archives nothing more.
+        term.process(b"echo hi\r\nhi\r\n");
+        assert_eq!(term.alt_archive().texts(), rows);
+    }
+
+    #[test]
+    fn rows_painted_in_the_same_read_as_the_prompt_are_archived() {
+        // The kill's read carries the app's last paint AND the prompt: the commit
+        // must happen at the `A`, not at an epilogue that runs after the swap.
+        let mut term = stuck_pager();
+        let mut read = b"\x1b[5;1Hlast paint before death".to_vec();
+        read.extend_from_slice(PROMPT_AFTER_KILL);
+        term.process(&read);
+        assert!(!term.modes().alternate_screen);
+        let rows = term.alt_archive().texts();
+        assert!(
+            rows.iter().any(|r| r == "last paint before death"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn b_c_and_d_on_the_alt_screen_do_not_leave_it() {
+        // `D` for the very app entering the alt screen can share its read with
+        // the `?1049h`; none of the three names a prompt.
+        let mut term = stuck_pager();
+        term.process(b"\x1b]133;D;0\x07\x1b]133;B\x07\x1b]133;C\x07");
+        assert!(term.modes().alternate_screen);
+        assert_eq!(term.grid().scrollback_lines(), 0);
+    }
+
+    #[test]
+    fn a_vscode_633_prompt_leaves_the_alt_screen_too() {
+        let mut term = stuck_pager();
+        term.process(b"\r\n\x1b]633;D;-1\x07\x1b]633;A\x07PS> \x1b]633;B\x07");
+        assert!(!term.modes().alternate_screen);
+        assert_eq!(screen(&term)[4], "PS>");
+    }
+
+    #[test]
+    fn a_prompt_the_nonce_gate_drops_leaves_nothing() {
+        // With the nonce demanded, an unauthenticated `133;A` — what any program
+        // on the alt screen could print — is dropped whole: the app keeps its
+        // screen. The authenticated one recovers as before.
+        let mut term = stuck_pager();
+        term.authorize_shell_integration([0x11; 32]);
+        term.modes_mut().require_shell_integration_nonce = true;
+        term.process(b"\r\n\x1b]133;A\x07forged> ");
+        assert!(
+            term.modes().alternate_screen,
+            "a forged prompt cannot yank the app"
+        );
+        let id = "11".repeat(32);
+        term.process(format!("\x1b]133;A;id={id}\x07PS> ").as_bytes());
+        assert!(!term.modes().alternate_screen);
+        assert_eq!(screen(&term)[4], "PS>");
+    }
+
+    #[test]
+    fn a_prompt_on_the_main_screen_changes_no_screen_state() {
+        let mut term = Terminal::new(5, 40);
+        term.process(b"one\r\n\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(!term.modes().alternate_screen);
+        assert_eq!(screen(&term)[1], "$");
+        assert_eq!(term.alt_archive().gaps().count(), 0);
     }
 }

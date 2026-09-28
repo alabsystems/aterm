@@ -224,7 +224,9 @@ who whoami grant dial*` are owner-only and answer `ERR denied` to any non-self o
 the exception that *rejects* one, because it aggregates per session and would read wrong.
 
 Asymmetry: `spawn` is instance/window-targeted (`aterm ctl spawn` → `OK <sid>`), `close` is
-Session-targeted (`aterm ctl "@<sid>" close` → `OK closed <sid>`).
+Session-targeted (`aterm ctl "@<sid>" close` → `OK closed <sid>`). `close` closes that one
+pane: a split's other panes keep their shells, and a job running in the pane refuses it
+(`ERR close refused …`).
 
 ## Observe
 
@@ -285,8 +287,8 @@ aterm ctl "@$SID" image --bytes                # OK 1 + "<w> <h> <nbytes> <base6
 - Reply is `OK <w> <h> <path>`. On macOS the path contains `Application Support` —
   **never** `awk '{print $4}'`; take the rest of the line.
 - Filename must be a **bare filename**; captures are confined to `<socket-dir>/images/`.
-- **A background tab cannot be screenshotted:** `ERR no window displays the target session
-  (background tab?)`, and no file is written. `text`/`screen` have no such limit.
+- **A background tab cannot be screenshotted:** `ERR image: no window shows that session;
+  raise its tab first`, and no file is written. `text`/`screen` have no such limit.
 - `--bytes` is the only capture form a remote (`dial`) driver can use, since a path names
   the *server's* filesystem. PNG is 8-bit RGBA, full device-pixel (Retina 2×) —
   budget ~0.8–1.2 MB of base64 per shot.
@@ -302,6 +304,8 @@ aterm ctl "@$SID" send if=Do.you.want.to.proceed 1  # the same guard on a raw wr
 aterm ctl "@$SID" ctrl c
 aterm ctl "@$SID" paste 'some text'  # bracketed-paste seam
 aterm ctl "@$SID" resize 30 100      # ROWS first
+aterm ctl "@$SID" mainscreen         # a full-screen app killed from outside left its screen up: back to the shell's (OK left=1)
+aterm ctl confirm yes                # Windows: answer the close/quit an `invoke` left waiting in the window (`controls front`)
 ```
 
 `send|key|ctrl|feed|mouse|paste` reply `OK seq=<n>` — the content baseline *before* the
@@ -401,7 +405,7 @@ disables re-press where a duplicate Enter would be harmful. `trim=1` closes the 
 
 Busy paths: `ERR busy turn=<id>` or `ERR busy lease=<holder>`.
 
-### Cooperative lease (advisory)
+### Drive lease (cooperative, or a hard hold)
 
 ```sh
 aterm ctl "@$SID" lease acquire ttl=5000 holder=agent-a
@@ -409,7 +413,12 @@ aterm ctl who        # 0 s-… driving=lease:agent-a watchers=0 turns=3 alive
 aterm ctl "@$SID" lease release holder=agent-a
 ```
 
-Advisory — it blocks `turn`, but raw `send`/`key` still go through. `turn` is the hard arbiter.
+Cooperative by default — it blocks another connection's `turn`, but raw `send`/`key` still
+go through. `turn` is the hard arbiter. `lease acquire … hard` is a HOLD: every other
+connection's `send`/`key`/`paste`/`turn` gets `ERR busy lease=<holder>` while the holder's own
+connection writes on. The harness holds a tab so while its live upgrade restarts the agent
+(`hand=lease:aterm-harness@<pid>`, the bare shell between the old agent and the new): treat
+that `ERR busy` as any other — retry, and your input lands in the new agent.
 
 ## Open a tab in a specific window — without stealing focus
 
@@ -502,11 +511,12 @@ aterm ctl exits                      # the instance EXIT LEDGER (owner-only), ol
 aterm ctl exits 20 since=<id>        # the newest 20 with id > <id> — page with the last id you saw
 ```
 
-`exit <id> t=<ms> sid=<sid> local=<n> reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown> exit_code=<n|-> by=<sid|human|->`
+`exit <id> t=<ms> sid=<sid> local=<n> reason=<shell-exit|ctl-close|ui-close|window-close|app-quit|unknown> exit_code=<n|-> by=<sid|human|ctl|bridge|->`
 
 - `by=` is the closing CALLER: an edge-scoped client's own sid, `human` for a UI/window
-  close, `-` when the connection carried no session identity (an owner-token client is
-  anonymous). `exit_code=-` = hung up by a close, died by signal, or not yet reaped.
+  close, `ctl` for an owner-token client (its token names no session), `bridge` for the
+  fabric bridge, `-` when the close path did not say. `exit_code=-` = hung up by a close,
+  died by signal, or not yet reaped.
 - `t=` is the `timeline`/`history` clock. Bounded ring, monotonic ids; `OK 0` = none retained.
 - The same facts reach a live watcher as they happen: `subscribe @sid events` gets
   `EVENT <local> closing reason= by=` ahead of `EVENT <local> exited`; `subscribe … sessions`
@@ -686,6 +696,13 @@ aterm drive ledger "@$SID" --journal j.jsonl --format html --out ledger.html   #
 `await match <ready-pattern>` → `text`. Its `--idle`/`--timeout` are **milliseconds**
 (600 / 180000), unlike `aterm ctl --timeout` in seconds.
 
+**Instructions for a model worker go by mail, not the composer.** A plain `turn` (and
+`paste`) delivers its text as ONE bracketed paste, and a model worker (Claude Code) treats
+pasted text as not its human's — its own injection safeguard, working as intended — so it
+may ask instead of acting. (`send`, and so `prompt`, writes the bytes raw; `turn typed=1`
+presses them one key at a time.) Give a model worker real instructions with `aterm drive
+task`, which posts them as mail and types only a one-line inbox nudge.
+
 **`--ready REGEX`** sets the prompt-ready row pattern for that final best-effort settle.
 The default matches a **Claude** input caret (`(^|\s)❯(\s|$)`) — right only when the driven
 program *is* Claude. Point it at your own REPL's prompt otherwise, or pass `''` for
@@ -855,3 +872,5 @@ use `aterm ctl` — that path is in-process.
 19. `key if=<re> <name>` / `send if=<re> <text>` check and press under ONE lock: `OK skipped
     seq=<n>` (exit 0) means no row matched and nothing was written — an answer, not an
     error. The guard is ONE token: `if=Do.you.want.to.proceed`.
+20. `tab <N>`, `tab close <N>`, `tab move` and the `index=` of `inspect app/v1 tabs` count
+    from 0; the ordinals painted on the tab strip count from 1.

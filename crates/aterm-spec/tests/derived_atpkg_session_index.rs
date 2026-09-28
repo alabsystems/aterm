@@ -1,7 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use aterm_spec::{derive::atpkg_session_index_handoff_model, interp, verify};
+use aterm_spec::{
+    derive::{atpkg_session_index_eligibility_model, atpkg_session_index_handoff_model},
+    interp, verify,
+};
+
+#[test]
+fn an_empty_local_look_does_not_delay_the_first_eligible_index_probe() {
+    let model = atpkg_session_index_eligibility_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name)
+    );
+    verify::prove_and_catch_scalar(&model, "atpkg session index eligibility");
+
+    let mut healthy = model.init_state();
+    let buggy = interp::with_buggy(&model, 1);
+    let mut old = buggy.init_state();
+    for action in ["EmptyLook", "Tick", "Enable", "FirstEligibleLook"] {
+        assert!(model.fire(action, &mut healthy), "{action}: {healthy:?}");
+        assert!(buggy.fire(action, &mut old), "{action}: {old:?}");
+    }
+    assert_eq!(healthy["requests"], 1);
+    assert_eq!(old["requests"], 0);
+    assert!(!buggy.check_invariant("NoArtificialNetworkWarmup", &old));
+}
 
 #[test]
 fn a_near_index_answer_obeys_the_seat_window_and_verified_floor() {

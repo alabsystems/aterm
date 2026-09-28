@@ -331,7 +331,7 @@ impl AsyncHarness {
 
         // A second live view of a different app: the crossed-sink control
         // needs an identity that is live on its own and still not this reply's.
-        let mut documents = DocumentStore::new();
+        let mut documents = DocumentStore::for_test();
         let document = documents.open("mem://async-conformance".into(), "alpha".into());
         let markdown_instance = runtime
             .insert_instance(NativeApp::Markdown(MarkdownApp::new(

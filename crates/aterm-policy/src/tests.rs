@@ -1,16 +1,10 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unit tests for the Phase 0 scaffold (#7991).
-//!
-//! These tests cover the three acceptance criteria from the techlead brief:
-//!
-//! 1. Round-trip: `hardened → TOML → parse → equal`.
-//! 2. Profile refinement ordering: `hardened ⊆ standard ⊆ permissive` over
-//!    the unmatched-default response rank.
-//!
-//! A wider profile matrix against every concrete sequence lives with the
-//! engine (#7992) once the decision tree exists.
+//! Unit tests for the policy data model, profiles and engine: TOML round-trips,
+//! the `hardened ⊆ standard ⊆ permissive` refinement over every sequence the
+//! profiles rule on, Hardened's fail-closed default, rule-vs-default
+//! arbitration, and the exhaustive `OriginTag` lattice order.
 
 use super::{
     Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION, aliases,
@@ -66,12 +60,11 @@ fn refinement_unmatched_default_is_monotone() {
 
 #[test]
 fn refinement_holds_over_all_sequences_and_origins() {
-    // The §4.5 / TLA+ T2 invariant in FULL: for EVERY (sequence, origin), the
+    // The refinement invariant in FULL: for EVERY (sequence, origin), the
     // stricter profile is never looser than the looser one, i.e.
     // rank(hardened) >= rank(standard) >= rank(permissive) (higher rank = stricter;
-    // see `response_rank`). The test above only covers the unmatched default; the
-    // kani `policy_monotonicity` harness covers this symbolically but is not
-    // discharged on this host. Verify it here over a comprehensive CONCRETE grid:
+    // see `response_rank`). The test above only covers the unmatched default.
+    // Verify it here over a comprehensive CONCRETE grid:
     // every sequence the default profiles carry a rule for, plus several unmatched
     // fall-throughs, evaluated under all 8 origins.
     use super::selector::DispatchedSequence;
@@ -120,8 +113,7 @@ fn refinement_holds_over_all_sequences_and_origins() {
 
 #[test]
 fn hardened_fails_closed_on_unknown_for_untrusted_origins() {
-    // Fail-closed invariant (kani `policy_fail_closed_on_unknown`, not discharged
-    // on this host): a strict profile must never let an UNTRUSTED origin execute a
+    // Fail-closed invariant: a strict profile must never let an UNTRUSTED origin execute a
     // sequence it does not explicitly rule on. `Host` (the trusted host app) is
     // intentionally allowed to execute via the Host-gated `response any` wildcard
     // rule, so it is excluded; every OTHER origin must fall through to the Drop
@@ -251,6 +243,55 @@ fn alias_table_has_expected_entries() {
 fn alias_lookup_is_case_sensitive() {
     assert!(aliases::lookup("OSC 52 set").is_some());
     assert!(aliases::lookup("osc 52 set").is_none());
+}
+
+// ---------------------------------------------------------------------------
+// Rule-vs-default arbitration
+// ---------------------------------------------------------------------------
+
+/// A single-rule policy whose selector matches and whose origin gate is met
+/// returns exactly that rule's response — for EVERY response and EVERY
+/// `origin_min` (5 × 8, the whole domain). Rules out wildcard leakage (the `*`
+/// bucket firing ahead of the specific one), default leakage (`unmatched`
+/// winning over a matching rule — the default here is `Ask`, so a leak is
+/// observable for every other response) and a misreported rule index.
+#[test]
+fn single_matching_rule_decides_for_every_response_and_origin_gate() {
+    use super::selector::DispatchedSequence;
+    let responses = [
+        Response::Drop,
+        Response::Warn,
+        Response::Execute,
+        Response::Ask,
+        Response::Rewrite,
+    ];
+    for response in responses {
+        for origin_min in ALL_ORIGINS {
+            let eng = PolicyEngine::new(Policy {
+                schema_version: SCHEMA_VERSION,
+                profile: Profile::Standard,
+                defaults: Defaults {
+                    unmatched: Response::Ask,
+                    shell_integration_require_nonce: false,
+                },
+                rules: vec![Rule {
+                    sequence: "OSC 9".to_owned(),
+                    origin_min,
+                    response,
+                    rate_limit: None,
+                    prompt_id: None,
+                }],
+                rate_limits: vec![],
+            });
+            // `Host` dominates every origin, so the gate always admits the rule.
+            let d = eng.evaluate(
+                &DispatchedSequence::osc(9, [String::from("msg")]),
+                OriginTag::Host,
+            );
+            assert_eq!(d.response, response, "origin_min {origin_min:?}");
+            assert_eq!(d.matched_rule, Some(0), "origin_min {origin_min:?}");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

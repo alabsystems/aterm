@@ -36,10 +36,12 @@
 //! rejected by the committed model and admitted by `Buggy = 1`, so a pass is
 //! never vacuous.
 
-use aterm_buffer::{Cursor, Edit, ReadCap, SubUpdate, Surface, WriteCap};
+use aterm_buffer::{Cursor, Edit, SubUpdate, Surface};
+mod support;
 use aterm_spec::derive::cursor_model;
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
+use support::{read_cap, write_cap};
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -55,7 +57,7 @@ const PROBE: u64 = 3;
 fn cursor_position(s: &Surface, cur: Cursor) -> u64 {
     let mut probe = s.clone();
     for i in 0..PROBE {
-        probe.apply(&WriteCap, Edit::AppendLine(format!("probe {i}")));
+        probe.apply(&write_cap(), Edit::AppendLine(format!("probe {i}")));
     }
     match probe.poll(cur).0 {
         SubUpdate::Events(events) => events
@@ -94,7 +96,7 @@ fn conforms(prev: &State, next: &State, action: &str) -> (bool, String) {
 fn real_subscription_cursor_conforms_to_cursor_model() {
     let m = cursor_model();
     let mut s = Surface::new();
-    let mut cur = s.subscribe(&ReadCap);
+    let mut cur = s.subscribe(&read_cap());
     let mut state = project(&s, cur);
     assert_eq!(
         state,
@@ -113,7 +115,7 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
                 1 => Edit::SetLine(aterm_buffer::LineId(0), format!("set {burst}.{i}")),
                 _ => Edit::ClearLine(aterm_buffer::LineId(0)),
             };
-            s.apply(&WriteCap, edit);
+            s.apply(&write_cap(), edit);
             let next = project(&s, cur);
             let (ok, why) = conforms(&state, &next, "Grow");
             assert!(ok, "real write {state:?} -> {next:?} is not Grow\n{why}");
@@ -152,7 +154,7 @@ fn real_subscription_cursor_conforms_to_cursor_model() {
 
     // NEGATIVE CONTROL — the modelled defect from this real state: one more
     // write, then a delivery that parks the cursor one past the head.
-    s.apply(&WriteCap, Edit::AppendLine("tail".into()));
+    s.apply(&write_cap(), Edit::AppendLine("tail".into()));
     let behind = project(&s, cur);
     let mut overshoot = behind.clone();
     overshoot.insert("cursor", behind["seq"] + 1);

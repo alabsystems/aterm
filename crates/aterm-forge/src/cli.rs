@@ -68,8 +68,9 @@ USAGE
         index row, and (when run in a workspace) whether it was built for THIS
         Cargo.lock. Proves INTEGRITY and SHAPE, not PROVENANCE: every digest a
         bundle carries is inside it, so an attacker who edits it re-seals them.
-        Only a signature over the printed bundle-sha256 closes that, and
-        signing is the owner's ceremony.
+        Only a signature over the printed bundle-sha256 closes that: a
+        signed atpkg pkg manifest pinning it, outside this tool, once
+        delivery ships (deferred; none exists today).
 
   cargo forge mirror unbundle --file FILE --out DIR [--force]
         check-bundle, then extract — re-hashing every entry as it is written

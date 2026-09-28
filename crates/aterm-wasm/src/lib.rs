@@ -142,11 +142,19 @@ pub struct AtermTerminal {
     // persistent cache would leave selection/cursor/recoloured cells stale.
     force_full_repaint: bool,
     // Reused per-frame engine snapshot: `render` refills this in place via
-    // `cell_frame_into` instead of allocating a fresh `RenderInput` (the outer
-    // container Vecs + a per-row inner Vec for each row) every frame — the same
+    // `cell_frame_damage_scoped_into` (only the damaged rows under the DMG-1
+    // continuity proof, the full refill otherwise) instead of allocating a
+    // fresh `RenderInput` (the outer container Vecs + a per-row inner Vec for
+    // each row) every frame — the same
     // kept scratch its two sibling frontends (aterm-gpu-web's `frame_scratch`,
     // the native windowed `input_scratch`) already hold (E8).
     frame_scratch: RenderInput,
+    // TEST BUILDS ONLY: which arm the last `refill_frame_scratch` took (DMG-1)
+    // — `Scoped` on an ordinary echo frame, `Full` (with the refusing clause)
+    // otherwise, `None` before the first refill — for the reach tests. The
+    // shipped build neither stores nor returns it.
+    #[cfg(test)]
+    last_refill: Option<aterm_core::render::FrameRefill>,
     // Built-in smart-selection rules (url/file_path/email/...) for scroll-correct
     // link detection via smart_word_at; reused across link_at calls.
     smart: SmartSelection,
@@ -297,12 +305,31 @@ fn apply_terminal_theme_colors(term: &mut Terminal, fg: u32, bg: u32, cursor: u3
 }
 
 impl AtermTerminal {
-    /// Refill every engine-owned frame channel. `cell_frame_into` includes the
-    /// live implicit background and cursor colour, so sparse tails, OSC
-    /// 10/11/12 resets, and DECSCNM remain one coherent terminal snapshot.
+    /// Refill every engine-owned frame channel AND consume the frame's damage
+    /// session, through the engine's ONE damage consumer,
+    /// [`Terminal::cell_frame_damage_scoped_into`] — the extraction the native
+    /// GUI renders through. Under its continuity proof only the damage
+    /// tracker's rows re-resolve (a keystroke echo refills one row, not
+    /// `rows × cols`); any break falls back to the full refill, which is always
+    /// sound. The unconditional restamp covers the live implicit background,
+    /// cursor and selection colours, so sparse tails, OSC 10/11/12 resets, and
+    /// DECSCNM remain one coherent terminal snapshot either way.
+    ///
+    /// The effects pipeline closes a damage session only when one is still
+    /// open (`EffectsPipeline::apply`), so it no longer re-takes the session
+    /// this call consumed — a second `take_damage` would bump the extraction
+    /// generation and force the full arm on every frame with sparkle words or
+    /// rain on.
     fn refill_frame_scratch(&mut self) {
-        self.term
-            .cell_frame_into(&mut self.frame_scratch, self.rows, self.cols);
+        let refill =
+            self.term
+                .cell_frame_damage_scoped_into(&mut self.frame_scratch, self.rows, self.cols);
+        #[cfg(test)]
+        {
+            self.last_refill = Some(refill);
+        }
+        #[cfg(not(test))]
+        let _ = refill;
     }
 
     /// Read one `(grapheme, is_wide)` display cell through the single-slot row
@@ -409,6 +436,8 @@ impl AtermTerminal {
             win: WindowCpu::new(),
             force_full_repaint: false,
             frame_scratch: RenderInput::empty(),
+            #[cfg(test)]
+            last_refill: None,
             smart: SmartSelection::with_builtin_rules(),
             effects: EffectsPipeline::new(),
             theme_cursor: cursor & 0x00FF_FFFF,
@@ -1114,8 +1143,8 @@ impl AtermTerminal {
         // Computed AFTER the pumps (a reflow re-attach marks full damage, so the
         // epoch term sees it). When the key equals the last RENDERED frame's key
         // and nothing present-time is pending, this frame is byte-identical by
-        // construction: skip the three full-grid passes (cell_frame_into resolve,
-        // compute_dirty_rows row diff, cache clone_from) AND the raster/expand
+        // construction: skip the refill (`cell_frame_damage_scoped_into`), the
+        // compute_dirty_rows row diff and the cache clone_from AND the raster/expand
         // entirely. The skip is observable only as ZERO present bands — exactly
         // what an unchanged frame already exported through the GateHit arm — with
         // `rgba` retaining the last frame's bytes (the host contract for band
@@ -1161,21 +1190,16 @@ impl AtermTerminal {
             self.win.invalidate();
             self.force_full_repaint = false;
         }
-        // E8: refill the kept scratch in place rather than allocating a fresh
-        // snapshot each frame (the gpu-web/native kept-scratch pattern);
-        // `cell_frame_into` fully overwrites the engine-owned channels, and the
-        // effects/stamp passes below re-fill the host-owned overlay channels, so
-        // a reused scratch never carries a previous frame's state.
+        // E8 + DMG-1: refill the kept scratch in place (the gpu-web/native
+        // kept-scratch pattern), re-resolving only the damaged rows when the
+        // continuity proof holds; the effects/stamp passes below re-fill the
+        // host-owned overlay channels, so a reused scratch never carries a
+        // previous frame's state. The refill also CONSUMES the damage session
+        // (WF-1): the NEXT net-new grid change opens a fresh session and
+        // advances the epoch the frame gate compares. aterm-render never reads
+        // the tracker (it diffs snapshots), and this render loop is the
+        // engine's only damage consumer here.
         self.refill_frame_scratch();
-        // WF-1: consume the damage session the snapshot above just captured, so
-        // the NEXT net-new grid change opens a fresh session and advances the
-        // epoch the frame gate compares. Before the gate existed nothing on the
-        // web path ever called take_damage, so the epoch advanced exactly once
-        // per instance lifetime and could never serve as a change detector.
-        // aterm-render never reads the tracker (it diffs snapshots), and this
-        // render loop is the engine's only damage consumer here, so consuming
-        // the session cannot starve any other reader.
-        self.term.take_damage();
         // Fill the overlay channels (aurora/trail/sparkle) for the host-advanced
         // instant. With every effect off this only clears the channels a reused
         // scratch may carry — byte-identical to the pre-effects render.
@@ -2701,6 +2725,8 @@ impl AtermTerminal {
             win: WindowCpu::new(),
             force_full_repaint: false,
             frame_scratch: RenderInput::empty(),
+            #[cfg(test)]
+            last_refill: None,
             smart: SmartSelection::with_builtin_rules(),
             effects: EffectsPipeline::new(),
             theme_cursor: theme.cursor & 0x00FF_FFFF,
@@ -5408,6 +5434,111 @@ mod tests {
         let bad = t.search_budgeted("f(oo", false, true, None, 5);
         assert!(bad.complete() && bad.matches().is_empty());
         assert!(bad.reset() && bad.search_id().is_none());
+    }
+
+    /// DMG-1 ON THE WEB PATH: an echo frame re-resolves ONE row — with every
+    /// damage-reading effect on. The host extracts through
+    /// `cell_frame_damage_scoped_into` (which consumes the damage session),
+    /// and the effects pipeline closes a session only when one is still open,
+    /// so sparkle words and rain no longer re-take it. Before that fold the
+    /// pipeline's second `take_damage` bumped the extraction generation on
+    /// every frame and the next echo took `Full { cause: DamageTaken }`.
+    #[test]
+    fn echo_frames_refill_one_row_with_sparkle_and_rain_on() {
+        use aterm_core::render::FrameRefill;
+        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            eprintln!("no system font; skipping web-path scoped-refill test");
+            return;
+        };
+        t.set_sparkle_words_enabled(true);
+        t.set_matrix_rain_enabled(true);
+        t.process(b"$ ");
+        t.render();
+        assert!(
+            matches!(t.last_refill, Some(FrameRefill::Full { .. })),
+            "the first fill is full by construction"
+        );
+        for (i, ch) in b"hello world".iter().enumerate() {
+            t.process(std::slice::from_ref(ch));
+            t.advance_effects(16.0);
+            t.render();
+            assert_eq!(
+                t.last_refill,
+                Some(FrameRefill::Scoped { rows_refilled: 1 }),
+                "echo #{i} must refill exactly its one row"
+            );
+        }
+    }
+
+    /// DMG-1 ON THE WEB PATH, EQUALITY: across a mutation stream (typing,
+    /// wraps and scrolls, erases, SGR, an OSC 11 recolour, the alt screen, a
+    /// history viewport and a resize) with the damage-reading effects on,
+    /// every rendered frame's engine channels equal a FULL extraction of the
+    /// same terminal. The oracle is seeded from the rendered scratch (so the
+    /// host-owned overlay channels the effects wrote are carried over) and
+    /// refilled with `cell_frame_into`, which rewrites every engine channel —
+    /// so only an engine divergence can make the two differ. Both arms must
+    /// be reached, or the equality proves nothing about the scoped one.
+    #[test]
+    fn web_path_scoped_refill_matches_a_full_extraction_over_a_mutation_stream() {
+        use aterm_core::render::FrameRefill;
+        let Some(mut t) = AtermTerminal::new_from_system(8, 40, 14.0) else {
+            eprintln!("no system font; skipping web-path scoped-equality test");
+            return;
+        };
+        t.set_sparkle_words_enabled(true);
+        t.set_matrix_rain_enabled(true);
+        let steps: &[&[u8]] = &[
+            b"$ ",
+            b"e",
+            b"c",
+            b"ho hello cat",
+            b"\r\n",
+            b"\x1b[31mred\x1b[0m and plain",
+            b"\x1b[2K\rerased and retyped",
+            b"\x1b]11;#102030\x07",
+            b"a line long enough to wrap past the forty column edge of this grid",
+            b"\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n\r\n",
+            b"\x1b[?1049h",
+            b"alt screen text",
+            b"\x1b[?1049l",
+            b"x",
+        ];
+        let (mut scoped, mut full) = (0usize, 0usize);
+        let mut check = |t: &mut AtermTerminal, what: &str| {
+            let (rows, cols) = (t.rows, t.cols);
+            let mut oracle = t.frame_scratch.clone();
+            t.term.cell_frame_into(&mut oracle, rows, cols);
+            assert!(
+                t.frame_scratch == oracle,
+                "the rendered frame diverged from a full extraction after: {what}"
+            );
+            match t.last_refill {
+                Some(FrameRefill::Scoped { .. }) => scoped += 1,
+                Some(FrameRefill::Full { .. }) => full += 1,
+                None => panic!("render must refill"),
+            }
+        };
+        for step in steps {
+            t.process(step);
+            t.advance_effects(16.0);
+            t.render();
+            check(&mut t, &String::from_utf8_lossy(step));
+        }
+        t.scroll_lines(3);
+        t.render();
+        check(&mut t, "history viewport");
+        t.scroll_lines(-3);
+        t.render();
+        check(&mut t, "back to the live bottom");
+        t.resize(10, 30);
+        t.render();
+        check(&mut t, "resize");
+        t.process(b"after resize");
+        t.render();
+        check(&mut t, "echo after resize");
+        assert!(scoped >= 5, "the scoped arm must be reached ({scoped})");
+        assert!(full >= 2, "the full arm must be reached ({full})");
     }
 
     /// WF-1 frame gate, two-sided + byte parity. Side 1 (skip): a second

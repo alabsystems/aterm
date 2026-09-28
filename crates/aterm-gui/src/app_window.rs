@@ -317,14 +317,39 @@ pub(crate) enum CloseConfirm {
     /// there is none.
     #[default]
     Interactive,
-    /// A programmatic close (`tab close`, the operator's Stop row): proceed with no
-    /// dialog, busy or not — a scripted close is an explicit instruction.
+    /// Proceed with no dialog, busy or not, for a close that is already an
+    /// explicit instruction: the operator's typed Stop row (it declared
+    /// `role=operator`), and the replay of a close the human confirmed on the
+    /// windows in-window banner ([`App::replay_confirmed_close`] — asking again
+    /// would pose the answered question twice).
     Programmatic,
-    /// The `close` verb: no dialog; an idle close proceeds, a busy one is refused so
-    /// the verb answers `ERR close refused (a running job armed the last-tab
-    /// confirm)` exactly as its catalog entry promises.
+    /// The `close` and `tab close` verbs: no dialog; an idle close proceeds, and a
+    /// close that would hang up a running job is refused. A busy LAST-tab close
+    /// answers [`WIRE_CLOSE_REFUSED`], as the `close` catalog entry promises; a
+    /// busy pane in a window that stays open answers the pane refusal
+    /// (`app_tabs::WIRE_PANE_CLOSE_REFUSED`), and a busy tab among several the
+    /// tab refusal ([`WIRE_TAB_CLOSE_REFUSED`]). `tab close` shares this policy
+    /// since the 2026-09-22 audit: it is the same retirement by another
+    /// spelling, and under `Programmatic` it was the one wire path that killed a
+    /// running job.
     WireRefuseBusy,
 }
+
+/// The wire refusal of a busy last-tab close — the `close` verb's catalog
+/// promise, verbatim. Both `close_session_by_id` (the `close` verb) and
+/// [`App::confirm_destructive_close`] (through `pending_action_refusal`, for
+/// `tab close`) answer with it, so the two verbs refuse in one voice.
+pub(crate) const WIRE_CLOSE_REFUSED: &str =
+    "close refused (a running job armed the last-tab confirm)";
+
+/// The wire refusal of a busy `tab close` aimed at a tab that is NOT its
+/// window's last: a pane of that tab would hang up its own foreground job.
+/// The tab's sibling of the pane refusal `close` answers for the same pane
+/// (`app_tabs::WIRE_PANE_CLOSE_REFUSED`): same opening words, so a driver that
+/// matches `close refused (a running job` meets every busy refusal, but it
+/// names the TAB, the thing `tab close` aimed at — a split tab has several
+/// panes, and "that pane" would not say which.
+pub(crate) const WIRE_TAB_CLOSE_REFUSED: &str = "close refused (a running job in that tab)";
 
 impl App {
     /// Coalesce a destructive request behind the one live overlap handoff and
@@ -1433,8 +1458,9 @@ impl App {
         // W11 MotionPolicy: seed the OS "Reduce Motion" flag at ATTACH and subscribe
         // to its change notification once (the observer target is retained for the
         // process life, like `_menu`). Windows has a real attach-time query but no
-        // live observer, so it re-samples on each attach. Linux/other platforms
-        // currently return `false` / `None`, leaving explicit config in control.
+        // live observer, so it re-samples on each attach; Linux does the same
+        // with GNOME's `enable-animations` (a bounded `gsettings get`, `false`
+        // wherever it cannot be read, leaving explicit config in control).
         if self._reduce_motion.is_none()
             && let Some(proxy) = self.proxy.as_ref()
         {
@@ -2222,8 +2248,9 @@ impl App {
     }
 
     /// A newly attached window can remain behind another app without ever
-    /// receiving a focus event. Adopt the OS state before its first frame;
-    /// surfaceless/controller-owned windows keep their declared focus.
+    /// receiving a focus event: read the OS window's key state at attach and
+    /// hand it to [`Self::adopt_initial_focus`], the one attach-time seam both
+    /// successful CPU/GPU tails call.
     fn adopt_attached_window_focus(&mut self, wid: WindowId) {
         let focused = self
             .windows
@@ -2233,6 +2260,16 @@ impl App {
         self.adopt_initial_focus(wid, focused);
     }
 
+    /// THE ATTACH-TIME FOCUS ADOPTION (`docs/DESIGN-host-boundary-2026-08-30.md`
+    /// §7 decision 8). `os_focus` is the OS window's `has_focus()` at attach;
+    /// `None` (no OS surface) keeps the controller-declared focus. Otherwise the
+    /// window takes the OS answer before its first frame, through
+    /// [`Self::on_focus`] — the seam cursor/pet/rain visibility, modifier state,
+    /// notification suppression and focus reports share. On macOS this agrees
+    /// with what winit sends anyway (a `Focused(false)` queued for every window
+    /// it creates, then `Focused(true)` if activation makes it key); on a
+    /// backend that sends no creation-time event it is the only correction a
+    /// window born behind another app ever gets.
     pub(crate) fn adopt_initial_focus(&mut self, wid: WindowId, os_focus: Option<bool>) {
         if let Some(focused) = os_focus
             && self
@@ -2240,8 +2277,6 @@ impl App {
                 .get(&wid)
                 .is_some_and(|ws| ws.focused != focused)
         {
-            // Use the existing focus seam: cursor/pet/rain visibility, modifier
-            // state, notification suppression and focus reports must agree.
             self.on_focus(wid, focused);
         }
     }
@@ -2498,6 +2533,13 @@ impl App {
         if self.paste_banner.as_ref().is_some_and(|p| p.wid == wid) {
             self.paste_banner = None;
         }
+        // And for the close/quit confirm (Windows, `close_confirm`): the window
+        // closing was the very thing being asked about — a wire `close` or `tab
+        // close` landed while the question stood — so the question is moot.
+        // Dropping it is the only answer left, and it frees the one-at-a-time slot.
+        if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
+            self.close_banner = None;
+        }
         // Clear the winit→logical mapping for this window (its OS id is gone).
         self.winit_to_window.retain(|_, &mut v| v != wid);
         // Drop the closed window from the focus-order stack so it can never be picked
@@ -2628,14 +2670,41 @@ impl App {
         }
     }
 
-    /// M2 quit-safety: whether session `id`'s PTY has a foreground JOB (not the idle
-    /// shell). See [`crate::quit_safety::foreground_is_job`]. Unknown id → idle.
-    fn session_foreground_busy(&self, id: u64) -> bool {
-        let Some(s) = self.pool.get(id) else {
-            return false;
+    /// M2 quit-safety: whether session `id` is running a foreground JOB (not the
+    /// idle shell). See [`Self::session_busy`]. Unknown id → idle. Crate-visible
+    /// for the `close` verb's per-pane guard (`App::pane_close_hangs_up_a_job`),
+    /// which must read the SAME predicate the window close reads.
+    pub(crate) fn session_foreground_busy(&self, id: u64) -> bool {
+        self.pool.get(id).is_some_and(Self::session_busy)
+    }
+
+    /// THE one busy predicate every close path reads — the ctl `close` / `tab
+    /// close` refusal, the caption ✕ / red light, Close Tab and Quit — so the
+    /// four cannot disagree. [`crate::quit_safety::foreground_busy`]: the PTY's
+    /// verdict (`tcgetpgrp` on unix; the child-process walk on windows) OR the
+    /// shell-integration state — the fact `status`/`blocks` already showed
+    /// (executing: OSC 133;C opened, no 133;D yet) while the windows walk alone
+    /// let `close` end an instance mid-`Start-Sleep 60` (audit 2026-09-22).
+    ///
+    /// The engine is LOCKED, not `try_lock`ed: a close gesture is a one-off on
+    /// the main thread, which already takes this lock every frame to render, and
+    /// the only other holder is the PTY reader for the length of one chunk. A
+    /// contended `try_lock` would have to guess, and a guess here is either a
+    /// killed job or a wedged close. Poison is recovered the way every other
+    /// main-thread read of the engine recovers it.
+    fn session_busy(s: &crate::Session) -> bool {
+        let executing = {
+            let term = s
+                .term
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            crate::quit_safety::shell_executing(&term)
         };
-        let fg = crate::quit_safety::foreground_pgrp(s.master);
-        crate::quit_safety::foreground_is_job(fg, s.pid)
+        crate::quit_safety::foreground_busy(
+            crate::quit_safety::foreground_pgrp(s.master),
+            s.pid,
+            executing,
+        )
     }
 
     /// M2: any pane (across every tab) of window `wid` has a foreground job that
@@ -2669,14 +2738,12 @@ impl App {
                 .is_some_and(|all_views| all_views <= local_views)
     }
 
-    /// M2: any live session in the whole app has a foreground job running.
+    /// M2: any live session in the whole app has a foreground job running — the
+    /// whole-app Quit's `busy`, read through the same [`Self::session_busy`] the
+    /// per-window close reads, so a job Quit would kill is never one Close Tab
+    /// would have refused.
     fn any_foreground_job(&self) -> bool {
-        self.pool.iter().any(|s| {
-            crate::quit_safety::foreground_is_job(
-                crate::quit_safety::foreground_pgrp(s.master),
-                s.pid,
-            )
-        })
+        self.pool.iter().any(Self::session_busy)
     }
 
     /// Arm the ~2 s close/quit confirm window on `wid` and show the warning in its
@@ -2706,27 +2773,82 @@ impl App {
     ///
     /// NON-INTERACTIVE closes never reach a dialog: `headless` (no window to confirm
     /// against) always proceeds, and a control-socket-driven close answers by its
-    /// [`CloseConfirm`] policy — a `tab close` is a DELIBERATE programmatic
-    /// instruction and proceeds busy or not; a `close` proceeds when idle and is
-    /// REFUSED (never asked) when a job runs, which is the `ERR close refused (a
-    /// running job armed the last-tab confirm)` its catalog entry promises. Either
-    /// way no wire close blocks on a human click: that wedged the UI thread inside
-    /// `runModal` and the client's reply behind it — measured 2026-09-08, a `close`
-    /// of an idle last tab in a background window hung the instance until it was
-    /// killed. The M2 busy-job guard is therefore a refusal on the `close` verb, not
-    /// enforced at all on `tab close` or headless, and a dialog only for UI gestures.
+    /// [`CloseConfirm`] policy — the `close` and `tab close` verbs proceed when
+    /// idle and are REFUSED (never asked) when a job runs, which is the `ERR close
+    /// refused (a running job armed the last-tab confirm)` the `close` catalog
+    /// entry promises; only an explicit instruction proceeds busy or not — the
+    /// operator's typed Stop row, and the replay of a close the human already
+    /// confirmed on the windows banner ([`CloseConfirm::Programmatic`]).
+    /// Either way no wire close blocks on a human click: that wedged the UI thread
+    /// inside `runModal` and the client's reply behind it — measured 2026-09-08, a
+    /// `close` of an idle last tab in a background window hung the instance until
+    /// it was killed. The M2 busy-job guard is therefore a refusal on the wire
+    /// verbs, not enforced at all headless, and a dialog only for UI gestures.
+    ///
+    /// `tab close` used to run `Programmatic` — proceed busy or not — so a `tab
+    /// close` of a last tab with a running job killed the job and ended the
+    /// instance with `OK 0 1` while the sibling `close` refused and `invoke
+    /// CloseTab` raised the dialog (audit 2026-09-22, reproduced twice). The
+    /// refusal now travels through `pending_action_refusal`, the channel the
+    /// `tab` verb's `apply_tab_cmd_in` and the menu `invoke` seam read, so it
+    /// answers on the wire in the `close` verb's exact words instead of an `OK`
+    /// over a tab that is still there.
+    ///
+    /// WINDOWS ASKS THROUGH THE IN-WINDOW BANNER, NOT A DIALOG (2026-09-22 audit):
+    /// the native confirm there was a task-modal `TaskDialogIndirect` on this
+    /// thread, which parked the event loop until a human clicked — and with it every
+    /// control verb (`ERR main-thread reply did not arrive within 30s`), with nothing
+    /// reporting that a dialog was pending. So on Windows an interactive gesture
+    /// that needs a confirm is REFUSED NOW (`false`) and its question is parked on
+    /// `close_banner` (see [`crate::close_confirm`]); Enter later REPLAYS the gesture
+    /// under [`CloseConfirm::Programmatic`], so it is never asked twice. The macOS
+    /// `NSAlert` and the Linux titlebar-warning confirm are untouched.
+    ///
+    /// The gesture here is a WINDOW close — a last-tab close that escalates to one,
+    /// Alt+F4, the caption ✕ — so its replay is [`crate::close_confirm::CloseReplay::Window`];
+    /// the Quit action names its own replay through [`Self::confirm_destructive_gesture`].
     pub(crate) fn confirm_destructive_close(
         &mut self,
         wid: WindowId,
         exits_app: bool,
         busy: bool,
     ) -> bool {
+        self.confirm_destructive_gesture(
+            wid,
+            exits_app,
+            busy,
+            crate::close_confirm::CloseReplay::Window(wid),
+        )
+    }
+
+    /// [`Self::confirm_destructive_close`] with the gesture's REPLAY named: what
+    /// Enter re-runs once the Windows banner is answered (a window close, or the
+    /// whole-app quit whose barriers a window close does not run). Off Windows the
+    /// replay is unused — macOS answers synchronously through the alert, Linux by
+    /// the armed titlebar warning — and the decision is byte-identical to before.
+    pub(crate) fn confirm_destructive_gesture(
+        &mut self,
+        wid: WindowId,
+        exits_app: bool,
+        busy: bool,
+        replay: crate::close_confirm::CloseReplay,
+    ) -> bool {
         if self.headless {
             return true;
         }
         match self.close_confirm {
             CloseConfirm::Programmatic => return true,
-            CloseConfirm::WireRefuseBusy => return !busy,
+            CloseConfirm::WireRefuseBusy => {
+                if busy {
+                    // Every consumer of this channel clears it BEFORE its own
+                    // action (`apply_tab_cmd_in`, `invoke_menu_action_by_name`),
+                    // so a `close`-verb refusal — which answers from the store
+                    // diff and never reads this — cannot be reported against a
+                    // later `tab` or `invoke`.
+                    self.pending_action_refusal = Some(WIRE_CLOSE_REFUSED.to_string());
+                }
+                return !busy;
+            }
             CloseConfirm::Interactive => {}
         }
         // Windows follows Windows Terminal's convention, not macOS's: prompt when
@@ -2752,6 +2874,16 @@ impl App {
             // is busy; Windows: also a single idle tab): the close needs no confirm.
             return true;
         };
+        // Windows: park the question on the in-window banner and refuse for now —
+        // never `apprt.confirm`, whose task-modal dialog is the loop-parking wedge
+        // this arm replaces (see the doc above and `close_confirm`). A `cfg!`, not
+        // a `#[cfg]` split: both arms stay compiled on every host, so neither the
+        // banner (unused off Windows) nor the titlebar fallback below (unused on
+        // it) is dead code anywhere, and off Windows the branch is never taken —
+        // macOS and Linux run exactly the code they ran before.
+        if cfg!(windows) {
+            return self.present_close_banner(wid, prompt, replay);
+        }
         if let Some(proceed) = self
             .apprt
             .confirm(prompt.title, prompt.body, prompt.proceed)
@@ -2759,9 +2891,9 @@ impl App {
             return proceed;
         }
         // No native dialog on this platform (off macOS): the in-window
-        // titlebar-warning fallback. `close_decision` gates on `busy` only, so an idle
-        // whole-app quit still closes immediately (as before); a busy gesture is
-        // refused once and confirmed by a repeat within the armed window.
+        // titlebar-warning fallback. `close_decision` gates on `busy` only, so an
+        // idle whole-app quit still closes immediately (as before); a busy gesture
+        // is refused once and confirmed by a repeat within the armed window.
         let armed = self
             .windows
             .get(&wid)
@@ -2773,6 +2905,172 @@ impl App {
                 self.arm_close_warning(wid);
                 false
             }
+        }
+    }
+
+    /// Park a destructive question on the in-window banner over `wid` and REFUSE the
+    /// gesture for now: `false`, always. The event loop keeps turning while the
+    /// question stands, which is the whole point (`close_confirm`). ONE at a time: a
+    /// second gesture while one stands is refused too and the STANDING question keeps
+    /// its answer — the disabled owner window of the modal this replaces refused a
+    /// second Alt+F4 the same way — with a log line so the drop is not silent.
+    ///
+    /// The gesture's exit-ledger attribution is carried onto the window NOW, while
+    /// its `CloseAttribution` scope is still open (a Ctrl-W / strip-✕ close enters
+    /// `ui-close by=human` at its top): the replay runs a later turn with no scope,
+    /// exactly the deferral `close_tab_at` stashes for, so without this the journal
+    /// would say `reason=unknown by=-` for a close the user confirmed by name.
+    ///
+    /// A MINIMIZED window is restored first. The dialog this replaces came up on
+    /// its own over whatever was on screen; a band painted into an iconic window
+    /// is a question nobody can see, so a taskbar "Close window" on a minimized
+    /// busy window would read as a close that silently did nothing.
+    pub(crate) fn present_close_banner(
+        &mut self,
+        wid: WindowId,
+        prompt: crate::quit_safety::ConfirmPrompt,
+        replay: crate::close_confirm::CloseReplay,
+    ) -> bool {
+        if let Some(standing) = self.close_banner.as_ref() {
+            aterm_log::info!(
+                "close confirm already open over window {}; refusing the new {} gesture \
+                 until it is answered",
+                standing.wid.0,
+                crate::close_confirm::kind(&prompt),
+            );
+            // The STANDING question is what a wire caller must answer.
+            self.pending_action_refusal = Some(standing.wire_refusal());
+            return false;
+        }
+        // Who asked decides who may answer (`PendingClose::wire_may_answer`): the
+        // attribution scope the gesture opened — `ctl-close` for `invoke`, the
+        // human's `ui-close` / `window-close` for Ctrl-W / the caption ✕, none for
+        // the Quit menu — read NOW, while it is still open, like the stash below.
+        let (_, asked_by) = crate::session_store::current_close_attribution();
+        let pending = crate::close_confirm::PendingClose::new(wid, prompt, replay, asked_by);
+        // A gesture that mints a reply (`invoke CloseTab`, the `tab` verb) says the
+        // question is pending and how to answer it — never `OK` over a tab that is
+        // still there. Every wire consumer clears this before its own action, so a
+        // human's Ctrl-W leaves nothing a later verb could be blamed for.
+        self.pending_action_refusal = Some(pending.wire_refusal());
+        self.stash_deferred_close_attribution(wid);
+        self.close_banner = Some(pending);
+        if let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
+            if w.is_minimized() == Some(true) {
+                w.set_minimized(false);
+            }
+            w.request_redraw();
+        }
+        false
+    }
+
+    /// Answer the in-window close/quit banner: `proceed` REPLAYS the parked gesture
+    /// through [`crate::Wake::ConfirmedClose`] — the one lane that holds the
+    /// `ActiveEventLoop` the close needs — and `!proceed` drops the question, so
+    /// nothing closes. Reached from the Enter/Escape gate in `on_key`, from a click
+    /// on the band (`app_mouse`), and from the wire's `confirm yes|no`
+    /// ([`Self::answer_close_confirm_from_wire`]). No-op (`None`) when no banner is
+    /// up. Returns the replay it posted, for the seams and tests that have no event
+    /// loop to watch.
+    pub(crate) fn answer_close_banner(
+        &mut self,
+        proceed: bool,
+    ) -> Option<crate::close_confirm::CloseReplay> {
+        let pending = self.close_banner.take()?;
+        if let Some(w) = self
+            .windows
+            .get(&pending.wid)
+            .and_then(|ws| ws.os_window.as_ref())
+        {
+            w.request_redraw();
+        }
+        if !proceed {
+            // The attribution `present_close_banner` stashed was for a replay that
+            // will not run; a later close must not inherit this gesture's name.
+            if let Some(ws) = self.windows.get_mut(&pending.wid) {
+                ws.pending_close_attribution = None;
+            }
+            return None;
+        }
+        if let Some(proxy) = self.proxy.as_ref() {
+            let _ = proxy.send_event(crate::Wake::ConfirmedClose {
+                replay: pending.replay,
+            });
+        }
+        Some(pending.replay)
+    }
+
+    /// The `confirm yes|no` verb ([`crate::Wake::AnswerCloseConfirm`]): answer the
+    /// standing question exactly as Enter / Escape at the window would, when the
+    /// wire may. `Ok` is the reply after `OK ` (`answered=yes kind=quit`), `Err`
+    /// the refusal after `ERR `.
+    ///
+    /// It needs no aim: there is ONE question per instance, so the verb reaches it
+    /// over whichever window it stands, whatever window is in front. A wire
+    /// keystroke never answers it (see [`crate::close_confirm`] for the two ways
+    /// that failed), and a question a person asked at the window is refused here
+    /// and left standing for them ([`crate::close_confirm::PendingClose::wire_may_answer`]).
+    pub(crate) fn answer_close_confirm_from_wire(
+        &mut self,
+        proceed: bool,
+    ) -> Result<String, String> {
+        let Some(pending) = self.close_banner.as_ref() else {
+            return Err(crate::close_confirm::NOTHING_PENDING.to_string());
+        };
+        if !pending.wire_may_answer() {
+            return Err(pending.wire_refusal());
+        }
+        let reply = pending.wire_answered(proceed);
+        self.answer_close_banner(proceed);
+        Ok(reply)
+    }
+
+    /// Serve [`crate::Wake::ConfirmedClose`]: run the gesture the banner stood in
+    /// for, under [`CloseConfirm::Programmatic`] so [`Self::confirm_destructive_close`]
+    /// answers from the policy and never asks again — the bracket the operator's
+    /// Stop row runs under: the human's Enter is the same explicit instruction
+    /// that row is. The policy is restored before returning,
+    /// whatever the replay did, so the latch spans exactly this replay and no other
+    /// close can ride through it. A window that closed meanwhile (a wire `close`
+    /// landed first) has nothing left to replay.
+    pub(crate) fn replay_confirmed_close(
+        &mut self,
+        el: &ActiveEventLoop,
+        replay: crate::close_confirm::CloseReplay,
+    ) {
+        let policy = self.close_confirm;
+        self.close_confirm = CloseConfirm::Programmatic;
+        match replay {
+            crate::close_confirm::CloseReplay::Window(wid) => {
+                if self.windows.contains_key(&wid) {
+                    self.close_window(el, wid);
+                } else {
+                    aterm_log::info!(
+                        "confirmed close of window {} dropped: it closed while the question stood",
+                        wid.0
+                    );
+                }
+            }
+            crate::close_confirm::CloseReplay::Quit => self.on_quit_requested(el),
+        }
+        self.close_confirm = policy;
+    }
+
+    /// The `controls front` line for the close/quit confirm: the pending question
+    /// and the wire way to answer it, or `confirm open=false`. Reported whichever
+    /// window the banner stands over — an agent asking whether the instance is
+    /// waiting on an answer wants the truth about the instance, not one window —
+    /// and the `confirm yes|no` it prints reaches the question from any window.
+    ///
+    /// `None` — no line at all — off Windows while nothing is pending, which is
+    /// always there: macOS and Linux never park a close question in the window
+    /// (their confirm answers inside the gesture), so their `controls front`
+    /// keeps the one `overlay` line it has always printed.
+    pub(crate) fn close_confirm_controls_line(&self) -> Option<String> {
+        match self.close_banner.as_ref() {
+            Some(pending) => Some(pending.controls_line()),
+            None if cfg!(windows) => Some(crate::close_confirm::CONTROLS_CLOSED.to_string()),
+            None => None,
         }
     }
 
@@ -2852,7 +3150,12 @@ impl App {
         // document barrier (a dirty suspended document must not be skipped).
         if let Some(wid) = anchor {
             let busy = self.any_foreground_job();
-            if !self.confirm_destructive_close(wid, true, busy) {
+            if !self.confirm_destructive_gesture(
+                wid,
+                true,
+                busy,
+                crate::close_confirm::CloseReplay::Quit,
+            ) {
                 return;
             }
         }
@@ -2920,7 +3223,12 @@ impl App {
             .or_else(|| self.windows.keys().next().copied());
         if let Some(window) = anchor {
             let busy = self.any_foreground_job();
-            if !self.confirm_destructive_close(window, true, busy) {
+            if !self.confirm_destructive_gesture(
+                window,
+                true,
+                busy,
+                crate::close_confirm::CloseReplay::Quit,
+            ) {
                 let _ = crate::menu::cancel_native_termination(generation);
                 return;
             }
@@ -3746,6 +4054,100 @@ pub(crate) fn hidpi_target_font_px(font_px_explicit: bool, scale: f64) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed shell-integration bytes to `session`'s engine, the way its PTY
+    /// reader would.
+    fn feed(app: &crate::App, session: u64, bytes: &[u8]) {
+        let term = app.pool.get(session).expect("live session").term.clone();
+        term.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .process(bytes);
+    }
+
+    /// THE WINDOWS DEFECT (audit 2026-09-22, defect a): a cmdlet, loop or
+    /// script running INSIDE `pwsh.exe` spawns no child, so the child-process
+    /// walk never saw a job and the X button, Close Tab, Quit and the ctl
+    /// `close` all read the session as idle mid-`Start-Sleep 60`. The stub
+    /// session's PTY says nothing at all (`master`/`pid` = -1) — the ConPTY
+    /// shape exactly — so every gate below can be armed ONLY by the block
+    /// state, and every one of them is: the per-session predicate, the
+    /// per-window one the ✕ / Close Tab / `close` read, and the whole-app one
+    /// Quit reads. All four go idle again on 133;D.
+    #[test]
+    fn a_running_block_arms_every_close_gate_without_a_child_process() {
+        let app = crate::App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(
+            !app.session_foreground_busy(0),
+            "a fresh stub session is idle"
+        );
+        assert!(!app.window_has_foreground_job(wid));
+        assert!(!app.any_foreground_job());
+
+        feed(
+            &app,
+            0,
+            b"\x1b]133;A\x07PS> \x1b]133;B\x07Start-Sleep 60\n\x1b]133;C\x07",
+        );
+        assert!(
+            app.session_foreground_busy(0),
+            "133;C opened, no 133;D: the shell said a command is running"
+        );
+        assert!(
+            app.window_has_foreground_job(wid),
+            "the window close gate (✕, Close Tab, ctl close) sees it"
+        );
+        assert!(app.any_foreground_job(), "the whole-app Quit gate sees it");
+        assert!(
+            !app.session_foreground_busy(99),
+            "an unknown session id is idle, never a wedge"
+        );
+
+        feed(&app, 0, b"\x1b]133;D;0\x07");
+        assert!(!app.session_foreground_busy(0), "133;D: the job is over");
+        assert!(!app.window_has_foreground_job(wid));
+        assert!(!app.any_foreground_job());
+    }
+
+    /// The co-viewed-session exemption is kept: a session another window also
+    /// displays (Cmd-Shift-O, pool views > 1) is NOT this window's to hang up —
+    /// closing this window only detaches a view — so it must not arm THIS
+    /// window's close gate even while its block executes. The whole-app Quit
+    /// gate still counts it: Quit hangs up every view.
+    #[test]
+    fn a_co_viewed_running_block_exempts_the_window_gate_but_not_quit() {
+        let mut app = crate::App::headless_for_test();
+        let wid = WindowId(0);
+        feed(
+            &app,
+            0,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07while :; do :; done\n\x1b]133;C\x07",
+        );
+        assert!(
+            app.window_has_foreground_job(wid),
+            "precondition: busy, sole viewer"
+        );
+
+        app.pool.attach(0); // a second window now shows session 0
+        assert_eq!(app.pool.views(0), Some(2));
+        assert!(
+            !app.window_has_foreground_job(wid),
+            "closing this window only detaches a view: the job survives elsewhere"
+        );
+        assert!(
+            app.any_foreground_job(),
+            "Quit would hang up every view, so the job still counts there"
+        );
+
+        assert!(
+            !app.pool.detach(0),
+            "back to one view; the session lives on"
+        );
+        assert!(
+            app.window_has_foreground_job(wid),
+            "the sole viewer again: this window's close would hang the job up"
+        );
+    }
 
     /// (L1) The early reveal's class-brush erase and the first presented frame
     /// are ONE colour: the brush is seeded from `early_reveal_backdrop`, and
@@ -4859,5 +5261,367 @@ mod tests {
         );
         assert_eq!(dims(&app, wid_b), (30, 90));
         assert_eq!(dims(&app, WindowId(0)), (24, 80));
+    }
+}
+
+/// The Windows close/quit confirm as an IN-WINDOW banner (`close_confirm`): the
+/// gesture is refused now and its question parked; the loop — this test's thread —
+/// is never parked with it. The platform-independent half runs everywhere (the
+/// banner type compiles on every host); the arm that ROUTES the interactive
+/// confirm to it is Windows-only and pinned under `cfg(windows)`.
+#[cfg(test)]
+mod close_confirm_tests {
+    use super::*;
+    use crate::close_confirm::CloseReplay;
+    use crate::quit_safety::ConfirmPrompt;
+
+    fn busy_quit_prompt() -> ConfirmPrompt {
+        crate::quit_safety::confirm_prompt(true, true).expect("a busy quit always prompts")
+    }
+
+    fn busy_close_prompt() -> ConfirmPrompt {
+        crate::quit_safety::confirm_prompt(false, true).expect("a busy close prompts")
+    }
+
+    /// Presenting REFUSES the gesture now and parks the question; a second gesture
+    /// while it stands is refused too and the FIRST question keeps its answer (the
+    /// disabled owner window of the modal this replaces); Escape drops it and
+    /// nothing closes; Enter hands back the replay for the event loop to run.
+    #[test]
+    fn presenting_refuses_now_and_the_answer_replays_or_drops() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        assert!(!app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid)));
+        assert!(app.close_banner.as_ref().is_some_and(|p| p.wid == wid));
+        assert!(
+            app.windows[&wid].pending_close_attribution.is_some(),
+            "the gesture's exit-ledger attribution rides to the replay"
+        );
+        // A verb that mints a reply (`invoke CloseTab`) answers ERR with the
+        // pending question, never OK over a tab still there. No wire scope was
+        // open, so this is a person's question and the reply says whose.
+        let refusal = app
+            .pending_action_refusal
+            .take()
+            .expect("the parked question is reported to the wire");
+        assert_eq!(refusal, "a quit is waiting for the person at the window");
+        // A second gesture: refused, and the FIRST question stands unchanged —
+        // and it is the STANDING question (a quit) the refusal names, not the
+        // window close that was dropped.
+        assert!(!app.present_close_banner(wid, busy_close_prompt(), CloseReplay::Quit));
+        assert_eq!(
+            app.close_banner.as_ref().map(|p| p.replay),
+            Some(CloseReplay::Window(wid))
+        );
+        assert!(
+            app.pending_action_refusal
+                .take()
+                .is_some_and(|why| why.starts_with("a quit ")),
+            "the refusal names the question that stands, not the one dropped"
+        );
+        // Escape: dropped, nothing closes, the stash is cleared.
+        assert_eq!(app.answer_close_banner(false), None);
+        assert!(app.close_banner.is_none());
+        assert!(app.windows.contains_key(&wid), "cancel closes nothing");
+        assert!(app.windows[&wid].pending_close_attribution.is_none());
+        // Enter: the replay is handed back (and posted, when there is a loop).
+        assert!(!app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Quit));
+        assert_eq!(app.answer_close_banner(true), Some(CloseReplay::Quit));
+        assert!(app.close_banner.is_none());
+        // No banner: answering is a no-op.
+        assert_eq!(app.answer_close_banner(true), None);
+    }
+
+    /// `controls front` says what stands and how to answer it — the report the
+    /// audit found missing while the dialog wedged every other verb. With nothing
+    /// pending, Windows says so (`confirm open=false`, the shape every other
+    /// surface reports) and macOS/Linux — which never park a close question —
+    /// print exactly the one `overlay` line they always printed.
+    #[test]
+    fn controls_front_reports_the_pending_confirm() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        let lines = app.read_aux_controls(crate::app_introspect::AuxTarget::Front);
+        if cfg!(windows) {
+            assert_eq!(
+                app.close_confirm_controls_line().as_deref(),
+                Some("confirm open=false")
+            );
+            assert_eq!(lines, ["overlay open=false", "confirm open=false"]);
+        } else {
+            assert_eq!(app.close_confirm_controls_line(), None);
+            assert_eq!(lines, ["overlay open=false"], "unix stays byte-identical");
+        }
+        // Raised on the wire: `invoke CloseTab` runs inside the caller's
+        // `ctl-close` scope (`App::invoke_attributed`).
+        {
+            let _closing = crate::session_store::CloseAttribution::enter(
+                crate::session_store::ExitReason::CtlClose,
+                crate::session_store::ExitActor::Ctl,
+            );
+            app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid));
+        }
+        let line = app
+            .close_confirm_controls_line()
+            .expect("a pending confirm is reported on every host");
+        assert!(
+            line.starts_with("confirm open=true kind=quit window=0 by=ctl "),
+            "{line}"
+        );
+        assert!(line.contains("answer=\"confirm yes\""), "{line}");
+        let lines = app.read_aux_controls(crate::app_introspect::AuxTarget::Front);
+        assert_eq!(lines.last(), Some(&line), "{lines:?}");
+        assert_eq!(app.answer_close_banner(false), None);
+        // Raised by the person at the window (no wire scope): reported, with no
+        // wire verb that answers it.
+        app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid));
+        let line = app
+            .close_confirm_controls_line()
+            .expect("a pending confirm is reported on every host");
+        assert!(line.contains(" by=human "), "{line}");
+        assert!(line.contains("answer=\"-\""), "{line}");
+        // Answered: the report goes back to its closed shape.
+        assert_eq!(app.answer_close_banner(false), None);
+        assert_eq!(
+            app.close_confirm_controls_line().is_some(),
+            cfg!(windows),
+            "closed again"
+        );
+    }
+
+    /// Raise `prompt` over `wid` the way `invoke CloseTab` does: through
+    /// `App::invoke_attributed`, the wake's own bracket. Its `ctl-close` scope is
+    /// what makes the question the wire's to answer, so the link is pinned here
+    /// rather than assumed.
+    fn raise_from_the_wire(app: &mut App, wid: WindowId, prompt: ConfirmPrompt) {
+        let proceeded = app.invoke_attributed(crate::session_store::ExitActor::Ctl, |app| {
+            Ok(app
+                .present_close_banner(wid, prompt, CloseReplay::Window(wid))
+                .to_string())
+        });
+        assert_eq!(proceeded.as_deref(), Ok("false"), "the gesture waits");
+        assert!(
+            app.close_banner
+                .as_ref()
+                .is_some_and(crate::close_confirm::PendingClose::wire_may_answer),
+            "a question raised under `invoke` is the wire's"
+        );
+    }
+
+    /// The wire's `confirm yes|no` answers the question a control client raised
+    /// from ANY window. The person bringing another window forward does not take
+    /// the question out of the wire's reach — the gap an answer by keystroke had,
+    /// since a flagless `key enter` lands in the FRONT window's shell. `no` keeps
+    /// everything (the stashed close attribution goes with the question), `yes`
+    /// keeps the attribution for the replay it posts, and each reply says what it
+    /// answered, over which question.
+    #[test]
+    fn the_wire_answers_its_own_question_whatever_window_is_in_front() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        assert_eq!(
+            app.answer_close_confirm_from_wire(true),
+            Err("nothing is waiting for an answer".to_string())
+        );
+        raise_from_the_wire(&mut app, wid, busy_quit_prompt());
+        // The person brings another window to the front.
+        let sid = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        app.frontmost_window = Some(other);
+        assert_eq!(
+            app.answer_close_confirm_from_wire(false),
+            Ok("answered=no kind=quit".to_string())
+        );
+        assert!(app.close_banner.is_none());
+        assert!(app.windows.contains_key(&wid), "`no` closes nothing");
+        assert!(app.windows[&wid].pending_close_attribution.is_none());
+
+        raise_from_the_wire(&mut app, wid, busy_quit_prompt());
+        assert_eq!(
+            app.answer_close_confirm_from_wire(true),
+            Ok("answered=yes kind=quit".to_string())
+        );
+        assert!(app.close_banner.is_none());
+        assert!(
+            app.windows[&wid].pending_close_attribution.is_some(),
+            "`yes` leaves the close's attribution for the replay to journal"
+        );
+        assert_eq!(
+            app.answer_close_confirm_from_wire(false),
+            Err("nothing is waiting for an answer".to_string()),
+            "answered once"
+        );
+    }
+
+    /// A question the PERSON at the window asked (no wire scope open: Ctrl-W,
+    /// Alt+F4, the caption ✕, the Quit menu) is refused to the wire, both ways,
+    /// and stays up for the person.
+    #[test]
+    fn the_wire_cannot_answer_a_question_the_person_asked() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        assert!(!app.present_close_banner(wid, busy_close_prompt(), CloseReplay::Window(wid)));
+        for proceed in [true, false] {
+            assert_eq!(
+                app.answer_close_confirm_from_wire(proceed),
+                Err("a window close is waiting for the person at the window".to_string())
+            );
+            assert!(app.close_banner.is_some(), "the person's question stands");
+        }
+    }
+
+    fn named_key(key: winit::keyboard::NamedKey) -> winit::event::KeyEvent {
+        winit::event::KeyEvent::synthetic_for_test(
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::Enter),
+            winit::keyboard::Key::Named(key),
+            key.to_text().map(winit::keyboard::SmolStr::new),
+            winit::keyboard::KeyLocation::Standard,
+            winit::event::ElementState::Pressed,
+            false,
+        )
+    }
+
+    fn char_key(c: &str) -> winit::event::KeyEvent {
+        winit::event::KeyEvent::synthetic_for_test(
+            winit::keyboard::PhysicalKey::Code(winit::keyboard::KeyCode::KeyA),
+            winit::keyboard::Key::Character(winit::keyboard::SmolStr::new(c)),
+            Some(winit::keyboard::SmolStr::new(c)),
+            winit::keyboard::KeyLocation::Standard,
+            winit::event::ElementState::Pressed,
+            false,
+        )
+    }
+
+    /// THE KEYBOARD GATE in `on_key`, driven with real winit key events. While a
+    /// question stands over a window it owns that window's keyboard, as the
+    /// task-modal dialog it replaced did: Escape cancels and closes nothing,
+    /// Enter answers yes (its attribution kept for the replay), and every other
+    /// key — printable text, a chord — is swallowed, so nothing reaches the
+    /// shell under the question. A key in ANOTHER window passes through to that
+    /// window. The witness is the session sink's input-attempt epoch, which every
+    /// PTY write moves; the unguarded press first proves it does move.
+    #[test]
+    fn the_keyboard_answers_a_standing_question_and_nothing_leaks_under_it() {
+        use winit::keyboard::NamedKey;
+        let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(-1));
+        let mut app = App::headless_for_test_with_sink(std::sync::Arc::clone(&sink));
+        app.headless = false;
+        let wid = WindowId(0);
+        // On Windows every key goes through the session's ordered writer thread
+        // (`paste_order::UI_WRITES_CAN_BLOCK`), so the sink's epoch moves AFTER
+        // `on_key` returns; reading it at once raced the writer (2 of 5 runs
+        // failed "an unguarded key writes"). Drain the writer before each read.
+        // A key that leaked under the question would still be written and still
+        // move the epoch, so the "nothing reaches the shell" checks stay strict.
+        let settled = |sink: &aterm_session::sink::SinkWriter| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while sink.ordered_egress_count() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        };
+        // Non-vacuity: with no question standing, a typed key reaches the sink.
+        let before = sink.input_epoch();
+        app.on_key(wid, char_key("a"));
+        settled(&sink);
+        assert_ne!(sink.input_epoch(), before, "an unguarded key writes");
+
+        app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid));
+        let before = sink.input_epoch();
+        app.on_key(wid, char_key("a"));
+        app.on_key(wid, named_key(NamedKey::Tab));
+        settled(&sink);
+        assert_eq!(
+            sink.input_epoch(),
+            before,
+            "nothing reaches the shell under it"
+        );
+        assert!(
+            app.close_banner.is_some(),
+            "and nothing but an answer answers it"
+        );
+
+        app.on_key(wid, named_key(NamedKey::Escape));
+        settled(&sink);
+        assert!(app.close_banner.is_none(), "Escape cancels");
+        assert!(app.windows.contains_key(&wid), "…and closes nothing");
+        assert!(app.windows[&wid].pending_close_attribution.is_none());
+        assert_eq!(sink.input_epoch(), before, "the answer is not typed either");
+
+        app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid));
+        app.on_key(wid, named_key(NamedKey::Enter));
+        settled(&sink);
+        assert!(app.close_banner.is_none(), "Enter answers");
+        assert!(
+            app.windows[&wid].pending_close_attribution.is_some(),
+            "…yes: the attribution waits for the replay"
+        );
+        assert_eq!(sink.input_epoch(), before, "the Enter is not typed");
+
+        // A question over ANOTHER window leaves this one's keyboard alone.
+        let sid = app.next_session_id;
+        let other = app.insert_logical_window(crate::stub_session(sid), 24, 80);
+        app.present_close_banner(other, busy_quit_prompt(), CloseReplay::Window(other));
+        app.on_key(wid, char_key("b"));
+        settled(&sink);
+        assert_ne!(sink.input_epoch(), before, "a key in another window passes");
+        assert!(app.close_banner.is_some(), "…and answers nothing");
+    }
+
+    /// A window closing while its question stands takes the question with it — the
+    /// close was the very thing being asked about.
+    #[test]
+    fn a_closing_window_drops_its_question() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.present_close_banner(wid, busy_quit_prompt(), CloseReplay::Window(wid));
+        assert_eq!(app.close_window_logical(wid), CloseOutcome::Exit);
+        assert!(app.close_banner.is_none());
+    }
+
+    /// WINDOWS: the interactive confirm asks through the banner, never a dialog —
+    /// the gesture is refused now, and the loop is never parked. On EVERY host the
+    /// wire policies still answer from the policy before any banner, and a single
+    /// idle tab is still instant and unasked. Not `#[cfg(windows)]`: the routing is
+    /// a `cfg!` branch compiled everywhere, so only the half that would reach the
+    /// platform dialog off Windows (a real `NSAlert` in a unit test) is skipped
+    /// there, and the rest runs on the machines that run this suite.
+    #[test]
+    fn an_interactive_busy_close_parks_the_banner_instead_of_a_dialog() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        if cfg!(windows) {
+            app.close_confirm = CloseConfirm::Interactive;
+            assert!(!app.confirm_destructive_close(wid, true, true));
+            let pending = app.close_banner.as_ref().expect("the question is parked");
+            assert_eq!(pending.wid, wid);
+            assert_eq!(pending.replay, CloseReplay::Window(wid));
+            assert_eq!(
+                crate::close_confirm::kind(&pending.prompt),
+                "quit",
+                "a last-window close quits the app, and its prompt says so"
+            );
+            // The Quit action names its own replay.
+            app.close_banner = None;
+            assert!(!app.confirm_destructive_gesture(wid, true, true, CloseReplay::Quit));
+            assert_eq!(
+                app.close_banner.as_ref().map(|p| p.replay),
+                Some(CloseReplay::Quit)
+            );
+        }
+        // The wire policies never reach the banner.
+        app.close_banner = None;
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        assert!(!app.confirm_destructive_close(wid, true, true));
+        assert!(app.close_banner.is_none());
+        app.close_confirm = CloseConfirm::Programmatic;
+        assert!(app.confirm_destructive_close(wid, true, true));
+        assert!(app.close_banner.is_none());
+        // A single idle tab: instant, unasked.
+        app.close_confirm = CloseConfirm::Interactive;
+        assert!(app.confirm_destructive_close(wid, false, false));
+        assert!(app.close_banner.is_none());
     }
 }

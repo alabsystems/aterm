@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `subscribe … screen,events,ts` of a private headless aterm (150x50), the managed 2.1.283 launched by path with `--model haiku --dangerously-skip-permissions` · the MAIN grid between the launch and the REPL: in a new folder, the frame right after the harness pressed the folder-trust dialog (the dialog erased; the REPL comes up on the alternate screen 300-510 ms later, and the server published `agent=idle` from this frame, and from its like in all 14 such launches measured, a draft typed then lost 5 of 5); in a folder already trusted, the same rows from the launch on (`agent=idle` 0.1-2 s before the REPL, a draft typed then lost 4 of 6) · cursor=4,0 (hidden): on the row under the launch line, where a repeat on 2026-09-27 (`subscribe … screen,cursor`) measured it on this frame (there the launch line one row higher, the cursor on the row under it) · user, host and scratch-path UUID redacted at equal length
+user@a-mac-host-name-redactedxxxxxx proj-O2 % export DISABLE_AUTOUPDATER=1; echo USER=$USER LOGNAME=$LOGNAME
+USER=_user0 LOGNAME=_user0
+user@a-mac-host-name-redactedxxxxxx proj-O2 % '/Users/_user0/Library/Application Support/aterm/pkg/store/claude/1000002000001000283/bin/claude' --mode
+l haiku --dangerously-skip-permissions
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

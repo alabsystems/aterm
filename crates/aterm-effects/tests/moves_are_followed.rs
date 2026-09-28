@@ -62,7 +62,7 @@ use trail_host::*;
 
 // ===========================================================================
 // b2m — CLAUDE CODE'S COMPOSER, TYPED INTO: the bottom-anchored composer
-// (alt screen, 53 rows, retina 15×28 cells), LOCK A only (every named row
+// (alt screen, 53 rows, retina 15×28 cells), the frame hold only (every named row
 // read). Frames on a 16.667 ms train (`fr16`), or at the GUI's real pacing
 // (`paced`: a frame 16.667 ms after the last while output waits to be
 // presented or `needs_frame_cadence`, else at `next_change_deadline`;
@@ -542,7 +542,7 @@ mod b2m {
 // b2r — AN INLINE CHAT BOX RE-LAID: a box (40×100) typed into, then re-laid
 // by full redraws with no key; a move
 // that follows nothing while the band was lit, leaving the text's row dark,
-// is a MISSED FOLLOW. LOCK A only (every named row read), no scroll seam.
+// is a MISSED FOLLOW. The frame hold only (every named row read), no scroll seam.
 // ===========================================================================
 mod b2r {
     use super::*;
@@ -698,7 +698,7 @@ mod b2r {
 // ===========================================================================
 // b2s — A SECOND MOVE: a band carried by one follow, then moved again with
 // no key between. Host: the scroll seam
-// (no alt re-baseline), LOCK A with the caret row re-read.
+// (no alt re-baseline), the frame hold with the caret row re-read.
 // ===========================================================================
 mod b2s {
     use super::*;
@@ -982,7 +982,7 @@ mod b2s {
 // ===========================================================================
 // b3 — BOXES, COMPOSERS AND TEARS UNDER SYNC-1: `h1`…`h10`, `h8b` and the
 // paste-then-wrap `diag`. Host: SYNC-1 (no frame while a `?2026` bracket is
-// open), the scroll seam (no alt re-baseline), LOCK A (caret row not
+// open), the scroll seam (no alt re-baseline), the frame hold (caret row not
 // re-read). HOST OPTION `fr16`/`fr8`: the frame train (60 / 120 Hz). Each
 // verdict is the case's own MISSED/DARK count.
 // ===========================================================================
@@ -2030,7 +2030,7 @@ mod b3 {
 // `t1p`, `t1c` (a torn relocation), `t2` (an unsynced composer's torn
 // wrap), `t3` (a relocation by a scroll), `t6`, `t6b` (a line under an
 // identical command pushed down). Host: `trail_host::PacedHost` (the scroll
-// seam, the alt re-baseline, LOCK A with the caret row not re-read; SYNC-1
+// seam, the alt re-baseline, the frame hold with the caret row not re-read; SYNC-1
 // off — every case here is unsynced) on a flat 16 ms or 8 ms train, the
 // GUI's real pacing, or the pet's (`fr16`, `fr8`, `paced`, `pet`). Keys
 // 90–110 ms apart.

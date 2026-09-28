@@ -11,7 +11,7 @@
 //!
 //! ## Why the companion gets its own file
 //!
-//! The spelling ruling (`cursor_glow.rs:205-225`) is that **`rainbow kitty`
+//! The spelling ruling (`GlowStyle::style_names_kitty_pet`, `cursor_glow/style.rs`) is that **`rainbow kitty`
 //! and the bare `kitty` mean the RESIDENT PET** ([`crate::kitty_pet`]);
 //! `… flying` is the rare, earned flying head ([`crate::kitty_cursor`]). The
 //! pet is therefore the DEFAULT companion of the very style v2 replaces, and a
@@ -32,34 +32,38 @@
 //!
 //! ## WIRING STATUS — read this before trusting any claim below
 //!
-//! Nothing in the host calls this router yet. Neither render arm
-//! (`App::tick_cursor_fx`, `app_render.rs:22418`, nor
-//! `App::compose_cursor_companion`, `app_render.rs:31307`) calls `duty`, and
-//! the shipped pet is still fed by v1's `CompanionOwner::sense`
-//! (`companion.rs:1020`). Everything here is therefore a **receiver-facing
-//! value**: the four §7.2(a) beats are exposed as DATA on [`Flight`] —
-//! the snap-to cell ([`Flight::land`]), the spine floor
-//! (`Flight::disp_floor`), the whip (`Flight::lead_at`) and the arrival
-//! edge ([`Flight::land_at`]) — and the seams that would CONSUME them do not
-//! exist yet. Naming them, so the next stage cannot mistake this file for the
-//! finished feature:
+//! Both host render arms reach this router through ONE seam,
+//! `route_v2_companion` (`aterm-gui/src/app_render.rs`) — the single-pane
+//! `emit_single_cursor_companion` (the live present and both capture splices)
+//! and the split path's `App::compose_cursor_companion` — which runs
+//! [`body_for`], [`impulse_for`] and [`placement`] in `duty`'s order and
+//! applies the flying head's TELEPORT by rebasing the placement follower on a
+//! horizontal [`BodyImpulse::Fly`] frame, so the next placement snaps to
+//! [`Flight::land`]. The resident pet is fed by `CompanionOwner::prepare`
+//! (`crate::companion`) on every host, never by this module, and it takes the
+//! perk edge through `Engine::pet_offer` → `PetBrain::note_v2_offer`
+//! (`route_v2_pet_offer`).
 //!
-//! * **Teleport** — the placement follower (`word_decorations.rs:3805-3826`)
-//!   snaps only on a dead continuity or a > 2·`ch` row jump; the §7.2(a)
-//!   `|Δx| > 8·cw` arm that sets `settle = Some(rest)` on a [`BodyImpulse::Fly`]
-//!   frame is host-stage work in that file.
-//! * **Spine impulse** — `CursorCat::advance_spine` is private
-//!   (`kitty_cursor.rs:1302`) and the head has no public `disp` setter; a
-//!   `CursorCat::on_meteor(&Flight)` seam is animator-stage work.
-//! * **Whip** — `kitty_cursor.rs:1344` computes `lead = LEAD_MAX·bank`, never
-//!   negative; the same seam must add `Flight::lead_at` in its place.
-//! * **Landing squash** — `CursorCat::land_at` is private
-//!   (`kitty_cursor.rs:585`) and set only to the animator's own `now`; the
-//!   same seam must set it to [`Flight::land_at`].
-//! * **The pet's perk offer** — `PetBrain` has no perk-edge entry (its
-//!   latches are `note_bell` / `note_command_done` / `note_petted` /
-//!   `note_peek`, `kitty_pet.rs:3407-3462`); [`BodyImpulse::Perk`] is an offer
-//!   with no mailbox until the owner rules on §22's question 14.
+//! What is NOT applied anywhere: four of the six §7.2(a) beats, exposed as
+//! DATA on [`Flight`], because `CursorCat` has no receiver for them
+//! (animator-stage work, `kitty_cursor.rs`):
+//!
+//! * **Spine impulse** (`Flight::disp_floor`) — `CursorCat::advance_spine` is
+//!   private and the head has no public `disp` setter.
+//! * **Whip** (`Flight::lead_at`) — `CursorCat` computes `lead = LEAD_MAX ·
+//!   bank`, never negative; a `CursorCat::on_meteor(&Flight)` seam would add
+//!   the whip in its place.
+//! * **Eyes** (the in-flight squint and the 1-px look-back that ends at
+//!   `Flight::settled_at`, [`FLYING_LOOKBACK_MS`] after arrival) — the head's
+//!   eye pose is its own, with no setter for either parameter.
+//! * **Landing squash** ([`Flight::land_at`]) — `CursorCat::land_at` is
+//!   private and set only to the animator's own `now`.
+//!
+//! The other two are the host's: the TELEPORT (the placement follower's
+//! rebase, above) and the FACING, which is the animator's existing
+//! `facing_left` bank and nothing else (§7.2: "no facing flip beyond the
+//! existing bank") — the host reads no facing off the `Flight`, whose
+//! `facing_left` is test-side.
 //!
 //! Consequently §20.1's
 //! `the_flying_head_is_at_the_landing_on_frame_zero_and_squashes_on_arrival`
@@ -84,8 +88,8 @@
 //! * **L-C — one impulse, two readings.** The flying head takes the meteor
 //!   whole (teleport, spine impulse, whip, squash on the arrival edge); the pet
 //!   is *offered* the arrival edge as a perk edge and takes nothing else. A
-//!   pet never teleports here — that is open owner question **14**, which the
-//!   spec's §22 sheet leaves outside v2 with `keeps its own pounce` in bold.
+//!   pet never teleports — owner question **14**, RULED 2026-09-05: *"no
+//!   teleport"*; the pet keeps its own pounce (§22).
 //! * **L-D — the flying head never covers the cell you are typing into.** See
 //!   [`placement`], which is where the measured occlusion defect is fixed. The
 //!   pet is NOT seated here: it seats itself (`PetBrain::tick`), and §7.2(b)
@@ -103,15 +107,11 @@
 //! [`placement`] takes the shipped footprint AS HANDED IN — byte-for-byte,
 //! margin clamp and boundary rise included — as step 1, and adds the yields.
 //!
-//! ## KNOWN GAP — a companion silently disappears in SPLITS (host stage)
+//! ## Both render arms, one decision
 //!
-//! The v1 companion decision is made inside the single-pane arm
-//! (`App::tick_cursor_fx`) while the composed arm draws its companion from
-//! `App::compose_cursor_companion`. Two arms, one decision — so an impulse
-//! minted for a split pane can reach a body that the other arm drew, or no
-//! body at all. `duty` is shaped so both arms can call it with their own
-//! query and ink probe; wiring either arm is host-stage work (see WIRING
-//! STATUS above — today neither does).
+//! The single-pane and the composed (split) arm both route through aterm-gui
+//! `route_v2_companion`, each with its own geometry and ink probe, so an
+//! impulse minted for a split pane reaches the body that pane draws.
 //!
 //! ## Determinism and allocation
 //!
@@ -124,14 +124,14 @@ use aterm_time::Instant;
 
 use crate::companion::CompanionDuty;
 use crate::cursor_glow::Geom;
-use crate::kitty_pet::{PetFrame, PetSense};
+use crate::kitty_pet::PetFrame;
 #[cfg(test)]
 use crate::kitty_registry::KittyLook;
 use crate::word_decorations::CatFootprint;
 
 #[cfg(test)]
 use super::timing;
-use super::{CompanionImpulse, Ctx, Dir};
+use super::{CompanionImpulse, Dir};
 
 // ===========================================================================
 // 1. The constants (§7.2's beat table)
@@ -262,9 +262,11 @@ pub enum Reaction {
 }
 
 /// THE FLYING HEAD'S MOVE, resolved — §7.2(a)'s beat table (Teleport, Spine
-/// impulse, Whip, Facing, Eyes, Landing squash) **as data** for the animator
-/// seams the WIRING STATUS names. Nothing here is applied; every field and
-/// method is a value a receiver reads.
+/// impulse, Whip, Facing, Eyes, Landing squash) **as data**. The host applies
+/// the teleport ([`Flight::land`], via the placement follower's rebase); the
+/// facing is the animator's own existing bank, which the host does not read
+/// from here; the spine floor, the whip, the eyes (squint and look-back) and
+/// the landing squash wait on the animator seams the WIRING STATUS names.
 ///
 /// A `Flight` is minted for every CREDITED spawn: §6.1's same-row jump at or
 /// past `timing::JUMP_MIN_CELLS` — the same 8 cells §7.2(a)'s snap clause
@@ -284,8 +286,7 @@ pub struct Flight {
     /// fan, the flash and the audio bell. The landing squash lands ON this
     /// instant, so the squash, the pin and the bell are one event. Derived
     /// once in this file by [`arrival`], from the `(t0, t_flight)` the
-    /// contract carries; carrying the `Instant` itself on
-    /// [`CompanionImpulse::Meteor`] is the contract's follow-up.
+    /// contract carries — one derivation, so no second copy can disagree.
     pub land_at: Instant,
     /// **THE SNAP-TO** (§7.2(a), row "Teleport"): the landing cell — the
     /// caret the head escorts on the frame the impulse was minted, which by
@@ -371,11 +372,11 @@ pub enum BodyImpulse {
     ///   → scaled coil → `clamp(0.021·cells, 0.16, 0.42)` flight, and the
     ///   big-jump show at `BIG_JUMP_COLS 24`, are all exactly what they were.
     ///
-    /// **There is no receiver for it in this stage** — `PetBrain` has no
-    /// perk-edge entry (WIRING STATUS). Whether the pet should TELEPORT on a
-    /// long jump is open owner question **14** (§22, default in bold: *keeps
-    /// its own pounce*), deliberately outside v2. Answering it is a change to
-    /// this one variant.
+    /// The receiver is `PetBrain::note_v2_offer`, reached through
+    /// `Engine::pet_offer`'s `perk_at` (which is this variant's `at`, routed
+    /// through [`impulse_for`]). Whether the pet should TELEPORT on a long
+    /// jump was owner question **14**, RULED 2026-09-05: *"no teleport"* —
+    /// the pet keeps its own pounce.
     Perk {
         /// The arrival edge `t₀ + T`, offered.
         at: Instant,
@@ -395,9 +396,10 @@ impl BodyImpulse {
     /// frame cadence open only for the things v2 is still evaluating — the
     /// whip's lead, the squint and the look-back of a [`BodyImpulse::Fly`].
     /// A [`BodyImpulse::React`] is an EDGE, and so is a [`BodyImpulse::Perk`]:
-    /// the offer is a value, v2 computes nothing after minting it, and a
-    /// router that armed up to 120 ms of cadence for a mailbox that does not
-    /// exist would be holding the frame for nobody. The pose clocks belong to
+    /// the offer is a value, v2 computes nothing after minting it, and the
+    /// pet's own latch (`PetBrain::note_v2_offer`) holds whatever cadence the
+    /// perk needs — a router that also armed one would be holding the frame
+    /// twice. The pose clocks belong to
     /// the animators (the pet's `PetFrame::fp`, the head's
     /// `CursorCat::is_active`), and a router that also armed the cadence for
     /// them would be a second, disagreeing answer to "is anything animating".
@@ -773,96 +775,11 @@ fn seat(
 }
 
 // ===========================================================================
-// 5. What the pet senses (§7.2(b))
-// ===========================================================================
-
-/// The frame facts only the HOST holds — the four things [`PetSense`] wants
-/// that v2 genuinely cannot see.
-///
-/// Kept deliberately small. Everything else on a `PetSense` is geometry and
-/// posture v2 already carries on its [`Ctx`], and anything the pet can observe
-/// for itself is not put on this struct: that is `kitty_pet.rs`'s own-sensor
-/// doctrine (`kitty_pet.rs:1897`), which exists because a pet that stopped
-/// behaving when a *trail* was turned down would be a bug with no explanation.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct HostSense {
-    /// **THE GRID CARET** — the visible caret cell `(row, col)`, or `None`
-    /// when the cursor is hidden (DECTCEM) or the viewport is scrolled into
-    /// history: `TerminalFacts::caret` (`host.rs:160`), read from the grid
-    /// every frame. This is deliberately NOT [`Ctx::caret`]: that is the last
-    /// LICENSED landing (`Engine::on_event` writes it only from a licensed
-    /// `Event::Move`), so it never sees a program-driven cursor, a TUI
-    /// repaint or an alt-screen app — and a pet fed from it would sit at a
-    /// stale station and then Startle at a phantom delta on the next licensed
-    /// move. The pet is its own move sensor; it must diff the real caret.
-    ///
-    /// The host applies the SONG's caret law before filling this: v1 hands
-    /// the pet `facts.caret` only while `pet_caret_admitted` holds
-    /// (`companion.rs:1020`), withholding it through the sing-along's face
-    /// swap so the pet fades out holding position. A host that migrates to
-    /// [`sense`] hands v2 that same post-law value, never the raw grid read.
-    pub caret: Option<(u16, u16)>,
-    /// Is the emulator PAINTING that caret this frame (DECTCEM shown)? A
-    /// hidden cursor is still a caret and still travels in `caret`; this is
-    /// the separate fact about whether the user can SEE it. See
-    /// [`PetSense::caret`] for the conflation this pair replaced.
-    pub caret_drawn: bool,
-    /// The emulator wrapped the caret since the last host read. A FACT from
-    /// the grid, never a heuristic: it is the only thing separating a
-    /// bottom-row scrolled wrap from `Home` at the last column, which look
-    /// byte-identical on the grid.
-    pub wrapped: bool,
-    /// The focused pane is genuinely streaming this frame (scroll or content
-    /// clock advanced AND the shell is in its OSC 133/633 Execute phase).
-    pub output_burst: bool,
-    /// The mouse pointer in fractional grid cells of the pet's pane, `None`
-    /// outside it. The pet's brain diffs it itself.
-    pub pointer: Option<(f32, f32)>,
-}
-
-/// **WHAT THE PET SENSES** (§7.2(b)) — build the [`PetSense`] the pet's
-/// `PetBrain::tick` (`kitty_pet.rs:3494`) wants, out of the host facts above
-/// plus the geometry and posture on v2's [`Ctx`].
-///
-/// §7.2(b) defines no pet projection at all — the pet's choreography is
-/// "untouched" and the ONLY coupling is the offered impulse — so this is a
-/// PROJECTION of the same facts v1's `CompanionOwner::sense`
-/// (`companion.rs:1020`) feeds it, and nothing more. In particular:
-///
-/// * the caret is the host's grid caret ([`HostSense::caret`]), never
-///   [`Ctx::caret`] — see the field doc for why;
-/// * the spine ([`Ctx::disp`], [`Ctx::birth_disp`], [`Ctx::phase`]) is
-///   deliberately NOT injected: the pet runs its own `vhat` velocity estimate
-///   against its own owner-tuned thresholds (`RHYTHM_MOVES`, `LEAD_TIME`,
-///   `LEAD_MAX`), and a second momentum signal would retime the chase and the
-///   pounce — precisely what D13 forbids.
-///
-/// `reduced_motion` comes from the LIVE config the engine assembles each tick
-/// (`cfg.reduced_motion || Event::ReducedMotion`), so a posture change reaches
-/// the pet on the same frame it reaches the ribbon.
-#[must_use]
-pub fn sense(ctx: &Ctx<'_>, host: HostSense) -> PetSense {
-    PetSense {
-        now: ctx.now,
-        caret: host.caret,
-        caret_drawn: host.caret_drawn,
-        wrapped: host.wrapped,
-        rows: u16::try_from(ctx.geom.rows).unwrap_or(u16::MAX),
-        cols: u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX),
-        cell_w: u16::try_from(ctx.geom.cw).unwrap_or(u16::MAX),
-        cell_h: u16::try_from(ctx.geom.ch).unwrap_or(u16::MAX),
-        reduced_motion: ctx.cfg.reduced_motion,
-        output_burst: host.output_burst,
-        pointer: host.pointer,
-    }
-}
-
-// ===========================================================================
-// 5b. THE PET AND THE SKY (panel #10) — the resident's whole receiving end
+// 5. THE PET AND THE SKY (panel #10) — the resident's whole receiving end
 // ===========================================================================
 //
-// D13 left the pet ONE coupling — the offered perk edge — and no mailbox for
-// it (WIRING STATUS). Panel #10 keeps the coupling one-way and makes it
+// D13 left the pet ONE coupling — the offered perk edge — and the router no
+// mailbox for it. Panel #10 keeps the coupling one-way and makes it
 // three offers instead of one, all riding the SAME per-frame value:
 //
 //   (a) the perk        — `t₀ + T`, the landing pin's own instant (D13);
@@ -1134,13 +1051,14 @@ pub struct Duty {
     pub deadline: Option<Instant>,
 }
 
-/// **THE SEAM'S ONE CALL** — body, impulse, seat, identity and cadence, from
-/// one query.
+/// **THE SEAM'S COMPOSITION, test side** — body, impulse, seat, identity and
+/// cadence, from one query.
 ///
-/// Deliberately a free function over plain values with no state of its own, so
-/// that both host render arms — the single-pane present and the composed one
-/// — can call it with their own geometry and ink probe and draw whatever comes
-/// back (the KNOWN GAP in this module's header). Today neither arm does.
+/// The same three steps, in the same order, that aterm-gui's
+/// `route_v2_companion` makes (which both render arms call), as a free
+/// function over plain values so this module's tests can pin the composition
+/// without a host. The host runs them inline because it also needs the
+/// impulse's transferring read and the teleport rebase between them.
 ///
 /// The order is fixed and each step depends on the last: the body first
 /// (nothing else is meaningful without it), then the impulse for that body,
@@ -1186,7 +1104,6 @@ mod tests {
     use super::*;
     use crate::companion::{cursor_companion_duty, flying_kitty_admitted, pet_companion_admitted};
     use crate::cursor_glow::GlowStyle;
-    use crate::kitty_pet::{PetBrain, PetFrame};
     use std::time::Duration;
 
     const CW: i32 = 9;
@@ -1208,23 +1125,6 @@ mod tests {
             win_w: 1080,
             win_h: 720,
             head: 0,
-        }
-    }
-
-    fn geom() -> Geom {
-        geom_cols(120)
-    }
-
-    fn config() -> super::super::Config {
-        super::super::Config {
-            dark_theme: true,
-            intensity: 1.0,
-            duration: Duration::from_millis(900),
-            ribbon_tall: true,
-            ribbon_flat: false,
-            theme_fg: 0x00E8_E8F0,
-            theme_bg: 0x0016_161C,
-            reduced_motion: false,
         }
     }
 
@@ -1298,7 +1198,7 @@ mod tests {
         cell_span(s.x, i32::from(s.w), CW, 120)
     }
 
-    /// THE SPELLING RULING (`cursor_glow.rs:205-225`), routed through the
+    /// THE SPELLING RULING (`GlowStyle::style_names_kitty_pet`, `cursor_glow/style.rs`), routed through the
     /// HOST's own custody chain: every spelling the pet predicate owns —
     /// `rainbow kitty` and the bare `kitty` included — resolves to the
     /// RESIDENT PET, which is the default install and the cat most users see.
@@ -1394,8 +1294,9 @@ mod tests {
 
     /// D13, both halves. The FLYING head takes the meteor whole; the PET is
     /// offered the arrival edge and NOTHING else — no teleport, no spine
-    /// impulse, no retiming of the pounce, and no cadence held for a mailbox
-    /// that does not exist. Open owner question 14 stays open.
+    /// impulse, no retiming of the pounce, and no cadence held by the router
+    /// for a latch that is the pet's own. Owner question 14 is ruled: no
+    /// teleport.
     #[test]
     fn the_pet_is_offered_the_meteor_edge_but_keeps_its_own_pounce() {
         let t0 = Instant::now();
@@ -1429,7 +1330,7 @@ mod tests {
         );
         assert!(
             !matches!(pet, BodyImpulse::Fly(_)),
-            "a v2 meteor must never relocate the pet (open question 14)"
+            "a v2 meteor must never relocate the pet (owner Q14: no teleport)"
         );
         assert_eq!(
             pet.deadline(),
@@ -1826,163 +1727,6 @@ mod tests {
         };
         assert!(leftward.facing_left());
         assert!(!flight.facing_left());
-    }
-
-    /// The pet's caret is the HOST's grid caret, never v2's licensed landing:
-    /// with the two deliberately different, the pet gets the host's; a hidden
-    /// caret is `None`, never a stale cell. The rest of the sense is v2's own
-    /// geometry and live posture, and no spine rides along.
-    #[test]
-    fn the_pet_senses_the_grid_caret_not_v2s_licensed_landing() {
-        let now = Instant::now();
-        let cfg = super::super::Config {
-            reduced_motion: true,
-            ..config()
-        };
-        let ctx = Ctx {
-            now,
-            geom: geom(),
-            cfg: &cfg,
-            disp: 0.9,
-            birth_disp: 0.9,
-            phase: 12.0,
-            caret: (7, 33),
-            caret_t: 0.5,
-            caret_walk: None,
-            mend: None,
-            surge: 0.0,
-            flow: Default::default(),
-        };
-        let s = sense(
-            &ctx,
-            HostSense {
-                caret_drawn: true,
-                caret: Some((2, 9)),
-                wrapped: true,
-                output_burst: true,
-                pointer: Some((4.0, 5.0)),
-            },
-        );
-        assert_eq!(s.now, now);
-        assert_eq!(
-            s.caret,
-            Some((2, 9)),
-            "the grid caret, not the last licensed landing (7, 33)"
-        );
-        assert!(s.wrapped && s.output_burst);
-        assert_eq!((s.rows, s.cols, s.cell_w, s.cell_h), (40, 120, 9, 18));
-        assert!(s.reduced_motion, "the live posture reaches the pet");
-        assert_eq!(s.pointer, Some((4.0, 5.0)));
-
-        let hidden = sense(&ctx, HostSense::default());
-        assert_eq!(hidden.caret, None, "a hidden caret is None, never (7, 33)");
-        assert!(!hidden.wrapped && !hidden.output_burst);
-    }
-
-    /// §20.1, the pet row: the pet's pose stream under v2 is byte-identical to
-    /// v1's for the same move — including a meteor-sized jump and program
-    /// motion v2 never licensed — because [`sense`] projects the same host
-    /// facts v1 feeds it and nothing of v2's own. The v2 brain is fed through
-    /// [`sense`] with `Ctx::caret` frozen at a stale licensed landing; the v1
-    /// brain is fed the host facts directly. Every frame must agree.
-    #[test]
-    fn the_pet_keeps_its_own_pounce_under_a_v2_meteor() {
-        fn key(
-            f: &PetFrame,
-        ) -> (
-            u8,
-            u8,
-            crate::kitty_pet::PetAction,
-            u32,
-            u32,
-            u32,
-            bool,
-            u32,
-            u32,
-            bool,
-        ) {
-            (
-                f.alpha,
-                f.lane_alpha,
-                f.action,
-                f.col.to_bits(),
-                f.row.to_bits(),
-                f.lift.to_bits(),
-                f.facing_left,
-                f.scale_x.to_bits(),
-                f.scale_y.to_bits(),
-                f.under_ink,
-            )
-        }
-        let start = Instant::now();
-        let cfg = config();
-        let mut v1 = PetBrain::default();
-        let mut v2 = PetBrain::default();
-        // The host's caret walk, one entry per 16 ms frame: half a second at
-        // (3, 5); a 12-key run; a 40-cell jump (a meteor by any measure); a
-        // program-driven hop to another row that no licence gate would pass;
-        // then a settle.
-        let mut walk: Vec<Option<(u16, u16)>> = Vec::new();
-        walk.extend(std::iter::repeat_n(Some((3, 5)), 30));
-        for k in 0..12_u16 {
-            walk.extend(std::iter::repeat_n(Some((3, 6 + k)), 3));
-        }
-        walk.extend(std::iter::repeat_n(Some((3, 58)), 40));
-        walk.extend(std::iter::repeat_n(Some((9, 2)), 40));
-        walk.extend(std::iter::repeat_n(None, 10));
-        walk.extend(std::iter::repeat_n(Some((9, 2)), 60));
-
-        let mut max_col = f32::MIN;
-        let mut min_col = f32::MAX;
-        for (i, &caret) in walk.iter().enumerate() {
-            let now = start + Duration::from_millis(16 * i as u64);
-            let a = v1.tick(PetSense {
-                caret_drawn: true,
-                now,
-                caret,
-                wrapped: false,
-                rows: 40,
-                cols: 120,
-                cell_w: 9,
-                cell_h: 18,
-                reduced_motion: false,
-                output_burst: false,
-                pointer: None,
-            });
-            let ctx = Ctx {
-                now,
-                geom: geom(),
-                cfg: &cfg,
-                disp: 0.9,
-                birth_disp: 0.9,
-                phase: 3.0,
-                // Frozen on purpose: the last landing the licence gate passed.
-                caret: (3, 5),
-                caret_t: 0.25,
-                caret_walk: None,
-                mend: None,
-                surge: 0.0,
-                flow: Default::default(),
-            };
-            let b = v2.tick(sense(
-                &ctx,
-                HostSense {
-                    caret_drawn: true,
-                    caret,
-                    wrapped: false,
-                    output_burst: false,
-                    pointer: None,
-                },
-            ));
-            assert_eq!(key(&a), key(&b), "frame {i}: the pet's pose stream forked");
-            max_col = max_col.max(a.col);
-            min_col = min_col.min(a.col);
-        }
-        assert!(
-            max_col > 40.0 && min_col < 20.0,
-            "fixture: the pet must actually chase the jump and the hop \
-             (cols {min_col}..{max_col}) for the comparison to mean anything"
-        );
     }
 
     /// The cadence contract: v2 arms the frame clock only for what v2 is still

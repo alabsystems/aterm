@@ -180,7 +180,6 @@ impl StreamingSearch {
                 )
             }
             FilterMode::Regex => {
-                #[cfg(feature = "regex")]
                 if let Some(ref re) = self.compiled_regex {
                     let mut columns = MatchColumns::new(text, false);
                     re.find_iter(text)
@@ -196,17 +195,6 @@ impl StreamingSearch {
                         .collect()
                 } else {
                     Vec::new()
-                }
-
-                #[cfg(not(feature = "regex"))]
-                {
-                    let (search_text, search_pattern) = self.prepare_case_folded_inputs(text);
-                    self.literal_matches_in_row(
-                        row,
-                        text,
-                        search_text.as_ref(),
-                        search_pattern.as_ref(),
-                    )
                 }
             }
             FilterMode::Fuzzy => {

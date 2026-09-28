@@ -106,6 +106,41 @@ impl Grid {
         }
     }
 
+    /// DENSE forward walk over history from index `start` (0 = oldest) to the
+    /// newest history line: item `k` is exactly what
+    /// [`get_history_line(start + k)`](Self::get_history_line) returns, a
+    /// `None` standing in for a line that cannot be read.
+    ///
+    /// The tiered store is walked through
+    /// [`ScrollbackStorage::dense_from`] — one decode per warm block / cold
+    /// page, lines moved out, hot lines borrowed, one warning per corrupt
+    /// segment — instead of the per-line binary search, block-cache probe and
+    /// `Line` clone `get_history_line` pays on every tiered line. The lazy
+    /// buffer and the ring are read exactly as the per-line reader reads them.
+    /// Coordinates are stable: an undecodable segment yields one placeholder
+    /// per line it spans, so an absolute row keyed as `oldest + start + k`
+    /// is always the right row. Pinned against the per-line oracle by
+    /// `history_lines_from_matches_get_history_line_*`.
+    #[must_use]
+    pub fn history_lines_from(&self, start: usize) -> HistoryLines<'_> {
+        // The same three counts `try_get_history_line` partitions by.
+        let tiered = self.storage.scrollback.as_ref();
+        let tiered_end = tiered.map_or(0, ScrollbackStorage::line_count);
+        let lazy_end = tiered_end.saturating_add(self.storage.lazy_buffer_lines());
+        let end = lazy_end.saturating_add(self.storage.ring_buffer_scrollback());
+        let idx = start.min(end);
+        HistoryLines {
+            grid: self,
+            tiered: tiered
+                .filter(|_| idx < tiered_end)
+                .map(|sb| sb.dense_from(idx)),
+            idx,
+            tiered_end,
+            lazy_end,
+            end,
+        }
+    }
+
     /// Get a historical line by index (0 = oldest), logging read failures.
     #[must_use]
     pub fn get_history_line(&self, idx: usize) -> Option<Cow<'_, Line>> {
@@ -395,3 +430,64 @@ mod tests {
         );
     }
 }
+
+/// Dense forward walk over a grid's history — see
+/// [`Grid::history_lines_from`]. Exactly one item per history line from the
+/// start index to the newest, in order: tiered store, then the lazy buffer,
+/// then the ring.
+pub struct HistoryLines<'a> {
+    grid: &'a Grid,
+    /// The tiered store's dense walk, while the cursor is still inside it.
+    tiered: Option<aterm_scrollback::DenseScrollbackIter<'a>>,
+    /// History index of the NEXT item.
+    idx: usize,
+    tiered_end: usize,
+    lazy_end: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for HistoryLines<'a> {
+    type Item = Option<Cow<'a, Line>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.end {
+            return None;
+        }
+        let idx = self.idx;
+        self.idx += 1;
+        if idx < self.tiered_end {
+            // The dense walk yields exactly `tiered_end - start` items, so it
+            // cannot run dry inside the tiered range; `flatten` keeps a
+            // defective store a placeholder rather than a panic.
+            return Some(self.tiered.as_mut().and_then(Iterator::next).flatten());
+        }
+        self.tiered = None;
+        let storage = &self.grid.storage;
+        if idx < self.lazy_end {
+            return Some(
+                storage
+                    .lazy_buffer
+                    .get_line(idx - self.tiered_end)
+                    .map(Cow::Borrowed),
+            );
+        }
+        let ring_idx = idx - self.lazy_end;
+        let Some(row) = storage.ring_history_row(ring_idx) else {
+            return Some(None);
+        };
+        let default_extras = scroll_convert::ScrolledRowExtras::default();
+        let extras = storage
+            .ring_history_extras(ring_idx)
+            .unwrap_or(&default_extras);
+        Some(Some(Cow::Owned(Grid::row_to_line_with_stored_extras(
+            row, extras,
+        ))))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end - self.idx;
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for HistoryLines<'_> {}

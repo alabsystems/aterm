@@ -859,6 +859,7 @@ impl Model {
 // ---- The model catalog: the *_model() data constructors, split by family ----
 // (pure code motion). The `pub use` re-exports keep every existing
 // `crate::derive::*_model` path — and the xref registry — compiling unchanged.
+mod models_agent_verdict;
 mod models_atpkg_contention_release;
 mod models_atpkg_flip_quiet;
 mod models_atpkg_full_pass;
@@ -877,6 +878,7 @@ mod models_console_life;
 mod models_control_bind_retry;
 mod models_control_preparation;
 mod models_core;
+mod models_crash_journal;
 mod models_effects;
 mod models_fabric_enable;
 mod models_fabric_outbox_wake;
@@ -899,7 +901,7 @@ mod models_rainbow_composer_newline;
 mod models_rainbow_continuity;
 mod models_rainbow_short_wrap;
 mod models_release;
-mod models_release_head;
+mod models_release_publish_once;
 mod models_render;
 mod models_ribbon_follow;
 mod models_ribbon_release_restoration;
@@ -924,20 +926,23 @@ mod models_update_retired_intent;
 mod models_update_web_cache;
 mod models_update_window_show;
 
+pub use models_agent_verdict::claude_idle_at_composer_model;
 pub use models_atpkg_contention_release::atpkg_contention_release_park_model;
 pub use models_atpkg_flip_quiet::atpkg_flip_quiet_model;
 pub use models_atpkg_full_pass::atpkg_full_pass_rule_model;
 pub use models_atpkg_head_watch_hosts::atpkg_head_watch_hosts_model;
 pub use models_atpkg_index_probe::{
     atpkg_index_pending_park_model, atpkg_index_probe_completion_cadence_model,
-    atpkg_index_probe_cooldown_model, atpkg_index_successor_selection_model,
-    atpkg_index_wake_highwater_model,
+    atpkg_index_probe_cooldown_model, atpkg_index_shared_handoff_model,
+    atpkg_index_successor_selection_model, atpkg_index_wake_highwater_model,
 };
 pub use models_atpkg_index_publish::atpkg_index_publish_walk_model;
 pub use models_atpkg_pass_stamps::atpkg_pass_stamps_model;
 pub use models_atpkg_pending_wait::atpkg_pending_wait_model;
 pub use models_atpkg_published_spacing::atpkg_published_spacing_model;
-pub use models_atpkg_session_index::atpkg_session_index_handoff_model;
+pub use models_atpkg_session_index::{
+    atpkg_session_index_eligibility_model, atpkg_session_index_handoff_model,
+};
 pub use models_atpkg_session_index_retry::atpkg_session_index_retry_model;
 pub use models_atpkg_vendor_pending::atpkg_vendor_pending_check_model;
 pub use models_broadcast_checkpoint::broadcast_cursor_checkpoint_model;
@@ -946,18 +951,22 @@ pub use models_console_life::*;
 pub use models_control_bind_retry::native_update_handoff_bind_retry_model;
 pub use models_control_preparation::native_update_control_preparation_model;
 pub use models_core::*;
+pub use models_crash_journal::crash_journal_claim_model;
 pub use models_effects::*;
 pub use models_fabric_enable::*;
 pub use models_fabric_outbox_wake::{
     fabric_outbox_wake_model, fabric_reconnect_backoff_model, fabric_refill_retry_model,
 };
-pub use models_foreground_handback::foreground_handback_model;
+pub use models_foreground_handback::{
+    foreground_handback_model, foreground_handback_ownership_model,
+};
 pub use models_fx::*;
 pub use models_glyphs::*;
 pub use models_gui::*;
 pub use models_harness::*;
 pub use models_harness_host::{
-    harness_exit_record_model, harness_relaunch_on_exit_model, harness_worker_lifecycle_model,
+    harness_exit_record_model, harness_relaunch_on_exit_model, harness_upgrade_look_model,
+    harness_worker_lifecycle_model,
 };
 pub use models_input::input_unread_gate_model;
 pub use models_misc::*;
@@ -966,13 +975,13 @@ pub use models_notify_follow::notify_follow_checkpoint_model;
 pub use models_operator::*;
 pub use models_paste_order::*;
 pub use models_pet_observation_admission::*;
-pub use models_program_queue::program_resolver_queue_model;
+pub use models_program_queue::{claude_footer_watch_model, program_resolver_queue_model};
 pub use models_program_resolution::program_resolution_retry_model;
 pub use models_rainbow_composer_newline::rainbow_composer_newline_gate_model;
 pub use models_rainbow_continuity::*;
 pub use models_rainbow_short_wrap::rainbow_short_wrap_park_model;
 pub use models_release::*;
-pub use models_release_head::release_channel_head_model;
+pub use models_release_publish_once::release_publish_once_model;
 pub use models_render::*;
 pub use models_ribbon_follow::*;
 pub use models_ribbon_release_restoration::*;
@@ -985,7 +994,7 @@ pub use models_session::*;
 pub use models_subscribe_announcement::subscribe_announcement_order_model;
 pub use models_supervise::{
     supervisor_claim_model, supervisor_decline_keys_model, supervisor_focus_choice_model,
-    supervisor_question_answer_model, supervisor_turn_end_model,
+    supervisor_host_turn_end_model, supervisor_question_answer_model, supervisor_turn_end_model,
 };
 pub use models_title_summary::*;
 pub use models_typed_rekey::typed_rekey_model;
@@ -994,6 +1003,7 @@ pub use models_update_activation_observation::native_update_activation_observati
 pub use models_update_check_coordination::{
     native_update_boot_health_lock_model, native_update_check_join_model,
     native_update_check_receipt_model, native_update_check_wait_model,
+    native_update_two_process_apply_model,
 };
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;

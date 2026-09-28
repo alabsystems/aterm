@@ -10,9 +10,10 @@
 //! full `Line` clone per line on an O(N) sequential walk (ST-6). Newest-first
 //! reads use `get_line_rev` directly.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 
-use super::{Line, Scrollback, ScrollbackError};
+use super::{Line, Scrollback, ScrollbackError, ScrollbackStorage};
 
 /// One bulk read for the streaming walk: the owned lines from a requested
 /// index through the end of its storage segment, or the error plus how many
@@ -79,6 +80,161 @@ impl Scrollback {
         }
     }
 }
+
+impl Scrollback {
+    /// First logical index of the hot tier (`cold + warm` lines): the dense
+    /// walk's switch from bulk segment decodes to borrowed hot lines.
+    pub(crate) fn hot_start(&self) -> usize {
+        self.cold
+            .line_count()
+            .saturating_add(self.warm.line_count())
+    }
+}
+
+impl ScrollbackStorage {
+    /// DENSE forward walk from logical line `start` (0 = oldest) to the end:
+    /// exactly one item per logical line, `None` standing in for a line that
+    /// cannot be read.
+    ///
+    /// The product readers — the search index, its incremental refresh — key
+    /// every line by its ABSOLUTE row, so a walk that silently skips a corrupt
+    /// segment (as [`iter`](Self::iter) does) would shift every later line
+    /// onto its neighbour's coordinate. This one never skips: an undecodable
+    /// warm block or cold page yields one `None` per line it spans, and a short
+    /// or missing decode yields `None` for each line it failed to supply.
+    /// Item `k` is therefore line `start + k`, always, and it equals what the
+    /// per-line oracle `get_line(start + k).ok().flatten()` returns — pinned by
+    /// the conformance tests in `storage_tests.rs`.
+    ///
+    /// Cost: one decode per warm block / cold page (lines are MOVED out, never
+    /// cloned) and a zero-copy `Cow::Borrowed` per hot line — instead of the
+    /// per-line binary search, block-cache probe and `Line` clone `get_line`
+    /// pays on every warm/cold line. A corrupt segment is logged once, not
+    /// once per line.
+    #[must_use]
+    pub fn dense_from(&self, start: usize) -> DenseScrollbackIter<'_> {
+        let end = self.line_count();
+        let hot_start = match self {
+            ScrollbackStorage::Memory(sb) => sb.hot_start(),
+            #[cfg(feature = "disk-tier")]
+            ScrollbackStorage::Disk(sb) => sb.hot_start(),
+        };
+        DenseScrollbackIter {
+            storage: self,
+            idx: start.min(end),
+            end,
+            hot_start: hot_start.min(end),
+            buf: VecDeque::new(),
+            owed_placeholders: 0,
+            placeholders: 0,
+        }
+    }
+}
+
+/// Dense forward walk over a [`ScrollbackStorage`] — see
+/// [`ScrollbackStorage::dense_from`]. Yields `Some(line)` for every readable
+/// line and `None` as a placeholder for every unreadable one, so the item
+/// count always equals `line_count() - start`.
+pub struct DenseScrollbackIter<'a> {
+    storage: &'a ScrollbackStorage,
+    /// Logical index of the NEXT item.
+    idx: usize,
+    /// `line_count()` when the walk began (the storage is borrowed, so it
+    /// cannot change underneath).
+    end: usize,
+    /// First hot-tier index: below it lines come from bulk segment decodes,
+    /// at or above it they are borrowed straight out of the hot tier.
+    hot_start: usize,
+    /// Decoded lines of the current warm block / cold page, front first.
+    buf: VecDeque<Line>,
+    /// Placeholder rows still owed for the segment that failed to decode.
+    owed_placeholders: usize,
+    placeholders: usize,
+}
+
+impl DenseScrollbackIter<'_> {
+    /// How many placeholders (unreadable lines) the walk has yielded so far.
+    #[must_use]
+    pub fn placeholders(&self) -> usize {
+        self.placeholders
+    }
+
+    /// Yield one placeholder for the line at the cursor.
+    fn placeholder<'a>(&mut self) -> Option<Option<Cow<'a, Line>>> {
+        self.idx = self.idx.saturating_add(1);
+        self.placeholders = self.placeholders.saturating_add(1);
+        Some(None)
+    }
+}
+
+impl<'a> Iterator for DenseScrollbackIter<'a> {
+    type Item = Option<Cow<'a, Line>>;
+
+    // Skip: the segment-walk driver — like `ScrollbackIter::next`, its bulk
+    // reads route into the per-tier decode paths (each individually
+    // classified). Conformance-tested against the per-line oracle.
+    #[cfg_attr(trust_verify, trust::skip)]
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if self.idx >= self.end {
+                return None;
+            }
+            if self.owed_placeholders > 0 {
+                self.owed_placeholders -= 1;
+                return self.placeholder();
+            }
+            if let Some(line) = self.buf.pop_front() {
+                self.idx = self.idx.saturating_add(1);
+                return Some(Some(Cow::Owned(line)));
+            }
+            if self.idx >= self.hot_start {
+                // Hot tier: uncompressed and in RAM — borrow, never clone.
+                return match self.storage.get_line(self.idx) {
+                    Ok(Some(line)) => {
+                        self.idx = self.idx.saturating_add(1);
+                        Some(Some(line))
+                    }
+                    Ok(None) => self.placeholder(),
+                    Err(e) => {
+                        aterm_log::warn!(
+                            "scrollback dense walk: line {} unreadable: {e}",
+                            self.idx
+                        );
+                        self.placeholder()
+                    }
+                };
+            }
+            // Warm/cold: one decode for the whole rest of the segment. The
+            // segment never extends past its tier, but clamp to the hot
+            // boundary anyway so a malformed decode can never push a line
+            // onto another line's coordinate.
+            let tier_left = self.hot_start.saturating_sub(self.idx);
+            match self.storage.read_segment(self.idx) {
+                Ok(mut lines) if !lines.is_empty() => {
+                    lines.truncate(tier_left);
+                    self.buf = VecDeque::from(lines);
+                }
+                // A short decode (or a stale count): this line has no data.
+                // One placeholder, then the next line is attempted on its own.
+                Ok(_) => return self.placeholder(),
+                Err((e, skip)) => {
+                    aterm_log::warn!(
+                        "scrollback dense walk: {skip} unreadable line(s) at {}: {e}",
+                        self.idx
+                    );
+                    self.owed_placeholders = skip.min(tier_left).max(1);
+                }
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let n = self.end.saturating_sub(self.idx);
+        (n, Some(n))
+    }
+}
+
+impl ExactSizeIterator for DenseScrollbackIter<'_> {}
 
 /// Iterator over scrollback lines (oldest to newest).
 ///

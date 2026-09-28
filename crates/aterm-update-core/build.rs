@@ -9,9 +9,9 @@
 //! Precedence, highest first:
 //!
 //! 1. `[workspace.metadata.aterm] update_channel = "OWNER/REPO"` — the PUBLIC
-//!    update channel. This is the key that matters: releases are cut privately
-//!    and mirrored to it by `cargo ship cut`'s `mirror` step, so a shipped build
-//!    can read the channel with no credential at all.
+//!    update channel. This is the key that matters: `targo ship cut` publishes
+//!    each release onto it, once, so a shipped build can read the channel with
+//!    no credential at all.
 //! 2. `[workspace.package] repository` (inherited here as `CARGO_PKG_REPOSITORY`)
 //!    — the source/publish repo, used when no separate channel is declared.
 //! 3. the compiled-in `alabsystems/aterm` fallback.

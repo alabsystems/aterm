@@ -657,3 +657,254 @@ impl SgrStyleHandler<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! The semicolon-form underline colour (SGR `58;2;r;g;b` / `58;5;n`),
+    //! pinned at the byte level.
+    //!
+    //! Audit 2026-09-22 (Windows): `ESC[4m ESC[58;2;255;0;0m TEXT` underlined in
+    //! the default grey, `ESC[58;5;196m` likewise, and `ESC[4m` followed by
+    //! `ESC[58;2;0;255;0m` switched the underline OFF — the shape you get when
+    //! `58;2;0;255;0` is read as five independent params (2 = dim, 0 = reset),
+    //! while the colon form `58:2::255:0:0` was fine. These tests feed EXACTLY
+    //! those byte sequences to the terminal and read the grid back, so a
+    //! regression in the parser's parameter consumption or in the SGR dispatch
+    //! fails HERE, in the crate that owns it, rather than in a screenshot.
+    //!
+    //! They pass with no change to the SGR code (0.90.0 and 0.94.0 alike): aterm
+    //! was never the layer that dropped the colour. MEASURED on the host that
+    //! runs every Windows tab (the inbox conhost 10.0.26100.1 behind
+    //! `CreatePseudoConsole` with `dwFlags` 0, Windows 10.0.26200) by recording
+    //! the pseudoconsole's output pipe while a child wrote the sequences:
+    //! `ESC[4m ESC[58;5;196m` came back as `ESC[4m ESC[5m` (the index became
+    //! BLINK), `ESC[4m ESC[58;2;1;1;1m` as `ESC[1m ESC[2m ESC[4m` (bold, dim),
+    //! and `ESC[4m ESC[58;2;255;0;0m`, `ESC[4m ESC[58;2;0;255;0m` and the
+    //! combined `ESC[4;58;2;255;0;0m` as no rendition at all (the trailing `0`
+    //! was SGR 0); the grey underline is the colour-first order
+    //! `ESC[58;2;255;0;0m ESC[4m`, which came back as a bare `ESC[4m`.
+    //! `ESC[58:2::255:0:0m`, `ESC[58:5:196m` and `ESC[38;2;255;0;0m` came back
+    //! verbatim, while the colon form WITHOUT the colour-space slot,
+    //! `ESC[58:2:255:0:0m`, was dropped. conhost's `_ApplyGraphicsOption` has no
+    //! `UnderlineColor` arm — `58` takes the `default: return 1` path and its
+    //! sub-values are dispatched as their own SGRs; only the colon path
+    //! (`_ApplyGraphicsOptionWithSubParams`) reads a colour for 58, and the same
+    //! holds at microsoft/terminal `main` (read 2026-09-27). Nothing in aterm
+    //! can restore bytes conhost never forwards; on Windows a program wanting a
+    //! coloured underline must send `58:2::r:g:b` or `58:5:n`.
+
+    use super::super::Terminal;
+    use super::super::render_cells::UnderlineStyle;
+    use super::*;
+
+    /// `0x01_RRGGBB`: the packed form `parse_underline_color` stores for RGB.
+    const RED: u32 = 0x01_FF00_00;
+    const GREEN: u32 = 0x01_00FF_00;
+    /// `0x02_0000NN`: the packed form for a palette index.
+    const IDX_196: u32 = 0x02_0000_C4;
+
+    type Drawn = Vec<(char, UnderlineStyle, Option<[u8; 3]>)>;
+
+    /// `(char, underline style, resolved underline colour)` for the first `n`
+    /// cells of row 0 — what the renderer will draw.
+    fn drawn(term: &mut Terminal, n: usize) -> Drawn {
+        term.render_row(0)
+            .iter()
+            .take(n)
+            .map(|c| (c.ch, c.underline, c.underline_color))
+            .collect()
+    }
+
+    fn single(text: &str, color: [u8; 3]) -> Drawn {
+        text.chars()
+            .map(|ch| (ch, UnderlineStyle::Single, Some(color)))
+            .collect()
+    }
+
+    #[test]
+    fn semicolon_rgb_after_sgr_4_colours_the_underline_red() {
+        let mut term = Terminal::new(2, 16);
+        term.process(b"\x1b[4m\x1b[58;2;255;0;0m");
+        assert_eq!(
+            term.transient.current_underline_color,
+            Some(RED),
+            "58;2;255;0;0 is one RGB colour"
+        );
+        assert!(
+            term.style.flags.contains(CellFlags::UNDERLINE),
+            "SGR 4 survives the colour"
+        );
+        term.process(b"TEXT\x1b[0m");
+        assert_eq!(drawn(&mut term, 4), single("TEXT", [255, 0, 0]));
+        assert_eq!(
+            term.transient.current_underline_color, None,
+            "SGR 0 clears the colour"
+        );
+    }
+
+    #[test]
+    fn semicolon_indexed_after_sgr_4_colours_the_underline_from_the_palette() {
+        let mut term = Terminal::new(2, 16);
+        term.process(b"\x1b[4m\x1b[58;5;196m");
+        assert_eq!(
+            term.transient.current_underline_color,
+            Some(IDX_196),
+            "58;5;196 is one palette index"
+        );
+        assert!(term.style.flags.contains(CellFlags::UNDERLINE));
+        assert!(
+            !term.style.flags.contains(CellFlags::BLINK),
+            "5 is the colour form, not SGR 5"
+        );
+        term.process(b"TEXT\x1b[0m");
+        let c = term.color_palette().get(196);
+        assert_eq!(drawn(&mut term, 4), single("TEXT", [c.r, c.g, c.b]));
+    }
+
+    #[test]
+    fn semicolon_rgb_with_zero_components_keeps_the_underline_on() {
+        // The audit's tell: `58;2;0;255;0` read as five SEPARATE params would
+        // apply 2 (dim) and 0 (full reset) and leave no underline at all.
+        let mut term = Terminal::new(2, 16);
+        term.process(b"\x1b[4m\x1b[58;2;0;255;0m");
+        assert_eq!(term.transient.current_underline_color, Some(GREEN));
+        assert!(
+            term.style.flags.contains(CellFlags::UNDERLINE),
+            "the underline must survive its own colour"
+        );
+        assert!(
+            !term.style.flags.contains(CellFlags::DIM),
+            "2 is the colour space, not SGR 2"
+        );
+        assert!(
+            term.style.fg == PackedColor::DEFAULT_FG && term.style.bg == PackedColor::DEFAULT_BG,
+            "no component of the triple is a reset"
+        );
+        term.process(b"TEXT\x1b[0m");
+        assert_eq!(drawn(&mut term, 4), single("TEXT", [0, 255, 0]));
+    }
+
+    #[test]
+    fn semicolon_colour_split_at_every_read_boundary_is_one_colour() {
+        // The pipe read can end anywhere inside the CSI (a ConPTY read returns
+        // whatever conhost has flushed), so the params must survive a split
+        // at every byte: one byte per `process` is the worst case of it.
+        for (bytes, want) in [
+            (&b"\x1b[4m\x1b[58;2;0;255;0mTEXT\x1b[0m"[..], [0, 255, 0]),
+            (&b"\x1b[4;58;2;255;0;0mTEXT\x1b[0m"[..], [255, 0, 0]),
+        ] {
+            let mut term = Terminal::new(2, 16);
+            for b in bytes {
+                term.process(std::slice::from_ref(b));
+            }
+            assert_eq!(
+                drawn(&mut term, 4),
+                single("TEXT", want),
+                "{:?} fed one byte at a time",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+    }
+
+    #[test]
+    fn colon_semicolon_and_combined_forms_draw_the_same_cells() {
+        let mut semicolon = Terminal::new(2, 16);
+        semicolon.process(b"\x1b[4m\x1b[58;2;255;0;0mTEXT\x1b[0m");
+        let mut colon = Terminal::new(2, 16);
+        colon.process(b"\x1b[58:2::255:0:0m\x1b[4mTEXT\x1b[0m");
+        let mut combined = Terminal::new(2, 16);
+        combined.process(b"\x1b[4;58;2;255;0;0mTEXT\x1b[0m");
+        let want = single("TEXT", [255, 0, 0]);
+        assert_eq!(drawn(&mut semicolon, 4), want, "58;2;r;g;b");
+        assert_eq!(drawn(&mut colon, 4), want, "58:2::r:g:b");
+        assert_eq!(drawn(&mut combined, 4), want, "4;58;2;r;g;b");
+    }
+
+    #[test]
+    fn sgr_59_clears_the_colour_but_not_the_underline() {
+        let mut term = Terminal::new(2, 16);
+        term.process(b"\x1b[4m\x1b[58;2;255;0;0mA\x1b[59m");
+        assert_eq!(
+            term.transient.current_underline_color, None,
+            "59 resets the colour"
+        );
+        assert!(
+            term.style.flags.contains(CellFlags::UNDERLINE),
+            "59 leaves the underline itself alone"
+        );
+        term.process(b"B\x1b[0m");
+        assert_eq!(
+            drawn(&mut term, 2),
+            vec![
+                ('A', UnderlineStyle::Single, Some([255, 0, 0])),
+                // No SGR 58 colour: the line takes the cell's own ink.
+                ('B', UnderlineStyle::Single, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_param_after_the_semicolon_colour_is_applied_on_its_own() {
+        // Exact consumption at the byte level: the param AFTER the triple or
+        // the index is dispatched as its own SGR — neither swallowed by the
+        // colour nor the colour's tail read as attributes.
+        let mut term = Terminal::new(2, 16);
+        term.process(b"\x1b[58;2;255;0;0;1m");
+        assert_eq!(term.transient.current_underline_color, Some(RED));
+        assert!(term.style.flags.contains(CellFlags::BOLD), "58;2;r;g;b;1");
+        term.process(b"\x1b[0m\x1b[58;5;196;3m");
+        assert_eq!(term.transient.current_underline_color, Some(IDX_196));
+        assert!(term.style.flags.contains(CellFlags::ITALIC), "58;5;n;3");
+        // 38 and 48 must agree with 58 on the same shapes.
+        term.process(b"\x1b[0m\x1b[38;2;1;2;3;4m");
+        assert!(term.style.fg == PackedColor::rgb(1, 2, 3), "38;2;r;g;b");
+        assert!(
+            term.style.flags.contains(CellFlags::UNDERLINE),
+            "38;2;r;g;b;4"
+        );
+        term.process(b"\x1b[0m\x1b[48;5;7;9m");
+        assert!(term.style.bg == PackedColor::indexed(7), "48;5;n");
+        assert!(
+            term.style.flags.contains(CellFlags::STRIKETHROUGH),
+            "48;5;n;9"
+        );
+        // And an underline colour followed by a colour reset keeps the
+        // underline colour: 39 is the foreground's, not 58's.
+        term.process(b"\x1b[0m\x1b[4;58;2;255;0;0;39m");
+        assert_eq!(term.transient.current_underline_color, Some(RED));
+        assert!(term.style.fg == PackedColor::DEFAULT_FG, "4;58;2;r;g;b;39");
+    }
+
+    #[test]
+    fn semicolon_forms_consume_exactly_their_sub_parameters() {
+        // The parse and the skip are two functions; they must agree on the
+        // width of each form: 58;2;r;g;b is FIVE params (four after the 58),
+        // 58;5;n is THREE (two after).
+        assert_eq!(
+            SgrStyleHandler::parse_underline_color(&[58, 2, 255, 0, 0]),
+            Some(RED)
+        );
+        assert_eq!(SgrStyleHandler::extended_color_skip(&[58, 2, 255, 0, 0]), 4);
+        assert_eq!(
+            SgrStyleHandler::parse_underline_color(&[58, 5, 196]),
+            Some(IDX_196)
+        );
+        assert_eq!(SgrStyleHandler::extended_color_skip(&[58, 5, 196]), 2);
+        // A truncated triple is refused, never read short.
+        assert_eq!(
+            SgrStyleHandler::parse_underline_color(&[58, 2, 255, 0]),
+            None
+        );
+        // 38/48 use the same skip and the same widths.
+        assert!(
+            SgrStyleHandler::parse_extended_color(&[38, 2, 1, 2, 3])
+                == Some(PackedColor::rgb(1, 2, 3))
+        );
+        assert_eq!(SgrStyleHandler::extended_color_skip(&[38, 2, 1, 2, 3]), 4);
+        assert!(
+            SgrStyleHandler::parse_extended_color(&[48, 5, 7]) == Some(PackedColor::indexed(7))
+        );
+        assert_eq!(SgrStyleHandler::extended_color_skip(&[48, 5, 7]), 2);
+        assert!(SgrStyleHandler::parse_extended_color(&[38, 2, 1, 2]).is_none());
+    }
+}

@@ -27,10 +27,10 @@
 //! for byte before any other law uses them. The DEC 2026 bracket is the
 //! window's own — the on-glass capture carries it.
 //!
-//! Every law runs at the HOST seam (`trail_host::Core`, LOCK A), as
+//! Every law runs at the HOST seam (`trail_host::Core`, the frame hold), as
 //! `tests/composer_box_growth_wrap.rs` does: a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its
-//! rows sampled exactly as `app_render.rs`'s LOCK A samples them, fed through
+//! rows sampled exactly as `app_render.rs`'s frame hold samples them, fed through
 //! `CursorGlow::observe_row` / `observe_ribbon_row` / `ribbon_rows` and ticked
 //! through `CursorGlow::tick` at 16.7 ms, keys at the capture's 80 ms. Each
 //! law says whether it was RED on `aa71f9319` (the tree the report was
@@ -229,7 +229,7 @@ fn shared_letters(a: &str, b: &str) -> Vec<u16> {
         .collect()
 }
 
-/// The host: `trail_host`'s LOCK-A frame seam (every named row read, the
+/// The host: `trail_host`'s frame-hold seam (every named row read, the
 /// caret row's among them) on the owner's 53×91 grid of retina cells, the
 /// default dark theme (fg `0xD0D0D0`, bg `0x111318`) at intensity 0.70 —
 /// `tests/composer_box_growth_wrap.rs`'s setup — and a 16.667 ms frame

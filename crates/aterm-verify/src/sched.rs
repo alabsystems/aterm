@@ -4,9 +4,9 @@
 //! Running stages concurrently while the ladder still reads top to bottom.
 //!
 //! The script was sequential because bash is. Most of these stages are genuinely
-//! independent — the grep guards, the license headers, the install-channel and
-//! start-compare harnesses share nothing with the build — so they run at the same
-//! time here. What they are NOT free to share is a resource, and the scheduler
+//! independent — the grep guards, the delivery-tooling suites and the contract
+//! probe share nothing with the test compile — so they run at the same time
+//! here. What they are NOT free to share is a resource, and the scheduler
 //! models exactly two kinds:
 //!
 //! * A [`Lane`] is a contended resource — in practice a cargo target directory.
@@ -18,7 +18,7 @@
 //!   its nested workspace's two target dirs, and the conformance suites' RELEASE
 //!   artifact has `target/conformance-release` — a directory under `target/`
 //!   whose cargo lock is nevertheless its own — so all are real lanes that
-//!   genuinely overlap the main build.
+//!   genuinely overlap the main lane's compile.
 //!
 //! * An EXCLUSIVE stage runs with nothing else in flight. The measuring tests and
 //!   the two smokes MEASURE: paint takes, launchd deadlines, frames per second,
@@ -91,9 +91,9 @@ pub(crate) fn ready(
                 || earlier.exclusive
                 // An earlier stage in my lane still owes me the resource.
                 // `Pure` is the absence of a resource, not a resource shared by
-                // everything holding it: the guards, the license headers and the
-                // two shell harnesses contend for NOTHING, so they run beside
-                // each other as well as beside the build.
+                // everything holding it: the guards and the shell suites contend
+                // for NOTHING, so they run beside each other as well as beside
+                // the compile.
                 || (earlier.lane == me.lane && me.lane != Lane::Pure))
     });
     !blocked && !(me.exclusive && running > 0) && awaited(specs, i).all(|j| done[j])
@@ -198,7 +198,7 @@ where
         }
 
         // The printer: hand out finished stages strictly in declared order, so a
-        // fast pure stage never jumps the build it was scheduled beside.
+        // fast pure stage never jumps the compile it was scheduled beside.
         for i in 0..n {
             let mut g = state.lock().expect("scheduler mutex");
             while g.results[i].is_none() {
@@ -230,22 +230,22 @@ mod tests {
         }
     }
 
-    const SIDE_LANES: [Lane; 3] = [Lane::RegexTarget, Lane::XtaskTarget, Lane::DriverTarget];
+    /// The lanes the test run waits for.
+    const AWAITED_LANES: [Lane; 1] = [Lane::DriverTarget];
 
     fn plan_shape() -> Vec<StageSpec> {
         vec![
-            spec(StageId::Build, "build", Lane::MainTarget, false),
+            spec(StageId::TestCompile, "compile", Lane::MainTarget, false),
             StageSpec {
-                after_lanes: SIDE_LANES.to_vec(),
+                after_lanes: AWAITED_LANES.to_vec(),
                 ..spec(StageId::Test, "test", Lane::MainTarget, false)
             },
             spec(StageId::Doctests, "doctests", Lane::MainTarget, false),
-            spec(StageId::RegexLane, "regex", Lane::RegexTarget, false),
             spec(StageId::Tippy, "tippy", Lane::TippyTarget, false),
             spec(StageId::Formatting, "fmt", Lane::XtaskTarget, false),
             spec(StageId::GrepGuards, "grep", Lane::Pure, false),
-            spec(StageId::LicenseHeaders, "license", Lane::Pure, false),
-            spec(StageId::FeatureGates, "gates", Lane::XtaskTarget, false),
+            spec(StageId::DeliveryTooling, "delivery", Lane::Pure, false),
+            spec(StageId::Forge, "forge", Lane::XtaskTarget, false),
             spec(StageId::LibcOracle, "libc", Lane::LibcOracleTarget, false),
             spec(StageId::FreezeGate, "l0", Lane::FreezeGateTarget, false),
             spec(StageId::DriverBuilds, "drivers", Lane::DriverTarget, false),
@@ -346,7 +346,7 @@ mod tests {
         let reports = run_stages(
             &specs,
             |s| {
-                // Pure stages finish instantly; the build takes its time. The
+                // Pure stages finish instantly; the compile takes its time. The
                 // ladder must not reorder because of it.
                 if s.lane == Lane::MainTarget {
                     std::thread::sleep(Duration::from_millis(40));
@@ -416,14 +416,13 @@ mod tests {
         let times = met_run(
             &specs,
             &[
-                ("build", "grep"),
-                ("build", "tippy"),
-                ("build", "l0"),
-                ("build", "libc"),
-                ("grep", "license"),
-                ("build", "regex"),
-                ("build", "fmt"),
-                ("build", "drivers"),
+                ("compile", "grep"),
+                ("compile", "tippy"),
+                ("compile", "l0"),
+                ("compile", "libc"),
+                ("grep", "delivery"),
+                ("compile", "fmt"),
+                ("compile", "drivers"),
             ],
         );
         let idx = |t: &str| specs.iter().position(|s| s.title == t).expect("stage");
@@ -432,39 +431,38 @@ mod tests {
             (*s, *e)
         };
         assert!(
-            overlaps(at(idx("build")), at(idx("grep"))),
-            "the pure guards must not wait for the build"
+            overlaps(at(idx("compile")), at(idx("grep"))),
+            "the pure guards must not wait for the test compile"
         );
         assert!(
-            overlaps(at(idx("build")), at(idx("tippy"))),
-            "tippy has its own target dir and must overlap the build"
+            overlaps(at(idx("compile")), at(idx("tippy"))),
+            "tippy has its own target dir and must overlap the test compile"
         );
         assert!(
-            overlaps(at(idx("build")), at(idx("l0"))),
-            "the L0 gate builds in its own workspace and must overlap the build"
+            overlaps(at(idx("compile")), at(idx("l0"))),
+            "the L0 gate builds in its own workspace and must overlap the test compile"
         );
         assert!(
-            overlaps(at(idx("build")), at(idx("libc"))),
-            "the libc oracle builds in its own workspace and must overlap the build"
+            overlaps(at(idx("compile")), at(idx("libc"))),
+            "the libc oracle builds in its own workspace and must overlap the test compile"
         );
         assert!(
-            overlaps(at(idx("grep")), at(idx("license"))),
+            overlaps(at(idx("grep")), at(idx("delivery"))),
             "`Pure` is the ABSENCE of a contended resource: pure stages must \
              overlap each other too, not queue behind one another"
         );
-        // 2026-09-13: the three side lanes start at t0, beside the build.
-        for side in ["regex", "fmt", "drivers"] {
+        // The side lanes start at t0, beside the test compile.
+        for side in ["fmt", "drivers"] {
             assert!(
-                overlaps(at(idx("build")), at(idx(side))),
-                "{side} has its own target dir and must overlap the build"
+                overlaps(at(idx("compile")), at(idx(side))),
+                "{side} has its own target dir and must overlap the test compile"
             );
         }
     }
 
-    /// Before 2026-09-13 the regex lane, the xtask verbs and the driver builds
-    /// queued behind the test run in `target/`. In their own lanes they must
-    /// still never overlap it — and the driver stages behind the smokes'
-    /// barrier must still come after it.
+    /// The test run never overlaps the driver lane: the stages it awaits finish
+    /// before it starts, and the driver stages behind the smokes' barrier start
+    /// after it ends.
     #[test]
     fn the_test_run_never_overlaps_a_side_lane() {
         let specs = plan_shape();
@@ -472,7 +470,7 @@ mod tests {
         let test = specs.iter().position(|s| s.title == "test").expect("test");
         let (_, t_start, t_end) = *times.iter().find(|(k, _, _)| *k == test).expect("timed");
         for (j, s_j, e_j) in &times {
-            if SIDE_LANES.contains(&specs[*j].lane) {
+            if AWAITED_LANES.contains(&specs[*j].lane) {
                 assert!(
                     !overlaps((t_start, t_end), (*s_j, *e_j)),
                     "the test run overlapped {}",
@@ -535,7 +533,6 @@ mod tests {
                 std::path::PathBuf::from("/repo"),
                 mode,
                 scope,
-                false,
                 crate::EnvSnapshot::default(),
                 std::path::PathBuf::from("/tmp"),
             )
@@ -641,7 +638,6 @@ mod tests {
                 std::path::PathBuf::from("/repo"),
                 mode,
                 scope,
-                false,
                 crate::EnvSnapshot::default(),
                 std::path::PathBuf::from("/tmp"),
             )
@@ -716,11 +712,11 @@ mod tests {
         assert!(check_after_lanes(&specs).is_err());
         // …and so would one awaiting a stage that waits on lanes itself.
         let mut specs = plan_shape();
-        let regex = specs
+        let drivers = specs
             .iter()
-            .position(|s| s.title == "regex")
-            .expect("regex");
-        specs[regex].after_lanes = vec![Lane::DriverTarget];
+            .position(|s| s.title == "drivers")
+            .expect("drivers");
+        specs[drivers].after_lanes = vec![Lane::XtaskTarget];
         assert!(check_after_lanes(&specs).is_err());
         // …or one naming its own lane.
         let mut specs = plan_shape();

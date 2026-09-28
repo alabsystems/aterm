@@ -255,7 +255,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY the render path: LOCK A's caret row and every ribbon row
+    /// EXACTLY the render path: the frame hold's caret row and every ribbon row
     /// whether or not the caret is visible, the print anchor fed immediately
     /// before the tick (`app_render.rs`), the tick, then the census.
     fn frame(&mut self) {

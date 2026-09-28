@@ -3,6 +3,10 @@ set -l __atpkg_bin "/opt/aterm-si fixture/pkg/bin"
 if not contains $__atpkg_bin $PATH; set -gx PATH $PATH $__atpkg_bin; end
 set -gx ATPKG_BIN $__atpkg_bin
 set -l __atpkg_agents "/opt/aterm-si fixture/pkg/agents"
+set -l __atpkg_reroute "/opt/aterm-si fixture/pkg/reroute"
+set -l __atpkg_front
+if test -n "$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID"; set __atpkg_front "$__atpkg_agents"; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -e ATPKG_AGENTS; end
+if test -z "$__ATERM_REROUTE_PASSTHROUGH"; or test "$__ATERM_REROUTE_PASSTHROUGH" = 0; if test -n "$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID$ATERM_REROUTE_DIR"; set __atpkg_front "$__atpkg_reroute" $__atpkg_front; end; end
 set -l __atpkg_rest
-for __atpkg_d in $PATH; if test "$__atpkg_d" != "$__atpkg_agents"; set __atpkg_rest $__atpkg_rest "$__atpkg_d"; end; end
-if test -n "$ATERM_AGENTS_DIR$ATERM_CHILD$ATERM_SESSION_ID"; set -gx PATH "$__atpkg_agents" $__atpkg_rest; set -gx ATPKG_AGENTS $__atpkg_agents; else; set -gx PATH $__atpkg_rest; set -e ATPKG_AGENTS; end
+for __atpkg_d in $PATH; if test "$__atpkg_d" != "$__atpkg_agents"; and test "$__atpkg_d" != "$__atpkg_reroute"; set __atpkg_rest $__atpkg_rest "$__atpkg_d"; end; end
+set -gx PATH $__atpkg_front $__atpkg_rest

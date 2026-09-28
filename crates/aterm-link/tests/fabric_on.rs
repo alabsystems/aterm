@@ -1217,8 +1217,8 @@ fn doctor_puts_a_fix_under_every_warning() {
 
 /// **`off` NAMES EVERY SESSION THE FLEET HOLDS** — the round-13 review's
 /// finding 3. A fleet halt is published on the bus; the bridge holds the
-/// session; the Owner's `hold <sid> off` is `ERR denied` (a fleet hold is the
-/// bridge's alone); and `off` — dry and real — used to say nothing about it
+/// session; the Owner's `hold <sid> off` is `ERR denied: only the fleet sets
+/// or lifts a fleet hold`; and `off` — dry and real — used to say nothing about it
 /// while stopping the one thing that could ever lift it. Now it names the
 /// session, says it is held, and says what lifts it.
 #[test]
@@ -1264,7 +1264,7 @@ fn review_off_names_a_session_the_fleet_holds() {
     let denied = gui.verb(&format!("hold {sid} off"));
     assert_eq!(
         denied.header().trim(),
-        "ERR denied",
+        "ERR denied: only the fleet sets or lifts a fleet hold",
         "a fleet hold is not the Owner's to lift"
     );
 

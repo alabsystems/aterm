@@ -315,6 +315,33 @@ pub enum NamedKey {
 }
 
 impl NamedKey {
+    /// A sided modifier key's modifier bit and its other-side twin
+    /// (`ShiftLeft` → `(SHIFT, ShiftRight)`); `None` for every other key.
+    ///
+    /// Kitty reports a modifier key's release with its own bit still SET while
+    /// the twin is held (both Shifts down, one let go: `shift` is still in
+    /// force). The window answers that from its physical-press record when it
+    /// forwards the release; the encoder takes the bit as the caller states it
+    /// ([`super::encode_key_with_event`]).
+    #[must_use]
+    pub fn modifier_twin(self) -> Option<(Modifiers, NamedKey)> {
+        Some(match self {
+            NamedKey::ShiftLeft => (Modifiers::SHIFT, NamedKey::ShiftRight),
+            NamedKey::ShiftRight => (Modifiers::SHIFT, NamedKey::ShiftLeft),
+            NamedKey::ControlLeft => (Modifiers::CTRL, NamedKey::ControlRight),
+            NamedKey::ControlRight => (Modifiers::CTRL, NamedKey::ControlLeft),
+            NamedKey::AltLeft => (Modifiers::ALT, NamedKey::AltRight),
+            NamedKey::AltRight => (Modifiers::ALT, NamedKey::AltLeft),
+            NamedKey::SuperLeft => (Modifiers::SUPER, NamedKey::SuperRight),
+            NamedKey::SuperRight => (Modifiers::SUPER, NamedKey::SuperLeft),
+            NamedKey::HyperLeft => (Modifiers::HYPER, NamedKey::HyperRight),
+            NamedKey::HyperRight => (Modifiers::HYPER, NamedKey::HyperLeft),
+            NamedKey::MetaLeft => (Modifiers::META, NamedKey::MetaRight),
+            NamedKey::MetaRight => (Modifiers::META, NamedKey::MetaLeft),
+            _ => return None,
+        })
+    }
+
     /// Get the Kitty keyboard protocol key code for this named key.
     ///
     /// Returns the Unicode code point used in CSI u encoding.

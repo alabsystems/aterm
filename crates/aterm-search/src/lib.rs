@@ -376,8 +376,7 @@ impl TerminalSearch {
     /// Literal searches are lazy and stop at the first qualifying match. The
     /// default case-insensitive path uses allocation-free ASCII matching and
     /// range-bounded candidate iteration. Regex mode retains the batch regex
-    /// implementation and can return [`SearchOptionsError::RegexNotEnabled`]
-    /// when the crate feature is disabled.
+    /// implementation.
     #[cfg(test)]
     pub fn find_next_opts(
         &self,

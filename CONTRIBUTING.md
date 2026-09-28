@@ -59,8 +59,8 @@ There is no hosted CI: nothing runs automatically on a pull request, so paste
 the output of the tests you ran into the description.
 
 **Which gate is the contract, and which one is yours.** The gate that decides
-whether a change lands is `tools/verify.sh` — a thirty-two-stage local
-ladder (`crates/aterm-verify`) that a maintainer runs on the rebased branch, on
+whether a change lands is `tools/verify.sh` — a local ladder of stages
+(`crates/aterm-verify`) that a maintainer runs on the rebased branch, on
 the development line, at land time. You are not expected to run it, and this
 file does not ask you to: that ladder drives the development line's own
 toolchain, while this snapshot deliberately pins a stock Rust release (see
@@ -83,14 +83,11 @@ What you *can* run on this snapshot, all on the pinned toolchain:
 **`gate all` is not that ladder**, and a red `gate all` here is not evidence
 about your change. `crates/xtask/src/gate.rs` marks the verb MANUAL ONLY —
 nothing invokes it automatically — and its roster includes `lint`, whose tippy
-and trustfmt lanes drive the development line's own toolchain and whose guard
-lane shells out to a set of `tools/*.sh` scripts (`paint_guard`, `spin_guard`
-and friends) that [PUBLICATION.md](PUBLICATION.md)'s export list does not name;
-the only file it names under `tools/` is the installer. A lane that could not
-run is reported as reaching *no verdict*, and `gate lint` — and so `gate all` —
-returns failure for it rather than a pass, deliberately: a check that did not
-run must never read as a check that passed. Run the specific lanes above
-instead.
+and trustfmt lanes drive the development line's own toolchain. A lane that
+could not run is reported as reaching *no verdict*, and `gate lint` — and so
+`gate all` — returns failure for it rather than a pass, deliberately: a check
+that did not run must never read as a check that passed. Run the specific
+lanes above instead.
 
 If a change affects how the window looks or feels, also run a real aterm
 instance, capture the rendered frame through `aterm ctl image`, and include

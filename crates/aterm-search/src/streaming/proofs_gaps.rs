@@ -17,7 +17,6 @@
 //! through cross-operation sequences with every unit-effect transition judged
 //! against the model. Remaining kani-and-model-free territory, deliberately out of the
 //! migration slice and NOT claimed as covered: `content_modified` (#7244),
-//! `jump_to_match` (needs `Expr::InRange` — a hand-built Model extension),
 //! `scan_all` wrapped-row remapping (#7471/#7572), and the regex path
 //! (feature-gated off under kani, dual-path #2688). `update_pattern_*` below
 //! stay ledger-UNANCHORED: pattern content is unbounded, so there is no model

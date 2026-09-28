@@ -35,7 +35,7 @@
 //!
 //! Every test drives the composer at the HOST seam — a real
 //! `aterm_core::terminal::Terminal`, its rows sampled exactly as
-//! `app_render.rs`'s LOCK A samples them (`tests/composer_box_growth_wrap.rs`
+//! `app_render.rs`'s frame hold samples them (`tests/composer_box_growth_wrap.rs`
 //! `Host::frame`, verbatim), frames on a 16.7 ms train — and reads, for
 //! each wrap, the counters and the moving line's own cells tracked by
 //! identity `(col, born)`, frame by frame for 1.6 s.
@@ -506,7 +506,7 @@ impl Host {
         h
     }
 
-    /// EXACTLY LOCK A, then the tick (`tests/composer_box_growth_wrap.rs`
+    /// EXACTLY the frame hold, then the tick (`tests/composer_box_growth_wrap.rs`
     /// `Host::frame`, verbatim) — then the census, while a wrap's window is
     /// open.
     fn frame(&mut self) {

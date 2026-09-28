@@ -5,7 +5,7 @@
 //! Holding the lane for a dedup decision does not manufacture a completed check.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, TryLockError, TryLockResult};
+use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use crate::Source;
 
@@ -44,10 +44,14 @@ impl Lane {
         }
     }
 
-    pub(crate) fn try_lock(&self) -> TryLockResult<MutexGuard<'_, Completion>> {
+    /// The lane, if no other checker holds it. A lane poisoned by a panicked
+    /// checker is recovered here (its completion invalidated, the poison
+    /// cleared), so the only refusal a caller ever sees is "busy".
+    pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, Completion>> {
         match self.state.try_lock() {
-            Err(TryLockError::Poisoned(poisoned)) => Ok(self.recover_poisoned(poisoned)),
-            result => result,
+            Ok(guard) => Some(guard),
+            Err(TryLockError::Poisoned(poisoned)) => Some(self.recover_poisoned(poisoned)),
+            Err(TryLockError::WouldBlock) => None,
         }
     }
 
@@ -74,27 +78,18 @@ impl Lane {
 
     pub(crate) fn run_or_join(&self, build: u64, source: &Source, check: impl FnOnce()) {
         let before = self.sequence.load(Ordering::Acquire);
-        let joined = match self.try_lock() {
-            Ok(mut guard) => {
-                check();
-                self.complete(&mut guard, build, source);
-                return;
-            }
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let mut guard = self.recover_poisoned(poisoned);
-                check();
-                self.complete(&mut guard, build, source);
-                return;
-            }
-            Err(TryLockError::WouldBlock) => true,
-        };
-        if joined {
-            let mut guard = self
-                .state
-                .lock()
-                .unwrap_or_else(|poisoned| self.recover_poisoned(poisoned));
-            self.finish_join(&mut guard, before, build, source, check);
+        if let Some(mut guard) = self.try_lock() {
+            check();
+            self.complete(&mut guard, build, source);
+            return;
         }
+        // Another checker holds the lane: wait for it, then join its answer if
+        // it completed this request's source/build, or run the check ourselves.
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| self.recover_poisoned(poisoned));
+        self.finish_join(&mut guard, before, build, source, check);
     }
 
     fn finish_join(
@@ -246,7 +241,7 @@ mod tests {
             .unwrap_or_else(|poisoned| lane.recover_poisoned(poisoned));
         assert!(guard.source.is_none());
         drop(guard);
-        assert!(lane.try_lock().is_ok());
+        assert!(lane.try_lock().is_some());
     }
 
     #[test]
@@ -264,11 +259,11 @@ mod tests {
             !model.check_invariant("NoSleepingCheckOwner", &historical),
             "retaining the real local guard across sleep is the caught negative control"
         );
-        assert!(matches!(lane.try_lock(), Err(TryLockError::WouldBlock)));
+        assert!(lane.try_lock().is_none(), "the lane is held");
         let mut waited = false;
         after_skip(gate, guard, 30, || {
             waited = true;
-            let lane_free = lane.try_lock().is_ok();
+            let lane_free = lane.try_lock().is_some();
             // SAMPLED ONCE. `after_skip` has dropped `gate`, and a dropped
             // `FileLock` is free at once (`LOCK_UN`, 2026-09-24) even while a
             // sibling test's fork still holds a copy of its descriptor — so the
@@ -297,7 +292,7 @@ mod tests {
             !once_waited,
             "interval=0 dedup must stop without another wait"
         );
-        assert!(lane.try_lock().is_ok());
+        assert!(lane.try_lock().is_some());
         let _ = std::fs::remove_dir_all(staging.root);
     }
 }

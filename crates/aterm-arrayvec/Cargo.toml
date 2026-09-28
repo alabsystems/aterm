@@ -77,8 +77,8 @@ aterm-alloc = { workspace = true }
 # `default-features = false` — so `default`/`std` exist only to make that
 # spelling a no-op rather than an error.
 default = ["std"]
-# Accepted and ignored: this crate is `#![no_std]` either way (see src/lib.rs
-# for what still links std today, and why).
+# Accepted and ignored: this crate and `aterm-alloc` under it are `#![no_std]`
+# either way.
 std = []
 # DELIBERATE EMPTY STUBS, and the failure mode is worth knowing. Upstream
 # spells these `serde = ["dep:serde"]` etc. and each pulls in a trait impl.

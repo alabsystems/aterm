@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `subscribe … screen,events,ts` of a private headless aterm (150x50), the managed 2.1.283 launched by path with `--model haiku --dangerously-skip-permissions` · the alternate screen's FIRST frame: the banner, the composer's top rule and its caret row, the bottom rule and the footer not drawn yet (47 ms before the next) · cursor=48,0 (hidden): on the row the bottom rule is drawn on next, measured on this frame in a repeat on 2026-09-27 (`subscribe … screen,cursor`) · user, host and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/idle-repl/m1/proj-O2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how does <filepath> work?"
+
+

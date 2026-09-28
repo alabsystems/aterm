@@ -31,8 +31,13 @@ fn v(s: &str) -> Version {
     Version::parse(s).expect("version")
 }
 
+/// A fresh directory per CALL: two tests share a name (`Rig::new("daemon-busy")` and
+/// `daemon_home("daemon-busy")`), and the harness runs them on parallel threads of one
+/// process, so a per-name directory let one wipe the other's mid-pass.
 fn scratch(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("aterm-cxd-{name}-{}", std::process::id()));
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("aterm-cxd-{name}-{}-{n}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
     std::fs::create_dir_all(&d).expect("scratch");
     d
@@ -147,6 +152,9 @@ struct World {
     miss: Option<&'static str>,
     /// What the lane left typed in the composer, as the stand-in draws it.
     left: Arc<Mutex<Option<String>>>,
+    /// The `lease acquire …` reply (a `lease release` is `OK lease released`
+    /// after an acquire it granted).
+    lease: &'static str,
     exited: Arc<AtomicBool>,
     relaunched: Arc<AtomicBool>,
     asked: Arc<Mutex<Vec<String>>>,
@@ -223,6 +231,14 @@ fn instance(dir: &Path, w: World) -> String {
                         .collect::<Vec<_>>()
                         .join("\n"),
                     "line" => "OK % ".to_string(),
+                    "lease" if line.contains(" lease release ") => {
+                        if w.lease.starts_with("OK lease acquired") {
+                            "OK lease released".to_string()
+                        } else {
+                            "OK lease none".to_string()
+                        }
+                    }
+                    "lease" => w.lease.to_string(),
                     // A fenced, guarded `ctrl+u`: the composer's line is
                     // cleared, as Codex 0.157 clears it.
                     "key"
@@ -239,7 +255,7 @@ fn instance(dir: &Path, w: World) -> String {
                         // What the host does on a missed guard: the text is
                         // TYPED and its Enter not pressed.
                         let text = line
-                            .split_once(" timeout=30000 ")
+                            .split_once(&format!(" {TURN_WAIT} "))
                             .map_or("", |(_, t)| t)
                             .to_string();
                         if let Ok(mut l) = w.left.lock() {
@@ -441,6 +457,7 @@ impl Rig {
             status_extra: Arc::clone(&status_extra),
             miss: None,
             left: Arc::clone(&left),
+            lease: "ERR unscripted",
             exited: Arc::clone(&exited),
             relaunched: Arc::clone(&relaunched),
             asked: Arc::clone(&asked),
@@ -456,6 +473,7 @@ impl Rig {
             human_grace_s: 120,
             hand_back: false,
             background: false,
+            aterm_state: None,
         };
         let lock = embedded.then(|| {
             codex
@@ -621,6 +639,52 @@ fn a_daemon_client_is_exited_by_a_typed_exit_and_resumed_on_the_managed_twin() {
     );
 }
 
+/// ND1 FOR A CODEX (the review of the first cut: the Codex restart's
+/// `/exit`-to-relaunch bare shell took no hand, and the `aterm help` text
+/// said every restart did): the harness's HARD hand is taken before the
+/// `/exit`'s last look and kept — never let go — through the `/exit`, the
+/// bare shell and the relaunch line, both typed under it on its own
+/// connection, and given back once the relaunched TUI is carried on.
+/// NEGATIVE CONTROL: another driver's hold on the tab — the restart waits
+/// `held`, types nothing and gives nothing back.
+#[test]
+fn a_codex_restart_holds_the_tab_from_its_last_look_to_the_relaunched_tui() {
+    let held = "OK lease acquired holder=x ttl_ms=60000 expires_in_ms=60000 hard=1";
+    let rig = Rig::new("codex-hand", T1, false, |w| w.lease = held);
+    rig.settle(10);
+    let r = rig.visit(daemon_current());
+    assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+    let asked = rig.asked();
+    let at = |needle: &str| asked.iter().position(|l| l.contains(needle));
+    let taken = at(" lease acquire ").expect("the hand taken");
+    assert!(asked[taken].ends_with(" hard"), "{}", asked[taken]);
+    let exit = at(" /exit").expect("the /exit");
+    let line = asked
+        .iter()
+        .rposition(|l| l.contains(" turn "))
+        .expect("the relaunch line");
+    assert!(taken < exit && exit < line, "{asked:#?}");
+    assert!(
+        !asked[taken..=line]
+            .iter()
+            .any(|l| l.contains(" lease release ")),
+        "never let go: {asked:#?}"
+    );
+    assert!(
+        asked[line..].iter().any(|l| l.contains(" lease release ")),
+        "given back: {asked:#?}"
+    );
+    // NEGATIVE CONTROL: another driver holds the tab.
+    let rig = Rig::new("codex-hand-theirs", T1, false, |w| {
+        w.lease = "ERR lease held holder=orchestrator expires_in_ms=5000";
+    });
+    rig.settle(10);
+    let r = rig.visit(daemon_current());
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert!(rig.typed().is_empty(), "{:#?}", rig.asked());
+    assert!(!rig.asked().iter().any(|l| l.contains(" lease release ")));
+}
+
 #[test]
 fn a_daemon_client_waits_for_its_daemon_and_for_every_quiet_gate() {
     // The daemon's own move goes first.
@@ -745,7 +809,8 @@ fn an_embedded_conversation_is_asked_first_and_moved_only_on_its_ready_answer() 
     age(&rig.rollout);
     rig.settle_keeping(&rig.state());
     let r = rig.visit(None);
-    assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+    // The continuation typed: `continued`, the harness's own turn.
+    assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
     let typed = rig.typed();
     assert_eq!(
         typed.len(),
@@ -766,7 +831,7 @@ fn an_embedded_conversation_is_asked_first_and_moved_only_on_its_ready_answer() 
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
     assert_eq!(
         rig.ledger_steps(),
-        vec!["announced:1", "exit-typed", "relaunched", "done"]
+        vec!["announced:1", "exit-typed", "relaunched", "continued"]
     );
 }
 
@@ -1070,6 +1135,7 @@ fn daemon_home(name: &str, last: &str, age_s: u64) -> (PathBuf, Opts, DaemonScri
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let script = DaemonScript {
         home: home.clone(),
@@ -1261,6 +1327,7 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let tabs = [LiveTab {
         sid: TAB.to_string(),
@@ -1286,7 +1353,7 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
             |_| None,
         )
     };
-    assert_eq!(check(&kernel, Some(target.clone())), Some(true));
+    assert_eq!(check(&kernel, Some(target.clone())), Some(Due::Yes));
     assert_eq!(
         check(
             &kernel,
@@ -1295,10 +1362,10 @@ fn due_distinguishes_a_current_codex_from_an_unknown_or_claude_foreground() {
                 ..target.clone()
             })
         ),
-        Some(false),
+        Some(Due::No),
         "a current Codex is a conclusive answer, not an unknown foreground"
     );
-    assert_eq!(check(&kernel, None), Some(false), "no managed target");
+    assert_eq!(check(&kernel, None), Some(Due::No), "no managed target");
     kernel.name = "claude";
     assert_eq!(
         due_with(
@@ -1363,6 +1430,7 @@ fn a_codex_of_another_home_is_never_this_sweeps() {
         human_grace_s: 120,
         hand_back: false,
         background: false,
+        aterm_state: None,
     };
     let k = Found2 {
         exe: root.join("bin/codex"),
@@ -1772,10 +1840,111 @@ fn a_background_terminal_under_an_embedded_session_holds_its_exit_ready_or_not()
     });
     assert_eq!(footer.visit(None).step, "wait:background-terminal");
     assert_eq!(footer.typed().len(), 1);
-    // NEGATIVE CONTROL: nothing runs under it — it moves.
+    // NEGATIVE CONTROL: nothing runs under it — it moves, and is carried on.
     rig.kernel.terminals.clear();
     rig.settle_keeping(&rig.state());
-    assert_eq!(rig.visit(None).step, "done");
+    assert_eq!(rig.visit(None).step, "continued");
+}
+
+/// A TERMINAL THAT NEVER ENDS DOES NOT HOLD THE UPGRADE FOR GOOD (the Codex
+/// arm of the 2026-09-26 four-day tab): a READY answer outlived by a
+/// background terminal for a whole re-ask window is asked about again, and
+/// past the last ask the upgrade gives up — the Claude lane's one rule.
+/// Before, the embedded drive swapped the reducer's Terminate for a bare
+/// `wait:background-terminal` it never re-asked.
+#[test]
+fn a_background_terminal_that_outlives_the_answer_is_asked_again_then_given_up() {
+    let mut rig = embedded_ready("emb-reask", |_| {});
+    rig.kernel.terminals = vec!["sleep".into()];
+    assert_eq!(rig.visit(None).step, "wait:background-terminal");
+    assert_eq!(
+        rig.typed().len(),
+        1,
+        "inside the window: waited on, not asked"
+    );
+    let backdated = |rig: &Rig, asks: u32| {
+        let past = now_s() - upgrade::REASK_S - 5;
+        let st = St {
+            phase: Phase::Announced { at_s: past, asks },
+            ready_since: past,
+            ..rig.state()
+        };
+        rig.settle_keeping(&st);
+    };
+    backdated(&rig, 1);
+    assert_eq!(
+        rig.visit(None).step,
+        "announced:2",
+        "asked again, naming it"
+    );
+    assert_eq!(
+        rig.typed().len(),
+        2,
+        "a second notice, and still no `/exit`"
+    );
+    backdated(&rig, upgrade::MAX_ASKS);
+    assert_eq!(rig.visit(None).step, "gave-up");
+    assert!(
+        matches!(rig.state().phase, Phase::Failed(ref why) if why == upgrade::GAVE_UP),
+        "given up, nothing ended: {:?}",
+        rig.state().phase
+    );
+}
+
+/// NO STOP IS FOR GOOD IN THE CODEX LANE EITHER (the owner, 2026-09-27: "you
+/// should NEVER have upgrades stalled"). An embedded conversation's round
+/// gives up over a background terminal that outlives its READY; it RESTS —
+/// `wait:failed:unanswered`, looked at again, nothing typed — and once it has
+/// rested `RETRY_S` a new round starts (`rearmed:unanswered`, on the ledger,
+/// nothing typed at that look), whose first notice the next look types, with
+/// a READY marker of its own. NEGATIVE CONTROL: the owner's `--skip` of the
+/// build holds the rested round where it is, however long it rests.
+#[test]
+fn a_codex_round_that_gave_up_rests_then_a_new_one_asks_again() {
+    let mut rig = embedded_ready("emb-rearm", |_| {});
+    rig.kernel.terminals = vec!["sleep".into()];
+    let past = now_s() - upgrade::REASK_S - 5;
+    rig.settle_keeping(&St {
+        phase: Phase::Announced {
+            at_s: past,
+            asks: upgrade::MAX_ASKS,
+        },
+        ready_since: past,
+        ..rig.state()
+    });
+    assert_eq!(rig.visit(None).step, "gave-up");
+    let old_marker = rig.state().marker;
+    let resting = rig.visit(None);
+    assert_eq!(resting.step, "wait:failed:unanswered");
+    assert!(matches!(
+        super::super::after(&resting.step, 9),
+        super::super::After::Later(_)
+    ));
+    let typed = rig.typed().len();
+    let rested = St {
+        failed_at: now_s() - upgrade::RETRY_S,
+        ..rig.state()
+    };
+    rig.settle_keeping(&St {
+        request: Request::Skip("0.157.1".into()),
+        request_tab: TAB.into(),
+        ..rested.clone()
+    });
+    assert_eq!(rig.visit(None).step, "wait:failed:unanswered", "skipped");
+    rig.settle_keeping(&rested);
+    assert_eq!(rig.visit(None).step, "rearmed:unanswered");
+    assert_eq!(rig.typed().len(), typed, "a new round types nothing itself");
+    assert_eq!(rig.state().phase, Phase::Pending);
+    rig.settle_keeping(&rig.state());
+    assert_eq!(rig.visit(None).step, "announced:1");
+    assert_eq!(rig.typed().len(), typed + 1, "its first notice");
+    let marker = rig.state().marker;
+    assert!(!marker.is_empty() && marker != old_marker, "{marker}");
+    assert!(
+        rig.ledger_steps().iter().any(|s| s == "rearmed:unanswered"),
+        "{:?}",
+        rig.ledger_steps()
+    );
 }
 
 #[test]
@@ -1836,7 +2005,7 @@ fn a_daemon_client_is_not_exited_where_no_marks_tell_its_hint_from_the_prompt() 
         w.blocks1 = r#"{"blocks":[]}"#.to_string();
         w.blocks2 = r#"{"blocks":[]}"#.to_string();
     });
-    assert_eq!(emb.visit(None).step, "done");
+    assert_eq!(emb.visit(None).step, "continued");
 }
 
 /// The key presses the stand-in saw.
@@ -2105,7 +2274,7 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     // Their hand gone: the carry-on goes, and the move is done.
     rig.status_extra.lock().expect("status").clear();
     let r = carry_in_flight_with(&carry, blank(&rig.tui), rig.state(), &key(TAB), &rig.kernel);
-    assert_eq!(r.step, "done", "{r:?}\n{:#?}", rig.asked());
+    assert_eq!(r.step, "continued", "{r:?}\n{:#?}", rig.asked());
     let typed = rig.typed();
     assert_eq!(typed.len(), 4, "{typed:#?}");
     assert!(
@@ -2116,7 +2285,13 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     assert_eq!(rig.state().phase, Phase::Done);
     assert_eq!(
         rig.ledger_steps(),
-        vec!["announced:1", "exit-typed", "relaunched", "adopted", "done"]
+        vec![
+            "announced:1",
+            "exit-typed",
+            "relaunched",
+            "adopted",
+            "continued"
+        ]
     );
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
 }

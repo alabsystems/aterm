@@ -30,7 +30,7 @@ console_error_panic_hook = "0.1"
 # getrandom, and MatrixRain is deterministically seeded. This module's closure
 # is a strict subset of aterm-wasm's (held by aterm_forge::loc's
 # the_wasm_cells_cover_every_shipped_web_crate), so it gets no forge cell of its
-# own and the saving is counted on wasm-cpu. Guarded by tools/grep_guard.sh B13.
+# own and the saving is counted on wasm-cpu. Guarded by tools/grep_guard.sh B18.
 
 [lints]
 workspace = true

@@ -240,9 +240,8 @@ pub fn probe(
         }
     }
     dirs.extend(views.into_iter().map(|(_, dir)| dir));
-    let once = || Some(table.clone());
     for dir in dirs {
-        if let Some(Some(exe)) = crate::gc::running_from(&dir, &once) {
+        if let Some(exe) = crate::gc::running_from_table(&dir, &table) {
             return Busy::Running { exe };
         }
     }

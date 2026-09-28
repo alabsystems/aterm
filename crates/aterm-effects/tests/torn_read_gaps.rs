@@ -10,8 +10,8 @@
 //!
 //! A Claude Code frame — spinner, rules, composer — is over 1 KiB, and the
 //! macOS PTY hands it over in 1024-byte reads. When the host presents between
-//! two reads of one frame (the `?2026` hold is capped, LOCK A samples on every
-//! present), the composer row has been `CSI 2K`-cleared and rewritten only up
+//! two reads of one frame (the `?2026` hold is capped, the frame hold samples
+//! on every present), the composer row has been `CSI 2K`-cleared and rewritten only up
 //! to the read boundary, the caret hidden. The content witness read every
 //! recorded cell right of the boundary as glyph → BLANK, and the identical
 //! text back 2 to 30 ms later found the light already committed to leave:
@@ -28,7 +28,7 @@
 //!   with it, a one-cell hole at each word boundary when it did not come back.
 //!
 //! Every take here drives the real seam: an `aterm_core` [`Terminal`] fed the
-//! composer's bytes, its rows sampled as `app_render.rs`'s LOCK A samples
+//! composer's bytes, its rows sampled as `app_render.rs`'s frame hold samples
 //! them, [`CursorGlow`] ticked on a 16 ms train with the hints the app stamps
 //! for each key. The census is the PLAN's coverage on the typed row: a HOLE is
 //! a dark column strictly between two lit ones. Measured on the same takes
@@ -281,7 +281,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY LOCK A — the caret's row probe and every ribbon row, whether
+    /// EXACTLY the frame hold — the caret's row probe and every ribbon row, whether
     /// or not the caret is visible — then the tick, then the census.
     fn frame(&mut self) {
         let c = self.term.cursor();

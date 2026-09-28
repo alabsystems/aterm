@@ -497,18 +497,21 @@ impl PaletteState {
                     row.enabled = live.terminal_front && live.can_rename;
                 }
                 // "Check for Updates…" drives the IN-APP updater, which exists
-                // only on macOS (`aterm_update::enabled()` is cfg-gated there).
-                // Off macOS the row used to sit enabled and silently no-op —
-                // the check never starts and no staged build can exist — so it
-                // greys out (and the socket `invoke` refuses by name) instead,
-                // the same honesty rule as RenameSession/ToggleMatrixRain
-                // above. NOT gated on live updater state: on macOS the action
-                // always at least opens the Software Update route, so the row
-                // stays unconditionally enabled there (byte-identical
-                // behaviour). The Settings route itself remains reachable off
-                // macOS via Settings… — only the dead update VERB is refused.
+                // only where `aterm_update::enabled()` says so (macOS and
+                // Linux; not Windows). Where it does not, the row used to sit
+                // enabled and silently no-op — the check never starts and no
+                // staged build can exist — so it greys out (and the socket
+                // `invoke` refuses by name) instead, the same honesty rule as
+                // RenameSession/ToggleMatrixRain above. NOT gated on live
+                // updater state: with an updater the action always at least
+                // opens the Software Update route, so the row stays
+                // unconditionally enabled there. The Settings route itself
+                // remains reachable everywhere via Settings… — only the dead
+                // update VERB is refused. The predicate is the menu model's
+                // ([`MenuAction::offered_on_this_platform`]), so the `chrome`
+                // verb's menu lines and this row cannot disagree.
                 MenuAction::SoftwareUpdate => {
-                    row.enabled = cfg!(target_os = "macos");
+                    row.enabled = MenuAction::SoftwareUpdate.offered_on_this_platform();
                 }
                 MenuAction::Copy => row.enabled = live.has_selection,
                 MenuAction::NextTab | MenuAction::PrevTab => row.enabled = live.multi_tab,
@@ -920,7 +923,7 @@ impl PaletteState {
 pub(crate) fn palette_a11y(state: &PaletteState) -> accesskit::TreeUpdate {
     use accesskit::{Action, Node, NodeId, Role, Toggled, Tree, TreeId, TreeUpdate};
 
-    // High + disjoint from the `row_index + 1` control ids (mirrors settings' `GROUP_BASE`).
+    // High + disjoint from the `row_index + 1` control ids.
     const LIST: NodeId = NodeId(u64::MAX);
     let root_id = NodeId(0);
     let vis = state.filtered();
@@ -2325,6 +2328,53 @@ mod tests {
         assert!(s.rows.iter().any(|r| r.action == MenuAction::ApplyUpdate));
     }
 
+    /// ONE PREDICATE FOR THE UPDATE ROWS ON EVERY SURFACE. "Check for Updates…"
+    /// is enabled here (`controls menu`) exactly where the `chrome` verb's menu
+    /// lines list it — both read [`MenuAction::offered_on_this_platform`], i.e.
+    /// whether this platform has the in-app updater. Measured 2026-09-22 on
+    /// Windows: `chrome` listed the row while this palette greyed it. The
+    /// apply-now row needs a staged build, which no platform without an
+    /// updater can have, so with nothing staged it is absent everywhere. Linux
+    /// has the updater, so the row is enabled there; before this it was greyed
+    /// on every platform but macOS.
+    #[test]
+    fn update_rows_follow_the_platform_updater_on_every_surface() {
+        let mut s = PaletteState::new();
+        s.resolve(&PaletteLive::default());
+        let enabled = s
+            .rows
+            .iter()
+            .find(|r| r.action == MenuAction::SoftwareUpdate)
+            .expect("the row stays listed, greyed where it cannot act")
+            .enabled;
+        assert_eq!(
+            enabled,
+            MenuAction::SoftwareUpdate.offered_on_this_platform()
+        );
+        assert_eq!(enabled, aterm_update::enabled());
+        if cfg!(windows) {
+            assert!(!enabled, "Windows has no in-app updater");
+        }
+        let chrome_offers = crate::menu::menu_chrome_lines()
+            .iter()
+            .any(|line| line.contains("Check for Updates…"));
+        assert_eq!(
+            chrome_offers, enabled,
+            "`chrome` lists the row exactly where `controls menu` enables it"
+        );
+        assert!(
+            s.controls_lines().iter().any(|line| {
+                line.contains("action=SoftwareUpdate")
+                    && line.contains(&format!("enabled={enabled}"))
+            }),
+            "`controls menu` reports the same state"
+        );
+        assert!(
+            !s.rows.iter().any(|r| r.action == MenuAction::ApplyUpdate),
+            "nothing staged, so no apply-now row"
+        );
+    }
+
     /// REALIZED (complaint 3): the post-update arrow row appears with a TIME-FADED
     /// alpha — full at boot, decayed mid-TTL, zero at/after TTL — and freezes at full
     /// under reduced motion. A staged build SUPERSEDES the celebration row.
@@ -2786,46 +2836,5 @@ mod tests {
 
         assert_ne!(state.a11y_node_id(0), stale);
         assert_eq!(state.a11y_filtered_index(stale), None);
-    }
-
-    /// Gated visual preview (`ATERM_PALETTE_PREVIEW=path`) → PNG at 2×-Retina-ish metrics.
-    #[test]
-    fn preview_palette_overlay() {
-        let Ok(path) = std::env::var("ATERM_PALETTE_PREVIEW") else {
-            return;
-        };
-        let mut s = PaletteState::new();
-        s.resolve(&PaletteLive {
-            has_selection: true,
-            multi_tab: true,
-            ..Default::default()
-        });
-        let (cw, ch, px) = (16.0_f32, 34.0_f32, 26.0_f32);
-        let cols = 56usize;
-        let panel_rows = s.wanted_rows() + 8;
-        let g = SettingsGeom {
-            cw,
-            ch,
-            font_px: px,
-            cols,
-            panel_rows,
-        };
-        let tray = palette_tray(&s, &g, Theme::default());
-        let (buf, pw, ph) = crate::tray_raster::rasterize_tray(
-            &tray.prims,
-            (cols as f32 * cw) as u32,
-            (panel_rows as f32 * ch) as u32,
-            1.0,
-            [22, 24, 30, 255],
-        );
-        let mut out = Vec::new();
-        {
-            let mut enc = aterm_png::Encoder::new(&mut out, pw, ph);
-            enc.set_color(aterm_png::ColorType::Rgba);
-            enc.set_depth(aterm_png::BitDepth::Eight);
-            let mut wr = enc.write_header().unwrap();
-            wr.write_image_data(&buf).unwrap();
-        }
-        std::fs::write(&path, &out).unwrap();
     }
 }

@@ -491,6 +491,9 @@ impl TerminalHandler<'_> {
             CsiHandler::KittyKeyboardQuery => {
                 // Capability off: NO reply (an unsupporting terminal ignores the
                 // query), so apps fall back to legacy encoding — never a `?0u` ack.
+                // The answer is the kitty flag word alone: ConPTY win32-input-mode
+                // (DEC 9001) lives in `modes`, never in it, so an app under conhost
+                // still reads `?0u` until it pushes flags of its own.
                 if self.modes.kitty_keyboard_enabled {
                     self.handle_kitty_keyboard_query(cap);
                 }
@@ -550,6 +553,10 @@ impl TerminalHandler<'_> {
                 if pp == 4 {
                     if let Some(&pv) = params.get(1) {
                         self.xterm_keyboard.set_modify_other_keys(sgr_color_u8(pv));
+                        if pv != 0 {
+                            *self.evidence_asserted |=
+                                super::super::program_evidence::MODIFY_OTHER_KEYS;
+                        }
                     } else {
                         self.xterm_keyboard.reset_modify_other_keys();
                     }
@@ -568,6 +575,10 @@ impl TerminalHandler<'_> {
                 if pp == 4 {
                     if let Some(&pv) = params.get(1) {
                         self.xterm_keyboard.set_format_other_keys(sgr_color_u8(pv));
+                        if pv != 0 {
+                            *self.evidence_asserted |=
+                                super::super::program_evidence::FORMAT_OTHER_KEYS;
+                        }
                     } else {
                         self.xterm_keyboard.reset_format_other_keys();
                     }
@@ -604,6 +615,8 @@ impl TerminalHandler<'_> {
                         flags,
                         ScreenBuffer::from(self.modes.alternate_screen),
                     );
+                    // A push is kitty evidence whatever its flags (the stack).
+                    *self.evidence_asserted |= super::super::program_evidence::KITTY;
                 }
             }
             CsiHandler::KittyKeyboardSet => {
@@ -614,6 +627,9 @@ impl TerminalHandler<'_> {
                     let flags = (params.first().copied().unwrap_or(0) & 0b1_1111) as u8;
                     let mode = sgr_color_u8(params.get(1).copied().unwrap_or(1));
                     self.kitty_keyboard.set_flags(flags, mode);
+                    if self.kitty_keyboard.snapshot().flags.bits() != 0 {
+                        *self.evidence_asserted |= super::super::program_evidence::KITTY;
+                    }
                 }
             }
             CsiHandler::KittyKeyboardPop => {

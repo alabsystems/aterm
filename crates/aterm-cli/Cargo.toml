@@ -7,16 +7,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "aterm — the transparent session: runs your shell unchanged, byte for byte, through the protected spawn seam. The live model an AI reads is WINDOW mode; a session's own VT model is demand-driven and off by default (U1)."
-
-[features]
-# Development seams in an optimized build (`aterm_types::dev_seam!`: ATERM_SESSION_MODEL).
-# Debug builds compile them anyway; the release cutter never enables this —
-# aterm-release's buildplan pins it.
-dev-seams = []
+description = "aterm — the transparent session: runs your shell unchanged, byte for byte, through the protected spawn seam. The live model an AI reads is WINDOW mode; a session models nothing (U1)."
 
 [dependencies]
-aterm-core = { workspace = true }
 # P0: the daily-driver CLI runs the shell through the PROTECTED spawn seam
 # (cap-gated + fail-closed fork/exec + OS-sandbox-wrapped when the mode demands
 # it + resource-bounded in the confinement modes only, safety/containment — see
@@ -64,6 +57,14 @@ aterm-ctl = { path = "../aterm-ctl" }
 # the Windows driver is kernel32 console FFI with no libc.
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
+
+# `aterm doctor` / `show-config` on Windows report the shell the WINDOW will
+# spawn, which starts from aterm.toml's `shell` key — read through the parser
+# the window loads the file with. First-party, and already in this binary's
+# graph (aterm-containment and aterm-update link it), so it adds no package;
+# a hand-rolled line scan would be the second parser of one file.
+[target.'cfg(windows)'.dependencies]
+aterm-toml = { workspace = true }
 
 [lints]
 workspace = true

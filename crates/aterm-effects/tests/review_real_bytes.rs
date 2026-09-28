@@ -7,7 +7,7 @@
 //! movement bug."*).
 //!
 //! Everything here drives the HOST SEAM: a real `aterm_core` [`Terminal`] fed
-//! the bytes, its rows sampled exactly as `app_render.rs`'s LOCK A samples
+//! the bytes, its rows sampled exactly as `app_render.rs`'s frame hold samples
 //! them (the caret's row, every row the ribbon names, the print anchor), its
 //! content-scroll clock read as `sync_cursor_effect_scroll` reads it, fed to
 //! [`CursorGlow`] with the hints `app_input.rs` stamps for each key.
@@ -304,7 +304,7 @@ const TAKES: [Take; 6] = [
     },
 ];
 
-/// How a program burst reaches LOCK A.
+/// How a program burst reaches the frame hold.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Chunking {
     /// The burst in one read, one present.
@@ -466,7 +466,7 @@ impl ReplayHost {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// The host's own order: `sync_cursor_effect_scroll`, LOCK A's samples
+    /// The host's own order: `sync_cursor_effect_scroll`, the frame hold's samples
     /// (the caret's row, every ribbon row, the print anchor), the tick.
     /// Returns false when SYNC-1 withheld the present.
     fn frame(&mut self) -> bool {
@@ -858,7 +858,7 @@ impl Composer {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// LOCK A and the tick; then the census.
+    /// the frame hold and the tick; then the census.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));

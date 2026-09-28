@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-#[cfg(feature = "regex")]
 use crate::index::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT, REGEX_STEP_LIMIT};
 
 #[cfg(test)]
@@ -30,14 +29,12 @@ fn kani_retain<T: Clone>(items: &mut Vec<T>, mut keep: impl FnMut(&T) -> bool) {
 /// Guards the one-time `aterm_log` warning emitted when a regex pattern first
 /// abandons a row on its scan budget. Process-wide and never reset: the point
 /// is to explain *once* why results are short, not to narrate every row.
-#[cfg(feature = "regex")]
 static REGEX_BUDGET_WARNED: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 impl StreamingSearch {
     /// Compile a regex pattern, prepending `(?i)` when case-insensitive mode
     /// is active. Without this, Regex mode ignores the `case_sensitive` config.
-    #[cfg(feature = "regex")]
     fn compile_regex(&self, pattern: &str) -> Result<aterm_regex::Regex, SearchError> {
         let effective = if self.config.case_sensitive {
             pattern.to_string()
@@ -98,7 +95,6 @@ impl StreamingSearch {
         }
 
         // Compile regex if needed (with case-sensitivity from config)
-        #[cfg(feature = "regex")]
         if mode == FilterMode::Regex {
             self.compiled_regex = Some(self.compile_regex(pattern)?);
         }
@@ -148,14 +144,10 @@ impl StreamingSearch {
             self.scan_progress = -1;
             self.total_matches = 0;
             self.bump_generation();
-            #[cfg(feature = "regex")]
-            {
-                self.compiled_regex = None;
-            }
+            self.compiled_regex = None;
         } else {
             // Pattern changed - restart search
             // Validate regex before mutating state (failed ops shouldn't have side effects)
-            #[cfg(feature = "regex")]
             let compiled = if self.filter_mode == FilterMode::Regex {
                 Some(self.compile_regex(new_pattern)?)
             } else {
@@ -163,10 +155,7 @@ impl StreamingSearch {
             };
 
             self.pattern = new_pattern.to_string();
-            #[cfg(feature = "regex")]
-            {
-                self.compiled_regex = compiled;
-            }
+            self.compiled_regex = compiled;
             self.state = SearchState::Searching;
             self.results.clear();
             self.seen_positions.clear();
@@ -234,7 +223,6 @@ impl StreamingSearch {
         // that the truncation is on the record rather than silent. Warned once
         // per process, like the index's first-eviction warning, because a
         // pattern that exhausts its budget on one row will do it on thousands.
-        #[cfg(feature = "regex")]
         if self.filter_mode == FilterMode::Regex
             && self
                 .compiled_regex
@@ -463,10 +451,7 @@ impl StreamingSearch {
         self.scan_progress = -1;
         self.total_matches = 0;
         self.bump_generation();
-        #[cfg(feature = "regex")]
-        {
-            self.compiled_regex = None;
-        }
+        self.compiled_regex = None;
     }
 
     // ========================================================================
@@ -519,22 +504,6 @@ impl StreamingSearch {
             NavigationDirection::Backward,
             self.config.wrap_enabled,
         );
-    }
-
-    /// Jump to a specific match index (1-based).
-    ///
-    /// NOT a model action: needs a nondeterministic in-range index
-    /// (`Expr::InRange`, outside the `ty_model!` grammar — a hand-built Model
-    /// extension is the tracked follow-up); local unit tests cover it.
-    #[cfg(test)]
-    pub fn jump_to_match(&mut self, index: usize) {
-        if self.state != SearchState::HasResults {
-            return;
-        }
-
-        if index >= 1 && index <= self.results.len() {
-            self.current_index = index;
-        }
     }
 
     /// Calculate next index with wraparound (the model's `NextMatch`/`PrevMatch`
@@ -592,7 +561,6 @@ impl StreamingSearch {
             )
         {
             // Recompile regex with updated case-sensitivity flag
-            #[cfg(feature = "regex")]
             if self.filter_mode == FilterMode::Regex
                 && let Ok(re) = self.compile_regex(&self.pattern.clone())
             {
@@ -618,7 +586,6 @@ impl StreamingSearch {
         }
 
         // Compile new regex if switching to regex mode (with case-sensitivity)
-        #[cfg(feature = "regex")]
         if mode == FilterMode::Regex && !self.pattern.is_empty() {
             self.compiled_regex = Some(self.compile_regex(&self.pattern.clone())?);
         }
@@ -1044,7 +1011,8 @@ mod tests {
     #[test]
     fn test_content_invalidated_clamps_current_index() {
         let mut engine = engine_with_matches("test", &["test 0", "test 1", "test 2"]);
-        engine.jump_to_match(3); // current is now 3
+        engine.next_match();
+        engine.next_match(); // current is now 3
         assert_eq!(engine.current_index(), 3);
 
         // Remove the last match
@@ -1112,7 +1080,7 @@ mod tests {
 ///
 /// `REGEX_SIZE_LIMIT` bounds what compiles; `REGEX_STEP_LIMIT` bounds what
 /// running it over a row costs. See `index.rs` for the derivation of both.
-#[cfg(all(test, feature = "regex"))]
+#[cfg(test)]
 mod regex_scan_budget_tests {
     use super::*;
 

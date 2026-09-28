@@ -591,6 +591,10 @@ fn no_measured_bypass_line_is_approved() {
         "git -c core.fsmonitor='touch /tmp/pwn' status",
         "git -c core.pager='sh -c \"rm -rf ~\"' log",
         "git grep -O\"touch /tmp/x\" foo",
+        "git grep -nO hello",
+        "git grep --open hello",
+        "git log --help",
+        "git -h log",
         "rg --pre ./x.sh foo",
         "sort --compress-program=./x.sh f",
         "/tmp/evil/ls",
@@ -3886,6 +3890,428 @@ fn the_owners_subagent_rm_box_is_escalated_under_the_owners_limits() {
             "bypass={bypass_mode}: {d:?}"
         );
     }
+}
+
+/// A fresh git repository in a scratch directory (removed by the caller),
+/// created hermetically: no system or global config.
+fn scratch_repo(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("aterm-approval-git-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let dir = std::fs::canonicalize(&dir).expect("canonical");
+    scratch_git(&dir, &["init", "-q", "."]);
+    dir
+}
+
+fn scratch_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}");
+}
+
+/// The owner's git-read ruling (2026-09-25), through [`decide`]: under
+/// `approve = "safe"` a `git status` box is approved in a clean
+/// repository and escalated — naming the key — in one whose configuration
+/// runs a program on that read. Before the ruling every one of these was
+/// approved as a read. A `-c` override on the line, a remote read and an
+/// unknown cwd escalate too; at full power the box is still pressed, with
+/// the key as its `unproven`.
+#[test]
+fn a_git_read_is_approved_only_where_its_config_runs_nothing() {
+    let repo = scratch_repo("rule");
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            repo.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+        )
+    };
+    let status = bash_box(&["git status --short"], None);
+    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
+    assert_eq!(
+        approved(&on_screen(&bash_box(&["git log --oneline -3"], None), &c)),
+        Some(RULE_READ_ONLY)
+    );
+
+    // A filter driver runs only on a path whose attributes select it.
+    std::fs::write(repo.join(".gitattributes"), "* filter=x\n").expect("attributes");
+    scratch_git(&repo, &["add", ".gitattributes"]);
+    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
+    for key in [
+        "core.fsmonitor",
+        "diff.external",
+        "diff.bin.textconv",
+        "filter.x.clean",
+        "filter.x.process",
+    ] {
+        scratch_git(&repo, &["config", key, "touch /tmp/aterm-approval-git-pwn"]);
+        let why = reason(&on_screen(&status, &c)).to_string();
+        assert!(why.contains(key), "{key}: {why}");
+        scratch_git(&repo, &["config", "--unset", key]);
+    }
+    // Clean again: approved again (negative control on the unset).
+    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
+
+    // A directory the line names is judged too.
+    let other = scratch_repo("other");
+    scratch_git(&other, &["config", "core.fsmonitor", "./evil.sh"]);
+    let named = bash_box(&[&format!("git -C {} status", other.display())], None);
+    assert!(reason(&on_screen(&named, &c)).contains("core.fsmonitor"));
+    let cd = bash_box(&[&format!("cd {} && git log -1", other.display())], None);
+    assert!(reason(&on_screen(&cd, &c)).contains("core.fsmonitor"));
+
+    // A git behind a wrapper the classifier sees through is placed the same
+    // way (the 2026-09-26 review: each of these was approved in a repository
+    // whose fsmonitor runs a program), and one this check cannot place asks.
+    for line in [
+        format!("env -u FOO git -C {} status", other.display()),
+        format!("env -C {} git status", other.display()),
+        format!("env --chdir={} git status", other.display()),
+        format!("cd {} && echo x | xargs -d , git status", other.display()),
+        format!(
+            "cd {} && perl -e 'alarm 9; exec @ARGV' git status",
+            other.display()
+        ),
+    ] {
+        let why = reason(&on_screen(&bash_box(&[&line], None), &c)).to_string();
+        assert!(why.contains("core.fsmonitor"), "{line}: {why}");
+    }
+    let fed = bash_box(&["echo . | xargs -I {} git -C {} status"], None);
+    assert!(reason(&on_screen(&fed, &c)).contains("xargs"));
+
+    // A `-c` override on the line (the classifier's refusal), a read that
+    // contacts a remote, and a session whose cwd is unknown.
+    let dash_c = bash_box(&["git -c core.fsmonitor=./x.sh status"], None);
+    assert!(reason(&on_screen(&dash_c, &c)).contains("-c"));
+    let remote = bash_box(&["git remote show origin"], None);
+    assert!(reason(&on_screen(&remote, &c)).contains("contacts a remote"));
+    let unknown = ApprovalCtx {
+        cwd_known: false,
+        ..c.clone()
+    };
+    assert!(reason(&on_screen(&status, &unknown)).contains("cwd unknown"));
+
+    // Full power still presses it, the key kept as `unproven`.
+    scratch_git(&repo, &["config", "core.fsmonitor", "./evil.sh"]);
+    let all = ApprovalCtx {
+        approve: Approve::All,
+        ..c.clone()
+    };
+    match on_screen(&status, &all) {
+        Decision::Approve {
+            rule_id, unproven, ..
+        } => {
+            assert_eq!(rule_id, RULE_ALLOW_ONCE);
+            assert!(
+                unproven
+                    .as_deref()
+                    .is_some_and(|u| u.contains("core.fsmonitor")),
+                "{unproven:?}"
+            );
+        }
+        d => panic!("full power presses it: {d:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&other);
+}
+
+/// The Bash tool keeps a directory of its own: an earlier `cd sub`, which
+/// Claude Code runs unasked, leaves the next `git status` running in `sub`,
+/// though the session reports where it was launched (the 2026-09-26 review).
+/// Where the transcript puts the Bash tool ([`ApprovalCtx::shell_cwds`]) is
+/// judged too. NEGATIVE CONTROL: the same box with no such directory read —
+/// what the check did before — is approved, the nested repository's
+/// fsmonitor unseen.
+#[test]
+fn a_git_read_is_judged_where_the_bash_tool_stands() {
+    let launch = scratch_repo("launch");
+    let nested = launch.join("sub");
+    std::fs::create_dir_all(&nested).expect("nested dir");
+    scratch_git(&nested, &["init", "-q", "."]);
+    scratch_git(&nested, &["config", "core.fsmonitor", "./evil.sh"]);
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            launch.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+        )
+    };
+    let status = bash_box(&["git status --short"], None);
+    assert_eq!(
+        approved(&on_screen(&status, &c)),
+        Some(RULE_READ_ONLY),
+        "the launch directory alone loads nothing that runs"
+    );
+    let moved = ApprovalCtx {
+        shell_cwds: vec![nested.clone()],
+        ..c.clone()
+    };
+    let why = reason(&on_screen(&status, &moved)).to_string();
+    assert!(why.contains("core.fsmonitor"), "{why}");
+    // A relative `-C` on the line is resolved from there as well.
+    let rel = bash_box(&["git -C . log -1"], None);
+    assert!(reason(&on_screen(&rel, &moved)).contains("core.fsmonitor"));
+    // Where the Bash tool stands in the launch directory, nothing is added.
+    let home = ApprovalCtx {
+        shell_cwds: vec![launch.clone()],
+        ..c.clone()
+    };
+    assert_eq!(approved(&on_screen(&status, &home)), Some(RULE_READ_ONLY));
+    let _ = std::fs::remove_dir_all(&launch);
+}
+
+/// The git rule reads in the WORKER's environment ([`ApprovalCtx::worker`]),
+/// the one the command will run with: the worker's own `GIT_CONFIG_*` is
+/// configuration its read loads, and a worker whose environment could not be
+/// read has its git read escalated, naming why — full power presses it all
+/// the same, that reason kept as `unproven`. NEGATIVE CONTROL: the same box
+/// in the same clean repository, a hermetic worker, is approved; and a line
+/// that runs no git never needs the worker's environment.
+#[test]
+fn a_git_read_is_judged_in_the_workers_environment() {
+    let repo = scratch_repo("worker-env");
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            repo.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+        )
+    };
+    let status = bash_box(&["git status --short"], None);
+    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
+
+    let configured = ApprovalCtx {
+        worker: Ok(WorkerEnv::hermetic(None)
+            .with("GIT_CONFIG_VALUE_0=./evil.sh")
+            .with("GIT_CONFIG_KEY_0=core.fsmonitor")
+            .with("GIT_CONFIG_COUNT=1")),
+        ..c.clone()
+    };
+    let why = reason(&on_screen(&status, &configured)).to_string();
+    assert!(
+        why.contains("core.fsmonitor") && why.contains("command"),
+        "{why}"
+    );
+
+    let unread = ApprovalCtx {
+        worker: Err("the worker's process is gone".to_string()),
+        ..c.clone()
+    };
+    let why = reason(&on_screen(&status, &unread)).to_string();
+    assert!(
+        why.contains("environment is unknown") && why.contains("the worker's process is gone"),
+        "{why}"
+    );
+    let ls = bash_box(&["ls -la"], None);
+    assert_eq!(approved(&on_screen(&ls, &unread)), Some(RULE_READ_ONLY));
+    match on_screen(
+        &status,
+        &ApprovalCtx {
+            approve: Approve::All,
+            ..unread
+        },
+    ) {
+        Decision::Approve {
+            rule_id, unproven, ..
+        } => {
+            assert_eq!(rule_id, RULE_ALLOW_ONCE);
+            assert!(
+                unproven
+                    .as_deref()
+                    .is_some_and(|u| u.contains("environment is unknown")),
+                "{unproven:?}"
+            );
+        }
+        d => panic!("full power presses it: {d:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// WHICH GIT THE PROBE RUNS (review, 2026-09-27): the probe runs the first
+/// `git` on the worker's `PATH`, in the supervisor, before anything is
+/// approved — so a `PATH` entry the worker writes without approval (its
+/// project's `.venv/bin`, a scratch directory) ahead of git escalates, naming
+/// the entry: a git planted there would run in the probe and as the command.
+/// Here a planted `git` that would write a marker stands in the project's
+/// `.venv/bin`; it never runs. NEGATIVE CONTROL: the same entry outside every
+/// directory the worker writes (a real git's own directory, first) is read.
+#[cfg(unix)]
+#[test]
+fn a_worker_path_entry_the_worker_writes_is_refused_before_the_probe_runs_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = scratch_repo("worker-path");
+    let venv = repo.join(".venv/bin");
+    std::fs::create_dir_all(&venv).expect("venv");
+    let marker = repo.join("planted-ran");
+    let planted = venv.join("git");
+    std::fs::write(
+        &planted,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .expect("git");
+    std::fs::set_permissions(&planted, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            repo.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+        )
+    };
+    let status = bash_box(&["git status --short"], None);
+    let venv_first = ApprovalCtx {
+        worker: Ok(WorkerEnv::hermetic(None).with(&format!("PATH={}:{real_path}", venv.display()))),
+        ..c.clone()
+    };
+    let why = reason(&on_screen(&status, &venv_first)).to_string();
+    assert!(
+        why.contains(&venv.display().to_string()) && why.contains("without approval"),
+        "{why}"
+    );
+    assert!(!marker.exists(), "the planted git ran");
+    // A Bash tool standing in the project reaches the same verdict from a
+    // launch directory elsewhere.
+    let launch = scratch_repo("worker-path-launch");
+    let elsewhere = ApprovalCtx {
+        cwd: launch.clone(),
+        shell_cwds: vec![repo.clone()],
+        ..venv_first.clone()
+    };
+    assert!(reason(&on_screen(&status, &elsewhere)).contains("without approval"));
+    assert!(!marker.exists(), "the planted git ran");
+    // NEGATIVE CONTROL: the worker's PATH without the project's entry.
+    assert_eq!(approved(&on_screen(&status, &c)), Some(RULE_READ_ONLY));
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&launch);
+}
+
+/// THE BASH TOOL'S SETTINGS (review, 2026-09-27): Claude Code gives its Bash
+/// tool the `env` of its settings files — the project's
+/// `.claude/settings.json` and `settings.local.json` (repository content an
+/// accept-edits worker writes), the user's in the worker's Claude directory,
+/// a `--settings` it was launched with, the managed file — which the process
+/// environment this check reads does not carry. One that changes what a git
+/// read loads escalates, naming the file and the key, and so does a settings
+/// file whose `env` cannot be known (it does not parse, it is padded past
+/// what is read, it is no regular file). NEGATIVE CONTROLS: a pager or an
+/// editor there, a value the worker already has, and settings with no `env`
+/// change nothing.
+#[test]
+fn a_git_read_whose_bash_tool_settings_change_git_escalates() {
+    let repo = scratch_repo("worker-settings");
+    std::fs::create_dir_all(repo.join(".claude")).expect(".claude");
+    let c = ApprovalCtx {
+        approve: Approve::Safe,
+        ..ApprovalCtx::new(
+            repo.clone(),
+            Some(PathBuf::from("/Users/_owner")),
+            502,
+            None,
+        )
+    };
+    let status = bash_box(&["git status --short"], None);
+    let project = repo.join(".claude/settings.json");
+    let local = repo.join(".claude/settings.local.json");
+    for (file, body, key) in [
+        (
+            &project,
+            r#"{"env":{"GIT_CONFIG_GLOBAL":"./evil.gitconfig"}}"#,
+            "GIT_CONFIG_GLOBAL",
+        ),
+        (
+            &local,
+            r#"{"env":{"GIT_CONFIG_COUNT":"1"}}"#,
+            "GIT_CONFIG_COUNT",
+        ),
+        (&project, r#"{"env":{"HOME":"/tmp/elsewhere"}}"#, "HOME"),
+    ] {
+        std::fs::write(file, body).expect("settings");
+        let why = reason(&on_screen(&status, &c)).to_string();
+        assert!(
+            why.contains(key) && why.contains(&file.display().to_string()),
+            "{why}"
+        );
+        let _ = std::fs::remove_file(file);
+    }
+    // The user's settings, under the worker's own Claude directory.
+    let claude = repo.join("identity-claude");
+    std::fs::create_dir_all(&claude).expect("claude dir");
+    std::fs::write(
+        claude.join("settings.json"),
+        r#"{"env":{"XDG_CONFIG_HOME":"/x"}}"#,
+    )
+    .expect("user");
+    let identity = ApprovalCtx {
+        worker: Ok(
+            WorkerEnv::hermetic(None).with(&format!("CLAUDE_CONFIG_DIR={}", claude.display()))
+        ),
+        ..c.clone()
+    };
+    assert!(reason(&on_screen(&status, &identity)).contains("XDG_CONFIG_HOME"));
+    // A `--settings` the worker was launched with, inline and as a file.
+    for arg in [
+        r#"--settings={"env":{"GIT_DIR":"/x"}}"#.to_string(),
+        "--settings=.claude/extra.json".to_string(),
+    ] {
+        std::fs::write(
+            repo.join(".claude/extra.json"),
+            r#"{"env":{"GIT_DIR":"/x"}}"#,
+        )
+        .expect("extra");
+        let launched = ApprovalCtx {
+            worker: Ok(WorkerEnv::hermetic(None).launched_with(&["claude", &arg])),
+            ..c.clone()
+        };
+        assert!(
+            reason(&on_screen(&status, &launched)).contains("GIT_DIR"),
+            "{arg}"
+        );
+    }
+    // A settings file there whose `env` cannot be known: one that does not
+    // parse, one padded past what is read, one that is no regular file.
+    let padded = format!(
+        "{{\"env\":{{\"GIT_DIR\":\"/x\"}},\"pad\":\"{}\"}}",
+        "x".repeat(2 << 20)
+    );
+    for body in ["{ not json", padded.as_str()] {
+        std::fs::write(&project, body).expect("settings");
+        let why = reason(&on_screen(&status, &c)).to_string();
+        assert!(
+            why.contains("its `env` is unknown") && why.contains(&project.display().to_string()),
+            "{why}"
+        );
+    }
+    let _ = std::fs::remove_file(&project);
+    std::fs::create_dir(&project).expect("a directory where the file goes");
+    assert!(reason(&on_screen(&status, &c)).contains("its `env` is unknown"));
+    std::fs::remove_dir(&project).expect("rmdir");
+    // NEGATIVE CONTROLS.
+    for body in [
+        r#"{"env":{"GIT_PAGER":"delta","GIT_EDITOR":"true","LANG":"C"}}"#,
+        r#"{"env":{"GIT_CONFIG_NOSYSTEM":"1"}}"#,
+        r#"{"permissions":{"allow":["Bash(git status)"]}}"#,
+    ] {
+        std::fs::write(&project, body).expect("settings");
+        assert_eq!(
+            approved(&on_screen(&status, &c)),
+            Some(RULE_READ_ONLY),
+            "{body}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// THE OWNER'S OWN REVIEW STANDS (owner directive, 2026-09-25: "make sure

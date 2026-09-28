@@ -31,19 +31,12 @@ impl Grid {
         }
     }
 
-    /// Assert the grid invariants empirically confirmed (by fuzzing — see
-    /// aterm-core `fuzz_process_never_panics`, validated across 300k+ iterations
-    /// of arbitrary bytes / crafted escapes / unicode / reflow / alt-screen) to
-    /// hold against the live implementation: `CursorInBounds`, `ScrollRegionValid` +
-    /// `DisplayOffsetValid`, and the ring-buffer structure. This is the wirable
-    /// subset of [`Self::assert_invariants`] — everything EXCEPT `WideCharConsistent`.
-    ///
-    /// `WideCharConsistent` is the one omitted check: it is genuinely violable —
-    /// writing a wide grapheme onto a prior wide char's continuation cell
-    /// (autowrap on a narrow grid) leaves a dangling WIDE main with no
-    /// continuation (a real spec-vs-impl gap, owner-territory because the
-    /// wide-char write/erase semantics intersect a previously-reverted
-    /// differential divergence). Asserting it here would FALSE-fail.
+    /// Assert the O(1) grid invariants — `CursorInBounds`, `ScrollRegionValid` +
+    /// `DisplayOffsetValid`, and the ring-buffer structure — the subset of
+    /// [`Self::assert_invariants`] cheap enough to run on every `process` batch.
+    /// The O(cells) `WideCharConsistent` walk is
+    /// [`Self::assert_wide_char_consistent`], which the no-panic fuzzers
+    /// (aterm-core `fuzz_process_never_panics`) run after every step.
     ///
     /// Available in debug builds, tests, and the `testing` feature (the last so a
     /// release-mode fuzz harness can still call it). INTEGRITY-SELFCHECK (M7) wires
@@ -77,15 +70,20 @@ impl Grid {
 
     /// WideCharConsistent + WideCharNotAtEnd: wide chars have continuations
     /// and don't appear at the last column.
-    // Compiled exactly when its ONE caller can reach it: `assert_invariants` is
-    // `#[cfg(test)]` with a `#[cfg(debug_assertions)]`
-    // body — so a release test build has the caller with an empty body, and a
-    // wider gate here leaves this method alive-but-dead under `--release
-    // --all-targets` lints. Deliberately NOT wired into the structural set: see
-    // `assert_structural_invariants`'s doc — WideCharConsistent is genuinely
-    // violable (the wide-write-over-continuation gap, owner-territory).
-    #[cfg(all(debug_assertions, test))]
-    fn assert_wide_char_consistent(&self) {
+    ///
+    /// Held by the writers, not by luck: every wide write clears an orphaned
+    /// half at both edges of what it overwrites (`fixup_wide_char_write`, and
+    /// `fixup_wide_chars_in_range` before the bulk wide-run writes — the
+    /// 2026-06-30 fix for the dangling-WIDE case the fuzzer found). O(cells),
+    /// so it is not part of the per-batch
+    /// [`Self::assert_structural_invariants`] self-check.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a visible wide cell lacks its continuation or sits in the
+    /// last column.
+    #[cfg(any(debug_assertions, test, feature = "testing"))]
+    pub fn assert_wide_char_consistent(&self) {
         for row_idx in 0..self.storage.visible_rows {
             if let Some(row) = self.row(row_idx) {
                 for col in 0..self.storage.cols.saturating_sub(1) {

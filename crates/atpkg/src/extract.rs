@@ -630,7 +630,7 @@ fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
 /// a symlink (one per path — links share nothing).
 #[derive(Debug, Clone)]
 enum Node {
-    /// `(permission bits as `platform::permission_mode` reports them, masked to 0o7777;
+    /// `(the folded permission bits — `platform::folded_mode`, masked to 0o7777;
     /// lowercase-hex content sha256)`.
     File(u32, String),
     /// Lowercase-hex sha256 of the raw target bytes ([`crate::tree::symlink_target_sha`]).
@@ -662,12 +662,17 @@ enum Node {
 ///
 /// * **relpath** — `dest.strip_prefix(dest_root)`, i.e. exactly what
 ///   [`crate::tree::tree_root`]'s walk computes for the same file, built by the same
-///   `Path::join` of the same vetted (and stripped) components (so the separator and
-///   the raw OS bytes agree on every platform).
-/// * **mode** — read BACK from the file after `set_mode`, through the same
-///   `platform::permission_mode` the walk uses, so a filesystem that stores something
-///   other than what we asked for (or Windows, which has no POSIX bits and reports 0)
-///   moves both digests together.
+///   `Path::join` of the same vetted (and stripped) components, and spelled into line
+///   bytes by the same [`crate::tree::rel_line_bytes`] (`/`-separated on every
+///   platform — `Path::join`'s `\` on Windows folded into signed roots as a different
+///   line until 2026-09-22, see `crate::tree`'s module docs).
+/// * **mode** — [`crate::platform::folded_mode`]: on Unix read BACK from the file after
+///   `set_mode`, through the same `platform::permission_mode` the walk uses, so a
+///   filesystem that stores something other than what we asked for moves both digests
+///   together; on Windows, which stores no POSIX bits and reads back `0`, the mode the
+///   extractor was asked to apply — the only value that reproduces a root a producer
+///   with real bits signed. The declared modes are also kept ([`Self::declared_modes`])
+///   so the on-disk walk can fold the same slot there.
 /// * **content digest** — hashed chunk by chunk as [`write_capped`] writes it.
 /// * **symlink target** — the verbatim bytes handed to `symlink(2)`, which are the
 ///   bytes `read_link` hands the walk back.
@@ -760,6 +765,21 @@ impl TreeAccumulator {
         self.paths.insert(rel, node);
     }
 
+    /// The mode each recorded REGULAR FILE folds — keyed by its line bytes, the map the
+    /// on-disk walk needs on a filesystem that stores no permission bits
+    /// ([`crate::tree::tree_root_declared`]). An alias reports its target's node, so two
+    /// names of one inode carry one mode, exactly as the walk would read them. Links
+    /// have no mode slot and are not listed.
+    pub(crate) fn declared_modes(&self) -> crate::tree::DeclaredModes {
+        let mut modes = crate::tree::DeclaredModes::new();
+        for (rel, node) in &self.paths {
+            if let Some(Node::File(mode, _)) = self.nodes.get(*node) {
+                modes.insert(rel.clone(), *mode);
+            }
+        }
+        modes
+    }
+
     /// Fold every recorded path into the tree root, through the SAME formatters and the
     /// SAME sort+SHA-256 the on-disk walk uses.
     pub(crate) fn root(self) -> String {
@@ -782,8 +802,10 @@ impl TreeAccumulator {
     }
 }
 
-/// The raw OS bytes of `path` relative to `root` — the relpath half of a `tree_root`
-/// entry line, computed exactly as [`crate::tree::tree_root`]'s walk computes it.
+/// The line bytes of `path` relative to `root` — the relpath half of a `tree_root`
+/// entry line, computed exactly as [`crate::tree::tree_root`]'s walk computes it, through
+/// the one spelling function ([`crate::tree::rel_line_bytes`]: raw OS bytes,
+/// `/`-separated on every platform).
 ///
 /// Both ends are already inside `root` by construction ([`vet_entry`] re-checked the
 /// join), so the `strip_prefix` cannot fail; it is mapped to the same fail-closed
@@ -792,9 +814,7 @@ pub(crate) fn rel_bytes_under(root: &Path, path: &Path) -> Result<Vec<u8>, Extra
     let rel = path
         .strip_prefix(root)
         .map_err(|_| ExtractError::Rejected(ExtractReject::RootEscape, path.to_path_buf()))?;
-    // `platform::os_str_bytes` goes via `call1` — see `tree.rs`'s walk for why (std's
-    // inlined `unsafe` in the `OsStr` byte-slice cast is otherwise attributed here).
-    Ok(crate::call1(crate::platform::os_str_bytes, rel.as_os_str()).to_vec())
+    Ok(crate::tree::rel_line_bytes(rel))
 }
 
 /// THE precondition the folded digest stands on, ENFORCED rather than assumed.
@@ -1430,11 +1450,12 @@ fn extract_stream(
 /// never read.
 #[derive(Debug)]
 pub(crate) struct WrittenFile {
-    /// The permission bits as [`crate::platform::permission_mode`] reports them for the
-    /// file we just wrote, masked to `0o7777`. READ BACK (an `fstat` on the handle we
-    /// still hold, after `set_mode`) rather than assumed to be the requested `mode`, so
-    /// this is the same number the on-disk walk would have read — including `0` on
-    /// Windows, which has no POSIX bits.
+    /// The permission bits the fold records for the file we just wrote, masked to
+    /// `0o7777` — [`crate::platform::folded_mode`] over an `fstat` of the handle we
+    /// still hold (after `set_mode`) and the requested `mode`. On Unix that is the mode
+    /// READ BACK rather than the request, the same number the on-disk walk reads; on
+    /// Windows, which stores no POSIX bits, it is the request itself — the only value a
+    /// producer's signed root can be reproduced from (`crate::tree`'s module docs).
     pub(crate) mode: u32,
     /// Lowercase-hex SHA-256 of the content, accumulated over the SAME 64 KiB chunks the
     /// copy loop writes. Byte-for-byte the digest `tree::file_sha256` would produce by
@@ -1532,12 +1553,13 @@ fn write_capped(
     // Read the mode BACK, from the handle still open on the file we just wrote (so this
     // is the inode's stored value, not our request), through the very function the
     // on-disk walk uses. `File::metadata` is an `fstat` — no path resolution, nothing
-    // to race, and no second open.
+    // to race, and no second open. Where the inode stores no bits (Windows) the fold
+    // takes the request instead — `platform::folded_mode` decides, per platform.
     match hasher {
         Some(hasher) => {
             let meta = f.metadata().map_err(|e| io_at(e, "fstat", dest))?;
             Ok(WrittenFile {
-                mode: crate::platform::permission_mode(&meta) & 0o7777,
+                mode: crate::platform::folded_mode(&meta, mode),
                 content_sha_hex: crate::tree::hex(&hasher.finalize()),
                 len,
             })
@@ -2101,6 +2123,17 @@ mod tests {
         make_archive_moded(dir, label, &moded)
     }
 
+    /// The fold `tree` produced and the on-disk walk that must agree with it, byte for
+    /// byte: the plain walk where the inode stores modes (Unix — `tree_root_declared`
+    /// never consults the record there), the declared-mode walk where it stores none
+    /// (Windows, where the plain walk folds `0` and can agree with nothing a producer
+    /// signed). ONE call shape for every parity site, so the Windows fix is exercised
+    /// by the same tests that pin the Unix contract.
+    fn fused_and_walked(tree: TreeAccumulator, root: &Path) -> (String, String) {
+        let walked = crate::tree::tree_root_declared(root, &tree.declared_modes()).unwrap();
+        (tree.root(), walked)
+    }
+
     /// [`make_archive`] with a per-entry archive mode. Same bytes for a `0o644` entry.
     #[allow(clippy::type_complexity)]
     fn make_archive_moded(
@@ -2467,8 +2500,15 @@ mod tests {
                 ("bin/targo", b'0', "", b"the replaced binary", 0o755),
             ],
         );
-        let fused = extract_tar_zst_rooted(&archive, &root, 10_000_000, 10_000).unwrap();
-        let walked = crate::tree::tree_root(&root).unwrap();
+        let tree = extract_tar_zst_tree(
+            &archive,
+            &root,
+            10_000_000,
+            10_000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let (fused, walked) = fused_and_walked(tree, &root);
         assert_eq!(
             fused, walked,
             "the extraction-time root must equal the on-disk walk byte for byte"
@@ -2526,8 +2566,16 @@ mod tests {
             let root = d.join(label);
             std::fs::create_dir_all(&root).unwrap();
             let archive = make_archive_moded(d, label, &[("bin/ay", b'0', "", payload, mode)]);
-            let fused = extract_tar_zst_rooted(&archive, &root, 10_000_000, 10_000).unwrap();
-            assert_eq!(fused, crate::tree::tree_root(&root).unwrap());
+            let tree = extract_tar_zst_tree(
+                &archive,
+                &root,
+                10_000_000,
+                10_000,
+                ExtractOptions::default(),
+            )
+            .unwrap();
+            let (fused, walked) = fused_and_walked(tree, &root);
+            assert_eq!(fused, walked);
             fused
         }
         let d = dest("fused-sensitive");
@@ -2536,9 +2584,11 @@ mod tests {
         let other_mode = one_file(&d, "c", b"payload", 0o755);
         assert_eq!(other_mode.len(), 64);
         assert_ne!(base, other_content, "content must move the fused root");
-        // Windows reports no permission bits at all (`permission_mode` = 0), so the mode
-        // component is constant there — for BOTH producers, which is the point.
-        #[cfg(unix)]
+        // On Unix the mode is read back from the inode; on Windows, which stores no
+        // permission bits, the fold records the DECLARED mode (`0755` here against
+        // `0644`) — so the root moves with the archive's mode class on every platform,
+        // exactly as the producer's did when it signed the row (until 2026-09-22 the
+        // Windows fold was a constant `0`, and no signed root could ever match it).
         assert_ne!(base, other_mode, "mode must move the fused root");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -2560,8 +2610,16 @@ mod tests {
         let archive = make_archive(&d, "occupied", &[("bin/ay", b'0', "", b"payload")]);
 
         // Empty: extraction proceeds and agrees with the walk, as always.
-        let fused = extract_tar_zst_rooted(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert_eq!(fused, crate::tree::tree_root(&root).unwrap());
+        let tree = extract_tar_zst_tree(
+            &archive,
+            &root,
+            10_000_000,
+            10_000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let (fused, walked) = fused_and_walked(tree, &root);
+        assert_eq!(fused, walked);
 
         // …and the SAME call over the now-occupied root is refused, so a second
         // extraction can never fold a root that omits what is already there.
@@ -2592,8 +2650,16 @@ mod tests {
         let root = d.join("staging");
         std::fs::create_dir_all(&root).unwrap();
         let archive = make_archive(&d, "empty", &[]);
-        let fused = extract_tar_zst_rooted(&archive, &root, 10_000_000, 10_000).unwrap();
-        assert_eq!(fused, crate::tree::tree_root(&root).unwrap());
+        let tree = extract_tar_zst_tree(
+            &archive,
+            &root,
+            10_000_000,
+            10_000,
+            ExtractOptions::default(),
+        )
+        .unwrap();
+        let (fused, walked) = fused_and_walked(tree, &root);
+        assert_eq!(fused, walked);
         let root2 = d.join("staging2");
         std::fs::create_dir_all(&root2).unwrap();
         extract_tar_zst(&archive, &root2, 10_000_000, 10_000).unwrap();
@@ -2705,28 +2771,27 @@ mod tests {
         .unwrap();
 
         let r_zst = d.join("zst");
-        let root_zst = extract_tar_zst_tree(&zst, &r_zst, 10_000_000, 10_000, vendor(1))
-            .unwrap()
-            .root();
+        let (root_zst, walk_zst) = fused_and_walked(
+            extract_tar_zst_tree(&zst, &r_zst, 10_000_000, 10_000, vendor(1)).unwrap(),
+            &r_zst,
+        );
         let r_gz = d.join("gz");
-        let root_gz = extract_tar_gz_tree(&gz, &r_gz, 10_000_000, 10_000, vendor(1))
-            .unwrap()
-            .root();
+        let (root_gz, walk_gz) = fused_and_walked(
+            extract_tar_gz_tree(&gz, &r_gz, 10_000_000, 10_000, vendor(1)).unwrap(),
+            &r_gz,
+        );
         let r_zip = d.join("zip");
-        let root_zip = extract_zip_tree(&zip, &r_zip, 10_000_000, 10_000, vendor(1))
-            .unwrap()
-            .root();
+        let (root_zip, walk_zip) = fused_and_walked(
+            extract_zip_tree(&zip, &r_zip, 10_000_000, 10_000, vendor(1)).unwrap(),
+            &r_zip,
+        );
 
-        for (label, root, fused) in [
-            ("zst", &r_zst, &root_zst),
-            ("gz", &r_gz, &root_gz),
-            ("zip", &r_zip, &root_zip),
+        for (label, root, fused, walked) in [
+            ("zst", &r_zst, &root_zst, &walk_zst),
+            ("gz", &r_gz, &root_gz, &walk_gz),
+            ("zip", &r_zip, &root_zip, &walk_zip),
         ] {
-            assert_eq!(
-                fused,
-                &crate::tree::tree_root(root).unwrap(),
-                "{label}: fold vs walk"
-            );
+            assert_eq!(fused, walked, "{label}: fold vs walk");
             assert!(
                 !root.join("gh_2.80.0_macOS_arm64").exists(),
                 "{label}: the top level was stripped"
@@ -2798,15 +2863,16 @@ mod tests {
         // strip 0: `./` is the root itself — a no-op — and the rest lands exactly where
         // `tar -xzf … -C st` lays it. The fold still equals the on-disk walk.
         let r0 = d.join("gz0");
-        let root0 = extract_tar_gz_tree(&gz, &r0, 10_000_000, 10_000, vendor(0))
-            .unwrap()
-            .root();
+        let (root0, walk0) = fused_and_walked(
+            extract_tar_gz_tree(&gz, &r0, 10_000_000, 10_000, vendor(0)).unwrap(),
+            &r0,
+        );
         assert_eq!(
             std::fs::read(r0.join("top/bin/gh")).unwrap(),
             b"#!/bin/sh\necho gh\n"
         );
         assert_eq!(std::fs::read(r0.join("top/LICENSE")).unwrap(), b"MIT");
-        assert_eq!(root0, crate::tree::tree_root(&r0).unwrap(), "fold vs walk");
+        assert_eq!(root0, walk0, "fold vs walk");
 
         // strip 1: the leading `.` IS the component the strip spends itself on —
         // `top/bin/gh`, not `bin/gh` — which is the tree the authoring tar staged.
@@ -3193,10 +3259,8 @@ mod tests {
             !d.join("gz-strip-ok/data").exists(),
             "stripped away means not written"
         );
-        assert_eq!(
-            ok.root(),
-            crate::tree::tree_root(&d.join("gz-strip-ok")).unwrap()
-        );
+        let (fused, walked) = fused_and_walked(ok, &d.join("gz-strip-ok"));
+        assert_eq!(fused, walked);
 
         let zip = d.join("big.zip");
         std::fs::write(
@@ -3359,14 +3423,15 @@ mod tests {
         std::fs::write(&p, &plain).unwrap();
         let q = d.join("z64.zip");
         std::fs::write(&q, &z64).unwrap();
-        let root_p = extract_zip_tree(&p, &d.join("plain"), 10_000, 10, vendor(0))
-            .unwrap()
-            .root();
+        let (root_p, walk_p) = fused_and_walked(
+            extract_zip_tree(&p, &d.join("plain"), 10_000, 10, vendor(0)).unwrap(),
+            &d.join("plain"),
+        );
         let root_q = extract_zip_tree(&q, &d.join("z64"), 10_000, 10, vendor(0))
             .unwrap()
             .root();
         assert_eq!(root_p, root_q, "ZIP64 is an encoding, not a different tree");
-        assert_eq!(root_p, crate::tree::tree_root(&d.join("plain")).unwrap());
+        assert_eq!(root_p, walk_p);
 
         let refuse = |label: &str, bytes: &[u8]| {
             let path = d.join(format!("{label}.zip"));
@@ -3456,9 +3521,14 @@ mod tests {
         let w = stage_file(&payload[..], &dest_path, 0o755, 1 << 20).unwrap();
         assert_eq!(w.len, payload.len() as u64);
         assert_eq!(std::fs::read(&dest_path).unwrap(), payload);
+        // The folded mode is the one requested on EVERY platform: read back on Unix,
+        // declared on Windows — a `0` here is the exact defect that made every Windows
+        // `claude` install fail its re-verify (2026-09-22).
+        assert_eq!(w.mode, 0o755, "the raw-binary lane folds mode 0755");
         let mut tree = TreeAccumulator::new();
         tree.record_file(b"bin/claude".to_vec(), w.mode, w.content_sha_hex);
-        assert_eq!(tree.root(), crate::tree::tree_root(&d).unwrap());
+        let (fused, walked) = fused_and_walked(tree, &d);
+        assert_eq!(fused, walked);
         #[cfg(unix)]
         assert_eq!(
             std::fs::metadata(&dest_path).unwrap().permissions().mode() & 0o7777,

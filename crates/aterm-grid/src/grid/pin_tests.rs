@@ -4,7 +4,7 @@
 
 //! Tests for grid pin and generation tracking.
 
-use crate::{GenerationTracker, Pin, PinnedRange};
+use crate::{GenerationTracker, Grid, Pin, PinnedRange};
 
 #[test]
 fn pin_creation() {
@@ -147,4 +147,32 @@ fn pinned_range_validity() {
     // Evict page 2
     tracker.evict_page(2);
     assert!(!range.is_valid(&tracker));
+}
+
+/// A restore continues the source's numbering: the counter moves to the
+/// carried value, bounded below by what the grid holds and above by the
+/// overflow ceiling.
+#[test]
+fn continue_absolute_numbering_is_bounded_both_ways() {
+    let mut grid = Grid::new(4, 10);
+    assert_eq!(grid.absolute_row_counter(), 4);
+    grid.continue_absolute_numbering(1_000);
+    assert_eq!(grid.absolute_row_counter(), 1_000);
+    assert_eq!(
+        grid.visible_to_absolute(0),
+        996,
+        "the top row is renumbered"
+    );
+    grid.continue_absolute_numbering(0);
+    assert_eq!(
+        grid.absolute_row_counter(),
+        4,
+        "never below the rows it holds"
+    );
+    grid.continue_absolute_numbering(u64::MAX);
+    assert_eq!(
+        grid.absolute_row_counter(),
+        u64::MAX >> 16,
+        "the forged value is clamped"
+    );
 }

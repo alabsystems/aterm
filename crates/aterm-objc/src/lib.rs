@@ -223,7 +223,7 @@
 //!   container's `Drop` reschedules through [`run_on_main`], so the
 //!   [`Retained`] is released — and any resulting `-dealloc` and Rust ivar
 //!   destructor run — on the main thread, wherever the container itself
-//!   happened to die. `examples/objc_bound_drive.rs` measures both sides
+//!   happened to die. `tests/main_thread_bound_drive.rs` measures both sides
 //!   against a `NaiveBound<T>` that carries the identical `unsafe impl<T> Send`
 //!   with an ordinary drop: the naive one runs a declared class's ivar
 //!   destructor on a spawned thread through 100% safe code, and the compiler

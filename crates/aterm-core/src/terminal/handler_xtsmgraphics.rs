@@ -143,44 +143,25 @@ impl TerminalHandler<'_> {
 
             // Sixel geometry - read current text area pixel size
             (XtsmgraphicsItem::SixelGeometry, XtsmgraphicsAction::Read) => {
-                // Per xterm spec, Pa=1 (Read) returns the current text area
-                // dimensions in pixels, NOT the maximum. Applications like lsix
-                // and img2sixel use this to size output to fit the viewport (#7470).
-                //
-                // Capability note (CF-008): `invoke_window_callback` now
-                // requires a `WindowOpsCapability`. XTSMGRAPHICS historically
-                // did not consult `allow_window_ops` — this was an existing
-                // privilege conflation not covered by CF-008 (which is
-                // scoped to XTWINOPS / `CSI t`). Preserve prior behavior by
-                // minting a capability unconditionally here; tightening this
-                // to a separate graphics-query policy bit is follow-up work
-                // (tracked separately).
+                // Per xterm, Pa=1 (Read) returns the current text area in
+                // pixels, not the maximum; lsix and img2sixel size their output
+                // from it (#7470). That is the fact CSI 14 t reports, so it
+                // rides the same window-ops capability (policy engine, then
+                // `allow_window_ops`) and the same answer. Without the
+                // capability, or before a host has reported a cell box, it
+                // answers the maximum dimension, as it always has.
                 let max_dim = u16::try_from(SIXEL_MAX_DIMENSION).unwrap_or(u16::MAX);
-                let window_auth = super::window_auth::WindowMintAuthority::new();
-                let window_cap = window_auth
-                    .try_mint(true)
-                    .expect("WindowMintAuthority::try_mint(true) is infallible");
-                if let Some(aterm_types::WindowResponse::SizePixels { height, width }) = self
-                    .invoke_window_callback(
-                        aterm_types::WindowOperation::ReportTextAreaSizePixels,
-                        &window_cap,
-                    )
-                {
-                    // Clamp to SIXEL_MAX_DIMENSION — the absolute renderer limit.
-                    let w = width.min(max_dim);
-                    let h = height.min(max_dim);
-                    self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[w, h]);
-                } else {
-                    // No window callback available — fall back to max dimension.
-                    // This is less correct but avoids returning an error when the
-                    // host hasn't registered a window callback.
-                    self.send_xtsmgraphics_response(
-                        cap,
-                        pi,
-                        XtsmgraphicsStatus::Success,
-                        &[max_dim, max_dim],
+                let window_cap = super::window_auth::WindowMintAuthority::new()
+                    .try_mint_with_engine(
+                        self.policy.xtwinops_gate(14),
+                        self.modes.allow_window_ops,
                     );
-                }
+                let size = window_cap.as_ref().and_then(|wc| self.text_area_pixels(wc));
+                let clamp = |px: u32| u16::try_from(px.min(u32::from(max_dim))).unwrap_or(max_dim);
+                let (w, h) = size.map_or((max_dim, max_dim), |(height, width)| {
+                    (clamp(width), clamp(height))
+                });
+                self.send_xtsmgraphics_response(cap, pi, XtsmgraphicsStatus::Success, &[w, h]);
             }
 
             // Sixel geometry - read maximum
@@ -226,5 +207,58 @@ impl TerminalHandler<'_> {
         response.push('S');
 
         self.send_response(cap, response.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::terminal::Terminal;
+    use aterm_types::{WindowOperation, WindowResponse};
+
+    fn geometry_read(term: &mut Terminal) -> String {
+        term.process(b"\x1b[?2;1S");
+        String::from_utf8(term.take_response().expect("XTSMGRAPHICS always answers"))
+            .expect("ASCII")
+    }
+
+    /// With window ops granted, the sixel-geometry read answers the real text
+    /// area (the same in-core product CSI 14 t reports), width first.
+    #[test]
+    fn sixel_geometry_read_reports_the_text_area_with_window_ops() {
+        let mut term = Terminal::new(24, 80);
+        term.modes_mut().allow_window_ops = true;
+        term.set_cell_pixel_size(9, 19);
+        // 80 cols x 9 px = 720 wide; 24 rows x 19 px = 456 tall.
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;720;456S");
+    }
+
+    /// Without window ops the read never reaches the host: a callback that
+    /// WOULD answer is not consulted, and the reply is the maximum dimension.
+    /// (The old unconditional mint consulted it.)
+    #[test]
+    fn sixel_geometry_read_does_not_reach_the_host_without_window_ops() {
+        let mut term = Terminal::new(24, 80);
+        term.set_cell_pixel_size(9, 19);
+        term.set_window_callback(|op| match op {
+            WindowOperation::ReportTextAreaSizePixels => Some(WindowResponse::SizePixels {
+                height: 111,
+                width: 222,
+            }),
+            _ => None,
+        });
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;4096;4096S");
+
+        // Negative control: the same host IS consulted once window ops are on.
+        term.modes_mut().allow_window_ops = true;
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;222;111S");
+    }
+
+    /// Window ops alone, before any host has reported a cell box, still
+    /// answers the maximum rather than a guess.
+    #[test]
+    fn sixel_geometry_read_falls_back_without_a_cell_box() {
+        let mut term = Terminal::new(24, 80);
+        term.modes_mut().allow_window_ops = true;
+        assert_eq!(geometry_read(&mut term), "\x1b[?2;0;4096;4096S");
     }
 }

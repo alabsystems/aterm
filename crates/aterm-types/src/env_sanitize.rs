@@ -139,6 +139,8 @@ pub const ENV_DENY_VARS: &[&str] = &[
     // The Paste gesture's file-fed clipboard (lib.rs `debug_paste_text`), for live
     // checks of a large paste without the owner's clipboard.
     "ATERM_DEBUG_PASTE_FILE",
+    // Every clipboard read and write goes to this file (clipboard.rs `route`), not the OS.
+    "ATERM_DEBUG_CLIPBOARD_FILE",
     // A fresh shell spawned as a lost-nonce adopted one (spawn.rs
     // `debug_lost_shell_nonce`): a nested aterm's shells are its own.
     "ATERM_DEBUG_LOST_SHELL_NONCE",
@@ -308,7 +310,8 @@ mod tests {
     /// no inherited QA seam. Each name here has a reader in a dev build (`dev_seam!`):
     /// debug_seamless_reexec_armed (ATERM_DEBUG_SEAMLESS_REEXEC), relaunch_nudge_seam
     /// (ATERM_DEBUG_RELAUNCH_NUDGE), the status-bar seeding (ATERM_DEBUG_STATUS_BARS),
-    /// the strain row's fake load (ATERM_DEBUG_STRAIN),
+    /// the strain row's fake load (ATERM_DEBUG_STRAIN), the clipboard's stand-in file
+    /// (ATERM_DEBUG_CLIPBOARD_FILE),
     /// seal_guard's updates_root (ATERM_UPDATE_ROOT) and the handoff deadlines
     /// (ATERM_HANDOFF_READY_TIMEOUT_MS, ATERM_HANDOFF_PROOF_TIMEOUT_MS). The retired
     /// update knobs are NOT listed: nothing reads them any more.
@@ -319,6 +322,7 @@ mod tests {
             "ATERM_DEBUG_RELAUNCH_NUDGE",
             "ATERM_DEBUG_STATUS_BARS",
             "ATERM_DEBUG_STRAIN",
+            "ATERM_DEBUG_CLIPBOARD_FILE",
             "ATERM_DEBUG_LOST_SHELL_NONCE",
             "ATERM_UPDATE_ROOT",
             "ATERM_HANDOFF_READY_TIMEOUT_MS",

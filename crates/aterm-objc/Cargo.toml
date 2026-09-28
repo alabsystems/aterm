@@ -17,6 +17,15 @@ description = "aterm's first-party Objective-C runtime layer: typed message send
 [lints]
 workspace = true
 
+# THE CONTAINER DRIVE, as a test with no libtest harness. libtest runs every
+# `#[test]` on a worker and parks its main thread, so neither branch of
+# `run_on_main` (which `MainThreadBound`'s `Drop` goes through) can be driven
+# from one. Without the harness `main` is the process main thread; the file
+# answers libtest's argv itself, as one test of this name.
+[[test]]
+name = "main_thread_bound_drive"
+harness = false
+
 # TEST-ONLY. The shipped layer keeps its zero dependencies; the Tier-1 bind of
 # the run-loop wake timer (`tests/conformance_wake_timer.rs`) steps the derived
 # `run_loop_waker_model` beside the real timer, and that model lives in

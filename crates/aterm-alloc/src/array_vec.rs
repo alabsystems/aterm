@@ -3,15 +3,12 @@
 
 //! `ArrayVec<T, N>`: fixed-capacity inline-only storage.
 //!
-//! The implementation names only `core` items (never `std`), so this module
-//! compiles unchanged in a `#![no_std]` crate. That matters because
+//! The implementation names only `core` items, and the crate root is
+//! `#![no_std]`, so the compiler enforces that. It matters because
 //! `crates/aterm-arrayvec` republishes this type under the package name
 //! `arrayvec`, and three of the six third-party consumers of that package
 //! (`naga`, `tiny-skia`, `vte`) are `no_std`-capable and take it with
-//! `default-features = false`. Re-check with
-//! `grep -n 'std::' crates/aterm-alloc/src/array_vec.rs` — every hit other than
-//! this sentence must be inside the `#[cfg(test)]` module at the bottom (10
-//! hits today: this line and 9 in the tests).
+//! `default-features = false`.
 
 use core::fmt;
 use core::hash::{Hash, Hasher};
@@ -961,6 +958,7 @@ impl<T, const N: usize> Drop for Drain<'_, T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::format;
 
     #[test]
     #[should_panic(expected = "ArrayVec overflow")]

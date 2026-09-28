@@ -491,7 +491,7 @@ mod tests {
     ];
 
     /// Invariant 1: the engine never samples a clock. Family C's C3 walks only
-    /// core/src/terminal (tools/grep_guard.sh:608), so the crate carries its
+    /// core/src/terminal (tools/grep_guard.sh, family C), so the crate carries its
     /// own fence: `Instant::now()` / `SystemTime::now()` count == 0 in the
     /// SHIPPED code — everything before each file's `#[cfg(test)]` MODULE
     /// (tests mint a base instant to drive the engine from, as the status

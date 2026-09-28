@@ -52,10 +52,13 @@ pub fn stamp_words(at_unix_ms: u64) -> String {
 }
 
 /// When `at` was on the reader's LOCAL clock (design ruling 262), `offset_s`
-/// seconds from UTC: `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else
-/// `2026-09-22 9:02:11 AM` — the local date the meta line of an expanded
-/// entry says, beside the relative words its row already shows. Copy keeps
-/// the UTC stamp ([`stamp_words`]). Pure: the host supplies the offset.
+/// seconds from UTC: `Today 12:53:49 PM`, `Yesterday 9:02:11 AM`, else the
+/// day as its header says it ([`day_heading`]: `Thursday 9:02:11 AM`,
+/// `Tuesday, 15 September, 9:02:11 AM`) — the local date the meta line of an
+/// expanded entry says, beside the relative words its row already shows.
+/// Round 18, day four (D14): an ISO `2026-09-24 10:30:00 AM` sat under a
+/// `Thursday` header. Copy keeps the UTC stamp ([`stamp_words`]). Pure: the
+/// host supplies the offset.
 #[must_use]
 pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
     let local = |ms: u64| {
@@ -64,25 +67,21 @@ pub fn local_words(now_unix_ms: u64, at_unix_ms: u64, offset_s: i64) -> String {
     };
     let (at, now) = (local(at_unix_ms), local(now_unix_ms));
     let (at_day, now_day) = (at / 86_400, now / 86_400);
-    let rem = at % 86_400;
-    let (hh, mm, ss) = (rem / 3600, (rem % 3600) / 60, rem % 60);
-    let (h12, half) = match hh {
-        0 => (12, "AM"),
-        1..=11 => (hh, "AM"),
-        12 => (12, "PM"),
-        _ => (hh - 12, "PM"),
-    };
-    let mut clock = h12.to_string();
-    clock.push(':');
-    push_padded(&mut clock, mm, 2);
-    clock.push(':');
-    push_padded(&mut clock, ss, 2);
-    clock.push(' ');
-    clock.push_str(half);
+    let clock = twelve_hour(at % 86_400, true);
     let day = match now_day.checked_sub(at_day) {
         Some(0) => "Today".to_string(),
         Some(1) => "Yesterday".to_string(),
-        _ => date_words(at * 1000),
+        _ => {
+            let day = |d: u64| i64::try_from(d).unwrap_or(i64::MAX);
+            let words = day_heading(day(now_day), day(at_day), false);
+            // A dated heading has commas of its own: one more before the
+            // clock keeps the time from reading as part of the date.
+            if words.contains(',') {
+                format!("{words},")
+            } else {
+                words
+            }
+        }
     };
     format!("{day} {clock}")
 }
@@ -102,6 +101,108 @@ pub fn spoken_relative_words(now_unix_ms: u64, at_unix_ms: u64) -> String {
         whole(n, "hour")
     } else {
         words
+    }
+}
+
+/// `secs` seconds into a day on a twelve-hour clock: `9:02 AM`, or with
+/// `seconds` `9:02:11 AM`.
+fn twelve_hour(secs: u64, seconds: bool) -> String {
+    let (hh, mm, ss) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    let (h12, half) = match hh {
+        0 => (12, "AM"),
+        1..=11 => (hh, "AM"),
+        12 => (12, "PM"),
+        _ => (hh - 12, "PM"),
+    };
+    let mut clock = h12.to_string();
+    clock.push(':');
+    push_padded(&mut clock, mm, 2);
+    if seconds {
+        clock.push(':');
+        push_padded(&mut clock, ss, 2);
+    }
+    clock.push(' ');
+    clock.push_str(half);
+    clock
+}
+
+/// The reader's LOCAL calendar day of `at_unix_ms` — days since 1970-01-01
+/// on a clock `offset_s` seconds from UTC (design ruling 273). Pure: the
+/// host supplies the offset, as for [`local_words`].
+#[must_use]
+pub fn local_day(at_unix_ms: u64, offset_s: i64) -> i64 {
+    i64::try_from(at_unix_ms / 1000)
+        .unwrap_or(i64::MAX)
+        .saturating_add(offset_s)
+        .div_euclid(86_400)
+}
+
+/// When `at` was on the reader's local clock, `offset_s` from UTC, without
+/// the day or the seconds: `9:02 AM` — the time a Settings ▸ Messages row
+/// shows under a day header older than today (design ruling 273).
+#[must_use]
+pub fn clock_words(at_unix_ms: u64, offset_s: i64) -> String {
+    let secs = i64::try_from(at_unix_ms / 1000)
+        .unwrap_or(i64::MAX)
+        .saturating_add(offset_s)
+        .rem_euclid(86_400);
+    twelve_hour(u64::try_from(secs).unwrap_or(0), false)
+}
+
+/// A DAY HEADER's words (design ruling 273), for local day `day` read on
+/// local day `today` (both [`local_day`] numbers) — the macOS Mail and
+/// Messages convention: `Today`, `Yesterday`, the weekday within the last
+/// week (`Thursday`), else the date, `Friday, 18 September`, with the year
+/// only when it is not this year (`Friday, 18 September 2025`). A day after
+/// `today` (a clock set back) reads `Today`. `short` abbreviates the weekday
+/// and the month of a date, for a column too narrow for the whole words
+/// (`Fri, 18 Sep`, `Fri, 18 Sep 2025`); the other words are already short.
+#[must_use]
+pub fn day_heading(today: i64, day: i64, short: bool) -> String {
+    const WEEKDAYS: [&str; 7] = [
+        "Monday",
+        "Tuesday",
+        "Wednesday",
+        "Thursday",
+        "Friday",
+        "Saturday",
+        "Sunday",
+    ];
+    const MONTHS: [&str; 12] = [
+        "January",
+        "February",
+        "March",
+        "April",
+        "May",
+        "June",
+        "July",
+        "August",
+        "September",
+        "October",
+        "November",
+        "December",
+    ];
+    // 1970-01-01 was a Thursday (index 3).
+    let weekday = WEEKDAYS[usize::try_from((day + 3).rem_euclid(7)).unwrap_or(0)];
+    match today.saturating_sub(day) {
+        i64::MIN..=0 => "Today".to_string(),
+        1 => "Yesterday".to_string(),
+        2..=6 => weekday.to_string(),
+        _ => {
+            let civil = |d: i64| civil_from_days(u64::try_from(d).unwrap_or(0));
+            let ((y, m, d), (this_year, _, _)) = (civil(day), civil(today));
+            let mut month = MONTHS[usize::try_from(m.saturating_sub(1)).unwrap_or(0) % 12];
+            let mut weekday = weekday;
+            if short {
+                month = &month[..3];
+                weekday = &weekday[..3];
+            }
+            if y == this_year {
+                format!("{weekday}, {d} {month}")
+            } else {
+                format!("{weekday}, {d} {month} {y}")
+            }
+        }
     }
 }
 
@@ -185,8 +286,11 @@ pub(crate) fn abbreviate_paths_in(text: &str, home: Option<&str>) -> String {
 }
 
 /// The closed table a Complete echo reads a title's leading present
-/// participle through: only the verbs a band title uses, or plausibly will.
-const FINISHED_VERBS: [(&str, &str); 15] = [
+/// participle through: only the verbs a band title uses, or plausibly will —
+/// a script's own titles too (ruling 270: day three's `Deploying site`,
+/// `Generating thumbnails` and `Rendering the video` were logged, delivered,
+/// in their in-flight words).
+const FINISHED_VERBS: [(&str, &str); 40] = [
     ("Downloading", "Downloaded"),
     ("Installing", "Installed"),
     ("Updating", "Updated"),
@@ -202,6 +306,31 @@ const FINISHED_VERBS: [(&str, &str); 15] = [
     ("Indexing", "Indexed"),
     ("Building", "Built"),
     ("Fetching", "Fetched"),
+    ("Deploying", "Deployed"),
+    ("Generating", "Generated"),
+    ("Rendering", "Rendered"),
+    ("Exporting", "Exported"),
+    ("Importing", "Imported"),
+    ("Publishing", "Published"),
+    ("Compiling", "Compiled"),
+    ("Converting", "Converted"),
+    ("Processing", "Processed"),
+    ("Encoding", "Encoded"),
+    ("Compressing", "Compressed"),
+    ("Extracting", "Extracted"),
+    ("Scanning", "Scanned"),
+    ("Testing", "Tested"),
+    ("Signing", "Signed"),
+    ("Packaging", "Packaged"),
+    ("Linking", "Linked"),
+    ("Migrating", "Migrated"),
+    ("Cloning", "Cloned"),
+    ("Pulling", "Pulled"),
+    ("Pushing", "Pushed"),
+    ("Transcoding", "Transcoded"),
+    ("Resizing", "Resized"),
+    ("Cleaning", "Cleaned"),
+    ("Analyzing", "Analyzed"),
 ];
 
 /// A work title in its FINISHED form (design ruling 154): `Downloading aterm
@@ -212,6 +341,24 @@ pub(crate) fn finished_form(title: &str) -> Option<String> {
     let first = title.split(' ').next().unwrap_or(title);
     let (_, done) = FINISHED_VERBS.iter().find(|(ing, _)| *ing == first)?;
     Some(format!("{done}{}", &title[first.len()..]))
+}
+
+/// A DELIVERED work title the table has no past tense for (ruling 270):
+/// `Uploading the backup` → `Uploading the backup — done`, the words its
+/// Complete echo showed (`DONE_WORD` in the time slot), so the log never
+/// reads "still uploading" beside a ✓. Only a title that leads with a
+/// present participle (a capitalised word of five letters or more ending
+/// `ing`); any other title reads as its outcome already and keeps its
+/// words. `None` for a title in the table ([`finished_form`] answers it).
+#[must_use]
+pub(crate) fn done_form(title: &str) -> Option<String> {
+    let first = title.split(' ').next().unwrap_or(title);
+    let participle = first.len() >= 5
+        && first.ends_with("ing")
+        && first.starts_with(|c: char| c.is_ascii_uppercase())
+        && first.chars().all(|c| c.is_ascii_alphabetic());
+    (participle && finished_form(title).is_none())
+        .then(|| format!("{title} \u{2014} {}", crate::DONE_WORD))
 }
 
 /// A work title that ended WITHOUT delivering (design ruling 259):
@@ -272,9 +419,11 @@ mod tests {
         assert_eq!(local_words(at, at, 0), "Today 3:53:20 PM");
         assert_eq!(local_words(at, at, -7 * 3600), "Today 8:53:20 AM");
         assert_eq!(local_words(at + MS_PER_DAY, at, 0), "Yesterday 3:53:20 PM");
+        // Round 18 (D14): an older day as its header says it, never ISO.
+        assert_eq!(local_words(at + 3 * MS_PER_DAY, at, 0), "Sunday 3:53:20 PM");
         assert_eq!(
-            local_words(at + 3 * MS_PER_DAY, at, 0),
-            "2025-09-21 3:53:20 PM"
+            local_words(at + 30 * MS_PER_DAY, at, 0),
+            "Sunday, 21 September, 3:53:20 PM"
         );
         // Nine hours east, the same instant is past midnight: the next day.
         assert_eq!(local_words(at, at, 9 * 3600), "Today 12:53:20 AM");
@@ -297,6 +446,40 @@ mod tests {
         assert_eq!(relative_words(now, now - 2 * MS_PER_HOUR), "2 h ago");
         assert_eq!(relative_words(now, now - 30 * MS_PER_HOUR), "yesterday");
         assert_eq!(relative_words(now, now - 3 * MS_PER_DAY), "2025-09-18");
+    }
+
+    /// DAY HEADERS (ruling 273): the reader's local day — the offset moves
+    /// an instant across midnight — and the Mail/Messages words: today,
+    /// yesterday, a weekday within the week, then the date, with the year
+    /// only off this year; a day ahead of today (a clock set back) is today.
+    #[test]
+    fn day_headings_follow_the_readers_calendar() {
+        // 2026-09-27 12:00:00 UTC is a Sunday.
+        let noon = 1_790_510_400_000;
+        assert_eq!(date_words(noon), "2026-09-27");
+        let today = local_day(noon, 0);
+        assert_eq!(local_day(noon, 13 * 3600), today + 1, "past midnight east");
+        assert_eq!(local_day(noon, -13 * 3600), today - 1, "before it west");
+        assert_eq!(local_day(0, -3600), -1, "a day before the epoch is -1");
+        let h = |ago: i64| day_heading(today, today - ago, false);
+        assert_eq!(h(-1), "Today");
+        assert_eq!(h(0), "Today");
+        assert_eq!(h(1), "Yesterday");
+        assert_eq!(h(2), "Friday");
+        assert_eq!(h(3), "Thursday");
+        assert_eq!(h(6), "Monday");
+        assert_eq!(h(7), "Sunday, 20 September");
+        assert_eq!(h(9), "Friday, 18 September");
+        assert_eq!(h(269), "Thursday, 1 January");
+        assert_eq!(h(270), "Wednesday, 31 December 2025");
+        let short = |ago: i64| day_heading(today, today - ago, true);
+        assert_eq!(short(1), "Yesterday");
+        assert_eq!(short(3), "Thursday");
+        assert_eq!(short(9), "Fri, 18 Sep");
+        assert_eq!(short(270), "Wed, 31 Dec 2025");
+        assert_eq!(clock_words(noon, 0), "12:00 PM");
+        assert_eq!(clock_words(noon, -12 * 3600 - 60), "11:59 PM");
+        assert_eq!(clock_words(noon + 9 * 60_000, 9 * 3600), "9:09 PM");
     }
 
     /// The goldens `format_rfc3339` is pinned to: the epoch, a plain date, a
@@ -374,6 +557,30 @@ mod tests {
             "Working",
         ] {
             assert_eq!(finished_form(kept), None, "{kept:?} keeps its words");
+        }
+    }
+
+    /// RULING 270: a delivered title the table has no past tense for says
+    /// `— done`, as its echo did; a title with no leading participle, and
+    /// one the table answers, is left to the other forms.
+    #[test]
+    fn a_delivered_title_with_no_past_tense_says_done() {
+        assert_eq!(
+            finished_form("Deploying site").as_deref(),
+            Some("Deployed site")
+        );
+        assert_eq!(
+            done_form("Uploading the backup").as_deref(),
+            Some("Uploading the backup \u{2014} done")
+        );
+        for kept in [
+            "Deploying site",
+            "Paste stopped",
+            "aterm is ready",
+            "Sing",
+            "Re-Uploading",
+        ] {
+            assert_eq!(done_form(kept), None, "{kept:?}");
         }
     }
 

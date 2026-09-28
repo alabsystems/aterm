@@ -30,7 +30,7 @@
 //! (machine-independent: text only), and a negative control (drop one record)
 //! MUST diverge, so the determinism assertions are non-vacuous.
 
-use aterm_core::terminal::{ClockReading, HostBindings, Terminal};
+use aterm_core::terminal::{ClockReading, Terminal};
 
 const ROWS: u16 = 12;
 const COLS: u16 = 40;
@@ -223,7 +223,7 @@ fn from_checkpoint_hydration_continues_the_mirror() {
     feed(&mut host_at, &SESSION[..AT], clock);
     let snapshot = host_at.checkpoint();
 
-    let mut viewer = Terminal::from_checkpoint(&snapshot, HostBindings::none());
+    let mut viewer = Terminal::from_checkpoint(&snapshot);
     feed(&mut viewer, &SESSION[AT..], clock);
 
     assert_eq!(

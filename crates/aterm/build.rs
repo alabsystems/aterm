@@ -127,8 +127,13 @@ fn main() {
         return;
     }
 
-    // The link arg the step emits targets every bin of this package, which is
-    // exactly one: `[[bin]] name = "aterm"`.
+    // The link arg the step emits targets every bin of this package: the console
+    // image `aterm` AND the windowed image `aterm-windowed` (shipped as
+    // `aterm-gui.exe`), which is what we want — both files are launched by
+    // Explorer or shown in Task Manager, so both carry the icon, the manifest
+    // and the version block. One .rc for both: the only per-file string in it
+    // is `OriginalFilename`, and it names `aterm.exe` for the windowed image
+    // too (see the note beside that VALUE).
     let outcome = aterm_winres::compile(&rc_path);
     if outcome.is_linked() {
         return;
@@ -253,8 +258,11 @@ BEGIN
             VALUE "InternalName",     "aterm"
             VALUE "LegalCopyright",   "Copyright (C) 2026 Andrew Yates. Licensed under Apache-2.0."
             // Every installed CLI alias (aterm-ctl.exe, atpkg.exe, ...) is a
-            // HARDLINK onto this same file, so they all report aterm.exe here.
-            // That is the truth, not a bug: there is exactly one executable.
+            // HARDLINK onto the console image, so they all report aterm.exe
+            // here, truthfully. The windowed image (aterm-windowed.exe, shipped
+            // as aterm-gui.exe) reports it too: one .rc serves both bins, and a
+            // per-bin resource would need a second rc compile + link-arg-bin
+            // pair to change one cosmetic string Explorer does not show.
             VALUE "OriginalFilename", "aterm.exe"
             VALUE "ProductName",      "aterm"
             VALUE "ProductVersion",   "{display}"

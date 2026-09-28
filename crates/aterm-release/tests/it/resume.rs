@@ -8,7 +8,7 @@
 //! gate, channel-floor carry-forward, exhaustive status selection) and the
 //! hand-rolled CLI parse table.
 
-use crate::{cli, gates, ledger, manifest_out, mirror, publish, verify};
+use crate::{channel, cli, gates, ledger, manifest_out, publish, verify};
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -138,11 +138,8 @@ fn journal() -> Journal {
         signature_pubkey: None,
         signature_machine_id: None,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         done: vec![],
     }
 }
@@ -157,28 +154,27 @@ fn pipeline_step_order_is_the_spec_7_order() {
             "lock",
             "build",
             "selfcheck",
-            "draft",
-            "upload",
-            "preflip",
+            // The origin tag names the release commit before anything is published,
+            // so the release `publish` makes the head always names a tag origin has.
             "tag",
-            "flip",
-            "archive",
-            "verify",
-            // The public-channel mirror runs AFTER the private release is
-            // fully verified and BEFORE the lease is released, so a mirror
-            // failure is loud and resumable rather than a silently
-            // private-only release the fleet can never see.
-            "mirror",
+            // THE one publication (2026-09-26): the channel release bound, uploaded,
+            // proved and made the head, BEFORE the lease is released — a failure is
+            // loud and resumable, never a release the fleet cannot see.
+            "publish",
             // `unlock` is LAST (2026-09-23): the website follows the cut AFTER
             // the pipeline, best-effort and unjournaled, so a site failure can
             // never park the journal and block the next cut.
             "unlock",
         ]
     );
-    assert!(
-        !STEPS.contains(&"site"),
-        "the retired `site` step must never be journaled again"
-    );
+    for retired in [
+        "site", "draft", "upload", "preflip", "flip", "archive", "verify", "mirror",
+    ] {
+        assert!(
+            !STEPS.contains(&retired),
+            "the retired `{retired}` step must never be journaled again"
+        );
+    }
 }
 
 #[test]
@@ -190,37 +186,28 @@ fn first_incomplete_walks_the_step_order() {
         "a fresh journal acquires the remote lease before build"
     );
     j.done = vec!["lock".into(), "build".into(), "selfcheck".into()];
-    assert_eq!(j.first_incomplete(), Some("draft"));
-    j.done = [
-        "lock",
-        "build",
-        "selfcheck",
-        "draft",
-        "upload",
-        "preflip",
-        "tag",
-        "flip",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    assert_eq!(j.first_incomplete(), Some("tag"));
+    j.done = ["lock", "build", "selfcheck", "tag"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     assert_eq!(
         j.first_incomplete(),
-        Some("archive"),
-        "a crash after visibility resumes into channel convergence before verify"
+        Some("publish"),
+        "a crash anywhere in the one publication resumes into its convergence"
     );
     // Completion ORDER in the file is irrelevant — only membership counts.
     j.done = vec![
         "selfcheck".into(),
         "lock".into(),
         "build".into(),
-        "draft".into(),
+        "tag".into(),
     ];
-    assert_eq!(j.first_incomplete(), Some("upload"));
+    assert_eq!(j.first_incomplete(), Some("publish"));
     // A gap resumes at the GAP, not after the highest completed step: the
     // journal records what finished; skipping an incomplete earlier one is
     // never safe.
-    j.done = vec!["lock".into(), "build".into(), "draft".into()];
+    j.done = vec!["lock".into(), "build".into(), "tag".into()];
     assert_eq!(j.first_incomplete(), Some("selfcheck"));
     j.done = STEPS.iter().map(|s| s.to_string()).collect();
     assert_eq!(
@@ -236,7 +223,7 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     let path = dir.join("state.toml");
     for done in [
         vec!["build".to_string()],
-        vec!["lock".to_string(), "draft".to_string()],
+        vec!["lock".to_string(), "publish".to_string()],
         vec!["lock".to_string(), "lock".to_string()],
         vec!["lock".to_string(), "unknown".to_string()],
     ] {
@@ -247,7 +234,7 @@ fn current_journal_done_state_is_an_exact_canonical_prefix() {
     let mut valid = journal();
     valid.done = STEPS[..5].iter().map(|step| (*step).to_string()).collect();
     valid.release_id = Some(55);
-    valid.draft_create_issued = true;
+    valid.release_intent = true;
     valid.upload_intents = vec!["aterm-0.26.0.dmg".into()];
     valid.save(&path).unwrap();
     assert_eq!(Journal::load(&path).unwrap().unwrap(), valid);
@@ -286,14 +273,18 @@ fn the_site_hook_exit_contract_is_pinned() {
     }
 }
 
-/// ONE JOURNAL FORMAT (2026-09-23; 10 since 2026-09-24). Every older format — the
-/// format-9 file 0.92 left ending in the retired `site` step, the format-8 file
-/// 0.91 left parked at it, the v7 one every cut through v0.63.0
-/// left, a v1 file with no `format` at all — is refused on load in one sentence
-/// that names the file, the cut, and the two ways forward (delete it, or finish it
-/// with the cutter that wrote it), instead of being walked against a frozen step
-/// list. The negative control is the same done list at the current format, which
-/// loads, and an in-flight current journal, which still blocks a fresh cut.
+/// ONE JOURNAL FORMAT (2026-09-23; 11 since 2026-09-26) — and a HEADER every format
+/// wrote. Every older format — the format-10 file every pre-publish-once cutter writes,
+/// 0.93's included (its private-origin draft/flip/archive/verify leg and the mirror),
+/// the format-9 file 0.92 left ending in the retired `site` step, the format-8 file 0.91
+/// left parked at it, the v7 one every cut through v0.63.0 left, a v1 file with no
+/// `format` at all — is never walked against a frozen step list: `Journal::load` refuses
+/// it in one sentence naming the file, the cut, and who finishes it. But its HEADER is
+/// read by everything that acts on a journal, so a finished one (its `unlock`
+/// journaled) is history a fresh cut clears, and an unfinished one blocks it by name and
+/// points at the `--resume` that hands it to its own cutter. The negative control is the
+/// same done list at the current format, which loads, and an in-flight current journal,
+/// which still blocks a fresh cut.
 #[test]
 fn an_older_journal_format_is_refused_in_one_sentence() {
     let dir = tmpdir("journal-older-format");
@@ -305,7 +296,7 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
             &path,
             format!(
                 "{format}version = \"0.91.0\"\nbuild_number = 1790120000\n\
-                 commit = \"{}\"\nrelease_id = 55\ndraft_create_issued = true\n\
+                 commit = \"{}\"\nrelease_id = 55\nrelease_intent = true\n\
                  done = [{done}]\n",
                 "f".repeat(40)
             ),
@@ -313,6 +304,9 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
         .unwrap();
     };
     for (format, done, named) in [
+        // A pre-publish-once cutter's journal: a cut it started is a cut only it can
+        // finish.
+        ("format = 10\n", through_unlock.to_string(), "format-10"),
         // Both format-9 step lists: main's, which kept `site`, and this cutter's
         // first, which had already dropped it — one number, two lists, so neither
         // may reach the prefix check (the_finished_0_92_journal_... below).
@@ -337,40 +331,88 @@ fn an_older_journal_format_is_refused_in_one_sentence() {
             .to_string();
         assert!(error.contains(named), "{error}");
         assert!(error.contains("v0.91.0 build 1790120000"), "{error}");
-        assert!(error.contains("delete it if that cut finished"), "{error}");
-        assert!(error.contains("the cutter that wrote it"), "{error}");
+        assert!(
+            error.contains("the cutter built at that claim commit finishes or withdraws it"),
+            "{error}"
+        );
+        assert!(
+            error.contains("a finished one is history the next cut clears"),
+            "{error}"
+        );
         assert_eq!(error.matches(". ").count(), 0, "one sentence: {error}");
+        assert!(
+            Journal::load_if_ours(&path).unwrap().is_none(),
+            "a read-only command takes nothing from it, and does not fail on it"
+        );
+        let header = publish::JournalHeader::read(&path).unwrap().unwrap();
+        let triage = publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real);
+        if done.contains("\"unlock\"") {
+            assert!(triage.unwrap(), "{named}: a finished journal is history");
+        } else {
+            let error = triage.expect_err("an unfinished one blocks").to_string();
+            assert!(
+                error.contains(named) && error.contains("--resume` hands it"),
+                "{error}"
+            );
+        }
     }
-
-    // NEGATIVE CONTROL: the same finished list at the current format loads and is
-    // cleared by the next cut; an in-flight one blocks it, by name.
+    // An UNFINISHED older journal names its last step and the cutter that finishes it.
     write(
-        &format!("format = {}\n", publish::JOURNAL_FORMAT),
-        through_unlock,
+        "format = 10\n",
+        "\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\"",
     );
-    let finished = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(finished.first_incomplete(), None);
-    assert!(publish::fresh_cut_journal_triage(Some(&finished), publish::CutKind::Real).unwrap());
-    write(
-        &format!("format = {}\n", publish::JOURNAL_FORMAT),
-        "\"lock\", \"build\", \"selfcheck\", \"draft\", \"upload\", \"preflip\", \
-           \"tag\", \"flip\", \"archive\", \"verify\"",
-    );
-    let in_flight = Journal::load(&path).unwrap().unwrap();
-    assert_eq!(in_flight.first_incomplete(), Some("mirror"));
-    let error = publish::fresh_cut_journal_triage(Some(&in_flight), publish::CutKind::Real)
+    let header = publish::JournalHeader::read(&path).unwrap().unwrap();
+    assert!(!header.finished());
+    let error = publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real)
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("already in progress") && error.contains("mirror"),
+        error.contains("after step \"upload\" by a format-10 cutter")
+            && error.contains(&format!("the cutter built at its claim {}", "f".repeat(12))),
         "{error}"
     );
-    // A retired `site` entry after a current-format list is corruption, not history.
+
+    // NEGATIVE CONTROL: the current step list at the current format loads and is
+    // cleared by the next cut; an in-flight one blocks it, by name.
+    let now_through_unlock = "\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"";
     write(
         &format!("format = {}\n", publish::JOURNAL_FORMAT),
-        &format!("{through_unlock}, \"site\""),
+        now_through_unlock,
     );
-    assert!(Journal::load(&path).is_err());
+    let finished = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(finished.first_incomplete(), None);
+    assert!(
+        publish::fresh_cut_journal_triage(
+            Some(&publish::JournalHeader::read(&path).unwrap().unwrap()),
+            publish::CutKind::Real
+        )
+        .unwrap()
+    );
+    write(
+        &format!("format = {}\n", publish::JOURNAL_FORMAT),
+        "\"lock\", \"build\", \"selfcheck\", \"tag\"",
+    );
+    let in_flight = Journal::load(&path).unwrap().unwrap();
+    assert_eq!(in_flight.first_incomplete(), Some("publish"));
+    let error = publish::fresh_cut_journal_triage(
+        Some(&publish::JournalHeader::read(&path).unwrap().unwrap()),
+        publish::CutKind::Real,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("already in progress") && error.contains("publish"),
+        "{error}"
+    );
+    // The format-10 step list, or a retired `site` entry, under the current number is
+    // corruption, not history.
+    for stale in [
+        through_unlock.to_string(),
+        format!("{now_through_unlock}, \"site\""),
+    ] {
+        write(&format!("format = {}\n", publish::JOURNAL_FORMAT), &stale);
+        assert!(Journal::load(&path).is_err(), "{stale}");
+    }
     assert!(!publish::fresh_cut_journal_triage(None, publish::CutKind::Real).unwrap());
 }
 
@@ -423,22 +465,37 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
         error.contains("claim e8a8c80ab93cdf5bdfd048e22514b663874bb57a"),
         "{error}"
     );
-    assert!(error.contains("delete it if that cut finished"), "{error}");
+    assert!(
+        error.contains("a finished one is history the next cut clears"),
+        "{error}"
+    );
     assert!(
         !error.contains("prefix of the canonical pipeline"),
         "{error}"
     );
+    // …and by its header it IS finished: the next cut clears it.
+    let header = publish::JournalHeader::read(&path).unwrap().unwrap();
+    assert!(header.finished());
+    assert!(publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real).unwrap());
     assert_eq!(error.matches(". ").count(), 0, "one sentence: {error}");
 
-    // NEGATIVE CONTROL: the same cut at the current format, without the retired
-    // step, is a finished journal the next cut clears.
+    // NEGATIVE CONTROL: the same cut at the current format, with the current step
+    // list and the one release capability it records, is a finished journal the next
+    // cut clears.
     let current = V0_92_JOURNAL
-        .replacen(
-            "format = 9\n",
-            &format!("format = {}\n", publish::JOURNAL_FORMAT),
-            1,
-        )
-        .replacen(", \"site\"]", "]", 1);
+        .lines()
+        .filter(|line| !line.starts_with("mirror_") && !line.starts_with("done = "))
+        .map(|line| match line {
+            "format = 9" => format!("format = {}", publish::JOURNAL_FORMAT),
+            "draft_create_issued = true" => "release_intent = true".to_string(),
+            other => other.to_string(),
+        })
+        .chain(std::iter::once(
+            "done = [\"lock\", \"build\", \"selfcheck\", \"tag\", \"publish\", \"unlock\"]"
+                .to_string(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(&path, current).unwrap();
     let finished = Journal::load(&path)
         .expect("the current format loads")
@@ -446,7 +503,88 @@ done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip
     assert_eq!(finished.version, "0.92.0");
     assert_eq!(finished.done.len(), publish::STEPS.len());
     assert_eq!(finished.first_incomplete(), None);
-    assert!(publish::fresh_cut_journal_triage(Some(&finished), publish::CutKind::Real).unwrap());
+    assert!(
+        publish::fresh_cut_journal_triage(
+            Some(&publish::JournalHeader::read(&path).unwrap().unwrap()),
+            publish::CutKind::Real
+        )
+        .unwrap()
+    );
+}
+
+/// THE JOURNAL v0.93.0 LEFT BEHIND, verbatim (`dist/cut-state.toml` in the clone that
+/// cut it, 2026-09-24): format 10, the pre-publish-once step list, finished through
+/// `unlock`. The first publish-once cut from that clone meets exactly this file. It is
+/// history to every command: a fresh cut (and a dry run) clears it, and the read-only
+/// commands take nothing from it and do not fail on it — while `Journal::load` still
+/// never walks its step list.
+#[test]
+fn the_finished_0_93_journal_is_history_to_every_command() {
+    const V0_93_JOURNAL: &str = r#"format = 10
+version = "0.93.0"
+build_number = 1790305290
+commit = "73a9b424007d54efc8aad91354dd1151623e2a40"
+min_build = 1786131079
+arm64_only = false
+manifest_signed = true
+signature_required = true
+signature_pubkey = "YOHw0OoefQ79NdE8qsQFobIMR7QXChpreYBi2Of74Uo="
+signature_machine_id = "m3"
+release_id = 396261568
+draft_create_issued = true
+upload_intents = ["aterm-0.93.0.dmg", "aterm-0.93.0.dmg.sha256", "aterm-0.93.0-mac.zip", "aterm-0.93.0-mac.zip.sha256", "aterm-appcast.toml", "aterm-0.93.0-build.txt", "aterm-machines.toml", "aterm-machines.toml.sig", "aterm-appcast.toml.sig", "aterm-0.93.0-dSYM.zip"]
+mirror_release_id = 396254439
+mirror_create_issued = true
+mirror_upload_intents = ["aterm-0.93.0-mac.zip", "aterm-0.93.0-mac.zip.sha256", "aterm-0.93.0.dmg", "aterm-0.93.0.dmg.sha256", "aterm-mac.zip", "aterm-mac.zip.sha256", "aterm.dmg", "aterm.dmg.sha256", "aterm-appcast.toml.sig", "aterm-appcast.toml"]
+done = ["lock", "build", "selfcheck", "draft", "upload", "preflip", "tag", "flip", "archive", "verify", "mirror", "unlock"]
+"#;
+    let dir = tmpdir("journal-v0-93");
+    let path = dir.join("cut-state.toml");
+    std::fs::write(&path, V0_93_JOURNAL).unwrap();
+
+    let header = publish::JournalHeader::read(&path).unwrap().unwrap();
+    assert_eq!(
+        (
+            header.format,
+            header.version.as_str(),
+            header.build_number,
+            header.finished()
+        ),
+        (10, "0.93.0", 1_790_305_290, true)
+    );
+    for kind in [
+        publish::CutKind::Real,
+        publish::CutKind::DryRun,
+        publish::CutKind::Rehearse,
+    ] {
+        assert!(
+            publish::fresh_cut_journal_triage(Some(&header), kind).unwrap(),
+            "{kind:?} clears it"
+        );
+    }
+    assert!(Journal::load_if_ours(&path).unwrap().is_none());
+    let error = Journal::load(&path).unwrap_err().to_string();
+    assert!(
+        error.contains("format-10 cut journal (v0.93.0 build 1790305290"),
+        "{error}"
+    );
+
+    // NEGATIVE CONTROL: the same cut stopped short of `unlock` is NOT history — it
+    // holds a lease, and only its own cutter may finish or withdraw it.
+    std::fs::write(
+        &path,
+        V0_93_JOURNAL.replace(", \"mirror\", \"unlock\"]", "]"),
+    )
+    .unwrap();
+    let header = publish::JournalHeader::read(&path).unwrap().unwrap();
+    assert!(!header.finished());
+    let error = publish::fresh_cut_journal_triage(Some(&header), publish::CutKind::Real)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("after step \"verify\" by a format-10 cutter"),
+        "{error}"
+    );
 }
 
 /// A FAILING WEBSITE HOOK LEAVES THE CUT COMPLETE. The hook stub exits 1 (the
@@ -461,7 +599,7 @@ fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
     let path = dir.join("cut-state.toml");
     let mut complete = journal();
     complete.release_id = Some(55);
-    complete.draft_create_issued = true;
+    complete.release_intent = true;
     complete.done = STEPS.iter().map(|step| (*step).to_string()).collect();
     complete.save(&path).unwrap();
 
@@ -492,7 +630,11 @@ fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
     let after = Journal::load(&path).unwrap().unwrap();
     assert_eq!(after.first_incomplete(), None, "the journal stays complete");
     assert!(
-        publish::fresh_cut_journal_triage(Some(&after), publish::CutKind::Real).unwrap(),
+        publish::fresh_cut_journal_triage(
+            Some(&publish::JournalHeader::read(&path).unwrap().unwrap()),
+            publish::CutKind::Real
+        )
+        .unwrap(),
         "and the next cut is not refused by it"
     );
 
@@ -518,19 +660,19 @@ fn a_failing_site_hook_warns_and_leaves_the_journal_complete() {
 #[test]
 fn the_exact_asset_set_refuses_the_retired_lite_twin() {
     // Today's exact set has exactly one DMG and no retired name…
-    let set = mirror::required_asset_names("0.61.0", false, false);
+    let set = channel::required_asset_names("0.61.0", false, false);
     assert!(
         !set.iter()
             .any(|n| n.contains("lite") || n.contains("offline") || n.contains("x86_64")),
         "{set:?}"
     );
-    mirror::validate_mirror_asset_set_with_linux(&set, "0.61.0", false, false, &[]).unwrap();
+    channel::validate_channel_asset_set(&set, "0.61.0", false, false, &[]).unwrap();
     // …and a channel head the old cutter already gave the lean twin to is
     // refused, naming the foreign object.
     let mut stale = set.clone();
     stale.push("aterm-0.61.0-lite.dmg".to_string());
     stale.push("aterm-offline.dmg".to_string());
-    let err = mirror::validate_mirror_asset_set_with_linux(&stale, "0.61.0", false, false, &[])
+    let err = channel::validate_channel_asset_set(&stale, "0.61.0", false, false, &[])
         .expect_err("the retired twin on the channel head is a foreign object");
     assert!(err.to_string().contains("aterm-0.61.0-lite.dmg"), "{err}");
 }
@@ -1207,10 +1349,6 @@ fn live_archive_identity_requires_exact_version_build_commit_and_local_bytes() {
     assert!(err.contains("byte-identical"), "{err}");
 }
 
-// ---------------------------------------------------------------------------
-// journaled single-head appcast archive migration
-// ---------------------------------------------------------------------------
-
 fn archive_release(tag: &str, draft: bool, assets: &[(u64, &str)]) -> publish::AppcastRelease {
     publish::AppcastRelease {
         release_id: assets.first().map_or(1, |(id, _)| *id),
@@ -1225,111 +1363,6 @@ fn archive_release(tag: &str, draft: bool, assets: &[(u64, &str)]) -> publish::A
             })
             .collect(),
     }
-}
-
-#[derive(Debug)]
-struct FakeArchiveRemote {
-    releases: Vec<publish::AppcastRelease>,
-    renamed: Vec<publish::AppcastRename>,
-    /// Fail once just before this zero-based successful rename count.
-    fail_after: Option<usize>,
-    /// Retired mutant: claim PATCH success without changing metadata.
-    no_archive_mutant: bool,
-}
-
-impl FakeArchiveRemote {
-    fn new(releases: Vec<publish::AppcastRelease>) -> Self {
-        Self {
-            releases,
-            renamed: Vec::new(),
-            fail_after: None,
-            no_archive_mutant: false,
-        }
-    }
-
-    fn asset_name(&self, id: u64) -> Option<&str> {
-        self.releases
-            .iter()
-            .flat_map(|release| &release.assets)
-            .find(|asset| asset.id == id)
-            .map(|asset| asset.name.as_str())
-    }
-}
-
-impl publish::AppcastArchiveRemote for FakeArchiveRemote {
-    fn list_releases(&mut self) -> ledger::Result<Vec<publish::AppcastRelease>> {
-        Ok(self.releases.clone())
-    }
-
-    fn rename_asset(&mut self, rename: &publish::AppcastRename) -> ledger::Result<()> {
-        if self.fail_after == Some(self.renamed.len()) {
-            self.fail_after = None;
-            return Err(ledger::Error::new("injected crash between PATCHes"));
-        }
-        self.renamed.push(rename.clone());
-        if self.no_archive_mutant {
-            return Ok(());
-        }
-        let release = self
-            .releases
-            .iter_mut()
-            .find(|release| !release.draft && release.tag == rename.tag)
-            .ok_or_else(|| ledger::Error::new("fake release missing"))?;
-        let asset = release
-            .assets
-            .iter_mut()
-            .find(|asset| asset.id == rename.id)
-            .ok_or_else(|| ledger::Error::new("fake asset missing"))?;
-        if asset.name != rename.from {
-            return Err(ledger::Error::new(format!(
-                "fake source drifted: {:?} != {:?}",
-                asset.name, rename.from
-            )));
-        }
-        asset.name.clone_from(&rename.to);
-        Ok(())
-    }
-}
-
-fn archive_fixture() -> Vec<publish::AppcastRelease> {
-    vec![
-        archive_release(
-            "v0.55.0",
-            false,
-            &[
-                (1, manifest_out::MANIFEST_ASSET),
-                (2, manifest_out::MANIFEST_SIG_ASSET),
-            ],
-        ),
-        archive_release(
-            "v0.54.0",
-            false,
-            &[
-                (3, manifest_out::MANIFEST_ASSET),
-                (4, manifest_out::MANIFEST_SIG_ASSET),
-            ],
-        ),
-        archive_release("v0.53.0", false, &[(5, manifest_out::MANIFEST_ASSET)]),
-        archive_release(
-            "v0.52.0",
-            false,
-            &[
-                (6, "aterm-appcast-v0.52.0.toml"),
-                (7, "aterm-appcast-v0.52.0.toml.sig"),
-            ],
-        ),
-        // Drafts are outside the channel and remain byte/name untouched, even
-        // if they carry exact names that would collide if published.
-        archive_release(
-            "v0.56.0",
-            true,
-            &[
-                (8, manifest_out::MANIFEST_ASSET),
-                (9, manifest_out::MANIFEST_SIG_ASSET),
-                (10, "aterm-appcast-v0.56.0.toml"),
-            ],
-        ),
-    ]
 }
 
 /// A valid Ed25519 key (the RFC 8032 vector also used above).
@@ -1350,369 +1383,7 @@ fn without_a_paper_master_signing_stays_per_machine_opt_in() {
 }
 
 #[test]
-fn unsigned_successor_is_allowed_even_when_archived_signatures_exist() {
-    // Killed ratchet: an unsigned v0.55.0 head archives cleanly alongside a prior
-    // release that still carries archived `.sig` bytes. No signed head demanded.
-    let releases = vec![
-        archive_release("v0.55.0", false, &[(1, manifest_out::MANIFEST_ASSET)]),
-        archive_release(
-            "v0.26.0",
-            false,
-            &[
-                (2, "aterm-appcast-v0.26.0.toml"),
-                (3, "aterm-appcast-v0.26.0.toml.sig"),
-            ],
-        ),
-    ];
-    let plan = publish::plan_appcast_archive(&releases, "v0.55.0", false)
-        .expect("unsigned successor is always permitted");
-    assert!(
-        plan.is_empty(),
-        "already-archived history needs no further renames: {plan:?}"
-    );
-}
-
-/// Happy-path conformance against the injected executor: every historical
-/// exact manifest/signature is renamed in place, already-archived history and
-/// drafts are untouched, and asset IDs prove bytes were preserved.
-#[test]
-fn archive_converges_to_one_exact_head_with_deterministic_reversible_renames() {
-    let mut remote = FakeArchiveRemote::new(archive_fixture());
-    let renamed = publish::converge_appcast_archive(&mut remote, "v0.55.0", false).unwrap();
-    assert_eq!(renamed, 3);
-    assert_eq!(
-        remote
-            .renamed
-            .iter()
-            .map(|rename| (rename.id, rename.from.as_str(), rename.to.as_str()))
-            .collect::<Vec<_>>(),
-        [
-            (3, "aterm-appcast.toml", "aterm-appcast-v0.54.0.toml"),
-            (
-                4,
-                "aterm-appcast.toml.sig",
-                "aterm-appcast-v0.54.0.toml.sig"
-            ),
-            (5, "aterm-appcast.toml", "aterm-appcast-v0.53.0.toml"),
-        ]
-    );
-    assert_eq!(remote.asset_name(1), Some(manifest_out::MANIFEST_ASSET));
-    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.0.toml"));
-    assert_eq!(remote.asset_name(4), Some("aterm-appcast-v0.54.0.toml.sig"));
-    assert_eq!(remote.asset_name(6), Some("aterm-appcast-v0.52.0.toml"));
-    assert_eq!(remote.asset_name(8), Some(manifest_out::MANIFEST_ASSET));
-    publish::prove_single_appcast_head(&remote.releases, "v0.55.0", false).unwrap();
-}
-
-/// Journal-level partial resume: the first metadata PATCH survives an injected
-/// crash, and the next convergence plans only the unrenamed suffix. No asset is
-/// downloaded, replaced, or renamed twice.
-#[test]
-fn archive_partial_patch_resumes_from_remote_metadata() {
-    let mut remote = FakeArchiveRemote::new(vec![
-        archive_release(
-            "v0.55.0",
-            false,
-            &[
-                (1, manifest_out::MANIFEST_ASSET),
-                (2, manifest_out::MANIFEST_SIG_ASSET),
-            ],
-        ),
-        archive_release(
-            "v0.54.0",
-            false,
-            &[
-                (3, manifest_out::MANIFEST_ASSET),
-                (4, manifest_out::MANIFEST_SIG_ASSET),
-            ],
-        ),
-    ]);
-    remote.fail_after = Some(1);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("injected crash"), "{err}");
-    assert_eq!(remote.asset_name(3), Some("aterm-appcast-v0.54.0.toml"));
-    assert_eq!(remote.asset_name(4), Some(manifest_out::MANIFEST_SIG_ASSET));
-
-    assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.55.0", false).unwrap(),
-        1,
-        "resume performs only the unfinished signature PATCH"
-    );
-    assert_eq!(
-        remote
-            .renamed
-            .iter()
-            .map(|rename| rename.id)
-            .collect::<Vec<_>>(),
-        [3, 4],
-        "the successful prefix is never repeated"
-    );
-}
-
-/// Collision preflight covers the entire release set before mutation, so an
-/// existing deterministic target can never be overwritten or partially mixed
-/// with earlier successful renames.
-#[test]
-fn archive_name_collision_fails_before_any_patch() {
-    let mut releases = archive_fixture();
-    // Put the collision after two earlier releases that would otherwise plan
-    // three renames; whole-set planning must still execute zero PATCHes.
-    releases[3].assets.push(publish::AppcastAsset {
-        id: 30,
-        name: manifest_out::MANIFEST_ASSET.into(),
-    });
-    let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("name collision"), "{err}");
-    assert!(
-        remote.renamed.is_empty(),
-        "collision must preflight globally"
-    );
-    assert_eq!(remote.asset_name(3), Some(manifest_out::MANIFEST_ASSET));
-}
-
-/// Negative control for the retired no-archive behavior: even an executor that
-/// falsely reports PATCH success cannot pass the postcondition without actually
-/// moving the same asset IDs to deterministic archive names.
-#[test]
-fn no_archive_mutant_is_caught_by_fresh_remote_proof() {
-    let mut remote = FakeArchiveRemote::new(archive_fixture());
-    remote.no_archive_mutant = true;
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("after PATCH") || err.contains("single-head invariant"),
-        "{err}"
-    );
-    assert_eq!(remote.asset_name(3), Some(manifest_out::MANIFEST_ASSET));
-}
-
-/// The exact discovery invariant is independently executable and includes the
-/// draft boundary plus the paired-signature postcondition.
-#[test]
-fn exactly_one_head_invariant_accepts_only_current_published_exact_name() {
-    let converged = vec![
-        archive_release(
-            "v0.55.0",
-            false,
-            &[
-                (1, manifest_out::MANIFEST_ASSET),
-                (4, manifest_out::MANIFEST_SIG_ASSET),
-            ],
-        ),
-        archive_release("v0.54.0", false, &[(2, "aterm-appcast-v0.54.0.toml")]),
-        archive_release("v0.56.0", true, &[(3, manifest_out::MANIFEST_ASSET)]),
-    ];
-    publish::prove_single_appcast_head(&converged, "v0.55.0", false).unwrap();
-
-    let mut two_heads = converged.clone();
-    two_heads[1].assets[0].name = manifest_out::MANIFEST_ASSET.into();
-    assert!(publish::prove_single_appcast_head(&two_heads, "v0.55.0", false).is_err());
-
-    let mut no_head = converged.clone();
-    no_head[0].assets[0].name = "aterm-appcast-v0.55.0.toml".into();
-    assert!(publish::prove_single_appcast_head(&no_head, "v0.55.0", false).is_err());
-
-    let mut stale_sig = converged;
-    stale_sig[1].assets.push(publish::AppcastAsset {
-        id: 5,
-        name: manifest_out::MANIFEST_SIG_ASSET.into(),
-    });
-    assert!(publish::prove_single_appcast_head(&stale_sig, "v0.55.0", false).is_err());
-}
-
-/// A resumed old cut is never allowed to rename a newer live head. This is
-/// independent of GitHub list order: the vMAJOR.MINOR.PATCH channel protocol
-/// is the authority, and the entire plan fails before the first PATCH.
-#[test]
-fn stale_archive_refuses_newer_exact_head_before_any_patch() {
-    let mut releases = archive_fixture();
-    releases[4].draft = false;
-    let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("same-or-newer published channel tag v0.56.0"),
-        "{err}"
-    );
-    assert!(remote.renamed.is_empty(), "stale plan must mutate nothing");
-    assert_eq!(remote.asset_name(3), Some(manifest_out::MANIFEST_ASSET));
-    assert_eq!(remote.asset_name(8), Some(manifest_out::MANIFEST_ASSET));
-
-    let model = aterm_spec::derive::release_channel_single_head_model();
-    let mut stale = model.init_state();
-    for action in [
-        "LoadUnfinishedLegacyJournal",
-        "AcquireCompetingOwner",
-        "PublishNewerHead",
-    ] {
-        assert!(model.fire(action, &mut stale), "{action}: {stale:?}");
-    }
-    let refused = model.successors("AbortNewerHead", &stale)[0].clone();
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &stale,
-        &refused,
-        Some("AbortNewerHead"),
-        "archive planner refuses a newer exact channel head before PATCH",
-    );
-    assert!(
-        admitted,
-        "model rejected production stale-head refusal: {why}"
-    );
-}
-
-/// THE first-cut hazard of the cut-over, executable: the live channel head is
-/// the retired two-component v0.61, and the first release under the new scheme
-/// is v0.2.0 — which orders BELOW it on any two-field comparison. A retired
-/// release is not on this version line at all, so it cannot contest authority;
-/// it is still archived off the client's discovery surface like any history.
-#[test]
-fn archive_authority_ignores_retired_two_component_releases() {
-    let current = archive_release("v0.2.0", false, &[(1, manifest_out::MANIFEST_ASSET)]);
-    let retired = archive_release("v0.61", false, &[(2, manifest_out::MANIFEST_ASSET)]);
-    let plan = publish::plan_appcast_archive(&[current, retired], "v0.2.0", false)
-        .expect("a retired release cannot block the first cut under the new scheme");
-    assert_eq!(
-        plan.iter()
-            .map(|rename| (rename.tag.as_str(), rename.to.as_str()))
-            .collect::<Vec<_>>(),
-        [("v0.61", "aterm-appcast-v0.61.toml")],
-        "the retired head still loses its exact name"
-    );
-
-    // Convergence proves the single-head invariant against a real remote.
-    let mut remote = FakeArchiveRemote::new(vec![
-        archive_release("v0.2.0", false, &[(1, manifest_out::MANIFEST_ASSET)]),
-        archive_release("v0.61", false, &[(2, manifest_out::MANIFEST_ASSET)]),
-        archive_release("v0.25", false, &[(3, "aterm-appcast-v0.25.toml")]),
-    ]);
-    assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.2.0", false).unwrap(),
-        1,
-        "already-archived retired history needs no further renames"
-    );
-    assert_eq!(remote.asset_name(1), Some(manifest_out::MANIFEST_ASSET));
-    assert_eq!(remote.asset_name(2), Some("aterm-appcast-v0.61.toml"));
-    publish::prove_single_appcast_head(&remote.releases, "v0.2.0", false).unwrap();
-}
-
-/// The archive planner orders by the full three-component tag: the
-/// repository's real pre-canonical `v0.21.2607041853` shape is provably older
-/// history, while a same/newer PATCH extension is never mistaken for it.
-#[test]
-fn archive_orders_deep_numeric_tags_without_weakening_stale_head_guard() {
-    let current = archive_release("v0.55.0", false, &[(1, manifest_out::MANIFEST_ASSET)]);
-    let older = archive_release(
-        "v0.21.2607041853",
-        false,
-        &[(2, manifest_out::MANIFEST_ASSET)],
-    );
-    let plan = publish::plan_appcast_archive(&[current.clone(), older], "v0.55.0", false)
-        .expect("a lower three-component tag is provably older");
-    assert_eq!(plan.len(), 1);
-    assert_eq!(plan[0].tag, "v0.21.2607041853");
-
-    let future = archive_release("v0.55.1", false, &[(3, manifest_out::MANIFEST_ASSET)]);
-    let err = publish::plan_appcast_archive(&[current, future], "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("same-or-newer"), "{err}");
-
-    let model = aterm_spec::derive::release_channel_single_head_model();
-    let mut wrong_tag = model.init_state();
-    for action in [
-        "LoadUnfinishedLegacyJournal",
-        "AcquireCompetingOwner",
-        "ReplaceTagAtSameBuild",
-    ] {
-        assert!(
-            model.fire(action, &mut wrong_tag),
-            "{action}: {wrong_tag:?}"
-        );
-    }
-    let refused = model.successors("AbortWrongTag", &wrong_tag)[0].clone();
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &wrong_tag,
-        &refused,
-        Some("AbortWrongTag"),
-        "archive planner refuses a same-build noncanonical successor tag",
-    );
-    assert!(
-        admitted,
-        "model rejected production wrong-tag refusal: {why}"
-    );
-}
-
-/// Killed ratchet: an unsigned current head archives cleanly even when the
-/// prior fixture history carried signatures. Nothing forces a signed head, so
-/// the whole migration converges to a single unsigned exact head.
-#[test]
-fn unsigned_current_head_archives_cleanly_alongside_signed_history() {
-    let mut releases = archive_fixture();
-    releases[0]
-        .assets
-        .retain(|asset| asset.name != manifest_out::MANIFEST_SIG_ASSET);
-    let mut remote = FakeArchiveRemote::new(releases);
-    let renamed = publish::converge_appcast_archive(&mut remote, "v0.55.0", false)
-        .expect("unsigned successor is always permitted");
-    assert_eq!(renamed, 3);
-    publish::prove_single_appcast_head(&remote.releases, "v0.55.0", false).unwrap();
-
-    // Planning the same converged unsigned head again is a no-op, never a refusal.
-    assert!(
-        publish::plan_appcast_archive(&remote.releases, "v0.55.0", false)
-            .unwrap()
-            .is_empty()
-    );
-}
-
-/// The PINNED channel's arm, which every archive test above leaves out by
-/// passing `false`: under a signing epoch (`step_archive` passes the cut's own
-/// `signature_required`) a signed head archives exactly as an unsigned one does,
-/// and an UNSIGNED head is refused before any PATCH — renaming the older signed
-/// heads away would leave installed updaters nothing they accept.
-#[test]
-fn a_signing_epoch_archives_a_signed_head_and_refuses_an_unsigned_one_before_any_patch() {
-    let mut remote = FakeArchiveRemote::new(archive_fixture());
-    assert_eq!(
-        publish::converge_appcast_archive(&mut remote, "v0.55.0", true).unwrap(),
-        3
-    );
-    publish::prove_single_appcast_head(&remote.releases, "v0.55.0", true).unwrap();
-
-    let mut releases = archive_fixture();
-    releases[0]
-        .assets
-        .retain(|asset| asset.name != manifest_out::MANIFEST_SIG_ASSET);
-    let mut remote = FakeArchiveRemote::new(releases);
-    let err = publish::converge_appcast_archive(&mut remote, "v0.55.0", true)
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains("refusing to hide every older signed candidate"),
-        "{err}"
-    );
-    assert!(
-        remote.renamed.is_empty(),
-        "the refusal precedes every PATCH"
-    );
-    assert_eq!(remote.asset_name(3), Some(manifest_out::MANIFEST_ASSET));
-}
-
-/// Production listing parser retains exact and archived IDs under their
-/// deterministic names and represents asset-less releases for pagination.
-#[test]
-fn archive_listing_parser_is_lossless_for_relevant_metadata() {
+fn appcast_listing_parser_is_lossless_for_relevant_metadata() {
     let rows = r#"{"release_id":55,"tag":"v0.55.0","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml.sig"}]}
 {"release_id":54,"tag":"v0.54.0","draft":false,"target_commitish":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","assets":[{"id":3,"name":"aterm-appcast-v0.54.0.toml"},{"id":4,"name":"aterm-appcast-v0.54.0.toml.sig"}]}
 {"release_id":56,"tag":"v0.56.0","draft":true,"target_commitish":"cccccccccccccccccccccccccccccccccccccccc","assets":[{"id":5,"name":"aterm-appcast.toml"}]}
@@ -1750,17 +1421,24 @@ fn archive_listing_parser_is_lossless_for_relevant_metadata() {
 }
 
 /// Production's JSON projection retains every matching asset instead of
-/// collapsing `[0]`; duplicate exact names therefore reach the same ambiguity
-/// guard exercised by the in-memory remote.
+/// collapsing `[0]`; duplicate exact names therefore reach the head-signature
+/// replay's ambiguity guard, which refuses before any download.
 #[test]
-fn archive_listing_preserves_duplicates_for_fail_closed_preflight() {
+fn appcast_listing_preserves_duplicates_for_fail_closed_replay() {
     let rows = r#"{"release_id":55,"tag":"v0.55.0","draft":false,"target_commitish":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","assets":[{"id":1,"name":"aterm-appcast.toml"},{"id":2,"name":"aterm-appcast.toml"},{"id":3,"name":"aterm-appcast.toml.sig"}]}
 "#;
     let parsed = publish::parse_appcast_asset_listing(rows).unwrap();
     assert_eq!(parsed[0].assets.len(), 3);
-    let err = publish::plan_appcast_archive(&parsed, "v0.55.0", false)
-        .unwrap_err()
-        .to_string();
+    let err = publish::verify_channel_head_signature_with(
+        &parsed,
+        "v0.55.0",
+        b"",
+        None,
+        OTHER_KEY,
+        |_, _, _, _| panic!("an ambiguous head is refused before any download"),
+    )
+    .unwrap_err()
+    .to_string();
     assert!(err.contains("duplicate assets"), "{err}");
 }
 
@@ -1836,52 +1514,39 @@ impl ledger::GitRunner for HistoricalTagGit {
     }
 }
 
+/// The published head binds back to its source through the origin tag the cut
+/// pushed: an annotated tag whose peel is the manifest's claim commit.
 #[test]
-fn historical_tag_binding_accepts_annotated_and_lightweight_exact_refs() {
+fn the_head_tag_binding_accepts_the_exact_annotated_ref() {
     let tag_object = "1".repeat(40);
-    let annotated_commit = "a".repeat(40);
-    let lightweight_commit = "b".repeat(40);
-    let output = format!(
-        "{tag_object}\trefs/tags/v0.25.0\n{annotated_commit}\trefs/tags/v0.25.0^{{}}\n\
-         {lightweight_commit}\trefs/tags/v0.24.0\n"
-    );
+    let commit = "a".repeat(40);
+    let output = format!("{tag_object}\trefs/tags/v0.25.0\n{commit}\trefs/tags/v0.25.0^{{}}\n");
     let git = HistoricalTagGit::with_stdout(output.into_bytes());
-    publish::assert_remote_historical_tag_commits(
-        &git,
-        &[
-            ("v0.25.0", annotated_commit.as_str()),
-            ("v0.24.0", lightweight_commit.as_str()),
-        ],
-    )
-    .unwrap();
+    publish::assert_remote_annotated_tag_commit(&git, "v0.25.0", &commit).unwrap();
 }
 
 #[test]
-fn historical_tag_binding_rejects_missing_wrong_and_malformed_refs() {
+fn the_head_tag_binding_rejects_missing_lightweight_wrong_and_malformed_refs() {
     let commit = "a".repeat(40);
     let wrong = "b".repeat(40);
+    let tag_object = "1".repeat(40);
     let missing = HistoricalTagGit::with_stdout(Vec::new());
-    assert!(
-        publish::assert_remote_historical_tag_commits(&missing, &[("v0.25.0", commit.as_str())])
-            .is_err()
-    );
+    assert!(publish::assert_remote_annotated_tag_commit(&missing, "v0.25.0", &commit).is_err());
 
-    let wrong_git =
-        HistoricalTagGit::with_stdout(format!("{wrong}\trefs/tags/v0.25.0\n").into_bytes());
-    assert!(
-        publish::assert_remote_historical_tag_commits(&wrong_git, &[("v0.25.0", commit.as_str())])
-            .is_err()
+    let lightweight =
+        HistoricalTagGit::with_stdout(format!("{commit}\trefs/tags/v0.25.0\n").into_bytes());
+    assert!(publish::assert_remote_annotated_tag_commit(&lightweight, "v0.25.0", &commit).is_err());
+
+    let wrong_git = HistoricalTagGit::with_stdout(
+        format!("{tag_object}\trefs/tags/v0.25.0\n{wrong}\trefs/tags/v0.25.0^{{}}\n").into_bytes(),
     );
+    assert!(publish::assert_remote_annotated_tag_commit(&wrong_git, "v0.25.0", &commit).is_err());
 
     let malformed_git = HistoricalTagGit::with_stdout(
         format!("{commit}\trefs/tags/v0.25.0\n{commit}\trefs/tags/v0.25.0^{{}}\n").into_bytes(),
     );
     assert!(
-        publish::assert_remote_historical_tag_commits(
-            &malformed_git,
-            &[("v0.25.0", commit.as_str())]
-        )
-        .is_err()
+        publish::assert_remote_annotated_tag_commit(&malformed_git, "v0.25.0", &commit).is_err()
     );
 }
 
@@ -1929,34 +1594,19 @@ fn published_snapshot_preserves_symbolic_target_but_claim_capability_does_not() 
         false,
     )
     .unwrap();
-
-    let mut scratch = yank_published("v0.25.0", historical.id, None);
-    scratch.release_id = Some(historical.id);
-    scratch.release = Some(historical.clone());
-    assert!(
-        verify::validate_unbound_published_target(&scratch).is_err(),
-        "scratch/rehearsal scans cannot borrow an unrelated origin tag binding"
-    );
-    scratch.release.as_mut().unwrap().target_commitish = manifest_commit;
-    verify::validate_unbound_published_target(&scratch).unwrap();
 }
 
-/// A MIRRORED channel head is valid with a default-branch target, and the private
-/// claim-SHA capability check must keep rejecting it.
+/// A channel release is valid with a default-branch target: the claim commit lives
+/// on origin, so a channel release is anchored at the channel's default branch, and
+/// its identity is the immutable ID, the tag and the state — never a claim SHA.
 ///
-/// This is the invariant `step_mirror` violated on v0.6.0 and v0.7.0. Both cuts
-/// created the public draft, uploaded the assets and flipped it live — correctly —
-/// and then `prove_mirror_channel_head` ran the PRIVATE scan over the channel and
-/// refused, because a mirrored release is anchored at the channel's default branch
-/// (`create_mirror_draft` sends no `target_commitish`: the claim commit does not
-/// exist in that repository). The releases were right; the cut wedged with the
-/// lease still held and needed a hand-edited journal to finish.
-///
-/// The first assertion is the negative control. It must stay: it is what stops
-/// someone "fixing" the channel case by relaxing the private capability check,
-/// which every scratch/rehearsal path depends on.
+/// This is the invariant the mirror violated on v0.6.0 and v0.7.0: both cuts put
+/// the release on the channel correctly, then ran a claim-SHA-bound scan over it and
+/// refused, wedging with the lease held. The negative control stays: the claim-SHA
+/// capability still refuses the object, so nobody "fixes" a channel scan by binding
+/// it to a target a channel release can never carry.
 #[test]
-fn a_mirrored_channel_head_is_valid_with_a_default_branch_target() {
+fn a_channel_release_is_valid_with_a_default_branch_target() {
     let claim = "d".repeat(40);
     let mirrored = publish::ReleaseObjectIdentity {
         id: 360_201_027,
@@ -1965,20 +1615,10 @@ fn a_mirrored_channel_head_is_valid_with_a_default_branch_target() {
         target_commitish: "main".into(),
     };
 
-    // NEGATIVE CONTROL — the private invariant still refuses this object.
-    let mut row = yank_published("v0.7.0", 1_785_125_098, None);
-    row.release_id = Some(mirrored.id);
-    row.release = Some(mirrored.clone());
-    row.tag = "v0.7.0".into();
-    assert!(
-        verify::validate_unbound_published_target(&row).is_err(),
-        "the private claim-SHA capability must keep rejecting a default-branch \
-         target — scratch and rehearsal scans depend on it"
-    );
-
-    // ...and the object itself is a perfectly good release: same id, same tag,
-    // published. Only the target differs, and on a channel it must.
+    // The object is a perfectly good channel release: same id, same tag, published.
     publish::validate_release_object_snapshot(Some(&mirrored), &mirrored).unwrap();
+    publish::validate_release_object_tag_state(Some(&mirrored), mirrored.id, "v0.7.0", false)
+        .unwrap();
     assert!(
         publish::validate_release_object_capability(
             Some(&mirrored),
@@ -2070,13 +1710,8 @@ fn appcast_with_floor(version: &str, build: u64, min_build: Option<u64>) -> Vec<
     .into_bytes()
 }
 
-fn release_metadata_row(
-    tag: &str,
-    draft: bool,
-    exact_count: usize,
-    archive_count: usize,
-) -> String {
-    format!("{tag}\t{draft}\t{exact_count}\t{archive_count}")
+fn release_metadata_row(tag: &str, draft: bool, exact_count: usize) -> String {
+    format!("{tag}\t{draft}\t{exact_count}")
 }
 
 /// GitHub documents no List Releases row ordering. Numeric authority and the
@@ -2085,9 +1720,9 @@ fn release_metadata_row(
 #[test]
 fn client_arbitration_is_permutation_invariant_and_skips_older_503() {
     let rows = [
-        release_metadata_row("v0.9.0", false, 1, 0),
-        release_metadata_row("v0.10.0", false, 1, 0),
-        release_metadata_row("v0.8.0", false, 1, 0),
+        release_metadata_row("v0.9.0", false, 1),
+        release_metadata_row("v0.10.0", false, 1),
+        release_metadata_row("v0.8.0", false, 1),
     ];
     for order in [
         [0usize, 1usize, 2usize],
@@ -2146,9 +1781,9 @@ fn client_arbitration_tolerates_real_lower_numeric_legacy_heads() {
     let mut rows: Vec<String> = legacy_tags
         .iter()
         .rev()
-        .map(|tag| release_metadata_row(tag, false, 1, 0))
+        .map(|tag| release_metadata_row(tag, false, 1))
         .collect();
-    rows.insert(6, release_metadata_row("v0.54.0", false, 1, 0));
+    rows.insert(6, release_metadata_row("v0.54.0", false, 1));
     let listing = rows.join("\n");
     let mut fetched = Vec::new();
     let (_, scanned) = verify::scan_release_page(&listing, true, |_, tag, asset| {
@@ -2187,8 +1822,8 @@ fn client_arbitration_refuses_unorderable_tags() {
         "0.54.0",
     ] {
         let listing = [
-            release_metadata_row("v0.54.0", false, 1, 0),
-            release_metadata_row(rejected, false, 1, 0),
+            release_metadata_row("v0.54.0", false, 1),
+            release_metadata_row(rejected, false, 1),
         ]
         .join("\n");
         let mut fetched = false;
@@ -2216,9 +1851,9 @@ fn client_arbitration_refuses_unorderable_tags() {
 #[test]
 fn client_arbitration_skips_retired_two_component_releases() {
     let listing = [
-        release_metadata_row("v0.61", false, 1, 0),
-        release_metadata_row("v0.2.0", false, 1, 0),
-        release_metadata_row("v0.25", false, 1, 0),
+        release_metadata_row("v0.61", false, 1),
+        release_metadata_row("v0.2.0", false, 1),
+        release_metadata_row("v0.25", false, 1),
     ]
     .join("\n");
     let mut fetched = Vec::new();
@@ -2247,8 +1882,8 @@ fn client_arbitration_skips_retired_two_component_releases() {
     // With no current-scheme candidate at all, a page of retired releases
     // selects NOTHING — it must never fall back to archive history.
     let retired_only = [
-        release_metadata_row("v0.61", false, 1, 0),
-        release_metadata_row("v0.25", false, 1, 0),
+        release_metadata_row("v0.61", false, 1),
+        release_metadata_row("v0.25", false, 1),
     ]
     .join("\n");
     let (_, none) = verify::scan_release_page(&retired_only, true, |_, tag, _| {
@@ -2261,14 +1896,14 @@ fn client_arbitration_skips_retired_two_component_releases() {
 #[test]
 fn client_arbitration_rejects_malformed_and_duplicate_metadata_before_fetch() {
     let fixtures = [
-        release_metadata_row("v0.54.0", false, 2, 0),
+        release_metadata_row("v0.54.0", false, 2),
         [
-            release_metadata_row("v0.54.0", false, 1, 0),
-            release_metadata_row("v0.54.0", false, 1, 0),
+            release_metadata_row("v0.54.0", false, 1),
+            release_metadata_row("v0.54.0", false, 1),
         ]
         .join("\n"),
-        "v0.54.0\tfalse\tnot-a-count\t0".to_string(),
-        "v0.54.0\tfalse\t1".to_string(),
+        "v0.54.0\tfalse\tnot-a-count".to_string(),
+        "v0.54.0\tfalse".to_string(),
     ];
     for listing in fixtures {
         let mut fetched = false;
@@ -2291,8 +1926,8 @@ fn client_arbitration_rejects_malformed_and_duplicate_metadata_before_fetch() {
 #[test]
 fn authoritative_fetch_and_version_mismatch_never_fall_back() {
     let listing = [
-        release_metadata_row("v0.9.0", false, 1, 0),
-        release_metadata_row("v0.10.0", false, 1, 0),
+        release_metadata_row("v0.9.0", false, 1),
+        release_metadata_row("v0.10.0", false, 1),
     ]
     .join("\n");
 
@@ -2326,32 +1961,14 @@ fn authoritative_fetch_and_version_mismatch_never_fall_back() {
     );
 }
 
-/// Archived names are normal historical metadata and invisible to the client
-/// lane; only the exhaustive operator lane may fetch them.
-#[test]
-fn client_replay_ignores_archived_only_history() {
-    let mut fetched = false;
-    let (_, scanned) = verify::scan_release_page(
-        &release_metadata_row("v0.41.0", false, 0, 1),
-        true,
-        |_, _, _| {
-            fetched = true;
-            Ok(appcast("0.41.0", 410))
-        },
-    )
-    .unwrap();
-    assert!(!fetched);
-    assert!(scanned.is_empty());
-}
-
 /// Negative control for the exact retired behavior: disabling the early stop
 /// reaches the injected old-release 503 and fails. If the positive fixture did
 /// not distinguish the two policies, this assertion could not pass.
 #[test]
 fn no_stop_negative_control_reproduces_old_appcast_503() {
     let listing = [
-        release_metadata_row("v0.54.0", false, 1, 0),
-        release_metadata_row("v0.41.0", false, 0, 1),
+        release_metadata_row("v0.54.0", false, 1),
+        release_metadata_row("v0.41.0", false, 1),
     ]
     .join("\n");
     let mut fetched = Vec::new();
@@ -2369,10 +1986,7 @@ fn no_stop_negative_control_reproduces_old_appcast_503() {
         fetched,
         [
             ("v0.54.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
-            (
-                "v0.41.0".to_string(),
-                manifest_out::archived_manifest_asset("v0.41.0")
-            )
+            ("v0.41.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
         ]
     );
     assert!(err.to_string().contains("v0.41.0 appcast: HTTP 503"));
@@ -2384,10 +1998,10 @@ fn no_stop_negative_control_reproduces_old_appcast_503() {
 #[test]
 fn exhaustive_page_preserves_all_published_appcasts() {
     let listing = [
-        release_metadata_row("v0.55.0", true, 1, 0),
-        release_metadata_row("v0.54.0", false, 1, 0),
-        release_metadata_row("v0.53.0", false, 0, 0),
-        release_metadata_row("v0.41.0", false, 0, 1),
+        release_metadata_row("v0.55.0", true, 1),
+        release_metadata_row("v0.54.0", false, 1),
+        release_metadata_row("v0.53.0", false, 0),
+        release_metadata_row("v0.41.0", false, 1),
     ]
     .join("\n");
     let mut fetched = Vec::new();
@@ -2406,10 +2020,7 @@ fn exhaustive_page_preserves_all_published_appcasts() {
         fetched,
         [
             ("v0.54.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
-            (
-                "v0.41.0".to_string(),
-                manifest_out::archived_manifest_asset("v0.41.0")
-            )
+            ("v0.41.0".to_string(), manifest_out::MANIFEST_ASSET.into()),
         ]
     );
     assert_eq!(
@@ -2423,35 +2034,22 @@ fn exhaustive_page_preserves_all_published_appcasts() {
         verify::select_newest(&scanned).map(|published| published.tag.as_str()),
         Some("v0.54.0")
     );
-    assert_eq!(
-        scanned[1].asset,
-        manifest_out::archived_manifest_asset("v0.41.0"),
-        "exhaustive status/yank history must retain renamed manifests"
-    );
 }
 
-/// The production jq carries both exact and archive counts, so neither lane can
-/// collapse duplicate names to an arbitrary `[0]` result.
+/// The production jq carries the exact appcast COUNT, so neither lane can collapse
+/// duplicate names to an arbitrary `[0]` result.
 #[test]
-fn exhaustive_history_rejects_duplicate_exact_or_archive_names() {
-    for listing in [
-        release_metadata_row("v0.54.0", false, 2, 0),
-        release_metadata_row("v0.41.0", false, 0, 2),
-        release_metadata_row("v0.54.0", false, 1, 1),
-    ] {
-        let mut fetched = false;
-        let err = verify::scan_release_page(&listing, false, |_, _, _| {
-            fetched = true;
-            Ok(appcast("0.54.0", 540))
-        })
-        .unwrap_err()
-        .to_string();
-        assert!(!fetched);
-        assert!(
-            err.contains("duplicate assets") || err.contains("both exact"),
-            "{err}"
-        );
-    }
+fn exhaustive_history_rejects_duplicate_exact_names() {
+    let listing = release_metadata_row("v0.54.0", false, 2);
+    let mut fetched = false;
+    let err = verify::scan_release_page(&listing, false, |_, _, _| {
+        fetched = true;
+        Ok(appcast("0.54.0", 540))
+    })
+    .unwrap_err()
+    .to_string();
+    assert!(!fetched);
+    assert!(err.contains("duplicate assets"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -2468,7 +2066,7 @@ fn cli_parses_the_whole_spec_5_surface() {
         .find("successor FIRST")
         .expect("help documents successor-first yank");
     let cleanup = cli::USAGE
-        .find("only then remove")
+        .find("only then delete")
         .expect("help documents post-proof cleanup");
     assert!(
         successor < cleanup,
@@ -2762,6 +2360,17 @@ fn cli_rejects_malformed_and_conflicting_invocations() {
 /// used to take it — a leftover spelling in a script or a runbook must not read as an
 /// unknown flag, and must never be silently accepted.
 #[test]
+fn the_retired_unmirrored_exit_is_refused_in_one_sentence() {
+    let err = parse(&["cut", "--retire-unmirrored", "v0.93.0"]).unwrap_err();
+    assert_eq!(err, cli::RETIRED_UNMIRRORED_REFUSAL);
+    assert!(
+        err.contains("publishes once") && err.contains("--abandon"),
+        "the refusal names why and what replaces it: {err}"
+    );
+    assert_eq!(err.matches(". ").count(), 0, "one sentence: {err}");
+}
+
+#[test]
 fn the_retired_strand_flag_is_refused_in_one_sentence() {
     for args in [
         vec!["cut", cli::RETIRED_STRAND_FLAG],
@@ -2883,21 +2492,8 @@ fn a_resume_that_will_rebuild_runs_the_provenance_gate_first() {
 fn a_resume_past_the_build_never_consults_the_provenance_gate() {
     for done in [
         vec!["lock", "build"],
-        vec!["lock", "build", "selfcheck", "draft"],
-        vec![
-            "lock",
-            "build",
-            "selfcheck",
-            "draft",
-            "upload",
-            "preflip",
-            "tag",
-            "flip",
-            "archive",
-            "verify",
-            "mirror",
-            "unlock",
-        ],
+        vec!["lock", "build", "selfcheck", "tag"],
+        vec!["lock", "build", "selfcheck", "tag", "publish", "unlock"],
     ] {
         let mut j = journal();
         j.done = done.iter().map(|s| (*s).to_string()).collect();

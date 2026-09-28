@@ -3988,7 +3988,7 @@ mod tests {
     fn native_document_queue_admission_conforms_to_the_derived_model() {
         let model = aterm_spec::derive::native_document_queue_model();
         let mut state = model.init_state();
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let uri = "file:///queue-retry.md";
         let document = documents.open(uri.to_string(), "draft".to_string());
         let disk = documents.snapshot(document).unwrap();
@@ -4648,6 +4648,10 @@ mod tests {
         assert!(error.contains("retry opening Manual"), "{error}");
         assert!(app.active_native_view(WindowId(0)).is_none());
 
+        // Released by LOCK_UN, not by the close alone: a child another test is
+        // forking holds this descriptor until it execs, and the retry below has
+        // the event loop's 25 ms journal-lock budget (the fd-copy sweep of 2026-09-27).
+        held.unlock().expect("release the journal lock");
         drop(held);
         app.ensure_and_open_config_editor_path_in_window(WindowId(0), &config)
             .expect("Manual retry succeeds after the lock is released");
@@ -5177,6 +5181,10 @@ mod tests {
             .expect("Manual Save command");
         assert!(save.enabled, "busy failure remains explicitly retryable");
 
+        // Released by LOCK_UN, not by the close alone: a fork's copy outlives the
+        // close until its exec (measured up to 523 ms here), and the retry's
+        // preflight gives up after 500 ms (the fd-copy sweep of 2026-09-27).
+        held.unlock().expect("release the write lock");
         drop(held);
         app.save_document_checkpoint(document, view)
             .expect("Manual Save retry succeeds after lock release");

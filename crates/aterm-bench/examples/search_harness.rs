@@ -26,7 +26,7 @@
 //   -> {"rotating_build_klps":...,"rotating_query_qps":...,"rotating_lines_per_mib":...,
 //       "replog_build_klps":...,"replog_query_qps":...,"replog_lines_per_mib":...,
 //       "index_line_klps":...,"rotating_bytes_per_line":...,"replog_bytes_per_line":...,
-//       "corpus_lines":...,"n":...,"warmup":...}
+//       "tiered_build_klps":...,"corpus_lines":...,"n":...,"warmup":...}
 //
 // Same non-flake discipline as the sibling harnesses: deterministic corpora
 // (no RNG/clock), release subprocess, median-of-N, generous gate ratio.
@@ -97,12 +97,26 @@ use aterm_bench::{linkheavy_corpus, replog_corpus, rotating_corpus};
 /// `RING_LINES` (no eviction: the lane measures indexing, not retention).
 const LINKHEAVY_LINES: usize = 25_000;
 
-/// Fill a fresh ring-only terminal (the SHIPPING config — no tiered store) with
-/// the corpus, so the index covers scrollback + visible exactly as production.
+/// Fill a fresh ring-only terminal (no tiered store) with the corpus, so the
+/// index covers scrollback + visible over the ring's per-row reads.
 fn filled_terminal(corpus: &[u8]) -> Terminal {
     let mut term = TerminalBuilder::new()
         .size(ROWS, COLS)
         .ring_buffer_size(RING_LINES)
+        .build();
+    term.process(black_box(corpus));
+    term
+}
+
+/// Fill a terminal with the TIERED store the GUI session runs (default ring
+/// cap, the rest of history in hot/warm/cold tiers), so the build walks the
+/// compressed tiers — the path the dense history walk
+/// (`Grid::history_lines_from`) exists for. Informational lane
+/// (`tiered_build_klps`): reported, not gated.
+fn filled_tiered_terminal(corpus: &[u8]) -> Terminal {
+    let mut term = TerminalBuilder::new()
+        .size(ROWS, COLS)
+        .tiered_scrollback_defaults()
         .build();
     term.process(black_box(corpus));
     term
@@ -138,8 +152,10 @@ struct CorpusReport {
 /// Measure one corpus. `query` must HIT (a no-match query would measure the
 /// bloom/trigram early-out, not verification).
 fn measure_corpus(corpus: &[u8], query: &str) -> CorpusReport {
-    let mut term = filled_terminal(corpus);
+    measure_terminal(filled_terminal(corpus), query)
+}
 
+fn measure_terminal(mut term: Terminal, query: &str) -> CorpusReport {
     // -- retained index memory: net heap across the FIRST build (cache empty) --
     let before = net();
     let index = term.indexed_search();
@@ -269,6 +285,7 @@ fn main() {
     // ".tgz" hits inside every logical line's visible URL (P7 lane).
     let link = measure_corpus(&linkheavy, "tgz");
     let index_line_klps = measure_index_line(&rotating);
+    let tiered = measure_terminal(filled_tiered_terminal(&rotating), "jkl");
 
     eprintln!(
         "search_harness: rotating — build {:.1} klines/s | {:.0} q/s ({} matches) | \
@@ -286,6 +303,10 @@ fn main() {
         link.build_klps, link.query_qps, link.match_count, link.bytes_per_line, link.indexed_lines,
     );
     eprintln!("search_harness: index_scrollback_line primitive {index_line_klps:.1} klines/s");
+    eprintln!(
+        "search_harness: tiered rotating — build {:.1} klines/s ({} lines, informational)",
+        tiered.build_klps, tiered.indexed_lines,
+    );
 
     println!(
         "{{\"rotating_build_klps\":{:.3},\"rotating_query_qps\":{:.3},\
@@ -296,6 +317,7 @@ fn main() {
          \"index_line_klps\":{:.3},\"rotating_bytes_per_line\":{:.1},\
          \"replog_bytes_per_line\":{:.1},\"linkheavy_bytes_per_line\":{:.1},\
          \"rotating_matches\":{},\"replog_matches\":{},\"linkheavy_matches\":{},\
+         \"tiered_build_klps\":{:.3},\
          \"corpus_lines\":{CORPUS_LINES},\"n\":{N_ITERS},\"warmup\":{WARMUP}}}",
         rot.build_klps,
         rot.query_qps,
@@ -313,5 +335,6 @@ fn main() {
         rot.match_count,
         rep.match_count,
         link.match_count,
+        tiered.build_klps,
     );
 }

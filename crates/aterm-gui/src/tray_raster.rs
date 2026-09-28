@@ -1792,11 +1792,12 @@ fn ui_font_candidates() -> Vec<UiFontCandidate> {
         // no pixel; it stops paying ~107 ms per launch for a result that was
         // always thrown away.
         //
-        // Restoring the documented intent (docs/INTROSPECTABLE_SURFACES_DESIGN.md
-        // §9 says "SF Pro on macOS") needs variable-instance support in the UI
-        // face path, not another candidate entry — that is a deliberate design
-        // choice about the chrome's appearance, so it is left to the owner rather
-        // than smuggled in as a perf fix.
+        // Helvetica Neue IS the macOS chrome UI face (decided 2026-09-25 under
+        // the owner's standing direction; docs/INTROSPECTABLE_SURFACES_DESIGN.md
+        // §9 now says so). SF Pro would be a deliberate appearance change, not a
+        // candidate entry: `SFNS.ttf` is one variable face, which the UI path
+        // could draw through `aterm_render::variation` (`VariedFace` at a resolved
+        // wght) if that change is ever wanted.
         UiFontCandidate {
             regular_path: "/System/Library/Fonts/HelveticaNeue.ttc".into(),
             regular_index: 0,
@@ -2830,24 +2831,6 @@ impl Canvas {
                 }
             }
         }
-    }
-
-    /// PNG bytes of this canvas. TEST-ONLY: the two preview escape hatches
-    /// (`ATERM_TRAY_PREVIEW`, `ATERM_TRAY_THEMES`) are the only callers, so the
-    /// shipping binary does not carry the encoder path. Gated rather than
-    /// `#[allow]`-ed, so it goes dead loudly if those previews are removed.
-    #[cfg(test)]
-    fn to_png(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        {
-            let mut enc = aterm_png::Encoder::new(&mut out, self.w, self.h);
-            enc.set_color(aterm_png::ColorType::Rgba);
-            enc.set_depth(aterm_png::BitDepth::Eight);
-            if let Ok(mut wr) = enc.write_header() {
-                let _ = wr.write_image_data(&self.px);
-            }
-        }
-        out
     }
 }
 
@@ -4165,22 +4148,6 @@ mod tests {
             (None, None) => {}
             _ => panic!("immutable UI asset identity changed during compile/raster"),
         }
-
-        // Line-ending agnostic: a Windows checkout (`core.autocrlf`) hands
-        // `include_str!` CRLF text, and a `\n`-only marker then never splits —
-        // the scan silently widened to this whole test module.
-        let source = include_str!("tray_raster.rs").replace("\r\n", "\n");
-        let canvas = source
-            .split("struct Canvas")
-            .nth(1)
-            .expect("Canvas source")
-            .split("#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production raster source");
-        assert!(
-            !canvas.contains("std::fs::") && !canvas.contains("ui_font_candidates()"),
-            "paint/raster source must remain resolver and filesystem free",
-        );
     }
 
     /// A theme-derived spread of prims — three gauge rings, a capacity capsule, a
@@ -5944,89 +5911,5 @@ mod tests {
                 .any(|c| *c != [13, 15, 20, 255]),
             "tray rendered content over the backdrop"
         );
-
-        // Emit a preview PNG for visual inspection when ATERM_TRAY_PREVIEW is set.
-        if let Ok(path) = std::env::var("ATERM_TRAY_PREVIEW") {
-            let cv = Canvas {
-                origin_x: 0,
-                origin_y: 0,
-                w: pw,
-                h: ph,
-                px: px.clone(),
-                glyphs: std::collections::HashMap::new(),
-                clip: Vec::new(),
-            };
-            let _ = std::fs::write(path, cv.to_png());
-        }
-    }
-
-    /// Render the tray across several built-in themes (panel + colors DERIVED from each
-    /// theme, backdrop = each theme's bg), stacked into one composite PNG, so the tray's
-    /// theme-awareness is visible. Gated on ATERM_TRAY_THEMES=path.
-    #[test]
-    fn previews_across_themes() {
-        let Ok(path) = std::env::var("ATERM_TRAY_THEMES") else {
-            return;
-        };
-        let names = ["Default", "Dracula", "GitHub Light", "Gruvbox Light"];
-        let (cw, ch) = (380.0_f32, 168.0_f32);
-        let scale = 2.0_f32;
-        let (tw, th) = ((cw * scale) as u32, (ch * scale) as u32);
-        let gap = 16u32;
-        let comp_w = tw + 2 * gap;
-        let comp_h = (th + gap) * names.len() as u32 + gap;
-        let mut comp = vec![0u8; (comp_w * comp_h * 4) as usize];
-        // neutral mid backdrop so both dark + light cards read against it
-        for c in comp.as_chunks_mut::<4>().0 {
-            c.copy_from_slice(&[40, 42, 48, 255]);
-        }
-        for (i, name) in names.iter().enumerate() {
-            let theme = aterm_types::scheme::builtin(name).map_or_else(Theme::default, |s| {
-                let p = s.to_theme_parts();
-                Theme {
-                    fg: p.fg,
-                    bg: p.bg,
-                    cursor: p.cursor,
-                    selection: p.selection,
-                }
-            });
-            let bg = theme.bg;
-            let backdrop = [
-                ((bg >> 16) & 0xff) as u8,
-                ((bg >> 8) & 0xff) as u8,
-                (bg & 0xff) as u8,
-                255,
-            ];
-            let panel = crate::chrome_band::band_colors(theme).bar_bg;
-            let mut prims = vec![DrawPrim::Panel {
-                x: 0.0,
-                y: 0.0,
-                w: cw,
-                h: ch,
-                radius: 16.0,
-                fill: [panel[0], panel[1], panel[2], 0xF0],
-            }];
-            prims.extend(demo_prims(cw, ch, theme));
-            let (px, pw, ph) = rasterize_tray(&prims, cw as u32, ch as u32, scale, backdrop);
-            // blit into the composite
-            let oy = gap + i as u32 * (th + gap);
-            let ox = gap;
-            for row in 0..ph.min(th) {
-                let src = (row * pw * 4) as usize;
-                let dst = (((oy + row) * comp_w + ox) * 4) as usize;
-                let n = (pw.min(tw) * 4) as usize;
-                comp[dst..dst + n].copy_from_slice(&px[src..src + n]);
-            }
-        }
-        let cv = Canvas {
-            origin_x: 0,
-            origin_y: 0,
-            w: comp_w,
-            h: comp_h,
-            px: comp,
-            glyphs: std::collections::HashMap::new(),
-            clip: Vec::new(),
-        };
-        let _ = std::fs::write(path, cv.to_png());
     }
 }

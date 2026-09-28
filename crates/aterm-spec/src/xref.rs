@@ -244,9 +244,10 @@ pub fn proof_anchors() -> impl Iterator<Item = &'static ProofAnchor> {
 // four actions the evidence is "the annotated function ran during this action's own
 // step" and NOT "the branch that implements this action was taken". Both
 // `Terminal::post_process` (4 `SelectionCustody` actions) and
-// `Terminal::note_output_custody` (4 `PressCustody` actions) are entered
+// `Terminal::note_output_custody` (7 `PressCustody` actions) are entered
 // unconditionally on every VT batch, so nothing here can tell their siblings apart at
-// all — permuting those four labels among themselves changes no observable.
+// all — permuting either function's labels among themselves (its four, its seven)
+// changes no observable.
 // [`StepAudit::summary`] DERIVES that count and prints it rather than letting the gate
 // claim more; [`StepAudit::shared_site`] is the anchor-table list and
 // [`StepAudit::indiscriminate`] the run-derived one. The other surviving hole is an
@@ -1037,12 +1038,29 @@ pub fn model_registry() -> Vec<Model> {
         // one queue token, even across a worker restart; Tier-1 drives the
         // GUI's real PendingJobs transitions and worker.
         program_resolver_queue_model(),
+        // A stopped Claude footer watch must neither reread a dormant session
+        // nor erase a replacement group's watch. Tier-1 in the GUI scheduler.
+        claude_footer_watch_model(),
         // The event loop's run-loop wake timer (the 2026-09-26 freeze): a late
         // timer costs CoreFoundation one catch-up step, and a spent timer is
         // re-armed, never trusted. Tier-1 in aterm-objc's `conformance_wake_timer`
         // over the real CoreFoundation; no `#[refines]` anchors (the crate ships
         // with zero dependencies).
         run_loop_waker_model(),
+        // The §3.2 two-way supernova burst mutex over the shared `nova_add`
+        // channel. Tier-1 bound TEST-ONLY — aterm-effects' word_decorations test
+        // `real_burst_grants_conform_to_the_supernova_mutex_model` drives the
+        // real `super_prepass`/`nova_prepass` grants against `action_enabled` —
+        // with no `#[refines]` anchors (aterm-effects carries no `spec-anchors`
+        // feature). Registered so the non-vacuity sweep covers its invariants.
+        supernova_burst_mutex_model(),
+        // The server's agent verdict as the handshake an orchestrator types on:
+        // Claude Code is `idle` only at the prompt box that holds the terminal's
+        // cursor, never on the screens of its launch — nor at the box an earlier
+        // run left above a same-tab relaunch; Tier-1 drives StatusObserver's real
+        // publication over the measured 2.1.283 frames and their cursors. No
+        // `#[refines]` anchors (aterm-phase takes no dependencies).
+        claude_idle_at_composer_model(),
         transact_model(),
         kernel_model(),
         snapshot_model(),
@@ -1052,6 +1070,9 @@ pub fn model_registry() -> Vec<Model> {
         // or child/worker path; none claims per-method `#[refines]` anchors.
         atpkg_index_probe_cooldown_model(),
         atpkg_index_probe_completion_cadence_model(),
+        // A new host uses the remaining shared cooldown after a suppressed
+        // attempt; Tier-1 binds its fake-clock due decisions in both hosts.
+        atpkg_index_shared_handoff_model(),
         atpkg_index_successor_selection_model(),
         atpkg_index_wake_highwater_model(),
         atpkg_index_pending_park_model(),
@@ -1064,6 +1085,9 @@ pub fn model_registry() -> Vec<Model> {
         // The seated session's near/far index worker and window handoff are
         // Tier-1 bound to Runner::step with injected HEADs and real claims.
         atpkg_session_index_handoff_model(),
+        // An empty local eligibility look does not consume the network-probe
+        // cooldown. Tier-1 binds this to the runner's fake-clock steps.
+        atpkg_session_index_eligibility_model(),
         // Same-build full-pass retries widen after failures; a higher build
         // bypasses the wait. Tier-1 binds the model to IndexAttempt's clock.
         atpkg_session_index_retry_model(),
@@ -1093,6 +1117,15 @@ pub fn model_registry() -> Vec<Model> {
         // in aterm-agent's upgrade tests over the real `exit_record`/`after_exit`;
         // no `#[refines]` anchors.
         harness_exit_record_model(),
+        // The live upgrade's looks at one session: never let go for what a
+        // look could not read — a READY answer included — and, from the
+        // worker's attach, its note behind asked until the launch's record
+        // reads, the state behind from the attach (the re-test of 155c72a28).
+        // Tier-1 in aterm-gui's harness_host tests over the real `attach`,
+        // `WorkerIdle` and `ask_note`, and in aterm-agent's upgrade tests over
+        // the real classifier (`due_among`, `no_record`); no `#[refines]`
+        // anchors.
+        harness_upgrade_look_model(),
         // The drain's bound against a person: Tier-1 bound to `upgrade::next_step`
         // in aterm-agent's upgrade tests.
         harness_upgrade_drain_bound_model(),
@@ -1102,6 +1135,13 @@ pub fn model_registry() -> Vec<Model> {
         // Tier-1 in aterm-agent's `harness::upgrade_drive` tests over the real
         // reducer, gates and record transitions; no `#[refines]` anchors.
         harness_upgrade_never_strands_model(),
+        // The login wall (2026-09-27): nothing of the upgrade's typed where
+        // the wall shows or stands, no give-up spent on a notice the wall
+        // answered, no continuation into a login the supervisor saw gone,
+        // and the owner told before anything else. Tier-1 in aterm-agent's
+        // `conformance_login_wall` over the real readers, reducer and
+        // turn-end decider on every reachable state; no `#[refines]` anchors.
+        harness_login_wall_model(),
         // The live upgrade's Codex branch: when the shared daemon may be moved
         // onto the managed build. Tier-1 bound in aterm-agent's
         // `harness::upgrade_codex` tests to the real `daemon_step` over every
@@ -1114,6 +1154,9 @@ pub fn model_registry() -> Vec<Model> {
         // `Priority::admit`, `render`/`parse` and `upgrade_models::target`; no
         // per-method `#[refines]` anchors.
         harness_model_priority_model(),
+        // WHEN a due model move is taken (the 2026-09-25 incident's ladder).
+        // Tier-1 in aterm-agent tests/conformance_upgrade_models/ladder.rs.
+        harness_model_ladder_model(),
         // A pending stub waiting for its program against the pass installing it: it reads
         // whether the pass runs before whether the shim resolves. Tier-1 bound to the real
         // decision (`pending_wait_step`) in `atpkg::cli`'s tests.
@@ -1159,7 +1202,7 @@ pub fn model_registry() -> Vec<Model> {
         // function satisfies — so anchoring bought a green ledger line rather than a
         // check. `Terminal::note_custody` closes that: the site that DECIDES a
         // transition records which one it was, so the conformance validates each step
-        // against the action the engine itself named. 11/11 anchored on the four
+        // against the action the engine itself named. 16/16 anchored on the four
         // recorders, Tier-1 in `aterm_gui::press_custody_conformance`, run by the gate.
         //
         // Registration alone (independent of anchoring) is what puts BOTH under
@@ -1200,6 +1243,10 @@ pub fn model_registry() -> Vec<Model> {
         // with each genuine shipping service; registering the models here makes the
         // drift-free spec source discoverable to the closure/anchor ledger today.
         control_connection_admission_model(),
+        // Where a control connection is between requests (request lane, wait
+        // lane, parked); Tier-1 + `#[refines]` anchors in aterm-gui's
+        // `control_lanes.rs`.
+        control_lane_tenure_model(),
         native_control_routing_model(),
         native_tab_identity_model(),
         native_reopen_ledger_model(),
@@ -1239,8 +1286,7 @@ pub fn model_registry() -> Vec<Model> {
         title_summary_socket_owner_retry_model(),
         native_updater_model(),
         // Release/updater channel state machines. The release-floor resolver and
-        // journal/guard Tier-1 live in aterm-release; the archive model is the
-        // metadata-only single-head lifecycle.
+        // journal/guard Tier-1 live in aterm-release.
         release_durable_post_intent_model(),
         roster_pair_redo_model(),
         release_channel_floor_model(),
@@ -1249,11 +1295,12 @@ pub fn model_registry() -> Vec<Model> {
         release_historical_recovery_model(),
         release_published_identity_model(),
         release_yank_successor_first_model(),
-        release_channel_single_head_model(),
-        // Who holds the public channel's `latest`: the engine's prerelease source
-        // release and the cut's one guarded head PATCH. Tier-1 in aterm-release
-        // (tests/it/channel_latest.rs) over a fake GitHub; no `#[refines]` anchors.
-        release_channel_head_model(),
+        // The one publication a cut makes and who holds the channel's `latest`: the
+        // engine's prerelease source release, the cut's proved assets and its one
+        // guarded head PATCH, and an abandon that withdraws without deleting. Tier-1 in
+        // aterm-release (tests/it/channel_latest.rs) over a fake GitHub; no `#[refines]`
+        // anchors.
+        release_publish_once_model(),
         // The release claim's writer/reader contract (owner ruling R2): the release
         // commit carries only the published code, main keeps every peer commit and
         // ledger line, builds strictly increase, and a claimed-unpublished version is
@@ -1426,6 +1473,11 @@ pub fn model_registry() -> Vec<Model> {
         // scripted foreground probe in
         // aterm-gui/src/foreground_handback_conformance.rs.
         foreground_handback_model(),
+        // Who owns an input mode across jobs when the reader MISSES one (the
+        // 2026-09-27 lane at load 59-65): a re-armed mode is the re-armer's,
+        // so a missed job loses only its own handback. Tier-1 drives the real
+        // PTY reader in aterm-gui/src/foreground_handback_conformance.rs.
+        foreground_handback_ownership_model(),
         // A self-update carries every history line of a tab or COUNTS it
         // (2026-09-26): the join names a sidecar only over the session's own
         // fenced, contiguous history, and every fallback and failed sidecar is
@@ -1457,6 +1509,14 @@ pub fn model_registry() -> Vec<Model> {
         // real successor App over one journal directory in
         // aterm-gui/src/editor_carry_conformance.rs.
         native_update_editor_carry_model(),
+        // The crash journal's claim (2026-09-26, PTY keeper P1): a window's
+        // layout journal is taken once, never while its owner runs, reopened
+        // only after an unclean end the crash marker attests, never when the
+        // launch that wrote it had itself reopened a journal and died within
+        // 90 s, and always left whole by a death mid-rewrite. Tier-1 drives the
+        // real owner and claim over a real directory, lock and crash markers
+        // in aterm-gui/src/crash_journal_conformance.rs.
+        crash_journal_claim_model(),
         // A shell spawned before the re-key channel is healed by a key its
         // relaunch line reads from a one-use file, and a key whose line never
         // ran is taken back, file and all. Tier-1 drives the real issue and

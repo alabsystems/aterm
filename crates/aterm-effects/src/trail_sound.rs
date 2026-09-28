@@ -775,6 +775,7 @@ pub struct EventMeta {
     /// | `13` | `;` | `SEMI` |
     /// | `14` | `:` | `COLON` |
     /// | `15` | `-` | `DASH` |
+    /// | `16` | *(no glyph — host-stamped at a no-echo prompt)* | `SECRET` |
     ///
     /// Classes `0..=3` keep the meaning they had under the five-way split;
     /// `4` NARROWED from "any punctuation" to the four stops when the table
@@ -984,6 +985,25 @@ pub mod glyph_class {
     /// `-` — the dash. Appended with [`COMMA`]. A TIE: it sounds the note
     /// before it, held a little longer than a letter.
     pub const DASH: u8 = 15;
+    /// **A KEY TYPED INTO A PASSWORD PROMPT** — APPENDED 2026-09-27 (owner,
+    /// verbatim: *"password: fix to all same tone"*). Not a glyph: no
+    /// character maps to it and [`super::typed_glyph_class`] never returns
+    /// it. Only the host stamps it, on a keyed cue whose press the session's
+    /// tty will not echo (canonical no-echo mode — `sudo`, an `ssh`
+    /// passphrase, `read -s`, `getpass`; `SinkWriter::tty_swallows_input`),
+    /// together with `rank = 0`, `shifted = false` and the kind `Typed` even
+    /// for the spacebar — so the cue says "a key was pressed" and nothing
+    /// about which one.
+    ///
+    /// The music box sounds every such cue as ONE fixed tine
+    /// (`rainbow_kitty_v2`'s `v2_secret`): the same pitch, timbre, gain and
+    /// pan for a letter, a capital, a digit, any mark and the space, and it
+    /// moves no melody state, so the line after the prompt is the line that
+    /// would have played had those keys never been typed. The eight v1
+    /// palettes read no class at all: an unknown class lands on their
+    /// letter path, and with rank 0 and no shift that path already says
+    /// nothing per key, so they are left as they were.
+    pub const SECRET: u8 = 16;
 }
 
 /// [`EventMeta::glyph_class`] for a typed character — the ONE producer of the
@@ -2876,19 +2896,13 @@ fn celebration_mode(sig: u32) -> i32 {
     MODE_ROTATIONS[(sig % 3) as usize]
 }
 
-/// AXIS 4 — per-key pulse DUTY for the riff's lead (chip timbre families
-/// {0.25, 0.375, 0.5}), wired but GATED OFF: an owner decision pending the
-/// owner's ear. Duty is the loudest timbral lever the chip voice has — three
-/// keys apart would read as three different instruments — so it ships dark
-/// until it has been heard. Flipping the flag is the whole change.
-const CELEBRATION_KEY_DUTY: bool = false;
-fn celebration_duty(sig: u32) -> f32 {
-    if CELEBRATION_KEY_DUTY {
-        [0.25, 0.375, 0.5][((sig >> 8) % 3) as usize]
-    } else {
-        0.25
-    }
-}
+/// The riff lead's pulse DUTY — one timbre for every key. A fourth per-key
+/// axis (duty drawn from {0.25, 0.375, 0.5}) was wired dark from 2026-08-07
+/// and dropped 2026-09-25 under the owner's standing direction: duty is the
+/// loudest timbral lever the chip voice has, so three keys apart would read
+/// as three different instruments, and a const-false branch nobody auditioned
+/// in seven weeks was dead code.
+const CELEBRATION_LEAD_DUTY: f32 = 0.25;
 
 /// Which form slots are VERSE (per-key walk) vs the SHARED CHORUS. The
 /// verses are the A-family (bars 0/1/3) and the lift pair C/C' (bars 4/5);
@@ -3501,13 +3515,16 @@ pub struct TrailSynth {
     /// 1.2 dB, which is larger than anything the echo does.
     #[cfg(test)]
     pub(crate) echo_trim: f32,
-    /// TEST-ONLY: spawn the music box's capital RING on its DRAWN phase
-    /// instead of locked to the strike's 2f — the negative control for the
-    /// 2026-09-20 phase lock (`rainbow_kitty_v2`'s ring pin). The draw count
-    /// is identical either way (`v2_spawn_ph0` always draws four), so the two
-    /// takes differ by the ring's phase and nothing else.
+    /// TEST-ONLY: put the music box's capital RING back on the strike's
+    /// OCTAVE (its 2026-09-20 pitch) on its drawn phase — the negative
+    /// control for the 2026-09-27 twelfth (`rainbow_kitty_v2`'s ring pin):
+    /// a ring on a partial of the strike is a per-key lottery between
+    /// cancelling and doubling, and the pin must be able to see one. Until
+    /// that day this was `ring_unlocked`, the octave ring's drawn phase
+    /// against its lock. The draw count is identical either way
+    /// (`v2_spawn_ph0` always draws four).
     #[cfg(test)]
-    pub(crate) ring_unlocked: bool,
+    pub(crate) ring_at_octave: bool,
     /// TEST-ONLY: leave a forte strike's modulator where `spawn` put it — on
     /// the DRAWN angle to its carrier — instead of locked
     /// (`rainbow_kitty_v2`'s `v2_lock_hammer`): the negative control for the
@@ -3999,7 +4016,7 @@ impl TrailSynth {
             #[cfg(test)]
             echo_trim: 1.0,
             #[cfg(test)]
-            ring_unlocked: false,
+            ring_at_octave: false,
             #[cfg(test)]
             hammer_unlocked: false,
             #[cfg(test)]
@@ -6330,9 +6347,8 @@ impl TrailSynth {
     ///   turnaround FILL included, which the old code dropped (it tumbled
     ///   back to the reference key mid-modulation).
     /// * AXIS 3 — the MODE: [`celebration_mode`]'s pentatonic rotation,
-    ///   folded in with the root — felt color, same lattice.
-    /// * AXIS 4 — per-key pulse DUTY ([`celebration_duty`]) — wired but
-    ///   gated OFF pending the owner's ear.
+    ///   folded in with the root — felt color, same lattice. The lead's pulse
+    ///   duty is NOT an axis: every key plays [`CELEBRATION_LEAD_DUTY`].
     ///
     /// Deliberate deviations from the trail path, each an anti-annoyance
     /// inversion: NO governor duck (the armed state IS a key-repeat flood —
@@ -6392,8 +6408,7 @@ impl TrailSynth {
         // `melody_hz`, so the whole song modulates coherently and stays on
         // the shared consonant lattice.
         let shift = celebration_root(sig) + celebration_mode(sig);
-        // AXIS 4 — per-key duty, owner-gated (see [`CELEBRATION_KEY_DUTY`]).
-        let duty = celebration_duty(sig);
+        let duty = CELEBRATION_LEAD_DUTY;
         // Escalation ramp 0..1 across the opening bars of the hold. A PURE
         // function of the bar index — no rng draw — so the riff replays
         // independently of the typed layer's consumption of the shared stream.
@@ -6541,7 +6556,7 @@ impl TrailSynth {
         self.last_riff_sig = Some(sig);
         let g = ev.gain * (0.55 + 0.45 * ev.heat) * CELEBRATION_KIND_GAIN;
         let shift = celebration_root(sig) + celebration_mode(sig);
-        let duty = celebration_duty(sig);
+        let duty = CELEBRATION_LEAD_DUTY;
         let hz = self.melody_hz(CELEBRATION_BASE_HZ, shift);
         let sub = self.melody_hz(CELEBRATION_BASE_HZ, CELEBRATION_OUTRO_SUB_DEG + shift);
         let lead = Voice {
@@ -9742,6 +9757,10 @@ mod tests {
             [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
             "a class id moved: 0..=11 are the twelve-way table's, 12..=15 appended"
         );
+        // …and 16 is APPENDED too (2026-09-27; owner: *"password: fix to all
+        // same tone"*): the password prompt's one tone, stamped by the host
+        // alone. No glyph maps to it — the TOTAL sweep below stays `<= DASH`.
+        assert_eq!(SECRET, 16, "the password class is appended after DASH");
         let table: [(&str, u8); 12] = [
             (".", STOP),
             ("([{", OPEN),
@@ -12465,26 +12484,6 @@ mod tests {
         use crate::kitty_sing::NEUTRAL_SIGNATURE;
         assert_eq!(celebration_root(NEUTRAL_SIGNATURE), 0);
         assert_eq!(celebration_mode(NEUTRAL_SIGNATURE), 0);
-    }
-
-    /// AXIS 4 stays DARK until the owner has heard it: with the gate off,
-    /// every signature's lead duty is the authored 0.25 — flipping
-    /// [`CELEBRATION_KEY_DUTY`] is the entire enable.
-    #[test]
-    fn per_key_duty_is_gated_off_pending_the_owners_ear() {
-        for sig in [
-            0u32,
-            12,
-            24,
-            crate::kitty_sing::song_signature('w'),
-            u32::MAX,
-        ] {
-            if CELEBRATION_KEY_DUTY {
-                assert!([0.25f32, 0.375, 0.5].contains(&celebration_duty(sig)));
-            } else {
-                assert_eq!(celebration_duty(sig), 0.25);
-            }
-        }
     }
 
     /// THE CLAP BAR: the backbeat clap joins at bar 8 — one full phrase in

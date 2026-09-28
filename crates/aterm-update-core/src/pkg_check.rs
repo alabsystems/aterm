@@ -388,32 +388,16 @@ pub fn claim(stamp: &Path, now_unix: i64, every_secs: u64) -> bool {
     true
 }
 
-/// `YYYY-MM-DDTHH:MM:SSZ` (any trailing fraction/offset ignored) → unix seconds.
-/// The same strict shape the roster's date parser reads; a stamp that does not fit
-/// it is `None`.
+/// A package status stamp → unix seconds. DECIDED 2026-09-25: strict about the zone,
+/// tolerant of a fraction — `aterm_types::rfc3339::parse_utc_fractional`. The pass writer
+/// stamps `last_pass_at` as `….000000000Z` (atpkg `status.rs`), so a fraction is a shape
+/// this record really carries and is truncated; a zone offset is not, and reading one as
+/// UTC would move every freshness verdict the GUI draws from it (the Packages screen, the
+/// Update screen's "checked" line, the scheduler's pass spacing) by up to 14 h. It used to
+/// ignore anything after the seconds, offsets included.
 #[must_use]
 pub fn rfc3339_to_unix(s: &str) -> Option<i64> {
-    let b = s.as_bytes();
-    if b.len() < 19
-        || b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-    {
-        return None;
-    }
-    let y: i64 = s.get(0..4)?.parse().ok()?;
-    let mo: i64 = s.get(5..7)?.parse().ok()?;
-    let d: i64 = s.get(8..10)?.parse().ok()?;
-    let h: i64 = s.get(11..13)?.parse().ok()?;
-    let mi: i64 = s.get(14..16)?.parse().ok()?;
-    let se: i64 = s.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
-        return None;
-    }
-    let days = aterm_types::rfc3339::days_from_civil(y, mo, d);
-    Some(days * 86400 + h * 3600 + mi * 60 + se)
+    aterm_types::rfc3339::parse_utc_fractional(s)
 }
 
 #[cfg(test)]
@@ -828,11 +812,21 @@ mod tests {
             rfc3339_to_unix("2026-09-10T06:40:53.123Z"),
             rfc3339_to_unix("2026-09-10T06:40:53Z")
         );
+        assert_eq!(
+            rfc3339_to_unix("2026-09-10T06:40:53.000000000Z"),
+            rfc3339_to_unix("2026-09-10T06:40:53Z"),
+            "the pass writer's own shape"
+        );
         for bad in [
             "",
             "2026-09-10",
             "2026/09/10T06:40:53Z",
             "2026-13-10T06:40:53Z",
+            // An offset is a different instant, not a decoration to ignore.
+            "2026-09-10T06:40:53+05:30",
+            "2026-09-10T06:40:53.123-08:00",
+            "2026-09-10T06:40:53",
+            "2026-09-10T06:40:53Zjunk",
         ] {
             assert_eq!(rfc3339_to_unix(bad), None, "{bad:?}");
         }

@@ -25,9 +25,8 @@
 //!    cannot reach a mint site because it is absent from that crate's compiled
 //!    surface. The property is proven abstractly by
 //!    [`aterm_spec::derive::mint_reachability_model`] (invariant `NoUntrustedTop`,
-//!    model-checked by `ty`) and bound to the real tree by the
-//!    `mint_sites_are_launcher_only` source-scan gate
-//!    (`crates/aterm-cap/tests/mint_reachability.rs`): exactly the two launchers
+//!    model-checked by `ty`) and bound to the real tree by the source-scan gate
+//!    `crates/aterm-cap/tests/mint_reachability.rs`: exactly the two launchers
 //!    enable the feature, and no production code outside a launcher reaches the
 //!    mint. The `unsafe` keyword is retained as an audit marker carrying the
 //!    "call once, from the trusted launcher" contract.
@@ -39,7 +38,7 @@
 //! STATUS: no-struct-forgery is sound-by-construction (privacy); the grant/tier/
 //! effect-gate behaviour is tested below; no-mint-reachability (§5.4) is delivered
 //! via the `launcher-mint` feature seal + `mint_reachability_model` (`ty`) +
-//! `mint_sites_are_launcher_only` (source-scan).
+//! `tests/mint_reachability.rs` (source-scan).
 
 use std::marker::PhantomData;
 
@@ -78,8 +77,8 @@ impl Tier {
 /// The `_seal` private field prevents struct-literal forgery: outside this crate
 /// there is no way to name it, so no `Cap { .. }` literal can construct a `Cap`.
 /// The only source is [`Authority::grant`], which requires holding an
-/// [`Authority`]. (This is the no-struct-forgery property; the stronger
-/// no-mint-reachability property is ROADMAP §5.4 — see the crate docs.)
+/// [`Authority`]. (This is the no-struct-forgery property; no-mint-reachability
+/// (§5.4) is the separate `launcher-mint` feature seal — see the crate docs.)
 pub struct Cap<E> {
     tier: Tier,
     _effect: PhantomData<fn() -> E>,
@@ -89,8 +88,10 @@ pub struct Cap<E> {
 /// A private, un-nameable witness. It is `Copy` (so a granted [`Cap`] can be
 /// copied) but still unconstructable outside this crate — copying one requires
 /// already holding it, which requires the [`Authority`]. This blocks struct
-/// literals only; it does NOT by itself prove no code path reaches the mint
-/// (that is the §5.4 no-mint-reachability obligation, not yet implemented).
+/// literals only. That no code path reaches the mint (§5.4 no-mint-reachability)
+/// is supplied separately: the `launcher-mint` feature seal on
+/// `Authority::root_authority`, `tests/mint_reachability.rs`, and
+/// `aterm_spec::derive::mint_reachability_model`.
 #[derive(Clone, Copy)]
 struct Seal;
 
@@ -173,8 +174,8 @@ impl Authority {
     ///
     /// The property is proven abstractly by
     /// [`aterm_spec::derive::mint_reachability_model`] (invariant `NoUntrustedTop`,
-    /// model-checked by `ty`) and bound to the real tree by the
-    /// `mint_sites_are_launcher_only` source-scan conformance gate: exactly the two
+    /// model-checked by `ty`) and bound to the real tree by the source-scan
+    /// conformance gate `tests/mint_reachability.rs`: exactly the two
     /// launcher binaries enable `launcher-mint`, and no library/engine crate reaches
     /// the mint in production code.
     #[cfg(any(test, feature = "launcher-mint"))]
@@ -282,9 +283,9 @@ mod tests {
     // Demonstrates the effect layer: a privileged op that is impossible to call
     // without a Cap<Spawn> of sufficient tier. (The no-STRUCT-FORGERY property is
     // a compile-time fact — a `Cap { .. }` literal does not compile outside the
-    // crate because the `_seal` field is private. This is NOT the stronger
-    // no-mint-reachability claim, which is ROADMAP §5.4 and not yet delivered;
-    // root authority is still reachable via the `unsafe` trusted-launcher mint.)
+    // crate because the `_seal` field is private. The separate no-mint-reachability
+    // property (§5.4) is the `launcher-mint` feature seal, gated by
+    // `tests/mint_reachability.rs`.)
     #[test]
     fn effect_gated_operation() {
         fn privileged_spawn(cap: &Cap<Spawn>) -> Result<&'static str, Denied> {

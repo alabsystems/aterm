@@ -566,28 +566,30 @@ pub fn roster_pair_redo_model() -> Model {
 /// holds a cross-machine release lease while it re-reads the live channel and
 /// publishes: a floor that advanced beyond the frozen value aborts the cut, while a
 /// covered floor permits publication without a post-check race. The exact-commit
-/// lease remains held after flip through archive and verify; only the final
-/// journaled unlock releases it. This models the whole scan → freeze/crash/resume →
-/// lease → revalidate → publish → archive/verify → unlock lifecycle rather than
-/// testing the arithmetic decisions in isolation.
+/// lease remains held after the head PATCH until what a stranger sees has been proved
+/// (`publish`'s last act — the client's own election, the evergreen pointer, the
+/// anonymous downloads); only the final journaled unlock releases it. This models the
+/// whole scan → freeze/crash/resume → lease → revalidate → publish → prove head →
+/// unlock lifecycle rather than testing the arithmetic decisions in isolation. (Until
+/// 2026-09-26 the post-publish suffix was the private origin's archive and verify;
+/// the one publication proves its own head.)
 ///
 /// `Buggy=1` enables independent non-vacuity controls:
 /// `ResolveOperatorOnly` drops the observed channel input (the retired
 /// operator-only policy), `PublishUnchecked` skips late revalidation,
 /// `BypassLeaseAdvance` lets the channel change after a covered verdict despite
-/// lease ownership, and `UnlockBeforeVerification` drops the owner before
-/// downstream release steps complete. Six more are the slips each remaining law
-/// exists to refuse, one apiece: `ResolveUncheckedCarryForward` validates only the
-/// operator's request against the claim, so a channel floor above the build is
-/// carried forward (`effective_min_build` validates the MAXIMUM);
-/// `ResumeFromOperatorRequest` rebuilds the resumed floor from the resume
-/// command's request instead of `journal.min_build`; `ConfirmCoveredWithoutLease`
-/// is the floor check run without the owner check `publish_checked` pairs it
-/// with; `CompleteWithoutUnlock` journals completion over a refused CAS delete;
-/// `RejectAdvancedReleasingLease` drops the remote lease on the late guard's
-/// error path; and `AbandonIgnoringFailedCas` marks an abandon done whose CAS
-/// delete never landed. Tier-1 binds the resolver, journal,
-/// `PublishChecked`, exact-owner acquire/resume, and CAS unlock production seams.
+/// lease ownership, and `UnlockBeforeHeadProof` drops the owner before the head is
+/// proved. Six more are the slips each remaining law exists to refuse, one apiece:
+/// `ResolveUncheckedCarryForward` validates only the operator's request against the
+/// claim, so a channel floor above the build is carried forward (`effective_min_build`
+/// validates the MAXIMUM); `ResumeFromOperatorRequest` rebuilds the resumed floor from
+/// the resume command's request instead of `journal.min_build`;
+/// `ConfirmCoveredWithoutLease` is the floor check run without the owner check
+/// `publish_checked` pairs it with; `CompleteWithoutUnlock` journals completion over a
+/// refused CAS delete; `RejectAdvancedReleasingLease` drops the remote lease on the late
+/// guard's error path; and `AbandonIgnoringFailedCas` marks an abandon done whose CAS
+/// delete never landed. Tier-1 binds the resolver, journal, `PublishChecked`,
+/// exact-owner acquire/resume, and CAS unlock production seams.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_channel_floor_model() -> Model {
@@ -596,8 +598,8 @@ pub fn release_channel_floor_model() -> Model {
             const Buggy = 0;
             const MaxFloor = 4;
             // phase: 0 Inputs, 1 Frozen, 2 Revalidated under lease,
-            // 3 Published, 4 Aborted, 5 ResumePending, 6 Archived,
-            // 7 Verified, 8 Completed/Unlocked.
+            // 3 Published (the head PATCH), 4 Aborted, 5 ResumePending,
+            // 6 Head proved, 7 Completed/Unlocked.
             var phase = 0;
             var operator_floor = 0;
             var observed_floor = 0;
@@ -609,8 +611,7 @@ pub fn release_channel_floor_model() -> Model {
             var resumed = 0;
             var lease_owned = 0;
             var lease_bypassed = 0;
-            var archive_done = 0;
-            var verify_done = 0;
+            var head_proved = 0;
             var unlock_bypassed = 0;
             var advanced_rejected = 0;
             var abandon_done = 0;
@@ -717,27 +718,20 @@ pub fn release_channel_floor_model() -> Model {
             action PublishUnchecked when (Buggy == 1 && phase == 1) {
                 phase = 3;
             }
-            action ArchiveAfterPublish when (phase == 3 && lease_owned == 1) {
+            action ProveHead when (phase == 3 && lease_owned == 1) {
                 phase = 6;
-                archive_done = 1;
-            }
-            action VerifyRelease when (
-                phase == 6 && lease_owned == 1 && archive_done == 1
-            ) {
-                phase = 7;
-                verify_done = 1;
+                head_proved = 1;
             }
             action Unlock when (
-                phase == 7 && lease_owned == 1 && archive_done == 1 &&
-                verify_done == 1
+                phase == 6 && lease_owned == 1 && head_proved == 1
             ) {
-                phase = 8;
+                phase = 7;
                 lease_owned = 0;
             }
-            action UnlockBeforeVerification when (
+            action UnlockBeforeHeadProof when (
                 Buggy == 1 && phase == 3 && lease_owned == 1
             ) {
-                phase = 8;
+                phase = 7;
                 lease_owned = 0;
                 unlock_bypassed = 1;
             }
@@ -771,10 +765,9 @@ pub fn release_channel_floor_model() -> Model {
                 late_checked = 1;
             }
             action CompleteWithoutUnlock when (
-                Buggy == 1 && phase == 7 && lease_owned == 1 &&
-                archive_done == 1 && verify_done == 1
+                Buggy == 1 && phase == 6 && lease_owned == 1 && head_proved == 1
             ) {
-                phase = 8;
+                phase = 7;
             }
             action RejectAdvancedReleasingLease when (
                 Buggy == 1 && phase == 1 && lease_owned == 1 &&
@@ -800,7 +793,7 @@ pub fn release_channel_floor_model() -> Model {
                     operator_floor <= frozen_floor &&
                     observed_floor <= frozen_floor
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant FrozenFloorFitsClaim:
                 if phase > 0 && phase <= 3 {
@@ -808,7 +801,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     frozen_floor <= claimed_build
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant RuntimeMatchesFrozenJournal:
                 if phase > 0 && phase <= 3 {
@@ -816,7 +809,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     frozen_floor == journal_floor
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant JournalSurvivesCrash:
                 if phase == 5 {
@@ -824,7 +817,7 @@ pub fn release_channel_floor_model() -> Model {
                     observed_floor <= journal_floor &&
                     journal_floor <= claimed_build && frozen_floor == 0
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant PublishedNeverLowersLatest:
                 if phase == 3 {
@@ -832,7 +825,7 @@ pub fn release_channel_floor_model() -> Model {
                 } else if phase > 5 {
                     latest_floor <= frozen_floor
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant PublishedRequiresLateGuard:
                 if phase == 3 {
@@ -847,13 +840,13 @@ pub fn release_channel_floor_model() -> Model {
             invariant VisibleWorkOwnsLease:
                 if phase == 3 {
                     lease_owned == 1
-                } else if phase > 5 && phase <= 7 {
+                } else if phase == 6 {
                     lease_owned == 1
                 } else {
                     lease_owned <= 1
                 };
             invariant CompletedReleasesLease:
-                if phase == 8 { lease_owned == 0 } else { lease_owned <= 1 };
+                if phase == 7 { lease_owned == 0 } else { lease_owned <= 1 };
             invariant RejectionCannotSilentlyDropLease:
                 if advanced_rejected == 1 && abandon_done == 0 {
                     phase == 4 && lease_owned == 1
@@ -866,21 +859,21 @@ pub fn release_channel_floor_model() -> Model {
                 } else {
                     abandon_done == 0
                 };
-            invariant CompletionRequiresPostPublishSteps:
-                if phase == 8 {
-                    archive_done == 1 && verify_done == 1
+            invariant CompletionRequiresProvedHead:
+                if phase == 7 {
+                    head_proved == 1
                 } else {
-                    phase <= 8
+                    phase <= 7
                 };
             invariant LeaseCannotBeBypassed: lease_bypassed == 0;
             invariant UnlockCannotBeBypassed: unlock_bypassed == 0;
             invariant FloorStateBounds:
-                phase <= 8 && operator_floor <= MaxFloor &&
+                phase <= 7 && operator_floor <= MaxFloor &&
                 observed_floor <= MaxFloor && claimed_build <= MaxFloor &&
                 frozen_floor <= MaxFloor && journal_floor <= MaxFloor &&
                 latest_floor <= MaxFloor && late_checked <= 1 && resumed <= 1 &&
-                lease_owned <= 1 && lease_bypassed <= 1 && archive_done <= 1 &&
-                verify_done <= 1 && unlock_bypassed <= 1 &&
+                lease_owned <= 1 && lease_bypassed <= 1 && head_proved <= 1 &&
+                unlock_bypassed <= 1 &&
                 advanced_rejected <= 1 && abandon_done <= 1;
         }
     }
@@ -1850,6 +1843,12 @@ pub fn release_published_identity_model() -> Model {
 /// and finish the convergent release delete. Only after the tag is gone may the
 /// release disappear, and clean completion atomically releases both session refs.
 ///
+/// Since the cut publishes once (2026-09-26), "the release disappears" is a DEMOTION
+/// of the bad channel release to a prerelease (`verify::run_yank`): to every client
+/// and every scan it has left the published set exactly as a deleted release has, and
+/// it keeps its signed source attestation and stays reversible. The tag is the origin
+/// tag the cut pushed.
+///
 /// `Buggy=1` exposes delete-before-successor, weak-floor cleanup, wrong-identity
 /// cleanup, cleanup after lease/fence loss, premature session release, the
 /// release-first crash cut that strands a tag after destroying the only remotely
@@ -2217,730 +2216,6 @@ pub fn release_yank_successor_first_model() -> Model {
                 weak_floor_bypassed <= 1 && identity_bypassed <= 1 &&
                 release_first_bypassed <= 1 && cleanup_session_bypassed <= 1 &&
                 early_session_release_bypassed <= 1;
-        }
-    }
-}
-
-/// Single-head release-channel archive lifecycle.
-///
-/// The bounded channel begins with two historical releases whose manifests still use
-/// the client's exact discovery name. Signatures are an explicit channel policy:
-/// `ConfigureSignatures` adds the corresponding historical signatures and requires
-/// the flipped current head to carry one too. `Flip` publishes the journal's exact
-/// `(tag, build)` under the discovery names. Metadata-only renames then move each
-/// historical object to its deterministic archive name without changing the live
-/// head or deleting an object.
-///
-/// A crash preserves the remote exact-commit owner and completed rename prefix while
-/// dropping only the process-local guard. Normal resume reattaches to that same owner
-/// and re-proves that the immutable live head still has the journal's exact tag and
-/// build before re-entering archive. A legacy journal may be observed without the new
-/// remote lease; if a competing owner then publishes a monotonically newer head (or a
-/// different tag at the same build), the stale journal must refuse rather than archive
-/// against it. The manifest observed under the journal tag must independently match
-/// the journal's exact version/build/commit/DMG bytes and signature policy—the
-/// production `validate_live_release_identity` seam. Missing or mismatched current
-/// manifests, collisions, and a configured-but-missing current signature all refuse
-/// before mutation.
-///
-/// `Buggy=1` exposes independent controls for premature finalization, stale-build and
-/// wrong-tag resume, bypassing the exact observed-build or signature gates, a competing
-/// owner entering or advancing during archive, and live-head regression. It also
-/// archives by DELETING a historical manifest or signature instead of renaming it —
-/// the object `prove_renames_preserved_assets` refuses as "vanished instead of being
-/// metadata-renamed" — and lets a nominal crash release the remote exact-commit
-/// lease, as a `Drop` on the lease guard that CAS-deleted its ref on unwind would
-/// (`ReleaseLeaseGuard` deliberately has none). The invariants prove each class is
-/// observable as well as preserving every historical object across crash/resume.
-#[must_use]
-#[cfg_attr(trust_verify, trust::skip)]
-pub fn release_channel_single_head_model() -> Model {
-    crate::ty_model! {
-        ReleaseChannelSingleHead {
-            const Buggy = 0;
-            const OldHeads = 2;
-            const JournalBuild = 2;
-            const JournalTag = 2;
-            const MaxBuild = 3;
-            const MaxTag = 3;
-            // phase: 0 OldChannel, 1 Flipped/journal-at-archive,
-            // 2 Archiving, 3 Stable, 4 Refused.
-            var phase = 0;
-            var old_exact_manifest = 2;
-            var old_archived_manifest = 0;
-            var old_exact_signature = 0;
-            var old_archived_signature = 0;
-            // Identity counters distinguish a same-object metadata rename from
-            // delete+recreate, which would preserve counts but replace bytes/IDs.
-            var preserved_manifest_ids = 2;
-            var replacement_manifest_ids = 0;
-            var preserved_signature_ids = 0;
-            var replacement_signature_ids = 0;
-            var current_exact_manifest = 0;
-            var current_exact_signature = 0;
-            var live_identity_valid = 1;
-            var signatures_configured = 0;
-            var historical_signature_seen = 0;
-            var signature_revalidation_pending = 0;
-            // The live exact-name manifest identifies the current channel head.
-            // `previous_head_build` and `max_seen_build` make non-regression
-            // explicit; archive snapshots make immutability explicit.
-            var head_build = 1;
-            var head_tag = 1;
-            var journal_tag_build = 0;
-            var previous_head_build = 1;
-            var max_seen_build = 1;
-            var archive_head_build = 0;
-            var archive_head_tag = 0;
-            // Remote owner: 0 None, 1 This journal's exact commit,
-            // 2 Competing publisher. `guard_attached` is process-local.
-            var owner = 0;
-            var guard_attached = 0;
-            var legacy_format = 0;
-            var legacy_unleased = 0;
-            var collision = 0;
-            var resumed = 0;
-            var finalized = 0;
-            var idempotent_recheck = 0;
-            var stale_head_bypassed = 0;
-            var build_guard_bypassed = 0;
-            var identity_guard_bypassed = 0;
-            var signature_bypassed = 0;
-            var signature_ratchet_bypassed = 0;
-            var competing_owner_bypassed = 0;
-            var legacy_resume_bypassed = 0;
-
-            action ConfigureSignatures when (
-                phase == 0 && signatures_configured == 0 &&
-                historical_signature_seen == 0 &&
-                signature_revalidation_pending == 0
-            ) {
-                signatures_configured = 1;
-                historical_signature_seen = 1;
-                old_exact_signature = OldHeads;
-                preserved_signature_ids = OldHeads;
-            }
-            action DetectSignaturePolicyAdvanceUnderSession when (
-                phase == 0 && historical_signature_seen == 0 &&
-                signature_revalidation_pending == 0
-            ) {
-                historical_signature_seen = 1;
-                old_exact_signature = OldHeads;
-                preserved_signature_ids = OldHeads;
-                signature_revalidation_pending = 1;
-                owner = 1;
-                guard_attached = 1;
-            }
-            action RejectSignaturePolicyAdvance when (
-                phase == 0 && historical_signature_seen == 1 &&
-                signatures_configured == 0 && signature_revalidation_pending == 1
-            ) {
-                phase = 4;
-            }
-            action IgnoreSignedHistory when (
-                Buggy == 1 && phase == 0 && historical_signature_seen == 0
-            ) {
-                historical_signature_seen = 1;
-                old_exact_signature = OldHeads;
-                preserved_signature_ids = OldHeads;
-                signature_ratchet_bypassed = 1;
-            }
-
-            action Flip when (
-                phase == 0 && signature_revalidation_pending == 0 &&
-                signatures_configured == historical_signature_seen
-            ) {
-                phase = 1;
-                current_exact_manifest = 1;
-                current_exact_signature = signatures_configured;
-                previous_head_build = head_build;
-                head_build = JournalBuild;
-                head_tag = JournalTag;
-                journal_tag_build = JournalBuild;
-                max_seen_build = JournalBuild;
-                owner = 1;
-                guard_attached = 1;
-            }
-            action FlipBeforeSignatureRevalidation when (
-                Buggy == 1 && phase == 0 &&
-                signature_revalidation_pending == 1 &&
-                historical_signature_seen == 1 && signatures_configured == 0
-            ) {
-                phase = 1;
-                current_exact_manifest = 1;
-                previous_head_build = head_build;
-                head_build = JournalBuild;
-                head_tag = JournalTag;
-                journal_tag_build = JournalBuild;
-                max_seen_build = JournalBuild;
-                owner = 1;
-                guard_attached = 1;
-                signature_ratchet_bypassed = 1;
-            }
-            // Pre-v3 journals are classified before any lease/fence acquisition.
-            // This environment edge represents an unfinished historical cut whose
-            // live tag already exists but whose recovery protocol is insufficient.
-            action LoadUnfinishedLegacyJournal when (
-                phase == 0 && owner == 0 && signatures_configured == 0 &&
-                historical_signature_seen == 0 &&
-                signature_revalidation_pending == 0
-            ) {
-                phase = 1;
-                current_exact_manifest = 1;
-                previous_head_build = head_build;
-                head_build = JournalBuild;
-                head_tag = JournalTag;
-                journal_tag_build = JournalBuild;
-                max_seen_build = JournalBuild;
-                legacy_format = 1;
-                legacy_unleased = 1;
-                resumed = 1;
-            }
-            action ExposeCollision when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                collision == 0
-            ) {
-                collision = 1;
-            }
-            action ObserveMissingCurrentSignature when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                signatures_configured == 1 &&
-                current_exact_signature == 1
-            ) {
-                current_exact_signature = 0;
-            }
-            action ObserveMissingCurrentManifest when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1
-            ) {
-                current_exact_manifest = 0;
-                journal_tag_build = 0;
-            }
-            action ObserveWrongCurrentBuild when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 &&
-                journal_tag_build == JournalBuild
-            ) {
-                journal_tag_build = JournalBuild - 1;
-            }
-            action ObserveAdvancedCurrentBuild when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 &&
-                journal_tag_build == JournalBuild
-            ) {
-                journal_tag_build = JournalBuild + 1;
-            }
-            action ObserveLiveIdentityMismatch when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 && live_identity_valid == 1
-            ) {
-                live_identity_valid = 0;
-            }
-            action BeginArchive when (
-                phase == 1 && collision == 0 && owner == 1 &&
-                guard_attached == 1 &&
-                head_build == JournalBuild && head_tag == JournalTag &&
-                current_exact_manifest == 1 && journal_tag_build == JournalBuild &&
-                current_exact_signature == signatures_configured &&
-                live_identity_valid == 1
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-            }
-            action AbortCollision when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                collision == 1
-            ) {
-                phase = 4;
-            }
-            action AbortMissingSignature when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                signatures_configured == 1 &&
-                current_exact_signature == 0
-            ) {
-                phase = 4;
-            }
-            action AbortMissingCurrentManifest when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 0
-            ) {
-                phase = 4;
-            }
-            action AbortWrongCurrentBuild when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 &&
-                journal_tag_build <= JournalBuild - 1
-            ) {
-                phase = 4;
-            }
-            action AbortAdvancedCurrentBuild when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 &&
-                journal_tag_build > JournalBuild
-            ) {
-                phase = 4;
-            }
-            action AbortLiveIdentityMismatch when (
-                phase == 1 && owner == 1 && guard_attached == 1 &&
-                current_exact_manifest == 1 && live_identity_valid == 0
-            ) {
-                phase = 4;
-            }
-            // Refusal is observed while the local guard is still on the stack;
-            // unwinding drops only that process-local handle. The persistent
-            // remote lease remains for explicit recovery/abandon.
-            action ExitAfterRefusal when (
-                phase == 4 && owner == 1 && guard_attached == 1
-            ) {
-                guard_attached = 0;
-            }
-            action RenameHistoricalManifest when (
-                phase == 2 && owner == 1 && guard_attached == 1 &&
-                head_build == JournalBuild && head_tag == JournalTag &&
-                current_exact_manifest == 1 && journal_tag_build == JournalBuild &&
-                current_exact_signature == signatures_configured &&
-                live_identity_valid == 1 && old_exact_manifest > 0
-            ) {
-                old_exact_manifest = old_exact_manifest - 1;
-                old_archived_manifest = old_archived_manifest + 1;
-            }
-            action RenameHistoricalSignature when (
-                phase == 2 && owner == 1 && guard_attached == 1 &&
-                head_build == JournalBuild && head_tag == JournalTag &&
-                current_exact_manifest == 1 && journal_tag_build == JournalBuild &&
-                current_exact_signature == signatures_configured &&
-                live_identity_valid == 1 && old_exact_signature > 0
-            ) {
-                old_exact_signature = old_exact_signature - 1;
-                old_archived_signature = old_archived_signature + 1;
-            }
-            action DeleteAndRecreateHistoricalManifest when (
-                Buggy == 1 && phase == 2 && owner == 1 &&
-                guard_attached == 1 && old_exact_manifest > 0 &&
-                preserved_manifest_ids > 0
-            ) {
-                old_exact_manifest = old_exact_manifest - 1;
-                old_archived_manifest = old_archived_manifest + 1;
-                preserved_manifest_ids = preserved_manifest_ids - 1;
-                replacement_manifest_ids = replacement_manifest_ids + 1;
-            }
-            action DeleteAndRecreateHistoricalSignature when (
-                Buggy == 1 && phase == 2 && owner == 1 &&
-                guard_attached == 1 && old_exact_signature > 0 &&
-                preserved_signature_ids > 0
-            ) {
-                old_exact_signature = old_exact_signature - 1;
-                old_archived_signature = old_archived_signature + 1;
-                preserved_signature_ids = preserved_signature_ids - 1;
-                replacement_signature_ids = replacement_signature_ids + 1;
-            }
-            // One deletion apiece, of the first object the archive reaches, keeps
-            // the Buggy=1 space well inside the interpreter's bound; a single
-            // vanished object is the whole defect.
-            action ArchiveByDeletingHistoricalManifest when (
-                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
-                old_exact_manifest > 0 && old_archived_manifest == 0 &&
-                preserved_manifest_ids == OldHeads
-            ) {
-                old_exact_manifest = old_exact_manifest - 1;
-                preserved_manifest_ids = preserved_manifest_ids - 1;
-            }
-            action ArchiveByDeletingHistoricalSignature when (
-                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
-                old_exact_signature > 0 && old_archived_signature == 0 &&
-                preserved_signature_ids == OldHeads
-            ) {
-                old_exact_signature = old_exact_signature - 1;
-                preserved_signature_ids = preserved_signature_ids - 1;
-            }
-            action CrashReleasingRemoteLease when (
-                Buggy == 1 && phase == 2 && owner == 1 && guard_attached == 1 &&
-                resumed == 0 && old_archived_manifest == 0 &&
-                old_archived_signature == 0
-            ) {
-                phase = 1;
-                resumed = 1;
-                guard_attached = 0;
-                owner = 0;
-            }
-            // A crash preserves the remote exact-commit lease and every renamed
-            // asset, but drops the process-local guard. Resume re-observes that same
-            // owner before regaining mutation authority.
-            action CrashDuringArchive when (
-                phase == 2 && owner == 1 && guard_attached == 1 &&
-                resumed == 0
-            ) {
-                phase = 1;
-                resumed = 1;
-                guard_attached = 0;
-            }
-            action ReattachJournalOwner when (
-                phase == 1 && owner == 1 && guard_attached == 0 &&
-                legacy_format == 0
-            ) {
-                guard_attached = 1;
-            }
-            // Old journals predate the remote lease step. This environment edge
-            // makes their missing owner explicit instead of pretending a crash of
-            // the new protocol releases its persistent lease.
-            action ObserveLegacyJournalWithoutLease when (
-                Buggy == 1 && phase == 1 && owner == 0 && guard_attached == 0 &&
-                resumed == 1 && legacy_format == 1 && legacy_unleased == 1 &&
-                legacy_resume_bypassed == 0
-            ) {
-                legacy_resume_bypassed = 1;
-            }
-            action RefuseLegacyJournal when (
-                phase == 1 && owner == 0 && guard_attached == 0 &&
-                resumed == 1 && legacy_format == 1 && legacy_unleased == 1
-            ) {
-                phase = 4;
-            }
-            action AcquireJournalOwner when (
-                Buggy == 1 && phase == 1 && owner == 0 &&
-                guard_attached == 0
-            ) {
-                owner = 1;
-                guard_attached = 1;
-                legacy_resume_bypassed = 1;
-            }
-            action AcquireCompetingOwner when (
-                phase == 1 && owner == 0 && guard_attached == 0 &&
-                head_build <= MaxBuild - 1 &&
-                head_tag <= MaxTag - 1
-            ) {
-                owner = 2;
-            }
-            // A different cut may legitimately win after a crash. Builds never
-            // regress; the stale journal subsequently has no mutation authority.
-            action PublishNewerHead when (
-                phase == 1 && owner == 2 && head_build <= MaxBuild - 1 &&
-                head_tag <= MaxTag - 1
-            ) {
-                previous_head_build = head_build;
-                head_build = head_build + 1;
-                head_tag = head_tag + 1;
-                max_seen_build = head_build + 1;
-                current_exact_manifest = 1;
-                current_exact_signature = signatures_configured;
-                owner = 0;
-                guard_attached = 0;
-            }
-            // Exact tag and build are both required. This environment transition
-            // isolates the tag half while preserving build monotonicity.
-            action ReplaceTagAtSameBuild when (
-                phase == 1 && owner == 2 && head_tag <= MaxTag - 1
-            ) {
-                previous_head_build = head_build;
-                head_tag = head_tag + 1;
-                max_seen_build = head_build;
-                current_exact_manifest = 1;
-                current_exact_signature = signatures_configured;
-                owner = 0;
-                guard_attached = 0;
-            }
-            action AbortNewerHead when (
-                phase == 1 && owner == 0 && guard_attached == 0 &&
-                legacy_format == 1 && legacy_unleased == 1 && resumed == 1 &&
-                head_build > JournalBuild
-            ) {
-                phase = 4;
-            }
-            action AbortWrongTag when (
-                phase == 1 && owner == 0 && guard_attached == 0 &&
-                legacy_format == 1 && legacy_unleased == 1 && resumed == 1 &&
-                head_build == JournalBuild &&
-                head_tag > JournalTag
-            ) {
-                phase = 4;
-            }
-            action FinalizeArchived when (
-                phase == 2 && owner == 1 && guard_attached == 1 &&
-                head_build == JournalBuild && head_tag == JournalTag &&
-                current_exact_manifest == 1 && journal_tag_build == JournalBuild &&
-                current_exact_signature == signatures_configured &&
-                live_identity_valid == 1 &&
-                old_exact_manifest == 0 && old_exact_signature == 0
-            ) {
-                phase = 3;
-                finalized = 1;
-            }
-            action FinalizeWithoutArchive when (
-                Buggy == 1 && phase == 2 && owner == 1 &&
-                guard_attached == 1 &&
-                old_exact_manifest > 0
-            ) {
-                phase = 3;
-                finalized = 1;
-                owner = 0;
-                guard_attached = 0;
-            }
-            action BeginArchiveStaleHead when (
-                Buggy == 1 && phase == 1 && owner == 0 &&
-                guard_attached == 0 && legacy_format == 1 &&
-                legacy_unleased == 1 && resumed == 1 &&
-                head_build > JournalBuild
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                stale_head_bypassed = 1;
-                legacy_resume_bypassed = 1;
-            }
-            action BeginArchiveWrongTag when (
-                Buggy == 1 && phase == 1 && owner == 0 &&
-                guard_attached == 0 && legacy_format == 1 &&
-                legacy_unleased == 1 && resumed == 1 &&
-                head_build == JournalBuild && head_tag > JournalTag
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                stale_head_bypassed = 1;
-                legacy_resume_bypassed = 1;
-            }
-            action BeginArchiveMissingSignature when (
-                Buggy == 1 && phase == 1 && owner == 1 &&
-                guard_attached == 1 &&
-                head_build == JournalBuild && head_tag == JournalTag &&
-                signatures_configured == 1 && current_exact_signature == 0
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                signature_bypassed = 1;
-            }
-            action BeginArchiveWrongObservedBuild when (
-                Buggy == 1 && phase == 1 && owner == 1 &&
-                guard_attached == 1 && head_build == JournalBuild &&
-                head_tag == JournalTag &&
-                journal_tag_build <= JournalBuild - 1
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                build_guard_bypassed = 1;
-            }
-            action BeginArchiveAdvancedObservedBuild when (
-                Buggy == 1 && phase == 1 && owner == 1 &&
-                guard_attached == 1 && head_build == JournalBuild &&
-                head_tag == JournalTag && journal_tag_build > JournalBuild
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                build_guard_bypassed = 1;
-            }
-            action BeginArchiveInvalidLiveIdentity when (
-                Buggy == 1 && phase == 1 && owner == 1 &&
-                guard_attached == 1 && head_build == JournalBuild &&
-                head_tag == JournalTag && current_exact_manifest == 1 &&
-                journal_tag_build == JournalBuild && live_identity_valid == 0
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                identity_guard_bypassed = 1;
-            }
-            action BeginArchiveAsCompetingOwner when (
-                Buggy == 1 && phase == 1 && owner == 2 &&
-                guard_attached == 0 &&
-                head_build == JournalBuild && head_tag == JournalTag
-            ) {
-                phase = 2;
-                archive_head_build = head_build;
-                archive_head_tag = head_tag;
-                competing_owner_bypassed = 1;
-            }
-            action CompetingOwnerAdvancesDuringArchive when (
-                Buggy == 1 && phase == 2 && owner == 1 &&
-                guard_attached == 1 &&
-                head_build <= MaxBuild - 1 && head_tag <= MaxTag - 1
-            ) {
-                previous_head_build = head_build;
-                head_build = head_build + 1;
-                head_tag = head_tag + 1;
-                max_seen_build = head_build + 1;
-                owner = 2;
-                guard_attached = 0;
-                competing_owner_bypassed = 1;
-            }
-            action RegressCurrentHead when (
-                Buggy == 1 && phase == 1 && owner == 2 &&
-                guard_attached == 0 && head_build > 1
-            ) {
-                previous_head_build = head_build;
-                head_build = head_build - 1;
-                owner = 0;
-            }
-            // Re-running convergence after success yields an empty plan and leaves
-            // both the exact/archive partition and the current head unchanged.
-            action RecheckStable when (
-                phase == 3 && idempotent_recheck == 0
-            ) {
-                idempotent_recheck = 1;
-            }
-
-            invariant HistoricalManifestNeverDeleted:
-                old_exact_manifest + old_archived_manifest == OldHeads;
-            invariant HistoricalSignatureNeverDeleted:
-                if historical_signature_seen == 1 {
-                    old_exact_signature + old_archived_signature == OldHeads
-                } else {
-                    old_exact_signature + old_archived_signature == 0
-                };
-            invariant SignedHistoryRatchetsCurrentPolicy:
-                if phase > 0 && phase <= 3 {
-                    signatures_configured == historical_signature_seen &&
-                    signature_revalidation_pending == 0
-                } else if signature_revalidation_pending == 1 {
-                    historical_signature_seen == 1 && signatures_configured == 0 &&
-                    owner == 1 &&
-                    if phase == 0 {
-                        guard_attached == 1
-                    } else {
-                        phase == 4 && guard_attached <= 1
-                    }
-                } else {
-                    signatures_configured == historical_signature_seen
-                };
-            invariant HistoricalManifestIdentityPreserved:
-                preserved_manifest_ids == OldHeads &&
-                replacement_manifest_ids == 0;
-            invariant HistoricalSignatureIdentityPreserved:
-                preserved_signature_ids == old_exact_signature +
-                    old_archived_signature &&
-                replacement_signature_ids == 0;
-            invariant CurrentExactHeadSurvivesArchive:
-                if phase == 0 {
-                    current_exact_manifest == 0 && current_exact_signature == 0
-                } else if phase == 2 {
-                    current_exact_manifest == 1 &&
-                    current_exact_signature == signatures_configured
-                } else if phase == 3 {
-                    current_exact_manifest == 1 &&
-                    current_exact_signature == signatures_configured
-                } else {
-                    current_exact_manifest <= 1 &&
-                    current_exact_signature <= signatures_configured
-                };
-            invariant CurrentHeadNeverRegresses:
-                previous_head_build <= head_build &&
-                head_build == max_seen_build;
-            invariant ArchiveUsesExactJournalHead:
-                if phase == 2 {
-                    head_build == JournalBuild && head_tag == JournalTag
-                } else {
-                    phase <= 4
-                };
-            invariant ArchiveObservedExactJournalBuild:
-                if phase == 2 {
-                    current_exact_manifest == 1 &&
-                    journal_tag_build == JournalBuild
-                } else {
-                    phase <= 4
-                };
-            invariant ArchiveUsesValidatedLiveIdentity:
-                if phase == 2 {
-                    live_identity_valid == 1
-                } else {
-                    phase <= 4
-                };
-            invariant ArchiveHeadIsImmutable:
-                if phase == 2 {
-                    head_build == archive_head_build &&
-                    head_tag == archive_head_tag
-                } else {
-                    phase <= 4
-                };
-            invariant ArchiveOwnsSharedLease:
-                if phase == 2 {
-                    owner == 1 && guard_attached == 1
-                } else {
-                    owner <= 2 && guard_attached <= 1
-                };
-            invariant NominalCrashPreservesRemoteLease:
-                if phase == 1 && resumed == 1 && legacy_unleased == 0 {
-                    owner == 1
-                } else {
-                    owner <= 2
-                };
-            invariant ConfiguredSignatureRequiredForArchive:
-                if phase == 2 {
-                    current_exact_signature == signatures_configured
-                } else {
-                    current_exact_signature <= signatures_configured
-                };
-            invariant StableHasSingleExactHead:
-                if phase == 3 {
-                    finalized == 1 && current_exact_manifest == 1 &&
-                    current_exact_signature == signatures_configured &&
-                    old_exact_manifest == 0 && old_exact_signature == 0 &&
-                    head_build == JournalBuild && head_tag == JournalTag &&
-                    journal_tag_build == JournalBuild &&
-                    owner == 1 && guard_attached == 1
-                } else {
-                    finalized == 0
-                };
-            invariant ArchiveExitRetainsSharedLease:
-                if phase == 3 {
-                    owner == 1 && guard_attached == 1
-                } else if phase == 4 {
-                    if legacy_format == 1 { owner == 0 } else { owner == 1 }
-                } else {
-                    owner <= 2 && guard_attached <= 1
-                };
-            invariant StablePreservesArchivedHistory:
-                if phase == 3 {
-                    old_archived_manifest == OldHeads &&
-                    old_archived_signature == if historical_signature_seen == 1 {
-                        OldHeads
-                    } else {
-                        0
-                    }
-                } else {
-                    phase <= 4
-                };
-            invariant CollisionNeverFinalizes:
-                if finalized == 1 { collision == 0 } else { collision <= 1 };
-            invariant StaleHeadCannotBeBypassed: stale_head_bypassed == 0;
-            invariant ObservedBuildGuardCannotBeBypassed:
-                build_guard_bypassed == 0;
-            invariant LiveIdentityGuardCannotBeBypassed:
-                identity_guard_bypassed == 0;
-            invariant SignaturePolicyCannotBeBypassed: signature_bypassed == 0;
-            invariant SignatureRatchetCannotBeBypassed:
-                signature_ratchet_bypassed == 0;
-            invariant CompetingOwnerCannotBypassLease:
-                competing_owner_bypassed == 0;
-            invariant LegacyJournalCannotResumeMutation:
-                legacy_resume_bypassed == 0;
-            invariant ArchiveStateBounds:
-                phase <= 4 && old_exact_manifest <= OldHeads &&
-                old_archived_manifest <= OldHeads &&
-                old_exact_signature <= OldHeads &&
-                old_archived_signature <= OldHeads &&
-                preserved_manifest_ids <= OldHeads &&
-                replacement_manifest_ids <= OldHeads &&
-                preserved_signature_ids <= OldHeads &&
-                replacement_signature_ids <= OldHeads &&
-                current_exact_manifest <= 1 && current_exact_signature <= 1 &&
-                live_identity_valid <= 1 &&
-                signatures_configured <= 1 && historical_signature_seen <= 1 &&
-                signature_revalidation_pending <= 1 &&
-                head_build <= MaxBuild &&
-                head_tag <= MaxTag && journal_tag_build <= MaxBuild &&
-                previous_head_build <= MaxBuild &&
-                max_seen_build <= MaxBuild && archive_head_build <= MaxBuild &&
-                archive_head_tag <= MaxTag && owner <= 2 && guard_attached <= 1 &&
-                legacy_format <= 1 && legacy_unleased <= 1 && collision <= 1 &&
-                resumed <= 1 &&
-                finalized <= 1 && idempotent_recheck <= 1 &&
-                stale_head_bypassed <= 1 && build_guard_bypassed <= 1 &&
-                identity_guard_bypassed <= 1 &&
-                signature_bypassed <= 1 && signature_ratchet_bypassed <= 1 &&
-                competing_owner_bypassed <= 1 && legacy_resume_bypassed <= 1;
         }
     }
 }

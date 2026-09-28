@@ -289,11 +289,8 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
     },
     ScopeClaim {
         id: "supernova-burst-mutex",
-        machine: None,
-        unmodelled_because: "No ty_model! exists for the §3.2 two-way burst mutex (derive.rs \
-            has no MAX_ACTIVE_SUPERNOVAE / nova_add machine). Modelling it is the follow-up \
-            this claim's STANDING FINDING blocks on; the CARDINALITY is pinned here \
-            regardless, which is what stops the shard set growing further.",
+        machine: Some("SupernovaBurstMutex"),
+        unmodelled_because: "",
         scope: Scope::Window,
         root: "WindowState",
         chain: &[
@@ -349,7 +346,11 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
             per-pane quads the host appends AFTER this pass has finished spending, so they \
             are neither funded by the budget nor counted by it. That overrun is measured, \
             and shown to truncate nothing and allocate nothing per frame, in \
-            aterm-effects/tests/nova_channel_budget.rs.",
+            aterm-effects/tests/nova_channel_budget.rs. `SupernovaBurstMutex` is the \
+            machine-checked form of the instance count; its Tier-1 bind to the real \
+            grants is TEST-ONLY (aterm-effects' word_decorations test \
+            `real_burst_grants_conform_to_the_supernova_mutex_model`), with no \
+            `#[refines]` anchor on `super_prepass`/`nova_prepass`.",
     },
 ];
 

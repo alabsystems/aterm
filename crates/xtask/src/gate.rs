@@ -4,15 +4,11 @@
 
 //! The local enforcement gate — aterm's replacement for CI (there is NO CI).
 //!
-//! Run via `targo --unverified run -p xtask -- gate <check>`. The verbs named by
-//! `WRAPPED_BY_VERIFY_SH` are wrapped by `tools/verify.sh` and so also run
-//! under the opt-in `cargo ship cut --gate`, which shells out to
-//! `tools/verify.sh --full`; the rest are manual. That list is DERIVED from the
-//! driver's own stage list by
-//! `the_wrapped_list_is_exactly_what_the_verify_driver_calls` — this sentence
-//! hand-typed "four verbs (`drift`, `dormant`, `mainloop`, `counts`)" while
-//! `cells` and `lint --fmt-only` were also in the plan, and no reader caught it.
-//! Never a hook, never CI (owner decision). This header used to also claim an
+//! Run via `targo --unverified run -p xtask -- gate <check>`. The merge gate
+//! (`tools/verify.sh`, crates/aterm-verify/src/stages.rs) calls four of these
+//! verbs and no others: `lint --fmt-only`, `forge` and `cells-foreign` on every
+//! tier, and `cells` under `--full`. The rest are manual. Read the stage code,
+//! not this sentence, for the live list. Never a hook, never CI (owner decision). This header used to also claim an
 //! `aterm-dev gate` surface; there is none — that crate's `SUBS` registry
 //! lists visual-judge / audit /
 //! verify-proofs / setup-trust and nothing else (checked 2026-07-31).
@@ -275,7 +271,8 @@
 //!   2026-08-30. This header said "four" until 2026-08-31.
 //! - `lint`: TRUST's linter and formatter — `targo-tippy -D warnings` +
 //!   `targo-fmt --all --check` and a per-file `trustfmt --check` sweep over
-//!   everything `--all` cannot reach — plus grep_guard + license headers. BOTH are
+//!   everything `--all` cannot reach. (grep_guard and the license sweep are
+//!   stages of the merge gate, `tools/verify.sh`, not lanes here.) BOTH are
 //!   the stage2's own branded drivers, invoked directly and never resolved off
 //!   PATH: the stage2 ships no `cargo-clippy` and no `cargo-fmt`, so `cargo
 //!   clippy` / `cargo fmt` would either die at component lookup or find stock
@@ -521,10 +518,13 @@
 //!   already compile them, and each carries a verdict that differs by who asks
 //!   (`cshim` rows are declined on the host; a `floor` counts host artifacts a
 //!   cross run cannot produce) — so they stay in the opt-in whole-matrix verb.
-//!   MEASURED 2026-09-17 on m17-tower: 90.5 s cold, 1.2 s warm, 16.6 s after one
-//!   core-crate edit, against a `gate all` that costs 251.0-542.6 s on the same
-//!   box (the spread is `perf`'s release harness, warm or cold) — +3.0% to
-//!   +6.6%. It leaves 5.0 GB of target dirs, outside the repo, in
+//!   MEASURED 2026-09-17 on m17-tower, when it was three cells: 90.5 s cold,
+//!   1.2 s warm, 16.6 s after one core-crate edit, against a `gate all` that
+//!   costs 251.0-542.6 s on the same box (the spread is `perf`'s release
+//!   harness, warm or cold) — +3.0% to +6.6%. Five cells since 2026-09-18,
+//!   re-measured 2026-09-27 on m7 (see [`gate_cells_foreign`]: 394 s cold into
+//!   12.1 GiB with incremental on, 2.6 GiB with it off as `tools/verify.sh`
+//!   runs it). It leaves those target dirs, outside the repo, in
 //!   `$ATERM_CELL_TARGET_DIR` (default: `$XDG_CACHE_HOME/aterm/cells/<checkout>`,
 //!   which is disk-backed and one per checkout — see [`cell_target_dir`] for why
 //!   it is not the temp dir, and why worktrees may not share it).
@@ -575,10 +575,10 @@
 //!   2026-08-24 (the paint guard having made a blocking hook cost twelve
 //!   minutes), its 2026-09-17 successor read a gate receipt rather than a verb,
 //!   and on 2026-09-25 the hook was deleted outright (no hooks, by the owner's
-//!   mandate). Nothing automatic runs this verb; tools/verify.sh invokes only the verbs
-//!   `WRAPPED_BY_VERIFY_SH` names. So `fault`, `forge` and `perf` still have
-//!   NO automated caller: run them by hand, or wire them into verify.sh (`fault`
-//!   is cheap and toolchain-free; `perf` belongs behind `--full`).
+//!   mandate). Nothing automatic runs this verb; tools/verify.sh invokes `lint
+//!   --fmt-only`, `forge` and `cells-foreign` on every tier (and `cells` under
+//!   `--full`); `perf` has NO automated caller (it measures, and belongs behind
+//!   `--full`).
 //!
 //!   `forge` IS GREEN, AND COST IS THE ONLY ARGUMENT LEFT AGAINST WIRING IT IN.
 //!   This paragraph used to say the verb "is RED on this tree today, so wiring
@@ -607,8 +607,16 @@
 //!   figure for wiring `forge` into verify.sh is a FLAT ~12–14 s added to every
 //!   invocation, needing no compiler and no network (it reads `Cargo.lock`,
 //!   `vendor/`, `vendor/forge.toml`, the budget file and five offline resolves).
-//!   Whether that belongs in `--fast`, behind `--full`, or nowhere is the
-//!   owner's call — but it is now a call about seconds, not about a red gate.
+//!   DECIDED 2026-09-25 under the owner's standing direction: the gate itself, as
+//!   `StageId::Forge` in the xtask lane (re-measured that day at 9.1 s wall with
+//!   xtask warm). A gate behind `--full` has no automatic caller either, which
+//!   is how `cells` missed a Windows break for two days. That DEPARTS from the
+//!   2026-09-25 triage's recommended default — `--full`, because forge's inputs
+//!   change rarely and `--full` already pays for the whole cells matrix — and
+//!   the departure is deliberate (recorded 2026-09-27): `--full` runs only when
+//!   a person types it, so the rare change that matters (a `Cargo.lock` bump,
+//!   a fork re-pin, a vendored file edited) would reach `main` unjudged, and the
+//!   flat 9 s is spent in the xtask lane, beside the build, not after it.
 //!
 //! THE NON-VACUITY OBLIGATION ([`NON_VACUITY_REGISTRY`]). Six times on
 //! 2026-07-31 a gate in this repo was found ASSERTING MORE THAN IT VERIFIED —
@@ -809,24 +817,6 @@ pub(crate) fn opt_in_names() -> Vec<&'static str> {
     OPT_IN_OUTSIDE_ROSTER.to_vec()
 }
 
-/// The gate verbs `tools/verify.sh` wraps, and which therefore also run under
-/// `cargo ship cut --gate`. ONE definition, checked against the driver's own
-/// stage list by `the_wrapped_list_is_exactly_what_the_verify_driver_calls`.
-/// Hand-typed prose said "drift, dormant, mainloop and counts" from the day
-/// `cells` and `lint --fmt-only` joined the plan until 2026-09-13.
-/// Read only by `the_wrapped_list_is_exactly_what_the_verify_driver_calls`: no RUNTIME
-/// path consults it, so it exists only in the test build.
-#[cfg(test)]
-const WRAPPED_BY_VERIFY_SH: &[&str] = &[
-    "cells",
-    "citations",
-    "counts",
-    "dormant",
-    "drift",
-    "lint",
-    "mainloop",
-];
-
 /// How a roster gate's ABILITY TO GO RED is established: `test` — a `#[test] fn`
 /// in `file` (workspace-relative) — plants a violation and asserts a RED verdict.
 /// There is no "known gap" alternative: every roster gate has been shown to fail,
@@ -835,9 +825,9 @@ struct RedFixture {
     gate: &'static str,
     test: &'static str,
     file: &'static str,
-    /// EXACTLY what the fixture calls. A component-level demonstration
-    /// (`run_repo_guards`) must say so here; only a fixture that calls the
-    /// verb's own reporting function may claim the verb. Prose, for the
+    /// EXACTLY what the fixture calls. A component-level demonstration (one
+    /// lane's function, not the verb) must say so here; only a fixture that
+    /// calls the verb's own reporting function may claim the verb. Prose, for the
     /// reader — the machine-checked half is `calls`.
     drives: &'static str,
     /// The symbol the fixture MUST mention, checked as a substring of its
@@ -850,7 +840,7 @@ struct RedFixture {
     calls: &'static str,
     /// Does the fixture drive the VERB, or only a component of it? The
     /// printed score separates the two rather than counting them together —
-    /// `lint`'s fixture drives `run_repo_guards`, not `gate_lint`, and a
+    /// `lint`'s first fixture drove one lane's function, not `gate_lint`, and a
     /// score that calls both "verb-level" over-claims exactly like the
     /// verdict line this repo fixed this morning.
     verb_level: bool,
@@ -1043,7 +1033,7 @@ const NON_VACUITY_REGISTRY: &[RedFixture] = &[
         test: "every_lint_lane_can_turn_the_verb_red",
         file: "crates/xtask/src/gate.rs",
         drives: "the VERB: gate_lint_with() over a lane provider that gives ONE \
-                 lane at a time a FINDING (tippy / trustfmt / guards), each \
+                 lane at a time a FINDING (tippy / trustfmt), each \
                  required to turn the verdict red on its own, plus a clean sweep \
                  pinning order and arity. The NO-VERDICT half is \
                  every_not_run_lane_blocks_the_verdict, which drives the same verb \
@@ -3243,7 +3233,16 @@ struct CellReport {
     tests_owed: usize,
     /// Why the test-target pass did not run here, when it did not.
     tests_note: Option<String>,
+    /// The cell's wall seconds: its check and its test-target pass.
     secs: u64,
+    /// What the cell's target dir holds once its compile is done
+    /// (`aterm_verify::disk::dir_bytes`), or `None` where nothing was
+    /// compiled. With `secs`, the cell's COST, printed on every run: the
+    /// foreign cells run in every merge-contract run, and their target dirs
+    /// are the most that run writes outside the snapshot's own target lanes
+    /// (2.6 GiB cold, 2026-09-27), so a reader of the log sees what the gate
+    /// cost without measuring it by hand.
+    disk: Option<u64>,
     status: String,
     outcome: CellOutcome,
 }
@@ -3275,6 +3274,7 @@ impl CellReport {
             tests_owed: 0,
             tests_note: Some("nothing was compiled for this cell at all".to_string()),
             secs: 0,
+            disk: None,
             status: SKIPPED_NO_STD.to_string(),
             outcome: CellOutcome::Skipped,
         }
@@ -3793,10 +3793,11 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// "From a Unix box the build is clean, which is exactly why it landed".
 ///
 /// WHAT IT RUNS, AND WHY NOT THE WHOLE MATRIX. [`foreign_cells`] — `win`,
-/// `wasm-cpu` and `wasm-gpu` on today's matrix: the cells no box in this fleet
-/// runs natively, which is exactly the set whose verdict is the SAME wherever it
-/// is run. `mac-arm` and `linux` stay behind the opt-in `cells` verb because
-/// each is native on some box — where the ordinary build, test and tippy lanes,
+/// `wasm-cpu`, `wasm-gpu`, `linux-arm` and `win-arm` on today's matrix (the
+/// first three until 2026-09-18): the cells no box in this fleet runs
+/// natively, which is exactly the set whose verdict is the SAME wherever it is
+/// run. `mac-arm`, `mac-x64` and `linux` stay behind the opt-in `cells` verb
+/// because each is native on some box — where the ordinary build, test and tippy lanes,
 /// `gate linux` and the shipped release already compile it — and cross on
 /// another, and the gate's verdict for them differs between the two. The two
 /// mechanisms, and the red one of them is in right now, are in
@@ -3805,13 +3806,28 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// THE COST, MEASURED, because "it cross-checks several triples" was the entire
 /// argument for keeping it out. m17-tower (Ryzen 9900X3D, 24 threads, x86_64
 /// Linux), load average ~6, the debug `xtask` binary, `$ATERM_CELL_TARGET_DIR`
-/// outside the repo, `/usr/bin/time -p`, 2026-09-17:
+/// outside the repo, `/usr/bin/time -p`, 2026-09-17, when the matrix had five
+/// cells and this subset three:
 ///
 /// ```text
 ///   RUN                      COLD      WARM (no edit)          AFTER ONE CORE EDIT
 ///   gate cells (5 cells)    235.7 s    2.10 / 2.15 / 2.25 s    55.7 s
 ///   gate cells-foreign (3)   90.5 s    1.21 / 1.24 s           16.6 s
 /// ```
+///
+/// RE-MEASURED 2026-09-27 with the subset's FIVE cells, on m7 (M5 Max) at load
+/// average 40-65 from other sessions — wall seconds, each run into its own
+/// `$ATERM_CELL_TARGET_DIR`, and `CARGO_INCREMENTAL` both ways because
+/// `tools/verify.sh`'s children run with it off:
+///
+/// ```text
+///   RUN                              COLD     WARM (no edit)   AFTER ONE CORE EDIT   DISK
+///   cells-foreign (5), incremental   394 s    —                75 s                  12.1 GiB
+///   cells-foreign (5), CARGO_INC=0   432 s    8 s              278 s                  2.6 GiB
+/// ```
+///
+/// Three quarters of the incremental cache is `incremental/`. The 2026-09-17
+/// row and these are not comparable box to box; the load here was 7-10x.
 ///
 /// ("one core edit" is `touch crates/aterm-grid/src/lib.rs`, a crate most of the
 /// tree sits above.) The 39 s the subset drops is almost all the HOST cell, and
@@ -3824,13 +3840,15 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// a cold `gate all` and +6.6% of a warm one after an edit, and +1.2 s on either
 /// when nothing changed.
 ///
-/// THE OTHER COST, since it is not seconds. The three cells leave 5.0 GB of
-/// target directories behind (win 3.6 G — it is the one owed the test-target
-/// pass — wasm-gpu 824 M, wasm-cpu 620 M). That used to land in the system temp
+/// THE OTHER COST, since it is not seconds. The three cells of 2026-09-17 left
+/// 5.0 GB of target directories behind (win 3.6 G — it is the one owed the
+/// test-target pass — wasm-gpu 824 M, wasm-cpu 620 M); the five of 2026-09-27
+/// leave 12.1 GiB with incremental on and 2.6 GiB with it off (the table
+/// above). That used to land in the system temp
 /// dir, which is a RAM-backed tmpfs on this box, and this paragraph used to tell
 /// the reader to point `$ATERM_CELL_TARGET_DIR` at a disk themselves — which is
 /// how a `/tmp/aterm-cells` reached 13.6 GB here and took the swap with it.
-/// [`cell_target_dir`] now defaults to the disk-backed cache dir, so the 5.0 GB
+/// [`cell_target_dir`] now defaults to the disk-backed cache dir, so the cache
 /// lands on a disk without anyone being told to arrange it.
 ///
 /// WHAT IT STILL DOES NOT CATCH, said here rather than left for a reader to
@@ -3841,18 +3859,18 @@ fn foreign_cells() -> Vec<aterm_forge::model::Cell> {
 /// that Windows and wasm are compiled on EVERY box, on every `gate all`, instead
 /// of on whoever remembered to type `--full`.
 ///
-/// AND HOW FAR "EVERY `gate all`" REACHES, because the header says it two
-/// hundred lines up and a reader of this function should not have to go and
-/// find it: `all` is MANUAL. Nothing in the tree invokes it — there is no git hook
-/// (the `.githooks/pre-push` that once did was deleted on 2026-09-25, by the
-/// owner's no-hooks mandate) and `tools/verify.sh` calls the verbs
-/// `WRAPPED_BY_VERIFY_SH` names, not `all`. So this gate closes the hole for
-/// anyone who types `xtask gate all`, and the automatic half is a stage in
-/// `crates/aterm-verify`'s FAST plan — a `StageId`, a `plan.rs` push and a
-/// `stages.rs` arm — at the cost measured above: +16.6 s after an edit, +1.2 s
-/// when nothing changed. That is the owner's call and it is now
-/// a call about seconds — the same sentence this file already had to write about
-/// `forge`.
+/// AND WHO RUNS IT. `all` is MANUAL — nothing in the tree invokes it, and there
+/// is no git hook (the `.githooks/pre-push` that once did was deleted on
+/// 2026-09-25, by the owner's no-hooks mandate). The automatic half is
+/// `StageId::ForeignCells` in `crates/aterm-verify`'s FAST plan, decided
+/// 2026-09-25 under the owner's standing direction on the 2026-09-17 numbers;
+/// its real cost is the `CARGO_INC=0` row above (8 s when nothing changed,
+/// 278 s after a core edit on a loaded M5 Max, 2.6 GiB cold). A snapshot's run
+/// builds into the snapshot's own cells lane beside it
+/// (`aterm_verify::disk::cells_lane`), which the verify disk preflight counts
+/// and caps, not into the per-checkout cache under `~/.cache/aterm/cells`.
+/// It needs rustup's `stable` with the four foreign std targets; without them
+/// this verb exits 0 naming the missing std and the verify stage is a SKIP.
 fn gate_cells_foreign() -> bool {
     let cells = foreign_cells();
     // FAIL-CLOSED, and this is not a theoretical arm: `gate_cells` reads an
@@ -4922,7 +4940,10 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             tests_checked,
             tests_owed,
             tests_note: test_note,
-            secs,
+            // The whole cell — its check AND its test-target pass, which writes
+            // into the same target dir — measured once both are done.
+            secs: started.elapsed().as_secs(),
+            disk: Some(aterm_verify::disk::dir_bytes(&target_dir)),
             status,
             outcome: if cell_ok {
                 CellOutcome::Checked
@@ -4991,9 +5012,20 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
     // TEST targets a compiler read for the cell's triple. `-` means the cell is
     // exempt (the host cell, whose `cargo test` already does it; the wasm32
     // cells, which nothing tests) — never "0 of 0 and green".
+    // SECS and DISK are the cell's COST (`CellReport::disk`), summed on the
+    // line under the table.
     eprintln!(
-        "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5}  STATUS",
-        "CELL", "TRIPLE", "TOOLCHAIN", "CHECKED", "GRAPH", "OWN-CODE", "PM", "TESTS", "SECS"
+        "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5} {:>9}  STATUS",
+        "CELL",
+        "TRIPLE",
+        "TOOLCHAIN",
+        "CHECKED",
+        "GRAPH",
+        "OWN-CODE",
+        "PM",
+        "TESTS",
+        "SECS",
+        "DISK"
     );
     for r in &reports {
         let mut tail = String::new();
@@ -5004,7 +5036,7 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
             tail.push_str(&format!(" (shimmed: {})", r.shimmed.join(", ")));
         }
         eprintln!(
-            "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5}  {}{}",
+            "{:<10} {:<26} {:<34} {:>8} {:>6} {:>9} {:>4} {:>7} {:>5} {:>9}  {}{}",
             r.cell,
             r.triple,
             r.toolchain,
@@ -5018,14 +5050,39 @@ fn cells_under_policy(root: &Path, policy: &CellPolicy, wanted: &[String]) -> bo
                 format!("{}/{}", r.tests_checked, r.tests_owed)
             },
             r.secs,
+            r.disk
+                .map_or_else(|| "-".to_string(), aterm_verify::disk::gib),
             r.status,
             tail
         );
     }
+    eprintln!("{}", cells_cost_line(&reports));
     eprintln!();
     let verdict = cells_verdict(&reports, all_cells.len(), narrowed, fail);
     eprintln!("{}", verdict.text);
     verdict.ok
+}
+
+/// THE GATE'S COST, the line under the table: the seconds and the target-dir
+/// bytes of the cells this run compiled. `gate cells-foreign` is a stage of
+/// every merge-contract run since 2026-09-25, and a review on 2026-09-27
+/// measured it by hand because nothing printed what it cost (12 GiB and 242 s
+/// cold into a per-checkout cache, before the snapshot's run moved it into a
+/// cells lane its disk preflight counts). The bytes are what the target dirs
+/// HOLD after the run, not what it added: a warm run's dirs hold a cold run's
+/// artifacts too, and holding is what the disk preflight budgets.
+fn cells_cost_line(reports: &[CellReport]) -> String {
+    let compiled: Vec<&CellReport> = reports.iter().filter(|r| r.disk.is_some()).collect();
+    let secs: u64 = compiled.iter().map(|r| r.secs).sum();
+    let bytes = compiled
+        .iter()
+        .filter_map(|r| r.disk)
+        .fold(0u64, u64::saturating_add);
+    format!(
+        "gate cells: cost — {} cell(s) compiled in {secs} s; their target dirs hold {}.",
+        compiled.len(),
+        aterm_verify::disk::gib(bytes)
+    )
 }
 
 /// THE MATRIX CLAIM. Nothing else in this file may spell these words, and
@@ -5430,9 +5487,9 @@ enum LaneVerdict {
 
 impl LaneVerdict {
     /// Fold two verdicts about the SAME lane, keeping the more alarming — a
-    /// lane made of several scripts (see [`run_repo_guards`]) is only `Clean`
-    /// when every one of them ran and passed, and a real finding must not be
-    /// downgraded to NOT RUN by a later missing script.
+    /// lane made of several passes (the fmt lane's three, tippy's two) is only
+    /// `Clean` when every one of them ran and passed, and a real finding must
+    /// not be downgraded to NOT RUN by a later pass that could not run.
     fn worst(self, other: Self) -> Self {
         match (self, other) {
             (Self::Finding, _) | (_, Self::Finding) => Self::Finding,
@@ -5442,178 +5499,7 @@ impl LaneVerdict {
     }
 }
 
-/// Run the repo guard scripts (`tools/grep_guard.sh`, `tools/license_check.sh`,
-/// `tools/proof_cache_selftest.sh`, `tools/paint_guard.sh`,
-/// `tools/spin_guard.sh`),
-/// FAILING CLOSED when one is missing.
-///
-/// Each takes the repo root as its argument, and each is executed directly so
-/// its `#!/usr/bin/env bash` shebang is honored — they use bash-only process
-/// substitution and arrays, and break under `sh`.
-///
-/// A missing guard is never a silent pass: `ok &= …` inside an `if …exists()`
-/// with no `else` let `gate lint` print GREEN with two of its four components
-/// never run, while tools/verify.sh's `run_guard` fails closed on the identical
-/// condition ("$label missing or not executable"). It now answers `NotRun`
-/// rather than `Finding` — a distinction with no effect on whether the verdict
-/// is blocked (every NOT RUN blocks; see [`LintLane`]) and every effect on what
-/// the operator is told to go fix, which is a checkout, not the code.
-///
-/// AND A GUARD THAT EXITS 0 WITHOUT MEASURING IS NAMED. `paint_guard` and
-/// `spin_guard` each honour a `<tree fingerprint>` escape that prints
-/// `SKIPPED by …` and exits 0; all three cache-backed guards can print
-/// `: INHERITED …` (a green earned by an EARLIER process — `proof_cache` for
-/// part of its own work); and both matrix guards print `: NOT CHECKED` off
-/// their platform. DEFECT (fixed): read on the exit code alone — the old
-/// `run_shell`, whose stdio the guards inherited — an unproven tree was
-/// byte-identical to a measured one, so this lane reported `Clean` ("the lane
-/// RAN, over the real tree, and found nothing") about work that never happened.
-/// Their stdout is captured now (see [`guard_announced_skip`]), and every such
-/// guard is named on this lane's last line.
-///
-/// It still does not BLOCK, and that part is a POLICY CALL left exactly where it
-/// was: the escapes are fingerprint-scoped emergency levers and the cache
-/// inheritance is provenance-checked by the `proof_cache` tooth below, so both
-/// are deliberate passes rather than accidents. What was never deliberate was
-/// going unmentioned. Turning either into `NotRun`, or carrying the names up
-/// into `gate lint: GREEN — but NOT CHECKED: …` (which needs
-/// [`LintLanes::run`] to return more than a [`LaneVerdict`]), is the owner's.
-fn run_repo_guards(root: &Path) -> LaneVerdict {
-    let root_str = root.to_string_lossy().into_owned();
-    // One argv for every guard: each takes the repo root and nothing else.
-    let args = [root_str.as_str()];
-    let mut verdict = LaneVerdict::Clean;
-    let mut not_vouched: Vec<&str> = Vec::new();
-    for (label, rel) in [
-        ("grep_guard", "tools/grep_guard.sh"),
-        ("license_check", "tools/license_check.sh"),
-        // The gate on the two expensive guards' CACHE (2026-08-26 cached-green
-        // audit). Both teeth below skip when a previous verdict may honestly
-        // stand in for this run, and `tools/proof_cache.sh` is the code that
-        // decides "honestly" — so it is the piece that, if it quietly loosens,
-        // turns both proofs back into decorations. It already did once: a green
-        // that had been RE-ROLLED over a flaky red was stamped under the same
-        // content hash, and every push after it inherited that green without
-        // re-running, for six releases. This selftest drives the real decision
-        // function over a scratch directory in milliseconds and asserts that
-        // re-rolled, unprovenanced, expired, future-dated and unreadable greens
-        // are all refused — while a genuine first-try green still skips, since
-        // a cache that never skips is a broken gate too. It runs FIRST, before
-        // anything consults a cache.
-        ("proof_cache", "tools/proof_cache_selftest.sh"),
-        // The paint-conformance tooth (2026-08-24 blackout audit,
-        // docs/RELEASE-PROOF-DISCIPLINE.md): when the derived local source
-        // closure of the RELEASE artifact (or the gate's own machinery)
-        // differs from the last take it proved green, it re-runs the shape
-        // matrix — headless launch, control-socket keystrokes, pixels asserted.
-        // An unchanged closure costs one content hash, so an ordinary `gate
-        // lint` keeps the affordability rule the hook wrote before it was
-        // demoted (this guard's 720 s run is what demoted it); the script owns
-        // the
-        // macOS-only honesty and the loud ATERM_SKIP_PAINT_GUARD escape.
-        // Its skip now prints INHERITED, never GREEN: GREEN out of that script
-        // means the matrix ran in that process (see proof_cache above).
-        ("paint_guard", "tools/paint_guard.sh"),
-        // The spin-conformance tooth (2026-08 responsiveness audit, item A3).
-        // The freeze-safety gate watches for loops that BLOCK; a loop spinning
-        // at 200 kHz read as vigor, and shipped — 31,913 stale deadline
-        // re-arms/sec, 79% CPU on an IDLE instance, input p99 335 ms. This
-        // guard launches the RELEASE binary headless, lets a steady repainter
-        // arrive on it (output without grid movement — the shape the spin was
-        // made of), and asserts that `past_deadline_arms` stays ~0 across the
-        // measured window. Proven able to go RED: 7929 arms with the fix
-        // reverted, 0 with it in place. Same affordability shape as paint_guard:
-        // an unchanged derived artifact closure costs one content hash, and
-        // the script owns its own POSIX-only honesty and the loud
-        // ATERM_SKIP_SPIN_GUARD escape.
-        ("spin_guard", "tools/spin_guard.sh"),
-    ] {
-        let script = root.join(rel);
-        let lane = if script.exists() {
-            // CAPTURED, not inherited: the same helper the fmt lane uses, so a
-            // guard's own announcement can be read instead of just its exit
-            // code. The repo ROOT is the no-op PATH prefix this helper requires
-            // — it holds no executables, so prepending it cannot change what a
-            // guard resolves — and both streams are still teed verbatim.
-            //
-            // THROUGH THE INTERPRETER, never by exec'ing the script file. Every
-            // guard is `#!/usr/bin/env bash`, and `env bash <script>` is what
-            // the kernel would run for it — but on macOS a process is
-            // provenance-TRACKED when the executable it was exec'd from carries
-            // `com.apple.provenance`, and a SCRIPT exec'd by path counts as that
-            // executable (docs/RELEASING.md, the shim rule). A checkout written
-            // from a tracked shell — a shell inside a TAGGED aterm.app, an agent
-            // under a tagged `claude` — has the files THAT SHELL wrote tagged,
-            // which is most of a worked-in checkout and includes the guards
-            // (1,980 of the owner's 3,858 tracked files, 2026-09-22), so exec'ing
-            // `tools/spin_guard.sh` tracked the guard, the guard tracked the
-            // snapshot, and `proof_snapshot.py` refused its own take with
-            // "published proof snapshot has extended metadata" even from a
-            // launchd job, the one untracked lane there is. Measured the same
-            // day: exec of the tagged script → tracked; `bash <script>` and
-            // `python3 <file>` → untracked. The interpreter is whatever `bash`
-            // `/usr/bin/env` finds first on PATH — /bin/bash here, and any
-            // replacement is a binary rather than a repo file, so it carries the
-            // tag only if its own installer was tracked. `$0` is still the
-            // script's path, so the guards' `HERE="$(dirname "$0")"` resolves as
-            // before, and a guard whose +x bit is gone now runs instead of
-            // failing the lane — the lane's own `exists()` check is what still
-            // catches a MISSING guard.
-            let script_arg = script.to_string_lossy().into_owned();
-            let mut via_bash: Vec<&str> = vec!["bash", script_arg.as_str()];
-            via_bash.extend(args.iter().copied());
-            let (ok, stdout, stderr) =
-                run_capturing_both(label, Path::new("/usr/bin/env"), &via_bash, root, root);
-            if guard_announced_skip(&stdout) || guard_announced_skip(&stderr) {
-                not_vouched.push(label);
-            }
-            if ok {
-                LaneVerdict::Clean
-            } else {
-                LaneVerdict::Finding
-            }
-        } else {
-            eprintln!(
-                "  {label}: NOT RUN — {} is missing. Its checks did not run; this is not a clean lint.",
-                script.display()
-            );
-            LaneVerdict::NotRun
-        };
-        verdict = verdict.worst(lane);
-    }
-    if !not_vouched.is_empty() {
-        eprintln!(
-            "  guards: NOT VOUCHED FOR BY THIS RUN — {}. Each exited 0 while announcing \
-             (SKIPPED by / INHERITED / NOT CHECKED) that some or all of its checks DID NOT RUN \
-             in this process, so its subject is unproven BY THIS RUN and the verdict speaks \
-             only for the guards that measured the tree.",
-            not_vouched.join(", ")
-        );
-    }
-    verdict
-}
-
-/// How a guard announces, on its own stdout, that it exited 0 WITHOUT measuring
-/// the tree: `<word>: SKIPPED by …` (the fingerprint-scoped escape),
-/// `<word>: INHERITED …` (a cached green earned by an earlier process) or
-/// `<word>: NOT CHECKED …` (the platform escape).
-///
-/// Matched only after the `<word>: ` prefix every guard puts on its report
-/// lines, and only at the START of the tail. Both restrictions are load-bearing:
-/// a bare `contains("INHERITED")` reads the `NOT INHERITED` line — printed on
-/// the path where the guard DOES measure — exactly backwards, and an unanchored
-/// match could be fed a line of TREE TEXT that a guard like `grep_guard` echoes
-/// out of the sources it scans.
-fn guard_announced_skip(transcript: &str) -> bool {
-    const NOT_VOUCHED: [&str; 3] = ["SKIPPED by ", "INHERITED", "NOT CHECKED"];
-    transcript.lines().any(|line| {
-        line.trim()
-            .split_once(": ")
-            .is_some_and(|(_, tail)| NOT_VOUCHED.iter().any(|shape| tail.starts_with(shape)))
-    })
-}
-
-/// The three lanes `gate lint` folds into one verdict, in run order.
+/// The two lanes `gate lint` folds into one verdict, in run order.
 ///
 /// A [`LaneVerdict::NotRun`] on ANY of them blocks. There used to be one
 /// exemption — the fmt lane's — and it was removed when the lane was armed
@@ -5637,10 +5523,9 @@ fn guard_announced_skip(transcript: &str) -> bool {
 enum LintLane {
     Tippy,
     Trustfmt,
-    Guards,
 }
 
-const LINT_LANES: [LintLane; 3] = [LintLane::Tippy, LintLane::Trustfmt, LintLane::Guards];
+const LINT_LANES: [LintLane; 2] = [LintLane::Tippy, LintLane::Trustfmt];
 
 impl LintLane {
     /// The lane's name in the report, and in the hook's diagnostics.
@@ -5648,7 +5533,6 @@ impl LintLane {
         match self {
             Self::Tippy => "tippy",
             Self::Trustfmt => "trustfmt",
-            Self::Guards => "guards",
         }
     }
 }
@@ -5879,7 +5763,7 @@ impl LintLanes for LiveLintLanes<'_> {
                 }
                 None => {
                     eprintln!(
-                        "  tippy: NOT RUN — no targo-tippy/targo-clippy in {}. Nothing was \
+                        "  tippy: NOT RUN — no targo-tippy in {}. Nothing was \
                          linted; this is not a clean lint. Build the Trust stage2 \
                          (`python3 x.py build --stage 2` in $HOME/trust) and re-run.",
                         self.tools.display()
@@ -5920,7 +5804,6 @@ impl LintLanes for LiveLintLanes<'_> {
                 .fmt_workspace_pass()
                 .worst(fmt_sweep(self.root, self.tools))
                 .worst(fmt_edition_agreement(self.root)),
-            LintLane::Guards => run_repo_guards(self.root),
         }
     }
 }
@@ -6645,13 +6528,11 @@ fn fmt_sweep(root: &Path, tools: &Path) -> LaneVerdict {
     LaneVerdict::Finding
 }
 
-/// The tippy binary in `tools`, by the same candidate order `tools/verify.sh`
-/// uses. `None` means NOT RUN — never "clean".
+/// The tippy binary in `tools` — `targo-tippy`, the one name the Trust
+/// toolchain ships (the pre-rebrand `targo-clippy` is retired). `None` means
+/// NOT RUN — never "clean".
 fn resolve_tippy(tools: &Path) -> Option<PathBuf> {
-    ["targo-tippy", "targo-clippy"]
-        .iter()
-        .map(|name| tools.join(name))
-        .find(|path| path.is_file())
+    Some(tools.join("targo-tippy")).filter(|path| path.is_file())
 }
 
 /// How many members `--workspace` covers. The manifest says
@@ -6913,10 +6794,7 @@ fn gate_lint_args(args: &[String]) -> bool {
 /// bare `GREEN` continues to mean what it has always meant: every lane ran, and
 /// every lane was clean.
 fn gate_lint_with(lanes: &mut dyn LintLanes, selection: LaneSelection) -> bool {
-    eprintln!(
-        "=== gate lint (tippy -D warnings + trustfmt + guards[grep_guard,license_check,\
-         proof_cache,paint_guard,spin_guard]) ==="
-    );
+    eprintln!("=== gate lint (tippy -D warnings + trustfmt) ===");
     let mut findings: Vec<&str> = Vec::new();
     let mut blocked_not_run: Vec<&str> = Vec::new();
     let mut skipped: Vec<&str> = Vec::new();
@@ -6933,9 +6811,9 @@ fn gate_lint_with(lanes: &mut dyn LintLanes, selection: LaneSelection) -> bool {
         }
     }
     // A FINDING OUTRANKS A NOT-RUN in the headline. If tippy found real errors
-    // and the guards script was also missing, the thing the developer must act
-    // on is the errors; the missing script is reported on its own line and
-    // still blocks, so nothing is lost by ranking it second.
+    // and the formatter could not run, the thing the developer must act on is
+    // the errors; the missing formatter is reported on its own line and still
+    // blocks, so nothing is lost by ranking it second.
     if !findings.is_empty() {
         eprintln!(
             "{LINT_VERDICT_FAILED} — findings in: {}",
@@ -7811,7 +7689,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     // VERB-LEVEL red proofs for `gate lint` and `gate perf`.
     //
     // Both gates were registered non-vacuity gaps: `perf` had never been shown
-    // to fail at all, and `lint`'s only red fixture drove `run_repo_guards`, a
+    // to fail at all, and `lint`'s only red fixture drove one lane's function, a
     // component. A gate nobody has watched go red is a gate nobody has shown
     // is listening.
     // ------------------------------------------------------------------
@@ -7985,7 +7863,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
 
     #[test]
     fn every_lint_lane_can_turn_the_verb_red() {
-        // ONE LANE AT A TIME. Failing all three together only proves their
+        // ONE LANE AT A TIME. Failing both together only proves their
         // conjunction — it leaves each arm free to stop failing closed with
         // nothing noticing, which is exactly what the old fixture allowed.
         //
@@ -8016,7 +7894,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     /// failure for it to have had: the fmt lane's exemption was the one thing it
     /// pinned, and the exemption is gone (see [`LintLane`]). What must NOT be
     /// lost with it is the other half — that a lane which never ran is never
-    /// read as clean — so that is asserted here for all three.
+    /// read as clean — so that is asserted here for every lane.
     #[test]
     fn every_not_run_lane_blocks_the_verdict() {
         for lane in LINT_LANES {
@@ -8082,7 +7960,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         assert!(gate_lint_with(&mut stub, LaneSelection::NoFmt));
         assert_eq!(
             stub.seen,
-            vec![LintLane::Tippy, LintLane::Guards],
+            vec![LintLane::Tippy],
             "--no-fmt must skip fmt and keep every other lane"
         );
         // …and it narrows NOTHING else: tippy still blocks under --no-fmt.
@@ -8091,8 +7969,8 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
     }
 
     /// `--fmt-only` is `--no-fmt`'s opposite and must be as narrow: the
-    /// formatter lane runs, NOTHING else does, and the two other lanes are
-    /// reported as not checked rather than silently dropped.
+    /// formatter lane runs, NOTHING else does, and the other lane is reported
+    /// as not checked rather than silently dropped.
     ///
     /// The second half is the one worth pinning. A narrowing flag that also
     /// stopped BLOCKING would be the same defect this verb has already paid for
@@ -8156,7 +8034,6 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         };
         let tippy = live.run(LintLane::Tippy);
         let fmt = live.run(LintLane::Trustfmt);
-        let guards = live.run(LintLane::Guards);
         let _ = std::fs::remove_dir_all(&tmp);
         assert_eq!(
             tippy,
@@ -8167,11 +8044,6 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
             fmt,
             LaneVerdict::NotRun,
             "a missing formatter must not report clean formatting"
-        );
-        assert_eq!(
-            guards,
-            LaneVerdict::NotRun,
-            "missing guard scripts must not report clean guards"
         );
         assert_eq!(resolve_tippy(&tools), None);
     }
@@ -8652,7 +8524,7 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         extract_call_string_args, fault_report, flag_was_rejected, impl_source_files,
         is_ordinary_kani_proof_attr, judge_kernel_certification, needle_present,
         non_vacuity_violations, proof_inventory_is_valid, readme_asserts_proof_inventory,
-        roster_names, run_repo_guards,
+        roster_names,
     };
     use crate::workspace_root;
     use std::path::{Path, PathBuf};
@@ -8820,35 +8692,6 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         assert_eq!(
             certified_driver(&tools),
             Some(tools.stage2_dir.join("trustc"))
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A missing guard script must BLOCK the lint, matching verify.sh's
-    /// `run_guard` ("$label missing or not executable"). The old `if
-    /// script.exists()` had no `else`, so this returned true — `gate lint`
-    /// could print GREEN with grep_guard and license_check never run.
-    ///
-    /// It reports NOT RUN rather than a finding (nothing about the tree was
-    /// learned), and the second assertion drives the VERB with that same verdict
-    /// so the pair keeps meaning "blocked": a NOT-RUN that stopped blocking
-    /// would pass the first assert and fail the second.
-    #[test]
-    fn missing_guard_scripts_fail_the_lint_closed() {
-        let dir = std::env::temp_dir().join("aterm_gate_guards_absent_test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("create empty root");
-        assert_eq!(
-            run_repo_guards(&dir),
-            LaneVerdict::NotRun,
-            "a root with no tools/ passed the guard stage"
-        );
-        assert!(
-            !gate_lint_with(
-                &mut StubLintLanes::not_running(LintLane::Guards),
-                LaneSelection::All
-            ),
-            "a guards lane that never ran must still block the verdict"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -9486,51 +9329,6 @@ error: could not compile `aterm-gui` (lib) due to 1 previous error
         );
     }
 
-    /// `WRAPPED_BY_VERIFY_SH` is exactly the gate verbs the verify driver
-    /// calls, read out of its own stage list. `cells` and `lint --fmt-only`
-    /// joined the plan and two hand-typed sentences in this file did not move.
-    #[test]
-    fn the_wrapped_list_is_exactly_what_the_verify_driver_calls() {
-        let stages = std::fs::read_to_string(
-            crate::workspace_root().join("crates/aterm-verify/src/stages.rs"),
-        )
-        .expect("the verify driver's stage list is readable");
-        let mut wrapped: Vec<String> = Vec::new();
-        // `xtask_gate_args("counts")` and `xtask_gate_args_with("lint", …)`; the
-        // definitions themselves take an identifier, not a literal, and are skipped.
-        for (i, _) in stages.match_indices("xtask_gate_args") {
-            let rest = &stages[i..];
-            let Some(open) = rest.find('(') else { continue };
-            let after = rest[open + 1..].trim_start();
-            if let Some(lit) = after.strip_prefix('"')
-                && let Some(end) = lit.find('"')
-            {
-                wrapped.push(lit[..end].to_string());
-            }
-        }
-        // The loop form: `for gate in [...] { … xtask_gate_args(gate) … }`.
-        assert!(
-            stages.contains("xtask_gate_args(gate)"),
-            "the loop form is gone; this extractor needs re-reading"
-        );
-        let list = stages
-            .split_once("for gate in [")
-            .expect("the wrapped-verb loop exists")
-            .1;
-        for part in list[..list.find(']').expect("the loop array closes")].split(',') {
-            let verb = part.trim().trim_matches('"');
-            if !verb.is_empty() {
-                wrapped.push(verb.to_string());
-            }
-        }
-        wrapped.sort_unstable();
-        wrapped.dedup();
-        assert_eq!(
-            wrapped, WRAPPED_BY_VERIFY_SH,
-            "WRAPPED_BY_VERIFY_SH must name every gate verb tools/verify.sh calls"
-        );
-    }
-
     // -----------------------------------------------------------------------
     // G-CERTIFIED: the kernel-certification parse contract
     // -----------------------------------------------------------------------
@@ -9973,6 +9771,7 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
             tests_owed: 30,
             tests_note: None,
             secs: 12,
+            disk: Some(3 << 30),
             status: "GREEN".to_string(),
             outcome: super::CellOutcome::Checked,
         }
@@ -10023,6 +9822,31 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         assert!(v.text.contains("NO COMPILER READ THEM"), "{}", v.text);
         // And the repair is in the sentence, not in a wiki.
         assert!(v.text.contains("rustup target add"), "{}", v.text);
+    }
+
+    /// THE COST LINE sums what was COMPILED: the seconds and target-dir bytes
+    /// of every cell that ran, and nothing for a cell nothing was compiled for
+    /// (its `-` DISK is not a zero-byte cell). Before 2026-09-27 no line said
+    /// what the gate cost, and a review had to measure it by hand.
+    #[test]
+    fn the_cost_line_sums_the_cells_that_compiled_and_only_those() {
+        let mut win = checked_cell("win", "x86_64-pc-windows-msvc");
+        win.secs = 30;
+        win.disk = Some(1 << 30);
+        let mut arm = checked_cell("linux-arm", "aarch64-unknown-linux-gnu");
+        arm.secs = 12;
+        arm.disk = Some((1 << 30) + (1 << 29));
+        let skipped =
+            super::CellReport::skipped(&cell("wasm-cpu", "wasm32-unknown-unknown"), 54, 20, 1);
+        assert_eq!(skipped.disk, None);
+        assert_eq!(
+            super::cells_cost_line(&[win, skipped, arm]),
+            "gate cells: cost — 2 cell(s) compiled in 42 s; their target dirs hold 2.5 GiB."
+        );
+        assert_eq!(
+            super::cells_cost_line(&[]),
+            "gate cells: cost — 0 cell(s) compiled in 0 s; their target dirs hold 0.0 GiB."
+        );
     }
 
     /// THE OTHER HALF OF THE SAME DECISION, pinned so it cannot be "fixed" into
@@ -10733,7 +10557,7 @@ note: Trust verification: 1 proved, 0 failed, 0 unknown, 0 timed out, 0 runtime-
         let wasm = super::test_pass_exemption("wasm32-unknown-unknown", false)
             .expect("the wasm cells are exempt");
         assert!(wasm.contains("dev-dependencies"), "{wasm}");
-        // THE LIVE CELL LIST: at most two of forge's five cells may be exempt on
+        // THE LIVE CELL LIST: at most two of forge's eight cells may be exempt on
         // any box, and the three shipping triples are never among them unless
         // one of them IS the box. A third exemption appearing here means someone
         // widened the escape hatch.

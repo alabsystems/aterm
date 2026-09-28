@@ -172,6 +172,15 @@ pub(super) fn copy_cells_to_row(
             skip_next_spacer = true;
         } else if skip_next_spacer && cell.flags().contains(CellFlags::WIDE_CONTINUATION) {
             skip_next_spacer = false;
+        } else if cell.flags().contains(CellFlags::WIDE) && j.saturating_add(1) == new_cols {
+            // A wide head in the destination's last column has nowhere to put
+            // its continuation. The chunked reflow never gets here
+            // (`adjust_chunk_boundary` ends the chunk before the pair), but the
+            // in-place DECDWL/DECDHL truncation does. Blank it, as
+            // `Row::resize` does, rather than leave a dangling WIDE cell.
+            new_row.set(j, crate::Cell::EMPTY);
+            j = j.saturating_add(1);
+            skip_next_spacer = true;
         } else if j < new_cols {
             let dest_col = j;
             new_row.set(dest_col, *cell);

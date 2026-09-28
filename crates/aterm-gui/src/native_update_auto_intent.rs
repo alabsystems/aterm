@@ -83,7 +83,8 @@ pub(crate) enum ApplyPhase {
     /// Park only at a machine-wide idle moment.
     PreferIdle,
     /// Park at a gap between keystrokes, and — while an aterm window is
-    /// focused — a gap in every session's output.
+    /// focused — a gap in the output of every session shown in the active tab
+    /// of a focused OS window.
     PreferOutputGap,
     /// Park at a gap between keystrokes; output is not consulted.
     KeysOnly,
@@ -141,8 +142,10 @@ pub(crate) struct ActivityFacts {
     /// `App::update_apply_hands_off_keys`: no keystroke landed in an aterm
     /// window inside the typing gap.
     pub(crate) hands_off_keys: bool,
-    /// `App::automatic_update_output_quiet`: every live session's PTY output is
-    /// at least one quiet epoch old.
+    /// `App::automatic_update_output_quiet`: every session shown in the active
+    /// tab of a focused OS window has PTY output at least one quiet epoch old
+    /// (a background tab, an unfocused window or a zoomed-away split does not
+    /// count).
     pub(crate) output_quiet: bool,
     /// `App::any_os_window_focused`: an aterm window has keyboard focus, so the
     /// user is looking at this terminal.

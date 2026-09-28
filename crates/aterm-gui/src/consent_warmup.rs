@@ -39,9 +39,8 @@
 //!
 //! The folders arrive as already-resolved `(Folder, PathBuf)` pairs from
 //! `aterm_containment::consent::folder_paths`. This module writes none of its
-//! own — that is the B13 rule (`tools/grep_guard.sh`), and
-//! `tests::the_module_contains_no_protected_path_literal` asserts it about
-//! this very file.
+//! own — that is the B13 rule (`tools/grep_guard.sh`), which reads every
+//! shipping line of this file.
 //!
 //! # Not reachable from a control verb
 //!
@@ -49,7 +48,8 @@
 //! environment variable, no `VERBS` row, and no dispatch arm. A consent-raising
 //! action reachable from inside a session would be a consent surface an agent
 //! controls, which is the same rule that governs `tccutil reset` (§3.7).
-//! `tests::no_control_dispatch_arm_can_reach_the_warm_up` is the fence.
+//! `consent_retire`'s `tests::no_control_module_names_a_consent_raising_entry_point`
+//! is the fence.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, SyncSender, TrySendError};
@@ -357,8 +357,8 @@ struct LivePass {
 /// of the bounded result queue.
 ///
 /// Instance-owned, with NO process-global anywhere in this module
-/// (`tests::the_module_owns_no_process_global_and_reads_no_environment_knob` is
-/// the fence). That is what
+/// (`tests::neither_consent_worker_owns_a_process_global_or_reads_an_environment_knob`
+/// is the fence). That is what
 /// makes §3.5's successor rule structural rather than a cleanup step: an
 /// in-place apply builds a fresh `App`, which builds a fresh `WarmupState`, so
 /// every row is `unknown` again and nothing claims anything about a modal that
@@ -720,24 +720,6 @@ mod tests {
 
     use super::*;
 
-    /// The module's SHIPPING source: everything before the first `#[cfg(test)]`
-    /// attribute, which is this module's own. Mirrors `tools/grep_guard.sh`'s
-    /// `np_strip`, and it is what lets the scans below name the very patterns
-    /// they are forbidding.
-    fn shipping_source() -> &'static str {
-        const SOURCE: &str = include_str!("consent_warmup.rs");
-        let marker = "#[cfg(test)]";
-        let shipping = SOURCE
-            .split(marker)
-            .next()
-            .expect("split always yields a first part");
-        assert!(
-            shipping.len() < SOURCE.len(),
-            "the test module must be excluded from the scan"
-        );
-        shipping
-    }
-
     // -----------------------------------------------------------------------
     // The pure fold
     // -----------------------------------------------------------------------
@@ -832,114 +814,66 @@ mod tests {
     // The fence
     // -----------------------------------------------------------------------
 
+    /// OFF BY DEFAULT AND UNREACHABLE FROM INSIDE A SESSION, for both consent
+    /// workers: no process-global (it would survive an in-place apply; this state
+    /// is instance-owned so a successor re-probes) and no environment knob
+    /// (`ATERM_*` is stripped from children anyway, and a knob a program inside a
+    /// session could flip would be a consent surface an agent controls — design
+    /// §4). The observer's enable decision arrives as a resolved `bool` from the
+    /// config layer. The scan reads everything above each module's top-level
+    /// `mod tests`, comment lines dropped, as grep_guard's `np_strip` does. It is
+    /// cut at the MODULE boundary, not at the first `#[cfg(test)]`: both files
+    /// gate single test-only methods with an indented one, and cutting there
+    /// would leave the rest of the shipping code unread.
     #[test]
-    fn the_module_contains_no_protected_path_literal() {
-        let shipping = shipping_source();
-        // The same set `tools/grep_guard.sh` B13a/B13b forbid in aterm-gui and
-        // aterm-cli. Paths reach this module as already-resolved `PathBuf`s.
-        let literals = [
-            "~/Documents",
-            "~/Desktop",
-            "~/Downloads",
-            "~/Pictures",
-            "~/Movies",
-            "~/Music",
-            "/Volumes",
-            "Library/Containers",
-            "Library/CloudStorage",
-            "CloudStorage",
-            "Containers",
-        ];
-        for needle in literals {
-            assert!(
-                !shipping.contains(needle),
-                "the warm-up module must hold no protected-folder path literal, found {needle:?}"
-            );
-        }
-        let joins = [
-            "join(\"Documents\")",
-            "join(\"Desktop\")",
-            "join(\"Downloads\")",
-            "join(\"Volumes\")",
-            "join(\"Containers\")",
-            "join(\"CloudStorage\")",
-        ];
-        for needle in joins {
-            assert!(
-                !shipping.contains(needle),
-                "a resolved-at-$HOME protected path is still a path literal, found {needle:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_module_owns_no_process_global_and_reads_no_environment_knob() {
-        let shipping = shipping_source();
-        for line in shipping.lines() {
-            let trimmed = line.trim_start();
-            assert!(
-                !trimmed.starts_with("static ")
-                    && !trimmed.starts_with("pub static ")
-                    && !trimmed.starts_with("pub(crate) static "),
-                "a process-global would survive an in-place apply; this state is \
-                 instance-owned so a successor re-probes: {line}"
-            );
-        }
-        assert!(!shipping.contains("OnceLock"));
-        assert!(!shipping.contains("thread_local!"));
-        // No environment variable may reach the warm-up: `ATERM_*` is stripped
-        // from children anyway, and a knob a program inside a session could flip
-        // would be a consent surface an agent controls (design §4).
-        assert!(!shipping.contains("env::var"));
-    }
-
-    #[test]
-    fn no_control_dispatch_arm_can_reach_the_warm_up() {
-        // The consent-RAISING entry points. Reading the rows is harmless and is
-        // deliberately not on this list; starting a pass is what puts a system
-        // modal on the owner's screen, and a program inside a session must not
-        // be able to do that.
-        const ENTRY_POINTS: &[&str] = &[
-            "begin_consent_warmup",
-            "WarmupState::start",
-            "consent_warmup::WarmupProbe",
-        ];
-        let sources: &[(&str, &str)] = &[
-            ("control.rs", include_str!("control.rs")),
-            ("control_auth.rs", include_str!("control_auth.rs")),
-            ("control_auth_unix.rs", include_str!("control_auth_unix.rs")),
-            ("control_auth_win.rs", include_str!("control_auth_win.rs")),
-            ("control_host.rs", include_str!("control_host.rs")),
-            ("control_input.rs", include_str!("control_input.rs")),
-            ("control_media.rs", include_str!("control_media.rs")),
-            ("control_privacy.rs", include_str!("control_privacy.rs")),
-            ("control_query.rs", include_str!("control_query.rs")),
-            ("control_session.rs", include_str!("control_session.rs")),
+    fn neither_consent_worker_owns_a_process_global_or_reads_an_environment_knob() {
+        for (name, source, last_shipping_fn) in [
             (
-                "control_connection_conformance.rs",
-                include_str!("control_connection_conformance.rs"),
+                "consent_observer.rs",
+                include_str!("consent_observer.rs"),
+                "fn note_eperm(",
             ),
             (
-                "control_redraw_conformance.rs",
-                include_str!("control_redraw_conformance.rs"),
+                "consent_warmup.rs",
+                include_str!("consent_warmup.rs"),
+                "fn run_pass(",
             ),
-        ];
-        for (name, source) in sources {
-            for entry in ENTRY_POINTS {
+        ] {
+            let (shipping, _tests) = source
+                .split_once("\n#[cfg(test)]\nmod tests {")
+                .expect("the module has a top-level test module to exclude");
+            // Non-vacuity: the slice reaches the module's last shipping item,
+            // which sits below every indented test seam.
+            assert!(
+                shipping.contains(last_shipping_fn),
+                "{name}: the scan stops before `{last_shipping_fn}`; it no longer \
+                 covers the whole shipping module"
+            );
+            for line in shipping
+                .lines()
+                .map(str::trim_start)
+                .filter(|l| !(l.starts_with("//") || l.starts_with('*')))
+            {
                 assert!(
-                    !source.contains(entry),
-                    "{name} reaches the warm-up entry point `{entry}`: a consent-raising \
-                     action reachable from inside a session is a consent surface an agent \
-                     controls (design §3.5)"
+                    !(line.starts_with("static ")
+                        || line.starts_with("pub static ")
+                        || line.starts_with("pub(crate) static ")),
+                    "{name}: a process-global: {line}"
                 );
+                for needle in [
+                    "env::var",
+                    "ATERM_",
+                    "OnceLock",
+                    "thread_local!",
+                    "static mut",
+                ] {
+                    assert!(
+                        !line.contains(needle),
+                        "{name}: must own no global and read no env knob, found {needle:?}: {line}"
+                    );
+                }
             }
         }
-        // …and the entry point really is spelled that way, so a rename cannot
-        // silently defang the scan above.
-        assert!(
-            include_str!("lib.rs").contains("fn begin_consent_warmup"),
-            "the gesture entry point moved; update ENTRY_POINTS"
-        );
     }
 
     // -----------------------------------------------------------------------

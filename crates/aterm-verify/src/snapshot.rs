@@ -9,10 +9,10 @@
 //! binaries that the smokes then drove. None of that was compile work the gate
 //! had asked for, and none of it was visible in the ladder.
 //!
-//! So a run (everything but `--selftest`, unless `--in-place`) happens in a git
-//! WORKTREE of the caller's repository at `<caller-root>-verify.noindex` (or
-//! `--snapshot <dir>`). The `.noindex` suffix keeps Spotlight out of the
-//! sources and every target dir without touching macOS defaults. Before
+//! So every run happens in a git WORKTREE of the caller's repository at
+//! `<caller-root>-verify.noindex` (or `--snapshot <dir>`). The `.noindex`
+//! suffix keeps Spotlight out of the sources and every target dir without
+//! touching macOS defaults. Before
 //! anything is planned, the worktree is synced to exactly what the caller has:
 //!
 //!  1. `git checkout --detach --force <caller HEAD>`;
@@ -121,27 +121,14 @@ pub const LANE_ENV_VARS: [&str; 14] = [
 
 const LANE_ENV_PREFIX: &str = "CARGO_PROFILE_";
 
-/// Where the stages of a run execute.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub enum SourceMode {
-    /// The caller's own checkout — `--in-place`, `--selftest`, or a root that
-    /// is not a git checkout.
-    #[default]
-    InPlace,
-    /// A synced snapshot of `caller`.
-    Snapshot { caller: PathBuf },
-}
-
-impl SourceMode {
-    /// The tail of the `verify: source …` header line.
-    #[must_use]
-    pub fn place(&self, root: &Path) -> String {
-        match self {
-            SourceMode::InPlace => format!("in place {}", root.display()),
-            SourceMode::Snapshot { caller } => {
-                format!("snapshot {} (of {})", root.display(), caller.display())
-            }
-        }
+/// The tail of the `verify: source …` header line for a run rooted at `root`:
+/// a snapshot of `caller`, or — for a context the gate's own tests build
+/// in-process, which has none — the root itself, in place.
+#[must_use]
+pub fn place(root: &Path, caller: Option<&Path>) -> String {
+    match caller {
+        Some(caller) => format!("snapshot {} (of {})", root.display(), caller.display()),
+        None => format!("in place {}", root.display()),
     }
 }
 
@@ -228,7 +215,8 @@ pub fn prepare(o: &Options<'_>) -> Result<Snapshot, String> {
         .map_err(|e| format!("cannot resolve the checkout {}: {e}", o.caller.display()))?;
     if !identity::is_git_toplevel(&caller, o.path_env) {
         return Err(format!(
-            "{} is not the top of a git checkout, so it cannot be snapshotted (pass --in-place)",
+            "{} is not the top of a git checkout, so it has no HEAD to snapshot and the gate \
+             verifies nothing else",
             caller.display()
         ));
     }
@@ -293,11 +281,8 @@ impl Drop for MachineHold {
 
 /// Take this machine's gate lock for `caller`, WAITING (bounded by
 /// [`MACHINE_WAIT_MAX`]) while another live gate holds it. The gate's `main`
-/// takes it before it chooses its source, for every run but the self-test and
-/// a gate started inside the holding gate's own run ([`inside_machine_holder`]),
-/// so a snapshot, an in-place run and a non-git root are all serialized, and
-/// the snapshot a waiting gate syncs is the caller's tree as of when it really
-/// starts.
+/// takes it before it chooses its source, for every run, so the snapshot a
+/// waiting gate syncs is the caller's tree as of when it really starts.
 ///
 /// # Errors
 /// A holder still running after the bound, or a lock that cannot be taken.
@@ -354,7 +339,7 @@ pub fn machine_lock_dir(moved: Option<&Path>) -> Option<PathBuf> {
 /// WAITING while another gate holds it — a line on stderr when the wait starts
 /// and once a minute after, naming the holder — and refusing once `max_wait`
 /// has passed. A sibling note (`<dir>/holder`) only names the holder for that
-/// line and for [`inside_machine_holder`] — never the locked file itself: on
+/// line — never the locked file itself: on
 /// Windows `try_lock` is `LockFileEx`, a MANDATORY lock that fails every other
 /// handle's read of the locked range, even one in this process. The lock is
 /// the kernel's, so a gate that died without running destructors leaves a
@@ -438,34 +423,6 @@ pub fn machine_could_not_run_text(why: &str) -> String {
         "  FAIL  machine: {why}\n  VERIFY: COULD NOT RUN — the gate could not take this \
          machine's gate lock, so it decided nothing. This is NOT a finding about your change.\n"
     )
-}
-
-/// Set in every child of the gate that holds this machine's lock, to that
-/// gate's pid. A gate started INSIDE the running one is part of that run:
-/// waiting for the holder would be waiting for its own ancestor, which cannot
-/// finish until the child does. The fixture tests also move their lock
-/// (`--machine-lock-dir`); this covers any other gate a stage starts. Internal
-/// protocol: the holding gate is the only writer.
-pub const MACHINE_HOLDER_ENV: &str = "ATERM_VERIFY_MACHINE_HOLDER";
-
-/// Is this process running under the gate that holds the machine lock? Only
-/// when [`MACHINE_HOLDER_ENV`] names the pid the holder note records, that pid is
-/// alive, and it is not this process — a value inherited from a finished gate
-/// serializes as before.
-#[must_use]
-pub fn inside_machine_holder(lock_dir: Option<&Path>) -> bool {
-    lock_dir
-        .is_some_and(|dir| inside_holder_in(dir, std::env::var(MACHINE_HOLDER_ENV).ok().as_deref()))
-}
-
-/// [`inside_machine_holder`] against the lock in `dir` and the inherited
-/// holder pid `outer`.
-fn inside_holder_in(dir: &Path, outer: Option<&str>) -> bool {
-    let Some(outer) = outer.and_then(|o| o.trim().parse::<u32>().ok()) else {
-        return false;
-    };
-    let held = std::fs::read_to_string(dir.join("holder")).unwrap_or_default();
-    holder_pid(&held).is_some_and(|p| p == outer && p != std::process::id() && pid_alive(p))
 }
 
 /// The ladder text for a run that could not get its snapshot.
@@ -1610,6 +1567,9 @@ fn stamp_lanes(
 /// adds was not measured. An entry a killed run leaves in the trash is deleted
 /// by the next [`prepare`], which empties the trash.
 ///
+/// The cells lane beside the snapshot ([`crate::disk::cells_lane`]) is removed
+/// with them: the preflight counts it in the lanes the cap judges.
+///
 /// Returns one sentence per lane that was not removed and deleted; empty means
 /// every one was.
 #[must_use]
@@ -1655,6 +1615,30 @@ pub fn remove_lanes(snap: &Path) -> Vec<String> {
             ));
         }
     }
+    // The cells lane beside the snapshot ([`crate::disk::cells_lane`]): the
+    // preflight counted it, so the cap removes it too. Into the trash by the
+    // same one rename where it can go (the snapshot's own volume, nearly
+    // always); in place where it cannot. No stamp to put back: it has none.
+    if let Some(cells) = crate::disk::existing_cells_lane(snap) {
+        let shown = cells.display().to_string();
+        let dest = trash.join(format!("cells-lane.{}.cap", std::process::id()));
+        let gone = match std::fs::rename(&cells, &dest) {
+            Ok(()) => {
+                let _ = std::fs::create_dir_all(&cells);
+                std::fs::remove_dir_all(&dest).map_err(|e| {
+                    format!("{shown} moved to {} but not deleted ({e})", dest.display())
+                })
+            }
+            Err(_) => std::fs::remove_dir_all(&cells)
+                .map(|()| {
+                    let _ = std::fs::create_dir_all(&cells);
+                })
+                .map_err(|e| format!("{shown} not removed ({e})")),
+        };
+        if let Err(why) = gone {
+            failed.push(why);
+        }
+    }
     failed
 }
 
@@ -1691,54 +1675,6 @@ fn delete_in_background(trash: &Path) -> Option<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A GATE INSIDE THE HOLDER (third audit, 2026-09-24): the gate's test stage
-    /// drives this binary against fixtures, and a nested gate that queued on the
-    /// machine lock waited for its own ancestor — every full gate hung until
-    /// the stage ceiling. A child is inside the hold only when the pid it
-    /// inherited is the lock's recorded, live holder and not itself; any other
-    /// value (none, garbage, a finished gate's, a different holder's) queues.
-    #[cfg(unix)]
-    #[test]
-    fn only_a_gate_the_live_holder_started_skips_the_machine_lock() {
-        let dir = std::env::temp_dir().join(format!("atv-holder-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // A live process that is not this one: our parent (the test runner's).
-        let parent = std::os::unix::process::parent_id();
-        std::fs::write(
-            dir.join("holder"),
-            format!("pid {parent}\nstarted 0\ncaller /x\n"),
-        )
-        .unwrap();
-        let p = parent.to_string();
-        assert!(
-            inside_holder_in(&dir, Some(&p)),
-            "the live holder's own child"
-        );
-        assert!(!inside_holder_in(&dir, None), "no inherited holder");
-        assert!(!inside_holder_in(&dir, Some("garbage")));
-        assert!(
-            !inside_holder_in(&dir, Some("999999999")),
-            "another holder's pid"
-        );
-        std::fs::write(dir.join("holder"), "pid 999999999\nstarted 0\ncaller /x\n").unwrap();
-        assert!(
-            !inside_holder_in(&dir, Some("999999999")),
-            "a finished holder"
-        );
-        let me = std::process::id().to_string();
-        std::fs::write(
-            dir.join("holder"),
-            format!("pid {me}\nstarted 0\ncaller /x\n"),
-        )
-        .unwrap();
-        assert!(
-            !inside_holder_in(&dir, Some(&me)),
-            "never this process itself"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// ONE GATE PER MACHINE (2026-09-24): a gate that finds the machine lock
     /// held by a LIVE gate waits instead of running beside it, gives up past
@@ -2032,7 +1968,9 @@ mod tests {
             assert!(snap.join(f).exists(), "{f} is not a lane and was removed");
         }
 
-        // What the preflight measures is what the stamps name.
+        // What the preflight measures is what the stamps name (the cells lane
+        // beside a snapshot is measured and removed but never stamped: this
+        // test's snapshot has none; the next test gives one).
         let stamped: Vec<PathBuf> = lane_dirs(&snap)
             .iter()
             .map(|d| d.strip_prefix(&snap).expect("inside").to_path_buf())
@@ -2051,6 +1989,47 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&snap).ok();
+    }
+
+    /// THE CAP REMOVES THE CELLS LANE BESIDE THE SNAPSHOT (2026-09-27): the
+    /// preflight counts `gate cells-foreign`'s target dirs among the lanes, so
+    /// the removal that brings the lanes under the cap takes them too, leaves
+    /// the directory in place and empty, and touches nothing else beside the
+    /// snapshot.
+    #[cfg(unix)]
+    #[test]
+    fn the_cap_removes_the_cells_lane_beside_the_snapshot() {
+        let base = crate::mktemp_dir("atv-snap-cap-cells").expect("mktemp");
+        let snap = base.join("c-verify.noindex");
+        let cells = base.join("c-verify-cells.noindex");
+        for f in [
+            snap.join("target/debug/a"),
+            cells.join("win/debug/b"),
+            base.join("c-verify-other/keep"),
+        ] {
+            std::fs::create_dir_all(f.parent().expect("parent")).expect("mkdir");
+            std::fs::write(&f, b"x").expect("write");
+        }
+        assert_eq!(remove_lanes(&snap), Vec::<String>::new());
+        assert!(!cells.join("win/debug/b").exists(), "the cells lane stayed");
+        assert!(cells.is_dir(), "the cells lane is recreated empty");
+        assert_eq!(
+            std::fs::read_dir(&cells).expect("read").count(),
+            0,
+            "the cells lane is empty"
+        );
+        assert!(
+            base.join("c-verify-other/keep").exists(),
+            "a neighbour was removed"
+        );
+        assert_eq!(
+            std::fs::read_dir(snap.join(GATE_STATE_DIR).join("trash"))
+                .expect("trash")
+                .count(),
+            0,
+            "the removed bytes were deleted, not parked"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]

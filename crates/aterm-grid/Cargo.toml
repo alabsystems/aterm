@@ -41,6 +41,9 @@ aterm-spec = { workspace = true, optional = true }
 
 [dev-dependencies]
 ntest = "0.9"
+# The corruption seam for the dense-history conformance tests
+# (`history_lines_from_*`); dev-only, so no product build carries it.
+aterm-scrollback = { workspace = true, features = ["testing"] }
 proptest = { workspace = true }
 criterion = "0.5"
 aterm-tempfile = { workspace = true }

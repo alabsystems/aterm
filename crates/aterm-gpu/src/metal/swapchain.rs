@@ -992,8 +992,6 @@ impl Drop for OwnedDrawable {
 
 fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     let _pool = AutoreleasePool::new();
-    #[cfg(feature = "acquire-conformance")]
-    super::acquire_probe::before_acquire();
     #[cfg(test)]
     encoder::queue_ffi_census::note();
     // SAFETY: layer is a retained CAMetalLayer. Retain both +0 returns before

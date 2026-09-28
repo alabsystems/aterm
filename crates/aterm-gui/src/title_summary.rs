@@ -253,7 +253,13 @@ impl Snapshot {
                     activity_state(block.state),
                     block.exit_code,
                     command,
-                    block.working_directory.as_deref().map(str::to_owned),
+                    // A block's cwd is the OSC 7 URI path (`/C:/Users//x` on
+                    // Windows); spell it natively like the terminal's own cwd,
+                    // or this fallback shows the URI form. Identity off Windows.
+                    block
+                        .working_directory
+                        .as_deref()
+                        .map(|dir| crate::cwd_native::native_path(dir).into_owned()),
                 )
             },
         );
@@ -612,10 +618,22 @@ fn shed_place<'a>(title: &str, description: &'a str) -> &'a str {
     if place.is_empty() || state.is_empty() {
         return description;
     }
-    // `~/aterm`, `/home/<user>/aterm` and a bare `aterm` all count as naming it.
-    let names_place = title
-        .rsplit(['/', ' ', ':'])
-        .any(|token| !token.is_empty() && token == place);
+    // `~/aterm`, `/home/<user>/aterm` and a bare `aterm` all count as naming it
+    // — and so does `~\aterm`: the cwd rung writes the NATIVE separator on
+    // Windows, and without `\` here every idle tab there painted
+    // `~\aterm · Ready in aterm` (measured, audit 2026-09-22) while the same
+    // shell on Linux painted `~/aterm`.
+    let mut tokens = title.rsplit(['/', '\\', ' ', ':']);
+    // A title ENDING in a bare `~` is a prompt at home: the one cwd a title
+    // never spells by name, so `~ · Ready in <user>` said the one place twice
+    // beside siblings reading `~/aterm` — the same idle shell, two label
+    // shapes. Only for the deterministic READY sentence, whose place is built
+    // from the same cwd the prompt's `~` is: an authored or model description
+    // ("Tests failing in CI") names a place of its own, and a shell at home
+    // must not lose it. And only the LAST token: a `~` anywhere else
+    // (`~/aterm`, `x~`) names some other directory and is not read as home.
+    let at_home = state == description::READY && tokens.clone().next() == Some("~");
+    let names_place = at_home || tokens.any(|token| !token.is_empty() && token == place);
     if names_place { state } else { description }
 }
 
@@ -2364,15 +2382,51 @@ mod tests {
         // strip paints `…in aterm` (seen on glass). Nothing is left over: a
         // bare "Ready" is what EVERY idle tab would say, so it goes too.
         assert_eq!(
-            shed_place("user@m17-tower: ~/aterm", "Ready in aterm"),
+            shed_place("dev@m17-tower: ~/aterm", "Ready in aterm"),
             "Ready"
         );
         assert_eq!(
-            shed_place_already_in_title("user@m17-tower: ~/aterm", "Ready in aterm"),
+            shed_place_already_in_title("dev@m17-tower: ~/aterm", "Ready in aterm"),
             ""
         );
         assert_eq!(shed_place("~/wave/nn", "Ready in nn"), "Ready");
         assert_eq!(shed_place_already_in_title("~/wave/nn", "Ready in nn"), "");
+        // The cwd rung writes the NATIVE separator on Windows: `~\aterm` names
+        // the place exactly as `~/aterm` does (measured: every idle Windows
+        // tab painted `~\aterm · Ready in aterm` until it did).
+        assert_eq!(shed_place("~\\aterm", "Ready in aterm"), "Ready");
+        assert_eq!(
+            shed_place_already_in_title("~\\aterm", "Ready in aterm"),
+            ""
+        );
+        assert_eq!(
+            shed_place_already_in_title("C:\\Users\\x\\aterm", "Ready in aterm"),
+            ""
+        );
+        // HOME is spelled `~`, never by its name: a prompt at home says the
+        // place the description names, so an idle shell there is its title
+        // alone like every other idle shell.
+        for home in ["~", "dev@m17-tower: ~", "PS ~"] {
+            assert_eq!(shed_place(home, "Ready in dev"), "Ready", "{home:?}");
+            assert_eq!(
+                shed_place_already_in_title(home, "Ready in dev"),
+                "",
+                "{home:?}"
+            );
+        }
+        // Only a title that ENDS at home: `~/aterm` names `aterm`, and a
+        // tilde inside a word names nothing.
+        assert_eq!(shed_place("~/aterm", "Ready in dev"), "Ready in dev");
+        assert_eq!(shed_place("backup~", "Ready in dev"), "Ready in dev");
+        // And only the READY sentence: an authored or model description at
+        // home names a place of its own, which the title does not say.
+        for description in ["Tests failing in CI", "Deploying in prod"] {
+            assert_eq!(shed_place("~", description), description);
+            assert_eq!(
+                shed_place_already_in_title("dev@m17-tower: ~", description),
+                description
+            );
+        }
         // A title that does NOT name the place keeps the full sentence: the
         // "where" would otherwise be lost entirely.
         assert_eq!(
@@ -2522,6 +2576,51 @@ mod tests {
         assert_eq!(
             deterministic_description(&snap("", ActivityState::Prompt, None)),
             "Ready in aterm"
+        );
+    }
+
+    /// ONE IDLE LABEL. An idle shell's chrome is its cwd title and nothing
+    /// else: the state sentence appears only while it carries information.
+    /// Measured (audit 2026-09-22): three identical idle shells read
+    /// `~\aterm · Ready in aterm`, `~\aterm · Active terminal session` and
+    /// `~\aterm`. The second came from a fresh pane whose title was set (to
+    /// ConPTY's program path) before its cwd was known; it now says the bare
+    /// state word, which the composer sheds beside any title — so all three
+    /// paths compose to the title alone.
+    #[test]
+    fn an_idle_shell_composes_to_its_title_alone() {
+        let unknown = Snapshot {
+            title: "C:\\Program Files\\PowerShell\\7\\pwsh.exe".to_string(),
+            cwd: String::new(),
+            command: String::new(),
+            state: ActivityState::Unknown,
+            exit_code: None,
+            recent_output: String::new(),
+        };
+        assert_eq!(deterministic_description(&unknown), "Ready");
+        let coordinator = Coordinator::new(None);
+        for description in ["Ready", "Ready in aterm"] {
+            let composed = coordinator.compose(
+                None,
+                "~\\aterm",
+                Some(description),
+                TitleFormat::TitleDescription,
+                &Config::default(),
+                ChromeSurface::TabStrip,
+            );
+            assert_eq!(composed, "~\\aterm", "{description:?} beside the cwd title");
+        }
+        // With NO title the state word is all there is to say, and it is said.
+        assert_eq!(
+            coordinator.compose(
+                None,
+                "",
+                Some("Ready"),
+                TitleFormat::TitleDescription,
+                &Config::default(),
+                ChromeSurface::TabStrip,
+            ),
+            "Ready"
         );
     }
 

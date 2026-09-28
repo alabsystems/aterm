@@ -10,7 +10,12 @@
 //! the same. So a caller names the program ([`identify`]) and asks that
 //! program's reader ([`ScreenReader`]):
 //!
-//! * [`ClaudeReader`] — this crate's Claude Code grammar, behind the trait;
+//! * [`ClaudeReader`] — this crate's Claude Code grammar, behind the trait.
+//!   Its `idle` is authoritative only at its prompt box (the `❯` composer,
+//!   or shell mode's `!`) or on a wall: the screens between a launch and the
+//!   REPL read `idle` NOT authoritatively; and read where the terminal's
+//!   cursor is known ([`read_at`]), only at the box that HOLDS the cursor,
+//!   never at a box an earlier run left on the screen;
 //! * [`CodexReader`] — Codex's grammar ([`crate::codex`], measured on codex
 //!   0.156.1): its boxes with their roles, the status row and the streaming
 //!   answer as busy, a turn's end row as idle or a question, its `■` walls
@@ -31,7 +36,8 @@
 use crate::anchors::{ANCHORS, Anchor, CODEX_ANCHORS, guard_regex};
 use crate::codex;
 use crate::phase::{
-    Phase, busy_signal, composer_draft, context_left, has_composer_frame, survey_open, worker_phase,
+    Phase, busy_signal, composer_draft, context_left, has_composer_frame, has_shell_mode_frame,
+    prompt_box_holds, survey_open, worker_phase,
 };
 use crate::prompt::{PromptKind, PromptV2, parse_prompt_v2};
 use crate::turn::{continuation_suggestion, goal_active, interrupted, said_tail};
@@ -82,11 +88,15 @@ pub struct Reading {
     pub program: Program,
     pub phase: Phase,
     /// Whether [`Self::phase`] is the reader's evidence rather than its
-    /// default: `false` for the generic reader always, and for the Codex
-    /// reader where nothing on the screen says whether a turn runs — each
-    /// says `idle` there because it cannot tell working from waiting, not
-    /// because it saw either. A policy that acts on `idle` (a continuation)
-    /// or on `prompt` requires it.
+    /// default: `false` for the generic reader always, for the Codex
+    /// reader where nothing on the screen says whether a turn runs, and for
+    /// Claude Code's `idle` with no composer frame drawn (its launch, before
+    /// the REPL is up) — each says `idle` there because it cannot tell
+    /// working from waiting, not because it saw either — and, read with the
+    /// cursor ([`ScreenReader::read_at`]), for Claude Code's `idle` at a
+    /// prompt box that does not hold the cursor (an earlier run's). A policy
+    /// that acts on `idle` (a continuation, a first prompt) or on `prompt`
+    /// requires it.
     pub phase_authoritative: bool,
     /// The wall the last turn ended on — `None` while a box is up, and while
     /// the worker is (hard) busy only a HEALTH wall
@@ -167,6 +177,39 @@ pub trait ScreenReader: Sync {
     /// Whether `phase`, read from `rows`, is evidence ([`Reading::
     /// phase_authoritative`]).
     fn phase_authoritative(&self, rows: &[String], phase: &Phase) -> bool;
+    /// Whether the TERMINAL'S CURSOR vouches for `reading` — read from
+    /// `rows`, the cursor on row `cursor_row` of them (`None`: on none of
+    /// them) — where [`Self::read_at`] reads a screen whose cursor is known.
+    /// `true` by default: a reader whose program's phase the cursor says
+    /// nothing about.
+    fn cursor_vouches(
+        &self,
+        _rows: &[String],
+        _reading: &Reading,
+        _cursor_row: Option<usize>,
+    ) -> bool {
+        true
+    }
+
+    /// The whole reading of a screen whose cursor is KNOWN: [`Self::read`],
+    /// its phase evidence only where the cursor vouches for it too
+    /// ([`Self::cursor_vouches`]). `cursor_row` is the cursor's row among
+    /// `rows` (`None`: on none of them), `cursor_col` its column. Whatever
+    /// acts on an `idle` reading of a live screen — the server's verdict
+    /// (`await agent idle`), the supervisor's idle-point step — reads it here:
+    /// Claude Code's `idle` is its prompt box's only where that box HOLDS the
+    /// cursor ([`crate::phase::prompt_box_holds`]), never a box an earlier
+    /// run left on the screen.
+    fn read_at(
+        &self,
+        rows: &[String],
+        cursor_row: Option<usize>,
+        cursor_col: Option<usize>,
+    ) -> Reading {
+        let mut reading = self.read(rows, cursor_col);
+        reading.phase_authoritative &= self.cursor_vouches(rows, &reading, cursor_row);
+        reading
+    }
 
     /// The whole reading.
     fn read(&self, rows: &[String], cursor_col: Option<usize>) -> Reading {
@@ -269,8 +312,48 @@ impl ScreenReader for ClaudeReader {
     fn anchors(&self) -> &'static [Anchor] {
         ANCHORS
     }
-    fn phase_authoritative(&self, _: &[String], _: &Phase) -> bool {
-        true
+    /// Every reading but one: Claude Code's `idle` is evidence only AT ITS
+    /// COMPOSER — the frame drawn (its `❯` caret, or `!` in shell mode:
+    /// `phase::has_shell_mode_frame`), or a wall the turn ended on. `idle` is
+    /// this grammar's word for "no box, no spinner, no question", which a
+    /// screen with no REPL on it satisfies too: the shell's rows between
+    /// the launch and the REPL (in a new folder, the main grid right after
+    /// the folder-trust dialog was pressed and erased) and the alternate
+    /// screen's first, half-drawn frame. Measured on 2.1.283 (2026-09-26,
+    /// the `LAUNCH_*` fixtures): the server published `idle` from those
+    /// frames 0.1-2 s before the REPL was drawn, and text typed then was
+    /// lost — every time after the trust dialog — while a draft typed
+    /// within 6 ms of the composer's first whole frame landed every time.
+    /// Every other phase (a box, busy, a question, a limit) says what it
+    /// says with or without the frame.
+    fn phase_authoritative(&self, rows: &[String], phase: &Phase) -> bool {
+        *phase != Phase::Idle
+            || has_composer_frame(rows)
+            || has_shell_mode_frame(rows)
+            || wall(rows).is_some()
+    }
+    /// Claude Code's `idle` at a prompt box is evidence only where that box
+    /// HOLDS THE TERMINAL'S CURSOR ([`crate::phase::prompt_box_holds`]); a
+    /// wall, and every other phase, stand as read. A prompt box on the screen
+    /// is not enough: Claude Code's inline renderer relaunched in the SAME tab
+    /// leaves the previous run's box on the main grid above the new launch
+    /// line (its footer `Press Ctrl-C again to exit`), and the screens of the
+    /// new launch — the shell's rows under that line, then the new REPL half
+    /// drawn — show that old box whole. Measured on 2.1.283 (the review of
+    /// 2026-09-26, 150x50): the server published `agent=idle` from such a
+    /// frame 187-352 ms before the new REPL was drawn, and a draft typed on
+    /// `await agent idle` was lost 3 of 3 after the folder-trust dialog, 1 of
+    /// 3 without it (the `INLINE_RELAUNCH_*` fixtures). The cursor is under
+    /// the new launch line there, never in the old box.
+    fn cursor_vouches(
+        &self,
+        rows: &[String],
+        reading: &Reading,
+        cursor_row: Option<usize>,
+    ) -> bool {
+        reading.phase != Phase::Idle
+            || reading.wall.is_some()
+            || cursor_row.is_some_and(|row| prompt_box_holds(rows, row))
     }
 }
 
@@ -472,6 +555,49 @@ pub fn read(program: Option<&str>, rows: &[String], cursor_col: Option<usize>) -
     identify(program, rows).read(rows, cursor_col)
 }
 
+/// [`read`] of a screen whose cursor is KNOWN ([`ScreenReader::read_at`]):
+/// the cursor on row `cursor_row` of `rows` (`None`: on none of them), at
+/// column `cursor_col`. What acts on an `idle` reading of a live screen reads
+/// it here.
+#[must_use]
+pub fn read_at(
+    program: Option<&str>,
+    rows: &[String],
+    cursor_row: Option<usize>,
+    cursor_col: Option<usize>,
+) -> Reading {
+    identify(program, rows).read_at(rows, cursor_row, cursor_col)
+}
+
+/// Where a screen's LIVE ZONE begins — the rows a reader is handed when the
+/// screen is read by its tail: the first of its last `n` DRAWN rows, counted
+/// up from its last row that is not blank. The blank rows under what is
+/// drawn are not counted against `n`; they stay in the zone, below it, so
+/// `rows[live_zone_start(rows, n)..]` is the grid's last `n` rows and the
+/// blank rows' worth above them. The server's agent verdict reads this zone
+/// (`presence::CLASSIFY_ROWS`), and so does a supervisor whose tail read
+/// ends on a blank row and is taken again whole.
+///
+/// Why drawn rows: Claude Code's INLINE renderer (its classic main-screen
+/// renderer — `tui = "default"`, `CLAUDE_CODE_NO_FLICKER=0`, or its
+/// fullscreen renderer turned off after failed starts) draws its REPL under
+/// the line that launched it and leaves the rows below blank until the
+/// transcript fills the pane. On a pane taller than `n` rows the grid's
+/// last `n` rows held the prompt box's bottom rule, its footer and blank
+/// rows, never its caret or top rule, and Claude Code's `idle` there was no
+/// evidence (measured on 2.1.283, 2026-09-26: a 50-row pane, the REPL on
+/// rows 8-11 — `agent=` stayed `unknown` and `await agent idle` timed out).
+/// A screen drawn to its last row (the fullscreen renderer's footer, a
+/// Codex composer) has the zone the grid's last `n` rows always gave.
+#[must_use]
+pub fn live_zone_start(rows: &[String], n: usize) -> usize {
+    let drawn = rows
+        .iter()
+        .rposition(|r| !r.trim().is_empty())
+        .map_or(0, |last| last + 1);
+    drawn.saturating_sub(n)
+}
+
 /// The program word of a `program=` / `detail=` value: the basename of its
 /// first word, lowercased, a login shell's `-` dropped.
 /// THE ONE NAME TABLE: the agent a program name is, by its name alone —
@@ -587,8 +713,9 @@ mod tests {
     /// A reader's default is not evidence: the generic reader's `idle` and
     /// the Codex reader's `idle` where nothing says whether a turn runs (the
     /// last message's head scrolled away, no end row) are not
-    /// authoritative; the Codex box, its status row and every Claude reading
-    /// are.
+    /// authoritative; the Codex box, its status row and Claude Code's idle
+    /// at its composer are (its idle with no composer:
+    /// [`claude_codes_idle_is_read_at_its_composer`]).
     #[test]
     fn a_default_idle_is_not_authoritative() {
         let headless = rows(&[
@@ -819,6 +946,437 @@ mod tests {
         assert_eq!(CodexReader.health_wall(&busy), None);
         assert_eq!(GenericReader.health_wall(&busy), None);
         assert_eq!(ClaudeReader.health_wall(&busy).map(|w| w.row), Some(at));
+    }
+
+    /// CLAUDE CODE IS IDLE AT ITS COMPOSER, NOT BEFORE IT (the live e2e of
+    /// 2026-09-26, NEW-1: the server published `agent=idle` 72-248 ms after
+    /// the harness pressed the folder-trust dialog, before Claude Code had
+    /// drawn its REPL, and a first prompt sent on `await agent idle` was lost
+    /// or left unsent). Measured on 2.1.283 frame by frame (the `LAUNCH_*`
+    /// fixtures): the main grid's shell rows between the launch and the REPL
+    /// — the dialog just erased, or no dialog at all — and the alternate
+    /// screen's first half-drawn frame read `idle` by default, NOT
+    /// authoritatively, with no composer; the REPL drawn whole is
+    /// authoritative idle (the control: a draft typed at that frame landed
+    /// every time). The other readings of a screen with no composer frame
+    /// stand, authoritative: the trust dialog is a prompt, a spinner row is
+    /// busy, a last row ending in `?` a question, a wall a wall.
+    #[test]
+    fn claude_codes_idle_is_read_at_its_composer() {
+        use crate::prompt::fixtures::{
+            LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN, LAUNCH_REPL_READY,
+        };
+        for (name, text) in [
+            ("before the REPL", LAUNCH_BEFORE_REPL),
+            ("the REPL half drawn", LAUNCH_REPL_HALF_DRAWN),
+        ] {
+            let r = read(Some("claude"), &screen(text), Some(2));
+            assert_eq!(r.program, Program::Claude, "{name}");
+            assert_eq!(r.phase, Phase::Idle, "{name}");
+            assert!(!r.phase_authoritative, "{name}: {r:?}");
+            assert_eq!((r.composer, r.wall), (None, None), "{name}");
+            // The live zone the server classifies (its last 40 drawn rows)
+            // says the same.
+            let rows = screen(text);
+            let zone = &rows[live_zone_start(&rows, 40)..];
+            assert!(
+                !read(Some("claude"), zone, None).phase_authoritative,
+                "{name}"
+            );
+        }
+        let ready = read(Some("claude"), &screen(LAUNCH_REPL_READY), Some(2));
+        assert_eq!(
+            (ready.phase.clone(), ready.phase_authoritative),
+            (Phase::Idle, true),
+            "the control: {ready:?}"
+        );
+        assert!(ready.composer.is_some() && ready.fresh, "{ready:?}");
+        // The other readings with no composer frame on the screen.
+        let spinning = rows(&["% claude", "", "✶ Deliberating… (3s · thinking)"]);
+        let asking = shell_asking();
+        let end = screen(END_529);
+        let top = end
+            .iter()
+            .position(|r| r.starts_with('─'))
+            .expect("the rule");
+        let walled = end[..top].to_vec();
+        for (name, r, phase) in [
+            ("trust dialog", screen(TRUST), Phase::Prompt),
+            ("spinner", spinning, Phase::Busy),
+            ("question", asking, Phase::Question),
+            ("wall", walled, Phase::Idle),
+        ] {
+            assert!(!has_composer_frame(&r), "{name}");
+            let reading = read(Some("claude"), &r, None);
+            assert_eq!(reading.phase, phase, "{name}");
+            assert!(reading.phase_authoritative, "{name}: {reading:?}");
+        }
+        assert_eq!(
+            read(Some("claude"), &end[..top], None).wall.map(|w| w.kind),
+            Some(WallKind::Overloaded),
+            "the wall's reading, its composer cut"
+        );
+    }
+
+    /// CLAUDE CODE'S INLINE REPL IS READ WHERE IT IS DRAWN (the review of
+    /// 2026-09-26): its inline renderer (the classic main-screen one) draws
+    /// the REPL under the line that launched it and leaves the rows below
+    /// blank until the transcript fills the pane. Measured on 2.1.283 at
+    /// 150x50 (the `INLINE_*` fixtures): the prompt box drawn whole on rows
+    /// 8-11, 38 blank rows under it. The grid's last 40 rows hold its bottom
+    /// rule and footer, not its caret or top rule — read there, its `idle`
+    /// was no evidence, `agent=` stayed `unknown` and `await agent idle`
+    /// timed out (RED: the first assertion). The live zone is the last 40
+    /// DRAWN rows ([`live_zone_start`]): the whole REPL, authoritative `idle`
+    /// (GREEN). The inline launch's other frames keep their readings through
+    /// the zone: the dialog is the trust prompt, the half-drawn REPL (its
+    /// bottom rule begun, `──`) no evidence. A screen drawn to its last row
+    /// has the zone the grid's last 40 rows always gave (the fullscreen
+    /// REPL's control).
+    #[test]
+    fn an_inline_repl_above_the_last_40_rows_is_read_in_the_live_zone() {
+        use crate::prompt::fixtures::{
+            INLINE_REPL_HALF_DRAWN, INLINE_REPL_READY, INLINE_TRUST, LAUNCH_REPL_READY,
+        };
+        let zone = |rows: &[String]| rows[live_zone_start(rows, 40)..].to_vec();
+        let tail = |rows: &[String]| rows[rows.len().saturating_sub(40)..].to_vec();
+        let ready = screen(INLINE_REPL_READY);
+        assert_eq!(ready.len(), 50, "a 50-row pane");
+        let caret = ready
+            .iter()
+            .position(|r| r.starts_with('❯'))
+            .expect("the caret row");
+        assert!(caret < 10, "the prompt box sits above the last 40 rows");
+        // RED: the grid's last 40 rows (the cut before this zone).
+        let cut = read(Some("claude"), &tail(&ready), None);
+        assert_eq!(
+            (cut.phase.clone(), cut.phase_authoritative),
+            (Phase::Idle, false),
+            "the grid's last 40 rows: {cut:?}"
+        );
+        // GREEN: the live zone holds the whole REPL.
+        assert_eq!(live_zone_start(&ready, 40), 0);
+        let r = read(Some("claude"), &zone(&ready), Some(2));
+        assert_eq!(
+            (r.phase.clone(), r.phase_authoritative),
+            (Phase::Idle, true),
+            "{r:?}"
+        );
+        assert!(r.composer.is_some() && r.fresh, "{r:?}");
+        // The inline launch's other frames, through the zone.
+        let dialog = read(Some("claude"), &zone(&screen(INLINE_TRUST)), None);
+        assert_eq!(
+            (dialog.phase.clone(), dialog.prompt.as_ref().map(|p| p.kind)),
+            (Phase::Prompt, Some(PromptKind::Trust)),
+            "{dialog:?}"
+        );
+        let half = read(Some("claude"), &zone(&screen(INLINE_REPL_HALF_DRAWN)), None);
+        assert_eq!(
+            (half.phase, half.phase_authoritative, half.composer),
+            (Phase::Idle, false, None),
+            "the REPL half drawn is no evidence"
+        );
+        // The control: the fullscreen REPL is drawn to its last row, and its
+        // zone is the grid's last 40 rows, as it always was.
+        let full = screen(LAUNCH_REPL_READY);
+        assert_eq!(full.len(), 50);
+        assert_eq!(zone(&full), tail(&full));
+    }
+
+    /// [`live_zone_start`]'s arithmetic: the last `n` rows counted up from
+    /// the last row that is not blank (spaces and no-break spaces are blank),
+    /// never below 0; a screen with nothing drawn starts at 0.
+    #[test]
+    fn the_live_zone_counts_drawn_rows() {
+        let grid = |drawn: usize, blank: usize| {
+            let mut r: Vec<String> = (0..drawn).map(|i| format!("row {i}")).collect();
+            r.extend((0..blank).map(|i| [" ", "", "\u{a0}"][i % 3].to_string()));
+            r
+        };
+        for (drawn, blank, n, start) in [
+            (50, 0, 40, 10),
+            (12, 38, 40, 0),
+            (45, 5, 40, 5),
+            (60, 40, 40, 20),
+            (3, 0, 40, 0),
+            (0, 50, 40, 0),
+            (0, 0, 40, 0),
+            (10, 5, 4, 6),
+        ] {
+            assert_eq!(
+                live_zone_start(&grid(drawn, blank), n),
+                start,
+                "{drawn} drawn, {blank} blank, n={n}"
+            );
+        }
+    }
+
+    /// CLAUDE CODE'S SHELL MODE IS ITS PROMPT BOX (the review of 2026-09-26:
+    /// the rule above first read it `idle` NOT authoritatively, where every
+    /// build before it read `idle`). `!` typed into the empty prompt box
+    /// turns the caret into `!` — of every printable key typed alone there on
+    /// 2.1.283, the one that changes the caret — and the REPL is up, taking
+    /// keys: authoritative `idle`, the placeholder under the caret or a
+    /// command typed (the `SHELL_MODE*` fixtures). It stays what it was for
+    /// everything that reads the `❯` composer: no `composer`, no composer
+    /// frame. NEGATIVE CONTROLS: the same box with its bottom rule not drawn,
+    /// a `!` row with no rule above it (a shell's line), and a `!` that is
+    /// the head of a word, not the caret, are no prompt box.
+    #[test]
+    fn claude_codes_shell_mode_is_its_prompt_box() {
+        use crate::prompt::fixtures::{SHELL_MODE, SHELL_MODE_DRAFT};
+        for (name, text, caret) in [
+            (
+                "shell mode",
+                SHELL_MODE,
+                "!\u{a0}Try \"write a test for <filepath>\"",
+            ),
+            ("shell mode, a command typed", SHELL_MODE_DRAFT, "!\u{a0}ls"),
+        ] {
+            let full = screen(text);
+            assert!(
+                full.iter().any(|r| r == caret),
+                "{name}: the measured caret row"
+            );
+            // The whole screen, and the live zone the server classifies (its
+            // last 40 drawn rows).
+            for rows in [&full[..], &full[live_zone_start(&full, 40)..]] {
+                let r = read(Some("claude"), rows, Some(2));
+                assert_eq!(r.program, Program::Claude, "{name}");
+                assert_eq!(
+                    (r.phase.clone(), r.phase_authoritative),
+                    (Phase::Idle, true),
+                    "{name}: {r:?}"
+                );
+                assert_eq!((r.composer, r.wall), (None, None), "{name}");
+                assert!(!has_composer_frame(rows), "{name}");
+            }
+            // NEGATIVE CONTROLS, each one edit of the measured screen.
+            let at = full.iter().position(|r| r == caret).expect("the caret");
+            let bottom = at + 1;
+            assert!(crate::phase::is_rule(&full[bottom]), "{name}");
+            let mut half = full.clone();
+            half[bottom] = String::new();
+            let mut unruled = full.clone();
+            unruled[at - 1] = String::new();
+            let mut word = full.clone();
+            word[at] = "!important: not a caret".to_string();
+            for (what, rows) in [
+                ("no bottom rule", half),
+                ("no top rule", unruled),
+                ("a word", word),
+            ] {
+                let r = read(Some("claude"), &rows, None);
+                assert_eq!(
+                    (r.phase.clone(), r.phase_authoritative),
+                    (Phase::Idle, false),
+                    "{name}, {what}: {r:?}"
+                );
+            }
+        }
+    }
+
+    /// CLAUDE CODE'S IDLE IS THE PROMPT BOX THAT HOLDS THE CURSOR (the
+    /// review of 2026-09-26: the inline renderer relaunched in the SAME tab,
+    /// 150x50). The previous run's prompt box stays on the main grid above
+    /// the new launch line, and the screens of the new launch show it whole:
+    /// read by the frame alone, the frame right after the folder-trust
+    /// dialog was pressed read authoritative `idle`, the server published
+    /// `agent=idle` from it 187-352 ms before the new REPL was drawn, and a
+    /// draft typed on `await agent idle` was lost 3 of 3 (RED: the first
+    /// assertion, the rule this branch had). Read with the cursor Claude Code
+    /// keeps there — under the new launch line, measured — it is no evidence;
+    /// every measured 2.1.283 launch and relaunch frame reads with its
+    /// measured cursor as the REPL it shows: `idle` for the REPL drawn whole
+    /// (the new tab and the same tab, both renderers, shell mode), no
+    /// evidence before it or half drawn, the dialog a prompt. NEGATIVE
+    /// CONTROLS: the REPL whole with its cursor anywhere but in its box, or
+    /// on none of the rows read, is no evidence; the cursor takes nothing
+    /// from a box, a wall or a spinner, nor from another program's reader.
+    #[test]
+    fn claude_codes_idle_is_the_prompt_box_that_holds_the_cursor() {
+        use crate::prompt::fixtures::{
+            INLINE_RELAUNCH_BEFORE_REPL, INLINE_RELAUNCH_REPL_HALF_DRAWN,
+            INLINE_RELAUNCH_REPL_READY, INLINE_RELAUNCH_TRUST, INLINE_REPL_HALF_DRAWN,
+            INLINE_REPL_READY, INLINE_TRUST, LAUNCH_BEFORE_REPL, LAUNCH_REPL_HALF_DRAWN,
+            LAUNCH_REPL_READY, SHELL_MODE, SHELL_MODE_DRAFT, cursor,
+        };
+        let stale = screen(INLINE_RELAUNCH_BEFORE_REPL);
+        let (row, col) = cursor(INLINE_RELAUNCH_BEFORE_REPL).expect("measured");
+        assert!(
+            stale[..row]
+                .iter()
+                .any(|r| r.contains("Press Ctrl-C again to exit"))
+        );
+        // RED: the frame alone reads the old box as the REPL.
+        let framed = read(Some("claude"), &stale, None);
+        assert_eq!(
+            (framed.phase.clone(), framed.phase_authoritative),
+            (Phase::Idle, true),
+            "the frame rule: {framed:?}"
+        );
+        // GREEN: the cursor is under the new launch line, not in the box.
+        let at = read_at(Some("claude"), &stale, Some(row), Some(col));
+        assert_eq!(
+            (at.phase.clone(), at.phase_authoritative),
+            (Phase::Idle, false),
+            "{at:?}"
+        );
+        let zone = live_zone_start(&stale, 40);
+        let zoned = read_at(
+            Some("claude"),
+            &stale[zone..],
+            row.checked_sub(zone),
+            Some(col),
+        );
+        assert!(!zoned.phase_authoritative, "the live zone: {zoned:?}");
+
+        // Every measured launch and relaunch frame, with its measured cursor.
+        for (name, text, want) in [
+            ("launch, before the REPL", LAUNCH_BEFORE_REPL, None),
+            ("launch, the REPL half drawn", LAUNCH_REPL_HALF_DRAWN, None),
+            ("launch, the REPL", LAUNCH_REPL_READY, Some(Phase::Idle)),
+            ("shell mode", SHELL_MODE, Some(Phase::Idle)),
+            (
+                "shell mode, a command typed",
+                SHELL_MODE_DRAFT,
+                Some(Phase::Idle),
+            ),
+            ("inline, the dialog", INLINE_TRUST, Some(Phase::Prompt)),
+            ("inline, the REPL half drawn", INLINE_REPL_HALF_DRAWN, None),
+            ("inline, the REPL", INLINE_REPL_READY, Some(Phase::Idle)),
+            (
+                "relaunch, the dialog",
+                INLINE_RELAUNCH_TRUST,
+                Some(Phase::Prompt),
+            ),
+            (
+                "relaunch, before the REPL",
+                INLINE_RELAUNCH_BEFORE_REPL,
+                None,
+            ),
+            (
+                "relaunch, half drawn",
+                INLINE_RELAUNCH_REPL_HALF_DRAWN,
+                None,
+            ),
+            (
+                "relaunch, the REPL",
+                INLINE_RELAUNCH_REPL_READY,
+                Some(Phase::Idle),
+            ),
+        ] {
+            let rows = screen(text);
+            let (row, col) = cursor(text).unwrap_or_else(|| panic!("{name}: a measured cursor"));
+            assert!(row < rows.len(), "{name}");
+            let zone = live_zone_start(&rows, 40);
+            for (cut, r) in [
+                (
+                    "whole",
+                    read_at(Some("claude"), &rows, Some(row), Some(col)),
+                ),
+                (
+                    "zone",
+                    read_at(
+                        Some("claude"),
+                        &rows[zone..],
+                        row.checked_sub(zone),
+                        Some(col),
+                    ),
+                ),
+            ] {
+                let got = r.phase_authoritative.then(|| r.phase.clone());
+                assert_eq!(got, want, "{name} ({cut}): {r:?}");
+            }
+            // NEGATIVE CONTROLS: the same screen with the cursor on no row
+            // read, and on every row outside a prompt box, is no idle.
+            let off = read_at(Some("claude"), &rows, None, None);
+            if want == Some(Phase::Idle) {
+                assert!(!off.phase_authoritative, "{name}: the cursor off the rows");
+                let outside =
+                    (0..rows.len()).filter(|&r| !crate::phase::prompt_box_holds(&rows, r));
+                for r in outside {
+                    assert!(
+                        !read_at(Some("claude"), &rows, Some(r), None).phase_authoritative,
+                        "{name}: the cursor on row {r}, outside the box"
+                    );
+                }
+            } else {
+                assert_eq!(off.phase_authoritative, want.is_some(), "{name}");
+            }
+        }
+
+        // The cursor takes nothing from any phase but idle at a box, nor
+        // from a wall, nor from another program's reader.
+        let spinning = rows(&["% claude", "", "✶ Deliberating… (3s · thinking)"]);
+        let end = screen(END_529);
+        let top = end
+            .iter()
+            .position(|r| r.starts_with('─'))
+            .expect("the rule");
+        for (name, r, phase) in [
+            ("trust dialog", screen(TRUST), Phase::Prompt),
+            ("spinner", spinning, Phase::Busy),
+            ("question", shell_asking(), Phase::Question),
+            ("wall", end[..top].to_vec(), Phase::Idle),
+        ] {
+            let reading = read_at(Some("claude"), &r, None, None);
+            assert_eq!(
+                (reading.phase, reading.phase_authoritative),
+                (phase, true),
+                "{name}"
+            );
+        }
+        for program in [Some("codex"), None] {
+            let codex = screen(crate::codex::fixtures::IDLE);
+            assert_eq!(
+                read_at(program, &codex, None, None),
+                read(program, &codex, None),
+                "{program:?}: the cursor is Claude Code's rule"
+            );
+        }
+    }
+
+    /// [`crate::phase::prompt_box_holds`]: a box holds its rows from its top
+    /// rule down to its bottom rule, the `❯` composer and shell mode's `!`
+    /// alike; the rows above and below it, a caret with no rule over it and
+    /// a box with no bottom rule yet hold nothing; and where a half-drawn
+    /// box sits under a whole one, the whole one does not stretch down to
+    /// the half one (the relaunch's first frame, measured).
+    #[test]
+    fn a_prompt_box_holds_its_rows_and_nothing_else() {
+        use crate::phase::prompt_box_holds as holds;
+        use crate::prompt::fixtures::{INLINE_RELAUNCH_REPL_HALF_DRAWN, cursor};
+        let rule = "─".repeat(40);
+        for caret in ["❯ Try \"fix lint errors\"", "!\u{a0}ls", "!"] {
+            let r = rows(&[
+                "banner",
+                "",
+                &rule,
+                caret,
+                "  more of the draft",
+                &rule,
+                "  footer",
+                "",
+            ]);
+            let held: Vec<usize> = (0..r.len() + 2).filter(|&i| holds(&r, i)).collect();
+            assert_eq!(held, [2, 3, 4, 5], "{caret}");
+        }
+        let unruled = rows(&["banner", "", "❯ a transcript row", &rule, "  footer"]);
+        assert!((0..unruled.len()).all(|i| !holds(&unruled, i)));
+        let half = rows(&["", &rule, "❯ Try", "──"]);
+        assert!((0..half.len()).all(|i| !holds(&half, i)));
+        assert!(!holds(&[], 0) && !holds(&rows(&["❯"]), 0));
+        let relaunch = screen(INLINE_RELAUNCH_REPL_HALF_DRAWN);
+        let (row, _) = cursor(INLINE_RELAUNCH_REPL_HALF_DRAWN).expect("measured");
+        let old: Vec<usize> = (0..relaunch.len())
+            .filter(|&i| holds(&relaunch, i))
+            .collect();
+        assert_eq!(old, [8, 9, 10], "only the old box, whole");
+        assert!(
+            !holds(&relaunch, row),
+            "the cursor, on the new box's half-drawn rule"
+        );
     }
 
     #[test]

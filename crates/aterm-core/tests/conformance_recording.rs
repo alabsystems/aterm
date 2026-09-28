@@ -21,7 +21,7 @@
 //! diverge — so the conformance is non-vacuous: it would catch an unfaithful
 //! replay, not merely pass because both sides ran the same code.
 
-use aterm_core::terminal::{HostBindings, Terminal};
+use aterm_core::terminal::Terminal;
 
 /// A hard-case prefix script (driven to `t0`, the keyframe point). Exercises
 /// scrollback, SGR, scroll region, alt-screen round-trip, cursor moves, charset,
@@ -76,7 +76,7 @@ fn replay_from_checkpoint_matches_live_engine() {
     assert!(live.parser_is_ground(), "delta must end at parser-ground");
 
     // Hydrated timeline: from_checkpoint(t0) -> replay the SAME delta -> t1'.
-    let mut replay = Terminal::from_checkpoint(&keyframe, HostBindings::none());
+    let mut replay = Terminal::from_checkpoint(&keyframe);
     run(&mut replay, DELTA);
 
     // Faithfulness: the real engine's checkpoint+replay reproduces live at t1
@@ -110,7 +110,7 @@ fn replay_negative_control_dropped_delta_diverges() {
     let keyframe = live.checkpoint();
     run(&mut live, DELTA);
 
-    let mut replay = Terminal::from_checkpoint(&keyframe, HostBindings::none());
+    let mut replay = Terminal::from_checkpoint(&keyframe);
     for (i, c) in DELTA.iter().enumerate() {
         if i == DROP_IDX {
             continue; // drop one recorded event

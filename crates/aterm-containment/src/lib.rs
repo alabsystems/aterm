@@ -4,72 +4,20 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! 4-mode containment POLICY DATA MODEL for AI agent isolation.
+//! 4-mode containment for AI agent isolation: a policy data model plus the
+//! spawn-seam actuator that enforces it.
 //!
-//! ## Honest scope (`ATERM_DESIGN` §0.1)
+//! It maps a [`ContainmentMode`] to a [`Capabilities`] set, records the chosen
+//! mode at the spawn seam, and — for `Containment` — actuates a real OS sandbox
+//! (macOS Seatbelt via `sandbox-exec`) or refuses to start. What each mode
+//! enforces is stated ONCE, in [`actuator`]'s module doc; in short:
 //!
-//! This crate is a **policy data model plus a spawn-seam actuator**. It maps a
-//! [`ContainmentMode`] to a [`Capabilities`] set, records the chosen mode at the
-//! spawn seam, and — as of this increment — actuates a REAL OS sandbox (macOS
-//! Seatbelt `(deny network*)` PLUS a conservative `(deny file-read* file-write*)`
-//! over the user's secret-credential directories, via `sandbox-exec`) for
-//! `Containment` mode; GENERAL OS filesystem scoping remains a follow-up. The
-//! mode→capability MAPPING is
-//! DESIGNED for non-escalation/monotonicity and encodes those as Kani proof
-//! harnesses ([`kani_proofs`]); that is a property of the mapping, not a proof
-//! that the operating system enforces anything. (The harnesses are opt-in — see
-//! `scripts/verify-kani-proofs.sh` — and a TLA+ model is the intended formal
-//! spec but is NOT yet in-tree.)
-//!
-//! What is actuated TODAY (see [`actuator`]):
-//! - the spawn seam consults [`actuator::decide`] before forking the shell;
-//! - the chosen mode and the OS-sandbox posture are written to the audit log;
-//! - resource limits (`setrlimit`) are installed fail-closed by `aterm-sandbox`
-//!   / `aterm-pty` in the child before exec;
-//! - **OS NETWORK + SECRET-FS + PRIVATE-DATA sandbox (macOS).** In `Containment`
-//!   mode the spawn is wrapped with `/usr/bin/sandbox-exec -p <SBPL>` applying the
-//!   per-user profile from [`sbpl::profile_for`] — `(version 1)(allow default)(deny
-//!   network*)` PLUS a conservative `(deny file-read* file-write* …)` over the
-//!   secret-credential set under `$HOME` (`.ssh`, `.aws`, `.gnupg`, `.config/gh`,
-//!   `.config/aterm`, `.netrc`, …) AND the private-user-data set (`Documents`,
-//!   `Downloads`, media, the local Mail/Messages/keychain/cookies/browser-profile
-//!   stores — [`sbpl::PRIVATE_SUBDIRS`]). So the kernel Seatbelt DENIES all network
-//!   AND read/write of those credential and private-data stores to the child shell,
-//!   while the rest of the filesystem stays usable so a normal `$SHELL` works.
-//!   [`actuator::os_sandbox_actuated`] is `true` on macOS and
-//!   [`actuator::network_sandbox_actuated`] reports it per-mode; the network deny,
-//!   the secret deny and the private-data deny are all verified by the actuator's
-//!   enforcement-proof tests. The launcher fails CLOSED if the wrapper is missing
-//!   (it refuses to spawn an unsandboxed shell when the policy demands the sandbox).
-//!
-//! What is still **deferred** (honest, NOT yet a guarantee):
-//! - **GENERAL OS FILESYSTEM scoping.** Beyond the conservative secret + private-data
-//!   sets above, the Seatbelt profile is `(allow default)` for the filesystem (a
-//!   blanket `(deny file-*)` base tight enough to matter also breaks a normal
-//!   `$SHELL`); inverting the policy into a positive per-[`FsCapability`] allowlist
-//!   (deny-by-default) is an explicit FOLLOW-UP. The audit log and
-//!   `os_sandbox_actuated`/`network_sandbox_actuated` say exactly this — network
-//!   enforced, secret-dir + private-data read/write enforced, general filesystem not
-//!   yet scoped.
-//! - **Network ENFORCEMENT off macOS** (a Linux seccomp/Landlock lane) and
-//!   **allowlist-mode** network scoping (`Safety`) — both follow-ups; there
-//!   `os_sandbox_actuated` is `false` and the actuator logs the unconfined posture
-//!   explicitly, so it is an audited choice, never a silent claim.
-//! - **OUTPUT / INPUT I/O FILTERING.** `Containment` maps output to
-//!   [`OutputCapability::Filtered`] and input to [`InputCapability::Filtered`], and
-//!   NO I/O is filtered at runtime: treat the `Filtered` capability as a
-//!   policy-data-model value, never a runtime guarantee. (A streaming
-//!   OSC/DCS/APC/SOS/PM stripper for that tier, `OutputSanitizer`, sat here with no
-//!   caller and was deleted, 2026-09-25; a reader-loop hook would bring its own.)
-//!
-//! aterm operates in one of four containment modes, set once by the launcher:
-//!
-//! | Mode | Trust Level | Description (policy intent) |
-//! |------|------------|-------------|
-//! | **Master** | Full | Developer mode — all capabilities unrestricted |
-//! | **User** | Normal | Standard safeguards — output shadow-scanned |
-//! | **Safety** | Reduced | Allowlisted operations only — POLICY INTENT: no allowlist confinement is enforced at runtime (the unwired allowlist gates that modelled it were deleted, 2026-09-25) |
-//! | **Containment** | Hostile | Most restrictive POLICY (no network; I/O *modelled* as filtered) — the NO-NETWORK part AND a conservative SECRET-directory read/write deny (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config/gh`, `~/.config/aterm`, `~/.netrc`) are OS-enforced on macOS (Seatbelt `deny network*` + `deny file-read*/file-write*` via `sandbox-exec`). The `Filtered` I/O capability is a POLICY/PROOF artifact only — output filtering is NOT wired into any runtime path and input filtering is unimplemented (see the deferred-I/O note below) — and GENERAL OS filesystem scoping is the deferred follow-up |
+//! | Mode | Trust | Enforced |
+//! |------|-------|----------|
+//! | **Master** | Full | Nothing beyond the capability-gated spawn. |
+//! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps the launching shell's resource limits. |
+//! | **Safety** | Reduced | Hardened resource limits; no OS sandbox. |
+//! | **Containment** | Hostile | macOS Seatbelt: no network, writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
 //!
 //! ## Core Axiom
 //!
@@ -77,19 +25,19 @@
 //! instruction to an AI agent. The containment system treats all external
 //! data as untrusted by default.
 //!
-//! ## Safety Properties (of the POLICY MAPPING — Kani harnesses; TLA+ model planned)
+//! ## Properties of the policy mapping
 //!
-//! These are properties of the mode→capability mapping, encoded as Kani proof
-//! harnesses in [`kani_proofs`] (a `tla/Containment.tla` model is the intended
-//! formal spec but is not yet in-tree). They are properties of the mapping data
-//! model, NOT of any OS enforcement:
+//! These are properties of the mode→capability mapping, pinned by the unit tests
+//! in `policy.rs` and `mode.rs` (default test lane) and re-checked by the opt-in
+//! Kani harnesses in `kani_proofs` (`scripts/verify-kani-proofs.sh`, trust-mc).
+//! They are properties of the data model, NOT of any OS enforcement:
 //!
 //! - **`NonEscalation`** — mode never increases in capability
 //! - **`CapabilitiesMatchMode`** — capabilities always consistent with mode
-//! - **`ModeImmutableAfterInit`** — model-level launcher-ownership invariant;
-//!   runtime immutability comes from `OnceLock` plus `NonEscalation`
+//! - **`ModeImmutableAfterInit`** — runtime immutability comes from `OnceLock`
+//!   plus `NonEscalation`
 //! - **`ContainmentMinimal`** — Containment mode is the minimal POLICY (every
-//!   capability value at its floor) — minimality of the data model, not OS isolation
+//!   capability value at its floor)
 //! - **`MonotonicCapabilities`** — capabilities only decrease over time
 //!
 //! ## Usage
@@ -104,9 +52,6 @@
 //! let mode = aterm_containment::current_mode();
 //! let caps = ContainmentPolicy::capabilities(mode);
 //! ```
-//!
-//! The intended formal spec is a `tla/Containment.tla` model (planned, NOT yet
-//! in-tree); the in-tree checks are the [`kani_proofs`] harnesses.
 
 #![deny(missing_docs)]
 #![deny(clippy::all)]
@@ -146,13 +91,11 @@ pub mod sbpl;
 pub(crate) mod audit;
 
 pub use actuator::{
-    SpawnDecision, decide as decide_spawn, network_sandbox_actuated, os_sandbox_actuated,
+    NO_OS_SANDBOX_REASON, SpawnDecision, decide as decide_spawn, network_sandbox_actuated,
+    os_sandbox_actuated,
 };
 pub use audit::{log_denial, log_posture};
-pub use capability::{
-    CommandCapability, FsCapability, InputCapability, McpCapability, NetworkCapability,
-    OutputCapability, PluginCapability, ProcessCapability,
-};
+pub use capability::{FsCapability, NetworkCapability, ProcessCapability};
 // The consent tier's types and its three FDA/responsibility OS entry points.
 // Every PURE helper — `classify_probe`, `classify_responsible`,
 // `probe_fda_with`, `display_name`, `readable_info_plist`,
@@ -230,10 +173,7 @@ impl std::error::Error for InitError {
 /// [`InitError::AlreadyInitialized`].
 ///
 /// This function establishes runtime immutability directly through
-/// `OnceLock` single-init semantics. In the INTENDED (not-in-tree) TLA+ model,
-/// `ModeImmutableAfterInit` records launcher ownership of the initialized
-/// mode, and `NonEscalation` captures the security effect of staying at or
-/// below that starting mode.
+/// `OnceLock` single-init semantics.
 ///
 /// # Errors
 ///

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::harness::upgrade::QUIET_S;
+use crate::harness::upgrade::{self, QUIET_S};
 
 fn v(s: &str) -> Version {
     Version::parse(s).expect("a version")
@@ -79,6 +79,44 @@ fn a_version_is_read_from_the_package_that_names_the_binary_never_by_running_it(
     // `codex --version`'s own words are no version (its first word).
     assert_eq!(Version::parse("codex-cli"), None);
     let _ = std::fs::remove_dir_all(&d);
+}
+
+/// THE CODEX LANE CARRIES THE MODEL, AND ONLY CARRIES IT (the decision of
+/// 2026-09-26, beside the Claude lane's same-family move): whatever model the
+/// launch named, in any spelling, rides the relaunch verbatim, and a launch
+/// that named none gets none — no model is guessed for Codex, and none is
+/// moved down.
+#[test]
+fn a_codex_relaunch_keeps_the_launch_model_verbatim_and_adds_none() {
+    for (launch, kept) in [
+        (&["codex", "-m", "gpt-5.4"][..], &["-m", "gpt-5.4"][..]),
+        (
+            &["codex", "--model=gpt-5.4-mini"],
+            &["--model=gpt-5.4-mini"],
+        ),
+        (
+            &["codex", "-mgpt-5.4", "--no-daemon"],
+            &["-mgpt-5.4", "--no-daemon"],
+        ),
+    ] {
+        let want: Vec<String> = std::iter::once("resume")
+            .chain(kept.iter().copied())
+            .chain([T1])
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            rewrite_argv(&argv(launch), Some(T1)).expect("carried"),
+            want,
+            "{launch:?}"
+        );
+    }
+    let bare = rewrite_argv(&argv(&["codex", "--no-daemon"]), Some(T1)).expect("carried");
+    assert!(
+        !bare
+            .iter()
+            .any(|w| w == "-m" || w.starts_with("--model") || w.starts_with("-m")),
+        "{bare:?}"
+    );
 }
 
 #[test]
@@ -1083,4 +1121,80 @@ fn a_break_of_background_work_notices_an_embedded_session_and_exits_nothing() {
         ),
         Step::Terminate
     );
+}
+
+/// NO STOP IS FOR GOOD IN THE CODEX LANE EITHER (2026-09-27): a stopped
+/// round of a client with no notice to take (daemon mode, or an embedded
+/// thread with no conversation) rests `RETRY_S` — `failed` — then starts a
+/// new round, at a break too; an embedded conversation's is the Claude
+/// lane's reducer's, word for word. The owner's skip of the target holds
+/// it; a skip of another build does not.
+#[test]
+fn a_stopped_codex_round_rests_then_rearms() {
+    let stopped = Phase::Failed("resumed-elsewhere".to_string());
+    let idle = Facts {
+        status: "idle".to_string(),
+        status_age_s: 60,
+        composer_empty: true,
+        quiet_s: 60,
+        ..Facts::default()
+    };
+    let aged = |secs: u64, at_break: bool| Facts {
+        failed_s: secs,
+        background_point: at_break,
+        ..idle.clone()
+    };
+    let embedded = Mode::Embedded {
+        thread: "t".to_string(),
+        conversation: true,
+    };
+    for mode in [
+        Mode::Daemon,
+        Mode::Embedded {
+            thread: "t".to_string(),
+            conversation: false,
+        },
+        embedded,
+    ] {
+        assert_eq!(
+            next_step(
+                &mode,
+                &stopped,
+                &aged(upgrade::RETRY_S - 1, false),
+                false,
+                false,
+                1
+            ),
+            Step::Wait("failed"),
+            "{mode:?}"
+        );
+        for at_break in [false, true] {
+            assert_eq!(
+                next_step(
+                    &mode,
+                    &stopped,
+                    &aged(upgrade::RETRY_S, at_break),
+                    false,
+                    false,
+                    1
+                ),
+                Step::Rearm,
+                "{mode:?} at_break={at_break}"
+            );
+        }
+        let step = |request: Request| {
+            requested_step(
+                &request,
+                &mode,
+                &stopped,
+                &aged(upgrade::RETRY_S, false),
+                false,
+                false,
+                1,
+                "0.157.1",
+            )
+        };
+        assert_eq!(step(Request::Skip("0.157.1".into())), Step::Wait("skipped"));
+        assert_eq!(step(Request::Skip("0.157.0".into())), Step::Rearm);
+    }
 }

@@ -30,5 +30,5 @@ fn init_from_flag_uses_the_flag_over_default() {
         caps.process,
         aterm_containment::ProcessCapability::Restricted
     );
-    assert_eq!(caps.mcp, aterm_containment::McpCapability::Allowlist);
+    assert_eq!(caps.fs, aterm_containment::FsCapability::ProjectReadWrite);
 }

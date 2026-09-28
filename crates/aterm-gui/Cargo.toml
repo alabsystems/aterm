@@ -194,7 +194,7 @@ a11y-accesskit = ["dep:accesskit", "dep:accesskit_winit"]
 # verb matrix into a NON-test build — the only way a target with its own `fn main`
 # can run the suite (a bin gets no dev-dependencies). OFF by default: the shipped
 # GUI carries neither the gate nor the suite.
-control-conformance = ["aterm-control/conformance", "aterm-gpu/acquire-conformance"]
+control-conformance = ["aterm-control/conformance"]
 # Bench-only observation seam (src/bench_support.rs), the `test-open-probe`
 # precedent applied to this crate: `benches/frame_latency.rs` is an EXTERNAL
 # target, so it sees only the crate's public surface — but the frame-path
@@ -455,14 +455,18 @@ aterm-gpu = { workspace = true, features = ["spec-anchors"] }
 # aterm-session supplies the `fd_lifecycle` anchors (the SinkWriter PTY-master
 # fd-lifecycle: UseFd #[refines] on master()/write_frame + Clone/DropClone RAII
 # waivers). Re-declared here with `spec-anchors` ON so `inventory` collects them
-# into this gate's test binary (initiative A7, WS-G).
-aterm-session = { workspace = true, features = ["spec-anchors"] }
+# into this gate's test binary (initiative A7, WS-G), and `testing` ON for the
+# sink's read-only accounting the egress-contract suite asserts on.
+aterm-session = { workspace = true, features = ["spec-anchors", "testing"] }
 # TRUST_NATIVE_TLA §4 (Phase 4): the PROOF-anchor (kani-half) crates. Linked into this
 # test build with `spec-anchors` ON so `inventory` collects their `proof_anchor!`
 # records (Ring/EvictFull/TierResidency) for the unified verifier ledger. These are NOT
 # normal `[dependencies]` of aterm-gui, so the production binary never links them — the
 # ledger is a test-build artifact, exactly like the ISOLATION anchors above.
-aterm-scrollback = { workspace = true, features = ["spec-anchors"] }
+# aterm-scrollback's `testing` adds the corruption seam
+# (`inject_corrupted_warm_block`) the native search's dense-history tests stage a
+# corrupt tiered segment with (`control_query::dense_history_tests`).
+aterm-scrollback = { workspace = true, features = ["spec-anchors", "testing"] }
 aterm-grid = { workspace = true, features = ["spec-anchors"] }
 # aterm-search supplies the `streaming_search` #[refines] anchors (the derived
 # StreamingSearch machine's temporal half) AND its kani `proof_anchor!` records;
@@ -669,18 +673,6 @@ required-features = ["bench-support"]
 name = "styled_frame"
 harness = false
 required-features = ["bench-support"]
-
-# The allocation-count gate behind the styled-frame bench's headline claim. It
-# needs a counting GLOBAL allocator, which only an integration test can install
-# without imposing itself on every other test in the crate, and it needs the
-# `bench-support` seam to reach the crate-private gather at all.
-[[test]]
-name = "styled_frame_alloc"
-required-features = ["bench-support"]
-
-[[example]]
-name = "drawable_acquire_drive"
-required-features = ["control-conformance"]
 
 [lints]
 workspace = true

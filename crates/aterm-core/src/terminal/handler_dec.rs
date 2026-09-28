@@ -319,8 +319,22 @@ impl TerminalHandler<'_> {
                         self.cursor_state().restore_cursor_state();
                     }
                 }
+                // ConPTY win32-input-mode (microsoft/terminal spec #4999). conhost
+                // requests it at every ConPTY start; until it was honoured the
+                // request fell into the unknown-mode arm below, so no key could
+                // ever carry a Windows modifier and aterm's legacy Shift+Enter LF
+                // reached PowerShell as Ctrl+Enter (measured 2026-09-22). Folded
+                // into the keyboard encoding as `KeyboardMode::WIN32_INPUT`; the
+                // encoder decides which keys need a win32 record (Enter chords)
+                // and which stay legacy VT — conhost accepts the mixed stream.
+                9001 => {
+                    self.modes.win32_input_mode = set;
+                }
                 _ => {} // Unknown DEC mode
             }
+            // The foreground handback's attribution: a setter parsed now is
+            // this holder's, even over a mode already in force.
+            *self.evidence_asserted |= super::program_evidence::asserted_by_dec_mode(param, set);
         }
     }
 
@@ -394,6 +408,10 @@ impl TerminalHandler<'_> {
             return;
         }
 
+        // No cursor saved: an orphaned-screen leave must not restore one either.
+        self.transient.alt_entered_without_cursor_save = true;
+        // A live app owns the alternate screen now, on both sides of conhost.
+        self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
         // Clear hyperlink state — hyperlinks should not leak across screen
         // boundaries. A hyperlink opened on main should not apply to alt
@@ -463,6 +481,7 @@ impl TerminalHandler<'_> {
     )]
     fn exit_alternate_screen_raw(&mut self) {
         if !self.modes.alternate_screen {
+            self.keep_screen_from_conhost_repaint();
             return;
         }
 
@@ -495,6 +514,10 @@ impl TerminalHandler<'_> {
             // 47 exit does not clear it — a later re-entry shows it again.
             let alt = std::mem::replace(self.grid, main_grid);
             *self.alt_grid = Some(alt);
+            // The whole visible surface just changed — see
+            // `exit_alternate_screen`'s note on why the restored grid is
+            // marked fully damaged.
+            self.grid.damage_mut().mark_full();
         }
         self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
@@ -518,6 +541,7 @@ impl TerminalHandler<'_> {
     )]
     fn exit_alternate_screen_1047(&mut self) {
         if !self.modes.alternate_screen {
+            self.keep_screen_from_conhost_repaint();
             return;
         }
 
@@ -595,6 +619,8 @@ impl TerminalHandler<'_> {
         // the DECSC save, observable by a later bare DECRC on the main
         // screen restoring the position 1049 saved.
         self.cursor_save.main = Some(self.snapshot_cursor_state());
+        self.transient.alt_entered_without_cursor_save = false;
+        self.transient.conhost_alt_screen_left_up = false;
         self.kitty_keyboard.switch_screen(true);
         // Clear pending Sixel image to prevent in-progress images from
         // leaking into the alt screen context (#7469).
@@ -682,6 +708,7 @@ impl TerminalHandler<'_> {
     )]
     fn exit_alternate_screen(&mut self) {
         if !self.modes.alternate_screen {
+            self.keep_screen_from_conhost_repaint();
             return;
         }
 
@@ -707,6 +734,16 @@ impl TerminalHandler<'_> {
             // DECSLRM set while in the alt screen stays in force after exit.
             Self::copy_margins(self.grid, &mut main_grid);
             *self.grid = main_grid;
+            // THE RESTORED GRID IS A WHOLE-SCREEN CHANGE. Its damage tracker
+            // was consumed by the last present before the program entered the
+            // alt screen and has recorded nothing since, so without this mark
+            // `has_damage()` read false and `damage_epoch()` did not advance
+            // on the swap back — and every consumer that keys a repaint on the
+            // epoch (both browser hosts' WF-1 frame gates) kept the ALT screen
+            // on glass until some later write happened to damage the main
+            // grid. Entering already marks full (the alt buffer is erased or
+            // fresh); leaving must too.
+            self.grid.damage_mut().mark_full();
         }
         self.flatten_restored_display_offset();
         self.grid.restore_tab_stops(&tab_stops, tab_suppressed);
@@ -721,6 +758,140 @@ impl TerminalHandler<'_> {
         // outgoing screen's selection — `post_process` parks it — and the `All` this
         // used to record would clear it on the way back in.
         self.grid.invalidate_host_coordinates();
+    }
+
+    /// Leave an alternate screen NO APP IS BEHIND any more — the `?1049l` that
+    /// should have ended it never came. A no-op on the primary screen.
+    ///
+    /// MEASURED (2026-09-22, Windows 11, ConPTY, the `cast` tap): `less` from Git
+    /// for Windows entered with a lone `ESC[?1049h` frame; killed from another tab
+    /// (`Stop-Process`), conhost sent NO `?1049l` and no repaint — the next bytes
+    /// were pwsh's `133;D;-1`, `133;A`, its prompt and `133;B`, painted onto the
+    /// pager rows. Commands typed there scrolled the alt grid, which has no
+    /// scrollback, and a later `less` + `q` restored a main screen that never held
+    /// them. A bare ConPTY probe reproduces it without aterm (2026-09-27):
+    /// conhost forwards ANY client's switch, as `?1049h` plus its own full
+    /// repaint of the new buffer — MSYS `printf`, cmd's `echo`, .NET's
+    /// `Console.Out` alike — and a killed client leaves its alt buffer up for
+    /// good. `Write-Host` from pwsh never switches only because PowerShell strips
+    /// the sequence first: `$PSStyle.OutputRendering` read `PlainText` in an
+    /// aterm tab. On unix the same happens to a full-screen app that gets
+    /// SIGKILL: nothing emits rmcup on its behalf.
+    ///
+    /// Two callers name the same fact: the shell painting a PROMPT on the alt
+    /// screen (`prompt_leaves_orphaned_alt_screen` — a prompt there is never
+    /// intended, the shell believes it is on the main screen), and the host's
+    /// explicit recovery (`Terminal::leave_alternate_screen`, the `mainscreen`
+    /// verb) for a shell that paints no integration marks.
+    ///
+    /// In order: commit the alt grid as its final frame and flush it WHOLE to the
+    /// archive (`AltArchiveState::leave_orphaned` — everything typed on the stuck
+    /// screen stays readable through `offscreen`), then the exit the dead app's
+    /// own reset would have been. After `?1049h`: the 1049 exit — the main grid,
+    /// its scrollback and the cursor `?1049h` saved come back, so the prompt paints
+    /// where it would have after a clean exit. After `?47h`/`?1047h`, which save no
+    /// cursor: the 1047 exit — the cursor stays where the alt screen had it, as
+    /// both modes' exits leave it, and the dead screen is blanked rather than kept
+    /// for a later `?47h` to show again (its rows are in the archive). The 1049
+    /// exit there would restore the main slot, which can still hold an earlier
+    /// app's save. Then the modes the dead app owned go (`release_dead_app_modes`).
+    ///
+    /// Under conhost (`win32_input_mode`) the primary screen is laid out the way
+    /// conhost sees it instead, because conhost never leaves ITS alternate buffer
+    /// (`TransientState::conhost_alt_screen_left_up`): everything the shell prints
+    /// from here on is conhost's alternate buffer, rendered with ABSOLUTE cursor
+    /// moves. MEASURED (2026-09-27, 80x24, `less` killed after four history
+    /// rows): with the prompt put back on the row `?1049h` saved (row 8) while
+    /// conhost's cursor was on row 23, a command typed there that wrapped showed
+    /// its head on the prompt's row and a second, prompt-less copy on rows 19-20
+    /// (conhost re-anchors a wrap with `ESC[23;80H`, the `cast` tap); and a
+    /// resize (`resize 24 90`, `resize 24 80`) made conhost repaint its whole
+    /// alternate buffer over the primary screen, erasing the history rows the
+    /// 1049 exit had put back on it (`search 'history row'`: no results). So the
+    /// cursor stays where the alternate screen had it — conhost's cursor, both
+    /// sides parsed the same bytes — and every used primary row goes into the
+    /// scrollback first: a later conhost repaint can only overwrite rows conhost
+    /// itself painted, and the history is out of its reach. The same two runs
+    /// with this layout: the wrapped command is one line under its prompt, and
+    /// after the resize every history row is in the scrollback, with the dead
+    /// pager's rows repainted on the blank rows above the prompt.
+    pub(super) fn leave_orphaned_alternate_screen(&mut self) {
+        if !self.modes.alternate_screen {
+            return;
+        }
+        self.alt_archive
+            .leave_orphaned(self.grid, self.transient.sync_end_seq);
+        let conhost = self.modes.win32_input_mode;
+        let conhost_cursor = (self.grid.cursor(), self.grid.pending_wrap());
+        if self.transient.alt_entered_without_cursor_save {
+            self.exit_alternate_screen_1047();
+        } else {
+            self.exit_alternate_screen();
+        }
+        self.release_dead_app_modes();
+        if conhost {
+            self.scroll_screen_into_scrollback();
+            let (cursor, pending_wrap) = conhost_cursor;
+            self.grid.set_cursor(cursor.row, cursor.col);
+            self.grid.set_pending_wrap(pending_wrap);
+        }
+        // Under conhost our leave is ours alone: its own alternate buffer stays
+        // up, and its next switch repaints over this screen (the field has the
+        // measurement). Unix has no such second screen to fall out of step with.
+        self.transient.conhost_alt_screen_left_up = conhost;
+    }
+
+    /// The modes a dead full-screen app owned, which its own exit would have
+    /// reset and the exits above carry over (xterm keeps them across a switch
+    /// for a LIVE app): its scroll region and horizontal margins — the shell's
+    /// output would scroll inside them and never reach the scrollback the leave
+    /// brought back; mouse tracking — the wheel and clicks would go on feeding a
+    /// dead app instead of scrolling that scrollback; application cursor keys
+    /// and keypad — `less` sends `?1h` and `ESC =`, and conhost forwarded both
+    /// (the `cast` tap, 2026-09-27); and an open 2026 window, which would hold
+    /// every present until its timeout. The shell set none of them. Focus
+    /// reporting stays (conhost asks for it at every ConPTY start, beside
+    /// `?9001h`), and so do bracketed paste and the keyboard protocols, which a
+    /// shell sets for itself — the kitty flags are per screen already.
+    fn release_dead_app_modes(&mut self) {
+        self.grid.reset_scroll_region();
+        self.modes.left_right_margin_mode = false;
+        self.grid.reset_horizontal_margins();
+        self.modes.mouse_mode = MouseMode::None;
+        self.modes.mouse_encoding = MouseEncoding::X10;
+        self.modes.application_cursor_keys = false;
+        self.modes.application_keypad = false;
+        if self.modes.synchronized_output {
+            self.disable_synchronized_output();
+        }
+    }
+
+    /// conhost is about to repaint over our primary screen — it is switching the
+    /// alternate buffer it was left on (`TransientState::conhost_alt_screen_left_up`
+    /// has the measurement) — so move the screen's rows into the scrollback
+    /// first: the rows the shell printed since the recovery live nowhere else.
+    /// No-op unless that state is set, which this consumes. The screen is left
+    /// blank with the cursor where it was: both repaints start by homing it.
+    pub(super) fn keep_screen_from_conhost_repaint(&mut self) {
+        if std::mem::take(&mut self.transient.conhost_alt_screen_left_up) {
+            self.scroll_screen_into_scrollback();
+        }
+    }
+
+    /// Scroll every used screen row (down to the last non-blank one) into the
+    /// scrollback, leaving the screen blank and the cursor where it was. Nothing
+    /// moves under a partial scroll region (the scroll would not reach the
+    /// scrollback) or from a blank screen.
+    fn scroll_screen_into_scrollback(&mut self) {
+        let region = self.grid.scroll_region();
+        if region.top != 0 || region.bottom + 1 != self.grid.rows() {
+            return;
+        }
+        let used = (0..self.grid.rows())
+            .rev()
+            .find(|&r| self.grid.row(r).is_some_and(|row| !row.is_empty()))
+            .map_or(0, |r| usize::from(r) + 1);
+        self.grid.scroll_region_up(used);
     }
 
     #[cfg_attr(
@@ -990,6 +1161,8 @@ impl TerminalHandler<'_> {
             2048 => state(self.modes.in_band_size_reports),
             2500 => state(self.modes.bidi_box_mirroring),
             2501 => state(self.modes.bidi_autodetection),
+            // ConPTY win32-input-mode — answered to the console host that set it.
+            9001 => state(self.modes.win32_input_mode),
             // Recognized but permanently reset: modes with no effect in a modern
             // terminal emulator.  Pm=4 is more spec-correct than Pm=0 (unknown).
             4 | 8 => 4,   // DECSCLM (smooth scroll), DECARM (auto repeat) — OS-managed
@@ -1547,6 +1720,41 @@ mod cursor_damage_scope_tests {
         }
     }
 
+    /// Leaving the alternate screen swaps the whole visible surface back to the
+    /// main buffer, so the restored grid must carry FULL damage and the damage
+    /// epoch must advance — for every exit mode. Before this, the restored
+    /// grid's tracker was still the one consumed before the program entered
+    /// the alt screen: `has_damage()` read false, the epoch stood still, and
+    /// an epoch-gated host (the browser hosts' WF-1 frame gates) kept
+    /// presenting the alt screen after `vim`/`less` had quit.
+    #[test]
+    fn leaving_the_alternate_screen_marks_the_restored_grid_fully_damaged() {
+        for (enter, exit) in [
+            (&b"\x1b[?1049h"[..], &b"\x1b[?1049l"[..]),
+            (b"\x1b[?1047h", b"\x1b[?1047l"),
+            (b"\x1b[?47h", b"\x1b[?47l"),
+        ] {
+            let name = String::from_utf8_lossy(exit);
+            let mut term = Terminal::new(8, 40);
+            term.process(b"main text");
+            term.take_damage();
+            term.process(enter);
+            term.process(b"alt text");
+            let _ = term.damage_epoch();
+            term.take_damage();
+            let before = term.damage_epoch();
+            term.process(exit);
+            assert!(
+                term.grid().damage().is_full(),
+                "{name}: the restored main grid must be fully damaged"
+            );
+            assert!(
+                term.damage_epoch() > before,
+                "{name}: the swap back must advance the damage epoch"
+            );
+        }
+    }
+
     /// The control: a change that really does repaint every cell still marks the
     /// whole grid. Reverse video (DECSCNM) and the bidi direction are resolved at
     /// render-snapshot time over cells already stored, so they own the full mark
@@ -1730,6 +1938,601 @@ mod xterm_keyboard_mode_tests {
         term.process(b"\x1b[?1045h");
         // Mode 1045 is tracked-only: the encoder-facing KeyboardMode is unchanged.
         assert_eq!(term.keyboard_mode(), before);
+    }
+}
+
+#[cfg(test)]
+mod win32_input_mode_tests {
+    //! ConPTY win32-input-mode (DEC 9001): the mode table half. The bytes the
+    //! encoder emits under it are pinned in `keyboard_mode::shift_enter_e2e_tests`.
+    use crate::terminal::Terminal;
+    use aterm_types::keyboard::KeyboardMode;
+
+    #[test]
+    fn mode_9001_is_off_by_default_and_toggles_the_win32_input_bit() {
+        let mut term = Terminal::new(24, 80);
+        assert!(!term.modes().win32_input_mode);
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        term.process(b"\x1b[?9001h");
+        assert!(term.modes().win32_input_mode);
+        assert!(term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        term.process(b"\x1b[?9001l");
+        assert!(!term.modes().win32_input_mode);
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+    }
+
+    #[test]
+    fn mode_9001_is_consumed_not_echoed_to_the_grid() {
+        // conhost sends it at session start, before the prompt: the sequence
+        // must be consumed whole and leave nothing on the grid — pinned so the
+        // mode arm can never regress to printing any part of it.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (0, 0));
+    }
+
+    #[test]
+    fn decrqm_reports_mode_9001_state() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
+        term.process(b"\x1b[?9001h");
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;1$y");
+    }
+
+    #[test]
+    fn xtsave_and_xtrestore_carry_mode_9001() {
+        // The DECRQM table and the XTSAVE table are one fact (see
+        // `query_dec_mode`); a mode reported by one must round-trip the other.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        term.process(b"\x1b[?9001s"); // XTSAVE
+        term.process(b"\x1b[?9001l");
+        assert!(!term.modes().win32_input_mode);
+        term.process(b"\x1b[?9001r"); // XTRESTORE
+        assert!(term.modes().win32_input_mode);
+    }
+
+    #[test]
+    fn ris_clears_mode_9001() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        term.process(b"\x1bc");
+        assert!(!term.modes().win32_input_mode);
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+    }
+
+    #[test]
+    fn mode_9001_survives_decstr() {
+        // DECSTR is the application's soft reset (cursor keys, keypad, margins,
+        // SGR — the xterm list `soft_reset` walks); the console host's input
+        // negotiation is not the application's to undo, so only RIS clears it.
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        term.process(b"\x1b[!p");
+        assert!(term.modes().win32_input_mode);
+    }
+}
+
+impl super::Terminal {
+    /// Force the PRIMARY screen: the host's recovery for an alternate screen a
+    /// killed app left up (`TerminalHandler::leave_orphaned_alternate_screen` has
+    /// the measurement). `true` when the alternate screen was active; its last
+    /// frame is then in the archive ([`Self::alt_archive`]), whole.
+    ///
+    /// Runs as an EMPTY output batch rather than swapping the grids here: the
+    /// batch prologue and epilogue own the viewport pin, the selection park and
+    /// restore, the archive's boundary, the observation kernel and the mode
+    /// mirror, and every one of them keys on a swap that happens INSIDE the
+    /// batch — the road a `?1049l` from the app takes.
+    pub fn leave_alternate_screen(&mut self) -> bool {
+        if !self.modes.alternate_screen {
+            return false;
+        }
+        self.transient.host_leave_alternate_screen = true;
+        self.process(b"");
+        debug_assert!(
+            !self.modes.alternate_screen,
+            "the batch takes the request first thing, and the handler refuses only a \
+             screen that is not alternate"
+        );
+        true
+    }
+}
+
+#[cfg(test)]
+mod orphaned_alt_screen_tests {
+    //! A killed full-screen app leaves the alternate screen up with no `?1049l`
+    //! (measured 2026-09-22: `less` under ConPTY, `Stop-Process` from another tab).
+    //! The prompt half is in `handler_osc_shell.rs`; this is the host's recovery
+    //! and the mode-table facts both halves rest on.
+    use crate::terminal::Terminal;
+
+    fn on_alt_with_history() -> Terminal {
+        let mut term = Terminal::new(5, 40);
+        for i in 0..8 {
+            term.process(format!("main line {i}\r\n").as_bytes());
+        }
+        term.process(b"$ less file\r\n\x1b[?1049h\x1b[H\x1b[2Jpager row 1\r\npager row 2");
+        assert!(term.modes().alternate_screen);
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            0,
+            "the alt grid has no scrollback"
+        );
+        term
+    }
+
+    #[test]
+    fn host_leave_restores_the_main_grid_and_its_scrollback() {
+        let mut term = on_alt_with_history();
+        assert!(term.leave_alternate_screen());
+        assert!(!term.modes().alternate_screen);
+        // 8 main lines, the command line and the empty row its `\r\n` opened = 10
+        // rows on a 5-row grid: 5 scrolled off, reachable again.
+        assert_eq!(term.grid().scrollback_lines(), 5);
+        let screen: Vec<String> = (0..5).map(|r| term.row_text(r).unwrap()).collect();
+        assert_eq!(screen[3].trim_end(), "$ less file");
+        assert!(
+            screen.iter().all(|r| !r.contains("pager")),
+            "the pager rows stay on the alt grid, not the restored screen: {screen:?}"
+        );
+        // The cursor `?1049h` saved: the row after the command, column 0 — where the
+        // prompt paints after a clean exit.
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (4, 0));
+    }
+
+    #[test]
+    fn host_leave_on_the_main_screen_is_a_refused_no_op() {
+        let mut term = Terminal::new(5, 40);
+        term.process(b"hello\r\n");
+        let before = term.row_text(0).unwrap();
+        assert!(!term.leave_alternate_screen());
+        assert!(!term.modes().alternate_screen);
+        assert_eq!(term.row_text(0).unwrap(), before);
+        assert_eq!(term.grid().scrollback_lines(), 0);
+    }
+
+    #[test]
+    fn host_leave_is_one_shot_and_a_later_app_can_enter_again() {
+        let mut term = on_alt_with_history();
+        assert!(term.leave_alternate_screen());
+        // The request was consumed by the batch that served it: the next output
+        // batch does not leave a screen the next app enters.
+        term.process(b"\x1b[?1049h\x1b[Hsecond app");
+        assert!(term.modes().alternate_screen);
+        assert_eq!(term.row_text(0).unwrap().trim_end(), "second app");
+        term.process(b"\x1b[?1049l");
+        assert!(!term.modes().alternate_screen);
+    }
+
+    #[test]
+    fn host_leave_of_a_mode_47_screen_keeps_the_cursor_where_the_app_had_it() {
+        // `?47h` saves no cursor, so the leave restores none: the cursor stays
+        // where the alt screen left it, as the app's own `?47l` would leave it —
+        // even with the main slot still holding an EARLIER 1049 app's save (a
+        // 1049 exit restores without consuming it).
+        let mut term = Terminal::new(5, 40);
+        term.process(b"one\r\n\x1b[?1049h\x1b[5;9Hpager\x1b[?1049l");
+        assert_eq!(
+            (term.cursor().row, term.cursor().col),
+            (1, 0),
+            "the clean 1049 exit"
+        );
+        term.process(b"two\r\n\x1b[?47h\x1b[3;5Hdead app");
+        assert!(term.modes().alternate_screen);
+        assert!(term.leave_alternate_screen());
+        assert!(!term.modes().alternate_screen);
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (2, 12));
+        assert_eq!(term.row_text(0).unwrap().trim_end(), "one");
+        assert_eq!(term.row_text(1).unwrap().trim_end(), "two");
+        // The dead screen's rows went to the archive, not back onto the screen a
+        // later `?47h` shows: the persistent alt buffer comes back blank.
+        let archived = term.alt_archive().texts();
+        assert_eq!(archived.last().map(String::as_str), Some("    dead app"));
+        term.process(b"\x1b[?47h");
+        assert!(
+            (0..5).all(|r| !term.row_text(r).unwrap().contains("dead app")),
+            "a later ?47h re-showed the dead screen"
+        );
+    }
+
+    #[test]
+    fn host_leave_of_a_1049_screen_entered_after_a_47_one_restores_its_save() {
+        // The entry mode is the LATEST entry's: a 47 app that exited cleanly does
+        // not turn the next 1049 app's leave into a 47 one.
+        let mut term = Terminal::new(5, 40);
+        term.process(b"one\r\n\x1b[?47hx\x1b[?47l\r\ntwo\r\n");
+        term.process(b"\x1b[?1049h\x1b[4;7Hpager");
+        assert!(term.leave_alternate_screen());
+        let cursor = term.cursor();
+        assert_eq!(
+            (cursor.row, cursor.col),
+            (3, 0),
+            "the cursor `?1049h` saved"
+        );
+    }
+
+    #[test]
+    fn a_dead_apps_scroll_region_and_input_modes_do_not_outlive_it() {
+        // An editor killed mid-session leaves its scroll region, mouse tracking,
+        // cursor-key and keypad modes and an open 2026 window behind; the exit
+        // carries the region over (xterm does, for a live app), so without the
+        // release the shell's output scrolled inside rows 1-5 and never reached
+        // the scrollback — commands lost again. Focus reporting is conhost's
+        // (and the shell's) and stays.
+        use crate::terminal::{MouseEncoding, MouseMode};
+        let mut term = Terminal::new(10, 40);
+        term.process(b"\x1b[?1004hhistory\r\n$ vim file\r\n");
+        term.process(b"\x1b[?1049h\x1b[1;5r\x1b[?1002h\x1b[?1006h\x1b[?1h\x1b=\x1b[?2026h");
+        term.process(b"\x1b[Hbuffer row\r\n");
+        term.process(b"\r\n\x1b]133;D;-1\x07\x1b]133;A\x07$ \x1b]133;B\x07");
+        assert!(!term.modes().alternate_screen);
+        let modes = term.modes();
+        assert_eq!(modes.mouse_mode, MouseMode::None);
+        assert_eq!(modes.mouse_encoding, MouseEncoding::X10);
+        assert!(!modes.application_cursor_keys);
+        assert!(!modes.application_keypad);
+        assert!(!modes.synchronized_output);
+        assert!(modes.focus_reporting);
+        let region = term.grid().scroll_region();
+        assert_eq!((region.top, region.bottom), (0, 9));
+        term.process(b"seq 20\r\n");
+        for i in 0..20 {
+            term.process(format!("out {i}\r\n").as_bytes());
+        }
+        let first = term.grid().oldest_absolute_row();
+        let n = term.grid().scrollback_lines() + 10;
+        let rows: Vec<String> = (first..)
+            .take(n)
+            .map(|abs| {
+                term.abs_row_text(abs)
+                    .unwrap_or_default()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        for want in ["history", "$ vim file", "$ seq 20"]
+            .map(str::to_string)
+            .into_iter()
+            .chain((0..20).map(|i| format!("out {i}")))
+        {
+            assert_eq!(
+                rows.iter().filter(|r| **r == want).count(),
+                1,
+                "{want:?}: {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_host_leave_releases_the_dead_apps_modes_too() {
+        let mut term = on_alt_with_history();
+        term.process(b"\x1b[2;4r\x1b[?1000h\x1b[?1h");
+        assert!(term.leave_alternate_screen());
+        let region = term.grid().scroll_region();
+        assert_eq!((region.top, region.bottom), (0, 4));
+        assert_eq!(term.modes().mouse_mode, crate::terminal::MouseMode::None);
+        assert!(!term.modes().application_cursor_keys);
+    }
+}
+
+#[cfg(test)]
+mod conhost_left_alt_screen_tests {
+    //! After an orphaned leave under conhost, conhost itself is still on the
+    //! alternate buffer the dead app entered, and its next buffer switch repaints
+    //! over our primary screen. The streams are the `cast` tap's, measured
+    //! 2026-09-27 on Windows 11 (`less` from Git for Windows, `Stop-Process`,
+    //! then two commands, a second `less` and `q`), scaled to a 10-row grid.
+    use crate::terminal::Terminal;
+
+    const ROWS: u16 = 10;
+    const PROMPT: &[u8] = b"\x1b]133;A\x07PS> \x1b]133;B\x07";
+
+    /// Every retained row, scrollback first, trailing blanks trimmed.
+    fn all_rows(term: &Terminal) -> Vec<String> {
+        let first = term.grid().oldest_absolute_row();
+        let n = term.grid().scrollback_lines() + usize::from(ROWS);
+        (first..)
+            .take(n)
+            .map(|abs| {
+                term.abs_row_text(abs)
+                    .unwrap_or_default()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn count(rows: &[String], want: &str) -> usize {
+        rows.iter().filter(|r| *r == want).count()
+    }
+
+    /// conhost's blank repaint of the viewport and its `?1049h`, in ONE read.
+    fn blank_repaint_then_enter() -> Vec<u8> {
+        let mut read = b"\x1b[?25l\x1b[H".to_vec();
+        for _ in 1..ROWS {
+            read.extend_from_slice(b"\x1b[K\r\n");
+        }
+        read.extend_from_slice(b"\x1b[K\x1b[?25h\x1b[?1049h");
+        read
+    }
+
+    /// conhost's repaint of its PRIMARY buffer after `?1049l`: frozen at the
+    /// dead pager's start, so it knows nothing typed since.
+    fn stale_primary_repaint() -> Vec<u8> {
+        let mut read = b"\x1b[?25l\x1b[H".to_vec();
+        for row in ["history 1", "history 2", "PS> less file"] {
+            read.extend_from_slice(row.as_bytes());
+            read.extend_from_slice(b"\x1b[K\r\n");
+        }
+        read.extend_from_slice(b"\x1b[K\x1b[4;1H\x1b[?25h");
+        read
+    }
+
+    /// A pager killed on the alternate screen, the prompt's recovery, and two
+    /// commands typed after it — under conhost (`?9001h`) or not.
+    fn recovered_with_two_commands(conhost: bool) -> Terminal {
+        let mut term = Terminal::new(ROWS, 40);
+        if conhost {
+            term.process(b"\x1b[?9001h\x1b[?1004h");
+        }
+        term.process(b"history 1\r\nhistory 2\r\n");
+        term.process(PROMPT);
+        term.process(b"less file\r\n\x1b]133;C\x07");
+        term.process(b"\x1b[?1049h");
+        term.process(b"\x1b[H\x1b[2Jpager 1\r\npager 2\r\n:");
+        term.process(b"\r");
+        term.process(b"\n\x1b]133;D;-1\x07");
+        term.process(PROMPT);
+        assert!(
+            !term.modes().alternate_screen,
+            "the prompt recovered the tab"
+        );
+        for cmd in ["one", "two"] {
+            term.process(
+                format!("echo {cmd}\r\n\x1b]133;C\x07{cmd}\r\n\x1b]133;D;0\x07").as_bytes(),
+            );
+            term.process(PROMPT);
+        }
+        term.process(b"less file\r\n\x1b]133;C\x07");
+        term
+    }
+
+    const TYPED_AFTER: [&str; 4] = ["PS> echo one", "one", "PS> echo two", "two"];
+
+    #[test]
+    fn a_second_pager_under_conhost_keeps_what_was_typed_after_the_recovery() {
+        let mut term = recovered_with_two_commands(true);
+        assert_eq!(
+            term.grid().scrollback_lines(),
+            3,
+            "the recovery moved the history rows out of conhost's reach, nothing since"
+        );
+        term.process(&blank_repaint_then_enter());
+        assert!(term.modes().alternate_screen);
+        term.process(b"\x1b[Hsecond pager");
+        term.process(b"\x1b[10;1H\x1b[?1049l");
+        term.process(&stale_primary_repaint());
+        term.process(b"\x1b]133;D;0\x07");
+        term.process(PROMPT);
+        let rows = all_rows(&term);
+        for want in TYPED_AFTER {
+            assert_eq!(
+                count(&rows, want),
+                1,
+                "{want:?} must survive once: {rows:?}"
+            );
+        }
+        // The screen is conhost's frozen primary buffer plus the new prompt; the
+        // rows it lost are in the scrollback above it.
+        assert_eq!(term.row_text(2).unwrap().trim_end(), "PS> less file");
+        assert_eq!(term.row_text(3).unwrap().trim_end(), "PS>");
+    }
+
+    #[test]
+    fn without_conhost_the_same_bytes_move_nothing() {
+        // Negative control: the loss the state exists to prevent. With no console
+        // host in between, no orphaned leave marks one, and the blank repaint
+        // overwrites the rows in place — on unix nothing sends those bytes.
+        let mut term = recovered_with_two_commands(false);
+        term.process(&blank_repaint_then_enter());
+        assert!(term.modes().alternate_screen);
+        term.process(b"\x1b[?1049l");
+        term.process(&stale_primary_repaint());
+        assert_eq!(term.grid().scrollback_lines(), 0);
+        let rows = all_rows(&term);
+        for want in TYPED_AFTER {
+            assert_eq!(count(&rows, want), 0, "{rows:?}");
+        }
+    }
+
+    #[test]
+    fn a_stray_1049l_under_conhost_keeps_the_rows_from_the_primary_repaint() {
+        // Something writes `?1049l` to the console while conhost is still on the
+        // dead app's buffer: conhost switches back and repaints its frozen
+        // primary right after — our screen is already primary, so the reset
+        // itself is the only warning.
+        let mut term = recovered_with_two_commands(true);
+        term.process(b"\x1b[?1049l");
+        assert!(!term.modes().alternate_screen);
+        term.process(&stale_primary_repaint());
+        let rows = all_rows(&term);
+        for want in TYPED_AFTER {
+            assert_eq!(count(&rows, want), 1, "{rows:?}");
+        }
+        // Consumed: a later exit on the primary screen moves nothing again.
+        let kept = term.grid().scrollback_lines();
+        term.process(b"\x1b[?1049l");
+        assert_eq!(term.grid().scrollback_lines(), kept);
+    }
+
+    #[test]
+    fn the_host_forced_leave_under_conhost_keeps_the_rows_too() {
+        // cmd.exe paints no marks: the `mainscreen` verb is the recovery, and
+        // conhost is left on the dead app's buffer exactly the same way. The
+        // shape is the `cast` tap's for cmd (2026-09-27): after the kill, cmd's
+        // `\r\n` and its prompt under the pager's last row, a command typed
+        // there, and only then the verb.
+        let mut term = Terminal::new(ROWS, 40);
+        term.process(b"\x1b[?9001h");
+        term.process(b"C:\\>less file\r\n\x1b[?1049h\x1b[H\x1b[2J");
+        for i in 1..ROWS {
+            term.process(format!("pager {i}\r\n").as_bytes());
+        }
+        term.process(b":\r\nC:\\>echo stuck\r\nstuck\r\n\r\nC:\\>");
+        assert!(term.leave_alternate_screen());
+        // conhost's cursor, after its prompt on the bottom row; the one primary
+        // row is in the scrollback, the rows typed while stuck in the archive.
+        assert_eq!((term.cursor().row, term.cursor().col), (ROWS - 1, 4));
+        assert_eq!(all_rows(&term)[0], "C:\\>less file");
+        assert_eq!(term.grid().scrollback_lines(), 1);
+        let archived = term.alt_archive().texts();
+        for want in ["C:\\>echo stuck", "stuck", "C:\\>"] {
+            assert!(archived.iter().any(|r| r == want), "{want:?}: {archived:?}");
+        }
+        // A command after the verb, then conhost's next pager: its blank repaint
+        // and `?1049h`, and the exit.
+        term.process(b"echo after\r\nafter\r\n\r\nC:\\>");
+        term.process(&blank_repaint_then_enter());
+        term.process(b"\x1b[?1049l");
+        let rows = all_rows(&term);
+        assert_eq!(count(&rows, "C:\\>less file"), 1, "{rows:?}");
+        assert_eq!(count(&rows, "after"), 1, "{rows:?}");
+        // The prompt it was typed after was painted on the dead screen, so the
+        // row holds the command alone, where conhost put it.
+        assert_eq!(count(&rows, "    echo after"), 1, "{rows:?}");
+    }
+
+    /// A pager that filled the screen after a short history, killed, and the
+    /// shell's prompt: conhost scrolled its alternate buffer for the prompt's
+    /// `\r\n`, so its cursor is on the BOTTOM row, far below the row `?1049h`
+    /// saved — the geometry the reviewer measured (conhost on row 23, the 1049
+    /// save on row 8).
+    fn recovered_on_the_bottom_row(conhost: bool) -> Terminal {
+        let mut term = Terminal::new(ROWS, 40);
+        if conhost {
+            term.process(b"\x1b[?9001h\x1b[?1004h");
+        }
+        term.process(b"history 1\r\nhistory 2\r\n");
+        term.process(PROMPT);
+        term.process(b"less file\r\n\x1b]133;C\x07\x1b[?1049h\x1b[H\x1b[2J");
+        for i in 1..ROWS {
+            term.process(format!("pager {i}\r\n").as_bytes());
+        }
+        term.process(b":");
+        term.process(b"\r\n\x1b]133;D;-1\x07");
+        term.process(PROMPT);
+        assert!(!term.modes().alternate_screen);
+        term
+    }
+
+    const HISTORY: [&str; 3] = ["history 1", "history 2", "PS> less file"];
+
+    #[test]
+    fn under_conhost_the_prompt_lands_on_conhosts_row_and_absolute_moves_agree() {
+        let mut term = recovered_on_the_bottom_row(true);
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (ROWS - 1, 4), "after `PS> `");
+        assert_eq!(term.grid().scrollback_lines(), 3);
+        assert_eq!(all_rows(&term)[..3], HISTORY);
+        // A command that wraps, as conhost renders it (the `cast` tap: `\r\n
+        // ESC[23;80H` on 24 rows): fill the row, scroll, re-anchor on the head's
+        // row by ABSOLUTE position and re-print its last cell, so the tail wraps.
+        let head = format!("echo {}", "x".repeat(31));
+        term.process(head.as_bytes());
+        term.process(format!("\r\n\x1b[{};40Hx", ROWS - 1).as_bytes());
+        term.process(b"TAIL");
+        assert_eq!(
+            term.row_text(usize::from(ROWS - 2)).unwrap().trim_end(),
+            format!("PS> {head}")
+        );
+        assert_eq!(
+            term.row_text(usize::from(ROWS - 1)).unwrap().trim_end(),
+            "TAIL",
+            "the tail is on the row right after its head"
+        );
+    }
+
+    #[test]
+    fn a_conhost_repaint_after_the_recovery_cannot_reach_the_history() {
+        // A resize makes conhost repaint its whole ALTERNATE buffer — the dead
+        // pager's rows and everything the shell printed since — over our
+        // primary screen (measured by the reviewer: `resize 24 90`, `resize 24
+        // 80`, and no history row was findable). These are those rows.
+        let mut term = recovered_on_the_bottom_row(true);
+        term.process(b"echo one\r\n\x1b]133;C\x07one\r\n\x1b]133;D;0\x07");
+        term.process(PROMPT);
+        let mut repaint = b"\x1b[?25l\x1b[H".to_vec();
+        let conhost_buffer = (4..ROWS)
+            .map(|i| format!("pager {i}"))
+            .chain([":", "PS> echo one", "one", "PS> "].map(str::to_string));
+        for (i, row) in conhost_buffer.enumerate() {
+            if i > 0 {
+                repaint.extend_from_slice(b"\r\n");
+            }
+            repaint.extend_from_slice(row.as_bytes());
+            repaint.extend_from_slice(b"\x1b[K");
+        }
+        repaint.extend_from_slice(format!("\x1b[{ROWS};5H\x1b[?25h").as_bytes());
+        term.process(&repaint);
+        let rows = all_rows(&term);
+        for want in HISTORY.into_iter().chain(["PS> echo one", "one"]) {
+            assert_eq!(count(&rows, want), 1, "{want:?}: {rows:?}");
+        }
+        // The repaint wrote on the rows conhost itself painted, not beside them.
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (ROWS - 1, 4));
+        assert_eq!(
+            term.row_text(usize::from(ROWS - 2)).unwrap().trim_end(),
+            "one"
+        );
+    }
+
+    #[test]
+    fn without_conhost_the_prompt_returns_to_the_row_1049_saved() {
+        // Negative control: with no console host the prompt recovery is the
+        // clean exit — the history stays on the screen, the cursor goes back to
+        // the row `?1049h` saved, and nothing is moved into the scrollback.
+        let term = recovered_on_the_bottom_row(false);
+        assert_eq!(term.grid().scrollback_lines(), 0);
+        for (row, want) in HISTORY.into_iter().enumerate() {
+            assert_eq!(term.row_text(row).unwrap().trim_end(), want);
+        }
+        let cursor = term.cursor();
+        assert_eq!((cursor.row, cursor.col), (3, 4));
+    }
+
+    #[test]
+    fn a_live_enter_or_a_reset_ends_the_state() {
+        // A new app's enter, however it arrives, means conhost's alternate buffer
+        // is a live one again; RIS forgets the state outright. Either way the
+        // next switch moves nothing.
+        for end in [&b"\x1b[?1049h\x1b[?1049l"[..], b"\x1bc"] {
+            let mut term = recovered_with_two_commands(true);
+            term.process(end);
+            let kept = term.grid().scrollback_lines();
+            term.process(&blank_repaint_then_enter());
+            term.process(b"\x1b[?1049l");
+            assert_eq!(term.grid().scrollback_lines(), kept, "{end:?}");
+        }
+    }
+
+    #[test]
+    fn a_partial_scroll_region_is_left_alone() {
+        // A scroll within DECSTBM does not reach the scrollback, so the rows are
+        // not moved at all rather than scrolled into nowhere; the state is spent.
+        let mut term = recovered_with_two_commands(true);
+        term.process(b"\x1b[1;5r");
+        let before = all_rows(&term);
+        term.process(b"\x1b[?1049l");
+        assert_eq!(all_rows(&term), before);
+        term.process(b"\x1b[r\x1b[?1049l");
+        assert_eq!(all_rows(&term), before, "spent by the first switch");
     }
 }
 
@@ -1919,7 +2722,7 @@ mod mode_and_query_agreement_tests {
         const REPORTED: &[u16] = &[
             1, 3, 5, 6, 7, 9, 12, 25, 40, 45, 66, 67, 69, 80, 95, 1000, 1002, 1003, 1004, 1005,
             1006, 1007, 1015, 1016, 1035, 1036, 1039, 1045, 1243, 2004, 2026, 2027, 2031, 2048,
-            2500, 2501,
+            2500, 2501, 9001,
         ];
         let mut lost = Vec::new();
         for &mode in REPORTED {

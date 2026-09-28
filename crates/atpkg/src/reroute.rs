@@ -25,7 +25,11 @@
 //! machine-wide ever points at it: the rc hook keeps APPENDING the managed
 //! `bin/`, and `cargo`/`rustc`/`rustup` stay on `store::SENSITIVE_SHIMS` — a
 //! managed `bin/` never carries those names (CONTRIBUTING.md), and this
-//! directory is not `bin/`.
+//! directory is not `bin/`. The rc hook DOES move this directory first — inside an
+//! aterm session only, in the same gated arm as `agents/`, and not under
+//! [`PASSTHROUGH_ENV`] (2026-09-27, `crate::hooks`): the transparent-session lane has no
+//! shell integration, and there `path_helper` left it behind `/opt/homebrew/bin`, so a
+//! bare `cargo` ran Homebrew's with no announcement. Outside aterm the hook removes it.
 //!
 //! # The policy is per row, and the table is data
 //!
@@ -189,9 +193,11 @@ pub struct SourceVerb {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     /// Run `branded` with the caller's arguments; announce one line.
+    /// `program` is the program `aterm pkg install` names to install `branded`.
     /// `source_verb` is `Some` only when the branded tool is VERB-FIRST.
     Direct {
         branded: &'static str,
+        program: &'static str,
         source_verb: Option<SourceVerb>,
     },
     /// Refuse; name `branded` and every `lane` with the caller's arguments.
@@ -248,6 +254,7 @@ pub const TABLE: &[Row] = &[
         upstream: "clippy",
         policy: Policy::Direct {
             branded: "tippy",
+            program: "trust",
             source_verb: None,
         },
     },
@@ -255,6 +262,7 @@ pub const TABLE: &[Row] = &[
         upstream: "rustfmt",
         policy: Policy::Direct {
             branded: "trustfmt",
+            program: "trust",
             source_verb: None,
         },
     },
@@ -262,6 +270,7 @@ pub const TABLE: &[Row] = &[
         upstream: "rustdoc",
         policy: Policy::Direct {
             branded: "trustdoc",
+            program: "trust",
             source_verb: None,
         },
     },
@@ -269,6 +278,7 @@ pub const TABLE: &[Row] = &[
         upstream: "lean",
         policy: Policy::Direct {
             branded: "clean",
+            program: "clean",
             source_verb: Some(SourceVerb {
                 verb: "check",
                 ext: ".lean",
@@ -376,13 +386,17 @@ fn signpost_closing() -> String {
     )
 }
 
-/// The DIRECT row's one line: what runs first, then the escape.
+/// The DIRECT row's one line: what runs, then the escape — named only where it reaches
+/// something (`upstream_found`): stock Rust ships no `clippy`, so with no upstream copy
+/// on PATH an `aterm --no-reroute` session has none either.
 #[must_use]
-pub fn direct_announcement(upstream: &str, branded: &str) -> String {
-    format!(
-        "aterm: running {branded}, Trust's '{upstream}'. {}",
-        escape_clause(upstream)
-    )
+pub fn direct_announcement(upstream: &str, branded: &str, upstream_found: bool) -> String {
+    let mut line = format!("aterm: running {branded}, Trust's '{upstream}'.");
+    if upstream_found {
+        line.push(' ');
+        line.push_str(&escape_clause(upstream));
+    }
+    line
 }
 
 /// The SIGNPOST announcement, the caller's arguments filled into every lane:
@@ -394,11 +408,65 @@ pub fn direct_announcement(upstream: &str, branded: &str) -> String {
 ///        `aterm help rust` shows which toolchain this directory gets; the default here is Trust.
 ///        ([reroute] announce = false in aterm.toml silences this — Settings ▸ Packages.)
 /// ```
+///
+/// `toolchain` is the caller's `+trust…` directive, which runs as typed: rustup's view of
+/// that toolchain, whose `cargo`/`rustc` are Trust's own (`crate::seam::STOCK_NAMES`), so
+/// the first line names it and says no "no proof claim" of it —
+/// `aterm: running 'cargo +trust' (rustup's trust toolchain); on Trust the tool is 'targo':`.
 #[must_use]
-pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
+pub fn signpost_message(
+    row: &Row,
+    lanes: &[Lane],
+    args: &[String],
+    toolchain: Option<&str>,
+) -> String {
+    let head = toolchain.map_or(Head::Upstream, Head::Toolchain);
+    signpost_block(row, lanes, args, head)
+}
+
+/// A SIGNPOST row with no upstream copy on PATH: nothing ran, so the first line says
+/// that, the branded lanes follow, and the closing lines (which silence an
+/// announcement) do not:
+///
+/// ```text
+/// aterm: upstream 'cargo' is not on PATH; on Trust the tool is 'targo':
+///          targo trust build          VERIFIED   — emits a proof claim
+///          targo --unverified build   UNVERIFIED — no proof claim
+/// ```
+#[must_use]
+pub fn no_upstream_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
+    signpost_block(row, lanes, args, Head::NotOnPath)
+}
+
+/// What the first line of a SIGNPOST block says of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Head<'a> {
+    /// Upstream runs as typed.
+    Upstream,
+    /// Upstream runs under the caller's `+<toolchain>` — a Trust one ([`signpost_message`]).
+    Toolchain(&'a str),
+    /// No upstream copy on PATH: nothing ran.
+    NotOnPath,
+}
+
+/// [`signpost_message`] and [`no_upstream_message`].
+fn signpost_block(row: &Row, lanes: &[Lane], args: &[String], head: Head<'_>) -> String {
     let upstream = row.upstream;
     let branded = branded_of(row);
     let rest = args.join(" ");
+    // The first line's state: what runs, or that there is nothing to run. `verb` is the
+    // `cargo clippy`/`cargo fmt` spelling's; `claim` is said only of upstream.
+    let head_line = |verb: &str, claim: &str| match head {
+        Head::Upstream => format!(
+            "aterm: running upstream '{}'{claim}",
+            join_command(upstream, verb)
+        ),
+        Head::Toolchain(toolchain) => format!(
+            "aterm: running '{}' (rustup's {toolchain} toolchain)",
+            join_command(&format!("{upstream} +{toolchain}"), verb)
+        ),
+        Head::NotOnPath => format!("aterm: upstream '{upstream}' is not on PATH"),
+    };
     let mut out = String::new();
     // `cargo clippy` / `cargo fmt`: one spelling, no lane.
     if let Some((verb, reroute)) = args
@@ -407,38 +475,35 @@ pub fn signpost_message(row: &Row, lanes: &[Lane], args: &[String]) -> String {
         .filter(|_| upstream == "cargo")
     {
         let tail = args[1..].join(" ");
-        out.push_str(&format!(
-            "aterm: running upstream '{upstream} {verb}'; on Trust the tool is '{reroute}':\n"
-        ));
+        out.push_str(&head_line(verb, ""));
+        out.push_str(&format!("; on Trust the tool is '{reroute}':\n"));
         out.push_str(&format!("         {}\n", join_command(reroute, &tail)));
-        out.push_str(&signpost_closing());
-        return out;
-    }
-    if lanes.is_empty() {
-        out.push_str(&format!(
-            "aterm: running upstream '{upstream}' (no proof claim); on this toolchain the tool is '{branded}'\n"
-        ));
+    } else if lanes.is_empty() {
+        out.push_str(&head_line("", " (no proof claim)"));
+        out.push_str(&format!("; on this toolchain the tool is '{branded}'\n"));
         out.push_str("       (drop-in equivalence is not yet proven):\n");
         out.push_str(&format!("         {}\n", join_command(branded, &rest)));
+    } else {
+        out.push_str(&head_line("", " (no proof claim)"));
+        out.push_str(&format!("; on Trust the tool is '{branded}':\n"));
+        let commands: Vec<String> = lanes
+            .iter()
+            .map(|lane| join_command(lane.command, &rest))
+            .collect();
+        let width = commands.iter().map(String::len).max().unwrap_or(0) + 3;
+        let label_width = lanes.iter().map(|lane| lane.label.len()).max().unwrap_or(0);
+        for (lane, command) in lanes.iter().zip(&commands) {
+            out.push_str(&format!(
+                "         {command:<width$}{:<label_width$} — {}\n",
+                lane.label, lane.note
+            ));
+        }
+    }
+    if head == Head::NotOnPath {
+        out.pop();
+    } else {
         out.push_str(&signpost_closing());
-        return out;
     }
-    out.push_str(&format!(
-        "aterm: running upstream '{upstream}' (no proof claim); on Trust the tool is '{branded}':\n"
-    ));
-    let commands: Vec<String> = lanes
-        .iter()
-        .map(|lane| join_command(lane.command, &rest))
-        .collect();
-    let width = commands.iter().map(String::len).max().unwrap_or(0) + 3;
-    let label_width = lanes.iter().map(|lane| lane.label.len()).max().unwrap_or(0);
-    for (lane, command) in lanes.iter().zip(&commands) {
-        out.push_str(&format!(
-            "         {command:<width$}{:<label_width$} — {}\n",
-            lane.label, lane.note
-        ));
-    }
-    out.push_str(&signpost_closing());
     out
 }
 
@@ -466,21 +531,46 @@ pub fn oracle_message(upstream: &str, upstream_path: Option<&Path>) -> String {
 /// silent, so nothing is refused: the branded tool runs, with one line.
 pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 
-/// The one line printed when `cargo trust …`/`cargo --unverified …` runs `targo`.
+/// The program `aterm pkg install` names for `targo`, the tool an explicit lane runs.
+pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
+
+/// The one line printed when `cargo trust …`/`cargo --unverified …` runs `targo`. No
+/// escape: stock cargo has no such subcommand, so upstream would not run this command.
 #[must_use]
-pub fn explicit_lane_note(upstream: &str, branded: &str, lane: &str) -> String {
+pub fn explicit_lane_note(upstream: &str, branded: &str) -> String {
+    format!("aterm: running {branded}, Trust's '{upstream}'.")
+}
+
+/// The one line printed when `cargo +<tc>` names a non-Trust toolchain and runs, unless
+/// [`ANNOUNCE_SETTING`] silences it — which the line names, since it prints on every build.
+#[must_use]
+pub fn passthrough_note(upstream: &str) -> String {
     format!(
-        "aterm: running {branded} {lane} for '{upstream} {lane}'. {}",
-        escape_clause(upstream)
+        "aterm: running upstream '{upstream}' — no proof claim ({ANNOUNCE_SETTING} in aterm.toml silences this)."
     )
 }
 
-/// The one line printed when `cargo +<tc>` names a non-Trust toolchain and runs.
+/// A branded tool that is not installed: nothing ran, and the one command that installs it.
 #[must_use]
-pub fn passthrough_note(upstream: &str, toolchain: &str) -> String {
+pub fn not_installed_message(upstream: &str, branded: &str, program: &str) -> String {
     format!(
-        "aterm: running upstream '{upstream} +{toolchain}' (no proof claim; an `aterm --no-reroute` session prints no note)"
+        "aterm: '{upstream}' did not run — {branded} is not installed; `aterm pkg install {program}` installs it."
     )
+}
+
+/// A branded tool its program's live build holds, with its shim gone: nothing ran, and
+/// `repair` re-lays the shim (`install` would answer up to date).
+#[must_use]
+pub fn lost_shim_message(upstream: &str, branded: &str) -> String {
+    format!(
+        "aterm: '{upstream}' did not run — {branded}'s shim is missing; `aterm pkg repair` restores it."
+    )
+}
+
+/// No upstream copy on PATH — the same words the stub's escape walk prints.
+#[must_use]
+pub fn not_on_path_message(upstream: &str) -> String {
+    format!("aterm: upstream '{upstream}' is not on PATH")
 }
 
 /// Printed by the stub itself when atpkg is unreachable — fail CLOSED, with the
@@ -488,7 +578,7 @@ pub fn passthrough_note(upstream: &str, toolchain: &str) -> String {
 #[must_use]
 pub fn unreachable_message(upstream: &str) -> String {
     format!(
-        "aterm: '{upstream}' is rerouted inside aterm sessions, but aterm's package manager is not reachable to say where; `aterm --no-reroute` restores upstream '{upstream}'"
+        "aterm: '{upstream}' did not run — aterm's package manager is missing (`aterm --no-reroute` restores upstream '{upstream}')"
     )
 }
 
@@ -503,23 +593,29 @@ fn join_command(command: &str, rest: &str) -> String {
 /// The row's policy as ONE clause, `<args>` standing for the caller's arguments — the
 /// sentence `aterm pkg which <upstream>` answers with. Built from the same row the stub
 /// applies, so the `which` surface cannot drift from what the stub prints (design S6:
-/// one "which copy runs and why" surface).
+/// one "which copy runs and why" surface). The escape is named only where it reaches
+/// something (`upstream_found`, [`upstream_on_path`]), as in [`direct_announcement`].
 #[must_use]
-pub fn policy_summary(row: &Row) -> String {
+pub fn policy_summary(row: &Row, upstream_found: bool) -> String {
     let upstream = row.upstream;
-    let escape = escape_clause(upstream);
+    let escape = if upstream_found {
+        format!(" {}", escape_clause(upstream))
+    } else {
+        String::new()
+    };
     match row.policy {
         Policy::Direct {
             branded,
             source_verb,
+            ..
         } => match source_verb {
             Some(SourceVerb { verb, ext }) => format!(
-                "runs '{branded} <args>' with one stderr line ('{branded} {verb} <file>' for a bare `{ext}` file) {escape}"
+                "runs '{branded} <args>' with one stderr line ('{branded} {verb} <file>' for a bare `{ext}` file){escape}"
             ),
-            None => format!("runs '{branded} <args>' with one stderr line {escape}"),
+            None => format!("runs '{branded} <args>' with one stderr line{escape}"),
         },
         Policy::Signpost { branded, lanes: [] } => format!(
-            "announced, naming '{branded} <args>' (drop-in equivalence is not yet proven), then run upstream {escape}"
+            "announced, naming '{branded} <args>' (drop-in equivalence is not yet proven), then run upstream{escape}"
         ),
         Policy::Signpost { lanes, .. } => {
             let named: Vec<String> = lanes
@@ -535,12 +631,12 @@ pub fn policy_summary(row: &Row) -> String {
                 s.push_str("; ");
                 s.push_str(&verbs.join(", "));
             }
-            s.push_str(", then run upstream ");
+            s.push_str(", then run upstream");
             s.push_str(&escape);
             s
         }
         Policy::Oracle { branded } => format!(
-            "refused ('{branded}' is measured against it); its own path reaches the real {upstream} {escape}"
+            "refused ('{branded}' is measured against it); its own path reaches the real {upstream}{escape}"
         ),
     }
 }
@@ -626,7 +722,9 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path) -> String 
     s.push_str("    fi\n");
     s.push_str("  done\n");
     s.push_str("  IFS=$__aterm_ifs; set +f\n");
-    s.push_str("  printf '%s\\n' \"aterm: upstream '$__aterm_name' is not on PATH\" 1>&2\n");
+    s.push_str("  printf '%s\\n' \"");
+    s.push_str(&not_on_path_message("$__aterm_name"));
+    s.push_str("\" 1>&2\n");
     s.push_str("  exit 127\nfi\n");
     s.push_str("ATPKG=");
     s.push_str(&crate::stub::sh_single_quote(&atpkg.to_string_lossy()));
@@ -729,21 +827,31 @@ pub fn agents_stub_body_sh(name: &str, agents_dir: &Path) -> String {
     s.push_str("  fi\n");
     s.push_str("done\n");
     s.push_str("IFS=$__aterm_ifs; set +f\n");
-    s.push_str("printf '%s\\n' \"");
+    // Nothing left to run. A twin standing here means this shell is outside aterm (inside,
+    // the first arm exec'd it): `aterm <name>` reaches it. No twin: nothing is installed.
+    s.push_str("if [ -x \"$__aterm_agents/$__aterm_name\" ] && [ ! -d \"$__aterm_agents/$__aterm_name\" ]; then\n");
+    s.push_str("  printf '%s\\n' \"");
     s.push_str(&agents_not_found_message("$__aterm_name"));
-    s.push_str("\" 1>&2\nexit 127\n");
+    s.push_str("\" 1>&2\nelse\n");
+    s.push_str("  printf '%s\\n' \"");
+    s.push_str(&agents_not_installed_message("$__aterm_name"));
+    s.push_str("\" 1>&2\nfi\nexit 127\n");
     s
 }
 
-/// The agents stub's one line when nothing is left to run: no copy on PATH outside aterm's
-/// own directories, and the managed twin not taken. `name` is spliced into a double-quoted
-/// `sh` string (the stub passes `$__aterm_name`), so the text holds no `"`, `$`, `` ` ``
-/// or `\` of its own.
+/// The agents stub's line outside aterm when no copy is on PATH and the managed twin
+/// stands. `name` is spliced into a double-quoted `sh` string (the stub passes
+/// `$__aterm_name`), so the text holds no `"`, `$`, `` ` `` or `\` of its own.
 #[must_use]
 pub fn agents_not_found_message(name: &str) -> String {
-    format!(
-        "aterm: no '{name}' on PATH outside aterm's reroute and agents directories, and the managed copy is taken only inside an aterm session, when installed (aterm help reroute)"
-    )
+    format!("aterm: no '{name}' on PATH — run: aterm {name}")
+}
+
+/// The agents stub's line when no copy is on PATH and no managed twin stands — the same
+/// splicing rule as [`agents_not_found_message`].
+#[must_use]
+pub fn agents_not_installed_message(name: &str) -> String {
+    format!("aterm: '{name}' is not installed — run: aterm pkg install {name}")
 }
 
 /// The agent programs that get a reroute stub: every [`crate::stub::AGENT_PROGRAMS`] name
@@ -889,7 +997,7 @@ pub fn is_reroute_stub(path: &Path) -> bool {
 }
 
 /// Whether `dir` is a reroute directory — ours, under any spelling — by its
-/// marker file. What both walks (the stub's `sh` and [`exec_upstream`]) skip.
+/// marker file. What both walks (the stub's `sh` and [`upstream_on_path`]) skip.
 #[must_use]
 pub fn is_reroute_dir(dir: &Path) -> bool {
     std::fs::symlink_metadata(dir.join(DIR_MARKER_FILE)).is_ok_and(|meta| meta.is_file())
@@ -1087,56 +1195,225 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         eprintln!("atpkg {HIDDEN_VERB}: '{upstream}' is not a rerouted name");
         return ExitCode::from(REFUSAL_EXIT);
     };
-    // Belt and braces: the stub decides this first, but `aterm <upstream>` and a
-    // direct `atpkg __reroute` call arrive here without it.
-    if engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()) {
-        return exec_upstream(layout, upstream, args);
+    let path_var = std::env::var_os("PATH");
+    let machine = Machine {
+        // Belt and braces: the stub decides this first, but `aterm <upstream>` and a
+        // direct `atpkg __reroute` call arrive here without it.
+        passthrough: engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()),
+        // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `[reroute] announce = false`
+        // (the owner's "suppressed with a flag", a setting since 2026-09-23) drops
+        // the line but never the run.
+        announce: &|| crate::config::cached_reroute().announce(),
+        upstream: &|| upstream_on_path(layout, upstream, path_var.as_deref()),
+        branded: &|branded, program| installed(layout, branded, program),
+    };
+    match plan(row, args, &machine) {
+        Plan::Refuse { say } => {
+            eprintln!("{say}");
+            ExitCode::from(REFUSAL_EXIT)
+        }
+        Plan::Missing { say } => {
+            eprintln!("{say}");
+            ExitCode::from(127)
+        }
+        Plan::Upstream { say, target, args } => {
+            if let Some(say) = say {
+                eprintln!("{say}");
+            }
+            exec_upstream(&target, &args)
+        }
+        Plan::Branded { say, copy, args } => {
+            eprintln!("{say}");
+            exec_branded(layout, &copy, &args)
+        }
+        Plan::Shim { shim, args } => {
+            // The shim exports its own environment; its line is the one said.
+            let copy = Managed {
+                target: shim,
+                env: crate::shim_env::ShimEnv::NONE,
+            };
+            exec_branded(layout, &copy, &args)
+        }
+    }
+}
+
+/// What [`plan`] reads from the machine, injected so every arm is decided — and tested —
+/// without a spawn. Each probe is read only by the arm that needs it.
+struct Machine<'a> {
+    /// The [`PASSTHROUGH_ENV`] marker is engaged.
+    passthrough: bool,
+    /// `[reroute] announce` ([`crate::config::RerouteConfig`]).
+    announce: &'a dyn Fn() -> bool,
+    /// The first upstream copy on PATH ([`upstream_on_path`]).
+    upstream: &'a dyn Fn() -> Option<PathBuf>,
+    /// Where a branded tool, shipped by the program named second, stands ([`installed`]).
+    branded: &'a dyn Fn(&str, &str) -> Install,
+}
+
+/// Where a branded tool stands on this machine — the cases `atpkg run` tells apart.
+#[derive(Debug, PartialEq, Eq)]
+enum Install {
+    /// Its shim forwards to a build: the managed copy.
+    Runs(Managed),
+    /// `bin/<branded>` stands but forwards to no build — a yanked build's tombstone, a
+    /// pending stub. It runs, and its own line says what is true of it.
+    Shim(PathBuf),
+    /// Its program's live build holds it, but its shim is gone
+    /// ([`crate::cli::live_without_shim_of`]).
+    ShimLost,
+    /// Nothing here holds it.
+    Absent,
+}
+
+/// A branded tool's managed copy, as its shim would exec it.
+#[derive(Debug, PartialEq, Eq)]
+struct Managed {
+    /// Through the store, never PATH: [`crate::ops::exec_path`]'s, not `which`'s — this
+    /// execs the tool without its shim, so it takes the exec root the shim's guard would
+    /// (`crate::compat` — a trust build whose tippy refuses the store's own `bin/rustc`
+    /// copy lints only from there).
+    target: PathBuf,
+    /// What the shim would export before its `exec` (`ops::exec_env`, design S7) —
+    /// `atpkg run`'s rule, so a branded program whose policy declares an environment gets
+    /// it by either door.
+    env: crate::shim_env::ShimEnv,
+}
+
+/// The managed copy of `branded`, `None` when it is not installed.
+fn managed(layout: &Layout, branded: &str) -> Option<Managed> {
+    Some(Managed {
+        target: crate::ops::exec_path(layout, branded)?,
+        env: crate::ops::exec_env(layout, branded),
+    })
+}
+
+/// Where `branded`, one of the tools `program` ships, stands on this machine ([`Install`]).
+fn installed(layout: &Layout, branded: &str, program: &str) -> Install {
+    if let Some(copy) = managed(layout, branded) {
+        return Install::Runs(copy);
+    }
+    let Some(name) = crate::store::ToolName::new(branded) else {
+        return Install::Absent;
+    };
+    let shim = layout.shim(&name);
+    if crate::stub::is_pending_stub(&shim) || crate::cli::is_tombstone_shim(layout, branded) {
+        return Install::Shim(shim);
+    }
+    if crate::cli::live_without_shim_of(layout, program, branded).is_some() {
+        return Install::ShimLost;
+    }
+    Install::Absent
+}
+
+/// One `__reroute` call, decided BEFORE a word is printed, so no line announces a tool
+/// that is not there to run: what to say on stderr, then what to exec — or, with nothing
+/// to run, why.
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// Say `say` (when `Some`), then exec the upstream copy at `target`.
+    Upstream {
+        say: Option<String>,
+        target: PathBuf,
+        args: Vec<String>,
+    },
+    /// Say `say`, then exec the managed `copy`.
+    Branded {
+        say: String,
+        copy: Managed,
+        args: Vec<String>,
+    },
+    /// Say `say` and exit [`REFUSAL_EXIT`]: the ORACLE row.
+    Refuse { say: String },
+    /// Exec a branded tool's `shim` that forwards to no build ([`Install::Shim`]),
+    /// saying nothing: the shim's own line speaks.
+    Shim { shim: PathBuf, args: Vec<String> },
+    /// Say `say` and exit 127: the tool to run is not there.
+    Missing { say: String },
+}
+
+/// The row's policy applied to `args` on `machine` — [`run`] without its effects.
+fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
+    let upstream = row.upstream;
+    // Upstream as typed, `say` printed first — or, with no copy on PATH, the stub's line.
+    let run_upstream = |say: &dyn Fn() -> Option<String>| match (machine.upstream)() {
+        Some(target) => Plan::Upstream {
+            say: say(),
+            target,
+            args: args.to_vec(),
+        },
+        None => Plan::Missing {
+            say: not_on_path_message(upstream),
+        },
+    };
+    // The managed `branded` — or, where it cannot run, the line that names the fix.
+    let run_branded =
+        |branded: &str, program: &str, args: Vec<String>, say: &dyn Fn() -> String| match (machine
+            .branded)(
+            branded, program,
+        ) {
+            Install::Runs(copy) => Plan::Branded {
+                say: say(),
+                copy,
+                args,
+            },
+            Install::Shim(shim) => Plan::Shim { shim, args },
+            Install::ShimLost => Plan::Missing {
+                say: lost_shim_message(upstream, branded),
+            },
+            Install::Absent => Plan::Missing {
+                say: not_installed_message(upstream, branded, program),
+            },
+        };
+    if machine.passthrough {
+        return run_upstream(&|| None);
     }
     match row.policy {
         Policy::Direct {
             branded,
+            program,
             source_verb,
-        } => {
-            eprintln!("{}", direct_announcement(upstream, branded));
-            exec_branded(layout, upstream, branded, &direct_args(source_verb, args))
-        }
+        } => run_branded(branded, program, direct_args(source_verb, args), &|| {
+            direct_announcement(upstream, branded, (machine.upstream)().is_some())
+        }),
         Policy::Signpost { branded, lanes } => {
-            if let Some(toolchain) =
-                explicit_toolchain(args).filter(|toolchain| !toolchain.starts_with("trust"))
-            {
-                eprintln!("{}", passthrough_note(upstream, toolchain));
-                return exec_upstream(layout, upstream, args);
+            let toolchain = explicit_toolchain(args);
+            if toolchain.is_some_and(|toolchain| !toolchain.starts_with("trust")) {
+                return run_upstream(&|| (machine.announce)().then(|| passthrough_note(upstream)));
             }
             // `+trust…` keeps the lane question but must not reach the rendered
             // commands: the managed `targo` is not a rustup proxy and rejects
             // a `+toolchain` directive, and a fix the user cannot paste is no fix.
-            let args = if explicit_toolchain(args).is_some() {
+            // Upstream still gets the caller's own arguments, `+trust…` included, and
+            // the first line names that toolchain as what runs.
+            let shown = if toolchain.is_some() {
                 &args[1..]
             } else {
                 args
             };
             if upstream == "cargo"
-                && let Some(lane) = args
+                && shown
                     .first()
-                    .filter(|verb| EXPLICIT_LANE_VERBS.contains(&verb.as_str()))
+                    .is_some_and(|verb| EXPLICIT_LANE_VERBS.contains(&verb.as_str()))
             {
-                eprintln!("{}", explicit_lane_note(upstream, branded, lane));
-                return exec_branded(layout, upstream, branded, args);
+                return run_branded(branded, EXPLICIT_LANE_PROGRAM, shown.to_vec(), &|| {
+                    explicit_lane_note(upstream, branded)
+                });
             }
-            // ANNOUNCE, THEN RUN — the 2026-09-08 ruling. `[reroute] announce =
-            // false` (the owner's "suppressed with a flag", a setting since
-            // 2026-09-23) drops the line but never the run.
-            if crate::config::cached_reroute().announce() {
-                eprintln!("{}", signpost_message(row, lanes, args));
+            match (machine.upstream)() {
+                Some(target) => Plan::Upstream {
+                    say: (machine.announce)()
+                        .then(|| signpost_message(row, lanes, shown, toolchain)),
+                    target,
+                    args: args.to_vec(),
+                },
+                None => Plan::Missing {
+                    say: no_upstream_message(row, lanes, shown),
+                },
             }
-            exec_upstream(layout, upstream, args)
         }
-        Policy::Oracle { .. } => {
-            let path_var = std::env::var_os("PATH");
-            let upstream_path = upstream_on_path(layout, upstream, path_var.as_deref());
-            eprintln!("{}", oracle_message(upstream, upstream_path.as_deref()));
-            ExitCode::from(REFUSAL_EXIT)
-        }
+        Policy::Oracle { .. } => Plan::Refuse {
+            say: oracle_message(upstream, (machine.upstream)().as_deref()),
+        },
     }
 }
 
@@ -1184,23 +1461,16 @@ pub fn upstream_on_path(layout: &Layout, name: &str, path_var: Option<&OsStr>) -
     None
 }
 
-/// The first upstream copy (see [`upstream_on_path`]), exec'd with
+/// The first upstream copy (`target`, from [`upstream_on_path`]), exec'd with
 /// [`PASSTHROUGH_ENV`] set so its own spawns pass silently.
-fn exec_upstream(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
-    let path_var = std::env::var_os("PATH");
-    let Some(target) = upstream_on_path(layout, upstream, path_var.as_deref()) else {
-        eprintln!("aterm: upstream '{upstream}' is not on PATH outside the reroute directories");
-        return ExitCode::from(127);
-    };
-    let mut command = std::process::Command::new(&target);
+fn exec_upstream(target: &Path, args: &[String]) -> ExitCode {
+    let mut command = std::process::Command::new(target);
     command.args(args).env(PASSTHROUGH_ENV, "1");
     let err = crate::platform::exec_or_run(&mut command);
     eprintln!("aterm: failed to exec {}: {err}", target.display());
     ExitCode::from(127)
 }
 
-/// A DIRECT row: the managed copy of `branded`, through the store (never PATH),
-/// with the managed `bin/` appended for its children — `atpkg run`'s discipline.
 /// The arguments a DIRECT row hands its branded tool.
 ///
 /// Identity for every row without a [`SourceVerb`]. For a verb-first row it
@@ -1224,28 +1494,18 @@ fn direct_args(source_verb: Option<SourceVerb>, args: &[String]) -> Vec<String> 
     }
 }
 
-fn exec_branded(layout: &Layout, upstream: &str, branded: &str, args: &[String]) -> ExitCode {
-    // `exec_path`, not `which`: this execs the tool without its shim, so it has to take
-    // the exec root the shim's guard would (`crate::compat` — a trust build whose tippy
-    // refuses the store's own `bin/rustc` copy lints only from there).
-    let Some(target) = crate::ops::exec_path(layout, branded) else {
-        eprintln!(
-            "aterm: '{upstream}' reroutes to '{branded}', which is not installed here — opening aterm provisions the toolset (`aterm pkg install <program>` for one program); `aterm --no-reroute` restores upstream '{upstream}'."
-        );
-        return ExitCode::from(127);
-    };
+/// A branded tool's managed `copy` ([`managed`]), exec'd with the managed `bin/` appended
+/// for its children and its shim's environment exported — `atpkg run`'s discipline.
+fn exec_branded(layout: &Layout, copy: &Managed, args: &[String]) -> ExitCode {
     let child_path =
         crate::store::append_bin_to_path(std::env::var_os("PATH").as_deref(), &layout.bin_dir());
-    let mut command = std::process::Command::new(&target);
+    let mut command = std::process::Command::new(&copy.target);
     command.args(args).env("PATH", child_path);
-    // …and what the shim would export before its `exec` (`ops::exec_env`, design S7) —
-    // `atpkg run`'s rule, so a branded program whose policy declares an environment gets
-    // it by either door.
-    for (name, value) in crate::ops::exec_env(layout, branded).entries() {
+    for (name, value) in copy.env.entries() {
         command.env(name, value);
     }
     let err = crate::platform::exec_or_run(&mut command);
-    eprintln!("aterm: failed to exec {}: {err}", target.display());
+    eprintln!("aterm: failed to exec {}: {err}", copy.target.display());
     ExitCode::from(127)
 }
 
@@ -1493,7 +1753,7 @@ mod tests {
         let Policy::Signpost { lanes, .. } = row.policy else {
             panic!()
         };
-        let text = signpost_message(row, lanes, &args(&["build", "--release"]));
+        let text = signpost_message(row, lanes, &args(&["build", "--release"]), None);
         assert!(
             text.starts_with(
                 "aterm: running upstream 'cargo' (no proof claim); on Trust the tool is 'targo':\n"
@@ -1529,7 +1789,7 @@ mod tests {
             "no environment knob is taught: {text}"
         );
         // No arguments: the bare commands, no trailing space.
-        let bare = signpost_message(row, lanes, &[]);
+        let bare = signpost_message(row, lanes, &[], None);
         assert!(bare.contains("targo trust   "), "{bare}");
         assert!(!bare.contains("targo trust  \n"), "{bare}");
     }
@@ -1578,6 +1838,7 @@ mod tests {
             row,
             lanes,
             &args(&["clippy", "--workspace", "--", "-D", "warnings"]),
+            None,
         );
         assert!(
             text.starts_with(
@@ -1590,7 +1851,7 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains("targo trust"), "{text}");
-        let text = signpost_message(row, lanes, &args(&["fmt", "--check"]));
+        let text = signpost_message(row, lanes, &args(&["fmt", "--check"]), None);
         assert!(text.contains("targo fmt --check"), "{text}");
     }
 
@@ -1600,14 +1861,14 @@ mod tests {
         let Policy::Signpost { lanes, .. } = rustc.policy else {
             panic!()
         };
-        let text = signpost_message(rustc, lanes, &args(&["main.rs"]));
+        let text = signpost_message(rustc, lanes, &args(&["main.rs"]), None);
         assert!(text.contains("trustc main.rs"), "{text}");
         assert!(text.contains("trustc -Ztrust-verify=off main.rs"), "{text}");
         let tlc = row_for("tlc").unwrap();
         let Policy::Signpost { lanes, .. } = tlc.policy else {
             panic!()
         };
-        let text = signpost_message(tlc, lanes, &args(&["Spec.tla"]));
+        let text = signpost_message(tlc, lanes, &args(&["Spec.tla"]), None);
         assert!(
             text.starts_with(
                 "aterm: running upstream 'tlc' (no proof claim); on this toolchain the tool is 'ty'\n"
@@ -1625,10 +1886,9 @@ mod tests {
     fn direct_oracle_and_passthrough_are_one_line_each_and_name_the_escape() {
         let no_copy = oracle_message("z3", None);
         for text in [
-            direct_announcement("rustfmt", "trustfmt"),
+            direct_announcement("rustfmt", "trustfmt", true),
             oracle_message("z3", Some(Path::new("/opt/homebrew/bin/z3"))),
             no_copy.clone(),
-            passthrough_note("cargo", "stable"),
             unreachable_message("cargo"),
         ] {
             assert_eq!(text.lines().count(), 1, "{text}");
@@ -1643,8 +1903,23 @@ mod tests {
             );
         }
         assert!(
-            direct_announcement("rustfmt", "trustfmt").starts_with("aterm: running trustfmt, "),
+            direct_announcement("rustfmt", "trustfmt", true)
+                .starts_with("aterm: running trustfmt, "),
             "a DIRECT line leads with what runs"
+        );
+        // Stock Rust ships no `clippy`: with no upstream copy on PATH, no escape offered.
+        assert_eq!(
+            direct_announcement("clippy", "tippy", false),
+            "aterm: running tippy, Trust's 'clippy'."
+        );
+        // `cargo +stable` runs what was typed: one line, and the setting that silences it.
+        assert_eq!(
+            passthrough_note("cargo"),
+            "aterm: running upstream 'cargo' — no proof claim ([reroute] announce = false in aterm.toml silences this)."
+        );
+        assert_eq!(
+            unreachable_message("cargo"),
+            "aterm: 'cargo' did not run — aterm's package manager is missing (`aterm --no-reroute` restores upstream 'cargo')"
         );
         assert!(
             oracle_message("z3", Some(Path::new("/opt/homebrew/bin/z3")))
@@ -2144,10 +2419,313 @@ mod tests {
         assert!(
             EXPLICIT_LANE_VERBS.contains(&"trust") && EXPLICIT_LANE_VERBS.contains(&"--unverified")
         );
-        let note = explicit_lane_note("cargo", "targo", "trust");
-        assert_eq!(note.lines().count(), 1, "{note}");
-        assert!(note.contains("running targo trust"), "{note}");
-        assert!(note.contains("aterm --no-reroute"), "{note}");
+        // No escape: stock cargo has no `trust` subcommand, so upstream would not run it.
+        assert_eq!(
+            explicit_lane_note("cargo", "targo"),
+            "aterm: running targo, Trust's 'cargo'."
+        );
+    }
+
+    /// A managed copy at `/store/<tool>`, declaring no environment.
+    fn store(tool: &str) -> Managed {
+        Managed {
+            target: PathBuf::from(format!("/store/{tool}")),
+            env: crate::shim_env::ShimEnv::NONE,
+        }
+    }
+
+    /// [`plan`] for `name call…` on a machine whose PATH walk finds `upstream` and whose
+    /// store holds the `branded` names ([`store`]).
+    fn plan_on(
+        name: &str,
+        call: &[&str],
+        announce: bool,
+        upstream: Option<&str>,
+        branded: &[&str],
+    ) -> Plan {
+        let machine = Machine {
+            passthrough: false,
+            announce: &|| announce,
+            upstream: &|| upstream.map(PathBuf::from),
+            branded: &|tool, _| {
+                if branded.contains(&tool) {
+                    Install::Runs(store(tool))
+                } else {
+                    Install::Absent
+                }
+            },
+        };
+        plan(
+            row_for(name).expect("a rerouted name"),
+            &args(call),
+            &machine,
+        )
+    }
+
+    const UP: &str = "/usr/bin/up";
+
+    /// NOTHING IS ANNOUNCED THAT WILL NOT RUN: with nothing to run, one answer says so —
+    /// never a "running" line first — and the setting does not silence it.
+    #[test]
+    fn a_plan_with_nothing_to_run_says_only_that() {
+        let tlc = plan_on("tlc", &["Spec.tla"], true, None, &[]);
+        assert_eq!(
+            tlc,
+            Plan::Missing {
+                say: "aterm: upstream 'tlc' is not on PATH; on this toolchain the tool is 'ty'\n       (drop-in equivalence is not yet proven):\n         ty Spec.tla".into(),
+            }
+        );
+        assert_eq!(plan_on("tlc", &["Spec.tla"], false, None, &[]), tlc);
+        let Plan::Missing { say } = plan_on("cargo", &["build"], true, None, &[]) else {
+            panic!("no upstream cargo runs nothing");
+        };
+        assert!(
+            say.starts_with(
+                "aterm: upstream 'cargo' is not on PATH; on Trust the tool is 'targo':\n"
+            ),
+            "{say}"
+        );
+        assert!(say.ends_with("UNVERIFIED — no proof claim"), "{say}");
+        assert!(
+            !say.contains("running") && !say.contains(ANNOUNCE_SETTING),
+            "{say}"
+        );
+        assert_eq!(
+            plan_on("cargo", &["clippy"], true, None, &[]),
+            Plan::Missing {
+                say: "aterm: upstream 'cargo' is not on PATH; on Trust the tool is 'targo tippy':\n         targo tippy".into(),
+            }
+        );
+        assert_eq!(
+            plan_on("cargo", &["+stable", "build"], true, None, &[]),
+            Plan::Missing {
+                say: "aterm: upstream 'cargo' is not on PATH".into(),
+            }
+        );
+        // A branded tool not installed: one line naming the program that installs it.
+        assert_eq!(
+            plan_on("rustfmt", &["x.rs"], true, Some(UP), &[]),
+            Plan::Missing {
+                say: "aterm: 'rustfmt' did not run — trustfmt is not installed; `aterm pkg install trust` installs it.".into(),
+            }
+        );
+        assert_eq!(
+            plan_on("lean", &["f.lean"], true, None, &[]),
+            Plan::Missing {
+                say: not_installed_message("lean", "clean", "clean"),
+            }
+        );
+        assert_eq!(
+            plan_on("cargo", &["trust", "build"], true, Some(UP), &[]),
+            Plan::Missing {
+                say: not_installed_message("cargo", "targo", "trust"),
+            }
+        );
+    }
+
+    /// A branded tool that cannot run names the fix that works: a shim that forwards to no
+    /// build (a tombstone, a pending stub) is exec'd with nothing said first, so its own
+    /// line speaks; a lost shim names `repair`; only a tool nothing here holds names
+    /// `install`. The probe is asked about the program the table names.
+    #[test]
+    fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
+        let shim = PathBuf::from("/prefix/bin/clean");
+        let machine = Machine {
+            passthrough: false,
+            announce: &|| true,
+            upstream: &|| Some(PathBuf::from(UP)),
+            branded: &|tool, program| {
+                assert_eq!((tool, program), ("clean", "clean"));
+                Install::Shim(shim.clone())
+            },
+        };
+        assert_eq!(
+            plan(row_for("lean").unwrap(), &args(&["f.lean"]), &machine),
+            Plan::Shim {
+                shim: shim.clone(),
+                args: args(&["check", "f.lean"]),
+            }
+        );
+        let machine = Machine {
+            passthrough: false,
+            announce: &|| true,
+            upstream: &|| Some(PathBuf::from(UP)),
+            branded: &|tool, program| {
+                assert_eq!(program, "trust", "{tool}");
+                Install::ShimLost
+            },
+        };
+        assert_eq!(
+            plan(row_for("rustfmt").unwrap(), &args(&["x.rs"]), &machine),
+            Plan::Missing {
+                say: "aterm: 'rustfmt' did not run — trustfmt's shim is missing; `aterm pkg repair` restores it.".into(),
+            }
+        );
+        assert_eq!(
+            plan(
+                row_for("cargo").unwrap(),
+                &args(&["trust", "build"]),
+                &machine
+            ),
+            Plan::Missing {
+                say: lost_shim_message("cargo", "targo"),
+            }
+        );
+    }
+
+    /// [`installed`] on a real store: a laid shim runs; with it lost, the live build says
+    /// so; a tombstone and a pending stub are the shim to exec; nothing else is absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_branded_tool_is_read_off_the_store_the_way_atpkg_run_reads_it() {
+        let l = layout("installed");
+        assert_eq!(installed(&l, "clean", "clean"), Install::Absent);
+        let d = l.build_dir("clean", 7);
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        let exe = d.join("bin").join("clean");
+        std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::store::mark_build_ready(&d).unwrap();
+        crate::activate::install_shims(
+            &l,
+            &d,
+            &["clean".to_string()],
+            crate::activate::Aliases::Alab,
+        )
+        .unwrap();
+        crate::activate::activate_build(&l, &d).unwrap();
+        assert!(
+            matches!(installed(&l, "clean", "clean"), Install::Runs(_)),
+            "a laid shim runs"
+        );
+        let clean = crate::store::ToolName::new("clean").unwrap();
+        std::fs::remove_file(l.shim(&clean)).unwrap();
+        assert_eq!(installed(&l, "clean", "clean"), Install::ShimLost);
+        assert_eq!(
+            installed(&l, "clean", "trust"),
+            Install::Absent,
+            "another program's build holds no `clean`"
+        );
+        crate::activate::install_tombstone_shim(&l, &clean).unwrap();
+        assert_eq!(
+            installed(&l, "clean", "clean"),
+            Install::Shim(l.shim(&clean))
+        );
+        let targo = crate::store::ToolName::new("targo").unwrap();
+        crate::stub::write_pending_stub(&l, &targo).unwrap();
+        assert_eq!(
+            installed(&l, "targo", "trust"),
+            Install::Shim(l.shim(&targo))
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// What runs, and with which arguments: upstream gets the caller's own (a `+trust…`
+    /// included — only the rendered lanes drop it), the setting silences every upstream
+    /// line, and a DIRECT line names the escape only where an upstream copy exists.
+    #[test]
+    fn a_plan_runs_what_was_asked_with_the_callers_arguments() {
+        let up = || PathBuf::from(UP);
+        let Plan::Upstream {
+            say: Some(say),
+            target,
+            args: argv,
+        } = plan_on("cargo", &["+trust", "build"], true, Some(UP), &[])
+        else {
+            panic!("`cargo +trust build` announces and runs upstream");
+        };
+        assert_eq!((target, argv), (up(), args(&["+trust", "build"])));
+        // What runs is rustup's trust toolchain, as typed: the first line names it and
+        // says no "no proof claim" of it; the lanes drop the `+trust` targo rejects.
+        let (first, lanes) = say.split_once('\n').expect("a block");
+        assert_eq!(
+            first,
+            "aterm: running 'cargo +trust' (rustup's trust toolchain); on Trust the tool is 'targo':"
+        );
+        assert!(
+            lanes.contains("targo trust build ") && !lanes.contains("+trust"),
+            "{say}"
+        );
+        let Plan::Upstream { say: Some(say), .. } =
+            plan_on("cargo", &["+trust", "clippy"], true, Some(UP), &[])
+        else {
+            panic!("`cargo +trust clippy` announces and runs upstream");
+        };
+        assert!(
+            say.starts_with(
+                "aterm: running 'cargo +trust clippy' (rustup's trust toolchain); on Trust the tool is 'targo tippy':\n"
+            ),
+            "{say}"
+        );
+        for call in [&["build"][..], &["+stable", "build"][..]] {
+            assert_eq!(
+                plan_on("cargo", call, false, Some(UP), &[]),
+                Plan::Upstream {
+                    say: None,
+                    target: up(),
+                    args: args(call),
+                },
+                "{call:?}: the setting silences the line, never the run"
+            );
+        }
+        assert_eq!(
+            plan_on("cargo", &["+stable", "build"], true, Some(UP), &[]),
+            Plan::Upstream {
+                say: Some(passthrough_note("cargo")),
+                target: up(),
+                args: args(&["+stable", "build"]),
+            }
+        );
+        assert_eq!(
+            plan_on("clippy", &["x"], true, None, &["tippy"]),
+            Plan::Branded {
+                say: "aterm: running tippy, Trust's 'clippy'.".into(),
+                copy: store("tippy"),
+                args: args(&["x"]),
+            }
+        );
+        let Plan::Branded { say, .. } = plan_on("rustfmt", &[], false, Some(UP), &["trustfmt"])
+        else {
+            panic!("an installed DIRECT tool runs");
+        };
+        assert_eq!(say, direct_announcement("rustfmt", "trustfmt", true));
+        // An explicit lane: targo, without the `+trust` it rejects.
+        assert_eq!(
+            plan_on(
+                "cargo",
+                &["+trust", "trust", "build"],
+                true,
+                Some(UP),
+                &["targo"]
+            ),
+            Plan::Branded {
+                say: explicit_lane_note("cargo", "targo"),
+                copy: store("targo"),
+                args: args(&["trust", "build"]),
+            }
+        );
+        assert_eq!(
+            plan_on("z3", &[], true, Some(UP), &["ay"]),
+            Plan::Refuse {
+                say: oracle_message("z3", Some(Path::new(UP))),
+            },
+            "ORACLE refuses, installed or not"
+        );
+        // The escape engaged: upstream, silently, whatever the row.
+        let machine = Machine {
+            passthrough: true,
+            announce: &|| true,
+            upstream: &|| Some(up()),
+            branded: &|_, _| Install::Absent,
+        };
+        assert_eq!(
+            plan(row_for("rustfmt").unwrap(), &args(&["x.rs"]), &machine),
+            Plan::Upstream {
+                say: None,
+                target: up(),
+                args: args(&["x.rs"]),
+            }
+        );
     }
 
     /// The stub's own decisions, in a real `/bin/sh`: the escape hatch execs the
@@ -2210,10 +2788,7 @@ mod tests {
         let out = run(&stub_body_sh("cargo", Path::new("/gone/atpkg"), &d), None);
         assert_eq!(out.status.code(), Some(2));
         let err = String::from_utf8_lossy(&out.stderr);
-        assert!(
-            err.contains("not reachable") && err.contains("aterm --no-reroute"),
-            "{err}"
-        );
+        assert_eq!(err.trim_end(), unreachable_message("cargo"), "{err}");
         assert!(
             String::from_utf8_lossy(&out.stdout).is_empty(),
             "stdout must stay clean"
@@ -2226,7 +2801,7 @@ mod tests {
         let out = run(&none, None);
         assert_eq!(out.status.code(), Some(2));
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("not reachable"),
+            String::from_utf8_lossy(&out.stderr).contains("did not run"),
             "{out:?}"
         );
         let path_atpkg = l.prefix.join("path-bin");
@@ -2486,17 +3061,20 @@ mod tests {
                 format!("bin {name}: --version x y\n"),
                 "{name}"
             );
-            // Nothing at all: exit 127, one line naming the help page, stdout clean.
+            // Nothing at all, and the twin gone: exit 127, one line naming the install,
+            // stdout clean — inside aterm and out.
             let nothing = std::env::join_paths([d.clone()]).unwrap();
-            let out = run_stub(&stub, &nothing, &[("ATERM_CHILD", "1")]);
-            assert_eq!(out.status.code(), Some(127), "{name}");
-            assert!(out.stdout.is_empty(), "{name}");
-            let err = String::from_utf8_lossy(&out.stderr);
-            assert_eq!(
-                err.trim_end(),
-                agents_not_found_message(name),
-                "{name}: one line"
-            );
+            for env in [&[("ATERM_CHILD", "1")][..], &[]] {
+                let out = run_stub(&stub, &nothing, env);
+                assert_eq!(out.status.code(), Some(127), "{name} {env:?}");
+                assert!(out.stdout.is_empty(), "{name} {env:?}");
+                let err = String::from_utf8_lossy(&out.stderr);
+                assert_eq!(
+                    err.trim_end(),
+                    agents_not_installed_message(name),
+                    "{name} {env:?}: one line"
+                );
+            }
             let _ = std::fs::remove_dir_all(&local);
             let _ = std::fs::remove_dir_all(&brew);
             let _ = std::fs::remove_dir_all(&l.prefix);
@@ -2667,11 +3245,15 @@ mod tests {
                 "{marker} is never set: {body}"
             );
         }
-        let posix = crate::hooks::hook_files(Path::new("/p/bin"), Path::new("/p/agents"))
-            .into_iter()
-            .find(|(n, _)| n.ends_with(".zsh"))
-            .unwrap()
-            .1;
+        let posix = crate::hooks::hook_files(
+            Path::new("/p/bin"),
+            Path::new("/p/agents"),
+            Path::new("/p/reroute"),
+        )
+        .into_iter()
+        .find(|(n, _)| n.ends_with(".zsh"))
+        .unwrap()
+        .1;
         assert!(
             posix.contains(&format!(
                 "case \"{}\" in",

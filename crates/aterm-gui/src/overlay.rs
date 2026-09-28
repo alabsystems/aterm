@@ -22,7 +22,9 @@ use crate::conn_card::ConnCardState;
 use crate::connection_map::ConnectionMapState;
 use crate::palette::PaletteState;
 use crate::session_picker::SessionPickerState;
-use crate::settings::{PreviewCtx, SettingsGeom, SettingsState};
+#[cfg(test)]
+use crate::settings::SettingsState;
+use crate::settings::{PreviewCtx, SettingsGeom};
 use crate::widget::TrayInput;
 
 /// The paint/lifecycle contract shared by every overlay surface. `tray` and
@@ -59,22 +61,29 @@ pub(crate) trait OverlayModel {
     fn a11y(&self) -> accesskit::TreeUpdate;
 }
 
+/// The retired Settings card: an overlay that occupies its rows and consumes input but
+/// paints, scrolls and publishes nothing. It exists only because `cfg(test)` code still
+/// opens [`Overlay::Settings`] as a generic modal.
+#[cfg(test)]
 impl OverlayModel for SettingsState {
     fn fingerprint(&self) -> u64 {
-        SettingsState::fingerprint(self)
+        1
     }
     fn wanted_rows(&self, avail: usize) -> usize {
         crate::settings::wanted_rows(&self.fields).min(avail)
     }
-    fn tray(&self, geom: &SettingsGeom, theme: Theme, ctx: PreviewCtx) -> TrayInput {
-        crate::settings::settings_tray(self, geom, theme, ctx)
+    fn tray(&self, _geom: &SettingsGeom, _theme: Theme, _ctx: PreviewCtx) -> TrayInput {
+        TrayInput {
+            prims: Vec::new(),
+            card: (0.0, 0.0, 0.0, 0.0),
+        }
     }
     fn scroll_extent(&self) -> (usize, usize, usize) {
-        SettingsState::scroll_extent(self)
+        (0, 0, 0)
     }
     #[cfg(a11y_tree)]
     fn a11y(&self) -> accesskit::TreeUpdate {
-        crate::accesskit_tree::settings_tree(self)
+        crate::accesskit_tree::empty_tree()
     }
 }
 
@@ -293,40 +302,27 @@ mod tests {
         // directly from a shared inner hash: the wrapper's tag+rotate must still separate
         // them. We assert the wrapper formula over identical inner values.
         for inner in [0u64, 1, 42, u64::MAX, 0x00FF_00FF_00FF_00FF] {
-            let s = (1u64.rotate_left(56) ^ inner) | 1;
             let p = (3u64.rotate_left(56) ^ inner) | 1;
             let c = (5u64.rotate_left(56) ^ inner) | 1;
-            assert_ne!(s, p, "settings vs palette collide at inner={inner:#x}");
-            assert_ne!(s, c, "settings vs conn-card collide at inner={inner:#x}");
             assert_ne!(p, c, "palette vs conn-card collide at inner={inner:#x}");
-            assert_ne!(s, 0, "settings fp must be nonzero");
             assert_ne!(p, 0, "palette fp must be nonzero");
             assert_ne!(c, 0, "conn-card fp must be nonzero");
         }
 
-        // And over real, live models (whose inner hashes will differ too).
-        let settings = Overlay::Settings(SettingsState::from_config(
-            &crate::app_config::Config::default(),
-        ));
+        // And over a real, live model.
         let palette = Overlay::Palette(PaletteState::new());
-        let (fs, fp) = (settings.fingerprint(), palette.fingerprint());
-        assert_ne!(fs, fp);
-        assert_ne!(fs, 0);
-        assert_ne!(fp, 0);
-        assert_eq!(settings.kind(), OverlayKind::Settings);
+        assert_ne!(palette.fingerprint(), 0);
         assert_eq!(palette.kind(), OverlayKind::Palette);
     }
 
     /// `status_line()` (the `controls front` open case) reports `open=true`, the surface
     /// `kind=<keyword>`, the exact `Overlay::fingerprint()`, and a `scroll/total/visible`
-    /// extent — for EVERY variant (exhaustive fan-out). The `kind` keyword must re-parse
+    /// extent — for every shipping variant. The `kind` keyword must re-parse
     /// via `AuxTarget::parse` to the SAME surface, so a driver can pipe `controls front`
     /// into `controls <kind>`.
     #[test]
     fn status_line_reports_open_kind_fp_and_extent() {
-        let cfg = crate::app_config::Config::default();
         let cases = [
-            Overlay::Settings(SettingsState::from_config(&cfg)),
             Overlay::Palette(PaletteState::new()),
             Overlay::ConnCard(ConnCardState::new(
                 crate::WindowId(0),
@@ -341,7 +337,7 @@ mod tests {
             )),
             Overlay::SessionPicker(SessionPickerState::new(
                 crate::WindowId(0),
-                aterm_session::SessionId::new("s-a"),
+                Some(aterm_session::SessionId::new("s-a")),
                 "a".to_string(),
                 crate::session_picker::PickerIntent::Connect,
                 Vec::new(),

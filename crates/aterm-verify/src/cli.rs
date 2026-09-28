@@ -3,8 +3,9 @@
 
 //! The flag surface, which is FROZEN.
 //!
-//! `--fast` / `--full` / `--scope <crate>` / `--selftest` keep working
-//! unedited, including `--scope=<crate>` and `-h`/`--help`.
+//! `--fast` / `--full` / `--scope <crate>` keep working unedited, including
+//! `--scope=<crate>` and `-h`/`--help`. (`--selftest` and `--in-place` are gone
+//! since 2026-09-27: every run is a real run of a snapshot.)
 //!
 //! **THE GATE NEEDS NO FLAG** (2026-09-23, the owner, reading
 //! `tools/verify.sh --fast` in a report: *"why fucking --fast? I always want
@@ -18,32 +19,20 @@
 //! shim already resolved the repo root from its own path, and a compiled binary
 //! cannot). It changes no stage's decision.
 //!
-//! And one opt-out, `--in-place` (2026-09-13): a run in a git checkout verifies
-//! a pinned SNAPSHOT of the caller's HEAD and uncommitted change by default
-//! ([`crate::snapshot`]), and `--in-place` runs in the caller's own checkout as
-//! every run did before. `--selftest`, and a root that is not a git checkout,
-//! run in place.
-//! It changes where the stages run, never which stages run.
-//!
 //! THE GATE READS NO ENVIRONMENT KNOB OF ITS OWN (2026-09-24). Every setting a
 //! person gives the gate is a flag here — `--stage-timeout`, `--test-threads`,
-//! `--snapshot`, `--timings`, `--log`/`--no-log`, `--skip-gui-smoke`,
-//! `--machine-lock-dir` — because
-//! this crate links into the shipped `aterm` (`aterm help rust`), where the
-//! owner's rule admits no environment variable that changes what it does
-//! (`aterm-update-core`'s `env_reads` gate). Each used to be an `ATERM_VERIFY_*`
-//! / `ATERM_SKIP_GUI_SMOKE` export; `ATERM_VERIFY_ROOT` and `ATERM_VERIFY_BASE`
-//! duplicated `--root` and `--base` and are gone outright. The one variable the
-//! gate still reads, `ATERM_VERIFY_MACHINE_HOLDER`, is protocol: the gate that
-//! holds the machine sets it for its own children, and nothing else does.
+//! `--snapshot`, `--log`/`--no-log`, `--skip-gui-smoke`, `--machine-lock-dir` —
+//! because this crate links into the shipped `aterm` (`aterm help rust`), where
+//! the owner's rule admits no environment variable that changes what it does
+//! (`aterm-update-core`'s `env_reads` gate).
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::time::Duration;
 
 /// The per-commit merge contract — the DEFAULT, what a bare `tools/verify.sh`
-/// runs (`--fast` spells it and changes nothing) — or `--full` (+ differential
-/// oracle and the trust-mc / Kani floor).
+/// runs (`--fast` spells it and changes nothing) — or `--full` (+ the trust-mc /
+/// Kani floor, the cross-cell type-check and the Codex live upgrade).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     #[default]
@@ -73,10 +62,7 @@ pub struct Args {
     /// below, so `--base main` without `--changed` is still the usage error it
     /// always was in intent.
     pub base: Option<String>,
-    pub selftest: bool,
     pub root: Option<PathBuf>,
-    /// `--in-place`: run in the caller's checkout instead of the snapshot.
-    pub in_place: bool,
     /// `--disk-floor <GiB>`: the free space this run requires, in whole GiB,
     /// in place of the disk preflight's estimate. `None` keeps the estimate
     /// ([`crate::disk::Budget::need`]). The gate's own integration tests pass
@@ -94,8 +80,6 @@ pub struct Args {
     /// `--snapshot <dir>`: where the snapshot lives, in place of
     /// `<root>-verify.noindex` ([`crate::snapshot`]).
     pub snapshot: Option<PathBuf>,
-    /// `--timings <file>`: the per-child timing TSV ([`crate::exec::Timings`]).
-    pub timings: Option<PathBuf>,
     /// `--log <path>`: where the gate writes its own copy of the ladder, in
     /// place of `<root>/.aterm-verify/logs/verify-<pid>.log`.
     pub log: Option<PathBuf>,
@@ -134,8 +118,7 @@ pub enum ParseError {
     StageTimeoutNeedsSeconds,
     /// `--test-threads` with no value, or one that is not a positive count.
     TestThreadsNeedsCount,
-    /// A path flag (`--snapshot`, `--timings`, `--log`, `--machine-lock-dir`)
-    /// with no value.
+    /// A path flag (`--snapshot`, `--log`, `--machine-lock-dir`) with no value.
     NeedsPath(String),
     /// `--log <path>` and `--no-log` together.
     LogAndNoLog,
@@ -189,9 +172,7 @@ where
         match a.as_str() {
             "--fast" => out.mode = Mode::Fast,
             "--full" => out.mode = Mode::Full,
-            "--selftest" => out.selftest = true,
             "--changed" => out.changed = true,
-            "--in-place" => out.in_place = true,
             "--no-log" => out.no_log = true,
             "--skip-gui-smoke" => out.skip_gui_smoke = true,
             "-h" | "--help" => out.help = true,
@@ -225,7 +206,7 @@ where
             "--test-threads" => {
                 out.test_threads = Some(parse_threads(&it.next().unwrap_or_default())?);
             }
-            "--snapshot" | "--timings" | "--log" | "--machine-lock-dir" => {
+            "--snapshot" | "--log" | "--machine-lock-dir" => {
                 let v = path_value(&a, it.next().unwrap_or_default())?;
                 *out.path_slot(&a) = Some(v);
             }
@@ -286,14 +267,13 @@ where
 }
 
 /// The flags whose value is a path ([`path_value`]).
-const PATH_FLAGS: [&str; 4] = ["--snapshot", "--timings", "--log", "--machine-lock-dir"];
+const PATH_FLAGS: [&str; 3] = ["--snapshot", "--log", "--machine-lock-dir"];
 
 impl Args {
     /// The field a path flag ([`PATH_FLAGS`]) sets.
     fn path_slot(&mut self, flag: &str) -> &mut Option<PathBuf> {
         match flag {
             "--snapshot" => &mut self.snapshot,
-            "--timings" => &mut self.timings,
             "--machine-lock-dir" => &mut self.machine_lock_dir,
             _ => &mut self.log,
         }
@@ -339,33 +319,41 @@ main merge-queue. There is exactly one way to verify, so there is exactly one
 way for a reviewer (human or AI) to be wrong about it: run this.
 
   tools/verify.sh                   # the per-commit gate (the merge contract)
-  tools/verify.sh --full            # the gate + differential oracle + trust-mc
-                                    #   + cross-cells + the Codex live upgrade
+  tools/verify.sh --full            # the gate + trust-mc + cross-cells
+                                    #   + the Codex live upgrade
   tools/verify.sh --changed         # change-scoped tier (NOT the merge contract)
-  tools/verify.sh --scope <crate>   # narrow build/test to one crate (+ guards)
+  tools/verify.sh --scope <crate>   # narrow the test compile, test run,
+                                    #   measuring tests, doctests and lint
+                                    #   to one crate (+ guards)
   tools/verify.sh --scope aterm-grid
-  tools/verify.sh --in-place        # run in this checkout, not the snapshot
 
-(no flag) : THE GATE, and the merge contract: targo build + targo test
-            --workspace + the zero-tolerance grep guards + the delivery-tooling
-            suites (installer, cargo pin, export policy, release preflight,
-            site sync, dev signing identity) + a headless control-socket smoke
-            (the AI-first spine must never regress, so every gate run proves
-            the socket still answers) + the foreground handback lane, which
-            drives a private headless aterm.
+(no flag) : THE GATE, and the merge contract: targo test --workspace and its
+            doctests + tippy + formatting + the zero-tolerance grep guards and
+            license headers + the delivery-tooling suites (installer, cargo pin,
+            export policy, release preflight, site sync, dev signing identity)
+            + the L0 temporal-safety gate + gate forge and gate cells-foreign
+            (the cells no fleet box hosts, each for its own triple, which needs
+            rustup's `stable` with the four foreign std targets or is a SKIP
+            that withholds the merge contract) + a headless control-socket
+            smoke (the AI-first spine must never regress, so every gate run
+            proves the socket still answers) + the foreground handback lane,
+            which drives a private headless aterm.
 --fast    : the default, spelled out. It changes nothing and nothing needs it;
             it is accepted so a script that types it keeps working.
---full    : everything the default runs, PLUS the aterm-vs-alacritty differential
-            oracle and the trust-mc / Kani BMC harnesses *when those tools are
+--full    : everything the default runs, PLUS the lint of the required-features
+            targets, the trust-mc / Kani BMC harnesses *when those tools are
             installed* (skipped-not-failed when absent — see docs/PROCESS.md),
-            PLUS the cross-cell type-check (forge's five cells, each for its
-            own triple; ~19 s warm, ~106 s cold), PLUS — last, run alone, ~10
-            min — the Codex live upgrade, which reads THIS machine's managed
-            store and the vendor's current Codex, so it is not in the per-commit
-            contract (a named skip when the store holds no older Codex).
---scope   : restrict the targo build/test to `-p <crate>`; the guards and the
-            socket smoke always run whole-tree (they are cheap and global).
---changed : a change-scoped PRE-FLIGHT. Restricts build/test/doctest/lint to
+            the cross-cell type-check (every forge cell, each for its own
+            triple; ~19 s warm and ~106 s cold when the matrix had five cells)
+            and the startup-comparison harness's own test, PLUS — last, run
+            alone, ~10 min — the Codex live upgrade,
+            which reads THIS machine's managed store and the vendor's current
+            Codex, so it is not in the per-commit contract (a named skip when
+            the store holds no older Codex).
+--scope   : restrict the targo test/doctest/lint to `-p <crate>`; the guards
+            and the socket smoke always run whole-tree (they are cheap and
+            global).
+--changed : a change-scoped PRE-FLIGHT. Restricts test/doctest/lint to
             the crates this branch touches PLUS every workspace crate that
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default
@@ -376,19 +364,15 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             cannot be computed honestly the run WIDENS to the whole workspace,
             because a broken narrower must do MORE work, never less.
 
---in-place: in a git checkout every run except --selftest verifies a
-            SNAPSHOT — a git worktree at <root>-verify.noindex (or
-            --snapshot <dir>) synced to this checkout's HEAD,
+--snapshot <dir>: every run verifies a SNAPSHOT — a git worktree at
+            <root>-verify.noindex (or this dir) synced to this checkout's HEAD,
             uncommitted diff and untracked files — so a pull, an edit or
             another build in this checkout cannot change what the run is
-            verifying. --in-place runs here instead, as a root that is not a
-            git checkout always does. A compiler (or, in a git checkout, the
-            source tree) that moves mid-run stops every stage not yet started
-            and adds a source identity COULD NOT RUN row, so a run with nothing
-            failed ends COULD NOT RUN (exit 3) and a stage that already FAILED
-            keeps FAIL (exit 1). --timings <file> rewrites that file each
-            run with a TSV row per child and per stage, without changing a
-            byte of the ladder.
+            verifying. A root git cannot open is COULD NOT RUN (exit 3). A
+            compiler or source tree that moves mid-run stops every stage not
+            yet started and adds a source identity COULD NOT RUN row, so a run
+            with nothing failed ends COULD NOT RUN (exit 3) and a stage that
+            already FAILED keeps FAIL (exit 1).
 
 --disk-floor <GiB>: before anything is built the run budgets what it will
             write and answers COULD NOT RUN (exit 3), with no receipt, when the
@@ -477,7 +461,6 @@ fn ceiling_text(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     fn ok(args: &[&str]) -> Args {
         parse(args.iter().copied()).expect("parses")
@@ -508,22 +491,57 @@ mod tests {
         }
     }
 
+    /// The value flags fail closed: a missing or malformed value is a usage error,
+    /// never a default. `verify.sh` appends `--root <dir>`, so a trailing `--log`
+    /// must not take `--root` as its path.
     #[test]
-    fn the_frozen_spellings_all_still_work() {
-        assert_eq!(ok(&[]).mode, Mode::Fast, "default is the per-commit gate");
-        assert_eq!(ok(&["--fast"]).mode, Mode::Fast);
-        assert_eq!(ok(&["--full"]).mode, Mode::Full);
-        assert!(ok(&["--selftest"]).selftest);
-        assert_eq!(
-            ok(&["--scope", "aterm-grid"]).scope.as_deref(),
-            Some("aterm-grid")
-        );
-        assert_eq!(
-            ok(&["--scope=aterm-grid"]).scope.as_deref(),
-            Some("aterm-grid")
-        );
-        assert!(ok(&["-h"]).help);
-        assert!(ok(&["--help"]).help);
+    fn the_value_flags_fail_closed() {
+        let a = ok(&[
+            "--stage-timeout",
+            "120",
+            "--test-threads=4",
+            "--snapshot",
+            "/s",
+            "--log",
+            "/l.log",
+            "--machine-lock-dir=/m",
+        ]);
+        assert_eq!(a.stage_timeout, Some(Some(Duration::from_secs(120))));
+        assert_eq!(a.test_threads, NonZeroU32::new(4));
+        assert_eq!(a.snapshot, Some(PathBuf::from("/s")));
+        assert_eq!(a.log, Some(PathBuf::from("/l.log")));
+        assert_eq!(a.machine_lock_dir, Some(PathBuf::from("/m")));
+        assert_eq!(ok(&["--stage-timeout=off"]).stage_timeout, Some(None));
+        for (bad, err) in [
+            (
+                vec!["--stage-timeout", "45m"],
+                ParseError::StageTimeoutNeedsSeconds,
+            ),
+            (
+                vec!["--stage-timeout=-1"],
+                ParseError::StageTimeoutNeedsSeconds,
+            ),
+            (
+                vec!["--test-threads", "0"],
+                ParseError::TestThreadsNeedsCount,
+            ),
+            (vec!["--test-threads=x"], ParseError::TestThreadsNeedsCount),
+            (
+                vec!["--snapshot"],
+                ParseError::NeedsPath("--snapshot".into()),
+            ),
+            (
+                vec!["--log", "--root", "/repo"],
+                ParseError::NeedsPath("--log".into()),
+            ),
+            (
+                vec!["--machine-lock-dir", "--fast"],
+                ParseError::NeedsPath("--machine-lock-dir".into()),
+            ),
+            (vec!["--log", "/l", "--no-log"], ParseError::LogAndNoLog),
+        ] {
+            assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
+        }
     }
 
     #[test]
@@ -558,6 +576,10 @@ mod tests {
             ParseError::Unknown("--fest".into()).message(),
             "verify: unknown argument: --fest"
         );
+        // The retired modes (2026-09-27) are refused, never quietly accepted.
+        for gone in ["--selftest", "--in-place", "--timings"] {
+            assert_eq!(parse([gone]), Err(ParseError::Unknown(gone.into())));
+        }
     }
 
     #[test]
@@ -582,94 +604,6 @@ mod tests {
         let given = ok(&["--changed", "--base", "HEAD~1"]);
         assert_eq!(given.base_ref(), "HEAD~1");
         assert_eq!(ok(&["--changed"]).base_ref(), "main");
-    }
-
-    /// The knobs that were environment variables until 2026-09-24 are flags, in
-    /// both spellings, and a missing or malformed value is a usage error naming
-    /// the flag — never read as "unset", and never as the unbounded wait.
-    #[test]
-    fn the_former_environment_knobs_are_flags_that_fail_closed() {
-        let a = ok(&[
-            "--stage-timeout",
-            "120",
-            "--test-threads=4",
-            "--snapshot",
-            "/s",
-            "--timings=/t.tsv",
-            "--log",
-            "/l.log",
-            "--skip-gui-smoke",
-            "--machine-lock-dir=/m",
-        ]);
-        assert_eq!(a.machine_lock_dir, Some(PathBuf::from("/m")));
-        assert_eq!(a.stage_timeout, Some(Some(Duration::from_secs(120))));
-        assert_eq!(a.test_threads, NonZeroU32::new(4));
-        assert_eq!(a.snapshot, Some(PathBuf::from("/s")));
-        assert_eq!(a.timings, Some(PathBuf::from("/t.tsv")));
-        assert_eq!(a.log, Some(PathBuf::from("/l.log")));
-        assert!(a.skip_gui_smoke && !a.no_log);
-        assert_eq!(ok(&["--stage-timeout=off"]).stage_timeout, Some(None));
-        assert_eq!(ok(&[]).stage_timeout, None, "not given keeps the default");
-        assert!(ok(&["--no-log"]).no_log);
-        for (bad, err) in [
-            (
-                vec!["--stage-timeout"],
-                ParseError::StageTimeoutNeedsSeconds,
-            ),
-            (
-                vec!["--stage-timeout", "45m"],
-                ParseError::StageTimeoutNeedsSeconds,
-            ),
-            (
-                vec!["--stage-timeout=-1"],
-                ParseError::StageTimeoutNeedsSeconds,
-            ),
-            (
-                vec!["--test-threads", "0"],
-                ParseError::TestThreadsNeedsCount,
-            ),
-            (vec!["--test-threads=x"], ParseError::TestThreadsNeedsCount),
-            (
-                vec!["--snapshot"],
-                ParseError::NeedsPath("--snapshot".into()),
-            ),
-            (
-                vec!["--timings="],
-                ParseError::NeedsPath("--timings".into()),
-            ),
-            (vec!["--log", "/l", "--no-log"], ParseError::LogAndNoLog),
-            // The shim's own `--root` after a forgotten path is not the path.
-            (
-                vec!["--fast", "--log", "--root", "/repo"],
-                ParseError::NeedsPath("--log".into()),
-            ),
-            (
-                vec!["--snapshot", "--in-place"],
-                ParseError::NeedsPath("--snapshot".into()),
-            ),
-            (
-                vec!["--machine-lock-dir", "--fast"],
-                ParseError::NeedsPath("--machine-lock-dir".into()),
-            ),
-        ] {
-            assert_eq!(parse(bad.iter().copied()), Err(err), "{bad:?}");
-        }
-        let text = usage();
-        for flag in [
-            "--stage-timeout",
-            "--test-threads",
-            "--snapshot",
-            "--timings",
-            "--no-log",
-            "--skip-gui-smoke",
-            "--machine-lock-dir",
-        ] {
-            assert!(text.contains(flag), "usage must document {flag}");
-        }
-        assert!(
-            !text.contains("ATERM_"),
-            "usage names no environment knob: {text}"
-        );
     }
 
     #[test]
@@ -738,38 +672,7 @@ mod tests {
         assert_eq!(parse(["--root"]), Err(ParseError::RootNeedsPath));
         // and it changes nothing else about the run
         let a = ok(&["--root", "/tmp/x"]);
-        assert_eq!(
-            (a.mode, a.scope, a.selftest, a.changed),
-            (Mode::Fast, None, false, false)
-        );
-    }
-
-    /// `--in-place` is the one way back to the old behaviour, so it has to
-    /// parse on its own, compose with every mode and narrowing, and change
-    /// nothing else about the run.
-    #[test]
-    fn in_place_is_the_opt_out_from_the_snapshot_and_changes_nothing_else() {
-        assert!(!ok(&[]).in_place, "the snapshot is the default");
-        assert!(ok(&["--in-place"]).in_place);
-        let a = ok(&["--full", "--in-place", "--scope", "aterm-grid"]);
-        assert_eq!(
-            (
-                a.mode,
-                a.scope.as_deref(),
-                a.in_place,
-                a.selftest,
-                a.changed
-            ),
-            (Mode::Full, Some("aterm-grid"), true, false, false)
-        );
-        let b = ok(&["--changed", "--in-place", "--base", "origin/main"]);
-        assert!(b.in_place && b.changed);
-        assert_eq!(
-            parse(["--in-place=yes"]),
-            Err(ParseError::Unknown("--in-place=yes".into())),
-            "a flag, not an option: a value is a typo and says so"
-        );
-        assert!(usage().contains("--in-place"));
+        assert_eq!((a.mode, a.scope, a.changed), (Mode::Fast, None, false));
     }
 
     #[test]
@@ -798,48 +701,5 @@ mod tests {
             "no invocation prescribes the no-op --fast: {text}"
         );
         assert_eq!(ok(&[]), ok(&["--fast"]), "--fast changes nothing");
-    }
-
-    /// The ceiling the help NAMES is the ceiling the code ENFORCES. It was a
-    /// hand-typed "45-minute" across two raises of the constant; deriving it is
-    /// the only thing that keeps them equal.
-    #[test]
-    fn usage_names_the_ceiling_the_constant_enforces() {
-        let text = usage();
-        assert!(
-            !text.contains("{CEILING}"),
-            "the template placeholder reached a reader: {text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "{} wall-clock ceiling",
-                ceiling_text(crate::exec::DEFAULT_CHILD_CEILING)
-            )),
-            "usage must name DEFAULT_CHILD_CEILING: {text}"
-        );
-        // The disk preflight's numbers are the constants', never typed here.
-        assert!(
-            !text.contains("{DISK_"),
-            "a disk placeholder reached a reader: {text}"
-        );
-        let disk = crate::disk::Budget::MEASURED;
-        assert!(
-            text.contains(&format!(
-                "{} from empty lanes",
-                crate::disk::gib(disk.need(0))
-            )),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "lanes over\n            {} are removed",
-                crate::disk::gib(disk.lane_cap)
-            )),
-            "{text}"
-        );
-        assert_eq!(ceiling_text(Duration::from_secs(3 * 60 * 60)), "3-hour");
-        assert_eq!(ceiling_text(Duration::from_secs(90 * 60)), "90-minute");
-        assert_eq!(ceiling_text(Duration::from_secs(45 * 60)), "45-minute");
-        assert_eq!(ceiling_text(Duration::from_secs(90)), "90-second");
     }
 }

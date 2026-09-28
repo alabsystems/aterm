@@ -103,31 +103,31 @@ fn bloom_fresh_filter_empty() {
     );
 }
 
-/// INV-BLOOM-4: Count tracks insertions.
+/// INV-BLOOM-4: A later insert never erases an earlier one.
 ///
-/// After N insertions (N in 0..=2), `count()` equals N.
-/// Uses concrete filter size and bounded N to keep CBMC tractable.
-/// Reduced from n<=4 to n<=2: each insert_bytes call has K=7 hash
-/// operations, so 4 inserts = 28 symbolic hash chains causing explosion.
-// TODO(#7932): tautology — strengthen or delete — T1: constructor round-trip field == any-binding
+/// Insert two symbolic single-byte keys; both must still be reported present
+/// afterwards (setting bits is monotone, so no key's bits can be cleared by a
+/// sibling's), and the count is two. Two single-byte keys keep CBMC tractable:
+/// each `insert_bytes` runs K=7 symbolic hash chains.
 #[kani::proof]
-#[kani::unwind(8)] // K=7 hash functions + outer loop bound
-fn bloom_count_tracks_insertions() {
+#[kani::unwind(8)] // K=7 hash functions + margin
+fn bloom_inserts_are_monotone() {
     let mut bloom = BloomFilter::with_size(128);
 
-    let n: usize = kani::any();
-    kani::assume(n <= 2);
-
-    for i in 0..n {
-        #[allow(clippy::cast_possible_truncation, reason = "n <= 2, always fits in u8")]
-        let key = [i as u8];
-        bloom.insert_bytes(&key);
-    }
+    let first = [kani::any::<u8>()];
+    let second = [kani::any::<u8>()];
+    bloom.insert_bytes(&first);
+    bloom.insert_bytes(&second);
 
     kani::assert(
-        bloom.count() == n,
-        "INV-BLOOM-4: count must equal number of insertions",
+        bloom.might_contain_bytes(&first),
+        "INV-BLOOM-4: the first key survives the second insert",
     );
+    kani::assert(
+        bloom.might_contain_bytes(&second),
+        "INV-BLOOM-4: the second key is present",
+    );
+    kani::assert(bloom.count() == 2, "INV-BLOOM-4: two inserts counted");
 }
 
 /// INV-BLOOM-5: Clear resets all state.

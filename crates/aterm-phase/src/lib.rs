@@ -80,10 +80,10 @@ pub use question::{
 };
 pub use reader::{
     AGENT_RUNTIMES, ClaudeReader, CodexReader, GenericReader, Program, Reading, ScreenReader,
-    identify, may_host_agent, program_of, read, resume_hint,
+    identify, live_zone_start, may_host_agent, program_of, read, read_at, resume_hint,
 };
 pub use turn::{
     Progress, continuation_suggestion, goal_active, interrupted, said_tail, status_row_progress,
     status_row_stall,
 };
-pub use wall::{Placement, Wall, WallKind, classify_wall, memory_wall, wall};
+pub use wall::{Placement, Wall, WallKind, classify_wall, login_restored, memory_wall, wall};

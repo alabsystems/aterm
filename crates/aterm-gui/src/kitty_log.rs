@@ -959,7 +959,7 @@ impl KittyLog {
     }
 
     /// Best-effort atomic write: create-parent, pid+seq-unique sibling temp,
-    /// rename (mirrors `Health::write` + `save_prefs_edits`). Never panics.
+    /// rename (mirrors `Health::write`). Never panics.
     fn write(&self, path: &Path) -> bool {
         atomic_write_toml(path, self)
     }
@@ -1174,33 +1174,6 @@ fn now_rfc3339() -> String {
 // workspace home for the Howard-Hinnant civil-calendar math. This file used to
 // carry a byte-identical copy and said so in its own doc comment.
 use aterm_types::rfc3339::format_rfc3339;
-
-/// The settings overlay's SNAPSHOT of the log (§F4.6): taken on open /
-/// category switch / drain-while-open, so the card painter stays a pure
-/// function of `SettingsState` (no live App reads from the painter).
-/// `revision` is the change stamp `SettingsState::fingerprint` folds while
-/// the Kitty Log category is active.
-#[derive(Clone)]
-pub(crate) struct KittyLogView {
-    /// The host's revision counter at snapshot time (bumps once per recorded
-    /// sighting — a cheap staleness check and the repaint fingerprint term).
-    pub(crate) revision: u64,
-    /// The in-memory totals (admitted startup ledger + this session's sightings).
-    pub(crate) log: KittyLog,
-}
-
-impl Default for KittyLogView {
-    /// The NEVER-SYNCED sentinel: `revision = u64::MAX` can never equal the
-    /// host's counter (which starts at 0 and bumps once per sighting), so a
-    /// freshly opened overlay always takes its first snapshot — even when the
-    /// host holds only the admitted startup ledger at revision 0.
-    fn default() -> Self {
-        Self {
-            revision: u64::MAX,
-            log: KittyLog::default(),
-        }
-    }
-}
 
 /// A ring slot: one recently-logged `(session, ident)` episode.
 #[derive(Clone, Copy)]
@@ -1574,15 +1547,6 @@ impl KittyLogHost {
         self.favourite
     }
 
-    /// Snapshot for the settings overlay (memory only — no IO).
-    #[cfg(test)]
-    pub(crate) fn view(&self) -> KittyLogView {
-        KittyLogView {
-            revision: self.revision,
-            log: self.mem.clone(),
-        }
-    }
-
     /// TYPED drain-site entry point (`record_typed_kitty`): dedupe, record,
     /// and debounce-flush this tick's sightings. A first-ever discovery is
     /// RETURNED as the Kitty Log's own accounting of the unlock (the caller
@@ -1937,192 +1901,6 @@ impl KittyLogHost {
         // `None` is the in-memory-only or pre-arm-failure path: never perform
         // exit I/O there.
     }
-}
-
-// ---- The collection book (settings §F4.6) -------------------------------------------
-
-/// One rendered collection-book row — shared by the legacy settings painter and
-/// `SettingsState::controls_lines` model tests. Native Settings owns its own compiled
-/// semantic projection.
-pub(crate) struct KittyBookRow {
-    /// Rarity tier: `legendary` / `rare` / `traits` / `common`.
-    pub(crate) tier: &'static str,
-    /// The registry `config_key` (or the trait key) of this cell.
-    #[cfg(test)]
-    pub(crate) key: &'static str,
-    /// The human label ([`KittyType::label`] / [`KittyMagic::label`] / trait).
-    pub(crate) label: &'static str,
-    /// Whether it has been sighted at all (`false` paints the `???` row).
-    pub(crate) seen: bool,
-    /// Encounter count for an individual item; distinct discoveries for an
-    /// aggregate progress row.
-    pub(crate) count: u64,
-    /// Number of designs represented by this row (`1` for individual art).
-    pub(crate) goal: usize,
-    /// Language chips: every code that has sighted this cell.
-    pub(crate) langs: Vec<String>,
-    /// RFC3339 UTC of the first sighting (empty when unseen).
-    pub(crate) first_seen: String,
-    /// RFC3339 UTC of the last sighting (empty when unseen).
-    pub(crate) last_seen: String,
-}
-
-/// The header stats + rows of the collection book.
-pub(crate) struct KittyBook {
-    /// Lifetime sighting total.
-    pub(crate) sightings: u64,
-    /// Distinct authored glyphs discovered.
-    pub(crate) collected: usize,
-    /// The generated, actually reachable art roster.
-    pub(crate) denominator: usize,
-    /// The primary-language codes seen, in first-discovery order.
-    pub(crate) languages: Vec<String>,
-    /// Label of the newest collected special (or accessory fallback), or `None`.
-    pub(crate) rarest: Option<&'static str>,
-    /// The book rows, grouped by tier in display order.
-    pub(crate) rows: Vec<KittyBookRow>,
-}
-
-fn glyph_label(key: &str) -> &'static str {
-    match key {
-        "spec_fluffy" => "Cloud Puff",
-        "spec_maneki" => "Lucky Bean",
-        "spec_sleeping" => "Cinnamon Roll",
-        "spec_stretch" => "Toastbyte",
-        "spec_tabbybell" => "Biscuit",
-        "spec_tuxedo" => "Sir Socks",
-        "spec_witch" => "Moon Mochi",
-        "spec_yarn" => "Tangle",
-        "acc_bell" => "Golden Bell",
-        "acc_bow" => "Red Bow",
-        "acc_crown" => "Crown",
-        _ => "Cat Character",
-    }
-}
-
-fn collectible_row(log: &KittyLog, index: usize, tier: &'static str) -> KittyBookRow {
-    let def = &GLYPHS[index];
-    let found = log.collectibles.iter().find(|item| item.key == def.id);
-    KittyBookRow {
-        tier,
-        #[cfg(test)]
-        key: def.id,
-        label: glyph_label(def.id),
-        seen: found.is_some(),
-        count: found.map_or(0, |item| item.count),
-        goal: 1,
-        langs: found.map_or_else(Vec::new, |item| item.langs.clone()),
-        first_seen: found.map_or_else(String::new, |item| item.first_seen.clone()),
-        last_seen: found.map_or_else(String::new, |item| item.last_seen.clone()),
-    }
-}
-
-/// Build the collection book from the generated, reachable v4 art roster.
-/// Eight full-cat specials and three overlay accessories get individual rows;
-/// the 25 head variants are summarized in one row so the page remains compact.
-pub(crate) fn kitty_book(log: &KittyLog) -> KittyBook {
-    let mut languages: Vec<String> = Vec::new();
-    for e in &log.entries {
-        if !languages.contains(&e.lang) {
-            languages.push(e.lang.clone());
-        }
-    }
-    let denominator = GLYPH_IDS.len();
-    // Full-body specials outrank attachments; within a class, use discovery
-    // order from the durable ledger so this is meaningful rather than an
-    // accidental consequence of generated enum ordering.
-    let rarest = [GlyphKind::Special, GlyphKind::Accessory]
-        .into_iter()
-        .find_map(|kind| {
-            log.collectibles.iter().rev().find_map(|item| {
-                glyph_from_key(&item.key)
-                    .filter(|id| GLYPHS[*id as usize].kind == kind)
-                    .map(|id| glyph_label(GLYPHS[id as usize].id))
-            })
-        });
-    let mut rows: Vec<KittyBookRow> = Vec::with_capacity(12);
-    for (i, def) in GLYPHS.iter().enumerate() {
-        match def.kind {
-            GlyphKind::Special => rows.push(collectible_row(log, i, "specials")),
-            GlyphKind::Accessory => rows.push(collectible_row(log, i, "accessories")),
-            GlyphKind::Head => {}
-        }
-    }
-    let head_items: Vec<&KittyCollectible> = log
-        .collectibles
-        .iter()
-        .filter(|item| {
-            glyph_from_key(&item.key).is_some_and(|id| GLYPHS[id as usize].kind == GlyphKind::Head)
-        })
-        .collect();
-    let mut head_row = KittyBookRow {
-        tier: "heads",
-        #[cfg(test)]
-        key: "heads",
-        label: "Head variants",
-        seen: !head_items.is_empty(),
-        count: head_items.len() as u64,
-        goal: GLYPHS
-            .iter()
-            .filter(|def| def.kind == GlyphKind::Head)
-            .count(),
-        langs: Vec::new(),
-        first_seen: String::new(),
-        last_seen: String::new(),
-    };
-    for item in head_items {
-        head_row.first_seen = min_ts(&head_row.first_seen, &item.first_seen);
-        head_row.last_seen = max_ts(&head_row.last_seen, &item.last_seen);
-        for code in &item.langs {
-            if !head_row.langs.iter().any(|c| c == code) {
-                head_row.langs.push(code.clone());
-            }
-        }
-    }
-    rows.push(head_row);
-    KittyBook {
-        sightings: log.sightings,
-        collected: GLYPHS
-            .iter()
-            .filter(|def| log.collectibles.iter().any(|item| item.key == def.id))
-            .count(),
-        denominator,
-        languages,
-        rarest,
-        rows,
-    }
-}
-
-/// Serialize the retired Settings-card book as `kittylog …` introspection lines for
-/// legacy model tests. Production `controls settings` compiles the native route's
-/// semantic tree and does not append an off-screen Kitty Log catalog.
-#[cfg(test)]
-pub(crate) fn book_lines(log: &KittyLog) -> Vec<String> {
-    let book = kitty_book(log);
-    let mut out = Vec::with_capacity(book.rows.len() + 1);
-    out.push(format!(
-        "kittylog sightings={} collected={} denominator={} languages=[{}] rarest={}",
-        book.sightings,
-        book.collected,
-        book.denominator,
-        book.languages.join(","),
-        book.rarest.map_or("none", |l| l).to_lowercase(),
-    ));
-    for r in &book.rows {
-        out.push(format!(
-            "kittylog tier={} key={} label={:?} seen={} count={} goal={} langs=[{}] first={:?} last={:?}",
-            r.tier,
-            r.key,
-            r.label,
-            r.seen,
-            r.count,
-            r.goal,
-            r.langs.join(","),
-            r.first_seen,
-            r.last_seen,
-        ));
-    }
-    out
 }
 
 #[cfg(test)]
@@ -3297,11 +3075,6 @@ mod tests {
             "an unpinned ledger claims no companion on startup — the launch \
              kitty rides (the startup import no longer elects the latest \
              discovery; owner ruling, 2026-08-17)"
-        );
-        assert_eq!(
-            kitty_book(host.log()).rarest,
-            Some("Cinnamon Roll"),
-            "rarest selection consumes chronological ledger order"
         );
         host.flush_exit();
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
@@ -4603,88 +4376,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(path.parent().expect("scratch parent"));
-    }
-
-    /// The book: generated-art denominator, reachable grouping, `???`
-    /// (unseen) rows, rarest pick, and the introspection serialization.
-    #[test]
-    fn book_groups_by_tier_with_completeness() {
-        let lex = Lexicon::builtin();
-        let mut log = KittyLog::default();
-        log.record(&sighting(1), lex, "2026-07-01T00:00:00Z");
-        let sleeping = KittySighting {
-            magic: KittyMagic::Sakura,
-            look: KittyLook {
-                variant: CatGlyphId::SpecSleeping,
-                ..KittyLook::default()
-            },
-            ..sighting(2)
-        };
-        log.record(&sleeping, lex, "2026-07-02T00:00:00Z");
-        // A bow-wearing plain cat (v3 §2.1): the accessory chip row lights up.
-        let bowed = KittySighting {
-            traits: TRAIT_SHY | TRAIT_BOW,
-            look: KittyLook {
-                accessory: Some(CatGlyphId::AccBow),
-                ..KittyLook::default()
-            },
-            ..sighting(3)
-        };
-        log.record(&bowed, lex, "2026-07-03T00:00:00Z");
-        let book = kitty_book(&log);
-        assert_eq!(book.sightings, 3);
-        assert_eq!(book.collected, 3, "head + full cat + accessory");
-        assert_eq!(book.denominator, GLYPH_IDS.len(), "generated roster");
-        assert_eq!(book.languages.len(), 1);
-        assert_eq!(book.rarest, Some("Cinnamon Roll"));
-        assert_eq!(book.rows.len(), 8 + 3 + 1, "specials + accessories + heads");
-        let sleep = book.rows.iter().find(|r| r.key == "spec_sleeping").unwrap();
-        assert!(sleep.seen && sleep.tier == "specials" && sleep.count == 1);
-        let witch = book.rows.iter().find(|r| r.key == "spec_witch").unwrap();
-        assert!(!witch.seen, "unseen special renders the ??? row");
-        let bow = book.rows.iter().find(|r| r.key == "acc_bow").unwrap();
-        assert!(bow.tier == "accessories" && bow.seen && bow.count == 1);
-        let crown = book.rows.iter().find(|r| r.key == "acc_crown").unwrap();
-        assert!(
-            crown.tier == "accessories" && !crown.seen && crown.count == 0,
-            "unworn accessory renders the ??? chip"
-        );
-        let heads = book.rows.iter().find(|r| r.key == "heads").unwrap();
-        assert!(heads.seen && heads.tier == "heads" && heads.count == 1);
-        assert_eq!(heads.goal, 25, "aggregate tracks distinct head designs");
-        // The serialization mirrors the same model (screen == introspection).
-        let lines = book_lines(&log);
-        assert_eq!(lines.len(), 1 + book.rows.len());
-        assert!(
-            lines[0].contains("sightings=3")
-                && lines[0].contains("collected=3")
-                && lines[0].contains(&format!("denominator={}", GLYPH_IDS.len()))
-                && lines[0].contains("rarest=cinnamon roll"),
-            "{}",
-            lines[0]
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("tier=specials key=spec_sleeping") && l.contains("seen=true")),
-            "the sleeping-special row serializes"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("tier=accessories key=acc_bow") && l.contains("count=1")),
-            "the bow chip serializes"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|l| l.contains("tier=heads key=heads") && l.contains("count=1 goal=25")),
-            "head progress serializes as distinct designs"
-        );
-        // An EMPTY log still advertises the finite generated roster.
-        let empty = kitty_book(&KittyLog::default());
-        assert_eq!(empty.denominator, GLYPH_IDS.len());
-        assert!(empty.rows.iter().all(|r| !r.seen));
-        assert_eq!(empty.rarest, None);
     }
 }

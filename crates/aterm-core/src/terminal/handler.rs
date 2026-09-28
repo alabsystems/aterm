@@ -127,6 +127,10 @@ define_terminal_handler! {
     charset: CharacterSetState => charset,
     alt_grid: Option<Grid> => alt_grid,
     cursor_save: super::CursorSaveState => cursor_save,
+    // The alt-screen scroll-off archive, for ONE handler call: the orphaned-screen
+    // leave (a shell prompt on the alternate screen) commits the alt grid before
+    // it swaps it away — see `AltArchiveState::leave_orphaned`.
+    alt_archive: super::alt_archive::AltArchiveState => alt_archive,
 
     // Protocol state
     dcs: DcsState => dcs,
@@ -143,8 +147,11 @@ define_terminal_handler! {
     // Monotonic repaint-blink epoch (see the `Terminal` field doc): the DEC
     // dispatcher bumps it on a DECTCEM hide processed inside DEC-2026 sync.
     repaint_blink_epoch: u64 => repaint_blink_epoch,
+    // The foreground handback's asserted evidence (see the `Terminal` field
+    // doc): the DEC and CSI dispatchers set a bit on each parsed setter.
+    evidence_asserted: u16 => evidence_asserted,
     absolute_row_revision: u64 => absolute_row_revision,
-    // OSC / escape-sequence policy (#7994, #7995, #7996): the installed engine
+    // OSC / escape-sequence policy (#7994, #7995): the installed engine
     // plus the gate verdicts compiled from it. Hot-swappable at runtime via
     // `Terminal::apply_policy_engine`, which recompiles the table in the same
     // step. With no engine installed `send_response` and the OSC palette
@@ -154,9 +161,7 @@ define_terminal_handler! {
     // `TerminalModes::allow_*` / per-capability `authorized` state. Gates whose
     // probe is a compile-time constant read `self.policy.gates()` instead — see
     // `policy_gates.rs`. See also `response_rate_limiter.rs` and
-    // `policy_bridge.rs` module docs, and
-    // designs/2026-04-19-osc-policy-engine.md §6.3 for the Release N
-    // deprecation-window semantics.
+    // `policy_bridge.rs` module docs.
     policy: super::policy_gates::PolicyState => policy,
     current_working_directory: Option<String> => current_working_directory,
     // Platform flag: secure keyboard entry (reset by RIS, #7336)

@@ -326,3 +326,110 @@ pub fn harness_exit_record_model() -> Model {
         }
     }
 }
+
+/// THE UPGRADE'S LOOKS AT ONE SESSION, as its worker takes them at the
+/// loop's idle points (`aterm-gui`'s `harness_host::WorkerIdle::at_idle`,
+/// over `aterm-agent`'s `upgrade_drive::due`), and ITS NOTE BEHIND
+/// (`harness_host::ask_note`, over `upgrade_drive::note_behind`), from the
+/// worker's attach at a fresh launch. For ONE session: `due` it has an
+/// upgrade to take; `readable` it can be read (the instance's socket
+/// answers, Claude Code's record of the agent is written — at a launch, a
+/// moment after the attach); `ready` it was announced to and answered
+/// READY, so its next step restarts it; `looks` a look is owed — the loop
+/// parked for the session's next idle point, or a later look set on the
+/// ladder; `done` the upgrade said its last word; `owed` its note behind is
+/// still to be taken; `noted` its upgrade state is minted, and `aged` with
+/// its age from the attach.
+///
+/// * `Look` — a look that reads an upgrade to take asks the owed note first,
+///   then steps it: the notice (the READY answer folded in), then the
+///   restart and the last word. A step that finds no state mints one, its
+///   age from the step.
+/// * `NotDue` — a look that reads nothing to take lets the upgrade go (the
+///   note, read, has nothing to note).
+/// * `Unread` — a look that could not read says so (`wait:no-socket`,
+///   `wait:no-record`) and sets a later look on the ladder.
+/// * `Note` / `NoteUnread` — the owed note asked (at the attach, at the
+///   host's wakes and ladder, at an idle point): read, it mints the state
+///   with the attach's age, or finds nothing to note; unread, it stays owed.
+/// * `Lose` / `Regain` — the reads fail and come back (the lanes held and
+///   given back; the record written).
+/// * `Settle` — the upgrade stops being due by another hand (the owner's
+///   `--skip`, a person's own restart onto the build).
+///
+/// `NeverDropped`: an upgrade due and not done always has a look owed — one
+/// that answered READY included (the live re-test of 155c72a28, 2026-09-26:
+/// every control lane held, the looks' `who` was refused, `due` read "not
+/// due", and four of seven sessions were let go for good — one that had
+/// answered READY to "aterm will restart this Claude Code" among them).
+/// `BehindFromTheAttach`: a state minted is behind from the attach (the same
+/// re-test's N3: the note was asked once, at the attach, before the launch's
+/// record was written, and the first step minted the state after the first
+/// busy turn, its age from then).
+///
+/// `Buggy=1` is the host of 155c72a28: an unreadable look owes nothing
+/// (`Regain`, `Look`, `Lose`, `Unread`: a READY'd session let go), and an
+/// unreadable note is given up (`NoteUnread`, `Regain`, `Look`). Tier-1, in
+/// two halves: `aterm-gui`'s `the_real_look_conforms_to_the_upgrade_look_model`
+/// drives the real `attach`, `WorkerIdle` and `ask_note` through every
+/// transition of the model from every reachable state, and projects the
+/// worker's park, later look and owed note onto `looks` and `owed`; and
+/// `aterm-agent`'s `the_real_classifier_conforms_to_the_upgrade_look_model`
+/// drives the real `upgrade_drive::due_among` and `no_record` over every
+/// combination of what a look reads of a tab (the record, its group, its
+/// process's ids and argv, its launch's age), projecting each onto `due` and
+/// `readable` — `readable` is every read the verdict needed — and checks the
+/// model enables the action its verdict is.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn harness_upgrade_look_model() -> Model {
+    crate::ty_model! {
+        HarnessUpgradeLook {
+            const Buggy = 0;
+            var due = 1;
+            var readable = 0;
+            var ready = 0;
+            var looks = 1;
+            var done = 0;
+            var owed = 1;
+            var noted = 0;
+            var aged = 0;
+
+            action Look when (looks == 1 && done == 0 && due == 1 && readable == 1) {
+                ready = 1;
+                done = ready;
+                looks = if (ready == 1) { 0 } else { 1 };
+                owed = 0;
+                noted = 1;
+                aged = if (noted == 1) { aged } else { owed };
+            }
+            action NotDue when (looks == 1 && done == 0 && due == 0 && readable == 1) {
+                looks = 0;
+                owed = 0;
+            }
+            action Unread when (looks == 1 && done == 0 && readable == 0) {
+                looks = if (Buggy == 1) { 0 } else { 1 };
+            }
+            action Note when (owed == 1 && readable == 1) {
+                owed = 0;
+                noted = if (due == 1) { 1 } else { noted };
+                aged = if (due == 1) { 1 } else { aged };
+            }
+            action NoteUnread when (owed == 1 && readable == 0) {
+                owed = if (Buggy == 1) { 0 } else { 1 };
+            }
+            action Lose when (readable == 1) {
+                readable = 0;
+            }
+            action Regain when (readable == 0) {
+                readable = 1;
+            }
+            action Settle when (due == 1 && done == 0) {
+                due = 0;
+            }
+
+            invariant NeverDropped: done == 1 || due == 0 || looks == 1;
+            invariant BehindFromTheAttach: noted == 0 || aged == 1;
+        }
+    }
+}

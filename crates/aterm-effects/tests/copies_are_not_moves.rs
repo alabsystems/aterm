@@ -46,7 +46,7 @@ use trail_host::*;
 // ===========================================================================
 // a2 — ERASES UNDER A TWIN, AND COPIES THAT LAND BESIDE A LINE: `f1`…`f6`,
 // `pre1` and the counterexamples `ce*`. One host: the scroll seam first,
-// LOCK A (caret row not re-read), the tick; the pane columns noted; `far0`
+// the frame hold (caret row not re-read), the tick; the pane columns noted; `far0`
 // drops every far-row read. Keys: a group's presses 6 ms apart, 90 ms after
 // the last event.
 // ===========================================================================
@@ -579,7 +579,7 @@ mod a2 {
 
 // ===========================================================================
 // a3 — COPIES UNDER THE GUI'S PACING: `h1`, `h3`, `h4`, `h4b`, `h5` and
-// `p1`…`p4`. One host: the scroll seam, LOCK A (caret
+// `p1`…`p4`. One host: the scroll seam, the frame hold (caret
 // row not re-read), the tick. HOST OPTIONS on the case: `flat` = a frame
 // every 16 ms; `paced` = the GUI's real pacing (a frame at 16 ms only while
 // `needs_frame_cadence`, else at `next_change_deadline`, else only when
@@ -1528,7 +1528,7 @@ mod l3c {
 // ===========================================================================
 // d4 — A GLYPH CAUGHT UP, A TYPO FIXED, UNDER THE PREVIOUS COMMAND: `t4`,
 // `t5`. Host: `trail_host::PacedHost`
-// (the scroll seam, the alt re-baseline, LOCK A with the caret row not
+// (the scroll seam, the alt re-baseline, the frame hold with the caret row not
 // re-read) on a flat 16 ms or 8 ms train, the GUI's real pacing, or the
 // pet's (`fr16`, `fr8`, `paced`, `pet`). Keys 90–110 ms apart. The reading is
 // `(followed, frames of 90 the previous command's row was lit)` after the

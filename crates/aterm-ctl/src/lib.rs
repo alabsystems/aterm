@@ -147,7 +147,8 @@
 //!   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
 //!   identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
 //!   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
-//!   agent_fp=<hex16|-> supervisor=<holder|->
+//!   agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
+//!   user_title=<pct|-> supervisor=<holder|->
 //!   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
 //!   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>[ *]` (the server's
 //!   `sessions` line prefixed with the instance pid; `*` marks the calling
@@ -410,7 +411,8 @@ CLIENT VERBS (answered by aterm-ctl itself, no server round-trip):
                   window=<id|none|-> active=<0|1|-> wfocus=<0|1|-> detail=<pct|->
                   identity=<name|-> path=<frozen|live> program=<name|-> agent=<word|->
                   agent_detail=<pct|-> agent_rev=<n> agent_since_ms=<ms> agent_gen=<e.s|->
-                  agent_fp=<hex16|-> supervisor=<holder|->
+                  agent_fp=<hex16|-> human_ms=<ms|-> role=<pct|-> attention=<pct|->
+                  user_title=<pct|-> supervisor=<holder|->
                   path_evidence=<measured:<ms>|unconfirmed:<ms>|carried|->
                   copy=<managed|foreign|-> upgrade=<-|<state>/<to>/<why>/<age>>[ *]
                   (* = the calling terminal's own session; window= is the
@@ -1179,6 +1181,13 @@ const SCREEN_ENV: &str = "STY";
 /// them verbatim — `TERM` is what tells that window apart from a real pane.
 const TERM_ENV: &str = "TERM";
 
+/// The terminal program — tier 3's second corroboration. tmux 3.2 and later
+/// overwrite it with `tmux` in every pane, whatever `default-terminal` makes
+/// `TERM`; aterm's spawn seam stamps `aterm` for every session shell. So it
+/// tells a tmux pane from an aterm window exactly as `TERM` does, in the one
+/// configuration `TERM` cannot.
+const TERM_PROGRAM_ENV: &str = "TERM_PROGRAM";
+
 /// A multiplexer standing between the calling shell and the aterm session a
 /// flagless call would drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1231,6 +1240,30 @@ fn marker_kind(tmux: Option<&str>, sty: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// The environment values [`detect_mux_nesting`] decides from — each the value
+/// of the variable its field names, `None` when unset — passed in, so the
+/// decision is a pure function the tests drive without touching the process
+/// environment ([`mux_nesting_from_env`] reads the real one).
+#[derive(Debug, Clone, Copy, Default)]
+struct MuxEnv<'a> {
+    /// [`MUX_ENV`], the in-pane verdict.
+    mux: Option<&'a str>,
+    /// [`MUX_BASE_ENV`], the session shell's own multiplexer environment.
+    base: Option<&'a str>,
+    /// [`MUX_OUTER_SID_ENV`].
+    outer_sid: Option<&'a str>,
+    /// `$TMUX`.
+    tmux: Option<&'a str>,
+    /// `$STY`.
+    sty: Option<&'a str>,
+    /// `$TERM`.
+    term: Option<&'a str>,
+    /// [`SELF_SID_ENV`], the session identity in scope.
+    self_sid: Option<&'a str>,
+    /// [`TERM_PROGRAM_ENV`].
+    term_program: Option<&'a str>,
+}
+
 /// Decide whether a multiplexer sits between this shell and its aterm session,
 /// from the environment values alone (passed in, so the decision is a pure
 /// function the tests can drive without touching the process environment).
@@ -1254,24 +1287,27 @@ fn marker_kind(tmux: Option<&str>, sty: Option<&str>) -> Option<&'static str> {
 ///    in scope (something to mis-target) and `TERM` names a multiplexer (the
 ///    corroboration `$TMUX`/`$STY` need — see [`TERM_ENV`]).
 ///
-/// The known gap, stated rather than papered over: a tmux configured with
-/// `default-terminal "xterm-256color"` defeats tier 3's `TERM` corroboration.
-/// Tier 2 catches it — it never reads `TERM` — for every session started by a
-/// shell the integration loads into; a pane of a shell with neither mark is
-/// still invisible, and `aterm ctl mux` says `mux=none` there rather than
+/// A tmux configured with `default-terminal "xterm-256color"` defeats tier 3's
+/// `TERM` corroboration; tier 2 catches it (it never reads `TERM`), and tier 3
+/// takes tmux's own `TERM_PROGRAM=tmux` ([`TERM_PROGRAM_ENV`]) instead. The
+/// remaining gap, stated rather than papered over: a pre-3.2 tmux (which does
+/// not set `TERM_PROGRAM`) with that `default-terminal`, in a pane of a shell
+/// with neither mark — `aterm ctl mux` says `mux=none` there rather than
 /// pretending.
-fn detect_mux_nesting(
-    mux: Option<&str>,
-    base: Option<&str>,
-    outer_sid: Option<&str>,
-    tmux: Option<&str>,
-    sty: Option<&str>,
-    term: Option<&str>,
-    self_sid: Option<&str>,
-) -> Option<MuxNesting> {
+fn detect_mux_nesting(env: &MuxEnv<'_>) -> Option<MuxNesting> {
     fn set(v: Option<&str>) -> Option<&str> {
         v.filter(|s| !s.is_empty())
     }
+    let MuxEnv {
+        mux,
+        base,
+        outer_sid,
+        tmux,
+        sty,
+        term,
+        self_sid,
+        term_program,
+    } = *env;
     let outer = set(outer_sid).or_else(|| set(self_sid)).map(str::to_string);
     if let Some(marker) = set(mux) {
         if matches!(marker, "0" | "off" | "no" | "none" | "false") {
@@ -1306,9 +1342,17 @@ fn detect_mux_nesting(
     // deny `question_mark`, and `outer` is still moved into `outer_sid` below,
     // so the borrow-and-discard is the equivalent that keeps it owned.
     outer.as_ref()?;
-    let term_kind = mux_kind(set(term)?)?;
+    // Two corroborations, either enough: a multiplexer-written `TERM`, or — for a
+    // tmux whose `default-terminal` is `xterm-256color` — the `TERM_PROGRAM=tmux`
+    // tmux 3.2 and later stamp into every pane whatever `TERM` says. aterm's spawn
+    // seam stamps `TERM_PROGRAM=aterm` for every session shell, so an aterm window
+    // launched from a pane re-stamps it and stays distinguishable: the innermost
+    // writer wins, the argument [`TERM_ENV`] makes for `TERM`.
+    let corroborated = set(term)
+        .and_then(mux_kind)
+        .or_else(|| (set(tmux).is_some() && set(term_program) == Some("tmux")).then_some("tmux"))?;
     Some(MuxNesting {
-        kind: marker_kind(tmux, sty).unwrap_or(term_kind),
+        kind: marker_kind(tmux, sty).unwrap_or(corroborated),
         outer_sid: outer,
         detected_by: "environment",
     })
@@ -1316,15 +1360,27 @@ fn detect_mux_nesting(
 
 /// [`detect_mux_nesting`] over the real process environment.
 fn mux_nesting_from_env() -> Option<MuxNesting> {
-    detect_mux_nesting(
-        env::var(MUX_ENV).ok().as_deref(),
-        env::var(MUX_BASE_ENV).ok().as_deref(),
-        env::var(MUX_OUTER_SID_ENV).ok().as_deref(),
-        env::var(TMUX_ENV).ok().as_deref(),
-        env::var(SCREEN_ENV).ok().as_deref(),
-        env::var(TERM_ENV).ok().as_deref(),
-        env::var(SELF_SID_ENV).ok().as_deref(),
-    )
+    let var = |name: &str| env::var(name).ok();
+    let (mux, base, outer_sid, tmux, sty, term, self_sid, term_program) = (
+        var(MUX_ENV),
+        var(MUX_BASE_ENV),
+        var(MUX_OUTER_SID_ENV),
+        var(TMUX_ENV),
+        var(SCREEN_ENV),
+        var(TERM_ENV),
+        var(SELF_SID_ENV),
+        var(TERM_PROGRAM_ENV),
+    );
+    detect_mux_nesting(&MuxEnv {
+        mux: mux.as_deref(),
+        base: base.as_deref(),
+        outer_sid: outer_sid.as_deref(),
+        tmux: tmux.as_deref(),
+        sty: sty.as_deref(),
+        term: term.as_deref(),
+        self_sid: self_sid.as_deref(),
+        term_program: term_program.as_deref(),
+    })
 }
 
 /// Verbs answered by this CLIENT, which never reach a server and so are not in
@@ -8354,15 +8410,11 @@ mod tests {
     /// marker inherited by a shell that is not in a pane at all).
     #[test]
     fn mux_marker_decides_and_its_disable_spellings_turn_the_guard_off() {
-        let n = detect_mux_nesting(
-            Some("screen"),
-            None,
-            Some("s-outer"),
-            None,
-            None,
-            None,
-            None,
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            mux: Some("screen"),
+            outer_sid: Some("s-outer"),
+            ..MuxEnv::default()
+        })
         .expect("a marked boundary is nested");
         assert_eq!(n.kind, "screen");
         assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
@@ -8372,15 +8424,13 @@ mod tests {
         );
         // The marker wins even when nothing else in the environment agrees —
         // including a session base that would otherwise answer "no crossing".
-        let n = detect_mux_nesting(
-            Some("tmux"),
-            Some("|"),
-            None,
-            None,
-            None,
-            Some("xterm-256color"),
-            Some("s-env"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            mux: Some("tmux"),
+            base: Some("|"),
+            term: Some("xterm-256color"),
+            self_sid: Some("s-env"),
+            ..MuxEnv::default()
+        })
         .expect("marked");
         assert_eq!(n.kind, "tmux");
         assert_eq!(
@@ -8390,15 +8440,15 @@ mod tests {
         );
         for off in ["0", "off", "no", "none", "false"] {
             assert_eq!(
-                detect_mux_nesting(
-                    Some(off),
-                    Some("|"),
-                    Some("s-outer"),
-                    Some("/tmp/tmux-1000/default,9,0"),
-                    None,
-                    Some("screen-256color"),
-                    Some("s-outer"),
-                ),
+                detect_mux_nesting(&MuxEnv {
+                    mux: Some(off),
+                    base: Some("|"),
+                    outer_sid: Some("s-outer"),
+                    tmux: Some("/tmp/tmux-1000/default,9,0"),
+                    term: Some("screen-256color"),
+                    self_sid: Some("s-outer"),
+                    ..MuxEnv::default()
+                }),
                 None,
                 "ATERM_MUX={off} must disable the guard outright"
             );
@@ -8418,15 +8468,13 @@ mod tests {
     fn mux_session_base_decides_a_pane_without_reading_term() {
         // A session shell born outside any multiplexer stamps "|"; the pane's
         // own $STY no longer matches, and that mismatch alone is the crossing.
-        let n = detect_mux_nesting(
-            None,
-            Some("|"),
-            None,
-            None,
-            Some("4242.pts-3.host"),
-            Some("screen.xterm-256color"),
-            Some("s-outer"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            base: Some("|"),
+            sty: Some("4242.pts-3.host"),
+            term: Some("screen.xterm-256color"),
+            self_sid: Some("s-outer"),
+            ..MuxEnv::default()
+        })
         .expect("STY differing from the session base is a pane");
         assert_eq!(n.kind, "screen");
         assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
@@ -8434,15 +8482,13 @@ mod tests {
         // THE GAP TIER 3 CANNOT SEE: tmux with `default-terminal
         // "xterm-256color"` looks exactly like an aterm window to TERM. The base
         // never reads TERM, so it calls this a pane anyway.
-        let n = detect_mux_nesting(
-            None,
-            Some("|"),
-            None,
-            Some("/tmp/tmux-1000/default,9,0"),
-            None,
-            Some("xterm-256color"),
-            Some("s-outer"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            base: Some("|"),
+            tmux: Some("/tmp/tmux-1000/default,9,0"),
+            term: Some("xterm-256color"),
+            self_sid: Some("s-outer"),
+            ..MuxEnv::default()
+        })
         .expect("a tmux pane with aterm's own TERM is still a pane");
         assert_eq!(n.kind, "tmux", "the marker names the program, not TERM");
         assert_eq!(n.detected_by, "session-base");
@@ -8451,43 +8497,36 @@ mod tests {
         // is NOT refused — the case the loader guard was invented for, decided
         // here without TERM.
         assert_eq!(
-            detect_mux_nesting(
-                None,
-                Some("/tmp/tmux-1000/default,9,0|"),
-                None,
-                Some("/tmp/tmux-1000/default,9,0"),
-                None,
-                Some("xterm-256color"),
-                Some("s-fresh"),
-            ),
+            detect_mux_nesting(&MuxEnv {
+                base: Some("/tmp/tmux-1000/default,9,0|"),
+                tmux: Some("/tmp/tmux-1000/default,9,0"),
+                term: Some("xterm-256color"),
+                self_sid: Some("s-fresh"),
+                ..MuxEnv::default()
+            }),
             None,
             "a base equal to this environment means nothing was entered since"
         );
         // A nested multiplexer inside that window is a crossing again.
-        let n = detect_mux_nesting(
-            None,
-            Some("/tmp/tmux-1000/default,9,0|"),
-            None,
-            Some("/tmp/tmux-1000/default,9,7"),
-            None,
-            Some("screen-256color"),
-            Some("s-fresh"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            base: Some("/tmp/tmux-1000/default,9,0|"),
+            tmux: Some("/tmp/tmux-1000/default,9,7"),
+            term: Some("screen-256color"),
+            self_sid: Some("s-fresh"),
+            ..MuxEnv::default()
+        })
         .expect("a DIFFERENT tmux than the session's own is a pane");
         assert_eq!(n.kind, "tmux");
         // Different base, but no marker names a multiplexer here (someone unset
         // $TMUX by hand): there is nothing to report, and inventing a kind from
         // TERM would be the papering-over this whole seam refuses.
         assert_eq!(
-            detect_mux_nesting(
-                None,
-                Some("/tmp/tmux-1000/default,9,0|"),
-                None,
-                None,
-                None,
-                Some("screen-256color"),
-                Some("s-fresh"),
-            ),
+            detect_mux_nesting(&MuxEnv {
+                base: Some("/tmp/tmux-1000/default,9,0|"),
+                term: Some("screen-256color"),
+                self_sid: Some("s-fresh"),
+                ..MuxEnv::default()
+            }),
             None,
             "a base mismatch with no live marker names no multiplexer"
         );
@@ -8503,15 +8542,12 @@ mod tests {
     /// apart from a real pane.
     #[test]
     fn mux_fallback_needs_an_aterm_identity_and_a_multiplexer_term() {
-        let n = detect_mux_nesting(
-            None,
-            None,
-            None,
-            None,
-            Some("4242.pts-3.host"),
-            Some("screen.xterm-256color"),
-            Some("s-outer"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            sty: Some("4242.pts-3.host"),
+            term: Some("screen.xterm-256color"),
+            self_sid: Some("s-outer"),
+            ..MuxEnv::default()
+        })
         .expect("STY + a screen TERM inside an aterm session is a pane");
         assert_eq!(n.kind, "screen");
         assert_eq!(n.outer_sid.as_deref(), Some("s-outer"));
@@ -8519,28 +8555,23 @@ mod tests {
         // tmux's DEFAULT TERM is screen-256color, so the marker — not TERM —
         // names the program. Reporting "screen" for a tmux pane would send the
         // reader to the wrong manual.
-        let n = detect_mux_nesting(
-            None,
-            None,
-            None,
-            Some("/tmp/tmux-1000/default,9,0"),
-            None,
-            Some("screen-256color"),
-            Some("s-outer"),
-        )
+        let n = detect_mux_nesting(&MuxEnv {
+            tmux: Some("/tmp/tmux-1000/default,9,0"),
+            term: Some("screen-256color"),
+            self_sid: Some("s-outer"),
+            ..MuxEnv::default()
+        })
         .expect("tmux pane");
         assert_eq!(n.kind, "tmux");
         // An aterm window launched FROM a pane: markers inherited, TERM aterm's.
         assert_eq!(
-            detect_mux_nesting(
-                None,
-                None,
-                None,
-                Some("/tmp/tmux-1000/default,9,0"),
-                Some("4242.pts-3.host"),
-                Some("xterm-256color"),
-                Some("s-fresh"),
-            ),
+            detect_mux_nesting(&MuxEnv {
+                tmux: Some("/tmp/tmux-1000/default,9,0"),
+                sty: Some("4242.pts-3.host"),
+                term: Some("xterm-256color"),
+                self_sid: Some("s-fresh"),
+                ..MuxEnv::default()
+            }),
             None,
             "a stale $TMUX/$STY with aterm's own TERM is not a pane"
         );
@@ -8548,15 +8579,11 @@ mod tests {
         // mis-target: flagless calls there legitimately drive the user's
         // windows through the `latest` pointer, and must not be refused.
         assert_eq!(
-            detect_mux_nesting(
-                None,
-                None,
-                None,
-                None,
-                Some("1.pts-0.h"),
-                Some("screen"),
-                None
-            ),
+            detect_mux_nesting(&MuxEnv {
+                sty: Some("1.pts-0.h"),
+                term: Some("screen"),
+                ..MuxEnv::default()
+            }),
             None,
             "no aterm session identity in scope means nothing to mis-target"
         );
@@ -8564,16 +8591,59 @@ mod tests {
         // both deliver empty values) — including the base, whose real spelling
         // is never shorter than "|".
         assert_eq!(
-            detect_mux_nesting(
-                Some(""),
-                Some(""),
-                Some(""),
-                Some(""),
-                Some(""),
-                Some(""),
-                Some("")
-            ),
+            detect_mux_nesting(&MuxEnv {
+                mux: Some(""),
+                base: Some(""),
+                outer_sid: Some(""),
+                tmux: Some(""),
+                sty: Some(""),
+                term: Some(""),
+                self_sid: Some(""),
+                ..MuxEnv::default()
+            }),
             None
+        );
+    }
+
+    /// Tier 3's second corroboration: a tmux whose `default-terminal` is
+    /// `xterm-256color` leaves `TERM` looking like aterm's own, but tmux 3.2 and
+    /// later stamp `TERM_PROGRAM=tmux` into every pane. Before this, that pane in
+    /// a shell with neither mark read `mux=none`. Negative control: an aterm
+    /// window launched FROM the pane inherits `$TMUX` but re-stamps
+    /// `TERM_PROGRAM=aterm`, and is not a pane; and `TERM_PROGRAM=tmux` without
+    /// a `$TMUX` marker names nothing.
+    #[test]
+    fn mux_fallback_takes_tmuxs_term_program_when_term_is_xterm() {
+        let n = detect_mux_nesting(&MuxEnv {
+            tmux: Some("/tmp/tmux-1000/default,9,0"),
+            term: Some("xterm-256color"),
+            self_sid: Some("s-outer"),
+            term_program: Some("tmux"),
+            ..MuxEnv::default()
+        })
+        .expect("a tmux 3.2+ pane with an xterm TERM is still a pane");
+        assert_eq!(n.kind, "tmux");
+        assert_eq!(n.detected_by, "environment");
+        assert_eq!(
+            detect_mux_nesting(&MuxEnv {
+                tmux: Some("/tmp/tmux-1000/default,9,0"),
+                term: Some("xterm-256color"),
+                self_sid: Some("s-fresh"),
+                term_program: Some("aterm"),
+                ..MuxEnv::default()
+            }),
+            None,
+            "an aterm window launched from a pane re-stamps TERM_PROGRAM"
+        );
+        assert_eq!(
+            detect_mux_nesting(&MuxEnv {
+                term: Some("xterm-256color"),
+                self_sid: Some("s-outer"),
+                term_program: Some("tmux"),
+                ..MuxEnv::default()
+            }),
+            None,
+            "TERM_PROGRAM alone, with no $TMUX, names no pane"
         );
     }
 

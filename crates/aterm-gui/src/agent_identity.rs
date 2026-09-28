@@ -278,6 +278,14 @@ fn identity_dir(root: &Path, name: &str) -> Option<PathBuf> {
         .map(|_| dir)
 }
 
+/// Every identity on disk, by name — the `identities` verb's roster, for the
+/// identity picker. A missing or unreadable root is an empty roster.
+pub(crate) fn roster() -> Vec<String> {
+    aterm_types::dirs::identities_dir()
+        .and_then(|root| list_names(&root).ok())
+        .unwrap_or_default()
+}
+
 /// Every identity under `root`, by name: the entries whose name IS its own
 /// folded spelling and which are real directories. Anything else in the root
 /// is not an identity and is not listed. A missing root is an empty roster.
@@ -547,7 +555,7 @@ mod tests {
     #[test]
     fn ensure_resolves_the_identities_root_through_the_state_home() {
         let state = scratch("state");
-        aterm_log::env::scoped("ATERM_STATE_HOME", &state, || {
+        crate::test_env::scoped("ATERM_STATE_HOME", &state, || {
             assert_eq!(
                 dir_for("worker"),
                 Some(state.join("identities").join("worker"))
@@ -740,7 +748,7 @@ mod tests {
         let humans_opencode = xdg.join("opencode");
         std::fs::create_dir_all(&humans_opencode).unwrap();
         let root = scratch.join("identities");
-        aterm_log::env::scoped("XDG_CONFIG_HOME", &xdg, || {
+        crate::test_env::scoped("XDG_CONFIG_HOME", &xdg, || {
             let dir = ensure_in(&root, "worker", true).expect("created");
             assert!(
                 dir.join(".claude/CLAUDE.md").is_file(),

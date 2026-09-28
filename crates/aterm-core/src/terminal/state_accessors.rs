@@ -555,10 +555,10 @@ impl Terminal {
         self.hyperlink_auth.extra_schemes().len()
     }
 
-    /// Install or replace the OSC / escape-sequence policy engine (#7996).
+    /// Install or replace the OSC / escape-sequence policy engine.
     ///
-    /// Called by the FFI shim `aterm_terminal_apply_policy` after parsing a TOML
-    /// policy document, and by the GUI at startup. The stored engine is LIVE and
+    /// Called by the GUI for every session before its reader runs. The stored
+    /// engine is LIVE and
     /// ENFORCING: the handler-side wiring consults
     /// `policy_engine.evaluate(sequence, origin)` at the OSC 52 / XTWINOPS /
     /// response / rate-limit gates (see `policy_bridge.rs`), so installing an
@@ -570,11 +570,11 @@ impl Terminal {
         self.policy.install(engine);
     }
 
-    /// Clear the installed policy engine (#7996).
+    /// Clear the installed policy engine.
     ///
     /// Leaves the terminal in its legacy `TerminalModes::allow_*`-only
-    /// behavior. Primarily useful for tests and checkpoint restore
-    /// (#7997 will serialize the engine so this path stays explicit).
+    /// behavior — the posture a checkpoint restore starts from, since a
+    /// checkpoint deliberately does not carry the engine.
     #[cfg(test)]
     pub fn clear_policy_engine(&mut self) {
         // `clear` recompiles the gate table back to the legacy posture in the
@@ -645,6 +645,24 @@ impl Terminal {
         self.transient
             .print_anchor
             .map(|(row, col)| (row, col, self.transient.print_anchor_seq))
+    }
+
+    /// What the ACTIVE grid holds NOW at the echo anchor's run's LAST cell —
+    /// `(row, col - 1)` of [`Self::print_anchor`], live whatever the viewport's
+    /// scroll position (the anchor is an active-grid coordinate) — in
+    /// [`Self::row_cols_into`]'s per-column convention: the lead char, `'\0'`
+    /// at a wide continuation, `' '` for a blank. `None` before the first
+    /// print, for a run that ended at column 0, or when the anchor lies off
+    /// the grid (a resize since). Read under the same lock hold as the anchor,
+    /// it tells the cursor-effect host whether a run ended on the key just
+    /// typed or on something the program drew after it — zsh's i-search
+    /// echoes `<glyph>_` and ends on its fake cursor. One cell, no allocation.
+    #[must_use]
+    pub fn print_anchor_glyph(&self) -> Option<char> {
+        let (row, col) = self.transient.print_anchor?;
+        let col = col.checked_sub(1)?;
+        (row < self.grid.rows() && col < self.grid.cols())
+            .then(|| self.grid.screen_row_view(row).col_char(col))
     }
 
     /// The VIEWPORT row the cursor projects onto, on screen or not.

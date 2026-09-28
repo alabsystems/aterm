@@ -604,7 +604,7 @@ pub fn is_reparse(meta: &Metadata) -> bool {
     meta.file_type().is_symlink()
 }
 
-/// Remove whatever indirection sits at `link`. On Unix a `channels/<ch>/current` link is a
+/// Remove whatever indirection sits at `link`. On Unix a `store/<program>/current` link is a
 /// symlink, so `remove_file` unlinks it (never following into the target). Best-effort.
 pub fn remove_link(link: &Path) {
     let _ = fs::remove_file(link);
@@ -641,6 +641,13 @@ pub fn open_create_write(path: &Path, mode: u32) -> io::Result<File> {
         .truncate(true)
         .mode(mode)
         .open(path)
+}
+
+/// Open `path` the way [`sync_file_contents`] needs it: read-only — `fsync(2)` takes any
+/// open descriptor, and a read-only open never fails on a file the store cannot write
+/// (the `dmg` lane's vendor bundle keeps its modes).
+pub fn open_for_sync(path: &Path) -> io::Result<File> {
+    File::open(path)
 }
 
 /// Push ONE open file's contents out of the page cache: a plain `fsync(2)`.
@@ -680,6 +687,22 @@ pub fn permission_mode(meta: &Metadata) -> u32 {
     meta.permissions().mode()
 }
 
+/// Whether this platform's filesystems store POSIX permission bits an `fstat` reads
+/// back. Unix does, so the tree-root walk folds the inode's bits ([`permission_mode`])
+/// and never a declared-mode record ([`crate::tree::tree_root_declared`]).
+pub const HAS_POSIX_MODES: bool = true;
+
+/// The mode slot the extraction-time fold records for a file just written with
+/// `requested` bits: the bits READ BACK from the open handle (`meta`), masked to
+/// `0o7777` — never the request — so a filesystem that stores something other than what
+/// it was asked for moves the root and the stage fails closed. Unix stores them
+/// verbatim (`fchmod`), so this equals `requested` on every filesystem atpkg has met.
+#[must_use]
+pub fn folded_mode(meta: &Metadata, requested: u32) -> u32 {
+    let _ = requested;
+    permission_mode(meta) & 0o7777
+}
+
 /// The raw OS bytes of an `OsStr` (no lossy conversion), for the tree-root path hash.
 #[must_use]
 pub fn os_str_bytes(s: &OsStr) -> &[u8] {
@@ -711,7 +734,7 @@ pub fn volume_free_bytes(dir: &Path) -> Option<u64> {
 /// Atomically point `link` at `target`: create a sibling temp symlink and `rename(2)` it
 /// over `link`. `rename` is atomic on POSIX, so the swap has no window where `link` is
 /// missing or partially written — even if a previous `link` already existed. The
-/// directory-indirection primitive behind `channels/<ch>/current` and the sysroot dir links.
+/// directory-indirection primitive behind `store/<program>/current` and the sysroot dir links.
 pub fn atomic_symlink(target: &Path, link: &Path) -> io::Result<()> {
     // `Path::file_name` / `OsStr::to_str` go via `call1`: std's INLINED `unsafe`
     // (the `from_utf8_unchecked` fast path, the `OsStr` byte-slice casts) is

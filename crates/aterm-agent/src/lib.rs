@@ -789,6 +789,11 @@ COMMANDS
     prompt <text...>   Type <text>, press Enter, then BLOCK until the agent's turn
                        settles (no screen change for --idle ms), and print the
                        settled screen. This is the one you want for a drive loop.
+                       Real instructions for a MODEL worker (Claude Code) go by
+                       `task` (below), as mail: a plain `aterm ctl turn` delivers
+                       its text as one bracketed paste, which the model reads as
+                       PASTED, not as its human's words — its own injection
+                       safeguard may refuse to act on it and ask.
     read               Print the live screen (one row per line).
     await <cond>       Block until a condition, then print the kernel's verdict:
                          idle <ms>        surface unchanged for <ms> (turn done)
@@ -853,7 +858,9 @@ SUPERVISING A WORKER (an agent session — Claude Code or Codex — in another t
                        read-only subcommand and form (`git branch NAME`
                        creates). Anywhere on the line, these refuse: git
                        push/reset/commit…, `git -c`, `git --output`,
-                       `--ext-diff`, `grep -O`, a redirect to a file (`>&file`
+                       `--ext-diff`, `git grep -O` in any spelling (`-nO`,
+                       `--open`), `git <cmd> --help` (it runs the configured
+                       man viewer), a redirect to a file (`>&file`
                        too), sed -i, python3 -c, sort -o and
                        --compress-program, rg --pre, printf -v, less +cmd,
                        date -s, uniq IN OUT, find -fprint, and an assignment

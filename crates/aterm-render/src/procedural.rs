@@ -13,8 +13,8 @@
 //! Coverage comes in two regimes, split by family:
 //!
 //! * ORTHOGONAL families (axis-aligned strokes and fills: lines, junctions,
-//!   dashes, doubles, blocks, shades, quadrants, sextants, braille, the
-//!   legacy eighth blocks U+1FB70–1FB8B) are HARD 0/255 — no antialiasing —
+//!   dashes, doubles, blocks, shades, quadrants, sextants, octants, braille,
+//!   the legacy eighth blocks U+1FB70–1FB8B) are HARD 0/255 — no antialiasing —
 //!   so the CPU coverage blend and the GPU alpha blend produce EXACTLY the
 //!   same pixels on these cells (coverage 255 -> pure foreground, coverage 0
 //!   -> untouched background).
@@ -56,7 +56,8 @@
 //! Within those rules, full coverage of the drawn blocks: solid, dashed
 //! (double/triple/quadruple), rounded arcs (U+256D–2570), diagonals
 //! (U+2571–2573), every light/heavy/double junction, eighth blocks, quadrants,
-//! braille, sextants and the legacy wedge/eighth ranges. The shade characters
+//! braille, sextants, the Unicode 16 octants and the legacy wedge/eighth
+//! ranges. The shade characters
 //! ░▒▓ (U+2591–2593) are necessarily rendered as 0/255 ordered dithers (25% /
 //! 50% checkerboard / 75%) instead of translucent grey, keeping the CPU==GPU
 //! exactness guarantee — keyed by the cell's ABSOLUTE pixel-position parity
@@ -97,14 +98,20 @@ pub fn symbol_coverage(ch: char, cell_w: usize, cell_h: usize, span: usize) -> O
 
 /// Whether `ch` is in a range this module draws (box drawing U+2500–257F,
 /// block elements U+2580–259F, braille U+2800–28FF, legacy sextants /
-/// wedges / eighth blocks U+1FB00–1FB8B, Powerline separators U+E0B0–E0BF —
+/// wedges / eighth blocks U+1FB00–1FB8B, Unicode 16 block octants
+/// U+1CD00–1CDE5, Powerline separators U+E0B0–E0BF —
 /// centred solid/outline triangles, rounded half-circles, and the four corner
 /// ("angled") triangles + outlines), and the `⎿` tree connector U+23BF, which
 /// is a box-drawing stroke in all but block name and must tile with `│`.
 pub fn covers(ch: char) -> bool {
     matches!(
         u32::from(ch),
-        0x23BF | 0x2500..=0x259F | 0x2800..=0x28FF | 0x1FB00..=0x1FB8B | 0xE0B0..=0xE0BF
+        0x23BF
+            | 0x2500..=0x259F
+            | 0x2800..=0x28FF
+            | 0x1FB00..=0x1FB8B
+            | 0x1CD00..=0x1CDE5
+            | 0xE0B0..=0xE0BF
     )
 }
 
@@ -167,6 +174,7 @@ pub fn coverage_phased(
         0x1FB00..=0x1FB3B => draw_sextant(&mut c, cp),
         0x1FB3C..=0x1FB6F => draw_wedge(&mut c, cp),
         0x1FB70..=0x1FB8B => draw_legacy_block(&mut c, cp),
+        0x1CD00..=0x1CDE5 => draw_octant(&mut c, OCTANT_MASKS[(cp - 0x1CD00) as usize]),
         0xE0B0..=0xE0BF => draw_powerline(&mut c, cp),
         _ => unreachable!("covers() gates the ranges"),
     }
@@ -1194,6 +1202,49 @@ fn draw_sextant(c: &mut Canvas, cp: u32) {
     }
 }
 
+/// Unicode 16 block octants U+1CD00–1CDE5, indexed by `cp - 0x1CD00`: the
+/// 2×4 fill mask of each, bit `n - 1` for octant `n` (1 upper-left, 2
+/// upper-right, 3/4 the second row, 5/6 the third, 7/8 the bottom row).
+/// Generated from the Unicode character names (`BLOCK OCTANT-<digits>`).
+/// Unicode encodes only 230 of the 256 patterns here: the other 26 already
+/// exist (space, █, the half blocks and quadrants, ▂ ▆ and the upper
+/// quarter/three-quarter blocks, the four corner single-octant blocks in
+/// U+1CEA0–1CEAF, and the middle-quarter blocks U+1FBE6–1FBE7).
+const OCTANT_MASKS: [u8; 230] = [
+    0x04, 0x06, 0x07, 0x08, 0x09, 0x0B, 0x0C, 0x0D, 0x0E, 0x10, 0x11, 0x12, 0x13, 0x15, 0x16, 0x17,
+    0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+    0x29, 0x2A, 0x2B, 0x2C, 0x2D, 0x2E, 0x2F, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3A, 0x3B, 0x3C, 0x3D, 0x3E, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A,
+    0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x51, 0x52, 0x53, 0x54, 0x56, 0x57, 0x58, 0x59, 0x5B, 0x5C, 0x5D,
+    0x5E, 0x60, 0x61, 0x62, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x6B, 0x6C, 0x6D, 0x6E,
+    0x6F, 0x70, 0x71, 0x72, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7A, 0x7B, 0x7C, 0x7D, 0x7E,
+    0x7F, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8C, 0x8D, 0x8E, 0x8F,
+    0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9A, 0x9B, 0x9C, 0x9D, 0x9E, 0x9F,
+    0xA1, 0xA2, 0xA3, 0xA4, 0xA6, 0xA7, 0xA8, 0xA9, 0xAB, 0xAC, 0xAD, 0xAE, 0xB0, 0xB1, 0xB2, 0xB3,
+    0xB4, 0xB5, 0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xBB, 0xBC, 0xBD, 0xBE, 0xBF, 0xC1, 0xC2, 0xC3, 0xC4,
+    0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xCB, 0xCC, 0xCD, 0xCE, 0xCF, 0xD0, 0xD1, 0xD2, 0xD3, 0xD4,
+    0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xDB, 0xDC, 0xDD, 0xDE, 0xDF, 0xE0, 0xE1, 0xE2, 0xE3, 0xE4,
+    0xE5, 0xE6, 0xE7, 0xE8, 0xE9, 0xEA, 0xEB, 0xEC, 0xED, 0xEE, 0xEF, 0xF1, 0xF2, 0xF3, 0xF4, 0xF6,
+    0xF7, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE,
+];
+
+/// Draw one octant mask. The column split is `eighth(4, w)`, the sextants'
+/// and ▌'s; the row splits are `eighth(2|4|6, h)`, the upper quarter /
+/// half / three-quarter blocks' (U+1FB82, ▀, U+1FB85). The eight sub-rects
+/// tile the cell with no gap and no overlap, so octants are hard 0/255 and
+/// seam with each other and with those blocks exactly.
+fn draw_octant(c: &mut Canvas, mask: u8) {
+    let (w, h) = (c.w, c.h);
+    let xs = [0, eighth(4, w), w];
+    let ys = [0, eighth(2, h), eighth(4, h), eighth(6, h), h];
+    for bit in 0..8usize {
+        if mask & (1 << bit) != 0 {
+            let (col, row) = (bit % 2, bit / 2);
+            c.rect(xs[col], ys[row], xs[col + 1], ys[row + 1]);
+        }
+    }
+}
+
 /// Block diagonal wedges + triangular blocks U+1FB3C–1FB6F (Symbols for
 /// Legacy Computing), supersampled.
 ///
@@ -1514,6 +1565,7 @@ mod tests {
         (0x2500u32..=0x259F)
             .chain(0x2800..=0x28FF)
             .chain(0x1FB00..=0x1FB8B)
+            .chain(0x1CD00..=0x1CDE5)
             .chain(0xE0B0..=0xE0BF)
             .map(|cp| char::from_u32(cp).unwrap())
     }
@@ -1715,6 +1767,78 @@ mod tests {
             !at(&ul, w - 1, 0) && !at(&ul, 0, h - 1),
             "U+1FB00 only upper-left"
         );
+    }
+
+    /// Octants: all 230 are covered, hard 0/255, distinct, and exactly their
+    /// mask: at every lattice size the eight sub-rects tile the cell with no
+    /// gap or overlap, and each glyph is the union of its mask's sub-rects.
+    #[test]
+    fn octants_fill_the_2x4_grid_exactly() {
+        assert_eq!(OCTANT_MASKS.len(), 0x1CDE5 - 0x1CD00 + 1);
+        let distinct: std::collections::HashSet<u8> = OCTANT_MASKS.iter().copied().collect();
+        assert_eq!(distinct.len(), 230, "every octant is a distinct pattern");
+        assert!(!distinct.contains(&0) && !distinct.contains(&0xFF));
+        for &(w, h) in SIZES {
+            if w < 2 || h < 4 {
+                continue;
+            }
+            // Each single octant, drawn alone, covers a disjoint sub-rect; the
+            // eight together cover every pixel exactly once.
+            let mut hits = vec![0u8; w * h];
+            for bit in 0..8 {
+                let mut c = Canvas::new(w, h);
+                draw_octant(&mut c, 1 << bit);
+                assert!(
+                    c.buf.contains(&255),
+                    "octant {} is empty at {w}x{h}",
+                    bit + 1
+                );
+                for (hit, &b) in hits.iter_mut().zip(&c.buf) {
+                    *hit += u8::from(b == 255);
+                }
+            }
+            assert!(
+                hits.iter().all(|&n| n == 1),
+                "the 2x4 grid tiles at {w}x{h}"
+            );
+            for (i, &mask) in OCTANT_MASKS.iter().enumerate() {
+                let ch = char::from_u32(0x1CD00 + i as u32).unwrap();
+                assert!(covers(ch));
+                let cov = coverage(ch, w, h).unwrap();
+                let mut want = Canvas::new(w, h);
+                draw_octant(&mut want, mask);
+                assert_eq!(cov, want.buf, "U+{:04X} at {w}x{h}", 0x1CD00 + i);
+            }
+        }
+        // Spot-check the name decoding: U+1CD00 is BLOCK OCTANT-3 (second row,
+        // left) and U+1CDE5 is BLOCK OCTANT-2345678.
+        assert_eq!(OCTANT_MASKS[0], 0b0000_0100);
+        assert_eq!(OCTANT_MASKS[229], 0b1111_1110);
+    }
+
+    /// Octants seam with the blocks that share their splits: the octant
+    /// unions Unicode encodes elsewhere draw the very pixels of ▀, ▌, ▘ and
+    /// the upper quarter / three-quarter blocks.
+    #[test]
+    fn octant_splits_match_the_blocks_they_extend() {
+        for &(w, h) in SIZES {
+            for (mask, ch) in [
+                (0b0000_1111u8, '\u{2580}'), // 1234 = ▀
+                (0b0101_0101, '\u{258C}'),   // 1357 = ▌
+                (0b0000_0101, '\u{2598}'),   // 13 = ▘
+                (0b0000_0011, '\u{1FB82}'),  // 12 = upper one quarter
+                (0b0011_1111, '\u{1FB85}'),  // 123456 = upper three quarters
+                (0xFF, '\u{2588}'),          // everything = █
+            ] {
+                let mut c = Canvas::new(w, h);
+                draw_octant(&mut c, mask);
+                assert_eq!(
+                    c.buf,
+                    coverage(ch, w, h).unwrap(),
+                    "mask {mask:08b} vs {ch:?} at {w}x{h}"
+                );
+            }
+        }
     }
 
     /// Powerline separators are covered, anti-aliased with hard cell edges,

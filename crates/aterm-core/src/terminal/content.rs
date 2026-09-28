@@ -11,7 +11,7 @@ use crate::grid::{Grid, row_u16};
 
 use super::Terminal;
 
-fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
+pub(super) fn push_cell_text(grid: &Grid, row: u16, col: u16, out: &mut String) {
     // LIVE-frame (screen-row) reads throughout: the extras lookups below are
     // keyed by the live visible row, and callers pass terminal-relative rows
     // (the renderer's selection contract, `sel_row = viewport_row -

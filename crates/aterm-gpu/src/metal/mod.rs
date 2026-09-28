@@ -146,8 +146,6 @@
 // kernels, the read-back getters — are `#[cfg(test)]`, so they stay in the
 // tests that make the shader port trustworthy without shipping.
 
-#[cfg(feature = "acquire-conformance")]
-pub(crate) mod acquire_probe;
 pub(crate) mod acquire_worker;
 #[cfg(test)]
 pub(crate) mod blit;

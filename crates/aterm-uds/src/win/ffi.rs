@@ -44,6 +44,11 @@ pub(crate) const WSA_WAIT_TIMEOUT: u32 = 258;
 /// `dwTimeout` sentinel: wait with no deadline.
 pub(crate) const WSA_INFINITE: u32 = 0xFFFF_FFFF;
 
+/// `afunix.h`: `SIO_AF_UNIX_GETPEERPID` = `_WSAIOR(IOC_VENDOR, 256)` —
+/// `IOC_OUT` (0x4000_0000) | `IOC_VENDOR` (0x1800_0000) | 256. Answers the
+/// connected peer's pid as afunix recorded it at connect (a `ULONG`).
+pub(crate) const SIO_AF_UNIX_GETPEERPID: u32 = 0x5800_0100;
+
 // `WSAEventSelect` network-event bits.
 pub(crate) const FD_READ: i32 = 0x01;
 pub(crate) const FD_WRITE: i32 = 0x02;
@@ -93,6 +98,17 @@ unsafe extern "system" {
         s: RawSocket,
         hEventObject: WsaEvent,
         lpNetworkEvents: *mut WsaNetworkEvents,
+    ) -> i32;
+    pub(crate) fn WSAIoctl(
+        s: RawSocket,
+        dwIoControlCode: u32,
+        lpvInBuffer: *mut core::ffi::c_void,
+        cbInBuffer: u32,
+        lpvOutBuffer: *mut core::ffi::c_void,
+        cbOutBuffer: u32,
+        lpcbBytesReturned: *mut u32,
+        lpOverlapped: *mut core::ffi::c_void,
+        lpCompletionRoutine: *mut core::ffi::c_void,
     ) -> i32;
     pub(crate) fn WSAWaitForMultipleEvents(
         cEvents: u32,

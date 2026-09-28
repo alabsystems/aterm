@@ -7,10 +7,8 @@
 //! re-measured here **against libobjc directly**, not against the module under
 //! test: this file declares its own `class_addMethod`, `class_replaceMethod`,
 //! `method_setImplementation`, `class_getInstanceMethod` and
-//! `method_getTypeEncoding`, exactly as `examples/objc_dispatch_drive.rs`
-//! declares its own libdispatch surface and for the same reason. A measurement
-//! that goes through the wrapper cannot catch the wrapper being wrong about the
-//! runtime.
+//! `method_getTypeEncoding`, because a measurement that goes through the
+//! wrapper cannot catch the wrapper being wrong about the runtime.
 //!
 //! # These tests run on a libtest WORKER thread, and that is fine here
 //!

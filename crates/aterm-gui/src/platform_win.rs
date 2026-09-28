@@ -2222,8 +2222,9 @@ impl AppRt for AppRtWindows {
         crate::notify::spawn_delivery(suppress, silent)
     }
 
-    /// Delegate to the shared menu module (a `None` stub today — a native Win32 menu
-    /// bar is future work; the terminal drives its commands from keybindings).
+    /// Delegate to the shared menu module — `None` on Windows BY DESIGN:
+    /// docs/WINDOWS_PARAGON_DESIGN.md rejects a native menu bar; the own-rendered
+    /// command palette + keybindings are the command surface.
     fn install_menu(&self, proxy: &EventLoopProxy<Wake>) -> Option<menu::MenuHandle> {
         menu::install(proxy)
     }

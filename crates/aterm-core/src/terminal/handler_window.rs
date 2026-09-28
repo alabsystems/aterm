@@ -357,23 +357,33 @@ impl TerminalHandler<'_> {
         sub: u16,
         cap: &WindowOpsCapability,
     ) {
-        let whole_window = sub == 2;
-        let op = if whole_window {
-            WindowOperation::ReportWindowSizePixels
-        } else {
-            WindowOperation::ReportTextAreaSizePixels
-        };
-        let size = match self.invoke_window_callback(op, cap) {
-            Some(WindowResponse::SizePixels { height, width }) => {
-                Some((u32::from(height), u32::from(width)))
+        let size = if sub == 2 {
+            match self.invoke_window_callback(WindowOperation::ReportWindowSizePixels, cap) {
+                Some(WindowResponse::SizePixels { height, width }) => {
+                    Some((u32::from(height), u32::from(width)))
+                }
+                _ => None,
             }
-            _ if whole_window => None,
-            _ => self.text_area_size_pixels(),
+        } else {
+            self.text_area_pixels(cap)
         };
         if let Some((height, width)) = size {
             // CSI 4 ; height ; width t
             let response = format!("\x1b[4;{height};{width}t");
             self.send_response(response_cap, response.as_bytes());
+        }
+    }
+
+    /// The text area in pixels as `(height, width)`: the host's answer when it
+    /// gives one, else the in-core product of the grid and the host-reported
+    /// cell box, else `None`. The one source for CSI 14 t and XTSMGRAPHICS's
+    /// sixel-geometry read, so both ride the same window-ops capability.
+    pub(super) fn text_area_pixels(&mut self, cap: &WindowOpsCapability) -> Option<(u32, u32)> {
+        match self.invoke_window_callback(WindowOperation::ReportTextAreaSizePixels, cap) {
+            Some(WindowResponse::SizePixels { height, width }) => {
+                Some((u32::from(height), u32::from(width)))
+            }
+            _ => self.text_area_size_pixels(),
         }
     }
 
@@ -488,7 +498,7 @@ impl TerminalHandler<'_> {
     /// The `_cap: &WindowOpsCapability` argument is a zero-sized compile-
     /// time proof that the caller has already discharged the
     /// `allow_window_ops` policy check by minting a capability through
-    /// [`super::window_auth::WindowMintAuthority::try_mint`]. Because the
+    /// [`super::window_auth::WindowMintAuthority::try_mint_with_engine`]. Because the
     /// capability type's constructor is `pub(super)` and its seal field
     /// is private, no PTY-origin byte and no external crate can produce
     /// a capability — so reaching this function structurally implies

@@ -415,9 +415,9 @@ fn a_licensed_typed_move_is_byte_identical_across_the_license_commit() {
     //
     // A moving entry is normally the loudest alarm this file has, so it was
     // treated as one and CHECKED rather than re-recorded:
-    //   * exactly ONE site emits `GlowBlend::Over` — `cursor_glow.rs`'s rainbow
-    //     bed. Every other stream, and all eight non-rainbow styles, are
-    //     `alpha == 0`.
+    //   * exactly ONE site emitted `GlowBlend::Over` — `cursor_glow.rs`'s
+    //     rainbow bed (v2's ribbon and meteor in `rainbow_kitty/` since). Every
+    //     other stream, and all eight non-rainbow styles, are `alpha == 0`.
     //   * `over_premul_is_add_sat_at_zero_alpha` (aterm-render) proves
     //     EXHAUSTIVELY, over the whole byte cross-product, that at `alpha == 0`
     //     the source-over equation IS `add_sat`.

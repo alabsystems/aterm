@@ -34,12 +34,22 @@
 //! (a source-only release) or a tag this client does not install from — is recorded as
 //! exactly that ("channel head <tag> has no app manifest yet") and the check ends: the
 //! publisher owns `latest`, and the next check reads the head again. Nothing lists the
-//! catalog to look past it. A source-only head whose tag outranks the last one the
-//! ledger authorized for this source is an APP BUILD IN FLIGHT ([`app_build_in_flight`]): the
-//! publication train mints the release source-first and the app cut attaches its
-//! assets minutes later, so the next checks come on `cadence::IN_FLIGHT_RETRY` (2, 4,
-//! 8 minutes) instead of a whole interval, counted machine-wide on the check receipt
-//! ([`head_in_flight`]).
+//! catalog to look past it, and nothing may: `latest` is the ONLY unmetered signal
+//! that the publisher promoted a release. The download host serves a PRERELEASE's
+//! assets exactly as a release's (measured 2026-09-26: a prerelease's asset answers the
+//! same 302), and the publisher relies on no client electing one — since 2026-09-23
+//! aterm's source release is a prerelease carrying its cut's `aterm-appcast.toml` until
+//! the head PATCH, and a cut retired after binding keeps it for good. An older tag
+//! found past the head would also be judged under its OWN roster, never the head's
+//! newer one, so a revocation published source-first would not reach the machines
+//! behind it. (A look past the head over git's tag list was built on 2026-09-26 and
+//! withdrawn in review for exactly these two reasons.)
+//!
+//! A source-only head whose tag outranks the last one the ledger authorized for this
+//! source is an APP BUILD IN FLIGHT ([`app_build_in_flight`]): the publication train
+//! mints the release source-first and the app cut attaches its assets minutes later,
+//! so the next checks come on `cadence::IN_FLIGHT_RETRY` (2, 4, 8 minutes) instead of a
+//! whole interval, counted machine-wide on the check receipt ([`head_in_flight`]).
 //!
 //! The lane is not a trust decision. Artifact trust is the master-signed roster, the
 //! pinned Team ID and the manifest sha256 — none of which the transport touches.
@@ -1173,7 +1183,9 @@ fn web_release(source: &Source, tag: &str) -> Result<AuthoritativeRelease, Strin
 /// broken on this machine. The tag is NOT recorded as authorized, so the next check
 /// reads the head again and picks up the app cut the moment the publisher's release
 /// carries it. No listing is consulted to look past the head: `latest` is the
-/// publisher's to point at an installable release.
+/// publisher's to point at an installable release, and an older tag's served appcast
+/// is no proof it was ever promoted (a prerelease's is served too — see the module
+/// docs).
 fn record_head_without_app(staging: &Staging, current_build: u64, tag: &str) {
     crate::health::Health::record_success(&staging.health());
     crate::status::record(
@@ -4611,6 +4623,68 @@ mod tests {
             matches!(outcome, Ok(Acquisition::Proceed(_))),
             "{outcome:?}"
         );
+        let _ = std::fs::remove_dir_all(&staging.root);
+    }
+
+    /// NOTHING LOOKS PAST THE HEAD, however many tags on the host would answer (review
+    /// of 2026-09-26, which withdrew a look past it). The download host serves a
+    /// PRERELEASE's assets with the same 302 into the asset store as a release's —
+    /// measured on `atpkg-claude-2026090801`, a prerelease — and the publisher's
+    /// promotion gate is `latest` alone, so a check that probed the tags past a head it
+    /// cannot install from would elect an in-flight or retired cut that was never
+    /// promoted (and judge it under its own roster, not the head's). A machine that
+    /// authorized v0.9.0, with `latest` on a tag it does not install from and EVERY
+    /// derived appcast on the host answering 302, spends the pointer's one HEAD and
+    /// ends on the head: healthy, the head unauthorized, the ledger's tag kept.
+    #[test]
+    fn nothing_looks_past_a_head_even_when_every_tag_past_it_would_answer() {
+        let _guard = crate::STRANDED_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let staging = Staging::scratch("no-look-past");
+        let source = test_source();
+        crate::status::clear_check_note();
+        crate::unreadable::clear();
+        set_head_in_flight(None);
+        write_ledger(&staging, "v0.9.0", WEB_BUILD, "alabsystems/aterm");
+        let mut heads = Vec::new();
+        let mut head = |url: &str| -> Result<HeadAnswer, HttpError> {
+            heads.push(url.to_string());
+            Ok(HeadAnswer {
+                code: 302,
+                location: Some(if url == evergreen_url() {
+                    tag_url("atpkg-index-44", APPCAST_ASSET)
+                } else {
+                    // Any other tag's derived appcast: served, as a prerelease's is.
+                    "https://release-assets.githubusercontent.com/github-production-release-asset/x"
+                        .to_string()
+                }),
+            })
+        };
+        let outcome = acquire(&staging, WEB_BUILD, &source, &mut head);
+        assert!(matches!(outcome, Ok(Acquisition::Ended)), "{outcome:?}");
+        assert_eq!(
+            heads,
+            [evergreen_url()],
+            "the pointer's HEAD and nothing past it"
+        );
+        let text = std::fs::read_to_string(&staging.status).unwrap();
+        assert!(
+            text.contains(
+                "channel head atpkg-index-44 has no app manifest yet — nothing to install from it"
+            ),
+            "{text}"
+        );
+        assert_eq!(
+            crate::status::latest_tag(&staging, WEB_BUILD, &source).as_deref(),
+            Some("v0.9.0"),
+            "the head is never authorized, and the ledger keeps what it had"
+        );
+        assert_eq!(
+            crate::health::Health::read(&staging.health()).acquisition_failures(),
+            0
+        );
+        assert_eq!(head_in_flight(), None, "not an app build in flight");
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 

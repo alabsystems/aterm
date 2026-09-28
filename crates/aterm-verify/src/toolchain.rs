@@ -457,7 +457,9 @@ pub struct Toolchain {
     pub stage2_dir: PathBuf,
     pub targo: PathBuf,
     pub trustdoc: PathBuf,
-    /// `targo-tippy`, or the older `targo-clippy`, if either is installed.
+    /// `targo-tippy`, if installed. The pre-rebrand `targo-clippy` is not a
+    /// candidate: no shipped toolchain carries it, and `atpkg-pack-bundle.sh`
+    /// lists it among the retired public names.
     pub tippy: Option<PathBuf>,
     /// A candidate that carried a `targo` but was NOT the pinned toolchain, and
     /// was therefore refused. Kept so [`Self::missing_targo_label`] can say
@@ -587,10 +589,7 @@ impl Toolchain {
             let reported = chosen.unwrap_or_else(|| store_bin.clone().unwrap_or(rustup));
             (reported, store_bin)
         };
-        let tippy = ["targo-tippy", "targo-clippy"]
-            .into_iter()
-            .map(|n| tool_dir.join(n))
-            .find(|p| is_executable_file(p));
+        let tippy = Some(tool_dir.join("targo-tippy")).filter(|p| is_executable_file(p));
         Self {
             targo: tool_dir.join("targo"),
             trustdoc: tool_dir.join("trustdoc"),
@@ -666,7 +665,6 @@ impl Toolchain {
                     child_ceiling: Some(std::time::Duration::from_secs(60)),
                     remove_env: &[],
                     add_env: &[],
-                    timings: None,
                 },
             );
             let text = std::fs::read_to_string(&log).unwrap_or_default();
@@ -760,7 +758,7 @@ impl Toolchain {
     #[must_use]
     pub fn missing_tippy_label(&self) -> String {
         format!(
-            "tippy lint (no targo-tippy or targo-clippy in {} — fix: {})",
+            "tippy lint (no targo-tippy in {} — fix: {})",
             self.stage2_dir.display(),
             Self::INSTALL_REMEDY,
         )
@@ -1338,7 +1336,7 @@ mod tests {
     }
 
     #[test]
-    fn tippy_prefers_the_current_name_and_accepts_the_old_one() {
+    fn tippy_is_found_by_its_trust_name_only() {
         let tmp = crate::mktemp_dir("atv-tippy").expect("mktemp");
         // The lookup happens in the RESOLVED directory (see the symlink test):
         // on macOS /tmp is itself a symlink to /private/tmp.
@@ -1346,17 +1344,13 @@ mod tests {
         exec_stub(&tmp.join("targo-clippy"));
         let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
         assert_eq!(
-            t.tippy.as_deref(),
-            Some(real.join("targo-clippy").as_path())
+            t.tippy, None,
+            "the retired pre-rebrand name is not a tippy: the lane is NOT RUN"
         );
 
         exec_stub(&tmp.join("targo-tippy"));
         let t = Toolchain::discover(Some(&tmp), Path::new("/unused"), OsStr::new(""), None);
-        assert_eq!(
-            t.tippy.as_deref(),
-            Some(real.join("targo-tippy").as_path()),
-            "the Trust fork's own name wins when both exist"
-        );
+        assert_eq!(t.tippy.as_deref(), Some(real.join("targo-tippy").as_path()));
         fs::remove_dir_all(&tmp).ok();
     }
 

@@ -1379,6 +1379,116 @@ fn alt_exit_commits_what_was_drawn_after_the_last_esu() {
     );
 }
 
+// ------------------------------------------------ orphaned screens (no rmcup)
+
+/// `leave_whole` is `leave` without the chrome rule: the last frame goes to the
+/// archive entire. Measured need: a killed pager's `:` row and status bar were
+/// the "chrome", and the shell's rows landed among them.
+#[test]
+fn leave_whole_flushes_the_chrome_a_leave_leaves_out() {
+    let mut whole = AltArchive::new();
+    let mut region = AltArchive::new();
+    for a in [&mut whole, &mut region] {
+        commit(a, &frame(0, 20));
+        commit(a, &frame(1, 20)); // measures the chrome: 5 fixed rows
+        assert_eq!(a.texts(), vec![tx(0)]);
+    }
+    region.leave();
+    assert_eq!(
+        region.texts(),
+        range(tx, 0..21),
+        "a live app's chrome is left out"
+    );
+    whole.leave_whole();
+    let mut want = range(tx, 0..21);
+    want.extend(CHROME.iter().map(|c| (*c).to_string()));
+    assert_eq!(whole.texts(), want, "a dead app's chrome is content");
+    for a in [&whole, &region] {
+        assert_eq!(gap_kinds(a), vec![(a.last(), AltArchiveGapKind::Leave)]);
+        assert_eq!(a.epoch(), 1);
+    }
+    // Both are a fresh baseline: the next commit installs, archiving nothing.
+    commit(&mut whole, &frame(40, 20));
+    assert_eq!(whole.len(), want.len());
+}
+
+/// The host forces the primary screen (`mainscreen`) after a shell with no
+/// integration marks typed onto a dead pager's screen: every row the stuck
+/// screen showed — the pager's, the chrome's, the shell's — is readable
+/// afterwards, once, in order, behind one `leave` gap.
+#[test]
+fn host_leave_archives_the_rows_typed_onto_the_stuck_screen() {
+    let mut t = term();
+    t.process(b"\x1b[?1049h");
+    for s in 0..=3 {
+        t.process(&sync_frame(&frame(s, 20)));
+    }
+    assert_eq!(t.alt_archive().texts(), range(tx, 0..3));
+    // The app is dead; the shell's prompt and a command scroll the alt grid by
+    // three rows (the grid has no scrollback to catch them).
+    t.process(b"\x1b[25;1H\r\nPS> echo one\r\none\r\nPS> ");
+    assert!(t.modes().alternate_screen);
+    assert!(t.leave_alternate_screen());
+    assert!(!t.modes().alternate_screen);
+    // 3..6 scrolled off at the final commit; the rest is the final screen, whole.
+    let mut want = range(tx, 0..23);
+    want.extend(CHROME.iter().map(|c| (*c).to_string()));
+    // Archived rows are trimmed like `text` shows them: the prompt's trailing
+    // space is not kept.
+    want.extend(["PS> echo one", "one", "PS>"].map(str::to_string));
+    assert_eq!(t.alt_archive().texts(), want);
+    let gaps: Vec<_> = t.alt_archive().gaps().collect();
+    assert_eq!(
+        gaps.len(),
+        1,
+        "the handler's leave; the epilogue must not add one"
+    );
+    assert_eq!(gaps[0].kind, AltArchiveGapKind::Leave);
+    // The main screen is back and later output archives nothing.
+    t.process(b"PS> \r\n");
+    assert_eq!(t.alt_archive().texts(), want);
+    assert_eq!(t.alt_archive().gaps().count(), 1);
+}
+
+/// The archive is off (`ATERM_ALT_ARCHIVE=0`): the recovery still leaves the
+/// screen; there is simply nothing to keep.
+#[test]
+fn host_leave_with_the_archive_off_still_leaves() {
+    let mut t = Terminal::new(25, COLS);
+    t.set_alt_archive_enabled(false);
+    t.process(b"\x1b[?1049h");
+    t.process(&plain_frame(&frame(0, 20)));
+    assert!(t.leave_alternate_screen());
+    assert!(!t.modes().alternate_screen);
+    assert!(t.alt_archive().is_empty());
+    assert_eq!(t.alt_archive().gaps().count(), 0);
+}
+
+/// The conhost enter scan hops ESC to ESC: it finds `?1049h` wherever it sits
+/// — first, last, past the 64-byte blocks `find_byte` compares, behind ESCs that
+/// start other sequences — and nothing that only resembles it.
+#[test]
+fn the_conhost_enter_scan_finds_1049h_and_nothing_else() {
+    const ENTER: &[u8] = b"\x1b[?1049h";
+    assert!(has_alt_1049_enter(ENTER));
+    let mut long = b"\x1b[?25l\x1b[H".to_vec();
+    long.extend(std::iter::repeat_n(b'x', 200));
+    long.extend_from_slice(b"\x1b\x1b[K\x1b[?25h");
+    assert!(!has_alt_1049_enter(&long));
+    long.extend_from_slice(ENTER);
+    assert!(has_alt_1049_enter(&long));
+    for near in [
+        &b""[..],
+        b"\x1b[?1049l",
+        b"\x1b[?1047h",
+        b"\x1b[?10490h",
+        b"[?1049h",
+        b"\x1b[?1049",
+    ] {
+        assert!(!has_alt_1049_enter(near), "{near:?}");
+    }
+}
+
 #[test]
 fn ris_and_host_reset_wipe_the_archive() {
     let mut t = term();

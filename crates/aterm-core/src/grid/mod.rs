@@ -78,6 +78,11 @@ pub use aterm_grid::grid::{MaterializedRow, materialize_from_line};
 // offload stashes it in module state between host turns — needs to NAME the
 // type. Re-exported here so that doesn't force a direct aterm-grid dependency.
 pub use aterm_grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
+// The host-repaint policy `Terminal::resize_with_policy` /
+// `resize_offloading_scrollback_with_policy` take: the GUI selects it per
+// session from the PTY backend (ConPTY on Windows), so it must be nameable
+// without a direct aterm-grid dependency, like the job types above.
+pub use aterm_grid::grid::reflow::ResizePolicy;
 
 // The seamless update's history carry (`Terminal::history_fence` and the
 // import). The fence and the built history cross threads and crates in the

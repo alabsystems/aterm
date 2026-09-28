@@ -22,12 +22,20 @@
 //! reading until broken-pipe — any future change that stops the reader before
 //! close reintroduces the macOS-style quit-hang this crate already fought.
 //!
-//! Parser implications (documented, no engine change): (1) ConPTY re-renders —
-//! output arrives as full-region repaints + cursor addressing rather than the
-//! child's raw byte stream; the engine is a VT state machine, unaffected.
-//! (2) conhost may emit private-mode requests such as win32-input-mode
-//! (`CSI ? 9001 h`); the parser ignores unknown private modes and keystrokes
-//! flow as plain xterm VT input written to the input pipe. (3) conhost issues
+//! Parser implications: (1) ConPTY re-renders — output arrives as full-region
+//! repaints + cursor addressing rather than the child's raw byte stream; the
+//! engine is a VT state machine, unaffected. (2) conhost requests
+//! win32-input-mode (`CSI ? 9001 h`) at every session start, and the engine
+//! HONOURS it (DEC mode 9001 → `KeyboardMode::WIN32_INPUT`): an Enter chord
+//! (Shift/Ctrl, with or without Alt, main block or keypad) is written to the
+//! input pipe as the win32 key-record pair `CSI 13;28;Uc;Kd;Cs;1 _` conhost
+//! asked for — UnicodeChar CR for Shift+Enter and LF whenever Ctrl is held,
+//! the chars a physical chord carries under Windows Terminal — because legacy
+//! VT has no byte for those chords and conhost read the legacy Shift+Enter LF
+//! as Ctrl+Enter (measured 2026-09-22). The record outranks a kitty push the
+//! application made through conhost, which drops a CSI u written back. Every
+//! other key still flows as plain xterm VT input; conhost accepts the mixed
+//! stream. (3) conhost issues
 //! DSR/CPR queries; the existing reader-thread `take_response()` reply path
 //! answers them with zero changes.
 
@@ -37,8 +45,10 @@ mod shell;
 mod winpath;
 
 // Published so config validation can ask the REAL resolver how a `shell` value
-// would resolve, rather than modelling it (see `ShellResolution`).
-pub use shell::{ShellResolution, classify_shell_name};
+// would resolve, rather than modelling it (see `ShellResolution`), and so
+// `aterm doctor` / `show-config` can name the shell a new tab spawns and the
+// arm that chose it (see `ShellOrigin`) instead of the CLI's own `$SHELL`.
+pub use shell::{ShellOrigin, ShellResolution, classify_shell_name, select_shell_with_origin};
 
 use std::collections::HashMap;
 use std::ffi::{OsStr, c_void};
@@ -380,6 +390,36 @@ impl Drop for AttrList {
     }
 }
 
+/// Put THIS process back into normal CTRL+C processing — the state every
+/// ConPTY child inherits at `CreateProcessW` (see the spawn's comment for the
+/// measured defect). `SetConsoleCtrlHandler(NULL, FALSE)` is the documented
+/// switch: with a NULL routine, `FALSE` "restores normal processing of CTRL+C
+/// input" and that attribute "is inherited by child processes". It needs no
+/// attached console to succeed — aterm-gui is a GUI-subsystem image with none —
+/// and it is idempotent, so it runs unconditionally per spawn rather than once
+/// under a flag whose truth could be undone by a later `CreateProcess` caller
+/// in this process. The return value is deliberately ignored: a failure here
+/// leaves the pre-existing state, which is exactly what the spawn did before,
+/// and nothing about the spawn depends on it.
+///
+/// THE HOST'S OWN DISPOSITION CHANGES TOO — this is not a child-only switch.
+/// For aterm-gui (GUI subsystem, no console) that is moot. For the console
+/// image that hosts `--headless` sessions (aterm-cli's `spawn_shell_with_pid`
+/// lands in this same spawn), a host that a harness launched with
+/// CREATE_NEW_PROCESS_GROUP precisely so it would survive the shared console's
+/// Ctrl+C becomes CTRL_C-terminable from its first spawn on. Accepted on
+/// purpose: Windows gives a child no way to hold a Ctrl+C state its parent does
+/// not hold at CreateProcess, and a host that shrugs off Ctrl+C while every
+/// shell under it is deaf to it is the defect. A harness that needs the host
+/// to outlive its console's Ctrl+C gives it its own console (DETACHED_PROCESS
+/// or CREATE_NEW_CONSOLE) instead: neither flag touches the Ctrl+C
+/// disposition, and a host with no shared console has no Ctrl+C to survive.
+fn restore_ctrl_c_processing() {
+    // SAFETY: NULL routine + FALSE is the documented "restore normal CTRL+C"
+    // form; no pointer is dereferenced and no handler is registered.
+    unsafe { ffi::SetConsoleCtrlHandler(std::ptr::null(), 0) };
+}
+
 /// Clamp a u16 cell count into ConPTY's positive `i16` COORD range.
 fn coord(cols: u16, rows: u16) -> ffi::COORD {
     ffi::COORD {
@@ -441,7 +481,7 @@ pub fn spawn_shell(
 /// `sandbox_wrap = Some(_)` (the macOS Seatbelt SBPL wrap) is REFUSED with
 /// `Unsupported`: a caller that demanded an OS sandbox must never get an
 /// unsandboxed shell. (In practice unreachable: `decide_spawn` only emits a
-/// profile on macOS.)
+/// profile on macOS, and refuses a Containment spawn everywhere else.)
 ///
 /// `limits` are actuated on the Job Object while the child is still SUSPENDED
 /// (`aterm_sandbox::Limits::apply_to_job`): the address-space, CPU,
@@ -688,6 +728,16 @@ pub fn spawn_shell_with_pid_cell_px(
     // duplication, so the child's console init binds its stdio to the fresh
     // pseudoconsole in every launch environment.
     si.StartupInfo.dwFlags = ffi::STARTF_USESTDHANDLES;
+    // CTRL+C INHERITANCE — LOAD-BEARING (audit 2026-09-22, reproduced): an
+    // aterm launched by a harness that used CREATE_NEW_PROCESS_GROUP had Ctrl+C
+    // dead in EVERY tab (0x03 reached the shell as text; a running loop never
+    // stopped), while Explorer/shell-launched instances were fine. That flag
+    // sets the launched process's "ignore CTRL+C" state, Windows copies that
+    // state into each child at CreateProcess, and the ConPTY child inherits it
+    // from US — so the shell in the new tab starts deaf to Ctrl+C no matter
+    // what the terminal writes. Restore normal processing before every spawn so
+    // the child's state is the same regardless of who launched aterm.
+    restore_ctrl_c_processing();
     // SAFETY: PROCESS_INFORMATION is POD out-memory.
     let mut pi: ffi::PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: program_w/cmdline_w/env_block are NUL-terminated (double-NUL for
@@ -1435,6 +1485,20 @@ pub fn resize(master: i32, rows: u16, cols: u16) {
     resize_with_cell_px(master, rows, cols, None);
 }
 
+/// Whether `master` is a LIVE ConPTY session — one this process spawned
+/// through `CreatePseudoConsole` or adopted through the DefTerm handoff. Both
+/// are conhost-backed, and conhost repaints the whole viewport after every
+/// `ResizePseudoConsole` (row-0-anchored, from its own buffer — measured
+/// 2026-09-22, see `aterm_grid::grid::reflow::ResizePolicy`), so the frontend
+/// picks its resize seam policy from THIS answer rather than from
+/// `cfg(windows)`: a stub or replay session on Windows (a fabricated key, a
+/// closed one) has no conhost behind it and keeps the native accounting.
+/// A closed session answers `false` — nothing resizes it afterwards.
+#[must_use]
+pub fn backend_is_conpty(master: i32) -> bool {
+    session(master).is_some()
+}
+
 /// Unix-seam parity for [`resize_with_cell_px`](crate::resize_with_cell_px):
 /// ConPTY resizes in CHARACTER cells (`COORD`) and has no winsize pixel fields,
 /// so `cell_px` has nowhere to land and is ignored. Kept so the frontend's one
@@ -1657,6 +1721,33 @@ mod tests {
         );
     }
 
+    // ---- Ctrl+C inheritance: the pre-spawn reset ----
+
+    // `SetConsoleCtrlHandler(NULL, FALSE)` must be idempotent, since it runs
+    // before EVERY spawn, and must succeed from whatever console state the
+    // process has. This test runs under cargo's console, so what it EXERCISES
+    // is the attached-console case; the no-console case (aterm-gui is a
+    // GUI-subsystem image) is the documented contract, not measured here.
+    // Windows exposes no query for the inherited "ignore CTRL+C" bit, so what
+    // a unit test can pin is exactly this: the call is made, it cannot fail
+    // the spawn, and repeating it is harmless. The inheritance itself is the
+    // OS contract quoted on the fn.
+    #[test]
+    fn restore_ctrl_c_processing_is_callable_and_idempotent() {
+        restore_ctrl_c_processing();
+        restore_ctrl_c_processing();
+        // Direct form, checking the documented success path: with a NULL
+        // routine the call reports success whether or not a console is attached.
+        // SAFETY: the documented NULL/FALSE form; nothing is dereferenced.
+        let ok = unsafe { ffi::SetConsoleCtrlHandler(std::ptr::null(), 0) };
+        assert_ne!(
+            ok,
+            0,
+            "SetConsoleCtrlHandler(NULL, FALSE) failed: {}",
+            io::Error::last_os_error()
+        );
+    }
+
     // ---- DefTerm inbound handoff: adopt_handoff + the signal-pipe resize ----
 
     /// Access rights the adoption path actually depends on. `SYNCHRONIZE` is
@@ -1818,6 +1909,55 @@ mod tests {
             before,
             "a refused handoff must not register a session"
         );
+    }
+
+    // ---- backend_is_conpty: the frontend's resize-policy gate ----
+
+    // The gate answers from the REGISTRY, never from the platform: a key no
+    // session was registered under (a GUI stub, a fabricated key) is not
+    // ConPTY even on Windows, a registered session is — the adopted lane
+    // included, since conhost repaints an adopted viewport exactly like a
+    // spawned one — and a closed session stops being one the moment
+    // `close_master` unregisters it. Registered the adopted way (a real,
+    // waitable handle to our own process + a real pipe) so no shell has to be
+    // spawned: what is under test is the registry answer, not conhost.
+    #[test]
+    fn backend_is_conpty_follows_the_registry() {
+        assert!(!backend_is_conpty(-1), "a negative key is nobody's session");
+        assert!(
+            !backend_is_conpty(0x7fff_ffff),
+            "a fabricated key is not a session"
+        );
+
+        // SAFETY: OpenProcess on our own pid yields a real, closable handle.
+        let me = unsafe {
+            ffi::OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                0,
+                ffi::GetCurrentProcessId(),
+            )
+        };
+        assert_ne!(me, 0, "OpenProcess on self must succeed");
+        let (mut rd, mut wr): (isize, isize) = (0, 0);
+        // SAFETY: two out-params, default attrs, default buffer size.
+        assert_ne!(
+            unsafe { ffi::CreatePipe(&mut rd, &mut wr, std::ptr::null_mut(), 0) },
+            0,
+            "CreatePipe must succeed"
+        );
+        let sh =
+            adopt_handoff(0, 0, wr, me).expect("adopt_handoff must accept a real client handle");
+        assert!(
+            backend_is_conpty(sh.master),
+            "a registered (adopted) session is a ConPTY backend"
+        );
+        close_master(sh.master);
+        assert!(
+            !backend_is_conpty(sh.master),
+            "a closed session is unregistered and no longer answers ConPTY"
+        );
+        // SAFETY: the read end is still ours (the session never owned it).
+        unsafe { ffi::CloseHandle(rd) };
     }
 
     // Construction shape: an adopted session must carry hpc == 0 (conhost owns

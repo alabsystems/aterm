@@ -2,26 +2,32 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Capability enums for each subsystem.
+//! Capability enums for the three axes something reads.
 //!
-//! Each subsystem has a capability level that maps to a containment mode.
-//! Higher numeric value = more access.
+//! Each axis has a capability level that maps to a containment mode; a higher
+//! discriminant means more access. The discriminants are pinned by the tests
+//! below and relied on by the `kani_proofs` harnesses.
 //!
-//! The `TLA+ encoding:` notes below name the encodings of the INTENDED
-//! `tla/Containment.tla` model. That model is NOT in-tree and is on no
-//! build/CI path (see the crate-root note); these Rust definitions and the
-//! tests over them are the source of truth for the numbering.
+//! Who reads each axis: `network` selects the Seatbelt profile
+//! ([`crate::sbpl::profile_for`]); `fs` scopes its file rules and moves
+//! `aterm-shell-integration`'s cache under `/tmp` for the confined modes;
+//! `process` is checked by the spawn gate ([`crate::actuator::decide`]). The MCP,
+//! plugin, output, input and command axes that used to sit here had no reader
+//! anywhere and were deleted, 2026-09-25.
 
 /// Network capability levels.
 ///
-/// TLA+ encoding: None=0, Allowlist=1, Full=2.
+/// Discriminants: None=0, Allowlist=1, Full=2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum NetworkCapability {
-    /// No network access. Containment mode.
+    /// No network access. Containment mode — enforced by the macOS Seatbelt
+    /// `(deny network*)`.
     None = 0,
-    /// Allowlisted destinations only. Safety mode.
+    /// Safety mode. Nothing narrows the network for it: Seatbelt can filter only
+    /// by port or localhost, not by host, so a destination allowlist would need a
+    /// proxy nobody is building. At runtime this behaves exactly like `Full`.
     Allowlist = 1,
     /// Unrestricted network. Master/User mode.
     Full = 2,
@@ -29,14 +35,17 @@ pub enum NetworkCapability {
 
 /// Filesystem capability levels.
 ///
-/// TLA+ encoding: TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3.
+/// Discriminants: TmpOnly=0, ProjectRW=1, HomeRW=2, Full=3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
 pub enum FsCapability {
-    /// Read/write only to `/tmp`. Containment mode.
+    /// Containment mode. On macOS the Seatbelt profile confines WRITES to the
+    /// temp roots and `/dev` (plus the shell's own history files) and denies
+    /// reads and writes of the credential and private-data stores; see
+    /// [`crate::actuator`].
     TmpOnly = 0,
-    /// Read/write to project directory + tmp. Safety mode.
+    /// Safety mode. Not enforced by any OS mechanism.
     ProjectReadWrite = 1,
     /// Read/write to home directory. User mode.
     HomeReadWrite = 2,
@@ -46,7 +55,7 @@ pub enum FsCapability {
 
 /// Process capability levels.
 ///
-/// TLA+ encoding: NoFork=0, Restricted=1, Full=2.
+/// Discriminants: NoFork=0, Restricted=1, Full=2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
@@ -57,87 +66,6 @@ pub enum ProcessCapability {
     Restricted = 1,
     /// Unrestricted process creation. Master/User mode.
     Full = 2,
-}
-
-/// MCP (Model Context Protocol) capability levels.
-///
-/// TLA+ encoding: Disabled=0, Allowlist=1, Full=2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum McpCapability {
-    /// MCP disabled entirely. Containment mode.
-    Disabled = 0,
-    /// Allowlisted MCP tools only. Safety mode.
-    Allowlist = 1,
-    /// All MCP tools available. Master/User mode.
-    Full = 2,
-}
-
-/// Plugin capability levels.
-///
-/// TLA+ encoding: Disabled=0, Allowlist=1, Full=2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum PluginCapability {
-    /// Plugins disabled entirely. Containment mode.
-    Disabled = 0,
-    /// Allowlisted plugins only. Safety mode.
-    Allowlist = 1,
-    /// All plugins available. Master/User mode.
-    Full = 2,
-}
-
-/// Output handling capability levels.
-///
-/// TLA+ encoding: Filtered=0, ShadowScanned=1, Unmodified=2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum OutputCapability {
-    /// All output filtered through LLM before display. Containment mode.
-    Filtered = 0,
-    /// Output displayed unmodified but shadow-scanned in parallel.
-    /// User/Safety mode.
-    ShadowScanned = 1,
-    /// Output passed through unmodified, no scanning. Master mode.
-    Unmodified = 2,
-}
-
-/// Input handling capability levels.
-///
-/// TLA+ encoding: Filtered=0, Scanned=1, Unmodified=2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum InputCapability {
-    /// All input filtered before reaching agent. Containment mode.
-    Filtered = 0,
-    /// Input scanned for injection patterns. User/Safety mode.
-    Scanned = 1,
-    /// Input passed through unmodified. Master mode.
-    Unmodified = 2,
-}
-
-/// Command execution capability levels.
-///
-/// Maps containment modes to a maximum command-execution capability.
-/// TLA+ encoding: `CmdNone`=0, `CmdTier2`=1, `CmdTier3`=2, `CmdAll`=3.
-/// This mirrors `CommandCaps` and `PolicyCommand` in the INTENDED
-/// `tla/Containment.tla` model (not in-tree; see the crate-root note).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[repr(u8)]
-#[non_exhaustive]
-pub enum CommandCapability {
-    /// No command execution allowed. Containment mode.
-    NoCommands = 0,
-    /// Commands up to tier 2 (`MediumRisk`). Safety mode.
-    UpToTier2 = 1,
-    /// Commands up to tier 3 (`HighRisk`). User mode.
-    UpToTier3 = 2,
-    /// All tiers including Critical (tier 4). Master mode.
-    AllTiers = 3,
 }
 
 #[cfg(test)]
@@ -158,7 +86,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repr_matches_tla() {
+    fn test_repr_encoding() {
         assert_eq!(NetworkCapability::None as u8, 0);
         assert_eq!(NetworkCapability::Allowlist as u8, 1);
         assert_eq!(NetworkCapability::Full as u8, 2);
@@ -171,33 +99,11 @@ mod tests {
         assert_eq!(ProcessCapability::NoFork as u8, 0);
         assert_eq!(ProcessCapability::Restricted as u8, 1);
         assert_eq!(ProcessCapability::Full as u8, 2);
-
-        assert_eq!(McpCapability::Disabled as u8, 0);
-        assert_eq!(McpCapability::Allowlist as u8, 1);
-        assert_eq!(McpCapability::Full as u8, 2);
-
-        assert_eq!(PluginCapability::Disabled as u8, 0);
-        assert_eq!(PluginCapability::Allowlist as u8, 1);
-        assert_eq!(PluginCapability::Full as u8, 2);
-
-        assert_eq!(OutputCapability::Filtered as u8, 0);
-        assert_eq!(OutputCapability::ShadowScanned as u8, 1);
-        assert_eq!(OutputCapability::Unmodified as u8, 2);
-
-        assert_eq!(InputCapability::Filtered as u8, 0);
-        assert_eq!(InputCapability::Scanned as u8, 1);
-        assert_eq!(InputCapability::Unmodified as u8, 2);
-
-        assert_eq!(CommandCapability::NoCommands as u8, 0);
-        assert_eq!(CommandCapability::UpToTier2 as u8, 1);
-        assert_eq!(CommandCapability::UpToTier3 as u8, 2);
-        assert_eq!(CommandCapability::AllTiers as u8, 3);
     }
 
     #[test]
-    fn test_command_ordering() {
-        assert!(CommandCapability::AllTiers > CommandCapability::UpToTier3);
-        assert!(CommandCapability::UpToTier3 > CommandCapability::UpToTier2);
-        assert!(CommandCapability::UpToTier2 > CommandCapability::NoCommands);
+    fn test_process_ordering() {
+        assert!(ProcessCapability::Full > ProcessCapability::Restricted);
+        assert!(ProcessCapability::Restricted > ProcessCapability::NoFork);
     }
 }

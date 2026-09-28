@@ -25,13 +25,18 @@
 //! per-op edge over the child it spawned (presented on the dial), so the child
 //! authorizes the EXACT op the verb needs.
 //!
-//! ## Scope: one hop
+//! ## Scope: one hop per kind
 //!
-//! The shipped path forwards DIRECT children only — the child's own selector is
-//! inlined to `@.` so it runs the verb on itself, and a child is never in its own
-//! proxy table, so no cycle can form. Transitive `@<grandchild>` forwarding (which
-//! would need a `via=<n>` hop guard) is NOT implemented; a grandchild selector
-//! simply does not resolve here and falls through to a local `ERR no such session`.
+//! The EDGE-authority hop forwards DIRECT children only, by design — the child's
+//! own selector is inlined to `@.` so it runs the verb on itself, and a child is
+//! never in its own proxy table, so no cycle can form. An Owner-scope
+//! `@<grandchild>` needs no transitive edge forwarding: every instance publishes
+//! a graph entry for every session it hosts into the shared runtime dir (a
+//! nested instance inherits the parent's), so the grandchild resolves through
+//! the SIBLING hop below and is dialed directly with its own instance's token.
+//! Transitive edge-token forwarding is intentionally absent: an edge-scoped
+//! connection never forwards (it falls through to local resolution), so an edge
+//! cannot be escalated into reach its grant did not name.
 //!
 //! ## Identity binding
 //!
@@ -1375,7 +1380,17 @@ mod tests {
         )
         .expect("crashed");
         let crashed_path = crashed.path().to_path_buf();
-        drop(crashed); // the lock released, the file left: a crashed parent
+        // The lock released, the file left: a crashed parent. Released by
+        // LOCK_UN before the close, because this process stands in for a parent
+        // that is GONE: a lock released by the close alone lives on in any
+        // child another test is forking at that instant, until it execs, and
+        // the sweep below would read the parent as live (the fd-copy sweep of
+        // 2026-09-27; `control_auth`'s instance lease test states the same).
+        crashed
+            ._lock
+            .unlock()
+            .expect("release the crashed parent's lock");
+        drop(crashed);
         let edges = dir.join("edges");
         let empty = edges.join(SessionId::generate().as_str());
         std::fs::write(&empty, b"").unwrap();

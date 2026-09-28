@@ -17,6 +17,9 @@ description = "Tiered scrollback storage with LZ4/Zstd compression and disk offl
 # for what would otherwise be the zstd-compressed cold tier.
 default = []
 fuzz = []
+# Test-only corruption seam (`Scrollback::inject_corrupted_warm_block`) for
+# DOWNSTREAM crates' conformance tests; enabled only from a dev-dependency.
+testing = []
 # Opt-in zstd-compressed cold tier (default = LZ4-only). Gates the `zstd` dep and
 # all of its encode/decode sites. Off by default to keep the engine pure-Rust.
 zstd = ["dep:zstd"]

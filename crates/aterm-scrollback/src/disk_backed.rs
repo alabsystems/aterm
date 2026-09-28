@@ -366,6 +366,15 @@ impl DiskBackedScrollback {
         }
     }
 
+    /// First logical index of the hot tier (`cold + warm` lines) — the dense
+    /// walk's switch from bulk segment decodes to borrowed hot lines
+    /// (`ScrollbackStorage::dense_from`).
+    pub(crate) fn hot_start(&self) -> usize {
+        self.cold
+            .line_count()
+            .saturating_add(self.warm.line_count())
+    }
+
     /// Bulk read for the streaming iterators (ST-6): owned lines from `idx`
     /// through the end of its tier segment (cold page / warm block / one hot
     /// line). Tier dispatch mirrors `get_line`; the disk-cold path decodes a

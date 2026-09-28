@@ -1913,6 +1913,29 @@ mod output_echo_tracker_tests {
     }
 }
 
+/// The IME composition clock's transition on one preedit event (see
+/// `WindowState::ime_compose`): a non-empty preedit starts the clock unless a
+/// composition is already open, and one that follows a CLEARED composition
+/// that never committed starts a new clock and counts the old one cancelled;
+/// an empty preedit marks the open composition cleared, keeping its start for
+/// the commit that usually follows at once. Pure but for the cancel count.
+fn ime_compose_on_preedit(
+    open: Option<(std::time::Instant, bool)>,
+    composing: bool,
+    now: std::time::Instant,
+) -> Option<(std::time::Instant, bool)> {
+    match (open, composing) {
+        (Some((started, false)), true) => Some((started, false)),
+        (Some((_, true)), true) => {
+            crate::metrics::note_ime_cancelled();
+            Some((now, false))
+        }
+        (None, true) => Some((now, false)),
+        (Some((started, _)), false) => Some((started, true)),
+        (None, false) => None,
+    }
+}
+
 /// The surface that OWNS the in-flight IME composition of one window — resolved
 /// per frame by [`App::preedit_owner`] through the same `App::ime_route` that
 /// [`App::on_ime_commit`] dispatches on, so where the composition PAINTS and
@@ -2075,6 +2098,61 @@ pub(crate) fn typed_class_for(typed: Option<char>) -> aterm_effects::rainbow_kit
 #[inline]
 pub(crate) fn typed_glyph_class(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_class(typed)
+}
+
+/// WHAT THE KEYED CLICK SAYS ABOUT ITS KEY — the four stamps the keyed seam
+/// hands the synth: the gesture kind, the shift, the glyph class and the
+/// alphabet rank.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyClickStamp {
+    pub(crate) kind: aterm_effects::trail_sound::SoundKind,
+    pub(crate) shifted: bool,
+    pub(crate) glyph_class: u8,
+    pub(crate) rank: u8,
+}
+
+/// **THE KEYED CLICK'S STAMP, AND A PASSWORD PROMPT'S ONE TONE** (owner,
+/// 2026-09-27, verbatim: *"password: fix to all same tone"*).
+///
+/// Off a no-echo prompt the stamp is the key's own: the spacebar's comma
+/// ([`aterm_effects::trail_sound::SoundKind::Space`]) or the typed click, the
+/// capital's shift (`shifted`, never on the space), and the glyph's class and
+/// rank ([`typed_glyph_class`], [`typed_glyph_rank`]).
+///
+/// When the session's tty is in canonical no-echo mode (`secret`, the same
+/// `SinkWriter::tty_swallows_input` verdict the licence law reads — `sudo`,
+/// an `ssh` passphrase, `read -s`, `getpass`) it is ONE stamp for every key:
+/// `Typed` even for the spacebar, unshifted, class
+/// [`aterm_effects::trail_sound::glyph_class::SECRET`], rank 0 — so the click
+/// says a key was pressed and nothing about which. Until that day the click
+/// at a password prompt still told a capital (forte and its ring), a digit
+/// (the wood bar), each mark, the space (the bass) and, through the rank,
+/// each letter's place in the melody.
+pub(crate) fn key_click_stamp(
+    secret: bool,
+    spacebar: bool,
+    shifted: bool,
+    typed: Option<char>,
+) -> KeyClickStamp {
+    use aterm_effects::trail_sound::{SoundKind, glyph_class::SECRET};
+    if secret {
+        return KeyClickStamp {
+            kind: SoundKind::Typed,
+            shifted: false,
+            glyph_class: SECRET,
+            rank: 0,
+        };
+    }
+    KeyClickStamp {
+        kind: if spacebar {
+            SoundKind::Space
+        } else {
+            SoundKind::Typed
+        },
+        shifted: shifted && !spacebar,
+        glyph_class: typed_glyph_class(typed),
+        rank: typed_glyph_rank(typed),
+    }
 }
 
 /// THE KEYED SEAM'S `at_ms` — the melody's clock for this press, read at the
@@ -2295,7 +2373,7 @@ const _: () = {
 /// keystroke BEFORE the pasted text (submission order violated). This routes a
 /// paste — and any keystroke submitted while that paste is still in flight —
 /// through ONE per-session FIFO drained by a single writer thread, so bytes reach
-/// the PTY in submission order. Both run the SAME [`crate::input::seam_egress`] on
+/// the PTY in submission order. Both run the SAME [`crate::input::seam_egress_receipt`] on
 /// the writer thread (no encoder duplication, so the Human/Controller byte
 /// invariant is untouched — only WHERE the write runs moves).
 ///
@@ -2304,6 +2382,27 @@ const _: () = {
 /// `App::input` runs on the single UI thread, so a session's count is raised
 /// before the next key can choose inline delivery and lowered by its writer
 /// only after the preceding write completes.
+///
+/// BOUNDED AND TORN DOWN (P0 of docs/AUDIT-performance-quality-2026-08-29.md).
+/// The FIFO used to be an unbounded channel: every paste queued behind a
+/// program that had stopped reading kept its whole text alive in it, so
+/// repeated maximum pastes grew memory without limit. Admission is now ONE
+/// budget per serializer (`Budget`, `Limits`: jobs and retained capacity,
+/// counting the job being written), and pastes — and the reports the UI
+/// thread encodes, which a DEC 1003 motion flood would otherwise pile up —
+/// may never spend the keys' reserve. A job the budget cannot hold, or a
+/// writer that is gone, is REFUSED at submission: nothing queued, nothing
+/// written, never a fallback around the FIFO and never a wait on the UI
+/// thread ([`crate::input::EgressReceipt::queue_full`], said once per session
+/// by `App::refuse_input`). The job's reservation is released when the job is
+/// dropped, however it ends. Teardown is the sink's sever (`Session::drop` →
+/// [`SinkWriter::sever_input`]): the job parked in the sink abandons its frame
+/// and every job behind it fails at once, so closing a tab over a frozen
+/// program frees its writer, its queued pastes and its PTY (unix; on Windows a
+/// write inside the blocking ConPTY `WriteFile` ends only when that call
+/// returns). On Windows this writer is also the ConPTY writer every key and
+/// every mouse, wheel and focus report goes through, so the UI thread only
+/// ever enqueues ([`ordered_or_inline`], [`report_ordered_or_inline`]).
 pub(crate) mod paste_order {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2399,6 +2498,17 @@ pub(crate) mod paste_order {
                 .is_ok()
         }
 
+        /// Whether a charge of `bytes` fits this queue at all, however empty:
+        /// the byte bound [`Self::claim`] tests, with nothing retained.
+        fn could_ever_hold(&self, bytes: u32, paste: bool) -> bool {
+            bytes
+                <= if paste {
+                    self.limits.paste_bytes
+                } else {
+                    self.limits.bytes
+                }
+        }
+
         #[cfg_attr(
             test,
             aterm_spec::refines(
@@ -2460,7 +2570,11 @@ pub(crate) mod paste_order {
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(super) enum Rejected {
+        /// The queue is full now; it frees as earlier input is written.
         Full,
+        /// The input's charge (owned capacity included) exceeds the queue even
+        /// when it is empty — waiting cannot help, splitting it can.
+        TooLarge,
         Unavailable,
     }
 
@@ -2481,7 +2595,12 @@ pub(crate) mod paste_order {
         term: Arc<Mutex<Terminal>>,
         modes: Arc<ModeMirror>,
         sink: Arc<SinkWriter>,
-        echo: Arc<OutputEchoTracker>,
+        /// The session's echo tracker, through which the writer runs the one
+        /// egress law ([`tracked_egress_metered`]) — `None` for a report the
+        /// UI thread already encoded ([`report_ordered_or_inline`]): its bytes
+        /// ride as a verbatim `KeySequence`, and the tracker, which ignores
+        /// mouse, wheel and focus reports, must not read them as typing.
+        echo: Option<Arc<OutputEchoTracker>>,
         ev: InputEvent,
         /// What this write's completion re-stamps on the cursor engines
         /// (the delivery edge, 2026-09-10) — `None` for a write nobody's
@@ -2501,6 +2620,53 @@ pub(crate) mod paste_order {
         meter: Option<Arc<BulkMeter>>,
         /// Last field: payloads above are dropped before capacity is returned.
         _reservation: Reservation,
+    }
+
+    /// ConPTY has no non-blocking write: a key or report written inline on
+    /// Windows could park the UI thread (and every window) on a program that
+    /// has stopped reading. There the per-session ordered writer is the ConPTY
+    /// writer thread, and every key ([`ordered_or_inline`]) and every report
+    /// — mouse, wheel, focus, colour scheme ([`report_ordered_or_inline`]) —
+    /// goes through it
+    /// (docs/AUDIT-typing-to-pixels-2026-08-26.md P0). On unix the inline
+    /// write cannot park ([`SinkWriter::write_frame_interactive_with_receipt`]),
+    /// so only input behind a queued paste takes the FIFO.
+    const UI_WRITES_CAN_BLOCK: bool = cfg!(windows);
+
+    #[cfg(test)]
+    thread_local! {
+        /// TEST-ONLY: this thread's App paths take the Windows route
+        /// ([`force_conpty_route_for_test`]).
+        static CONPTY_ROUTE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// The platform's routing fact ([`UI_WRITES_CAN_BLOCK`]); a test may set
+    /// it for its own thread, so a whole App path — a tab switch's focus
+    /// report, say — runs on the Windows route on unix.
+    fn ui_writes_can_block() -> bool {
+        #[cfg(test)]
+        if CONPTY_ROUTE.with(std::cell::Cell::get) {
+            return true;
+        }
+        UI_WRITES_CAN_BLOCK
+    }
+
+    /// TEST-ONLY: route this thread's keys and reports as on Windows until
+    /// the guard drops.
+    #[cfg(test)]
+    pub(crate) fn force_conpty_route_for_test() -> ConptyRoute {
+        CONPTY_ROUTE.with(|route| route.set(true));
+        ConptyRoute(())
+    }
+
+    #[cfg(test)]
+    pub(crate) struct ConptyRoute(());
+
+    #[cfg(test)]
+    impl Drop for ConptyRoute {
+        fn drop(&mut self) {
+            CONPTY_ROUTE.with(|route| route.set(false));
+        }
     }
 
     /// One session's serializer: the FIFO sender and a `Weak` to the session
@@ -2539,7 +2705,7 @@ pub(crate) mod paste_order {
     /// A queued job owns the sink, and a live sink always keeps this worker.
     fn run(rx: Receiver<Job>, sink: Weak<SinkWriter>, idle_check: Duration) {
         loop {
-            let job = match rx.recv_timeout(idle_check) {
+            let mut job = match rx.recv_timeout(idle_check) {
                 Ok(job) => job,
                 Err(RecvTimeoutError::Timeout) if sink.strong_count() == 0 => break,
                 Err(RecvTimeoutError::Timeout) => continue,
@@ -2551,18 +2717,40 @@ pub(crate) mod paste_order {
             // acceptance (direct kernel write or bounded spill admission).
             // The metric then books the slice the UI thread could not: hardware
             // key arrival → completed write, including time queued behind paste.
-            let receipt = tracked_egress_metered(
-                &job.term,
-                &job.modes,
-                &job.sink,
-                &job.echo,
-                &job.ev,
-                crate::input::EgressMode::Backpressured,
-                job.ticket,
-                job.meter.as_deref(),
-            );
+            let receipt = match &job.echo {
+                Some(echo) => tracked_egress_metered(
+                    &job.term,
+                    &job.modes,
+                    &job.sink,
+                    echo,
+                    &job.ev,
+                    crate::input::EgressMode::Backpressured,
+                    job.ticket,
+                    job.meter.as_deref(),
+                ),
+                // An encoded report: its bytes, verbatim, untracked like the
+                // inline report it stands in for.
+                None => crate::input::seam_egress_receipt(
+                    &job.term,
+                    &job.modes,
+                    &job.sink,
+                    &job.ev,
+                    crate::input::EgressMode::Backpressured,
+                ),
+            };
             crate::metrics::note_pty_write_at(job.key_ns);
-            if let Some((session, proxy)) = job.hot_key
+            // ECHO ROUND TRIP for a key that waited here (2026-09-25): the UI
+            // thread's bracket closed before this write, so the clock arms at
+            // the write's own acceptance — the same "bytes really entered this
+            // PTY" gate, carried by the receipt's accepted order instead of an
+            // epoch compare. Visible presses only (`hot_key`): a paste never
+            // arms, and a swallowed password key would only expire.
+            if let Some((session, _)) = job.hot_key
+                && receipt.fully_accepted_nonempty()
+            {
+                crate::echo_rtt::arm_deferred(session, &job.sink);
+            }
+            if let Some((session, proxy)) = job.hot_key.take()
                 && let Some(wake) = completed_queued_key_wake(receipt, Some(session))
                 && let Some(proxy) = proxy
             {
@@ -2681,8 +2869,33 @@ pub(crate) mod paste_order {
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
         meter: Option<Arc<BulkMeter>>,
     ) -> Result<(), Rejected> {
-        let bytes = retained_bytes(&ev).ok_or(Rejected::Full)?;
-        let paste = matches!(ev, InputEvent::Paste(..));
+        submit(term, modes, sink, Some(echo), ev, ticket, hot_key, meter)
+    }
+
+    /// The one submission body behind [`enqueue_metered`] and the report
+    /// route: `echo` is `None` only for an encoded report (see [`Job::echo`]).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "enqueue_metered's handles, with the tracker optional for an encoded report"
+    )]
+    fn submit(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        echo: Option<&Arc<OutputEchoTracker>>,
+        ev: InputEvent,
+        ticket: Option<DeliveryTicket>,
+        hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
+        meter: Option<Arc<BulkMeter>>,
+    ) -> Result<(), Rejected> {
+        let bytes = retained_bytes(&ev).ok_or(Rejected::TooLarge)?;
+        // A paste never spends the keys' reserve, and neither does a report
+        // the UI thread encoded (`echo` is `None`): under any-motion tracking
+        // (DEC 1003) a moving pointer queues one report per motion event, and
+        // admitted like a key that flood would take the next key's room
+        // (2026-09-26 review). Behind a program that has stopped reading, a
+        // motion flood refuses motion, never the key typed after it.
+        let paste = matches!(ev, InputEvent::Paste(..)) || echo.is_none();
         let master = sink.master();
         let (tx, budget) = {
             let mut reg = REG.lock().unwrap_or_else(|p| p.into_inner());
@@ -2695,7 +2908,11 @@ pub(crate) mod paste_order {
             }
         };
         if !budget.claim(bytes, paste) {
-            return Err(Rejected::Full);
+            return Err(if budget.could_ever_hold(bytes, paste) {
+                Rejected::Full
+            } else {
+                Rejected::TooLarge
+            });
         }
         // Claim the FIFO slot BEFORE releasing to the writer: a later keystroke on
         // this same (UI) thread then observes pending > 0 and queues behind us.
@@ -2711,7 +2928,10 @@ pub(crate) mod paste_order {
         // against a metric that means "keystroke to PTY", and `MAX_KEY_WRITE_NS`
         // is a `fetch_max` that never resets, so that reading poisons the maximum
         // for the life of the process.
-        let key_ns = if matches!(ev, InputEvent::Paste(..)) {
+        //
+        // A REPORT claims nothing either: a click, wheel or focus change is not
+        // the keystroke the arrival stamp was taken for.
+        let key_ns = if matches!(ev, InputEvent::Paste(..)) || echo.is_none() {
             0
         } else {
             crate::metrics::take_key_arrival()
@@ -2720,7 +2940,7 @@ pub(crate) mod paste_order {
             term: term.clone(),
             modes: modes.clone(),
             sink: sink.clone(),
-            echo: echo.clone(),
+            echo: echo.cloned(),
             ev,
             key_ns,
             ticket,
@@ -2734,7 +2954,12 @@ pub(crate) mod paste_order {
             },
         };
         match tx.try_send(job) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The UI thread's echo bracket must not arm for this event:
+                // its write happens on the writer thread, which arms it there.
+                crate::echo_rtt::note_deferred_write();
+                Ok(())
+            }
             Err(error) => {
                 let (reason, job) = match error {
                     std::sync::mpsc::TrySendError::Full(job) => (Rejected::Full, job),
@@ -2761,16 +2986,21 @@ pub(crate) mod paste_order {
         }
     }
 
-    /// The shared ordered/inline tail. While a
-    /// paste is draining for this sink's master, submit `ev` onto the same
-    /// per-session FIFO so it cannot overtake the pasted bytes — a successful
-    /// enqueue is full delivery into the ordered spill contract. Otherwise
-    /// write inline through `seam_egress`. Pastes always use the worker,
-    /// including a paste delivered to a hidden session with an idle FIFO.
+    /// The shared ordered/inline tail. While a paste is draining for this
+    /// sink's master — and on Windows always ([`UI_WRITES_CAN_BLOCK`]) —
+    /// submit `ev` onto the same per-session FIFO so it cannot overtake the
+    /// pasted bytes — a successful enqueue is full delivery into the ordered
+    /// spill contract. Pastes always use the worker, including a paste
+    /// delivered to a hidden session with an idle FIFO. A rejected admission
+    /// accepts nothing and never bypasses the FIFO: the receipt says the input
+    /// queue refused it ([`crate::input::EgressReceipt::queue_full`]) and the
+    /// caller says so once ([`App::refuse_input`]). Otherwise write inline
+    /// through the interactive egress, which never parks and refuses the same
+    /// way at the sink's spill cap.
     /// Returns the egress verdict plus whether the write ran INLINE: an
-    /// enqueued event wrote nothing here — the real write happens later on the
-    /// writer thread. `ev` is cloned only on the (paste-draining) enqueue
-    /// path, never on the common inline one.
+    /// enqueued (or refused) event wrote nothing here — the real write, if
+    /// any, happens later on the writer thread. `ev` is cloned only on the
+    /// enqueue path, never on the common inline one.
     pub(super) fn ordered_or_inline(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -2780,16 +3010,38 @@ pub(crate) mod paste_order {
         ticket: Option<DeliveryTicket>,
         hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
     ) -> (crate::input::EgressReceipt, bool) {
-        if is_ordering(sink) || matches!(ev, InputEvent::Paste(..)) {
+        ordered_or_inline_routed(
+            ui_writes_can_block(),
+            term,
+            modes,
+            sink,
+            echo,
+            ev,
+            ticket,
+            hot_key,
+        )
+    }
+
+    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the
+    /// Windows arm — every key through the writer — runs under test on unix.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "ordered_or_inline's handles plus the one routing fact it is parameterised on"
+    )]
+    pub(super) fn ordered_or_inline_routed(
+        ui_writes_can_block: bool,
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        echo: &Arc<OutputEchoTracker>,
+        ev: &InputEvent,
+        ticket: Option<DeliveryTicket>,
+        hot_key: Option<(u64, Option<&EventLoopProxy<Wake>>)>,
+    ) -> (crate::input::EgressReceipt, bool) {
+        if ui_writes_can_block || is_ordering(sink) || matches!(ev, InputEvent::Paste(..)) {
             match enqueue(term, modes, sink, echo, ev.clone(), ticket, hot_key) {
                 Ok(()) => (crate::input::EgressReceipt::deferred_full(), false),
-                Err(_) => (
-                    crate::input::EgressReceipt::from_reported_delivery(
-                        crate::input::Delivery::BusyZero,
-                        None,
-                    ),
-                    false,
-                ),
+                Err(_) => (crate::input::EgressReceipt::queue_full(), false),
             }
         } else {
             (
@@ -2804,6 +3056,68 @@ pub(crate) mod paste_order {
                 ),
                 true,
             )
+        }
+    }
+
+    /// THE UI THREAD'S REPORT EGRESS: a mouse button, motion or wheel report
+    /// or a focus report, from the App's own arms, and every report the UI
+    /// thread sends outside them ([`super::write_ui_report`]: a tab switch's
+    /// focus delta, a colour-scheme change); a control verb's reports run on
+    /// its expendable thread and write there. A report follows the
+    /// keys' route (2026-09-26): while this session's ordered writer holds
+    /// anything — a paste draining, a key behind it — and on Windows always
+    /// ([`UI_WRITES_CAN_BLOCK`]: ConPTY has no write that cannot park the
+    /// thread, and a click into a frozen program would otherwise freeze every
+    /// window), the report is ENCODED here, under the modes the gesture was
+    /// judged by, and its bytes are queued for the writer, behind everything
+    /// submitted before it. Otherwise it is written inline, through the
+    /// interactive egress that never parks.
+    ///
+    /// The returned receipt's `egress` is what the caller's local fallback
+    /// reads either way (tracking off: the selection gesture or the viewport
+    /// scroll). A report the FIFO does not admit — admitted like a paste, so
+    /// a motion flood never takes the keys' reserve ([`submit`]) — is refused
+    /// ([`crate::input::EgressReceipt::queue_full`]) and never written, and
+    /// never bypasses the FIFO either; one that writes nothing (tracking off,
+    /// focus reporting off) queues nothing.
+    pub(super) fn report_ordered_or_inline(
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+    ) -> crate::input::EgressReceipt {
+        report_ordered_or_inline_routed(ui_writes_can_block(), term, modes, sink, ev)
+    }
+
+    /// [`report_ordered_or_inline`] with the platform's routing fact explicit,
+    /// so the Windows arm — every report through the writer — runs under test
+    /// on unix.
+    pub(super) fn report_ordered_or_inline_routed(
+        ui_writes_can_block: bool,
+        term: &Arc<Mutex<Terminal>>,
+        modes: &Arc<ModeMirror>,
+        sink: &Arc<SinkWriter>,
+        ev: &InputEvent,
+    ) -> crate::input::EgressReceipt {
+        if !(ui_writes_can_block || is_ordering(sink)) {
+            return crate::input::seam_egress_receipt(
+                term,
+                modes,
+                sink,
+                ev,
+                crate::input::EgressMode::Interactive,
+            );
+        }
+        let (egress, bytes) = crate::input::seam_encode(term, modes, sink, ev);
+        if bytes.is_empty() {
+            return crate::input::EgressReceipt::unwritten(egress);
+        }
+        // The seam's own bytes, carried verbatim: the raw-bytes arm writes
+        // exactly them, so the writer produces nothing of its own.
+        let frame = InputEvent::KeySequence(bytes);
+        match submit(term, modes, sink, None, frame, None, None, None) {
+            Ok(()) => crate::input::EgressReceipt::deferred_full(),
+            Err(_) => crate::input::EgressReceipt::queue_full(),
         }
     }
 
@@ -2842,6 +3156,33 @@ pub(crate) mod paste_order {
         };
         sink.claim_ordered_egress();
         OrderingPin { sink: sink.clone() }
+    }
+
+    /// TEST-ONLY: the jobs and retained bytes `sink`'s serializer holds
+    /// admitted right now (the job being written included); `(0, 0)` when it
+    /// has no serializer.
+    #[cfg(test)]
+    pub(crate) fn admitted_for_test(sink: &Arc<SinkWriter>) -> (u64, u64) {
+        REG.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&sink.master())
+            .map_or((0, 0), |serializer| {
+                let used = serializer.budget.used.load(Ordering::Acquire);
+                (used >> 32, used & u64::from(u32::MAX))
+            })
+    }
+
+    /// TEST-ONLY: the admission's limits — retained bytes, jobs, and the
+    /// bytes and jobs a paste or an encoded report may use (the rest is the
+    /// keys' reserve).
+    #[cfg(test)]
+    pub(crate) const fn limits_for_test() -> (u32, u32, u32, u32) {
+        (
+            LIMITS.bytes,
+            LIMITS.jobs,
+            LIMITS.paste_bytes,
+            LIMITS.paste_jobs,
+        )
     }
 
     /// Exercise the real channel-rejection arms without a stalled child or
@@ -3250,8 +3591,31 @@ pub(crate) mod paste_order {
                 app.messages
                     .live_rows()
                     .filter(|m| m.msg.key.as_deref() == Some("session.input-full.0"))
-                    .count(),
-                1
+                    .map(|m| m.msg.detail.clone())
+                    .collect::<Vec<_>>(),
+                [vec![
+                    "earlier input is still being sent \u{2014} try again".to_string()
+                ]],
+                "one row, naming the cause the queue reported: a full queue, not a size"
+            );
+            // A paste whose len equals the paste cap still cannot fit an empty
+            // queue once its Job is charged: too large, not busy, and the one
+            // row's line follows the new cause.
+            assert_eq!(
+                submit(&mut app, paste("p".repeat(7 * 1024 * 1024))),
+                InputOutcome::WriteFailed
+            );
+            assert_eq!(budget.used.load(Ordering::Acquire) >> 32, 3);
+            assert_eq!(
+                app.messages
+                    .live_rows()
+                    .filter(|m| m.msg.key.as_deref() == Some("session.input-full.0"))
+                    .map(|m| m.msg.detail.clone())
+                    .collect::<Vec<_>>(),
+                [vec![
+                    "the paste is too large \u{2014} paste it in smaller pieces".to_string()
+                ]],
+                "one row, its line replaced by the new cause"
             );
             ready_tx.send(()).unwrap();
             let (responsive, actual, expected, mut reader) = drain.join().unwrap();
@@ -3350,6 +3714,16 @@ pub(crate) mod paste_order {
         assert!(exited_with_sender_live);
     }
 }
+
+/// The 2026-09-25 input/egress contract, driven through the real ordered
+/// writer, reply writer and key seam (`app_input/egress_contract_tests.rs`).
+#[cfg(all(test, unix))]
+mod egress_contract_tests;
+
+/// The output → redraw-request span and the IME composition clock
+/// (`app_input/input_legs_tests.rs`).
+#[cfg(all(test, unix))]
+mod input_legs_tests;
 
 #[cfg(test)]
 mod paste_order_sink_isolation_tests {
@@ -5479,7 +5853,7 @@ impl TrickLineFire {
 /// belongs to was ADDRESSED (the flash has no notion of addressed, and a
 /// final word's flash must finish). Ends the host's memory of the fire.
 fn revoke_trick_line(ws: &mut crate::WindowState, now: std::time::Instant) {
-    ws.cursor_pet.revoke_trick();
+    ws.companion.revoke_trick();
     if !matches!(
         ws.trick_fire,
         TrickLineFire::Admitted {
@@ -5509,7 +5883,134 @@ fn revoke_dispatch(ws: &mut crate::WindowState, at: std::time::Instant, write_fa
     ws.cursor_trail.revoke_input_hints_at(at);
 }
 
+/// A mouse, wheel or focus report REFUSED because its session's input queue
+/// is full ([`paste_order::report_ordered_or_inline`]): counted under
+/// `input_refused` like a refused key, but silent — a pointer moving over a
+/// program that has stopped reading would otherwise post at the motion rate.
+/// The failed delivery still reaches the arm's outcome.
+fn note_refused_report(receipt: input::EgressReceipt) {
+    if receipt.input_queue_full() {
+        crate::metrics::note_input_refused();
+    }
+}
+
+/// A report the UI thread writes to a session OUTSIDE [`App::input`] — the
+/// focus delta addressed by session id ([`App::write_focus_report`]), the
+/// DEC 2031 colour-scheme report an OS appearance change queued
+/// (`App::apply_os_color_scheme`) — by the one route every report takes
+/// ([`paste_order::report_ordered_or_inline`]): behind whatever the session's
+/// ordered writer holds, through that writer always on Windows, inline only
+/// through the interactive egress that never parks. The UI thread only
+/// enqueues or refuses; a refusal is counted silently
+/// ([`note_refused_report`]).
+pub(crate) fn write_ui_report(
+    term: &Arc<Mutex<Terminal>>,
+    modes: &Arc<ModeMirror>,
+    sink: &Arc<SinkWriter>,
+    ev: &InputEvent,
+) {
+    note_refused_report(paste_order::report_ordered_or_inline(term, modes, sink, ev));
+}
+
+/// Why a person's input did not reach the session: the cause the "Input not
+/// sent" row names, one per case the code tells apart, each with its one
+/// remedy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputRefusal {
+    /// A paste larger than the ordered queue holds even when it is empty.
+    PasteTooLarge,
+    /// Earlier input is still being written and the queue behind it is full
+    /// (a paste, or a key queued behind a draining paste).
+    Busy,
+    /// The session's input writer was gone; the next input starts a new one.
+    Unavailable,
+}
+
+impl InputRefusal {
+    /// The cause of a refused ordered enqueue, as the queue measured it.
+    const fn of_rejected(rejected: paste_order::Rejected) -> Self {
+        match rejected {
+            paste_order::Rejected::TooLarge => Self::PasteTooLarge,
+            paste_order::Rejected::Full => Self::Busy,
+            paste_order::Rejected::Unavailable => Self::Unavailable,
+        }
+    }
+
+    /// The row's one line.
+    const fn line(self) -> &'static str {
+        match self {
+            Self::PasteTooLarge => "the paste is too large \u{2014} paste it in smaller pieces",
+            Self::Busy => "earlier input is still being sent \u{2014} try again",
+            Self::Unavailable => "nothing was sent \u{2014} try again",
+        }
+    }
+}
+
 impl App {
+    /// Write ONE DEC 1004 report to `session` ([`Self::recompute_focus_reports`],
+    /// the delta every tab switch, pane focus, split, close, detach and
+    /// migrate converges on) by the route every report takes
+    /// ([`paste_order::report_ordered_or_inline`]): behind whatever this
+    /// session's ordered writer already holds — a report written inline
+    /// would reach the program between queued pastes — and on Windows always
+    /// through that writer, so a tab switch away from a frozen program never
+    /// parks the UI thread on its ConPTY. A report the queue has no room for
+    /// is refused and counted, silently ([`note_refused_report`]). The bytes
+    /// are the source-blind seam's, identical whether or not the session is
+    /// the one its window is showing.
+    ///
+    /// Addressed by session id because `App::input` routes by WINDOW and
+    /// lands on whatever currently fronts it: the session LOSING the keyboard
+    /// is, by the time we know it lost it, no longer front, so its `ESC[O`
+    /// can only be addressed this way. A closed session (the focused pane's
+    /// shell just exited) is simply absent from the pool and is written
+    /// nothing. (Until 2026-09-26 this wrote inline even after the App's own
+    /// focus arm had moved onto the ordered route.)
+    pub(super) fn write_focus_report(&self, session: u64, focused: bool) {
+        let Some(live) = self.pool.get(session) else {
+            return;
+        };
+        write_ui_report(
+            &live.term,
+            &live.ctx.modes,
+            &live.ctx.sink,
+            &InputEvent::Focus(focused),
+        );
+    }
+
+    /// A key or paste REFUSED for `session`: its ordered writer's queue could
+    /// not admit it or the writer is unavailable (`paste_order`), or the
+    /// interactive egress met the sink's spill cap. The program has stopped
+    /// reading, and the input was refused rather than park the event loop,
+    /// queue without bound or overtake accepted input. Nothing reached the
+    /// PTY. Count it (`input_refused` under `metrics percentiles`, so an agent
+    /// can see why its input failed) and say so ONCE per session, silently: a
+    /// Messages row, coalesced by key, that tells the person what to do. No
+    /// bell — a burst of refused keys would ring once per key (the owner's
+    /// standing direction: silent and non-interrupting where possible; the
+    /// 2026-09-25 bell was folded into this row when main's admission queue
+    /// and this branch's egress refusal met, 2026-09-27). The row names the
+    /// cause the code measured ([`InputRefusal`]) with its one remedy. No
+    /// payload is retained or repeated in the message.
+    fn refuse_input(&mut self, session: u64, why: InputRefusal) {
+        crate::metrics::note_input_refused();
+        let key = format!("session.input-full.{session}");
+        // One row per session: a repeat of its cause posts nothing, and a new
+        // cause replaces the line (the same key supersedes the row).
+        if self
+            .messages
+            .live_by_key(&key)
+            .is_some_and(|row| matches!(row.msg.detail.as_slice(), [line] if line == why.line()))
+        {
+            return;
+        }
+        // The person's own gesture failed: the one gesture-failure shape
+        // (ruling 270), keyed so a burst of refused keys is one row, naming
+        // the cause the code measured with its one remedy (main's
+        // `InputRefusal::line`, the single detail line the dedupe above reads).
+        self.post_message(crate::message_reporters::input_refused(why.line()).key(&key));
+    }
+
     /// Close every LICENSE term at a newer input boundary.
     ///
     /// The license (docs/design/EFFECTS-LICENSE-REDESIGN.md) asks one question
@@ -5580,7 +6081,7 @@ impl App {
     /// Phase 0.5 — the App::input CONVERGENCE SEAM (design Addendum A.2).
     ///
     /// The SOLE policy site for input egress. The byte-producing core lives in the
-    /// source-blind [`input::seam_egress`] (the ONLY byte-producing reader of
+    /// source-blind [`input::seam_egress_receipt`] (the ONLY byte-producing reader of
     /// `keyboard_mode()` / `mouse_tracking_enabled()` — the predictive-echo gate's
     /// `kitty_suppresses_predictive_echo()` sample below is a read-only DISPLAY
     /// projection that never feeds an encoder — and the ONLY caller of
@@ -5607,22 +6108,6 @@ impl App {
     /// by `input::tests::bytes_human_eq_controller`).
     pub(crate) fn input(&mut self, wid: WindowId, ev: InputEvent, src: Source) -> InputOutcome {
         self.input_to_session(wid, ev, src, None, crate::app_input::PressPhase::Initial)
-    }
-
-    /// Coalesce rejected input into one visible explanation per session. No
-    /// payload is retained or repeated in the message; accepted work stays FIFO.
-    fn report_ordered_input_rejection(&mut self, session: u64) {
-        let key = format!("session.input-full.{session}");
-        if self.messages.live_by_key(&key).is_some() {
-            return;
-        }
-        self.post_message(aterm_messages::Message::new(
-            aterm_messages::tags::SESSION,
-            aterm_messages::Severity::Warn,
-            "Input not sent",
-        ).key(&key).line(
-            "The input could not fit in the queue or its writer is unavailable. Split an oversized paste into smaller pieces. Otherwise, wait for earlier input to finish and retry; Stop paste can cancel a paste in progress.",
-        ));
     }
 
     /// Whether tone-of-typing inference may run AT ALL: the `tone_melody`
@@ -6384,8 +6869,8 @@ impl App {
                     }
                     InputOutcome::Ok
                 }
-                Err(_) => {
-                    self.report_ordered_input_rejection(target_session);
+                Err(rejected) => {
+                    self.refuse_input(target_session, InputRefusal::of_rejected(rejected));
                     InputOutcome::WriteFailed
                 }
             };
@@ -6394,13 +6879,12 @@ impl App {
             let mut terminal = term_lock(&term);
             let _ = apply_press_custody(&mut terminal, press_kind);
         }
+        // A press refused by a full input queue reports `WriteFailed` here and
+        // is said once, like the visible key arm's ([`App::refuse_input`]).
         let (receipt, _) =
             paste_order::ordered_or_inline(&term, &modes, &sink, &echo, &ev, None, None);
-        if matches!(
-            receipt.egress,
-            input::Egress::Reported(input::Delivery::BusyZero)
-        ) {
-            self.report_ordered_input_rejection(target_session);
+        if receipt.input_queue_full() {
+            self.refuse_input(target_session, InputRefusal::Busy);
         }
         egress_to_outcome(receipt.egress)
     }
@@ -6637,8 +7121,10 @@ impl App {
                     Some(OverlayKind::ConnectionMap) => {
                         self.connection_map_input_event(wid, &ev);
                     }
+                    // The retired Settings card survives only as a `cfg(test)` overlay
+                    // that consumes input; it has no key model of its own any more.
                     #[cfg(test)]
-                    Some(OverlayKind::Settings) => self.settings_input_event(wid, &ev),
+                    Some(OverlayKind::Settings) => {}
                     None => {}
                 }
                 return InputOutcome::Ok;
@@ -6905,10 +7391,24 @@ impl App {
                 // Read for printable presses and a bare Tab / ⌃V only (a
                 // release, a chord and a nav key never read the tty), and
                 // withholding on positive evidence alone: `None` banks as
-                // ever. The PTY write, the pet, the click and the cadence
-                // are unchanged.
+                // ever. The PTY write, the pet and the cadence are
+                // unchanged. ~~The click is unchanged~~ **RE-RULED
+                // 2026-09-27** (owner: *"password: fix to all same tone"*):
+                // the click at such a prompt is ONE tone for every key
+                // ([`key_click_stamp`]), and the bare Shift's ting is not
+                // cued at all (`shift_lift_withheld`, below).
                 let tty_swallows = input_now.is_some()
                     && (typed_forward == Some(true) || insert_tab || paste_chord_key)
+                    && sink.tty_swallows_input();
+                // …AND A BARE SHIFT AT THAT PROMPT RINGS NO TING: the ting
+                // announces a capital, and a capital is exactly what the
+                // password's one tone does not say. The same one
+                // `tcgetattr`, read for the press that could cue the lift
+                // (a first-landing bare Shift) and no other, and withheld
+                // on positive evidence alone.
+                let shift_lift_withheld = input_now.is_some()
+                    && shift_key
+                    && press_kind == PressKind::Inert
                     && sink.tty_swallows_input();
                 // A press the typed arm below WITHHELD for that reason. Its
                 // `swallowed_no_echo=` tally is taken after the PTY write,
@@ -7451,11 +7951,6 @@ impl App {
                             // the key seam falls back to the echo's generic
                             // Typed cue, a soft degradation the classifier
                             // cannot avoid: an echo is just a cursor move).
-                            let click_kind = if spacebar {
-                                aterm_effects::trail_sound::SoundKind::Space
-                            } else {
-                                aterm_effects::trail_sound::SoundKind::Typed
-                            };
                             // THE CAPITAL'S RING. Shiftedness is a property
                             // of the KEY EVENT and this is the only seam that
                             // has one: the echo path mints its Typed cues from
@@ -7493,15 +7988,25 @@ impl App {
                                     (Some(ch), None) if ch.is_uppercase()
                                 )
                             });
-                            let click_shifted = (glyph_shifted
-                                || typed.is_some_and(char::is_uppercase)
-                                || committed_capital)
-                                && !spacebar;
+                            //
+                            // THE STAMP IS ONE FUNCTION ([`key_click_stamp`]):
+                            // the kind, the shift, the class and the rank —
+                            // and at a password prompt (`tty_swallows`, the
+                            // same verdict the licence law withholds on;
+                            // 2026-09-27) one stamp for every key.
+                            let stamp = key_click_stamp(
+                                tty_swallows,
+                                spacebar,
+                                glyph_shifted
+                                    || typed.is_some_and(char::is_uppercase)
+                                    || committed_capital,
+                                typed,
+                            );
                             if click_audible
                                 && ws.cursor_glow.cue_keystroke_shifted(
                                     input_now,
-                                    click_kind,
-                                    click_shifted,
+                                    stamp.kind,
+                                    stamp.shifted,
                                 )
                             {
                                 let delivered =
@@ -7515,8 +8020,8 @@ impl App {
                                                 cue,
                                                 *synth,
                                                 term_cols,
-                                                typed_glyph_class(typed),
-                                                typed_glyph_rank(typed),
+                                                stamp.glyph_class,
+                                                stamp.rank,
                                                 key_sound_at_ms(),
                                             ));
                                             true
@@ -7537,9 +8042,13 @@ impl App {
                         // they do for the typed click. No credit is banked —
                         // there is no echo to mute — and no redraw fallback:
                         // an undeliverable lift is dropped, not replayed
-                        // stale by the next frame's drain.
+                        // stale by the next frame's drain. NOT AT A PASSWORD
+                        // PROMPT (2026-09-27, `shift_lift_withheld`): the
+                        // ting would announce the capital the prompt's one
+                        // tone hides.
                         if shift_key
                             && press_kind == PressKind::Inert
+                            && !shift_lift_withheld
                             && click_audible
                             && ws.cursor_glow.cue_modifier(input_now)
                         {
@@ -7891,11 +8400,13 @@ impl App {
                         .then_some((session, self.proxy.as_ref())),
                 );
                 let outcome = egress_to_outcome(receipt.egress);
-                if matches!(
-                    receipt.egress,
-                    input::Egress::Reported(input::Delivery::BusyZero)
-                ) {
-                    self.report_ordered_input_rejection(session);
+                // THE INPUT QUEUE IS FULL: the program has stopped reading, or
+                // the ordered writer could take no more, and this key was
+                // REFUSED rather than park the event loop, grow memory without
+                // bound or overtake accepted input. Nothing reached the PTY;
+                // say so once ([`App::refuse_input`]).
+                if receipt.input_queue_full() {
+                    self.refuse_input(session, InputRefusal::Busy);
                 }
                 // THE SWALLOWED-PRESS TALLY, at the write: a press the tty
                 // will not echo counts once it is on the wire (inline) or
@@ -7918,7 +8429,7 @@ impl App {
                     && let (Some(now), Some(kind)) = (input_now, console_input)
                     && let Some(ws) = self.windows.get_mut(&wid)
                 {
-                    ws.cursor_pet.note_console_input(now, kind);
+                    ws.companion.note_console_input(now, kind);
                 }
                 // A queued key has not crossed the PTY boundary yet, and a
                 // failed inline write never will: its arrival-time licences
@@ -8371,7 +8882,7 @@ impl App {
                                     && live
                                     && !matches!(ws.trick_fire, TrickLineFire::Withheld { .. })
                                 {
-                                    ws.cursor_pet.note_trick_submit(input_now);
+                                    ws.companion.note_trick_submit(input_now);
                                 }
                                 // The line is over — or PROVABLY EMPTY (backspaced
                                 // or word-killed down to nothing, which the
@@ -8401,7 +8912,7 @@ impl App {
                         && self.trail_is_kitty_pet()
                         && let Some(ws) = self.windows.get_mut(&wid)
                     {
-                        ws.cursor_pet.note_trick(input_now, trick, confirmed);
+                        ws.companion.note_trick(input_now, trick, confirmed);
                         if let Some(w) = ws.os_window.as_ref() {
                             w.request_redraw();
                         }
@@ -8436,19 +8947,16 @@ impl App {
                     self.drag_selection(wid, row, col);
                     return InputOutcome::Ok;
                 }
-                let receipt = input::seam_egress_receipt(
-                    &term,
-                    &modes,
-                    &sink,
-                    &ev,
-                    input::EgressMode::Interactive,
-                );
+                let receipt = paste_order::report_ordered_or_inline(&term, &modes, &sink, &ev);
+                note_refused_report(receipt);
                 // Full with no accepted bytes also means the tracking mode
                 // ignores this motion (DEC1000, or buttonless DEC1002). Such a
                 // hover cannot revoke a key waiting for its own echo. Actual
-                // reports, including accepted spill writes, remain boundaries;
-                // failed report attempts conservatively remain boundaries too.
+                // reports, including accepted spill writes and reports queued
+                // for the ordered writer, remain boundaries; failed report
+                // attempts conservatively remain boundaries too.
                 if receipt.accepted_order().is_some()
+                    || receipt.is_queued()
                     || !matches!(
                         receipt.egress,
                         input::Egress::TrackingOff { .. }
@@ -8536,7 +9044,8 @@ impl App {
                 // SOLE focus-report egress (in `seam_egress`): ESC[I / ESC[O,
                 // gated on DEC 1004. The GUI-visual blink/cursor-override side-effect stays in
                 // `on_focus`.
-                input::seam_egress(&term, &modes, &sink, &ev, input::EgressMode::Interactive);
+                let receipt = paste_order::report_ordered_or_inline(&term, &modes, &sink, &ev);
+                note_refused_report(receipt);
                 InputOutcome::Ok
             }
         }
@@ -8591,7 +9100,9 @@ impl App {
             } else {
                 unreachable!()
             };
-        let egress = input::seam_egress(term, modes, sink, ev, input::EgressMode::Interactive);
+        let receipt = paste_order::report_ordered_or_inline(term, modes, sink, ev);
+        note_refused_report(receipt);
+        let egress = receipt.egress;
         if let input::Egress::TrackingOff { .. } = egress
             && button == aterm_types::mouse::MouseButton::Left
         {
@@ -8647,7 +9158,9 @@ impl App {
         {
             rain.note_alt_scroll();
         }
-        let egress = input::seam_egress(term, modes, sink, ev, input::EgressMode::Interactive);
+        let receipt = paste_order::report_ordered_or_inline(term, modes, sink, ev);
+        note_refused_report(receipt);
+        let egress = receipt.egress;
         if let input::Egress::TrackingOff {
             wheel_lines,
             wheel_up,
@@ -9491,7 +10004,8 @@ impl App {
             let page = i32::from(term.rows()).max(1);
             // PRESS CUSTODY: nothing to do here any more. The recorder moved DOWN
             // into `Terminal::scroll_display` / `scroll_to_top` /
-            // `scroll_to_absolute_row`, which is what every arm below calls, so this
+            // `scroll_to_absolute_row` / `return_to_live`, which is what every arm
+            // below calls (a rise, a fall and a return to live alike), so this
             // seam records by construction — and so do the six that used to bypass
             // it: the wheel's instant arm, the wheel's glide tick,
             // `settle_scroll_motion_at_target`, `control::apply_scroll_intent`, the
@@ -9501,7 +10015,8 @@ impl App {
                 ScrollIntent::Down => term.scroll_display(-page),
                 ScrollIntent::By(n) => term.scroll_display(n),
                 ScrollIntent::Top => term.scroll_to_top(),
-                ScrollIntent::Bottom => term.scroll_to_bottom(),
+                // A non-typing return to live: records `SnapToLive`.
+                ScrollIntent::Bottom => term.return_to_live(),
                 // Jump-to-prompt: lift the nearest recorded OSC-133 prompt row
                 // above (Prev) or below (Next) the current top visible row to
                 // the top — the union of command marks and blocks, see
@@ -9557,9 +10072,16 @@ impl App {
     /// clones of the term + sink, so the PTY master fd stays open for the whole
     /// write (the OwnedFd-closes-on-last-clone-drop contract) and whole-frame
     /// atomicity is the sink's own guarantee (direct writes serialize under its
-    /// lock; a wedged-tty spill stays frame-contiguous). On session teardown the
-    /// slave closes and the parked write returns an error, so the thread always
-    /// ends — no leak. `ev` must be `InputEvent::Paste(..)`.
+    /// lock; a wedged-tty spill stays frame-contiguous). On session teardown
+    /// `Session::drop` severs the sink's input (`SinkWriter::sever_input`), so a
+    /// parked write abandons its frame within one recheck period and the thread
+    /// always ends — no leak, even under a child that outlives its hang-up
+    /// (unix; on Windows a write inside the blocking ConPTY `WriteFile` ends only
+    /// when that call returns — the owed overlapped/IOCP pump). A
+    /// paste the session's queue cannot admit is REFUSED at submission (said
+    /// once, [`App::refuse_input`], and `WriteFailed`), never queued without
+    /// bound and never written around the queue.
+    /// `ev` must be `InputEvent::Paste(..)`.
     ///
     /// THE DELAY IS WHY A PASTE CARRIES ITS FRAMING. Everything above says the
     /// bytes are produced later, on another thread, after a bounded queue —
@@ -9665,8 +10187,8 @@ impl App {
                     self.watch_paste(session, sink, meter, paste_bytes, input_now);
                 }
             }
-            Err(_) => {
-                self.report_ordered_input_rejection(session);
+            Err(rejected) => {
+                self.refuse_input(session, InputRefusal::of_rejected(rejected));
                 return InputOutcome::WriteFailed;
             }
         }
@@ -9713,7 +10235,7 @@ impl App {
             revoke_dispatch(ws, input_now, false);
             // One accepted paste gesture cancels curiosity. It is not a
             // claim that the asynchronous write landed or changed the grid.
-            ws.cursor_pet
+            ws.companion
                 .note_console_input(input_now, PetInputKind::Paste);
         }
         InputOutcome::Ok
@@ -10550,7 +11072,9 @@ impl App {
     /// Finish one physical hold according to its press-time disposition. A
     /// release with no observed press is byte-silent; a forwarded release goes
     /// to the original session with the original logical key/modifiers/layout,
-    /// never to whichever window happens to have focus now.
+    /// never to whichever window happens to have focus now — save a modifier
+    /// key's own bit, which is the state the release leaves (set while the
+    /// key's other side is still held, as kitty reports it).
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -10586,9 +11110,20 @@ impl App {
                 window,
                 session,
                 key,
-                mods,
+                mut mods,
                 base_layout,
             } => {
+                // A MODIFIER's release reports the state it leaves (kitty): its
+                // own bit stays set while the key's other side is still
+                // physically held — both Shifts down, one let go, `shift` is
+                // still in force — and is clear otherwise, whatever the press saw.
+                if let aterm_types::keyboard::Key::Named(named) = &key
+                    && let Some((flag, _)) = named.modifier_twin()
+                {
+                    let twin_held = aterm_winit_keymap::physical_modifier_twin(physical_key)
+                        .is_some_and(|twin| self.physical_press_owners.contains_key(&twin));
+                    mods.set(flag, twin_held);
+                }
                 // A key RELEASE is the same tolerated key traffic as its press:
                 // `input_to_session` and the window-event seam both buffer
                 // `Key`/`KeyboardInput` events (all event types) through a
@@ -10628,11 +11163,10 @@ impl App {
                 // that paste, even though focus moved and we cannot call `input`
                 // (which would re-resolve the now-current session). A successful
                 // enqueue is full delivery into the ordered spill contract.
-                let egress = if byte_silent {
-                    // Nothing to order behind a draining paste either: an event that
-                    // encodes to zero bytes cannot overtake anything.
-                    input::Egress::Reported(input::Delivery::Full)
-                } else {
+                // Nothing to order behind a draining paste either when the
+                // release is byte-silent: an event that encodes to zero bytes
+                // cannot overtake anything, and is fully delivered as it is.
+                let receipt = (!byte_silent).then(|| {
                     paste_order::ordered_or_inline(
                         &session.term,
                         &session.ctx.modes,
@@ -10643,12 +11177,13 @@ impl App {
                         None,
                     )
                     .0
-                    .egress
-                };
+                });
                 #[cfg(test)]
                 {
-                    let input::Egress::Reported(delivery) = egress else {
-                        unreachable!("a key release always returns Reported")
+                    let delivery = match receipt.map(|receipt| receipt.egress) {
+                        None => input::Delivery::Full,
+                        Some(input::Egress::Reported(delivery)) => delivery,
+                        Some(_) => unreachable!("a key release always returns Reported"),
                     };
                     record_physical_release_trace(PhysicalReleaseTrace::Forwarded {
                         arrival_window: release_window,
@@ -10662,8 +11197,8 @@ impl App {
                     });
                 }
                 let session_id = session.id;
-                if matches!(egress, input::Egress::Reported(input::Delivery::BusyZero)) {
-                    self.report_ordered_input_rejection(session_id);
+                if receipt.is_some_and(input::EgressReceipt::input_queue_full) {
+                    self.refuse_input(session_id, InputRefusal::Busy);
                 }
             }
             crate::PhysicalPressOwner::Literal { .. } => {
@@ -11045,12 +11580,36 @@ impl App {
             self.note_press_disposition(wid, &ev, None);
             return;
         }
-        // While the Settings overlay is open it OWNS the keyboard: swallow every key —
-        // move / activate / edit / close — BEFORE any keybinding, `[key_sequences]` rule,
-        // hardcoded Cmd chord, scrollback chord, or Cmd-F can fire. Checked first, mirroring
-        // the settings-first gate in `on_mouse_input`; without this a `[key_sequences]` rule
-        // would write RAW bytes to the PTY (and chords would mutate the window) under the
-        // modal. `on_key_settings_mode` returns `true` for every key while the panel is up.
+        // CLOSE/QUIT CONFIRMATION BANNER (Windows — `close_banner` is `None`
+        // elsewhere): while it stands over THIS window it owns the keyboard, exactly
+        // as the task-modal dialog it replaced did (the owner window was DISABLED,
+        // so no keybinding, chord or PTY write could fire under it): Enter proceeds
+        // (the parked gesture replays), Escape cancels, everything else is
+        // swallowed. The decision is the same [`crate::alert_keys::confirm_key`]
+        // router as the paste banner above, so a Return under a held modifier still
+        // answers. A key aimed at a DIFFERENT window passes untouched.
+        if self.close_banner.as_ref().is_some_and(|p| p.wid == wid) {
+            let (chars, code) = match &ev.logical_key {
+                Key::Named(NamedKey::Enter) => (Some("\r"), 0),
+                Key::Named(NamedKey::Escape) => (Some("\u{1b}"), 0),
+                _ => (None, 0),
+            };
+            match crate::alert_keys::confirm_key(true, 0, chars, code) {
+                crate::alert_keys::ConfirmKey::Accept => {
+                    self.answer_close_banner(true);
+                }
+                crate::alert_keys::ConfirmKey::Cancel => {
+                    self.answer_close_banner(false);
+                }
+                crate::alert_keys::ConfirmKey::PassThrough => {}
+            }
+            self.note_press_disposition(wid, &ev, None);
+            return;
+        }
+        // While an overlay is open it OWNS the keyboard: swallow every key BEFORE any
+        // keybinding, `[key_sequences]` rule, hardcoded Cmd chord, scrollback chord, or
+        // Cmd-F can fire. Checked first; without this a `[key_sequences]` rule would write
+        // RAW bytes to the PTY (and chords would mutate the window) under the modal.
         let overlay_repeat = self.palette_repeat_event(wid, &ev);
         if self.on_key_overlay_mode(wid, mods, &ev) {
             self.note_press_disposition(
@@ -11447,9 +12006,9 @@ impl App {
         // to snap "because the snap has to precede the zoom's re-grid"; the
         // re-grid does not require it (`Grid::reflow` captures and clamps the
         // pre-resize offset for every other resize path — window resize, divider
-        // drag — none of which snap). Until the anchored restore lands the
-        // rows-only case can still slide the view by the row-count delta, which
-        // is strictly better than discarding the position outright.
+        // drag — none of which snap). A rows-only re-grid restores the same top
+        // visible line (`Grid::reflow`'s anchor arm); a width change rewraps and
+        // clamps the offset.
         if self.on_key_font_zoom(mods, &ev) {
             self.note_press_disposition(
                 wid,
@@ -12475,7 +13034,7 @@ impl App {
             Some(OverlayKind::SessionPicker) => self.on_key_session_picker_mode(wid, ev),
             Some(OverlayKind::ConnectionMap) => self.on_key_connection_map_mode(wid, ev),
             #[cfg(test)]
-            Some(OverlayKind::Settings) => self.on_key_settings_mode(wid, _mods, ev),
+            Some(OverlayKind::Settings) => true,
             None => false,
         }
     }
@@ -12768,448 +13327,6 @@ impl App {
         }
     }
 
-    /// While the Settings overlay is open on `wid`, drive it from the keyboard and
-    /// SWALLOW every key (return `true`) so nothing reaches the PTY (design §6):
-    /// Tab/⇧Tab toggle the sidebar/content panes; sidebar ↑/↓ move the category and
-    /// →/↵ focus content; content ↑/↓ move the selection, ←/→ adjust in place (←
-    /// NEVER leaves the pane — Tab is the switcher), ↵/Space activates, ⌫ resets.
-    /// Esc walks one level per press: colour wheel > open menu > text edit >
-    /// search query > content→sidebar > close. Closed ⇒ `false` (keys flow
-    /// normally). Mirrors [`on_key_search_mode`]; keep IDENTICAL to the controller
-    /// twin [`Self::settings_input_event`].
-    #[cfg(test)]
-    fn on_key_settings_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
-        let (editing, searching, has_query, menu_open, wheel_open, in_sidebar, landing) =
-            match self.windows.get(&wid).and_then(|ws| ws.settings()) {
-                Some(s) => (
-                    s.editing.is_some(),
-                    s.searching,
-                    !s.query.trim().is_empty(),
-                    s.menu.is_some(),
-                    s.wheel.is_some(),
-                    s.pane == crate::settings::SettingsPane::Sidebar && !s.filtering(),
-                    s.landing,
-                ),
-                None => return false, // panel closed → keys flow normally
-            };
-        if landing {
-            // The §L landing page owns the keys: typing edits the suggestion
-            // box, ↵ sends a non-empty box (else Get started), Tab/↓ skip
-            // straight to the panel, Esc closes. No popover/edit state can be
-            // open while the hero is up. Keep IDENTICAL to the controller twin
-            // [`Self::settings_input_event`].
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => self.settings_exit(),
-                Key::Named(NamedKey::Enter) => self.settings_landing_confirm(),
-                Key::Named(NamedKey::Backspace) => self.settings_comment_backspace(),
-                Key::Named(NamedKey::Tab | NamedKey::ArrowDown) => {
-                    self.settings_landing_get_started();
-                }
-                _ => {
-                    if let Some(t) = &ev.text {
-                        for ch in t.chars().filter(|c| !c.is_control()) {
-                            self.settings_comment_push(ch);
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        if wheel_open {
-            // The colour wheel owns the keys (its Esc level precedes every other):
-            // Tab cycles Wheel→Value→Hex, arrows scrub the focused control (Shift =
-            // coarse), typed hex digits edit the readout (no-ops off the hex field),
-            // ↵ commits ONCE through the shared seam, Esc discards.
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => self.settings_wheel_cancel(),
-                Key::Named(NamedKey::Enter) => self.settings_wheel_commit(),
-                Key::Named(NamedKey::Tab) => self.settings_wheel_focus_next(),
-                Key::Named(NamedKey::ArrowLeft) => {
-                    self.settings_wheel_arrow(-1.0, 0.0, mods.shift_key());
-                }
-                Key::Named(NamedKey::ArrowRight) => {
-                    self.settings_wheel_arrow(1.0, 0.0, mods.shift_key());
-                }
-                Key::Named(NamedKey::ArrowUp) => {
-                    self.settings_wheel_arrow(0.0, 1.0, mods.shift_key());
-                }
-                Key::Named(NamedKey::ArrowDown) => {
-                    self.settings_wheel_arrow(0.0, -1.0, mods.shift_key());
-                }
-                Key::Named(NamedKey::Backspace) => self.settings_wheel_hex_backspace(),
-                _ => {
-                    if let Some(t) = &ev.text {
-                        for ch in t.chars().filter(|c| !c.is_control()) {
-                            self.settings_wheel_hex_push(ch);
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        if menu_open {
-            // The popup menu owns the keys: ↑/↓ move the highlight (clamped), Enter/
-            // Space commit it, Esc closes with NO change (the menu Esc level precedes
-            // the filter/close levels), and a typed letter jumps to the next matching
-            // option.
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => self.settings_menu_cancel(),
-                Key::Named(NamedKey::ArrowUp) => self.settings_menu_move(-1),
-                Key::Named(NamedKey::ArrowDown) => self.settings_menu_move(1),
-                Key::Named(NamedKey::Enter | NamedKey::Space) => self.settings_menu_commit(),
-                _ => {
-                    if ev.text.as_deref() == Some(" ") {
-                        self.settings_menu_commit();
-                    } else if let Some(c) = ev
-                        .text
-                        .as_deref()
-                        .and_then(|t| t.chars().next())
-                        .filter(|c| c.is_alphanumeric())
-                    {
-                        self.settings_menu_jump(c);
-                    }
-                }
-            }
-            return true;
-        }
-        if editing {
-            // In the in-panel text editor: keys edit the buffer, not the selection.
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => self.settings_edit_cancel(),
-                Key::Named(NamedKey::Enter) => self.settings_edit_commit(),
-                Key::Named(NamedKey::Backspace) => self.settings_edit_backspace(),
-                // Everything printable (incl. Space, which arrives as text) is inserted;
-                // control chars (arrows, fn keys) are swallowed without effect.
-                _ => {
-                    if let Some(t) = &ev.text {
-                        for ch in t.chars().filter(|c| !c.is_control()) {
-                            self.settings_edit_push(ch);
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        if searching {
-            // Search-bar focus: typing filters; Enter/↓ drops into the list; Esc clears.
-            match &ev.logical_key {
-                Key::Named(NamedKey::Escape) => self.settings_search_clear(),
-                Key::Named(NamedKey::Enter | NamedKey::ArrowDown) => self.settings_search_confirm(),
-                Key::Named(NamedKey::Backspace) => self.settings_search_backspace(),
-                _ => {
-                    if let Some(t) = &ev.text {
-                        for ch in t.chars().filter(|c| !c.is_control()) {
-                            self.settings_search_push(ch);
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-        match &ev.logical_key {
-            // Esc, one level per press: clear an active filter, step content back to
-            // the sidebar, and only from the sidebar close the panel/window.
-            Key::Named(NamedKey::Escape) => {
-                if has_query {
-                    self.settings_search_clear();
-                } else if !in_sidebar {
-                    self.settings_focus_sidebar();
-                } else {
-                    self.settings_exit();
-                }
-            }
-            // Tab / ⇧Tab toggle the two panes (macOS full-keyboard-access order).
-            Key::Named(NamedKey::Tab) => self.settings_toggle_pane(),
-            Key::Named(NamedKey::ArrowUp) => self.settings_move(-1),
-            Key::Named(NamedKey::ArrowDown) => self.settings_move(1),
-            // ← adjusts IN PLACE and NEVER leaves the content pane (Tab switches
-            // panes, so adjust and navigate can't collide); in the sidebar it idles.
-            Key::Named(NamedKey::ArrowLeft) => {
-                if !in_sidebar {
-                    self.settings_step(-1, mods.shift_key());
-                }
-            }
-            // → from the sidebar drops focus into the content pane; in content it
-            // adjusts in place (Shift = ×10), each press persisting (design §6).
-            Key::Named(NamedKey::ArrowRight) => {
-                if in_sidebar {
-                    self.settings_focus_content();
-                } else {
-                    self.settings_step(1, mods.shift_key());
-                }
-            }
-            // ↵/Space: sidebar → focus content; content → activate (toggle / cycle /
-            // open the popup menu / open the free-form editor).
-            Key::Named(NamedKey::Enter | NamedKey::Space) => {
-                if in_sidebar {
-                    self.settings_focus_content();
-                } else {
-                    self.settings_activate();
-                }
-            }
-            // `/` focuses the search bar from either pane; ⌘F is its macOS-
-            // conventional twin (design §4.4) — without this arm the chord is a
-            // dead key under the swallow-everything overlay gate. (On macOS the
-            // Edit ▸ Find… key equivalent usually intercepts ⌘F ahead of keyDown
-            // and lands in `find_requested`, which diverts here too.)
-            Key::Character(s) if s.as_str() == "/" => self.settings_search_begin(),
-            Key::Character(s) if mods.super_key() && s.eq_ignore_ascii_case("f") => {
-                self.settings_search_begin();
-            }
-            // Reset the focused row to its built-in default: Del, Cmd-Backspace, or —
-            // in the grouped content pane, where the focused control is on glass —
-            // plain ⌫ (design §6). The flat filtered list keeps Cmd-⌫ only.
-            Key::Named(NamedKey::Delete) => self.settings_reset_selected(),
-            Key::Named(NamedKey::Backspace) if mods.super_key() || (!in_sidebar && !has_query) => {
-                self.settings_reset_selected();
-            }
-            _ => {
-                if ev.text.as_deref() == Some(" ") {
-                    if in_sidebar {
-                        self.settings_focus_content();
-                    } else {
-                        self.settings_activate();
-                    }
-                } else if ev.text.as_deref() == Some("/") {
-                    self.settings_search_begin();
-                }
-            }
-        }
-        true
-    }
-
-    /// Drive the settings overlay from an ENGINE-NEUTRAL [`InputEvent`] — the convergence
-    /// seam ([`Self::input`]) reached by CONTROLLER `key`/`text`/`paste` verbs, which
-    /// bypass the winit `on_key` path. Mirrors [`Self::on_key_settings_mode`] so a
-    /// Controller navigates + edits the panel EXACTLY as a Human does (completing
-    /// introspection CONTROL of the overlay — `aterm-ctl settings open` then `key Down` /
-    /// `key Enter` / `text …` work). The caller still swallows the event from the PTY.
-    #[cfg(test)]
-    fn settings_input_event(&mut self, wid: WindowId, ev: &InputEvent) {
-        use aterm_types::keyboard::{
-            Key as TKey, KeyEventType, Modifiers as TMods, NamedKey as TNamed,
-        };
-        let (editing, searching, has_query, menu_open, wheel_open, in_sidebar, landing) =
-            match self.windows.get(&wid).and_then(|ws| ws.settings()) {
-                Some(s) => (
-                    s.editing.is_some(),
-                    s.searching,
-                    !s.query.trim().is_empty(),
-                    s.menu.is_some(),
-                    s.wheel.is_some(),
-                    s.pane == crate::settings::SettingsPane::Sidebar && !s.filtering(),
-                    s.landing,
-                ),
-                None => return,
-            };
-        match ev {
-            InputEvent::Key {
-                key,
-                mods,
-                event_type,
-                ..
-            } => {
-                // A key RELEASE is not a command (matches the press-driven winit path).
-                if matches!(event_type, KeyEventType::Release) {
-                    return;
-                }
-                if landing {
-                    // The §L landing page owns the keys — mirrors the winit
-                    // branch exactly (typing edits the suggestion box, ↵
-                    // sends-or-starts, Tab/↓ skip to the panel, Esc closes).
-                    match key {
-                        TKey::Named(TNamed::Escape) => self.settings_exit(),
-                        TKey::Named(TNamed::Enter) => self.settings_landing_confirm(),
-                        TKey::Named(TNamed::Backspace) => self.settings_comment_backspace(),
-                        TKey::Named(TNamed::Tab | TNamed::ArrowDown) => {
-                            self.settings_landing_get_started();
-                        }
-                        TKey::Named(TNamed::Space) => self.settings_comment_push(' '),
-                        TKey::Character(c) if !c.is_control() => self.settings_comment_push(*c),
-                        _ => {}
-                    }
-                    return;
-                }
-                if wheel_open {
-                    // The colour wheel owns the keys (Esc precedence: wheel > menu >
-                    // edit > search > panes > close) — mirrors the winit branch.
-                    match key {
-                        TKey::Named(TNamed::Escape) => self.settings_wheel_cancel(),
-                        TKey::Named(TNamed::Enter) => self.settings_wheel_commit(),
-                        TKey::Named(TNamed::Tab) => self.settings_wheel_focus_next(),
-                        TKey::Named(TNamed::ArrowLeft) => {
-                            self.settings_wheel_arrow(-1.0, 0.0, mods.contains(TMods::SHIFT));
-                        }
-                        TKey::Named(TNamed::ArrowRight) => {
-                            self.settings_wheel_arrow(1.0, 0.0, mods.contains(TMods::SHIFT));
-                        }
-                        TKey::Named(TNamed::ArrowUp) => {
-                            self.settings_wheel_arrow(0.0, 1.0, mods.contains(TMods::SHIFT));
-                        }
-                        TKey::Named(TNamed::ArrowDown) => {
-                            self.settings_wheel_arrow(0.0, -1.0, mods.contains(TMods::SHIFT));
-                        }
-                        TKey::Named(TNamed::Backspace) => self.settings_wheel_hex_backspace(),
-                        TKey::Character(c) if !c.is_control() => {
-                            self.settings_wheel_hex_push(*c);
-                        }
-                        _ => {}
-                    }
-                    return;
-                }
-                if menu_open {
-                    // The popup menu owns the keys (Esc precedence: menu > filter >
-                    // close) — mirrors the winit menu branch exactly.
-                    match key {
-                        TKey::Named(TNamed::Escape) => self.settings_menu_cancel(),
-                        TKey::Named(TNamed::ArrowUp) => self.settings_menu_move(-1),
-                        TKey::Named(TNamed::ArrowDown) => self.settings_menu_move(1),
-                        TKey::Named(TNamed::Enter | TNamed::Space) => self.settings_menu_commit(),
-                        TKey::Character(' ') => self.settings_menu_commit(),
-                        TKey::Character(c) if c.is_alphanumeric() => self.settings_menu_jump(*c),
-                        _ => {}
-                    }
-                    return;
-                }
-                if editing {
-                    match key {
-                        TKey::Named(TNamed::Escape) => self.settings_edit_cancel(),
-                        TKey::Named(TNamed::Enter) => self.settings_edit_commit(),
-                        TKey::Named(TNamed::Backspace) => self.settings_edit_backspace(),
-                        TKey::Named(TNamed::Space) => self.settings_edit_push(' '),
-                        TKey::Character(c) if !c.is_control() => self.settings_edit_push(*c),
-                        _ => {}
-                    }
-                } else if searching {
-                    match key {
-                        TKey::Named(TNamed::Escape) => self.settings_search_clear(),
-                        TKey::Named(TNamed::Enter | TNamed::ArrowDown) => {
-                            self.settings_search_confirm()
-                        }
-                        TKey::Named(TNamed::Backspace) => self.settings_search_backspace(),
-                        TKey::Named(TNamed::Space) => self.settings_search_push(' '),
-                        TKey::Character(c) if !c.is_control() => self.settings_search_push(*c),
-                        _ => {}
-                    }
-                } else {
-                    // Nav mode — keep IDENTICAL to the winit branch above.
-                    match key {
-                        TKey::Named(TNamed::Escape) => {
-                            if has_query {
-                                self.settings_search_clear();
-                            } else if !in_sidebar {
-                                self.settings_focus_sidebar();
-                            } else {
-                                self.settings_exit();
-                            }
-                        }
-                        TKey::Named(TNamed::Tab) => self.settings_toggle_pane(),
-                        TKey::Named(TNamed::ArrowUp) => self.settings_move(-1),
-                        TKey::Named(TNamed::ArrowDown) => self.settings_move(1),
-                        // ← never leaves content; in the sidebar it idles
-                        // (design §6 — falls to the no-op catch-all).
-                        TKey::Named(TNamed::ArrowLeft) if !in_sidebar => {
-                            self.settings_step(-1, mods.contains(TMods::SHIFT));
-                        }
-                        TKey::Named(TNamed::ArrowRight) => {
-                            if in_sidebar {
-                                self.settings_focus_content();
-                            } else {
-                                self.settings_step(1, mods.contains(TMods::SHIFT));
-                            }
-                        }
-                        TKey::Named(TNamed::Enter | TNamed::Space) => {
-                            if in_sidebar {
-                                self.settings_focus_content();
-                            } else {
-                                self.settings_activate();
-                            }
-                        }
-                        TKey::Named(TNamed::Delete) => self.settings_reset_selected(),
-                        // Plain ⌫ resets only in the grouped content pane (the winit
-                        // branch's Cmd-⌫ arrives as a shortcut, not through here).
-                        TKey::Named(TNamed::Backspace) if !in_sidebar && !has_query => {
-                            self.settings_reset_selected();
-                        }
-                        TKey::Character('/') => self.settings_search_begin(),
-                        // ⌘F focuses the search exactly like `/` (design §4.4) —
-                        // keep IDENTICAL to the winit branch above.
-                        TKey::Character('f' | 'F') if mods.contains(TMods::SUPER) => {
-                            self.settings_search_begin();
-                        }
-                        TKey::Character(' ') => {
-                            if in_sidebar {
-                                self.settings_focus_content();
-                            } else {
-                                self.settings_activate();
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            // Typed text / paste feeds the in-panel editor or the search box; a lone space
-            // activates in nav (or commits the open menu; a letter jumps its highlight),
-            // a lone `/` opens search. With the colour wheel up, text feeds its hex
-            // readout (no-ops off the hex field).
-            InputEvent::Text(t) | InputEvent::Paste(t, _) => {
-                if wheel_open {
-                    for ch in t.chars().filter(|c| !c.is_control()) {
-                        self.settings_wheel_hex_push(ch);
-                    }
-                } else if menu_open {
-                    if t == " " {
-                        self.settings_menu_commit();
-                    } else if let Some(c) = t.chars().next().filter(|c| c.is_alphanumeric()) {
-                        self.settings_menu_jump(c);
-                    }
-                } else if editing {
-                    for ch in t.chars().filter(|c| !c.is_control()) {
-                        self.settings_edit_push(ch);
-                    }
-                } else if searching {
-                    for ch in t.chars().filter(|c| !c.is_control()) {
-                        self.settings_search_push(ch);
-                    }
-                } else if t == " " {
-                    if in_sidebar {
-                        self.settings_focus_content();
-                    } else {
-                        self.settings_activate();
-                    }
-                } else if t == "/" {
-                    self.settings_search_begin();
-                }
-            }
-            // The wheel scrolls the open menu's option window, else the body band —
-            // the human `on_mouse_wheel` path converges HERE too (the modal gate in
-            // [`Self::input`] routes a swallowed Wheel to this handler), so mouse and
-            // controller wheel scrolling are one code path.
-            InputEvent::Wheel { dir, lines, .. } => {
-                // The panel is a VERTICAL list; a horizontal flick (audit I7)
-                // has nothing to move here, so it is swallowed rather than
-                // being folded into the vertical delta.
-                let Some(up) = dir.vertical_up() else {
-                    return;
-                };
-                let delta = if up {
-                    -(*lines as isize)
-                } else {
-                    *lines as isize
-                };
-                if wheel_open {
-                    // Swallowed: scrolling the band under the anchored colour wheel
-                    // would detach the popover from its row mid-scrub.
-                } else if menu_open {
-                    self.settings_menu_scroll(delta);
-                } else {
-                    self.settings_scroll_body(delta);
-                }
-            }
-            _ => {}
-        }
-    }
-
     /// Cmd-= / Cmd-+ / Cmd-- / Cmd-0 live font zoom (grow / shrink / reset) of
     /// [`on_key`]. Returns `true` when a zoom chord fired.
     fn on_key_font_zoom(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
@@ -13449,6 +13566,8 @@ impl App {
             changed = ws.preedit != text || ws.preedit_caret != caret;
             ws.preedit.clone_from(&text);
             ws.preedit_caret = caret;
+            ws.ime_compose =
+                ime_compose_on_preedit(ws.ime_compose, !text.is_empty(), std::time::Instant::now());
         }
         if self.active_native_view(wid).is_some() {
             let _ = self.dispatch_native_event(
@@ -13653,6 +13772,19 @@ impl App {
         if let Some(ws) = self.windows.get_mut(&wid) {
             ws.preedit.clear();
             ws.preedit_caret = None;
+            // THE COMPOSITION CLOCK closes here, wherever the text lands: the
+            // person's wait from the first marked character to the committed
+            // one. An empty commit is a composition that produced nothing.
+            if let Some((started, _)) = ws.ime_compose.take() {
+                if text.is_empty() {
+                    crate::metrics::note_ime_cancelled();
+                } else {
+                    let ns = std::time::Instant::now()
+                        .saturating_duration_since(started)
+                        .as_nanos();
+                    crate::metrics::note_ime_compose(u64::try_from(ns).unwrap_or(u64::MAX));
+                }
+            }
         }
         match route {
             PreeditOwner::Native => {
@@ -14053,11 +14185,11 @@ impl App {
                 }
             }
             // THE FABRIC MENU (round 19, SPEC19 §9; the App side lives in
-            // `app_fabric_menu.rs`). Fleet… opens the connection map until the
-            // fleet screen exists (round 20) — the row's help says so.
+            // `app_fabric_menu.rs`). Fleet… is the Fabric menu's route to the
+            // Sessions/Connection Map — the fleet view, not a second screen.
             MenuAction::Fleet => {
                 if let Err(e) = self.open_connection_map() {
-                    aterm_log::info!("fleet (the connection map until round 20): {e}");
+                    aterm_log::info!("fleet (the connection map): {e}");
                 }
             }
             // The rest act on the FRONT window — the "front tab is the
@@ -14096,6 +14228,24 @@ impl App {
                         wid,
                         crate::session_timeline::MetaField::Role,
                     );
+                }
+            }
+            // Window ▸ Show Identity: the focused session's identity, read-only,
+            // as a Markdown tab.
+            MenuAction::ShowIdentity => {
+                if let Some(wid) = self.frontmost_window {
+                    self.open_session_identity_tab(wid);
+                }
+            }
+            // File ▸ New Window / New Tab With Identity…: the identity picker.
+            MenuAction::NewWindowWithIdentity | MenuAction::NewTabWithIdentity => {
+                if let Some(wid) = self.frontmost_window {
+                    let place = if action == MenuAction::NewWindowWithIdentity {
+                        crate::session_picker::PickerIntent::NewWindowWithIdentity
+                    } else {
+                        crate::session_picker::PickerIntent::NewTabWithIdentity
+                    };
+                    let _ = self.open_identity_picker(wid, place);
                 }
             }
             // View ▸ Presence Band / Rim: flip the live bit and persist it.
@@ -17274,13 +17424,20 @@ mod smooth_scroll_tests {
             "a chained notch: still the seam's one lock"
         );
         let cell_h = app.win_cell_size(wid).1.max(1) as i64;
+        // Two notches. A notch is one row except on Windows, where it is the
+        // desktop's lines-per-detent (`input::wheel_platform_lines`: the live
+        // `SPI_GETWHEELSCROLLLINES`, 3 by default — six rows there).
+        let notch_rows = i64::from(crate::input::wheel_platform_lines(
+            1,
+            app.windows[&wid].rows,
+        ));
         assert_eq!(
             app.windows[&wid]
                 .scroll_glide
                 .as_ref()
                 .map(|st| st.glide.target_px()),
-            Some(2 * cell_h),
-            "the chain retargeted to two rows from the carried facts"
+            Some(2 * notch_rows * cell_h),
+            "the chain retargeted to two notches' rows from the carried facts"
         );
     }
 
@@ -19298,8 +19455,15 @@ mod press_path_lock_elision_tests {
     /// an observer pipe: the release path routes through
     /// `pool.get(session).ctx.sink`, so a window-only mirror would report silence
     /// for bytes that really flowed.
+    ///
+    /// Returns the pipe's nonblocking READ end. The sink OWNS the write end,
+    /// as a shipping session owns its master: the fd closes with the last
+    /// `Arc<SinkWriter>`, never while this App (or a job it queued) can
+    /// still write it, so no write of this App's can reach a parallel test's
+    /// pipe on a recycled number.
     #[cfg(unix)]
-    fn app_observing_pty() -> (App, [i32; 2]) {
+    fn app_observing_pty() -> (App, i32) {
+        use std::os::fd::{FromRawFd, OwnedFd};
         use std::sync::Arc;
 
         use aterm_session::sink::SinkWriter;
@@ -19312,16 +19476,17 @@ mod press_path_lock_elision_tests {
             unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
             0
         );
+        let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
         (
-            App::headless_for_test_with_sink(Arc::new(SinkWriter::new(pipe[1]))),
-            pipe,
+            App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer))),
+            pipe[0],
         )
     }
 
     #[cfg(unix)]
-    fn drain(pipe: [i32; 2]) -> Vec<u8> {
+    fn drain(pipe: i32) -> Vec<u8> {
         let mut bytes = [0u8; 64];
-        let read = unsafe { libc::read(pipe[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        let read = unsafe { libc::read(pipe, bytes.as_mut_ptr().cast(), bytes.len()) };
         if read <= 0 {
             return Vec::new();
         }
@@ -20115,6 +20280,76 @@ mod press_path_lock_elision_tests {
             b"\x1b[57441;2u".to_vec(),
             "report-all: the bare Shift press is reported"
         );
+        // The RIGHT Shift is its own kitty key, `RIGHT_SHIFT` 57447: winit names
+        // the modifier without a side (the side is the event's location), and the
+        // window used to report every right-side modifier as the left one.
+        app.on_key(
+            wid,
+            winit::event::KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(KeyCode::ShiftRight),
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift),
+                None,
+                winit::keyboard::KeyLocation::Right,
+                ElementState::Pressed,
+                false,
+            ),
+        );
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57447;2u".to_vec(),
+            "report-all: the right Shift is reported as RIGHT_SHIFT"
+        );
+    }
+
+    /// kitty reports a modifier's RELEASE with the state it leaves: both Shifts
+    /// down and one let go, `shift` is still in force, so the release carries
+    /// the bit (`CSI 57441;2:3u`); the last one's release clears it
+    /// (`CSI 57447;1:3u`), and so does a lone Shift's. The window decides it
+    /// from its physical-press record. Before, every modifier release cleared
+    /// its bit, and the first release read `CSI 57441;1:3u`.
+    #[cfg(unix)]
+    #[test]
+    fn a_modifier_release_keeps_its_bit_while_the_other_side_is_held() {
+        let (mut app, pipe) = app_observing_pty();
+        let wid = WindowId(0);
+        let term = app.front_terminal(wid).expect("terminal").term.clone();
+        // Report all keys (8) and event types (2): releases are reported.
+        term_lock(&term).process(b"\x1b[>10u");
+        let shift = |code: KeyCode, state: ElementState| {
+            winit::event::KeyEvent::synthetic_for_test(
+                PhysicalKey::Code(code),
+                winit::keyboard::Key::Named(winit::keyboard::NamedKey::Shift),
+                None,
+                if code == KeyCode::ShiftRight {
+                    winit::keyboard::KeyLocation::Right
+                } else {
+                    winit::keyboard::KeyLocation::Left
+                },
+                state,
+                false,
+            )
+        };
+        app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
+        assert_eq!(drain(pipe), b"\x1b[57441;2u".to_vec(), "left down");
+        app.on_key(wid, shift(KeyCode::ShiftRight, ElementState::Pressed));
+        assert_eq!(drain(pipe), b"\x1b[57447;2u".to_vec(), "right down");
+        app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Released));
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57441;2:3u".to_vec(),
+            "left up while right is held: shift is still in force"
+        );
+        app.on_key(wid, shift(KeyCode::ShiftRight, ElementState::Released));
+        assert_eq!(
+            drain(pipe),
+            b"\x1b[57447;1:3u".to_vec(),
+            "the last Shift up clears the bit"
+        );
+        // A lone Shift: its release clears the bit, whatever its press saw.
+        app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Pressed));
+        assert_eq!(drain(pipe), b"\x1b[57441;2u".to_vec(), "lone down");
+        app.on_key(wid, shift(KeyCode::ShiftLeft, ElementState::Released));
+        assert_eq!(drain(pipe), b"\x1b[57441;1:3u".to_vec(), "lone up");
     }
 
     /// Unmapped physical keys have no wire encoding in either dialect, so they
@@ -20452,9 +20687,8 @@ mod press_path_lock_elision_tests {
                 let t = term_lock(&term);
                 assert_eq!(t.grid().display_offset(), offset_before);
                 assert!(t.text_selection().has_selection());
-                // What ⌘-C will read. Asserted instead of driving the real
-                // `c` press, because that would shell out to `pbcopy` and
-                // clobber the developer's clipboard from a unit test.
+                // What ⌘-C will read, asserted at the selection rather than
+                // through the `c` press and the clipboard it writes.
                 let text = t.selection_to_string().expect("selection resolves to text");
                 assert!(
                     !text.is_empty(),
@@ -20596,10 +20830,7 @@ mod press_path_lock_elision_tests {
             "the glide residual must still be dropped at the press"
         );
         assert_eq!(drain(pipe), b"a".to_vec(), "and the key still types");
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        unsafe { libc::close(pipe) };
     }
 
     /// SELECTION CUSTODY (R1): a bare Cmd chord no shortcut claims is swallowed
@@ -20672,10 +20903,7 @@ mod press_path_lock_elision_tests {
             app.windows[&wid].scroll_frac_px, 0,
             "the window half still drops the banked glide residual"
         );
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        unsafe { libc::close(pipe) };
     }
 
     /// The slot is keyed on the SESSION: a sample published for one session must
@@ -20741,10 +20969,7 @@ mod press_path_lock_elision_tests {
             ),
             "the elided release still reports the seam's own verdict"
         );
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        unsafe { libc::close(pipe) };
     }
 
     /// NEGATIVE CONTROL — the guard must never eat a real release report. With
@@ -20794,10 +21019,7 @@ mod press_path_lock_elision_tests {
             b"\x1b[97;5:3u".to_vec(),
             "REPORT_EVENT_TYPES releases must still reach the app"
         );
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        unsafe { libc::close(pipe) };
     }
 
     /// SELECTION CUSTODY (R1) for the two byte-producing press payloads that
@@ -21216,7 +21438,7 @@ mod press_path_lock_elision_tests {
 
 #[cfg(all(test, unix))]
 mod pet_console_input_tests {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -21229,12 +21451,23 @@ mod pet_console_input_tests {
 
     const CTL: Source = Source::Controller;
 
-    fn observing_app() -> (App, [OwnedFd; 2]) {
+    /// An App whose session writes into a pipe, and the pipe's READ end.
+    ///
+    /// The SINK owns the write end (`new_owned`), exactly as a shipping
+    /// session owns its PTY master: a paste egresses on the per-session
+    /// `paste_order` writer thread, whose queued job holds an
+    /// `Arc<SinkWriter>`, so the fd closes only after that job's write. On a
+    /// borrowed fd the test's scope closed the number with the job still
+    /// queued, and the paste's "echo hi" landed in whatever pipe a parallel
+    /// test had just opened on the recycled number — measured as
+    /// `press_path_lock_elision_tests` reading `echo hia` for its own `a`.
+    fn observing_app() -> (App, OwnedFd) {
         let mut pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        let fds = unsafe { [OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])] };
-        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(fds[1].as_raw_fd())));
-        (app, fds)
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer)));
+        (app, reader)
     }
 
     fn press(key: Key) -> InputEvent {
@@ -21247,7 +21480,7 @@ mod pet_console_input_tests {
     }
 
     fn observed(app: &App) -> (u64, Option<PetInputKind>) {
-        let pet = &app.windows[&WindowId(0)].cursor_pet;
+        let pet = &app.windows[&WindowId(0)].companion;
         (pet.console_input_seq(), pet.console_input_kind())
     }
 
@@ -21303,7 +21536,7 @@ mod pet_console_input_tests {
             ),
         ];
         for (what, build, arms) in cases {
-            let (mut app, _fds) = observing_app();
+            let (mut app, _reader) = observing_app();
             let wid = WindowId(0);
             // UNFOCUSED: the only state in which the wake decides anything.
             // With OS focus held `cursor_fx_focus` is true whatever the stamp
@@ -21341,7 +21574,7 @@ mod pet_console_input_tests {
     #[test]
     fn human_and_control_input_note_once_without_caret_travel_or_echo_credit() {
         for source in [Source::Human, CTL] {
-            let (mut app, _fds) = observing_app();
+            let (mut app, _reader) = observing_app();
             let wid = WindowId(0);
             let term = app.front_terminal(wid).unwrap().term.clone();
             term_lock(&term).process(b"old\r");
@@ -21361,7 +21594,7 @@ mod pet_console_input_tests {
 
     #[test]
     fn ime_preview_is_silent_and_each_commit_bundle_notes_once() {
-        let (mut app, _fds) = observing_app();
+        let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
         let before = observed(&app).0;
         app.on_ime_preedit(wid, "中文".into(), Some((0, 0)));
@@ -21382,7 +21615,7 @@ mod pet_console_input_tests {
     /// preedit that ends a composition stamps nothing new.
     #[test]
     fn an_ime_composition_is_a_person_typing() {
-        let (mut app, _fds) = observing_app();
+        let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
         let session = app.focused_session_id(wid).expect("a focused session");
         let human = |app: &App| {
@@ -21406,7 +21639,7 @@ mod pet_console_input_tests {
 
     #[test]
     fn navigation_and_delete_keep_distinct_intents_at_the_real_seam() {
-        let (mut app, _fds) = observing_app();
+        let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
         for (key, kind) in [
             (NamedKey::ArrowLeft, PetInputKind::Navigate),
@@ -21427,7 +21660,7 @@ mod pet_console_input_tests {
 
     #[test]
     fn releases_modifiers_raw_sequences_and_failed_writes_cannot_claim_an_edit() {
-        let (mut app, _fds) = observing_app();
+        let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
         let before = observed(&app).0;
         let release = InputEvent::Key {
@@ -21456,7 +21689,7 @@ mod pet_console_input_tests {
 
     #[test]
     fn a_paste_and_queued_key_each_commit_one_intent_without_drain_replay() {
-        let (mut app, _fds) = observing_app();
+        let (mut app, _reader) = observing_app();
         let wid = WindowId(0);
         let sink = app.front_terminal(wid).unwrap().sink.clone();
         let pin = super::paste_order::pin_ordering_for_test(&sink);
@@ -23332,8 +23565,30 @@ mod typed_kitty_summon_tests {
         let lib_source = include_str!("lib.rs");
         assert_eq!(
             lib_source.matches("clear_tab_surface_move_license").count(),
-            8,
+            7,
             "all custom tab-strip wake boundaries remain fenced",
+        );
+        // The eighth, `Wake::TabCmd` (a TabView drag shares it with the wire
+        // `tab` verb), fences in the ONE wire `tab` bracket its arm and the
+        // aimed arm both enter (`control_media.rs`), before the action runs.
+        let tab_arm = lib_source
+            .split_once("Wake::TabCmd { action, by, reply } =>")
+            .expect("the TabCmd arm")
+            .1;
+        assert!(
+            tab_arm.find("self.tab_cmd_front(").unwrap() < tab_arm.find("Wake::").unwrap(),
+            "the TabCmd arm enters the wire bracket"
+        );
+        let bracket = include_str!("control_media.rs")
+            .split_once("fn tab_cmd_applied(")
+            .expect("the wire tab bracket")
+            .1;
+        assert!(
+            bracket
+                .find("clear_tab_surface_move_license(None)")
+                .unwrap()
+                < bracket.find("apply(self)").unwrap(),
+            "the wire tab bracket fences before the action runs"
         );
         let toolbar_source = include_str!("toolbar.rs");
         let context_menu = toolbar_source
@@ -24215,6 +24470,194 @@ mod typed_kitty_summon_tests {
                 libc::close(master);
             }
         }
+    }
+
+    /// **A PASSWORD PROMPT CLICKS ONE TONE AND RINGS NO TING** (owner,
+    /// 2026-09-27, verbatim: *"password: fix to all same tone"*). Real pty
+    /// pairs, as `a_press_the_tty_will_not_echo_banks_no_credit` drives
+    /// them, and the audio host's capture tap: `a`, `A` (Shift), `1`, `.`,
+    /// a space and a bare Shift are pressed into each.
+    ///
+    /// - CANONICAL NO-ECHO (`read -s`, `sudo`, an `ssh` passphrase): every
+    ///   glyph key clicks — a key was pressed — and every click is the SAME
+    ///   stamp: `Typed` (the space too), unshifted, class `SECRET`, rank 0;
+    ///   the bare Shift cues nothing at all.
+    /// - COOKED (the positive control, and the negative control on the
+    ///   instrument): the same presses carry their own class, rank, shift and
+    ///   the space's comma, and the Shift lifts — so a host that stamped
+    ///   nothing, or stamped `SECRET` everywhere, fails one half.
+    ///
+    /// RED with the host change reverted: the no-echo pty's clicks carry
+    /// `A`'s shift, `1`'s digit class and the space's comma, and its Shift
+    /// tings.
+    #[cfg(unix)]
+    #[test]
+    fn a_password_prompt_clicks_one_tone_and_rings_no_ting() {
+        use aterm_effects::trail_sound::{SoundGesture, SoundKind, glyph_class};
+        use aterm_session::sink::SinkWriter;
+        use std::sync::Arc;
+
+        type Edit = fn(&mut libc::tcflag_t);
+        let cases: [(&str, Edit, bool); 2] = [
+            ("cooked (echo+icanon)", |_| {}, false),
+            ("canonical no-echo (read -s)", |l| *l &= !libc::ECHO, true),
+        ];
+        let press = |key: Key, mods: Modifiers| InputEvent::Key {
+            key,
+            mods,
+            base_layout: None,
+            event_type: KeyEventType::Press,
+        };
+        for (label, edit, secret) in cases {
+            let (master, slave) = pty_pair_with_lflag(edit);
+            let sink = Arc::new(SinkWriter::new(master));
+            assert_eq!(
+                sink.tty_swallows_input(),
+                secret,
+                "{label}: the sink's verdict"
+            );
+            let mut app = App::headless_for_test_with_sink(sink.clone());
+            app.config.cursor_trail = Some(true);
+            app.config.cursor_trail_style = Some("rainbow kitty".to_string());
+            app.trail_audio = crate::trail_audio::TrailAudio::capturing_for_test();
+            let wid = WindowId(0);
+            app.tick_cursor_fx(
+                wid,
+                crate::app_render::CursorFxInputs::sample_for_test(Instant::now()),
+            )
+            .expect("the fixture window ticks");
+            let _ = app.trail_audio.take_captured_with_meta_for_test();
+            let keys = [
+                ('a', press(Key::Character('a'), Modifiers::empty())),
+                ('A', press(Key::Character('a'), Modifiers::SHIFT)),
+                ('1', press(Key::Character('1'), Modifiers::empty())),
+                ('.', press(Key::Character('.'), Modifiers::empty())),
+                (' ', press(Key::Named(NamedKey::Space), Modifiers::empty())),
+            ];
+            for (ch, ev) in keys {
+                let _ = app.input(wid, ev, Source::Human);
+                let spoken = app.trail_audio.take_captured_with_meta_for_test();
+                let clicks: Vec<_> = spoken
+                    .iter()
+                    .filter(|(ev, _)| {
+                        matches!(
+                            ev.kind,
+                            SoundGesture::Trail(SoundKind::Typed | SoundKind::Space)
+                        )
+                    })
+                    .collect();
+                assert_eq!(clicks.len(), 1, "{label}: `{ch}` clicks once: {spoken:?}");
+                let (ev, meta) = clicks[0];
+                let got = (ev.kind, ev.shifted, meta.glyph_class, meta.rank);
+                if secret {
+                    assert_eq!(
+                        got,
+                        (
+                            SoundGesture::Trail(SoundKind::Typed),
+                            false,
+                            glyph_class::SECRET,
+                            0
+                        ),
+                        "{label}: `{ch}` told the synth which key it was"
+                    );
+                } else {
+                    let want_kind = if ch == ' ' {
+                        SoundKind::Space
+                    } else {
+                        SoundKind::Typed
+                    };
+                    assert_eq!(
+                        got,
+                        (
+                            SoundGesture::Trail(want_kind),
+                            ch == 'A',
+                            super::typed_glyph_class(Some(ch)),
+                            super::typed_glyph_rank(Some(ch)),
+                        ),
+                        "{label}: `{ch}` is not its own click"
+                    );
+                }
+            }
+            let _ = app.input(
+                wid,
+                press(Key::Named(NamedKey::ShiftLeft), Modifiers::empty()),
+                Source::Human,
+            );
+            let lifted = app
+                .trail_audio
+                .take_captured_with_meta_for_test()
+                .iter()
+                .any(|(ev, _)| matches!(ev.kind, SoundGesture::Trail(SoundKind::Shift)));
+            assert_eq!(lifted, !secret, "{label}: the bare Shift's ting");
+            // The press is otherwise the press it was: the swallowed tally
+            // counts the five glyph keys at the prompt and none off it.
+            let ws = app.windows.get(&wid).unwrap();
+            assert_eq!(
+                ws.cursor_glow.in_flight_tally().swallowed_no_echo,
+                if secret { 5 } else { 0 },
+                "{label}: the `swallowed_no_echo=` tally"
+            );
+            drop(app);
+            drop(sink);
+            // SAFETY: both fds are ours and open; the borrowed-fd sink did
+            // not close the master.
+            unsafe {
+                libc::close(slave);
+                libc::close(master);
+            }
+        }
+    }
+
+    /// [`super::key_click_stamp`] is the whole decision: off a prompt the
+    /// key's own four stamps (the spacebar's comma, never a shifted space),
+    /// at a prompt one stamp whatever the key.
+    #[test]
+    fn the_key_click_stamp_is_one_stamp_at_a_prompt() {
+        use super::{KeyClickStamp, key_click_stamp};
+        use aterm_effects::trail_sound::{SoundKind, glyph_class};
+        let one = KeyClickStamp {
+            kind: SoundKind::Typed,
+            shifted: false,
+            glyph_class: glyph_class::SECRET,
+            rank: 0,
+        };
+        for (space, shifted, typed) in [
+            (false, false, Some('a')),
+            (false, true, Some('A')),
+            (false, false, Some('7')),
+            (false, true, Some('?')),
+            (true, false, Some(' ')),
+            (true, true, Some(' ')),
+            (false, false, None),
+        ] {
+            assert_eq!(
+                key_click_stamp(true, space, shifted, typed),
+                one,
+                "{typed:?}"
+            );
+        }
+        assert_eq!(
+            key_click_stamp(false, true, true, Some(' ')),
+            KeyClickStamp {
+                kind: SoundKind::Space,
+                shifted: false,
+                glyph_class: glyph_class::LETTER,
+                rank: super::typed_glyph_rank(Some(' ')),
+            }
+        );
+        assert_eq!(
+            key_click_stamp(false, false, true, Some('A')),
+            KeyClickStamp {
+                kind: SoundKind::Typed,
+                shifted: true,
+                glyph_class: glyph_class::LETTER,
+                rank: 1,
+            }
+        );
+        assert_eq!(
+            key_click_stamp(false, false, false, Some('7')).glyph_class,
+            glyph_class::DIGIT
+        );
     }
 
     /// A BACKSPACE INTO A COMMITTED IME RUN GIVES BACK ONE GLYPH'S CREDIT
@@ -25357,7 +25800,7 @@ mod typed_trick_tests {
     }
 
     fn pending(app: &App, wid: WindowId) -> Option<Trick> {
-        app.windows[&wid].cursor_pet.pending_trick()
+        app.windows[&wid].companion.brain().pending_trick()
     }
 
     fn flash(app: &App, wid: WindowId) -> TrickFlashPhase {
@@ -25608,10 +26051,13 @@ mod typed_trick_tests {
         );
         let now = Instant::now();
         {
-            let pet = &mut app.windows.get_mut(&wid).expect("window").cursor_pet;
-            pet.note_command_done(now, true, Some(12));
+            let grieving = crate::app_render::pet_fails_a_command_for_test(
+                app.windows.get_mut(&wid).expect("window"),
+                now,
+                Some(12),
+            );
             assert!(
-                !pet.grieving(),
+                !grieving,
                 "`sit: command not found` is forgiven — the whole line was pet talk"
             );
         }
@@ -25621,9 +26067,12 @@ mod typed_trick_tests {
         type_word(&mut plain, wid, "ls");
         plain.input(wid, named(NamedKey::Enter), Source::Human);
         assert_eq!(pending(&plain, wid), None);
-        let pet = &mut plain.windows.get_mut(&wid).expect("window").cursor_pet;
-        pet.note_command_done(now, true, Some(12));
-        assert!(pet.grieving(), "an ordinary failed line still sulks");
+        let grieving = crate::app_render::pet_fails_a_command_for_test(
+            plain.windows.get_mut(&wid).expect("window"),
+            now,
+            Some(12),
+        );
+        assert!(grieving, "an ordinary failed line still sulks");
     }
 
     /// One row of the gate table: the gate's name and the config edit that
@@ -25704,9 +26153,12 @@ mod typed_trick_tests {
             // with the feature off the cat grieves as it always did, and an
             // ignored `sit` is a real command of the user's, so its failure
             // is theirs to feel.
-            let pet = &mut app.windows.get_mut(&wid).expect("window").cursor_pet;
-            pet.note_command_done(Instant::now(), true, Some(12));
-            assert!(pet.grieving(), "{label}: the fast failure grieves");
+            let grieving = crate::app_render::pet_fails_a_command_for_test(
+                app.windows.get_mut(&wid).expect("window"),
+                Instant::now(),
+                Some(12),
+            );
+            assert!(grieving, "{label}: the fast failure grieves");
         }
     }
 
@@ -25734,7 +26186,7 @@ mod typed_trick_tests {
             "the name confirms nothing withheld"
         );
         assert!(
-            !app.windows[&wid].cursor_pet.trick_engaged(),
+            !app.windows[&wid].companion.brain().trick_engaged(),
             "the brain was never told"
         );
         assert_eq!(
@@ -25766,7 +26218,7 @@ mod typed_trick_tests {
         app.windows
             .get_mut(&wid)
             .expect("window")
-            .cursor_pet
+            .companion
             .revoke_trick();
         app.config.sparkle_words = Some(crate::app_config::SparkleWordsConfig {
             tricks: Some(crate::app_config::SparkleTricksConfig {
@@ -25780,7 +26232,7 @@ mod typed_trick_tests {
         app.recompute_sparkle();
         type_word(&mut app, wid, "kitty ");
         assert_eq!(pending(&app, wid), None, "tricks are off: no confirmation");
-        assert!(!app.windows[&wid].cursor_pet.trick_engaged());
+        assert!(!app.windows[&wid].companion.brain().trick_engaged());
     }
 
     /// AN ERASED LINE FORGETS ITS FIRE. `kitty sit␣` withheld (an ignored
@@ -25824,10 +26276,13 @@ mod typed_trick_tests {
         );
         type_word(&mut app, wid, "kitty");
         app.input(wid, named(NamedKey::Enter), Source::Human);
-        let pet = &mut app.windows.get_mut(&wid).expect("window").cursor_pet;
-        pet.note_command_done(Instant::now(), true, Some(12));
+        let grieving = crate::app_render::pet_fails_a_command_for_test(
+            app.windows.get_mut(&wid).expect("window"),
+            Instant::now(),
+            Some(12),
+        );
         assert!(
-            !pet.grieving(),
+            !grieving,
             "`kitty: command not found` is forgiven — nothing withheld is left on the line"
         );
     }
@@ -25871,10 +26326,13 @@ mod typed_trick_tests {
         );
         app.input(wid, named(NamedKey::Enter), Source::Human);
         {
-            let pet = &mut app.windows.get_mut(&wid).expect("window").cursor_pet;
-            pet.note_command_done(Instant::now(), true, Some(12));
+            let grieving = crate::app_render::pet_fails_a_command_for_test(
+                app.windows.get_mut(&wid).expect("window"),
+                Instant::now(),
+                Some(12),
+            );
             assert!(
-                !pet.grieving(),
+                !grieving,
                 "B's pet-only line is forgiven: nothing on it was withheld"
             );
         }
@@ -25901,7 +26359,7 @@ mod typed_trick_tests {
             type_word(&mut app, wid, "sit ");
             assert_eq!(pending(&app, wid), None, "{style}: no pet, no latch");
             assert!(
-                !app.windows[&wid].cursor_pet.trick_engaged(),
+                !app.windows[&wid].companion.brain().trick_engaged(),
                 "{style}: the brain was never told"
             );
             assert_eq!(
@@ -25962,17 +26420,21 @@ mod typed_trick_tests {
         // latch, so a confirmed one survives it. (The negative control is the
         // tentative `sit␣` alone, which the same call drops.)
         let ws = app.windows.get_mut(&wid).expect("window");
-        ws.cursor_pet.revoke_trick();
+        ws.companion.revoke_trick();
         assert_eq!(
-            ws.cursor_pet.pending_trick(),
+            ws.companion.brain().pending_trick(),
             Some(Trick::Sit),
             "the confirmation reached the pet as CONFIRMED"
         );
         let (mut app, wid, _) = pet_app();
         type_word(&mut app, wid, "sit ");
         let ws = app.windows.get_mut(&wid).expect("window");
-        ws.cursor_pet.revoke_trick();
-        assert_eq!(ws.cursor_pet.pending_trick(), None, "negative control");
+        ws.companion.revoke_trick();
+        assert_eq!(
+            ws.companion.brain().pending_trick(),
+            None,
+            "negative control"
+        );
     }
 
     /// LOOK NEVER WINS A PHRASE, end to end: `hey kitty sit` leaves the pet
@@ -25997,9 +26459,9 @@ mod typed_trick_tests {
                 "{line:?}"
             );
             let ws = app.windows.get_mut(&wid).expect("window");
-            ws.cursor_pet.revoke_trick();
+            ws.companion.revoke_trick();
             assert_eq!(
-                ws.cursor_pet.pending_trick(),
+                ws.companion.brain().pending_trick(),
                 Some(want),
                 "{line:?} is final"
             );
@@ -26027,7 +26489,7 @@ mod typed_trick_tests {
             "an addressed word's flash finishes"
         );
         assert_eq!(
-            ws.cursor_pet.pending_trick(),
+            ws.companion.brain().pending_trick(),
             Some(Trick::Sit),
             "a confirmed latch is a request the user finished making"
         );
@@ -26043,7 +26505,7 @@ mod typed_trick_tests {
             TrickFlashPhase::Idle,
             "a tentative word's pending flash is dropped"
         );
-        assert_eq!(ws.cursor_pet.pending_trick(), None);
+        assert_eq!(ws.companion.brain().pending_trick(), None);
     }
 
     /// ⌃C and ⌃U RESET the line — fresh and pure, not poisoned — so a typo
@@ -26321,7 +26783,11 @@ mod typed_trick_tests {
         app.set_serious_mode(true);
         {
             let ws = &app.windows[&wid];
-            assert_eq!(ws.cursor_pet.pending_trick(), None, "the pet was reset");
+            assert_eq!(
+                ws.companion.brain().pending_trick(),
+                None,
+                "the pet was reset"
+            );
             assert_eq!(ws.trick_fire, TrickLineFire::None, "the memory ended");
             assert!(
                 ws.trick_listener.is_pure()
@@ -26377,9 +26843,12 @@ mod typed_trick_tests {
             Some(Trick::Sit),
             "the first line after Serious Mode lifts is heard"
         );
-        let pet = &mut app.windows.get_mut(&wid).expect("window").cursor_pet;
-        pet.note_command_done(Instant::now(), true, Some(12));
-        assert!(!pet.grieving(), "…and its `command not found` is forgiven");
+        let grieving = crate::app_render::pet_fails_a_command_for_test(
+            app.windows.get_mut(&wid).expect("window"),
+            Instant::now(),
+            Some(12),
+        );
+        assert!(!grieving, "…and its `command not found` is forgiven");
     }
 
     /// THE INTROSPECTION RENDERER DECLARES THE SNAPSHOT'S ROW ORIGIN. The
@@ -27185,7 +27654,7 @@ mod favourite_kitty_tests {
 /// gate's own roster laws are proven in `app_kitty`; this module binds the
 /// App half — the rung report written at verdict time, the arrival mapping
 /// and sufficient-difference demotion at the pet sync sites
-/// (`app_render::pet_arrival_for_sync` / `sync_pet_companion_look`), and the
+/// (`aterm_effects::companion::pet_arrival_for_sync` / `app_render::emit_resident_pet`), and the
 /// one commit predicate: a hello is SPENT only by a drawn present that put a
 /// genuinely differing pair on the pet. Real OSC 133/633 bytes drive every
 /// landing (the locked companion suite's fixture idiom), and the capture
@@ -27221,19 +27690,23 @@ mod homecoming_rate_law_tests {
     fn tick_pet_on_glass(app: &mut App, wid: WindowId, t: Instant) {
         let ws = app.windows.get_mut(&wid).expect("window");
         for step in 0..100u64 {
-            let frame = ws.cursor_pet.tick(aterm_effects::kitty_pet::PetSense {
-                caret_drawn: true,
-                now: t + Duration::from_millis(100 * step),
-                caret: Some((5, 10)),
-                rows: 24,
-                cols: 80,
-                cell_w: 10,
-                cell_h: 20,
-                reduced_motion: false,
-                output_burst: false,
-                pointer: None,
-                wrapped: false,
-            });
+            let frame = crate::app_render::pet_tick_for_test(
+                ws,
+                aterm_effects::host::CaptureMode::Present,
+                aterm_effects::kitty_pet::PetSense {
+                    caret_drawn: true,
+                    now: t + Duration::from_millis(100 * step),
+                    caret: Some((5, 10)),
+                    rows: 24,
+                    cols: 80,
+                    cell_w: 10,
+                    cell_h: 20,
+                    reduced_motion: false,
+                    output_burst: false,
+                    pointer: None,
+                    wrapped: false,
+                },
+            );
             if frame.alpha > 0 {
                 return;
             }
@@ -27253,7 +27726,48 @@ mod homecoming_rate_law_tests {
     /// with `present = true` — the one caller allowed to spend a hello.
     fn perform_on_glass(app: &mut App, wid: WindowId, look: KittyLook, t: Instant) -> (u8, u8) {
         let ws = app.windows.get_mut(&wid).expect("window");
-        crate::app_render::sync_pet_companion_look(ws, look.normalized(), true, t)
+        // The frame the performance draws: a live present once the resident
+        // is on glass, the materialising still for a pet not yet seen.
+        let capture = if ws.companion.alpha() > 0 {
+            aterm_effects::host::CaptureMode::Present
+        } else {
+            aterm_effects::host::CaptureMode::StaticCapture
+        };
+        let pet = crate::app_render::pet_owner_tick_for_test(
+            ws,
+            capture,
+            aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
+                now: t,
+                caret: Some((5, 10)),
+                rows: 24,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            },
+        );
+        assert!(pet.on_glass, "fixture: the performance is a drawn frame");
+        let _ = crate::app_render::emit_resident_pet(
+            ws,
+            &pet,
+            look.normalized(),
+            crate::app_render::CompanionInk::Single,
+            true,
+            t,
+            aterm_effects::companion::ContrastFallback {
+                bg: 0x0010_1010,
+                cursor: 0x00FF_FFFF,
+                accent: 0x0050_FA7B,
+            },
+        );
+        ws.companion
+            .brain()
+            .worn_pair()
+            .expect("the performance dresses the pet")
     }
 
     /// §2.0.2's canonical trace (vim 30 s, claude 30 s, back to vim) on the
@@ -27359,10 +27873,10 @@ mod homecoming_rate_law_tests {
         {
             let ws = &app.windows[&wid];
             assert_eq!(
-                crate::app_render::pet_arrival_for_sync(
+                aterm_effects::companion::pet_arrival_for_sync(
                     ws.kitty_rung,
-                    ws.kitty_tenure.arrival(),
-                    ws.cursor_pet.worn_pair(),
+                    ws.kitty_tenure.arrival().pet_arrival(),
+                    ws.companion.brain().worn_pair(),
                     vim.coat,
                 ),
                 PetArrival::Quiet,
@@ -27438,10 +27952,10 @@ mod homecoming_rate_law_tests {
         {
             let ws = &app.windows[&wid];
             assert_eq!(
-                crate::app_render::pet_arrival_for_sync(
+                aterm_effects::companion::pet_arrival_for_sync(
                     ws.kitty_rung,
-                    ws.kitty_tenure.arrival(),
-                    ws.cursor_pet.worn_pair(),
+                    ws.kitty_tenure.arrival().pet_arrival(),
+                    ws.companion.brain().worn_pair(),
                     git.coat,
                 ),
                 PetArrival::Quiet,
@@ -27455,7 +27969,7 @@ mod homecoming_rate_law_tests {
             "a demoted hello commits nothing: the authorisation stands"
         );
         assert_eq!(
-            app.windows[&wid].cursor_pet.worn_pair(),
+            app.windows[&wid].companion.brain().worn_pair(),
             Some((vim.coat, vim.iris)),
             "the quiet re-dress is parked; the costume law is untouched"
         );
@@ -27513,7 +28027,7 @@ mod homecoming_rate_law_tests {
         at_prompt(&mut app);
         app.splice_word_decorations_for_test(wid, t0);
         assert_eq!(
-            app.windows[&wid].cursor_pet.worn_pair(),
+            app.windows[&wid].companion.brain().worn_pair(),
             Some((launch.coat, launch.iris)),
             "fixture: the capture splice dresses the pet through the shared emitter"
         );
@@ -27574,7 +28088,7 @@ mod homecoming_rate_law_tests {
         at_prompt(&mut app);
         app.splice_word_decorations_for_test(wid, t0);
         assert_eq!(
-            app.windows[&wid].cursor_pet.worn_pair(),
+            app.windows[&wid].companion.brain().worn_pair(),
             Some((launch.coat, launch.iris)),
             "fixture: the pet is dressed while the window is focused"
         );
@@ -27598,7 +28112,7 @@ mod homecoming_rate_law_tests {
         // sync site is never reached — nothing parks, nothing commits.
         app.splice_word_decorations_for_test(wid, t2);
         assert_eq!(
-            app.windows[&wid].cursor_pet.worn_pair(),
+            app.windows[&wid].companion.brain().worn_pair(),
             Some((launch.coat, launch.iris)),
             "not on glass: the pet was never even re-dressed"
         );
@@ -27616,7 +28130,7 @@ mod homecoming_rate_law_tests {
         app.windows.get_mut(&wid).expect("window").focused = true;
         tick_pet_on_glass(&mut app, wid, t2 + Duration::from_secs(1));
         assert!(
-            app.windows[&wid].cursor_pet.is_active(),
+            app.windows[&wid].companion.brain().is_active(),
             "fixture: focus returned and the pet is drawable again"
         );
         perform_on_glass(&mut app, wid, claude, t2 + Duration::from_secs(1));
@@ -29426,7 +29940,7 @@ mod rename_field_key_tests {
 /// the one function both reach, `App::input`.
 #[cfg(all(test, unix))]
 mod person_presence_tests {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{FromRawFd, OwnedFd};
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
@@ -29437,12 +29951,18 @@ mod person_presence_tests {
 
     const CTL: Source = Source::Controller;
 
-    fn app() -> (App, [OwnedFd; 2]) {
+    /// An App over a pipe, and the pipe's read end. The sink OWNS the write
+    /// end: `typing()` pastes, a paste's write runs on the `paste_order`
+    /// writer thread, and a borrowed fd closed with the test's scope would
+    /// take that write into a parallel test's pipe on the recycled number
+    /// (`pet_console_input_tests::observing_app` has the measured case).
+    fn app() -> (App, OwnedFd) {
         let mut pipe = [-1; 2];
         assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-        let fds = unsafe { [OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])] };
-        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new(fds[1].as_raw_fd())));
-        (app, fds)
+        let (reader, writer) =
+            unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
+        let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer)));
+        (app, reader)
     }
 
     fn ctx(app: &App) -> Arc<SessionCtx> {
@@ -29531,7 +30051,7 @@ mod person_presence_tests {
     #[test]
     fn a_window_keystroke_stamps_human_ms_and_a_control_write_never_does() {
         for event in typing().into_iter().chain(pointing()) {
-            let (mut app, _fds) = app();
+            let (mut app, _reader) = app();
             let ctx = ctx(&app);
             assert_eq!(app.input(WindowId(0), event.clone(), CTL), InputOutcome::Ok);
             assert_eq!(ctx.human_input.ms_since(crate::metrics::now_us()), None);
@@ -29560,7 +30080,7 @@ mod person_presence_tests {
     /// focus report) stamps nothing.
     #[test]
     fn a_burst_is_one_human_event_and_what_is_not_a_hand_stamps_nothing() {
-        let (mut app, _fds) = app();
+        let (mut app, _reader) = app();
         let ctx = ctx(&app);
         for event in [
             InputEvent::Key {
@@ -29682,5 +30202,61 @@ mod native_ime_selection_tests {
             "one commit is one undo frame"
         );
         assert_eq!(state.search_input.selection().range(), 1..3);
+    }
+}
+
+/// THE REFUSED-INPUT ROW's words and its fold (design rulings 270 and 274):
+/// each cause the queue measures names its one remedy, a burst of one cause
+/// is one row, and a new cause replaces that row's line under the same key.
+/// The `Unavailable` cause has no live path (it needs the input writer
+/// gone), so it is raised here.
+#[cfg(test)]
+mod refusal_row_tests {
+    use super::{InputRefusal, paste_order};
+
+    #[test]
+    fn each_refusal_names_its_remedy_and_a_burst_is_one_row() {
+        assert_eq!(
+            InputRefusal::of_rejected(paste_order::Rejected::TooLarge),
+            InputRefusal::PasteTooLarge
+        );
+        assert_eq!(
+            InputRefusal::of_rejected(paste_order::Rejected::Full),
+            InputRefusal::Busy
+        );
+        assert_eq!(
+            InputRefusal::of_rejected(paste_order::Rejected::Unavailable),
+            InputRefusal::Unavailable
+        );
+        let mut app = crate::App::headless_for_test();
+        app.clear_messages_for_test();
+        let key = "session.input-full.7";
+        let row = |app: &crate::App| {
+            app.messages
+                .live_by_key(key)
+                .map(|live| (live.id, live.msg.title.clone(), live.msg.detail.clone()))
+        };
+        app.refuse_input(7, InputRefusal::Unavailable);
+        let (first, title, detail) = row(&app).expect("the row");
+        assert_eq!(title, "Couldn't send your input");
+        assert_eq!(detail, ["nothing was sent \u{2014} try again"]);
+        for _ in 0..5 {
+            app.refuse_input(7, InputRefusal::Unavailable);
+        }
+        assert_eq!(row(&app).map(|r| r.0), Some(first), "a burst is one row");
+        app.refuse_input(7, InputRefusal::Busy);
+        let (_, _, detail) = row(&app).expect("still one row");
+        assert_eq!(
+            detail,
+            ["earlier input is still being sent \u{2014} try again"],
+            "a new cause replaces the line"
+        );
+        assert_eq!(
+            app.messages
+                .live_rows()
+                .filter(|live| live.msg.key.as_deref() == Some(key))
+                .count(),
+            1
+        );
     }
 }

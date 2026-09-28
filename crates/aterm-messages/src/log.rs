@@ -14,7 +14,7 @@
 //! lines, so a hand-edited or hostile line cannot put in the ring what
 //! `post` would never have admitted.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::center::Outcome;
@@ -235,6 +235,18 @@ impl LogRecord {
             LogState::Posted => None,
             LogState::Retired(how) => Some(how),
         }
+    }
+
+    /// Whether this RETIRED record still offers `intent` (the page's and the
+    /// `messages` verb's one rule): never one that acted on the live row
+    /// itself ([`Intent::ends_with_row`], ruling 265), and never the word the
+    /// row was answered with (ruling 270: an upgrade row answered `Not today`
+    /// drew `Not today` again as its Primary). A live row offers every
+    /// intent it carries.
+    #[must_use]
+    pub fn still_offers(&self, intent: &Intent) -> bool {
+        !intent.ends_with_row()
+            && !matches!(self.retired(), Some(Retired::Answered { label }) if label == intent.label())
     }
 }
 
@@ -652,6 +664,13 @@ pub struct MessageLog {
     next_id: u64,
     pending: VecDeque<(LogLine, Shelf)>,
     dropped: u32,
+    /// REPLAY ONLY (ruling 270): a file id another writer posted again,
+    /// mapped to the fresh ids its later records were loaded under, oldest
+    /// first — so no two records in the ring share an id.
+    remapped: BTreeMap<u64, Vec<MessageId>>,
+    /// The fresh ids [`Self::remapped`] handed out: a record under one of
+    /// them is not the file's record of that number.
+    minted_at_replay: BTreeSet<u64>,
 }
 
 impl MessageLog {
@@ -661,31 +680,48 @@ impl MessageLog {
         Self::default()
     }
 
-    /// Load one line from the file. `Posted` inserts (deduped by id) as
-    /// **retired Stale** — every line on disk came from a process that is
-    /// gone, and a Posted with no Retired is exactly a row nobody folded;
-    /// `Retired` and `Acted` merge into their record (a later Retired line
-    /// overrides the Stale reading); every id below the ceiling raises
-    /// `next_id`. The words arrive already clipped by the decoder.
+    /// Load one line from the file. `Posted` inserts as **retired Stale** —
+    /// every line on disk came from a process that is gone, and a Posted
+    /// with no Retired is exactly a row nobody folded; `Retired` and `Acted`
+    /// merge into their record (a later Retired line overrides the Stale
+    /// reading); every id below the ceiling raises `next_id`. The words
+    /// arrive already clipped by the decoder.
+    ///
+    /// THE SAME ID, ANOTHER RECORD (6443feeba, ruling 270): two processes
+    /// sharing the file mint ids from their own counters, so one number can
+    /// name two records (measured on the owner's Mac: a long-running
+    /// window's 15 after a test instance had posted and retired its own).
+    /// A Posted that repeats the SAME post (its stamp, tag and title — the
+    /// handoff can write one twice) is that record, deduped. Any other
+    /// Posted under a number the ring already holds is another writer's and
+    /// loads under a FRESH id, whether the first record is closed or still
+    /// open, so Settings ▸ Messages never draws two entries under one key.
+    /// A later `Retired` or `Acted` for the number goes to the open record
+    /// whose title it names, else the newest open one, else the newest.
     pub fn replay(&mut self, line: LogLine) {
         if let Some(id) = line.id() {
             self.raise(id);
         }
         match line {
             LogLine::Posted(mut rec) => {
-                // THE SAME ID, ANOTHER RECORD (2026-09-27): a Posted repeated
-                // for a record still open is the same record (deduped, as
-                // ever); one whose id names a record a Retired line already
-                // CLOSED is another process's — a second instance sharing
-                // the file whose counter ran behind (measured on the owner's
-                // Mac: a long-running window minted id 15 after a test
-                // instance had posted and retired its own 15, and the window's
-                // "Claude Code 2.1.283 … up to date" was dropped here while its
-                // Retired line overwrote the other record's words). It is its
-                // own record, and later lines for the id merge into the
-                // newest one ([`Self::get_mut`] reads newest first).
-                if self.get(rec.id).is_some_and(|r| !Self::closed_by_a_line(r)) {
+                let file_id = rec.id;
+                let candidates = self.replay_candidates(file_id);
+                if candidates.iter().any(|id| {
+                    self.get(*id).is_some_and(|r| {
+                        !Self::closed_by_a_line(r)
+                            && r.stamp == rec.stamp
+                            && r.tag == rec.tag
+                            && r.title == rec.title
+                    })
+                }) {
                     return;
+                }
+                if self.get(file_id).is_some() || !candidates.is_empty() {
+                    let fresh = self.next_id();
+                    self.raise(fresh);
+                    self.minted_at_replay.insert(fresh.raw());
+                    self.remapped.entry(file_id.raw()).or_default().push(fresh);
+                    rec.id = fresh;
                 }
                 rec.state = LogState::Retired(Retired::Stale);
                 rec.retired_at = None;
@@ -700,7 +736,8 @@ impl MessageLog {
                 repeats,
                 mark,
             } => {
-                if let Some(rec) = self.get_mut(id) {
+                let target = self.replay_target(id, Some(&title));
+                if let Some(rec) = target.and_then(|id| self.get_mut(id)) {
                     rec.state = LogState::Retired(how);
                     rec.retired_unix_ms = Some(unix_ms);
                     rec.retired_at = None;
@@ -714,12 +751,85 @@ impl MessageLog {
                 }
             }
             LogLine::Acted { id, unix_ms, label } => {
-                if let Some(rec) = self.get_mut(id) {
+                let target = self.replay_target(id, None);
+                if let Some(rec) = target.and_then(|id| self.get_mut(id)) {
                     rec.last_action = Some((label, unix_ms));
                 }
             }
             LogLine::Dropped { .. } => {}
         }
+    }
+
+    /// Load a whole file's lines ([`Self::replay`] each, in the order given —
+    /// the loader sorts them by id): first past EVERY id among them, so an id
+    /// minted for a collision is above the file's own and never renumbers a
+    /// record that comes later in the sort (ruling 270; live, day three's fix
+    /// stage: a collision at 3 minted 4 and pushed the wire's 4…9 up by one).
+    pub fn replay_all(&mut self, lines: impl IntoIterator<Item = LogLine>) {
+        let lines: Vec<LogLine> = lines.into_iter().collect();
+        if let Some(top) = lines.iter().filter_map(LogLine::id).max() {
+            self.raise(top);
+        }
+        for line in lines {
+            self.replay(line);
+        }
+    }
+
+    /// The records loaded for file id `file_id`, oldest first: the ring's
+    /// own record of that number (unless a remap minted it), then the ones
+    /// remapped from it.
+    fn replay_candidates(&self, file_id: MessageId) -> Vec<MessageId> {
+        let own = (!self.minted_at_replay.contains(&file_id.raw()) && self.get(file_id).is_some())
+            .then_some(file_id);
+        own.into_iter()
+            .chain(
+                self.remapped
+                    .get(&file_id.raw())
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            )
+            .collect()
+    }
+
+    /// Where a replayed line for file id `file_id` merges: the open record
+    /// whose posted title `title` names — the title itself, or one of the
+    /// final words the center derives from it ([`Self::final_words_of`]: a
+    /// delivered row retires `Deployed site`, never `Deploying site`) —
+    /// else the newest open one, else the newest.
+    fn replay_target(&self, file_id: MessageId, title: Option<&str>) -> Option<MessageId> {
+        let candidates = self.replay_candidates(file_id);
+        let open = |id: &MessageId| self.get(*id).is_some_and(|r| !Self::closed_by_a_line(r));
+        title
+            .and_then(|title| {
+                candidates.iter().rev().find(|id| {
+                    open(id)
+                        && self
+                            .get(**id)
+                            .is_some_and(|r| Self::final_words_of(&r.title, title))
+                })
+            })
+            .or_else(|| candidates.iter().rev().find(|id| open(id)))
+            .or_else(|| candidates.last())
+            .copied()
+    }
+
+    /// Whether `final_title` (a Retired line's words) can be how a row posted
+    /// as `posted` ended: the posted title kept, or its finished, `— done`,
+    /// stopped or ended form (`center::outcome_title`'s table forms). A
+    /// reporter's own declared words are not derivable and fall through to
+    /// the newest open record.
+    fn final_words_of(posted: &str, final_title: &str) -> bool {
+        posted == final_title
+            || [
+                crate::words::finished_form(posted),
+                crate::words::done_form(posted),
+                crate::words::stopped_form(posted),
+                crate::words::ended_form(posted),
+            ]
+            .iter()
+            .flatten()
+            .any(|w| w == final_title)
     }
 
     /// Whether a replayed record was closed by a `Retired` line: its state
@@ -885,12 +995,36 @@ impl MessageLog {
         self.push_record(rec);
     }
 
-    /// A carried row's record, live again in this process: inserted when the
-    /// tail the successor loaded did not hold it, else re-opened.
+    /// A carried row's record, live again in this process: re-opened when
+    /// the tail the successor loaded held the parent's own Posted line for
+    /// it (its stamp and tag — the title may have been restated since), else
+    /// inserted.
+    ///
+    /// ONE ID, ONE RECORD (ruling 270; round 17 review, V3): the carried id
+    /// is the live row's and wins. A record of ANOTHER writer loaded under
+    /// that number — a file id, or one [`Self::replay_all`] minted for a
+    /// collision above the file's top while the parent's Posted line was
+    /// not yet on disk — moves to a fresh id and keeps its own words, never
+    /// re-opened under the carried row's. The parent's own record, if a
+    /// collision loaded it under a minted id, takes its number back. The
+    /// center raises past the carry's `next_id` first, so the fresh id is
+    /// above every carried one.
     pub(crate) fn adopt_carried(&mut self, rec: LogRecord) {
         self.raise(rec.id);
-        match self.get_mut(rec.id) {
+        let mine = self.replay_candidates(rec.id).into_iter().find(|id| {
+            self.get(*id)
+                .is_some_and(|r| r.stamp == rec.stamp && r.tag == rec.tag)
+        });
+        if mine != Some(rec.id) && self.get(rec.id).is_some() {
+            let fresh = self.mint();
+            self.minted_at_replay.insert(fresh.raw());
+            if let Some(squatter) = self.get_mut(rec.id) {
+                squatter.id = fresh;
+            }
+        }
+        match mine.and_then(|id| self.get_mut(id)) {
             Some(existing) => {
+                existing.id = rec.id;
                 existing.state = LogState::Posted;
                 existing.retired_unix_ms = None;
                 existing.retired_at = None;
@@ -1274,10 +1408,172 @@ pub(crate) mod tests {
                 .all(|r| r.state == LogState::Retired(Retired::Folded))
         );
 
+        let ids: Vec<u64> = log.records().map(|r| r.id.raw()).collect();
+        assert_eq!(ids, [15, 16], "one id per record (ruling 270)");
+        assert_eq!(log.next_id().raw(), 17);
+
         let mut open = MessageLog::empty();
         open.replay(LogLine::Posted(posted(15)));
         open.replay(LogLine::Posted(posted(15)));
         assert_eq!(open.len(), 1, "still open: the same record, deduped");
+
+        // RULING 270: the first record still OPEN when another writer posts
+        // its own 15 — both load, each under its own id, and each Retired
+        // line merges into the record whose words it names, whichever
+        // retires first.
+        let mut both = MessageLog::empty();
+        both.replay(LogLine::Posted(LogRecord {
+            title: "Claude Code 2.1.283 is up to date".into(),
+            ..posted(15)
+        }));
+        both.replay(LogLine::Posted(LogRecord {
+            title: "Built aterm".into(),
+            ..posted(15)
+        }));
+        both.replay(retired("Claude Code 2.1.283 is up to date"));
+        both.replay(LogLine::Acted {
+            id,
+            unix_ms: 10,
+            label: "Copy".into(),
+        });
+        let words: Vec<(u64, &str, bool)> = both
+            .records()
+            .map(|r| {
+                (
+                    r.id.raw(),
+                    r.title.as_str(),
+                    r.state == LogState::Retired(Retired::Folded),
+                )
+            })
+            .collect();
+        assert_eq!(
+            words,
+            [
+                (15, "Claude Code 2.1.283 is up to date", true),
+                (16, "Built aterm", false)
+            ]
+        );
+        assert_eq!(
+            both.get(MessageId::from_raw(16).unwrap())
+                .and_then(|r| r.last_action.clone()),
+            Some(("Copy".to_string(), 10)),
+            "a later line goes to the record still open"
+        );
+        // A file whose own writer later reaches 16 does not collide with
+        // the fresh id: it is remapped in turn.
+        both.replay(LogLine::Posted(LogRecord {
+            title: "Paste stopped".into(),
+            ..posted(16)
+        }));
+        let ids: Vec<u64> = both.records().map(|r| r.id.raw()).collect();
+        assert_eq!(ids, [15, 16, 17]);
+
+        // The loader's whole-file replay mints above every id in the file,
+        // so a later record keeps its own number (no cascade).
+        let mut file = MessageLog::empty();
+        file.replay_all([
+            LogLine::Posted(posted(15)),
+            retired("tab\there \\ back\nnew\rcr\u{1f}us \u{00b7} end"),
+            LogLine::Posted(LogRecord {
+                title: "Claude Code 2.1.283 is up to date".into(),
+                ..posted(15)
+            }),
+            LogLine::Posted(posted(16)),
+        ]);
+        let ids: Vec<u64> = file.records().map(|r| r.id.raw()).collect();
+        assert_eq!(ids, [15, 17, 16], "16 keeps its number");
+    }
+
+    /// RULING 270 (round 17 review, V2): a DELIVERED row retires under its
+    /// finished words (`Deploying site` → `Deployed site`, or `— done`), so a
+    /// Retired line is routed by the words the center derives from each open
+    /// candidate's posted title, not by the posted title alone. When the
+    /// OLDER of two colliding records retires first, its words stay on it and
+    /// the other writer's later words land on the other record. NEGATIVE
+    /// CONTROL: words no candidate's title can derive still fall back to the
+    /// newest open record.
+    #[test]
+    fn a_delivered_retirement_goes_to_the_record_its_finished_words_name() {
+        let id = MessageId::from_raw(15).unwrap();
+        let delivered = |title: &str, unix_ms: u64| LogLine::Retired {
+            id,
+            how: Retired::Folded,
+            unix_ms,
+            title: title.into(),
+            detail: vec![],
+            repeats: 1,
+            mark: Some((Severity::Success, Glyph::or_fallback('\u{2713}'))),
+        };
+        let load = |a: &str, b: &str, finals: [(&str, u64); 2]| {
+            let mut log = MessageLog::empty();
+            log.replay(LogLine::Posted(LogRecord {
+                title: a.into(),
+                ..posted(15)
+            }));
+            log.replay(LogLine::Posted(LogRecord {
+                title: b.into(),
+                ..posted(15)
+            }));
+            for (title, at) in finals {
+                log.replay(delivered(title, at));
+            }
+            log.records()
+                .map(|r| (r.id.raw(), r.title.clone(), r.retired_unix_ms))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            load(
+                "Deploying site",
+                "Building docs",
+                [("Deployed site", 20), ("Built docs", 30)]
+            ),
+            [
+                (15, "Deployed site".to_string(), Some(20)),
+                (16, "Built docs".to_string(), Some(30)),
+            ],
+            "the older record retired first keeps its own words"
+        );
+        assert_eq!(
+            load(
+                "Uploading the backup",
+                "Building docs",
+                [
+                    ("Uploading the backup \u{2014} done", 20),
+                    ("Built docs", 30)
+                ]
+            ),
+            [
+                (
+                    15,
+                    "Uploading the backup \u{2014} done".to_string(),
+                    Some(20)
+                ),
+                (16, "Built docs".to_string(), Some(30)),
+            ],
+            "a `— done` title names its record too"
+        );
+        assert_eq!(
+            load(
+                "Deploying site",
+                "Building docs",
+                [("Deploying stopped", 20), ("Built docs", 30)]
+            )[0],
+            (15, "Deploying stopped".to_string(), Some(20)),
+            "a stopped form names its record"
+        );
+        // NEGATIVE CONTROL: words derived from no candidate go to the newest
+        // open record, as before.
+        assert_eq!(
+            load(
+                "Deploying site",
+                "Building docs",
+                [("Site is live", 20), ("Deployed site", 30)]
+            ),
+            [
+                (15, "Deployed site".to_string(), Some(30)),
+                (16, "Site is live".to_string(), Some(20)),
+            ]
+        );
     }
 
     #[test]

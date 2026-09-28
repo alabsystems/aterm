@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Sequence selector parser and matcher (§3.3 of
-//! `designs/2026-04-19-osc-policy-engine.md`).
+//! Sequence selector parser and matcher.
 //!
 //! A [`SequenceSelector`] is the parsed form of a rule's `sequence` string,
 //! e.g. `"OSC 4;*;?"` → `SequenceSelector { function: Osc, major: Some(4),

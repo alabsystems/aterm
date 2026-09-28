@@ -15,17 +15,32 @@
 //! one this module plans: a COOPERATIVE, IN-PLACE resume relaunch —
 //!
 //! 1. **Announce** — at an idle point with an empty composer, type ONE turn
-//!    telling the agent an upgrade restart is coming, asking it to let its
-//!    background work finish (never cancel it), save its work, and answer with a
+//!    telling the agent an upgrade restart is coming. The turn asks it to let
+//!    its live background work finish (never cancel it) but stop any wait that
+//!    can never end ([`STOPPING_POINT`]), names the shells aterm sees under it
+//!    ([`running_clause`]), and asks it to save its work and answer with a
 //!    one-time READY marker ([`prepare_prompt`]). Never into a session at a
 //!    usage or rate limit ([`Facts::limited`]): what is typed there is queued
 //!    unread, and no ask, and no minute of the re-ask clock, is spent on it.
+//!    Nor into one at the LOGIN WALL ([`Facts::login`]): what is typed there
+//!    is answered by `Login expired · Please run /login` and read by no model;
+//!    a notice whose own turn the wall answered all the same (the login went
+//!    as it was typed) spent no ask, and is typed again once the login is
+//!    back ([`Facts::undelivered`]).
 //! 2. **Drain** — wait until the agent has answered with the marker
 //!    ([`transcript_has_ready`]), Claude's own session file says `idle`, nothing
 //!    runs under the agent (no shell, and no `caffeinate` but Claude Code's own
-//!    keep-awake), and the composer is still empty ([`gate_restart`]). Nothing is
-//!    ever killed to get there, and the agent's own work is waited for however
-//!    long it takes. A PERSON is not: a box nobody answers or a typed draft
+//!    keep-awake), and the composer is still empty ([`gate_restart`]). aterm
+//!    never kills anything to get there: the agent's own work is waited for,
+//!    and never ended. The wait is not silent, though. A notice unanswered, or
+//!    a READY answer that work under the agent outlives, is asked again every
+//!    [`REASK_S`], each time naming what runs. After [`MAX_ASKS`] notices the
+//!    upgrade gives up and says what held it ([`next_step`]) — for this round
+//!    only: NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
+//!    upgrades stalled"), and [`RETRY_S`] after any round stops the upgrade
+//!    starts a new one ([`Step::Rearm`]) with new markers and its asks
+//!    reset. A PERSON is not
+//!    waited for: a box nobody answers or a typed draft
 //!    nobody sends ([`person_hold`]), standing for [`HOLD_S`], holds the READY
 //!    answer for at most [`DRAIN_S`] after the announcement; past it the answer
 //!    is void (the driver forgets its marker and says why in the ledger) and the
@@ -41,21 +56,36 @@
 //!    running a script from before loaders, which the same line then upgrades
 //!    in place by sourcing the window's own loader (2026-09-26).
 //! 4. **Continue** — once the new process has re-registered the SAME session,
-//!    type one turn telling the agent it was upgraded, and which model it ran
-//!    before the restart, and to carry on ([`continue_prompt`]).
+//!    type one turn telling the agent it was upgraded, which model it ran
+//!    before the restart — and, when the relaunch asked for one, which model
+//!    it runs now — and to carry on ([`continue_prompt`],
+//!    [`continue_prompt_with_model`]).
 //! 5. **Confirm** — read the model the resumed session's first answer names
 //!    ([`transcript_first_model`], past the mark the restart took, in the new
 //!    build's rows) and record it beside the one before ([`restart_outcome`]).
 //!    The rewrite keeps an explicit `--model` ([`launch_model`]) and adds none
-//!    of its own, so a session launched without one comes back on Claude
-//!    Code's default at the relaunch — unless the model priority list
-//!    (`upgrade_models`) moves the conversation, when the announcement and the
-//!    continuation name the model ([`prepare_prompt_with_model`],
-//!    [`continue_prompt_with_model`]), the relaunch carries `--model`, and the
-//!    outcome says whether it was taken ([`restart_outcome_listed`]): a change
-//!    is the expected outcome and is only said, with what decided it; a
-//!    session that has not answered in time is said to be
-//!    UNCONFIRMED.
+//!    of its own, so a session launched without one comes back on whatever
+//!    Claude Code picks at the relaunch — unless the model rule moves it
+//!    (`upgrade_models`, owner decision 2026-09-27: the NEWEST MODEL OF ITS
+//!    OWN FAMILY first, Opus 5 -> Opus 5.5; only with none newer, up the
+//!    priority list, for a model nobody chose; never down), when the
+//!    announcement and the continuation name the model and why ([`prepare_prompt_with_model`],
+//!    [`continue_prompt_with_model`]), the relaunch carries it as `--model`
+//!    in place of the launch's own, and the outcome says whether it was taken
+//!    ([`restart_outcome_listed`]): a change is the expected outcome and is
+//!    only said, with what decided it; a session that has not answered in
+//!    time is said to be UNCONFIRMED. The explicit flag is what makes the
+//!    move certain: without one the relaunch leaves the model to Claude
+//!    Code's own resume, and the 2026-09-25 incident (2.1.282 -> 2.1.283, no
+//!    `--model`) came back on `claude-opus-5` while that build's newest Opus
+//!    was `claude-opus-5-5`.
+//!
+//! A conversation with NO TASK — nobody but the harness has asked it anything
+//! ([`TaskScan`]) — skips all of it (D1 of the live E2E of 2026-09-26): no
+//! notice, no READY, no `--resume` and no continuation; once idle it is ended
+//! and the new build started AFRESH in its tab ([`Step::Fresh`]). There is
+//! nothing to preserve, and a notice would start the conversation nobody
+//! asked for.
 //!
 //! AN AGENT THE UPGRADE ASKED IS NEVER LEFT STOPPED (the 2026-09-26 incident:
 //! an agent obeyed four queued notices at once, answered READY, and sat idle
@@ -95,6 +125,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use aterm_json::Value;
+
+use super::upgrade_models as models;
 
 /// A dotted-digits version (`2.1.281`), compared numerically part by part, a
 /// missing part reading as 0 — so `2.1` EQUALS `2.1.0`, and equality agrees with
@@ -939,29 +971,135 @@ fn is_ready_line(line: &str, marker: &str) -> bool {
 /// The supervisor's turn-end policy types nothing at a point that answers an
 /// announcement: the session's worker owns that point until it restarts the
 /// session (`IdleHost::owns_turn_end`).
-pub const ANNOUNCE_HEAD: &str = "[aterm harness] Claude Code ";
+pub const ANNOUNCE_HEAD: &str = concat!(harness_mark!(), " Claude Code ");
 
 /// THE ANNOUNCEMENT, typed as one ordinary user turn. It asks for a good
-/// stopping point and names the one line to answer with; it never asks the
-/// agent to cancel anything.
+/// stopping point ([`STOPPING_POINT`]) and names the one line to answer with;
+/// it never asks the agent to cancel work that is still making progress.
 #[must_use]
 pub fn prepare_prompt(from: &Version, to: &Version, source: Source, marker: &str) -> String {
     format!(
         "{ANNOUNCE_HEAD}{to} ({}) is installed; this session runs {from}. \
          To move you onto it, aterm will restart this Claude Code in place and resume this \
-         same conversation (claude --resume, same tab, same flags). Please get to a good \
-         stopping point first: let any background tasks, subagents or workflows you started \
-         finish (do not cancel them), save or commit work in progress, and do not start new \
-         long-running work. When nothing of yours is still running, reply with {marker} on a \
-         line by itself. If you cannot stop now, say why; aterm will wait and ask again later.",
+         same conversation (claude --resume, same tab, same flags). {STOPPING_POINT} When \
+         nothing of yours is still running, reply with {marker} on a line by itself. If you \
+         cannot stop now, say why; aterm will wait and ask again later.",
         source.as_str()
     )
 }
 
-/// [`prepare_prompt`] for a restart that ALSO moves the conversation to `model`
-/// from the priority list — or ONLY does (`to == from`: the build is current,
-/// the model is not). The text still starts with [`ANNOUNCE_HEAD`], so the
-/// supervisor's turn-end policy knows it for what it is.
+/// WHAT THE ANNOUNCEMENT ASKS OF THE AGENT'S OWN WORK. Live work is waited
+/// for and never cancelled (the owner's ask of 2026-09-23: "we'd want to not
+/// kill the background processes. we'd want to wait for them"). A wait that
+/// can never end is not such work, and the agent is the one who can tell. On
+/// 2026-09-26 a tab sat on Claude Code 2.1.278 for four days: it held two
+/// background `until [ <count> -ge 6 ]; do sleep 15; done` loops, and two of
+/// the six agents they counted had died on API 529s. The notice's old words
+/// ("let any background tasks … finish (do not cancel them)") told the agent
+/// to keep exactly that. Told what ran, with the clause below, the agent
+/// checked the count, stopped both loops, and answered READY within
+/// minutes. aterm itself still ends nothing ([`gate_restart`]).
+pub const STOPPING_POINT: &str = "Please get to a good stopping point first: let \
+     background tasks, subagents or workflows you started finish while they are still making \
+     progress (do not cancel them), but stop any background shell or task of yours that only \
+     waits for something that has already ended or can never happen (a poll loop on a workflow, \
+     agent, job or file that is gone): that wait is not work. Save or commit work in progress, \
+     and do not start new long-running work.";
+
+/// One process under the agent that the restart waits on, as the notice
+/// names it ([`running_clause`]). `age_s` is its elapsed time. `command` is
+/// what it runs, cut to its point by `upgrade_drive::command_head`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Held {
+    /// Its pid.
+    pub pid: u32,
+    /// Its executable's basename (`zsh`, `caffeinate`).
+    pub name: String,
+    /// Seconds since it started.
+    pub age_s: u64,
+    /// What it runs, one line. Empty unless it is the agent's own Bash-tool
+    /// shell, a direct child of the agent. The notice is a user turn, so it
+    /// quotes only what the agent itself ran, never a line a script it ran
+    /// put deeper down (`upgrade_drive::held_of`).
+    pub command: String,
+}
+
+/// The most processes [`running_clause`] names; the rest are counted.
+pub const HELD_NAMED: usize = 5;
+
+/// The longest command [`running_clause`] quotes, in characters.
+pub const HELD_COMMAND_CHARS: usize = 160;
+
+/// THE NOTICE'S LIST OF WHAT RUNS UNDER THE AGENT (the same 2026-09-26 tab as
+/// [`STOPPING_POINT`]). Every notice appends it when anything runs, a re-ask
+/// included. The agent then judges from what aterm itself sees: each process
+/// by pid, name and age, and the command it runs when it is the agent's own
+/// Bash-tool shell ([`Held::command`]). The four-day-old loops that held that
+/// tab were plain in this list, and invisible in "background tasks you
+/// started". Empty when nothing runs. One line with no control characters,
+/// because the notice is typed as one paste ([`held_list`]).
+#[must_use]
+pub fn running_clause(held: &[Held]) -> String {
+    let list = held_list(held);
+    if list.is_empty() {
+        return String::new();
+    }
+    format!(" Running under you now, as aterm sees it: {list}.")
+}
+
+/// What runs under the agent as a bare list, with no lead-in and no final
+/// period: `pid 63492 (zsh, 5d4h): <command>; pid …; and 2 more`. The notice
+/// wraps it for the agent ([`running_clause`]) and the give-up's ledger row
+/// for the owner. At most [`HELD_NAMED`] processes are named and the rest
+/// counted, and each command is cut to [`HELD_COMMAND_CHARS`]. Empty when
+/// nothing runs.
+#[must_use]
+pub fn held_list(held: &[Held]) -> String {
+    let mut out = String::new();
+    for (i, h) in held.iter().take(HELD_NAMED).enumerate() {
+        if i > 0 {
+            out.push_str("; ");
+        }
+        let command = one_line(&h.command, HELD_COMMAND_CHARS);
+        let _ = write!(
+            out,
+            "pid {} ({}, {})",
+            h.pid,
+            one_line(&h.name, 32),
+            span(h.age_s)
+        );
+        if !command.is_empty() {
+            let _ = write!(out, ": {command}");
+        }
+    }
+    if held.len() > HELD_NAMED {
+        let _ = write!(out, "; and {} more", held.len() - HELD_NAMED);
+    }
+    out
+}
+
+/// `text` as one line of at most `max` characters: every control character
+/// a space, runs of spaces one, and a cut marked with `…`.
+fn one_line(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// [`prepare_prompt`] for a restart that ALSO moves the conversation to
+/// `model` — or ONLY does (`to == from`: the build is current, the model is
+/// not) — from `running`, the model it runs now, which says why
+/// ([`models::move_why`]: the newest of its family, or the priority list's
+/// best). The text still starts with [`ANNOUNCE_HEAD`], so the supervisor's
+/// turn-end policy knows it for what it is.
 #[must_use]
 pub fn prepare_prompt_with_model(
     from: &Version,
@@ -969,36 +1107,41 @@ pub fn prepare_prompt_with_model(
     source: Source,
     marker: &str,
     model: Option<&str>,
+    running: Option<&str>,
 ) -> String {
     let Some(model) = model else {
         return prepare_prompt(from, to, source, marker);
     };
+    let why = models::move_why(running, model).words();
     let what = if to == from {
         format!(
-            "{ANNOUNCE_HEAD}{to} can run {model}, the best available model on aterm's priority \
-             list, and this session runs an older one. To move you onto it, aterm will restart \
-             this Claude Code in place and resume this same conversation on {model} (claude \
-             --resume --model {model}, same tab, same flags)."
+            "{ANNOUNCE_HEAD}{to} can run {model}, {why}, which this session does not run. To \
+             move you onto it, aterm will restart this Claude Code in place and resume this same \
+             conversation on {model} (claude --resume --model {model}, same tab, same flags)."
         )
     } else {
         format!(
             "{ANNOUNCE_HEAD}{to} ({}) is installed; this session runs {from}. To move you onto \
-             it, and onto {model} (the best available model on aterm's priority list), aterm \
-             will restart this Claude Code in place and resume this same conversation (claude \
-             --resume --model {model}, same tab, same flags).",
+             it, and onto {model} ({why}), aterm will restart this Claude Code in place and \
+             resume this same conversation (claude --resume --model {model}, same tab, same \
+             flags).",
             source.as_str()
         )
     };
     format!(
-        "{what} Please get to a good stopping point first: let any background tasks, subagents \
-         or workflows you started finish (do not cancel them), save or commit work in progress, \
-         and do not start new long-running work. When nothing of yours is still running, reply \
-         with {marker} on a line by itself. If you cannot stop now, say why; aterm will wait and \
-         ask again later."
+        "{what} {STOPPING_POINT} When nothing of yours is still running, reply with {marker} on \
+         a line by itself. If you cannot stop now, say why; aterm will wait and ask again later."
     )
 }
 
-/// [`continue_prompt`] for a relaunch that asked for `model` from the list.
+/// [`continue_prompt`] for a relaunch that asked for `model` on its command
+/// line: it says the model the session ran before the restart (`ran`), the one
+/// it runs NOW, and why ([`models::move_why`] of the two: the newest of its
+/// family, or the priority list's best). The claim
+/// is the relaunch line's own: a command-line `--model` is what a resumed
+/// Claude Code runs, over its transcript's model and the saved default alike
+/// (MEASURED 2026-09-24, design §9); the outcome row confirms it from the
+/// resumed session's first answer ([`restart_outcome_listed`]).
 #[must_use]
 pub fn continue_prompt_with_model(
     from: &Version,
@@ -1009,15 +1152,19 @@ pub fn continue_prompt_with_model(
     let Some(model) = model else {
         return continue_prompt(from, to, ran);
     };
-    let before = ran.map_or(String::new(), |m| format!(" (it ran {m} before)"));
     let build = if to == from {
         format!("on Claude Code {to}")
     } else {
         format!("on Claude Code {to} (from {from})")
     };
+    let runs = ran.map_or_else(
+        || "it now runs".to_string(),
+        |m| format!("it ran {m} before the restart and now runs"),
+    );
+    let why = models::move_why(ran, model).words();
     format!(
-        "[aterm harness] Upgraded: this session was restarted {build} with {model}, the best \
-         available model on aterm's priority list{before}, and resumed. {CARRY_ON}"
+        "{HARNESS_MARK} Upgraded: this session was restarted {build} and resumed; {runs} \
+         {model}, {why} (for this session only: your default model is unchanged). {CARRY_ON}"
     )
 }
 
@@ -1033,7 +1180,7 @@ pub fn continue_prompt(from: &Version, to: &Version, ran: Option<&str>) -> Strin
         None => " and resumed".to_string(),
     };
     format!(
-        "[aterm harness] Upgraded: this session was restarted on Claude Code {to} (from \
+        "{HARNESS_MARK} Upgraded: this session was restarted on Claude Code {to} (from \
          {from}){resumed}. {CARRY_ON}"
     )
 }
@@ -1142,9 +1289,10 @@ pub fn restart_outcome(
     }
 }
 
-/// [`restart_outcome`] for a relaunch that asked for `chosen` from the
-/// model PRIORITY LIST (`upgrade_models`): a change is said with that reason,
-/// and a model after other than `chosen` is said as not taken.
+/// [`restart_outcome`] for a relaunch that asked for `chosen` by the model
+/// rule (`upgrade_models`): a change is said with its reason — the newest of
+/// its family, or the priority list's choice ([`models::move_why`] from
+/// `before`) — and a model after other than `chosen` is said as not taken.
 #[must_use]
 pub fn restart_outcome_listed(
     to: &str,
@@ -1154,12 +1302,26 @@ pub fn restart_outcome_listed(
 ) -> String {
     let head = format!("claude restarted on {to} · model");
     let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
+    let (asked, chose) = match models::move_why(before, chosen) {
+        models::MoveWhy::Family => (
+            format!("the relaunch asked for {chosen}, the newest of its family"),
+            "the newest of its family",
+        ),
+        models::MoveWhy::List => (
+            format!("the priority list asked for {chosen}"),
+            "the priority list chose it",
+        ),
+        models::MoveWhy::Unknown => (
+            format!("the relaunch asked for {chosen}"),
+            "the model rule chose it",
+        ),
+    };
     match (before, after) {
         (_, Some(a)) if base(a) != base(chosen) => {
-            format!("{head} {a} (the priority list asked for {chosen}; it was not taken)")
+            format!("{head} {a} ({asked}; it was not taken)")
         }
         (Some(b), Some(a)) if base(b) != base(a) => {
-            format!("{head} {b} -> {a} (the priority list chose it; /model changes it)")
+            format!("{head} {b} -> {a} ({chose}; /model changes it)")
         }
         (_, Some(a)) => format!("{head} {a}"),
         (Some(b), None) => {
@@ -1380,6 +1542,519 @@ fn is_announcement(message: &Value) -> bool {
     }
 }
 
+// ---------------------------------------------------------------- the login wall
+
+/// THE LOGIN WALL'S SIGNATURE in a transcript row, as Claude Code 2.1.281
+/// writes it (measured 2026-09-27, the owner's session `03396a15…`: every turn
+/// from 05:00:24 to 14:33:36 UTC ended on one, 45-86 ms after it began): a
+/// main-chain assistant row of Claude Code's own (`<synthetic>`), flagged
+/// `isApiErrorMessage`, whose `error` is `authentication_failed` — its text
+/// `Login expired · Please run /login`, drawn `⏺ Login expired · …` on the
+/// screen ([`login_wall`]).
+fn is_auth_wall_row(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("assistant")
+        && v.get("isSidechain").and_then(Value::as_bool) != Some(true)
+        && v.get("isApiErrorMessage").and_then(Value::as_bool) == Some(true)
+        && v.get("error").and_then(Value::as_str) == Some("authentication_failed")
+}
+
+/// What one transcript row says of the login ([`login_rows`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginRow {
+    /// The wall ([`is_auth_wall_row`]).
+    Wall,
+    /// What lifts it: the vendor's own `Login successful` (a person's
+    /// `/login` finished: `<local-command-stdout>Login successful…`), or a
+    /// row of the session's own model — a turn the API answered.
+    Lifted,
+}
+
+/// Whether `text` is the output of a `/login` that FINISHED, as Claude Code
+/// writes it to the transcript: `<local-command-stdout>Login successful…`.
+fn login_succeeded(text: &str) -> bool {
+    text.trim_start()
+        .starts_with("<local-command-stdout>Login successful")
+}
+
+/// Every row of `jsonl` (a transcript's tail) that says something of the
+/// login, in order, with its time (unix seconds, `None` when it names none).
+fn login_rows(jsonl: &str) -> impl Iterator<Item = (LoginRow, Option<u64>)> + '_ {
+    jsonl.lines().filter_map(|line| {
+        if !line.contains("authentication_failed")
+            && !line.contains("Login successful")
+            && !line.contains("\"assistant\"")
+        {
+            return None;
+        }
+        let v = aterm_json::from_str::<Value>(line).ok()?;
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return None;
+        }
+        let at = v
+            .get("timestamp")
+            .and_then(Value::as_str)
+            .and_then(super::upgrade_models::parse_utc);
+        if is_auth_wall_row(&v) {
+            return Some((LoginRow::Wall, at));
+        }
+        // The person's `Login successful` comes in two shapes: 2.1.281 writes
+        // it as a `user` row's `message.content` (the incident's session,
+        // 14:33:36 UTC); 2.1.283 as a `system` row, `subtype`
+        // `local_command`, with a top-level `content` (the owner's other
+        // session, 14:33:54 UTC the same day — measured; read as neither,
+        // the wall stood until the model next answered).
+        let lifted = match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => v
+                .get("message")
+                .and_then(|m| m.get("model"))
+                .and_then(Value::as_str)
+                .is_some_and(is_model_id),
+            Some("user") => v
+                .get("message")
+                .and_then(|m| m.get("content"))
+                .and_then(Value::as_str)
+                .is_some_and(login_succeeded),
+            Some("system") => {
+                v.get("subtype").and_then(Value::as_str) == Some("local_command")
+                    && v.get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(login_succeeded)
+            }
+            _ => false,
+        };
+        lifted.then_some((LoginRow::Lifted, at))
+    })
+}
+
+/// THE SESSION STANDS AT THE LOGIN WALL, by its transcript (`jsonl`, a
+/// tail): the last row that says anything of the login is the wall — Claude
+/// Code's `authentication_failed` row ([`is_auth_wall_row`]) — with neither
+/// the person's `Login successful` nor an answer of the session's own model
+/// after it. Read beside the screen ([`login_wall`]): the wall's row leaves
+/// the screen when a `/login` dialog is dismissed, and the login is still
+/// gone. A login finished in ANOTHER tab writes nothing here: this reads the
+/// wall until something typed into this session is answered.
+#[must_use]
+pub fn transcript_login_wall(jsonl: &str) -> bool {
+    login_rows(jsonl)
+        .last()
+        .is_some_and(|(row, _)| row == LoginRow::Wall)
+}
+
+/// When THE LAST LOGIN WALL in `jsonl` (a transcript's tail) was LIFTED
+/// (unix seconds): the time of the first row after its last wall row that
+/// lifts it ([`LoginRow::Lifted`]). `None` when the tail holds no wall, when
+/// the wall still stands, or when the lifting row names no time. What holds
+/// the upgrade's clocks through the wall ([`clock_held_until`]): a notice
+/// the agent read before the login went — its wind-down turn the one the
+/// wall answered — gets its whole window once the agent can answer again.
+#[must_use]
+pub fn login_lifted_at(jsonl: &str) -> Option<u64> {
+    let (mut walled, mut lifted) = (false, None);
+    for (row, at) in login_rows(jsonl) {
+        match row {
+            LoginRow::Wall => (walled, lifted) = (true, None),
+            LoginRow::Lifted if walled => (walled, lifted) = (false, at),
+            LoginRow::Lifted => {}
+        }
+    }
+    lifted
+}
+
+/// Whether the LATEST NOTICE carrying `marker` NEVER REACHED THE MODEL: in
+/// `jsonl` (a transcript's tail), the first main-chain assistant row after
+/// the last announcement ([`ANNOUNCE_HEAD`]) whose words carry `marker` is
+/// the login wall ([`is_auth_wall_row`]) — its own turn ended on
+/// `authentication_failed` before the model said a word (the incident of
+/// 2026-09-27: all four of the upgrade's notices were answered so, each in
+/// under 90 ms). `false` when the model answered it, when nothing has
+/// answered it yet, and when the tail holds no such notice. Claude Code's
+/// other rows of its own (`No response requested.`) are passed over. A
+/// notice the model read LATER, as history in a turn someone else began
+/// (the owner's `continue` after the login), is still one that never reached
+/// it as asked: what it answers there is read as any answer is
+/// ([`transcript_has_ready`]). So is one Claude Code ASKS AGAIN ITSELF once
+/// a `/login` lifts the wall — 2.1.283 did, measured 2026-09-27 in the
+/// owner's other session: `Login successful`, then the model answering the
+/// prompt the wall had answered, nothing typed (the binaries' `shouldQuery`
+/// after an `authentication_failed` row; 2.1.281 carries the same branch and
+/// did not take it in the incident). The model HAS read that notice; unless
+/// its answer is READY, the notice is typed once more, as the same ask — one
+/// prompt too many, no ask spent.
+#[must_use]
+pub fn notice_undelivered(jsonl: &str, marker: &str) -> bool {
+    notice_fate(jsonl, marker) == Some(true)
+}
+
+/// [`notice_undelivered`], and `None` where `jsonl` holds no announcement
+/// carrying `marker` at all — a tail too short to judge it by.
+#[must_use]
+pub fn notice_fate(jsonl: &str, marker: &str) -> Option<bool> {
+    let (mut armed, mut undelivered) = (false, None);
+    for line in jsonl.lines() {
+        if !line.contains("\"user\"") && !line.contains("assistant") {
+            continue;
+        }
+        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        match v.get("type").and_then(Value::as_str) {
+            Some("user") => {
+                if v.get("message")
+                    .is_some_and(|m| is_announcement(m) && line.contains(marker))
+                {
+                    (armed, undelivered) = (true, Some(false));
+                }
+            }
+            Some("assistant") if armed => {
+                if is_auth_wall_row(&v) {
+                    (armed, undelivered) = (false, Some(true));
+                } else if v
+                    .get("message")
+                    .and_then(|m| m.get("model"))
+                    .and_then(Value::as_str)
+                    .is_some_and(is_model_id)
+                {
+                    armed = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    undelivered
+}
+
+/// What a transcript's tail says of the login to an upgrade ([`transcript_login`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TranscriptLogin {
+    /// The wall stands ([`transcript_login_wall`]): [`Facts::login`].
+    pub stands: bool,
+    /// When the last wall was lifted ([`login_lifted_at`]): the clocks start
+    /// again from it ([`clock_held_until`]).
+    pub lifted_at: Option<u64>,
+    /// Whether the latest notice never reached the model
+    /// ([`notice_fate`]), for a phase that asks it — an announced upgrade,
+    /// and one that gave up; `None` where the tail holds no such notice (or
+    /// the phase asks nothing): [`Facts::undelivered`] reads it `false`, and
+    /// the driver looks further back for a give-up's.
+    pub undelivered: Option<bool>,
+}
+
+/// THE TRANSCRIPT'S WORD ON THE LOGIN for an upgrade in `phase` whose latest
+/// notice carries `marker`, from `tail` — the one fold the driver makes of
+/// it (`upgrade_drive::login_facts`) and the conformance walk binds.
+#[must_use]
+pub fn transcript_login(phase: &Phase, marker: &str, tail: &str) -> TranscriptLogin {
+    let asks = match phase {
+        Phase::Announced { .. } => true,
+        Phase::Failed(why) => why == GAVE_UP,
+        _ => false,
+    };
+    TranscriptLogin {
+        stands: transcript_login_wall(tail),
+        lifted_at: login_lifted_at(tail),
+        undelivered: (asks && !marker.is_empty())
+            .then(|| notice_fate(tail, marker))
+            .flatten(),
+    }
+}
+
+/// THE LOGIN FACT ([`Facts::login`]) of a screen of `agent`'s, by the ONE
+/// recogniser the supervisor reads its walls with ([`aterm_phase::wall`]):
+/// the turn ended on the auth wall — Claude Code's `⏺ Login expired · Please
+/// run /login` error row, `Not logged in · …` under the gutter; Codex's
+/// login notice ([`aterm_phase::codex::wall`]).
+#[must_use]
+pub fn login_wall(agent: Agent, rows: &[String]) -> bool {
+    let wall = match agent {
+        Agent::Claude => aterm_phase::wall(rows),
+        Agent::Codex => aterm_phase::codex::wall(rows),
+    };
+    wall.is_some_and(|w| w.kind == aterm_phase::WallKind::Auth)
+}
+
+/// The ask number of the next notice ([`Step::Announce`]) of an upgrade in
+/// `phase`: one more than the asks it has made — except where its last
+/// notice NEVER REACHED THE MODEL (`undelivered`, [`notice_undelivered`]),
+/// which spent no ask: typed again as the same ask (and so with the same
+/// READY marker).
+#[must_use]
+pub fn announce_asks(phase: &Phase, undelivered: bool) -> u32 {
+    match phase {
+        Phase::Announced { asks, .. } if undelivered => (*asks).max(1),
+        Phase::Announced { asks, .. } => asks.saturating_add(1),
+        _ => 1,
+    }
+}
+
+/// Every READY marker of the round an older build left with only its latest
+/// on record (0.93.0's state keeps `marker` alone): each ask's, minted as its
+/// notice minted it ([`ready_marker`] over the round's `salt` and the ask —
+/// the ledger of 2026-09-27 names exactly these four).
+#[must_use]
+pub fn round_markers(session_id: &str, to: &Version, salt: u64) -> Vec<String> {
+    (1..=MAX_ASKS)
+        .map(|asks| ready_marker(session_id, to, salt.wrapping_add(u64::from(asks))))
+        .collect()
+}
+
+/// How many of the round's notices (`markers`) REACHED THE MODEL, by
+/// `jsonl`: every one whose own turn was not the login wall's
+/// ([`notice_fate`]) — and one the text no longer holds, which cannot be
+/// shown unread.
+#[must_use]
+pub fn notices_received(jsonl: &str, markers: &[String]) -> u32 {
+    let received = markers
+        .iter()
+        .filter(|m| notice_fate(jsonl, m) != Some(true))
+        .count();
+    u32::try_from(received).unwrap_or(u32::MAX)
+}
+
+/// A GIVE-UP SPENT ON NOTICES THAT NEVER REACHED THE MODEL IS TAKEN BACK (the
+/// incident of 2026-09-27: 0.93.0 typed all four into the login wall and gave
+/// up at 07:03): an upgrade that gave up ([`GAVE_UP`]) whose last notice was
+/// the wall's (`undelivered`) is asked about as the upgrade it would have been
+/// had the unread notices spent no ask — pending when none of them reached
+/// the model (`received`, [`notices_received`]), else announced with the
+/// asks that did, its window run out — so its next notice is the next ask
+/// the model has not had, and it gives up again only after [`MAX_ASKS`]
+/// notices the model received. `None`: nothing to take back — any other
+/// phase, a last notice the model received, or every notice received.
+#[must_use]
+pub fn rearmed(phase: &Phase, undelivered: bool, received: u32) -> Option<Phase> {
+    match phase {
+        Phase::Failed(why) if why == GAVE_UP && undelivered && received < MAX_ASKS => {
+            Some(if received == 0 {
+                Phase::Pending
+            } else {
+                Phase::Announced {
+                    at_s: 0,
+                    asks: received,
+                }
+            })
+        }
+        _ => None,
+    }
+}
+
+/// THE HARNESS'S MARK: what every turn the harness types into an agent's
+/// conversation begins with — the upgrade's notice ([`ANNOUNCE_HEAD`]), its
+/// continuation ([`continue_prompt`]), a relaunch's (`relaunch::
+/// resumed_prompt`) and the Codex branch's. What tells the harness's own turns
+/// from anyone else's in the conversation's record ([`TaskScan`]).
+pub const HARNESS_MARK: &str = harness_mark!();
+
+/// WHETHER A CONVERSATION HAS A TASK (D1 of the live E2E of 2026-09-26): a
+/// conversation nobody has asked anything — no turn from a PERSON or an
+/// ORCHESTRATOR (a control-socket client other than the harness) — is
+/// TASKLESS, however many turns the harness itself typed into it. Folded over
+/// the conversation's transcript, one line at a time ([`Self::line`]), oldest
+/// first: the record is appended to, so a caller can read on from where it
+/// stopped (`upgrade_drive::Tasked`).
+///
+/// A conversation has a task from the first PROMPT of someone else's: a
+/// main-chain user row whose words are not the harness's ([`HARNESS_MARK`]) —
+/// recorded as it is submitted, before the agent answers it, so a restart
+/// that re-reads the record just before its signal never ends a first prompt
+/// in flight (the review of 2026-09-26: counting only an ANSWERED prompt let
+/// an orchestrator's `send` + Enter that had not been answered yet read
+/// taskless). A command of someone else's (`<command-name>…`) is a task once
+/// it starts a turn (a main-chain assistant row after it, a `<synthetic>`
+/// one too), none once its local output says it started none (`/model`
+/// leaves no task), and counts as one while neither has been read. Not a
+/// prompt: a subagent's row (`isSidechain`), Claude Code's own expansion of
+/// a command or a skill (`isMeta`), a tool's result, a local command's
+/// output (`<local-command-…>`) and Esc's note (`[Request interrupted by
+/// user…`). Any other user row counts as someone's — an unknown shape reads
+/// as a task, the old behaviour, never as none.
+///
+/// THE HARNESS'S OWN TURNS are of two kinds, and neither is a task: the ones
+/// the upgrade and the relaunch type, which begin with [`HARNESS_MARK`], and
+/// the ones the supervisor's turn-end policy types — `keep going`,
+/// `answer_text`, an accepted suggestion, a wall's retry — whose words are
+/// the owner's and carry no mark, but which its loop's own ledger records as
+/// it types them ([`Self::supervisor_typed`]:
+/// `crate::supervise::approvals::typed_texts`). The policy types those only
+/// where a task already stands, except where nobody could say (a record
+/// that could not be read yet, a Codex, a conversation not registered yet):
+/// there one `keep going` read as someone's would make the conversation
+/// tasked for good (the review of 2026-09-26).
+///
+/// WHY THE TEXT AND NOT THE VENDOR'S FIELDS (measured on that E2E's
+/// transcripts, Claude Code 2.1.281 and 2.1.283): the harness's notice, its
+/// carry-on, the supervisor's `keep going` and a tester's prompt typed over
+/// the control socket all read `"promptSource":"typed"`, `"origin":
+/// {"kind":"human"}` — every one of them came through the terminal as typed
+/// input, so the vendor cannot tell them apart. The mark and the ledger are
+/// the harness's own record of what it typed — the mark written into the
+/// conversation's own record, where it survives every restart and resume;
+/// the screen (the launch card) is lost as soon as anything is typed, and a
+/// resumed conversation's screen shows its history.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskScan {
+    /// A command of someone else's waits: the turn it starts, or the local
+    /// output that says it started none. Read as a task meanwhile.
+    command: bool,
+    /// Someone else's prompt, or a command that started a turn, was read:
+    /// the conversation has a task, for good.
+    tasked: bool,
+    /// What the session's supervisor typed into it, from its ledger: a row
+    /// with the same words is its, not someone else's.
+    ours: Vec<String>,
+}
+
+impl TaskScan {
+    /// Read on knowing `ours`: the texts the session's supervisor typed
+    /// into it ([`TaskScan`]'s second kind of the harness's own turns).
+    pub fn supervisor_typed(&mut self, ours: &[String]) {
+        ours.clone_into(&mut self.ours);
+    }
+
+    /// Fold one transcript line in; whether the conversation has a task now
+    /// ([`Self::tasked`]). A line that is not a JSON row (a last line caught
+    /// half-written) is skipped.
+    pub fn line(&mut self, line: &str) -> bool {
+        if self.tasked || !(line.contains("\"user\"") || line.contains("\"assistant\"")) {
+            return self.tasked();
+        }
+        let Ok(v) = aterm_json::from_str::<Value>(line) else {
+            return self.tasked();
+        };
+        if v.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            return self.tasked();
+        }
+        match v.get("type").and_then(Value::as_str) {
+            Some("assistant") => self.tasked = self.command,
+            Some("user") => match prompt_of(&v, &self.ours) {
+                Prompt::Theirs => self.tasked = true,
+                Prompt::Command => self.command = true,
+                Prompt::Harness | Prompt::LocalOutput => self.command = false,
+                Prompt::None => {}
+            },
+            _ => {}
+        }
+        self.tasked()
+    }
+
+    /// Whether the conversation has a task: someone else's prompt was read,
+    /// or a command of theirs that has not said it started no turn.
+    #[must_use]
+    pub fn tasked(&self) -> bool {
+        self.tasked || self.command
+    }
+
+    /// Whether it has one FOR GOOD: nothing read later can take it away, so
+    /// nothing more need be read.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.tasked
+    }
+}
+
+/// [`TaskScan`] over a whole transcript, its session's supervisor having
+/// typed `ours` into it.
+#[must_use]
+pub fn transcript_tasked(jsonl: &str, ours: &[String]) -> bool {
+    let mut scan = TaskScan::default();
+    scan.supervisor_typed(ours);
+    for line in jsonl.lines() {
+        if scan.line(line) && scan.settled() {
+            break;
+        }
+    }
+    scan.tasked()
+}
+
+/// Whose prompt a main-chain user row is ([`TaskScan`]).
+enum Prompt {
+    /// The harness's own turn ([`HARNESS_MARK`]).
+    Harness,
+    /// A person's or an orchestrator's.
+    Theirs,
+    /// A command of theirs (`<command-name>…`): a turn only if it starts one.
+    Command,
+    /// A local command's output: the command before it started no turn.
+    LocalOutput,
+    /// No prompt at all: an expansion, a tool's result, Claude Code's own note.
+    None,
+}
+
+fn prompt_of(row: &Value, ours: &[String]) -> Prompt {
+    if row.get("isMeta").and_then(Value::as_bool) == Some(true) {
+        return Prompt::None;
+    }
+    let content = row.get("message").and_then(|m| m.get("content"));
+    let text = match content {
+        Some(Value::String(t)) => Some(t.as_str()),
+        Some(Value::Array(parts)) => {
+            let mut texts = parts
+                .iter()
+                .filter(|p| p.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|p| p.get("text").and_then(Value::as_str));
+            match texts.next() {
+                Some(t) => Some(t),
+                // Every part is a tool's result (or an image): the agent's
+                // own loop, no prompt.
+                None if !parts.is_empty()
+                    && parts
+                        .iter()
+                        .all(|p| p.get("type").and_then(Value::as_str) == Some("tool_result")) =>
+                {
+                    return Prompt::None;
+                }
+                None => None,
+            }
+        }
+        _ => None,
+    };
+    let Some(text) = text.map(str::trim_start) else {
+        return Prompt::Theirs;
+    };
+    let supervisors = |said: &str| ours.iter().any(|o| same_words(o, said));
+    if text.starts_with(HARNESS_MARK) {
+        Prompt::Harness
+    } else if text.starts_with("<local-command-") {
+        Prompt::LocalOutput
+    } else if text.starts_with("<command-name>") || text.starts_with("<command-message>") {
+        if supervisors(&command_line(text)) {
+            Prompt::Harness
+        } else {
+            Prompt::Command
+        }
+    } else if text.starts_with("[Request interrupted by user") {
+        Prompt::None
+    } else if supervisors(text) {
+        Prompt::Harness
+    } else {
+        Prompt::Theirs
+    }
+}
+
+/// Whether two texts are the same words, however spaced or wrapped.
+fn same_words(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
+/// The command a command row records, as it was typed: `/<name> <args>`
+/// from Claude Code's `<command-name>/<name></command-name>` and
+/// `<command-args><args></command-args>`.
+fn command_line(row: &str) -> String {
+    let tag = |name: &str| {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        row.split_once(&open)
+            .and_then(|(_, rest)| rest.split_once(&close))
+            .map_or("", |(inner, _)| inner.trim())
+    };
+    format!("{} {}", tag("command-name"), tag("command-args"))
+        .trim()
+        .to_string()
+}
+
 /// What the driver measured about one session, for the gates.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Facts {
@@ -1439,11 +2114,21 @@ pub struct Facts {
     /// workflow, a background agent, a shell, a Codex background terminal —
     /// as the session's own loop read it and saw it stand [`QUIET_S`]
     /// (`supervise`'s `BACKGROUND_SETTLE`). There, and only there, Claude's
-    /// own `busy`/`shell` status is no wait for the FIRST notice, and the
-    /// loop's settle stands for the screen's (a workflow's progress line
-    /// never holds still); every other step — a re-ask, the restart — is an
-    /// idle point's ([`next_step`]: `background`).
+    /// own `busy`/`shell` status is no wait for a NOTICE: the first one, or a
+    /// re-ask once [`REASK_S`] has passed since the last. The loop's settle
+    /// stands for the screen's, since a workflow's progress line never holds
+    /// still. The restart is an idle point's ([`next_step`]: `background`);
+    /// a READY a person held past the drain is voided here as there.
     pub background_point: bool,
+    /// THE CONVERSATION HAS NO TASK ([`TaskScan`]: nobody but the harness has
+    /// asked it anything): there is nothing to preserve and no answer a
+    /// person reads, so no notice is typed and nothing is resumed — the agent
+    /// is restarted onto the new build AFRESH ([`Step::Fresh`]), once idle
+    /// the full [`QUIET_S`] as any step; a person at the tab, a hold, a box,
+    /// a draft and running work still wait (D1 of the live E2E of
+    /// 2026-09-26: the notice started a conversation nobody asked for, and a
+    /// tester's first prompt met `ERR busy`).
+    pub taskless: bool,
     /// THE SESSION STANDS AT A USAGE OR RATE LIMIT ([`limited`], read from
     /// the same screen every other fact here is read from): what is typed
     /// now is queued behind the limit, or answered by an error, never read.
@@ -1457,12 +2142,42 @@ pub struct Facts {
     /// stands ([`gate_announce`], [`next_step`], [`clock_held`]); no
     /// person's `--now` waives it — a person cannot make the notice read.
     pub limited: bool,
+    /// THE SESSION STANDS AT THE LOGIN WALL: its screen shows the auth wall
+    /// ([`login_wall`], the supervisor's own recogniser), or its transcript's
+    /// last word on the login is Claude Code's `authentication_failed` row
+    /// ([`transcript_login_wall`]). Measured 2026-09-27 (tab
+    /// `s-b5cf2faabac5ce5127bd`, Claude Code 2.1.281): the login expired, and
+    /// every turn after it — the supervisor's `continue`s and four notices
+    /// half an hour apart — was answered in under 90 ms by `Login expired ·
+    /// Please run /login`; the upgrade gave up at 07:03, and the READY the
+    /// agent gave once the owner logged in at 14:33 answered an upgrade that
+    /// had stopped. A wait like the limit's ([`gate_announce`], [`next_step`],
+    /// [`clock_held`]), which a person's `/login` lifts and no `--now` waives.
+    pub login: bool,
+    /// THE LATEST NOTICE NEVER REACHED THE MODEL: its own turn ended on the
+    /// login wall ([`notice_undelivered`]). It spent no ask: [`next_step`]
+    /// types it again, as the same ask ([`announce_asks`]), at the first
+    /// point the notice could be typed — never waits out its window for it,
+    /// and never gives up on it. (A give-up spent on it is taken back before
+    /// the reducer is asked: [`rearmed`].)
+    pub undelivered: bool,
     /// Seconds the READY answer the upgrade acts on has stood unacted on,
-    /// the driver's stamp ([`ready_since`]; 0: no such answer now) — held,
-    /// like every clock of the upgrade, while the session is at its limit.
-    /// What bounds how long the agent's own background work may hold a
-    /// READY restart ([`next_step`]).
+    /// the driver's stamp ([`ready_since`]; 0: no such answer now, or one
+    /// first heard at this very look) — held, like every clock of the
+    /// upgrade, while the session is at its limit, and begun again by every
+    /// new notice. What bounds how long the agent's own background work may
+    /// hold a READY restart ([`next_step`]): the answer gets a whole
+    /// [`REASK_S`] of its own before that work supersedes it, however late in
+    /// its notice's window it came (the review of 2026-09-26: a notice's clock
+    /// alone could give up on a READY answered seconds before, when the agent
+    /// wound down past the interval as the notice itself asks).
     pub ready_s: u64,
+    /// Seconds since the upgrade's round STOPPED ([`Phase::Failed`]), the
+    /// driver's stamp (`upgrade_drive::St::failed_at`; 0: not stopped, or
+    /// stopped at this very look). A stop an older build recorded carries no
+    /// stamp, and reads as stopped long ago. Past [`RETRY_S`] the round is
+    /// re-armed ([`Step::Rearm`]): no stop is for good.
+    pub failed_s: u64,
 }
 
 /// THE LIMIT FACT ([`Facts::limited`]) of a screen of `agent`'s, by the ONE
@@ -1495,9 +2210,20 @@ pub enum Gate {
 }
 
 /// Seconds Claude must have been idle, and the screen quiet, before anything is
-/// typed: long enough that a person who just read the answer and started to
-/// think is not typed over, short enough that an idle session moves the same
-/// hour.
+/// typed or ended: long enough that a person who just read the answer and
+/// started to think is not typed over, short enough that an idle session
+/// moves the same hour. Measured on the agent's own verdict
+/// ([`Facts::quiet_s`]), which any turn moves.
+///
+/// A CONVERSATION WITH NO TASK SETTLES THE SAME ([`Facts::taskless`],
+/// [`Step::Fresh`]): there is no answer to read, but the session the harness
+/// looks at right after it was launched is the one whose FIRST PROMPT is on
+/// its way — an orchestrator's `await agent idle` returns at the very first
+/// idle verdict, and it sends then (ND1 of the live re-test of 2026-09-26:
+/// the fresh restart fired 1.3 s after that verdict, and a first prompt sent
+/// then would have met the shell). Settled, the prompt has either come — a
+/// task, recorded at once ([`TaskScan`]) — or the session has sat still for
+/// this long, and the restart holds the tab while it is under way.
 pub const QUIET_S: u64 = 20;
 
 /// Whether a session whose person stamp reads `human` is ATTENDED
@@ -1517,7 +2243,9 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 /// May the ANNOUNCEMENT be typed now? No hold, no person at the tab
 /// ([`Facts::attended`]), Claude idle and settled, the composer empty, no
 /// box, no busy footer, and the screen quiet — the person and the quiet
-/// waived by the owner's `--now` alone ([`Facts::owner_now`]).
+/// waived by the owner's `--now` alone ([`Facts::owner_now`]) — for a
+/// conversation with no task too ([`Facts::taskless`]: what the gate opens
+/// there is [`Step::Fresh`], never a notice).
 ///
 /// THE PERSON IS ASKED FIRST, before Claude's status (review of
 /// 2026-09-25): a busy attended tab waits `attended`, not `not-idle` — the
@@ -1540,18 +2268,23 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 /// step taken anywhere else still waits `not-idle` there.
 ///
 /// AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK ([`Facts::background_point`])
-/// the notice is typed all the same — the owner's answer of 2026-09-26: it
-/// interrupts the agent's orchestration once, and the agent answers READY
-/// when its work is done — Claude's `busy` (a workflow waited on) or `shell`
-/// status no wait there, and the settle the loop's; a person, a hold, a box,
-/// a draft and a live turn's busy footer still wait. [`gate_restart`] asks
-/// an idle point with nothing running under the agent all the same.
+/// the notice is typed all the same (the owner's answer of 2026-09-26). It
+/// interrupts the agent's orchestration once, and again only after a whole
+/// [`REASK_S`] with the work still running ([`next_step`]). The agent answers
+/// READY when its work is done. Claude's `busy` (a workflow waited on) or
+/// `shell` status is no wait there, and the settle is the loop's. A person, a
+/// hold, a box, a draft and a live turn's busy footer still wait.
+/// [`gate_restart`] asks an idle point with nothing running under the agent
+/// all the same.
 ///
 /// A SESSION AT ITS LIMIT IS NEVER ASKED ([`Facts::limited`]): it waits
 /// `limited`, right after the person, whatever else holds — a notice typed
 /// there is queued unread behind the limit (the 2026-09-25 incident: four of
-/// them, delivered at once when the limit reset). Nothing waives it, the
-/// owner's `--now` included.
+/// them, delivered at once when the limit reset). Nor is one at THE LOGIN
+/// WALL ([`Facts::login`]): it waits `login` — a notice typed there is
+/// answered by the wall and read by no model (the 2026-09-27 incident: four
+/// of them, each met by `Login expired · Please run /login`). Nothing waives
+/// either, the owner's `--now` included.
 #[must_use]
 pub fn gate_announce(f: &Facts) -> Gate {
     if f.held {
@@ -1562,6 +2295,9 @@ pub fn gate_announce(f: &Facts) -> Gate {
     }
     if f.limited {
         return Gate::Wait("limited");
+    }
+    if f.login {
+        return Gate::Wait("login");
     }
     let at_break = f.background_point && matches!(f.status.as_str(), "idle" | "busy" | "shell");
     if f.status != "idle" && !at_break {
@@ -1587,7 +2323,8 @@ pub fn gate_announce(f: &Facts) -> Gate {
 
 /// May the agent be ended now? Everything [`gate_announce`] asks, plus the
 /// agent's READY answer and NOTHING running under it. Nothing is ever killed to
-/// reach this gate: background work is waited for.
+/// reach this gate: background work is waited for. What bounds that wait is
+/// the re-ask in [`next_step`], never this gate.
 ///
 /// AN ATTENDED TAB IS NEVER SIGNALLED ON THE UPGRADE'S OWN JUDGMENT (review of
 /// 2026-09-25): [`gate_announce`]'s attended-tab guard stands here too, READY
@@ -1739,29 +2476,78 @@ pub enum Phase {
     },
     /// The new process holds the session and the continuation was typed.
     Done,
-    /// Stopped, and why. Not retried for the same (session, target) — with
-    /// ONE exception, [`GAVE_UP`]: an upgrade that stopped ASKING still
-    /// honours a READY answer to a notice of its own while the session that
-    /// was asked lives ([`next_step`]).
+    /// This ROUND stopped, and why. Never for good (the owner, 2026-09-27:
+    /// "you should NEVER have upgrades stalled"): [`RETRY_S`] after it
+    /// stopped ([`Facts::failed_s`]) the upgrade starts a new round
+    /// ([`Step::Rearm`], [`retry_due`]) — unless the owner's `--skip` of the
+    /// target, or a `--defer` not run out, holds it ([`requested_step`]). Until
+    /// then it waits `failed`, and an upgrade that stopped ASKING
+    /// ([`GAVE_UP`]) still honours a READY answer to a notice of its own while
+    /// the session that was asked lives ([`next_step`]).
     Failed(String),
 }
 
-/// The [`Phase::Failed`] reason of an upgrade that stopped asking after
+/// The [`Phase::Failed`] reason of a round that stopped asking after
 /// [`MAX_ASKS`] notices went unanswered ([`Step::GiveUp`]) — the owner's view
-/// says `gave-up`.
+/// says `gave-up`, and when the next round starts ([`RETRY_S`]).
 pub const GAVE_UP: &str = "unanswered";
 
-/// Seconds between announcements when the agent has not answered READY: the
-/// agent may have said it cannot stop yet, or the person took the turn. Spent
-/// only while the session can READ a notice: at a usage limit the clock is held
-/// ([`clock_held`]), so the agent has the whole window once the limit resets.
+/// Seconds between announcements when the agent has not answered READY (it
+/// may have said it cannot stop yet, or the person took the turn), or when
+/// work under it outlives a READY answer ([`next_step`]). The same interval
+/// holds at an idle point and at a break of the agent's background work.
+/// Spent only while the session can READ a notice: at a usage limit the clock
+/// is held ([`clock_held`]), so the agent has the whole window once the limit
+/// resets.
 pub const REASK_S: u64 = 30 * 60;
 
-/// The most announcements one upgrade makes: a bound on NAGGING, never a reason
-/// to strand the agent. Past it the upgrade stops asking ([`Step::GiveUp`]) —
-/// it releases the agent ([`release_prompt`]) and still honours a READY answer
-/// to one of its notices that comes late ([`GAVE_UP`]). Never a forced restart.
+/// The most announcements one ROUND of an upgrade makes: a bound on NAGGING,
+/// never a reason to strand the agent. Past it the round stops asking
+/// ([`Step::GiveUp`]), says so in the ledger naming what still runs under the
+/// agent, releases the agent ([`release_prompt`]), and still honours a READY
+/// answer to one of its notices that comes late ([`GAVE_UP`]) — until the next
+/// round, [`RETRY_S`] later, asks again. Never a forced restart.
 pub const MAX_ASKS: u32 = 4;
+
+/// Seconds a STOPPED round of an upgrade ([`Phase::Failed`], whatever stopped
+/// it) rests before the upgrade starts a new one ([`Step::Rearm`]): one
+/// round's worth of asking, `MAX_ASKS × REASK_S` (two hours today).
+///
+/// WHY THAT LONG AND NO LONGER (the owner, 2026-09-27: "you should NEVER have
+/// upgrades stalled" — a tab sat `failed:unanswered` for 1d22h, its agent's
+/// late READY voided under the background gate it always runs, and nothing
+/// would ever ask it again). A round asks for at most `MAX_ASKS × REASK_S`
+/// before it gives up; resting exactly as long again keeps the nagging to at
+/// most half of any stretch of time, one round on, one round off, however
+/// long the agent's work lasts. And it BOUNDS THE SILENCE: at an agent that
+/// can read, the longest stretch with no notice is the give-up's own window
+/// after the last notice plus this rest, `REASK_S + RETRY_S` (two and a half
+/// hours today) — where the stop that is not a give-up (a refused signal, a
+/// relaunch that never came up, a conversation resumed elsewhere) rests the
+/// same, once. The rest is not held at a usage limit: the round it starts
+/// types nothing there (a limited session is never asked), so no clock needs
+/// holding for it.
+pub const RETRY_S: u64 = MAX_ASKS as u64 * REASK_S;
+
+const _: () = assert!(RETRY_S >= REASK_S);
+
+/// THE LONGEST A REPEATED STOP STRETCHES THE REST, as a power of two of
+/// [`RETRY_S`] (the no-stall review of 2026-09-27, S1): a stop whose reason
+/// repeats round after round — a relaunch that never comes up would otherwise
+/// ask for a READY, signal the agent and leave it dead at its prompt every
+/// [`RETRY_S`] — rests `RETRY_S`, then twice, then four times as long, and no
+/// longer. Never terminal: the upgrade still asks again, a few times a day.
+pub const RETRY_BACKOFF_MAX_SHIFT: u32 = 2;
+
+/// How much LATER than [`RETRY_S`] after a stop the next round starts, for
+/// the `streak`-th stop in a row with the same reason (`St::fail`): nothing
+/// for the first, then `RETRY_S`, then `3 × RETRY_S` — the rest doubling up
+/// to `RETRY_S << RETRY_BACKOFF_MAX_SHIFT`.
+#[must_use]
+pub fn rest_extension(streak: u32) -> u64 {
+    let shift = streak.saturating_sub(1).min(RETRY_BACKOFF_MAX_SHIFT);
+    RETRY_S.saturating_mul((1_u64 << shift) - 1)
+}
 
 impl Phase {
     /// The word the ledger and `status` print.
@@ -1789,14 +2575,42 @@ pub enum Step {
     Terminate,
     /// The READY answer is void, and why (the [`person_hold`] word, or
     /// `background`): past [`DRAIN_S`] a person's state has held the gate for
-    /// [`HOLD_S`], or the agent's own background work for [`DRAIN_S`] after the
-    /// answer ([`void_of`]). Forget the markers, release the agent and record
-    /// it; an announced upgrade asks again [`REASK_S`] later.
+    /// [`HOLD_S`] ([`person_void`]), or — for an upgrade that gave up asking,
+    /// which has no re-ask left to supersede the answer with — the agent's own
+    /// background work for [`DRAIN_S`] after the answer ([`void_of`]). Forget
+    /// the markers, release the agent and record it; an announced upgrade asks
+    /// again [`REASK_S`] later.
     Void(&'static str),
-    /// Stop asking: [`MAX_ASKS`] announcements went unanswered. The upgrade
-    /// is then [`GAVE_UP`]: the agent is owed its release line, and a READY
-    /// answer that still comes before that line is honoured.
+    /// Stop asking: [`MAX_ASKS`] announcements went unanswered, or none left a
+    /// READY answer the restart could act on (the agent's own work outlived
+    /// it). The upgrade is then [`GAVE_UP`]: the agent is owed its release
+    /// line, and a READY answer that still comes before that line is honoured.
     GiveUp,
+    /// The conversation has no task ([`Facts::taskless`]): end the agent
+    /// (SIGTERM to its pid only) and start the new build AFRESH in its tab —
+    /// no notice before, no `--resume`, nothing typed after.
+    Fresh,
+    /// A stopped round has rested [`RETRY_S`] ([`retry_due`]): start a NEW
+    /// ROUND of the upgrade — pending again, a fresh salt (new READY markers),
+    /// its asks reset, the owner's spent `--now` gone — and say so in the
+    /// ledger (`rearmed:<why>`). Types nothing and ends nothing, so it is
+    /// taken anywhere, at a break and at a limit too: the round it starts
+    /// asks under every gate a first notice is typed under.
+    Rearm,
+}
+
+/// WHETHER A STOPPED ROUND STARTS A NEW ONE NOW ([`Step::Rearm`]): it stopped
+/// (`phase` is [`Phase::Failed`], for any reason) at least [`RETRY_S`] ago
+/// (`failed_s`, [`Facts::failed_s`]) — and it is not an upgrade that gave up
+/// asking with a READY answer to one of its notices in hand (`ready`), which
+/// is still acted on as it is ([`next_step`]): the re-arm replaces only the
+/// forever-wait, never an answer the agent gave.
+#[must_use]
+pub fn retry_due(phase: &Phase, failed_s: u64, ready: bool) -> bool {
+    match phase {
+        Phase::Failed(why) => !(why == GAVE_UP && ready) && failed_s >= RETRY_S,
+        _ => false,
+    }
 }
 
 /// THE REDUCER for the cooperative half: from where the upgrade stands, the
@@ -1804,15 +2618,42 @@ pub enum Step {
 /// relaunch halves are the driver's, because each is a wait on the kernel.
 ///
 /// At a break of the agent's own background work
-/// ([`Facts::background_point`]) only the FIRST notice is taken: the break
-/// interrupts the orchestration once, and a re-ask, the restart and every
-/// other step wait for an idle point (`background`: the agent's own work
-/// runs).
+/// ([`Facts::background_point`]) only a NOTICE is taken: the first one, and
+/// a re-ask once a whole [`REASK_S`] has passed since the last one
+/// ([`reask`]) — or, its asks spent, the give-up. A READY a person held past
+/// the drain is voided there as at an idle point. The restart, and a gave-up
+/// upgrade's late READY, wait for an idle point (`background`: the agent's
+/// own work runs); [`break_step`] is the one rule both drivers hold a break to.
+///
+/// THE AGENT'S OWN WORK BOUNDS NO WAIT, BUT IT DOES BOUND THE SILENCE
+/// (2026-09-26). A tab sat four days on an old Claude Code: behind
+/// two background poll loops whose workflow had died, every look after the
+/// first notice answered `background`, before this function looked at an
+/// answer, a re-ask or [`MAX_ASKS`]. With READY in hand, the restart's gate
+/// answered `background` too ([`gate_restart`]), and only a person's hold
+/// could void the answer. Nothing was ever asked again, nothing gave up, and
+/// the owner was told the move would come "once that ends". Now the work is
+/// still waited for and never ended, but a notice whose [`REASK_S`] has run
+/// out is asked again. That holds at a break, and with a READY answer that
+/// work under the agent still outlives by a whole [`REASK_S`] of the answer's
+/// own ([`Facts::ready_s`]): the new notice SUPERSEDES that answer — it is no
+/// longer the agent's last word after the latest notice — where a void would
+/// type the release line ("nothing will restart this session") only for the
+/// next notice to contradict it. Each re-ask names what runs (the driver's
+/// [`running_clause`]), and past [`MAX_ASKS`] the upgrade gives up and says
+/// what held it. `gave-up` is what the owner's `--now` re-arms.
+///
+/// A conversation with NO TASK ([`Facts::taskless`]) is never announced to:
+/// once [`gate_restart`] would let a READY agent go — its settle waived — it
+/// is restarted afresh ([`Step::Fresh`]), whether nothing was typed yet or a
+/// notice an older aterm typed stands unanswered — never at its limit
+/// (below): it waits `limited` as every step does.
 ///
 /// A SESSION AT ITS LIMIT ([`Facts::limited`]) is never asked, re-asked,
-/// given up on, voided or ended: every step waits `limited` — an
-/// announcement that could not be read is not an ask, so neither the asks
-/// budget nor, with the driver's [`clock_held`], the re-ask clock is spent.
+/// given up on, voided or ended, at a break or at an idle point: every step
+/// waits `limited` — an announcement that could not be read is not an ask,
+/// so neither the asks budget nor, with the driver's [`clock_held`], the
+/// re-ask clock is spent.
 ///
 /// AN UPGRADE THAT GAVE UP ASKING ([`GAVE_UP`]) STILL HEARS A LATE READY
 /// (the 2026-09-26 incident: four notices queued behind a usage limit were
@@ -1822,46 +2663,143 @@ pub enum Step {
 /// driver's reading of a marker this upgrade issued, answered by the very
 /// process its notice reached, and the step is the one an announced upgrade
 /// takes on it: [`gate_restart`], every gate kept, then the restart and the
-/// carry-on — or, past the drain's bound, the same void ([`void_of`]: a
-/// person's hold, or the agent's own background work, that outlasted it).
-/// Any other stop waits `failed`.
+/// carry-on — or, past the drain's bound, the void ([`void_of`]: a person's
+/// hold, or the agent's own background work, that outlasted it). With no
+/// re-ask left, the void — and the release it owes — is the way off for an
+/// answer the agent's work outlives. At a BREAK of that work the restart is
+/// never taken, so there the answer waits `background` until the same
+/// bound voids it (the owner's tab of 2026-09-27 sat 2h56m and counting at
+/// `wait=background`: it ran a background gate at every look, and the break
+/// answered `background` before the bound was ever asked).
+///
+/// NO STOP IS FOR GOOD (the owner, 2026-09-27: "you should NEVER have
+/// upgrades stalled"). Any other stopped round — and a gave-up one with no
+/// READY in hand — waits `failed` for [`RETRY_S`] after it stopped
+/// ([`Facts::failed_s`]), then starts a new round ([`Step::Rearm`],
+/// [`retry_due`]): at a break, at a limit and at the login wall too, since
+/// it types nothing; the round it starts asks under every gate. Until
+/// 2026-09-27 `failed` was terminal for the target: a new round came only
+/// with a newer build.
+///
+/// AT THE LOGIN WALL ([`Facts::login`]) every step waits `login`, as at a
+/// limit, at a break or at an idle point. A NOTICE THAT NEVER REACHED THE
+/// MODEL ([`Facts::undelivered`]: its own turn ended on the login wall) spent
+/// no ask: it is typed again at the first point a notice could be — a break
+/// included — never waited out as an unanswered one, never given up on
+/// ([`announce_asks`]: the same ask). An upgrade that GAVE UP on such
+/// notices (the 2026-09-27 incident: 0.93.0 spent all four into the wall and
+/// gave up at 07:03) is asked about as [`rearmed`] makes it, unless a READY
+/// came first.
 #[must_use]
 pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
+    if retry_due(phase, f.failed_s, ready) {
+        return Step::Rearm;
+    }
+    if f.taskless && matches!(phase, Phase::Pending | Phase::Announced { .. }) {
+        if f.limited {
+            return Step::Wait("limited");
+        }
+        if f.background_point {
+            return Step::Wait("background");
+        }
+        return match gate_restart(f, true) {
+            Gate::Go => Step::Fresh,
+            Gate::Wait(w) => Step::Wait(w),
+        };
+    }
+    let reannounce = || match gate_announce(f) {
+        Gate::Go => Step::Announce,
+        Gate::Wait(w) => Step::Wait(w),
+    };
     if f.background_point && *phase != Phase::Pending {
-        return Step::Wait("background");
+        let Phase::Announced { at_s, asks } = phase else {
+            // A gave-up upgrade's late READY at a break: the restart is an
+            // idle point's, but the agent's own work that outlives the
+            // answer voids it here as there — at a break that work runs by
+            // definition — so a session that is always at a break is never
+            // held on the answer for good.
+            if matches!(phase, Phase::Failed(why) if why == GAVE_UP) && ready {
+                if f.limited {
+                    return Step::Wait("limited");
+                }
+                if f.login {
+                    return Step::Wait("login");
+                }
+                let drained = REASK_S.saturating_add(f.ready_s) >= DRAIN_S;
+                return void_of(f, "background", drained)
+                    .map_or(Step::Wait("background"), Step::Void);
+            }
+            // A stopped round resting to its next says so, at a break as at an
+            // idle point: `wait=background` there was the owner's own stalled
+            // tab's word, and it named the agent's work, not the rest.
+            if matches!(phase, Phase::Failed(_)) {
+                return Step::Wait("failed");
+            }
+            return Step::Wait("background");
+        };
+        if f.limited {
+            return Step::Wait("limited");
+        }
+        if f.login {
+            return Step::Wait("login");
+        }
+        let since = now_s.saturating_sub(*at_s);
+        // A person's hold voids a READY answer here as at an idle point: the
+        // restart a stale answer would authorize comes at the next idle point.
+        if ready && let Some(who) = person_void(f, since >= DRAIN_S) {
+            return Step::Void(who);
+        }
+        // A notice the wall answered is no ask the clock may count toward a
+        // give-up: typed again here, where a notice may go.
+        if !ready && f.undelivered {
+            return reannounce();
+        }
+        return if clock(since, f, ready) >= REASK_S {
+            reask(f, *asks)
+        } else {
+            Step::Wait("background")
+        };
     }
     match phase {
-        Phase::Pending => match gate_announce(f) {
-            Gate::Go => Step::Announce,
-            Gate::Wait(w) => Step::Wait(w),
-        },
+        Phase::Pending => reannounce(),
         Phase::Announced { at_s, asks } => {
             if f.limited {
                 return Step::Wait("limited");
             }
+            if f.login {
+                return Step::Wait("login");
+            }
+            let since = now_s.saturating_sub(*at_s);
             if ready {
                 return match gate_restart(f, true) {
                     Gate::Go => Step::Terminate,
-                    Gate::Wait(w) => void_of(f, w, now_s.saturating_sub(*at_s) >= DRAIN_S)
-                        .map_or(Step::Wait(w), Step::Void),
+                    Gate::Wait(w) => match person_void(f, since >= DRAIN_S) {
+                        Some(who) => Step::Void(who),
+                        // The agent's own work outlives the answer: asked
+                        // again, naming what runs, or given up on.
+                        None if w == "background" && clock(since, f, ready) >= REASK_S => {
+                            reask(f, *asks)
+                        }
+                        None => Step::Wait(w),
+                    },
                 };
             }
-            if now_s.saturating_sub(*at_s) < REASK_S {
+            if f.undelivered {
+                return reannounce();
+            }
+            if since < REASK_S {
                 return Step::Wait("awaiting-ready");
             }
-            if *asks >= MAX_ASKS {
-                return Step::GiveUp;
-            }
-            match gate_announce(f) {
-                Gate::Go => Step::Announce,
-                Gate::Wait(w) => Step::Wait(w),
-            }
+            reask(f, *asks)
         }
         Phase::Exiting { .. } | Phase::Relaunched { .. } => Step::Wait("in-flight"),
         Phase::Done => Step::Wait("done"),
         Phase::Failed(why) if why == GAVE_UP && ready => {
             if f.limited {
                 return Step::Wait("limited");
+            }
+            if f.login {
+                return Step::Wait("login");
             }
             match gate_restart(f, true) {
                 Gate::Go => Step::Terminate,
@@ -1880,10 +2818,24 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
     }
 }
 
-/// Why the READY answer a restart's gate still holds (`w`, the gate's wait)
-/// is VOID now, if it is — past the drain's bound (`drained`, [`DRAIN_S`] after
-/// the notice): a PERSON's hold ([`person_hold`]: a box nobody answers, a
-/// draft nobody sends) that has stood [`HOLD_S`], or the agent's own
+/// THE PERSON'S VOID ([`DRAIN_S`], [`HOLD_S`]): past the drain's bound
+/// (`drained`, [`DRAIN_S`] after the notice), a PERSON's hold
+/// ([`person_hold`]: a box nobody answers, a draft nobody sends) that has
+/// stood [`HOLD_S`] over the READY answer, which the answer then no longer
+/// outlasts. `None` for no hold, one short of [`HOLD_S`], or inside the
+/// bound. Both arms of [`next_step`] void on it, at a break as at an idle
+/// point: the restart a stale answer would authorize comes at the next idle
+/// point, after the person let go.
+fn person_void(f: &Facts, drained: bool) -> Option<&'static str> {
+    if !drained || f.hold_s < HOLD_S {
+        return None;
+    }
+    person_hold(f)
+}
+
+/// Why the READY answer a gave-up upgrade's restart gate still holds (`w`,
+/// the gate's wait) is VOID now, if it is — past the drain's bound
+/// (`drained`): the person's hold ([`person_void`]), or the agent's own
 /// BACKGROUND work ([`Facts::background`]) still running under it
 /// [`DRAIN_S`] after the answer ([`Facts::ready_s`]) — the agent said
 /// nothing of its own still runs, and whatever does (a `run_in_background`
@@ -1891,23 +2843,18 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
 /// on — the settle, the agent's own turn, a person's hand, aterm's hold, the
 /// limit — passes, and the restart follows it.
 ///
-/// The same bound for an announced upgrade and for one that gave up and
-/// hears a late READY (the review of 2026-09-26: the gave-up arm had none, so
-/// a READY a person's box held for hours ended the agent seconds after the
-/// box was answered — the stale answer [`DRAIN_S`] exists to void — and one a
+/// The review of 2026-09-26 found the gave-up arm with no bound at all: a
+/// READY a person's box held for hours ended the agent seconds after the box
+/// was answered — the stale answer [`DRAIN_S`] exists to void — and one a
 /// background server held left the agent holding for good, the release it
-/// owed held behind the READY). Voided, the answer is forgotten and the
-/// agent released (`upgrade_drive::drain_expired`).
+/// owed held behind the READY. Voided, the answer is forgotten and the agent
+/// released (`upgrade_drive::drain_expired`). An ANNOUNCED upgrade voids only
+/// on the person: the agent's own work outliving its answer is met by a
+/// re-ask that supersedes the answer ([`next_step`]), not by a release line
+/// the next notice would contradict.
 fn void_of(f: &Facts, w: &'static str, drained: bool) -> Option<&'static str> {
-    if !drained {
-        return None;
-    }
-    if let Some(who) = person_hold(f)
-        && f.hold_s >= HOLD_S
-    {
-        return Some(who);
-    }
-    (w == "background" && f.ready_s >= DRAIN_S).then_some("background")
+    person_void(f, drained)
+        .or_else(|| (drained && w == "background" && f.ready_s >= DRAIN_S).then_some("background"))
 }
 
 /// Since when the READY answer the upgrade acts on has stood, for
@@ -1920,7 +2867,7 @@ fn void_of(f: &Facts, w: &'static str, drained: bool) -> Option<&'static str> {
 pub fn ready_since(prior: u64, ready: bool, f: &Facts, now_s: u64) -> u64 {
     if !ready {
         0
-    } else if prior == 0 || f.limited {
+    } else if prior == 0 || f.limited || f.login {
         now_s
     } else {
         prior
@@ -1934,10 +2881,13 @@ pub fn ready_since(prior: u64, ready: bool, f: &Facts, now_s: u64) -> u64 {
 /// is the one that hit it) is answered only after the limit resets, so the
 /// [`REASK_S`] window, the [`DRAIN_S`] bound and the path to [`MAX_ASKS`] are
 /// all counted from the last look that found the session limited: the agent
-/// gets the whole window once it can read again.
+/// gets the whole window once it can read again. The same at THE LOGIN WALL
+/// ([`Facts::login`]): what a notice's reader cannot answer, no clock runs
+/// on — and, the wall lifted, the driver starts the clock again from the
+/// lift the transcript records ([`login_lifted_at`]).
 #[must_use]
 pub fn clock_held(phase: &Phase, f: &Facts, now_s: u64) -> Phase {
-    if f.limited {
+    if f.limited || f.login {
         clock_held_until(phase, now_s)
     } else {
         phase.clone()
@@ -2009,7 +2959,9 @@ pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 /// after READY stopped (the owner's direction of 2026-09-26: "debug aterm
 /// about why you stalled and didn't continue working"). The agent stopped
 /// for a restart that is not coming; this tells it so, and to go on as if
-/// the notice had never come. It points at no work of its own — the review
+/// the notice had never come — and that nothing restarts it without asking
+/// first: a later round ([`Step::Rearm`]) asks with a notice and a READY of
+/// its own, never on the strength of this one. It points at no work of its own — the review
 /// of 2026-09-26: "continue the work you were doing before the notice"
 /// pulled an agent back to what it did before, over direction it had been
 /// given since — and it is typed only to the process the notice reached,
@@ -2019,12 +2971,51 @@ pub const RELEASE_HEAD: &str = "[aterm harness] Upgrade off: ";
 #[must_use]
 pub fn release_prompt(agent: Agent) -> String {
     format!(
-        "{RELEASE_HEAD}The {} upgrade is off for now: nothing will restart this session, and \
-         nothing the notice asked of you still applies. Carry on as you would have without it.",
+        "{RELEASE_HEAD}The {} upgrade is off for now: nothing will restart this session without \
+         asking you again first, and nothing the notice asked of you still applies. Carry on as \
+         you would have without it.",
         agent.product()
     )
 }
 
+/// WHAT A BREAK OF THE AGENT'S OWN BACKGROUND WORK MAY DO
+/// ([`Facts::background_point`]): type a notice, void a READY answer a person
+/// or the agent's own work held, give up asking, start a new round of a
+/// stopped one, or wait. All of them type at most a notice and end
+/// nothing. Any other step (the end) becomes a wait on that work
+/// (`background`), whatever the plan says. There is one rule, and both
+/// drivers apply it: `upgrade_drive` and the Codex lane.
+#[must_use]
+pub fn break_step(step: Step) -> Step {
+    match step {
+        Step::Announce | Step::GiveUp | Step::Void(_) | Step::Wait(_) | Step::Rearm => step,
+        Step::Terminate | Step::Fresh => Step::Wait("background"),
+    }
+}
+
+/// THE RE-ASK CLOCK: seconds since the latest notice. With a READY answer in
+/// hand, the clock runs from the later of the notice and the answer
+/// ([`Facts::ready_s`], begun again by every notice and held at a limit), so
+/// an answer given late still gets a whole [`REASK_S`] before work it
+/// outlives supersedes it.
+fn clock(since: u64, f: &Facts, ready: bool) -> u64 {
+    if ready { since.min(f.ready_s) } else { since }
+}
+
+/// THE RE-ASK ([`next_step`]): past [`MAX_ASKS`] notices the upgrade gives
+/// up. Before that the notice is typed again wherever [`gate_announce`] lets
+/// a notice go. A new notice carries a new READY marker and follows any
+/// earlier answer, so an answer the agent's work outlived is superseded,
+/// never acted on.
+fn reask(f: &Facts, asks: u32) -> Step {
+    if asks >= MAX_ASKS {
+        return Step::GiveUp;
+    }
+    match gate_announce(f) {
+        Gate::Go => Step::Announce,
+        Gate::Wait(w) => Step::Wait(w),
+    }
+}
 // ---------------------------------------------------------------- the owner's word
 
 /// THE OWNER'S WORD ON ONE SESSION'S UPGRADE (gap audit 2026-09-24, "no owner
@@ -2036,12 +3027,16 @@ pub fn release_prompt(agent: Agent) -> String {
 /// is not typed over (`Now`: the settling window and the attended-tab guard)
 /// or adds one (`DeferUntil`, `Skip`) — with ONE exception, made where the
 /// word is written (`upgrade_drive::ask`), never here: `Now` on an upgrade
-/// that GAVE UP (no READY answer after its last ask) re-arms it, so the
-/// notice is typed again. A refused or failed upgrade is not re-armed (review
-/// of 2026-09-25: re-arming every stopped kind restored typing, and after
-/// READY a SIGTERM, for upgrades the harness had stopped for good). The word
+/// that GAVE UP (no READY answer it could act on after its last ask) re-arms
+/// it at once, so the
+/// notice is typed again. A refused or failed upgrade is not re-armed by the
+/// word (review of 2026-09-25: re-arming every stopped kind on the owner's
+/// word restored typing, and after READY a SIGTERM, for what had just
+/// stopped it); it rests [`RETRY_S`] like every stopped round, and then the
+/// upgrade starts a new round itself ([`Step::Rearm`]). The word
 /// is on the tab the owner named, not on the conversation wherever it goes.
-/// A word that HOLDS the upgrade ([`Request::holds`]) makes the step wait
+/// A word that HOLDS the upgrade ([`Request::holds`], and a stopped round's
+/// new one, [`rearm_held`]) makes the step wait
 /// `skipped`/`deferred`, which no idle point cures, so the upgrade owns none
 /// of the session's turn ends: its supervisor continues the worker as if none
 /// were pending. Every word also arms a NEW ROUND of the upgrade — a fresh
@@ -2120,7 +3115,8 @@ impl Request {
 
 /// [`next_step`] under the owner's [`Request`] for the upgrade to `target`.
 /// A skip of THIS target or a deferral not yet run out holds a session that
-/// has not begun restarting (`skipped`, `deferred`, [`Request::holds`]); `Now`
+/// has not begun restarting (`skipped`, `deferred`, [`Request::holds`]) — and
+/// a stopped round's new one ([`rearm_held`]); `Now`
 /// waives the settling window and the attended-tab guard and nothing else. A
 /// restart already in flight is never held: the agent was signalled, and
 /// stopping half way would strand the conversation.
@@ -2139,21 +3135,43 @@ pub fn requested_step(
     target: &str,
 ) -> Step {
     if request.holds(phase, target, now_s) {
-        return Step::Wait(if matches!(request, Request::Skip(_)) {
-            "skipped"
-        } else {
-            "deferred"
-        });
+        return Step::Wait(held_word(request));
     }
-    if *request == Request::Now {
+    let step = if *request == Request::Now {
         let waived = Facts {
             owner_now: true,
             attended: false,
             ..f.clone()
         };
-        return next_step(phase, &waived, ready, now_s);
+        next_step(phase, &waived, ready, now_s)
+    } else {
+        next_step(phase, f, ready, now_s)
+    };
+    rearm_held(request, step, target, now_s)
+}
+
+/// The wait the owner's holding word says: `skipped` or `deferred`.
+fn held_word(request: &Request) -> &'static str {
+    if matches!(request, Request::Skip(_)) {
+        "skipped"
+    } else {
+        "deferred"
     }
-    next_step(phase, f, ready, now_s)
+}
+
+/// THE OWNER'S WORD HOLDS A NEW ROUND AS IT HOLDS ANY ([`Step::Rearm`],
+/// [`Request::holds`]): a stopped round the owner skipped (`--skip` of this
+/// target) or deferred (a `--defer` not run out) is not re-armed — it waits
+/// `skipped`/`deferred` — since the round it would start is held at once.
+/// A deferral that runs out lets it re-arm. Both lanes' [`requested_step`]
+/// end here (`upgrade_codex::requested_step`).
+#[must_use]
+pub fn rearm_held(request: &Request, step: Step, target: &str, now_s: u64) -> Step {
+    if step == Step::Rearm && request.holds(&Phase::Pending, target, now_s) {
+        Step::Wait(held_word(request))
+    } else {
+        step
+    }
 }
 
 /// The WAIT a sweep records for the owner: the gate's word, and for

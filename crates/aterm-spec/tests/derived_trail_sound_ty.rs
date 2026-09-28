@@ -32,11 +32,15 @@
 //!   then exactly what the Tier-1 conformance binds by comparing
 //!   `Model::action_enabled` with the real predicate everywhere it goes.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
 use aterm_spec::derive::{Expr, Model, trail_audio_reopen_ladder_model, trail_sound_seam_model};
 use aterm_spec::interp::{self, State};
 use aterm_spec::verify;
+
+#[path = "common/conjunct_audit.rs"]
+mod conjunct_audit;
+use conjunct_audit::audit_guard_conjuncts;
 
 fn fire(m: &Model, action: &str, s: &State) -> State {
     let next = m.successors(action, s);
@@ -55,54 +59,6 @@ fn run(m: &Model, actions: &[&str]) -> State {
         .fold(m.init_state(), |s, action| fire(m, action, &s))
 }
 
-/// The top-level conjuncts of a guard (`a && (b || c)` gives `a`, `b || c`).
-fn conjuncts(e: &Expr) -> Vec<Expr> {
-    match e {
-        Expr::And(l, r) => {
-            let mut out = conjuncts(l);
-            out.extend(conjuncts(r));
-            out
-        }
-        other => vec![other.clone()],
-    }
-}
-
-/// Rebuild a guard from conjuncts, `None` when nothing is left.
-fn conjoin(parts: Vec<Expr>) -> Option<Expr> {
-    parts
-        .into_iter()
-        .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
-}
-
-/// A state as an ordered, comparable key.
-type StateKey = Vec<(&'static str, i64)>;
-
-/// Every reachable NON-STUTTER `(pre, action, post)` edge of `m`. A
-/// self-loop changes no state, so a guard that only suppresses self-loops
-/// is not load-bearing behaviour, and must not read as such.
-fn edges(m: &Model) -> BTreeSet<(StateKey, &'static str, StateKey)> {
-    let key = |s: &State| s.iter().map(|(k, v)| (*k, *v)).collect::<Vec<_>>();
-    let mut seen = BTreeSet::new();
-    let mut out = BTreeSet::new();
-    let mut queue = VecDeque::new();
-    let init = m.init_state();
-    seen.insert(key(&init));
-    queue.push_back(init);
-    while let Some(s) = queue.pop_front() {
-        for a in &m.actions {
-            for n in m.successors(a.name, &s) {
-                if n != s {
-                    out.insert((key(&s), a.name, key(&n)));
-                }
-                if seen.insert(key(&n)) {
-                    queue.push_back(n);
-                }
-            }
-        }
-    }
-    out
-}
-
 fn assert_no_ghosts_and_no_dead_actions(m: &Model) {
     assert!(
         verify::uncaught_invariants(m).is_empty(),
@@ -113,17 +69,6 @@ fn assert_no_ghosts_and_no_dead_actions(m: &Model) {
     let fired = interp::fired_actions(&interp::with_buggy(m, 0));
     let all: BTreeSet<&str> = m.actions.iter().map(|a| a.name).collect();
     assert_eq!(fired, all, "{}: an action never fires at Buggy=0", m.name);
-}
-
-/// What dropping one guard conjunct does to the committed machine.
-#[derive(Debug, PartialEq, Eq)]
-struct ConjunctReport {
-    action: &'static str,
-    index: usize,
-    /// The invariants that FAIL once it is dropped, each checked alone.
-    carries: Vec<&'static str>,
-    /// Whether it changes a non-stutter reachable transition.
-    changes_behaviour: bool,
 }
 
 /// The declared role of one guard conjunct (see the module note).
@@ -139,51 +84,9 @@ enum Role {
     Environment(&'static [&'static str]),
 }
 
-/// The guard-conjunct audit (see the module note): one report per
-/// top-level conjunct of every guard, in model order.
-fn audit_guard_conjuncts(m: &Model) -> Vec<ConjunctReport> {
-    let committed = interp::with_buggy(m, 0);
-    let baseline = edges(&committed);
-    let mut out = Vec::new();
-    for (ai, action) in committed.actions.iter().enumerate() {
-        let Some(guard) = &action.guard else {
-            continue;
-        };
-        let parts = conjuncts(guard);
-        for drop in 0..parts.len() {
-            let mut weakened = committed.clone();
-            weakened.actions[ai].guard = conjoin(
-                parts
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != drop)
-                    .map(|(_, p)| p.clone())
-                    .collect(),
-            );
-            let carries = committed
-                .invariants
-                .iter()
-                .filter(|inv| {
-                    let mut alone = weakened.clone();
-                    alone.invariants.retain(|i| i.name == inv.name);
-                    interp::bmc(&alone).is_err()
-                })
-                .map(|inv| inv.name)
-                .collect();
-            out.push(ConjunctReport {
-                action: action.name,
-                index: drop,
-                carries,
-                changes_behaviour: edges(&weakened) != baseline,
-            });
-        }
-    }
-    out
-}
-
 /// Assert the audit against the declared roles, exactly.
 fn assert_audit(m: &Model, declared: &[(&str, usize, Role)]) {
-    let report = audit_guard_conjuncts(m);
+    let report = audit_guard_conjuncts(m, None);
     assert_eq!(
         report.len(),
         declared.len(),
@@ -218,7 +121,7 @@ fn trail_sound_seam_proves_the_rulings_and_catches_d1() {
     // everywhere, so the audit has nothing to weaken — asserted rather than
     // assumed, so a guard added later is audited instead of slipping past.
     assert!(m.actions.iter().all(|a| a.guard.is_none()));
-    assert!(audit_guard_conjuncts(&m).is_empty());
+    assert!(audit_guard_conjuncts(&m, None).is_empty());
 }
 
 #[test]

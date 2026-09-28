@@ -540,13 +540,13 @@ pub trait WindowAttributesExtWindows {
 impl WindowAttributesExtWindows for WindowAttributes {
     #[inline]
     fn with_owner_window(mut self, parent: HWND) -> Self {
-        self.platform_specific.owner = Some(parent);
+        self.platform_specific.owner = Some(crate::platform_impl::handle_from_isize(parent));
         self
     }
 
     #[inline]
     fn with_menu(mut self, menu: HMENU) -> Self {
-        self.platform_specific.menu = Some(menu);
+        self.platform_specific.menu = Some(crate::platform_impl::handle_from_isize(menu));
         self
     }
 
@@ -640,7 +640,7 @@ impl MonitorHandleExtWindows for MonitorHandle {
 
     #[inline]
     fn hmonitor(&self) -> HMONITOR {
-        self.inner.hmonitor()
+        crate::platform_impl::handle_to_isize(self.inner.hmonitor())
     }
 }
 

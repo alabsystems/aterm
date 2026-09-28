@@ -754,6 +754,159 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     assert!(USAGE.contains(&format!("{} MiB", DISK_LEDGER_MAX_BYTES / (1024 * 1024))));
 }
 
+/// THE HOST'S TICK: at or above the automatic floor it reads nothing and
+/// writes nothing; below it the stale build directory is removed and the
+/// report, the removal (with its witness) and nothing else land in the disk
+/// ledger. `[disk] auto_free_gib` moves the floor; `0` turns it off.
+#[test]
+fn the_disk_tick_reclaims_stale_targets_below_the_floor_and_nothing_above() {
+    let tmp = Tmp::new("disk-tick");
+    let state = tmp.path().join("state");
+    let target = tmp.path().join("repo/target");
+    std::fs::create_dir_all(target.join("debug")).expect("target");
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        format!("{}\n", disk::CACHEDIR_SIGNATURE),
+    )
+    .expect("tag");
+    std::fs::write(target.join(disk::CARGO_LOCK_FILE), b"").expect("lock");
+    std::fs::write(target.join("debug/blob"), vec![1u8; 2048]).expect("blob");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap())
+        .unwrap()
+        + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400;
+    let gib = 1024 * 1024 * 1024;
+    let cfg = disk::Config::default();
+    let targets = [target.clone()];
+
+    let look = |free: Option<u64>| DiskLook {
+        state: &state,
+        volume: tmp.path(),
+        free,
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let plenty = disk_tick(&look(Some(cfg.auto_free_gib * gib)), cfg, &mut |p| {
+        panic!("removed {} above the floor", p.display())
+    });
+    assert_eq!(plenty, DiskTick::Plenty);
+    assert!(
+        !state.join(DISK_LEDGER).exists(),
+        "nothing journalled above it"
+    );
+    let off = disk::Config {
+        auto_free_gib: 0,
+        ..cfg
+    };
+    let tick = disk_tick(&look(Some(1)), off, &mut |p| {
+        panic!("removed {} with the floor off", p.display())
+    });
+    assert_eq!(tick, DiskTick::Plenty);
+
+    let DiskTick::Reclaimed(done) = disk_tick(&look(Some(gib)), cfg, &mut disk::remove_tree) else {
+        panic!("below the floor, the tick applies");
+    };
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(!target.exists(), "the stale target is gone");
+    let ledger = std::fs::read_to_string(state.join(DISK_LEDGER)).expect("the ledger");
+    let rows: Vec<&str> = ledger.lines().collect();
+    assert_eq!(rows.len(), 2, "{ledger}");
+    assert!(rows[0].contains("\"trigger\":\"tick\""), "{}", rows[0]);
+    assert!(rows[1].contains("\"kind\":\"removed\""), "{}", rows[1]);
+    assert!(rows[1].contains("stale-build-dir"), "{}", rows[1]);
+}
+
+/// THE TICK FREES THE VOLUME IT MEASURED. The free figure is the home
+/// volume's, but the targets come from every agent's working directory: a
+/// stale build directory on another volume (an external disk, a second APFS
+/// volume) was removed when home ran short, freeing nothing there. Now only
+/// the measured volume's targets are looked at. The fixture measures `/dev`
+/// (devfs / devtmpfs: a volume of its own on macOS and Linux) against a
+/// stale target in the scratch dir; the control is the same look measuring
+/// the scratch dir's own volume.
+#[cfg(unix)]
+#[test]
+fn the_disk_tick_leaves_a_target_on_another_volume_alone() {
+    let tmp = Tmp::new("disk-volume");
+    let state = tmp.path().join("state");
+    let target = tmp.path().join("repo/target");
+    std::fs::create_dir_all(target.join("debug")).expect("target");
+    std::fs::write(
+        target.join("CACHEDIR.TAG"),
+        format!("{}\n", disk::CACHEDIR_SIGNATURE),
+    )
+    .expect("tag");
+    std::fs::write(target.join(disk::CARGO_LOCK_FILE), b"").expect("lock");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap())
+        .unwrap()
+        + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400;
+    let elsewhere = Path::new("/dev");
+    assert_ne!(
+        volume_id(elsewhere),
+        volume_id(tmp.path()),
+        "the fixture needs two volumes"
+    );
+    let targets = [target.clone()];
+    let look = |volume| DiskLook {
+        state: &state,
+        volume,
+        free: Some(1),
+        targets: &targets,
+        transcripts: None,
+        now,
+    };
+    let DiskTick::Reclaimed(done) =
+        disk_tick(&look(elsewhere), disk::Config::default(), &mut |p| {
+            panic!("removed {} to free another volume", p.display())
+        })
+    else {
+        panic!("below the floor, the tick runs");
+    };
+    assert!(done.removed.is_empty(), "{done:?}");
+    assert!(target.exists());
+    // CONTROL: measured on its own volume, the same target goes.
+    let DiskTick::Reclaimed(done) = disk_tick(
+        &look(tmp.path()),
+        disk::Config::default(),
+        &mut disk::remove_tree,
+    ) else {
+        panic!("below the floor, the tick runs");
+    };
+    assert_eq!(done.removed.len(), 1, "{done:?}");
+    assert!(!target.exists());
+}
+
+/// [`on_volume`] keeps the targets whose volume id is the measured one's, and
+/// nothing when an id cannot be read.
+#[test]
+fn only_the_measured_volumes_targets_are_candidates() {
+    let id_of = |p: &Path| -> Option<u32> {
+        match p.to_str()? {
+            s if s.starts_with("/home") => Some(1),
+            s if s.starts_with("/Volumes/ext") => Some(2),
+            _ => None,
+        }
+    };
+    let targets = [
+        PathBuf::from("/home/a/repo/target"),
+        PathBuf::from("/Volumes/ext/repo/target"),
+        PathBuf::from("/unreadable/repo/target"),
+    ];
+    assert_eq!(
+        on_volume(Path::new("/home/a"), &targets, &id_of),
+        vec![PathBuf::from("/home/a/repo/target")]
+    );
+    assert_eq!(
+        on_volume(Path::new("/Volumes/ext"), &targets, &id_of),
+        vec![PathBuf::from("/Volumes/ext/repo/target")]
+    );
+    assert!(on_volume(Path::new("/unreadable"), &targets, &id_of).is_empty());
+}
+
 #[test]
 fn the_disk_knobs_are_read_from_aterm_toml() {
     let tmp = Tmp::new("disk-knobs");
@@ -768,6 +921,30 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
     assert_eq!(cfg.warn_free_gib, 5);
     assert_eq!(cfg.target_stale_days, 30);
     assert!(!cfg.apply);
+    assert_eq!(
+        cfg.auto_free_gib,
+        disk::DEFAULT_AUTO_FREE_GIB,
+        "the default floor"
+    );
+    std::fs::write(&path, "[disk]\nauto_free_gib = 0\n").expect("write");
+    assert_eq!(disk_config(&env).auto_free_gib, 0, "the floor switched off");
+    // A floor below zero is never crossed: `-1` written to stop the removal
+    // stops it (it read as the default, 10, and left the removal ON).
+    std::fs::write(&path, "[disk]\nauto_free_gib = -3\n").expect("write");
+    assert_eq!(
+        disk_config(&env).auto_free_gib,
+        0,
+        "a negative floor is off, never the default"
+    );
+    assert!(!disk_config(&env).below_auto_floor(Some(0)));
+    // A value of the wrong type is the default, not a guess.
+    std::fs::write(&path, "[disk]\nauto_free_gib = \"off\"\n").expect("write");
+    assert_eq!(disk_config(&env).auto_free_gib, disk::DEFAULT_AUTO_FREE_GIB);
+    std::fs::write(
+        &path,
+        "[disk]\napply = false\nwarn_free_gib = 5\ntarget_stale_days = 30\n",
+    )
+    .expect("write");
     // The dotted spelling, in a file TOML reads.
     std::fs::write(&path, "disk.apply = true\n").expect("write");
     assert!(disk_config(&env).apply);
@@ -1448,7 +1625,7 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
         out,
         format!(
             "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) phase=pending \
-             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- stalled=overdue\n"
+             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- stalled=overdue\n"
         )
     );
     assert!(
@@ -1627,4 +1804,41 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
         lines[2]
     );
     assert!(lines[2].contains(r#""wait_for_s":30000"#), "{}", lines[2]);
+
+    // A FINISHED upgrade is history, not "behind": a session that caught up
+    // reads `pending_for=-` (and `null`), never the age of an upgrade that
+    // landed long ago. Seen live 2026-09-27: `step=current pending_for=1d19h`.
+    let current = super::super::upgrade_drive::Report {
+        step: "current".to_string(),
+        ..report.clone()
+    };
+    let done = super::super::upgrade_drive::Row {
+        behind_since: 1_000,
+        phase: super::super::upgrade::Phase::Done,
+        ..Default::default()
+    };
+    let mut out = Vec::new();
+    upgrade_line_with(&mut out, false, &current, Some((&done, 158_000)));
+    upgrade_line_with(&mut out, true, &current, Some((&done, 158_000)));
+    let out = String::from_utf8(out).expect("utf8");
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].ends_with("step=current pending_for=- wait_for=-"),
+        "a caught-up session was reported behind: {}",
+        lines[0]
+    );
+    assert!(lines[1].contains(r#""pending_for_s":null"#), "{}", lines[1]);
+}
+
+/// `disk` reads the aterm.toml the window writes: `default_config_path` IS
+/// `aterm_types::dirs::aterm_config_path` over the live environment. It was a
+/// hand copy of the Unix arms, so on Windows it named `$HOME\.config\…`, or
+/// nothing, while the window wrote `%APPDATA%\aterm\aterm.toml` (review,
+/// 2026-09-27).
+#[test]
+fn default_config_path_is_the_window_config_path() {
+    assert_eq!(
+        default_config_path(),
+        aterm_types::dirs::aterm_config_path()
+    );
 }

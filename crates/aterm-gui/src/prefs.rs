@@ -10,7 +10,7 @@
 //!   * [`editable_fields`] — the shared config-control registry
 //!     (label/key/kind/seed/placeholder, grouped by [`Section`]) from which the
 //!     curated native tab and Manual schema select their surfaces;
-//!   * [`apply_prefs_edits`] / [`save_prefs_edits`] — write edited values back
+//!   * [`apply_prefs_edits`] / [`save_prefs_snapshot_observed`] — write edited values back
 //!     NON-DESTRUCTIVELY (preserving the user's other keys, comments, and formatting
 //!     via `aterm-toml`; atomic temp-write + rename). The serialized native config
 //!     worker returns the exact committed bytes and post-publication proof for
@@ -1856,6 +1856,13 @@ pub(crate) enum PrefsEditError {
     /// A control value did not parse as its key's declared [`EditKind`] (e.g. a
     /// non-numeric font size). Carries the offending `(key, raw)` for the message.
     BadValue { key: String, raw: String },
+    /// A value that parses but that the resolver would IGNORE at load: `font_px`
+    /// outside `FONT_PX_MIN..=FONT_PX_MAX` (or not finite). `resolve_font_px`
+    /// admits only that range and falls through to the default rather than
+    /// clamping, so `settings set font_px 0` used to answer `OK saved`, persist
+    /// `font_px = 0.0`, and change nothing on screen (`dims` stayed at 16.00 —
+    /// measured 2026-09-22). Carries the range the reply must name.
+    OutOfRange { key: String, range: String },
     /// A credential-adjacent control contained an invalid value. The raw input is
     /// deliberately not retained: this error is logged and shown in Settings, so
     /// carrying a pasted secret here would turn a successful rejection into a
@@ -1869,6 +1876,9 @@ impl std::fmt::Display for PrefsEditError {
             PrefsEditError::Parse(e) => write!(f, "existing aterm.toml is not valid TOML: {e}"),
             PrefsEditError::BadValue { key, raw } => {
                 write!(f, "invalid value for {key}: {raw:?}")
+            }
+            PrefsEditError::OutOfRange { key, range } => {
+                write!(f, "invalid value for {key}: must be {range}")
             }
             PrefsEditError::SensitiveBadValue { key, expected } => {
                 write!(f, "invalid value for {key}: expected {expected}")
@@ -2239,11 +2249,25 @@ fn title_summary_ca_file_looks_like_path(value: &str) -> bool {
     !upper.contains("-----BEGIN ") && !upper.contains("-----END ")
 }
 
+/// Whether a `font_px` value is one the resolver ADMITS: finite and inside
+/// `FONT_PX_MIN..=FONT_PX_MAX` — the same predicate
+/// `app_config::resolve_font_px_with` filters each source by, so a value this
+/// writer accepts is a value the next load applies.
+fn font_px_admissible(px: f64) -> bool {
+    px.is_finite() && (f64::from(crate::FONT_PX_MIN)..=f64::from(crate::FONT_PX_MAX)).contains(&px)
+}
+
+/// The admissible `font_px` range as the reply spells it (`6..=200`).
+fn font_px_range() -> String {
+    format!("{}..={}", crate::FONT_PX_MIN, crate::FONT_PX_MAX)
+}
+
 /// Build the correctly-TYPED `aterm-toml` item for `key` from its raw control text,
 /// per [`edit_kind`]. A malformed numeric/bool — or an integer outside the key's
 /// serde-representable domain ([`integer_domain`]) — is a
 /// [`PrefsEditError::BadValue`] so a Save never writes a value the reload parser
-/// would reject.
+/// would reject, and a `font_px` the resolver would ignore is a
+/// [`PrefsEditError::OutOfRange`].
 fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditError> {
     use aterm_toml::edit::{Item, Value};
     let bad = || PrefsEditError::BadValue {
@@ -2297,7 +2321,21 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
         return Ok(Item::Value(Value::Array(array)));
     }
     let value = match edit_kind(key) {
-        EditKind::Float => Value::from(trimmed.parse::<f64>().map_err(|_| bad())?),
+        EditKind::Float => {
+            let px = trimmed.parse::<f64>().map_err(|_| bad())?;
+            // `font_px` is the one float the resolver IGNORES rather than clamps
+            // when it is out of range (`app_config::resolve_font_px_with` falls
+            // through to the default), so a write outside that range is a save
+            // that changes nothing — refused here, with the range, the way a
+            // non-numeric value is refused above.
+            if key == EDIT_FONT_PX && !font_px_admissible(px) {
+                return Err(PrefsEditError::OutOfRange {
+                    key: key.to_string(),
+                    range: font_px_range(),
+                });
+            }
+            Value::from(px)
+        }
         // Sign/width enforcement AFTER the numeric parse: `-1` for a `usize`
         // field or `70000` for a `u16` is perfectly parseable i64 AND valid
         // TOML, but the reload's serde model rejects the whole file over it —
@@ -5365,7 +5403,7 @@ pub(crate) fn editable_fields(cfg: &Config) -> Vec<EditField> {
     fields
 }
 
-/// The result of [`save_prefs_edits`], so the window can show visible feedback (a status
+/// The result of a Preferences save, so the window can show visible feedback (a status
 /// line) rather than silently succeeding/failing. `Saved` means the file actually changed
 /// and a reload should follow; `Unchanged` is a true all-no-op Save; `Conflict`
 /// preserves the expected and observed disk generations for a retry UI;
@@ -5405,56 +5443,6 @@ pub(crate) struct ConfigSnapshotSaveResult {
     /// generation. Conflicts and pre-publication failures require a fresh
     /// bounded worker observation instead.
     pub(crate) observed: Option<crate::native_document_host::AtomicFileBaseline>,
-}
-
-/// Persist a batch of Preferences edits to `aterm.toml` NON-DESTRUCTIVELY, returning a
-/// [`SaveOutcome`] so the caller can both decide whether to reload AND show the user
-/// what happened.
-///
-/// Best-effort + never panics: a missing file is treated as empty (the keys are
-/// created); validation/I/O failures return [`SaveOutcome::Error`], an OCC loss
-/// returns [`SaveOutcome::Conflict`], and a post-publication proof failure returns
-/// [`SaveOutcome::PublishedUnverified`]. [`SaveOutcome::Saved`] is returned only
-/// when the complete durable proof was produced.
-pub(crate) fn save_prefs_edits(edits: &[(&str, Option<String>)]) -> SaveOutcome {
-    let Some(path) = crate::app_config::config_path() else {
-        let msg = "no config path (HOME/XDG unset)".to_string();
-        crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; skipping");
-        return SaveOutcome::Error(msg);
-    };
-    // A missing file is fine — start from empty and create it on write. The
-    // returned baseline is the same fingerprint/target binding Manual uses.
-    let contents = match crate::native_document_host::read_config_atomic_file(
-        &path,
-        crate::native_document_host::DEFAULT_DOCUMENT_LIMIT,
-        true,
-    ) {
-        Ok(contents) => contents,
-        Err(error) => {
-            let msg = format!("{} unreadable ({error})", path.display());
-            crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; leaving config unchanged");
-            return SaveOutcome::Error(msg);
-        }
-    };
-    let existing = match std::str::from_utf8(&contents.bytes) {
-        Ok(text) => text.to_string(),
-        Err(error) => {
-            let msg = format!("{} is not UTF-8 ({error})", path.display());
-            crate::logging::stderr_line!("aterm-gui: prefs save: {msg}; leaving config unchanged");
-            return SaveOutcome::Error(msg);
-        }
-    };
-    let updated = match apply_prefs_edits(&existing, edits) {
-        Ok(t) => t,
-        Err(e) => {
-            crate::logging::stderr_line!("aterm-gui: prefs save: {e}; leaving config unchanged");
-            return SaveOutcome::Error(e.to_string());
-        }
-    };
-    if updated == existing {
-        return SaveOutcome::Unchanged; // nothing changed — skip the write + reload
-    }
-    commit_prefs_bytes(&path, &contents.baseline, updated.as_bytes())
 }
 
 /// Atomically persist a complete snapshot already produced by the versioned
@@ -5572,50 +5560,6 @@ pub(crate) fn save_prefs_snapshot_observed(
                     message,
                 },
                 observed: None,
-            }
-        }
-    }
-}
-
-fn commit_prefs_bytes(
-    path: &std::path::Path,
-    baseline: &crate::native_document_host::AtomicFileBaseline,
-    updated: &[u8],
-) -> SaveOutcome {
-    match crate::native_document_host::commit_atomic_bytes(baseline, updated) {
-        crate::native_document_host::AtomicCommitResult::Committed(_) => SaveOutcome::Saved,
-        crate::native_document_host::AtomicCommitResult::Conflict { observed, message } => {
-            let message = format!(
-                "{} changed while saving ({message}); review the latest file and retry",
-                path.display()
-            );
-            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
-            SaveOutcome::Conflict {
-                expected: baseline.observed.content,
-                observed,
-                message,
-            }
-        }
-        crate::native_document_host::AtomicCommitResult::Failed { stage, message } => {
-            let message = format!("{} save failed at {stage:?} ({message})", path.display());
-            crate::logging::stderr_line!("aterm-gui: prefs save: {message}; config unchanged");
-            SaveOutcome::Error(message)
-        }
-        crate::native_document_host::AtomicCommitResult::PublishedUnverified {
-            stage,
-            observed,
-            message,
-        } => {
-            let message = format!(
-                "{} may already contain the requested bytes; reload and reconcile before retrying \
-                 ({stage:?}: {message})",
-                path.display()
-            );
-            crate::logging::stderr_line!("aterm-gui: prefs save: {message}");
-            SaveOutcome::PublishedUnverified {
-                stage,
-                observed,
-                message,
             }
         }
     }
@@ -6304,86 +6248,13 @@ mod edit_tests {
         EDIT_CURSOR_COLOR, EDIT_CURSOR_STYLE, EDIT_CURSOR_TRAIL, EDIT_CURSOR_TRAIL_STYLE,
         EDIT_FONT_FAMILY, EDIT_FONT_PX, EDIT_FOREGROUND, EDIT_LIGATURES, EDIT_LINES, EDIT_MOTION,
         EDIT_SCROLLBACK, EDIT_SEARCH_HISTORY_LINES, EDIT_SELECTION_COLOR, EDIT_THEME,
-        EDIT_WINDOW_THEME, EditKind, PrefsEditError, SaveOutcome, apply_prefs_edits,
-        editable_fields, keywords_of, range_of,
+        EDIT_WINDOW_THEME, EditKind, PrefsEditError, apply_prefs_edits, editable_fields,
+        keywords_of, range_of,
     };
 
     /// `Some(v)` helper to keep the edit lists terse.
     fn set(v: &str) -> Option<String> {
         Some(v.to_string())
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn atomic_config_save_preserves_a_bound_final_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("wall clock follows the Unix epoch")
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "aterm-prefs-symlink-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).expect("create isolated test directory");
-        let target = directory.join("managed.toml");
-        let link = directory.join("aterm.toml");
-        std::fs::write(&target, "font_px = 12\n").expect("seed managed config");
-        symlink(&target, &link).expect("create config symlink");
-
-        let baseline = crate::native_document_host::read_config_atomic_file(&link, 4096, false)
-            .expect("config authority admits a bound final symlink")
-            .baseline;
-        assert!(matches!(
-            super::commit_prefs_bytes(&link, &baseline, b"font_px = 14\n"),
-            SaveOutcome::Saved
-        ));
-
-        assert!(
-            std::fs::symlink_metadata(&link)
-                .expect("symlink remains")
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(
-            std::fs::read_to_string(&target).expect("read updated target"),
-            "font_px = 14\n"
-        );
-        std::fs::remove_dir_all(directory).expect("remove isolated test directory");
-    }
-
-    #[test]
-    fn atomic_config_occ_preserves_structured_conflict_context() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "aterm-prefs-conflict-{}-{nonce}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("aterm.toml");
-        std::fs::write(&path, "font_px = 12\n").unwrap();
-        let baseline = crate::native_document_host::read_atomic_file(&path, 4096, false)
-            .unwrap()
-            .baseline;
-        std::fs::write(&path, "font_px = 14\n").unwrap();
-
-        assert!(matches!(
-            super::commit_prefs_bytes(&path, &baseline, b"font_px = 16\n"),
-            SaveOutcome::Conflict {
-                expected,
-                observed,
-                message,
-            } if expected == baseline.observed.content
-                && observed.content
-                    == crate::native_document_io::ContentFingerprint::of(b"font_px = 14\n")
-                && message.contains("review the latest file")
-        ));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "font_px = 14\n");
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -7561,6 +7432,47 @@ listen = \"127.0.0.1:7777\" # local only
         }
     }
 
+    /// A `font_px` the resolver would IGNORE at load (outside
+    /// `FONT_PX_MIN..=FONT_PX_MAX`, or not finite) is refused with the range,
+    /// and the file is untouched — `settings set font_px 0` used to answer
+    /// `OK saved`, write `font_px = 0.0`, and change nothing (2026-09-22).
+    /// The bounds themselves save, as does every other float key untouched
+    /// by the range rule.
+    #[test]
+    fn font_px_outside_the_resolvers_range_is_rejected_with_the_range() {
+        let range = format!("{}..={}", crate::FONT_PX_MIN, crate::FONT_PX_MAX);
+        assert_eq!(
+            range, "6..=200",
+            "the range the reply names is the renderer's"
+        );
+        for raw in [
+            "0", "500", "-5", "0.0", "200.5", "5.99", "NaN", "inf", "-inf",
+        ] {
+            let err =
+                apply_prefs_edits("theme = \"Nord\"\n", &[(EDIT_FONT_PX, set(raw))]).unwrap_err();
+            match &err {
+                PrefsEditError::OutOfRange { key, range: got } => {
+                    assert_eq!(key, EDIT_FONT_PX, "{raw}");
+                    assert_eq!(got, &range, "{raw}");
+                }
+                other => panic!("{raw}: expected OutOfRange, got {other:?}"),
+            }
+            assert_eq!(
+                err.to_string(),
+                format!("invalid value for font_px: must be {range}"),
+                "{raw}: the wire reply is `ERR ` + this"
+            );
+        }
+        for raw in ["6", "200", "14.5", "16"] {
+            let out = apply_prefs_edits("", &[(EDIT_FONT_PX, set(raw))])
+                .unwrap_or_else(|e| panic!("{raw} is inside the range: {e}"));
+            let c: Config = aterm_toml::from_str(&out).expect("round-trips");
+            assert_eq!(c.font_px, Some(raw.parse::<f32>().unwrap()), "{raw}");
+        }
+        // Another float key keeps its own (clamp-at-load) contract.
+        assert!(apply_prefs_edits("", &[(super::EDIT_LINE_HEIGHT, set("0"))]).is_ok());
+    }
+
     /// A non-integer scrollback (a float string) is rejected — `scrollback_lines` is a
     /// usize, so "1.5" must not silently truncate or write a float.
     #[test]
@@ -8351,7 +8263,7 @@ listen = \"127.0.0.1:7777\" # local only
     /// typed writer rejects obvious pasted API keys, authorization headers, JWTs,
     /// and URLs before it can produce replacement TOML. A bad token-file value also
     /// makes the whole edit batch fail, so an earlier valid edit cannot be partially
-    /// persisted by either the Settings overlay or native/control Settings service.
+    /// persisted by the native/control Settings service.
     #[test]
     fn smart_title_token_file_rejects_inline_credentials_before_toml() {
         let pasted_values = vec![
@@ -8386,14 +8298,6 @@ listen = \"127.0.0.1:7777\" # local only
                 }
                 other => panic!("expected redacted token-file error, got {other:?}"),
             }
-
-            // This is the exact string carried by `save_prefs_edits` into both its
-            // stderr line and the Settings status surface.
-            let outcome = super::SaveOutcome::Error(diagnostic);
-            let super::SaveOutcome::Error(message) = outcome else {
-                unreachable!();
-            };
-            assert!(!message.contains(pasted.as_str()));
         }
     }
 

@@ -108,8 +108,9 @@ with a journal beside it (`<sid>.journal.jsonl`):
   scroll or IME composition in the session through a window (`status human_ms=`, `EVENT <local> human`;
   control-socket writes, yours included, are not a person) — or of a draft in the
   composer last changing — it types and presses nothing, the survey's `0` included; a
-  turn a person stopped with Esc is held that long, then continued. A draft left
-  standing past the grace is sent as the next message.
+  turn a person stopped with Esc is held that long, then continued. In a session with a
+  task, a draft left standing past the grace is sent as the next message; in one nobody
+  has asked anything it is left where it is (and a live upgrade waits on it).
 - **It escalates only what the owner limited, and what nothing can answer** — a box
   beyond `approve`, a question under `answer_questions = false`, a written
   `continue_per_hour` spent, a lost login's browser step: the session's keyed
@@ -182,18 +183,19 @@ Two ways in:
 **Sandbox anything you run UNATTENDED.** Use a *disposable checkout* — a separate
 clone or a `git worktree` in a throwaway path — never the user's live tree. A
 branch is **not** a sandbox: it protects committed history, not the filesystem, so
-a stray write or `rm` still hits your real files — and `aterm-gui --headless
---sandbox` does **not** close that hole either. What containment mode actually
-buys, on macOS: the kernel Seatbelt profile denies ALL network, and denies
-read+write of the credential set (`.ssh`, `.aws`, `.gnupg`, `.config/gh`,
-`.netrc`, …) and the private-user-data set (Documents, Downloads, media, the
-Mail/Messages/keychain/cookies/browser stores). The rest of the filesystem is
-`(allow default)`: **writes are not confined, and your live tree stays
-writable.** Off macOS the OS sandbox is not actuated: rlimits and the process-cap gate
-still apply, but network and filesystem are not confined there. So use `--sandbox` for the
-network and secret denial, and the disposable checkout for the filesystem —
-neither substitutes for the other. Your budget and breaker are a discipline,
-not a sandbox.
+a stray write or `rm` still hits your real files. Containment mode (`aterm
+--headless --sandbox`) closes that hole on macOS by taking writes away: the kernel
+Seatbelt profile denies ALL network, denies read+write of the credential set
+(`.ssh`, `.aws`, `.gnupg`, `.config/gh`, `.netrc`, …) and the private-user-data set
+(Documents, Downloads, media, the Mail/Messages/keychain/cookies/browser stores),
+and confines WRITES to the temp roots (`$TMPDIR`, `/private/tmp`), `/dev` and the
+shell's history file — **the worker's working directory and `$HOME` are read-only
+to it**, so a contained worker that must edit or build works in a copy under
+`$TMPDIR`. Off macOS there is no OS sandbox, and `--sandbox` refuses to start
+(naming the gap) rather than run unconfined. So a worker that must write your
+project gets the disposable checkout; `--sandbox` is for a run that may touch
+neither the network, your secrets nor your files (an agent CLI that must reach its
+model cannot work there). Your budget and breaker are a discipline, not a sandbox.
 
 Keep a durable **notes file** with what a fresh copy of you needs to resume:
 objective, worker sid + socket, the ground-truth command, budget remaining, and
@@ -588,6 +590,11 @@ things keep that from happening again:
 
 ### Assign work by mail: `aterm drive task`
 
+Use this, not `turn`, for real instructions: a plain `turn` (like `paste`) delivers its
+text into the worker's composer as one bracketed paste, which reads to a model worker as
+PASTED, not as its human's words, so its injection safeguard may make it ask instead of
+act. A task goes in by mail; only a one-line inbox nudge is typed.
+
 ```sh
 aterm drive task "@$SID" --deadline 1800 'run the suite; report the counts'   # body by mail; nudged when idle
 aterm drive task "@$SID" --wait --deadline 600 'which branch is this?'                   # park for the answer
@@ -659,9 +666,14 @@ form, `python3` only a script on the `--allow-python` globs; and anywhere on the
 redirect to a file, `sed -i`, `python3 -c`, `git -c`/`--output`/`--ext-diff`, `rg --pre`,
 `printf -v`, an assignment to PATH, HOME, `GIT_*` or `LD_*`/`DYLD_*` refuses (`aterm drive
 --help` has the whole list). A tie breaks toward `not-read-only`. `git log && rm -rf .`
-opens read-only and is refused; so is `cat $(rm -rf x; echo f)`. One gap is open and is
-the owner's call: a git read honours repository config the worker can write
-(`core.fsmonitor`, `diff.external`).
+opens read-only and is refused; so is `cat $(rm -rf x; echo f)`. The label is about the
+command, not the repository: a git read honours repository config the worker can write
+(`core.fsmonitor`, `diff.external`, a textconv driver). The in-window supervisor approves a
+git read only after reading the effective config it would load and finding no such key —
+with the worker's own git and environment (its `PATH`, `HOME`, `GIT_CONFIG_*`), and where
+the worker's Bash tool stands too, which an earlier `cd` moves and the box does not show;
+when you approve one by hand, `git config --list --show-origin` in that repository, run
+in the worker's environment, is the check.
 
 **You still judge everything that is not read-only, every time** — `rm`, `mv`, any
 redirect, a git write, builds, package managers, any interpreter with inline code: a

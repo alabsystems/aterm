@@ -12,9 +12,7 @@
 //! subset-diverging remote fold. So "drive a remote aterm" is just **relaying the
 //! control protocol over a network transport** — the remote host runs the
 //! watchers; the driver sends `await idle`/`send`/`key` and reads back. No
-//! astream fold is on the critical path. astream remains the OPTIONAL record/
-//! replay format for an *offline observer* and is the one genuinely external
-//! piece (a sibling repo, not on disk) — out of scope here.
+//! astream fold is on the critical path.
 //!
 //! ## Status: built, tested, and wired into the listener (opt-in)
 //!
@@ -26,8 +24,7 @@
 //! ships as the `dial <name>` control verb (`aterm_gui::control::try_net_dial` ->
 //! `net_connections::dial_relay` -> `dial_and_relay_pinned`), and `aterm_agent::RelayClient`
 //! drives a `Turn` over that relay end-to-end (see aterm-agent's
-//! `remote_turn_loopback_tls` test); the astream record codec for an OFFLINE observer
-//! remains the one genuinely external follow-up. The pieces:
+//! `remote_turn_loopback_tls` test). The pieces:
 //!
 //! 1. [`tls`] — the TLS 1.3 transport ([`tls::relay`] owns both halves: TLS has no
 //!    `UnixStream::try_clone`), and [`drive`] composes both ends of the network
@@ -282,11 +279,11 @@ where
 /// analog, so identity pinning replaces it). The `fingerprint` half is enforced by
 /// the TLS layer ([`tls::client_config`] pins the cert); the `nonce` rebind half is
 /// checked via [`RemoteEndpoint::matches`], enforced on the dial path by
-/// [`dial_and_relay_pinned`](drive::dial_and_relay_pinned) BEFORE any relay. Because
-/// no shipping listener yet echoes its live launch identity, a pinned nonce
-/// currently FAILS CLOSED there (refuses to dial) rather than relay unverified — an
-/// operator-requested guard is never silently skipped. (`sid` is carried for the
-/// endpoint record but is not part of the `matches` check.)
+/// [`dial_and_relay_pinned`](drive::dial_and_relay_pinned) BEFORE any relay, against
+/// the live nonce the remote's `sessions bridge` roster reports for `sid` (or, with
+/// no `sid`, for any session carrying the pinned nonce). A pinned session the remote
+/// does not report FAILS CLOSED (refuses to dial) rather than relay unverified — an
+/// operator-requested guard is never silently skipped.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RemoteEndpoint {
     /// Host/address the endpoint was published at.

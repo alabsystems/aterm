@@ -21,7 +21,7 @@
 //! sample names it on its own — which is exactly what it is for.
 //!
 //! The seam is `review_regression.rs`'s, kept: every take drives a real
-//! `aterm_core` [`Terminal`], samples it exactly as `app_render.rs`'s LOCK A
+//! `aterm_core` [`Terminal`], samples it exactly as `app_render.rs`'s frame hold
 //! does (the caret's row probe, then every ribbon row, whatever the caret's
 //! visibility), reads the content-scroll clock as `sync_cursor_effect_scroll`
 //! does, and ticks [`CursorGlow`] on a 16 ms train. The census is the PLAN's

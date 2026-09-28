@@ -17,6 +17,10 @@ default = []
 # `aterm-spec`/`inventory`); the workspace `spec_xref_closure` gate (aterm-gui's
 # test build) enables it to COLLECT the anchors cross-crate, exactly like aterm-pty.
 spec-anchors = ["dep:aterm-spec"]
+# Test-only: expose the sink's read-only accounting (`reply_reserved`,
+# `is_severed`) to downstream crates' tests — aterm-gui's egress-contract
+# suite asserts on them. Resolver 2 keeps this out of every production build.
+testing = []
 
 [dependencies]
 aterm-pty = { workspace = true }

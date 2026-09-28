@@ -19,7 +19,7 @@
 //! recorded under a PTY wrapper inside a headless aterm instance while the
 //! owner's gesture was driven through the keyboard seam (type a line, Alt+Left
 //! ×3, type a word, Alt+Right ×3, type two letters) — through a real
-//! [`Terminal`], sampled exactly as `app_render.rs`'s LOCK A samples it, fed to
+//! [`Terminal`], sampled exactly as `app_render.rs`'s frame hold samples it, fed to
 //! [`CursorGlow`] with the hints the app stamps for those keys, and censuses the
 //! PLAN's coverage on the composer row every 8 ms.
 //!
@@ -268,7 +268,7 @@ impl Host {
     }
 
     /// The frame train up to `ms`. While Codex's `?2026` bracket is open the
-    /// host WITHHOLDS the present (SYNC-1, `app_render.rs`), so LOCK A never
+    /// host WITHHOLDS the present (SYNC-1, `app_render.rs`), so the frame hold never
     /// samples a torn frame: the train holds with it.
     /// `CODEX_REPLAY_CELLS=<ms-from>:<ms-to>` prints every ribbon cell on the
     /// composer row for the frames in that window: column, layer, cohort,

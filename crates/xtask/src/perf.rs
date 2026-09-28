@@ -802,6 +802,9 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
         "wasm_cpu_search_build_klps",
         "wasm_cpu_search_query_qps",
         "wasm_cpu_restore_hz",
+        "wasm_cpu_uniform_flood_present_fps",
+        "wasm_cpu_scrolled_stream_present_fps",
+        "wasm_cpu_styled_scrub_present_fps",
         "wasm_gpu_ingest_mixed_mbps",
         "wasm_gpu_frame_build_fps",
         "wasm_gpu_scroll_frame_build_fps",
@@ -809,8 +812,8 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
     baseline_file: "perf-baseline-wasm.json",
     comment: "aterm WASM-BENCH baseline (E0): the SHIPPED wasm modules (CPU aterm-wasm + GPU \
               aterm-gpu-web) driven under node by tools/wasm-bench — ingest, scroll/typing \
-              present, search build/query, restore, GPU wasm-side frame build. All \
-              BIGGER-IS-BETTER. Re-record with cargo run -p xtask -- gate perf \
+              present, uniform-flood / scrolled-stream / styled-scrub present, search \
+              build/query, restore, GPU wasm-side frame build. All BIGGER-IS-BETTER. Re-record with cargo run -p xtask -- gate perf \
               --record (needs node + a wasm32-capable stable toolchain).",
 };
 
@@ -828,6 +831,21 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
 /// first step while staying ~5x above a slow box's honest viewport cost.
 pub(crate) const RESIZE_RING_WORST_CAP_MS: f64 = 5_000.0;
 pub(crate) const RESIZE_TIERED_SYNC_WORST_CAP_MS: f64 = 100.0;
+
+/// The CPU wasm module's size ceiling, in bytes — an ABSOLUTE, LOWER-IS-BETTER
+/// cap on the post-`wasm-opt -O3` `aterm_wasm_bg.wasm` that
+/// `tools/wasm-bench/bench.mjs` reports as `wasm_cpu_module_bytes`.
+///
+/// Decided 2026-09-25 (docs/DESIGN-host-boundary-2026-08-30.md §9 decision 5,
+/// §8.4): the pre-pet baseline module is 3,792,917 B and the ceiling is +25% of
+/// it. Unlike the ratio floors this needs no committed baseline and no same-box
+/// history: it holds on a fresh checkout. When it trips, `gate perf` fails and
+/// its verdict names the growth; raising the number or shrinking the module is
+/// the owner's call, never an automatic re-record. Nothing runs `gate perf`
+/// automatically (the merge-contract ladder does not include it), so a commit
+/// that crosses the ceiling is caught only when someone runs `gate perf` or
+/// `gate all` — the design doc's decision 5 says so too.
+pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 4_741_146.0;
 
 /// Parse a lane's flat JSON into `(key, value)` pairs. `None` if ANY gated key
 /// is missing — a partial report must read as unparseable.
@@ -1382,7 +1400,37 @@ pub(crate) fn gate_wasm(trend: &mut Vec<TrendSample>) -> bool {
         eprintln!("  wasm: harness produced no JSON report:\n{stdout}");
         return false;
     };
-    judge_keyed(&WASM_LANE, json, trend)
+    let floors = judge_keyed(&WASM_LANE, json, trend);
+    wasm_module_fence(json) && floors
+}
+
+/// The module-size fence ([`WASM_CPU_MODULE_BYTES_CAP`]), split out for
+/// unit-testing. A missing key is a FAIL: an unmeasured size is not a small one.
+pub(crate) fn wasm_module_fence(json: &str) -> bool {
+    let key = "wasm_cpu_module_bytes";
+    let cap = WASM_CPU_MODULE_BYTES_CAP;
+    match json_number(json, key) {
+        Some(v) if v <= cap => {
+            eprintln!(
+                "    {key}: GREEN — {v:.0} B <= ceiling {cap:.0} B ({:.0} B of headroom)",
+                cap - v
+            );
+            true
+        }
+        Some(v) => {
+            eprintln!(
+                "    {key}: FAILED — {v:.0} B > ceiling {cap:.0} B by {:.0} B. The CPU wasm \
+                 module outgrew the committed budget (pre-pet 3,792,917 B + 25%); raise the \
+                 ceiling or shrink the module — an owner call, not a re-record.",
+                v - cap
+            );
+            false
+        }
+        None => {
+            eprintln!("    {key}: FAILED — missing from the harness report (ceiling unverified).");
+            false
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2454,52 @@ mod tests {
         ));
         // A missing fence value is a FAIL, never an implicit pass.
         assert!(!resize_fences("{\"resize_ring_worst_ms\":73.3}"));
+    }
+
+    /// A keyed lane whose committed baseline lacks one of its keys is not judged
+    /// at all — `compare_keyed_against_baseline` reads an incomplete file as
+    /// REPORT-ONLY — so a key added to a lane without its recorded value would
+    /// silently switch the WHOLE lane off. And a key the harness never emits
+    /// fails the lane on every run. Both halves are pinned here.
+    #[test]
+    fn every_keyed_lane_has_a_complete_committed_baseline_and_a_harness_that_emits_it() {
+        for lane in [&SEARCH_LANE, &RESTORE_LANE, &RESIZE_LANE, &WASM_LANE] {
+            let path = keyed_baseline_path(lane);
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{}: {} unreadable: {e}", lane.lane, path.display()));
+            assert!(
+                parse_keyed(lane, &text).is_some(),
+                "{}: {} lacks a gated key, so the whole lane would be REPORT-ONLY",
+                lane.lane,
+                path.display()
+            );
+        }
+        let bench = std::fs::read_to_string(workspace_root().join("tools/wasm-bench/bench.mjs"))
+            .expect("the wasm harness is in this tree");
+        for key in WASM_LANE
+            .keys
+            .iter()
+            .chain(["wasm_cpu_module_bytes"].iter())
+        {
+            assert!(
+                bench.contains(&format!("report.{key} =")),
+                "tools/wasm-bench/bench.mjs never sets `report.{key}`"
+            );
+        }
+    }
+
+    #[test]
+    fn the_wasm_module_ceiling_holds_absolutely() {
+        // The module live on /terminal on 2026-09-25: inside, by 98,653 B.
+        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":4642493}"));
+        // Exactly at the ceiling is inside it.
+        assert!(wasm_module_fence("{\"wasm_cpu_module_bytes\":4741146}"));
+        // One byte over trips it, with no baseline anywhere.
+        assert!(!wasm_module_fence("{\"wasm_cpu_module_bytes\":4741147}"));
+        // The GPU module's size is not this fence's business.
+        assert!(!wasm_module_fence("{\"wasm_gpu_module_bytes\":1}"));
+        // A missing size is a FAIL, never an implicit pass.
+        assert!(!wasm_module_fence("{\"wasm_cpu_ingest_mixed_mbps\":342.9}"));
     }
 
     // --- same-box trend ledger ---------------------------------------------

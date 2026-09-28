@@ -50,6 +50,15 @@ pub(crate) fn keyboard_mode_from_state(
     if !modes.special_modifiers {
         km.insert(KeyboardMode::NO_SPECIAL_MODIFIERS);
     }
+    // ConPTY win32-input-mode (DEC 9001): a negotiation with the console host,
+    // folded in beside the other legacy-encoding concerns. It is NOT gated on
+    // `kitty_keyboard_enabled` and never enters the kitty flag word — conhost
+    // set it and conhost reads the bytes, so in the encoder the record it
+    // asked for outranks a kitty push the application made through it (see
+    // `KeyboardMode::WIN32_INPUT` for the measurement).
+    if modes.win32_input_mode {
+        km.insert(KeyboardMode::WIN32_INPUT);
+    }
     km
 }
 
@@ -325,6 +334,155 @@ mod shift_enter_e2e_tests {
             b"\x1b[?1u",
             "the inactive (main) screen's kitty state must survive an alt-screen DECSTR"
         );
+    }
+
+    // --- ConPTY win32-input-mode (DEC 9001): "Shift+Enter in PowerShell" ---
+    //
+    // conhost sends `CSI ? 9001 h` at every ConPTY start. Before it was
+    // honoured, aterm's legacy Shift+Enter LF reached PSReadLine as Ctrl+Enter
+    // (InsertLineAbove), and Ctrl+Enter was indistinguishable from Enter. These
+    // walk the exact negotiation and pin the bytes conhost now receives.
+
+    /// The win32 key-record pair for `VK_RETURN`, spelled from the spec
+    /// (`CSI Vk ; Sc ; Uc ; Kd ; Cs ; Rc _`), not from the encoder.
+    fn win32_enter_pair(uc: u32, cs: u32) -> Vec<u8> {
+        format!("\x1b[13;28;{uc};1;{cs};1_\x1b[13;28;{uc};0;{cs};1_").into_bytes()
+    }
+
+    #[test]
+    fn conpty_9001_turns_enter_chords_into_win32_records_and_9001l_turns_them_back() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        let mode = term.keyboard_mode();
+        assert!(mode.contains(KeyboardMode::WIN32_INPUT));
+        assert!(
+            !mode.intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS),
+            "9001 must not masquerade as a kitty negotiation"
+        );
+        // …and the lock-free word the GUI's input seam actually encodes from
+        // carries it too (published at the end of the `process()` batch).
+        assert!(
+            term.mode_mirror()
+                .keyboard_mode()
+                .contains(KeyboardMode::WIN32_INPUT)
+        );
+
+        // Shift+Enter: SHIFT_PRESSED, UnicodeChar CR — the record a physical
+        // Shift+Enter carries under Windows Terminal (`ReadKey` → Enter+Shift
+        // CHAR=13, PSReadLine → AddLine; measured 2026-09-22), not aterm's
+        // Unix Shift+Enter LF policy.
+        assert_eq!(enc(&term, Modifiers::SHIFT), win32_enter_pair(13, 0x10));
+        // Ctrl+Enter / Ctrl+Shift+Enter: LEFT_CTRL_PRESSED, UnicodeChar LF —
+        // Windows' own translation of a native Ctrl+Enter, Shift or not.
+        assert_eq!(enc(&term, Modifiers::CTRL), win32_enter_pair(10, 0x08));
+        assert_eq!(
+            enc(&term, Modifiers::CTRL | Modifiers::SHIFT),
+            win32_enter_pair(10, 0x18)
+        );
+        // Plain Enter stays CR and Alt+Enter stays Meta-Enter: both measured
+        // working through conhost's legacy translation.
+        assert_eq!(enc(&term, Modifiers::empty()), vec![0x0d]);
+        assert_eq!(enc(&term, Modifiers::ALT), vec![0x1b, 0x0d]);
+
+        // DECRST 9001 restores the legacy policy byte for byte.
+        term.process(b"\x1b[?9001l");
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert_eq!(enc(&term, Modifiers::SHIFT), vec![0x0a]);
+        assert_eq!(enc(&term, Modifiers::CTRL), vec![0x0d]);
+    }
+
+    #[test]
+    fn conpty_9001_release_of_an_enter_chord_emits_no_second_key_up() {
+        // The pair already carries its key-up; the GUI's Release event for the
+        // same chord must therefore encode to NOTHING (the seam treats an empty
+        // encoding as a faithful no-op).
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        for mods in [
+            Modifiers::SHIFT,
+            Modifiers::CTRL,
+            Modifiers::CTRL | Modifiers::SHIFT,
+        ] {
+            assert!(
+                encode_key_with_layout(
+                    &Key::Named(NamedKey::Enter),
+                    mods,
+                    term.keyboard_mode(),
+                    KeyEventType::Release,
+                    None,
+                )
+                .is_empty(),
+                "{mods:?} release must not produce a second key-up"
+            );
+        }
+    }
+
+    #[test]
+    fn conpty_9001_never_leaks_into_the_kitty_query_or_the_kitty_stack() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        // The progressive-enhancement query still says "nothing negotiated".
+        term.process(b"\x1b[?u");
+        assert_eq!(
+            term.take_response().unwrap_or_default(),
+            b"\x1b[?0u",
+            "9001 is a host negotiation, not a kitty flag: the app must read ?0u"
+        );
+        // An app that then pushes kitty flags (conhost forwards the push
+        // verbatim) gets its flags — the query says so — but conhost is still
+        // the reader and drops a `CSI 13;2 u` written back (measured
+        // 2026-09-22), so the chord stays a record; plain Enter is untouched.
+        term.process(b"\x1b[>1u");
+        term.process(b"\x1b[?u");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?1u");
+        assert!(
+            term.keyboard_mode()
+                .contains(KeyboardMode::DISAMBIGUATE_ESC_CODES)
+        );
+        assert_eq!(enc(&term, Modifiers::SHIFT), win32_enter_pair(13, 0x10));
+        assert_eq!(enc(&term, Modifiers::empty()), vec![0x0d]);
+        // Pop the app's flags: 9001 is still set — the pop never touched it,
+        // because it never held it — and the record is unchanged.
+        term.process(b"\x1b[<u");
+        term.process(b"\x1b[?u");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?0u");
+        assert!(term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert!(
+            !term
+                .keyboard_mode()
+                .intersects(KeyboardMode::KITTY_PROTOCOL_FLAGS)
+        );
+        assert_eq!(enc(&term, Modifiers::SHIFT), win32_enter_pair(13, 0x10));
+    }
+
+    #[test]
+    fn conpty_9001_changes_no_application_facing_projection() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001h");
+        assert!(
+            !term.kitty_suppresses_predictive_echo(),
+            "a ConPTY shell still gets predictive echo: 9001 is not an app-owned composer"
+        );
+        assert!(!term.kitty_reports_functional_keys());
+        assert!(!term.kitty_report_all_keys());
+        assert_eq!(term.kitty_keyboard_flags().bits(), 0);
+    }
+
+    #[test]
+    fn conpty_9001_is_reported_by_decrqm_and_cleared_by_ris() {
+        let mut term = Terminal::new(24, 80);
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
+        term.process(b"\x1b[?9001h");
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;1$y");
+        // RIS: the mode resets with every other negotiated mode, so the next
+        // conhost session starts from its own `CSI ? 9001 h`, not a stale one.
+        term.process(b"\x1bc");
+        assert!(!term.keyboard_mode().contains(KeyboardMode::WIN32_INPUT));
+        assert_eq!(enc(&term, Modifiers::SHIFT), vec![0x0a]);
+        term.process(b"\x1b[?9001$p");
+        assert_eq!(term.take_response().unwrap_or_default(), b"\x1b[?9001;2$y");
     }
 }
 

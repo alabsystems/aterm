@@ -26,7 +26,7 @@ use aterm_spec::derive::{
 use aterm_spec::interp::State;
 use aterm_spec::verify::validate_transition_tiered;
 
-use crate::app_introspect::{begin_snapshot_generation, write_snapshot_artifacts};
+use crate::app_introspect::{SnapshotPng, begin_snapshot_generation, write_snapshot_artifacts};
 use crate::control_auth::ConfinedImage;
 use crate::pinned_dir::PinnedDir;
 
@@ -1419,7 +1419,8 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
     );
     assert_eq!(initial, model.init_state());
 
-    write_snapshot_artifacts(&frame_one, "generation-one", &first).expect("commit generation one");
+    write_snapshot_artifacts(&SnapshotPng::encode(&frame_one), "generation-one", &first)
+        .expect("commit generation one");
     assert_eq!(marker_generation(&done_path), 1);
     let committed_one = project_snapshot(
         &model,
@@ -1458,7 +1459,7 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
         "snapshot generation-two begin",
     );
 
-    let stale = write_snapshot_artifacts(&frame_one, "stale", &first)
+    let stale = write_snapshot_artifacts(&SnapshotPng::encode(&frame_one), "stale", &first)
         .expect_err("superseded worker must fail closed");
     assert!(stale.contains("superseded"));
     assert!(!done_path.exists());
@@ -1490,7 +1491,7 @@ fn real_snapshot_generation_fence_conforms_and_rejects_stale_commit_mutant() {
         &selected_two,
         "snapshot scheduler selects current worker",
     );
-    write_snapshot_artifacts(&frame_two, "generation-two", &second)
+    write_snapshot_artifacts(&SnapshotPng::encode(&frame_two), "generation-two", &second)
         .expect("current worker commits");
     assert_eq!(marker_generation(&done_path), 2);
     assert_eq!(

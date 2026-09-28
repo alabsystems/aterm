@@ -57,7 +57,10 @@ impl AtermGpuTerminal {
             let _ = self.term.set_memory_budget(bytes);
         }
         if self.term.lazy_backlog_len() > 0 {
-            self.term.drain_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
+            // A trickle OPPORTUNITY, as in the CPU sibling: skipped while a
+            // flood is cutting and still outrunning a batch per frame, so one
+            // flood leaves one marker.
+            self.term.trickle_lazy_bounded(RENDER_DRAIN_BATCH_LINES);
         }
     }
 }
@@ -98,7 +101,8 @@ impl AtermGpuTerminal {
 
     /// Promote up to `max_lines` staged lines into the compressed store
     /// (`0` = the render-frame batch size). Returns the lines STILL staged.
-    /// For hosts draining a pane whose render is throttled.
+    /// For hosts draining a pane whose render is throttled; a trickle
+    /// opportunity like the frame drain (see the aterm-wasm twin).
     pub fn drain_scrollback_backlog(&mut self, max_lines: u32) -> u32 {
         if let Some(bytes) = self.budget_share.pending_effective() {
             let _ = self.term.set_memory_budget(bytes);
@@ -108,7 +112,7 @@ impl AtermGpuTerminal {
         } else {
             max_lines as usize
         };
-        u32::try_from(self.term.drain_lazy_bounded(batch)).unwrap_or(u32::MAX)
+        u32::try_from(self.term.trickle_lazy_bounded(batch)).unwrap_or(u32::MAX)
     }
 
     /// Lines currently staged for promotion (the compress backlog).
@@ -117,8 +121,9 @@ impl AtermGpuTerminal {
     }
 
     /// Monotonic count of history lines LOST to non-user-requested truncation
-    /// (audit E10a, out-of-band — no sentinel content). See the aterm-wasm
-    /// twin for the full contract.
+    /// (audit E10a, out of band; a flood cut is also marked in content by one
+    /// dim row, store-pressure evictions are not). See the aterm-wasm twin
+    /// for the full contract.
     pub fn scrollback_truncated_lines(&self) -> f64 {
         self.term.scrollback_truncated_lines() as f64
     }

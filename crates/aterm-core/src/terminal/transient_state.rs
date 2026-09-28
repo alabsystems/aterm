@@ -164,6 +164,36 @@ pub(super) struct TransientState {
     /// an exit followed by a re-entry runs neither arm; this is how it learns that
     /// the alt buffer the current selection names has been destroyed in between.
     pub(super) alt_screen_left_in_batch: bool,
+    /// The host asked for the PRIMARY screen (`Terminal::leave_alternate_screen`,
+    /// the `mainscreen` control verb): an app died on the alternate screen and
+    /// its `?1049l` never came. Taken by the next batch's parser advance, which
+    /// leaves the screen from inside the batch so the swap gets the same
+    /// `post_process` and epilogue treatment as one the app sent.
+    pub(super) host_leave_alternate_screen: bool,
+    /// The alternate screen now up was entered by `?47h`/`?1047h`, which save no
+    /// cursor, rather than by `?1049h`. Read by the orphaned-screen leave alone,
+    /// so it exits the way the dead app's own reset would have: those modes carry
+    /// the alt cursor over, where a 1049 exit would restore the main slot — and
+    /// that slot can still hold an EARLIER 1049 app's save (a restore leaves it
+    /// set), which would put the prompt on a row from long ago. Not checkpointed:
+    /// a restored session takes the 1049 exit, the form nearly every app uses.
+    pub(super) alt_entered_without_cursor_save: bool,
+    /// An orphaned alternate screen was left while a Windows console host sits
+    /// between us and the app (`win32_input_mode`, which only conhost asks for):
+    /// OUR screen is the primary one again, but conhost's own alternate buffer is
+    /// still up — nothing ever told it to leave — and everything the shell prints
+    /// goes into that buffer. MEASURED (2026-09-27, Windows 11 ConPTY, the `cast`
+    /// tap): conhost's next alt-screen enter arrived as a full blank repaint of
+    /// the viewport followed by `?1049h` in one read, and its exit as `?1049l`
+    /// followed by a full repaint of its PRIMARY buffer, frozen at the dead
+    /// app's start. Both repaints land on our primary screen and overwrote every
+    /// row the shell printed after the recovery (two commands and their output,
+    /// gone from screen and scrollback). Set by the orphaned leave, which moves
+    /// the rows from before the recovery out of reach itself
+    /// (`TerminalHandler::leave_orphaned_alternate_screen`); taken by the first
+    /// of those two events, which first moves the screen's rows into the
+    /// scrollback (`TerminalHandler::keep_screen_from_conhost_repaint`).
+    pub(super) conhost_alt_screen_left_up: bool,
     /// XTSAVE (CSI ? Ps s) saved DEC private mode values.
     ///
     /// Maps mode number to its saved boolean state. Restored by XTRESTORE
@@ -256,6 +286,9 @@ impl TransientState {
             alt_park_main_row_counter: None,
             alt_restore_pin: None,
             alt_screen_left_in_batch: false,
+            host_leave_alternate_screen: false,
+            alt_entered_without_cursor_save: false,
+            conhost_alt_screen_left_up: false,
             xtsave_modes: XtsaveModesMap::default(),
             last_osc_bel_terminated: false,
             kitty_images: HashMap::new(),
@@ -301,6 +334,9 @@ impl TransientState {
         self.alt_park_main_row_counter = None;
         self.alt_restore_pin = None;
         self.alt_screen_left_in_batch = false;
+        self.host_leave_alternate_screen = false;
+        self.alt_entered_without_cursor_save = false;
+        self.conhost_alt_screen_left_up = false;
         self.xtsave_modes.clear();
         self.last_osc_bel_terminated = false;
         self.bell_pending = false;

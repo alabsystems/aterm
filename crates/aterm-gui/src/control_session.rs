@@ -157,7 +157,10 @@ pub(crate) fn cmd_sessions_bridge(store: &Store) -> String {
 /// `sessions status`: a Lines-framed roster of the status fields the Fabric
 /// bridge consumes, including the server's agent verdict. One wake replaces one
 /// wake per hosted session on each bridge roster round. The bridge validates
-/// every row's sid and launch nonce against its own preceding `sessions bridge` read.
+/// every row's sid and launch nonce against its own preceding `sessions bridge`
+/// read. A busy timeline writer makes only that row's agent field
+/// `agent_deferred=1`; the bridge keeps its last verdict, and the GUI's event
+/// loop does not wait for that writer.
 pub(crate) fn cmd_sessions_status(proxy: &EventLoopProxy<Wake>) -> String {
     match super::control_media::call_main(proxy, |reply| Wake::ReadSessionStatuses { reply }) {
         Ok(rows) => rows,
@@ -219,12 +222,89 @@ fn session_detail(h: &SessionHandle) -> Option<String> {
     }
 }
 
+/// The `<title>` column of `sessions` / `ls` (and `family`) for `h`: the tab
+/// strip's title RUNGS less its identity shed (below), read LIVE off the
+/// engine — not the store's copy.
+///
+/// The store's `title` is fed by one path only, `App::publish_active_terminal_title`,
+/// which runs for the ACTIVE tab of a window. Measured (audit 2026-09-22):
+/// a tab opened and switched away from before its prompt drew had an EMPTY
+/// `ls` title for its whole life, and a fresh split pane printed ConPTY's
+/// program path, `C:\Program%20Files\…\pwsh.exe`, while `title` on the same
+/// session answered `~\aterm`. So the column is, first rung that answers:
+///
+/// 1. the operator's `meta set title`;
+/// 2. the OSC title minus the console's program path
+///    ([`crate::tab_label::without_console_program_path`]);
+/// 3. the native cwd, `~`-abbreviated exactly as the strip's cwd rung paints it;
+/// 4. the store's title, program path dropped — only when the engine lock is
+///    contended (the roster runs on the control thread and never parks behind
+///    a PTY reader — the `detail=` discipline) or the session has neither a
+///    title nor a cwd;
+/// 5. "aterm", the strip's own last rung, for nothing at all — an empty token
+///    would shift every column after it for a whitespace-splitting reader.
+///
+/// WHAT THIS CHANGES against the store's copy, on every platform: a session
+/// with a `meta set title` now prints that title (the store held the OSC
+/// title), and a session with no OSC title prints its cwd, or "aterm", where
+/// it printed whatever the active-tab publisher last wrote ("aterm" for a
+/// focused one) or an empty token for one never focused. A session whose OSC
+/// title is set, and is not a program path, prints that title — what the
+/// store held for it whenever the store was current.
+///
+/// NOT the strip's identity shed: a stock prompt's `user@host:` stays, as it
+/// does in `title`, where the strip paints `~/x` for `user@host: ~/x` on this
+/// machine ([`crate::tab_label::informative`]). The roster is read by
+/// programs, and the prefix is part of what the program set; only the program
+/// path — which names no session — is dropped.
+///
+/// `family` is readable by an EDGE-scoped caller for its own relatives, so
+/// those rows now carry a relative's operator title or cwd where they carried
+/// its OSC title — the rung that relative's own tab chip paints for anyone at
+/// the window.
+fn roster_title(h: &SessionHandle) -> String {
+    // TOP RUNG: `meta set title` — a leaf lock, dropped before the term lock.
+    let user_title = h
+        .ctx
+        .meta
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .presentation_value("title");
+    if let Some(title) = user_title {
+        return title;
+    }
+    let live = |t: &Terminal| -> Option<String> {
+        use crate::cwd_native::ReportedCwd as _;
+        let title = crate::tab_label::without_console_program_path(t.title());
+        if !title.is_empty() {
+            return Some(title.to_owned());
+        }
+        t.native_working_directory()
+            .filter(|cwd| !cwd.is_empty())
+            .map(|cwd| crate::app_tabs::home_abbreviated(&cwd))
+    };
+    let resolved = match h.term.try_lock() {
+        Ok(t) => live(&t),
+        Err(std::sync::TryLockError::Poisoned(p)) => live(&p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    };
+    resolved.unwrap_or_else(|| {
+        let stale = crate::tab_label::without_console_program_path(&h.title);
+        if stale.is_empty() {
+            "aterm".to_owned()
+        } else {
+            stale.to_owned()
+        }
+    })
+}
+
 /// The `sessions` wire body for `snapshot`: the store columns, then the
 /// placement columns from `rows` — or `-` for all three window columns when the
 /// rows could not be read (`Err`), with every line still printed. `detail=` is
-/// the engine's, so it is answered either way. `frozen_path` answers the
-/// registry's adoption mark per local id (`path=frozen` when true) — a
-/// registry fact, so it is answered either way too.
+/// the engine's, so it is answered either way; so is the title
+/// ([`roster_title`]). `frozen_path` answers the registry's adoption mark per
+/// local id (`path=frozen` when true) — a registry fact, so it is answered
+/// either way too.
 pub(crate) fn sessions_lines(
     snapshot: &[SessionHandle],
     rows: Result<&[SessionWindowRow], &str>,
@@ -236,14 +316,22 @@ pub(crate) fn sessions_lines(
             .parent
             .as_ref()
             .map_or("-", aterm_session::SessionId::as_str);
-        let title = pct_encode(&h.title);
-        let has_meta = u8::from(
-            h.ctx
-                .meta
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .any_set(),
-        );
+        let title = pct_encode(&roster_title(h));
+        // One read of the session's metadata for every column after the title
+        // (which [`roster_title`] resolves on its own): the `meta=` bit, the
+        // live supervisor claim, and the typed role, attention and user title a
+        // fleet reader classifies by.
+        let (has_meta, supervisor, role, attention, user_title) = {
+            let meta = h.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+            let opt = |v: Option<&str>| v.map_or_else(|| "-".to_string(), pct_encode);
+            (
+                u8::from(meta.any_set()),
+                opt(meta.live_supervisor(crate::metrics::now_us())),
+                opt(meta.role.as_deref()),
+                opt(meta.attention.as_deref()),
+                opt(meta.user_title.as_deref()),
+            )
+        };
         let (window, active, wfocus, detail) = match rows {
             Ok(rows) => {
                 let p = placement_of(h, rows);
@@ -292,19 +380,16 @@ pub(crate) fn sessions_lines(
             "human_ms={}",
             h.ctx.human_input.wire(crate::metrics::now_us())
         );
-        // `supervisor=<holder|->` LAST: the live supervisor claim, so a fleet
-        // read shows which agent tabs something is answering for.
-        let supervisor = h
-            .ctx
-            .meta
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .live_supervisor(crate::metrics::now_us())
-            .map_or_else(|| "-".to_string(), pct_encode);
+        // Then the typed `role=`, `attention=` and `user_title=` (the escalated
+        // set and the operator a fleet glance needs, in the roster itself rather
+        // than one `@sid meta` hop per session) and `supervisor=<holder|->`, the
+        // live supervisor claim, so a fleet read shows which agent tabs something
+        // is answering for — all from the one meta read above.
         out.push_str(&format!(
             "{} {} {} {} {} meta={has_meta} nonce={nonce} window={window} active={active} \
              wfocus={wfocus} detail={detail} identity={identity} path={path} {agent} \
-             {human} supervisor={supervisor} {owner}\n",
+             {human} role={role} attention={attention} user_title={user_title} \
+             supervisor={supervisor} {owner}\n",
             h.local_id,
             h.sid.as_str(),
             parent,
@@ -390,14 +475,18 @@ static NEXT_LEASE_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 const LEASE_TTL_DEFAULT_MS: u64 = 30_000;
 const LEASE_TTL_MAX_MS: u64 = 600_000;
 
-/// `lease [status] | lease acquire [ttl=<ms>] [holder=<name>] | lease release
-/// [holder=<name>] [force]` — the explicit COOPERATIVE drive lease for raw
-/// (non-`turn`) drivers. One holder at a time, TTL-expiring, surfaced in `who` as
-/// `driving=lease:<holder>`. It is mutually exclusive with any live lease (a
-/// different holder's `acquire`, and a `turn`, are refused while it is held) and
-/// self-expiring, but it does NOT hard-block raw `send`/`key`/`feed` — those stay
-/// governed by the `turn` lease. It is the coordination signal cooperating agents
-/// check before driving; `turn` remains the HARD arbitration primitive.
+/// `lease [status] | lease acquire [ttl=<ms>] [holder=<name>] [hard] | lease
+/// release [holder=<name>] [force]` — the explicit drive lease. One holder at a
+/// time, TTL-expiring, surfaced in `who` as `driving=lease:<holder>`. It is
+/// mutually exclusive with any live lease (a different holder's `acquire`, and
+/// another connection's `turn`, are refused while it is held) and self-expiring.
+/// COOPERATIVE by default: it does NOT hard-block raw `send`/`key`/`feed` — those
+/// stay governed by the `turn` lease — the coordination signal cooperating
+/// agents check before driving. `hard` makes it a hold: every OTHER
+/// connection's write verbs are refused `ERR busy lease=<holder>` as under a
+/// `turn`, while the holder's own connection writes on — its own `turn` holds
+/// the slot for the turn and hands the lease back after it
+/// ([`crate::Lease::write_block`]). A person's keyboard is never blocked.
 pub(crate) fn cmd_lease(ctx: &SessionCtx, rest: &str) -> String {
     let mut toks = rest.split_whitespace();
     match toks.next().unwrap_or("status") {
@@ -418,23 +507,32 @@ fn lease_status(ctx: &SessionCtx) -> String {
     let lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
     match lease.as_ref() {
         Some(crate::Lease::Turn { id, .. }) => format!("OK lease turn={id}\n"),
-        Some(crate::Lease::Drive { holder, expires_us }) if *expires_us > now => {
+        Some(crate::Lease::Drive {
+            holder,
+            expires_us,
+            hard,
+            ..
+        }) if *expires_us > now => {
             format!(
-                "OK lease holder={holder} expires_in_ms={}\n",
-                (*expires_us - now) / 1000
+                "OK lease holder={holder} expires_in_ms={}{}\n",
+                (*expires_us - now) / 1000,
+                if *hard { " hard=1" } else { "" }
             )
         }
         _ => "OK lease none\n".to_string(),
     }
 }
 
-/// `lease acquire [ttl=<ms>] [holder=<name>]`: take (or, for the same holder,
-/// renew) the cooperative lease. Refuses a live `turn` or a DIFFERENT holder's
-/// live lease; steals a lapsed one. Returns the granted `holder` so an unnamed
-/// caller learns the auto-tag it must release with.
+/// `lease acquire [ttl=<ms>] [holder=<name>] [hard]`: take (or, for the same
+/// holder, renew) the lease — over the connection that asks, which a renewal
+/// moves it to, `hard` or cooperative as this acquire says. Refuses a live
+/// `turn` or a DIFFERENT holder's live lease; steals a lapsed one. Returns the
+/// granted `holder` so an unnamed caller learns the auto-tag it must release
+/// with.
 fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> String {
     let mut ttl_ms = LEASE_TTL_DEFAULT_MS;
     let mut holder: Option<String> = None;
+    let mut hard = false;
     for t in args {
         if let Some(v) = t.strip_prefix("ttl=") {
             match v.parse::<u64>() {
@@ -447,8 +545,10 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
                     .to_string();
             }
             holder = Some(v.to_string());
+        } else if t == "hard" {
+            hard = true;
         } else {
-            return format!("ERR lease acquire: unknown arg '{t}' (ttl=<ms> holder=<name>)\n");
+            return format!("ERR lease acquire: unknown arg '{t}' (ttl=<ms> holder=<name> hard)\n");
         }
     }
     let holder = holder.unwrap_or_else(|| {
@@ -463,6 +563,7 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
             crate::Lease::Drive {
                 holder: h,
                 expires_us,
+                ..
             } if *h != holder => {
                 return format!(
                     "ERR lease held holder={h} expires_in_ms={}\n",
@@ -475,11 +576,16 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     *lease = Some(crate::Lease::Drive {
         holder: holder.clone(),
         expires_us: now + ttl_ms.saturating_mul(1000),
+        conn: super::serving_connection(),
+        hard,
     });
     drop(lease);
     // The presence rim follows the lease (round 19): one wake per change of hand.
     crate::presence::post_lease_changed(&ctx.self_id, false);
-    format!("OK lease acquired holder={holder} ttl_ms={ttl_ms} expires_in_ms={ttl_ms}\n")
+    format!(
+        "OK lease acquired holder={holder} ttl_ms={ttl_ms} expires_in_ms={ttl_ms}{}\n",
+        if hard { " hard=1" } else { "" }
+    )
 }
 
 /// `lease release [holder=<name>] [force]`: drop the cooperative lease. The holder
@@ -527,6 +633,7 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         Some(crate::Lease::Drive {
             holder: h,
             expires_us,
+            ..
         }) => {
             let live = *expires_us > now;
             if !live || force || holder.as_deref() == Some(h.as_str()) {
@@ -618,8 +725,10 @@ pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
 ///   `child <sid> <state> <title>`  (zero or more, sorted by local id)
 /// Titles are percent-encoded (single space-free tokens), matching `sessions`.
 /// An unknown target id yields `ERR no such session\n` (fail-closed). An EXPLICIT
-/// `<sid>` argument is Owner-only (a scoped Edge gets `ERR denied`); the no-arg
-/// form is scoped to the already-gated resolved session.
+/// `<sid>` argument is Owner-only — fenced at the dispatch with every other
+/// argument-escalated seam (`control::escalated_op`), so a scoped Edge gets
+/// `ERR denied` before this runs; the no-arg form is scoped to the already-gated
+/// resolved session.
 ///
 /// For OWNER scope only, session-connection DISCOVERY rows follow the child
 /// rows (design §6): `pushes` / `pushed-by` / `pulls` / `pulled-by`, one per
@@ -630,16 +739,13 @@ pub(crate) fn cmd_edges_json(ctx: &SessionCtx) -> String {
 /// disclosure rationale — a scoped caller reads its own inbound table via
 /// `edges`). `parent`/`child` stay lineage, untouched.
 pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &str) -> String {
-    // Target sid: an explicit argument (Owner-only — arbitrary-node enumeration),
-    // else the resolved session's own id (already gated by the dispatch).
+    // Target sid: an explicit argument, else the resolved session's own id. Both
+    // are gated by the dispatch: the explicit form (arbitrary-node enumeration) is
+    // Owner-only there (`control::escalated_op`), so a scoped edge never gets here
+    // with one.
     let target_sid = match rest.trim() {
         "" => ctx.self_id.clone(),
-        s => {
-            if !scope.is_owner_class() {
-                return "ERR denied\n".to_string();
-            }
-            SessionId::new(s)
-        }
+        s => SessionId::new(s),
     };
     let snapshot = {
         let g = store.read().unwrap_or_else(|p| p.into_inner());
@@ -648,12 +754,14 @@ pub(crate) fn cmd_family(ctx: &SessionCtx, store: &Store, scope: Scope, rest: &s
     let Some(node) = snapshot.iter().find(|h| h.sid == target_sid) else {
         return "ERR no such session\n".to_string();
     };
+    // The title column is `sessions`' own ([`roster_title`]), so one session
+    // never reads under two names across the two roster verbs.
     let line = |kind: &str, h: &crate::session_store::SessionHandle| {
         format!(
             "{kind} {} {} {}\n",
             h.sid.as_str(),
             h.state.as_str(),
-            pct_encode(&h.title),
+            pct_encode(&roster_title(h)),
         )
     };
     // Build the body first so the header can carry a COUNT, matching every other
@@ -1009,10 +1117,7 @@ pub(crate) fn cmd_await(
         // a vacuous "clear"): name the typo now rather than burn the timeout.
         let grid_rows = t.rows() as usize;
         if !range.covers_any(grid_rows) {
-            return format!(
-                "ERR bad rows: the span meets no visible row (grid rows 0..={})\n",
-                grid_rows.saturating_sub(1)
-            );
+            return super::control_query::rows_off_grid(grid_rows);
         }
         if kind == "gone" {
             t.watch_rows_gone(matcher, range, now0)
@@ -1046,7 +1151,7 @@ pub(crate) fn cmd_await(
         }
     };
     let Some(id) = armed else {
-        return "ERR watcher budget full\n".to_string();
+        return format!("ERR {WAITS_FULL}\n");
     };
 
     let overall = now0 + Duration::from_millis(timeout_ms);
@@ -1564,7 +1669,7 @@ pub(crate) fn park_until_momentum_below(
             std::time::Instant::now(),
         );
         let Some(id) = armed else {
-            return MomentumWait::Unreadable("watcher budget full".to_string());
+            return MomentumWait::Unreadable(WAITS_FULL.to_string());
         };
         match park_watch(term, exited, sub, id, until) {
             // The crossing passed: confirm on a fresh reading (the loop head),
@@ -2006,6 +2111,13 @@ pub(crate) fn cmd_turn_guarded(
         text = tail;
     }
     let timeout_ms = timeout_ms.min(600_000);
+    // A turn with NO TEXT submits nothing a person typed: a bare `ctl turn` used to
+    // skip the typing and still press Enter into the live session (audit D-3). A
+    // lone Enter is `key enter`; an empty turn is a usage error unless it submits
+    // nothing either (`submit=none` — a settle read, the one empty form with a use).
+    if text.trim().is_empty() && submit != "none" {
+        return USAGE.to_string();
+    }
 
     // Compile a `settle=match:<re>`/`settle=gone:<re>` pattern up front (untrusted
     // regex, bounded by `row_matcher`) OUTSIDE the terminal lock and BEFORE the
@@ -2029,15 +2141,22 @@ pub(crate) fn cmd_turn_guarded(
     // lock (the dispatch-level check is the fast fail; THIS is authoritative), and
     // release on EVERY exit via the drop guard — including timeouts, exits, usage
     // errors and watcher-budget failures below.
-    let turn_id = {
+    let (turn_id, handed_back) = {
         let mut lease = ctx.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
+        let now = crate::metrics::now_us();
         // A LIVE lease of either kind blocks a new turn: a `turn` lease is the usual
-        // busy case; a cooperative `Drive` lease (unexpired) refuses too, so a raw
-        // driver's hold is not stomped mid-drive. An EXPIRED `Drive` lease is free —
-        // the turn takes over (and its guard clears the slot on exit).
-        if let Some(held) = lease
+        // busy case; a `Drive` lease (unexpired) refuses too, so a driver's hold is
+        // not stomped mid-drive — unless it is THIS connection's own: the holder
+        // types its turn under it, and gets it back when the turn is over (the
+        // live upgrade's relaunch line, under the restart's hold). An EXPIRED
+        // `Drive` lease is free — the turn takes over (and its guard clears the
+        // slot on exit).
+        let own = lease
             .as_ref()
-            .filter(|h| h.is_live(crate::metrics::now_us()))
+            .filter(|h| h.held_over(now, super::serving_connection()))
+            .cloned();
+        if own.is_none()
+            && let Some(held) = lease.as_ref().filter(|h| h.is_live(now))
         {
             return match held {
                 crate::Lease::Turn { id, .. } => format!("ERR busy turn={id}\n"),
@@ -2052,7 +2171,7 @@ pub(crate) fn cmd_turn_guarded(
             id,
             driver: io.driver.clone(),
         });
-        id
+        (id, own)
     };
     struct LeaseGuard<'a> {
         /// `ctx.turn_lease` — a NAMED field (not a tuple `.0`) so the
@@ -2069,13 +2188,16 @@ pub(crate) fn cmd_turn_guarded(
         /// The driving session, if a local one: its own band's `▸ @<sid>`
         /// reads this lease too, so it is woken with the driven session.
         driver: Option<&'a aterm_session::SessionId>,
+        /// The drive lease this turn's own connection held when it began:
+        /// handed back as the turn ends.
+        handed_back: Option<crate::Lease>,
     }
     impl Drop for LeaseGuard<'_> {
         fn drop(&mut self) {
             let mut lease = self.turn_lease.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(lease.as_ref(), Some(crate::Lease::Turn { id: held, .. }) if *held == self.id)
             {
-                *lease = None;
+                *lease = self.handed_back.take();
                 drop(lease);
                 // The turn settled (or timed out, or was refused): the rim lifts.
                 crate::presence::post_lease_changed(self.sid, false);
@@ -2090,6 +2212,7 @@ pub(crate) fn cmd_turn_guarded(
         id: turn_id,
         sid: &ctx.self_id,
         driver: io.driver.as_ref(),
+        handed_back,
     };
     // The turn's lease is held: the presence rim goes teal (round 19) — and
     // the driver's own band, if it is a local session, gains `▸ @<sid>`.
@@ -2226,7 +2349,7 @@ pub(crate) fn cmd_turn_guarded(
         // Echo settle: the editor ingested + painted the burst. Cap the phase so
         // an app that is ALREADY animating (mid-turn spinner) cannot stall us.
         let Some(id) = arm(WatcherSpec::IdleFor { dur: ECHO_SETTLE }) else {
-            return "ERR watcher budget full\n".to_string();
+            return format!("ERR {WAITS_FULL}\n");
         };
         match wait(id, deadline.min(Instant::now() + ECHO_CAP)) {
             Phase::Exited => return "ERR exited\n".to_string(),
@@ -2280,7 +2403,7 @@ pub(crate) fn cmd_turn_guarded(
             // (`after` = pre-press seq); a post-press arm would race past it.
             let after = term_lock(term).content_seq();
             let Some(mut id) = arm(WatcherSpec::SeqAdvanced { after }) else {
-                return "ERR watcher budget full\n".to_string();
+                return format!("ERR {WAITS_FULL}\n");
             };
             // The watcher must be armed before input, but the guard remains the
             // final operation before the press. For the durable operator this
@@ -2347,7 +2470,7 @@ pub(crate) fn cmd_turn_guarded(
                         let after = term_lock(term).content_seq();
                         match arm(WatcherSpec::SeqAdvanced { after }) {
                             Some(nid) => id = nid,
-                            None => return "ERR watcher budget full\n".to_string(),
+                            None => return format!("ERR {WAITS_FULL}\n"),
                         }
                     }
                     Phase::Deadline => break,
@@ -2409,7 +2532,7 @@ pub(crate) fn cmd_turn_guarded(
                     aterm_core::terminal::RowRange::All,
                     Instant::now(),
                 ) else {
-                    return "ERR watcher budget full\n".to_string();
+                    return format!("ERR {WAITS_FULL}\n");
                 };
                 let appear_by =
                     deadline.min(Instant::now() + Duration::from_millis(submit_window_ms));
@@ -2435,7 +2558,7 @@ pub(crate) fn cmd_turn_guarded(
             }),
         };
         let Some(id) = armed else {
-            return "ERR watcher budget full\n".to_string();
+            return format!("ERR {WAITS_FULL}\n");
         };
         match wait(id, deadline) {
             Phase::Exited => return "ERR exited\n".to_string(),
@@ -3110,8 +3233,9 @@ pub(crate) fn cmd_cast_frames(ctx: &SessionCtx, rest: &str) -> String {
 /// MICROSECONDS since the session's recorder epoch; `temporal status` -> `OK
 /// enabled=<bool> latest_tick=<n> keyframes=<n> live_events=<n> dropped_events=<n>`
 /// reports the reachable window and whether recording is on, so a caller can pick a
-/// valid tick without guessing. Two DISTINCT failures: `ERR temporal: recording
-/// disabled …\n` when recording was never enabled (the default — a config fix),
+/// valid tick without guessing. Two DISTINCT failures: `ERR temporal: this session
+/// is not recording …\n` when recording was never enabled for it (the default — a
+/// config fix that reaches NEW tabs: a session keeps its spawn-time wiring),
 /// versus `ERR temporal unreachable\n` when the base keyframe (or a needed input
 /// blob) has aged out of the bounded retention window (honest partial reach, never
 /// a wrong reconstruction). `<nbytes>` is the UTF-8 body length, matching the
@@ -3154,15 +3278,12 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
     let (enabled, replay) = {
         let rec = ctx.temporal.lock().unwrap_or_else(|p| p.into_inner());
         let enabled = rec.total_events() > 0;
-        let replay = if enabled {
-            rec.replay_at(aterm_core::terminal::HostBindings::none(), at)
-        } else {
-            None
-        };
+        let replay = if enabled { rec.replay_at(at) } else { None };
         (enabled, replay)
     };
     if !enabled {
-        return "ERR temporal: recording disabled (set temporal_recording=true in aterm.toml)\n"
+        return "ERR temporal: this session is not recording; set temporal_recording = true in \
+                aterm.toml and open a new tab\n"
             .to_string();
     }
     let Some(term) = replay else {
@@ -3186,6 +3307,15 @@ pub(crate) fn cmd_temporal(ctx: &SessionCtx, rest: &str) -> String {
     format!("OK {}\n{}", body.len(), body)
 }
 
+/// Why a wait could not arm: the session's watchers are all armed (the
+/// observation kernel's per-session cap, 256). Every `await`/`turn`/`yield`
+/// form says it in these words.
+const WAITS_FULL: &str = "too many waits open on this session; retry when one ends";
+
+/// `grant`'s answer to an op word [`Op::parse`] does not know: the words it does.
+const GRANT_UNKNOWN_OP: &str =
+    "ERR unknown op (read-screen|write-input|signal|config-write|clipboard-write|derive-loop)\n";
+
 /// `grant <src-id> <op>` -> mint an edge (src -> this session, op) and return its
 /// bearer token hex. Owner-only (also enforced by the gate's catch-all Deny).
 pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
@@ -3197,7 +3327,7 @@ pub(crate) fn cmd_grant(ctx: &SessionCtx, scope: Scope, rest: &str) -> String {
         return "ERR usage: grant <src-id> <op>\n".to_string();
     };
     let Some(op) = Op::parse(op_s) else {
-        return "ERR unknown op\n".to_string();
+        return GRANT_UNKNOWN_OP.to_string();
     };
     let src = SessionId::new(src);
     let tok = {
@@ -3518,7 +3648,7 @@ const EXITS_USAGE: &str = "ERR usage: exits [<n>] [since=<id>]\n";
 
 /// `exits [<n>] [since=<id>]` -> the instance's EXIT LEDGER, oldest-first, framed
 /// `OK <count>\n` + one `exit <id> t=<ms> sid=<sid> local=<n> reason=<…>
-/// exit_code=<n|-> by=<sid|human|->` line per session that LEFT the registry —
+/// exit_code=<n|-> by=<sid|human|ctl|bridge|->` line per session that LEFT the registry —
 /// the `history`/`timeline` grammar (`<n>` keeps the last n; `since=<id>` keeps
 /// rows with id strictly greater) over the roster journal, whose seq is the
 /// row id. Owner-only, like `sessions`: it names every sid the instance ever
@@ -3528,7 +3658,8 @@ const EXITS_USAGE: &str = "ERR usage: exits [<n>] [since=<id>]\n";
 /// was hung up by a close, died by signal, was not ours to reap, or had not yet
 /// exited at either of the ledger's two non-blocking looks — see
 /// `App::shell_exit_code`) and BY WHOM (`by=`, the closing connection's sid,
-/// `human`, or `-`).
+/// `human`, `ctl` for an owner-token client, `bridge` for the fabric bridge,
+/// or `-` — see [`caller_actor`]).
 /// Bounded like the journal it reads (drop-oldest): a row older than the
 /// retained window is gone, and `OK 0` means no exit is retained, not that
 /// none happened.
@@ -3596,34 +3727,50 @@ fn exit_rows<'a>(
 /// when the connection carries one. An edge-scoped connection does — its token
 /// was granted TO a session ([`aterm_session::EdgeTable::src_of`], read from the
 /// resolved target's table, the one that authorized this request), and that
-/// session is the caller. An owner-token connection is anonymous by
-/// construction: the per-instance token names the instance's owner, not a
-/// session, so it writes `Unknown` (`by=-`). NEVER the front tab (the sid a bare
+/// session is the caller. An owner-token connection carries no session: the
+/// per-instance token names the instance's owner, so it writes the KIND of
+/// client instead — [`ExitActor::Ctl`] (`by=ctl`) — and the fabric bridge, a
+/// connection the server pre-resolves rather than a token, writes
+/// [`ExitActor::Bridge`] (`by=bridge`). NEVER the front tab (the sid a bare
 /// `whoami` answers): `spawn` makes the new session the front tab, so an
 /// `@<new> close` would name the closed session as its own closer, and an
-/// agent's pane is rarely the tab on screen anyway. `by=-` beside
-/// `reason=ctl-close` is the honest row: a control client did it, and which one
-/// was not on the wire.
+/// agent's pane is rarely the tab on screen anyway. Until 2026-09-22 both
+/// owner-class scopes wrote `Unknown` (`by=-`) beside `reason=ctl-close`, the
+/// token the ledger uses for a path that never attributed at all, while
+/// `help exits` promised `by=<caller>` — the audit read a ctl close as
+/// `by=-` and could not tell the two apart.
 pub(crate) fn caller_actor(scope: Scope, target: &SessionCtx) -> ExitActor {
+    caller_actor_of(scope, Some(target))
+}
+
+/// [`caller_actor`] for a request that may have no resolved session — the
+/// App lane's `tab` and `invoke`, which drive the front window whether or not
+/// a terminal is active. The owner and the bridge are named by kind either
+/// way, and they are the only scopes that lane admits (an edge is denied
+/// every App-target verb there). An edge caller is found only in a resolved
+/// session's table; with none there is no table to find it in, so it names
+/// nobody (`-`).
+pub(crate) fn caller_actor_of(scope: Scope, target: Option<&SessionCtx>) -> ExitActor {
     match scope {
-        Scope::Owner => ExitActor::Unknown,
-        // The fabric bridge is anonymous here for exactly the reason the owner
-        // token is: it names a CONNECTION, not a session, and `by=` is a sid
-        // column. It is deliberately NOT folded into `Owner` — this is the one
-        // site where the two scopes would want to differ — but naming it would
-        // widen the `exits` wire with a fourth `by=` token, which §11.2 keeps as a
-        // separate, low-priority item. `by=-` beside `reason=ctl-close` stays the
-        // honest row until then.
+        Scope::Owner => ExitActor::Ctl,
+        // The bridge is a CONNECTION, not a session, so like the owner token it
+        // has no sid to write; it is named apart from `ctl` because a fleet
+        // order and a local client are different callers to a reader of the
+        // ledger, and this is the one site where the two owner-class scopes
+        // are attributed differently. Unix-only like the scope itself (the
+        // bridge is an inherited `socketpair`).
         #[cfg(any(unix, test))]
-        Scope::Bridge => ExitActor::Unknown,
+        Scope::Bridge => ExitActor::Bridge,
         Scope::Edge(presented) => target
-            .edges
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .src_of(&presented)
-            .map_or(ExitActor::Unknown, |src| {
-                ExitActor::Sid(src.as_str().to_string())
-            }),
+            .and_then(|target| {
+                target
+                    .edges
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .src_of(&presented)
+                    .map(|src| ExitActor::Sid(src.as_str().to_string()))
+            })
+            .unwrap_or(ExitActor::Unknown),
     }
 }
 
@@ -3656,6 +3803,22 @@ pub(crate) fn cmd_whoami(ctx: &SessionCtx, scope: Scope) -> String {
 mod tests {
     use super::*;
     use aterm_session::{EdgeTable, LaunchNonce};
+
+    /// `grant`'s unknown-op refusal lists exactly the words `Op::parse` takes,
+    /// so the list a person copies from is never one the verb then refuses.
+    #[test]
+    fn grant_unknown_op_lists_the_words_op_parse_takes() {
+        let list = GRANT_UNKNOWN_OP
+            .strip_prefix("ERR unknown op (")
+            .and_then(|rest| rest.strip_suffix(")\n"))
+            .expect("ERR unknown op (<a>|<b>…)");
+        let words: Vec<&str> = list.split('|').collect();
+        assert_eq!(words.len(), 6, "{words:?}");
+        for word in words {
+            assert_eq!(Op::parse(word).map(Op::as_str), Some(word), "{word}");
+        }
+        assert!(Op::parse("write").is_none(), "negative control");
+    }
 
     #[test]
     fn history_and_timeline_limits_match_retained_wire_rows() {
@@ -3957,10 +4120,11 @@ mod tests {
         }
     }
 
-    /// The published program / agent columns, `human_ms=` (2026-09-24) and
-    /// `supervisor=` (2026-09-23), elided by [`tail`] and pinned on their own by
+    /// The published program / agent columns, `human_ms=` (2026-09-24), the
+    /// typed `role=`/`attention=`/`user_title=` (2026-09-25), `supervisor=`
+    /// (2026-09-23) and the owner's columns, elided by [`tail`] and pinned on their own by
     /// [`the_roster_carries_the_published_program_and_agent_verdict`].
-    const AGENT_COLUMNS: [&str; 12] = [
+    const AGENT_COLUMNS: [&str; 15] = [
         "program=",
         "agent=",
         "agent_detail=",
@@ -3969,6 +4133,9 @@ mod tests {
         "agent_gen=",
         "agent_fp=",
         "human_ms=",
+        "role=",
+        "attention=",
+        "user_title=",
         "supervisor=",
         "path_evidence=",
         "copy=",
@@ -4031,6 +4198,33 @@ mod tests {
         ] {
             assert_eq!(parse_agent_words(bad), None, "{bad:?}");
         }
+    }
+
+    /// THE ESCALATED SET IN THE ROSTER (2026-09-25): the typed `role=`,
+    /// `attention=` and `user_title=` a fleet glance classifies by ride every
+    /// row, so the menu-bar fleet scan reads a sibling in ONE hop. Before, the
+    /// roster carried none of them and the scan paid up to 256 `@sid meta`
+    /// follow-ups per peer inside its 2 s budget, falling back to the ⚠-title
+    /// heuristic past the cap.
+    #[test]
+    fn the_roster_carries_the_typed_role_attention_and_title() {
+        let t0 = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        let h = handle(0, &t0);
+        {
+            let mut m = h.ctx.meta.lock().unwrap();
+            m.set("role", Some("operator".into()));
+            m.set("attention", Some("stuck on CI".into()));
+            m.set("title", Some("my build".into()));
+        }
+        let out = sessions_lines(std::slice::from_ref(&h), Ok(&[]), |_| false);
+        let line = out.lines().nth(1).unwrap();
+        assert!(
+            line.contains(
+                " role=operator attention=stuck%20on%20CI user_title=my%20build supervisor="
+            ),
+            "{line}"
+        );
+        assert!(line.contains(" meta=1 "), "{line}");
     }
 
     /// `path=` IS MEASURED WHERE IT CAN BE (gap audit 2026-09-24: a tab the live
@@ -4153,10 +4347,13 @@ mod tests {
             line.contains(" agent_gen=2.40 agent_fp=00000000000000ab "),
             "the verdict's stamp rides the row: {line}"
         );
-        // `human_ms=`, `supervisor=`, then the owner's three columns, close
-        // the row: no person has typed…
+        // `human_ms=`, the typed metadata, `supervisor=`, then the owner's
+        // three columns, close the row: no person has typed…
         assert!(
-            line.ends_with(" human_ms=- supervisor=- path_evidence=- copy=- upgrade=-"),
+            line.ends_with(
+                " human_ms=- role=- attention=- user_title=- supervisor=- path_evidence=- \
+                 copy=- upgrade=-"
+            ),
             "{line}"
         );
         // …and once one has, the row says how long ago.
@@ -4198,6 +4395,118 @@ mod tests {
         assert_eq!(
             tail(lines[3]),
             "2 - alive tab-2 meta=0 window=none active=0 wfocus=0 detail=- identity=- path=live"
+        );
+    }
+
+    /// THE TITLE IS THE STRIP'S, READ LIVE ([`roster_title`]): the measured
+    /// divergence was `ls` printing `C:\Program%20Files\…\pwsh.exe` (a fresh
+    /// pane) and `` (a tab opened in the background) while `title` and the
+    /// strip said `~\aterm`. Rung by rung, and the contended-lock fallback.
+    #[test]
+    fn sessions_lines_print_the_title_the_strip_settles_on() {
+        // No title, no cwd: the store's title, as before.
+        let bare = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        // ConPTY's program path with the cwd known: the cwd rung, never the
+        // path. A POSIX cwd so the native form is the same on every host.
+        let fresh = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        {
+            let mut t = fresh.lock().unwrap();
+            t.set_title("C:\\Program Files\\PowerShell\\7\\pwsh.exe");
+            t.process(b"\x1b]7;file://localhost/srv/demo-cwd\x07");
+        }
+        // The prompt's own title: printed as it is, identity and all.
+        let settled = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        settled
+            .lock()
+            .unwrap()
+            .set_title("user@m17-tower: ~\\aterm");
+        // `cmd.exe`'s `<path> - <command>`: the command.
+        let running = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        running
+            .lock()
+            .unwrap()
+            .set_title("C:\\Windows\\system32\\cmd.exe - ping build-01");
+        // The operator's title outranks everything the engine says.
+        let named = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        named.lock().unwrap().set_title("~\\aterm");
+        let snapshot = vec![
+            handle(0, &bare),
+            handle(1, &fresh),
+            handle(2, &settled),
+            handle(3, &running),
+            handle(4, &named),
+        ];
+        snapshot[4].ctx.meta.lock().unwrap().user_title = Some("ops shell".to_string());
+        let out = sessions_lines(&snapshot, Err("no event loop"), |_| false);
+        let titles: Vec<&str> = out
+            .lines()
+            .skip(1)
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "tab-0",
+                "/srv/demo-cwd",
+                "user@m17-tower:%20~\\aterm",
+                "ping%20build-01",
+                "ops%20shell"
+            ]
+        );
+
+        // A CONTENDED engine lock falls back to the store's title — with a
+        // program path dropped there too, and "aterm" standing in for an
+        // empty one, so the token never vanishes from the line.
+        let mut stale = handle(5, &fresh);
+        stale.title = "C:\\Windows\\system32\\cmd.exe".to_string();
+        let mut empty = handle(6, &fresh);
+        empty.title.clear();
+        let held = fresh.lock().unwrap();
+        let out = sessions_lines(&[stale, empty], Err("no event loop"), |_| false);
+        drop(held);
+        let titles: Vec<&str> = out
+            .lines()
+            .skip(1)
+            .map(|line| line.split_whitespace().nth(4).unwrap())
+            .collect();
+        assert_eq!(titles, ["aterm", "aterm"]);
+        for line in out.lines().skip(1) {
+            assert_eq!(
+                line.split_whitespace().nth(5),
+                Some("meta=0"),
+                "every column keeps its place: {line:?}"
+            );
+        }
+    }
+
+    /// `family` prints `sessions`' title column ([`roster_title`]): a session
+    /// whose OSC title is still ConPTY's program path reads under its cwd in
+    /// both roster verbs, and under the path in neither.
+    #[test]
+    fn family_prints_the_roster_title() {
+        let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
+        {
+            let mut t = term.lock().unwrap();
+            t.set_title("C:\\Program Files\\PowerShell\\7\\pwsh.exe");
+            t.process(b"\x1b]7;file://localhost/srv/demo-cwd\x07");
+        }
+        let h = handle(0, &term);
+        let store = crate::session_store::new_store();
+        store.write().unwrap().register(h.clone());
+        let family = cmd_family(&h.ctx, &store, Scope::Owner, "");
+        assert_eq!(
+            family.lines().nth(1),
+            Some(format!("self {} alive /srv/demo-cwd", h.sid.as_str()).as_str()),
+            "{family}"
+        );
+        let sessions = sessions_lines(&[h], Err("no event loop"), |_| false);
+        assert_eq!(
+            sessions
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split_whitespace().nth(4)),
+            Some("/srv/demo-cwd"),
+            "{sessions}"
         );
     }
 
@@ -4575,7 +4884,7 @@ mod tests {
 mod exits_tests {
     use aterm_session::{EdgeToken, Op};
 
-    use super::{Scope, caller_actor, cmd_exits};
+    use super::{Scope, caller_actor, caller_actor_of, cmd_exits};
     use crate::session_store::{ExitActor, ExitReason, RosterChange, new_store, test_handle};
 
     /// `exits` on an instance that has lost nothing is `OK 0` — including one
@@ -4698,12 +5007,14 @@ mod exits_tests {
 
     /// `by=` names the CALLER, never the closed session. An edge-scoped
     /// connection's caller is the session its token was granted to (read from
-    /// the TARGET's table); an owner-token connection is anonymous and writes
-    /// `-`; a token the target's table does not know is `-` too. In no case is
-    /// it the closed session's own sid — the E2E twin drives a private instance
+    /// the TARGET's table); an owner-token connection carries no session and
+    /// writes `ctl`, the bridge writes `bridge` (both wrote `-` until
+    /// 2026-09-22, indistinguishable from a path that never attributed); a
+    /// token the target's table does not know is `-`. In no case is it the
+    /// closed session's own sid — the E2E twin drives a private instance
     /// through `spawn` → `@<new> close` and checks the `exits` row agrees.
     #[test]
-    fn caller_actor_is_the_edge_source_never_the_target_and_anonymous_for_owner() {
+    fn caller_actor_is_the_edge_source_never_the_target_and_the_client_kind_for_owner() {
         let store = new_store();
         let caller = test_handle(1);
         let target = test_handle(2);
@@ -4731,13 +5042,32 @@ mod exits_tests {
         );
         assert_eq!(
             caller_actor(Scope::Owner, &target.ctx),
-            ExitActor::Unknown,
-            "an owner-token connection carries no session identity"
+            ExitActor::Ctl,
+            "an owner-token connection carries no session identity, so the row \
+             names the kind of client"
         );
+        assert_eq!(ExitActor::Ctl.as_wire(), "ctl");
+        assert_eq!(
+            caller_actor(Scope::Bridge, &target.ctx),
+            ExitActor::Bridge,
+            "the bridge is a connection with no sid, named apart from a local client"
+        );
+        assert_eq!(ExitActor::Bridge.as_wire(), "bridge");
         assert_eq!(
             caller_actor(Scope::Edge(EdgeToken::generate()), &target.ctx),
             ExitActor::Unknown,
             "a token the target's table never issued names nobody"
+        );
+        // With NO resolved session (the flagless `tab` on the App lane) the
+        // owner and the bridge are still named by kind, and an edge — whose
+        // table is the only thing that knows its source — names nobody; with
+        // one, the answer is `caller_actor`'s.
+        assert_eq!(caller_actor_of(Scope::Owner, None), ExitActor::Ctl);
+        assert_eq!(caller_actor_of(Scope::Bridge, None), ExitActor::Bridge);
+        assert_eq!(caller_actor_of(Scope::Edge(tok), None), ExitActor::Unknown);
+        assert_eq!(
+            caller_actor_of(Scope::Edge(tok), Some(&target.ctx)),
+            ExitActor::Sid(caller_sid.clone())
         );
         // The row an edge-attributed close writes carries the caller's sid, and
         // it differs from the sid of the row itself.

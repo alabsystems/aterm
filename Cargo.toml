@@ -49,9 +49,9 @@ account = "alabsystems"
 # This is deliberately NOT `[workspace.package] repository`. The two answer
 # different questions:
 #   * `repository` = where the SOURCE and the release pipeline live. It stays
-#     the private staging repo; `cargo ship cut` publishes there, gated by the
-#     ledger/lease/fence protocol, and it is the slug the cutter binds
-#     `git remote get-url origin` against.
+#     the private staging repo: the cut's ledger/lease/fence refs and its
+#     annotated tag live on it, and it is the slug the cutter binds
+#     `git remote get-url origin` against. No release object is made there.
 #   * `update_channel` = where INSTALLED COPIES look for updates. It is the
 #     PUBLIC channel: installed copies read its download host with no credential
 #     and no API request, so any channel an updater is pointed at — a
@@ -63,14 +63,16 @@ account = "alabsystems"
 #     ATERM_DEFAULT_REPO, THE channel `Source::resolve` answers in every shipped
 #     binary (only a development build honours an `[update] owner/repo` repoint;
 #     the ATERM_UPDATE_OWNER/_REPO env override is gone since 2026-09-23);
-#   * crates/aterm-release (the `mirror` pipeline step) copies each finished,
-#     verified release here after `verify` and before `unlock`.
+#   * crates/aterm-release (the cut's `publish` step) publishes each release
+#     here ONCE — onto the engine's source prerelease for the version — proves
+#     it, and makes it the channel head, before `unlock`.
 #
 # Repointing this is NOT an authenticity change: trust is the manifest SHA-256,
 # the optional pinned Ed25519 key, codesign + the pinned Team ID. The channel
-# only decides where bytes come from. DELETING the key is legal and means "no
-# public mirror": clients then default to `repository` and the `mirror` step
-# becomes an announced no-op.
+# only decides where bytes come from. DELETING the key makes `repository` the
+# channel for clients and cut alike — and a cut refuses a channel a
+# credential-less client cannot read, so that is only a cut for a PUBLIC
+# `repository`.
 [workspace.metadata.aterm]
 update_channel = "alabsystems/aterm"
 # The channel-signing anchor lives in `aterm-update-core::pins`, NOT here. It was
@@ -78,7 +80,7 @@ update_channel = "alabsystems/aterm"
 # clients verify against were two separately edited values that nothing compared.
 
 [workspace.package]
-version = "0.94.0"
+version = "0.95.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -541,12 +543,11 @@ opt-level = 2
 # Unset, build-override compiles build scripts, proc-macros and their deps at
 # debuginfo 0, while the same crates compiled as ordinary deps get full
 # debuginfo — so a crate reachable both ways (syn, quote, proc-macro2, and all
-# downstream of them) was built in two variants, and `build`, `test`,
-# `test --doc`, the smokes and the drivers in `tools/verify.sh` each rebuilt
-# their own. Measured with `--unit-graph` at 18f19eea6: with this pin the
-# doctest stage (`test --doc --workspace`) needs 3 units beyond
-# `test --workspace --no-run`, all doctest runs and 0 compiles (was 117
-# compiles); the smoke build 22 (was 49); the regex lane 37 (was 57). Only
+# downstream of them) was built in two variants, and the gate's test,
+# doctest, smoke and driver compiles each rebuilt their own. Measured with
+# `--unit-graph` at 18f19eea6: with this pin the doctest stage (`test --doc
+# --workspace`) needs 3 units beyond `test --workspace --no-run`, all doctest
+# runs and 0 compiles (was 117 compiles); the smoke build 22 (was 49). Only
 # debuginfo moves: features, opt-level, debug-assertions and overflow-checks are
 # untouched, so nothing any stage proves changes. One-time cost: an existing
 # target dir rehashes most units once. Pinned by

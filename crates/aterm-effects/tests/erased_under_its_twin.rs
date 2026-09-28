@@ -41,9 +41,9 @@
 //! `a_ctrl_u_right_after_a_whole_command_echoed_at_once_under_its_twin_follows_nothing`,
 //! `a_ctrl_u_right_after_a_paste_under_its_twin_follows_nothing`).
 //!
-//! Every law runs at the HOST seam (`trail_host::Core`, LOCK A): a real
+//! Every law runs at the HOST seam (`trail_host::Core`, the frame hold): a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled
-//! as `app_render.rs`'s LOCK A samples them — the caret row's probe first,
+//! as `app_render.rs`'s frame hold samples them — the caret row's probe first,
 //! then every row `CursorGlow::ribbon_rows` names, read after the batch is
 //! applied — and ticked through `CursorGlow::tick`. The reading is
 //! `(followed, frames the twin row was lit over the next ~1.4 s)`, against
@@ -72,7 +72,7 @@ use trail_host::{Core, LOCK_A, Theme};
 const ROWS: usize = 24;
 const COLS: usize = 80;
 
-/// The host: `trail_host`'s LOCK-A frame seam on a 24×80 grid of 8×16
+/// The host: `trail_host`'s frame-hold seam on a 24×80 grid of 8×16
 /// cells, and this file's input gestures.
 struct Host {
     c: Core,

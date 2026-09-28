@@ -117,17 +117,12 @@ impl FabricVerb {
             Self::Status => None,
             Self::On => Some((
                 "Turn the fabric on?",
-                "Runs `aterm fabric on`: starts the broker under launchd, writes the \
-                 rendezvous file, arms every running aterm and proves the round trip. \
-                 Sessions on this machine can then message each other and be halted \
-                 from the fleet.",
+                "Sessions on this machine can message each other, and the fleet can halt them.",
                 "Turn On",
             )),
             Self::Off => Some((
                 "Turn the fabric off?",
-                "Runs `aterm fabric off`: stops the broker and undoes the parts of \
-                 `aterm fabric on` that change behaviour; the node identity is kept. \
-                 Sessions lose their mail lane until it is turned on again.",
+                "Sessions stop getting messages until you turn it on again.",
                 "Turn Off",
             )),
         }
@@ -217,6 +212,34 @@ pub(crate) fn inbox_markdown(sid: &str, listing: &str) -> String {
     s.push_str("```text\n");
     s.push_str(listing.trim_end());
     s.push_str("\n```\n");
+    s
+}
+
+/// The Show Identity tab's text: a heading, then either the `identities <name>`
+/// reply verbatim in a fenced block, or the sentence for a session with none.
+pub(crate) fn identity_markdown(sid: &str, identity: Option<&str>, reply: Option<&str>) -> String {
+    let mut s = String::with_capacity(256 + reply.map_or(0, str::len));
+    match identity {
+        Some(name) => {
+            s.push_str(&format!("# Identity \u{2014} {name}\n\n"));
+            s.push_str(&format!(
+                "Session {sid} runs under the agent identity `{name}`: its agents keep \
+                 their homes (and logins) in the identity's own directory. Read-only \
+                 (`identities {name}`).\n\n"
+            ));
+            s.push_str("```text\n");
+            s.push_str(reply.unwrap_or("").trim_end());
+            s.push_str("\n```\n");
+        }
+        None => {
+            s.push_str("# Identity \u{2014} none\n\n");
+            s.push_str(&format!(
+                "Session {sid} carries no agent identity: it runs under your own agent \
+                 configuration. File \u{25b8} New Tab With Identity\u{2026} (or `spawn \
+                 identity=<name>`) starts a session that has one.\n"
+            ));
+        }
+    }
     s
 }
 
@@ -417,6 +440,37 @@ impl App {
             Err(e) => self.menu_failure(
                 "inbox",
                 "Couldn't open the inbox",
+                &[&e.to_string(), &path.display().to_string()],
+            ),
+        }
+    }
+
+    /// Window ▸ Show Identity: the focused session's agent identity, READ-ONLY,
+    /// as a Markdown tab — the `identities <name>` reply (its row and agents)
+    /// when the session wears one, a sentence saying it runs under the user's
+    /// own agent configuration when it does not.
+    pub(crate) fn open_session_identity_tab(&mut self, wid: WindowId) {
+        let Some(session) = self.focused_session_id(wid) else {
+            return;
+        };
+        let Some(sid) = self
+            .pool
+            .get(session)
+            .map(|s| s.ctx.self_id.as_str().to_string())
+        else {
+            return;
+        };
+        let identity = self.identity_of_local(session);
+        let reply = identity
+            .as_deref()
+            .map(|name| crate::agent_identity::cmd_identities(&self.store, name));
+        let text = identity_markdown(&sid, identity.as_deref(), reply.as_deref());
+        let path = menu_document_path("identity", &sid);
+        match write_private(&path, &text) {
+            Ok(()) => self.open_menu_document(wid, path),
+            Err(e) => self.menu_failure(
+                "identity",
+                "Show Identity did not open",
                 &[&e.to_string(), &path.display().to_string()],
             ),
         }
@@ -712,6 +766,46 @@ mod tests {
         assert!(row(&app, wid, MenuAction::HoldSession).enabled);
         assert!(!row(&app, wid, MenuAction::LiftHold).enabled);
         let _ = sid;
+    }
+
+    /// Show Identity: a session with no identity opens a tab SAYING so (it runs
+    /// under the user's own agent configuration), read-only, owner-private; the
+    /// markdown for a session that wears one fences the `identities <name>`
+    /// reply verbatim.
+    #[test]
+    fn show_identity_opens_a_read_only_tab_for_the_focused_session() {
+        let (mut app, wid, _sid, ctx) = app_with_stub();
+        app.open_session_identity_tab(wid);
+        let path = app
+            .last_menu_document
+            .clone()
+            .expect("a document was written");
+        let text = std::fs::read_to_string(&path).expect("readable");
+        assert!(text.starts_with("# Identity \u{2014} none\n"), "{text}");
+        assert!(
+            text.contains(&format!(
+                "Session {} carries no agent identity",
+                ctx.self_id.as_str()
+            )),
+            "{text}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the document is the owner's");
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let worn = super::identity_markdown(
+            "s-abc",
+            Some("worker"),
+            Some("OK 2\nworker dir=/x sessions=1 agents=claude:present\nagent=claude\n"),
+        );
+        assert!(worn.starts_with("# Identity \u{2014} worker\n"));
+        assert!(worn.ends_with(
+            "```text\nOK 2\nworker dir=/x sessions=1 agents=claude:present\nagent=claude\n```\n"
+        ));
     }
 
     /// Inbox…: a delivered task appears in the tab's file by id, sender, kind

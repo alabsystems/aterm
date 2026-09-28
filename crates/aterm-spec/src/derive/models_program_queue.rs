@@ -86,3 +86,59 @@ pub fn program_resolver_queue_model() -> Model {
         }
     }
 }
+
+/// One Claude footer resolver watch. Group 1 is the old foreground process,
+/// group 2 its replacement. A stop for group 1 removes only that watch; a
+/// session stop (retire or status-off) removes either. `IdleRead` is enabled
+/// exactly while a watch exists. `Buggy=1` makes the old-group stop erase the
+/// replacement, the stale-stop race the GUI's scheduler must refuse, and makes
+/// the session stop leave its watch behind — the dormant-refresh class a
+/// retired or status-off session read through (`DormantWatchCannotRead`). Both
+/// mutants are branches of LIVE actions, not an action only `Buggy` enables:
+/// `ty --strict-vacuity` credits a dead action only when it alone supplies its
+/// counterexample, and here the stale-stop branch would supply one too.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn claude_footer_watch_model() -> Model {
+    crate::ty_model! {
+        ClaudeFooterWatch {
+            const Buggy = 0;
+            var watch = 0;
+            var asked_old = 0;
+            var asked_new = 0;
+            var old_stopped = 0;
+            var retired = 0;
+
+            action AskOld when (asked_old == 0 && retired == 0) {
+                asked_old = 1;
+                watch = 1;
+            }
+            action AskNew when (asked_old == 1 && asked_new == 0 && retired == 0) {
+                asked_new = 1;
+                watch = 2;
+            }
+            action StopOld when (asked_old == 1 && old_stopped == 0 && retired == 0) {
+                old_stopped = 1;
+                watch = if watch == 1 || Buggy == 1 { 0 } else { watch };
+            }
+            action StopSession when (asked_old == 1 && retired == 0) {
+                retired = 1;
+                // Buggy=1: the dormant-refresh class (`b916d37ff`) — the stop
+                // leaves its watch behind, so a retired session keeps reading.
+                watch = if Buggy == 1 { watch } else { 0 };
+            }
+            action IdleRead when (watch > 0 && retired == 0) {
+                watch = watch;
+            }
+
+            invariant StaleStopKeepsReplacement:
+                if asked_new == 1 && old_stopped == 1 && retired == 0 {
+                    watch == 2
+                } else { watch <= 2 };
+            invariant DormantWatchCannotRead:
+                if retired == 1 || (old_stopped == 1 && asked_new == 0) {
+                    watch == 0
+                } else { watch <= 2 };
+        }
+    }
+}

@@ -152,7 +152,11 @@ fn outcome_title(msg: &Message, how: &Retired, echo: Option<EchoKind>) -> Option
     // replaces it.
     let own_end = msg.finished.as_deref() == Some(msg.title.as_str());
     let words = match Ending::of(msg, how, echo) {
-        Ending::Delivered => msg.finished_words(),
+        // A title the table has no past tense for says `— done`, as its
+        // echo did (ruling 270): never its in-flight words under a ✓.
+        Ending::Delivered => msg
+            .finished_words()
+            .or_else(|| crate::words::done_form(&msg.title)),
         Ending::Stopped | Ending::Ended if own_end => None,
         Ending::Stopped => crate::words::stopped_form(&msg.title),
         Ending::Ended => crate::words::ended_form(&msg.title),
@@ -900,7 +904,17 @@ impl MessageCenter {
 
     fn log_retired(&mut self, row: &Live, how: Retired, echo: Option<EchoKind>, now: Instant) {
         let outcome = outcome_title(&row.msg, &how, echo);
-        let mark = outcome_mark(&row.msg, &how, echo);
+        // A row RESTATED to another mark (an upgrade row answered by the
+        // owner's word, ruling 270: `ℹ`, no longer the stall's `⚠`) retires
+        // under the mark it shows; the outcome's own mark wins where it has
+        // one.
+        let mark = outcome_mark(&row.msg, &how, echo).or_else(|| {
+            let shown = (row.msg.severity, row.msg.glyph);
+            self.log
+                .get(row.id)
+                .is_some_and(|rec| (rec.severity, rec.glyph) != shown)
+                .then_some(shown)
+        });
         let detail: Vec<String> = match Ending::of(&row.msg, &how, echo) {
             // DELIVERED WORK KEEPS NO IN-FLIGHT FRAME (ruling 265): its live
             // title and its last reading (`Updating ALab tools`, `targo ·
@@ -1151,6 +1165,27 @@ impl MessageCenter {
         row.msg.title = title.to_string();
         row.msg.detail = detail.to_vec();
         self.retire_at_with(i, Retired::Withdrawn, None, now);
+        self.rebalance(now);
+        true
+    }
+
+    /// The person ANSWERED the row with a word its reporter confirmed was
+    /// taken (ruling 270): it retires `Answered { label }`, as a `NotNow`
+    /// press does, with no echo — the word is the ending, not delivered work
+    /// (`✓`, `took`) and not a fix. For a row whose capsule's word is
+    /// written off the host's thread and may be refused, so the press
+    /// itself ([`Self::act`]) cannot close it. `false` when no such live row.
+    pub fn answer(&mut self, id: MessageId, label: &str, now: Instant) -> bool {
+        let Some(i) = self.index(id) else {
+            return false;
+        };
+        self.retire_at(
+            i,
+            Retired::Answered {
+                label: label.to_string(),
+            },
+            now,
+        );
         self.rebalance(now);
         true
     }
@@ -2237,6 +2272,9 @@ impl MessageCenter {
     /// measured from it, never from the parent's ingress stamp (design
     /// ruling 204).
     pub fn seed_carried(&mut self, carry: &Carry, wall: WallStamp, now: Instant) {
+        // First, so an id the log mints while adopting (a squatter moved off
+        // a carried number) is above every carried one.
+        self.log.raise_to(carry.next_id);
         for c in &carry.live {
             let (Some(id), Some(severity), Ok(tag), Some(hold)) = (
                 MessageId::from_raw(c.id),
@@ -3948,6 +3986,77 @@ mod tests {
         q.post(busy("Updating to aterm v1"), stamp(9), now);
         q.commit_rows(now, 1);
         assert!(!q.busy_on_glass(), "a queued busy row does not animate");
+    }
+
+    /// ONE ID, ONE RECORD ACROSS THE HANDOFF (ruling 270; round 17 review,
+    /// V3): the successor loads the file's tail before the carry, and a
+    /// collision in it mints an id above the file's top — which can be a
+    /// carried row's id whose Posted line the parent had not flushed yet.
+    /// The carried row takes its number; the other writer's record moves to
+    /// a fresh id above the carry's and keeps its own words and state. The
+    /// parent's record the tail DID hold (same stamp and tag) is re-opened
+    /// in place. NEGATIVE CONTROL: the minted record is not re-opened under
+    /// the carried row's words.
+    #[test]
+    fn a_carried_row_never_reopens_another_writers_record_minted_at_load() {
+        let now = t0();
+        let live = |title: &str, key: &str| {
+            Message::new(tags::TOOLCHAIN, Severity::Info, title)
+                .meter(Meter::busy(""))
+                .hold(Hold::Live {
+                    stale_after: crate::STALE_ANNOUNCE,
+                })
+                .key(key)
+        };
+        let mut parent = fresh(now);
+        let a = parent
+            .post(live("Installing ALab tools", "a"), stamp(1), now)
+            .id;
+        let b = parent.post(live("Indexing docs", "b"), stamp(2), now).id;
+        let c = parent.post(live("Building docs", "c"), stamp(3), now).id;
+        parent.commit_rows(now, 3);
+        let carry = parent.carried();
+        assert!(
+            carry.live.iter().any(|m| m.id == c.raw()),
+            "{:?}",
+            carry.live
+        );
+        let rec = |id: MessageId| parent.log().get(id).cloned().unwrap();
+        // The tail on disk: the parent's a and b, and another writer's own
+        // `b` — a collision, minted at c's number (c is not on disk yet).
+        let other = LogRecord {
+            stamp: stamp(9),
+            title: "Another writer's work".into(),
+            ..rec(b)
+        };
+        let mut log = MessageLog::empty();
+        log.replay_all([
+            LogLine::Posted(rec(a)),
+            LogLine::Posted(rec(b)),
+            LogLine::Posted(other),
+        ]);
+        let squatter = log.records().find(|r| r.stamp == stamp(9)).map(|r| r.id);
+        assert_eq!(squatter, Some(c), "the collision minted the carried id");
+        let mut successor = MessageCenter::new(log, now);
+        successor.seed_carried(&carry, stamp(10), now);
+        let log = successor.log();
+        let mut ids: Vec<u64> = log.records().map(|r| r.id.raw()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), log.len(), "one id, one record");
+        let at_c = log.get(c).unwrap();
+        assert_eq!(at_c.title, "Building docs");
+        assert_eq!(at_c.state, LogState::Posted);
+        let moved = log.records().find(|r| r.stamp == stamp(9)).unwrap();
+        assert_eq!(moved.title, "Another writer's work", "keeps its own words");
+        assert_eq!(moved.state, LogState::Retired(Retired::Stale));
+        assert!(moved.id.raw() >= carry.next_id, "above every carried id");
+        // The parent's own b, which the tail held, is re-opened in place.
+        let at_b = log.get(b).unwrap();
+        assert_eq!(
+            (at_b.title.as_str(), &at_b.state),
+            ("Indexing docs", &LogState::Posted)
+        );
     }
 
     /// THE CARRY KEEPS BUSY, AND COMMIT STILLS WHAT NOBODY RESTATED: a busy

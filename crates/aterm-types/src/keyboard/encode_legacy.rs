@@ -145,7 +145,11 @@ fn encode_control_named_legacy(
             // every app using the universal CR=submit / LF=insert-newline convention
             // (Claude Code, readline, vim, …) honours as a newline — no negotiation, no
             // fake identity. Plain Enter stays CR; Alt keeps Meta-Enter (ESC CR);
-            // Ctrl+Enter stays CR.
+            // Ctrl+Enter stays CR. Under ConPTY win32-input-mode (DEC 9001, the
+            // first arm of `encode_key_with_layout`) the Shift/Ctrl chords never
+            // reach here: conhost reads a bare LF as Ctrl+Enter, so they go out
+            // as a win32 key record whose UnicodeChar is this same LF — the
+            // policy, carried across the pipe.
             if modifiers.contains(Modifiers::ALT) {
                 vec![0x1b, 0x0d]
             } else if modifiers.contains(Modifiers::SHIFT) && !modifiers.contains(Modifiers::CTRL) {
@@ -315,7 +319,10 @@ fn encode_numpad_named_legacy(
         // second Return to the hand on it, and it reaches this arm from the
         // keyboard now (`aterm_winit_keymap::map_numpad_key`), not only from a
         // controller's `key kpenter`; before that seam a physical Shift+KP_Enter
-        // typed LF, and it still must.
+        // typed LF, and it still must. Under ConPTY win32-input-mode (DEC 9001)
+        // a Shift/Ctrl+KP_Enter is routed EARLIER (`encode_key_with_layout`) as
+        // an ENHANCED_KEY win32 record, because conhost reads this arm's bare
+        // LF as Ctrl+Enter.
         NamedKey::NumpadEnter => {
             let effective_app = app_keypad && !modifiers.contains(Modifiers::SHIFT);
             if !effective_app || modifiers.contains(Modifiers::ALT) {

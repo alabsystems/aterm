@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Publish (release spec §7 steps 5–6) + the whole `cut` pipeline: draft-first
-//! one direct GitHub REST draft POST targeting the claim sha → upload every asset once by
-//! immutable release ID under a durable intent →
-//! re-run the pre-flip monotonic check against the client's exact selection
-//! rule → push the annotated tag (late — a failed cut never leaves a public
-//! tag, spec decision 5) → `--draft=false` flip → metadata-archive every
-//! historical exact-name appcast. No
-//! client can ever observe a half-uploaded release. Every step is journaled
-//! in `dist/cut-state.toml` for `--resume`/recut/abandon (spec §5).
+//! Publish (release spec §7 steps 5–6) + the whole `cut` pipeline. A cut publishes
+//! ONCE, straight onto the release channel installed copies read (owner ruling R4,
+//! 2026-09-23; the private-origin draft/flip/archive/verify leg and the mirror that
+//! copied it are gone since 2026-09-26): the annotated tag goes to origin, then
+//! `publish` ([`step_publish`], [`channel::publish_on_channel`]) checks the fleet's
+//! floors, binds the channel's release for this tag — the engine's source prerelease,
+//! adopted, or a draft it creates — uploads every asset once by immutable release ID
+//! under a durable intent with the appcast pair last, proves the exact asset set
+//! byte for byte, checks the floors again and makes the release the head with one
+//! guarded PATCH. No client can ever observe a half-uploaded release. Every step is
+//! journaled in `dist/cut-state.toml` for `--resume`/recut/abandon (spec §5).
 //!
 //! One orchestrator ([`run_cut`]) drives all four cut flavors — real, resume,
 //! `--dry-run`, `--rehearse` — through the SAME step list, so the rehearsal
@@ -33,7 +35,7 @@ use aterm_update_core::tag::TagError;
 
 use crate::ledger::{self, Error, GitCli, GitRunner, Result, RunOut, git_ok, rev_parse};
 use crate::{
-    buildplan, bundle, changelog, dmg, gates, machines, manifest_out, mirror, sign, verify,
+    buildplan, bundle, changelog, channel, dmg, gates, machines, manifest_out, sign, verify,
 };
 
 // ---------------------------------------------------------------------------
@@ -59,8 +61,9 @@ pub struct CutOptions {
     /// Additionally run `tools/verify.sh --full` inline after the gates —
     /// opt-in, never mandatory (spec decisions 15/22).
     pub gate: bool,
-    /// "OWNER/REPO": a full real cut published to a scratch repo with a
-    /// provisional (never-pushed) ledger number (spec decision 17).
+    /// "OWNER/REPO": a full real cut published to a scratch channel with a
+    /// provisional (never-pushed) ledger number (spec decision 17). Like every
+    /// channel an updater is pointed at, it must be public.
     pub rehearse: Option<String>,
     /// Ship a single-arch build (explicit opt-out of universal, decision 18).
     pub arm64_only: bool,
@@ -77,11 +80,11 @@ pub struct CutOptions {
 /// Which cut flavor is running — decided once, checked per step.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CutKind {
-    /// The real thing: claim pushed, publish to origin, tag.
+    /// The real thing: claim pushed, tag pushed to origin, published on the channel.
     Real,
     /// Stop after the self-check; nothing pushed or uploaded anywhere.
     DryRun,
-    /// Publish to the scratch repo; no ledger push, no tag on origin.
+    /// Publish to the scratch channel; no ledger push, no tag on origin.
     Rehearse,
 }
 
@@ -406,12 +409,8 @@ pub fn repo_slug(cargo_toml: &str) -> Option<String> {
     None
 }
 
-/// The PUBLIC update channel (`OWNER/REPO`) for a checkout, from the tracked
-/// `[workspace.metadata.aterm] update_channel`. `Ok(None)` = no public mirror
-/// configured. Resume and recovery re-read it from the worktree rather than the
-/// journal on purpose: it is tracked repository policy at the claim commit, not
-/// per-cut state, and re-reading keeps one answer for the whole pipeline.
-/// `[workspace.package] repository` of the checkout at `repo`, as `OWNER/REPO`.
+/// `[workspace.package] repository` of the checkout at `repo`, as `OWNER/REPO` — the
+/// origin the ledger, the lease, the fence and the tags live on.
 fn workspace_repo_slug(repo: &Path) -> Result<String> {
     let path = repo.join("Cargo.toml");
     let cargo_text = fs::read_to_string(&path)
@@ -424,10 +423,30 @@ fn workspace_repo_slug(repo: &Path) -> Result<String> {
     })
 }
 
-fn workspace_mirror_slug(repo: &Path) -> Result<Option<String>> {
-    let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
-        .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
-    mirror::update_channel_slug(&cargo_text)
+/// THE release channel (`OWNER/REPO`) of the manifest text `cargo_toml`: the tracked
+/// `[workspace.metadata.aterm] update_channel` — the channel every shipped binary
+/// reads — or `[workspace.package] repository` when the key is absent, which is what
+/// the client falls back to as well. Resume and recovery re-read it from the tree
+/// rather than the journal on purpose: it is tracked repository policy at the claim
+/// commit, not per-cut state, and re-reading keeps one answer for the whole pipeline.
+pub fn channel_slug(cargo_toml: &str) -> Result<String> {
+    if let Some(slug) = channel::update_channel_slug(cargo_toml)? {
+        return Ok(slug);
+    }
+    repo_slug(cargo_toml).ok_or_else(|| {
+        Error::new(
+            "Cargo.toml declares no update_channel and its [workspace.package] repository is \
+             not an exact GitHub OWNER/REPO URL",
+        )
+    })
+}
+
+/// [`channel_slug`] of the checkout at `repo`.
+pub fn workspace_channel_slug(repo: &Path) -> Result<String> {
+    let path = repo.join("Cargo.toml");
+    let cargo_text = fs::read_to_string(&path)
+        .map_err(|error| Error::new(format!("read {}: {error}", path.display())))?;
+    channel_slug(&cargo_text)
 }
 
 /// Parse the GitHub repository addressed by an `origin` URL.  Release state is
@@ -468,9 +487,9 @@ pub fn github_slug_from_remote_url(url: &str) -> Result<String> {
 }
 
 /// Bind the git remote used for lease/tag/CAS operations to the Cargo.toml
-/// repository used for GitHub release and archive operations.  This runs
-/// before every real cut/recovery mutation and is intentionally exact (GitHub
-/// may compare names case-insensitively; the release protocol does not).
+/// `[workspace.package] repository`. This runs before every real cut/recovery
+/// mutation and is intentionally exact (GitHub may compare names
+/// case-insensitively; the release protocol does not).
 pub fn assert_origin_repo_binding(git: &dyn GitRunner, expected_slug: &str) -> Result<()> {
     let out = git_ok(git, &["remote", "get-url", "origin"])?;
     let observed = github_slug_from_remote_url(out.stdout_utf8().trim())?;
@@ -498,8 +517,7 @@ pub fn unix_now() -> u64 {
 
 /// The release-org token, read from disk. Without it `cargo ship cut` authenticates
 /// EVERY call with `gh auth token` — the dev account, which has no push on the public
-/// update channel, so the mirror step cannot write there and the cut refuses at
-/// [`preflight_mirror_target`].
+/// release channel, so the cut refuses at [`preflight_channel_target`] before its claim.
 ///
 /// Same file the publication engine reads (`publication/bin/pub` `MIRROR_TOKEN_PATH`,
 /// documented in its `KEYS.md`): one credential for the release org, shared by both
@@ -510,7 +528,7 @@ pub(crate) fn channel_token_path() -> Option<PathBuf> {
 }
 
 /// Read + canonicalize the release-org token. `None` when absent, so a machine
-/// without it keeps the previous behaviour (`gh auth`) and simply cannot mirror.
+/// without it falls back to `gh auth` and simply cannot publish.
 pub(crate) fn channel_token() -> Option<String> {
     let token = fs::read_to_string(channel_token_path()?).ok()?;
     let token = token.trim().to_string();
@@ -519,39 +537,32 @@ pub(crate) fn channel_token() -> Option<String> {
 
 /// Is a channel-scoped credential in force for the current operation?
 ///
-/// Set only by [`ChannelCred`], around work that talks EXCLUSIVELY to the public
-/// channel. `step_mirror` qualifies: it reads its asset bytes from local `dist/`
-/// files and every remote call it makes is against the channel slug, so no private
-/// read can be mis-credentialed by the swap. A blanket process-wide swap would NOT
-/// be safe for a step that also reads the private release.
+/// Set only by [`ChannelCred`], around work whose every `gh` call talks to the release
+/// channel — which, since the cut publishes once, is every release-object call a real
+/// cut, a resume, a recovery, an abandon, a yank, `status` and `verify` make. (The
+/// ledger, the lease, the fence and the tag go through `git`, which never reads it.)
+/// A rehearsal's scratch channel is the operator's own and never enters it.
 static CHANNEL_CRED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// RAII scope: channel credential in force until dropped, including on the error
-/// paths — a `?` inside the scope must not leave the flag set for later private work.
-struct ChannelCred;
+/// paths. Scopes nest — a yank's successor cut runs inside the yank's — so dropping
+/// one restores what was in force when it was entered.
+pub(crate) struct ChannelCred {
+    previous: bool,
+}
 
 impl ChannelCred {
-    fn enter() -> Self {
-        CHANNEL_CRED.store(true, Ordering::SeqCst);
-        Self
+    pub(crate) fn enter() -> Self {
+        Self {
+            previous: CHANNEL_CRED.swap(true, Ordering::SeqCst),
+        }
     }
 }
 
 impl Drop for ChannelCred {
     fn drop(&mut self) {
-        CHANNEL_CRED.store(false, Ordering::SeqCst);
+        CHANNEL_CRED.store(self.previous, Ordering::SeqCst);
     }
-}
-
-/// Run `body` with the public-channel credential in force (RAII, cleared on every
-/// exit path). For callers outside this module that must talk to the channel —
-/// `verify::run_retire_unmirrored` deleting an orphaned public draft — so the call
-/// is authenticated as the release org, not the dev account (which cannot even SEE
-/// a draft on the channel: GitHub answers 404, and the caller would "succeed" by
-/// doing nothing).
-pub(crate) fn with_channel_cred<T>(body: impl FnOnce() -> Result<T>) -> Result<T> {
-    let _cred = ChannelCred::enter();
-    body()
 }
 
 /// The token to authenticate the current call with, or `None` for `gh`'s own auth.
@@ -596,7 +607,7 @@ pub fn gh_retry(args: &[&str]) -> Result<RunOut> {
 /// Mutation retry seam: revalidate the exact process fence immediately before
 /// EVERY attempt, including retries after a timeout/backoff.  A one-time step
 /// entry check would let a rotated stale process wake and mutate later.
-fn gh_retry_guarded(
+pub(crate) fn gh_retry_guarded(
     args: &[&str],
     mut before_each_attempt: impl FnMut() -> Result<()>,
 ) -> Result<RunOut> {
@@ -1995,7 +2006,7 @@ pub fn rotate_publisher_fence_for_recovery(
 }
 
 /// Re-prove both persistent claim ownership and the exact process token before
-/// each visibility/archive mutation.
+/// each release mutation.
 pub fn assert_publisher_session(
     git: &dyn GitRunner,
     lease: &ReleaseLeaseGuard,
@@ -2228,42 +2239,124 @@ pub fn release_completed_session_without_guard(
 /// journal's existence (a journal on disk MEANS the claim is verified);
 /// "build" covers build+bundle+sign+dmg+manifest as one re-enterable unit
 /// (its outputs are all derived from `(version, build_number)` on disk).
+/// `publish` is the ONE publication: the channel release bound, uploaded, proved
+/// and made the head ([`step_publish`]).
 ///
 /// `unlock` is the LAST journaled step: the website follows the cut after the
 /// pipeline, best-effort and unjournaled ([`site_follows_the_cut`]), so a failed
 /// site deploy can never park the journal and refuse the next cut.
-pub const STEPS: [&str; 12] = [
-    "lock",
-    "build",
-    "selfcheck",
-    "draft",
-    "upload",
-    "preflip",
-    "tag",
-    "flip",
-    "archive",
-    "verify",
-    "mirror",
-    "unlock",
-];
+pub const STEPS: [&str; 6] = ["lock", "build", "selfcheck", "tag", "publish", "unlock"];
 
 /// The one journal format this cutter reads and writes: exactly [`STEPS`], and
 /// every authority the current publisher/signing/release-ID protocol records.
 ///
-/// Format 10 (2026-09-24) replaced every earlier one, and the cutter no longer
-/// carries their step lists, defaults or special cases (formats 8 and 9 could end
-/// in a retired `site` step; formats below them walked lists with `cask` or
-/// without `mirror`). [`Journal::load`] refuses any other format in one sentence:
-/// delete the file if that cut finished, or finish it with the cutter that wrote
-/// it.
+/// Format 11 (2026-09-26) is the publish-once cut: the private-origin leg
+/// (`draft`, `upload`, `preflip`, `flip`, `archive`, `verify`) and the `mirror`
+/// that copied it are gone, `publish` replaces both, and the one release capability
+/// the journal holds is the channel's. A step list that changes gets a number no
+/// other cutter has written.
 ///
-/// Why 10 and not 9: this cutter first dropped `site` at 9, and `main` moved to 9
-/// independently, KEEPING `site` — v0.92.0 was cut with `main`'s cutter, and its
-/// finished journal reads `format = 9` with `done` ending in `"unlock", "site"`. One number
-/// naming two step lists let that journal past the format refusal and into
-/// `Journal::validate`'s prefix check, whose error names neither the file nor the
-/// remedy. A step list that changes gets a number no other cutter has written.
-pub const JOURNAL_FORMAT: u32 = 10;
+/// This cutter interprets no other format, and never needs to: every entry point reads
+/// the [`JournalHeader`] every format has written before anything else. A FINISHED
+/// journal of any format is history ([`JournalHeader::finished`]) — a fresh cut clears
+/// it, and `ship status`, `verify` and `yank` pass over it — and an unfinished one is
+/// finished or withdrawn only by the cutter built at its claim commit, to which
+/// `--resume`, `--abandon` and `recover` hand it ([`run_as_the_trees_cutter`]), exactly
+/// as they do a current-format journal whose cutter has moved on. [`Journal::load`]
+/// refuses another format only where nothing handed it over.
+pub const JOURNAL_FORMAT: u32 = 11;
+
+/// The part of a cut journal every format has written — the cut's version, build and
+/// claim commit, and its completed steps — read before anything interprets a step, so
+/// the cutter can decide WHO may act on a journal before it reads one it did not write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalHeader {
+    /// The journal's format; the first format wrote none, and reads as 1.
+    pub format: u32,
+    pub version: String,
+    pub build_number: u64,
+    /// The claim commit — whose cutter finishes the cut.
+    pub commit: String,
+    /// Completed steps, as that format named them.
+    pub done: Vec<String>,
+}
+
+impl JournalHeader {
+    /// Read the header; `Ok(None)` when there is no journal. A file that has no version,
+    /// build or claim commit is no cut journal at all, and is an error.
+    pub fn read(path: &Path) -> Result<Option<Self>> {
+        match read_journal_text(path)? {
+            Some(text) => Self::parse(&text, path).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    fn parse(text: &str, path: &Path) -> Result<Self> {
+        #[derive(Deserialize)]
+        struct Raw {
+            format: Option<u32>,
+            version: Option<String>,
+            build_number: Option<u64>,
+            commit: Option<String>,
+            #[serde(default)]
+            done: Vec<String>,
+        }
+        let raw: Raw = aterm_toml::from_str(text)
+            .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
+        let missing = |field: &str| {
+            Error::new(format!(
+                "{} names no {field}; it is not a cut journal",
+                path.display()
+            ))
+        };
+        Ok(Self {
+            format: raw.format.unwrap_or(1),
+            version: raw.version.ok_or_else(|| missing("version"))?,
+            build_number: raw.build_number.ok_or_else(|| missing("build_number"))?,
+            commit: raw.commit.ok_or_else(|| missing("claim commit"))?,
+            done: raw.done,
+        })
+    }
+
+    /// The cut released its lease and fence: `unlock` is journaled. Every step list any
+    /// format has had ends at `unlock` or runs past it (format 9 kept a `site` step
+    /// after it), so a finished journal of ANY format holds nothing and asks nothing of
+    /// any cutter — it is history.
+    #[must_use]
+    pub fn finished(&self) -> bool {
+        self.done.iter().any(|step| step == "unlock")
+    }
+
+    /// Where an unfinished cut stands, for a refusal: the step it re-enters at — or,
+    /// for another format, whose steps this cutter does not read, its last journaled
+    /// step and the cutter that finishes it.
+    #[must_use]
+    pub fn position(&self) -> String {
+        if self.format == JOURNAL_FORMAT {
+            let next = STEPS
+                .iter()
+                .find(|step| !self.done.iter().any(|done| done == *step))
+                .unwrap_or(&"unlock");
+            return format!("at step \"{next}\"");
+        }
+        format!(
+            "after step \"{}\" by a format-{} cutter — `{CUT_COMMAND} --resume` hands it \
+             to the cutter built at its claim {}",
+            self.done.last().map_or("(none)", String::as_str),
+            self.format,
+            self.commit.get(..12).unwrap_or(&self.commit)
+        )
+    }
+}
+
+/// The journal file's text; `Ok(None)` when it is absent.
+fn read_journal_text(path: &Path) -> Result<Option<String>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::new(format!("read {}: {e}", path.display()))),
+    }
+}
 
 /// The cut journal — everything a re-entry (this machine or, together with
 /// the remote-derived recut, any machine) needs to finish or abandon a cut.
@@ -2289,7 +2382,7 @@ pub struct Journal {
     #[serde(default)]
     pub linux: Option<buildplan::linux::Handoff>,
     /// Whether this cut's uploaded channel manifest has a detached signature.
-    /// Persisted so archive resume enforces the same paired-head invariant.
+    /// Persisted so a resume re-proves the same signed appcast pair.
     #[serde(default)]
     pub manifest_signed: bool,
     /// Monotonic channel policy derived before the ledger claim.  Once any
@@ -2313,8 +2406,7 @@ pub struct Journal {
     /// then tried to verify A's manifest under B's key and failed. The release was
     /// live but unmirrored, `unlock` was never reached, the lease stayed held by the
     /// dead publisher, and no supported command could free it: `--abandon` refuses a
-    /// published release, `--retire-unmirrored` wants the mirror step, `yank` wants a
-    /// finished journal (2026-08-19 round-6 audit).
+    /// published release and `yank` wants a finished journal (2026-08-19 round-6 audit).
     ///
     /// `None` means "the same key this machine signs with", which is every journal a
     /// normal cut writes. Set only by a recovery, and only from the RELEASE's own
@@ -2339,82 +2431,70 @@ pub struct Journal {
     /// secret is ever journaled.
     #[serde(default)]
     pub signature_machine_id: Option<String>,
-    /// Immutable GitHub release object capability. Draft tag names are not
-    /// unique, so every upload/edit/flip/delete after `draft` is pinned to
-    /// this ID and revalidates its tag, target commit, and draft state.
+    /// Immutable GitHub release object capability on the channel: THE release this
+    /// cut publishes onto. Draft tag names are not unique, so every upload, PATCH and
+    /// delete after the bind is pinned to this ID and revalidates its tag and state.
     #[serde(default)]
     pub release_id: Option<u64>,
-    /// Durable one-shot create intent. Set and fsync/rename-persisted before
-    /// the non-idempotent draft POST; if the response/object visibility is
-    /// ambiguous, resume may discover the object but may never POST again.
+    /// Durable one-shot intent for the release itself: persisted before the
+    /// non-idempotent create POST, or before an existing release under this tag is
+    /// ADOPTED (the engine's source prerelease — the object the intent then covers).
+    /// If the response or the object's visibility is ambiguous, resume may discover
+    /// the object but may never POST again.
     #[serde(default)]
-    pub draft_create_issued: bool,
+    pub release_intent: bool,
     /// Exact asset names for which an upload POST has ever been issued. The
     /// set is append-only: an absent name after an ambiguous response may be
     /// eventual consistency, so resume must discover it rather than POSTing a
-    /// duplicate object.
+    /// duplicate object. It is also what `--abandon` withdraws from an adopted
+    /// release: exactly the assets this cut put there.
     #[serde(default)]
     pub upload_intents: Vec<String>,
-    /// Immutable GitHub release object capability on the PUBLIC update channel
-    /// (`[workspace.metadata.aterm] update_channel`). The mirror is a second
-    /// repository with its own object identity, so it gets its own capability
-    /// rather than reusing [`Journal::release_id`].
-    #[serde(default)]
-    pub mirror_release_id: Option<u64>,
-    /// Durable one-shot create intent for the mirrored draft. Same contract as
-    /// [`Journal::draft_create_issued`]: once persisted, an invisible object
-    /// means "discover it", never "POST again" — a duplicate draft on the
-    /// public channel would be ambiguous authority in front of the whole fleet.
-    #[serde(default)]
-    pub mirror_create_issued: bool,
-    /// Exact asset names for which a mirror upload POST has ever been issued.
-    /// Append-only, exactly like [`Journal::upload_intents`].
-    #[serde(default)]
-    pub mirror_upload_intents: Vec<String>,
     /// Completed steps, in completion order (a subset of [`STEPS`]).
     #[serde(default)]
     pub done: Vec<String>,
 }
 
 impl Journal {
-    /// Read the journal; `Ok(None)` when absent. Unparseable is an ERROR (a
-    /// half-written journal must stop resume, not silently restart a cut), and so
-    /// is any format but [`JOURNAL_FORMAT`] — read from the file's header before
-    /// anything else, so an older journal gets its one-sentence refusal rather
-    /// than a parse error about a field it never had.
+    /// Read THIS cutter's journal; `Ok(None)` when absent. Unparseable is an ERROR (a
+    /// half-written journal must stop resume, not silently restart a cut), and so is any
+    /// format but [`JOURNAL_FORMAT`] — read from the [`JournalHeader`] first, so another
+    /// cutter's journal gets its one-sentence refusal rather than a parse error about a
+    /// field it never had. Every entry point that acts on a journal reads the header
+    /// first and hands another format to its own cutter; this refusal is what remains.
     pub fn load(path: &Path) -> Result<Option<Journal>> {
-        let text = match fs::read_to_string(path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::new(format!("read {}: {e}", path.display()))),
+        let Some(text) = read_journal_text(path)? else {
+            return Ok(None);
         };
-        #[derive(Deserialize)]
-        struct Header {
-            format: Option<u32>,
-            version: Option<String>,
-            build_number: Option<u64>,
-            commit: Option<String>,
-        }
-        let header: Header = aterm_toml::from_str(&text)
-            .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
-        if header.format != Some(JOURNAL_FORMAT) {
+        let header = JournalHeader::parse(&text, path)?;
+        if header.format != JOURNAL_FORMAT {
             return Err(Error::new(format!(
                 "{} is a format-{} cut journal (v{} build {}, claim {}) and this cutter reads \
-                 format {JOURNAL_FORMAT} only — delete it if that cut finished, or finish it \
-                 with the cutter that wrote it (aterm-release built at that claim commit).",
+                 format {JOURNAL_FORMAT} only — the cutter built at that claim commit finishes \
+                 or withdraws it (`--resume`, `--abandon` and `recover` hand it over), and a \
+                 finished one is history the next cut clears",
                 path.display(),
-                header.format.unwrap_or(1),
-                header.version.as_deref().unwrap_or("?"),
-                header
-                    .build_number
-                    .map_or_else(|| "?".to_string(), |n| n.to_string()),
-                header.commit.as_deref().unwrap_or("?"),
+                header.format,
+                header.version,
+                header.build_number,
+                header.commit,
             )));
         }
         let journal: Journal = aterm_toml::from_str(&text)
             .map_err(|e| Error::new(format!("parse {}: {e}", path.display())))?;
         journal.validate()?;
         Ok(Some(journal))
+    }
+
+    /// This cutter's journal, or `Ok(None)` — for no journal AND for another cutter's
+    /// format. For the commands that only READ a journal (`ship status`'s neighbours
+    /// `verify` and `yank`'s key lookup): a journal they cannot read vouches for nothing,
+    /// and must not make them fail.
+    pub fn load_if_ours(path: &Path) -> Result<Option<Journal>> {
+        match JournalHeader::read(path)? {
+            Some(header) if header.format == JOURNAL_FORMAT => Self::load(path),
+            _ => Ok(None),
+        }
     }
 
     /// Persist atomically (temp + rename): a crash mid-write must never leave
@@ -2561,77 +2641,38 @@ impl Journal {
                 "release journal marks build complete without its required manifest signature",
             ));
         }
-        if self.is_done("draft") && self.release_id.is_none_or(|id| id == 0) {
-            return Err(Error::new(
-                "release journal marks draft complete without a nonzero immutable GitHub release ID",
-            ));
-        }
-        if self.is_done("draft") && !self.draft_create_issued {
-            return Err(Error::new(
-                "release journal marks draft complete without durable create intent",
-            ));
-        }
-        if self.release_id.is_some() && !self.draft_create_issued {
-            return Err(Error::new(
-                "release journal carries an immutable release ID without durable create intent",
-            ));
-        }
-        Self::validate_upload_intent_set(
-            "",
-            self.release_id,
-            self.draft_create_issued,
-            &self.upload_intents,
-        )?;
-        // The public-channel mirror enforces the private side's capability
-        // invariants: an object ID implies a durable create intent, and
-        // upload intents imply both. A journal that failed these could
+        // The release capability: an object ID implies the durable intent that bound
+        // it, and upload intents imply both. A journal that failed these could
         // authorize a second POST against the channel the whole fleet reads.
-        if self.mirror_release_id.is_some_and(|id| id == 0) {
+        if self.release_id == Some(0) {
+            return Err(Error::new("release journal carries a zero release ID"));
+        }
+        if self.is_done("publish") && self.release_id.is_none() {
             return Err(Error::new(
-                "release journal carries a zero mirror release ID",
+                "release journal marks publish complete without an immutable GitHub release ID",
             ));
         }
-        if self.mirror_release_id.is_some() && !self.mirror_create_issued {
+        if self.release_id.is_some() && !self.release_intent {
             return Err(Error::new(
-                "release journal carries a mirror release ID without durable create intent",
+                "release journal carries an immutable release ID without its durable release intent",
             ));
         }
-        Self::validate_upload_intent_set(
-            "mirror ",
-            self.mirror_release_id,
-            self.mirror_create_issued,
-            &self.mirror_upload_intents,
-        )?;
-        Ok(())
-    }
-
-    /// The shared private/mirror upload-intent invariants: every intent name is
-    /// non-empty, in the exact upload URL alphabet, and unique; any intent at
-    /// all implies the durable draft capability (a persisted release ID and
-    /// create intent). `label` is `""` for the private side, `"mirror "` for
-    /// the channel side.
-    fn validate_upload_intent_set(
-        label: &str,
-        release_id: Option<u64>,
-        create_issued: bool,
-        upload_intents: &[String],
-    ) -> Result<()> {
         let mut intents = std::collections::BTreeSet::new();
-        if upload_intents.iter().any(|name| {
+        if self.upload_intents.iter().any(|name| {
             name.is_empty()
                 || !name
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
                 || !intents.insert(name)
         }) {
-            return Err(Error::new(format!(
-                "release journal {label}upload intents are empty, non-canonical, or duplicated"
-            )));
+            return Err(Error::new(
+                "release journal upload intents are empty, non-canonical, or duplicated",
+            ));
         }
-        if !upload_intents.is_empty() && (release_id.is_none() || !create_issued) {
-            return Err(Error::new(format!(
-                "release journal carries {label}upload intents without its durable {label}draft capability"
-            )));
+        if !self.upload_intents.is_empty() && (self.release_id.is_none() || !self.release_intent) {
+            return Err(Error::new(
+                "release journal carries upload intents without its bound release",
+            ));
         }
         Ok(())
     }
@@ -2713,25 +2754,28 @@ pub enum DraftCleanupDecision {
     RefuseUnknownOrInconsistent,
 }
 
-/// `claim_bound_draft` means the visible draft under this tag targets the very commit
-/// the recovery claim names — the remote's own answer to "is this object mine?".
+/// `claim_bound_draft` means the visible draft under this tag carries nothing but assets
+/// this version publishes ([`channel::binds_to_version`]) — the remote's own answer to
+/// "is this object this claim's?". A channel release carries no claim-commit target to
+/// bind by (the claim lives on origin), so it binds by what it holds, and a draft holding
+/// anything else is someone else's object.
 ///
 /// # A LOST JOURNAL IS NOT AN UNKNOWN OBJECT
 ///
 /// `None` intent is correctly as unsafe as `Some(true)` when nothing else can speak
 /// for the object. But a recovery on a second machine always has `None` (the journal
 /// died with the publisher), and refusing on that alone made the pipeline
-/// unrecoverable rather than merely careful: a publisher that died between
-/// `step_upload` and `step_flip` left a draft no machine could clean and
+/// unrecoverable rather than merely careful: a publisher that died between creating
+/// its draft and publishing it left a draft no machine could clean and
 /// `refs/tags/aterm-release-lease` held by a process that no longer exists. Every
 /// later `cargo ship cut` refused at `preflight_release_lease`, `--abandon` refused
 /// for want of the same journal, and the only remedy was deleting refs by hand.
 ///
-/// When the remote binds the draft to this claim's commit, the missing local intent
-/// adds nothing: that binding is the same one `validate_release_object_capability`
-/// enforces before the delete, and `recover` already requires the operator to have
-/// proven the old publisher exited ([`RECOVERY_STOPPED_PROCESS_FLAG`]). An unbound
-/// draft — someone else's object sitting on this tag — still refuses.
+/// When the remote binds the draft to this claim, the missing local intent adds
+/// nothing: only the lease holder writes this tag's release, the lease names this
+/// claim, and `recover` already requires the operator to have proven the old
+/// publisher exited ([`RECOVERY_STOPPED_PROCESS_FLAG`]). An unbound draft — someone
+/// else's object sitting on this tag — still refuses.
 #[must_use]
 pub const fn draft_cleanup_decision(
     durable_create_intent: Option<bool>,
@@ -3124,8 +3168,8 @@ impl<'a> BodySource<'a> {
 }
 
 impl OneShotPost {
-    /// JSON-body POST (draft creates). `temp_label` distinguishes the
-    /// private/mirror temp directories; `subject` names the request in errors.
+    /// JSON-body POST (the channel draft's create). `temp_label` names the temp
+    /// directory; `subject` names the request in errors.
     fn prepare_json(
         temp_label: &str,
         subject: &str,
@@ -3352,18 +3396,18 @@ pub fn roster_floor_covered(carried: Option<u64>, newest_channel: Option<u64>) -
 }
 
 // ---------------------------------------------------------------------------
-// single-head appcast archive migration (pure plan + injected executor)
+// the channel's appcast listing, for the head-signature replay
 // ---------------------------------------------------------------------------
 
-/// One GitHub release asset relevant to appcast channel migration.
+/// One GitHub release asset relevant to the head-signature replay.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AppcastAsset {
     pub id: u64,
     pub name: String,
 }
 
-/// The relevant assets on one release. Drafts remain represented so planning
-/// can prove they are skipped rather than relying on the API query to hide them.
+/// The appcast assets on one release. Drafts remain represented so the replay can
+/// prove they are skipped rather than relying on the API query to hide them.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AppcastRelease {
     pub release_id: u64,
@@ -3371,25 +3415,6 @@ pub struct AppcastRelease {
     pub draft: bool,
     pub target_commitish: String,
     pub assets: Vec<AppcastAsset>,
-}
-
-/// One reversible metadata-only rename. `id` binds the operation to the same
-/// stored bytes; production changes only the asset's `name` via REST PATCH.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AppcastRename {
-    pub release_id: u64,
-    pub tag: String,
-    pub target_commitish: String,
-    pub id: u64,
-    pub from: String,
-    pub to: String,
-}
-
-/// Injected remote boundary. Production uses GitHub GET + metadata PATCH;
-/// tests use an in-memory implementation that can crash between renames.
-pub trait AppcastArchiveRemote {
-    fn list_releases(&mut self) -> Result<Vec<AppcastRelease>>;
-    fn rename_asset(&mut self, rename: &AppcastRename) -> Result<()>;
 }
 
 fn unique_asset_id(release: &AppcastRelease, name: &str) -> Result<Option<u64>> {
@@ -3401,7 +3426,7 @@ fn unique_asset_id(release: &AppcastRelease, name: &str) -> Result<Option<u64>> 
     let first = ids.next();
     if ids.next().is_some() {
         return Err(Error::new(format!(
-            "release {} has duplicate assets named {name}; refusing an ambiguous archive",
+            "release {} has duplicate assets named {name}; refusing an ambiguous head",
             release.tag
         )));
     }
@@ -3470,256 +3495,17 @@ pub fn canonical_channel_tag_version(tag: &str) -> Result<String> {
     Ok(format!("{major}.{minor}.{patch}"))
 }
 
-/// Establish that the caller still owns the intended channel head before any
-/// historical metadata is touched. A stale v0.2.0 journal must never archive a
-/// subsequently published v0.3.0 head; comparing canonical channel versions is
-/// independent of GitHub's undocumented list order.
-fn prove_archive_authority<'a>(
-    releases: &'a [AppcastRelease],
-    current_tag: &str,
-    current_signature_required: bool,
-) -> Result<&'a AppcastRelease> {
-    let (current_major, current_minor, current_patch) = canonical_channel_tag_order(current_tag)?;
-    let current_order = vec![current_major, current_minor, current_patch];
-    let current: Vec<&AppcastRelease> = releases
-        .iter()
-        .filter(|release| !release.draft && release.tag == current_tag)
-        .collect();
-    if current.len() != 1 {
-        return Err(Error::new(format!(
-            "archive requires exactly one published current release {current_tag}; found {}",
-            current.len()
-        )));
-    }
-    let current = current[0];
-    if unique_asset_id(current, manifest_out::MANIFEST_ASSET)?.is_none() {
-        return Err(Error::new(format!(
-            "published current release {current_tag} does not carry the exact channel head {}",
-            manifest_out::MANIFEST_ASSET
-        )));
-    }
-    if current_signature_required
-        && unique_asset_id(current, manifest_out::MANIFEST_SIG_ASSET)?.is_none()
-    {
-        return Err(Error::new(format!(
-            "signed channel head {current_tag} has no exact {}; refusing to hide every older \
-             signed candidate",
-            manifest_out::MANIFEST_SIG_ASSET
-        )));
-    }
-
-    for release in releases.iter().filter(|release| !release.draft) {
-        let carries_exact = unique_asset_id(release, manifest_out::MANIFEST_ASSET)?.is_some()
-            || unique_asset_id(release, manifest_out::MANIFEST_SIG_ASSET)?.is_some();
-        if carries_exact && release.tag != current_tag {
-            // A retired two-component release can never be newer than a
-            // current-scheme head: it is not on this version line at all. It
-            // is still archived below (its exact asset leaves the client's
-            // discovery surface) — it just does not contest authority.
-            let TagKind::Candidate(release_order) = parse_release_tag(&release.tag)? else {
-                continue;
-            };
-            if release_order >= current_order {
-                return Err(Error::new(format!(
-                    "refusing stale archive for {current_tag}: same-or-newer published channel \
-                     tag {} still carries an exact appcast asset",
-                    release.tag
-                )));
-            }
-        }
-    }
-    Ok(current)
-}
-
-/// Build the complete migration plan BEFORE the first mutation. Existing
-/// archive targets alongside exact-name sources are hard collisions; a source
-/// already absent with its archive target present is a successfully completed
-/// prefix from an interrupted prior run.
-pub fn plan_appcast_archive(
-    releases: &[AppcastRelease],
-    current_tag: &str,
-    current_signature_required: bool,
-) -> Result<Vec<AppcastRename>> {
-    prove_archive_authority(releases, current_tag, current_signature_required)?;
-
-    let mut plan = Vec::new();
-    for release in releases {
-        if release.draft || release.tag == current_tag {
-            continue;
-        }
-        let archived_manifest = manifest_out::archived_manifest_asset(&release.tag);
-        let archived_signature = manifest_out::archived_manifest_signature_asset(&release.tag);
-        for (from, to) in [
-            (manifest_out::MANIFEST_ASSET, archived_manifest.as_str()),
-            (
-                manifest_out::MANIFEST_SIG_ASSET,
-                archived_signature.as_str(),
-            ),
-        ] {
-            let source = unique_asset_id(release, from)?;
-            let target = unique_asset_id(release, to)?;
-            match (source, target) {
-                (Some(_), Some(_)) => {
-                    return Err(Error::new(format!(
-                        "release {} has both {from} and archive target {to}; refusing to \
-                         overwrite a name collision",
-                        release.tag
-                    )));
-                }
-                (Some(id), None) => plan.push(AppcastRename {
-                    release_id: release.release_id,
-                    tag: release.tag.clone(),
-                    target_commitish: release.target_commitish.clone(),
-                    id,
-                    from: from.to_string(),
-                    to: to.to_string(),
-                }),
-                (None, _) => {}
-            }
-        }
-    }
-    Ok(plan)
-}
-
-/// Prove the converged discovery invariant: exactly the current published tag
-/// owns the exact manifest name, and no historical published release retains
-/// the matching exact signature name. Draft assets are intentionally outside
-/// the update channel and remain untouched.
-pub fn prove_single_appcast_head(
-    releases: &[AppcastRelease],
-    current_tag: &str,
-    current_signature_required: bool,
-) -> Result<()> {
-    let current = prove_archive_authority(releases, current_tag, current_signature_required)?;
-    let heads: Vec<&str> = releases
-        .iter()
-        .filter(|release| {
-            !release.draft
-                && release
-                    .assets
-                    .iter()
-                    .any(|asset| asset.name == manifest_out::MANIFEST_ASSET)
-        })
-        .map(|release| release.tag.as_str())
-        .collect();
-    if heads != [current_tag] {
-        return Err(Error::new(format!(
-            "single-head invariant failed: exact {} is published on {:?}, expected only \
-             {current_tag}",
-            manifest_out::MANIFEST_ASSET,
-            heads
-        )));
-    }
-    if current_signature_required
-        && unique_asset_id(current, manifest_out::MANIFEST_SIG_ASSET)?.is_none()
-    {
-        return Err(Error::new(format!(
-            "single-head invariant failed: signed current release {current_tag} has no {}",
-            manifest_out::MANIFEST_SIG_ASSET
-        )));
-    }
-    let stale_signatures: Vec<&str> = releases
-        .iter()
-        .filter(|release| {
-            !release.draft
-                && release.tag != current_tag
-                && release
-                    .assets
-                    .iter()
-                    .any(|asset| asset.name == manifest_out::MANIFEST_SIG_ASSET)
-        })
-        .map(|release| release.tag.as_str())
-        .collect();
-    if !stale_signatures.is_empty() {
-        return Err(Error::new(format!(
-            "single-head invariant failed: historical exact appcast signatures remain on \
-             {stale_signatures:?}"
-        )));
-    }
-    Ok(())
-}
-
-fn prove_renames_preserved_assets(
-    plan: &[AppcastRename],
-    releases: &[AppcastRelease],
-) -> Result<()> {
-    for rename in plan {
-        let release = releases
-            .iter()
-            .find(|release| {
-                !release.draft
-                    && release.release_id == rename.release_id
-                    && release.tag == rename.tag
-                    && release.target_commitish == rename.target_commitish
-            })
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "release {} vanished while archiving appcast asset {}",
-                    rename.tag, rename.id
-                ))
-            })?;
-        let asset = release
-            .assets
-            .iter()
-            .find(|asset| asset.id == rename.id)
-            .ok_or_else(|| {
-                Error::new(format!(
-                    "appcast asset {} on {} vanished instead of being metadata-renamed",
-                    rename.id, rename.tag
-                ))
-            })?;
-        if asset.name != rename.to {
-            return Err(Error::new(format!(
-                "appcast asset {} on {} is named {:?} after PATCH, expected {:?}",
-                rename.id, rename.tag, asset.name, rename.to
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Execute a complete preflighted plan, then re-list and prove both byte-object
-/// preservation (same asset IDs under archive names) and the sole exact head.
-/// A crash leaves the journal at `archive`; the next run plans only the
-/// unfinished suffix because successful metadata renames are already visible.
-///
-/// `current_signature_required` is the release's own epoch policy, never one
-/// derived from published history (that ratchet is retired): signed v0.26
-/// history must not make the unsigned v0.27-v0.54 bootstrap heads impossible to
-/// archive. When signing is configured, callers verify the current
-/// manifest/signature pair under the configured key before this call; an
-/// unsigned channel has no such pair to check.
-pub fn converge_appcast_archive(
-    remote: &mut impl AppcastArchiveRemote,
-    current_tag: &str,
-    current_signature_required: bool,
-) -> Result<usize> {
-    let before = remote.list_releases()?;
-    let plan = plan_appcast_archive(&before, current_tag, current_signature_required)?;
-    for rename in &plan {
-        remote.rename_asset(rename)?;
-    }
-    let after = remote.list_releases()?;
-    prove_renames_preserved_assets(&plan, &after)?;
-    prove_single_appcast_head(&after, current_tag, current_signature_required)?;
-    Ok(plan.len())
-}
-
 const APPCAST_ASSET_LIST_JQ: &str = r#".[] | . as $r |
-    ("aterm-appcast-" + $r.tag_name + ".toml") as $archive |
     {release_id: $r.id,
      tag: $r.tag_name,
      draft: $r.draft,
      target_commitish: $r.target_commitish,
      assets: [$r.assets[]? |
-       select(.name == "aterm-appcast.toml" or
-              .name == "aterm-appcast.toml.sig" or
-              .name == $archive or
-              .name == ($archive + ".sig")) |
+       select(.name == "aterm-appcast.toml" or .name == "aterm-appcast.toml.sig") |
        {id: .id, name: .name}]}
     | @json"#;
 
-/// Parse the bounded GitHub listing used by the production archive remote.
+/// Parse the bounded GitHub listing [`list_appcast_releases`] reads.
 /// Each line represents one release even when it has no relevant assets, so
 /// pagination counts releases rather than assets.
 pub fn parse_appcast_asset_listing(listing: &str) -> Result<Vec<AppcastRelease>> {
@@ -3742,137 +3528,27 @@ pub fn parse_appcast_asset_listing(listing: &str) -> Result<Vec<AppcastRelease>>
     Ok(releases)
 }
 
-struct GhAppcastArchiveRemote<'a> {
-    slug: &'a str,
-    session: Option<ArchivePublisherSession<'a>>,
-}
-
-struct ArchivePublisherSession<'a> {
-    repo: &'a Path,
-    lease: &'a ReleaseLeaseGuard,
-    fence: &'a PublisherFenceGuard,
-}
-
-impl<'a> GhAppcastArchiveRemote<'a> {
-    fn read_only(slug: &'a str) -> Self {
-        Self {
-            slug,
-            session: None,
+/// Every release on `slug` with its exact appcast pair, from a bounded listing.
+fn list_appcast_releases(slug: &str) -> Result<Vec<AppcastRelease>> {
+    const PER_PAGE: usize = 100;
+    const MAX_PAGES: u32 = 10;
+    let mut releases = Vec::new();
+    for page in 1..=MAX_PAGES {
+        let path = format!("repos/{slug}/releases?per_page={PER_PAGE}&page={page}");
+        let out = gh_retry(&["api", &path, "--jq", APPCAST_ASSET_LIST_JQ])?;
+        let page_releases = parse_appcast_asset_listing(&out.stdout_utf8())?;
+        let page_len = page_releases.len();
+        releases.extend(page_releases);
+        if page_len < PER_PAGE {
+            break;
+        }
+        if page == MAX_PAGES {
+            return Err(Error::new(format!(
+                "GitHub release listing reached the {MAX_PAGES}-page safety cap"
+            )));
         }
     }
-
-    fn fenced(
-        slug: &'a str,
-        repo: &'a Path,
-        lease: &'a ReleaseLeaseGuard,
-        fence: &'a PublisherFenceGuard,
-    ) -> Self {
-        Self {
-            slug,
-            session: Some(ArchivePublisherSession { repo, lease, fence }),
-        }
-    }
-
-    fn assert_mutation_fence(&self) -> Result<()> {
-        let session = self.session.as_ref().ok_or_else(|| {
-            Error::new("archive PATCH attempted without a unique publisher session")
-        })?;
-        assert_publisher_session(&GitCli::new(session.repo), session.lease, session.fence)
-    }
-}
-
-impl AppcastArchiveRemote for GhAppcastArchiveRemote<'_> {
-    fn list_releases(&mut self) -> Result<Vec<AppcastRelease>> {
-        const PER_PAGE: usize = 100;
-        const MAX_PAGES: u32 = 10;
-        let mut releases = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let path = format!(
-                "repos/{}/releases?per_page={PER_PAGE}&page={page}",
-                self.slug
-            );
-            let out = gh_retry(&["api", &path, "--jq", APPCAST_ASSET_LIST_JQ])?;
-            let page_releases = parse_appcast_asset_listing(&out.stdout_utf8())?;
-            let page_len = page_releases.len();
-            releases.extend(page_releases);
-            if page_len < PER_PAGE {
-                break;
-            }
-            if page == MAX_PAGES {
-                return Err(Error::new(format!(
-                    "GitHub release listing reached the {MAX_PAGES}-page safety cap; cannot \
-                     prove every published appcast was archived"
-                )));
-            }
-        }
-        Ok(releases)
-    }
-
-    fn rename_asset(&mut self, rename: &AppcastRename) -> Result<()> {
-        let path = format!("repos/{}/releases/assets/{}", self.slug, rename.id);
-        let name = format!("name={}", rename.to);
-        let mut last = String::new();
-        for (attempt, backoff) in [(1u32, 2u64), (2, 5), (3, 0)] {
-            let release = release_object_by_id(self.slug, rename.release_id)?;
-            validate_release_object_capability(
-                release.as_ref(),
-                rename.release_id,
-                &rename.tag,
-                &rename.target_commitish,
-                false,
-            )?;
-            // The endpoint has no If-Match/source-name precondition. Re-read
-            // before every retry, accept our target as timeout convergence,
-            // and reject every third-party name before PATCH.
-            let inventory = release_asset_inventory_for_release_id(self.slug, rename.release_id)?;
-            let observed =
-                release_inventory_asset_name_by_id(&inventory, rename.release_id, rename.id)?;
-            if observed == rename.to {
-                return Ok(());
-            }
-            if observed != rename.from {
-                return Err(Error::new(format!(
-                    "appcast asset {} on {} changed from {:?} to {observed:?} after preflight; \
-                     refusing to overwrite concurrent metadata",
-                    rename.id, rename.tag, rename.from
-                )));
-            }
-            self.assert_mutation_fence()?;
-            let adjacent_release = release_object_by_id(self.slug, rename.release_id)?;
-            validate_release_object_capability(
-                adjacent_release.as_ref(),
-                rename.release_id,
-                &rename.tag,
-                &rename.target_commitish,
-                false,
-            )?;
-            let adjacent_inventory =
-                release_asset_inventory_for_release_id(self.slug, rename.release_id)?;
-            if release_inventory_asset_name_by_id(
-                &adjacent_inventory,
-                rename.release_id,
-                rename.id,
-            )? != rename.from
-            {
-                return Err(Error::new(
-                    "appcast source membership changed immediately before PATCH",
-                ));
-            }
-            self.assert_mutation_fence()?;
-            let out = gh_raw(&["api", "--method", "PATCH", &path, "-f", &name])?;
-            if out.success() {
-                return Ok(());
-            }
-            last = out.stderr_utf8().trim().to_string();
-            if attempt < 3 {
-                std::thread::sleep(std::time::Duration::from_secs(backoff));
-            }
-        }
-        Err(Error::new(format!(
-            "archive PATCH for asset {} failed after 3 fenced attempts: {last}",
-            rename.id
-        )))
-    }
+    Ok(releases)
 }
 
 // ---------------------------------------------------------------------------
@@ -3925,13 +3601,12 @@ pub fn unrostered_signature_policy(material_pubkey: Option<&str>) -> Result<Sign
 ///
 /// * It can only ever fail SPURIOUSLY. Satisfying it — re-signing the roster from the
 ///   paper master — does not change one byte of what the cut will publish, because
-///   `step_mirror` serves the `dist/` bytes that `verify` proved live. So the gate
-///   blocks on a condition whose remedy fixes nothing.
+///   `publish` serves the `dist/` bytes the self-check proved. So the gate blocks on a
+///   condition whose remedy fixes nothing.
 /// * It fires on the path taken when something has ALREADY gone wrong. A roster whose
-///   window lapses between `flip` and `mirror` would otherwise make a cut that is one
-///   upload from done into one that can never be finished, leaving the release live
-///   on the publish repo and absent from the public channel the fleet actually reads,
-///   with the lease still held.
+///   window lapses between `build` and a resumed `publish` would otherwise make a cut
+///   that is one upload from done into one that can never be finished, with the lease
+///   still held.
 /// * It refuses cross-machine recovery outright — the one path designed for a dead
 ///   publisher, in the one design where publishers are plural.
 ///
@@ -4114,8 +3789,8 @@ pub fn verify_detached_manifest_signature(
 
 /// The exact-head signature check, with the asset download injected so the
 /// decision runs without GitHub: exactly one published `head_tag`, carrying the
-/// exact manifest and the exact signature (an archive-name fallback is
-/// forbidden), the signature byte-identical to the local cut artifact when one
+/// exact manifest and the exact signature, the signature byte-identical to the local
+/// cut artifact when one
 /// is given, and valid for `head_manifest` under `pubkey`.
 pub fn verify_channel_head_signature_with(
     releases: &[AppcastRelease],
@@ -4141,12 +3816,13 @@ pub fn verify_channel_head_signature_with(
             manifest_out::MANIFEST_ASSET
         )));
     }
-    let signature_id = unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?.ok_or_else(|| {
-        Error::new(format!(
-            "signed channel head {head_tag} has no exact {}; archive-name fallback is forbidden",
-            manifest_out::MANIFEST_SIG_ASSET
-        ))
-    })?;
+    let signature_id =
+        unique_asset_id(head, manifest_out::MANIFEST_SIG_ASSET)?.ok_or_else(|| {
+            Error::new(format!(
+                "signed channel head {head_tag} has no exact {}",
+                manifest_out::MANIFEST_SIG_ASSET
+            ))
+        })?;
     let head_signature = fetch_asset(
         head.release_id,
         signature_id,
@@ -4167,7 +3843,7 @@ pub fn verify_channel_head_signature_with(
     })
 }
 
-/// Live wrapper used by both cut-final verification and `cargo ship verify`.
+/// Live wrapper used by `cargo ship verify` and a yank's successor proof.
 ///
 /// Tier REPO model: with no configured/journaled update key the channel is
 /// unsigned and published signature history NEVER forces a signed successor.
@@ -4175,7 +3851,6 @@ pub fn verify_channel_head_signature_with(
 /// it (and byte-compared against the local cut artifact during a live cut) by
 /// [`verify_channel_head_signature_with`], over a snapshot-bound download.
 pub fn verify_live_channel_head_signature(
-    _repo: &Path,
     slug: &str,
     head_tag: &str,
     head_manifest: &[u8],
@@ -4188,8 +3863,7 @@ pub fn verify_live_channel_head_signature(
         return Ok(false);
     };
     let pubkey = canonical_update_pubkey(journal_pubkey)?;
-    let mut remote = GhAppcastArchiveRemote::read_only(slug);
-    let releases = remote.list_releases()?;
+    let releases = list_appcast_releases(slug)?;
     verify_channel_head_signature_with(
         &releases,
         head_tag,
@@ -5620,24 +5294,6 @@ pub fn release_asset_inventory_for_release_id(
     Ok(inventory)
 }
 
-pub fn release_inventory_asset_name_by_id(
-    inventory: &[ReleaseAssetInventoryEntry],
-    release_id: u64,
-    asset_id: u64,
-) -> Result<String> {
-    let matches: Vec<&ReleaseAssetInventoryEntry> = inventory
-        .iter()
-        .filter(|asset| asset.id == asset_id)
-        .collect();
-    let [asset] = matches.as_slice() else {
-        return Err(Error::new(format!(
-            "release ID {release_id} contains {} assets with immutable ID {asset_id}; expected exactly one",
-            matches.len()
-        )));
-    };
-    Ok(asset.name.clone())
-}
-
 /// Refuse a manifest that still names the RETIRED Intel DMG pair
 /// (`dmg_x86_64` / `dmg_x86_64_sha256`, retired 2026-08-26 with the
 /// batteries-included seed).
@@ -5660,120 +5316,6 @@ pub fn refuse_retired_intel_dmg(manifest: &Manifest) -> Result<()> {
                 .dmg_x86_64
                 .as_deref()
                 .unwrap_or("<digest without a name>")
-        )));
-    }
-    Ok(())
-}
-
-/// The exact asset set a draft may carry before it is allowed to become visible.
-///
-/// `roster_attached` is derived from the MANIFEST's own `machine_id`, not from a
-/// local flag, at every call site: a release whose appcast claims a machine must
-/// carry the roster that proves it, and a release whose appcast claims none must not
-/// carry a roster at all. Deriving it from the published bytes is what keeps this a
-/// total check — the draft is judged by what it says about itself.
-pub fn validate_draft_asset_set(
-    names: &[String],
-    manifest: &Manifest,
-    signature_required: bool,
-    provenance_name: &str,
-    dsym_name: Option<&str>,
-) -> Result<()> {
-    let roster_attached = manifest.machine_id.is_some();
-    let linux_assets = buildplan::linux::manifest_asset_names(manifest)?;
-    let count = |name: &str| {
-        names
-            .iter()
-            .filter(|observed| observed.as_str() == name)
-            .count()
-    };
-    // The manifest is the authority for the zip exactly as it is for the DMG: a
-    // manifest that names a container the release does not carry would publish a
-    // head every client resolves and then fails to download. Each container
-    // carries its `.sha256` sidecar — the record the release notes tell a human
-    // to verify the download against.
-    let dmg_sidecar = mirror::sha256_sidecar_name(&manifest.dmg);
-    let zip_sidecar = manifest.zip.as_deref().map(mirror::sha256_sidecar_name);
-    // RETIRED 2026-08-26: the Intel `dmg_x86_64` pair. This cutter emits
-    // neither wire key, so a manifest naming one is not this cutter's — refuse
-    // before judging the draft against a container shape that no longer ships.
-    refuse_retired_intel_dmg(manifest)?;
-    let mut exact_counts = vec![
-        (manifest_out::MANIFEST_ASSET, 1usize),
-        (
-            manifest_out::MANIFEST_SIG_ASSET,
-            usize::from(signature_required),
-        ),
-        (manifest.dmg.as_str(), 1usize),
-        (dmg_sidecar.as_str(), 1usize),
-        (provenance_name, 1usize),
-        (roster::ROSTER_ASSET, usize::from(roster_attached)),
-        (roster::ROSTER_SIG_ASSET, usize::from(roster_attached)),
-    ];
-    exact_counts.extend(linux_assets.iter().map(|name| (name.as_str(), 1usize)));
-    if let Some(zip) = manifest.zip.as_deref() {
-        exact_counts.push((zip, 1usize));
-    }
-    if let Some(sidecar) = zip_sidecar.as_deref() {
-        exact_counts.push((sidecar, 1usize));
-    }
-    for (name, expected) in exact_counts {
-        let observed = count(name);
-        if observed != expected {
-            return Err(Error::new(format!(
-                "draft artifact set carries {observed} assets named {name:?}; expected {expected}"
-            )));
-        }
-    }
-    let mut dmgs: Vec<&str> = names
-        .iter()
-        .filter(|name| name.ends_with(".dmg"))
-        .map(String::as_str)
-        .collect();
-    dmgs.sort_unstable();
-    // ONE DMG: the manifest-named one, nothing else.
-    let expected_dmgs: Vec<&str> = vec![manifest.dmg.as_str()];
-    if dmgs != expected_dmgs {
-        return Err(Error::new(format!(
-            "draft artifact set has non-canonical DMG names {dmgs:?}; expected exactly \
-             {expected_dmgs:?}"
-        )));
-    }
-    let mut allowed = vec![
-        manifest_out::MANIFEST_ASSET,
-        manifest.dmg.as_str(),
-        dmg_sidecar.as_str(),
-        provenance_name,
-    ];
-    allowed.extend(linux_assets.iter().map(String::as_str));
-    if let Some(zip) = manifest.zip.as_deref() {
-        allowed.push(zip);
-    }
-    if let Some(sidecar) = zip_sidecar.as_deref() {
-        allowed.push(sidecar);
-    }
-    if signature_required {
-        allowed.push(manifest_out::MANIFEST_SIG_ASSET);
-    }
-    if roster_attached {
-        allowed.push(roster::ROSTER_ASSET);
-        allowed.push(roster::ROSTER_SIG_ASSET);
-    }
-    if let Some(dsym) = dsym_name {
-        allowed.push(dsym);
-    }
-    for observed in names {
-        if !allowed.contains(&observed.as_str()) {
-            return Err(Error::new(format!(
-                "draft artifact set carries unexpected asset {observed:?}; stale build/debug assets cannot become visible"
-            )));
-        }
-    }
-    if names.len() != allowed.len() {
-        return Err(Error::new(format!(
-            "draft artifact set has {} objects, expected exact allowed set of {}",
-            names.len(),
-            allowed.len()
         )));
     }
     Ok(())
@@ -5988,8 +5530,8 @@ fn verify_release_asset_digest_inner(
         }
         if let Some(destination) = retain_at {
             // Recovery intentionally replaces a stale dist artifact atomically
-            // with the exact-ID bytes just verified above. Subsequent archive,
-            // self-check, and post-publish verification re-read this path.
+            // with the exact-ID bytes just verified above. `publish` re-reads this
+            // path.
             fs::rename(&temp_asset, destination).map_err(|error| {
                 Error::new(format!(
                     "retain verified release asset at {}: {error}",
@@ -6349,8 +5891,9 @@ pub fn stage_manifest(
 /// `None` — a FORK's cut, or one of this tree's from before 2026-08-15, when this doc
 /// still called it "the shipped state" — writes nothing and removes nothing, so an unarmed
 /// cut's `dist/` is exactly what it was. There is no "clean up a stale roster" branch
-/// on purpose: `validate_draft_asset_set` refuses any asset outside the exact allowed
-/// set, so a leftover file in `dist/` cannot become a published asset.
+/// on purpose: `publish` uploads only the names `CutCtx::channel_asset_names` derives,
+/// and `channel::validate_channel_asset_set` refuses any asset outside that exact set,
+/// so a leftover file in `dist/` cannot become a published asset.
 pub fn stage_roster_assets(dist: &Path, document: Option<&machines::RosterDocument>) -> Result<()> {
     let Some(document) = document else {
         return Ok(());
@@ -6389,8 +5932,8 @@ pub struct ExpectedReleaseIdentity<'a> {
     pub commit: &'a str,
 }
 
-/// Validate the exact bytes about to become archive authority.  This is a
-/// pure seam used by normal publish, killed-machine reconstruction, and
+/// Validate a published release's exact appcast pair before a lost machine's
+/// recovery reconstructs a journal from it. A pure seam, shared with its
 /// negative-control tests.  Metadata equality alone is insufficient: the
 /// local and live manifest/signature byte strings must match exactly.
 pub fn validate_live_release_identity(
@@ -6428,7 +5971,7 @@ pub fn validate_live_release_identity(
             expected.commit
         )));
     }
-    let expected_dmg = mirror::dmg_asset_name(expected.version);
+    let expected_dmg = channel::dmg_asset_name(expected.version);
     if manifest.dmg != expected_dmg {
         return Err(Error::new(format!(
             "published manifest names DMG {:?}, expected exact {expected_dmg:?}",
@@ -6438,7 +5981,7 @@ pub fn validate_live_release_identity(
     // The zip stays OPTIONAL on the wire (a release cut before zip staging has
     // none), but a manifest that names one must name the canonical one: the
     // client derives this same string from the tag and refuses anything else.
-    let expected_zip = mirror::zip_asset_name(expected.version);
+    let expected_zip = channel::zip_asset_name(expected.version);
     if let Some(zip) = manifest.zip.as_deref()
         && zip != expected_zip
     {
@@ -6576,7 +6119,11 @@ pub struct CutCtx {
     pub tree: PathBuf,
     pub dist: PathBuf,
     pub journal_path: PathBuf,
-    /// Publish target ("owner/repo") — origin, or the rehearsal scratch repo.
+    /// THE release channel this cut publishes onto ("owner/repo"): the tracked
+    /// `[workspace.metadata.aterm] update_channel` (`[workspace.package] repository`
+    /// when it is absent) for a real cut, the scratch channel for a rehearsal. The
+    /// ledger, the lease, the fence and the tag live on `origin`; the one release
+    /// object lives here.
     pub slug: String,
     pub version: String,
     pub tag: String,
@@ -6613,19 +6160,13 @@ pub struct CutCtx {
     /// [`resume_apple_tier`] applies to the Developer-ID certificate.
     pub attribution: Option<roster::Attribution>,
     pub roster: Option<machines::RosterDocument>,
-    /// Immutable GitHub release object ID, persisted in the real-cut journal
-    /// as soon as draft creation is observed.
+    /// The channel release's immutable GitHub ID, persisted in the real-cut journal
+    /// the moment it is bound ([`Journal::release_id`]).
     pub release_id: Option<u64>,
-    pub draft_create_issued: bool,
+    /// [`Journal::release_intent`].
+    pub release_intent: bool,
+    /// [`Journal::upload_intents`].
     pub upload_intents: Vec<String>,
-    /// The PUBLIC update channel this cut mirrors to, from the tracked
-    /// `[workspace.metadata.aterm] update_channel`. `None` = no public mirror
-    /// is configured (clients then read [`CutCtx::slug`] directly) and the
-    /// `mirror` step is an announced no-op.
-    pub mirror_slug: Option<String>,
-    pub mirror_release_id: Option<u64>,
-    pub mirror_create_issued: bool,
-    pub mirror_upload_intents: Vec<String>,
     pub kind: CutKind,
     /// `--no-paint-smoke`, carried to `step_selfcheck`. Never journaled: a
     /// resume re-earns the paint proof (and the CLI refuses the flag there,
@@ -6654,38 +6195,41 @@ impl CutCtx {
                 .collect()
         })
     }
-    fn linux_asset_paths(&self) -> Vec<PathBuf> {
-        self.linux.as_ref().map_or_else(Vec::new, |handoff| {
-            handoff
-                .artifacts
-                .iter()
-                .map(|artifact| self.dist.join(&artifact.asset))
-                .collect()
-        })
-    }
 
-    fn mirror_asset_names(&self) -> Vec<String> {
-        let mut names = mirror::required_asset_names(
+    /// EXACTLY the asset set this cut's channel release carries (beside the engine's
+    /// source attestation pair), sorted: the client set and the native Linux
+    /// executables — never the debugging aids, which stay in `dist/` (see `channel`'s
+    /// module note). The upload set and the acceptance rule are both read from here, so
+    /// they cannot drift apart.
+    fn channel_asset_names(&self) -> Vec<String> {
+        let mut names = channel::required_asset_names(
             &self.version,
             self.signature_required,
             self.attaches_roster(),
         );
-        names.extend(self.linux_asset_paths().iter().filter_map(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .map(str::to_string)
-        }));
+        names.extend(self.linux_asset_names());
         names.sort();
         names
     }
 
+    /// [`channel::validate_channel_asset_set`] of `names` against this cut's set.
+    fn validate_channel_assets(&self, names: &[String]) -> Result<()> {
+        channel::validate_channel_asset_set(
+            names,
+            &self.version,
+            self.signature_required,
+            self.attaches_roster(),
+            &self.linux_asset_names(),
+        )
+    }
+
     fn dmg_path(&self) -> PathBuf {
-        self.dist.join(mirror::dmg_asset_name(&self.version))
+        self.dist.join(channel::dmg_asset_name(&self.version))
     }
     /// The updater container (`ditto` zip). Same bundle as the DMG, staged
     /// without `hdiutil` — see `dmg::create_zip`.
     fn zip_path(&self) -> PathBuf {
-        self.dist.join(mirror::zip_asset_name(&self.version))
+        self.dist.join(channel::zip_asset_name(&self.version))
     }
     /// What PUBLISHED bytes must verify under. Falls back to this machine's own
     /// signing key, which is the same value on every cut that is not recovering
@@ -6705,38 +6249,40 @@ impl CutCtx {
     /// in-process digest, verified against the manifest by `step_selfcheck`.
     fn dmg_sha256_path(&self) -> PathBuf {
         self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::dmg_asset_name(
+            .join(channel::sha256_sidecar_name(&channel::dmg_asset_name(
                 &self.version,
             )))
     }
     fn zip_sha256_path(&self) -> PathBuf {
         self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::zip_asset_name(
+            .join(channel::sha256_sidecar_name(&channel::zip_asset_name(
                 &self.version,
             )))
     }
     /// The stable download twins in dist/ — `aterm.dmg` / `aterm-mac.zip`,
     /// byte copies of the canonical containers. Staged by `step_build` from
     /// the FINAL packaged bytes; re-proved (and, on a pre-twin journal's
-    /// resume, regenerated) by `step_selfcheck`; served to the public channel
-    /// through `mirror_asset_paths`.
+    /// resume, regenerated) by `step_selfcheck`; published through
+    /// `channel_asset_paths`.
     fn stable_dmg_path(&self) -> PathBuf {
-        self.dist.join(mirror::stable_dmg_asset_name())
+        self.dist.join(channel::stable_dmg_asset_name())
     }
     fn stable_zip_path(&self) -> PathBuf {
-        self.dist.join(mirror::stable_zip_asset_name())
+        self.dist.join(channel::stable_zip_asset_name())
     }
     /// The twins' `.sha256` sidecars — the SAME digests the versioned sidecars
     /// state, with the ALIAS filename embedded, because `shasum -a 256 -c`
     /// matches on the embedded name and a `releases/latest/download/...` click
     /// saves the alias name.
     fn stable_dmg_sha256_path(&self) -> PathBuf {
-        self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::stable_dmg_asset_name()))
+        self.dist.join(channel::sha256_sidecar_name(
+            &channel::stable_dmg_asset_name(),
+        ))
     }
     fn stable_zip_sha256_path(&self) -> PathBuf {
-        self.dist
-            .join(mirror::sha256_sidecar_name(&mirror::stable_zip_asset_name()))
+        self.dist.join(channel::sha256_sidecar_name(
+            &channel::stable_zip_asset_name(),
+        ))
     }
     fn manifest_path(&self) -> PathBuf {
         self.dist.join(manifest_out::MANIFEST_ASSET)
@@ -6745,10 +6291,8 @@ impl CutCtx {
         self.dist.join(format!("notes-{}.md", self.version))
     }
     fn provenance_path(&self) -> PathBuf {
-        self.dist.join(format!("aterm-{}-build.txt", self.version))
-    }
-    fn dsym_zip_path(&self) -> PathBuf {
-        self.dist.join(format!("aterm-{}-dSYM.zip", self.version))
+        self.dist
+            .join(channel::provenance_asset_name(&self.version))
     }
 
     fn is_done(&self, step: &str) -> bool {
@@ -6765,14 +6309,14 @@ impl CutCtx {
     fn bind_release_id(&mut self, id: u64) -> Result<()> {
         if id == 0 || self.release_id.is_some_and(|current| current != id) {
             return Err(Error::new(
-                "GitHub release ID is zero or differs from the already-bound draft capability",
+                "GitHub release ID is zero or differs from the already-bound release capability",
             ));
         }
         self.release_id = Some(id);
         if let Some(journal) = &mut self.journal {
             if journal.release_id.is_some_and(|current| current != id) {
                 return Err(Error::new(
-                    "journaled GitHub release ID differs from the observed draft capability",
+                    "journaled GitHub release ID differs from the observed release capability",
                 ));
             }
             journal.release_id = Some(id);
@@ -6781,37 +6325,41 @@ impl CutCtx {
         Ok(())
     }
 
-    /// Undo [`Self::persist_draft_create_intent`] for the one outcome that proves the
-    /// POST created nothing: the server answered it with a 4xx
-    /// ([`server_refused_without_creating`]). Not a general "clear the flag" — there is
-    /// deliberately no caller for that, because every other failure can hide a
-    /// delivered request.
-    pub(crate) fn release_draft_create_intent(&mut self) -> Result<()> {
-        self.draft_create_issued = false;
-        if let Some(journal) = &mut self.journal {
-            journal.draft_create_issued = false;
-            journal.save(&self.journal_path)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn persist_draft_create_intent(&mut self) -> Result<DurablePostPermit> {
-        if self.draft_create_issued {
+    /// Persist the durable release intent — before the one create POST, or before a
+    /// visible release under this tag is adopted — and mint the one permit that POST
+    /// consumes. An adoption leaves the permit unused: nothing will POST, the visible
+    /// release IS the object the intent covers.
+    pub(crate) fn persist_release_intent(&mut self) -> Result<DurablePostPermit> {
+        if self.release_intent {
             return Err(Error::new(
-                "draft create intent already exists; refusing to mint another process-local POST permit",
+                "release intent already exists; refusing to mint another process-local POST permit",
             ));
         }
         if self.kind == CutKind::Real && self.journal.is_none() {
             return Err(Error::new(
-                "real draft create has no durable journal; refusing to mint a POST permit",
+                "real release bind has no durable journal; refusing to mint a POST permit",
             ));
         }
-        self.draft_create_issued = true;
+        self.release_intent = true;
         if let Some(journal) = &mut self.journal {
-            journal.draft_create_issued = true;
+            journal.release_intent = true;
             journal.save(&self.journal_path)?;
         }
         Ok(DurablePostPermit(()))
+    }
+
+    /// Undo [`Self::persist_release_intent`] for the one outcome that proves the create
+    /// POST created nothing: the server answered it with a 4xx
+    /// ([`server_refused_without_creating`]). Not a general "clear the flag" — there is
+    /// deliberately no caller for that, because every other failure can hide a
+    /// delivered request.
+    pub(crate) fn release_release_intent(&mut self) -> Result<()> {
+        self.release_intent = false;
+        if let Some(journal) = &mut self.journal {
+            journal.release_intent = false;
+            journal.save(&self.journal_path)?;
+        }
+        Ok(())
     }
 
     fn upload_intent_issued(&self, name: &str) -> bool {
@@ -6861,104 +6409,9 @@ impl CutCtx {
         Ok(())
     }
 
-    fn required_release_id(&self, operation: &str) -> Result<u64> {
-        self.release_id.filter(|id| *id != 0).ok_or_else(|| {
-            Error::new(format!(
-                "{operation} has no immutable GitHub release ID capability"
-            ))
-        })
-    }
-
-    // --- public-channel mirror capabilities --------------------------------
-    // Deliberate twins of the private-side methods above rather than a shared
-    // generic: the two repositories must never share an intent set, or a
-    // converged upload on one would silently authorize a POST on the other.
-
-    fn bind_mirror_release_id(&mut self, id: u64) -> Result<()> {
-        if id == 0 || self.mirror_release_id.is_some_and(|current| current != id) {
-            return Err(Error::new(
-                "mirror release ID is zero or differs from the already-bound draft capability",
-            ));
-        }
-        self.mirror_release_id = Some(id);
-        if let Some(journal) = &mut self.journal {
-            if journal
-                .mirror_release_id
-                .is_some_and(|current| current != id)
-            {
-                return Err(Error::new(
-                    "journaled mirror release ID differs from the observed draft capability",
-                ));
-            }
-            journal.mirror_release_id = Some(id);
-            journal.save(&self.journal_path)?;
-        }
-        Ok(())
-    }
-
-    fn persist_mirror_create_intent(&mut self) -> Result<DurablePostPermit> {
-        if self.mirror_create_issued {
-            return Err(Error::new(
-                "mirror create intent already exists; refusing to mint another process-local POST permit",
-            ));
-        }
-        if self.kind == CutKind::Real && self.journal.is_none() {
-            return Err(Error::new(
-                "real mirror create has no durable journal; refusing to mint a POST permit",
-            ));
-        }
-        self.mirror_create_issued = true;
-        if let Some(journal) = &mut self.journal {
-            journal.mirror_create_issued = true;
-            journal.save(&self.journal_path)?;
-        }
-        Ok(DurablePostPermit(()))
-    }
-
-    fn mirror_upload_intent_issued(&self, name: &str) -> bool {
-        self.mirror_upload_intents
-            .iter()
-            .any(|issued| issued == name)
-    }
-
-    fn persist_mirror_upload_intent(&mut self, name: &str) -> Result<DurablePostPermit> {
-        if self.mirror_upload_intent_issued(name) {
-            return Err(Error::new(format!(
-                "mirror upload intent for {name} already exists; refusing to mint another process-local POST permit"
-            )));
-        }
-        if self.kind == CutKind::Real && self.journal.is_none() {
-            return Err(Error::new(
-                "real mirror upload has no durable journal; refusing to mint a POST permit",
-            ));
-        }
-        self.mirror_upload_intents.push(name.to_string());
-        if let Some(journal) = &mut self.journal {
-            journal.mirror_upload_intents.push(name.to_string());
-            journal.save(&self.journal_path)?;
-        }
-        Ok(DurablePostPermit(()))
-    }
-
-    /// The mirror twin of [`Self::retract_upload_intent`], under the same rule and
-    /// for the same reason: only a POST that never reached the network.
-    fn retract_mirror_upload_intent(&mut self, name: &str) -> Result<()> {
-        self.mirror_upload_intents.retain(|issued| issued != name);
-        if let Some(journal) = &mut self.journal {
-            journal
-                .mirror_upload_intents
-                .retain(|issued| issued != name);
-            journal.save(&self.journal_path)?;
-        }
-        Ok(())
-    }
-
-    /// Local paths of exactly the assets that cross to the public channel, in a
-    /// stable order. Derived from the same [`mirror::required_asset_names`] the
-    /// remote listing is checked against, so the upload set and the acceptance
-    /// rule cannot drift apart.
-    fn mirror_asset_paths(&self) -> Vec<PathBuf> {
-        self.mirror_asset_names()
+    /// Local paths of exactly the assets this cut publishes, in a stable order.
+    fn channel_asset_paths(&self) -> Vec<PathBuf> {
+        self.channel_asset_names()
             .into_iter()
             .map(|name| self.dist.join(name))
             .collect()
@@ -6972,64 +6425,6 @@ impl CutCtx {
     /// which has the assets on disk and no document in hand.
     fn attaches_roster(&self) -> bool {
         self.signature_machine_id.is_some()
-    }
-
-    /// The two roster assets in `dist/`, or nothing at all on an UNATTRIBUTED cut — a
-    /// fork's, or a resume past `build`. WRONG BEFORE: "on the shipped path"; this tree's
-    /// cuts have attributed since the master was armed on 2026-08-15.
-    fn roster_asset_paths(&self) -> Vec<PathBuf> {
-        if !self.attaches_roster() {
-            return Vec::new();
-        }
-        vec![
-            self.dist.join(roster::ROSTER_ASSET),
-            self.dist.join(roster::ROSTER_SIG_ASSET),
-        ]
-    }
-
-    /// Every local artifact that must reach the DRAFT release, in upload order.
-    ///
-    /// A named set rather than a `vec![]` inside `step_upload` because the roster's
-    /// membership in it is a fleet-safety property with no other test: an armed client
-    /// refuses a release carrying no `aterm-machines.toml` structurally, before any
-    /// artifact crypto, and the updater has no fallback to an older release — so a
-    /// regression that silently stopped attaching the pair would publish a well-formed
-    /// release that wedges the fleet, and nothing would fail.
-    fn upload_asset_paths(&self) -> Vec<PathBuf> {
-        let mut files = vec![
-            self.dmg_path(),
-            self.dmg_sha256_path(),
-            self.zip_path(),
-            self.zip_sha256_path(),
-            self.manifest_path(),
-            self.provenance_path(),
-        ];
-        files.extend(self.roster_asset_paths());
-        files.extend(self.linux_asset_paths());
-        files
-    }
-
-    /// Every local artifact whose bytes the draft proof compares against the remote
-    /// object, minus the dSYM (which is present only when the build produced one).
-    ///
-    /// The roster has to be in here and not merely in the asset-NAME check: the
-    /// appcast's signature does not cover it — the master's does — so nothing else in
-    /// that proof would notice a roster replaced remotely between upload and flip.
-    fn proof_asset_paths(&self) -> Vec<PathBuf> {
-        let mut files = vec![
-            self.manifest_path(),
-            self.dmg_path(),
-            self.dmg_sha256_path(),
-            self.zip_path(),
-            self.zip_sha256_path(),
-            self.provenance_path(),
-        ];
-        if self.signature_required {
-            files.push(self.manifest_path().with_extension("toml.sig"));
-        }
-        files.extend(self.roster_asset_paths());
-        files.extend(self.linux_asset_paths());
-        files
     }
 
     /// WHICH fingerprint the shipped binary must prove it compiled in.
@@ -7115,96 +6510,6 @@ pub fn assert_remote_annotated_tag_commit(
             "published release tag {tag} peels to {}, not manifest claim {expected_commit}",
             observed.commit
         )));
-    }
-    Ok(())
-}
-
-/// Bind historical published manifests to their exact remote tag refs in one
-/// bounded round trip. Current releases are annotated; legacy releases may be
-/// lightweight, in which case the direct ref itself must equal the manifest
-/// commit. This is deliberately separate from the annotated-only mutation and
-/// recovery helpers above.
-pub fn assert_remote_historical_tag_commits(
-    git: &dyn GitRunner,
-    expected: &[(&str, &str)],
-) -> Result<()> {
-    if expected.is_empty() {
-        return Ok(());
-    }
-    let mut expected_by_tag = std::collections::BTreeMap::new();
-    for &(tag, commit) in expected {
-        if tag.is_empty() || commit.is_empty() {
-            return Err(Error::new(
-                "historical tag binding contains an empty tag or commit",
-            ));
-        }
-        if expected_by_tag
-            .insert(tag.to_string(), commit.to_string())
-            .is_some()
-        {
-            return Err(Error::new(format!(
-                "historical tag binding contains duplicate tag {tag}"
-            )));
-        }
-    }
-
-    let mut query_refs = Vec::with_capacity(expected_by_tag.len() * 2);
-    let mut allowed_refs = std::collections::BTreeSet::new();
-    for tag in expected_by_tag.keys() {
-        let direct = format!("refs/tags/{tag}");
-        let peeled = format!("{direct}^{{}}");
-        allowed_refs.insert(direct.clone());
-        allowed_refs.insert(peeled.clone());
-        query_refs.push(direct);
-        query_refs.push(peeled);
-    }
-    let mut args = vec!["ls-remote", "--tags", "origin"];
-    args.extend(query_refs.iter().map(String::as_str));
-    let out = git_ok(git, &args)?;
-    let mut observed = std::collections::BTreeMap::new();
-    for row in out.stdout_utf8().lines() {
-        let mut fields = row.split_whitespace();
-        let (Some(oid), Some(reference), None) = (fields.next(), fields.next(), fields.next())
-        else {
-            return Err(Error::new("malformed historical remote tag row"));
-        };
-        if !valid_lease_owner(oid) || !allowed_refs.contains(reference) {
-            return Err(Error::new(format!(
-                "historical remote tag query returned invalid or unexpected ref {reference}"
-            )));
-        }
-        if observed
-            .insert(reference.to_string(), oid.to_ascii_lowercase())
-            .is_some()
-        {
-            return Err(Error::new(format!(
-                "historical remote tag query returned duplicate ref {reference}"
-            )));
-        }
-    }
-
-    for (tag, expected_commit) in expected_by_tag {
-        let direct_ref = format!("refs/tags/{tag}");
-        let peeled_ref = format!("{direct_ref}^{{}}");
-        let token = observed.get(&direct_ref).ok_or_else(|| {
-            Error::new(format!(
-                "published release {tag} has no exact remote tag identity"
-            ))
-        })?;
-        let resolved = match observed.get(&peeled_ref) {
-            Some(peeled) if peeled != token => peeled,
-            Some(_) => {
-                return Err(Error::new(format!(
-                    "published release tag {tag} has a malformed annotated identity"
-                )));
-            }
-            None => token,
-        };
-        if !resolved.eq_ignore_ascii_case(&expected_commit) {
-            return Err(Error::new(format!(
-                "published release tag {tag} resolves to {resolved}, not manifest claim {expected_commit}"
-            )));
-        }
     }
     Ok(())
 }
@@ -7337,79 +6642,175 @@ pub fn delete_release_object_by_id_with_guard(
     )))
 }
 
-/// Delete an unpublished draft only while the exact owner+process token is
-/// still current, and only when GitHub says the draft targets that owner.
-/// Published state is never inside this helper's authority.
-pub fn delete_owned_draft_release(
+/// What a cut that never made its release the head knows about the release it
+/// touched: its journal's release intent, bound ID and upload intents — or nothing at
+/// all, for a lost machine's recovery.
+#[derive(Debug, Clone, Copy)]
+pub struct WithdrawKnowledge<'a> {
+    pub release_intent: Option<bool>,
+    pub release_id: Option<u64>,
+    pub upload_intents: Option<&'a [String]>,
+    /// [`RECOVERY_NO_DRAFT_POSTED_FLAG`]: the operator answers for a LOST journal that
+    /// no create POST ever landed.
+    pub operator_asserts_no_post: bool,
+}
+
+impl<'a> WithdrawKnowledge<'a> {
+    /// Everything `journal` records.
+    #[must_use]
+    pub fn of(journal: &'a Journal) -> Self {
+        Self {
+            release_intent: Some(journal.release_intent),
+            release_id: journal.release_id,
+            upload_intents: Some(&journal.upload_intents),
+            operator_asserts_no_post: false,
+        }
+    }
+}
+
+/// WITHDRAW WHAT AN UNPUBLISHED CUT PUT ON THE CHANNEL, and nothing else — the remote
+/// half of `--abandon` and of a lost machine's recovery. The release under `tag` is
+/// left the way `pub publish` made it:
+///
+/// * a DRAFT this cut created is deleted by its immutable ID
+///   ([`draft_cleanup_decision`]: the journal's intent, or — for a lost journal — a
+///   draft carrying nothing but this version's assets);
+/// * the engine's SOURCE release this cut adopted keeps its source shapes (the
+///   attestation pair and the roster pair) and loses exactly the assets this cut
+///   uploaded — the journal's upload intents, or, for a lost journal, every asset this
+///   version publishes, a foreign name refusing ([`channel::withdrawable_assets`]). It
+///   is never deleted: it is the engine's, and a recut adopts it again;
+/// * an ABSENT release converges only when no create POST can still become visible
+///   ([`absent_draft_decision`]).
+///
+/// A release that is already the channel's published app release is outside this
+/// authority — retiring it is `yank`'s. Every DELETE runs with the exact
+/// owner+process token re-proved immediately before it. Returns the transcript line.
+pub fn withdraw_unpublished_release(
     repo: &Path,
     slug: &str,
     tag: &str,
-    expected_release_id: Option<u64>,
-    create_intent_knowledge: Option<bool>,
+    version: &str,
+    known: WithdrawKnowledge<'_>,
     lease: &ReleaseLeaseGuard,
     fence: &PublisherFenceGuard,
-) -> Result<bool> {
+) -> Result<String> {
     let git = GitCli::new(repo);
     assert_publisher_session(&git, lease, fence)?;
-    let by_tag = unique_release_object_by_tag(slug, tag)?;
-    // The remote's own binding, for the lost-journal recovery path: a draft under this
-    // tag that targets the claim commit is provably this claim's object.
-    let claim_bound = by_tag
-        .as_ref()
-        .is_some_and(|release| release.target_commitish == lease.owner());
-    match draft_cleanup_decision(create_intent_knowledge, by_tag.is_some(), claim_bound) {
-        DraftCleanupDecision::AbandonProvenNoPost => return Ok(false),
-        DraftCleanupDecision::DeleteIssuedVisible => {}
-        DraftCleanupDecision::RetainIssuedAwaitVisibility => {
-            return Err(Error::new(format!(
-                "draft-create intent for {tag} was issued but no exact object is visible; retaining owner/journal until delayed visibility converges"
-            )));
-        }
-        DraftCleanupDecision::RefuseUnknownOrInconsistent => {
-            return Err(Error::new(format!(
-                "draft cleanup knowledge/visibility is unknown or inconsistent for {tag}; retaining owner/journal"
-            )));
-        }
+    let state = verify::release_state(slug, tag)?;
+    if state == verify::ReleaseState::Published {
+        return Err(Error::new(format!(
+            "{tag} is the channel's PUBLISHED app release on {slug} — withdrawing it is not \
+             an abandon; retire a published build with `{SHIP_COMMAND} yank <build>`"
+        )));
     }
-    let by_tag = by_tag.expect("visible cleanup decision");
-    let release = if let Some(expected_id) = expected_release_id {
-        let Some(release) = release_object_by_id(slug, expected_id)? else {
+    let Some(release) = unique_release_object_by_tag(slug, tag)? else {
+        if absent_draft_decision(known.release_intent, known.operator_asserts_no_post)
+            == AbsentDraftDecision::RetainOwnerAwaitVisibility
+        {
+            let (why, remedy) = if known.release_intent == Some(true) {
+                (
+                    "known issued",
+                    "wait for the exact release to converge and run the command again",
+                )
+            } else {
+                (
+                    "unknown because the current journal is unavailable",
+                    "if the channel's releases page shows NO release for this tag, re-run with \
+                     --no-draft-was-posted to release the claim lease",
+                )
+            };
             return Err(Error::new(format!(
-                "journaled draft release ID {expected_id} is absent before a durable delete-start receipt; retaining owner/journal rather than treating a transient 404 as cleanup convergence"
-            )));
-        };
-        validate_release_object_capability(Some(&release), expected_id, tag, lease.owner(), true)?;
-        if by_tag.id != expected_id {
-            return Err(Error::new(format!(
-                "exact tag {tag} resolves to replacement release ID {}, not journal capability {expected_id}",
-                by_tag.id
+                "release {tag} is currently absent from {slug}, but its create intent is \
+                 {why}. An accepted POST may still become visible; retaining the claim lease \
+                 and refusing tag/journal cleanup until it converges — {remedy}"
             )));
         }
-        release
-    } else {
-        by_tag
+        return Ok(format!("no release {tag} on {slug} — nothing to withdraw"));
     };
-    if !release.draft {
+    if let Some(expected) = known.release_id
+        && expected != release.id
+    {
         return Err(Error::new(format!(
-            "{tag} release ID {} is PUBLISHED; refusing draft deletion",
+            "{tag} on {slug} resolves to release ID {}, not the ID {expected} this cut bound; \
+             refusing to touch a replacement",
             release.id
         )));
     }
-    validate_release_object_capability(Some(&release), release.id, tag, lease.owner(), true)?;
-    let deleted = delete_release_object_by_id_with_guard(
-        slug,
-        &release,
-        false,
-        || Ok(()),
-        || assert_publisher_session(&git, lease, fence),
-    )?;
-    if !release_objects_by_tag(slug, tag)?.is_empty() {
-        return Err(Error::new(format!(
-            "draft release ID {} was deleted but {tag} now resolves to a replacement; refusing tag/lease cleanup",
+    let inventory = release_asset_inventory_for_release_id(slug, release.id)?;
+    let names: Vec<String> = inventory.iter().map(|asset| asset.name.clone()).collect();
+    if release.draft {
+        match draft_cleanup_decision(
+            known.release_intent,
+            true,
+            channel::binds_to_version(&names, version),
+        ) {
+            DraftCleanupDecision::DeleteIssuedVisible => {}
+            DraftCleanupDecision::AbandonProvenNoPost
+            | DraftCleanupDecision::RetainIssuedAwaitVisibility
+            | DraftCleanupDecision::RefuseUnknownOrInconsistent => {
+                return Err(Error::new(format!(
+                    "the draft {tag} on {slug} (ID {}) is not provably this cut's: this \
+                     journal issued no create for it, or — with no journal — it carries \
+                     {names:?}, which is not only this version's assets. Retaining the claim \
+                     lease; inspect it by hand",
+                    release.id
+                )));
+            }
+        }
+        delete_release_object_by_id_with_guard(
+            slug,
+            &release,
+            false,
+            || Ok(()),
+            || assert_publisher_session(&git, lease, fence),
+        )?;
+        if !release_objects_by_tag(slug, tag)?.is_empty() {
+            return Err(Error::new(format!(
+                "draft {tag} (ID {}) was deleted but the tag now resolves to a replacement \
+                 on {slug}; refusing tag/lease cleanup",
+                release.id
+            )));
+        }
+        return Ok(format!(
+            "draft {tag} (ID {}) deleted from {slug}",
             release.id
-        )));
+        ));
     }
-    Ok(deleted)
+    let withdraw =
+        channel::withdrawable_assets(&names, version, known.upload_intents).map_err(|why| {
+            Error::new(format!(
+                "the source release {tag} on {slug} (ID {}) {why}; retaining the claim lease — \
+                 inspect it by hand",
+                release.id
+            ))
+        })?;
+    for name in &withdraw {
+        let asset = inventory
+            .iter()
+            .find(|asset| &asset.name == name)
+            .expect("withdrawable names come from this inventory");
+        let observed = release_object_by_id(slug, release.id)?;
+        validate_release_object_snapshot(observed.as_ref(), &release)?;
+        assert_publisher_session(&git, lease, fence)?;
+        let endpoint = format!("repos/{slug}/releases/assets/{}", asset.id);
+        let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
+        if release_asset_identity_for_release_id_optional(slug, release.id, name)?
+            .is_some_and(|(id, _)| id == asset.id)
+        {
+            return Err(Error::new(format!(
+                "delete {name} (asset ID {}) from {tag} on {slug} failed: {}",
+                asset.id,
+                out.stderr_utf8().trim()
+            )));
+        }
+    }
+    Ok(format!(
+        "{} asset(s) this cut uploaded withdrawn from {tag} on {slug} (ID {}); it stays the \
+         engine's source release, and a recut adopts it again",
+        withdraw.len(),
+        release.id
+    ))
 }
 
 fn recovery_claim_build(git: &dyn GitRunner, version: &str, owner: &str) -> Result<u64> {
@@ -7582,9 +6983,10 @@ fn combine_with_fence_release(
 }
 
 /// Explicit cross-machine recovery for a persistent lease whose local journal
-/// was lost.  Draft/absent cuts are safely abandoned; an already-published
-/// exact-identity cut is reconstructed at `archive` and finished through
-/// verification, and unlock.  A published release is never deleted here. The
+/// was lost.  An unpublished cut is safely withdrawn from the channel
+/// ([`withdraw_unpublished_release`]); an already-published exact-identity cut is
+/// reconstructed at `publish` — which converges without re-uploading a byte — and
+/// finished through unlock.  A published release is never deleted here. The
 /// boolean is the caller/operator's explicit stopped-process assertion, not a
 /// machine proof; false refuses before reading repository or remote state.
 ///
@@ -7613,18 +7015,23 @@ pub fn run_recover_lost(
     let owner = owner.to_ascii_lowercase();
     let cargo_text = fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|error| Error::new(format!("read Cargo.toml: {error}")))?;
-    let slug = repo_slug(&cargo_text)
+    let origin_slug = repo_slug(&cargo_text)
         .ok_or_else(|| Error::new("Cargo.toml repository is not an exact GitHub OWNER/REPO URL"))?;
+    let slug = channel_slug(&cargo_text)?;
     let git = GitCli::new(repo);
-    assert_origin_repo_binding(&git, &slug)?;
+    assert_origin_repo_binding(&git, &origin_slug)?;
+    // Every `gh` call a recovery makes is a release-channel call.
+    let _cred = ChannelCred::enter();
     let journal_path = repo.join("dist/cut-state.toml");
-    let journal = Journal::load(&journal_path)?;
-    if let Some(journal) = &journal
-        && (journal.version != version || !journal.commit.eq_ignore_ascii_case(&owner))
+    // The HEADER first, as every entry point reads it: a local journal of any format is
+    // this claim's, and the cutter built at the claim finishes it.
+    let header = JournalHeader::read(&journal_path)?;
+    if let Some(header) = &header
+        && (header.version != version || !header.commit.eq_ignore_ascii_case(&owner))
     {
         return Err(Error::new(format!(
             "local journal is v{} owner {}, not requested recovery v{version} {owner}",
-            journal.version, journal.commit
+            header.version, header.commit
         )));
     }
     if release_lease_owner(&git)?.as_deref() != Some(owner.as_str()) {
@@ -7633,12 +7040,12 @@ pub fn run_recover_lost(
         )));
     }
     let build = recovery_claim_build(&git, version, &owner)?;
-    if let Some(journal) = &journal
-        && journal.build_number != build
+    if let Some(header) = &header
+        && header.build_number != build
     {
         return Err(Error::new(format!(
             "local journal build {} differs from claim ledger tail {build}",
-            journal.build_number
+            header.build_number
         )));
     }
     // Recovery can rotate the old publisher fence and mutate a live release
@@ -7646,7 +7053,7 @@ pub fn run_recover_lost(
     // recovery owes before any such mutation: with a local journal, the claim's own
     // cutter in the cut tree at the claim (handing off to it when this is not);
     // without one, this checkout's.
-    let tree = if let Some(journal) = &journal {
+    let (tree, journal) = if header.is_some() {
         git_ok(&git, &["fetch", "origin", "main"])?;
         let tree = gates::place_cut_tree(&git, repo, &owner)?.path;
         let args = recover_args(
@@ -7658,12 +7065,18 @@ pub fn run_recover_lost(
         if run_as_the_trees_cutter(&tree, &owner, args)? == Cutter::HandedOff {
             return Ok(());
         }
-        recovery_resume_worktree_preflight(&tree, &GitCli::new(&tree), journal)?;
-        tree
+        let journal = Journal::load(&journal_path)?.ok_or_else(|| {
+            Error::new(format!(
+                "{} vanished during recovery",
+                journal_path.display()
+            ))
+        })?;
+        recovery_resume_worktree_preflight(&tree, &GitCli::new(&tree), &journal)?;
+        (tree, Some(journal))
     } else {
         gates::current_cutter_identity_gate(&git)?;
         recovery_worktree_preflight(&git)?;
-        repo.to_path_buf()
+        (repo.to_path_buf(), None)
     };
     let ancestor = git.git(&["merge-base", "--is-ancestor", &owner, "origin/main"])?;
     if !ancestor.success() {
@@ -7719,14 +7132,9 @@ pub fn run_recover_lost(
     // lost machine is quiescent or cancel its already-issued REST request.
     step("recover", RECOVERY_STOPPED_PROCESS_BANNER);
     let fence = rotate_publisher_fence_for_recovery(&git, &owner)?;
-    let resume_local_journal = journal.is_some();
-    let create_intent_knowledge = journal.as_ref().map(|journal| journal.draft_create_issued);
-    let expected_release_id = journal.as_ref().and_then(|journal| journal.release_id);
-    let abandoned_journal =
-        (journal.is_some() && !resume_local_journal).then_some(journal_path.as_path());
-    let result = if let Some(journal) = journal
-        && resume_local_journal
-    {
+    // This machine's own journal is finished the way a resume finishes it; only a
+    // LOST journal is recovered from what the channel holds.
+    let result = if let Some(journal) = journal {
         confirm_release_lease_owner(&git, &owner).and_then(|lease| {
             resume_cut(
                 ResumePaths {
@@ -7750,9 +7158,6 @@ pub fn run_recover_lost(
                 version,
                 build,
                 owner: &owner,
-                create_intent_knowledge,
-                expected_release_id,
-                abandoned_journal,
                 operator_asserts_no_post,
             },
             &fence,
@@ -7766,13 +7171,13 @@ struct LostRecoveryPlan<'a> {
     version: &'a str,
     build: u64,
     owner: &'a str,
-    create_intent_knowledge: Option<bool>,
-    expected_release_id: Option<u64>,
-    abandoned_journal: Option<&'a Path>,
     /// [`RECOVERY_NO_DRAFT_POSTED_FLAG`] was given.
     operator_asserts_no_post: bool,
 }
 
+/// A lost journal's recovery, decided by what the channel holds under the tag: the
+/// published app release is finished; anything else is withdrawn, and the tag, the
+/// lease and the fence go.
 fn recover_under_fence(
     repo: &Path,
     slug: &str,
@@ -7784,116 +7189,52 @@ fn recover_under_fence(
         version,
         build,
         owner,
-        create_intent_knowledge,
-        expected_release_id,
-        abandoned_journal,
         operator_asserts_no_post,
     } = plan;
     let git = GitCli::new(repo);
     let lease = confirm_release_lease_owner(&git, owner)?;
     assert_publisher_session(&git, &lease, fence)?;
     let tag = format!("v{version}");
-    match verify::release_state(slug, &tag)? {
-        verify::ReleaseState::Published => {
-            let fresh_policy =
-                fresh_published_recovery_signature_policy(slug, version, credentials)?;
-            recover_published_cut(
-                repo,
-                slug,
-                version,
-                build,
-                owner,
-                &fresh_policy,
-                lease,
-                fence.clone(),
-                credentials,
-            )
-        }
-        verify::ReleaseState::Draft | verify::ReleaseState::Absent => {
-            // The explicit recover command is the operator's assertion that
-            // the killed publisher is stopped.  Cooperative contenders are
-            // excluded by our fresh exact token; recheck immediately before
-            // each destructive operation.
-            assert_publisher_session(&git, &lease, fence)?;
-            match verify::release_state(slug, &tag)? {
-                verify::ReleaseState::Draft => {
-                    if !delete_owned_draft_release(
-                        repo,
-                        slug,
-                        &tag,
-                        expected_release_id,
-                        create_intent_knowledge,
-                        &lease,
-                        fence,
-                    )? {
-                        return Err(Error::new(format!(
-                            "draft {tag} was not deleted under exact one-shot recovery authority"
-                        )));
-                    }
-                    step("recover", &format!("unpublished exact draft {tag} deleted"));
-                }
-                verify::ReleaseState::Absent => {
-                    if absent_draft_decision(create_intent_knowledge, operator_asserts_no_post)
-                        == AbsentDraftDecision::RetainOwnerAwaitVisibility
-                    {
-                        let (why, remedy) = if create_intent_knowledge == Some(true) {
-                            (
-                                "known issued",
-                                "wait for the exact draft to converge and run recover again",
-                            )
-                        } else {
-                            (
-                                "unknown because the current journal is unavailable",
-                                "if the releases page shows NO draft for this tag, re-run with \
-                                 --no-draft-was-posted to release the claim lease",
-                            )
-                        };
-                        return Err(Error::new(format!(
-                            "release {tag} is currently absent, but draft-create intent is \
-                             {why}. An accepted POST may still become visible; retaining the \
-                             claim lease and refusing tag/journal cleanup until the exact draft \
-                             converges — {remedy}"
-                        )));
-                    }
-                }
-                verify::ReleaseState::Published => {
-                    let fresh_policy =
-                        fresh_published_recovery_signature_policy(slug, version, credentials)?;
-                    return recover_published_cut(
-                        repo,
-                        slug,
-                        version,
-                        build,
-                        owner,
-                        &fresh_policy,
-                        lease,
-                        fence.clone(),
-                        credentials,
-                    );
-                }
-            }
-            assert_publisher_session(&git, &lease, fence)?;
-            delete_owned_release_tag(&git, &tag, owner, &lease, fence)?;
-            release_completed_publisher_session(&git, owner, fence)?;
-            if let Some(journal_path) = abandoned_journal {
-                match fs::remove_file(journal_path) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => {
-                        return Err(Error::new(format!(
-                            "unpublished historical recovery released its remote owner but could not remove {}: {error}",
-                            journal_path.display()
-                        )));
-                    }
-                }
-            }
-            step(
-                "recover",
-                "unpublished cut safely abandoned · exact owner lease released",
-            );
-            Ok(())
-        }
+    if verify::release_state(slug, &tag)? == verify::ReleaseState::Published {
+        let fresh_policy = fresh_published_recovery_signature_policy(slug, version, credentials)?;
+        return recover_published_cut(
+            repo,
+            slug,
+            version,
+            build,
+            owner,
+            &fresh_policy,
+            lease,
+            fence.clone(),
+            credentials,
+        );
     }
+    // The explicit recover command is the operator's assertion that the killed
+    // publisher is stopped; cooperative contenders are excluded by our fresh exact
+    // token, re-proved immediately before each destructive operation.
+    let withdrawn = withdraw_unpublished_release(
+        repo,
+        slug,
+        &tag,
+        version,
+        WithdrawKnowledge {
+            release_intent: None,
+            release_id: None,
+            upload_intents: None,
+            operator_asserts_no_post,
+        },
+        &lease,
+        fence,
+    )?;
+    step("recover", &withdrawn);
+    assert_publisher_session(&git, &lease, fence)?;
+    delete_owned_release_tag(&git, &tag, owner, &lease, fence)?;
+    release_completed_publisher_session(&git, owner, fence)?;
+    step(
+        "recover",
+        "unpublished cut safely withdrawn · exact owner lease released",
+    );
+    Ok(())
 }
 
 fn fresh_published_recovery_signature_policy(
@@ -7918,9 +7259,9 @@ fn fresh_published_recovery_signature_policy(
 /// sense, beyond the ones every release has.
 ///
 /// Derived from the MANIFEST's `machine_id` — what the release says about itself —
-/// rather than from local state, exactly as `validate_draft_asset_set` derives the same
-/// requirement. A recovery that judged the release by the recovering machine's
-/// configuration would reconstruct one set and mirror another.
+/// rather than from local state. A recovery that judged the release by the recovering
+/// machine's configuration would reconstruct one set and `publish` would demand
+/// another.
 fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
     if manifest.machine_id.is_none() {
         return Vec::new();
@@ -7935,8 +7276,8 @@ fn recovered_roster_asset_names(manifest: &Manifest) -> Vec<&'static str> {
 ///
 /// `recover_published_cut` sets `signature_machine_id` from the recovered manifest —
 /// correctly, out of bytes a signature covers — and that makes `CutCtx::attaches_roster`
-/// true, which puts both roster names into `mirror_asset_paths`. `step_mirror` hard-errors
-/// on any mirror asset that is not a local file. Reconstructing the DMG, the zip, the
+/// true, which puts both roster names into `channel_asset_paths`. `publish` hard-errors
+/// on any release asset that is not a local file. Reconstructing the DMG, the zip, the
 /// appcast, its signature and the provenance but not these two therefore left
 /// `cargo ship recover-lost` unable to complete on the armed path: it failed with
 /// "…dist/ artifacts are gone… recover the cut rather than mirroring different bytes",
@@ -8173,13 +7514,7 @@ fn recover_published_cut(
             "published recovery release {tag} vanished while binding its immutable ID"
         ))
     })?;
-    validate_release_object_capability(
-        Some(&release_object),
-        release_object.id,
-        &tag,
-        owner,
-        false,
-    )?;
+    validate_channel_release_capability(Some(&release_object), release_object.id, &tag, false)?;
     let (manifest_bytes, signature_bytes) =
         download_live_manifest_pair(slug, release_object.id, &tag)?;
     // The key comes from the RELEASE, never from this machine — see
@@ -8219,9 +7554,8 @@ fn recover_published_cut(
             manifest.dmg
         )));
     }
-    // The updater container must be recoverable too: the mirror step serves the
-    // public channel from the reconstructed dist/, and the required asset set
-    // includes the zip.
+    // The updater container must be recoverable too: `publish` re-proves the channel
+    // release against the reconstructed dist/, and the asset set includes the zip.
     let (recovered_zip, recovered_zip_sha256) =
         match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
             (Some(zip), Some(sha256)) => (zip.to_string(), sha256.to_string()),
@@ -8238,20 +7572,14 @@ fn recover_published_cut(
             "published recovery release has no exact zip {recovered_zip}"
         )));
     }
-    let provenance_name = format!("aterm-{version}-build.txt");
-    if !exact_asset_present(&names, &provenance_name)? {
-        return Err(Error::new(format!(
-            "published recovery release has no exact provenance asset {provenance_name}; \
-             the current archive/verify suffix requires its version/build/commit proof"
-        )));
-    }
-    let provenance =
-        download_release_asset_for_release_id(slug, release_object.id, &provenance_name)?;
-    validate_claim_provenance(&provenance, version, build, owner)?;
+    // The claim identity is the SIGNED manifest's: `validate_live_release_identity`
+    // above bound its version, build and full commit to this claim. (The provenance
+    // record that once restated them never leaves the cutting machine's `dist/`.)
 
-    // Reconstruct only authoritative, remotely validated bytes.  The journal
-    // begins after flip: build/upload are never replayed from guesses, while
-    // archive/verify remain convergent production steps.
+    // Reconstruct only authoritative, remotely validated bytes. The journal resumes
+    // at `publish`: nothing is rebuilt or re-uploaded from guesses, and `publish` finds
+    // the head made (`ChannelRelease::head_made`), re-sends only its PATCH and proves the
+    // read side against these bytes.
     let dist = repo.join("dist");
     fs::create_dir_all(&dist)
         .map_err(|error| Error::new(format!("create {}: {error}", dist.display())))?;
@@ -8267,11 +7595,11 @@ fn recover_published_cut(
         )
     })?;
     // Regenerate the stable download twins from the digest-verified canonical
-    // containers: recovery must leave dist/ able to satisfy
-    // required_asset_names(), and each twin is by definition a byte copy of
+    // containers: recovery must leave dist/ able to satisfy the channel asset set,
+    // and each twin is by definition a byte copy of
     // its canonical asset: `aterm.dmg` is a byte copy of manifest.dmg, the ONE
     // DMG (RETIRED 2026-08-26: the lean/seeded split the alias once tracked).
-    fs::copy(&recovered_dmg, dist.join(mirror::stable_dmg_asset_name()))
+    fs::copy(&recovered_dmg, dist.join(channel::stable_dmg_asset_name()))
         .map_err(|error| Error::new(format!("reconstruct stable dmg twin: {error}")))?;
     verify_release_asset_digest_for_release_id_to(
         slug,
@@ -8283,24 +7611,23 @@ fn recover_published_cut(
     )?;
     fs::copy(
         dist.join(&recovered_zip),
-        dist.join(mirror::stable_zip_asset_name()),
+        dist.join(channel::stable_zip_asset_name()),
     )
     .map_err(|error| Error::new(format!("reconstruct stable zip twin: {error}")))?;
     // RETIRED 2026-08-26: the Intel DMG pair. A published release whose
     // manifest still names one was cut by a previous cutter under a container
-    // contract this one no longer produces or mirrors — refuse the takeover
-    // rather than reconstruct a dist/ the mirror's exact-set gate would then
-    // refuse anyway.
+    // contract this one no longer produces or publishes — refuse the takeover
+    // rather than reconstruct a dist/ the exact-set gate would then refuse anyway.
     refuse_retired_intel_dmg(&manifest)?;
     // The `.sha256` sidecars are pure functions of the manifest digests just
     // proved against the downloaded bytes, so a recovery REGENERATES them
-    // rather than downloading — the mirror step demands them from dist/ and a
+    // rather than downloading — `publish` demands them from dist/ and a
     // release published before sidecars existed can still be recovered. The
     // twins' ALIAS sidecars are the same proved digests under the alias names,
     // so the documented `shasum -a 256 -c` works on the files the evergreen
     // `releases/latest/download` URLs actually save.
-    let stable_dmg_name = mirror::stable_dmg_asset_name();
-    let stable_zip_name = mirror::stable_zip_asset_name();
+    let stable_dmg_name = channel::stable_dmg_asset_name();
+    let stable_zip_name = channel::stable_zip_asset_name();
     let sidecar_records = [
         (manifest.dmg.as_str(), manifest.sha256.as_str()),
         (recovered_zip.as_str(), recovered_zip_sha256.as_str()),
@@ -8308,10 +7635,10 @@ fn recover_published_cut(
         (stable_zip_name.as_str(), recovered_zip_sha256.as_str()),
     ];
     for (name, sha) in sidecar_records {
-        let sidecar = mirror::sha256_sidecar_name(name);
+        let sidecar = channel::sha256_sidecar_name(name);
         fs::write(
             dist.join(&sidecar),
-            mirror::sha256_sidecar_contents(sha, name),
+            channel::sha256_sidecar_contents(sha, name),
         )
         .map_err(|error| Error::new(format!("reconstruct {sidecar}: {error}")))?;
     }
@@ -8331,8 +7658,6 @@ fn recover_published_cut(
             }
         }
     }
-    fs::write(dist.join(&provenance_name), provenance)
-        .map_err(|error| Error::new(format!("reconstruct provenance: {error}")))?;
     reconstruct_roster_assets(slug, release_object.id, &names, &manifest, &dist)?;
     let journal_path = dist.join("cut-state.toml");
     let journal = Journal {
@@ -8357,41 +7682,27 @@ fn recover_published_cut(
         // this?" is the one the artifact itself carries. Deriving it locally would
         // let a recovery relabel someone else's release.
         signature_machine_id: manifest.machine_id.clone(),
+        // The published release IS the object: bound, with the durable intent that
+        // binding requires. No upload is in flight — every asset is already there.
         release_id: Some(release_object.id),
-        draft_create_issued: true,
+        release_intent: true,
         upload_intents: Vec::new(),
-        // A recovered cut has no mirror capability yet: the mirror step runs
-        // after `verify`, which this reconstruction has not reached, so it
-        // starts from a clean one-shot intent set.
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
-        done: [
-            "lock",
-            "build",
-            "selfcheck",
-            "draft",
-            "upload",
-            "preflip",
-            "tag",
-            "flip",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect(),
+        done: ["lock", "build", "selfcheck", "tag"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
     };
     journal.save(&journal_path)?;
     step(
         "recover",
         &format!(
-            "validated published {tag} version/build/commit + manifest{} + DMG digest{}; \
-             reconstructed journal at archive",
+            "validated published {tag} version/build/commit + manifest{} + DMG digest; \
+             reconstructed journal at publish",
             if signature_policy.required {
                 "/signature/public-key"
             } else {
                 ""
             },
-            " + provenance"
         ),
     );
     let mut ctx = CutCtx {
@@ -8403,7 +7714,7 @@ fn recover_published_cut(
         // recovering, e.g. a certificate that expired since the cut shipped.
         apple: sign::AppleTier::Inactive,
         repo: repo.to_path_buf(),
-        // Nothing after `flip` reads a tree, and a recovered cut starts at `archive`.
+        // Nothing from `publish` on reads a tree, and a recovered cut starts there.
         tree: repo.to_path_buf(),
         dist,
         journal_path,
@@ -8426,12 +7737,8 @@ fn recover_published_cut(
         attribution: None,
         roster: None,
         release_id: Some(release_object.id),
-        draft_create_issued: true,
+        release_intent: true,
         upload_intents: Vec::new(),
-        mirror_slug: workspace_mirror_slug(repo)?,
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         kind: CutKind::Real,
         // Recovery re-runs no build/selfcheck step (all are journaled done),
         // so there is no smoke left to skip.
@@ -8581,23 +7888,27 @@ pub fn rehearsal_source_line(published: &Result<gates::PublishedSource>) -> Stri
     }
 }
 
-/// What a FRESH cut (not `--resume`) does with a journal already on disk:
-/// `Ok(true)` — it is a finished cut's history, clear it; `Ok(false)` — there is
-/// none; `Err` — a cut is in flight and this one must not start. Split out of
-/// [`run_cut`] so "a finished journal never blocks the next cut" is a test.
-pub fn fresh_cut_journal_triage(existing: Option<&Journal>, kind: CutKind) -> Result<bool> {
+/// What a FRESH cut (not `--resume`) does with a journal already on disk, read by
+/// its [`JournalHeader`] — of this format or any other: `Ok(true)` — it is a finished
+/// cut's history, clear it; `Ok(false)` — there is none; `Err` — a cut is in flight
+/// and this one must not start. Split out of [`run_cut`] so "a finished journal never
+/// blocks the next cut, whichever cutter wrote it" is a test.
+pub fn fresh_cut_journal_triage(existing: Option<&JournalHeader>, kind: CutKind) -> Result<bool> {
     let Some(j) = existing else {
         return Ok(false);
     };
-    match j.first_incomplete() {
-        None => Ok(true),
-        Some(next) if kind == CutKind::Real => Err(Error::new(format!(
-            "a cut is already in progress: v{} (build {}) is journaled at step \
-             \"{next}\" — finish it with `{CUT_COMMAND} --resume`, discard it \
-             with `{CUT_COMMAND} --abandon v{}`, or delete dist/cut-state.toml",
+    if j.finished() {
+        return Ok(true);
+    }
+    let at = j.position();
+    match kind {
+        CutKind::Real => Err(Error::new(format!(
+            "a cut is already in progress: v{} (build {}) is journaled {at} — finish it with \
+             `{CUT_COMMAND} --resume`, discard it with `{CUT_COMMAND} --abandon v{}`, or \
+             delete dist/cut-state.toml",
             j.version, j.build_number, j.version
         ))),
-        Some(next) => {
+        CutKind::DryRun | CutKind::Rehearse => {
             // Dry-run/rehearse never touch the journal itself — but they
             // rebuild dist/ IN PLACE under a provisional number, into the
             // very paths the journaled cut's remaining steps will upload.
@@ -8606,10 +7917,9 @@ pub fn fresh_cut_journal_triage(existing: Option<&Journal>, kind: CutKind) -> Re
             // self-inconsistent release live. Refuse while a real cut is
             // in flight.
             Err(Error::new(format!(
-                "an unfinished real cut is journaled: v{} (build {}) at step \
-                 \"{next}\" — a {} would overwrite its dist/ artifacts with \
-                 provisional-number ones; finish it (`{CUT_COMMAND} --resume`) \
-                 or discard it (`{CUT_COMMAND} --abandon v{}`) first",
+                "an unfinished real cut is journaled: v{} (build {}) {at} — a {} would \
+                 overwrite its dist/ artifacts with provisional-number ones; finish it \
+                 (`{CUT_COMMAND} --resume`) or discard it (`{CUT_COMMAND} --abandon v{}`) first",
                 j.version,
                 j.build_number,
                 if kind == CutKind::DryRun {
@@ -8858,6 +8168,37 @@ pub fn cut_args(opts: &CutOptions) -> Vec<std::ffi::OsString> {
     args
 }
 
+/// The `cut --abandon` invocation for `version` — what an abandon hands the claim
+/// commit's own cutter. `cli::parse` of the result is the same abandon again
+/// (tests/it/resume.rs).
+#[must_use]
+pub fn abandon_args(version: &str) -> Vec<std::ffi::OsString> {
+    vec![
+        "cut".into(),
+        "--abandon".into(),
+        format!("v{version}").into(),
+    ]
+}
+
+/// Put the cut tree at the claim commit `header` names — where the cutter that finishes
+/// or withdraws that journal is built ([`run_as_the_trees_cutter`]).
+///
+/// # Errors
+/// A claim that is not a full commit id, and [`gates::place_cut_tree`]'s.
+pub fn place_claim_tree(
+    operator: &dyn GitRunner,
+    repo: &Path,
+    header: &JournalHeader,
+) -> Result<PathBuf> {
+    if !valid_lease_owner(&header.commit) {
+        return Err(Error::new(format!(
+            "the journaled claim {:?} is not a full 40- or 64-hex commit id",
+            header.commit
+        )));
+    }
+    Ok(gates::place_cut_tree(operator, repo, &header.commit)?.path)
+}
+
 /// The `recover` invocation that means these parsed arguments — what a recovery
 /// hands the release commit's own cutter. `cli::parse` of the result is the same
 /// recovery again (tests/it/resume.rs).
@@ -8884,7 +8225,7 @@ pub fn recover_args(
 }
 
 /// The whole `cargo ship cut` (spec §7 order): gates → claim → build+package
-/// → self-check → draft-first publish → post-publish verify.
+/// → self-check → origin tag → the ONE publication onto the channel.
 ///
 /// The version is `[workspace.package] version` as written
 /// ([`release_version_from_workspace`], which refuses a non-zero patch) — NOT from
@@ -8926,9 +8267,11 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     }
 
     // ---- journal triage (before anything else) ----------------------------
-    let existing = Journal::load(&journal_path)?;
+    // By the HEADER every format writes: who may act on a journal is decided before
+    // anything reads a step of it.
+    let existing = JournalHeader::read(&journal_path)?;
     if opts.resume {
-        let j = existing.ok_or_else(|| {
+        let header = existing.ok_or_else(|| {
             Error::new(format!(
                 "nothing to resume — no dist/cut-state.toml. A wedged cut from another \
                  machine is recovered by a plain `{CUT_COMMAND}` (remote-derived recut)."
@@ -8941,12 +8284,19 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             ));
         }
         // A resume builds, and finishes, the RELEASE commit: the cut tree goes back
-        // there, and the cutter that finishes it is that commit's own.
-        let tree = gates::place_cut_tree(&operator, repo, &j.commit)?.path;
-        if run_as_the_trees_cutter(&tree, &j.commit, cut_args(opts))? == Cutter::HandedOff {
+        // there, and the cutter that finishes it is that commit's own — whatever format
+        // it journals in.
+        let tree = place_claim_tree(&operator, repo, &header)?;
+        if run_as_the_trees_cutter(&tree, &header.commit, cut_args(opts))? == Cutter::HandedOff {
             return Ok(());
         }
-        let origin_slug = workspace_repo_slug(&tree)?;
+        let j = Journal::load(&journal_path)?.ok_or_else(|| {
+            Error::new(format!(
+                "{} vanished while resuming",
+                journal_path.display()
+            ))
+        })?;
+        let slug = workspace_channel_slug(&tree)?;
         return resume_cut(
             ResumePaths {
                 repo,
@@ -8954,7 +8304,7 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                 dist: &dist,
                 journal_path: &journal_path,
             },
-            &origin_slug,
+            &slug,
             j,
             t0,
             None,
@@ -8962,7 +8312,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         );
     }
     if fresh_cut_journal_triage(existing.as_ref(), kind)? {
-        // A finished cut's journal is just history — clear it and move on.
+        // A finished cut's journal — whichever cutter wrote it — is just history: clear
+        // it and move on.
         let _ = fs::remove_file(&journal_path);
     }
     // ---- the published commit (before the tier, the version and the claim) -
@@ -9019,10 +8370,15 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         // before the placement was this checkout's.
         assert_origin_repo_binding(&git, &origin_slug)?;
     }
-    // The PUBLIC channel installed copies read. Parsed from the same tracked
-    // key `aterm-update-core/build.rs` compiles into every client, so the
-    // pipeline mirrors to exactly the place the fleet looks.
-    let mirror_slug = mirror::update_channel_slug(&cargo_text)?;
+    // THE release channel: the same tracked key `aterm-update-core/build.rs` compiles
+    // into every client, so the cut publishes exactly where the fleet looks — or the
+    // rehearsal's scratch channel.
+    let publish_slug = match &opts.rehearse {
+        Some(scratch) => scratch.clone(),
+        None => channel_slug(&cargo_text)?,
+    };
+    // Every `gh` call a real cut makes from here on is a release-channel call.
+    let _cred = (kind == CutKind::Real).then(ChannelCred::enter);
     // THE version this cut publishes: the workspace version as written. The
     // ledger is still read (below) for the BUILD NUMBER claim, but it is no
     // longer a version lineage — its historical two-component lines are
@@ -9033,8 +8389,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // predates liveness recording. A resume overrides it with the journal's
     // version, which is the authoritative one for the cut being finished.
     set_publisher_fence_version(&release_version);
-
-    let publish_slug = opts.rehearse.clone().unwrap_or_else(|| origin_slug.clone());
 
     // Tier APPLE, resolved HERE: after the resume delegation above (a resume
     // resolves its own tier, under its own rule — see `resume_apple_tier`) and
@@ -9078,8 +8432,10 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             &main_changelog,
             &release_version,
             &mut |version| {
-                Ok(verify::release_state(&origin_slug, &format!("v{version}"))?
-                    == verify::ReleaseState::Published)
+                Ok(
+                    verify::release_state(&publish_slug, &format!("v{version}"))?
+                        == verify::ReleaseState::Published,
+                )
             },
         )?
     } else {
@@ -9193,49 +8549,27 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     if kind == CutKind::Real {
         preflight_release_lease(&git)?;
         step("lease", "remote release lease is free (pre-claim)");
-        // Prove the public channel is writable BEFORE the ledger claim. The
-        // mirror is the last remote step; failing it after the claim would burn
-        // a build number and leave a live release the fleet cannot see, and no
-        // amount of `--resume` fixes a missing permission grant.
-        match &mirror_slug {
-            Some(slug) if *slug != origin_slug => {
-                // Prove the CHANNEL credential, not `gh auth`: the mirror step will
-                // authenticate with the release-org token, so a preflight on the dev
-                // account would refuse a cut that would actually have succeeded.
-                let _cred = ChannelCred::enter();
-                preflight_mirror_target(slug)?;
-                step(
-                    "mirror",
-                    &format!("public update channel {slug} is public and writable (pre-claim)"),
-                );
-            }
-            Some(_) => {}
-            None => {
-                step(
-                    "mirror",
-                    &format!(
-                        "no {} {} declared — shipped builds will read {origin_slug}, which \
-                         needs a per-machine token",
-                        mirror::CHANNEL_TABLE,
-                        mirror::CHANNEL_KEY
-                    ),
-                );
-            }
-        }
+    }
+    if kind != CutKind::DryRun {
+        // Prove the channel is public and writable BEFORE the ledger claim — with the
+        // credential `publish` will use (the release-org token on a real cut, `gh auth`
+        // on a rehearsal's own scratch channel). Failing at `publish` would burn a
+        // build number, and no amount of `--resume` fixes a missing permission grant.
+        preflight_channel_target(&publish_slug)?;
+        step(
+            "channel",
+            &format!("release channel {publish_slug} is public and writable (pre-claim)"),
+        );
     }
 
     // ---- channel floor (before claim: bad input must not burn a number) ----
     // The updater selects the first valid manifest on GitHub's newest-first
     // release stream. Its floor is channel state, not a one-cut CLI option:
     // every successor must carry it forward or a fresh client could forget a
-    // prior yank. The late selfcheck/preflip/flip scans repeat this guard to
+    // prior yank. The late lock/selfcheck/publish scans repeat this guard to
     // close the race with another publisher.
-    let channel = if kind == CutKind::Rehearse {
-        verify::scan_published(&publish_slug, true)?
-    } else {
-        verify::scan_published_in_repo(repo, &publish_slug, true)?
-    };
-    let newest_channel = channel.first();
+    let head_scan = verify::scan_published(&publish_slug, true)?;
+    let newest_channel = head_scan.first();
     let newest_min_build = newest_channel.and_then(|published| published.min_build);
     // THE MACHINE-ROSTER GATE RUNS HERE, inside this call, and here is deliberate:
     // it is the last of the pre-claim gates and it sits BEFORE the ledger claim a few
@@ -9268,17 +8602,16 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     // ratchet reads BOTH and takes the greater. Only a real cut has a public channel to
     // ask; a rehearsal/dry run keeps the manifest-only floor.
     let manifest_roster_seq = published_roster_seq(newest_channel)?;
-    let observed_roster = match (&mirror_slug, kind) {
-        (Some(slug), CutKind::Real) if *slug != origin_slug => {
-            machines::channel_roster_document(slug).map_err(|e| {
-                Error::new(format!(
-                    "cannot read the machine roster on the public channel {slug}'s latest \
-                     release ({e}); refusing to reason about the fleet's roster floor — a \
-                     wrong answer here burns a build number and strands every client"
-                ))
-            })?
-        }
-        _ => None,
+    let observed_roster = if kind == CutKind::Real {
+        machines::channel_roster_document(&publish_slug).map_err(|e| {
+            Error::new(format!(
+                "cannot read the machine roster on the channel {publish_slug}'s latest \
+                 release ({e}); refusing to reason about the fleet's roster floor — a wrong \
+                 answer here burns a build number and strands every client"
+            ))
+        })?
+    } else {
+        None
     };
     let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
     // EQUAL generation, DIFFERENT document = a lineage fork; the number admits it, only
@@ -9467,12 +8800,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         attribution: attributed.attribution,
         roster: attributed.roster,
         release_id: None,
-        draft_create_issued: false,
+        release_intent: false,
         upload_intents: Vec::new(),
-        mirror_slug: mirror_slug.clone(),
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         kind,
         no_paint_smoke: opts.no_paint_smoke,
         lease: None,
@@ -9494,11 +8823,8 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             verify_pubkey: ctx.verify_pubkey.clone(),
             signature_machine_id: ctx.signature_machine_id.clone(),
             release_id: None,
-            draft_create_issued: false,
+            release_intent: false,
             upload_intents: Vec::new(),
-            mirror_release_id: None,
-            mirror_create_issued: false,
-            mirror_upload_intents: Vec::new(),
             done: vec![],
         };
         j.save(&journal_path)?;
@@ -9523,7 +8849,7 @@ struct ResumePaths<'a> {
 /// incomplete step (spec §5).
 fn resume_cut(
     paths: ResumePaths<'_>,
-    origin_slug: &str,
+    slug: &str,
     journal: Journal,
     t0: Instant,
     recovered_session: Option<(ReleaseLeaseGuard, PublisherFenceGuard)>,
@@ -9679,7 +9005,7 @@ fn resume_cut(
         tree: tree.to_path_buf(),
         dist: dist.to_path_buf(),
         journal_path: journal_path.to_path_buf(),
-        slug: origin_slug.to_string(),
+        slug: slug.to_string(),
         version: journal.version.clone(),
         tag: format!("v{}", journal.version),
         notes_section: journal.version.clone(),
@@ -9703,12 +9029,8 @@ fn resume_cut(
         attribution: resumed_attribution.attribution,
         roster: resumed_attribution.roster,
         release_id: journal.release_id,
-        draft_create_issued: journal.draft_create_issued,
+        release_intent: journal.release_intent,
         upload_intents: journal.upload_intents.clone(),
-        mirror_slug: workspace_mirror_slug(tree)?,
-        mirror_release_id: journal.mirror_release_id,
-        mirror_create_issued: journal.mirror_create_issued,
-        mirror_upload_intents: journal.mirror_upload_intents.clone(),
         kind: CutKind::Real,
         // Never journaled: a resumed self-check re-earns the paint proof.
         no_paint_smoke: false,
@@ -9740,9 +9062,11 @@ fn discard_staged(ctx: &CutCtx) {
 /// Execute the journaled steps in order, skipping completed ones. THE one
 /// pipeline all cut flavors share.
 fn run_pipeline(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
-    // A resume may begin after selfcheck/upload. Every suffix, including a
-    // mirror-only retry, must bind its native bytes to the frozen journal and
-    // signed appcast before any publication operation is reachable.
+    // Every `gh` call a real cut's pipeline makes is a release-channel call.
+    let _cred = (ctx.kind == CutKind::Real).then(ChannelCred::enter);
+    // A resume may begin after selfcheck. Every suffix, a publish-only retry
+    // included, must bind its native bytes to the frozen journal and signed
+    // appcast before any publication operation is reachable.
     if ctx.linux.is_some()
         && ctx
             .journal
@@ -9827,20 +9151,14 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
                     return Ok(());
                 }
             }
-            "draft" => step_draft(ctx)?,
-            "upload" => step_upload(ctx)?,
-            "preflip" => step_preflip(ctx)?,
             "tag" => {
                 // The rehearsal never tags origin; GitHub mints the scratch
-                // repo's tag at flip time.
+                // channel's tag when its release is published.
                 if ctx.kind == CutKind::Real {
                     step_tag(ctx)?;
                 }
             }
-            "flip" => step_flip(ctx)?,
-            "archive" => step_archive(ctx)?,
-            "verify" => step_verify(ctx)?,
-            "mirror" => step_mirror(ctx)?,
+            "publish" => step_publish(ctx)?,
             "unlock" => {
                 if ctx.kind == CutKind::Real {
                     step_unlock(ctx)?;
@@ -9896,8 +9214,8 @@ fn run_pipeline_inner(ctx: &mut CutCtx, t0: Instant) -> Result<()> {
             step(
                 "",
                 &format!(
-                    "point the running v0.25 at it:  ATERM_UPDATE_OWNER={owner} \
-                     ATERM_UPDATE_REPO={repo_name} aterm ctl update check"
+                    "point a development build at it: `[update] owner = \"{owner}\"` and \
+                     `repo = \"{repo_name}\"` in its config, then `aterm ctl update check`"
                 ),
             );
         }
@@ -9955,7 +9273,7 @@ fn ensure_ctx_release_lease(ctx: &CutCtx) -> Result<()> {
 /// signing key vanished, whose signing configuration appeared, or whose
 /// worktree pin changed mid-cut aborts instead of proceeding under the stale
 /// key state it claimed under. This is what holds the pinned-channel invariant
-/// at lock, preflip, and flip, not only at the pre-claim scan.
+/// at lock and at every step after it, not only at the pre-claim scan.
 fn revalidate_ctx_signature_policy(ctx: &CutCtx) -> Result<()> {
     if ctx.kind != CutKind::Real {
         return Ok(());
@@ -10151,7 +9469,7 @@ impl SiteFollow {
                     failure.as_deref().unwrap_or("unknown failure")
                 ),
                 format!(
-                    "the release v{version} is COMPLETE — live, verified, mirrored and \
+                    "the release v{version} is COMPLETE — live, proved, the channel head and \
                      unlocked, and its journal is finished, so the next cut is not blocked by \
                      this. Retry the website by hand, from the repository root: {}",
                     site_retry_command(version)
@@ -10163,7 +9481,7 @@ impl SiteFollow {
 
 /// THE WEBSITE FOLLOWS THE CUT — best-effort, after the pipeline, NOT journaled
 /// (2026-09-23). alab.systems' download button names the `aterm-<version>.dmg` the
-/// mirror just flipped live, with its true size, and `/releases` carries the notes.
+/// cut just made the channel head, with its true size, and `/releases` carries the notes.
 /// The mechanism is the SAME hook a `pub promote` runs (`publish/post-promote`,
 /// byte transforms in `publish/site-sync.py`, tested hermetically by
 /// `tools/test-site-sync.sh`). Since 2026-09-23 the promote-time run of that hook
@@ -10529,13 +9847,17 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     step(
         "",
         &format!(
-            "archs [{}] · {} · dSYM {}",
+            "archs [{}] · {} · dSYM {} · x86_64 {}",
             bout.archs,
             bout.compiler_line,
             match (&bout.dsym, &bout.dsym_zip) {
                 (Some(_), Some(z)) => format!("ok → {}", z.display()),
                 _ => "SKIPPED (no symbolication)".to_string(),
-            }
+            },
+            bout.x86_64_probe.as_ref().map_or_else(
+                || "not run (--arm64-only)".to_string(),
+                |record| format!("ran under Rosetta → {}", record.display())
+            )
         ),
     );
 
@@ -10610,7 +9932,7 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
     // `notarize_and_package` has produced the FINAL container bytes
     // (codesign/staple rewrites included), so each twin is byte-identical to
     // the bytes its in-process digest covers. required_asset_names() lists
-    // every one of them, so the mirror uploads them and refuses a channel head
+    // every one of them, so `publish` uploads them and refuses a channel head
     // without them. The twins are the PERMANENT download names the README
     // publishes and readers bookmark. (They are no longer what alab.systems
     // links: since 2026-08-28 the site's button is the VERSIONED
@@ -10689,12 +10011,12 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         (
             ctx.dmg_sha256_path(),
             dmg_sha.as_str(),
-            mirror::dmg_asset_name(&ctx.version),
+            channel::dmg_asset_name(&ctx.version),
         ),
         (
             ctx.zip_sha256_path(),
             zout.sha256.as_str(),
-            mirror::zip_asset_name(&ctx.version),
+            channel::zip_asset_name(&ctx.version),
         ),
         // The alias sidecars restate their SOURCE artifact's digest under the
         // alias filename — each twin above is a byte copy of exactly the
@@ -10702,16 +10024,16 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         (
             ctx.stable_dmg_sha256_path(),
             dmg_sha.as_str(),
-            mirror::stable_dmg_asset_name(),
+            channel::stable_dmg_asset_name(),
         ),
         (
             ctx.stable_zip_sha256_path(),
             zout.sha256.as_str(),
-            mirror::stable_zip_asset_name(),
+            channel::stable_zip_asset_name(),
         ),
     ];
     for (path, sha, name) in sidecars {
-        fs::write(&path, mirror::sha256_sidecar_contents(sha, &name))
+        fs::write(&path, channel::sha256_sidecar_contents(sha, &name))
             .map_err(|e| Error::new(format!("write {}: {e}", path.display())))?;
     }
     step(
@@ -10740,25 +10062,18 @@ fn step_build(ctx: &mut CutCtx) -> Result<()> {
         version: &ctx.version,
         build_number: ctx.build,
         commit: &ctx.commit,
-        dmg_name: &mirror::dmg_asset_name(&ctx.version),
+        dmg_name: &channel::dmg_asset_name(&ctx.version),
         dmg_sha256: &dmg_sha,
-        zip_name: &mirror::zip_asset_name(&ctx.version),
+        zip_name: &channel::zip_asset_name(&ctx.version),
         // No re-hash pass needed, but not because nothing touches the zip — on
         // the active tier the bundle inside it carries a notarization ticket.
         // `create_zip` runs AFTER the staple and hashes the bytes it writes, so
         // this digest already covers them.
         zip_sha256: &zout.sha256,
-        // The manifest's `url` must name the repository a reader can actually
-        // fetch from. These same bytes ride BOTH the private release and the
-        // mirrored public one, and only the public channel is readable without
-        // a credential — so the channel slug wins whenever one is configured,
-        // and we fall back to the publish slug only when there is no mirror
-        // (a legal configuration; see mirror::update_channel_slug).
-        repo_slug: &mirror::update_channel_slug(
-            &fs::read_to_string(ctx.tree.join("Cargo.toml"))
-                .map_err(|e| Error::new(format!("read Cargo.toml for manifest url: {e}")))?,
-        )?
-        .unwrap_or_else(|| ctx.slug.clone()),
+        // The manifest's `url` names the one release it rides: the channel this cut
+        // publishes onto (a rehearsal's scratch channel included), which the
+        // client's URL bind and the cut's own pointer gate both require.
+        repo_slug: &ctx.slug,
         min_os: &min_os,
         team_id: aterm_update_core::pins::APPLE_TEAM_ID,
         pub_date: &bundle::epoch_to_rfc3339(unix_now()),
@@ -11221,13 +10536,11 @@ pub fn selfcheck_paint_then_signing(
 }
 
 /// THE BYTES ON DISK ARE THE BYTES THE SIGNED MANIFEST NAMES — the re-proof every
-/// publication step runs before it reads `dist/`: [`step_selfcheck`] first, then
-/// `upload`, and the draft proof at `preflip` and inside `flip`. `dist/` is mutable
-/// and a resume skips `build`, so a step that ships bytes must re-read them; it
-/// re-reads them by DIGEST and runs nothing — the staged native Linux handoff (when
-/// the cut carries one), the sealed plist identity, the provenance record, the
-/// manifest's identity and signature, the DMG and zip against the manifest's
-/// digests, the evergreen twins and the `.sha256` sidecars.
+/// step that reads `dist/` runs: [`step_selfcheck`] (this, the staged bundle's sealed
+/// identity included) and `publish` ([`prove_publication_on_disk`] alone — a
+/// recovered cut has no bundle, and nothing it publishes is the bundle). `dist/` is
+/// mutable and a resume skips `build`, so a step that ships bytes must re-read them;
+/// it re-reads them by DIGEST and runs nothing.
 ///
 /// The BEHAVIOURAL proof — the shipped binary's own reports, the paint smoke,
 /// `codesign` and Tier APPLE — runs ONCE per cut, in [`step_selfcheck`], over
@@ -11239,13 +10552,13 @@ pub fn selfcheck_paint_then_signing(
 ///
 /// Returns the parsed on-disk manifest.
 fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
-    if let Some(handoff) = &ctx.linux {
-        handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
-    }
-    // A resume may skip `step_build`, and dist/ is intentionally mutable. Re-read
-    // the artifact itself before any publication-facing step can trust the
-    // historical packager result journaled by the original process.
-    validate_lean_dmg_on_disk(&ctx.dmg_path(), "self-check")?;
+    prove_bundle_on_disk(ctx)?;
+    prove_publication_on_disk(ctx)
+}
+
+/// The staged bundle's sealed identity: `CFBundleVersion` is the claimed build and
+/// `CFBundleShortVersionString` the claimed version.
+fn prove_bundle_on_disk(ctx: &CutCtx) -> Result<()> {
     let app = ctx.app_path();
 
     // Sealed CFBundleVersion == n.
@@ -11269,6 +10582,23 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
             ctx.version
         )));
     }
+    Ok(())
+}
+
+/// Everything the release will carry, re-proved from `dist/` by digest: the staged
+/// native Linux handoff (when the cut carries one), the lean DMG ceiling, the
+/// provenance record, the manifest's identity and signature — under the key the
+/// PUBLISHED bytes verify under ([`CutCtx::verification_pubkey`], which is a dead
+/// publisher's own on a cross-machine recovery) — the DMG and zip against the
+/// manifest's digests, the evergreen twins and the `.sha256` sidecars.
+fn prove_publication_on_disk(ctx: &CutCtx) -> Result<Manifest> {
+    if let Some(handoff) = &ctx.linux {
+        handoff.verify_staged(&ctx.dist, &ctx.version, ctx.build, &ctx.commit)?;
+    }
+    // A resume may skip `step_build`, and dist/ is intentionally mutable. Re-read
+    // the artifact itself before any publication-facing step can trust the
+    // historical packager result journaled by the original process.
+    validate_lean_dmg_on_disk(&ctx.dmg_path(), "self-check")?;
 
     let provenance = fs::read(ctx.provenance_path())
         .map_err(|error| Error::new(format!("read release provenance: {error}")))?;
@@ -11324,7 +10654,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         let signature = fs::read(&sig_path)
             .map_err(|error| Error::new(format!("read {}: {error}", sig_path.display())))?;
         verify_detached_manifest_signature(
-            ctx.signature_pubkey.as_deref().ok_or_else(|| {
+            ctx.verification_pubkey().ok_or_else(|| {
                 Error::new("self-check: signed channel has no persisted public key")
             })?,
             mtext.as_bytes(),
@@ -11348,7 +10678,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // Same proof for the updater container: it is the artifact the whole fleet
     // downloads, so a stale/absent zip must abort the cut here, not strand every
     // machine on a digest mismatch after publication.
-    let zip_name = mirror::zip_asset_name(&ctx.version);
+    let zip_name = channel::zip_asset_name(&ctx.version);
     let zip_sha256 = match (manifest.zip.as_deref(), manifest.zip_sha256.as_deref()) {
         (Some(name), Some(expected)) => {
             if name != zip_name {
@@ -11382,7 +10712,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // The stable download twins are byte copies of containers already proved
     // against the manifest's digest records, and dist/ is mutable while a
     // resume skips `step_build`, so the copies are re-proved too: the
-    // mirror later verifies the public channel's alias objects against dist/'s
+    // publish later verifies the channel's alias objects against dist/'s
     // twins, never against the canonical containers, so a stale twin here
     // would cross byte-verified against itself. The digest is the record's
     // own — the twin is only ever a byte copy, so hashing it and comparing IS
@@ -11393,7 +10723,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // byte copies, so something else wrote it. (A journal from the retired
     // lite lane, resumed here, has an `aterm.dmg` that aliases the OLD lean
     // twin's bytes, not manifest.dmg's — that is exactly the divergent case
-    // this refuses; a human re-cuts rather than the mirror serving two
+    // this refuses; a human re-cuts rather than the channel serving two
     // contracts under one evergreen name.)
     for (twin, source, expected_sha, what) in [
         (
@@ -11442,8 +10772,8 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
     // refusing would strand every journal written before sidecars existed. The
     // twins' ALIAS sidecars ride the same rule: same digests, alias filenames
     // (each names the exact bytes its evergreen URL saves).
-    let stable_dmg_name = mirror::stable_dmg_asset_name();
-    let stable_zip_name = mirror::stable_zip_asset_name();
+    let stable_dmg_name = channel::stable_dmg_asset_name();
+    let stable_zip_name = channel::stable_zip_asset_name();
     let sidecar_checks = [
         (
             ctx.dmg_sha256_path(),
@@ -11467,7 +10797,7 @@ fn prove_artifacts_on_disk(ctx: &CutCtx) -> Result<Manifest> {
         ),
     ];
     for (path, sha, name) in sidecar_checks {
-        let expected = mirror::sha256_sidecar_contents(sha, name);
+        let expected = channel::sha256_sidecar_contents(sha, name);
         if !path.exists() {
             fs::write(&path, &expected)
                 .map_err(|e| Error::new(format!("self-check: write {}: {e}", path.display())))?;
@@ -11665,38 +10995,36 @@ fn cut_roster_seq(ctx: &CutCtx) -> Result<Option<u64>> {
 }
 
 fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
-    let scanned = if ctx.kind == CutKind::Rehearse {
-        verify::scan_published(&ctx.slug, true)?
-    } else {
-        verify::scan_published_in_repo(&ctx.repo, &ctx.slug, true)?
-    };
+    let scanned = verify::scan_published(&ctx.slug, true)?;
     let best = scanned.first();
     let newest_floor = best.and_then(|published| published.min_build);
-    // The roster ratchet rides with the `min_build` ratchet, at all four of the places
-    // that guard it — lock, selfcheck, preflip, flip — because it closes the same race
-    // for the same reason: another publisher's release can land between this cut's
-    // pre-claim scan and its flip, and a channel head is never allowed to become
-    // visible under a roster generation the fleet has already moved past.
+    // The roster ratchet rides with the `min_build` ratchet, at every place that
+    // guards it — lock, selfcheck, and both ratchets of `publish` — because it closes
+    // the same race for the same reason: another publisher's release can land between
+    // this cut's pre-claim scan and its head PATCH, and a channel head is never allowed
+    // to become visible under a roster generation the fleet has already moved past.
     //
     // BOTH numbers, as at pre-claim: the head MANIFEST's attribution and the roster
     // ASSET the public channel actually serves. A machine joining the roster attaches
     // the new pair to already-published releases WITHOUT re-signing their manifests,
     // and every client ratchets on the asset it observed — so a join that lands
     // between this cut's pre-claim and its flip moves the fleet's floor while the
-    // manifest number stays put. Reading only the manifest here let such a cut flip
-    // under the old generation and strand every client that had ratcheted (2026-08-19
-    // audit). A public channel that cannot be read fails closed: a wrong answer here
-    // burns a build number and strands the fleet.
+    // manifest number stays put. Reading only the manifest here let such a cut go
+    // live under the old generation and strand every client that had ratcheted
+    // (2026-08-19 audit). A channel that cannot be read fails closed: a wrong answer
+    // here burns a build number and strands the fleet. A rehearsal's scratch channel
+    // has no fleet, and keeps the manifest-only floor.
     let manifest_roster_seq = published_roster_seq(best)?;
-    let observed_roster = match (&ctx.mirror_slug, ctx.kind) {
-        (Some(slug), CutKind::Real) if *slug != ctx.slug => machines::channel_roster_document(slug)
-            .map_err(|e| {
-                Error::new(format!(
-                    "cannot read the machine roster on the public channel {slug}'s latest \
-                     release ({e}); refusing to reason about the fleet's roster floor"
-                ))
-            })?,
-        _ => None,
+    let observed_roster = if ctx.kind == CutKind::Real {
+        machines::channel_roster_document(&ctx.slug).map_err(|e| {
+            Error::new(format!(
+                "cannot read the machine roster on the channel {}'s latest release ({e}); \
+                 refusing to reason about the fleet's roster floor",
+                ctx.slug
+            ))
+        })?
+    } else {
+        None
     };
     let observed_roster_seq = observed_roster.as_ref().map(|(seq, _)| *seq);
     let carried = cut_roster_seq(ctx)?;
@@ -11732,491 +11060,12 @@ fn best_published(ctx: &CutCtx) -> Result<Option<u64>> {
     Ok(best.map(|p| p.build))
 }
 
-/// Step "draft" (spec §7 step 5, first half): create the draft release
-/// targeting the claim sha. Draft-first is what closes the half-upload
-/// window: no client rule ever selects a draft.
-fn step_draft(ctx: &mut CutCtx) -> Result<()> {
-    if ctx.kind == CutKind::Rehearse {
-        // The scratch repo needs the release commit before --target can bind
-        // to it. Force-push: the scratch repo's history is disposable.
-        step(
-            "publish",
-            &format!("pushing HEAD to scratch repo {} (rehearsal)", ctx.slug),
-        );
-        let git = GitCli::new(&ctx.repo);
-        let url = format!("https://github.com/{}.git", ctx.slug);
-        git_ok(&git, &["push", "--force", &url, "HEAD:refs/heads/main"]).map_err(|e| {
-            Error::new(format!(
-                "cannot push to the rehearsal repo (create it first: \
-                 gh repo create {} --private): {e}",
-                ctx.slug
-            ))
-        })?;
-    }
-    let observed = unique_release_object_by_tag(&ctx.slug, &ctx.tag)?;
-    let release = match durable_post_decision(ctx.draft_create_issued, observed.is_some()) {
-        DurablePostDecision::PersistIntentThenPost => {
-            let release = create_draft(ctx)?;
-            step(
-                "publish",
-                &format!(
-                    "draft {} created (--target {})",
-                    ctx.tag,
-                    &ctx.commit[..12.min(ctx.commit.len())]
-                ),
-            );
-            release
-        }
-        DurablePostDecision::AwaitVisibility => {
-            return Err(Error::new(format!(
-                "draft create intent for {} was already durably issued, but the object is not yet visible; refusing a duplicate POST (resume after GitHub converges or use explicit stopped-publisher recovery)",
-                ctx.tag
-            )));
-        }
-        DurablePostDecision::ConvergeVisible if observed.as_ref().is_some_and(|r| r.draft) => {
-            let release = observed.expect("visible draft decision");
-            validate_release_object_capability(
-                Some(&release),
-                release.id,
-                &ctx.tag,
-                &ctx.commit,
-                true,
-            )?;
-            step(
-                "publish",
-                &format!(
-                    "draft {} ID {} already exists — exact target re-proven",
-                    ctx.tag, release.id
-                ),
-            );
-            release
-        }
-        DurablePostDecision::ConvergeVisible => {
-            return Err(Error::new(format!(
-                "{} is already PUBLISHED on {} — a published release is never overwritten; \
-                 retire a bad build with `{SHIP_COMMAND} yank <build>`",
-                ctx.tag, ctx.slug
-            )));
-        }
-    };
-    ctx.bind_release_id(release.id)?;
-    let reread = release_object_by_id(&ctx.slug, release.id)?;
-    validate_release_object_capability(reread.as_ref(), release.id, &ctx.tag, &ctx.commit, true)?;
-    if ctx.kind == CutKind::Real {
-        ensure_ctx_release_lease(ctx)?;
-        if remote_annotated_tag(&GitCli::new(&ctx.repo), &ctx.tag)?.is_some() {
-            return Err(Error::new(format!(
-                "draft creation unexpectedly materialized git tag {}; refusing to journal the draft step before the late exact annotated-tag protocol",
-                ctx.tag
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// One direct REST draft-create attempt, never [`gh_retry`] or the high-level
-/// `gh release create` command: a client-side timeout can report failure for a create that
-/// LANDED server-side, and GitHub happily mints a SECOND draft with the same
-/// tag_name (drafts don't own their tag until the flip) — the orphan would
-/// linger forever, keep `release_state` answering Draft for a version with no
-/// cut in flight, and survive `--abandon` (which deletes only the draft gh
-/// resolves). Durable intent is saved before the POST; this invocation then
-/// probes once, and a later resume may discover but never recreate it.
-fn create_draft(ctx: &mut CutCtx) -> Result<ReleaseObjectIdentity> {
-    let notes = release_body_for_post("draft", &ctx.notes_path())?;
-    let posted_body_len = notes.len();
-    let title = format!("aterm {}", ctx.version);
-    let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{}/releases", ctx.slug);
-    let payload = aterm_json::to_vec(&aterm_json::json!({
-        "tag_name": ctx.tag.as_str(),
-        "target_commitish": ctx.commit.as_str(),
-        "name": title,
-        "body": notes,
-        "draft": true,
-        "prerelease": false,
-    }))
-    .map_err(|error| Error::new(format!("serialize draft release request: {error}")))?;
-    let post = OneShotPost::prepare_json("create", "draft release request", &endpoint, &payload)?;
-    // Every fallible preflight precedes the durable edge. The returned
-    // non-cloneable permit is consumed by the immediately following POST.
-    ensure_ctx_release_lease(ctx)?;
-    let permit = ctx.persist_draft_create_intent()?;
-    // Creation is deliberately attempted at most once per invocation. A
-    // timeout followed by an eventually-consistent empty list cannot prove
-    // the POST did not land; retrying here can mint a duplicate draft.
-    let out = post.issue(permit)?;
-    if out.success() {
-        let release = parse_release_object_response(&out.stdout)?;
-        validate_release_object_capability(
-            Some(&release),
-            release.id,
-            &ctx.tag,
-            &ctx.commit,
-            true,
-        )?;
-        return Ok(release);
-    }
-    if let Some(release) = unique_release_object_by_tag(&ctx.slug, &ctx.tag)? {
-        validate_release_object_capability(
-            Some(&release),
-            release.id,
-            &ctx.tag,
-            &ctx.commit,
-            true,
-        )?;
-        return Ok(release);
-    }
-    // THE SERVER ANSWERED AND REFUSED: nothing was created, so the one-shot intent
-    // this invocation persisted is spent on nothing and must not wedge the cut. Release
-    // it, so the next invocation may post once more (see
-    // `server_refused_without_creating` for why that cannot mint a duplicate).
-    if server_refused_without_creating(&out) {
-        ctx.release_draft_create_intent()?;
-        return Err(Error::new(format!(
-            "draft create for {} was REFUSED by the server ({}); nothing was created, so the \
-             create intent has been released and `--resume` may post once more. If this keeps \
-             happening the refusal itself is the thing to read, not the intent.",
-            ctx.tag,
-            release_post_failure_detail(&out, posted_body_len)
-        )));
-    }
-    Err(Error::new(format!(
-        "draft create returned {} but no exact release object is visible for {}; refusing an ambiguous retry in this invocation (resume after GitHub converges): {}",
-        if out.success() { "success" } else { "failure" },
-        ctx.tag,
-        release_post_failure_detail(&out, posted_body_len)
-    )))
-}
-
-/// Step "upload": converge every exact-name asset through a durable one-shot
-/// intent. A lost POST response can delay resume, but can never duplicate or
-/// overwrite an object.
-fn step_upload(ctx: &mut CutCtx) -> Result<()> {
-    // dist/ is mutable and ignored by git: re-prove the bytes by digest before a
-    // (resumed) upload reads one of them. The behavioural pass ran once, in
-    // `selfcheck`, over these same bytes.
-    prove_artifacts_on_disk(ctx)?;
-    let release_id = ctx.required_release_id("upload")?;
-    let release = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(release.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
-    // Draft-first re-proof (spec decision 4): "draft" may be journaled done by
-    // a CRASHED attempt whose release was since finished — and possibly
-    // republished under a fresh build — from another machine. Only step_draft
-    // carries the Published guard, and resume skips it; without this re-check
-    // a stale journal could still issue a new upload request against a LIVE
-    // release in front of the whole fleet.
-    if verify::release_state(&ctx.slug, &ctx.tag)? == verify::ReleaseState::Published {
-        return Err(Error::new(format!(
-            "{} is already PUBLISHED on {} — refusing to upload over a live release; \
-             this journal is stale (the cut was finished elsewhere). Delete \
-             dist/cut-state.toml; retire a bad live build with `{SHIP_COMMAND} yank <build>`",
-            ctx.tag, ctx.slug
-        )));
-    }
-    // The roster travels with the release it authorizes; see `upload_asset_paths`. The
-    // predicate is the JOURNALED machine id, not the in-memory roster document, because
-    // a resume past `build` has the assets on disk and no document in hand — keying off
-    // the document would silently stop attaching them.
-    let mut files: Vec<PathBuf> = ctx.upload_asset_paths();
-    let sig = ctx.manifest_path().with_extension("toml.sig");
-    match (ctx.signature_required, ctx.manifest_signed, sig.is_file()) {
-        (true, true, true) => {
-            let manifest = fs::read(ctx.manifest_path()).map_err(|error| {
-                Error::new(format!("read {}: {error}", ctx.manifest_path().display()))
-            })?;
-            let signature = fs::read(&sig)
-                .map_err(|error| Error::new(format!("read {}: {error}", sig.display())))?;
-            verify_detached_manifest_signature(
-                ctx.signature_pubkey.as_deref().ok_or_else(|| {
-                    Error::new("upload: signed channel has no persisted public key")
-                })?,
-                &manifest,
-                &signature,
-            )?;
-            files.push(sig);
-        }
-        (false, false, false) => {}
-        _ => {
-            return Err(Error::new(
-                "manifest signature disk/journal/ratchet state disagrees; refusing opportunistic upload",
-            ));
-        }
-    }
-    if ctx.dsym_zip_path().is_file() {
-        files.push(ctx.dsym_zip_path());
-    }
-    for f in &files {
-        if !f.is_file() {
-            return Err(Error::new(format!(
-                "asset missing: {} — the build step's outputs are gone; delete \
-                 dist/cut-state.toml and run a plain `{CUT_COMMAND}` to recut",
-                f.display()
-            )));
-        }
-    }
-    for file in &files {
-        upload_release_asset_by_id(ctx, release_id, file)?;
-    }
-    step(
-        "",
-        &format!(
-            "{} assets converged on immutable draft release ID {release_id}",
-            files.len()
-        ),
-    );
-    Ok(())
-}
-
-fn upload_release_asset_by_id(ctx: &mut CutCtx, release_id: u64, file: &Path) -> Result<()> {
-    let name = file
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::new("release asset filename is not UTF-8"))?;
-    if !name
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(Error::new(format!(
-            "release asset name {name:?} is outside the exact upload URL alphabet"
-        )));
-    }
-
-    let prior_intent = ctx.upload_intent_issued(name);
-    let observed = release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)?;
-    match durable_post_decision(prior_intent, observed.is_some()) {
-        DurablePostDecision::AwaitVisibility => {
-            return Err(Error::new(format!(
-                "upload intent for draft asset {name} was already durably issued, but the asset is not visible; refusing a duplicate POST (resume after GitHub converges)"
-            )));
-        }
-        DurablePostDecision::PersistIntentThenPost => {}
-        DurablePostDecision::ConvergeVisible => {
-            let (old_id, _) = observed.expect("visible asset decision");
-            if verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file).is_ok() {
-                return Ok(());
-            }
-            if prior_intent {
-                return Err(Error::new(format!(
-                    "draft asset {name} exists with wrong bytes after its durable upload intent; refusing delete/re-upload because a prior POST may be the authority"
-                )));
-            }
-            let release = release_object_by_id(&ctx.slug, release_id)?;
-            validate_release_object_capability(
-                release.as_ref(),
-                release_id,
-                &ctx.tag,
-                &ctx.commit,
-                true,
-            )?;
-            ensure_ctx_release_lease(ctx)?;
-            let endpoint = format!("repos/{}/releases/assets/{old_id}", ctx.slug);
-            let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
-            match release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)? {
-                None => {}
-                Some((observed, _)) if observed != old_id => {
-                    return Err(Error::new(format!(
-                        "draft asset {name} was replaced while deleting exact asset ID {old_id}; refusing to delete the replacement"
-                    )));
-                }
-                Some(_) => {
-                    return Err(Error::new(format!(
-                        "delete exact draft asset ID {old_id} failed: {}",
-                        out.stderr_utf8().trim()
-                    )));
-                }
-            }
-        }
-    }
-
-    if durable_post_decision(prior_intent, false) != DurablePostDecision::PersistIntentThenPost {
-        return Err(Error::new(format!(
-            "upload intent for draft asset {name} cannot authorize another POST after convergence"
-        )));
-    }
-    let endpoint = exact_release_upload_url(&ctx.slug, release_id, name)?;
-    let post = OneShotPost::prepare_binary("release asset", &endpoint, file)?;
-    let release = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(release.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
-    ensure_ctx_release_lease(ctx)?;
-    let permit = ctx.persist_upload_intent(name)?;
-    // Like draft creation, an upload POST is issued once per invocation. An
-    // absent immediate probe after timeout may be visibility lag, not proof
-    // of non-delivery; resume will first converge on any exact-name object.
-    let out = post.issue(permit)?;
-    // BEFORE ANY REMOTE PROBE. This verdict is local and provable, and the probe
-    // below is a network call that can fail — under exactly the conditions that
-    // produce a curl exit 2 in the first place (memory pressure kills the gh spawn;
-    // a hammered API answers 5xx three times). A failed probe used to return early
-    // and leave the intent standing, restoring the permanent wedge this retraction
-    // exists to prevent (2026-08-19 round-7 audit). The pre-POST probe above already
-    // answered "did this asset exist beforehand".
-    if transport_never_started(&out) {
-        ctx.retract_upload_intent(name)?;
-        return Err(Error::new(format!(
-            "upload of {name} never reached the network (curl exit {}): {}. The durable \
-             intent was retracted, so a resume will retry it once the local cause is fixed",
-            out.status,
-            out.stderr_utf8().trim()
-        )));
-    }
-    if release_asset_identity_for_release_id_optional(&ctx.slug, release_id, name)?.is_some() {
-        verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
-        return Ok(());
-    }
-    Err(Error::new(format!(
-        "exact-ID upload of {name} returned {} but no asset is visible; refusing an ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
-        if out.success() { "success" } else { "failure" },
-        out.stderr_utf8().trim()
-    )))
-}
-
-pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Result<String> {
-    let valid_slug = slug.split_once('/').is_some_and(|(owner, repo)| {
-        !owner.is_empty()
-            && !repo.is_empty()
-            && !owner.contains('/')
-            && !repo.contains('/')
-            && owner
-                .bytes()
-                .chain(repo.bytes())
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    });
-    if !valid_slug
-        || release_id == 0
-        || name.is_empty()
-        || !name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
-    {
-        return Err(Error::new(
-            "release upload owner/repo, ID, or asset name is not canonical",
-        ));
-    }
-    // `gh api --hostname uploads.github.com` incorrectly treats that host as
-    // a GitHub Enterprise name and prefixes `api.`. An absolute endpoint is
-    // explicitly accepted by gh and preserves GitHub's dedicated upload host.
-    Ok(format!(
-        "{GITHUB_UPLOAD_ORIGIN}/repos/{slug}/releases/{release_id}/assets?name={name}"
-    ))
-}
-
-/// Re-prove the complete invisible publication object from immutable IDs.
-/// This is called both at `preflip` and again inside `flip`, so a crash or a
-/// replacement after either earlier journal mark cannot make mutable local or
-/// remote bytes visible without a fresh proof.
-fn prove_draft_artifacts(ctx: &mut CutCtx) -> Result<()> {
-    prove_artifacts_on_disk(ctx)?;
-    let release_id = ctx.required_release_id("draft artifact proof")?;
-    let before = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(before.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
-    let manifest_text = fs::read_to_string(ctx.manifest_path()).map_err(|error| {
-        Error::new(format!(
-            "read local manifest for draft proof {}: {error}",
-            ctx.manifest_path().display()
-        ))
-    })?;
-    let manifest = Manifest::parse(&manifest_text)
-        .map_err(|error| Error::new(format!("parse local manifest for draft proof: {error}")))?;
-    let provenance_path = ctx.provenance_path();
-    let provenance_name = provenance_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::new("provenance filename is not UTF-8"))?
-        .to_string();
-    let dsym_path = ctx.dsym_zip_path();
-    let dsym_name = dsym_path
-        .is_file()
-        .then(|| dsym_path.file_name().and_then(|name| name.to_str()))
-        .flatten();
-    let inventory_before = release_asset_inventory_for_release_id(&ctx.slug, release_id)?;
-    let mut names: Vec<String> = inventory_before
-        .iter()
-        .map(|asset| asset.name.clone())
-        .collect();
-    // A draft uploaded by a pre-sidecar cutter lacks exactly the `.sha256`
-    // sidecar assets. They are pure digest records `prove_artifacts_on_disk` above just
-    // re-proved (regenerating them on disk if absent), and
-    // `recover_published_cut` already attaches them to PUBLISHED releases on
-    // the same reasoning — so converge the draft here rather than strand every
-    // pre-sidecar journal at its own proof step. Anything else missing still
-    // fails `validate_draft_asset_set` below, on a fresh listing.
-    let sidecar_uploads = [
-        (
-            mirror::sha256_sidecar_name(&mirror::dmg_asset_name(&ctx.version)),
-            ctx.dmg_sha256_path(),
-        ),
-        (
-            mirror::sha256_sidecar_name(&mirror::zip_asset_name(&ctx.version)),
-            ctx.zip_sha256_path(),
-        ),
-    ];
-    let mut converged = false;
-    for (name, path) in &sidecar_uploads {
-        if !names.iter().any(|n| n == name) && path.is_file() {
-            upload_release_asset_by_id(ctx, release_id, path)?;
-            converged = true;
-        }
-    }
-    if converged {
-        names = release_asset_inventory_for_release_id(&ctx.slug, release_id)?
-            .iter()
-            .map(|asset| asset.name.clone())
-            .collect();
-    }
-    validate_draft_asset_set(
-        &names,
-        &manifest,
-        ctx.signature_required,
-        &provenance_name,
-        dsym_name,
-    )?;
-
-    // `validate_draft_asset_set` above has already required the roster's PRESENCE from
-    // the manifest's own `machine_id`; `proof_asset_paths` is the bytes half of that.
-    let mut files = ctx.proof_asset_paths();
-    if ctx.dsym_zip_path().is_file() {
-        files.push(ctx.dsym_zip_path());
-    }
-    for file in &files {
-        let name = file
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::new("draft artifact filename is not UTF-8"))?;
-        verify_release_asset_id_matches_local(&ctx.slug, release_id, name, file)?;
-    }
-    let inventory_after = release_asset_inventory_for_release_id(&ctx.slug, release_id)?;
-    if inventory_after != inventory_before {
-        return Err(Error::new(
-            "draft asset name/immutable-ID/size inventory changed during byte verification",
-        ));
-    }
-    let after = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(after.as_ref(), release_id, &ctx.tag, &ctx.commit, true)?;
-    Ok(())
-}
-
-/// Step "preflip" (spec §7 step 5): re-run the monotonic client-rule check
-/// right before anything becomes visible.
-fn step_preflip(ctx: &mut CutCtx) -> Result<()> {
-    prove_draft_artifacts(ctx)?;
-    revalidate_ctx_signature_policy(ctx)?;
-    let best = best_published(ctx)?;
-    step(
-        "",
-        &format!(
-            "pre-flip: client-rule selection (\"newest non-draft carrying {}\") still tops \
-             out {} — below {} ok",
-            manifest_out::MANIFEST_ASSET,
-            best.map_or("at none".to_string(), |b| format!("at {b}")),
-            ctx.build
-        ),
-    );
-    Ok(())
-}
-
-/// Step "tag" (real cut only): the LATE annotated tag (spec decision 5) —
-/// pushed only now, with all assets up and the pre-flip check green, so a
-/// failed cut never leaves a public tag.
+/// Step "tag" (real cut only): the annotated `vX.Y.Z` tag on origin, naming the
+/// release commit — pushed after the self-check and before anything is published,
+/// so the release `publish` makes the channel head always names a tag origin
+/// carries. It stays on the dev repository (the channel's own tag is the engine's);
+/// a cut abandoned after this step deletes it (`--abandon`), and a lost machine's
+/// recovery does too.
 fn step_tag(ctx: &mut CutCtx) -> Result<()> {
     let git = GitCli::new(&ctx.repo);
     let tag_ref = format!("refs/tags/{}", ctx.tag);
@@ -12286,277 +11135,18 @@ fn step_tag(ctx: &mut CutCtx) -> Result<()> {
     Ok(())
 }
 
-/// Step "flip": draft → live. The single instant the release becomes visible
-/// to the fleet — everything before it was invisible, everything after it is
-/// verification. Because a resume can re-enter here long after the crashed
-/// attempt journaled "preflip", the state AND the monotonic rule are both
-/// re-proven now, not trusted from the journal.
-fn step_flip(ctx: &mut CutCtx) -> Result<()> {
-    let release_id = ctx.required_release_id("flip")?;
-    match release_object_by_id(&ctx.slug, release_id)? {
-        Some(release) if release.draft => {
-            validate_release_object_capability(
-                Some(&release),
-                release_id,
-                &ctx.tag,
-                &ctx.commit,
-                true,
-            )?;
-            prove_draft_artifacts(ctx)?;
-            // Spec §7 step 5 mandates the client-rule monotonic check
-            // IMMEDIATELY before visibility: a newer build may have shipped
-            // in the days since this journal's "preflip" ran — abort here,
-            // while aborting is still invisible, instead of flipping a
-            // never-selectable release that would need a yank.
-            revalidate_ctx_signature_policy(ctx)?;
-            best_published(ctx)?;
-            let git = GitCli::new(&ctx.repo);
-            let remote_tag = remote_annotated_tag(&git, &ctx.tag)?.ok_or_else(|| {
-                Error::new(format!(
-                    "remote annotated tag {} vanished immediately before flip",
-                    ctx.tag
-                ))
-            })?;
-            if remote_tag.commit != ctx.commit {
-                return Err(Error::new(format!(
-                    "remote annotated tag {} peels to {}, not claim {}; refusing visibility",
-                    ctx.tag, remote_tag.commit, ctx.commit
-                )));
-            }
-            // Keep the owner check adjacent to the visibility mutation too;
-            // a deleted or foreign-replaced lease is never papered over by a
-            // process-local guard obtained at step entry.
-            let endpoint = format!("repos/{}/releases/{release_id}", ctx.slug);
-            gh_retry_guarded(
-                &[
-                    "api",
-                    "--method",
-                    "PATCH",
-                    &endpoint,
-                    "-F",
-                    "draft=false",
-                    "-f",
-                    "make_latest=true",
-                ],
-                || {
-                    prove_draft_artifacts(ctx)?;
-                    let current = release_object_by_id(&ctx.slug, release_id)?;
-                    validate_release_object_capability(
-                        current.as_ref(),
-                        release_id,
-                        &ctx.tag,
-                        &ctx.commit,
-                        true,
-                    )?;
-                    let tag = remote_annotated_tag(&GitCli::new(&ctx.repo), &ctx.tag)?.ok_or_else(
-                        || Error::new("remote annotated tag vanished before flip retry"),
-                    )?;
-                    if tag.commit != ctx.commit {
-                        return Err(Error::new(
-                            "remote annotated tag changed claim before flip retry",
-                        ));
-                    }
-                    ensure_ctx_release_lease(ctx)?;
-                    Ok(())
-                },
-            )?;
-            let after = release_object_by_id(&ctx.slug, release_id)?;
-            validate_release_object_capability(
-                after.as_ref(),
-                release_id,
-                &ctx.tag,
-                &ctx.commit,
-                false,
-            )?;
-            prove_latest_release_is_this_cut(&ctx.slug, &ctx.tag)?;
-            step("", &format!("draft release ID {release_id} → live"));
-        }
-        Some(release) => {
-            validate_release_object_capability(
-                Some(&release),
-                release_id,
-                &ctx.tag,
-                &ctx.commit,
-                false,
-            )?;
-            // Already live: EITHER our own flip landed and the crash ate the
-            // journal mark (converge silently), OR a stale journal is
-            // replaying against a release someone else published under this
-            // tag — only the live build number distinguishes the two, and
-            // claiming another cut's release as ours would break the
-            // draft-first invariant end to end.
-            let live = published_build(ctx)?;
-            if live != Some(ctx.build) {
-                return Err(Error::new(format!(
-                    "{} is already PUBLISHED on {} carrying build {}, not our {} — \
-                     this journal is stale (the cut was finished/republished \
-                     elsewhere); delete dist/cut-state.toml",
-                    ctx.tag,
-                    ctx.slug,
-                    live.map_or("<unreadable>".to_string(), |b| b.to_string()),
-                    ctx.build
-                )));
-            }
-            step(
-                "",
-                "already live (the flip landed before the crash) — converged",
-            );
-        }
-        None => {
-            return Err(Error::new(format!(
-                "exact release ID {release_id} ({}) vanished from {} before the flip — it was deleted or \
-                 abandoned elsewhere; delete dist/cut-state.toml and run a plain \
-                 `{CUT_COMMAND}` to recut with a fresh number",
-                ctx.tag, ctx.slug
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Step "archive": converge the release channel to one exact-name appcast.
-/// This runs only after our release is published, so the current tag remains
-/// continuously discoverable while every older published manifest/signature
-/// is metadata-renamed to its deterministic per-tag archive name. The step is
-/// journaled as a unit; each individual PATCH is itself convergent, and the
-/// final fresh listing proves the invariant before verify may proceed.
-fn step_archive(ctx: &mut CutCtx) -> Result<()> {
-    let release_id = ctx.required_release_id("archive")?;
-    let release = release_object_by_id(&ctx.slug, release_id)?;
-    validate_release_object_capability(release.as_ref(), release_id, &ctx.tag, &ctx.commit, false)?;
-    let live_manifest =
-        download_release_asset_for_release_id(&ctx.slug, release_id, manifest_out::MANIFEST_ASSET)?;
-    let live_signature = if ctx.signature_required {
-        Some(download_release_asset_for_release_id(
-            &ctx.slug,
-            release_id,
-            manifest_out::MANIFEST_SIG_ASSET,
-        )?)
-    } else {
-        if release_asset_identity_for_release_id_optional(
-            &ctx.slug,
-            release_id,
-            manifest_out::MANIFEST_SIG_ASSET,
-        )?
-        .is_some()
-        {
-            return Err(Error::new(
-                "unsigned archive target carries an unexpected exact signature asset",
-            ));
-        }
-        None
-    };
-    let local_manifest = fs::read(ctx.manifest_path()).map_err(|error| {
-        Error::new(format!(
-            "read journaled manifest {} before archive: {error}",
-            ctx.manifest_path().display()
-        ))
-    })?;
-    let signature_path = ctx.manifest_path().with_extension("toml.sig");
-    let local_signature = if ctx.signature_required {
-        Some(fs::read(&signature_path).map_err(|error| {
-            Error::new(format!(
-                "read journaled signature {} before archive: {error}",
-                signature_path.display()
-            ))
-        })?)
-    } else {
-        None
-    };
-    let live = validate_live_release_identity(
-        ExpectedReleaseIdentity {
-            version: &ctx.version,
-            build: ctx.build,
-            commit: &ctx.commit,
-        },
-        &live_manifest,
-        live_signature.as_deref(),
-        Some(&local_manifest),
-        local_signature.as_deref(),
-        ctx.signature_required,
-        ctx.verification_pubkey(),
-    )
-    .map_err(|error| {
-        Error::new(format!(
-            "refusing archive for {}: {error}; no historical asset was changed",
-            ctx.tag
-        ))
-    })?;
-    verify_release_asset_id_matches_local(&ctx.slug, release_id, &live.dmg, &ctx.dmg_path())?;
-    if let Some(zip) = live.zip.as_deref() {
-        verify_release_asset_id_matches_local(&ctx.slug, release_id, zip, &ctx.zip_path())?;
-    }
-    verify_release_asset_id_matches_local(
-        &ctx.slug,
-        release_id,
-        ctx.provenance_path()
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::new("provenance filename is not UTF-8"))?,
-        &ctx.provenance_path(),
-    )?;
-    // Keep the exact process-token check immediately adjacent to the first
-    // historical PATCH; validation can involve several authenticated reads.
-    ensure_ctx_release_lease(ctx)?;
-    let lease = ctx
-        .lease
-        .as_ref()
-        .ok_or_else(|| Error::new("archive has no persistent claim lease"))?;
-    let fence = ctx
-        .fence
-        .as_ref()
-        .ok_or_else(|| Error::new("archive has no unique publisher fence"))?;
-    let mut remote = GhAppcastArchiveRemote::fenced(&ctx.slug, &ctx.repo, lease, fence);
-    let renamed = converge_appcast_archive(&mut remote, &ctx.tag, ctx.signature_required)?;
-    step(
-        "archive",
-        &format!(
-            "{renamed} historical appcast asset{} metadata-renamed · {} is sole exact head",
-            if renamed == 1 { "" } else { "s" },
-            ctx.tag
-        ),
-    );
-    Ok(())
-}
-
-/// The build number the release under OUR tag carries live, read from its
-/// manifest asset (`None` only when the name is absent or its bounded bytes are
-/// syntactically unreadable). Duplicate names, oversize metadata, identity
-/// races, and transport failures remain hard errors — the one fact that tells
-/// "our own half-flipped cut" apart from "someone else's release wearing our
-/// tag" must never be guessed through ambiguity.
-fn published_build(ctx: &CutCtx) -> Result<Option<u64>> {
-    let release_id = ctx.required_release_id("published-build convergence proof")?;
-    if release_asset_identity_for_release_id_optional(
-        &ctx.slug,
-        release_id,
-        manifest_out::MANIFEST_ASSET,
-    )?
-    .is_none()
-    {
-        return Ok(None);
-    }
-    let bytes =
-        download_release_asset_for_release_id(&ctx.slug, release_id, manifest_out::MANIFEST_ASSET)?;
-    let Ok(text) = String::from_utf8(bytes) else {
-        return Ok(None);
-    };
-    Ok(Manifest::parse(&text).ok().map(|m| m.build_number))
-}
-
 // ---------------------------------------------------------------------------
-// step "mirror": copy the verified release to the PUBLIC update channel
+// step "publish": the ONE publication, straight onto the release channel
 // ---------------------------------------------------------------------------
 
-/// Pre-claim proof that the public update channel is reachable AND writable by
-/// this operator's credential.
+/// Pre-claim proof that the release channel is reachable, PUBLIC and writable by
+/// this operator's credential — and again inside `publish`, before the first write.
 ///
-/// Deliberately runs before the ledger claim. The mirror itself is the last
-/// remote step of a cut, so discovering "no push permission on the channel"
-/// there would burn a build number, leave a live private release the fleet
-/// cannot see, and hold the lease until an OWNER-level permission grant — which
-/// is not something a resume can fix. Failing here costs nothing.
-pub fn preflight_mirror_target(slug: &str) -> Result<()> {
+/// Deliberately runs before the ledger claim: discovering "no push permission on
+/// the channel" at `publish` would burn a build number and hold the lease until an
+/// OWNER-level permission grant — which is not something a resume can fix. Failing
+/// here costs nothing.
+pub fn preflight_channel_target(slug: &str) -> Result<()> {
     let endpoint = format!("repos/{slug}");
     let out = gh_retry(&[
         "api",
@@ -12566,11 +11156,9 @@ pub fn preflight_mirror_target(slug: &str) -> Result<()> {
     ])
     .map_err(|error| {
         Error::new(format!(
-            "cannot read the public update channel {slug} named by {table} {key}: {error}. \
-             A 404 here means the repository does not exist or this account cannot see it; \
-             create it (public) and grant the release account write access.",
-            table = mirror::CHANNEL_TABLE,
-            key = mirror::CHANNEL_KEY,
+            "cannot read the release channel {slug}: {error}. A 404 here means the \
+             repository does not exist or this credential cannot see it; create it (public) \
+             and grant the release account write access."
         ))
     })?;
     let row = out.stdout_utf8();
@@ -12578,44 +11166,42 @@ pub fn preflight_mirror_target(slug: &str) -> Result<()> {
     let mut fields = row.split('\t');
     let (Some(private), Some(push), None) = (fields.next(), fields.next(), fields.next()) else {
         return Err(Error::new(format!(
-            "public update channel {slug} returned a malformed repository row {row:?}"
+            "release channel {slug} returned a malformed repository row {row:?}"
         )));
     };
     if push != "true" {
         return Err(Error::new(format!(
-            "the authenticated account has no push permission on the public update \
-             channel {slug}, so `{CUT_COMMAND}` cannot mirror this release there and \
-             the fleet would never see it. This is an OWNER action, not a resume: grant \
-             the release account write access to {slug} (or clear \
-             `{table} {key}` in Cargo.toml to publish without a public mirror — shipped \
-             builds would then read the private repo and need a token). Refusing before \
-             the ledger claim so no build number is burned.",
-            table = mirror::CHANNEL_TABLE,
-            key = mirror::CHANNEL_KEY,
+            "the authenticated account has no push permission on the release channel {slug}, \
+             so `{CUT_COMMAND}` cannot publish there and the fleet would never see this \
+             release. This is an OWNER action, not a resume: grant the release account write \
+             access to {slug} (the release-org token is {}). Refusing before the ledger claim \
+             so no build number is burned.",
+            channel_token_path().map_or_else(
+                || "~/.secrets/gh_access_token_alabsystems".to_string(),
+                |path| path.display().to_string()
+            ),
         )));
     }
     if private == "true" {
         return Err(Error::new(format!(
-            "the update channel {slug} is PRIVATE. Mirroring there would reproduce the \
-             very failure this channel exists to remove: a shipped build with no \
-             provisioned credential cannot read a private repo's releases and silently \
-             never updates. Make {slug} public, or point \
-             `{table} {key}` at a public repository.",
-            table = mirror::CHANNEL_TABLE,
-            key = mirror::CHANNEL_KEY,
+            "the release channel {slug} is PRIVATE. Every installed copy reads its channel with \
+             no credential, so a private one is a channel no install can ever read — the \
+             silent never-updates failure. Make {slug} public, or point `{table} {key}` at a \
+             public repository.",
+            table = channel::CHANNEL_TABLE,
+            key = channel::CHANNEL_KEY,
         )));
     }
     Ok(())
 }
 
-/// Validate a MIRROR release object capability. The private side's
-/// [`validate_release_object_capability`] also binds `target_commitish` to the
-/// claim sha; the mirror deliberately cannot, because the public channel is a
-/// different repository whose history does not contain the claim commit at all
-/// (its releases are anchored at the public default branch). Identity there is
-/// the immutable release ID plus the tag plus the draft state — the three
-/// things a mutation must not have raced.
-fn validate_mirror_release_capability(
+/// Validate a channel release object capability: the immutable release ID, the tag
+/// and the draft state — the three things a mutation must not have raced. There is
+/// no `target_commitish` to bind: the channel is not the repository the claim commit
+/// lives in, so its releases are anchored at the channel's default branch, and the
+/// bytes' authenticity comes from the manifest digest, the pinned signature and
+/// codesign, never from a release target.
+fn validate_channel_release_capability(
     observed: Option<&ReleaseObjectIdentity>,
     expected_id: u64,
     expected_tag: &str,
@@ -12623,7 +11209,7 @@ fn validate_mirror_release_capability(
 ) -> Result<()> {
     let observed = observed.ok_or_else(|| {
         Error::new(format!(
-            "mirror release ID {expected_id} vanished before mutation"
+            "channel release ID {expected_id} vanished before mutation"
         ))
     })?;
     if observed.id != expected_id
@@ -12631,190 +11217,159 @@ fn validate_mirror_release_capability(
         || observed.draft != expected_draft
     {
         return Err(Error::new(format!(
-            "mirror release ID {expected_id} changed tag/state; refusing mutation"
+            "channel release ID {expected_id} changed tag/state; refusing mutation"
         )));
     }
     Ok(())
 }
 
-/// Step "mirror" — the step that makes auto-update actually work.
+/// Step "publish" — THE publication, and the step that makes auto-update work.
 ///
-/// It runs AFTER `verify`, so the private release is already live and fully
-/// proven, and BEFORE `unlock`, so the cut still holds its lease/fence and a
-/// failure is resumable rather than abandoned. It runs [`mirror::publish_on_channel`]:
-/// the fleet's floors checked; this cut's release on the public channel bound — the
-/// vX.Y.0 SOURCE release `pub publish` created, adopted; or a draft created under a
-/// durable one-shot intent where none exists; every client-required asset uploaded
-/// once by immutable ID and re-proved byte-identical to the local artifact, the
-/// appcast pair last, the exact asset set proved, the floors checked again, and ONE
-/// guarded PATCH that makes the release the channel head and GitHub's `latest`.
-///
-/// Failure is a cut failure on purpose. The compiled-in channel of every shipped
-/// binary is the mirror, so a release that reaches the private repo and not the
-/// channel is invisible to the fleet — indistinguishable, from a user's Mac,
-/// from no release at all. That is the silent-never-updates bug; it must be
-/// loud and it must be resumable.
-fn step_mirror(ctx: &mut CutCtx) -> Result<()> {
-    // Rehearsals publish to a scratch repo and must never touch the real public
-    // channel; dry-runs have already returned after selfcheck.
-    if ctx.kind != CutKind::Real {
-        return Ok(());
-    }
-    let Some(slug) = ctx.mirror_slug.clone() else {
-        step(
-            "mirror",
-            &format!(
-                "no {} {} declared — clients read {} directly; nothing to mirror",
-                mirror::CHANNEL_TABLE,
-                mirror::CHANNEL_KEY,
-                ctx.slug
-            ),
-        );
-        return Ok(());
-    };
-    if slug == ctx.slug {
-        step(
-            "mirror",
-            &format!("update channel is the publish repo {slug} — already published there"),
-        );
-        return Ok(());
-    }
-    // A journal can resume directly at `mirror`, after every ordinary
-    // self-check is marked complete. Refuse a replaced/legacy seeded dist DMG
-    // before creating or mutating any public-channel object.
-    validate_lean_dmg_on_disk(&ctx.dmg_path(), "mirror preflight")?;
+/// A cut publishes ONCE (owner ruling R4; the private-origin draft, flip, archive
+/// and verify, and the mirror that copied them, are gone since 2026-09-26). It runs
+/// [`channel::publish_on_channel`] over this cut's release on the channel: `dist/`
+/// re-proved against the signed appcast ([`prove_publication_on_disk`]) and the roster
+/// pair against the master signature ([`prove_roster_on_disk`]) — there is no earlier
+/// published copy to bind them to — then the fleet's floors checked; this cut's release
+/// bound — the vX.Y.0 SOURCE release `pub publish` created, adopted; or a draft created
+/// under a durable one-shot intent where none exists; every asset uploaded once by
+/// immutable ID and re-proved byte-identical to the local artifact, the appcast pair
+/// last, the exact asset set proved, the floors checked again, and ONE guarded PATCH
+/// that makes the release the channel head and GitHub's `latest`; then what a stranger
+/// sees, proved. A resume whose head PATCH already landed uploads nothing and reads no
+/// roster floor: it re-sends the PATCH and proves that last part
+/// ([`channel::ChannelRelease::head_made`]).
+fn step_publish(ctx: &mut CutCtx) -> Result<()> {
     ensure_ctx_release_lease(ctx)?;
-    // THE MIRROR IS A COPY OF THE ORIGIN RELEASE, NOT OF dist/. The roster pair in
-    // dist/ is the one file a separate, un-lease-gated ceremony (`atpkg-keys join`,
-    // `cargo ship provision`) rewrites between an origin flip and a resumed mirror —
-    // and this step then uploaded THOSE bytes beside a manifest signed under the
-    // roster the cut actually shipped, and judged the lineage fork from them too (a
-    // spurious fork no supported command could clear; and, at an equal generation, a
-    // genuinely forked document published as the channel head). Bind dist/'s roster
-    // to what the origin release carries before either use.
-    //
-    // READ BEFORE THE CHANNEL CREDENTIAL IS ENTERED: this fetch targets the PRIVATE
-    // origin repo, which the release-org channel token cannot read (2026-08-19
-    // round-4 skeptics — inside the scope every roster cut would have died here).
-    let shipped_roster = ctx
-        .attaches_roster()
-        .then(|| {
-            let origin_release_id = ctx.release_id.ok_or_else(|| {
-                Error::new("mirror step reached with no bound origin release ID".to_string())
-            })?;
-            download_release_asset_for_release_id(
-                &ctx.slug,
-                origin_release_id,
-                roster::ROSTER_ASSET,
-            )
-        })
-        .transpose()?;
-    if let Some(shipped) = shipped_roster.as_ref() {
-        let local = fs::read(ctx.dist.join(roster::ROSTER_ASSET)).map_err(|e| {
+    let slug = ctx.slug.clone();
+    // Every call below talks to the channel and nothing else — the asset bytes come
+    // from `dist/` — under the release-org credential `run_pipeline` holds for a real
+    // cut. A rehearsal's scratch channel is the operator's own, written with `gh auth`.
+    preflight_channel_target(&slug)?;
+    if ctx.kind == CutKind::Rehearse {
+        // A release's tag is minted on the repository's default branch, so the scratch
+        // channel needs this tree first. Force-push: its history is disposable.
+        step(
+            "publish",
+            &format!("pushing HEAD to the scratch channel {slug} (rehearsal)"),
+        );
+        let git = GitCli::new(&ctx.repo);
+        let url = format!("https://github.com/{slug}.git");
+        git_ok(&git, &["push", "--force", &url, "HEAD:refs/heads/main"]).map_err(|e| {
             Error::new(format!(
-                "read this cut's roster asset from dist/ before mirroring it: {e}"
+                "cannot push to the scratch channel (create it first — PUBLIC, like every \
+                 channel an updater reads: gh repo create {slug} --public): {e}"
             ))
         })?;
-        if local != *shipped {
-            return Err(Error::new(format!(
-                "dist/{} is NOT the roster this cut published on its origin release — a join or \
-                 provision rewrote it after the flip. Mirroring it would publish a roster the \
-                 signed manifest does not name. Restore the pair this cut shipped (download \
-                 {} and its .sig from the {} release into dist/), then `{CUT_COMMAND} \
-                 --resume`; or retire this cut with `{CUT_COMMAND} --retire-unmirrored {}`",
-                roster::ROSTER_ASSET,
-                roster::ROSTER_ASSET,
-                ctx.tag,
-                ctx.tag,
-            )));
-        }
     }
-    // EVERYTHING below this line talks to the public channel and nothing else: the
-    // asset bytes come from local `dist/` files (proved identical to the origin's
-    // above), and the two `ctx.slug` uses above are a message and the equality guard.
-    // So the release-org credential is safe to hold for the whole step, and it drops
-    // on every exit path including `?`.
-    let _cred = ChannelCred::enter();
-    preflight_mirror_target(&slug)?;
-
-    let files = ctx.mirror_asset_paths();
-    if let Some(missing) = files.iter().find(|file| !file.is_file()) {
-        return Err(Error::new(format!(
-            "mirror asset missing: {} — this cut's dist/ artifacts are gone, so the \
-             public channel cannot be served the same bytes that were verified; \
-             recover the cut rather than mirroring different bytes",
-            missing.display()
-        )));
-    }
-    mirror::publish_on_channel(
-        &mut LiveChannelRelease {
-            ctx,
-            slug: &slug,
-            bound: None,
-            shipped_roster: shipped_roster.as_deref(),
-        },
-        files,
-    )?;
+    channel::publish_on_channel(&mut LiveChannelRelease {
+        ctx,
+        slug: &slug,
+        bound: None,
+    })?;
     step(
-        "mirror",
+        "publish",
         &format!(
-            "v{} (build {}) is live on the public channel {slug} and owns its `latest` \
-             pointer — every install updates from here, no token required",
+            "v{} (build {}) is live on {slug} and owns its `latest` pointer — every install \
+             updates from here, no token required",
             ctx.version, ctx.build
         ),
     );
     Ok(())
 }
 
-/// Bind this cut's release on the public channel `slug` — `mirror`'s
-/// [`mirror::ChannelRelease::bind`]: the journal's durable intent and the release's
-/// immutable ID, re-read and capability-checked. Returns the ID and whether the release
-/// was already visible (ADOPTED) when bound.
+/// THE ROSTER THE SIGNED APPCAST NAMES. The pair in `dist/` is the one file a separate,
+/// un-lease-gated ceremony (`atpkg-keys join`, `cargo ship provision`) may rewrite
+/// between `build` and a resumed `publish`; uploading it unchecked could publish a
+/// roster the appcast's own attribution contradicts — a revoked signer, or an older
+/// generation — which every armed client refuses before any artifact crypto, with no
+/// fallback release. So it is held to the client's own rule
+/// ([`machines::verify_published_roster`]): master-signed, naming the appcast's
+/// `machine_id`, at the appcast's `roster_seq` or newer (a join's newer generation is
+/// exactly what the fleet admits).
+fn prove_roster_on_disk(ctx: &CutCtx, manifest: &Manifest) -> Result<()> {
+    if !ctx.attaches_roster() {
+        return Ok(());
+    }
+    let machine_id = manifest.machine_id.as_deref().ok_or_else(|| {
+        Error::new("this cut attaches a machine roster but its appcast names no machine_id")
+    })?;
+    if Some(machine_id) != ctx.signature_machine_id.as_deref() {
+        return Err(Error::new(format!(
+            "the appcast is attributed to machine {machine_id:?}, but this cut's journal \
+             records {:?}; refusing to publish an attribution its own journal contradicts",
+            ctx.signature_machine_id
+        )));
+    }
+    let read = |name: &str| {
+        fs::read(ctx.dist.join(name))
+            .map_err(|e| Error::new(format!("read dist/{name} before publishing it: {e}")))
+    };
+    machines::verify_published_roster(
+        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
+        read(roster::ROSTER_ASSET)?,
+        &read(roster::ROSTER_SIG_ASSET)?,
+        machine_id,
+        manifest.roster_seq,
+    )
+    .map_err(|e| {
+        Error::new(format!(
+            "dist/{} is not a roster the signed appcast names ({e}) — a join or provision \
+             rewrote it after this cut was built. Put back the pair it was built under, then \
+             `{CUT_COMMAND} --resume`; or `{CUT_COMMAND} --abandon v{}` and cut again",
+            roster::ROSTER_ASSET,
+            ctx.version
+        ))
+    })?;
+    Ok(())
+}
+
+/// Bind this cut's release on the channel `slug` — [`channel::ChannelRelease::bind`]:
+/// the journal's durable intent and the release's immutable ID, re-read and
+/// capability-checked. Returns the ID and whether the release was already visible
+/// (ADOPTED) when bound.
 fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
     let observed = unique_release_object_by_tag(slug, &ctx.tag)?;
     // `adopted`: the release was already visible (not a draft) when this step bound
-    // it — the source release `pub publish` created, or this cut's own release after
-    // a crash that landed the head PATCH but not the journal mark.
+    // it — the source release `pub publish` created, or this cut's own adoption from a
+    // previous pass. (A release this cut already made the head never reaches the bind:
+    // `head_made` finishes it first.)
     let mut adopted = false;
-    let release_id = match mirror::mirror_plan(
-        ctx.mirror_create_issued,
+    let release_id = match channel::bind_plan(
+        ctx.release_intent,
         observed.as_ref().map(|release| release.draft),
     ) {
-        mirror::MirrorPlan::AwaitVisibility => {
+        channel::BindPlan::AwaitVisibility => {
             return Err(Error::new(format!(
-                "mirror create intent for {} on {slug} was already durably issued, but no \
+                "the release intent for {} on {slug} was already durably issued, but no \
                  release object is visible; refusing a duplicate POST. Re-run \
                  `{CUT_COMMAND} --resume` after GitHub converges.",
                 ctx.tag
             )));
         }
-        mirror::MirrorPlan::CreateDraft => {
-            let release = create_mirror_draft(ctx, slug)?;
-            step(
-                "mirror",
-                &format!("draft {} created on public channel {slug}", ctx.tag),
-            );
+        channel::BindPlan::CreateDraft => {
+            let release = create_channel_draft(ctx, slug)?;
+            step("publish", &format!("draft {} created on {slug}", ctx.tag));
             release.id
         }
-        mirror::MirrorPlan::ConvergeDraft => {
+        channel::BindPlan::ConvergeDraft => {
             let release = observed.expect("visible draft decision");
-            // A draft we never issued a create POST for is not ours to adopt.
-            // The journal refuses to bind an object ID without the matching
-            // durable intent (that pairing is what makes the one-shot protocol
-            // meaningful), so say WHY here instead of failing later inside a
-            // journal save with an opaque invariant message.
-            if !ctx.mirror_create_issued {
+            // A draft we never issued a create POST for is not ours to adopt. The
+            // journal refuses to bind an object ID without the matching durable intent
+            // (that pairing is what makes the one-shot protocol meaningful), so say WHY
+            // here instead of failing later inside a journal save with an opaque
+            // invariant message.
+            if !ctx.release_intent {
                 return Err(Error::new(format!(
-                    "a draft release for {} already exists on the public channel {slug} \
-                     (ID {}) but this cut never issued a create POST for it — it is a \
-                     leftover or foreign object, and adopting it would bind a capability \
-                     with no durable intent. Inspect and delete it, then \
-                     `{CUT_COMMAND} --resume`.",
+                    "a draft release for {} already exists on {slug} (ID {}) but this cut \
+                     never issued a create POST for it — it is a leftover or foreign object, \
+                     and adopting it would bind a capability with no durable intent. Inspect \
+                     and delete it, then `{CUT_COMMAND} --resume`.",
                     ctx.tag, release.id
                 )));
             }
             step(
-                "mirror",
+                "publish",
                 &format!(
                     "draft {} ID {} already on {slug} — converging",
                     ctx.tag, release.id
@@ -12822,44 +11377,36 @@ fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
             );
             release.id
         }
-        mirror::MirrorPlan::ConvergePublished => {
-            // THREE benign readings, and every one converges through the rest of
-            // the same sequence. This cut's own durable adoption (or its own flipped
-            // draft) from a previous pass; the SOURCE release `pub publish` created
-            // first by enforced order (a prerelease since 2026-09-23, so it never
-            // holds `latest`), carrying only its attestation pair and the roster pair
-            // it re-uploads; or a release already carrying THIS cut's bytes with no
-            // intent in this journal — a lost-machine recovery, whose reconstructed
-            // journal starts with none, finishing what the dead machine started
-            // (possibly still a prerelease, if it died before its head PATCH).
-            // Anything else under our tag is foreign, and adopting it would publish
-            // someone else's bytes as this cut.
-            let release = observed.expect("visible published decision");
-            if ctx.mirror_create_issued {
-                // OUR durable adoption from a previous pass — a crash between intent
-                // and completion resumes here with a partial asset set, which must
-                // read as ours-in-progress, never as foreign.
+        channel::BindPlan::ConvergeVisible => {
+            // TWO benign readings, and both converge through the rest of the same
+            // sequence: this cut's own durable adoption from a previous pass, or the
+            // SOURCE release `pub publish` created first by enforced order (a
+            // prerelease, so it never holds `latest`), carrying only its attestation pair
+            // and the roster pair it re-uploads. Anything else under our tag is another
+            // cut's, and adopting it would publish someone else's bytes as this cut.
+            let release = observed.expect("visible release decision");
+            if ctx.release_intent {
+                // OUR durable adoption from a previous pass — a crash between intent and
+                // completion resumes here with a partial asset set, which must read as
+                // ours-in-progress, never as foreign.
                 step(
-                    "mirror",
-                    &format!(
-                        "{} on {slug} — resuming this cut's own shared-tag convergence",
-                        ctx.tag
-                    ),
+                    "publish",
+                    &format!("{} on {slug} — resuming this cut's own release", ctx.tag),
                 );
             } else {
-                let reason = adoptable_channel_release(ctx, slug, release.id)?;
-                // Adopting binds the release's ID, and the journal's invariant is that
-                // an ID implies OUR durable create intent — that pairing is the
-                // one-shot protocol. So the adoption is made durable FIRST (the permit
-                // is deliberately unused: nothing will POST, the visible release IS
-                // the object the intent covers), and only then is the ID bound. A
-                // crash after this resumes into the arm above.
-                let _adoption = ctx.persist_mirror_create_intent()?;
+                adoptable_channel_release(ctx, slug, release.id)?;
+                // Adopting binds the release's ID, and the journal's invariant is that an
+                // ID implies OUR durable intent — that pairing is the one-shot protocol.
+                // So the adoption is made durable FIRST (the permit is deliberately
+                // unused: nothing will POST, the visible release IS the object the intent
+                // covers), and only then is the ID bound. A crash after this resumes into
+                // the arm above.
+                let _adoption = ctx.persist_release_intent()?;
                 step(
-                    "mirror",
+                    "publish",
                     &format!(
-                        "{} on {slug} is {reason} — converging this cut's assets onto the \
-                         shared tag",
+                        "{} on {slug} is the SOURCE release (attestation pair, no binaries) \
+                         — putting this cut's assets on it",
                         ctx.tag
                     ),
                 );
@@ -12868,58 +11415,42 @@ fn bind_channel_release(ctx: &mut CutCtx, slug: &str) -> Result<(u64, bool)> {
             release.id
         }
     };
-    ctx.bind_mirror_release_id(release_id)?;
+    ctx.bind_release_id(release_id)?;
     let reread = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(reread.as_ref(), release_id, &ctx.tag, !adopted)?;
+    validate_channel_release_capability(reread.as_ref(), release_id, &ctx.tag, !adopted)?;
     Ok((release_id, adopted))
 }
 
 /// May this cut adopt the visible release under its tag that its journal holds no
-/// intent for? The decision is [`mirror::classify_unclaimed_channel_release`]'s; this
-/// is its network half — the asset listing, and one byte proof per app asset, asked
-/// only once no name has already made the release foreign.
+/// intent for? Only as the engine's source release
+/// ([`channel::unclaimed_is_source_release`]), decided from its asset listing.
 ///
 /// # Errors
-/// A foreign release, naming it and why; and any listing failure.
-fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<&'static str> {
+/// Another cut's release, naming it and why; and any listing failure.
+fn adoptable_channel_release(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_id)?
         .into_iter()
         .map(|asset| asset.name)
         .collect();
-    // The native Linux tarballs a cut carries are this cut's app assets too.
-    let elected = ctx.mirror_asset_names();
-    match mirror::classify_unclaimed_channel_release(&names, &elected, |name| {
-        verify_release_asset_id_matches_local(slug, release_id, name, &ctx.dist.join(name))
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-    }) {
-        mirror::UnclaimedChannelRelease::Source => {
-            Ok("the SOURCE release (attestation pair, no binaries)")
-        }
-        mirror::UnclaimedChannelRelease::Own => {
-            Ok("this cut's own release (every app asset on it is this cut's bytes)")
-        }
-        mirror::UnclaimedChannelRelease::Foreign(why) => Err(Error::new(format!(
-            "{} on {slug} (release ID {release_id}) already carries app assets and this cut \
-             holds no intent for it: {why}. It is not this cut's release, and adopting it \
-             would publish someone else's bytes as this cut — inspect it by hand.",
+    channel::unclaimed_is_source_release(&names).map_err(|why| {
+        Error::new(format!(
+            "{} on {slug} (release ID {release_id}) {why}, and this cut holds no intent for \
+             it: it is another cut's release, and adopting it would publish someone else's \
+             bytes as this cut — withdraw it with that cut's `--abandon` (or `recover`), or \
+             inspect it by hand.",
             ctx.tag
-        ))),
-    }
+        ))
+    })
 }
 
-/// [`mirror::ChannelRelease`] against GitHub: this cut's bound release on the public
-/// channel, every call under the release-org credential the caller holds.
+/// [`channel::ChannelRelease`] against GitHub: this cut's bound release on the channel.
 struct LiveChannelRelease<'a> {
     ctx: &'a mut CutCtx,
     slug: &'a str,
-    /// Set by [`mirror::ChannelRelease::bind`]: the release's immutable ID, and whether
+    /// Set by [`channel::ChannelRelease::bind`]: the release's immutable ID, and whether
     /// it was already visible (ADOPTED) when bound — then every capability check before
     /// the head PATCH expects `draft == false`.
     bound: Option<(u64, bool)>,
-    /// The roster this cut shipped on its origin release (proved identical to
-    /// dist/'s), when the cut attaches one.
-    shipped_roster: Option<&'a [u8]>,
 }
 
 impl LiveChannelRelease<'_> {
@@ -12928,27 +11459,80 @@ impl LiveChannelRelease<'_> {
         self.bound.ok_or_else(|| {
             Error::new(
                 "the channel sequence reached a release call before binding a release; \
-                 refusing (mirror::publish_on_channel binds right after the floors)",
+                 refusing (channel::publish_on_channel binds right after the floors)",
             )
         })
     }
 }
 
-impl mirror::ChannelRelease for LiveChannelRelease<'_> {
+impl channel::ChannelRelease for LiveChannelRelease<'_> {
+    fn head_made(&mut self) -> Result<bool> {
+        // The head PATCH goes only to a bound release, and the bind journals its intent
+        // and its ID before any write: a journal holding neither has made no head.
+        let Some(release_id) = self.ctx.release_id.filter(|_| self.ctx.release_intent) else {
+            return Ok(false);
+        };
+        let (slug, tag) = (self.slug, self.ctx.tag.as_str());
+        // THE PREDICATE `--abandon` REFUSES ON (`verify::run_abandon`), so the two cover
+        // each other: every state abandon will not touch, the resume finishes.
+        if verify::release_state(slug, tag)? != verify::ReleaseState::Published {
+            return Ok(false);
+        }
+        let live = release_object_by_id(slug, release_id)?;
+        if !live
+            .as_ref()
+            .is_some_and(|live| live.id == release_id && live.tag == tag && !live.draft)
+        {
+            return Err(Error::new(format!(
+                "{tag} is a published app release on {slug}, but not the release this \
+                 journal bound (ID {release_id}: {live:?}) — inspect it by hand; nothing was \
+                 written"
+            )));
+        }
+        self.bound = Some((release_id, true));
+        step(
+            "publish",
+            &format!(
+                "{tag} ID {release_id} on {slug} is already the channel's published app \
+                 release — this cut's head PATCH landed on an earlier pass, so nothing is \
+                 uploaded and no roster floor is read; re-asserting `latest` and proving \
+                 what a stranger sees"
+            ),
+        );
+        Ok(true)
+    }
+
+    fn artifacts(&mut self) -> Result<Vec<PathBuf>> {
+        let ctx = &*self.ctx;
+        let manifest = prove_publication_on_disk(ctx)?;
+        prove_roster_on_disk(ctx, &manifest)?;
+        let files = ctx.channel_asset_paths();
+        if let Some(missing) = files.iter().find(|file| !file.is_file()) {
+            return Err(Error::new(format!(
+                "release asset missing: {} — this cut's dist/ artifacts are gone, so the \
+                 channel cannot be served the bytes the self-check proved; \
+                 `{CUT_COMMAND} --abandon v{}` and cut again",
+                missing.display(),
+                ctx.version
+            )));
+        }
+        Ok(files)
+    }
+
     fn upload(&mut self, file: &Path) -> Result<()> {
         let (release_id, adopted) = self.bound()?;
-        upload_mirror_asset(self.ctx, self.slug, release_id, file, !adopted)
+        upload_channel_asset(self.ctx, self.slug, release_id, file, !adopted)
     }
 
     fn prove_assets(&mut self) -> Result<()> {
-        // From a FRESH remote listing: exactly the asset set the deployed updater
-        // elects, each object byte-identical to the artifact `verify` just proved
-        // live on the private repo — before the release can become the head.
+        // From a FRESH remote listing: exactly the asset set this cut publishes, each
+        // object byte-identical to the artifact `dist/` holds — before the release can
+        // become the head.
         let (release_id, adopted) = self.bound()?;
-        prove_mirror_draft_assets(self.ctx, self.slug, release_id, !adopted)
+        prove_channel_assets(self.ctx, self.slug, release_id, !adopted)
     }
 
-    fn ratchet(&mut self) -> Result<()> {
+    fn ratchet_head(&mut self) -> Result<()> {
         let (slug, ctx) = (self.slug, &*self.ctx);
         // THE HEAD: the pointer names this cut or an OLDER release, or the cut does
         // not take it (`prove_channel_head_is_older`).
@@ -12964,29 +11548,17 @@ impl mirror::ChannelRelease for LiveChannelRelease<'_> {
                 )
             },
             &mut anonymous_get_optional,
-        )?;
-        // THE ROSTER. Every earlier ratchet (lock, selfcheck, preflip, flip) ran
-        // against the ORIGIN, and a resume can reach this step alone, days later. A
-        // roster join is not lease-gated — it re-dresses the public head with a newer
-        // generation through a separate tool — so it can land between the origin flip
-        // and this one; making this release the head under the older generation then
-        // strands every client that ratcheted (RosterReject::Rollback, no fallback
-        // release). Read the public head's roster asset NOW and refuse.
-        let fleet_roster = machines::channel_roster_document(slug).map_err(|e| {
-            Error::new(format!(
-                "cannot read the machine roster on the public channel {slug}'s current head \
-                 ({e}) immediately before the public flip; refusing to flip under an unknown \
-                 fleet floor"
-            ))
-        })?;
-        let carried = cut_roster_seq(ctx)?;
-        // Judged from the roster this cut SHIPPED (proved byte-identical to dist/),
-        // never from dist/ alone.
-        if let Some(shipped) = self.shipped_roster {
-            machines::roster_lineage_agrees(shipped, carried, fleet_roster.as_ref())
-                .map_err(Error::new)?;
-        }
-        roster_floor_covered(carried, fleet_roster.as_ref().map(|(seq, _)| *seq))
+        )
+    }
+
+    fn ratchet(&mut self) -> Result<()> {
+        self.ratchet_head()?;
+        // THE FLOORS, read from the channel NOW: the carried apply floor, the monotonic
+        // build, and the machine-roster generation (the head manifest's attribution
+        // and the roster asset the channel serves — a join is not lease-gated and can
+        // land at any time) with the lineage-fork check (`best_published`). A resume
+        // can reach this step alone, days after the self-check read them.
+        best_published(self.ctx).map(|_| ())
     }
 
     fn bind(&mut self) -> Result<()> {
@@ -12998,10 +11570,10 @@ impl mirror::ChannelRelease for LiveChannelRelease<'_> {
         let (release_id, adopted) = self.bound()?;
         let (slug, expect_draft) = (self.slug, !adopted);
         let ctx = &*self.ctx;
-        let argv = mirror::head_patch_argv(&format!("repos/{slug}/releases/{release_id}"));
+        let argv = channel::head_patch_argv(&format!("repos/{slug}/releases/{release_id}"));
         gh_retry_guarded(&argv.iter().map(String::as_str).collect::<Vec<_>>(), || {
             let current = release_object_by_id(slug, release_id)?;
-            validate_mirror_release_capability(
+            validate_channel_release_capability(
                 current.as_ref(),
                 release_id,
                 &ctx.tag,
@@ -13011,7 +11583,7 @@ impl mirror::ChannelRelease for LiveChannelRelease<'_> {
             Ok(())
         })?;
         step(
-            "mirror",
+            "publish",
             &format!(
                 "{} ID {release_id} on {slug} → full release, make_latest=true",
                 ctx.tag
@@ -13025,14 +11597,13 @@ impl mirror::ChannelRelease for LiveChannelRelease<'_> {
         let slug = self.slug;
         let ctx = &*self.ctx;
         let after = release_object_by_id(slug, release_id)?;
-        validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
-        prove_mirror_channel_head(ctx, slug, release_id)?;
-        // Everything above ran through `gh`, i.e. WITH the release-org credential. That
-        // proves the release exists; it does NOT prove the thing this step exists for —
-        // that a machine with no credential at all can read it. A private (or
-        // membership-restricted) mirror passes every authenticated proof and is
-        // invisible to every real client, which is the silent never-updates failure the
-        // mirror was built to remove.
+        validate_channel_release_capability(after.as_ref(), release_id, &ctx.tag, false)?;
+        prove_client_elects_this_cut(ctx, slug, release_id)?;
+        // Everything above ran through `gh`, i.e. WITH a credential. That proves the
+        // release exists; it does NOT prove the thing this step exists for — that a
+        // machine with no credential at all can read it. A private (or
+        // membership-restricted) channel passes every authenticated proof and is
+        // invisible to every real client: the silent never-updates failure.
         //
         // THE POINTER GATE FIRST, then one HEAD per asset — both on the unmetered
         // download host, so the step spends nothing of the anonymous API budget (see
@@ -13286,11 +11857,11 @@ pub fn prove_assets_download_anonymously(
                      above passed, so the release and its assets exist — they are simply \
                      invisible to real installs (GitHub answers 404 on this host for a \
                      private repository), or the upload never completed. That is the silent \
-                     never-updates state the mirror exists to prevent. Make {slug} public \
+                     never-updates state the pointer gate exists to prevent. Make {slug} public \
                      (or repoint `{table} {key}`), then `{CUT_COMMAND} --resume`.",
                     u64::from(ANON_PROBE_ATTEMPTS) * ANON_PROBE_DELAY.as_secs(),
-                    table = mirror::CHANNEL_TABLE,
-                    key = mirror::CHANNEL_KEY,
+                    table = channel::CHANNEL_TABLE,
+                    key = channel::CHANNEL_KEY,
                 )));
             }
             AssetHead::Inconclusive(detail) => {
@@ -13413,7 +11984,7 @@ fn pointer_probe_from(
 /// byte-identical to the one this cut uploaded, and (3) that appcast's `url` binds it to
 /// its tag and container.
 ///
-/// The pointer is the cut's to set: [`mirror::ChannelRelease::make_head`] sends
+/// The pointer is the cut's to set: [`channel::ChannelRelease::make_head`] sends
 /// `make_latest=true` on every path before this runs.
 ///
 /// Retried on its own bound ([`POINTER_PROBE_ATTEMPTS`] × [`POINTER_PROBE_DELAY`]): GitHub
@@ -13588,7 +12159,7 @@ fn anonymous_get(location: &str) -> Result<Vec<u8>> {
 /// THE HEAD RATCHET: a cut takes the channel head — GitHub's `latest` — only from an
 /// OLDER release. It owns the pointer (the head PATCH sends `make_latest=true` on
 /// every path), and `make_latest` obeys nobody's version order: a stale journal
-/// resumed at `mirror` after a newer release shipped would otherwise hand every
+/// resumed at `publish` after a newer release shipped would otherwise hand every
 /// credential-less install back an older build than the one it may already run.
 ///
 /// Reads what a stranger's updater reads: `probe` is one resolution of the evergreen
@@ -13695,33 +12266,10 @@ fn assert_manifest_url_binds(slug: &str, tag: &str, manifest: &Manifest) -> Resu
     }
 }
 
-/// THE POINTER GATE (origin, authenticated). The origin repository is private, so its
-/// pointer answers a stranger 404 by design; what `make_latest=true` must have achieved
-/// there is visible only through the API. `releases/latest` must be this cut, or the
-/// mirror step would flip a public release whose origin twin GitHub does not consider
-/// latest — a state the yank/abandon tooling reasons from.
-fn prove_latest_release_is_this_cut(slug: &str, tag: &str) -> Result<()> {
-    let out = gh_retry(&[
-        "api",
-        &format!("repos/{slug}/releases/latest"),
-        "--jq",
-        ".tag_name",
-    ])?;
-    let latest = out.stdout_utf8().trim().to_string();
-    if latest != tag {
-        return Err(Error::new(format!(
-            "{slug} reports releases/latest = {latest:?} after flipping {tag} live with \
-             make_latest=true — GitHub did not make this cut the latest release; make it so \
-             (`gh release edit {tag} -R {slug} --latest`) and `{CUT_COMMAND} --resume`"
-        )));
-    }
-    Ok(())
-}
-
 /// [`prove_assets_download_anonymously`] for this cut: every asset the deployed updater
 /// elects, over the real transport, with the result in the transcript.
 fn prove_channel_assets_download_anonymously(ctx: &CutCtx, slug: &str) -> Result<()> {
-    let names = ctx.mirror_asset_names();
+    let names = ctx.channel_asset_names();
     let issued = prove_assets_download_anonymously(
         slug,
         &ctx.tag,
@@ -13741,18 +12289,23 @@ fn prove_channel_assets_download_anonymously(ctx: &CutCtx, slug: &str) -> Result
     Ok(())
 }
 
-/// One direct REST draft-create against the mirror, under the same one-shot
-/// durable-intent contract as [`create_draft`].
+/// One direct REST draft-create on the channel, never [`gh_retry`] or the high-level
+/// `gh release create` command: a client-side timeout can report failure for a create
+/// that LANDED server-side, and GitHub happily mints a SECOND draft with the same
+/// `tag_name` (drafts don't own their tag until published) — an orphan in front of the
+/// whole fleet's channel. The durable intent is saved before the POST; this invocation
+/// then probes once, and a later resume may discover but never recreate it.
 ///
-/// Unlike the private side this sends NO `target_commitish`: the claim commit
-/// does not exist in the public repository, and naming it would either fail the
-/// POST or (worse) bind the release to an unrelated object. GitHub anchors the
-/// tag at the channel repo's default branch when the draft is flipped, which is
-/// the correct meaning — the tag on the channel is a distribution marker, and
-/// the authenticity of the bytes comes from the manifest digest + optional
-/// pinned signature + codesign, never from the release's target.
-fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIdentity> {
-    let notes = release_body_for_post("mirror", &ctx.notes_path())?;
+/// It sends NO `target_commitish`: the claim commit lives on origin, not on the
+/// channel, and naming it would either fail the POST or bind the release to an
+/// unrelated object. GitHub anchors the tag at the channel's default branch when the
+/// draft is published — the tag on the channel is a distribution marker, and the
+/// authenticity of the bytes comes from the manifest digest, the pinned signature and
+/// codesign, never from the release's target. (Every real cut normally ADOPTS the
+/// engine's source release instead; this path is a channel `pub publish` did not
+/// prepare, and every rehearsal.)
+fn create_channel_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIdentity> {
+    let notes = release_body_for_post("publish", &ctx.notes_path())?;
     let posted_body_len = notes.len();
     let title = format!("aterm {}", ctx.version);
     let endpoint = format!("{GITHUB_API_ORIGIN}/repos/{slug}/releases");
@@ -13763,40 +12316,55 @@ fn create_mirror_draft(ctx: &mut CutCtx, slug: &str) -> Result<ReleaseObjectIden
         "draft": true,
         "prerelease": false,
     }))
-    .map_err(|error| Error::new(format!("serialize mirror release request: {error}")))?;
-    let post = OneShotPost::prepare_json("mirror", "mirror release request", &endpoint, &payload)?;
-    // Every fallible preflight precedes the durable edge; the non-cloneable
-    // permit is consumed by the POST that immediately follows.
+    .map_err(|error| Error::new(format!("serialize release request: {error}")))?;
+    let post = OneShotPost::prepare_json("create", "release request", &endpoint, &payload)?;
+    // Every fallible preflight precedes the durable edge; the non-cloneable permit is
+    // consumed by the POST that immediately follows.
     ensure_ctx_release_lease(ctx)?;
-    let permit = ctx.persist_mirror_create_intent()?;
+    let permit = ctx.persist_release_intent()?;
+    // Creation is deliberately attempted at most once per invocation. A timeout
+    // followed by an eventually-consistent empty list cannot prove the POST did not
+    // land; retrying here can mint a duplicate draft.
     let out = post.issue(permit)?;
     if out.success() {
         let release = parse_release_object_response(&out.stdout)?;
-        validate_mirror_release_capability(Some(&release), release.id, &ctx.tag, true)?;
+        validate_channel_release_capability(Some(&release), release.id, &ctx.tag, true)?;
         return Ok(release);
     }
     if let Some(release) = unique_release_object_by_tag(slug, &ctx.tag)? {
-        validate_mirror_release_capability(Some(&release), release.id, &ctx.tag, true)?;
+        validate_channel_release_capability(Some(&release), release.id, &ctx.tag, true)?;
         return Ok(release);
     }
+    // THE SERVER ANSWERED AND REFUSED: nothing was created, so the one-shot intent this
+    // invocation persisted is spent on nothing and must not wedge the cut. Release it,
+    // so the next invocation may post once more (see `server_refused_without_creating`
+    // for why that cannot mint a duplicate).
+    if server_refused_without_creating(&out) {
+        ctx.release_release_intent()?;
+        return Err(Error::new(format!(
+            "release create for {} was REFUSED by {slug} ({}); nothing was created, so the \
+             release intent has been released and `--resume` may post once more. If this \
+             keeps happening the refusal itself is the thing to read, not the intent.",
+            ctx.tag,
+            release_post_failure_detail(&out, posted_body_len)
+        )));
+    }
     Err(Error::new(format!(
-        "mirror draft create returned failure and no exact release object is visible for {} \
-         on {slug}; refusing an ambiguous retry in this invocation (resume after GitHub \
+        "release create returned failure and no exact release object is visible for {} on \
+         {slug}; refusing an ambiguous retry in this invocation (resume after GitHub \
          converges): {}",
         ctx.tag,
         release_post_failure_detail(&out, posted_body_len)
     )))
 }
 
-/// Converge one exact-name asset onto the mirrored draft under a durable
-/// one-shot intent. Structurally the same contract as
-/// [`upload_release_asset_by_id`], with one deliberate difference: an existing
-/// object with the WRONG bytes is never deleted and re-uploaded. On the private
-/// side that recovery exists because the draft is the only copy; here the
-/// authority already exists on the private repo, so a mismatch means something
-/// unexpected is holding our tag on the public channel and the safe move is to
-/// stop and let a human look.
-fn upload_mirror_asset(
+/// Converge one exact-name asset onto the bound channel release under a durable
+/// one-shot intent: a lost POST response can delay a resume, but can never duplicate
+/// or overwrite an object. An existing object with the WRONG bytes is never deleted
+/// and re-uploaded — something unexpected is holding this tag's name on the channel
+/// the whole fleet reads, and the safe move is to stop and let a human look — with
+/// ONE exception, the roster pair on an adopted release (below).
+fn upload_channel_asset(
     ctx: &mut CutCtx,
     slug: &str,
     release_id: u64,
@@ -13806,52 +12374,49 @@ fn upload_mirror_asset(
     let name = file
         .file_name()
         .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::new("mirror asset filename is not UTF-8"))?;
+        .ok_or_else(|| Error::new("release asset filename is not UTF-8"))?;
     if !name
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
     {
         return Err(Error::new(format!(
-            "mirror asset name {name:?} is outside the exact upload URL alphabet"
+            "release asset name {name:?} is outside the exact upload URL alphabet"
         )));
     }
-    let prior_intent = ctx.mirror_upload_intent_issued(name);
+    let prior_intent = ctx.upload_intent_issued(name);
     let observed = release_asset_identity_for_release_id_optional(slug, release_id, name)?;
     match durable_post_decision(prior_intent, observed.is_some()) {
         DurablePostDecision::AwaitVisibility => {
             return Err(Error::new(format!(
-                "mirror upload intent for {name} was already durably issued, but the asset is \
-                 not visible; refusing a duplicate POST (resume after GitHub converges)"
+                "upload intent for {name} was already durably issued, but the asset is not \
+                 visible; refusing a duplicate POST (resume after GitHub converges)"
             )));
         }
         DurablePostDecision::ConvergeVisible => {
             match verify_release_asset_id_matches_local(slug, release_id, name, file) {
                 Ok(_verified) => return Ok(()),
-                // THE ONE PERMITTED REPLACEMENT. On an adopted shared tag the
-                // source publish attached its own roster pair, and that copy
-                // can be STALE relative to the roster this cut verified on the
-                // origin release — the document the fleet's ratchet is judged
-                // against. Replacement is gated three ways: the adopted path
-                // only (a draft convergence never meets a foreign asset), the
-                // roster pair only (nothing else overlaps), and a mismatch
-                // only. The stale object is deleted by its immutable ID and
-                // the verified bytes go up through the same one-shot POST and
-                // re-download proof as any other asset.
+                // THE ONE PERMITTED REPLACEMENT. On an adopted source release the source
+                // publish attached its own roster pair, and that copy can be STALE
+                // relative to the roster this cut was built under — the document the
+                // fleet's ratchet is judged against. Replacement is gated three ways: the
+                // adopted path only (a draft convergence never meets a foreign asset), the
+                // roster pair only (nothing else overlaps), and a mismatch only. The stale
+                // object is deleted by its immutable ID and the proven bytes go up through
+                // the same one-shot POST and re-download proof as any other asset.
                 Err(error)
                     if !expect_draft
-                        && (name == aterm_update_core::roster::ROSTER_ASSET
-                            || name == aterm_update_core::roster::ROSTER_SIG_ASSET) =>
+                        && (name == roster::ROSTER_ASSET || name == roster::ROSTER_SIG_ASSET) =>
                 {
                     let (stale_id, _stale_size) =
                         observed.as_ref().expect("ConvergeVisible implies observed");
                     step(
-                        "mirror",
+                        "publish",
                         &format!(
-                            "replacing stale source-published {name} (asset ID {}) with \
-                             this cut's origin-verified bytes: {error}",
-                            stale_id
+                            "replacing stale source-published {name} (asset ID {stale_id}) with \
+                             this cut's bytes: {error}"
                         ),
                     );
+                    ensure_ctx_release_lease(ctx)?;
                     let endpoint = format!("repos/{slug}/releases/assets/{stale_id}");
                     let out = gh_raw(&["api", "--method", "DELETE", &endpoint])?;
                     if !out.success() {
@@ -13864,9 +12429,9 @@ fn upload_mirror_asset(
                 }
                 Err(error) => {
                     return Err(Error::new(format!(
-                        "mirror asset {name} on {slug} already exists with different bytes than \
-                         the verified release artifact; refusing to overwrite a public-channel \
-                         object. Inspect release ID {release_id} on {slug} by hand: {error}"
+                        "release asset {name} on {slug} already exists with different bytes \
+                         than this cut's artifact; refusing to overwrite a channel object. \
+                         Inspect release ID {release_id} on {slug} by hand: {error}"
                     )));
                 }
             }
@@ -13875,20 +12440,27 @@ fn upload_mirror_asset(
     }
 
     let endpoint = exact_release_upload_url(slug, release_id, name)?;
-    let post = OneShotPost::prepare_binary("mirror asset", &endpoint, file)?;
+    let post = OneShotPost::prepare_binary("release asset", &endpoint, file)?;
     let release = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
+    validate_channel_release_capability(release.as_ref(), release_id, &ctx.tag, expect_draft)?;
     ensure_ctx_release_lease(ctx)?;
-    let permit = ctx.persist_mirror_upload_intent(name)?;
+    let permit = ctx.persist_upload_intent(name)?;
+    // Like the create, an upload POST is issued once per invocation. An absent
+    // immediate probe after a timeout may be visibility lag, not proof of
+    // non-delivery; a resume first converges on any exact-name object.
     let out = post.issue(permit)?;
-    // Local, provable, and evaluated before the network probe — same ordering rule
-    // as the private leg, for the same reason.
+    // BEFORE ANY REMOTE PROBE. This verdict is local and provable, and the probe below
+    // is a network call that can fail — under exactly the conditions that produce a
+    // curl exit 2 in the first place (memory pressure kills the gh spawn; a hammered
+    // API answers 5xx three times). A failed probe used to return early and leave the
+    // intent standing, restoring the permanent wedge this retraction exists to prevent
+    // (2026-08-19 round-7 audit). The pre-POST probe above already answered "did this
+    // asset exist beforehand".
     if transport_never_started(&out) {
-        ctx.retract_mirror_upload_intent(name)?;
+        ctx.retract_upload_intent(name)?;
         return Err(Error::new(format!(
-            "mirror upload of {name} never reached the network (curl exit {}): {}. The \
-             durable intent was retracted, so a resume will retry it once the local cause \
-             is fixed",
+            "upload of {name} never reached the network (curl exit {}): {}. The durable \
+             intent was retracted, so a resume will retry it once the local cause is fixed",
             out.status,
             out.stderr_utf8().trim()
         )));
@@ -13898,149 +12470,142 @@ fn upload_mirror_asset(
         return Ok(());
     }
     Err(Error::new(format!(
-        "mirror upload of {name} returned {} but no asset is visible on {slug}; refusing an \
-         ambiguous duplicate retry in this invocation (resume after GitHub converges): {}",
+        "upload of {name} returned {} but no asset is visible on {slug}; refusing an ambiguous \
+         duplicate retry in this invocation (resume after GitHub converges): {}",
         if out.success() { "success" } else { "failure" },
         out.stderr_utf8().trim()
     )))
 }
 
-/// Prove the still-invisible mirrored draft carries EXACTLY the asset set the
-/// deployed updater elects, and that each of those objects is byte-identical to
-/// the local artifact `verify` proved live on the private repo.
-fn prove_mirror_draft_assets(
+/// Prove the bound release carries EXACTLY the asset set this cut publishes (beside
+/// the engine's source attestation pair), and that each of those objects is
+/// byte-identical to its artifact in `dist/` — from a fresh listing, bracketed by two
+/// identical inventories so nothing was swapped during the proof.
+fn prove_channel_assets(
     ctx: &CutCtx,
     slug: &str,
     release_id: u64,
     expect_draft: bool,
 ) -> Result<()> {
     let before = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(before.as_ref(), release_id, &ctx.tag, expect_draft)?;
+    validate_channel_release_capability(before.as_ref(), release_id, &ctx.tag, expect_draft)?;
     let inventory_before = release_asset_inventory_for_release_id(slug, release_id)?;
     let names: Vec<String> = inventory_before
         .iter()
         .map(|asset| asset.name.clone())
         .collect();
-    mirror::validate_mirror_asset_set_with_linux(
-        &names,
-        &ctx.version,
-        ctx.signature_required,
-        ctx.attaches_roster(),
-        &ctx.linux_asset_names(),
-    )?;
-    for file in ctx.mirror_asset_paths() {
+    ctx.validate_channel_assets(&names)?;
+    for file in ctx.channel_asset_paths() {
         let name = file
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| Error::new("mirror artifact filename is not UTF-8"))?;
+            .ok_or_else(|| Error::new("release artifact filename is not UTF-8"))?;
         verify_release_asset_id_matches_local(slug, release_id, name, &file)?;
     }
     let inventory_after = release_asset_inventory_for_release_id(slug, release_id)?;
     if inventory_after != inventory_before {
         return Err(Error::new(
-            "mirror asset name/immutable-ID/size inventory changed during byte verification",
+            "channel asset name/immutable-ID/size inventory changed during byte verification",
         ));
     }
     let after = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(after.as_ref(), release_id, &ctx.tag, expect_draft)?;
+    validate_channel_release_capability(after.as_ref(), release_id, &ctx.tag, expect_draft)?;
     Ok(())
 }
 
-/// Replay the DEPLOYED CLIENT's election against the live public channel and
-/// require that it lands on this cut.
+/// Replay the DEPLOYED CLIENT's election against the live channel and require that it
+/// lands on this cut.
 ///
-/// This is the acceptance test for the whole feature: not "we uploaded some
-/// files", but "a machine running this updater, with no token, now resolves
-/// exactly this build". It re-checks the elected release's tag, its exact asset
-/// set, and byte-identity of the manifest the client would download.
-fn prove_mirror_channel_head(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
+/// This is the acceptance test for the whole cut: not "we uploaded some files", but "a
+/// machine running this updater now resolves exactly this build". It re-checks the
+/// elected release's tag, its exact asset set, and byte-identity of the manifest the
+/// client would download.
+fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Result<()> {
     let live = release_object_by_id(slug, release_id)?;
-    validate_mirror_release_capability(live.as_ref(), release_id, &ctx.tag, false)?;
+    validate_channel_release_capability(live.as_ref(), release_id, &ctx.tag, false)?;
     let names: Vec<String> = release_asset_inventory_for_release_id(slug, release_id)?
         .into_iter()
         .map(|asset| asset.name)
         .collect();
-    mirror::validate_mirror_asset_set_with_linux(
-        &names,
-        &ctx.version,
-        ctx.signature_required,
-        ctx.attaches_roster(),
-        &ctx.linux_asset_names(),
-    )?;
+    ctx.validate_channel_assets(&names)?;
 
     // `stop_early: true` IS the client's replay: canonical tags only, exact
-    // `aterm-appcast.toml` only, greatest numeric tag wins regardless of REST
-    // row order — and it downloads exactly the one manifest a real updater
-    // would fetch.
-    //
-    // The CHANNEL scan is the required one here, not `scan_published`. A mirrored
-    // release's `target_commitish` is the channel's default branch, because the
-    // claim commit does not exist in that repository at all (see
-    // `create_mirror_draft`, which sends no target for exactly this reason, and
-    // `validate_mirror_release_capability` for the channel-side invariant).
-    let published = verify::scan_published_channel(slug, true)?;
-    let head = verify::select_newest(&published).ok_or_else(|| {
+    // `aterm-appcast.toml` only, greatest numeric tag wins regardless of REST row
+    // order — and it downloads exactly the one manifest a real updater would fetch.
+    let published = verify::scan_published(slug, true)?;
+    let head = published.first().ok_or_else(|| {
         Error::new(format!(
-            "public channel {slug} elects no release at all after mirroring v{} — installed \
+            "the channel {slug} elects no release at all after publishing v{} — installed \
              copies would still report no update",
             ctx.version
         ))
     })?;
     if head.tag != ctx.tag {
         return Err(Error::new(format!(
-            "public channel {slug} elects {}, not this cut's {}; the fleet would install a \
-             different build than the one just verified",
+            "the channel {slug} elects {}, not this cut's {}; the fleet would install a \
+             different build than the one just proved",
             head.tag, ctx.tag
         )));
     }
     if head.version != ctx.version || head.build != ctx.build {
         return Err(Error::new(format!(
-            "the manifest the public channel {slug} serves carries v{} build {}, not this \
-             cut's v{} build {}",
+            "the manifest the channel {slug} serves carries v{} build {}, not this cut's v{} \
+             build {}",
             head.version, head.build, ctx.version, ctx.build
         )));
     }
     if head.asset != manifest_out::MANIFEST_ASSET {
         return Err(Error::new(format!(
-            "public channel {slug} head resolved through asset {:?}, not the exact \
-             {} the client requires",
+            "the channel {slug} head resolved through asset {:?}, not the exact {} the client \
+             requires",
             head.asset,
             manifest_out::MANIFEST_ASSET
         )));
     }
     let local_manifest = fs::read_to_string(ctx.manifest_path()).map_err(|error| {
         Error::new(format!(
-            "read local manifest for mirror head proof {}: {error}",
+            "read local manifest for the head proof {}: {error}",
             ctx.manifest_path().display()
         ))
     })?;
     if head.text != local_manifest {
         return Err(Error::new(format!(
-            "the manifest served by the public channel {slug} is not byte-identical to this \
-             cut's dist/{}",
+            "the manifest served by the channel {slug} is not byte-identical to this cut's \
+             dist/{}",
             manifest_out::MANIFEST_ASSET
         )));
     }
     Ok(())
 }
 
-/// Step "verify" (spec §7 step 7): the full post-publish check, shared with
-/// the standalone `cargo ship verify`.
-fn step_verify(ctx: &mut CutCtx) -> Result<()> {
-    let signature = ctx.manifest_path().with_extension("toml.sig");
-    verify::post_publish(
-        &ctx.repo,
-        &ctx.slug,
-        &ctx.version,
-        Some(ctx.build),
-        Some(&ctx.manifest_path()),
-        ctx.kind == CutKind::Rehearse,
-        verify::PostPublishSignature {
-            expected: Some(ctx.signature_required),
-            pubkey: ctx.verification_pubkey(),
-            local_signature: Some(&signature),
-        },
-    )
+pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Result<String> {
+    let valid_slug = slug.split_once('/').is_some_and(|(owner, repo)| {
+        !owner.is_empty()
+            && !repo.is_empty()
+            && !owner.contains('/')
+            && !repo.contains('/')
+            && owner
+                .bytes()
+                .chain(repo.bytes())
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    });
+    if !valid_slug
+        || release_id == 0
+        || name.is_empty()
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return Err(Error::new(
+            "release upload owner/repo, ID, or asset name is not canonical",
+        ));
+    }
+    // `gh api --hostname uploads.github.com` incorrectly treats that host as
+    // a GitHub Enterprise name and prefixes `api.`. An absolute endpoint is
+    // explicitly accepted by gh and preserves GitHub's dedicated upload host.
+    Ok(format!(
+        "{GITHUB_UPLOAD_ORIGIN}/repos/{slug}/releases/{release_id}/assets?name={name}"
+    ))
 }
 
 #[cfg(test)]
@@ -14219,17 +12784,16 @@ mod release_body_post_tests {
             "a release body is being read without the bound — post it through \
              release_body_for_post"
         );
-        for site in ["fn create_draft", "fn create_mirror_draft"] {
-            let body = &src[src.find(site).expect("function present")..];
-            let post = body.find("post.issue(permit)?").expect("the POST");
-            let bounded = body[..post]
-                .find("release_body_for_post(")
-                .expect("the bound must precede the POST");
-            assert!(
-                bounded < post,
-                "{site}: the body must be bounded before it is sent"
-            );
-        }
+        let site = "fn create_channel_draft";
+        let body = &src[src.find(site).expect("function present")..];
+        let post = body.find("post.issue(permit)?").expect("the POST");
+        let bounded = body[..post]
+            .find("release_body_for_post(")
+            .expect("the bound must precede the POST");
+        assert!(
+            bounded < post,
+            "{site}: the body must be bounded before it is sent"
+        );
     }
 }
 
@@ -14280,27 +12844,20 @@ mod transport_body_tests {
     #[test]
     fn the_retraction_is_decided_before_any_remote_probe() {
         let src = include_str!("publish.rs");
-        for (func, retract) in [
-            (
-                "fn upload_release_asset_by_id",
-                "ctx.retract_upload_intent(name)?",
-            ),
-            (
-                "fn upload_mirror_asset",
-                "ctx.retract_mirror_upload_intent(name)?",
-            ),
-        ] {
-            let body = &src[src.find(func).expect("function present")..];
-            let issue = body.find("post.issue(permit)?").expect("the POST");
-            let retracted = body[issue..].find(retract).expect("the retraction");
-            let probed = body[issue..]
-                .find("release_asset_identity_for_release_id_optional")
-                .expect("the visibility probe");
-            assert!(
-                retracted < probed,
-                "{func}: the local never-sent verdict must precede the remote probe"
-            );
-        }
+        let (func, retract) = (
+            "fn upload_channel_asset",
+            "ctx.retract_upload_intent(name)?",
+        );
+        let body = &src[src.find(func).expect("function present")..];
+        let issue = body.find("post.issue(permit)?").expect("the POST");
+        let retracted = body[issue..].find(retract).expect("the retraction");
+        let probed = body[issue..]
+            .find("release_asset_identity_for_release_id_optional")
+            .expect("the visibility probe");
+        assert!(
+            retracted < probed,
+            "{func}: the local never-sent verdict must precede the remote probe"
+        );
     }
 
     fn out(status: i32, stderr: &str) -> RunOut {
@@ -14459,7 +13016,7 @@ mod roster_wiring_tests {
         assert_eq!(
             ctx.verification_pubkey(),
             Some("Ka-dead-publisher"),
-            "archive/verify must use the key that actually signed the artifacts"
+            "publish must prove the key that actually signed the artifacts"
         );
         assert_eq!(
             ctx.signature_pubkey.as_deref(),
@@ -14495,12 +13052,8 @@ mod roster_wiring_tests {
             attribution: None,
             roster: None,
             release_id: None,
-            draft_create_issued: false,
+            release_intent: false,
             upload_intents: Vec::new(),
-            mirror_slug: Some("channel/repo".to_string()),
-            mirror_release_id: None,
-            mirror_create_issued: false,
-            mirror_upload_intents: Vec::new(),
             kind: CutKind::Real,
             no_paint_smoke: false,
             lease: None,
@@ -14522,24 +13075,23 @@ mod roster_wiring_tests {
     /// one (a fork's, or a resume past `build`) attaches it to nothing. WRONG BEFORE: this
     /// had it backwards, calling the unattributed cut "every cut this tree makes".
     ///
-    /// Kills four mutations that were all silent: `attaches_roster()` returning false,
-    /// `roster_asset_paths()` returning empty, dropping the roster from the upload set,
-    /// and dropping it from the draft byte-proof set.
+    /// Kills the mutations that were all silent: `attaches_roster()` returning false,
+    /// and dropping the roster from the channel set — the one set a cut uploads and
+    /// byte-proves.
     #[test]
     fn an_attributed_cut_carries_its_roster_through_every_asset_set() {
         let rostered = ctx(Some("m3"));
         assert!(rostered.attaches_roster());
-        assert_eq!(
-            names(&rostered.roster_asset_paths()),
-            vec![
-                roster::ROSTER_ASSET.to_string(),
-                roster::ROSTER_SIG_ASSET.to_string()
-            ]
-        );
         for (label, set) in [
-            ("upload", rostered.upload_asset_paths()),
-            ("draft byte-proof", rostered.proof_asset_paths()),
-            ("mirror", rostered.mirror_asset_paths()),
+            ("channel upload", rostered.channel_asset_paths()),
+            (
+                "channel acceptance",
+                rostered
+                    .channel_asset_names()
+                    .iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            ),
         ] {
             let set = names(&set);
             assert!(
@@ -14558,18 +13110,11 @@ mod roster_wiring_tests {
         // THE FORK PATH (no master pinned): an unattributed cut attaches no roster.
         let plain = ctx(None);
         assert!(!plain.attaches_roster());
-        assert!(plain.roster_asset_paths().is_empty());
-        for set in [
-            plain.upload_asset_paths(),
-            plain.proof_asset_paths(),
-            plain.mirror_asset_paths(),
-        ] {
-            let set = names(&set);
-            assert!(
-                !set.iter().any(|n| n.starts_with("aterm-machines")),
-                "an unattributed cut must publish no roster: {set:?}"
-            );
-        }
+        let set = names(&plain.channel_asset_paths());
+        assert!(
+            !set.iter().any(|n| n.starts_with("aterm-machines")),
+            "an unattributed cut must publish no roster: {set:?}"
+        );
     }
 
     /// The verdict's three attribution fields reach the cut TOGETHER, or the release
@@ -14760,13 +13305,13 @@ mod roster_wiring_tests {
     }
 
     /// A recovery reconstructs the roster pair from what the PUBLISHED MANIFEST says
-    /// about itself, so the set it rebuilds is the set `mirror_asset_paths` will demand.
+    /// about itself, so the set it rebuilds is the set `channel_asset_paths` will demand.
     ///
     /// Kills the mutation "reconstruct nothing": the two sets then disagree, and
-    /// `step_mirror` dies on a file recovery never wrote — with advice ("recover the
-    /// cut") naming the command that was already running.
+    /// `publish` dies on a file recovery never wrote — with advice naming the command
+    /// that was already running.
     #[test]
-    fn recovery_rebuilds_exactly_the_roster_assets_the_mirror_will_demand() {
+    fn recovery_rebuilds_exactly_the_roster_assets_publish_will_demand() {
         let mut manifest = manifest_out::build(&manifest_out::ManifestInputs {
             version: "0.5.0",
             build_number: 500,
@@ -14785,9 +13330,9 @@ mod roster_wiring_tests {
         // An UNATTRIBUTED published release reconstructs no roster, and demands none.
         assert!(recovered_roster_asset_names(&manifest).is_empty());
         assert!(
-            ctx(manifest.machine_id.as_deref())
-                .roster_asset_paths()
-                .is_empty()
+            !names(&ctx(manifest.machine_id.as_deref()).channel_asset_paths())
+                .iter()
+                .any(|name| name.starts_with("aterm-machines"))
         );
 
         machines::attribute(
@@ -14802,7 +13347,7 @@ mod roster_wiring_tests {
             .into_iter()
             .map(str::to_string)
             .collect();
-        let demanded = names(&ctx(manifest.machine_id.as_deref()).mirror_asset_paths());
+        let demanded = names(&ctx(manifest.machine_id.as_deref()).channel_asset_paths());
         for name in &rebuilt {
             assert!(demanded.contains(name), "{name} rebuilt but not demanded");
         }
@@ -14980,7 +13525,7 @@ mod lean_dmg_ceiling_tests {
     /// the old seeded-image cutter. Even when the downloader reports a tiny
     /// size, the retained object's real metadata remains the authority.
     #[test]
-    fn an_oversized_recovered_dmg_is_refused_before_the_mirror_suffix() {
+    fn an_oversized_recovered_dmg_is_refused_before_publish() {
         let sequence = RELEASE_ASSET_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let dir = PrivateTempDir::create(std::env::temp_dir().join(format!(
             "aterm-lean-dmg-recovery-{}-{sequence}",
@@ -15158,7 +13703,7 @@ mod lean_dmg_ceiling_tests {
 
 #[cfg(test)]
 mod anonymous_readability_tests {
-    //! THE MIRROR STEP SPENDS NOTHING OF THE ANONYMOUS API BUDGET (2026-09-23).
+    //! THE PUBLISH STEP SPENDS NOTHING OF THE ANONYMOUS API BUDGET (2026-09-23).
     //!
     //! The 0.91 cut died three times at its post-flip readability probe — an anonymous
     //! `GET api.github.com/repos/<slug>/releases/tags/<tag>` — after the release was
@@ -15192,7 +13737,7 @@ mod anonymous_readability_tests {
     }
 
     fn names() -> Vec<String> {
-        mirror::required_asset_names("0.92.0", true, true)
+        channel::required_asset_names("0.92.0", true, true)
     }
 
     /// Run the proof over a scripted transport; returns (result, every URL asked,
@@ -15217,7 +13762,7 @@ mod anonymous_readability_tests {
         (out, asked, slept)
     }
 
-    /// The recording stub: every request the mirror's readability proof makes is a HEAD
+    /// The recording stub: every request the channel readability proof makes is a HEAD
     /// of `github.com/<slug>/releases/download/<tag>/<asset>`, one per required asset,
     /// and none is addressed to `api.github.com`.
     #[test]
@@ -15234,7 +13779,7 @@ mod anonymous_readability_tests {
         for url in &asked {
             assert!(
                 !aterm_update_core::cdn::is_api_host(url) && !url.contains("api.github.com"),
-                "the mirror's anonymous proof spent the metered API: {url}"
+                "the channel's anonymous proof spent the metered API: {url}"
             );
         }
         // NEGATIVE CONTROL: the predicate above is not vacuous — the URL the retired
@@ -15452,25 +13997,11 @@ mod remedy_tests {
 
     #[test]
     fn an_in_flight_cut_names_the_launcher_to_resume_or_abandon_it() {
-        let journal = Journal {
+        let journal = JournalHeader {
             format: JOURNAL_FORMAT,
             version: "0.92.0".into(),
             build_number: 1_790_200_000,
             commit: "a".repeat(40),
-            min_build: None,
-            arm64_only: false,
-            manifest_signed: false,
-            signature_required: false,
-            signature_pubkey: None,
-            verify_pubkey: None,
-            signature_machine_id: None,
-            release_id: None,
-            draft_create_issued: false,
-            upload_intents: Vec::new(),
-            mirror_release_id: None,
-            mirror_create_issued: false,
-            mirror_upload_intents: Vec::new(),
-            linux: None,
             done: vec!["lock".into()],
         };
         for kind in [CutKind::Real, CutKind::DryRun] {
@@ -15646,7 +14177,6 @@ mod tree_cutter_tests {
                 Ok(crate::cli::Cmd::Cut {
                     opts: parsed,
                     abandon: None,
-                    retire_unmirrored: None,
                 }) => assert_eq!(parsed, opts, "{argv:?}"),
                 other => panic!("{argv:?} parsed as {other:?}"),
             }
@@ -15684,6 +14214,25 @@ mod tree_cutter_tests {
                 }
                 other => panic!("{argv:?} parsed as {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn abandon_args_parse_back_to_the_same_abandon() {
+        let argv = strings(abandon_args("0.92.0"));
+        match crate::cli::parse(&argv) {
+            Ok(crate::cli::Cmd::Cut {
+                opts,
+                abandon: Some(version),
+            }) => {
+                assert_eq!(version, "0.92.0");
+                assert_eq!(
+                    opts,
+                    CutOptions::default(),
+                    "an abandon takes no other flag"
+                );
+            }
+            other => panic!("{argv:?} parsed as {other:?}"),
         }
     }
 }
@@ -15883,10 +14432,9 @@ mod signature_line_tests {
 
 #[cfg(test)]
 mod artifact_proof_tests {
-    //! ONE BEHAVIOURAL PASS PER CUT (2026-09-23, audit BC-5). `upload`, `preflip`
-    //! and `flip` re-prove `dist/` by digest ([`prove_artifacts_on_disk`]) and run
-    //! nothing; only `selfcheck` runs the shipped binary, the paint smoke and
-    //! `codesign`.
+    //! ONE BEHAVIOURAL PASS PER CUT (2026-09-23, audit BC-5). `publish` re-proves
+    //! `dist/` by digest ([`prove_publication_on_disk`]) and runs nothing; only
+    //! `selfcheck` runs the shipped binary, the paint smoke and `codesign`.
 
     use super::*;
 
@@ -15933,8 +14481,8 @@ mod artifact_proof_tests {
             ),
         )
         .unwrap();
-        let dmg = dist.join(mirror::dmg_asset_name(VERSION));
-        let zip = dist.join(mirror::zip_asset_name(VERSION));
+        let dmg = dist.join(channel::dmg_asset_name(VERSION));
+        let zip = dist.join(channel::zip_asset_name(VERSION));
         fs::write(&dmg, b"the lean dmg bytes").unwrap();
         fs::write(&zip, b"the updater zip bytes").unwrap();
         let dmg_sha = dmg::sha256_file(&dmg).unwrap();
@@ -15945,9 +14493,9 @@ mod artifact_proof_tests {
                 version: VERSION,
                 build_number: BUILD,
                 commit: &commit,
-                dmg_name: &mirror::dmg_asset_name(VERSION),
+                dmg_name: &channel::dmg_asset_name(VERSION),
                 dmg_sha256: &dmg_sha,
-                zip_name: &mirror::zip_asset_name(VERSION),
+                zip_name: &channel::zip_asset_name(VERSION),
                 zip_sha256: &zip_sha,
                 repo_slug: "channel/repo",
                 min_os: "11.0",
@@ -15982,12 +14530,8 @@ mod artifact_proof_tests {
             attribution: None,
             roster: None,
             release_id: None,
-            draft_create_issued: false,
+            release_intent: false,
             upload_intents: Vec::new(),
-            mirror_slug: None,
-            mirror_release_id: None,
-            mirror_create_issued: false,
-            mirror_upload_intents: Vec::new(),
             kind: CutKind::DryRun,
             no_paint_smoke: true,
             lease: None,
@@ -16010,7 +14554,7 @@ mod artifact_proof_tests {
 
         // NEGATIVE CONTROL: the self-check proper is BEHAVIOURAL — it runs the
         // shipped binary — so on the same bytes, with no binary to run, it refuses.
-        // Upload, preflip and flip called this until 2026-09-23.
+        // The publication steps called this until 2026-09-23.
         let error = step_selfcheck(&mut ctx)
             .expect_err("the behavioural pass must run the binary")
             .to_string();

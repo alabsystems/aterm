@@ -470,20 +470,19 @@ pub fn serve<F, G, E>(
 /// endpoint fails before any secret crosses the wire. The session-NONCE half of
 /// the rebind guard ([`RemoteEndpoint::matches`](crate::RemoteEndpoint::matches))
 /// is enforced when `pin` is `Some`: after the capability is presented and BEFORE
-/// any control bytes relay, the remote's live launch nonce is read and `matches`
-/// is required to hold. `pin == None` presents and relays with no nonce read.
+/// any control bytes relay, the remote's live launch nonce is read
+/// ([`observe_launch_nonce`]: one `sessions bridge` over the relay, which the
+/// listener has already authenticated at Owner scope) and `matches` is required to
+/// hold. `pin == None` presents and relays with no nonce read.
 ///
-/// **Fail-closed.** The shipping wire protocol does not yet carry a launch-identity
-/// echo, so the live nonce is currently UNOBSERVABLE
-/// ([`observe_launch_nonce_unavailable`]). A configured `pin` therefore refuses to
-/// dial rather than relay unverified — a pin the operator asked for is never
-/// silently skipped. When the listener grows a `LaunchNonce` echo, only the
-/// observer is replaced; this enforcement point is unchanged.
+/// **Fail-closed.** A pinned session the remote does not report — relaunched,
+/// closed, or a roster that could not be read — refuses to dial rather than relay
+/// unverified: a pin the operator asked for is never silently skipped.
 ///
 /// # Errors
 /// On a connect/TLS/handshake failure (incl. cert-pin mismatch) or a denied
 /// capability (before any relay); when `pin` is `Some`, a nonce-mismatch or
-/// unobservable-nonce error (also before any relay), so a relaunched/rebound
+/// unreported-session error (also before any relay), so a relaunched/rebound
 /// session is never driven by a stale pin. A relay-stage I/O error after a
 /// successful present is returned too, but by then the capability HAS been
 /// accepted and bytes may have flowed.
@@ -510,28 +509,85 @@ pub fn dial_and_relay_pinned<A: ToSocketAddrs>(
         prebuffer,
         local,
         HANDSHAKE_TIMEOUT,
-        pin,
-        observe_launch_nonce_unavailable,
+        pin.clone(),
+        move |transport| match &pin {
+            Some(pin) => observe_launch_nonce(pin, transport),
+            None => Ok(None),
+        },
     )
 }
 
+/// The most sessions, and the longest row, [`observe_launch_nonce`] reads.
+const ROSTER_MAX_ROWS: usize = 4096;
+const ROSTER_MAX_LINE: usize = 512;
+
 /// Read the remote's live launch nonce for the [`RemoteEndpoint::matches`] rebind
-/// check. The shipping wire protocol does not yet carry a launch-identity echo (the
-/// listener does not send its `LaunchNonce`), so this returns `None` — which makes
-/// [`dial_and_relay_pinned`] FAIL CLOSED when a nonce pin is configured, rather than
-/// silently skip the check. Replace this with a real read once the listener echoes
-/// its launch identity; the enforcement point in [`dial_and_relay_pinned_inner`] is
-/// then unchanged.
-fn observe_launch_nonce_unavailable(
-    _transport: &mut TlsTransport<rustls::ClientConnection>,
+/// check: `sessions bridge` over the authenticated relay (the listener AUTHs the
+/// local control socket at Owner scope before relaying), whose answer is `OK <n>`
+/// then one `<local> <sid> nonce=<hex32>` row per session. The pinned `sid`'s row
+/// names its live nonce; a pin with no `sid` is observed when ANY session still
+/// carries the pinned nonce. `None` when the remote reports no such session — a
+/// relaunched or closed one — which the enforcement point refuses. The read is
+/// bounded by the handshake deadline, so a remote that never answers fails the
+/// dial instead of hanging it.
+fn observe_launch_nonce(
+    pin: &RemoteEndpoint,
+    transport: &mut TlsTransport<rustls::ClientConnection>,
 ) -> io::Result<Option<String>> {
-    Ok(None)
+    use std::io::Write as _;
+    let roster = |e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!("reading the remote's session roster: {e}"),
+        )
+    };
+    let stream = transport.stream();
+    stream.get_mut().set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    stream.write_all(b"sessions bridge\n")?;
+    stream.flush()?;
+    let head = crate::read_line(stream, ROSTER_MAX_LINE).map_err(roster)?;
+    let n = head
+        .strip_prefix("OK ")
+        .and_then(|n| n.trim().parse::<usize>().ok())
+        .filter(|n| *n <= ROSTER_MAX_ROWS)
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "the remote refused its session roster ({:?}); refusing to dial (fail-closed)",
+                head.chars().take(80).collect::<String>()
+            ))
+        })?;
+    let mut rows = Vec::with_capacity(n);
+    for _ in 0..n {
+        rows.push(crate::read_line(stream, ROSTER_MAX_LINE).map_err(roster)?);
+    }
+    stream.get_mut().set_read_timeout(None)?;
+    Ok(roster_nonce(pin, &rows))
+}
+
+/// The live nonce [`observe_launch_nonce`] reports for `pin` among `sessions
+/// bridge` rows (module doc there).
+fn roster_nonce(pin: &RemoteEndpoint, rows: &[String]) -> Option<String> {
+    let mut parsed = rows.iter().filter_map(|row| {
+        let mut fields = row.split(' ');
+        let (_local, sid, nonce) = (fields.next()?, fields.next()?, fields.next()?);
+        Some((sid, nonce.strip_prefix("nonce=")?))
+    });
+    if pin.sid.is_empty() {
+        parsed
+            .any(|(_, nonce)| nonce == pin.nonce)
+            .then(|| pin.nonce.clone())
+    } else {
+        parsed
+            .find(|(sid, _)| *sid == pin.sid)
+            .map(|(_, nonce)| nonce.to_string())
+    }
 }
 
 /// [`dial_and_relay_pinned`] with the unauthenticated-phase deadline AND the
 /// launch-nonce observer injected. `observe_nonce` yields the remote's live launch
-/// nonce (`None` ⇒ unobservable ⇒ a configured pin fails closed); tests inject a
-/// matching/mismatching nonce to exercise the rebind guard without a wire echo. When
+/// nonce (`None` ⇒ the pinned session is not reported ⇒ a configured pin fails
+/// closed); production passes [`observe_launch_nonce`], and tests may inject a
+/// matching/mismatching nonce to exercise the guard alone. When
 /// `pin` is `None` the observer is never called and the relay is byte-identical to
 /// the un-pinned path.
 #[allow(clippy::too_many_arguments)]
@@ -618,8 +674,8 @@ where
     // caller configured a pin. The cert-fingerprint half is already TLS-enforced (a
     // non-pinned cert never completes the handshake above), so the observed
     // fingerprint provably equals `pin.fingerprint`; only the launch-nonce half
-    // remains, read here via `observe_nonce`. A pin that cannot be verified (no wire
-    // echo yet ⇒ `None`) FAILS CLOSED — an operator-requested guard is never silently
+    // remains, read here via `observe_nonce`. A pinned session the remote does not
+    // report (`None`) FAILS CLOSED — an operator-requested guard is never silently
     // skipped. `pin == None` never touches `observe_nonce`, so the un-pinned path is
     // byte-identical to the un-pinned dial.
     if let Some(pin) = &pin {
@@ -633,8 +689,8 @@ where
             }
             None => {
                 return Err(io::Error::other(
-                    "connection pins a launch nonce but the remote supplied no launch identity \
-                     (the wire echo is not yet implemented); refusing to dial (fail-closed)",
+                    "connection pins a launch nonce but the remote reported no session with \
+                     the pinned identity (relaunched or closed); refusing to dial (fail-closed)",
                 ));
             }
         }
@@ -1050,7 +1106,7 @@ mod tests {
             drv_local,
             Duration::from_millis(300),
             None,
-            observe_launch_nonce_unavailable,
+            |_t| Ok(None),
         );
         let elapsed = started.elapsed();
         assert!(
@@ -1567,7 +1623,7 @@ mod tests {
     /// Stand up a loopback-TLS listener that grants `op == "drive"` and echoes its
     /// local socket, then dial it with `dial_and_relay_pinned_inner` carrying `pin`
     /// and an observer that reports `observed` as the remote's live launch nonce
-    /// (`None` ⇒ unobservable, the shipping wire's current state). Returns the
+    /// (`None` ⇒ the remote reports no such session). Returns the
     /// DIALER's result — the rebind guard runs BEFORE any relay, so this is enough to
     /// prove accept/reject without driving a verb. The listener side is joined.
     fn dial_with_pin(pin: RemoteEndpoint, observed: Option<&'static str>) -> io::Result<()> {
@@ -1620,8 +1676,8 @@ mod tests {
 
     #[test]
     fn a_matching_launch_nonce_pin_passes_and_relays_a_verb() {
-        // The observer supplies the MATCHING live nonce (standing in for the wire
-        // echo the shipping protocol does not yet carry), so the rebind guard holds
+        // The observer supplies the MATCHING live nonce (standing in for the
+        // roster read, which `the_roster_observer_*` drives for real), so the rebind guard holds
         // and the relay carries a control verb end-to-end exactly as the un-pinned
         // path does.
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1700,9 +1756,9 @@ mod tests {
 
     #[test]
     fn a_pin_with_no_observable_nonce_fails_closed() {
-        // The shipping wire carries no launch-identity echo yet, so the live nonce is
-        // unobservable (`None`). A configured pin must FAIL CLOSED, never relay
-        // unverified — the same posture the production `dial_and_relay_pinned` takes.
+        // The remote reports no session with the pinned identity (`None`). A
+        // configured pin must FAIL CLOSED, never relay unverified — the same posture
+        // the production `dial_and_relay_pinned` takes.
         let pin = RemoteEndpoint {
             host: "ignored".into(),
             sid: "s-1".into(),
@@ -1712,5 +1768,131 @@ mod tests {
         let res = dial_with_pin(pin, None);
         let err = res.expect_err("an unverifiable pin must fail closed");
         assert!(err.to_string().contains("fail-closed"), "{err}");
+    }
+
+    /// A fake remote control server behind the listener: it answers `sessions
+    /// bridge` with `reply` and echoes every other line, so a verb relayed after
+    /// the roster read comes back unchanged.
+    fn spawn_roster_server(s: CtlStream, reply: &'static str) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            use std::io::BufRead as _;
+            let mut w = s.try_clone().unwrap();
+            let mut r = std::io::BufReader::new(s);
+            let mut line = String::new();
+            while r.read_line(&mut line).map(|n| n > 0).unwrap_or(false) {
+                let out = if line == "sessions bridge\n" {
+                    reply
+                } else {
+                    line.as_str()
+                };
+                if w.write_all(out.as_bytes())
+                    .and_then(|()| w.flush())
+                    .is_err()
+                {
+                    break;
+                }
+                line.clear();
+            }
+        })
+    }
+
+    /// Dial a loopback-TLS listener fronting [`spawn_roster_server`] through the
+    /// PRODUCTION [`dial_and_relay_pinned`] (its real observer), then relay one
+    /// verb. `Ok` carries what the driver's local client read back.
+    fn dial_roster(pin: RemoteEndpoint, reply: &'static str) -> io::Result<Vec<u8>> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
+        let ccfg = client_config(cert_fingerprint(TEST_CERT_DER));
+        let token = EdgeToken::generate();
+        let (svc_a, svc_b) = CtlStream::pair().unwrap();
+        let server = spawn_roster_server(svc_b, reply);
+        let svc_a = Arc::new(Mutex::new(Some(svc_a)));
+        let host = std::thread::spawn({
+            let svc_a = Arc::clone(&svc_a);
+            move || {
+                let (tcp, _) = listener.accept().unwrap();
+                accept_and_relay(
+                    tcp,
+                    scfg,
+                    |_s, op| (op == "drive").then_some(token),
+                    || Ok(svc_a.lock().unwrap().take().unwrap()),
+                )
+            }
+        });
+        let (drv_local, mut drv_client) = CtlStream::pair().unwrap();
+        let driver = std::thread::spawn(move || {
+            dial_and_relay_pinned(
+                addr,
+                ccfg,
+                "dial",
+                "drive",
+                &token,
+                b"",
+                drv_local,
+                Some(pin),
+            )
+        });
+        drv_client.write_all(b"screen\n").unwrap();
+        drv_client.flush().unwrap();
+        // A liveness bound, not a measurement: sized for a starved parallel run.
+        drv_client
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .unwrap();
+        let mut got = [0u8; 7];
+        let read = drv_client.read_exact(&mut got);
+        drv_client.shutdown(std::net::Shutdown::Both).ok();
+        drop(drv_client);
+        let dialed = driver.join().unwrap();
+        let _ = host.join().unwrap();
+        drop(svc_a);
+        server.join().ok();
+        match (read, dialed) {
+            (Ok(()), _) => Ok(got.to_vec()),
+            (Err(_), Err(e)) => Err(e),
+            (Err(e), Ok(())) => Err(e),
+        }
+    }
+
+    const ROSTER: &str = "OK 2\n1 s-a nonce=aaaa\n2 s-b nonce=bbbb\n";
+
+    /// THE LAUNCH-NONCE PIN, observed over the real wire: the dialer asks the
+    /// remote's `sessions bridge` (the listener has already authenticated its
+    /// control socket at Owner scope) and compares the pinned session's live
+    /// nonce. Before this, the observer returned nothing and EVERY configured
+    /// `expect_nonce` refused to dial. The roster exchange never reaches the
+    /// driver's own client: the verb it sends after comes back alone.
+    #[test]
+    fn the_roster_observer_passes_a_live_pin_and_refuses_a_stale_one() {
+        let pin = |sid: &str, nonce: &str| RemoteEndpoint {
+            host: "loopback".into(),
+            sid: sid.into(),
+            nonce: nonce.into(),
+            fingerprint: "fp".into(),
+        };
+        let got = dial_roster(pin("s-b", "bbbb"), ROSTER).expect("the pinned session is live");
+        assert_eq!(
+            got, b"screen\n",
+            "the relay carries the verb, not the roster"
+        );
+        // A pin without a sid holds while any session carries the nonce.
+        assert_eq!(
+            dial_roster(pin("", "aaaa"), ROSTER).expect("nonce-only pin"),
+            b"screen\n"
+        );
+        // A relaunched session: its sid answers with a fresh nonce.
+        let err = dial_roster(pin("s-b", "old0"), ROSTER).expect_err("a stale nonce");
+        assert!(err.to_string().contains("mismatch"), "{err}");
+        // A closed session: the remote reports no such sid, or no such nonce.
+        for p in [pin("s-gone", "bbbb"), pin("", "old0")] {
+            let err = dial_roster(p, ROSTER).expect_err("an unreported session");
+            assert!(err.to_string().contains("fail-closed"), "{err}");
+        }
+        // A remote that refuses the roster fails closed too.
+        let err = dial_roster(pin("s-b", "bbbb"), "ERR scope\n").expect_err("a refused roster");
+        assert!(
+            err.to_string().contains("refused its session roster"),
+            "{err}"
+        );
     }
 }

@@ -1949,8 +1949,8 @@ mod tests {
         // that made them, and the count is the honest size of the fork.
         // 121 -> 122 on 2026-09-26: app_state.rs's waker stop in a nested run
         // loop (measured.rs, the note of that date). 122 -> 123 on
-        // 2026-09-27: the waker became aterm_objc::WakeTimer (measured.rs,
-        // the note of that date).
+        // 2026-09-27: the waker became aterm_objc::WakeTimer, whose marker
+        // is in observer.rs (measured.rs, the note of that date).
         assert_eq!(patch, 123, "`{LOCAL_PATCH_MARKER}` marker count");
         let by_name: BTreeMap<&str, (u64, u64)> = forks
             .iter()

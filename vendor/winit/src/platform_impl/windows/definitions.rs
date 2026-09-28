@@ -3,11 +3,16 @@
 
 use std::ffi::c_void;
 
-use windows_sys::core::{IUnknown, GUID, HRESULT};
-use windows_sys::Win32::Foundation::{BOOL, HWND, POINTL};
-use windows_sys::Win32::System::Com::{
-    IAdviseSink, IDataObject, IEnumFORMATETC, IEnumSTATDATA, FORMATETC, STGMEDIUM,
-};
+use windows_sys::core::{BOOL, GUID, HRESULT};
+use windows_sys::Win32::Foundation::{HWND, POINTL};
+use windows_sys::Win32::System::Com::{FORMATETC, STGMEDIUM};
+
+// windows-sys 0.59 dropped these COM interface aliases; the 0.52 definitions.
+pub type IUnknown = *mut c_void;
+pub type IDataObject = *mut c_void;
+pub type IAdviseSink = *mut c_void;
+pub type IEnumFORMATETC = *mut c_void;
+pub type IEnumSTATDATA = *mut c_void;
 
 #[repr(C)]
 pub struct IUnknownVtbl {

@@ -47,15 +47,33 @@
 //!   [`TurnEndTiming::short_backoff`] up to [`TurnEndTiming::
 //!   short_backoff_max`] (2 min, 4, 8 … 60); a turn of real work that does
 //!   not end done ends the streak, and the next point is answered at once.
-//!   (Until 2026-09-24 a short turn was left alone and two in a row
-//!   escalated "worker reports done".) `cfg.continue_per_hour` is the
+//!   A turn the HARNESS typed — the upgrade's notice, answered READY, and a
+//!   relaunched agent's carry-on, answered — is no short turn: answered
+//!   short, the streak and its back-off stand as the worker's own turns left
+//!   them ([`TurnEndState::host_typed`]; N1 of the live E2E of 2026-09-26:
+//!   after a 2m34s stage, the READY answer and the carry-on's reply counted
+//!   as two short turns and the stage's continuation waited a 4-minute
+//!   back-off); answered with real work — a carry-on's answer is the
+//!   worker's own work, resumed — it ends the streak as any turn of real
+//!   work does. (Until 2026-09-24 a short turn was left alone and two in a
+//!   row escalated "worker reports done".) `cfg.continue_per_hour` is the
 //!   owner's cap: `0`, the default, is none; past a written cap the point is
 //!   escalated.
-//! * **No turn, no turn end.** A session nobody has asked anything
-//!   ([`TurnEndReading::fresh`]: the launch card and no message) is waiting
-//!   for its first task, not stopped short: nothing is typed into it, and
-//!   its first point starts no streak (the E2E probe of 2026-09-25: a
-//!   brand-new session got `keep going` two minutes after its launch).
+//! * **No task, no turn end.** A session nobody has asked anything
+//!   ([`TurnEndReading::taskless`]: the launch card and no message, or its
+//!   host's word that no person or orchestrator has asked its conversation
+//!   anything — the harness's OWN typed turns, a notice or a carry-on, are no
+//!   task) is waiting for its first task, not stopped short: no act of any
+//!   kind is typed into it — no continuation, no answer, no wall's retry —
+//!   and its first point starts no streak (the E2E probe of 2026-09-25: a
+//!   brand-new session got `keep going` two minutes after its launch; the
+//!   live E2E of 2026-09-26, B 1a5299ab: after the harness's own notice,
+//!   READY, restart and carry-on, a session nobody had asked anything got
+//!   `keep going`, and its agent asked what it should help with). A session
+//!   WITH a task is continued as below even when that task is finished —
+//!   the same E2E's C, whose tester's prompt was answered, was continued,
+//!   answered and carried on until haiku invented work (`git init`, `/init`,
+//!   files and a commit): that hazard is open, not closed by this rule.
 //! * **A person wins.** Nothing is typed within `cfg.human_grace_s` of a
 //!   person's last keystroke into the session ([`TurnEndReading::person`]:
 //!   the server's `human_ms=`, or the draft in the composer last changing,
@@ -98,8 +116,14 @@
 //! yes — and only when that continuation hits the bucket again is the model
 //! switched as above. Nothing is ever BOUGHT (the approval policy's
 //! `buys`). A full context: `/compact`, then continue (again on the retry
-//! ladder). A lost login: `/login`, then the ONE irreducible escalation —
-//! "finish sign-in in the browser". Claude Code's critical-memory banner
+//! ladder). A lost login — `Not logged in · …` under the gutter, or Claude
+//! Code 2.1.281's `⏺ Login expired · Please run /login` error row (the
+//! incident of 2026-09-27, read idle with no wall until then and continued
+//! for nine hours): `/login` ONCE, then the ONE irreducible escalation —
+//! "finish sign-in in the browser" — said as it is typed; then nothing more
+//! until the screen says the login is back (`⎿  Login successful`) or the
+//! worker works — never a continuation into it, never a draft sent into it
+//! (escalated instead). Claude Code's critical-memory banner
 //! ([`WallKind::Memory`], read even under a running spinner): the agent is
 //! RESTARTED — ended and relaunched on its own conversation by the session's
 //! host, which then tells it to carry on ([`TurnEndAction::Restart`], D3 of
@@ -142,6 +166,10 @@ pub const RULE_ANSWER: &str = "answer@v1";
 pub const RULE_CONSENT: &str = "consent-accept@v1";
 /// The agent restarted in its tab for Claude Code's critical-memory banner.
 pub const RULE_MEMORY_RESTART: &str = "memory-restart@v1";
+/// A turn the session's HOST typed — the live upgrade's notice, a relaunched
+/// agent's carry-on ([`TurnEndState::host_typed`]): awaited as this policy's
+/// own acts are, and its answer, short, is no short turn of the worker's.
+pub const RULE_HOST_TURN: &str = "harness-turn@v1";
 
 /// Why the session's host restarts the agent in its tab
 /// ([`TurnEndAction::Restart`]): a point nothing typed can answer.
@@ -226,7 +254,8 @@ pub fn says_done(tail: Option<&str>) -> bool {
     })
 }
 
-/// The rules whose act's yield counts toward the short streak.
+/// The rules whose act's yield counts toward the short streak — never
+/// [`RULE_HOST_TURN`], the harness's own turn.
 fn is_continue_rule(rule: &str) -> bool {
     rule == RULE_CONTINUE || rule == RULE_SUGGESTION || rule == RULE_ANSWER
 }
@@ -526,8 +555,18 @@ pub struct TurnEndReading {
     /// own rule even where it is, with no relaunch asked for over the
     /// upgrade's own but the memory banner's ([`decide_turn_end`]).
     pub upgrading: bool,
-    /// No turn yet ([`aterm_phase::Reading::fresh`]): nothing ended here.
-    pub fresh: bool,
+    /// NO TASK YET: nobody but the harness has asked the session anything —
+    /// the screen shows the launch card and no message
+    /// ([`aterm_phase::Reading::fresh`]), or the session's host says its
+    /// conversation holds no prompt of a person's or an orchestrator's
+    /// ([`crate::supervise::IdleHost::taskless`]: the harness's own notices
+    /// and carry-ons, and what the loop itself typed, are none). Nothing
+    /// ended here, and nothing is typed.
+    pub taskless: bool,
+    /// The screen says the LOGIN IS BACK ([`aterm_phase::login_restored`]:
+    /// `⎿  Login successful` under the `❯ /login` a person typed), what
+    /// lifts a lost login the policy saw ([`decide_turn_end`]'s login hold).
+    pub login_back: bool,
     /// How long ago a PERSON last typed or pasted into the session through
     /// its window (the server's `status human_ms=`; a control-socket write
     /// is not a person's), or the draft in the composer last changed — the
@@ -591,8 +630,9 @@ impl TurnEndReading {
             interrupted: reading.interrupted,
             restartable: false,
             upgrading: false,
-            fresh: reading.fresh,
+            taskless: reading.fresh,
             person: None,
+            login_back: claude && aterm_phase::login_restored(rows),
         }
     }
 
@@ -756,7 +796,8 @@ pub struct TurnEndState {
     pub timing: TurnEndTiming,
     /// When each typed act went, within the window.
     acts: VecDeque<Instant>,
-    /// The act typed last, until the next point shows what it did.
+    /// The act typed last — this policy's, or a turn its host typed
+    /// ([`Self::host_typed`]) — until the next point shows what it did.
     awaiting: Option<Awaited>,
     /// The act the current point follows (`None`: someone else's turn).
     followed: Option<&'static str>,
@@ -863,10 +904,15 @@ impl TurnEndState {
     }
 
     /// An act of this policy's is in flight: typed and its point not judged
-    /// yet, or a command's continuation owed.
+    /// yet, or a command's continuation owed. A turn the HOST typed
+    /// ([`Self::host_typed`]) is none: it holds this policy's acts back until
+    /// its answer shows, never the host's own next step, which reads its own
+    /// evidence (the READY answer in the conversation's record, the model a
+    /// carry-on's answer names) — an answer no read saw busy would otherwise
+    /// hold the upgrade still until the screen moved.
     #[must_use]
     pub fn act_in_flight(&self) -> bool {
-        self.awaiting.is_some() || self.after.is_some()
+        self.awaiting.is_some_and(|a| a.rule != RULE_HOST_TURN) || self.after.is_some()
     }
 
     /// The model switch in force, if any.
@@ -875,10 +921,23 @@ impl TurnEndState {
         self.model.as_ref()
     }
 
+    /// The lost login's track, if one stands — the wall seen and the worker
+    /// not working since — and how many `/login`s it has had (the
+    /// conformance walk's projection).
+    #[must_use]
+    pub fn login_track(&self) -> Option<usize> {
+        self.wall
+            .as_ref()
+            .filter(|t| t.class == WallClass::Auth)
+            .map(|t| t.attempts)
+    }
+
     /// Fold what a point shows into the state, BEFORE [`decide_turn_end`] is
     /// asked about it: the yield of the act typed last (a continuation or an
     /// answer that produced less than `min_work` lengthens the short streak,
-    /// one that produced more ends it), someone else's turn in between
+    /// one that produced more ends it; a turn the host typed,
+    /// [`Self::host_typed`], never lengthens it — answered short, the streak
+    /// and its back-off stand — and ends it with real work), someone else's turn in between
     /// (`worked` with nothing awaited: short, or the streak's end), the
     /// first point this state sees (its work unknown: short), and the wall on
     /// the screen (a new kind opens a track; the same kind again
@@ -934,6 +993,21 @@ impl TurnEndState {
             }
         };
         match (awaited, reading.worked) {
+            // The harness's own turn: answered short, the streak and the
+            // back-off it runs on stand as the worker's turns left them (the
+            // point it counts from too); answered with real work, the streak
+            // ends — a carry-on's answer is the worker's own work resumed.
+            (Some(RULE_HOST_TURN), worked) => {
+                let d = worked.unwrap_or_default();
+                if d >= min && !done {
+                    self.followed = Some(RULE_HOST_TURN);
+                    self.point_worked = d;
+                    self.point_at = Some(now);
+                    self.short = 0;
+                } else if self.point_at.is_none() {
+                    self.point_at = Some(now);
+                }
+            }
             (Some(rule), worked) => {
                 let d = worked.unwrap_or_default();
                 self.followed = Some(rule);
@@ -955,8 +1029,8 @@ impl TurnEndState {
             }
             // The first point seen, its work unknown: a supervisor that
             // attaches to an idle worker backs off before it types. A
-            // session with no turn yet ended nothing: no streak begins.
-            (None, None) if self.point_at.is_none() && !reading.fresh => {
+            // session with no task yet ended nothing: no streak begins.
+            (None, None) if self.point_at.is_none() && !reading.taskless => {
                 self.point_at = Some(now);
                 self.short = 1;
             }
@@ -1028,6 +1102,29 @@ impl TurnEndState {
         {
             t.attempts += 1;
         }
+    }
+
+    /// Record a turn the session's HOST typed — the live upgrade's notice, a
+    /// relaunched agent's carry-on ([`RULE_HOST_TURN`]): awaited as this
+    /// policy's own acts are (the point after it is its answer's, judged at
+    /// [`TurnEndTiming::take_within`] if no read sees it busy). Its answer is
+    /// never a short turn of the worker's: answered short (READY, a carry-on
+    /// the agent had nothing to add to), the streak and its back-off stand as
+    /// the worker's own turns left them (N1 of the live E2E of 2026-09-26:
+    /// the READY answer and the carry-on's reply, 2.8 s and 2.7 s, were read
+    /// as two short turns of someone else's, and the continuation after a
+    /// 2m34s stage waited 4 minutes); answered with real work, the streak
+    /// ends as after any turn of real work — the carry-on's answer is the
+    /// worker's own work, resumed (review of 2026-09-26: a 20-minute
+    /// carry-on answer was otherwise backed off like the first point before
+    /// it). No budget is spent: the owner's cap counts this policy's acts.
+    pub fn host_typed(&mut self, now: Instant) {
+        self.awaiting = Some(Awaited {
+            rule: RULE_HOST_TURN,
+            command: false,
+            at: now,
+            unseen_since: None,
+        });
     }
 }
 
@@ -1562,7 +1659,9 @@ pub fn decide_turn_end(
             };
         }
     }
-    if !reading.at_point(state.stale_input) || reading.fresh {
+    // No task: nothing ended here, and nothing is typed — no continuation,
+    // no answer, no wall's act.
+    if !reading.at_point(state.stale_input) || reading.taskless {
         return TurnEndAction::Nothing;
     }
     // A person at the keyboard wins: hands off for the grace after their last
@@ -1586,8 +1685,16 @@ pub fn decide_turn_end(
     let act = act_at_point(state, reading, cfg, now);
     // A draft standing in the composer (the grace above has passed since it
     // last changed): submitted in the act's place, under its rule — never
-    // typed over.
+    // typed over. Never into a lost login, though: the wall would answer it
+    // in milliseconds and the person's words would be spent on nothing, so
+    // where `/login` was the act the point is the person's, and said.
     match act.rule_id() {
+        Some(RULE_LOGIN) if reading.composer == Composer::Typed => TurnEndAction::Escalate {
+            reason: format!(
+                "the login is gone: {} (a draft stands in the composer; sign in with /login)",
+                reading.wall_message
+            ),
+        },
         Some(rule_id) if reading.composer == Composer::Typed => TurnEndAction::Submit { rule_id },
         _ => act,
     }
@@ -1623,6 +1730,22 @@ fn act_at_point(
     };
     if let Some(kind) = reading.wall {
         return wall_action(state, reading, cfg, now, kind, &budgeted, &continue_as);
+    }
+    // A LOST LOGIN THE POLICY SAW is waited out off the screen too: its track
+    // stands (`/login` typed or not) and the worker has not worked since. The
+    // wall's row gone — the `/login` dialog dismissed, a line of its output
+    // under it — is no login back, and whatever is typed there is answered
+    // by the wall again in milliseconds (the incident of 2026-09-27: nine
+    // hours of `continue`, `keep going` and upgrade notices, each met by
+    // `Login expired · Please run /login`). The vendor's own `Login
+    // successful` ([`TurnEndReading::login_back`]) lets the point be acted
+    // on, and so does the worker working, which ends the track
+    // ([`TurnEndState::observe`]); the owner was told when the wall showed.
+    if let Some(t) = &state.wall
+        && t.class == WallClass::Auth
+        && !reading.login_back
+    {
+        return TurnEndAction::Nothing;
     }
     // A command's continuation, owed once it has run.
     if let Some(rule) = state.after {

@@ -9,7 +9,15 @@ license.workspace = true
 repository.workspace = true
 description = "aterm buffer-primitives kernel (ATERM_DESIGN §4): the 11-verb BufferApi over the single event-log spine. RING-3, FROZEN at M1."
 
+[dependencies]
+# The capability witnesses: `ReadCap`/`WriteCap` are `aterm_cap::Cap<E>`, so
+# only a holder of the launcher-minted `Authority` can call a verb.
+aterm-cap = { workspace = true }
+
 [dev-dependencies]
+# The tests are their own trusted launcher: `launcher-mint` on the dev edge only
+# (aterm-cap's `mint_reachability` gate allows dev enablers, never production).
+aterm-cap = { workspace = true, features = ["launcher-mint"] }
 proptest = { workspace = true }
 # Tier-1 conformance (conformance_eventlog.rs) validates the real EventLog
 # against the DERIVED ring spec generated from aterm_spec::derive::ring_model().

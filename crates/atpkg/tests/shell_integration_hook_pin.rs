@@ -20,6 +20,7 @@ use std::path::Path;
 
 const FIXTURE_AGENTS: &str = "/opt/aterm-si fixture/pkg/agents";
 const FIXTURE_BIN: &str = "/opt/aterm-si fixture/pkg/bin";
+const FIXTURE_REROUTE: &str = "/opt/aterm-si fixture/pkg/reroute";
 
 const SI: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -51,11 +52,14 @@ fn every_shell_integration_script_re_sources_the_hook_atpkg_actually_writes() {
              the live re-source keys on it"
         );
         // And it is the hook file that pass writes, not merely a string that looks like one.
-        let written: Vec<String> =
-            atpkg::hooks::hook_files(Path::new(FIXTURE_BIN), Path::new(FIXTURE_AGENTS))
-                .into_iter()
-                .map(|(name, _)| name)
-                .collect();
+        let written: Vec<String> = atpkg::hooks::hook_files(
+            Path::new(FIXTURE_BIN),
+            Path::new(FIXTURE_AGENTS),
+            Path::new(FIXTURE_REROUTE),
+        )
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
         assert!(
             written.contains(&format!("{}.{ext}", atpkg::hooks::HOOK_BASENAME)),
             "hook_files writes no .{ext} hook: {written:?}"
@@ -65,7 +69,11 @@ fn every_shell_integration_script_re_sources_the_hook_atpkg_actually_writes() {
 
 #[test]
 fn the_shell_integration_hook_goldens_are_what_hook_files_writes() {
-    let files = atpkg::hooks::hook_files(Path::new(FIXTURE_BIN), Path::new(FIXTURE_AGENTS));
+    let files = atpkg::hooks::hook_files(
+        Path::new(FIXTURE_BIN),
+        Path::new(FIXTURE_AGENTS),
+        Path::new(FIXTURE_REROUTE),
+    );
     let body = |name: &str| -> String {
         files
             .iter()
@@ -78,7 +86,7 @@ fn the_shell_integration_hook_goldens_are_what_hook_files_writes() {
     assert_eq!(
         body(&format!("{}.zsh", atpkg::hooks::HOOK_BASENAME)),
         posix,
-        "regenerate {SI}fixtures/atpkg-hook-posix.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?})"
+        "regenerate {SI}fixtures/atpkg-hook-posix.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})"
     );
     assert_eq!(
         body(&format!("{}.bash", atpkg::hooks::HOOK_BASENAME)),
@@ -88,6 +96,6 @@ fn the_shell_integration_hook_goldens_are_what_hook_files_writes() {
     assert_eq!(
         body(&format!("{}.fish", atpkg::hooks::HOOK_BASENAME)),
         fish,
-        "regenerate {SI}fixtures/atpkg-hook-fish.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?})"
+        "regenerate {SI}fixtures/atpkg-hook-fish.golden from hook_files({FIXTURE_BIN:?}, {FIXTURE_AGENTS:?}, {FIXTURE_REROUTE:?})"
     );
 }

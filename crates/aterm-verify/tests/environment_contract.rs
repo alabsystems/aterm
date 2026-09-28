@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The environment a run verifies: the snapshot, the source and toolchain
-//! tripwires, and the timings side channel.
+//! The environment a run verifies: the snapshot, and the source and toolchain
+//! tripwires.
 //!
 //! WHY (2026-09-13). A `--fast` run took 14 h in a live checkout that was
 //! pulled four times while it ran, and it still printed one verdict as if it
@@ -35,13 +35,22 @@ use std::process::Command;
 use std::time::Duration;
 
 use aterm_verify::disk::{Budget, Reading};
-use aterm_verify::exec::Timings;
 use aterm_verify::identity::{self, PathState, ToolchainIdentity, TreeState, Tripwire};
-use aterm_verify::snapshot::{self, SourceMode};
+use aterm_verify::snapshot;
 use aterm_verify::verdict::MERGE_CONTRACT_SENTENCE;
-use aterm_verify::{Ctx, EnvSnapshot, Mode, Scope, exit, mktemp_dir, plan};
+use aterm_verify::{Ctx, EnvSnapshot, Mode, Scope, exit, mktemp_dir};
 
 const IGNORES: &str = "*.log\n/target/\n/target-*/\n/.aterm-verify/\n";
+
+/// The header of the ladder's first stage — the test compile, planned in every
+/// run — and so the witness that a stage ran. A refusal before the ladder
+/// (an unreadable tree, a held snapshot, a full volume) must never print it,
+/// and each test that asserts its absence also shows it present on the same
+/// fixture's run that does reach the ladder.
+const FIRST_STAGE: &str = "=== test compile (";
+
+/// The test compile's argv, which the fixtures' drivers match on.
+const TEST_COMPILE_ARGV: &str = "--unverified test --workspace --no-fail-fast --no-run";
 
 fn path_env() -> std::ffi::OsString {
     std::env::var_os("PATH").unwrap_or_default()
@@ -148,7 +157,6 @@ impl Fixture {
         write(&root.join("Cargo.toml"), "[workspace]\n");
         for rel in [
             "tools/verify.sh",
-            "tools/test-trust-gate-verdict.sh",
             "tools/test-trust-contract-probe.sh",
             "tools/perf-arena/test-start-compare.sh",
             "libc-oracle/run.sh",
@@ -220,12 +228,12 @@ impl Fixture {
     }
 
     /// `targo`: when `<base>/trigger` exists, run `on_build` during the
-    /// workspace build; answer the smokes either way.
+    /// workspace test compile; answer the smokes either way.
     fn with_targo(&self, on_build: &str) -> &Self {
         script(
             &self.stage2.join("targo"),
             &format!(
-                "case \"$*\" in\n  \"--unverified build --workspace\")\n    \
+                "case \"$*\" in\n  \"{TEST_COMPILE_ARGV}\")\n    \
                  if [ -e '{}' ]; then {on_build}; fi ;;\nesac\n{}",
                 self.base.join("trigger").display(),
                 self.answering_smoke()
@@ -243,17 +251,15 @@ impl Fixture {
         env.trust_stage2_bin = Some(self.stage2.clone());
         env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
         env.ay_bin_dir = Some(self.root.join("no-ay"));
-        env.cargo_target_dir = None;
         // Floor 0: a fixture builds nothing, and the real floor made these
         // ladders refuse whenever the HOST volume held less than it (2026-09-23,
         // 17.6 GiB free, 12 failures here). The estimate that replaced it would
-        // too: an in-place run is budgeted cold. The preflight laws below set
-        // their own requirement, or their own budget and reading.
+        // too: a fixture's empty lanes are budgeted cold. The preflight laws
+        // below set their own requirement, or their own budget and reading.
         Ctx::new(
             self.root.clone(),
             Mode::Fast,
             Scope::workspace(),
-            false,
             env,
             self.scratch.clone(),
         )
@@ -330,39 +336,6 @@ fn a_tree_that_moves_mid_run_never_claims_the_contract() {
     );
 }
 
-#[test]
-fn a_git_tree_that_cannot_be_read_in_place_is_could_not_run_before_any_stage() {
-    // MEASURED 2026-09-13 (review of batch B): an unreadable untracked file made
-    // `git hash-object` fail, the capture failure read as "not a git checkout",
-    // and the run went ahead with NO source tripwire and no source line — so an
-    // `--in-place` run could report green on a tree nobody was watching.
-    let repo = Fixture::new("atv-env-unreadable");
-    repo.git_init().with_targo("true");
-    let secret = repo.root.join("secret.txt");
-    write(&secret, "no one may read this\n");
-    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("chmod");
-
-    let (ladder, code) = repo.run(&repo.ctx());
-    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("chmod back");
-
-    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
-    assert!(ladder.contains("=== source identity ==="), "{ladder}");
-    assert!(
-        ladder.contains("git could not read the tree"),
-        "the reason is named: {ladder}"
-    );
-    assert!(
-        !ladder.contains("=== build ("),
-        "no stage ran on a tree the gate could not read: {ladder}"
-    );
-
-    // Readable again, the same fixture runs its ladder and names its source.
-    let (calm, calm_code) = repo.run(&repo.ctx());
-    assert_ne!(calm_code, exit::COULD_NOT_RUN, "{calm}");
-    assert!(calm.contains("verify: source "), "{calm}");
-}
-
 /// The machine lock a fixture gate takes: one beside the fixture, never the
 /// per-user one. On the real lock a fixture gate queues behind every other gate
 /// on the machine (silently: `.output()` swallows its stderr) and, when a real
@@ -401,28 +374,29 @@ fn gate(
     )
 }
 
-/// Both spellings of a run on a checkout git cannot open: COULD NOT RUN before
-/// any stage, never an in-place run with no source tripwire.
-fn assert_never_unarmed(root: &Path, stage2: &Path, path: &std::ffi::OsStr, what: &str) {
+/// A run on a checkout git cannot read or open: COULD NOT RUN before any stage,
+/// the reason named, never read as a root without a source — and the driver,
+/// which edits the tree when it runs, never ran.
+fn assert_refused(root: &Path, stage2: &Path, reason: &str, what: &str) {
     let manifest = fs::read(root.join("Cargo.toml")).expect("manifest");
-    for extra in [&["--in-place"][..], &[][..]] {
-        let (ladder, code) = gate(root, stage2, extra, path);
-        let run = format!("{what} {extra:?}");
-        assert_eq!(code, Some(exit::COULD_NOT_RUN), "{run}: {ladder}");
-        assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{run}: {ladder}");
-        assert!(
-            !ladder.contains("=== build ("),
-            "{run}: no stage ran: {ladder}"
-        );
-        assert!(
-            ladder.contains("could not open"),
-            "{run}: the reason is named: {ladder}"
-        );
-        assert!(
-            !ladder.contains("is not a git checkout"),
-            "{run}: never read as a root without a source: {ladder}"
-        );
-    }
+    let (ladder, code) = gate(root, stage2, &[], &path_env());
+    assert_eq!(code, Some(exit::COULD_NOT_RUN), "{what}: {ladder}");
+    assert!(
+        !ladder.contains(MERGE_CONTRACT_SENTENCE),
+        "{what}: {ladder}"
+    );
+    assert!(
+        !ladder.contains(FIRST_STAGE),
+        "{what}: no stage ran: {ladder}"
+    );
+    assert!(
+        ladder.contains(reason),
+        "{what}: the reason is named: {ladder}"
+    );
+    assert!(
+        !ladder.contains("is not a git checkout"),
+        "{what}: never read as a root without a source: {ladder}"
+    );
     assert_eq!(
         fs::read(root.join("Cargo.toml")).expect("manifest"),
         manifest,
@@ -430,16 +404,29 @@ fn assert_never_unarmed(root: &Path, stage2: &Path, path: &std::ffi::OsStr, what
     );
 }
 
+/// MEASURED 2026-09-13 (review of batch B, rounds 1 and 2): an unreadable
+/// untracked file made `git hash-object` fail, and a linked worktree whose
+/// gitdir dangles made `git rev-parse --show-toplevel` fail; each capture
+/// failure read as "not a git checkout", so the run went ahead with NO source
+/// tripwire, and a driver that edited the tree mid-run went VERIFY: PASS. Both
+/// shapes, through the real binary.
 #[test]
-fn a_checkout_git_cannot_open_is_could_not_run_not_an_unarmed_in_place_run() {
-    // MEASURED 2026-09-13 (review of batch B, round 2): a root that HAS a .git
-    // but where `git rev-parse --show-toplevel` fails read as "not a git
-    // checkout" — no source identity, and the snapshot mode fell back IN PLACE.
-    // A driver that edited the tree mid-run then went VERIFY: PASS.
-    let repo = Fixture::new("atv-env-noopen");
+fn a_checkout_git_cannot_read_or_open_is_could_not_run_before_any_stage() {
+    // An unreadable untracked file.
+    let repo = Fixture::new("atv-env-unreadable");
     repo.git_init()
         .with_targo("echo moved-mid-run >> Cargo.toml");
     repo.arm_trigger();
+    let secret = repo.root.join("secret.txt");
+    write(&secret, "no one may read this\n");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("chmod");
+    assert_refused(
+        &repo.root,
+        &repo.stage2,
+        "git could not read",
+        "an unreadable file",
+    );
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("chmod back");
 
     // A linked worktree whose main checkout was renamed: its gitdir dangles.
     let wt = repo.base.join("wt");
@@ -454,58 +441,13 @@ fn a_checkout_git_cannot_open_is_could_not_run_not_an_unarmed_in_place_run() {
             "HEAD",
         ],
     );
-    // The ignored smoke drivers too, so the only thing wrong with `wt` is git.
-    // They live in the driver lane's `target-drivers/` since the 2026-09-13 lane
-    // split (a `target/` is copied as well when the fixture has one).
-    for lane in ["target-drivers", "target"] {
-        if !repo.root.join(lane).exists() {
-            continue;
-        }
-        let copied = Command::new("cp")
-            .arg("-R")
-            .arg(repo.root.join(lane))
-            .arg(wt.join(lane))
-            .status()
-            .expect("cp runs");
-        assert!(copied.success(), "copy {lane} into the worktree");
-    }
-    // `Fixture::new` lays the redraw harness and the objc examples in the driver lane
-    // (the aterm-gui/aterm-ctl stubs come only from ANSWERING_SMOKE's build, which
-    // this test does not use), so the redraw harness proves the copy happened.
-    assert!(
-        wt.join("target-drivers/debug/aterm-redraw-conformance")
-            .exists(),
-        "the driver lane reached the worktree"
-    );
     fs::rename(&repo.root, repo.base.join("repo-renamed")).expect("rename the main checkout");
     assert!(wt.join(".git").is_file());
-    assert_never_unarmed(&wt, &repo.stage2, &path_env(), "dangling worktree gitdir");
-
-    // A normal checkout with git absent from PATH.
-    let plain = Fixture::new("atv-env-nogit");
-    plain
-        .git_init()
-        .with_targo("echo moved-mid-run >> Cargo.toml");
-    plain.arm_trigger();
-    let bin = plain.base.join("nogit-bin");
-    fs::create_dir_all(&bin).expect("mkdir");
-    for tool in [
-        "sh", "mkdir", "cat", "chmod", "ln", "sleep", "pwd", "rm", "mv", "echo", "mktemp",
-    ] {
-        if let Some(found) = ["/bin", "/usr/bin"]
-            .iter()
-            .map(|d| Path::new(d).join(tool))
-            .find(|p| p.exists())
-        {
-            std::os::unix::fs::symlink(found, bin.join(tool)).expect("symlink");
-        }
-    }
-    assert!(!bin.join("git").exists());
-    assert_never_unarmed(
-        &plain.root,
-        &plain.stage2,
-        bin.as_os_str(),
-        "git absent from PATH",
+    assert_refused(
+        &wt,
+        &repo.stage2,
+        "could not open",
+        "a dangling worktree gitdir",
     );
 }
 
@@ -534,7 +476,8 @@ fn an_edit_hidden_by_an_index_flag_is_verified_not_replaced_by_head() {
         "the edits are hidden"
     );
 
-    // In place: the identity names both edits, and not the unedited flagged file.
+    // In the caller: the identity names both edits, and not the unedited flagged
+    // file.
     let tree = TreeState::capture(&repo.root, &path_env()).expect("readable");
     assert!(
         tree.dirty.contains_key("a.txt") && tree.dirty.contains_key("b.txt"),
@@ -554,7 +497,7 @@ fn an_edit_hidden_by_an_index_flag_is_verified_not_replaced_by_head() {
         "{code:?}: {ladder}"
     );
     assert!(
-        ladder.contains("child: --unverified build --workspace a=a2 b=b2 c=c1"),
+        ladder.contains(&format!("child: {TEST_COMPILE_ARGV} a=a2 b=b2 c=c1")),
         "{code:?}: {ladder}"
     );
     assert!(
@@ -569,115 +512,6 @@ fn an_edit_hidden_by_an_index_flag_is_verified_not_replaced_by_head() {
         fs::read_to_string(repo.root.join("a.txt")).expect("a"),
         "a2\n"
     );
-}
-
-#[test]
-fn a_changed_run_selects_the_crate_an_index_flag_hides_an_edit_in() {
-    // MEASURED 2026-09-13 (review of batch B, round 3): `--changed --in-place`
-    // read its paths from `git diff --name-only` and `ls-files --others` only,
-    // so an edit under `--skip-worktree` selected 0 crates, built nothing, and
-    // went VERIFY: PASS.
-    let repo = Fixture::new("atv-env-changed-flag");
-    for (dir, name) in [("crates/a", "crate-a"), ("crates/b", "crate-b")] {
-        write(
-            &repo.root.join(dir).join("Cargo.toml"),
-            &format!("[package]\nname = \"{name}\"\nversion = \"0.1.0\"\n"),
-        );
-        write(&repo.root.join(dir).join("src/lib.rs"), "// v1\n");
-    }
-    repo.git_init();
-    let root = fs::canonicalize(&repo.root).expect("root");
-    let r = root.display();
-    script(
-        &repo.stage2.join("targo"),
-        &format!(
-            "case \"$*\" in\n  \"tree --workspace\"*)\n    \
-             echo 'crate-a v0.1.0 ({r}/crates/a)'; echo 'crate-b v0.1.0 ({r}/crates/b)'; exit 0 ;;\n  \
-             \"tree --invert crate-a\"*) echo 'crate-a v0.1.0 ({r}/crates/a)'; exit 0 ;;\n  \
-             \"tree --invert crate-b\"*) echo 'crate-b v0.1.0 ({r}/crates/b)'; exit 0 ;;\n\
-             esac\n{}",
-            repo.answering_smoke()
-        ),
-    );
-    let lib = root.join("crates/b/src/lib.rs");
-    let changed = |what: &str| {
-        let root_arg = root.to_str().expect("utf-8");
-        let out = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
-            .args(["--disk-floor", "0"])
-            .args([
-                "--fast",
-                "--changed",
-                "--base",
-                "HEAD",
-                "--in-place",
-                "--root",
-                root_arg,
-            ])
-            .arg("--skip-gui-smoke")
-            .env("TRUST_STAGE2_BIN", &repo.stage2)
-            .arg("--machine-lock-dir")
-            .arg(fixture_lock(&root))
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .expect("the gate binary runs");
-        let ladder = String::from_utf8_lossy(&out.stdout).into_owned();
-        assert!(
-            !ladder.contains("0 crate(s) selected") && !ladder.contains("<no crates selected>"),
-            "{what}: an edited crate was left out of the selection: {ladder}"
-        );
-        assert!(
-            ladder.contains("=== build (-p crate-b) ===")
-                || ladder.contains("change scope: WIDENED"),
-            "{what}: {ladder}"
-        );
-    };
-
-    // Control: the fixture narrows a plain edit to its crate.
-    write(&lib, "// v2\n");
-    changed("a plain edit");
-
-    // The same edit, hidden from `git diff` by the index flag.
-    git(&root, &["checkout", "--", "crates/b/src/lib.rs"]);
-    git(
-        &root,
-        &["update-index", "--skip-worktree", "crates/b/src/lib.rs"],
-    );
-    write(&lib, "// v2\n");
-    assert_eq!(
-        git(&root, &["status", "--porcelain"]),
-        "",
-        "the edit is hidden"
-    );
-    changed("a skip-worktree edit");
-}
-
-#[test]
-fn a_selftest_in_a_checkout_with_an_unreadable_file_is_still_a_selftest() {
-    // Round 2's early return for an unreadable source fired before the
-    // --selftest ladder, so a selftest — which builds nothing and claims
-    // nothing about the tree — read SELFTEST FAIL over one chmod-000 file.
-    let repo = Fixture::new("atv-env-selftest");
-    repo.git_init().with_targo("true");
-    let secret = repo.root.join("secret.txt");
-    write(&secret, "no one may read this\n");
-    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("chmod");
-
-    let plain = repo.ctx();
-    let ctx = Ctx::new(
-        plain.root.clone(),
-        Mode::Fast,
-        Scope::workspace(),
-        true,
-        plain.env.clone(),
-        repo.scratch.clone(),
-    );
-    let (ladder, code) = repo.run(&ctx);
-    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).expect("chmod back");
-
-    assert_eq!(code, exit::PASS, "{ladder}");
-    assert!(ladder.contains("VERIFY: SELFTEST OK"), "{ladder}");
-    assert!(!ladder.contains("=== source identity ==="), "{ladder}");
-    assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
 }
 
 #[test]
@@ -865,12 +699,7 @@ fn the_snapshot_verifies_the_callers_head_and_diff_and_ignores_later_caller_move
     );
     let digest = caller_tree.dirty_digest(&path_env()).expect("dirty");
     let line = wire
-        .header_line(
-            &SourceMode::Snapshot {
-                caller: c.root.clone(),
-            }
-            .place(&snap),
-        )
+        .header_line(&snapshot::place(&snap, Some(&c.root)))
         .expect("a git root has a source line");
     assert!(
         line.starts_with(&format!(
@@ -1005,7 +834,7 @@ fn snapshot_sync_keeps_ignored_lane_dirs() {
     // What a run leaves behind: warm lanes, plus a stray file and an edit a
     // stage wrote into the tree.
     write(&snap.join("target/debug/deps/libwarm.rlib"), "warm");
-    write(&snap.join("target-regex/debug/deps/libwarm.rlib"), "warm");
+    write(&snap.join("target-xtask/debug/deps/libwarm.rlib"), "warm");
     write(&snap.join("junk.txt"), "stray");
     write(&snap.join("a.txt"), "scribbled\n");
 
@@ -1014,13 +843,13 @@ fn snapshot_sync_keeps_ignored_lane_dirs() {
         snap.join("target/debug/deps/libwarm.rlib").exists(),
         "git clean -x would have wiped target/"
     );
-    assert!(snap.join("target-regex/debug/deps/libwarm.rlib").exists());
+    assert!(snap.join("target-xtask/debug/deps/libwarm.rlib").exists());
     assert!(
         !snap.join("junk.txt").exists(),
         "a stray file is not the caller's source"
     );
     assert_eq!(fs::read_to_string(snap.join("a.txt")).expect("a"), "a1\n");
-    for lane in ["target", "target-regex"] {
+    for lane in ["target", "target-xtask"] {
         let stamp =
             fs::read_to_string(snap.join(lane).join(snapshot::STAMP_FILE)).expect("stamped");
         assert!(stamp.starts_with("trustc-commit c1\n"), "{stamp}");
@@ -1118,7 +947,7 @@ fn a_second_gate_on_a_held_snapshot_is_could_not_run() {
         "{stdout}"
     );
     assert!(stdout.contains("VERIFY: COULD NOT RUN"), "{stdout}");
-    assert!(!stdout.contains("=== build"), "no stage ran: {stdout}");
+    assert!(!stdout.contains(FIRST_STAGE), "no stage ran: {stdout}");
     assert!(!stdout.contains("argv:"), "no driver ran: {stdout}");
 
     // A lock whose gate is gone is broken, not obeyed forever.
@@ -1605,75 +1434,6 @@ fn a_snapshot_path_naming_the_main_checkout_is_refused_and_untouched() {
     assert!(!c.root.join(identity::GATE_STATE_DIR).exists());
 }
 
-/// `  time  …` lines and the `verify: disk …` line carry measurements (the
-/// free space moves under any other writer on the volume), so they are masked;
-/// everything else must be identical.
-fn masked(ladder: &str) -> String {
-    ladder
-        .lines()
-        .map(|l| {
-            if l.starts_with("  time  ") {
-                "  time  <masked>"
-            } else if l.starts_with("verify: disk ") {
-                "verify: disk <masked>"
-            } else {
-                l
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-#[test]
-fn timings_do_not_change_a_byte_of_the_ladder() {
-    let repo = Fixture::new("atv-env-timings");
-    repo.with_targo("true");
-    let (plain, plain_code) = repo.run(&repo.ctx());
-
-    let tsv = repo.base.join("timings.tsv");
-    let ctx = repo
-        .ctx()
-        .with_timings(Some(Timings::create(&tsv).expect("tsv")));
-    let (timed, timed_code) = repo.run(&ctx);
-
-    assert_eq!(timed_code, plain_code);
-    assert_eq!(
-        masked(&timed),
-        masked(&plain),
-        "timings leaked into the ladder"
-    );
-
-    // …and every stage says how long it took, on stdout, whatever the setting.
-    let stages = plan::plan(&ctx).len();
-    assert_eq!(
-        plain.lines().filter(|l| l.starts_with("  time  ")).count(),
-        stages,
-        "{plain}"
-    );
-
-    let rows = fs::read_to_string(&tsv).expect("tsv written");
-    let mut lines = rows.lines();
-    assert_eq!(Some(Timings::HEADER.trim_end()), lines.next());
-    let rows: Vec<Vec<&str>> = lines.map(|l| l.split('\t').collect()).collect();
-    assert!(rows.iter().all(|r| r.len() == 8), "{rows:?}");
-    assert_eq!(rows.iter().filter(|r| r[1] == "(stage)").count(), stages);
-    let build = rows
-        .iter()
-        .find(|r| r[1].ends_with("targo --unverified build --workspace"))
-        .expect("the build child has a row");
-    assert!(
-        build[0].starts_with("build ("),
-        "attributed to its stage: {build:?}"
-    );
-    assert_eq!(build[2], "MainTarget");
-    assert_eq!(build[5], "0");
-    let (start, end): (f64, f64) = (
-        build[3].parse().expect("start"),
-        build[4].parse().expect("end"),
-    );
-    assert!(start <= end, "{build:?}");
-}
-
 #[test]
 fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_removed() {
     let repo = Fixture::new("atv-env-bin");
@@ -1713,12 +1473,12 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
         "the default snapshot sits beside the checkout: {ladder}"
     );
     let build = format!(
-        "child: --unverified build --workspace cwd={} ctd=unset",
+        "child: {TEST_COMPILE_ARGV} cwd={} ctd=unset",
         snap.display()
     );
     assert!(
         ladder.contains(&build),
-        "the build ran in the snapshot, off the caller's target dir: {ladder}"
+        "the test compile ran in the snapshot, off the caller's target dir: {ladder}"
     );
     assert!(!ladder.contains("caller-target"), "{ladder}");
     // And the caller's checkout was only read.
@@ -1730,7 +1490,7 @@ fn the_gate_binary_runs_its_ladder_in_the_snapshot_with_the_callers_target_dir_r
 }
 
 /// THE XTASK VERBS RUN THE HEADER'S COMPILER (2026-09-24). The Formatting stage
-/// (`gate lint --fmt-only`), `gate counts` and `gate drift` are xtask children,
+/// (`gate lint --fmt-only`), `gate forge` and `gate cells-foreign` are xtask children,
 /// and xtask calls `Toolchain::discover` again, reading `$TRUST_STAGE2_BIN`
 /// first. Two callers, through the real gate binary:
 ///
@@ -1765,7 +1525,7 @@ fn every_xtask_child_is_handed_the_toolchain_the_header_names() {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm-verify"));
         // Every knob is a flag (the gate reads none from the environment
         // since 2026-09-24): the smoke skipped, the fixture's own machine lock.
-        cmd.args(["--disk-floor", "0", "--fast", "--in-place", "--root"])
+        cmd.args(["--disk-floor", "0", "--fast", "--root"])
             .arg(&repo.root)
             .arg("--skip-gui-smoke")
             .arg("--machine-lock-dir")
@@ -2120,7 +1880,7 @@ fn a_run_whose_ladder_is_redirected_into_the_checkout_still_decides() {
 
     let status = Command::new(env!("CARGO_BIN_EXE_aterm-verify"))
         .args(["--disk-floor", "0"])
-        .args(["--fast", "--in-place", "--root"])
+        .args(["--fast", "--root"])
         .arg(&repo.root)
         .env("PATH", path_env())
         .arg("--skip-gui-smoke")
@@ -2199,58 +1959,6 @@ fn a_tracked_file_moving_gets_no_log_remedy() {
     );
 }
 
-/// The repository's own `core.hooksPath`, `None` when unset.
-fn hooks_path(root: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .current_dir(root)
-        .args(["config", "--local", "--get", "core.hooksPath"])
-        .output()
-        .expect("git runs");
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-/// THE RETIRED PUSH HOOK'S PIN IS UNDONE, AND NOTHING ELSE IS (2026-09-25).
-///
-/// An older gate set `core.hooksPath = .githooks` on every run; the hook is
-/// deleted by the owner's no-hooks mandate, and the gate now unsets exactly
-/// that value in the repository's own config. NEGATIVE CONTROLS: a hooks path
-/// the operator chose is left alone, an unset one stays unset, and a directory
-/// that is not a repository is a no-op rather than an error.
-#[test]
-fn the_retired_hook_pin_is_unset_and_nothing_else_is_touched() {
-    let base = mktemp_dir("atv-env-unpin").expect("mktemp");
-    let root = base.join("repo");
-    fs::create_dir_all(&root).expect("mkdir");
-    git(&root, &["init", "-q"]);
-    let path = path_env();
-
-    git(&root, &["config", "--local", "core.hooksPath", ".githooks"]);
-    assert!(
-        aterm_verify::unpin_retired_hook(&root, &path),
-        "the retired pin is unset"
-    );
-    assert_eq!(hooks_path(&root), None, "the retired pin is gone");
-    assert!(
-        !aterm_verify::unpin_retired_hook(&root, &path),
-        "idempotent: nothing left to undo"
-    );
-    assert_eq!(hooks_path(&root), None, "and it never SETS anything");
-
-    git(&root, &["config", "--local", "core.hooksPath", "my-hooks"]);
-    assert!(
-        !aterm_verify::unpin_retired_hook(&root, &path),
-        "an operator's own hooks path is not the gate's to touch"
-    );
-    assert_eq!(hooks_path(&root).as_deref(), Some("my-hooks"));
-
-    let bare_dir = base.join("not-a-repo");
-    fs::create_dir_all(&bare_dir).expect("mkdir");
-    assert!(!aterm_verify::unpin_retired_hook(&bare_dir, &path));
-    fs::remove_dir_all(&base).ok();
-}
-
 /// THE RUN LEAVES A RECEIPT, AND IT IS ABOUT THIS COMMIT AND THIS TREE.
 ///
 /// End-to-end for the receipt's one reader: the release cutter's receipt report
@@ -2264,31 +1972,13 @@ fn the_retired_hook_pin_is_unset_and_nothing_else_is_touched() {
 /// This fixture's ladder skips the GUI smoke (`--skip-gui-smoke`), so the
 /// run does not discharge the merge contract and the receipt says so: a skip is
 /// not a pass, and the receipt is where that survives the run.
-///
-/// The same run carries the retired push hook's pin, as a repository an older
-/// gate touched does, and must leave it UNSET and say so in the ladder
-/// ([`aterm_verify::unpin_retired_hook`]; the unit laws are
-/// `the_retired_hook_pin_is_unset_and_nothing_else_is_touched`).
 #[test]
 fn a_finished_run_writes_a_receipt_naming_the_commit_the_ladder_named() {
     let repo = Fixture::new("atv-env-receipt");
     repo.git_init().with_targo("true");
     let head = git(&repo.root, &["rev-parse", "HEAD"]);
-    git(
-        &repo.root,
-        &["config", "--local", "core.hooksPath", ".githooks"],
-    );
 
     let (ladder, _code) = repo.run(&repo.ctx());
-    assert!(
-        ladder.contains(aterm_verify::UNPINNED_NOTE),
-        "the run unset the retired pin and said so: {ladder}"
-    );
-    assert_eq!(
-        hooks_path(&repo.root),
-        None,
-        "the run left the retired core.hooksPath pin in place"
-    );
     assert!(
         ladder.contains(&format!("verify: source {head} in place ")),
         "{ladder}"
@@ -2443,7 +2133,7 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
         .unwrap_or_else(|| panic!("no disk line: {ladder}"));
     assert!(
         line.contains(" free on the volume holding ")
-            && line.contains("; target dirs ")
+            && line.contains("; lanes ")
             && line.ends_with("(--disk-floor: exactly this, no estimate)"),
         "{line}"
     );
@@ -2462,7 +2152,7 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
     );
     assert!(ladder.contains("VERIFY: COULD NOT RUN"), "{ladder}");
     assert!(
-        !ladder.contains("=== build"),
+        !ladder.contains(FIRST_STAGE),
         "no stage was planned: {ladder}"
     );
     assert!(!ladder.contains(MERGE_CONTRACT_SENTENCE), "{ladder}");
@@ -2474,35 +2164,6 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
     )
     .expect("the prior receipt is still there");
     assert_eq!(aterm_verify::receipt::Receipt::parse(&text), Some(prior));
-}
-
-/// …and the same requirement under `--selftest` prints the reading and refuses
-/// on nothing: a selftest builds nothing, so there is nothing a full volume
-/// could stop, and SELFTEST FAIL over it would be a finding about the driver
-/// that is not true — the rule the unreadable-source arm already follows. It
-/// measures no lanes either, and says so.
-#[test]
-fn a_selftest_prints_the_disk_reading_and_never_refuses_on_it() {
-    let repo = Fixture::new("atv-env-disk-selftest");
-    repo.git_init().with_targo("true");
-    let plain = repo.ctx();
-    let ctx = Ctx::new(
-        plain.root.clone(),
-        Mode::Fast,
-        Scope::workspace(),
-        true,
-        plain.env.clone(),
-        repo.scratch.clone(),
-    )
-    .with_disk_floor(u64::MAX);
-    let (ladder, code) = repo.run(&ctx);
-    assert_eq!(code, exit::PASS, "{ladder}");
-    assert!(
-        ladder.contains("; lanes unmeasured (not measured: a selftest builds nothing)"),
-        "{ladder}"
-    );
-    assert!(!ladder.contains("disk preflight"), "{ladder}");
-    assert!(ladder.contains("SELFTEST OK"), "{ladder}");
 }
 
 /// A volume with room changes nothing but the line that records the reading:
@@ -2523,7 +2184,7 @@ fn a_volume_with_room_runs_the_ladder_with_the_reading_on_record() {
         "{line}"
     );
     assert!(!ladder.contains("disk preflight"), "{ladder}");
-    assert!(ladder.contains("=== build"), "{ladder}");
+    assert!(ladder.contains(FIRST_STAGE), "{ladder}");
 }
 
 /// The fixture as a SNAPSHOT of a separate caller, with 256 KiB of warm lanes
@@ -2560,9 +2221,8 @@ fn warm_snapshot(repo: &Fixture) -> (Ctx, u64, Budget) {
 /// run the flat floor refused proceeds. The flat floor charged every run the
 /// whole cold footprint plus the reserve, whatever its lanes held; here that
 /// is `cold + reserve`, more than the 16 KiB this run is told it has, while
-/// `max(cold - lanes, warm growth) + reserve` is 12 KiB. The same lanes IN
-/// PLACE are not credited — they may be the caller's own caches — so there
-/// the same numbers refuse. No reading here comes from the host volume.
+/// `max(cold - lanes, warm growth) + reserve` is 12 KiB. No reading here comes
+/// from the host volume.
 #[test]
 fn warm_snapshot_lanes_are_credited_so_a_run_the_flat_floor_refused_proceeds() {
     let repo = Fixture::new("atv-env-disk-warm");
@@ -2574,9 +2234,9 @@ fn warm_snapshot_lanes_are_credited_so_a_run_the_flat_floor_refused_proceeds() {
     let (ladder, code) = repo.run(&ctx);
     assert_ne!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(!ladder.contains("disk preflight"), "{ladder}");
-    assert!(ladder.contains("=== build"), "{ladder}");
+    assert!(ladder.contains(FIRST_STAGE), "{ladder}");
     // The line names the branch the plan took: a snapshot's lanes, measured,
-    // neither removed nor in place. It cannot show HOW MUCH was credited — at
+    // not removed. It cannot show HOW MUCH was credited — at
     // KiB scale every term prints as 0.0 GiB — so the amount is pinned by the
     // decision above: with nothing credited this run needs `cold + reserve`,
     // more than the 16 KiB it was given, and it would have refused.
@@ -2585,12 +2245,7 @@ fn warm_snapshot_lanes_are_credited_so_a_run_the_flat_floor_refused_proceeds() {
         .find(|l| l.starts_with("verify: disk "))
         .unwrap_or_else(|| panic!("no disk line: {ladder}"));
     assert!(line.contains("; lanes 0.0 GiB; need "), "{line}");
-    for other in [
-        "not credited in place",
-        "over the ",
-        "unmeasured",
-        "--disk-floor",
-    ] {
+    for other in ["over the ", "unmeasured", "--disk-floor"] {
         assert!(!line.contains(other), "{other}: {line}");
     }
     assert!(
@@ -2604,27 +2259,12 @@ fn warm_snapshot_lanes_are_credited_so_a_run_the_flat_floor_refused_proceeds() {
     let (ladder, code) = repo.run(&flat);
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
     assert!(ladder.contains("\n=== disk preflight ===\n"), "{ladder}");
-
-    // In place the lanes are not credited, so the estimate is the cold one.
-    let mut in_place = repo
-        .ctx()
-        .with_disk_budget(budget)
-        .with_disk_free(|_| Reading::Free(16 * 1024));
-    in_place.disk_floor = None;
-    let (ladder, code) = repo.run(&in_place);
-    assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
-    assert!(ladder.contains(", not credited in place; "), "{ladder}");
-    assert!(
-        ladder.contains("in place they are not credited, so removing them gives that back"),
-        "{ladder}"
-    );
 }
 
 /// THE CAP, WIRED (2026-09-23): a snapshot's lanes over it are REMOVED before
 /// the free space is read, and the run is budgeted cold — here the cold budget
 /// is more than the injected free space, so it refuses, which pins that the
-/// credit went with the lanes. In place the same lanes are the caller's, and
-/// nothing is removed.
+/// credit went with the lanes.
 #[test]
 fn snapshot_lanes_over_the_cap_are_removed_before_the_reading_and_budgeted_cold() {
     let repo = Fixture::new("atv-env-disk-cap");
@@ -2634,21 +2274,6 @@ fn snapshot_lanes_over_the_cap_are_removed_before_the_reading_and_budgeted_cold(
         lane_cap: held - 1,
         ..budget
     };
-
-    let mut in_place = repo
-        .ctx()
-        .with_disk_budget(capped)
-        .with_disk_free(|_| Reading::Free(16 * 1024));
-    in_place.disk_floor = None;
-    let (ladder, _code) = repo.run(&in_place);
-    assert!(
-        !ladder.contains(" cap, so removed") && !ladder.contains("the removal of lanes"),
-        "{ladder}"
-    );
-    assert!(
-        repo.root.join("target/debug/warm").exists(),
-        "a caller's dirs were removed: {ladder}"
-    );
 
     let (ladder, code) = repo.run(&ctx.with_disk_budget(capped));
     assert_eq!(code, exit::COULD_NOT_RUN, "{ladder}");
@@ -2674,7 +2299,7 @@ fn snapshot_lanes_over_the_cap_are_removed_before_the_reading_and_budgeted_cold(
         "{ladder}"
     );
     assert!(
-        !ladder.contains("=== build"),
+        !ladder.contains(FIRST_STAGE),
         "no stage was planned: {ladder}"
     );
 }
@@ -2727,55 +2352,5 @@ fn the_free_space_is_read_after_the_cap_removes_the_lanes() {
         !repo.root.join("target/debug/warm").exists(),
         "the lane was not removed: {ladder}"
     );
-    assert!(ladder.contains("=== build"), "{ladder}");
-}
-
-/// The gate's former environment knobs are flags (2026-09-24), and an export of one does
-/// nothing — so the shim SAYS so and names the flag, before anything is built, rather
-/// than let a stale shell rc cost a stage ceiling or a timings TSV unnoticed. Driven
-/// through the real `tools/verify.sh` with a toolchain override that names nothing, so
-/// the run stops at COULD NOT RUN having built nothing.
-#[test]
-fn the_shim_names_a_retired_export_and_the_flag_that_replaced_it() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let nowhere = mktemp_dir("atv-env-retired").expect("mktemp");
-    let mut cmd = Command::new("bash");
-    cmd.arg(root.join("tools/verify.sh"))
-        .arg("--selftest")
-        .env("TRUST_STAGE2_BIN", nowhere.join("no-toolchain"));
-    for name in [
-        "ATERM_VERIFY_TEST_THREADS",
-        "ATERM_VERIFY_SNAPSHOT",
-        "ATERM_VERIFY_LOG",
-        "ATERM_SKIP_GUI_SMOKE",
-        "ATERM_VERIFY_ROOT",
-        "ATERM_VERIFY_BASE",
-        "ATERM_VERIFY_MACHINE_LOCK_DIR",
-    ] {
-        cmd.env_remove(name);
-    }
-    let out = cmd
-        .env("ATERM_VERIFY_STAGE_TIMEOUT", "21600")
-        .env("ATERM_VERIFY_TIMINGS", "")
-        .output()
-        .expect("the shim runs");
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(exit::COULD_NOT_RUN), "{err}");
-    assert!(
-        err.contains(
-            "verify: $ATERM_VERIFY_STAGE_TIMEOUT is exported and does nothing since \
-             2026-09-24 — pass --stage-timeout instead"
-        ),
-        "{err}"
-    );
-    assert!(
-        err.contains("$ATERM_VERIFY_TIMINGS is exported and does nothing")
-            && err.contains("pass --timings instead"),
-        "an empty export is still an export: {err}"
-    );
-    assert!(
-        !err.contains("ATERM_SKIP_GUI_SMOKE") && !err.contains("ATERM_VERIFY_LOG"),
-        "a name nobody exported is not named: {err}"
-    );
-    fs::remove_dir_all(nowhere).ok();
+    assert!(ladder.contains(FIRST_STAGE), "{ladder}");
 }

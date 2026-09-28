@@ -70,14 +70,14 @@ use aterm_json::Value;
 
 use super::upgrade::{self, Dialect, SessionFile, Version};
 use super::upgrade_drive::{
-    Client, Job, Kernel, Live, Opts, Report, Screen, SessionRosterCache, St, TAIL_BYTES, Targets,
-    Terminated, Typed, alive, background, composer_empty, connect, continuation_composer_empty,
+    Client, Hand, Job, Kernel, Live, Opts, Report, Screen, SessionRosterCache, St, TAIL_BYTES,
+    Targets, Terminated, Typed, alive, composer_empty, connect, continuation_composer_empty,
     conversation_live, cwd_of, exe_of, first_word, foreground_shell, held, host_roster, ids,
-    is_our_ancestor, kernel_start, ledger, load, model_and_mark, native_root, now_s,
-    owned_by_aterm, process_in_tab, record_asked, require_unique_owner, restore, riding_model,
-    roster, said, save, screen, session_file_of, session_files, since, squash, state_dir,
-    sweep_lock, table, tail_to_end, terminate, transcript, transcript_exists, turn, turn_fenced,
-    type_line, typing_fence, unique_tab_for_group,
+    is_our_ancestor, kernel_start, ledger, live_background, load, model_and_mark, native_root,
+    now_s, owned_by_aterm, process_in_tab, record_asked, require_unique_owner, restore,
+    riding_model, roster, said, save, screen, session_file_of, session_files, since, squash,
+    state_dir, supervisor_typed, sweep_lock, table, tail_to_end, tasked, terminate, transcript,
+    transcript_exists, turn, turn_fenced, type_line, typing_fence, unique_tab_for_group,
 };
 use crate::supervise::limit::one_line;
 pub use crate::supervise::policy::turn_end::Restart;
@@ -126,8 +126,9 @@ pub(super) struct Launch<'a> {
     pub(super) argv: &'a [String],
     /// What the line executes: an absolute path.
     pub(super) exe: &'a Path,
-    /// The model the relaunch asks for — the priority list's
-    /// ([`super::upgrade_models`]), or a bucket's fallback and its way back
+    /// The model the relaunch asks for — the model rule's (the newest of the
+    /// conversation's own family, else up the list: [`super::upgrade_models`]),
+    /// or a bucket's fallback and its way back
     /// ([`restart_here`]): the launch's own `--model`, every spelling, is
     /// replaced by it; an EMPTY one drops it (Claude's default). `None`
     /// keeps the launch's flags.
@@ -196,10 +197,11 @@ pub(super) fn shell_dialect(shell: u32, t: &[(u32, u32, String)]) -> Option<Dial
 
 /// The pure half of [`plan`]: the launch flags carried into a resume of
 /// `session` ([`upgrade::rewrite_argv`]) — or into a fresh start when there
-/// is none, the same flags without `--resume` — asking for `model` from the
-/// priority list when one is given ([`with_model`]) and in the permission
-/// `mode` when one is known ([`with_permission_mode`]), and the line that
-/// runs them ([`upgrade::relaunch_line`]), or the refusal either one makes.
+/// is none, the same flags without `--resume` — asking for `model` in place
+/// of the launch's own when one is given ([`with_model`]) and in the
+/// permission `mode` when one is known ([`with_permission_mode`]), and the
+/// line that runs them ([`upgrade::relaunch_line`]), or the refusal either one
+/// makes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn line_for(
     dialect: Dialect,
@@ -395,7 +397,7 @@ pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Repo
         NoPlan::Wait(why) => said(r, format!("wait:{why}")),
         NoPlan::Refused { what, .. } if opts.dry_run => said(r, format!("would-refuse:{what}")),
         NoPlan::Refused { why, what, detail } => {
-            st.stop(&why);
+            st.stop(&why, now_s());
             let r = said(r, format!("refused:{what}"));
             ledger(opts, &r, &detail);
             r
@@ -485,8 +487,9 @@ pub(super) fn relaunch_of(
 }
 
 /// Poll `cond` every 250 ms for at most `limit`: what it asks — a shell's
-/// terminal group, Claude's own session records, an agent's status — has no
-/// event to wait on (the agent's exit does: [`super::upgrade_wake::wait_exit`]).
+/// terminal group, Claude's own session records — has no event to wait on
+/// (the agent's exit does: [`super::upgrade_wake::wait_exit`]; and the
+/// agent's verdict: `await agent`, [`first_idle`]).
 pub(super) fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {
@@ -500,6 +503,17 @@ pub(super) fn wait_until(limit: Duration, mut cond: impl FnMut() -> bool) -> boo
 
 /// The agent ended (it was signalled, or it exited by itself): once it is
 /// gone and the shell has its prompt back, type the relaunch line.
+///
+/// THE HARNESS'S HAND IS ON THE TAB throughout
+/// ([`super::upgrade_drive::Hand`], ND1 of the live re-test of
+/// 2026-09-26): taken (or renewed) here — a restart took it before its last
+/// look — renewed through every wait ([`Hand::keep`]), kept while this
+/// connection types the line (the hold lets its own writes and its own
+/// `turn` through, and nobody else's), and given back once the relaunched
+/// agent is up and idle ([`await_new`]) or the relaunch fails. A relaunch
+/// left waiting with the agent ended and the line not typed (`Exiting`)
+/// keeps it on the bare shell until the next attempt renews it, or it
+/// lapses.
 ///
 /// Gone is the kernel's word, its `NOTE_EXIT` pushed
 /// ([`super::upgrade_wake::wait_exit`]). Claude's graceful
@@ -515,16 +529,36 @@ pub(super) fn relaunch(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    let mut hand = Hand::take_or_none(c, &st.tab);
+    let r = relaunch_held(opts, r, st, c, &mut hand, session, k);
+    if !matches!(st.phase, upgrade::Phase::Exiting { .. }) {
+        hand.give_back(c);
+    }
+    r
+}
+
+/// [`relaunch`] with the harness's `hand` on the tab.
+fn relaunch_held(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    c: &mut Client,
+    hand: &mut Hand,
+    session: &str,
+    k: &dyn Kernel,
+) -> Report {
     let old = st.pid;
     if !super::upgrade_wake::wait_exit(old, Duration::from_secs(30)) {
         // Never a harder signal: the agent finishes exiting on its own, and a
         // later pass finds the phase and the process as they are.
         return said(r, "wait:exiting");
     }
+    hand.keep(c);
     let shell = st.shell;
     let prompt_back = wait_until(Duration::from_secs(15), || {
         ids(shell).is_some_and(|(_, pgid, tpgid)| pgid == tpgid)
     });
+    hand.keep(c);
     if !prompt_back {
         return said(r, "wait:shell-prompt");
     }
@@ -549,7 +583,7 @@ pub(super) fn relaunch(
         Ok(()) => st.prompt = None,
         Err(RelaunchLineError::Wait(why)) => return said(r, format!("wait:{why}")),
         Err(RelaunchLineError::Turn(e)) => {
-            st.stop("relaunch-refused");
+            st.stop("relaunch-refused", now_s());
             let r = said(r, format!("failed:relaunch:{}", first_word(&e)));
             ledger(opts, &r, &st.line);
             return r;
@@ -558,7 +592,7 @@ pub(super) fn relaunch(
     st.phase = upgrade::Phase::Relaunched { at_s: now_s() };
     ledger(opts, &said(r.clone(), "relaunched"), &st.line);
     save(opts, session, st);
-    await_new(opts, r, st, c, session, k)
+    await_held(opts, r, st, c, hand, session, k)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -577,7 +611,7 @@ pub(super) enum RelaunchLineError {
 /// signal), and nothing is typed.
 ///
 /// THE SHELL IS PROVEN TO HOLD THE TAB IMMEDIATELY BEFORE EVERY TYPED TRY
-/// (review of 2026-09-25): a fenced turn parks up to 30 s on a person's
+/// (review of 2026-09-25): a fenced turn parks up to 10 s on a person's
 /// typing, and a person who started `vim`, `ssh`, a REPL or another `claude`
 /// at the returned prompt in that time had the relaunch line and its Enter
 /// typed into THAT program. So `tab_probe` is asked again right before each
@@ -766,8 +800,24 @@ fn withdraw_rekey(c: &mut Client, tab: &str) {
     let _ = c.request_line(&format!("@{tab} rekey withdraw"));
 }
 
+/// A refused relaunch turn: a busy tab (another driver's turn or lease —
+/// where the harness's hand could not be taken, or lapsed) is a wait, never
+/// the refusal that fails a relaunch whose agent is already gone.
+fn refused_line(e: String) -> RelaunchLineError {
+    if e.starts_with("ERR busy") {
+        RelaunchLineError::Wait("held")
+    } else {
+        RelaunchLineError::Turn(e)
+    }
+}
+
 /// The typing half of [`type_relaunch_line_with`]: `line` at the marked
-/// prompt — typed to bash, pasted fenced to zsh and fish.
+/// prompt — typed to bash, pasted fenced to zsh and fish — on the connection
+/// that holds the harness's hand, if it does
+/// ([`super::upgrade_drive::Hand`]): the hold refuses every other
+/// connection's writes and lets this one's through, its `turn` included, so
+/// nothing is let go for the line and no other driver's keys can land
+/// before or after it.
 fn type_at_prompt(
     c: &mut Client,
     shell: u32,
@@ -793,7 +843,7 @@ fn type_at_prompt(
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) => std::thread::sleep(RELAUNCH_FENCE_EVERY),
                 Err(Typed::Yielded) => return Err(RelaunchLineError::Wait("yield")),
-                Err(Typed::Refused(e)) => return Err(RelaunchLineError::Turn(e)),
+                Err(Typed::Refused(e)) => return Err(refused_line(e)),
             }
         }
     }
@@ -802,12 +852,12 @@ fn type_at_prompt(
         return Err(RelaunchLineError::Wait("tab-ownership-changed"));
     }
     if bash {
-        return type_line(c, tab, line).map_err(RelaunchLineError::Turn);
+        return type_line(c, tab, line).map_err(refused_line);
     }
     match turn_fenced(c, tab, line, None) {
         Ok(()) => Ok(()),
         Err(Typed::Yielded | Typed::Changed) => Err(RelaunchLineError::Wait("yield")),
-        Err(Typed::Refused(e)) => Err(RelaunchLineError::Turn(e)),
+        Err(Typed::Refused(e)) => Err(refused_line(e)),
     }
 }
 
@@ -1044,7 +1094,9 @@ const RELAUNCH_FENCE_EVERY: Duration = Duration::from_millis(400);
 /// with ([`carry_on`]) — or, where a supervisor loop takes it
 /// ([`Opts::hand_back`]), ADOPTED: the step ends there, the record stays in
 /// flight, and the loop's next idle point types the continuation
-/// ([`resume`]).
+/// ([`resume`]). A later step that finds the relaunch in flight comes here
+/// too: it holds the tab as the relaunch did ([`await_held`]), and gives it
+/// back as it returns.
 pub(super) fn await_new(
     opts: &Opts,
     r: Report,
@@ -1053,13 +1105,35 @@ pub(super) fn await_new(
     session: &str,
     k: &dyn Kernel,
 ) -> Report {
+    let mut hand = Hand::take_or_none(c, &st.tab);
+    let r = await_held(opts, r, st, c, &mut hand, session, k);
+    hand.give_back(c);
+    r
+}
+
+/// [`await_new`] with the harness's `hand` on the tab: kept through the wait
+/// for the new process, and on it until the new agent is up and idle
+/// ([`first_idle`]) — a prompt another driver sends meanwhile is refused and
+/// lands, retried, in an agent that reads it — and, where this step types
+/// the continuation itself, through it ([`carry_on`]: its own connection's
+/// turn goes through the hold). Its caller gives it back.
+fn await_held(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    c: &mut Client,
+    hand: &mut Hand,
+    session: &str,
+    k: &dyn Kernel,
+) -> Report {
     let home = opts.home.clone();
     let (old, shell) = (st.pid, st.shell);
     // A fresh start holds a conversation of its own: the shell's child is it.
-    let fresh = st.cause == CAUSE_FRESH;
+    let fresh = starts_afresh(&st.cause);
     let mut new: Option<SessionFile> = None;
     let mut roster = SessionRosterCache::default();
     wait_until(Duration::from_secs(90), || {
+        hand.keep(c);
         new = roster.files(&home, Instant::now()).and_then(|files| {
             files
                 .iter()
@@ -1074,10 +1148,25 @@ pub(super) fn await_new(
         });
         new.is_some()
     });
+    // The new process holds the conversation: the harness's hand stays on the
+    // tab until it is up and idle — and, where this step types the
+    // continuation itself, through it.
+    if let Some(sf) = &new {
+        first_idle(c, hand, &st.tab, || {
+            session_file_of(&home, sf.pid).is_some_and(|sf| sf.status == "idle")
+        });
+    }
     match new {
         Some(sf) if fresh => {
-            // Nothing was said before it ended: nothing to carry on with.
+            // Nothing was said before it ended: nothing to carry on with. The
+            // finished move is the owner's to see (`upgrade=done/…`), as any
+            // other restart's is.
             st.phase = upgrade::Phase::Done;
+            st.done_at = now_s();
+            st.outcome = format!(
+                "claude restarted afresh on {} · nothing to resume",
+                one_line(&sf.version)
+            );
             let mut r = said(r, "done:fresh");
             r.pid = sf.pid;
             ledger(opts, &r, &sf.session_id);
@@ -1101,7 +1190,7 @@ pub(super) fn await_new(
             if let upgrade::Phase::Relaunched { at_s } = st.phase
                 && now_s().saturating_sub(at_s) > STALE_S
             {
-                st.stop("no-resume");
+                st.stop("no-resume", now_s());
                 let r = said(r, "failed:no-resume");
                 ledger(
                     opts,
@@ -1115,6 +1204,34 @@ pub(super) fn await_new(
     }
 }
 
+/// How long the harness's hand waits on a relaunched agent to come up idle
+/// before it is given back anyway ([`first_idle`]): an agent that opens
+/// with a box (a new build's consent) is its supervisor's to answer, and the
+/// supervisor is still until the step returns.
+const FIRST_IDLE: Duration = Duration::from_secs(15);
+
+/// THE RELAUNCHED AGENT'S FIRST IDLE, waited for with the harness's `hand` on
+/// the tab (renewed first: at most [`FIRST_IDLE`] follows): the server's own
+/// verdict on its screen, pushed — ONE `await agent idle`, the wait an
+/// orchestrator's own `await agent idle` wakes from — or, from a server
+/// without the verb, `record_idle` (the agent's own record saying idle),
+/// polled.
+pub(super) fn first_idle(
+    c: &mut Client,
+    hand: &mut Hand,
+    tab: &str,
+    record_idle: impl FnMut() -> bool,
+) {
+    hand.keep(c);
+    let awaited = c.request_line(&format!(
+        "@{tab} await agent idle timeout={}",
+        FIRST_IDLE.as_millis()
+    ));
+    if !awaited.is_ok_and(|reply| reply.starts_with("OK")) {
+        wait_until(FIRST_IDLE, record_idle);
+    }
+}
+
 /// How much of a transcript past the restart's mark is read for the resumed
 /// session's first turn. Measured 2026-09-24 (the owner's session, 2.1.281 to
 /// 2.1.282): a queued task notification, three system rows and the
@@ -1123,23 +1240,24 @@ const SINCE_BYTES: u64 = 4 << 20;
 
 /// How long after the continuation the resumed session's first answer may
 /// still be what the model is confirmed from. NEVER WAITED FOR: the step that
-/// types the continuation reads once and a later one
+/// types the continuation reads nothing, and every later one
 /// ([`super::upgrade_drive::confirmations`], run first in every sweep and
-/// every host step) reads again, until this has passed. A sweep runs its
+/// every host step) reads, until this has passed. A sweep runs its
 /// visits one after another and its orphan pass after all of them, so a visit
 /// that blocked on the answer would age every restart left exiting toward
 /// [`STALE_S`] — and the answer can take all of this (a long first thought,
 /// retries, a usage limit that writes only `<synthetic>` rows). Measured
 /// 2026-09-24: 10 s (a thinking block, the first row a turn writes); the
-/// `turn` that types the continuation settles on the agent's screen, so the
-/// first read usually has it.
+/// `turn` that types the continuation returns once its submit is taken
+/// ([`super::upgrade_drive::TURN_WAIT`]), so a later step's read usually has
+/// it.
 pub(super) const MODEL_WAIT: Duration = Duration::from_secs(120);
 
 /// The new process holds the conversation: once it settles, tell it to carry
 /// on — with the upgrade's words, or with the relaunch's ([`resumed_prompt`])
-/// when the record is one [`after_exit`] made — and read, once, which model
-/// it came back on ([`confirm`]). `key` is the conversation the record is
-/// filed under.
+/// when the record is one [`after_exit`] made — `continued`, the model it
+/// came back on left to a later step ([`confirm`]). `key` is the conversation
+/// the record is filed under.
 pub(super) fn carry_on(
     opts: &Opts,
     r: Report,
@@ -1213,6 +1331,25 @@ pub(super) fn carry_on_with_tab_probe(
     if let Err(why) = require_unique_owner(&home, &latest) {
         return said(r, format!("wait:{why}"));
     }
+    // A conversation nobody but the harness has asked anything is carried on
+    // with NOTHING (D1 of the live E2E of 2026-09-26): its own turns are no
+    // task, and a carry-on typed into it starts one nobody asked for — the
+    // E2E's B 1a5299ab was carried on and then continued, and its agent
+    // could only ask what it should work on.
+    if settled && tasked(&home, key, &supervisor_typed(opts, tab)) == Some(false) {
+        st.phase = upgrade::Phase::Done;
+        r.from.clone_from(&st.from);
+        r.to = format!("{}({})", latest.version, st.source);
+        let r = said(r, "done:taskless");
+        st.outcome = format!(
+            "claude restarted on {} · nothing typed: nobody has asked this conversation anything",
+            one_line(&latest.version)
+        );
+        st.done_at = now_s();
+        ledger(opts, &r, &st.outcome);
+        save(opts, key, st);
+        return r;
+    }
     let to = Version::parse(&latest.version);
     let before = (!st.model_before.is_empty()).then(|| st.model_before.clone());
     let text = if relaunch_cause(&st.cause) {
@@ -1254,22 +1391,21 @@ pub(super) fn carry_on_with_tab_probe(
     // TYPED, and on disk before anything else is read: a step that dies from
     // here on leaves a restart that is DONE, never one in flight that the next
     // step would carry on — telling the agent twice. What is still owed is
-    // only the model after, read now and, while the answer may still come, by
-    // a later step.
+    // only the model after, which its answer names: a LATER step's to read
+    // ([`confirm`]). This one returned once the submit was taken, before any
+    // answer, and says only that it typed — `continued`, the word the host
+    // awaits the harness's own turn by (`upgrade_drive::typed`).
     st.resumed_on.clone_from(&latest.version);
     st.resumed_pid = new.pid;
     st.confirm_by = now_s().saturating_add(confirm_within.as_secs());
     save(opts, key, st);
-    confirm(opts, &r, st, key, now_s()).unwrap_or_else(|| {
-        let r = said(r, "continued");
-        ledger(
-            opts,
-            &r,
-            "the continuation is typed; the resumed session had not answered yet, and a later \
-             step reads its model",
-        );
-        r
-    })
+    let r = said(r, "continued");
+    ledger(
+        opts,
+        &r,
+        "the continuation is typed; a later step reads the model its answer names",
+    );
+    r
 }
 
 /// The continuation, typed once, fenced on a fresh read whose composer is
@@ -1332,7 +1468,7 @@ pub(super) fn confirm(opts: &Opts, r: &Report, st: &mut St, key: &str, now: u64)
 
 /// The owner's outcome line ([`upgrade::restart_outcome`], or
 /// [`upgrade::restart_outcome_listed`] for a relaunch that asked for a model
-/// from the priority list) from what the restart recorded, the model after as
+/// by the model rule) from what the restart recorded, the model after as
 /// `after`.
 fn outcome_line(st: &St, to: &str, after: Option<&str>) -> String {
     if !st.model_list.is_empty() {
@@ -1385,6 +1521,19 @@ pub(super) const CAUSE_EXIT: &str = "exit";
 /// ([`super::upgrade_drive::transcript_exists`]) and nothing to carry on.
 pub(super) const CAUSE_FRESH: &str = "exit-fresh";
 
+/// The [`St::cause`] of the UPGRADE's restart of a conversation nobody has
+/// asked anything ([`super::upgrade::Step::Fresh`]): started afresh on the
+/// newer build, nothing to preserve and nothing carried on — and, unlike a
+/// relaunch's, a move of the tab's the owner's view shows
+/// (`upgrade_status`'s rows).
+pub(super) const CAUSE_UPGRADE_FRESH: &str = "upgrade-fresh";
+
+/// Whether a record of `cause` starts its agent afresh: its new process holds
+/// a conversation of its own, and nothing is carried on ([`await_new`]).
+pub(super) fn starts_afresh(cause: &str) -> bool {
+    cause == CAUSE_FRESH || cause == CAUSE_UPGRADE_FRESH
+}
+
 /// The [`St::cause`] of a restart the host made for Claude Code's
 /// critical-memory banner ([`restart_here`], [`Restart::Memory`]).
 pub(super) const CAUSE_MEMORY: &str = "memory";
@@ -1392,6 +1541,11 @@ pub(super) const CAUSE_MEMORY: &str = "memory";
 /// The [`St::cause`] of a relaunch after the stall's remedy ended an agent
 /// that had stopped reading its input ([`after_exit`] with `stalled`, U1).
 pub(super) const CAUSE_STALL: &str = "stall";
+
+/// The [`St::cause`] of a relaunch after aterm ITSELF ended while the agent
+/// ran — a crash, a kill, a power loss, a restart — and the next launch
+/// reopened its tab ([`after_host_ended`], 2026-09-27).
+pub(super) const CAUSE_HOST: &str = "host";
 
 /// The [`St::cause`] of a restart onto a bucket's fallback model, `model:`
 /// then the model ([`Restart::Model`]).
@@ -1424,6 +1578,10 @@ pub fn resumed_prompt(version: &str, cause: &str) -> String {
         "Restarted: Claude Code reported its memory critical, so this session was ended and \
          restarted"
             .to_string()
+    } else if cause == CAUSE_HOST {
+        "Relaunched: aterm ended while this session ran (a crash, a kill or a restart), and \
+         reopened its tab"
+            .to_string()
     } else if cause == CAUSE_STALL {
         "Relaunched: Claude Code stopped reading its input and was ended, so this session was \
          restarted"
@@ -1449,7 +1607,8 @@ pub fn resumed_prompt(version: &str, cause: &str) -> String {
             .to_string()
     };
     format!(
-        "[aterm harness] {why} on Claude Code {} and resumed. {}",
+        "{} {why} on Claude Code {} and resumed. {}",
+        upgrade::HARNESS_MARK,
         one_line(version),
         upgrade::CARRY_ON
     )
@@ -1536,8 +1695,8 @@ pub(super) fn restart_from(
     // — the notice named none — the model the launch named before the
     // fallback's relaunch replaced it (its record kept it), else none.
     let launched = upgrade::launch_model(&snap.argv).unwrap_or_default();
-    // The memory banner's restart carries the model the priority list moves
-    // the conversation to, when one is due: every restart is its moment.
+    // The memory banner's restart carries the model the rule moves the
+    // conversation to, when one is due: every restart is its moment.
     let riding = match why {
         Restart::Memory => riding_model(opts, &sf, &snap.argv),
         _ => None,
@@ -1596,56 +1755,70 @@ pub(super) fn restart_from(
     let Ok(mut c) = connect(opts, &tab) else {
         return said(r, "wait:no-socket");
     };
-    // The last look before the one irreversible act: the same process, idle
-    // by its own record, its shell's foreground job on the tab's terminal,
-    // the composer empty, nothing running under it, nobody's hand.
-    let again = session_file_of(&opts.home, snap.pid);
-    let still = again.is_some_and(|a| {
-        a.session_id == session
-            && a.status == "idle"
-            && kernel_start(snap.pid).as_deref() == Some(squash(&a.proc_start).as_str())
-    }) && foreground_shell(Live.job(snap.pid)) == Ok(shell)
-        && Live
-            .terminal(snap.pid)
-            .as_ref()
-            .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
-        && screen(&mut c, &tab).is_some_and(|scr| composer_empty(&mut c, &tab, &scr))
-        && background(snap.pid, &t).is_empty()
-        && !held(&mut c, &tab, opts.human_grace_s);
-    if !still {
-        return said(r, "wait:changed");
-    }
-    if let Err(why) = require_unique_owner(&opts.home, &sf) {
-        return said(r, format!("wait:{why}"));
-    }
-    let Ok(pid) = i32::try_from(snap.pid) else {
-        return said(r, "wait:pid");
+    // The harness's hand on the tab from the last look to the relaunched
+    // agent's first idle ([`super::upgrade_drive::Hand`]), as for every
+    // restart: given back on every way out before the signal, and by the
+    // relaunch after it.
+    let Some(mut hand) = Hand::take(&mut c, &tab) else {
+        return said(r, "wait:held");
     };
-    // The model the agent ran and where its transcript ended: the resumed
-    // session's answer past it says which model it came back on.
-    let recent = transcript(&opts.home, &session).map(|p| tail_to_end(&p, TAIL_BYTES));
-    (st.model_before, st.mark) = model_and_mark(recent.as_ref());
-    st.pid = snap.pid;
-    st.shell = shell;
-    st.tab.clone_from(&tab);
-    st.line = line;
-    st.phase = upgrade::Phase::Exiting { at_s: now_s() };
-    save(opts, &session, &st);
-    if let Some(m) = &riding {
-        record_asked(opts, &session, m);
-    }
-    match terminate(&mut c, &tab, pid, opts.human_grace_s) {
-        Terminated::Sent => {}
-        Terminated::Refused(no) => {
+    let aborted: Option<Report> = 'signal: {
+        // The last look before the one irreversible act: the same process,
+        // idle by its own record, its shell's foreground job on the tab's
+        // terminal, the composer empty, nothing running under it, nobody's
+        // hand and nobody's unread input.
+        let again = session_file_of(&opts.home, snap.pid);
+        let still = again.is_some_and(|a| {
+            a.session_id == session
+                && a.status == "idle"
+                && kernel_start(snap.pid).as_deref() == Some(squash(&a.proc_start).as_str())
+        }) && foreground_shell(Live.job(snap.pid)) == Ok(shell)
+            && Live
+                .terminal(snap.pid)
+                .as_ref()
+                .is_some_and(|(p, name)| owned_by_aterm((*p, name.as_str())))
+            && screen(&mut c, &tab).is_some_and(|scr| composer_empty(&mut c, &tab, &scr))
+            && live_background(snap.pid).is_empty()
+            && !held(&mut c, &tab, opts.human_grace_s);
+        if !still {
+            break 'signal Some(said(r.clone(), "wait:changed"));
+        }
+        if let Err(why) = require_unique_owner(&opts.home, &sf) {
+            break 'signal Some(said(r.clone(), format!("wait:{why}")));
+        }
+        let Ok(pid) = i32::try_from(snap.pid) else {
+            break 'signal Some(said(r.clone(), "wait:pid"));
+        };
+        // The model the agent ran and where its transcript ended: the
+        // resumed session's answer past it says which model it came back on.
+        let recent = transcript(&opts.home, &session).map(|p| tail_to_end(&p, TAIL_BYTES));
+        (st.model_before, st.mark) = model_and_mark(recent.as_ref());
+        st.pid = snap.pid;
+        st.shell = shell;
+        st.tab.clone_from(&tab);
+        st.line = line;
+        st.phase = upgrade::Phase::Exiting { at_s: now_s() };
+        save(opts, &session, &st);
+        if let Some(m) = &riding {
+            record_asked(opts, &session, m);
+        }
+        match terminate(&mut c, &tab, pid, opts.human_grace_s) {
+            Terminated::Sent => None,
             // Nothing was sent: no restart is in flight, and the record is
             // what it was (an upgrade's, or none).
-            restore(opts, &session, prior.as_ref());
-            return said(r, format!("wait:signal-{no}"));
+            Terminated::Refused(no) => {
+                restore(opts, &session, prior.as_ref());
+                Some(said(r.clone(), format!("wait:signal-{no}")))
+            }
+            Terminated::Failed => {
+                restore(opts, &session, prior.as_ref());
+                Some(said(r.clone(), "failed:signal-refused"))
+            }
         }
-        Terminated::Failed => {
-            restore(opts, &session, prior.as_ref());
-            return said(r, "failed:signal-refused");
-        }
+    };
+    if let Some(r) = aborted {
+        hand.give_back(&mut c);
+        return r;
     }
     ledger(
         opts,
@@ -2009,6 +2182,55 @@ pub fn after_exit(
     upgrade: bool,
     stalled: bool,
 ) -> Report {
+    let cause = if stalled {
+        ExitCause::Stall
+    } else {
+        ExitCause::Exit
+    };
+    after_exit_as(opts, snap, left, upgrade, cause)
+}
+
+/// Why an agent that is no longer running is relaunched ([`after_exit_as`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitCause {
+    /// Its own exit: relaunched only when it left Claude's record (a crash),
+    /// never after a graceful one — someone's decision.
+    Exit,
+    /// The stall's remedy ended it (U1): nobody's decision about the session.
+    Stall,
+    /// aterm itself ended while it ran (2026-09-27): its shell and tab went
+    /// with aterm — a hangup the agent may have answered by removing its own
+    /// record, which is no one's decision about the session either.
+    HostEnded,
+}
+
+/// THE AGENT OF A TAB A CRASH TOOK (2026-09-27, the owner: after an exit they
+/// did not choose, reopen the layout and relaunch the agents aterm hosted).
+/// aterm ended while `snap`'s agent ran — a crash, a kill, a power loss, a
+/// restart — and the next launch reopened its tab, whose new shell is
+/// `snap.shell` in tab `snap.tab`; the rest of `snap` is what the live layout
+/// carried of the agent. Relaunched on its conversation as [`after_exit`]
+/// would, except that the graceful-exit rule does not apply (the hangup was
+/// aterm's, not a person's), and a relaunch in flight for another tab — the
+/// crashed run's — is closed, not waited on: that tab is gone.
+#[must_use]
+pub fn after_host_ended(opts: &Opts, snap: &Snapshot, upgrade: bool) -> Report {
+    after_exit_as(
+        opts,
+        snap,
+        &ExitRecord::Unread,
+        upgrade,
+        ExitCause::HostEnded,
+    )
+}
+
+fn after_exit_as(
+    opts: &Opts,
+    snap: &Snapshot,
+    left: &ExitRecord,
+    upgrade: bool,
+    cause: ExitCause,
+) -> Report {
     let mut r = Report {
         pid: snap.pid,
         tab: snap.tab.clone(),
@@ -2074,20 +2296,27 @@ pub fn after_exit(
     // at the tab, which is what the age limit stood in for.
     if let Some(mut st) = load(opts, &session).filter(St::in_flight) {
         r.to = format!("{}({})", st.to, st.source);
-        if st.tab != snap.tab {
+        if st.tab != snap.tab && cause != ExitCause::HostEnded {
             return said(r, "wait:conversation-in-other-tab");
         }
         // A record of ANOTHER process than the one that just left: that
         // relaunch landed (its agent is the one that left, adopted and gone
         // again before its continuation) or was overtaken — closed, and this
         // exit relaunched afresh.
-        let overtaken = (st.pid != snap.pid).then_some((
-            "exited-before-continuing",
-            "the relaunched agent exited before its continuation was typed",
-        ));
+        let overtaken = if cause == ExitCause::HostEnded && st.tab != snap.tab {
+            Some((
+                "host-ended",
+                "aterm ended while this relaunch was in flight; its tab was reopened",
+            ))
+        } else {
+            (st.pid != snap.pid).then_some((
+                "exited-before-continuing",
+                "the relaunched agent exited before its continuation was typed",
+            ))
+        };
         if let Some((why, detail)) = overtaken.or_else(|| expired(&st, now_s())) {
             if !opts.dry_run {
-                st.phase = upgrade::Phase::Failed(why.to_string());
+                st.fail(why, now_s());
                 ledger(opts, &said(r.clone(), format!("failed:{why}")), detail);
                 save(opts, &session, &st);
             }
@@ -2105,7 +2334,7 @@ pub fn after_exit(
     // relaunched on its conversation a second later).
     // The upgrade's own SIGTERM is the record in flight, carried on above;
     // the stall's remedy is no one's decision about the session (U1).
-    if survivor.is_none() && !stalled {
+    if survivor.is_none() && cause == ExitCause::Exit {
         return said(r, "ended:graceful-exit");
     }
     if !alive(snap.shell) {
@@ -2130,8 +2359,8 @@ pub fn after_exit(
     // resumed: the agent is started afresh, with the same flags. One whose
     // transcripts cannot be read is resumed (Claude says if it cannot).
     let resume = transcript_exists(&opts.home, &session) != Some(false);
-    // The model the priority list moves the conversation to rides the
-    // relaunch when one is due — read off the crash's own record (a graceful
+    // The model the rule moves the conversation to rides the relaunch when
+    // one is due — read off the crash's own record (a graceful
     // exit left none to read it by).
     let riding = survivor
         .as_ref()
@@ -2152,10 +2381,11 @@ pub fn after_exit(
         from: version.unwrap_or_default(),
         to,
         source,
-        cause: match (resume, stalled) {
+        cause: match (resume, cause) {
             (false, _) => CAUSE_FRESH,
-            (true, true) => CAUSE_STALL,
-            (true, false) => CAUSE_EXIT,
+            (true, ExitCause::Stall) => CAUSE_STALL,
+            (true, ExitCause::HostEnded) => CAUSE_HOST,
+            (true, ExitCause::Exit) => CAUSE_EXIT,
         }
         .to_string(),
         salt: now_s(),
@@ -2410,12 +2640,14 @@ pub fn held_by_someone(status: &str) -> bool {
 /// Whether one `status` reply names ANOTHER DRIVER'S hand on the session: a
 /// drive lease (`hand=lease:<holder>`) or a turn a named driver typed
 /// (`hand=turn:<id>:<holder>`) — never an owner-class turn, which names
-/// nobody (the supervisor's own continuations are typed so).
+/// nobody (the supervisor's own continuations are typed so), and never this
+/// process's own hand on a tab whose agent it restarts
+/// ([`super::upgrade_drive::Hand`]).
 #[must_use]
 pub fn driver_hand(status: &str) -> bool {
     status.split_whitespace().any(|t| {
         t.strip_prefix("hand=").is_some_and(|hand| {
-            hand.starts_with("lease:")
+            (hand.starts_with("lease:") && !super::upgrade_drive::our_hand(hand))
                 || hand
                     .strip_prefix("turn:")
                     .is_some_and(|turn| turn.contains(':'))

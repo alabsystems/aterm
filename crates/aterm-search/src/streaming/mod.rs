@@ -134,7 +134,7 @@ mod test_content {
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "regex"))]
+#[cfg(test)]
 mod regex_tests;
 
 #[cfg(kani)]

@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Check completion provenance, joins, and scheduler/boot lock release.
+//! Check completion provenance, joins, scheduler/boot lock release, and two processes
+//! arming one staged build.
 use super::Model;
 
 #[must_use]
@@ -108,6 +109,44 @@ pub fn native_update_boot_health_lock_model() -> Model {
             }
             invariant LaunchDoesNotAwaitHeldLock:
                 expired == 0 || (returned == 1 && counted == 0);
+        }
+    }
+}
+
+/// TWO PROCESSES ARM ONE BUILD, AND IT IS SWAPPED IN ONCE (auto-apply audit #8,
+/// 2026-09-21). Every aterm window and session runs the apply lane, so two processes
+/// on one machine routinely arm the same staged build. Process B may finish its whole
+/// pre-lock preflight on that build (`BPeek`) while process A's successor holds
+/// `apply_lock`, swaps the bundle and retires the marker (`ASwap`). What B then does
+/// under the lock (`BApply`) must follow the marker as it reads NOW: nothing is left,
+/// so nothing is swapped. `Buggy=1` is a lane that acts on its pre-lock peek — the
+/// second swap `OneSwapPerBuild` refutes. Tier-1: aterm-update `install.rs`,
+/// `two_processes_arming_one_build_swap_it_once`, which runs the boot lane's own
+/// `apply_lock_then_ready` for both processes over the real `apply_lock` and marker,
+/// and stages the same race through a peek-trusting lane as its negative control.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_two_process_apply_model() -> Model {
+    crate::ty_model! {
+        NativeUpdateTwoProcessApply {
+            const Buggy = 0;
+            var ready = 1;
+            var a_done = 0;
+            var b_peeked = 0;
+            var b_done = 0;
+            var swaps = 0;
+            action BPeek when (b_peeked == 0 && ready == 1) { b_peeked = 1; }
+            action ASwap when (a_done == 0 && ready == 1) {
+                a_done = 1;
+                ready = 0;
+                swaps = swaps + 1;
+            }
+            action BApply when (b_peeked == 1 && b_done == 0) {
+                b_done = 1;
+                swaps = if Buggy == 1 || ready == 1 { swaps + 1 } else { swaps };
+                ready = 0;
+            }
+            invariant OneSwapPerBuild: swaps <= 1;
         }
     }
 }

@@ -5,8 +5,8 @@
 //!
 //! WHY (2026-09-20/21). The gate builds a pinned snapshot of the caller's tree
 //! in several target dirs (`target/`, `target-tippy/`, `target-drivers/`,
-//! `target-xtask/`, `target-regex/`, plus the L0 gate's and the libc oracle's
-//! own), and nothing bounded what they held. Measured across incremental
+//! `target-xtask/`, plus the L0 gate's and the libc oracle's own), and nothing
+//! bounded what they held. Measured across incremental
 //! `--fast` runs: `target/` grew 36 GB -> 55 GB, `target-tippy/` sat at 16-18 GB
 //! and `target-drivers/` at 16-20 GB, on a 926 GB volume that also carries
 //! `$HOME/trust` (428 GB) and `~/ay` (195 GB). On 2026-09-20 two contract runs
@@ -67,6 +67,20 @@
 //! stands. `--disk-floor <GiB>` ([`Plan::floor`]) replaces the estimate with
 //! exactly that requirement.
 //!
+//! THE CELLS LANE (2026-09-27). `gate cells-foreign` (a stage of every tier
+//! since 2026-09-25) type-checks five foreign cells into target dirs OUTSIDE
+//! the root — `xtask` refuses a cells cache inside the workspace it judges — and
+//! by default into a per-checkout cache under `~/.cache/aterm/cells` that this
+//! preflight neither saw nor bounded: a cold contract run could pass it and
+//! then fill the volume. So a snapshot's run points that stage at ITS OWN
+//! cells lane, [`cells_lane`]: `<root>-cells.noindex` beside the snapshot, on
+//! its volume. [`measure_lanes`] measures it with the target lanes, the cap
+//! counts it and [`crate::snapshot::remove_lanes`] removes it with them; it
+//! carries no compiler stamp, because rustup's `stable` builds it, not the
+//! pinned trustc. Its cold footprint and a version bump's growth are in
+//! [`COLD_BYTES`] and [`WARM_GROWTH_BYTES`] ([`CELLS_COLD_BYTES`],
+//! [`CELLS_WARM_GROWTH_BYTES`]).
+//!
 //! WHAT NO PREFLIGHT CAN BUDGET is another writer. The estimate is of THIS
 //! run's own writes, and the volume is shared: other sessions' builds, their
 //! scratch under `/tmp`, anything. During the warm run of `216e2e5cb` on
@@ -114,7 +128,36 @@ pub const GIB: u64 = 1 << 30;
 /// before it, left the lanes at 21,220,340 KiB — 20.2 GiB (`du -sk`) — and
 /// the whole snapshot at 21 GiB (`du -sh`). 24 GiB is above both, for a
 /// workspace that only grows.
-pub const COLD_BYTES: u64 = 24 * GIB;
+///
+/// PLUS THE CELLS LANE, 3 GiB ([`CELLS_COLD_BYTES`]) since 2026-09-27: 27 GiB.
+pub const COLD_BYTES: u64 = 24 * GIB + CELLS_COLD_BYTES;
+
+/// What `gate cells-foreign` writes into an EMPTY [`cells_lane`]: 3 GiB.
+///
+/// MEASURED 2026-09-27 on this machine (M5 Max, load average 40-65 from other
+/// sessions), `gate cells-foreign` at `b4b147abc` into an empty
+/// `$ATERM_CELL_TARGET_DIR` with `CARGO_INCREMENTAL=0`, the environment every
+/// gate child has ([`crate::CHILD_ENV`]): 2,751,212 KiB (`du -sk`) — 2.6 GiB,
+/// over the five cells linux-arm 0.90, win 0.66, win-arm 0.66, wasm-gpu 0.24
+/// and wasm-cpu 0.16 GiB — in 432 s. The same run with incremental ON, the
+/// default of a hand-run `gate cells-foreign`, wrote 12,650,048 KiB (12.1
+/// GiB) in 394 s: three quarters of it `incremental/`, which is why the
+/// per-checkout caches under `~/.cache/aterm/cells` read 12-46 GB and the
+/// gate's lane reads 2.6. 3 GiB is above the measurement.
+pub const CELLS_COLD_BYTES: u64 = 3 * GIB;
+
+/// What a warm run adds to the [`cells_lane`] when every first-party crate
+/// rebuilds: 2 GiB.
+///
+/// Cargo keeps the old artifacts beside the new, so a workspace version bump
+/// (the growth [`WARM_GROWTH_BYTES`] budgets) adds a second copy of the
+/// first-party ones. MEASURED 2026-09-27 on the lane of [`CELLS_COLD_BYTES`]:
+/// the files under first-party `<name>-<hash>` artifact, build and fingerprint
+/// entries hold 1.00 GiB of its 2.62. A new `stable` rustc rehashes every unit
+/// and adds a whole cold footprint, which this does not cover, as the target
+/// lanes' budget does not cover a third-party rebuild. 2 GiB is above the
+/// measurement, which is a projection from one lane, not a measured bump.
+pub const CELLS_WARM_GROWTH_BYTES: u64 = 2 * GIB;
 
 /// What a run on WARM lanes still adds to them: 16 GiB.
 ///
@@ -135,13 +178,18 @@ pub const COLD_BYTES: u64 = 24 * GIB;
 /// that rebuilds the third-party crates as well can add up to a cold
 /// footprint, and this budget does not cover it: such a run that fills the
 /// volume ends COULD NOT RUN.
-pub const WARM_GROWTH_BYTES: u64 = 16 * GIB;
+///
+/// PLUS THE CELLS LANE's, 2 GiB ([`CELLS_WARM_GROWTH_BYTES`]) since
+/// 2026-09-27: 18 GiB.
+pub const WARM_GROWTH_BYTES: u64 = 16 * GIB + CELLS_WARM_GROWTH_BYTES;
 
 /// Room kept free beyond what the run writes into its lanes: 6 GiB.
 ///
 /// A MARGIN, NOT A MEASUREMENT, for this run's own writes outside its lanes
 /// and for the error in the two estimates above, which are read to the whole
-/// GiB. Of those writes, measured: its ladder log (2.4-3.1 MB for each
+/// GiB. (The foreign cells' target dirs are not among those writes since
+/// 2026-09-27: they are the [`cells_lane`], counted with the lanes.) Of those
+/// writes, measured: its ladder log (2.4-3.1 MB for each
 /// complete run in the snapshot's `.aterm-verify/logs`), its receipt (under 1
 /// KiB), and this crate's own test fixtures under `/tmp` and `$TMPDIR`, which
 /// peaked at 3.8 MiB and left 3.3 MiB behind (`du -sk`, sampled 420 times
@@ -151,9 +199,9 @@ pub const WARM_GROWTH_BYTES: u64 = 16 * GIB;
 /// (the module doc says what happens instead).
 pub const RESERVE_BYTES: u64 = 6 * GIB;
 
-/// The most a snapshot's lanes may hold when a run starts: 40 GiB,
+/// The most a snapshot's lanes may hold when a run starts: 45 GiB,
 /// [`COLD_BYTES`] plus [`WARM_GROWTH_BYTES`] — a cold footprint and one warm
-/// run's growth.
+/// run's growth (40 GiB until the cells lane joined them on 2026-09-27).
 ///
 /// Nothing else bounds them: a warm run grows the lanes, and only a new
 /// compiler empties them ([`crate::snapshot`]'s prune). Over the cap they are
@@ -165,8 +213,9 @@ pub const RESERVE_BYTES: u64 = 6 * GIB;
 /// creation to its receipt: cold, 38 min 12 s (`cb770c598`, FAIL) and 35 min
 /// 19 s (`b994cadd0`, PASS); warm, 32 min 3 s (`0a45a7446`, PASS), 37 min
 /// 31 s (`fd0be116b`, PASS) and 38 min 16 s (`216e2e5cb`, FAIL). Five runs on
-/// a machine other sessions share do not separate the two. The build stage
-/// alone took 137.0 s and 215.5 s cold, and 39.0 s, 108.7 s and 246.6 s warm.
+/// a machine other sessions share do not separate the two. The build stage of
+/// those runs alone took 137.0 s and 215.5 s cold, and 39.0 s, 108.7 s and
+/// 246.6 s warm.
 pub const LANE_CAP_BYTES: u64 = COLD_BYTES + WARM_GROWTH_BYTES;
 
 /// How long `du -sk` may run before the lanes count as unmeasured: 60 s.
@@ -325,10 +374,12 @@ impl Lanes {
     }
 }
 
-/// `du -sk` over the run's lanes ([`lane_dirs`]), within [`DU_DEADLINE`].
+/// `du -sk` over the run's lanes ([`lane_dirs`], root-relative, then the
+/// [`cells_lane`] where it exists, absolute), within [`DU_DEADLINE`].
 #[must_use]
 pub fn measure_lanes(root: &Path) -> Lanes {
-    let dirs = lane_dirs(root);
+    let mut dirs = lane_dirs(root);
+    dirs.extend(existing_cells_lane(root));
     if dirs.is_empty() {
         return Lanes::Measured(Vec::new());
     }
@@ -432,19 +483,15 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> std::thread::JoinHandle<V
     })
 }
 
-/// Whose lanes the run's are, which decides whether they are credited and
-/// whether the cap may remove them.
+/// Whose lanes the run's are. Since 2026-09-27 every run's are a snapshot's
+/// (the in-place mode, whose lanes were the caller's own caches and neither
+/// credited nor removed, is gone).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Owner {
     /// A snapshot's: the gate's alone — synced, stamped and locked by it, so
     /// what they hold is what earlier gate runs built there for this one to
-    /// reuse.
+    /// reuse, and the cap may remove them.
     Snapshot,
-    /// The caller's checkout (`--in-place`, `--selftest`, a root that is not a
-    /// git checkout). Its `target` and `target-*` dirs may be the caller's own
-    /// caches, which this run need not write to at all, so they are neither
-    /// credited nor removed.
-    InPlace,
 }
 
 /// The preflight's decision before any byte moves.
@@ -502,9 +549,6 @@ impl Plan {
     fn lanes_clause(&self) -> String {
         match (&self.held, self.owner) {
             (Err(why), _) => format!("lanes unmeasured ({why}), so none credited"),
-            (Ok(h), Owner::InPlace) => {
-                format!("target dirs {}, not credited in place", gib(*h))
-            }
             (Ok(h), Owner::Snapshot) if self.remove && self.unremoved.is_empty() => format!(
                 "lanes {}, over the {} cap, so removed before the free space was read",
                 gib(*h),
@@ -755,11 +799,6 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
                 }
             }
         }
-        (Owner::InPlace, None) => s.push_str(&format!(
-            "; in place they are not credited, so removing them gives that back and leaves \
-             the requirement at {}",
-            gib(plan.need)
-        )),
         (_, Some(_)) => s.push_str("; removing them gives that back"),
     }
     s.push_str(":\n");
@@ -767,6 +806,30 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
         s.push_str(&format!("      {:>10}  {}/\n", gib(*b), d.display()));
     }
     s
+}
+
+/// The CELLS LANE of the run rooted at `root`: `<name>-cells.noindex` BESIDE
+/// it, where `<name>` is the root's own name less a `.noindex` suffix — so the
+/// default snapshot `<caller>-verify.noindex` has `<caller>-verify-cells.noindex`.
+/// `None` for a root with no name (`/`).
+///
+/// A snapshot's run hands it to `gate cells-foreign` as
+/// `$ATERM_CELL_TARGET_DIR` (`stages::foreign_cells`). Beside the root, not in
+/// it: `xtask` refuses a cells cache inside the workspace it judges. On the
+/// root's volume, so the free space this preflight reads is the space it
+/// fills. `.noindex`, as the snapshot is, to keep Spotlight out of it.
+#[must_use]
+pub fn cells_lane(root: &Path) -> Option<PathBuf> {
+    let name = root.file_name()?.to_string_lossy().into_owned();
+    let base = name.strip_suffix(".noindex").unwrap_or(&name);
+    Some(root.with_file_name(format!("{base}-cells.noindex")))
+}
+
+/// [`cells_lane`] when it exists as a real directory — a symlink there points
+/// somewhere else and is neither measured nor removed.
+#[must_use]
+pub fn existing_cells_lane(root: &Path) -> Option<PathBuf> {
+    cells_lane(root).filter(|d| d.symlink_metadata().is_ok_and(|m| m.is_dir()))
 }
 
 /// The run's lanes, root-relative: the directory `target` and every `target-*`
@@ -777,7 +840,9 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
 /// THE ONE DEFINITION of a lane. [`crate::snapshot`] stamps exactly these, the
 /// preflight measures exactly these and the cap removes exactly these
 /// ([`crate::snapshot::remove_lanes`]), so what the preflight counts is what
-/// the cap deletes. A root directory whose name merely STARTS with `target` —
+/// the cap deletes — with the [`cells_lane`] beside the root added to the
+/// measure and the removal, and left out of the stamps (rustup's `stable`
+/// builds it, so a new trustc says nothing about it). A root directory whose name merely STARTS with `target` —
 /// `targets/`, `target_x/`, a dev `target.noindex/` — is not a lane: no run
 /// stamps it, and the cap as first written (2026-09-23, before it was
 /// committed) would have deleted it.
@@ -977,11 +1042,14 @@ mod tests {
 
     /// THE MEASURED BUDGET against the case that motivated it: the snapshot's
     /// lanes holding the 20.2 GiB `b994cadd0`'s cold run left (21,220,340 KiB
-    /// by `du -sk`, 2026-09-23) and the 22.2 GiB the volume read five minutes
-    /// before that run ended. The flat 40 GiB floor refuses that run; the
-    /// estimate asks for a warm run's growth plus the reserve, 22.0 GiB.
+    /// by `du -sk`, 2026-09-23). The flat 40 GiB floor refused the next run at
+    /// the 22.2 GiB the volume then read; the estimate asked for a warm run's
+    /// growth plus the reserve, 22.0 GiB, and admitted it. Since the cells lane
+    /// joined the lanes (2026-09-27) a warm run grows them 2 GiB more, so the
+    /// same lanes need 24.0 GiB — that 22.2 GiB reading is now refused, and the
+    /// estimate still asks 16 GiB less than the flat floor did.
     #[test]
-    fn a_warm_snapshot_at_22_gib_free_runs_where_the_flat_floor_refused_it() {
+    fn a_warm_snapshot_needs_its_growth_not_the_flat_floor() {
         let root = Path::new("/Users//x/aterm-verify.noindex");
         let warm = plan(
             Budget::MEASURED,
@@ -992,28 +1060,45 @@ mod tests {
         assert!(!warm.remove);
         assert_eq!(warm.credited, 21_220_340 * 1024);
         assert_eq!(warm.need, WARM_GROWTH_BYTES + RESERVE_BYTES);
-        assert_eq!(gib(warm.need), "22.0 GiB");
-        // One byte over the 22.2 GiB boundary: `GIB / 5` alone is just under a
+        assert_eq!(gib(warm.need), "24.0 GiB");
+        // One byte over the 24.2 GiB boundary: `GIB / 5` alone is just under a
         // real fifth.
-        let read = 22 * GIB + GIB / 5 + 1;
-        assert_eq!(gib(read), "22.2 GiB");
+        let read = 24 * GIB + GIB / 5 + 1;
+        assert_eq!(gib(read), "24.2 GiB");
         assert_eq!(decide(&Reading::Free(read), &warm, root), Ok(()));
-        assert_eq!(decide(&Reading::Free(22 * GIB), &warm, root), Ok(()));
-        let why = decide(&Reading::Free(22 * GIB - 1), &warm, root).expect_err("under 22");
+        assert_eq!(decide(&Reading::Free(24 * GIB), &warm, root), Ok(()));
+        let why = decide(&Reading::Free(24 * GIB - 1), &warm, root).expect_err("under 24");
         assert!(
-            why.starts_with("disk: 21.9 GiB free on the volume holding /Users//x/"),
+            why.starts_with("disk: 23.9 GiB free on the volume holding /Users//x/"),
             "{why}"
         );
-        assert!(why.contains("under the 22.0 GiB this run needs"), "{why}");
+        assert!(why.contains("under the 24.0 GiB this run needs"), "{why}");
         assert!(why.ends_with("nothing was built"), "{why}");
+        // The 2026-09-23 reading, short by the cells lane's growth.
+        assert!(decide(&Reading::Free(22 * GIB + GIB / 5 + 1), &warm, root).is_err());
 
         // From empty lanes the same budget asks for the whole footprint.
         let cold = plan(Budget::MEASURED, None, &held(0), Owner::Snapshot);
         assert_eq!(cold.need, COLD_BYTES + RESERVE_BYTES);
-        assert_eq!(gib(cold.need), "30.0 GiB");
-        assert!(decide(&Reading::Free(22 * GIB), &cold, root).is_err());
-        assert_eq!(decide(&Reading::Free(30 * GIB), &cold, root), Ok(()));
-        assert!(decide(&Reading::Free(30 * GIB - 1), &cold, root).is_err());
+        assert_eq!(gib(cold.need), "33.0 GiB");
+        assert!(decide(&Reading::Free(24 * GIB), &cold, root).is_err());
+        assert_eq!(decide(&Reading::Free(33 * GIB), &cold, root), Ok(()));
+        assert!(decide(&Reading::Free(33 * GIB - 1), &cold, root).is_err());
+    }
+
+    /// THE CELLS LANE IS IN THE BUDGET (2026-09-27): `gate cells-foreign`'s
+    /// cold footprint and growth are terms of the cold footprint and of a warm
+    /// run's growth, and so of the cap — before this the stage wrote 2.6 GiB
+    /// (12 GiB with incremental on) that no term counted.
+    #[test]
+    fn the_cells_lane_is_a_term_of_the_cold_footprint_the_growth_and_the_cap() {
+        assert_eq!(COLD_BYTES, 24 * GIB + CELLS_COLD_BYTES);
+        assert_eq!(WARM_GROWTH_BYTES, 16 * GIB + CELLS_WARM_GROWTH_BYTES);
+        assert_eq!(gib(CELLS_COLD_BYTES), "3.0 GiB");
+        assert_eq!(gib(CELLS_WARM_GROWTH_BYTES), "2.0 GiB");
+        // Above what was measured: 2,751,212 KiB cold, 1.00 GiB first-party.
+        const { assert!(CELLS_COLD_BYTES > 2_751_212 * 1024) };
+        const { assert!(CELLS_WARM_GROWTH_BYTES > GIB) };
     }
 
     /// OVER THE CAP a snapshot's lanes are removed and the run is budgeted
@@ -1033,11 +1118,6 @@ mod tests {
         assert_eq!(over.credited, 0, "removed lanes are not credited");
         assert_eq!(over.need, COLD_BYTES + RESERVE_BYTES);
 
-        let in_place = plan(b, None, &held(LANE_CAP_BYTES * 2), Owner::InPlace);
-        assert!(!in_place.remove, "the caller's dirs are never removed");
-        assert_eq!(in_place.credited, 0);
-        assert_eq!(in_place.need, COLD_BYTES + RESERVE_BYTES);
-
         let unknown = plan(
             b,
             None,
@@ -1053,7 +1133,7 @@ mod tests {
 
         // The cap is the sum it is documented as.
         assert_eq!(LANE_CAP_BYTES, COLD_BYTES + WARM_GROWTH_BYTES);
-        assert_eq!(gib(LANE_CAP_BYTES), "40.0 GiB");
+        assert_eq!(gib(LANE_CAP_BYTES), "45.0 GiB");
     }
 
     /// `--disk-floor` is exactly its number — no estimate, whatever the lanes
@@ -1118,17 +1198,17 @@ mod tests {
         );
         assert_eq!(
             header_line(&free, &warm, root),
-            "verify: disk 22.2 GiB free on the volume holding /r; lanes 20.2 GiB; need 22.0 \
-             GiB = max(24.0 GiB cold - 20.2 GiB credited, 16.0 GiB warm growth) + 6.0 GiB \
+            "verify: disk 22.2 GiB free on the volume holding /r; lanes 20.2 GiB; need 24.0 \
+             GiB = max(27.0 GiB cold - 20.2 GiB credited, 18.0 GiB warm growth) + 6.0 GiB \
              reserve\n"
         );
 
-        let mut over = plan(Budget::MEASURED, None, &held(45 * GIB), Owner::Snapshot);
+        let mut over = plan(Budget::MEASURED, None, &held(50 * GIB), Owner::Snapshot);
         let line = header_line(&free, &over, root);
         assert!(
             line.contains(
-                "; lanes 45.0 GiB, over the 40.0 GiB cap, so removed before the free \
-                           space was read; need 30.0 GiB = max(24.0 GiB cold - 0.0 GiB credited"
+                "; lanes 50.0 GiB, over the 45.0 GiB cap, so removed before the free \
+                           space was read; need 33.0 GiB = max(27.0 GiB cold - 0.0 GiB credited"
             ),
             "{line}"
         );
@@ -1140,11 +1220,6 @@ mod tests {
         );
         assert!(!line.contains("so removed"), "{line}");
 
-        let in_place = plan(Budget::MEASURED, None, &held(GIB), Owner::InPlace);
-        assert!(
-            header_line(&free, &in_place, root)
-                .contains("; target dirs 1.0 GiB, not credited in place; need 30.0 GiB"),
-        );
         let unknown = plan(
             Budget::MEASURED,
             None,
@@ -1153,9 +1228,9 @@ mod tests {
         );
         assert!(
             header_line(&free, &unknown, root)
-                .contains("; lanes unmeasured (du -sk failed), so none credited; need 30.0 GiB")
+                .contains("; lanes unmeasured (du -sk failed), so none credited; need 33.0 GiB")
         );
-        let floor = plan(Budget::MEASURED, Some(0), &held(GIB), Owner::InPlace);
+        let floor = plan(Budget::MEASURED, Some(0), &held(GIB), Owner::Snapshot);
         let line = header_line(&free, &floor, root);
         assert!(
             line.ends_with("; need 0.0 GiB (--disk-floor: exactly this, no estimate)\n"),
@@ -1223,6 +1298,55 @@ mod tests {
         assert!(sized[1].1 >= 256 * 1024, "{sized:?}");
         assert!(sized[1].1 < 1024 * 1024, "{sized:?}");
         std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// THE CELLS LANE sits BESIDE the root, is named from it, and is measured
+    /// with the lanes when it is a real directory — never through a symlink,
+    /// which points somewhere this run does not own.
+    #[cfg(unix)]
+    #[test]
+    fn the_cells_lane_sits_beside_the_root_and_is_measured_with_the_lanes() {
+        assert_eq!(
+            cells_lane(Path::new("/Users//x/aterm-verify.noindex")),
+            Some(PathBuf::from("/Users//x/aterm-verify-cells.noindex"))
+        );
+        assert_eq!(
+            cells_lane(Path::new("/s/snap")),
+            Some(PathBuf::from("/s/snap-cells.noindex"))
+        );
+        assert_eq!(cells_lane(Path::new("/")), None);
+
+        let base = crate::mktemp_dir("atv-disk-cells").expect("mktemp");
+        let snap = base.join("c-verify.noindex");
+        std::fs::create_dir_all(snap.join("target/debug")).expect("mkdir");
+        std::fs::write(snap.join("target/debug/a"), vec![1u8; 64 * 1024]).expect("write");
+        // No cells lane yet: the target lanes alone.
+        let Lanes::Measured(sized) = measure_lanes(&snap) else {
+            panic!("du -sk did not measure {}", snap.display());
+        };
+        assert_eq!(sized.len(), 1, "{sized:?}");
+        let cells = base.join("c-verify-cells.noindex");
+        std::fs::create_dir_all(cells.join("win/debug")).expect("mkdir");
+        std::fs::write(cells.join("win/debug/b"), vec![1u8; 512 * 1024]).expect("write");
+        let Lanes::Measured(sized) = measure_lanes(&snap) else {
+            panic!("du -sk did not measure {}", snap.display());
+        };
+        let names: Vec<PathBuf> = sized.iter().map(|(d, _)| d.clone()).collect();
+        assert_eq!(names, [PathBuf::from("target"), cells.clone()]);
+        assert!(sized[1].1 >= 512 * 1024, "{sized:?}");
+        assert!(
+            Lanes::Measured(sized.clone()).total().expect("measured") >= 576 * 1024,
+            "the cells lane counts toward the total the cap judges: {sized:?}"
+        );
+        // A link in its place is not measured.
+        std::fs::rename(&cells, base.join("elsewhere")).expect("mv");
+        std::os::unix::fs::symlink(base.join("elsewhere"), &cells).expect("symlink");
+        assert_eq!(existing_cells_lane(&snap), None);
+        let Lanes::Measured(sized) = measure_lanes(&snap) else {
+            panic!("du -sk did not measure {}", snap.display());
+        };
+        assert_eq!(sized.len(), 1, "{sized:?}");
+        std::fs::remove_dir_all(&base).ok();
     }
 
     /// THE BOUND: a child still running at the deadline is killed and reaped,
@@ -1326,10 +1450,10 @@ mod tests {
         }
         assert!(!text.contains("target.noindex"), "{text}");
         assert!(
-            text.contains("the next run is then cold and needs 30.0 GiB"),
+            text.contains("the next run is then cold and needs 33.0 GiB"),
             "{text}"
         );
-        assert!(text.contains("still "), "1 GiB free is short of 30: {text}");
+        assert!(text.contains("still "), "1 GiB free is short of 33: {text}");
         assert!(text.contains("--disk-floor <GiB>"), "{text}");
 
         // A nested lane beneath a symlink is somewhere else, never this run's.
@@ -1358,35 +1482,26 @@ mod tests {
     }
 
     /// What removing the lanes would buy is arithmetic over the same numbers
-    /// the header printed: enough when the freed bytes cover a cold run, the
-    /// shortfall when they do not, and in place the requirement unmoved.
+    /// the header printed: enough when the freed bytes cover a cold run, and
+    /// the shortfall when they do not.
     #[test]
     fn the_remedy_prices_removing_the_lanes_against_a_cold_run() {
         let root = Path::new("/nonexistent/root");
         let lanes = held(20 * GIB);
         let warm = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
-        let text = remedy(root, &warm, &lanes, &Reading::Free(12 * GIB), None);
+        let text = remedy(root, &warm, &lanes, &Reading::Free(14 * GIB), None);
         assert!(
             text.contains(
                 "this run's target dirs hold 20.0 GiB, all of it regenerable. Removing \
-                           them gives that back, and the next run is then cold and needs 30.0 GiB \
-                           (24.0 GiB cold + 6.0 GiB reserve): 32.0 GiB would be free — enough:\n"
+                           them gives that back, and the next run is then cold and needs 33.0 GiB \
+                           (27.0 GiB cold + 6.0 GiB reserve): 34.0 GiB would be free — enough:\n"
             ),
             "{text}"
         );
         assert!(text.contains("      20.0 GiB  target/\n"), "{text}");
         let text = remedy(root, &warm, &lanes, &Reading::Free(5 * GIB), None);
         assert!(
-            text.contains("25.0 GiB would be free — still 5.0 GiB short"),
-            "{text}"
-        );
-        let in_place = plan(Budget::MEASURED, None, &lanes, Owner::InPlace);
-        let text = remedy(root, &in_place, &lanes, &Reading::Free(5 * GIB), None);
-        assert!(
-            text.contains(
-                "in place they are not credited, so removing them gives that back and \
-                           leaves the requirement at 30.0 GiB"
-            ),
+            text.contains("25.0 GiB would be free — still 8.0 GiB short"),
             "{text}"
         );
     }
@@ -1418,10 +1533,10 @@ mod tests {
         assert!(text.contains("CARGO_INCREMENTAL=0"), "{text}");
         assert!(text.contains("Only if that is not enough"), "{text}");
 
-        // In place (no snapshot) there is no second tree, so nothing is claimed.
-        let in_place = remedy(&root, &p, &lanes, &free, None);
-        assert!(!in_place.contains("costs nothing"), "{in_place}");
-        assert!(in_place.contains("regenerable"), "{in_place}");
+        // With no caller named there is no second tree, so nothing is claimed.
+        let alone = remedy(&root, &p, &lanes, &free, None);
+        assert!(!alone.contains("costs nothing"), "{alone}");
+        assert!(alone.contains("regenerable"), "{alone}");
 
         // A caller with no incremental caches says nothing about them either.
         let bare = crate::mktemp_dir("atv-disk-bare").expect("mktemp");

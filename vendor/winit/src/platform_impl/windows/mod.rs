@@ -1,5 +1,5 @@
 use smol_str::SmolStr;
-use windows_sys::Win32::Foundation::{HANDLE, HWND};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{HMENU, WINDOW_LONG_PTR_INDEX};
 
 pub(crate) use self::event_loop::{
@@ -75,7 +75,7 @@ impl DeviceId {
 impl DeviceId {
     pub fn persistent_identifier(&self) -> Option<String> {
         if self.0 != 0 {
-            raw_input::get_raw_input_device_name(self.0 as HANDLE)
+            raw_input::get_raw_input_device_name(handle::from_usize(self.0 as usize))
         } else {
             None
         }
@@ -104,13 +104,13 @@ unsafe impl Sync for WindowId {}
 
 impl WindowId {
     pub const fn dummy() -> Self {
-        WindowId(0)
+        WindowId(std::ptr::null_mut())
     }
 }
 
 impl From<WindowId> for u64 {
     fn from(window_id: WindowId) -> Self {
-        window_id.0 as u64
+        handle::to_usize(window_id.0) as u64
     }
 }
 
@@ -122,7 +122,7 @@ impl From<WindowId> for HWND {
 
 impl From<u64> for WindowId {
     fn from(raw_id: u64) -> Self {
-        Self(raw_id as HWND)
+        Self(handle::from_usize(raw_id as usize))
     }
 }
 
@@ -185,6 +185,11 @@ mod dark_mode;
 mod definitions;
 mod dpi;
 mod drop_handler;
+mod handle;
+
+// The public API's integer handles (`crate::platform::windows::HWND` …) meet
+// windows-sys's pointer handles here.
+pub(crate) use self::handle::{from_isize as handle_from_isize, to_isize as handle_to_isize};
 mod event_loop;
 mod icon;
 mod ime;

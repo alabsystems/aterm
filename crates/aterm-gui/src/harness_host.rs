@@ -96,10 +96,13 @@
 //!   parks next, as a Claude Code's is. A session busy only with its OWN
 //!   BACKGROUND WORK (a workflow it waits on, a shell it left, a Codex
 //!   background terminal) is at a natural break: its loop offers that break
-//!   ([`IdleHost::at_background`]) and the worker types the FIRST NOTICE
-//!   there, nothing else (owner, 2026-09-26: "The notice interrupts the
+//!   ([`IdleHost::at_background`]) and the worker types only a NOTICE there,
+//!   and ends nothing (owner, 2026-09-26: "The notice interrupts the
 //!   agent's orchestration once, and the restart still never kills running
-//!   work"). While the agent
+//!   work"). Only a whole `REASK_S` of that work running on earns a re-ask
+//!   there, naming what runs. After `MAX_ASKS` notices the upgrade gives up.
+//!   A tab whose poll loops could never end was otherwise told once and then
+//!   waited on for days (2026-09-26). While the agent
 //!   winds down (READY given, the restart imminent) the upgrade OWNS the
 //!   session's turn ends ([`IdleHost::owns_turn_end`], read from the step's
 //!   own result, never from the screen) and nothing is typed; an agent that
@@ -107,8 +110,22 @@
 //!   switched off, a release still owed, and a drain of background work
 //!   past [`upgrade_drive::OWNED_BACKGROUND_LOOKS`] looks own nothing
 //!   ([`upgrade_drive::owns_turn_ends`]), and the worker is continued as at
-//!   any turn end. A step that must wait is looked at again on a growing
-//!   pause (the host thread's timed bell), never on a sweep.
+//!   any turn end — the loop decides the point it left to
+//!   the upgrade again the moment the upgrade owns nothing. A step that must
+//!   wait is looked at again on a growing pause (the host thread's timed
+//!   bell), never on a sweep; a turn the session runs in between starts the
+//!   pauses over ([`IdleHost::turn_ran`]). A look whose READ FAILED — the
+//!   socket refused it, Claude Code's records or the agent's process could
+//!   not be read whole, a launch's record is not written yet, a build the
+//!   agent could move to did not answer its `--version` in time
+//!   ([`aterm_agent::harness::upgrade_drive::Due::Unread`]) — decides
+//!   nothing: it is journaled (`wait:no-socket`, `wait:no-process`,
+//!   `wait:session-files-unreadable`, `wait:no-record`, `wait:no-version`)
+//!   and looked at again on a short pause of its own ([`UNREAD_LOOK`]), what
+//!   the upgrade owned left as it stood. Only a look that reads whole and
+//!   finds nothing the upgrade could act on lets it go: no build or model to
+//!   move to, a Codex it does not move, an agent past its launch with no
+//!   record of its own ([`aterm_agent::harness::upgrade_drive::RECORD_WINDOW_S`]).
 //! * RELAUNCH ON EXIT (`[harness] relaunch`). While the agent runs, the
 //!   worker records what a relaunch needs
 //!   ([`aterm_agent::harness::relaunch::snapshot`]); when the session's
@@ -158,10 +175,10 @@ use std::time::{Duration, Instant};
 use aterm_agent::harness::relaunch::{
     self, ExitLook, ExitRecord, Foreground, OnExit, Outcome, Relaunches, Restart, Say, Snapshot,
 };
-use aterm_agent::harness::upgrade_drive::{self, After};
+use aterm_agent::harness::upgrade_drive::{self, After, Behind, Due};
 use aterm_agent::harness::upgrade_wake::{ActivationWake, WakeTrigger};
 use aterm_agent::supervise::{
-    Ctl, CtlReply, Endpoint, IdleHost, Interrupter, RelayCtl, Session, SuperviseOpts,
+    Ctl, CtlReply, Endpoint, HostStep, IdleHost, Interrupter, RelayCtl, Session, SuperviseOpts,
     SupervisorConfig,
 };
 
@@ -226,6 +243,14 @@ const HOST_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 /// Every harness thread's name starts with this (`logging.rs` routes their
 /// panics by it).
 pub(crate) const THREAD_PREFIX: &str = "aterm-harness-";
+
+/// A restored tab's relaunch ([`HostHandle::relaunch_restored`]) is tried at
+/// most this many times — a shell that is still starting says `NotYet` —
+/// pausing [`RESTORED_FIRST_PAUSE`] first, doubling up to
+/// [`RESTORED_MAX_PAUSE`]: about two minutes in all.
+const RESTORED_TRIES: u32 = 8;
+const RESTORED_FIRST_PAUSE: Duration = Duration::from_secs(1);
+const RESTORED_MAX_PAUSE: Duration = Duration::from_secs(30);
 /// The keyed-attention owner this host writes (`meta set attention
 /// owner=supervisor …`): the engine's own, one constant.
 pub(crate) use aterm_agent::supervise::ATTENTION_OWNER;
@@ -520,6 +545,8 @@ pub(crate) struct WorkerJob {
     /// What the host keeps of the session for a relaunch ([`Kept`]),
     /// across its workers.
     pub(crate) kept: Arc<Mutex<Kept>>,
+    /// The session's note behind still to be taken ([`Owed`]).
+    note: Note,
 }
 
 /// What the host keeps of one open session for a relaunch, across its
@@ -566,25 +593,40 @@ pub(crate) struct FollowStamp {
 
 type RosterFn = dyn Fn() -> Vec<(String, Program, FollowStamp)> + Send + Sync;
 type WantedFn = dyn Fn(&str) -> bool + Send + Sync;
+/// What the upgrade reads of a session ([`upgrade_drive::due`]).
+type DueFn = dyn Fn(&str) -> Due + Send + Sync;
 type BodyFn = dyn Fn(&WorkerJob) -> BodyEnd + Send + Sync;
 type BadgeFn = dyn Fn(&str, Option<&str>) + Send + Sync;
 type EpochFn = dyn Fn() -> u64 + Send + Sync;
 type StepFn = dyn Fn(&str, u32) -> String + Send + Sync;
+/// The session noted behind since a unix second
+/// ([`upgrade_drive::note_behind`]).
+type BehindFn = dyn Fn(&str, u64) -> Behind + Send + Sync;
+/// The upgrade's clocks held until a unix second ([`Acts::hold`]): `false`
+/// while another sweep holds the lock, to be tried again.
+type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
 type SnapshotFn = dyn Fn(&str) -> Option<Snapshot> + Send + Sync;
 type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 type ExitLookFn = dyn Fn(&str, &Snapshot) -> Option<ExitLook> + Send + Sync;
 type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, bool) -> String + Send + Sync;
+/// The relaunch of an agent whose tab a crash of aterm took, in the tab the
+/// next launch reopened ([`relaunch::after_host_ended`]): `(sid, snapshot,
+/// upgrade)` to the step's word.
+type RestoredFn = dyn Fn(&str, &Snapshot, bool) -> String + Send + Sync;
 /// The owner's view of the upgrades ([`Hooks::upgrade_view`]): `true` looks
 /// again and answers the unix second it next changes by time alone, `false`
 /// stands it down.
 type ViewFn = dyn Fn(bool) -> Option<u64> + Send + Sync;
 type RestartFn = dyn Fn(&str, u32, &Restart) -> String + Send + Sync;
-/// The upgrade's clocks held until a unix second ([`Acts::hold`]): `false`
-/// while another sweep holds the lock, to be tried again.
-type HoldFn = dyn Fn(&str, u64) -> bool + Send + Sync;
+/// Whether the conversation a tab's agent holds has a task
+/// ([`upgrade_drive::tasked`], the tab's supervisor's own turns none), read
+/// on from where the worker's last read of it ended: `(sid, session, memo)`.
+type TaskedFn = dyn Fn(&str, &str, &mut upgrade_drive::Tasked) -> Option<bool> + Send + Sync;
 type BackoffFn = dyn Fn(usize) -> Duration + Send + Sync;
 type PauseFn = dyn Fn(Duration) -> Duration + Send + Sync;
+/// One look of the disk watch over the supervised sessions ([`Hooks::disk`]).
+type DiskFn = dyn Fn(&[String]) + Send + Sync;
 
 /// The host's seams onto the process: which sessions run an agent, whether
 /// one still does, one run of the loop, the faulted badge, how many
@@ -607,9 +649,14 @@ pub(crate) struct Hooks {
     pub(crate) pause: Arc<PauseFn>,
     /// THE OWNER'S VIEW of this instance's upgrades
     /// ([`upgrade_drive::View`]): looked at by the host thread when
-    /// [`look_at_upgrades`] says, its rows handed to the window
-    /// (`Wake::AgentUpgrade`) and its stalled tabs marked.
+    /// [`look_at_upgrades`] says, its rows handed to the app, headless or
+    /// not (`Wake::AgentUpgrade`), and its stalled tabs marked.
     pub(crate) upgrade_view: Arc<ViewFn>,
+    /// THE DISK WATCH (design §5.5's one timer, [`look_at_disk`]): handed
+    /// the supervised sessions every [`DISK_TICK`]; below the automatic
+    /// floor it reclaims the stale build directories where they work
+    /// ([`live_disk`], `aterm_agent::harness::cli::disk_tick`).
+    pub(crate) disk: Arc<DiskFn>,
 }
 
 /// The worker's acts beyond the loop, each over one session (`sid`): the
@@ -627,10 +674,17 @@ pub(crate) struct Hooks {
 #[derive(Clone)]
 pub(crate) struct Acts {
     pub(crate) open: Arc<WantedFn>,
-    pub(crate) due: Arc<WantedFn>,
+    pub(crate) due: Arc<DueFn>,
+    /// The session is behind — from its worker's attach, and from each
+    /// activation notice: its upgrade state minted with its age from the
+    /// second given, as the first step would mint it
+    /// ([`upgrade_drive::note_behind`]; asked until it decides, [`Owed`]).
+    pub(crate) behind: Arc<BehindFn>,
     pub(crate) step: Arc<StepFn>,
-    /// The upgrade's step at a break of the agent's own background work: the
-    /// first notice alone ([`upgrade_drive::Opts::background`]).
+    /// The upgrade's step at a break of the agent's own background work: a
+    /// notice alone (the first, or a re-ask once `REASK_S` has passed), or a
+    /// give-up past `MAX_ASKS`. Nothing is ended
+    /// ([`upgrade_drive::Opts::background`]).
     pub(crate) notice: Arc<StepFn>,
     pub(crate) owed: Arc<WantedFn>,
     pub(crate) resume: Arc<StepFn>,
@@ -642,7 +696,14 @@ pub(crate) struct Acts {
     /// as the exit is seen, before the back-off ([`on_agent_left`]).
     pub(crate) exit_look: Arc<ExitLookFn>,
     pub(crate) relaunch: Arc<RelaunchFn>,
+    /// The relaunch of a restored tab's agent after aterm itself ended
+    /// ([`HostHandle::relaunch_restored`]).
+    pub(crate) relaunch_restored: Arc<RestoredFn>,
     pub(crate) restart: Arc<RestartFn>,
+    /// Whether the conversation the session's agent holds has a task — a
+    /// prompt of a person's or an orchestrator's; the harness's own turns
+    /// are none ([`WorkerIdle::taskless`]).
+    pub(crate) tasked: Arc<TaskedFn>,
     /// The live upgrade's clocks held through the loop's limit episode
     /// ([`upgrade_drive::hold_clock`], [`WorkerIdle::limited`]).
     pub(crate) hold: Arc<HoldFn>,
@@ -814,30 +875,58 @@ fn stopped(job: &WorkerJob, hooks: &Hooks) -> WorkerExit {
 /// agent needs, and park the loop at the session's first idle point when the
 /// agent is owed its continuation (it was just relaunched: the loop answers
 /// whatever it opened with first, [`relaunch::owed`]) or has an upgrade to
-/// take — or when Claude has not yet registered the conversation the record
-/// must name (it has by the first idle point, where [`at_park`] reads it
-/// again).
+/// take — or when the upgrade could not read the session yet
+/// ([`Due::Unread`]: the first idle point looks again), or when Claude has
+/// not yet registered the conversation the record must name (it has by the
+/// first idle point, where [`WorkerIdle::at_idle`] reads it again).
 fn attach(job: &WorkerJob, hooks: &Hooks) {
+    if !upgrades(job.agent) {
+        return;
+    }
+    let due = if job.switches.upgrade() {
+        (hooks.acts.due)(&job.sid)
+    } else {
+        Due::No
+    };
+    // A launch's record not written yet is every fresh launch's shape, not news.
+    if let Due::Unread(why) = due
+        && why != upgrade_drive::UNREAD_RECORD
+    {
+        aterm_log::info!(
+            "harness @{}: the upgrade could not read the session as it attached ({why}); \
+             the first idle point looks again",
+            job.sid
+        );
+    }
+    let looks = due != Due::No;
+    // Behind from the attach (N3): the owner sees the row, and its age,
+    // before the session's first idle point — minutes later after a busy
+    // first turn. Owed while an upgrade is due or could not be read yet (a
+    // launch's record is written a moment after it starts), asked now, and
+    // asked again by the host until it decides ([`Owed`]).
+    if looks {
+        owe_note(&job.note, crate::upgrade_host::now_s());
+        if matches!(
+            ask_note(&job.sid, &job.note, hooks),
+            Some(Behind::Busy | Behind::Unread(_))
+        ) {
+            ring();
+        }
+    }
     if job.agent == Program::Codex {
         // The Codex branch of the upgrade (and its relaunch's owed
         // carry-on); a Codex's relaunch on exit is not built, so nothing of
         // one is recorded.
-        if (hooks.acts.owed)(&job.sid) || (job.switches.upgrade() && (hooks.acts.due)(&job.sid)) {
+        if (hooks.acts.owed)(&job.sid) || looks {
             job.park.store(true, Ordering::SeqCst);
         }
-        return;
-    }
-    if job.agent != Program::Claude {
         return;
     }
     refresh_snapshot(&job.sid, &job.kept, hooks);
     let incomplete = with_kept(job, |k| {
         k.snapshot.as_ref().is_none_or(|s| s.session.is_none())
     });
-    if incomplete
-        || (hooks.acts.owed)(&job.sid)
-        || (job.switches.upgrade() && (hooks.acts.due)(&job.sid))
-    {
+    if incomplete || (hooks.acts.owed)(&job.sid) || looks {
         job.park.store(true, Ordering::SeqCst);
     }
 }
@@ -855,6 +944,132 @@ fn upgrades(agent: Program) -> bool {
 /// session's builds, its tab and its screen.
 const BACKGROUND_LOOK: Duration = Duration::from_secs(60);
 
+/// A SESSION'S NOTE BEHIND STILL TO BE TAKEN (N3 of the live re-tests of
+/// 2026-09-26): owed from the worker's attach — an upgrade due, or one it
+/// could not read yet — and from every activation notice, and asked
+/// ([`ask_note`], [`Acts::behind`]) until it decides, noted or nothing to
+/// note, with the second the host first saw the session behind: the state it
+/// mints is behind from THEN. At a fresh launch Claude Code writes its record
+/// a moment after the worker attaches (1.2 s in the re-test of 155c72a28,
+/// where the note was asked once, at the attach, and never again before the
+/// first idle point: the column read `-` through the whole first turn, and
+/// "behind" counted from the first step). So a note that could not read
+/// ([`Behind::Unread`]) is asked again: at the host's wakes — the agent's
+/// first verdicts ring it as its REPL comes up — no sooner than [`NOTE_GAP`]
+/// after the last ask, and on the [`NOTE_AGAIN`] ladder at the latest; past
+/// the ladder, only at the loop's idle points, before their step — which
+/// then finds the state minted with its age from the attach.
+#[derive(Clone, Copy, Debug)]
+struct Owed {
+    /// Behind since this unix second: the attach's, or the notice's.
+    since: u64,
+    /// The asks in a row that could not read ([`NOTE_AGAIN`]'s rung).
+    unread: u32,
+    /// The last ask.
+    asked: Option<Instant>,
+    /// The host asks again by this instant; `None` once [`NOTE_AGAIN`] is
+    /// spent.
+    by: Option<Instant>,
+}
+
+/// A worker's owed note ([`Owed`]): asked by the worker (at its attach, at
+/// its idle points) and by the host thread (at its wakes). A leaf lock,
+/// never held over an ask.
+type Note = Arc<Mutex<Option<Owed>>>;
+
+/// The pauses before the host asks again a note that could not read
+/// ([`Owed`]): a launch's record comes within seconds; a control socket
+/// whose lanes are all held may take a minute and more (the re-test of
+/// 155c72a28: 90 s), and the idle points go on asking after the last.
+const NOTE_AGAIN: [Duration; 6] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+];
+
+/// How soon after an ask that could not read a host wake asks again
+/// ([`Owed`]): a wake is the event — the agent's verdict moving as its REPL
+/// comes up — and this keeps a burst of them from asking at each.
+const NOTE_GAP: Duration = Duration::from_secs(1);
+
+/// Owe the session's note behind since `since` — the earlier second kept
+/// when one is owed already — to be asked at once.
+fn owe_note(note: &Mutex<Option<Owed>>, since: u64) {
+    let mut owed = note.lock().unwrap_or_else(PoisonError::into_inner);
+    let since = owed.map_or(since, |o| o.since.min(since));
+    *owed = Some(Owed {
+        since,
+        unread: 0,
+        asked: None,
+        by: Some(Instant::now()),
+    });
+}
+
+/// Ask the session's owed note once ([`Acts::behind`], with no lock held
+/// over the ask) and keep what it decides: nothing more owed once it noted
+/// the session behind — the owner's view looked at again — or found nothing
+/// to note; asked again after [`relaunch::BUSY`] while another actor holds
+/// the state's lock, and on [`NOTE_AGAIN`] while the session cannot be read.
+/// What it said; `None` when no note is owed.
+fn ask_note(sid: &str, note: &Mutex<Option<Owed>>, hooks: &Hooks) -> Option<Behind> {
+    let lock = || note.lock().unwrap_or_else(PoisonError::into_inner);
+    let since = lock().as_ref()?.since;
+    let said = (hooks.acts.behind)(sid, since);
+    let now = Instant::now();
+    let mut owed = lock();
+    match (said, owed.as_mut()) {
+        (Behind::Noted | Behind::Nothing, _) => *owed = None,
+        (Behind::Busy, Some(o)) => {
+            o.asked = Some(now);
+            o.by = Some(now + (hooks.pause)(relaunch::BUSY));
+        }
+        (Behind::Unread(_), Some(o)) => {
+            o.asked = Some(now);
+            o.by = NOTE_AGAIN
+                .get(o.unread as usize)
+                .map(|pause| now + (hooks.pause)(*pause));
+            o.unread = o.unread.saturating_add(1);
+        }
+        (_, None) => {}
+    }
+    drop(owed);
+    if said == Behind::Noted {
+        note_upgrade_act();
+    }
+    Some(said)
+}
+
+/// The host thread's ask of a worker's owed note at a wake ([`Owed`]):
+/// asked once its instant has come, or — while it could not read — once the
+/// host wakes [`NOTE_GAP`] or more after the last ask. The instant the host
+/// is to wake for it, if any.
+fn host_note(
+    sid: &str,
+    note: &Mutex<Option<Owed>>,
+    now: Instant,
+    hooks: &Hooks,
+) -> Option<Instant> {
+    let asks = {
+        let owed = note.lock().unwrap_or_else(PoisonError::into_inner);
+        let o = owed.as_ref()?;
+        let by = o.by?;
+        by <= now
+            || (o.unread > 0
+                && o.asked
+                    .is_some_and(|at| now >= at + (hooks.pause)(NOTE_GAP)))
+    };
+    if asks {
+        ask_note(sid, note, hooks);
+    }
+    note.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|o| o.by)
+}
+
 /// One worker's upgrade, between its steps.
 #[derive(Default)]
 struct UpgradeRun {
@@ -867,12 +1082,18 @@ struct UpgradeRun {
     /// first, and now its client settles): measured live on 2026-09-26, the
     /// daemon's `held` and `settling` and then the client's own `settling`
     /// climbed the ladder together, and the client's twenty-second settle
-    /// was looked at again ten minutes later.
+    /// was looked at again ten minutes later. So does a turn the session ran
+    /// in between ([`WorkerIdle::turn_ran`]): its end is a point of its own
+    /// (its [`Self::waits`] kept).
     same: u32,
     /// The word the last step waited on (empty after anything but a wait).
     last: String,
     /// A step that could not run was said: said once, until one runs.
     broken: bool,
+    /// The looks in a row whose read failed ([`UNREAD_LOOK`]'s rung). They
+    /// are no waits of the step's: [`Self::waits`] and [`Self::same`] are
+    /// left as they stand.
+    unread: u32,
 }
 
 impl UpgradeRun {
@@ -883,7 +1104,13 @@ impl UpgradeRun {
             self.same = 0;
         }
         let after = upgrade_drive::after(step, self.same);
-        if matches!(after, After::Later(_)) {
+        // Only a WAIT counts toward the bounded hold on turn ends. A step that
+        // acted and then looks again later (a re-arm, a stop resting until its
+        // next round) starts every count over, as an act does: a new round that
+        // inherited the rest's two hours of looks would own no turn end, its
+        // twenty-second settle would never complete, and its first notice would
+        // never be typed (the no-stall review of 2026-09-27, B3).
+        if matches!(after, After::Later(_)) && step.starts_with("wait:") {
             self.waits = self.waits.saturating_add(1);
             self.same = self.same.saturating_add(1);
             step.clone_into(&mut self.last);
@@ -895,13 +1122,48 @@ impl UpgradeRun {
         after
     }
 
+    /// A turn ran since the last look: the ladder starts over at the new
+    /// point, the waits that bound the upgrade's hold on the turn ends kept.
+    fn new_point(&mut self) {
+        self.same = 0;
+        self.last.clear();
+    }
+
     /// Nothing to step: every count starts over.
     fn reset(&mut self) {
         self.waits = 0;
         self.same = 0;
         self.last.clear();
+        self.unread = 0;
+    }
+
+    /// A look whose read failed: the pause before the next one
+    /// ([`UNREAD_LOOK`]), the step's own counts untouched.
+    fn unread(&mut self) -> Duration {
+        let pause = aterm_agent::supervise::ladder::Ladder(&UNREAD_LOOK)
+            .step(usize::try_from(self.unread).unwrap_or(usize::MAX));
+        self.unread = self.unread.saturating_add(1);
+        pause
     }
 }
+
+/// How soon a look whose read failed ([`Due::Unread`]) is taken again: a
+/// short ladder of its own, a minute at most, for as long as the read fails
+/// (the review of the silent-drop fix). A socket whose lanes were all held
+/// gave them back within a minute and a half (the re-test of 155c72a28), a
+/// process read or a record caught half-written reads at the next try, and
+/// a session that answered READY is not left idle for the step's ten-minute
+/// rung ([`upgrade_drive::LATER`]) once it can be read. Nor does an unread
+/// look count as one of the step's waits: those bound how long the upgrade
+/// owns a READY'd session's turn ends
+/// ([`upgrade_drive::OWNED_BACKGROUND_LOOKS`]), and an
+/// outage must not spend them.
+const UNREAD_LOOK: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
 
 /// THE WORKER'S PART AT ITS LOOP'S IDLE POINTS ([`IdleHost`]): the request
 /// for the next idle point ([`WorkerJob::park`]), the step taken there — the
@@ -925,6 +1187,11 @@ pub(crate) struct WorkerIdle {
     /// Not before this instant is a break of the agent's own background work
     /// looked at again for the notice ([`BACKGROUND_LOOK`]).
     background_at: Mutex<Option<Instant>>,
+    /// Whether the session's conversation has a task, as far as its record
+    /// has been read ([`WorkerIdle::taskless`]).
+    tasked: Mutex<upgrade_drive::Tasked>,
+    /// The session's note behind still to be taken ([`Owed`]).
+    note: Note,
     /// The unix second the loop last knew the session at its limit, not yet
     /// applied to the upgrade's clocks ([`Acts::hold`]: another sweep held
     /// the lock) — applied before the next step.
@@ -954,9 +1221,17 @@ impl IdleHost for WorkerIdle {
     /// again, and take ONE step when the session has one to take, then say
     /// when to look again ([`upgrade_drive::after`]): at the next idle point
     /// after an announcement, an adoption or a continuation, on a growing
-    /// pause after a wait, never after the last word. The request is cleared
-    /// FIRST, so a notice that lands during the step asks again.
-    fn at_idle(&self) -> Option<String> {
+    /// pause after a wait, never after the last word. A look whose read
+    /// FAILED ([`Due::Unread`]) decides nothing — journaled `upgrade
+    /// step=wait:<word>` and looked at again on its own short ladder
+    /// ([`UNREAD_LOOK`]), what the upgrade owned and the step's counts left
+    /// as they stood (it read nothing to change them) — never "nothing to
+    /// take": only a look that reads the session whole and finds nothing
+    /// lets the upgrade go (the live re-test of 155c72a28: a look refused by
+    /// a full control socket let four sessions go for good, one that had
+    /// answered READY among them). The request is cleared FIRST, so a notice
+    /// that lands during the step asks again.
+    fn at_idle(&self) -> Option<HostStep> {
         self.park.store(false, Ordering::SeqCst);
         if !upgrades(self.agent) {
             return None;
@@ -969,20 +1244,51 @@ impl IdleHost for WorkerIdle {
         // A limit stamp the lock kept out goes on the record before the step
         // reads it.
         self.hold_clock();
+        // A note behind still owed (N3) is asked first: a step that mints the
+        // state then finds it minted with its age from the attach.
+        if self.switches.upgrade() {
+            ask_note(&self.sid, &self.note, hooks);
+        }
         let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        let due = || {
+            if self.switches.upgrade() {
+                (hooks.acts.due)(&self.sid)
+            } else {
+                Due::No
+            }
+        };
         let (what, step) = if (hooks.acts.owed)(&self.sid) {
             // Types into the agent, never ends it: its exit, meanwhile, is one.
             ("carry-on", (hooks.acts.resume)(&self.sid, self.grace))
-        } else if self.switches.upgrade() && (hooks.acts.due)(&self.sid) {
-            self.acting.store(true, Ordering::SeqCst);
-            let step = (hooks.acts.step)(&self.sid, self.grace);
-            self.acting.store(false, Ordering::SeqCst);
-            ("upgrade", step)
         } else {
-            run.reset();
-            self.owns.store(false, Ordering::SeqCst);
-            return None;
+            match due() {
+                Due::Yes => {
+                    self.acting.store(true, Ordering::SeqCst);
+                    let step = (hooks.acts.step)(&self.sid, self.grace);
+                    self.acting.store(false, Ordering::SeqCst);
+                    ("upgrade", step)
+                }
+                Due::Unread(why) => {
+                    // Read nothing, moved nothing: what the upgrade owned,
+                    // its counts and what the owner sees all stand.
+                    let pause = run.unread();
+                    *self.look_at.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(Instant::now() + (hooks.pause)(pause));
+                    ring();
+                    return Some(HostStep {
+                        line: format!("upgrade step=wait:{why}"),
+                        moved: false,
+                        typed: false,
+                    });
+                }
+                Due::No => {
+                    run.reset();
+                    self.owns.store(false, Ordering::SeqCst);
+                    return None;
+                }
+            }
         };
+        run.unread = 0;
         self.owns.store(
             upgrade_drive::owns_turn_ends(&step, run.waits),
             Ordering::SeqCst,
@@ -1017,19 +1323,28 @@ impl IdleHost for WorkerIdle {
                 }
             }
         }
-        Some(format!("{what} step={step}"))
+        Some(HostStep {
+            line: format!("{what} step={step}"),
+            moved: upgrade_drive::moved(&step),
+            typed: upgrade_drive::typed(&step),
+        })
     }
 
     /// A BREAK OF THE AGENT'S OWN BACKGROUND WORK its loop offers (the owner's
     /// answer of 2026-09-26: "Busy agentic sessions get upgraded at their
     /// next natural break. The notice interrupts the agent's orchestration
-    /// once, and the restart still never kills running work"): where an
-    /// upgrade is due and no carry-on is owed, the step is taken as the
-    /// NOTICE ALONE ([`Acts::notice`]: the first notice, nothing ended) —
-    /// and, typed, the upgrade owns the session's turn ends as after any
-    /// notice. The restart, a re-ask and a carry-on stay the next idle
-    /// point's (the park is left set for it). A break that typed nothing is
-    /// looked at again after [`BACKGROUND_LOOK`].
+    /// once, and the restart still never kills running work"). Where an
+    /// upgrade is due and no carry-on is owed, the step is taken as a NOTICE
+    /// ALONE ([`Acts::notice`]). That is the first notice, or a re-ask once
+    /// `REASK_S` has passed with the work still running (a tab whose poll
+    /// loops could never end was otherwise told once and then waited on for
+    /// days). Past `MAX_ASKS` the upgrade gives up here. Nothing is ended.
+    /// Once a notice is typed, the upgrade owns the session's turn ends, as
+    /// after any notice. A last word, or a word that holds the upgrade,
+    /// releases them ([`upgrade_drive::released_at_break`]). The restart and a
+    /// carry-on stay
+    /// the next idle point's (the park is left set for it). A break that
+    /// typed nothing is looked at again after [`BACKGROUND_LOOK`].
     fn at_background(&self) -> Option<String> {
         if !upgrades(self.agent) || !self.switches.upgrade() {
             return None;
@@ -1044,7 +1359,9 @@ impl IdleHost for WorkerIdle {
         }
         *lock() = Some(Instant::now() + BACKGROUND_LOOK);
         let hooks = &self.hooks;
-        if (hooks.acts.owed)(&self.sid) || !(hooks.acts.due)(&self.sid) {
+        // Nothing read decides nothing here either: the idle point the park
+        // keeps looks again.
+        if (hooks.acts.owed)(&self.sid) || (hooks.acts.due)(&self.sid) != Due::Yes {
             return None;
         }
         self.acting.store(true, Ordering::SeqCst);
@@ -1052,6 +1369,9 @@ impl IdleHost for WorkerIdle {
         self.acting.store(false, Ordering::SeqCst);
         // What the owner sees moves with the step, typed or waiting.
         note_upgrade_act();
+        if upgrade_drive::released_at_break(&step) {
+            self.owns.store(false, Ordering::SeqCst);
+        }
         if !step.starts_with("announced:") {
             return None;
         }
@@ -1099,6 +1419,59 @@ impl IdleHost for WorkerIdle {
     /// remedy's (U1).
     fn stalled(&self, held: bool) {
         self.stalled.store(held, Ordering::SeqCst);
+    }
+
+    /// A TURN RAN since the loop's last point ([`IdleHost::turn_ran`]): the
+    /// pause the upgrade climbed was of a point that is gone, so its ladder
+    /// starts over ([`UpgradeRun::new_point`]) and the new point is looked at
+    /// as it comes, its first pause the first rung again (D3 of the live E2E
+    /// of 2026-09-26: the settle's pause climbed across the Stage-1 turn, and
+    /// the turn end after it was looked at +0.3 s, +61 s and +366 s). Its
+    /// waits in a row still count: they bound how long it owns the session's
+    /// turn ends ([`upgrade_drive::owns_turn_ends`]), which a self-waking agent must not renew.
+    /// A step that did not wait left nothing to start over.
+    fn turn_ran(&self) {
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
+        if run.same == 0 {
+            return;
+        }
+        run.new_point();
+        let pending = self
+            .look_at
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .is_some();
+        if pending {
+            self.park.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// NOBODY HAS ASKED ITS CONVERSATION ANYTHING (D1 of the live E2E of
+    /// 2026-09-26): the conversation a Claude Code holds — the kept record,
+    /// followed across an in-app `/clear` ([`follow_snapshot`]) — read through
+    /// its transcript from where the last read ended ([`Acts::tasked`]): no
+    /// prompt of a person's or an orchestrator's — the harness's own notices
+    /// and carry-ons, and what this session's own loop typed (its ledger),
+    /// being none. The turn-end policy types nothing into it. A Codex, a
+    /// conversation not registered yet and a record nobody can read are left
+    /// to the screen.
+    fn taskless(&self) -> bool {
+        if self.agent != Program::Claude {
+            return false;
+        }
+        let session = self
+            .kept
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .snapshot
+            .as_ref()
+            .and_then(|s| s.session.clone());
+        let Some(session) = session else {
+            return false;
+        };
+        let mut memo = self.tasked.lock().unwrap_or_else(PoisonError::into_inner);
+        (self.hooks.acts.tasked)(&self.sid, &session, &mut memo) == Some(false)
     }
 
     /// The loop's LIMIT EPISODE opened or closed: the live upgrade owns none
@@ -1149,11 +1522,46 @@ impl WorkerIdle {
 /// while it still describes the tab ([`follow_snapshot`]).
 fn refresh_snapshot(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks) {
     match (hooks.acts.snapshot)(sid) {
-        Some(snap) => kept.lock().unwrap_or_else(PoisonError::into_inner).snapshot = Some(snap),
+        Some(snap) => {
+            publish_snapshot(sid, Some(&snap));
+            kept.lock().unwrap_or_else(PoisonError::into_inner).snapshot = Some(snap);
+        }
         None => {
             follow_snapshot(sid, kept, hooks);
         }
     }
+}
+
+/// THE SNAPSHOTS A CRASH CANNOT TAKE (2026-09-27): every session's kept
+/// relaunch snapshot, published as it changes so the window's crash journal
+/// ([`crate::crash_journal`]) carries it — what the next launch needs to
+/// relaunch the agent in its restored tab after aterm itself ended without
+/// quitting. Keyed by session id; a leaf lock (taken after, never around,
+/// a session's [`Kept`]).
+static PUBLISHED: Mutex<Option<HashMap<String, Snapshot>>> = Mutex::new(None);
+
+/// Publish `sid`'s kept snapshot (`None`: it has none).
+fn publish_snapshot(sid: &str, snap: Option<&Snapshot>) {
+    let mut map = PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner);
+    let map = map.get_or_insert_with(HashMap::new);
+    match snap {
+        Some(snap) => {
+            map.insert(sid.to_string(), snap.clone());
+        }
+        None => {
+            map.remove(sid);
+        }
+    }
+}
+
+/// The relaunch snapshot the host keeps for session `sid`, as last
+/// published ([`publish_snapshot`]).
+pub(crate) fn published_snapshot(sid: &str) -> Option<Snapshot> {
+    PUBLISHED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+        .and_then(|m| m.get(sid).cloned())
 }
 
 /// FOLLOW the session's kept snapshot against the tab's foreground job,
@@ -1177,15 +1585,22 @@ fn follow_snapshot(sid: &str, kept: &Mutex<Kept>, hooks: &Hooks) -> bool {
         return false;
     }
     match fg {
-        Foreground::Agent => session.snapshot = Some(snap),
+        Foreground::Agent => {
+            publish_snapshot(sid, Some(&snap));
+            session.snapshot = Some(snap);
+        }
         Foreground::Shell => {}
-        Foreground::Other => session.snapshot = None,
+        Foreground::Other => {
+            publish_snapshot(sid, None);
+            session.snapshot = None;
+        }
     }
     true
 }
 
 /// The agent's exit is handled: what was read of it goes with it.
 fn forget_snapshot(job: &WorkerJob) {
+    publish_snapshot(&job.sid, None);
     with_kept(job, |k| k.snapshot = None);
 }
 
@@ -1374,6 +1789,8 @@ struct Worker {
     acting: Arc<AtomicBool>,
     /// The host's activation notices this worker was told of.
     activations: u64,
+    /// [`WorkerJob::note`]: asked at the host's wakes.
+    note: Note,
 }
 
 impl Worker {
@@ -1471,6 +1888,13 @@ struct Shared {
 /// the next policy change or resume, [`HostHandle::ensure_thread`]) before
 /// supervision stays off for the process.
 const HOST_RESTARTS: u64 = 3;
+
+/// The disk watch's period: a free-space figure has no event to hang on
+/// (design §5.5, §4.2 row 18), so this is the one timer the host keeps.
+const DISK_TICK: Duration = Duration::from_secs(6 * 3600);
+/// The first look, a while after the host starts rather than in its first
+/// breath.
+const DISK_FIRST_LOOK: Duration = Duration::from_secs(120);
 
 impl Shared {
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1613,6 +2037,49 @@ impl HostHandle {
         }
     }
 
+    /// THE AGENTS A CRASH OF ATERM TOOK (2026-09-27): the next launch
+    /// reopened their tabs (the crash journal, or a restart's quit layout),
+    /// each `(sid, snapshot)` naming its new tab and shell and what the
+    /// layout carried of its agent.
+    /// Each is relaunched there on its conversation
+    /// ([`relaunch::after_host_ended`]) on a thread of its own — never this
+    /// caller's, the event loop — while `[harness] relaunch` allows it: a
+    /// step that is not yet possible (the shell still starting) is tried
+    /// again on a growing pause, [`RESTORED_TRIES`] times at most; a
+    /// relaunch, a launch that ends there, and one that cannot be made are
+    /// journaled, never retried. A headless instance relaunches nothing.
+    pub(crate) fn relaunch_restored(&self, restored: Vec<(String, Snapshot)>) {
+        if restored.is_empty() || self.shared.headless || !self.shared.switches.relaunch() {
+            return;
+        }
+        let act = Arc::clone(&self.hooks.acts.relaunch_restored);
+        let switches = Arc::clone(&self.shared.switches);
+        let spawned = std::thread::Builder::new()
+            .name(format!("{THREAD_PREFIX}restored"))
+            .spawn(move || {
+                crate::qos::set_self(crate::qos::Role::Background);
+                for (sid, snap) in restored {
+                    let mut pause = RESTORED_FIRST_PAUSE;
+                    for _ in 0..RESTORED_TRIES {
+                        if !switches.relaunch() {
+                            return;
+                        }
+                        let step = act(&sid, &snap, switches.upgrade());
+                        match relaunch::outcome(&step) {
+                            Outcome::NotYet(_) | Outcome::Busy => {
+                                std::thread::sleep(pause);
+                                pause = (pause * 2).min(RESTORED_MAX_PAUSE);
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            aterm_log::warn!("harness: the restored tabs' agents could not be relaunched: {e}");
+        }
+    }
+
     /// A reloaded `[harness]` policy: workers restart under it, or all stop
     /// (within one wait) when it is off. The host's own switches
     /// (`upgrade`, `relaunch`) land at each worker's next act, restarting
@@ -1732,6 +2199,8 @@ struct HostState {
     forgiven_gen: u64,
     /// What the owner's view was last looked at over ([`look_at_upgrades`]).
     view: ViewLook,
+    /// When the disk watch looks next ([`look_at_disk`]).
+    disk_at: Instant,
 }
 
 /// What the host last looked at the owner's view of the upgrades over
@@ -1753,6 +2222,7 @@ fn host_loop(shared: &Shared, hooks: &Hooks) {
         held: HashMap::new(),
         forgiven_gen: shared.lock().cfg_gen,
         view: ViewLook::default(),
+        disk_at: Instant::now() + DISK_FIRST_LOOK,
     };
     let mut seen = bell_now();
     let mut timed_out = true;
@@ -1815,10 +2285,8 @@ fn host_loop(shared: &Shared, hooks: &Hooks) {
             ),
             hooks,
         );
-        let until = match (next_look, view_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
+        let disk_at = look_at_disk(&mut host.disk_at, Instant::now(), active, &wanted, hooks);
+        let until = [next_look, view_at, disk_at].into_iter().flatten().min();
         (seen, timed_out) = bell_wait(seen, until);
     }
 }
@@ -1835,6 +2303,30 @@ fn full_follow_due(
     phase_now: u64,
 ) -> bool {
     timed_out || full_before != full_now || phase_now < phase_before || phase_now - phase_before > 1
+}
+
+/// THE DISK WATCH's timer: when [`HostState::disk_at`] has come, the
+/// supervised sessions are handed to [`Hooks::disk`] and the next look is
+/// [`DISK_TICK`] on. Nothing is looked at while supervision is off or no
+/// agent session is hosted — the watch is over where the agents work — and
+/// then no instant is named. The instant to look again, if one.
+fn look_at_disk(
+    disk_at: &mut Instant,
+    now: Instant,
+    active: bool,
+    wanted: &HashMap<String, Program>,
+    hooks: &Hooks,
+) -> Option<Instant> {
+    if !active || wanted.is_empty() {
+        return None;
+    }
+    if now >= *disk_at {
+        let mut sids: Vec<String> = wanted.keys().cloned().collect();
+        sids.sort();
+        (hooks.disk)(&sids);
+        *disk_at = now + DISK_TICK;
+    }
+    Some(*disk_at)
 }
 
 /// THE OWNER'S VIEW, looked at when something it shows may have moved: a
@@ -2038,9 +2530,21 @@ fn visit_workers(
         } else if w.cfg_gen != cfg_gen {
             w.hand_over();
         }
+        // A build installed mid-session (N3): the session is behind from the
+        // notice, not from its next idle point — a busy turn's length later.
         if w.activations != activations {
             w.activations = activations;
             w.park.store(true, Ordering::SeqCst);
+            if shared.switches.upgrade() && upgrades(wanted[sid]) {
+                owe_note(&w.note, crate::upgrade_host::now_s());
+            }
+        }
+        // A note still owed — from the notice, or from the attach — asked
+        // until it decides ([`Owed`]).
+        if shared.switches.upgrade()
+            && let Some(at) = host_note(sid, &w.note, now, hooks)
+        {
+            next_look = Some(next_look.map_or(at, |n| n.min(at)));
         }
         let mut look = w.look_at.lock().unwrap_or_else(PoisonError::into_inner);
         match *look {
@@ -2112,6 +2616,7 @@ fn start_workers(
         let look_at: Arc<Mutex<Option<Instant>>> = Arc::default();
         let acting: Arc<AtomicBool> = Arc::default();
         let stalled: Arc<AtomicBool> = Arc::default();
+        let note: Note = Arc::default();
         let idle = Arc::new(WorkerIdle {
             sid: sid.clone(),
             agent: wanted[sid],
@@ -2126,6 +2631,8 @@ fn start_workers(
             run: Mutex::default(),
             owns: AtomicBool::new(false),
             background_at: Mutex::default(),
+            tasked: Mutex::default(),
+            note: Arc::clone(&note),
             clock_hold: Mutex::default(),
         });
         let job = WorkerJob {
@@ -2147,6 +2654,7 @@ fn start_workers(
             stalled,
             switches: Arc::clone(&shared.switches),
             kept,
+            note: Arc::clone(&note),
         };
         let (stop, interrupt) = (Arc::clone(&job.stop), Arc::clone(&job.interrupt));
         let handover = Arc::clone(&job.handover);
@@ -2170,6 +2678,7 @@ fn start_workers(
                     left,
                     acting,
                     activations,
+                    note,
                 },
             );
         }
@@ -2398,6 +2907,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
             // continuation at its first idle point.
             hand_back: true,
             background: false,
+            // Where each worker's loop ledgers what it types
+            // (`approvals::default_path`): its turns are no task.
+            aterm_state: aterm_agent::operator::default_state_root().ok(),
         })
     };
     let opts = Arc::new(opts);
@@ -2408,7 +2920,10 @@ fn live_acts(store: Store, sock: String) -> Acts {
         Arc::clone(&opts),
         Arc::clone(&opts),
     );
-    let (o6, o7, o8, o9, o10) = (
+    let (o6, o7, o8, o9, o10, o11, o12, o13) = (
+        Arc::clone(&opts),
+        Arc::clone(&opts),
+        Arc::clone(&opts),
         Arc::clone(&opts),
         Arc::clone(&opts),
         Arc::clone(&opts),
@@ -2417,7 +2932,10 @@ fn live_acts(store: Store, sock: String) -> Acts {
     );
     Acts {
         open: Arc::new(move |sid| open(&store, sid)),
-        due: Arc::new(move |sid| o1(sid, 0).is_some_and(|o| upgrade_drive::due(&o))),
+        due: Arc::new(move |sid| o1(sid, 0).map_or(Due::No, |o| upgrade_drive::due(&o))),
+        behind: Arc::new(move |sid, since| {
+            o11(sid, 0).map_or(Behind::Nothing, |o| upgrade_drive::note_behind(&o, since))
+        }),
         step: Arc::new(move |sid, grace| {
             let Some(o) = o2(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -2489,6 +3007,14 @@ fn live_acts(store: Store, sock: String) -> Acts {
             aterm_log::info!("harness @{sid}: {}", r.line_as("relaunch"));
             r.step
         }),
+        relaunch_restored: Arc::new(move |sid, snap, upgrade| {
+            let Some(o) = o13(sid, 0) else {
+                return "refused:no-home".to_string();
+            };
+            let r = relaunch::after_host_ended(&o, snap, upgrade);
+            aterm_log::info!("harness @{sid}: {}", r.line_as("relaunch-after-host-ended"));
+            r.step
+        }),
         restart: Arc::new(move |sid, grace, why| {
             let Some(o) = o8(sid, grace) else {
                 return "refused:no-home".to_string();
@@ -2500,9 +3026,132 @@ fn live_acts(store: Store, sock: String) -> Acts {
             );
             r.step
         }),
-        hold: Arc::new(move |sid, until| {
-            o10(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
+        tasked: Arc::new(move |sid, session, memo| {
+            let o = o10(sid, 0)?;
+            memo.of(&o.home, session, &upgrade_drive::supervisor_typed(&o, sid))
         }),
+        hold: Arc::new(move |sid, until| {
+            o12(sid, 0).is_none_or(|o| upgrade_drive::hold_clock(&o, until))
+        }),
+    }
+}
+
+/// THE DISK WATCH over the store ([`Hooks::disk`]): each look takes the
+/// supervised sessions' working directories (what their shells last reported,
+/// OSC 7) and, off the host thread and one look at a time, hands the build
+/// directories found there to `aterm_agent::harness::cli::disk_tick` — which,
+/// below `[disk] auto_free_gib` of free space on the home volume, removes the
+/// ones ON THAT VOLUME stale by both their clocks and laid by a build tool
+/// (one on another volume would free nothing there), and journals each
+/// removal with its witness in `<harness state>/disk.jsonl`. Above the floor
+/// it reads the config and the free figure and nothing else.
+fn live_disk(store: Store) -> Arc<DiskFn> {
+    static LOOKING: AtomicBool = AtomicBool::new(false);
+    Arc::new(move |sids: &[String]| {
+        let cwds = working_dirs(&store, sids);
+        if LOOKING.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name(format!("{THREAD_PREFIX}disk"))
+            .spawn(move || {
+                disk_look(&cwds);
+                LOOKING.store(false, Ordering::SeqCst);
+            });
+        if let Err(e) = spawned {
+            LOOKING.store(false, Ordering::SeqCst);
+            aterm_log::warn!("harness disk watch could not start: {e}");
+        }
+    })
+}
+
+/// The working directories `sids` last reported, each once.
+fn working_dirs(store: &Store, sids: &[String]) -> Vec<std::path::PathBuf> {
+    use crate::cwd_native::ReportedCwd as _;
+    let handles: Vec<_> = {
+        let g = store.read().unwrap_or_else(PoisonError::into_inner);
+        sids.iter()
+            .filter_map(|sid| g.by_sid(&aterm_session::SessionId::new(sid)).cloned())
+            .collect()
+    };
+    let mut dirs: Vec<std::path::PathBuf> = handles
+        .iter()
+        .filter_map(|h| {
+            let t = h.term.try_lock().ok()?;
+            t.native_working_directory()
+                .filter(|c| !c.is_empty())
+                .map(|c| std::path::PathBuf::from(c.into_owned()))
+        })
+        .filter(|p| p.is_absolute())
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// The build directories directly under `dir`: its `target`, `target-<x>` and
+/// `target.<x>` (`target.noindex`) children that are real directories (a link is not
+/// followed: removing through one would take the link and leave the tree).
+/// Whether each is a stale build directory is `disk_tick`'s witness to find.
+fn build_dirs_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out: Vec<std::path::PathBuf> = read
+        .flatten()
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| {
+                n == "target" || n.starts_with("target-") || n.starts_with("target.")
+            })
+        })
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    out.sort();
+    out
+}
+
+/// One look of the disk watch over `cwds` (off the host thread).
+fn disk_look(cwds: &[std::path::PathBuf]) {
+    let (Some(home), Some(state)) = (aterm_primer::home_dir(), harness_state()) else {
+        return;
+    };
+    let config =
+        aterm_agent::harness::cli::disk_config_at(crate::app_config::config_path().as_deref());
+    let free = atpkg::freespace::available_bytes(&home);
+    if !config.below_auto_floor(free) {
+        return;
+    }
+    let targets: Vec<std::path::PathBuf> = cwds.iter().flat_map(|d| build_dirs_under(d)).collect();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let transcripts = home.join(".claude").join("projects");
+    let look = aterm_agent::harness::cli::DiskLook {
+        state: &state,
+        volume: &home,
+        free,
+        targets: &targets,
+        transcripts: Some(&transcripts),
+        now,
+    };
+    let tick = aterm_agent::harness::cli::disk_tick(
+        &look,
+        config,
+        &mut aterm_agent::harness::disk::remove_tree,
+    );
+    if let aterm_agent::harness::cli::DiskTick::Reclaimed(done) = tick
+        && !done.removed.is_empty()
+    {
+        aterm_log::info!(
+            "harness disk watch: below {} GiB free, removed {} stale build director{} ({}); \
+             each row is in {}",
+            config.auto_free_gib,
+            done.removed.len(),
+            if done.removed.len() == 1 { "y" } else { "ies" },
+            aterm_agent::harness::disk::human_bytes(done.freed_bytes),
+            state.join(aterm_agent::harness::cli::DISK_LEDGER).display(),
+        );
     }
 }
 
@@ -2520,24 +3169,23 @@ pub(crate) fn harness_state() -> Option<std::path::PathBuf> {
 }
 
 /// THE OWNER'S VIEW over this instance's own socket ([`Hooks::upgrade_view`],
-/// [`upgrade_drive::View`]): its rows handed to the window as
-/// `Wake::AgentUpgrade` through `proxy` (none headless, where no window
-/// shows them — the tabs' marks are still raised). No home or no state
-/// directory: nothing is ever recorded, so nothing is shown.
-fn live_view(
-    sock: String,
-    proxy: Option<winit::event_loop::EventLoopProxy<crate::Wake>>,
-) -> Arc<ViewFn> {
+/// [`upgrade_drive::View`]): its rows handed to the app as
+/// `Wake::AgentUpgrade` through `proxy` — a headless instance's too, whose
+/// loop applies them the same way: each tab's `upgrade=` on `status` and
+/// `sessions`, the records and the stalled rows in its message log (D6 of the
+/// live E2E of 2026-09-26: headless, the column read `-` for every tab the
+/// upgrade was moving, and `aterm help harness` made no headless exception).
+/// No home or no state directory: nothing is ever recorded, so nothing is
+/// shown.
+fn live_view(sock: String, proxy: winit::event_loop::EventLoopProxy<crate::Wake>) -> Arc<ViewFn> {
     let place = aterm_primer::home_dir().zip(harness_state());
     let view = Mutex::new(upgrade_drive::View::default());
     Arc::new(move |look| {
         let mut view = view.lock().unwrap_or_else(PoisonError::into_inner);
         let mut hand = |rows: &[upgrade_drive::Row]| {
-            if let Some(proxy) = &proxy {
-                let _ = proxy.send_event(crate::Wake::AgentUpgrade {
-                    rows: rows.to_vec(),
-                });
-            }
+            let _ = proxy.send_event(crate::Wake::AgentUpgrade {
+                rows: rows.to_vec(),
+            });
         };
         if !look {
             view.stand_down(&mut hand);
@@ -2554,6 +3202,7 @@ fn live_view(
                 human_grace_s: 0,
                 hand_back: true,
                 background: false,
+                aterm_state: None,
             },
             &mut hand,
         )
@@ -2595,17 +3244,17 @@ fn spawn_activation_wake(host: HostHandle) {
 }
 
 /// The production host: this process's store, its own control socket,
-/// atpkg's activation notice and the owner's word, and the window (`proxy`)
-/// the owner's view of the upgrades is handed to.
+/// atpkg's activation notice and the owner's word, and the app loop
+/// (`proxy`, headless or not) the owner's view of the upgrades is handed to.
 pub(crate) fn start_default(
     store: Store,
     sock: String,
     cfg: SupervisorConfig,
     headless: bool,
     suspended: bool,
-    proxy: Option<winit::event_loop::EventLoopProxy<crate::Wake>>,
+    proxy: winit::event_loop::EventLoopProxy<crate::Wake>,
 ) -> HostHandle {
-    let (s1, s2, s3) = (store.clone(), store.clone(), store);
+    let (s1, s2, s3, s4) = (store.clone(), store.clone(), store.clone(), store);
     let (k1, k2, k3, k4) = (sock.clone(), sock.clone(), sock.clone(), sock);
     let host = HostHandle::start(
         cfg,
@@ -2621,6 +3270,7 @@ pub(crate) fn start_default(
             backoff: Arc::new(restart_backoff),
             pause: Arc::new(|pause| pause),
             upgrade_view: live_view(k4, proxy),
+            disk: live_disk(s4),
         },
     );
     spawn_activation_wake(host.clone());
@@ -2764,15 +3414,8 @@ mod tests {
             opts.journal.as_deref(),
             Some(dir.join("drive").join("s-0123.journal.jsonl").as_path())
         );
-        // The ledger beside it, under the SAME root: the host names both,
-        // so the loop never reaches for the process's own state directory.
-        assert_eq!(
-            opts.ledger.as_deref(),
-            Some(dir.join("drive").join("s-0123.jsonl").as_path())
-        );
         assert_eq!(opts.policy, cfg);
-        let none = hosted_opts(&cfg, "s-0123", None);
-        assert_eq!((none.journal, none.ledger), (None, None));
+        assert_eq!(hosted_opts(&cfg, "s-0123", None).journal, None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2883,6 +3526,7 @@ mod tests {
             backoff: Arc::new(quick_backoff),
             pause: Arc::new(quick_pause),
             upgrade_view: Arc::new(|_| None),
+            disk: Arc::new(|_| {}),
         }
     }
 
@@ -2893,7 +3537,8 @@ mod tests {
         fn inert() -> Self {
             Acts {
                 open: Arc::new(|_| false),
-                due: Arc::new(|_| false),
+                due: Arc::new(|_| Due::No),
+                behind: Arc::new(|_, _| Behind::Nothing),
                 step: Arc::new(|_, _| "current".to_string()),
                 notice: Arc::new(|_, _| "current".to_string()),
                 owed: Arc::new(|_| false),
@@ -2903,7 +3548,9 @@ mod tests {
                 status: Arc::new(|_| None),
                 exit_look: Arc::new(|_, _| None),
                 relaunch: Arc::new(|_, _, _, _, _, _| "refused:inert".to_string()),
+                relaunch_restored: Arc::new(|_, _, _| "refused:inert".to_string()),
                 restart: Arc::new(|_, _, _| "refused:inert".to_string()),
+                tasked: Arc::new(|_, _, _| None),
                 hold: Arc::new(|_, _| true),
             }
         }
@@ -2941,6 +3588,56 @@ mod tests {
         c
     }
 
+    /// THE RESTORED TABS' AGENTS (2026-09-27): each `(tab, snapshot)` a cold
+    /// restore of the live layout hands the host is relaunched there by the
+    /// host's own act, off the caller's thread, once for a relaunch that
+    /// lands. NEGATIVE CONTROLS: `[harness] relaunch = false` relaunches
+    /// nothing, and neither does a headless instance.
+    #[test]
+    fn a_restored_tabs_agent_is_relaunched_while_relaunch_is_on() {
+        let snap = |tab: &str| Snapshot {
+            tab: tab.to_string(),
+            pid: 4242,
+            start: "Sat Sep 27 01:02:03 2026".to_string(),
+            shell: 4343,
+            program: std::path::PathBuf::from("/opt/claude/bin/claude"),
+            argv: vec!["/opt/claude/bin/claude".to_string()],
+            session: Some("0b6f3c1e-8a4d-4b61-9d52-7f1e2c3a4b5c".to_string()),
+            cwd: "/".to_string(),
+            version: None,
+        };
+        let run = |cfg: SupervisorConfig, headless: bool| {
+            let world = Arc::new(World::default());
+            let seen: Arc<Mutex<Vec<String>>> = Arc::default();
+            let mut h = hooks(&world, parking_body(&world));
+            let s = Arc::clone(&seen);
+            h.acts.relaunch_restored = Arc::new(move |sid, snap, _| {
+                assert_eq!(snap.tab, sid);
+                s.lock().unwrap().push(sid.to_string());
+                "adopted".to_string()
+            });
+            let host = HostHandle::start(cfg, headless, false, h);
+            host.relaunch_restored(vec![
+                ("s-a".to_string(), snap("s-a")),
+                ("s-b".to_string(), snap("s-b")),
+            ]);
+            (host, seen)
+        };
+        let (_host, seen) = run(on(), false);
+        until("both relaunched", || seen.lock().unwrap().len() == 2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(*seen.lock().unwrap(), ["s-a", "s-b"], "once each");
+
+        let mut limited = on();
+        limited.set("relaunch", "false").unwrap();
+        let (_host, seen) = run(limited, false);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(seen.lock().unwrap().is_empty(), "relaunch = false");
+        let (_host, seen) = run(on(), true);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(seen.lock().unwrap().is_empty(), "headless");
+    }
+
     #[test]
     fn config_off_runs_no_host_and_no_workers() {
         let world = Arc::new(World::default());
@@ -2956,10 +3653,89 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// A headless instance supervises what it hosts by default (the owner's
-    /// rule: every session aterm hosts), and `[harness] headless = false`
-    /// takes that away. NEGATIVE CONTROL: the same limit in a windowed
-    /// instance changes nothing.
+    /// THE DISK WATCH'S ONE TIMER ([`look_at_disk`]): nothing is handed
+    /// over before its instant, then the supervised sessions once, and the
+    /// next look is a [`DISK_TICK`] on. NEGATIVE CONTROLS: with supervision
+    /// off, or no agent session hosted, nothing is looked at and no instant
+    /// is named (the host parks on its bell alone).
+    #[test]
+    fn the_disk_watch_looks_once_per_tick_over_the_supervised_sessions() {
+        let world = Arc::new(World::default());
+        let looks: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+        let l = Arc::clone(&looks);
+        let hooks = Hooks {
+            disk: Arc::new(move |sids| l.lock().unwrap().push(sids.to_vec())),
+            ..hooks(&world, parking_body(&world))
+        };
+        let t0 = Instant::now();
+        let mut at = t0 + DISK_FIRST_LOOK;
+        let two: HashMap<String, Program> = [
+            ("s-b".to_string(), Program::Codex),
+            ("s-a".to_string(), Program::Claude),
+        ]
+        .into();
+
+        assert_eq!(look_at_disk(&mut at, t0, true, &two, &hooks), Some(at));
+        assert!(looks.lock().unwrap().is_empty(), "not before its instant");
+        let due = t0 + DISK_FIRST_LOOK;
+        assert_eq!(
+            look_at_disk(&mut at, due, true, &two, &hooks),
+            Some(due + DISK_TICK)
+        );
+        assert_eq!(
+            *looks.lock().unwrap(),
+            [vec!["s-a".to_string(), "s-b".to_string()]]
+        );
+        assert_eq!(
+            look_at_disk(&mut at, due + Duration::from_secs(60), true, &two, &hooks),
+            Some(due + DISK_TICK),
+            "one look per tick"
+        );
+        assert_eq!(looks.lock().unwrap().len(), 1);
+
+        let late = due + DISK_TICK * 2;
+        assert_eq!(look_at_disk(&mut at, late, false, &two, &hooks), None);
+        assert_eq!(
+            look_at_disk(&mut at, late, true, &HashMap::new(), &hooks),
+            None
+        );
+        assert_eq!(looks.lock().unwrap().len(), 1, "off, or nothing hosted");
+    }
+
+    /// Where the disk watch looks under an agent's working directory: its
+    /// build-directory children that are real directories. A file, a link (removing
+    /// through it would take the link and leave the tree) and another name
+    /// are not candidates; nor is a directory the watch cannot read. Unix-pinned:
+    /// the link case needs `std::os::unix::fs::symlink`.
+    #[cfg(unix)]
+    #[test]
+    fn the_disk_watch_takes_the_real_target_directories_under_a_cwd() {
+        let dir = std::env::temp_dir().join(format!("aterm-disk-under-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for d in [
+            "target",
+            "target-tippy",
+            "target.noindex",
+            "src",
+            "targetless/x",
+        ] {
+            std::fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        std::fs::write(dir.join("target-notes.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("target-link")).unwrap();
+        let found: Vec<String> = build_dirs_under(&dir)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            found,
+            ["target", "target-tippy", "target.noindex"],
+            "every real `target`, `target-<x>` and `target.<x>` directory, and nothing else"
+        );
+        assert!(build_dirs_under(&dir.join("absent")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// THE OWNER'S VIEW IS LOOKED AT WHEN SOMETHING IT SHOWS MAY HAVE MOVED
     /// ([`look_at_upgrades`]), and at the instant it names — never on a timer:
     /// the first look, a worker's act, an activation notice or the owner's
@@ -3022,6 +3798,10 @@ mod tests {
         assert_eq!(taken(), [true], "back on");
     }
 
+    /// A headless instance supervises what it hosts by default (the owner's
+    /// rule: every session aterm hosts), and `[harness] headless = false`
+    /// takes that away. NEGATIVE CONTROL: the same limit in a windowed
+    /// instance changes nothing.
     #[test]
     fn a_headless_instance_runs_a_host_unless_the_policy_limits_it() {
         let world = Arc::new(World::default());
@@ -3118,6 +3898,7 @@ mod tests {
                 s
             },
             kept: Arc::default(),
+            note: Arc::default(),
         };
         let codex = job(Program::Codex);
         attach(&codex, &hooks);
@@ -3715,6 +4496,20 @@ mod tests {
         runs: AtomicUsize,
         parks: AtomicUsize,
         due: AtomicBool,
+        /// What the upgrade reads of the session ([`Acts::due`]), in turn;
+        /// once spent, [`Self::due`] says.
+        due_says: Mutex<VecDeque<Due>>,
+        /// The step each idle point's look journaled (`HOST <line>`).
+        idle_said: Mutex<Vec<String>>,
+        /// The times the session was noted behind ([`Acts::behind`]).
+        behinds: AtomicUsize,
+        /// The second each note was asked with, and the steps taken before
+        /// it.
+        behind_since: Mutex<Vec<(u64, usize)>>,
+        /// The loop reaches no idle point: the agent's first turn runs.
+        busy: AtomicBool,
+        /// What each note answers, in turn; `Noted` once spent.
+        behind_says: Mutex<VecDeque<Behind>>,
         /// The steps the upgrade answers, in turn; `current` once spent.
         steps: Mutex<VecDeque<&'static str>>,
         stepped: AtomicUsize,
@@ -3768,6 +4563,17 @@ mod tests {
         noticed: AtomicUsize,
         /// What the host said at each break it acted at.
         break_said: Mutex<Vec<String>>,
+        /// What the conversation's record says of its task (`None`: nobody
+        /// can say), and each conversation it was asked about.
+        tasked: Mutex<Option<bool>>,
+        tasked_asked: Mutex<Vec<String>>,
+        /// What the worker's loop last read of [`IdleHost::taskless`].
+        taskless_seen: Mutex<Option<bool>>,
+        /// The loop says a turn ran ([`IdleHost::turn_ran`]) after every
+        /// step it takes: the session was busy between the looks.
+        turns_between: AtomicBool,
+        /// Every pause the host was asked to wait out, as named.
+        pauses: Mutex<Vec<Duration>>,
         /// Claude's own record of the agent that left is gone: removed by its
         /// exit, or by another Claude Code's start.
         record_gone: AtomicBool,
@@ -3809,7 +4615,7 @@ mod tests {
             let (w1, w2, w3, w4) = (w(self), w(self), w(self), w(self));
             let (a1, a2, a3, a4, a5, a6) = (w(self), w(self), w(self), w(self), w(self), w(self));
             let (a7, a8, a9, a10, a11) = (w(self), w(self), w(self), w(self), w(self));
-            let (a12, a13) = (w(self), w(self));
+            let (a12, a13, a14, a15) = (w(self), w(self), w(self), w(self));
             Hooks {
                 roster: Arc::new(move || {
                     w1.roster
@@ -3830,6 +4636,7 @@ mod tests {
                         }
                         if let Some(host) = job.opts.idle_host.as_ref() {
                             host.stalled(w3.stall_held.load(Ordering::SeqCst));
+                            *w3.taskless_seen.lock().unwrap() = Some(host.taskless());
                         }
                         if let Some(host) = job.opts.idle_host.as_ref()
                             && w3.ask_restart.swap(false, Ordering::SeqCst)
@@ -3846,10 +4653,19 @@ mod tests {
                                     owns.push(host.owns_turn_end());
                                 }
                             }
-                        } else if let Some(host) = job.opts.idle_host.as_ref().filter(|h| h.wants())
+                        } else if let Some(host) = job
+                            .opts
+                            .idle_host
+                            .as_ref()
+                            .filter(|h| h.wants() && !w3.busy.load(Ordering::SeqCst))
                         {
                             w3.parks.fetch_add(1, Ordering::SeqCst);
-                            let _ = host.at_idle();
+                            if let Some(said) = host.at_idle() {
+                                w3.idle_said.lock().unwrap().push(said.line);
+                            }
+                            if w3.turns_between.load(Ordering::SeqCst) {
+                                host.turn_ran();
+                            }
                             if let Some(owns) = w3.owns_seen.lock().unwrap().as_mut() {
                                 owns.push(host.owns_turn_end());
                             }
@@ -3863,7 +4679,27 @@ mod tests {
                 claim_epoch: Arc::new(|| 0),
                 acts: Acts {
                     open: Arc::new(move |sid| a1.open.lock().unwrap().contains(sid)),
-                    due: Arc::new(move |_| a2.due.load(Ordering::SeqCst)),
+                    due: Arc::new(move |_| {
+                        a2.due_says.lock().unwrap().pop_front().unwrap_or(
+                            if a2.due.load(Ordering::SeqCst) {
+                                Due::Yes
+                            } else {
+                                Due::No
+                            },
+                        )
+                    }),
+                    behind: Arc::new(move |_, since| {
+                        a15.behinds.fetch_add(1, Ordering::SeqCst);
+                        a15.behind_since
+                            .lock()
+                            .unwrap()
+                            .push((since, a15.stepped.load(Ordering::SeqCst)));
+                        a15.behind_says
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or(Behind::Noted)
+                    }),
                     owed: Arc::new(move |_| a8.owed.load(Ordering::SeqCst)),
                     resume: Arc::new(move |_, _| {
                         a9.carried.fetch_add(1, Ordering::SeqCst);
@@ -3939,6 +4775,7 @@ mod tests {
                             record,
                         })
                     }),
+                    relaunch_restored: Arc::new(|_, _, _| "refused:inert".to_string()),
                     relaunch: Arc::new(move |sid, _, snap, left, upgrade, stalled| {
                         assert_eq!(snap.tab, sid, "the snapshot of the session that left");
                         a5.exit_records.lock().unwrap().push(left.word());
@@ -3985,13 +4822,22 @@ mod tests {
                         }
                         step.to_string()
                     }),
+                    tasked: Arc::new(move |_, session, _| {
+                        let mut asked = a14.tasked_asked.lock().unwrap();
+                        if !asked.iter().any(|c| c == session) {
+                            asked.push(session.to_string());
+                        }
+                        *a14.tasked.lock().unwrap()
+                    }),
                     hold: Arc::new(|_, _| true),
                 },
                 backoff: Arc::new(quick_backoff),
-                // The relaunch's back-off (a second or more; the look at an
-                // exit waits in steps of 25 ms) is when another Claude Code
-                // may start and remove the dead agent's record.
+                // Every pause is recorded as named. The relaunch's back-off
+                // (a second or more; the look at an exit waits in steps of
+                // 25 ms) is when another Claude Code may start and remove the
+                // dead agent's record.
                 pause: Arc::new(move |pause| {
+                    a13.pauses.lock().unwrap().push(pause);
                     if pause >= relaunch::BACKOFF[0] && a13.sweep_in_backoff.load(Ordering::SeqCst)
                     {
                         a13.record_gone.store(true, Ordering::SeqCst);
@@ -3999,6 +4845,7 @@ mod tests {
                     quick_pause(pause)
                 }),
                 upgrade_view: Arc::new(|_| None),
+                disk: Arc::new(|_| {}),
             }
         }
     }
@@ -4021,7 +4868,7 @@ mod tests {
         let (l1, l2, r1) = (Arc::clone(&log), Arc::clone(&log), Arc::clone(&refuse));
         let mut hooks = hooks(&world, parking_body(&world));
         hooks.acts = Acts {
-            due: Arc::new(|_| true),
+            due: Arc::new(|_| Due::Yes),
             step: Arc::new(move |_, _| {
                 l1.lock().unwrap().push("step".to_string());
                 "announced:1".to_string()
@@ -4049,11 +4896,16 @@ mod tests {
             run: Mutex::default(),
             owns: AtomicBool::new(false),
             background_at: Mutex::default(),
+            tasked: Mutex::default(),
+            note: Arc::default(),
             clock_hold: Mutex::default(),
         };
         let taken = || std::mem::take(&mut *log.lock().unwrap());
         let idle = host(Program::Claude);
-        assert_eq!(idle.at_idle().as_deref(), Some("upgrade step=announced:1"));
+        assert_eq!(
+            idle.at_idle().map(|s| s.line).as_deref(),
+            Some("upgrade step=announced:1")
+        );
         assert!(idle.owns_turn_end(), "the notice owns the turn ends");
         assert_eq!(taken(), ["step"], "no stamp, no hold");
 
@@ -4138,13 +4990,376 @@ mod tests {
         host.shutdown_and_join();
     }
 
+    /// N3 OF THE LIVE RE-TEST OF 2026-09-26: A SESSION BEHIND AS ITS WORKER
+    /// ATTACHES IS BEHIND FROM THEN. The worker notes it ([`Acts::behind`]:
+    /// its upgrade state minted with its age from now) at attach, before
+    /// its loop's first idle point — which, after a busy first turn, came
+    /// minutes later, and the column read `-` until it. Claude Code and
+    /// Codex alike (the Codex worker returned before it until the review of
+    /// the N3 fix). NEGATIVE CONTROLS: nothing due, and `[harness] upgrade =
+    /// false`, note nothing.
+    #[test]
+    fn a_session_behind_at_attach_is_noted_behind_then() {
+        for (agent, due, upgrade, want) in [
+            (Program::Claude, true, true, 1),
+            (Program::Codex, true, true, 1),
+            (Program::Claude, false, true, 0),
+            (Program::Claude, true, false, 0),
+            (Program::Codex, true, false, 0),
+        ] {
+            let a = Arc::new(Acting::default());
+            a.set(&[("s-n", agent)]);
+            a.due.store(due, Ordering::SeqCst);
+            let mut cfg = on();
+            if !upgrade {
+                cfg.set("upgrade", "false").unwrap();
+            }
+            let host = HostHandle::start(cfg, false, false, a.hooks());
+            until("attached", || a.runs.load(Ordering::SeqCst) == 1);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(
+                a.behinds.load(Ordering::SeqCst),
+                want,
+                "{agent:?}, due {due}, upgrade {upgrade}"
+            );
+            host.shutdown_and_join();
+        }
+    }
+
+    /// N3 AS THE RE-TEST OF 155c72a28 FOUND IT: A FRESH LAUNCH. The worker
+    /// attaches before Claude Code has written its record (there 1.2 s
+    /// before it), so the upgrade cannot be read yet, and the agent's first
+    /// turn runs — no idle point for a minute or more. The note behind is
+    /// owed from the attach and asked again until the record reads: noted
+    /// BEFORE the first idle point, with the attach's second — every ask
+    /// carries it — and the upgrade's step is taken at that idle point. (The
+    /// first cut asked once, at the attach, only when due read `true`; its
+    /// host test stubbed that `true`, and live the column read `-` until the
+    /// first step.)
+    #[test]
+    fn a_fresh_launch_is_behind_from_its_attach_once_its_record_reads() {
+        for agent in [Program::Claude, Program::Codex] {
+            let a = Arc::new(Acting::default());
+            a.busy.store(true, Ordering::SeqCst);
+            *a.due_says.lock().unwrap() = [Due::Unread(upgrade_drive::UNREAD_RECORD)].into();
+            a.due.store(true, Ordering::SeqCst);
+            *a.behind_says.lock().unwrap() = [
+                Behind::Unread(upgrade_drive::UNREAD_RECORD),
+                Behind::Unread(upgrade_drive::UNREAD_RECORD),
+            ]
+            .into();
+            *a.steps.lock().unwrap() = ["announced:1"].into();
+            let before = crate::upgrade_host::now_s();
+            a.set(&[("s-f", agent)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("noted, the record read", || {
+                a.behinds.load(Ordering::SeqCst) == 3
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(a.behinds.load(Ordering::SeqCst), 3, "{agent:?}: decided");
+            assert_eq!(
+                a.parks.load(Ordering::SeqCst),
+                0,
+                "{agent:?}: before the first idle point"
+            );
+            let asked = a.behind_since.lock().unwrap().clone();
+            let since = asked[0].0;
+            assert!(
+                (before..=crate::upgrade_host::now_s()).contains(&since),
+                "{agent:?}: the attach's second"
+            );
+            assert!(
+                asked.iter().all(|&(s, stepped)| s == since && stepped == 0),
+                "{agent:?}: {asked:?}"
+            );
+            // The first turn ends: the idle point takes the upgrade's step.
+            a.busy.store(false, Ordering::SeqCst);
+            until("the step", || a.stepped.load(Ordering::SeqCst) >= 1);
+            host.shutdown_and_join();
+        }
+    }
+
+    /// N3 PAST THE HOST'S LADDER: a record still unread when the ladder is
+    /// spent is asked at the loop's idle point, BEFORE its step, with the
+    /// attach's second — so the step finds the state minted with its age from
+    /// the attach, not its own. NEGATIVE CONTROL: a note that reads nothing
+    /// to note is not asked again, and one with nothing due at the attach is
+    /// never owed.
+    #[test]
+    fn a_note_the_ladder_could_not_read_is_asked_at_the_idle_point_before_the_step() {
+        let a = Arc::new(Acting::default());
+        a.busy.store(true, Ordering::SeqCst);
+        *a.due_says.lock().unwrap() = [Due::Unread(upgrade_drive::UNREAD_SOCKET)].into();
+        a.due.store(true, Ordering::SeqCst);
+        *a.behind_says.lock().unwrap() =
+            [Behind::Unread(upgrade_drive::UNREAD_SOCKET); 1 + NOTE_AGAIN.len()].into();
+        a.set(&[("s-l", Program::Claude)]);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("the ladder spent", || {
+            a.behinds.load(Ordering::SeqCst) == 1 + NOTE_AGAIN.len()
+        });
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            a.behinds.load(Ordering::SeqCst),
+            1 + NOTE_AGAIN.len(),
+            "not asked again by the host"
+        );
+        a.busy.store(false, Ordering::SeqCst);
+        until("the step", || a.stepped.load(Ordering::SeqCst) >= 1);
+        let asked = a.behind_since.lock().unwrap().clone();
+        let (since, _) = asked[0];
+        assert_eq!(
+            asked[1 + NOTE_AGAIN.len()..],
+            [(since, 0)],
+            "asked once more at the idle point, before the step, with the attach's second"
+        );
+        host.shutdown_and_join();
+        // NEGATIVE CONTROLS.
+        for (at_attach, says, want) in [
+            (
+                Due::Unread(upgrade_drive::UNREAD_RECORD),
+                Behind::Nothing,
+                1,
+            ),
+            (Due::No, Behind::Noted, 0),
+        ] {
+            let a = Arc::new(Acting::default());
+            a.busy.store(true, Ordering::SeqCst);
+            *a.due_says.lock().unwrap() = [at_attach].into();
+            *a.behind_says.lock().unwrap() = [says].into();
+            a.set(&[("s-c", Program::Claude)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("attached", || a.runs.load(Ordering::SeqCst) == 1);
+            std::thread::sleep(Duration::from_millis(80));
+            assert_eq!(a.behinds.load(Ordering::SeqCst), want, "{at_attach:?}");
+            host.shutdown_and_join();
+        }
+    }
+
+    /// N3, MID-SESSION (the review of the N3 fix): A BUILD INSTALLED WHILE A
+    /// SESSION RUNS makes it behind FROM THE ACTIVATION NOTICE — the common
+    /// case, which the note at attach alone left reading `-` until the
+    /// session's next idle point, a busy turn's length later. The host notes
+    /// each worker's session behind at the notice ([`Acts::behind`]),
+    /// Claude Code and Codex alike; a step holding the state's lock
+    /// ([`Behind::Busy`]) is asked again after a pause, and a note that
+    /// minted or found nothing to mint is not asked again. NEGATIVE
+    /// CONTROLS: nothing is noted before the notice (nothing due at
+    /// attach), and under `[harness] upgrade = false` the notice notes
+    /// nothing.
+    #[test]
+    fn a_build_installed_mid_session_is_noted_behind_at_its_notice() {
+        for agent in [Program::Claude, Program::Codex] {
+            let a = Arc::new(Acting::default());
+            a.set(&[("s-m", agent)]);
+            *a.behind_says.lock().unwrap() = [Behind::Busy, Behind::Noted].into();
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("attached", || a.runs.load(Ordering::SeqCst) == 1);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(a.behinds.load(Ordering::SeqCst), 0, "{agent:?}");
+            host.note_activation();
+            until("noted, once the lock is let go", || {
+                a.behinds.load(Ordering::SeqCst) == 2
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(
+                a.behinds.load(Ordering::SeqCst),
+                2,
+                "{agent:?}: noted, not asked again"
+            );
+            *a.behind_says.lock().unwrap() = [Behind::Nothing].into();
+            host.note_activation();
+            until("asked at the next notice", || {
+                a.behinds.load(Ordering::SeqCst) == 3
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert_eq!(a.behinds.load(Ordering::SeqCst), 3, "{agent:?}");
+            let mut no_upgrade = on();
+            no_upgrade.set("upgrade", "false").unwrap();
+            host.set_config(no_upgrade);
+            let parks = a.parks.load(Ordering::SeqCst);
+            host.note_activation();
+            until("parked", || a.parks.load(Ordering::SeqCst) > parks);
+            std::thread::sleep(Duration::from_millis(30));
+            assert_eq!(a.behinds.load(Ordering::SeqCst), 3, "{agent:?}: off");
+            host.shutdown_and_join();
+        }
+    }
+
+    /// A LOOK THAT CANNOT READ THE SESSION IS A WAIT, NEVER "NOTHING TO TAKE"
+    /// (the live re-test of 155c72a28, 2026-09-26: every control lane held,
+    /// the looks' `who` was refused, `due` read `false`, and four of seven
+    /// sessions were let go for good, nothing journaled). Read so at attach
+    /// (a launch whose record is not written yet) the loop is parked all the
+    /// same; read so at an idle point the look is journaled `upgrade
+    /// step=wait:no-socket` and taken again on the unread ladder's first
+    /// rung ([`UNREAD_LOOK`]) — and the step is taken there once the session
+    /// reads due. Claude Code and Codex alike.
+    #[test]
+    fn a_look_that_cannot_read_the_session_looks_again_and_steps_once_it_can() {
+        for agent in [Program::Claude, Program::Codex] {
+            let a = Arc::new(Acting::default());
+            *a.due_says.lock().unwrap() = [
+                Due::Unread(upgrade_drive::UNREAD_RECORD),
+                Due::Unread(upgrade_drive::UNREAD_SOCKET),
+            ]
+            .into();
+            a.due.store(true, Ordering::SeqCst);
+            *a.steps.lock().unwrap() = ["done"].into();
+            a.set(&[("s-r", agent)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            // The line is journaled once `at_idle` returns, after its step.
+            until("the step at the later look, journaled", || {
+                a.idle_said.lock().unwrap().len() >= 2
+            });
+            assert_eq!(
+                a.idle_said.lock().unwrap()[..2],
+                ["upgrade step=wait:no-socket", "upgrade step=done"],
+                "{agent:?}"
+            );
+            assert!(
+                a.pauses.lock().unwrap().contains(&UNREAD_LOOK[0]),
+                "{agent:?}: looked at again on the unread ladder's first rung"
+            );
+            host.shutdown_and_join();
+        }
+    }
+
+    /// A SESSION THAT ANSWERED READY IS NEVER ABANDONED FOR A LOOK THAT
+    /// COULD NOT READ IT (the same re-test: a tab left over eight minutes
+    /// after its READY to "aterm will restart this Claude Code"). The look
+    /// after the READY is refused: journaled, looked at again — the upgrade
+    /// still owning the session's turn ends, since it read nothing to let
+    /// them go — and the restart is taken at the next look.
+    #[test]
+    fn a_session_that_answered_ready_is_restarted_after_a_look_that_could_not_read_it() {
+        let a = Arc::new(Acting::default());
+        *a.due_says.lock().unwrap() = [
+            Due::Yes,
+            Due::Yes,
+            Due::Unread(upgrade_drive::UNREAD_SOCKET),
+            Due::Yes,
+        ]
+        .into();
+        *a.steps.lock().unwrap() = ["announced:1", "adopted"].into();
+        *a.owns_seen.lock().unwrap() = Some(Vec::new());
+        a.set(&[("s-y", Program::Claude)]);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("the restart, journaled", || {
+            a.idle_said.lock().unwrap().len() >= 3
+        });
+        assert_eq!(
+            a.idle_said.lock().unwrap()[..3],
+            [
+                "upgrade step=announced:1",
+                "upgrade step=wait:no-socket",
+                "upgrade step=adopted"
+            ]
+        );
+        assert_eq!(
+            a.owns_seen.lock().unwrap().as_deref().map(|o| &o[..2]),
+            Some(&[true, true][..]),
+            "the READY answer's turn ends stay the upgrade's through the unread look"
+        );
+        host.shutdown_and_join();
+    }
+
+    /// A LOOK WHOSE READ FAILED IS NO WAIT OF THE STEP'S (the review of the
+    /// silent-drop fix): its own short ladder ([`UNREAD_LOOK`]: 5 s, 15 s,
+    /// 30 s, a minute), never the step's ([`upgrade_drive::LATER`]: 20 s,
+    /// 60 s, 300 s, 600 s — a 90 s lane outage left a READY'd session idle
+    /// until +380 s), and none of the step's waits spent: those bound how
+    /// long the upgrade owns a READY'd session's turn ends while its
+    /// background work drains ([`upgrade_drive::OWNED_BACKGROUND_LOOKS`]), and four refused
+    /// looks after the READY used them all up, so the drain after them owned
+    /// nothing. NEGATIVE CONTROL: the step's own waits after them climb the
+    /// step's ladder from its first rung, and still bound the hold.
+    #[test]
+    fn unread_looks_climb_their_own_short_ladder_and_spend_none_of_the_steps_waits() {
+        let a = Arc::new(Acting::default());
+        let unread = Due::Unread(upgrade_drive::UNREAD_SOCKET);
+        *a.due_says.lock().unwrap() = [
+            Due::Yes,
+            Due::Yes,
+            unread,
+            unread,
+            unread,
+            unread,
+            Due::Yes,
+            Due::Yes,
+            Due::Yes,
+            Due::Yes,
+        ]
+        .into();
+        *a.steps.lock().unwrap() = [
+            "announced:1",
+            "wait:background",
+            "wait:background",
+            "wait:background",
+            "wait:background",
+        ]
+        .into();
+        *a.owns_seen.lock().unwrap() = Some(Vec::new());
+        a.set(&[("s-w", Program::Claude)]);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("every step, its ownership read", || {
+            a.owns_seen
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|o| o.len() >= 9)
+        });
+        let owns = a.owns_seen.lock().unwrap().clone().unwrap_or_default();
+        assert_eq!(
+            owns[..9],
+            [true, true, true, true, true, true, true, true, false],
+            "owned through the refused looks, and for OWNED_BACKGROUND_LOOKS drains after"
+        );
+        let pauses = a.pauses.lock().unwrap().clone();
+        assert_eq!(
+            pauses[..7],
+            [
+                UNREAD_LOOK[0],
+                UNREAD_LOOK[1],
+                UNREAD_LOOK[2],
+                UNREAD_LOOK[3],
+                upgrade_drive::LATER[0],
+                upgrade_drive::LATER[1],
+                upgrade_drive::LATER[2],
+            ],
+            "the unread looks on their own ladder; the step's waits from its first rung"
+        );
+        host.shutdown_and_join();
+    }
+
+    /// NEGATIVE CONTROL: a look that READS the session and finds nothing to
+    /// take still lets the upgrade go — nothing journaled, nothing looked at
+    /// again, no step.
+    #[test]
+    fn a_look_that_reads_nothing_to_take_still_lets_the_upgrade_go() {
+        let a = Arc::new(Acting::default());
+        *a.due_says.lock().unwrap() = [Due::Yes, Due::No].into();
+        a.set(&[("s-z", Program::Claude)]);
+        let host = HostHandle::start(on(), false, false, a.hooks());
+        until("the first idle point", || {
+            a.parks.load(Ordering::SeqCst) == 1
+        });
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(a.parks.load(Ordering::SeqCst), 1, "not looked at again");
+        assert_eq!(a.stepped.load(Ordering::SeqCst), 0);
+        assert!(a.idle_said.lock().unwrap().is_empty());
+        assert!(a.pauses.lock().unwrap().is_empty(), "no later look");
+        host.shutdown_and_join();
+    }
+
     /// THE NOTICE AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK (the owner's
     /// answer of 2026-09-26: "Busy agentic sessions get upgraded at their
     /// next natural break. The notice interrupts the agent's orchestration
     /// once, and the restart still never kills running work"): a session
     /// whose loop offers only such breaks — its turn over, work it started
-    /// still running — is told of its upgrade there, once: the notice alone
-    /// (no step, nothing ended), the upgrade owning its turn ends after it,
+    /// still running — is told of its upgrade there: the notice alone (no
+    /// step, nothing ended; a re-ask comes only after a whole `REASK_S`, the
+    /// reducer's), the upgrade owning its turn ends after it,
     /// and the park left for the idle point, where the step goes on once the
     /// work is done. Claude Code and Codex alike. NEGATIVE CONTROLS: nothing
     /// due, the switch off, and a carry-on owed each ask for no notice; an
@@ -4282,6 +5497,93 @@ mod tests {
         host.shutdown_and_join();
     }
 
+    /// D1 OF THE LIVE E2E OF 2026-09-26: THE WORKER SAYS WHETHER NOBODY HAS
+    /// ASKED ITS SESSION ANYTHING, from the conversation its Claude Code holds
+    /// — the kept record's, read through the transcript ([`Acts::tasked`]) —
+    /// so the loop's turn-end policy types nothing into one whose record
+    /// holds only the harness's own turns. NEGATIVE CONTROLS: a conversation
+    /// someone asked something, and one nobody can read, are the screen's to
+    /// judge; a Codex is never asked about.
+    #[test]
+    fn the_worker_says_its_session_has_no_task_from_its_conversations_record() {
+        let seen = |agent: Program, tasked: Option<bool>| {
+            let a = Arc::new(Acting::default());
+            *a.tasked.lock().unwrap() = tasked;
+            a.set(&[("s-t", agent)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("the loop read it", || {
+                a.taskless_seen.lock().unwrap().is_some()
+            });
+            let seen = a.taskless_seen.lock().unwrap().unwrap_or_default();
+            let asked = a.tasked_asked.lock().unwrap().clone();
+            host.shutdown_and_join();
+            (seen, asked)
+        };
+        let (taskless, asked) = seen(Program::Claude, Some(false));
+        assert!(taskless, "only the harness's own turns: no task");
+        assert!(
+            asked
+                .iter()
+                .all(|c| c == "0badf00d-1111-2222-3333-444455556666"),
+            "the kept conversation's record: {asked:?}"
+        );
+        assert!(!seen(Program::Claude, Some(true)).0, "asked something");
+        assert!(
+            !seen(Program::Claude, None).0,
+            "nobody can say: the screen's"
+        );
+        let (taskless, asked) = seen(Program::Codex, Some(false));
+        assert!(!taskless && asked.is_empty(), "a Codex is not asked about");
+    }
+
+    /// D3(a) OF THE LIVE E2E OF 2026-09-26: A TURN BETWEEN TWO LOOKS STARTS
+    /// THE PAUSES OVER. The upgrade's pause climbed while its step waited on
+    /// the same word — also across a turn of the session's in between, so the
+    /// Stage-1 end was looked at +0.3 s, then +61 s, then +366 s. Told a turn
+    /// ran ([`IdleHost::turn_ran`]), the worker forgets the looks it counted
+    /// and the pause it waited out, and looks at the new point as it comes:
+    /// every pause is the first rung. What bounds the upgrade's hold on the
+    /// session's turn ends is NOT started over (review of 2026-09-26): its
+    /// waits in a row still count toward [`upgrade_drive::OWNED_SETTLE_LOOKS`], so an agent
+    /// that keeps waking itself during a drain cannot keep the turn ends
+    /// owned for ever. NEGATIVE CONTROL: with no turn between, the same waits
+    /// climb the ladder as before, and lapse the same.
+    #[test]
+    fn a_turn_between_two_looks_starts_the_pauses_over() {
+        use upgrade_drive::LATER;
+        let looks = |turns: bool| {
+            let a = Arc::new(Acting::default());
+            *a.owns_seen.lock().unwrap() = Some(Vec::new());
+            *a.steps.lock().unwrap() = ["wait:settling"; 3].into();
+            a.due.store(true, Ordering::SeqCst);
+            a.turns_between.store(turns, Ordering::SeqCst);
+            a.set(&[("s-r", Program::Claude)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("three looks", || a.stepped.load(Ordering::SeqCst) >= 3);
+            until("three seen", || {
+                a.owns_seen
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|v| v.len() >= 3)
+            });
+            host.shutdown_and_join();
+            let owns = a.owns_seen.lock().unwrap().clone().unwrap_or_default();
+            (a.pauses.lock().unwrap().clone(), owns)
+        };
+        let lapses = [true, true, false];
+        let (pauses, owns) = looks(true);
+        assert_eq!(pauses[..3], [LATER[0]; 3], "a turn between each");
+        assert_eq!(owns[..3], lapses, "a turn between: the hold still lapses");
+        let (pauses, owns) = looks(false);
+        assert_eq!(
+            pauses[..3],
+            [LATER[0], LATER[1], LATER[2]],
+            "no turn between: the ladder"
+        );
+        assert_eq!(owns[..3], lapses, "no turn between");
+    }
+
     /// A WAIT ON SOMETHING NEW STARTS THE PAUSES OVER (live, 2026-09-26: a
     /// Codex tab's daemon waited `held`, then `settling`, and then its client
     /// `settling` — three words, one climbing ladder, and the client's
@@ -4318,6 +5620,40 @@ mod tests {
         assert_eq!(run.after("announced:1"), After::NextIdle);
         assert_eq!((run.waits, run.same), (0, 0));
         assert_eq!(run.after("wait:settling"), After::Later(LATER[0]));
+    }
+
+    /// A RE-ARMED ROUND OWNS ITS FIRST SETTLE (the no-stall review of
+    /// 2026-09-27, B3): the looks a stopped round took while it rested are not
+    /// waits of the new round. A round that gave up, rested through many looks
+    /// and re-armed must own its next settle's turn end, or the supervisor
+    /// continues the worker, the settle never completes and the new round's
+    /// notice is never typed. NEGATIVE CONTROL: the new round's own settles
+    /// still count toward the bound.
+    #[test]
+    fn a_re_armed_round_owns_its_first_settle() {
+        let mut run = UpgradeRun::default();
+        for step in ["gave-up", "released:gave-up"] {
+            run.after(step);
+        }
+        for _ in 0..20 {
+            run.after("wait:failed");
+        }
+        assert!(
+            run.waits >= upgrade_drive::OWNED_SETTLE_LOOKS,
+            "the rest looked many times"
+        );
+        run.after("rearmed:unanswered");
+        assert_eq!(
+            (run.waits, run.same),
+            (0, 0),
+            "the re-arm starts the counts over"
+        );
+        run.after("wait:settling");
+        assert!(upgrade_drive::owns_turn_ends("wait:settling", run.waits));
+        for _ in 0..upgrade_drive::OWNED_SETTLE_LOOKS {
+            run.after("wait:settling");
+        }
+        assert!(!upgrade_drive::owns_turn_ends("wait:settling", run.waits));
     }
 
     /// THE UPGRADE OWNS A SESSION'S TURN ENDS BY ITS OWN STEP'S WORD (the
@@ -4357,6 +5693,29 @@ mod tests {
             "current",
         ] {
             assert!(!upgrade_drive::owns_turn_ends(last, 0), "{last}");
+        }
+        // At a break (2026-09-26): a wait on the agent's own work keeps the
+        // notice's claim; a last word, a hold, the limit, a void and a
+        // release give it back at once — a busy screen reaches no idle point
+        // to recompute it. NEGATIVE CONTROL: the notice and the wait keep it.
+        for gives_back in [
+            "gave-up",
+            "wait:skipped",
+            "wait:deferred",
+            "wait:attended",
+            "wait:held",
+            "wait:limited",
+            "failed:signal-refused",
+            "refused:--bogus",
+            "held-back:terminal:tmux",
+            "drain-expired:box",
+            "released:gave-up",
+            "wait:release:not-idle",
+        ] {
+            assert!(upgrade_drive::released_at_break(gives_back), "{gives_back}");
+        }
+        for keeps in ["announced:2", "wait:background", "wait:not-idle"] {
+            assert!(!upgrade_drive::released_at_break(keeps), "{keeps}");
         }
 
         // In the host: announced, then an answer without READY.
@@ -4608,6 +5967,11 @@ mod tests {
             "on its own build"
         );
         host.set_config(on());
+        // As in `the_snapshot_follows_its_agent_and_goes_with_its_exit`: until
+        // the relaunching worker is reaped, a roster naming the agent again
+        // reads as that worker's, and the person's exit below would reach no
+        // worker — its assertion then held of nothing.
+        until("the relaunching worker reaped", || host.live().is_empty());
         a.set(&[("s-e", Program::Claude)]);
         until("attached again", || host.live() == ["s-e"]);
         // A person typed just before the next exit: theirs.
@@ -4816,6 +6180,11 @@ mod tests {
         a.set(&[]);
         until("relaunched", || a.relaunched.lock().unwrap().len() == 1);
         assert_eq!(*a.resumed.lock().unwrap(), [Some(cleared)], "the new one");
+        // Its worker ends once the relaunch returns: until it is reaped, a
+        // roster naming the agent again reads as that worker's, and the
+        // person's exit below would reach no worker at all (the snapshot it
+        // refreshed then carried onto the wrapper's exit: a flake, 1 in 15).
+        until("the relaunching worker reaped", || host.live().is_empty());
         // (1) A person's exit; then a wrapper nothing can be read of.
         a.set(&[("s-s", Program::Claude)]);
         until("attached again", || host.live() == ["s-s"]);
@@ -5082,6 +6451,7 @@ mod tests {
                 backoff: Arc::new(quick_backoff),
                 pause: Arc::new(quick_pause),
                 upgrade_view: Arc::new(|_| None),
+                disk: Arc::new(|_| {}),
             }
         }
 
@@ -5298,5 +6668,266 @@ mod tests {
         gave_up.insert("old", 0);
         gave_up.insert("faulted", 1);
         assert!(!model.check_invariant("NeverGivesUp", &gave_up));
+    }
+
+    /// The world one real worker is driven over by
+    /// [`the_real_look_conforms_to_the_upgrade_look_model`]: what its looks
+    /// and its note read, the state the note or the first step mints (and
+    /// whether with the attach's second), and the upgrade its steps take (the
+    /// notice, READY folded in, then the restart and its last word).
+    #[derive(Default)]
+    struct LookWorld {
+        due: AtomicBool,
+        readable: AtomicBool,
+        ready: AtomicBool,
+        done: AtomicBool,
+        noted: AtomicBool,
+        aged: AtomicBool,
+        /// The second the first note was asked with: the attach's.
+        attached: Mutex<Option<u64>>,
+    }
+
+    impl LookWorld {
+        /// A worker attached — by the real [`attach`] — to a fresh launch
+        /// whose record is not written yet, and its loop's [`WorkerIdle`].
+        fn attached(world: &Arc<Self>) -> WorkerIdle {
+            world.due.store(true, Ordering::SeqCst);
+            let (w1, w2, w3) = (Arc::clone(world), Arc::clone(world), Arc::clone(world));
+            let mut acts = Acts::inert();
+            acts.due = Arc::new(move |_| {
+                if !w1.readable.load(Ordering::SeqCst) {
+                    Due::Unread(upgrade_drive::UNREAD_SOCKET)
+                } else if w1.due.load(Ordering::SeqCst) {
+                    Due::Yes
+                } else {
+                    Due::No
+                }
+            });
+            // `note_behind`: minted where no state stands, with the second asked.
+            acts.behind = Arc::new(move |_, since| {
+                let attached = *w2.attached.lock().unwrap().get_or_insert(since);
+                if !w2.readable.load(Ordering::SeqCst) {
+                    Behind::Unread(upgrade_drive::UNREAD_RECORD)
+                } else if w2.due.load(Ordering::SeqCst) && !w2.noted.swap(true, Ordering::SeqCst) {
+                    w2.aged.store(since == attached, Ordering::SeqCst);
+                    Behind::Noted
+                } else {
+                    Behind::Nothing
+                }
+            });
+            // The step: a state it finds none of is minted with its own age.
+            acts.step = Arc::new(move |_, _| {
+                if !w3.noted.swap(true, Ordering::SeqCst) {
+                    w3.aged.store(false, Ordering::SeqCst);
+                }
+                if w3.ready.swap(true, Ordering::SeqCst) {
+                    w3.done.store(true, Ordering::SeqCst);
+                    "done".to_string()
+                } else {
+                    "announced:1".to_string()
+                }
+            });
+            acts.snapshot = Arc::new(|sid| Some(snap(sid)));
+            let hooks = Hooks {
+                roster: Arc::new(Vec::new),
+                still_wanted: Arc::new(|_| true),
+                body: Arc::new(|_| BodyEnd::Stopped),
+                badge: Arc::new(|_, _| {}),
+                claim_epoch: Arc::new(|| 0),
+                acts,
+                backoff: Arc::new(quick_backoff),
+                pause: Arc::new(quick_pause),
+                upgrade_view: Arc::new(|_| None),
+                disk: Arc::new(|_| {}),
+            };
+            let switches = Arc::new(Switches::default());
+            switches.set(&on());
+            let job = WorkerJob {
+                sid: "s-look".to_string(),
+                agent: Program::Claude,
+                opts: SuperviseOpts::hosted(),
+                stop: Arc::default(),
+                interrupt: Arc::default(),
+                handover: Arc::default(),
+                clear_badge: false,
+                faults: Arc::default(),
+                park: Arc::default(),
+                look_at: Arc::default(),
+                left: Arc::default(),
+                acting: Arc::default(),
+                stalled: Arc::default(),
+                switches,
+                kept: Arc::default(),
+                note: Arc::default(),
+            };
+            attach(&job, &hooks);
+            WorkerIdle {
+                sid: job.sid,
+                agent: job.agent,
+                grace: 120,
+                park: job.park,
+                look_at: job.look_at,
+                acting: job.acting,
+                stalled: job.stalled,
+                switches: job.switches,
+                kept: job.kept,
+                hooks,
+                run: Mutex::default(),
+                owns: AtomicBool::new(false),
+                background_at: Mutex::default(),
+                tasked: Mutex::default(),
+                note: job.note,
+                clock_hold: Mutex::default(),
+            }
+        }
+
+        /// The model's variables as the real worker and its world stand.
+        fn project(&self, idle: &WorkerIdle) -> aterm_spec::interp::State {
+            let flag = |b: &AtomicBool| i64::from(b.load(Ordering::SeqCst));
+            let later = idle
+                .look_at
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some();
+            let owed = idle
+                .note
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_some();
+            [
+                ("due", flag(&self.due)),
+                ("readable", flag(&self.readable)),
+                ("ready", flag(&self.ready)),
+                ("looks", i64::from(idle.wants() || later)),
+                ("done", flag(&self.done)),
+                ("owed", i64::from(owed)),
+                ("noted", flag(&self.noted)),
+                ("aged", flag(&self.aged)),
+            ]
+            .into_iter()
+            .collect()
+        }
+
+        /// One action of `HarnessUpgradeLook`, done to the world or taken by
+        /// the real worker: a look — the one it owes comes (a later look is
+        /// the host's park, as [`visit_workers`] makes it), and the loop's
+        /// idle point takes it — or an ask of the owed note ([`ask_note`], as
+        /// the host's wakes and the attach ask it). What a look journaled.
+        fn act(&self, idle: &WorkerIdle, action: &str) -> Option<String> {
+            match action {
+                "Lose" => self.readable.store(false, Ordering::SeqCst),
+                "Regain" => self.readable.store(true, Ordering::SeqCst),
+                "Settle" => self.due.store(false, Ordering::SeqCst),
+                "Note" | "NoteUnread" => {
+                    assert!(
+                        ask_note(&idle.sid, &idle.note, &idle.hooks).is_some(),
+                        "{action}: no note owed"
+                    );
+                }
+                "Look" | "NotDue" | "Unread" => {
+                    if idle
+                        .look_at
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                        .is_some()
+                    {
+                        idle.park.store(true, Ordering::SeqCst);
+                    }
+                    assert!(idle.wants(), "{action}: no look owed");
+                    return idle.at_idle().map(|s| s.line);
+                }
+                other => panic!("unmodelled action {other}"),
+            }
+            None
+        }
+    }
+
+    /// Tier-1 of `HarnessUpgradeLook`: EVERY transition of the model, from
+    /// every reachable state (each reached by its shortest path), replayed
+    /// through a real worker — the real [`attach`] to a launch whose record
+    /// is not written yet, its [`WorkerIdle`]'s `at_idle` deciding from what
+    /// [`Acts::due`] reads, and the real [`ask_note`] — and the worker's park,
+    /// later look and owed note projected onto `looks` and `owed` after each;
+    /// every invariant checked on every observed state, and each look's
+    /// journal line the model's word (`wait:no-socket` for an unread look,
+    /// none for a look that let it go). NEGATIVE CONTROLS: the host of
+    /// 155c72a28 (`Buggy=1`) would owe nothing after a READY'd session's
+    /// refused look, and would give the note up at the attach and mint the
+    /// state at the first step — neither of which the real worker does, and
+    /// each of which breaks an invariant.
+    #[test]
+    fn the_real_look_conforms_to_the_upgrade_look_model() {
+        let model = aterm_spec::derive::harness_upgrade_look_model();
+        // The reachable states, each with the shortest path to it.
+        let mut paths = vec![(model.init_state(), Vec::<&str>::new())];
+        let mut at = 0;
+        while at < paths.len() {
+            let (state, path) = paths[at].clone();
+            for action in model.actions.iter().map(|a| a.name) {
+                let mut next = state.clone();
+                if model.fire(action, &mut next) && !paths.iter().any(|(s, _)| *s == next) {
+                    let mut longer = path.clone();
+                    longer.push(action);
+                    paths.push((next, longer));
+                }
+            }
+            at += 1;
+        }
+        assert!(paths.len() >= 12, "the space reached: {}", paths.len());
+        let mut replayed = HashSet::new();
+        for (state, path) in &paths {
+            for action in model.actions.iter().map(|a| a.name) {
+                let mut expect = state.clone();
+                if !model.fire(action, &mut expect) {
+                    continue;
+                }
+                replayed.insert(action);
+                let world = Arc::new(LookWorld::default());
+                let idle = LookWorld::attached(&world);
+                assert_eq!(world.project(&idle), model.init_state());
+                let mut said = None;
+                for step in path.iter().copied().chain([action]) {
+                    said = world.act(&idle, step);
+                }
+                let seen = world.project(&idle);
+                assert_eq!(seen, expect, "{path:?} then {action}");
+                for inv in &model.invariants {
+                    assert!(model.check_invariant(inv.name, &seen), "{}", inv.name);
+                }
+                match action {
+                    "Unread" => assert_eq!(said.as_deref(), Some("upgrade step=wait:no-socket")),
+                    "NotDue" => assert_eq!(said, None),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(
+            replayed.len(),
+            model.actions.len(),
+            "every action replayed: {replayed:?}"
+        );
+
+        // NEGATIVE CONTROLS.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        for (path, broken) in [
+            (&["Regain", "Look", "Lose", "Unread"][..], "NeverDropped"),
+            (&["NoteUnread", "Regain", "Look"][..], "BehindFromTheAttach"),
+        ] {
+            let world = Arc::new(LookWorld::default());
+            let idle = LookWorld::attached(&world);
+            let mut b = buggy.init_state();
+            for action in path {
+                assert!(buggy.fire(action, &mut b), "{action}");
+                world.act(&idle, action);
+            }
+            let seen = world.project(&idle);
+            assert_ne!(
+                seen, b,
+                "{path:?}: the real worker is not the host of 155c72a28"
+            );
+            assert!(model.check_invariant(broken, &seen), "{seen:?}");
+            assert!(!model.check_invariant(broken, &b), "{b:?}");
+        }
     }
 }

@@ -52,9 +52,7 @@
 
 use super::state::Terminal;
 
-/// Which custody transition last fired — one variant per `PressCustody` action, plus
-/// one for the shape the model has no action for
-/// ([`Self::OutputTookTheSelectionUnattributed`]).
+/// Which custody transition last fired — one variant per `PressCustody` action.
 ///
 /// The three inert press classes are separate variants even though they are
 /// state-identical, because they are separate FACTS: a release, an auto-repeat tick
@@ -74,9 +72,17 @@ use super::state::Terminal;
 pub enum CustodyTransition {
     /// The user moved the viewport back into history (a wheel notch, PgUp, the
     /// `scroll` verb, or a selection drag past the grid edge). Only a move that
-    /// RAISES the offset is this transition; scrolling back down toward live is not
-    /// a `PressCustody` action at all and records nothing.
+    /// RAISES the offset is this transition; a move back down is
+    /// [`Self::UserScrollTowardLive`] or [`Self::SnapToLive`].
     UserScroll,
+    /// The user moved the viewport back DOWN toward live without reaching it (a
+    /// wheel notch or PgDn that stops short of the tail). The highlight stays.
+    UserScrollTowardLive,
+    /// The user brought the viewport back to LIVE without typing: End /
+    /// `ScrollToBottom`, a downward scroll that lands at the tail, the ⌘-V and IME
+    /// snaps, the find bar's restore to a live view. Ownership goes to the
+    /// tail-follower; the highlight stays.
+    SnapToLive,
     /// A user gesture that leaves a selection behind — the press that starts a drag,
     /// and the release that completes one.
     UserSelect,
@@ -107,17 +113,21 @@ pub enum CustodyTransition {
     /// Program output REPLACED the rows the selection was sitting on. The highlight
     /// dies (a highlight left over replaced text makes a copy return something the
     /// user never selected) — but the reading position is still not output's to
-    /// take.
+    /// take: the re-pin rides the arriving lines.
     OutputDamagesTheSelectedRows,
+    /// [`Self::OutputDamagesTheSelectedRows`] with the view NOT moving under a
+    /// reader: the batch advanced no rows (an in-place rewrite — `\r` plus EL over
+    /// the selected row, a DECERA, a status line repainting itself) or its re-pin
+    /// saturated at the history floor.
+    OutputDamagesTheSelectedRowsInPlace,
     /// ED 3 / `clear_scrollback` / RIS: the coordinate space the offset and the
     /// selection anchors were stated in is gone, so the viewport goes back to the
     /// tail-follower and the selection cannot outlive the rows it named.
     OutputInvalidatesTheCoordinateSpace,
-    /// Output took a live highlight for a reason that is NOT damage overlap, and the
-    /// model has no action for it. NOT a `PressCustody` action — [`Self::action`]
-    /// returns a name no model admits and [`Self::last_event`] returns `-1`, outside
-    /// the model's `0..=7` tag space, so a step carrying it can never be validated as
-    /// if it were one.
+    /// Output took a live highlight for a reason that is NOT damage overlap. Its own
+    /// `PressCustody` action under the damaging take's tag (6) and law: the
+    /// highlight may go, the reading position may not — the re-pin rides the
+    /// arriving lines. (It was outside the model until 2026-09-25, with a `-1` tag.)
     ///
     /// `post_process` has five ways to reach this: a malformed or saturated splice
     /// projection, a splice mixed with another scroll in one batch (the historical
@@ -131,6 +141,10 @@ pub enum CustodyTransition {
     /// record was standing on the way out. "Output took it, for a reason I cannot
     /// name" is a real answer, and it rules out the keyboard.
     OutputTookTheSelectionUnattributed,
+    /// [`Self::OutputTookTheSelectionUnattributed`] with the view NOT moving under
+    /// a reader (no row arrived, or the re-pin saturated — a whole-interval
+    /// eviction at the history floor is the common shape).
+    OutputTookTheSelectionUnattributedInPlace,
 }
 
 impl CustodyTransition {
@@ -143,6 +157,8 @@ impl CustodyTransition {
     pub fn action(self) -> &'static str {
         match self {
             Self::UserScroll => "UserScroll",
+            Self::UserScrollTowardLive => "UserScrollTowardLive",
+            Self::SnapToLive => "SnapToLive",
             Self::UserSelect => "UserSelect",
             Self::UserClear => "UserClear",
             Self::TypingPress => "TypingPress",
@@ -152,22 +168,25 @@ impl CustodyTransition {
             Self::OutputAtLive => "OutputAtLive",
             Self::OutputWhileReading => "OutputWhileReading",
             Self::OutputDamagesTheSelectedRows => "OutputDamagesTheSelectedRows",
+            Self::OutputDamagesTheSelectedRowsInPlace => "OutputDamagesTheSelectedRowsInPlace",
             Self::OutputInvalidatesTheCoordinateSpace => "OutputInvalidatesTheCoordinateSpace",
-            // Deliberately NOT a model action: `Model::successors` panics on an
-            // unknown action name, so a conformance that ever handed this step to
-            // `validate_transition` fails loudly instead of quietly matching some
-            // neighbouring action.
             Self::OutputTookTheSelectionUnattributed => "OutputTookTheSelectionUnattributed",
+            Self::OutputTookTheSelectionUnattributedInPlace => {
+                "OutputTookTheSelectionUnattributedInPlace"
+            }
         }
     }
 
     /// The model's `last_event` tag: 0 a user gesture, 1 typing, 2 auto-repeat,
     /// 3 a bare modifier, 4 a release, 5 output that missed the selected rows,
-    /// 6 output that REPLACED them, 7 output that invalidated the coordinate space.
+    /// 6 output that TOOK the highlight (replaced the selected rows, or failed
+    /// closed on it), 7 output that invalidated the coordinate space, 8 a user
+    /// gesture back toward live that is not typing.
     ///
     /// Note that the tag is deliberately NOT injective: the three user gestures all
-    /// tag 0 and both undamaged-output kinds tag 5, exactly as the model declares.
-    /// The VARIANT is the discriminator; the tag is the model's projection of it.
+    /// tag 0, both undamaged-output kinds tag 5, the four taking kinds tag 6 and
+    /// both downward gestures tag 8, exactly as the model declares. The VARIANT is
+    /// the discriminator; the tag is the model's projection of it.
     #[must_use]
     pub fn last_event(self) -> i64 {
         match self {
@@ -177,12 +196,12 @@ impl CustodyTransition {
             Self::InertPress => 3,
             Self::ReleaseEvent => 4,
             Self::OutputAtLive | Self::OutputWhileReading => 5,
-            Self::OutputDamagesTheSelectedRows => 6,
+            Self::OutputDamagesTheSelectedRows
+            | Self::OutputDamagesTheSelectedRowsInPlace
+            | Self::OutputTookTheSelectionUnattributed
+            | Self::OutputTookTheSelectionUnattributedInPlace => 6,
             Self::OutputInvalidatesTheCoordinateSpace => 7,
-            // OUTSIDE the model's tag space on purpose (`StateBounds` bounds it
-            // `last_event <= 7`, and every invariant's else-arm reads `last_event <= 7`
-            // as its trivial case). The `custody` verb prints `-` for it.
-            Self::OutputTookTheSelectionUnattributed => -1,
+            Self::UserScrollTowardLive | Self::SnapToLive => 8,
         }
     }
 
@@ -190,7 +209,8 @@ impl CustodyTransition {
     /// something from the user — the latch condition for `last_custody_change`.
     ///
     /// True by the recording condition, not by hope. [`Self::UserScroll`] is recorded
-    /// only on a RISE, [`Self::OutputWhileReading`] only when the re-pin really moved
+    /// only on a RISE and the two downward gestures only on a FALL,
+    /// [`Self::OutputWhileReading`] only when the re-pin really moved
     /// the offset, and the two destroying output kinds only when a highlight died.
     /// The four press classes are false because three of them are inert by law and the
     /// fourth ([`Self::TypingPress`]) may land on an already-live, unselected viewport
@@ -214,12 +234,16 @@ impl CustodyTransition {
     pub fn always_takes_custody(self) -> bool {
         match self {
             Self::UserScroll
+            | Self::UserScrollTowardLive
+            | Self::SnapToLive
             | Self::UserSelect
             | Self::UserClear
             | Self::OutputWhileReading
             | Self::OutputDamagesTheSelectedRows
+            | Self::OutputDamagesTheSelectedRowsInPlace
             | Self::OutputInvalidatesTheCoordinateSpace
-            | Self::OutputTookTheSelectionUnattributed => true,
+            | Self::OutputTookTheSelectionUnattributed
+            | Self::OutputTookTheSelectionUnattributedInPlace => true,
             Self::TypingPress
             | Self::RepeatPress
             | Self::InertPress
@@ -241,8 +265,10 @@ impl CustodyTransition {
         matches!(
             self,
             Self::OutputDamagesTheSelectedRows
+                | Self::OutputDamagesTheSelectedRowsInPlace
                 | Self::OutputInvalidatesTheCoordinateSpace
                 | Self::OutputTookTheSelectionUnattributed
+                | Self::OutputTookTheSelectionUnattributedInPlace
                 | Self::TypingPress
         )
     }
@@ -359,18 +385,16 @@ impl Terminal {
     }
 
     /// PRESS CUSTODY — the viewport half of the record: the user moved the reading
-    /// position back into history.
+    /// position.
     ///
     /// `before` is the `display_offset` sampled immediately before the move, inside
-    /// the same `&mut self` borrow that performs it. Only a RISE is
-    /// [`CustodyTransition::UserScroll`]: the model's action is guarded
-    /// `offset <= MaxOffset - 1` and assigns `offset = offset + 1`, so it describes
-    /// moving AWAY from live and nothing else. Scrolling back DOWN —
-    /// `ScrollIntent::Down`, `Bottom`, a negative `By(n)`, the downward half of a
-    /// selection autoscroll, the paste/IME snap — lowers the offset, and no
-    /// `PressCustody` action admits that shape. Those record NOTHING rather than
-    /// being labelled with the nearest action that fits: a mislabelled no-op is a
-    /// corrupt trace, and `validate_transition` would accept one.
+    /// the same `&mut self` borrow that performs it. A RISE is
+    /// [`CustodyTransition::UserScroll`] (moving AWAY from live). A FALL is a user
+    /// gesture back toward live that is not typing — `ScrollIntent::Down`, a
+    /// negative `By(n)`, a wheel notch down, the downward half of a selection
+    /// autoscroll, a search jump below the view — and is
+    /// [`CustodyTransition::SnapToLive`] when it lands at the tail, else
+    /// [`CustodyTransition::UserScrollTowardLive`]. No move, no record.
     ///
     /// WHY IT LIVES HERE AND NOT IN THE GUI. It used to be `app_input::
     /// note_scroll_custody`, called from two of the roughly eight seams that raise
@@ -394,9 +418,10 @@ impl Terminal {
     /// left as an implied "no route exists".
     ///
     /// It is also clean with respect to the two documented NON-actions.
-    /// [`Terminal::scroll_to_bottom`] can only lower the offset, so it never records
-    /// — which is what keeps `apply_press_custody`'s snap from filing a second
-    /// `UserScroll` on top of its own `TypingPress`. And the SCR-1 output re-pin goes
+    /// [`Terminal::scroll_to_bottom`] does not call this, so it never records — which
+    /// is what keeps `apply_press_custody`'s snap from filing a `SnapToLive` over its
+    /// own `TypingPress` (the non-typing snaps go through
+    /// [`Terminal::return_to_live`], which does). And the SCR-1 output re-pin goes
     /// through `Grid::repin_display_offset`, a grid-level entry point this method
     /// cannot see, so output that rides the arriving lines can never be misfiled as a
     /// user gesture.
@@ -414,10 +439,33 @@ impl Terminal {
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PressCustody",
+            action = "UserScrollTowardLive",
+            project = "aterm_gui::press_custody_conformance::project_press_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PressCustody",
+            action = "SnapToLive",
+            project = "aterm_gui::press_custody_conformance::project_press_custody"
+        )
+    )]
     #[inline]
     pub(crate) fn note_scroll_custody(&mut self, before: usize) {
-        if self.grid.display_offset() > before {
+        let after = self.grid.display_offset();
+        if after > before {
             self.note_custody(CustodyTransition::UserScroll);
+        } else if after < before {
+            self.note_custody(if after == 0 {
+                CustodyTransition::SnapToLive
+            } else {
+                CustodyTransition::UserScrollTowardLive
+            });
         }
     }
 
@@ -471,13 +519,9 @@ impl Terminal {
     /// that is NOT damage overlap. `post_process` has five of them — a malformed or
     /// saturated splice projection, a splice mixed with another scroll in one batch
     /// (the historical fail-closed arm), an alt-screen exit mid-batch, the `left_alt`
-    /// upper-bound re-check, and a whole-interval eviction at the history floor — and
-    /// no `PressCustody` action has that shape: the two undamaged-output actions leave
-    /// the selection frame-unchanged, and the two destroying ones are guarded on
-    /// damage. Such a batch records
-    /// [`CustodyTransition::OutputTookTheSelectionUnattributed`], which is not a model
-    /// action and carries a `last_event` outside the model's tag space, so it can
-    /// never be validated as if it were one.
+    /// upper-bound re-check, and a whole-interval eviction at the history floor. Such
+    /// a batch records [`CustodyTransition::OutputTookTheSelectionUnattributed`] (or
+    /// its in-place twin), a model action under the damaging take's tag and law.
     ///
     /// It USED to empty the record instead, and that was the wrong half of a correct
     /// argument. Not MISLABELLING it was right — answering "why did my selection
@@ -497,20 +541,14 @@ impl Terminal {
     /// when the user owns the viewport (`offset = if owner == 1 { offset + 1 } else
     /// { 0 }`), so both ownerships are in the machine and Tier-1 drives both.
     ///
-    /// STILL UNMODELLED, stated rather than papered over: a DAMAGING batch whose
-    /// re-pin saturated at the history floor. Its offset does not rise, and the
-    /// action's `offset + 1` at `owner == 1` mandates that it does. Unlike the
-    /// undamaged twin below it is recorded anyway, because the two cases are not
-    /// alike: for undamaged output the only alternative name is `OutputAtLive`, which
-    /// would be FALSE (the view is not at live), whereas
-    /// `OutputDamagesTheSelectedRows` is a TRUE statement about what happened and only
-    /// the offset arithmetic is out of the model's range. A user whose highlight was
-    /// just overwritten gets the true answer; the modelling gap is listed in
-    /// `press_custody_conformance`'s KNOWN GAPS.
-    ///
-    /// That gap is `lines_added == 0`, which is NOT an exotic corner: an in-place
-    /// rewrite — `\r` plus EL, a DECERA, a status line repainting itself — damages
-    /// without scrolling and reaches it every time.
+    /// IN PLACE. A taking batch (damage, or a fail-closed arm) under a READER whose
+    /// view did not rise — no row arrived (an in-place rewrite: `\r` plus EL, a
+    /// DECERA, a status line repainting itself), or the re-pin saturated at the
+    /// history floor — is recorded under the `…InPlace` twin, whose model action
+    /// leaves the offset where it was. (Until 2026-09-25 that shape had no action and
+    /// was listed as a KNOWN GAP.) An undamaged batch that did not rise still records
+    /// nothing, because it took nothing and its only other name (`OutputAtLive`)
+    /// would claim the view is at live.
     #[cfg_attr(
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
@@ -539,7 +577,31 @@ impl Terminal {
         any(test, feature = "spec-anchors"),
         aterm_spec::refines(
             machine = "PressCustody",
+            action = "OutputDamagesTheSelectedRowsInPlace",
+            project = "aterm_gui::press_custody_conformance::project_press_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PressCustody",
             action = "OutputInvalidatesTheCoordinateSpace",
+            project = "aterm_gui::press_custody_conformance::project_press_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PressCustody",
+            action = "OutputTookTheSelectionUnattributed",
+            project = "aterm_gui::press_custody_conformance::project_press_custody"
+        )
+    )]
+    #[cfg_attr(
+        any(test, feature = "spec-anchors"),
+        aterm_spec::refines(
+            machine = "PressCustody",
+            action = "OutputTookTheSelectionUnattributedInPlace",
             project = "aterm_gui::press_custody_conformance::project_press_custody"
         )
     )]
@@ -555,18 +617,26 @@ impl Terminal {
         // was read from and the pair is a statement about one coordinate space.
         let after = self.grid.display_offset();
         let selection_now = self.text_selection.has_selection();
+        // A READER whose view did not rise: the taking kinds record their in-place
+        // twin, whose model action leaves the offset where it was.
+        let in_place = pinned_offset > 0 && after <= pinned_offset;
         let transition = match damage {
             // The VARIANT, not the bool: `clears_selection` answers `true` for `All`
             // without consulting the overlap predicate, so keying off the bool would
             // report a band hit for every ED 3 and this transition would never fire.
             OutputDamage::All => CustodyTransition::OutputInvalidatesTheCoordinateSpace,
+            OutputDamage::Hit if in_place => CustodyTransition::OutputDamagesTheSelectedRowsInPlace,
             OutputDamage::Hit => CustodyTransition::OutputDamagesTheSelectedRows,
             OutputDamage::None | OutputDamage::Missed => {
                 if selection_before && !selection_now {
-                    // Destroyed, but not by damage. Its own name, outside the model's
-                    // tag space — never `None`, which erases a true prior record and
-                    // reads as "this terminal has never done anything".
-                    CustodyTransition::OutputTookTheSelectionUnattributed
+                    // Destroyed, but not by damage — never `None`, which erases a
+                    // true prior record and reads as "this terminal has never done
+                    // anything".
+                    if in_place {
+                        CustodyTransition::OutputTookTheSelectionUnattributedInPlace
+                    } else {
+                        CustodyTransition::OutputTookTheSelectionUnattributed
+                    }
                 } else if lines_added == 0 {
                     // No row entered scrollback: a batch of cursor moves or an OSC
                     // query. No model action describes it either, and it took nothing,

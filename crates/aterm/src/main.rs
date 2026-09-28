@@ -24,11 +24,31 @@
 //! every pre-one-binary script, PATH entry, sibling `aterm-ctl` lookup, and in-app
 //! Help example keeps working while exactly ONE Mach-O exists.
 
-// GUI subsystem on Windows: rust binaries default to the CONSOLE subsystem,
-// which pops a stray blank console window alongside the terminal on every
-// Explorer / Start-menu launch. The window library's `attach_parent_console`
-// (first thing in its entry) reattaches stdio when launched FROM a console.
-#![cfg_attr(windows, windows_subsystem = "windows")]
+// NO `windows_subsystem = "windows"` HERE — this file is the CONSOLE image.
+//
+// The PE subsystem is a per-FILE header field, and Windows shells key on it:
+// a console-subsystem child is waited for, a GUI-subsystem one is not. This
+// binary carried the attribute until 2026-09-22 so an Explorer / Start-menu
+// launch would not flash a console, and every installed CLI name was a
+// hardlink of it — so from pwsh and cmd NO `aterm` verb was waited for. Measured
+// on the installed 0.90.0: `Measure-Command {aterm help}` = 18 ms with the
+// output painted over the returned prompt, `aterm --version 1>$null` panicked
+// with "failed printing to stdout: The pipe is being closed (os error 232)"
+// (the shell had already closed its end), and from a NON-interactive pwsh host
+// `aterm ctl <verb>` returned nothing at all (0/10). A scheduled task or a
+// script calling `aterm` got empty output.
+//
+// Windows therefore needs TWO file objects of the same code (one crate, one
+// `main`): `aterm.exe`, built from this root, CONSOLE subsystem — every CLI
+// alias hardlinks to it — and `aterm-gui.exe`, built from `src/windowed.rs`
+// (the `aterm-windowed` bin target, which `#[path]`-includes this file as a
+// module and adds only the attribute), WINDOWED subsystem, for the Start Menu,
+// the Explorer verb, the jump list and the pinned tile. The console image
+// never runs a window in-process on Windows: it hands the window to the
+// windowed sibling (`run_window` / `windowed_sibling`) and returns, so the
+// prompt comes back. The one-binary doctrine on macOS/Linux is untouched: the
+// extra bin target builds there as a std-only stub that includes none of this
+// file (see `windowed.rs`).
 
 use std::ffi::OsString;
 use std::ops::ControlFlow;
@@ -52,17 +72,23 @@ fn link_unavailable(verb: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
-fn main() -> ExitCode {
+// `pub(crate)`, not private: `src/windowed.rs` includes this file as a module
+// and calls this `main` from its own — a parent module cannot reach a child's
+// private items, and rustc accepts any visibility on a bin root's `main`.
+pub(crate) fn main() -> ExitCode {
     // Start the broad window cold-start clock before argv0 parsing or route
     // selection. The compatibility GUI-entry clock is anchored separately if
     // this dispatches to a window. Dyld/process-loader time remains excluded.
     aterm_gui::mark_rust_main_start();
-    // A GUI-subsystem exe (the attribute above) has no console on Windows;
-    // reattach the parent's FIRST — before ANY route prints — so help/version/
-    // verbs/diag output reaches a launching console and the TTY probe below
-    // sees real console handles. No-op off Windows and for Explorer launches.
+    // The WINDOWED image (`src/windowed.rs` shares this body) starts with no
+    // console on Windows; reattach the parent's FIRST — before ANY route prints
+    // — so help/version/verbs/diag output reaches a launching console and the
+    // TTY probe below sees real console handles. The console image finds its
+    // inherited handles present and this is a no-op there, as it is off
+    // Windows and for Explorer launches. The answer (did it attach?) matters
+    // only to the window library's own entry, which asks again itself.
     #[cfg(windows)]
-    aterm_gui::attach_parent_console();
+    let _ = aterm_gui::attach_parent_console();
     let mut argv: Vec<OsString> = std::env::args_os().collect();
     let rest: Vec<OsString> = if argv.is_empty() {
         Vec::new()
@@ -108,7 +134,17 @@ fn main() -> ExitCode {
         // `get(1..)` not `rest[1..]`: this arm is only reached with a first
         // token in hand, but that is an argument the verifier cannot follow
         // from here, and it refuted the index (measured 2026-09-09).
-        AliasRoute::AliasWindowVerb => return window_verb(&first, rest.get(1..).unwrap_or(&[])),
+        // `ThisProcess`: the alias names ARE the windowed image on Windows
+        // (`aterm-gui.exe` / a dev tree's `aterm-windowed.exe`), so a spawned
+        // window runs here — handing it to "the windowed sibling" would be a
+        // detached copy of ourselves, one hop for nothing.
+        AliasRoute::AliasWindowVerb => {
+            return window_verb(
+                &first,
+                rest.get(1..).unwrap_or(&[]),
+                WindowHost::ThisProcess,
+            );
+        }
         AliasRoute::AliasWindow => return gui_alias_entry(rest),
         // `aterm`, the old `aterm-cli` symlink target, and anything else
         // (a renamed copy) are all the front door.
@@ -233,8 +269,11 @@ fn main() -> ExitCode {
             // typed at a prompt, where a TTY on stdin would otherwise select the
             // SESSION and its parser would reject the word as an unknown option
             // — the exact `ship` failure this dispatch table exists to prevent.
+            // `WindowedSibling`: typed at a prompt, this is the CONSOLE image on
+            // Windows, and a window it has to spawn belongs in the windowed
+            // sibling (see the file header) so the prompt comes back at once.
             aterm_cli::Verb::NewTab | aterm_cli::Verb::NewWindow | aterm_cli::Verb::SplitPane => {
-                window_verb(verb.name(), &forwarded)
+                window_verb(verb.name(), &forwarded, WindowHost::WindowedSibling)
             }
         };
     }
@@ -386,11 +425,52 @@ fn main() -> ExitCode {
         // `rest`, NOT `scan`: the mode fork's scan stops at the `-e`/`--` payload
         // boundary, so handing it to the gate would present `aterm -e vim` as an
         // empty (maximally eligible) argument list. See `plain_launch_request`.
-        if let Some(code) = plain_launch_policy(&rest) {
-            return code;
-        }
-        aterm_gui::main_entry(mode_args);
-        return ExitCode::SUCCESS;
+        let spawn = match plain_launch_policy(&rest) {
+            ControlFlow::Break(code) => return code,
+            ControlFlow::Continue(spawn) => spawn,
+        };
+        // What the windowed sibling is told, when it is the one to open this
+        // window (see `WindowHost`): the policy's own decision when it made one
+        // — `new-window`, so the sibling cannot route it a second time — and
+        // otherwise the launch's own argument list, `--no-reroute` included,
+        // which the sibling's gate refuses exactly as this one just did.
+        let handoff = match &spawn {
+            Some(request) => spawn_handoff_argv(request),
+            None => rest.clone(),
+        };
+        // `scan`, not `mode_args`: the host decision reads the flags the mode
+        // fork read, before the strip, and never a `-e` payload's tokens.
+        return run_window(mode_args, window_host_for(scan), &handoff);
+    }
+
+    // THE NESTED-SESSION GUARD (Windows, 2026-09-22 audit, defect b). Every tab
+    // of the window is a shell with `ATERM_CHILD=1` in its environment, and a
+    // bare `aterm` typed there used to start the transparent SESSION lane
+    // nested inside the tab: the outer tab's keystrokes then arrived in the
+    // inner passthrough as literal win32-input-mode records
+    // (`[69;18;101;1;0;1_cho hi`, a PSReadLine ParserError), no command ever
+    // ran, and a stray `exit` closed the OUTER window. On Windows a tab is not
+    // a place to nest a console session, so a BARE launch becomes `aterm
+    // new-tab` for the cwd, handed to the ENCLOSING instance (the tab's own
+    // `ATERM_PARENT_SESSION_ID` is how `aterm_ctl::front_door_instance` finds
+    // it), and says so in one stderr line. Bare is `rest` empty — not one
+    // token: any token at all — `--sandbox`, `--containment <mode>`,
+    // `--no-reroute`, a `-e` payload, a typo — is a request the session parser
+    // must honour or refuse, never one to drop for a plain tab (review
+    // 2026-09-27: `aterm --sandbox` opened an UNcontained tab and exited 0;
+    // measured after the fix, `aterm --bogus` in a tab is the parser's usage
+    // error, exit 2, and no tab). An explicit `--session` still nests — that is what
+    // the flag is for — and so does the `aterm-cli` argv0 alias, whose
+    // binary-era contract is "the session regardless". Unix is untouched: a
+    // nested session there is the documented way to run one.
+    #[cfg(windows)]
+    if nests_inside_aterm(
+        rest.is_empty(),
+        force_session,
+        std::env::var_os("ATERM_CHILD").is_some(),
+        stdin_is_terminal(),
+    ) {
+        return nested_new_tab();
     }
 
     // The session: flags → quiet, then the passthrough (never returns).
@@ -534,7 +614,7 @@ fn main() -> ExitCode {
     //     pass WAITS instead. Gated on the switch the window reads — `[packages]
     //     enabled`, Automatic updates (the retired `auto_update` folded in; there is no
     //     environment kill switch since 2026-09-23) — and on this being an
-    //     INTERACTIVE launch: stdin a terminal and no `ATERM_SESSION_MODEL` — a harness
+    //     INTERACTIVE launch: stdin a terminal — a harness
     //     driving the session over pipes (the integration tests, a driver's `--session`
     //     child) must never provision the machine's real prefix as a side effect
     //     (2026-09-10 review: `targo test -p aterm` rewrote the owner's status.toml).
@@ -672,12 +752,11 @@ fn hand_agents_dir(layout: Option<&atpkg::store::Layout>) {
 }
 
 /// Whether this `--session` launch is a PERSON's terminal rather than a harness's
-/// child: stdin is a terminal and no `ATERM_SESSION_MODEL` is set (the development
-/// seam that arms the session's VT model — `aterm_types::dev_seam!`, read by no shipped
-/// binary). Only such a launch may spawn the detached toolchain pass — a piped launch is
-/// a test or a driver, and a test must never mutate the machine's real package prefix.
+/// child: stdin is a terminal. Only such a launch may spawn the detached toolchain
+/// pass — a piped launch is a test or a driver, and a test must never mutate the
+/// machine's real package prefix.
 fn session_lane_is_interactive() -> bool {
-    stdin_is_terminal() && aterm_cli::session_model_seam().is_none()
+    stdin_is_terminal()
 }
 
 /// Whether this launch spawns the detached pass: the MACHINE-WIDE rule the window's loop
@@ -685,8 +764,10 @@ fn session_lane_is_interactive() -> bool {
 /// stamps every lane reads ([`atpkg::status::pass_stamps`]: the outcome the last pass
 /// recorded, never `updated_at`; a pass installing now, not queued behind), then the
 /// session lane's own claim, so tabs opened in the same moment spawn one pass. The derived
-/// model `AtpkgFullPassRule` states the rule — and proves it never spawns inside a
-/// rate-limit hold it does not read; atpkg's `status` conformance binds this reading to it.
+/// model `AtpkgFullPassRule` states the rule — no pass back to back, no success read as a
+/// failure, no owed pass held back; there is no rate-limit hold to read, as the pass makes
+/// no metered request (owner ruling R3) — and atpkg's `status` conformance binds this
+/// reading to it.
 fn session_pass_due(layout: &atpkg::store::Layout, now_unix: i64) -> bool {
     use aterm_update_core::pkg_check;
     pkg_check::full_pass_owed(&atpkg::status::pass_stamps(layout, now_unix), now_unix).is_some()
@@ -835,11 +916,13 @@ fn session_lane(quiet: bool) -> ExitCode {
 /// How an invocation arriving under an argv0 ALIAS name is served.
 ///
 /// Extracted from `main` as a pure decision so the one case that matters most on
-/// Windows is unit-testable: the shipped install is SEVERAL IDENTICAL COPIES of
-/// this binary (`aterm.exe`, `aterm-gui.exe`, `aterm-ctl.exe`, …), the Start-Menu
-/// shortcut targets `aterm-gui.exe`, and the taskbar jump list is committed by
-/// whichever copy is running — so the windowing verbs and the routing policy have
-/// to work under the alias, not only under `aterm.exe`.
+/// Windows is unit-testable: the shipped install is ONE CODE under several names
+/// — the console image `aterm.exe` with the CLI names (`aterm-ctl.exe`,
+/// `atpkg.exe`, …) hardlinked onto it, and the windowed image `aterm-gui.exe`
+/// beside it (see the file header) — the Start-Menu shortcut targets
+/// `aterm-gui.exe`, and the taskbar jump list is committed by whichever image is
+/// running — so the windowing verbs and the routing policy have to work under
+/// the alias, not only under `aterm.exe`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 enum AliasRoute {
     /// `aterm-ctl` — the control client.
@@ -863,7 +946,10 @@ enum AliasRoute {
     /// against a console that does not exist.
     AliasWindowVerb,
     /// `aterm-gui …` — the window, with the plain-launch routing policy applied
-    /// (see [`gui_alias_entry`]).
+    /// (see [`gui_alias_entry`]). `aterm-windowed` is the same arm: it is the
+    /// cargo target name of the windowed image, which a dev tree runs under
+    /// that name and `build.ps1` renames to `aterm-gui.exe` for the shipped
+    /// folder.
     AliasWindow,
     /// Not an alias: `aterm`, the old `aterm-cli` symlink target, a renamed copy.
     FrontDoor,
@@ -878,7 +964,7 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
         "aterm-fleet" => AliasRoute::Fleet,
         "aterm-drive" => AliasRoute::Drive,
         "aterm-link" => AliasRoute::Link,
-        "aterm-gui" => match aterm_cli::Verb::from_operand(first) {
+        "aterm-gui" | "aterm-windowed" => match aterm_cli::Verb::from_operand(first) {
             Some(verb) if verb.is_windowing() => AliasRoute::AliasWindowVerb,
             // Every OTHER verb stays out of the alias on purpose: `aterm-gui`'s
             // binary-era contract is "the window", and `aterm-gui ctl …` was
@@ -914,12 +1000,370 @@ fn alias_route(argv0: &str, first: &str) -> AliasRoute {
 ///
 /// `--no-reroute` is consumed here as well (`take_no_reroute`): the alias IS the
 /// window, and the window must honour it exactly as the front door does.
+///
+/// The window runs IN THIS PROCESS on every platform: on Windows the alias
+/// names are the windowed image itself (`aterm-gui.exe`, or `aterm-windowed.exe`
+/// in a dev tree), which is exactly where a window belongs — see [`run_window`]
+/// for the console image's opposite answer. That is also why nothing is handed
+/// anywhere (the empty handoff below).
 fn gui_alias_entry(rest: Vec<OsString>) -> ExitCode {
-    if let Some(code) = plain_launch_policy(&rest) {
+    if let ControlFlow::Break(code) = plain_launch_policy(&rest) {
         return code;
     }
-    aterm_gui::main_entry(strip_flags(&take_no_reroute(&rest), &["--window"]));
+    run_window(
+        strip_flags(&take_no_reroute(&rest), &["--window"]),
+        WindowHost::ThisProcess,
+        &[],
+    )
+}
+
+// ---------------------------------------------------------------------------
+// WHERE A WINDOW RUNS: THIS PROCESS, OR THE WINDOWED SIBLING (Windows)
+// ---------------------------------------------------------------------------
+
+/// Which PROCESS serves a window this front door has decided to open.
+///
+/// Off Windows the two are the same thing: the one binary runs the window
+/// in-process, as it always has. On Windows the answer depends on which of the
+/// two images (see the file header) is running and on what was asked.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum WindowHost {
+    /// Run the window here. Right when this image IS the windowed one (the
+    /// `aterm-gui` / `aterm-windowed` argv0 aliases), and when the launch is
+    /// headless- or diagnose-shaped: the release gates and every harness READ
+    /// its output through the pipes they gave it, so it must stay in the
+    /// process they spawned.
+    ThisProcess,
+    /// The CONSOLE image on Windows, asked for a real window: check the
+    /// window's arguments HERE, then start the windowed sibling detached and
+    /// return at once, so the shell prompt comes back (see [`run_window`]).
+    /// Falls back to [`WindowHost::ThisProcess`] — out loud — when there is no
+    /// current sibling image beside this one.
+    WindowedSibling,
+}
+
+/// The host for a window-shaped FRONT-DOOR launch (`aterm --window`, the no-TTY
+/// launch), decided from the pre-payload `scan` the mode fork itself read.
+///
+/// Pure over the argument list — headless is the `--headless` FLAG, the one
+/// spelling the mode fork reads (the `ATERM_HEADLESS` environment twin is
+/// retired) — so the table is unit-testable. Off Windows every answer is
+/// `ThisProcess`; the enum exists so the Windows rule is readable in one place
+/// rather than scattered as `cfg`s.
+///
+/// Only `--headless` and `--diagnose` keep the WINDOW in this process. Every
+/// other flag the window's parser answers by printing — `--help`, `--version`,
+/// the listings, the registry verbs — and every usage error it refuses with is
+/// answered on the sibling route too, in this process and on this console,
+/// because that route's first step is that very parser run here
+/// (`aterm_gui::check_window_args`). A mirrored list of those flags stood here
+/// until 2026-09-27, and any flag added to the parser without it printed into
+/// the detached sibling's NUL.
+fn window_host_for(scan: &[OsString]) -> WindowHost {
+    if !cfg!(windows) {
+        return WindowHost::ThisProcess;
+    }
+    let in_process = scan
+        .iter()
+        .any(|a| matches!(a.to_string_lossy().as_ref(), "--headless" | "--diagnose"));
+    if in_process {
+        WindowHost::ThisProcess
+    } else {
+        WindowHost::WindowedSibling
+    }
+}
+
+/// Run the WINDOW for `args` where `host` says, and return the route's exit code.
+///
+/// `WindowedSibling` on Windows is the console image handing the window to
+/// `aterm-gui.exe` next to itself and returning 0 while the window is still
+/// coming up — the `wt`/`code` shape a shell user expects. `handoff` is the
+/// argument list the sibling is started with, which is NOT `args`: the sibling
+/// is the whole front door under its alias name, so it is told either the
+/// routing decision already made ([`spawn_handoff_argv`]) or the launch's own
+/// argument list, never a stripped remainder it would route a second time.
+///
+/// Before anything is started the window's own parser runs here
+/// (`aterm_gui::check_window_args`), because the sibling's stdio is NUL: a
+/// usage error (`aterm --window --font-px abc`) printed there reached nobody
+/// and the console image exited 0 with no window (review 2026-09-27). Now it
+/// prints here and exits 2, as it always did in-process, and a print-and-exit
+/// flag prints here too.
+///
+/// The fallback to an in-process window when there is no current sibling is
+/// SAID on stderr: a silent fallback would look exactly like the shipped layout
+/// working, on a folder where it is not laid out.
+fn run_window(args: Vec<OsString>, host: WindowHost, handoff: &[OsString]) -> ExitCode {
+    #[cfg(windows)]
+    if host == WindowHost::WindowedSibling {
+        aterm_gui::check_window_args(args.clone());
+        match windowed_sibling::launch(handoff) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(why) => eprintln!("aterm: {why}; opening the window in this console process"),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (host, handoff);
+    aterm_gui::main_entry(args);
     ExitCode::SUCCESS
+}
+
+/// The argument list the windowed sibling is started with for a window the
+/// routing policy has already decided to SPAWN: `new-window [-d <dir>]`.
+///
+/// `new-window` because it is the one verb the policy never redirects
+/// (`aterm_cli::route_launch`), so the sibling — the whole front door under
+/// its alias name — cannot turn the decision into something else. Handed only
+/// `-d <dir>`, it took the plain-launch route and ran the policy a SECOND time,
+/// and under `windowing_behavior = "attach"` with an instance up that made
+/// `aterm new-window`, and the jump list's New Window row, open a TAB (review
+/// 2026-09-27). The directory is `window_args`' own, already absolute.
+fn spawn_handoff_argv(request: &aterm_cli::WindowRequest) -> Vec<OsString> {
+    let mut argv = vec![OsString::from(aterm_cli::Verb::NewWindow.name())];
+    argv.extend(request.window_args());
+    argv
+}
+
+/// The windowed sibling image on Windows: finding it and starting it detached.
+#[cfg(windows)]
+mod windowed_sibling {
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::time::{Duration, SystemTime};
+
+    // Tiny FFI, in the style of crates/aterm-pty/src/windows/ffi.rs: the two
+    // calls that keep the shell's pipes out of the detached window, plus the
+    // query only the test's probe reads (gated with it: a release build of
+    // either image warned `GetHandleInformation` is never used, 2026-09-22).
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetStdHandle(kind: u32) -> isize;
+        #[cfg(test)]
+        fn GetHandleInformation(handle: isize, flags: *mut u32) -> i32;
+        fn SetHandleInformation(handle: isize, mask: u32, flags: u32) -> i32;
+    }
+    /// `STD_INPUT_HANDLE` / `STD_OUTPUT_HANDLE` / `STD_ERROR_HANDLE`.
+    const STD_HANDLES: [u32; 3] = [0xFFFF_FFF6, 0xFFFF_FFF5, 0xFFFF_FFF4];
+    /// `HANDLE_FLAG_INHERIT`.
+    const HANDLE_FLAG_INHERIT: u32 = 0x1;
+
+    /// `DETACHED_PROCESS`: the child gets NO console — not ours, and not a new
+    /// one — which is what a windowed image wants from a shell launch.
+    ///
+    /// NOT `CREATE_NEW_PROCESS_GROUP` (0x200), the other "detach" flag: it
+    /// starts the child with Ctrl+C DISABLED, and that setting is inherited by
+    /// every shell the window then spawns, so no tab could interrupt a command.
+    pub(super) const DETACHED_PROCESS: u32 = 0x0000_0008;
+
+    /// How much OLDER than this image a build tree's windowed image may be and
+    /// still count as the same build.
+    ///
+    /// A STALE sibling is the hazard (review 2026-09-27): `cargo run -p aterm`
+    /// and `cargo build --bin aterm` rebuild the console image alone, and the
+    /// window a developer then asks for would open in the `aterm-windowed.exe`
+    /// of some earlier build — old window code, while validating new. But the
+    /// two bins of ONE `-p aterm` build are linked in parallel and land in
+    /// either order: measured 2026-09-27 in a debug tree, `aterm-windowed.exe`
+    /// 6 ms OLDER than `aterm.exe`. So "older at all" would refuse half of all
+    /// fresh builds; a minute absorbs the link spread (release links run the
+    /// same fat LTO concurrently), and a stale sibling trails by a whole
+    /// edit-and-rebuild cycle.
+    const SAME_BUILD_SPREAD: Duration = Duration::from_secs(60);
+
+    /// Whether a build tree's windowed image, last written at `sibling`, is too
+    /// old to open a window for this image, last written at `this`. Pure, for
+    /// the table test; unreadable times are the caller's (they hand off).
+    pub(super) fn is_stale(sibling: SystemTime, this: SystemTime) -> bool {
+        this.duration_since(sibling)
+            .is_ok_and(|older_by| older_by > SAME_BUILD_SPREAD)
+    }
+
+    /// Whether `image` carries the cargo TARGET name of the windowed image —
+    /// only a build tree has one (`build.ps1` and `install.ps1` lay it as
+    /// `aterm-gui.exe`), and only a build tree can hold a stale one.
+    fn is_build_tree_image(image: &Path) -> bool {
+        image
+            .file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case("aterm-windowed.exe"))
+    }
+
+    /// Stop this process's std handles from being INHERITED by the sibling.
+    ///
+    /// MEASURED 2026-09-22 on the first build of the split: `$o = & aterm.exe
+    /// --window` from pwsh returned from `aterm.exe` at once and then HUNG until
+    /// the window was closed. `Stdio::null()` only sets the child's own three
+    /// std handles to NUL; `CreateProcess` is still called with
+    /// `bInheritHandles = TRUE` (it must be, to pass those), and that hands the
+    /// child EVERY inheritable handle in our table — and a shell's stdout /
+    /// stderr pipes are inheritable by construction, since we inherited them.
+    /// The detached window then held the write end of the shell's pipe and the
+    /// shell waited for EOF on it. Clearing `HANDLE_FLAG_INHERIT` on our copies
+    /// touches only our handle table; nothing else in this process opens an
+    /// inheritable handle before this point, and the process exits right after
+    /// the spawn. Best-effort: a handle that refuses the change is left as is,
+    /// which is exactly the measured behaviour and not worse.
+    pub(super) fn stop_inheriting_std_handles() {
+        // SAFETY: handle queries and a flag write on handles this process owns;
+        // no pointers cross the boundary.
+        unsafe {
+            for kind in STD_HANDLES {
+                let handle = GetStdHandle(kind);
+                if handle != 0 && handle != -1 {
+                    let _ = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+
+    /// Whether any of this process's std handles is still inheritable —
+    /// the observation behind [`stop_inheriting_std_handles`]'s test.
+    #[cfg(test)]
+    pub(super) fn a_std_handle_is_inheritable() -> bool {
+        // SAFETY: handle queries writing one `u32` into a local.
+        unsafe {
+            STD_HANDLES.into_iter().any(|kind| {
+                let handle = GetStdHandle(kind);
+                let mut flags = 0u32;
+                handle != 0
+                    && handle != -1
+                    && GetHandleInformation(handle, &mut flags) != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+            })
+        }
+    }
+
+    /// Start the windowed sibling with `args`, detached, stdio on NUL, and
+    /// return once it is running. `Err` names the reason in a sentence the
+    /// caller prints before falling back to an in-process window.
+    ///
+    /// WHICH file is `aterm_gui::windowed_front_door_beside`'s answer — the one
+    /// rule the jump list and the Explorer verb use too: `aterm-gui.exe` in an
+    /// install or `build.ps1` folder, `aterm-windowed.exe` in a build tree,
+    /// whose `aterm-gui.exe` is crate aterm-gui's thin dev bin (the window
+    /// library with none of this front door) and is never taken. A build
+    /// tree's image must also be as new as this one ([`is_stale`]).
+    ///
+    /// Stdio on NUL is what keeps the sibling OFF this console: it then finds
+    /// three real (device) handles, so its `attach_parent_console` attaches
+    /// nothing and no startup line of its can reach the prompt the shell has
+    /// already redrawn (defect c of the 2026-09-22 audit). Nothing is waited for
+    /// — the window's lifetime is its own — and nothing of the shell's is
+    /// carried into it either ([`stop_inheriting_std_handles`]), so a script
+    /// that captured our output gets its pipe's EOF the moment we exit.
+    pub(super) fn launch(args: &[OsString]) -> Result<(), String> {
+        use std::os::windows::process::CommandExt as _;
+        let exe =
+            std::env::current_exe().map_err(|e| format!("cannot locate this executable ({e})"))?;
+        let Some(sibling) = aterm_gui::windowed_front_door_beside(&exe) else {
+            return Err(format!(
+                "no windowed image (aterm-gui.exe, or aterm-windowed.exe in a build tree) \
+                 beside {}",
+                exe.display()
+            ));
+        };
+        let written = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        if is_build_tree_image(&sibling)
+            && let (Some(sibling_at), Some(this_at)) = (written(&sibling), written(&exe))
+            && is_stale(sibling_at, this_at)
+        {
+            return Err(format!(
+                "{} is older than {}",
+                sibling.display(),
+                exe.display()
+            ));
+        }
+        stop_inheriting_std_handles();
+        std::process::Command::new(&sibling)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .creation_flags(DETACHED_PROCESS)
+            .spawn()
+            .map(drop)
+            .map_err(|e| format!("could not start {} ({e})", sibling.display()))
+    }
+}
+
+/// THE NESTED-SESSION DECISION (Windows): whether a session-shaped launch was
+/// typed inside an aterm tab and should open a tab there instead of nesting.
+///
+/// Pure, so the table is a unit test. `bare` is a launch with NO argument at
+/// all — the one shape the defect was: any flag, a `-e`/`--command`/`--` child
+/// command line, or a typo is a request the session parser must serve or
+/// refuse, never one to drop for a plain tab; `force_session` is the `aterm-cli`
+/// argv0 alias (and an explicit `--session`, though that one is never bare) —
+/// "nest, I know"; `aterm_child` is the tab marker the window sets for every
+/// child; `stdin_tty` is the mode fork's own probe — a piped launch inside a
+/// tab is a harness, and a harness gets what it asked for.
+///
+/// Compiled off Windows only for its test: the guard that consults it is
+/// Windows-only, and Unix keeps nesting (a nested session there is the
+/// documented way to run one).
+#[cfg(any(windows, test))]
+fn nests_inside_aterm(bare: bool, force_session: bool, aterm_child: bool, stdin_tty: bool) -> bool {
+    bare && !force_session && aterm_child && stdin_tty
+}
+
+/// What the guarded launch does instead of nesting: `aterm new-tab -d <cwd>`,
+/// FORCED to the enclosing instance — not routed by `windowing_behavior`, whose
+/// shipped default (`new_window`) would open a second window for a launch that
+/// plainly meant "a terminal here". Unreachable instance (a tab whose window
+/// died, a socket switched off): a new window, said out loud, through the same
+/// sibling handoff every other window takes.
+#[cfg(windows)]
+fn nested_new_tab() -> ExitCode {
+    const ALREADY_INSIDE: &str = "aterm: already inside aterm — opened a new tab here \
+        (aterm --session nests a transparent session on purpose)";
+    let request = match aterm_cli::parse_window_request(
+        "new-tab",
+        &[OsString::from("-d"), OsString::from(".")],
+        resolve_dir_absolute,
+    ) {
+        Ok(request) => request,
+        Err(message) => {
+            eprintln!("aterm: {message}");
+            return ExitCode::from(2);
+        }
+    };
+    let forwarded = aterm_ctl::front_door_instance().and_then(|sock| {
+        let line = request.control_request().ok()?;
+        Some(aterm_ctl::front_door_send(&sock, &line))
+    });
+    match forwarded {
+        Some(Ok(reply)) if reply.starts_with("OK") => {
+            eprintln!("{ALREADY_INSIDE}");
+            ExitCode::SUCCESS
+        }
+        Some(Ok(reply)) => {
+            eprintln!(
+                "aterm: already inside aterm, but the running aterm refused a new tab: {reply}"
+            );
+            ExitCode::FAILURE
+        }
+        Some(Err(error)) => {
+            eprintln!(
+                "aterm: already inside aterm, but could not reach it ({error}); opening a new \
+                 window (aterm --session nests a transparent session on purpose)"
+            );
+            run_window(
+                request.window_args(),
+                WindowHost::WindowedSibling,
+                &spawn_handoff_argv(&request),
+            )
+        }
+        None => {
+            eprintln!(
+                "aterm: already inside aterm, but its control socket is not reachable; opening \
+                 a new window (aterm --session nests a transparent session on purpose)"
+            );
+            run_window(
+                request.window_args(),
+                WindowHost::WindowedSibling,
+                &spawn_handoff_argv(&request),
+            )
+        }
+    }
 }
 
 /// The index of the `-e`/`--command`/`--` PAYLOAD BOUNDARY, or `rest.len()`.
@@ -1024,23 +1468,30 @@ fn plain_launch_request(
 
 /// SINGLE-INSTANCE ROUTING (S12) for a PLAIN window launch — Explorer, the Start
 /// menu, a pinned tile, `aterm --window` with nothing else asked of it.
-/// `Some(code)` when the running instance served it; `None` to go on and open a
-/// window here.
+/// `Break(code)` when the running instance served it; `Continue` to go on and
+/// open a window here — carrying the routed request when the policy DECIDED
+/// that (the console image on Windows hands the decision, not the launch, to
+/// the windowed sibling: [`spawn_handoff_argv`]), and `None` when the launch
+/// was not the policy's to route at all.
 ///
 /// The eligibility gate is `plain_launch_is_policy_eligible` and it is
 /// deliberately narrow: `-e`, `--headless`, `--diagnose` and an
 /// update successor's inherited argv all carry instructions a forwarded tab
 /// cannot honour, so they fail closed to spawning. See that function for the
-/// case-by-case reasoning. Under the shipped default this returns `None` without
+/// case-by-case reasoning. Under the shipped default this spawns without
 /// dialing anything.
-fn plain_launch_policy(argv: &[OsString]) -> Option<ExitCode> {
+fn plain_launch_policy(
+    argv: &[OsString],
+) -> ControlFlow<ExitCode, Option<aterm_cli::WindowRequest>> {
     let env = aterm_cli::LaunchEnv {
         updated_from: std::env::var_os("ATERM_UPDATED_FROM").is_some(),
     };
-    let request = plain_launch_request(argv, env)?;
+    let Some(request) = plain_launch_request(argv, env) else {
+        return ControlFlow::Continue(None);
+    };
     match route_and_maybe_forward(&request) {
-        ControlFlow::Break(code) => Some(code),
-        ControlFlow::Continue(_) => None,
+        ControlFlow::Break(code) => ControlFlow::Break(code),
+        ControlFlow::Continue(_) => ControlFlow::Continue(Some(request)),
     }
 }
 
@@ -1057,18 +1508,24 @@ fn plain_launch_policy(argv: &[OsString]) -> Option<ExitCode> {
 /// filesystem, asking whether an instance is reachable, and performing whichever
 /// of the two routes came back.
 ///
-/// EXIT CODES, which matter more here than they look. This binary is
-/// GUI-subsystem on Windows (see the crate attribute), so the console it prints
-/// to is the parent's, reattached by `attach_parent_console` before ANY route
-/// runs — including this one. That reattachment deliberately restores the
-/// parent's own redirected handles (the `aterm --version > out.txt` invariant
-/// `build.ps1` depends on), and nothing here disturbs it: this route only ever
-/// writes to the already-resolved `stderr`, and it returns an `ExitCode` rather
-/// than calling `process::exit`, so `main`'s normal teardown still runs.
+/// EXIT CODES, which matter more here than they look. Under the WINDOWED image
+/// on Windows (`aterm-gui.exe new-window` from the jump list) the console this
+/// prints to is the parent's, reattached by `attach_parent_console` before ANY
+/// route runs — including this one. That reattachment deliberately restores
+/// the parent's own redirected handles (the `aterm --version > out.txt`
+/// invariant `build.ps1` depends on), and nothing here disturbs it: this route
+/// only ever writes to the already-resolved `stderr`, and it returns an
+/// `ExitCode` rather than calling `process::exit`, so `main`'s normal teardown
+/// still runs. Under the console image the shell simply waits for these codes.
 ///   * `0` — the tab/window/pane was opened (forwarded or spawned).
 ///   * `1` — the running instance answered `ERR`; its text is on stderr.
 ///   * `2` — a grammar error (unknown option, missing `<dir>`, bad directory).
-fn window_verb(verb: &str, args: &[OsString]) -> ExitCode {
+///
+/// `host` is where a SPAWNED window runs (see [`WindowHost`]): the console image
+/// hands it to the windowed sibling — as `new-window`, the decision this
+/// function just made ([`spawn_handoff_argv`]) — and the windowed image runs it
+/// here.
+fn window_verb(verb: &str, args: &[OsString], host: WindowHost) -> ExitCode {
     // `-h`/`--help` on a verb answers with that verb's own synopsis rather than
     // the "unknown option" the strict grammar would otherwise produce. Every
     // other front-door verb forwards `--help` to the tool it dispatches to and
@@ -1106,8 +1563,7 @@ fn window_verb(verb: &str, args: &[OsString]) -> ExitCode {
     {
         eprintln!("{line}");
     }
-    aterm_gui::main_entry(request.window_args());
-    ExitCode::SUCCESS
+    run_window(request.window_args(), host, &spawn_handoff_argv(&request))
 }
 
 /// Why a request the running instance did not answer opens a window here.
@@ -1301,11 +1757,12 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     if matches!(first.as_deref(), Some("--help" | "-h" | "help")) && rest.len() == 1 {
         // The verbs THIS binary answers: the Linux delivery's `enable | apply |
         // rollback` exist only there (a Mac refuses them), and `install` is the
-        // installer's own step (tools/install.sh), never typed.
+        // installer's own step (tools/install.sh), never typed — as is `enable
+        // --proof-dir`, whose signed release files only an installer holds.
         println!("{UPDATE_USAGE}");
         #[cfg(target_os = "linux")]
         println!(
-            "Linux: aterm update enable [--proof-dir DIR] | apply | rollback\n\
+            "Linux: aterm update enable | apply | rollback\n\
              Updates replace only the on-disk executable; running sessions are never \
              restarted."
         );
@@ -1335,7 +1792,7 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
                     std::path::Path::new(&rest[4]),
                 )
             }
-            _ => Err("usage: aterm update enable [--proof-dir DIR] | apply | rollback".into()),
+            _ => Err("usage: aterm update enable | apply | rollback".into()),
         };
         return match result {
             Ok(message) => {
@@ -1363,13 +1820,21 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
     let checking = sub.as_deref() == Some("check");
     let st = match sub.as_deref().unwrap_or("status") {
         "status" => aterm_update::status(build),
+        // Windows has no updater at all yet (design §7, W8 open): there is nothing to
+        // check, and `check_now` is only the unsupported-platform stub, whose sentence
+        // names no way to update. Answer as `status` does — the line that names the
+        // lane that DOES update a Windows copy (audit 2026-09-22).
+        "check" if cfg!(windows) => None,
         "check" => {
             // A check can download a whole release: say it is working, to a person only
             // — and only on a copy that checks (an installed aterm.app, an enrolled Linux
             // copy). A dev, disk-image or quarantined copy answers at once with its
-            // refusal; announcing a check there is a line about work that never starts.
+            // refusal, and a Linux install waiting for its first window skips the check;
+            // announcing a check there is a line about work that never starts.
             if std::io::IsTerminal::is_terminal(&std::io::stderr())
-                && aterm_update::status(build).is_some_and(|st| st.enabled && st.installable)
+                && aterm_update::status(build).is_some_and(|st| {
+                    st.enabled && st.installable && !linux_install_waits_for_window(&st)
+                })
             {
                 eprintln!("Checking for updates\u{2026}");
             }
@@ -1482,6 +1947,9 @@ fn dev_shared_writes_line(writes: aterm_gui::DevSharedWrites) -> String {
 /// that is the platform; on a Mac it is `HOME` unset or the updates directory not
 /// being a private one of the user's (`ensure_private_dir`: a real directory, owned,
 /// mode 0700, not a symlink) — the two ways `Staging::resolve` answers `None`.
+/// On Windows (no updater yet, so `check` lands here too) the line names the lane
+/// that does update a Windows copy: the platform-only sentence sent a reader to
+/// wait for an updater that does not exist (audit 2026-09-22).
 fn update_unreadable_line(version: &str) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -1493,7 +1961,15 @@ fn update_unreadable_line(version: &str) -> String {
         };
         format!("aterm {version} can\u{2019}t read its update ledger: {why}")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        format!(
+            "aterm {version} doesn\u{2019}t update itself on Windows yet \u{2014} to update it, \
+             run {} in your aterm checkout",
+            aterm_cli::WINDOWS_UPDATE_LANE
+        )
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         format!("aterm {version} doesn\u{2019}t update itself on this platform")
     }
@@ -1528,11 +2004,12 @@ fn update_summary(
 ) -> (String, Option<String>) {
     if !st.enabled {
         // Only a Linux copy reaches here (macOS always has an updater; elsewhere there
-        // is no ledger at all): not enrolled, or automatic updates are off. The
-        // ledger's sentence names the remedy (`aterm update enable`).
+        // is no ledger at all): not enrolled, or enrollment never finished — per copy,
+        // since each executable keeps its own record. The ledger's sentence names the
+        // remedy (`aterm update enable`) or why this copy's path can't be updated.
         let remedy = st.outcome.trim();
         return (
-            format!("aterm {version} doesn\u{2019}t update itself on this machine"),
+            format!("This copy of aterm {version} doesn\u{2019}t update itself"),
             (!remedy.is_empty()).then(|| remedy.to_string()),
         );
     }
@@ -1551,6 +2028,17 @@ fn update_summary(
         let next = staged.1.unwrap_or_else(|| format!("build {}", staged.0));
         return (
             format!("aterm {next} is downloaded \u{2014} `aterm update apply` installs it"),
+            None,
+        );
+    }
+    // A replaced Linux executable is final once an aterm window starts from it; until
+    // then a check reads no channel, so "up to date" would be a claim nothing tested.
+    if linux_install_waits_for_window(st) {
+        return (
+            format!(
+                "aterm {version} is installed \u{2014} launch an aterm window once to finish; \
+                 update checks wait until then"
+            ),
             None,
         );
     }
@@ -1650,7 +2138,10 @@ fn update_summary(
             // An install streak whose build is gone: not a check failure.
             "the last updates didn\u{2019}t install".to_string()
         } else {
-            format!("update checks keep failing: {}", check_trouble_words(class))
+            match check_trouble_words(class) {
+                Some(words) => format!("update checks keep failing: {words}"),
+                None => "update checks keep failing".to_string(),
+            }
         };
         return (
             format!("aterm {version} \u{b7} {trouble}; aterm keeps trying"),
@@ -1658,11 +2149,13 @@ fn update_summary(
         );
     }
     if st.failing_checks > 0 {
+        let why = check_trouble_words(class)
+            .map(|words| format!(": {words}"))
+            .unwrap_or_default();
         return (
             format!(
-                "aterm {version} \u{b7} the last check didn\u{2019}t finish: {}; aterm will try \
-                 again",
-                check_trouble_words(class)
+                "aterm {version} \u{b7} the last check didn\u{2019}t finish{why}; aterm will try \
+                 again"
             ),
             Some(UPDATE_LOG_HINT.to_string()),
         );
@@ -1685,15 +2178,37 @@ fn update_summary(
     (line, None)
 }
 
-/// A failing check CLASS (the updater's health-ledger names) in a person's words.
-fn check_trouble_words(kind: &str) -> &'static str {
+/// A failing check CLASS (the updater's health-ledger names) in a person's words;
+/// `None` for a class that names no cause (Linux records every failure as one class).
+fn check_trouble_words(kind: &str) -> Option<&'static str> {
     match kind {
-        "network" => "the update server can\u{2019}t be reached",
-        "manifest" => "the newest release couldn\u{2019}t be verified",
-        "pipeline" => "downloads aren\u{2019}t finishing",
-        "stage" => "a download couldn\u{2019}t be prepared",
-        _ => "the check failed",
+        "network" => Some("the update server can\u{2019}t be reached"),
+        "manifest" => Some("the newest release couldn\u{2019}t be verified"),
+        "pipeline" => Some("downloads aren\u{2019}t finishing"),
+        "stage" => Some("a download couldn\u{2019}t be prepared"),
+        _ => None,
     }
+}
+
+/// The launches a pending Linux install has spent of its budget, as the -v line's
+/// tail; nothing before the first.
+fn trial_launches_words(starts: u32) -> String {
+    if starts == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({starts} of {} launches used before it rolls back)",
+            aterm_update::LINUX_TRIAL_LAUNCHES
+        )
+    }
+}
+
+/// Whether a replaced Linux executable still waits for its first window launch
+/// (`aterm_update::linux::confirm`), during which checks and applies wait too.
+fn linux_install_waits_for_window(st: &aterm_update::UpdateStatus) -> bool {
+    st.linux.as_ref().is_some_and(|native| {
+        native.trial_phase.as_deref() == Some("Installed") && !native.trial_healthy
+    })
 }
 
 /// How long before `now` the instant `at` was: `just now`, `12 min ago`, `3 h ago`,
@@ -1719,11 +2234,9 @@ fn ago_words(at: i64, now: i64) -> String {
 /// the count).
 fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
     println!("  last decision: {}", st.summary());
+    // The running and installed builds are one file from this CLI; the ledger's
+    // decision above already says when the installed one is newer.
     if let Some(native) = &st.linux {
-        println!(
-            "  Linux: running build {build}, installed build {}",
-            native.installed_build
-        );
         // The plain line above already names the verb that installs it.
         if let Some(staged) = native.staged_build {
             match &native.staged_version {
@@ -1731,10 +2244,10 @@ fn print_update_detail(build: u64, st: &aterm_update::UpdateStatus) {
                 None => println!("  staged: build {staged}"),
             }
         }
-        if let Some(phase) = &native.trial_phase {
+        if linux_install_waits_for_window(st) {
             println!(
-                "  trial: {phase}, starts={}, healthy={}",
-                native.trial_starts, native.trial_healthy
+                "  waiting for an aterm window to launch{}",
+                trial_launches_words(native.trial_starts)
             );
         }
     }
@@ -1893,7 +2406,6 @@ mod tests {
             failing_applies: 0,
             failing_since: String::new(),
             failing_persistent: false,
-            rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
         }
@@ -1917,6 +2429,27 @@ mod tests {
             Some("aterm: no running aterm to split; opening a new window")
         );
         assert_eq!(split_pane_spawn_line(SpawnHere::Unreachable), None);
+    }
+
+    /// Windows has no updater, so `aterm update status` AND `check` land on this line
+    /// (audit 2026-09-22: 0.90.0 answered with the macOS sentences, 0.94.0 with "on
+    /// this platform"; neither named a way to update). It says the state, then the one
+    /// lane that updates a Windows copy — the same words `aterm help update` prints —
+    /// and never an app bundle Windows does not have.
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_line_names_the_lane_that_updates_it() {
+        let line = update_unreadable_line("0.94.0");
+        assert_eq!(
+            line,
+            format!(
+                "aterm 0.94.0 doesn\u{2019}t update itself on Windows yet \u{2014} to update \
+                 it, run {} in your aterm checkout",
+                aterm_cli::WINDOWS_UPDATE_LANE
+            )
+        );
+        assert!(!line.contains("aterm.app"), "{line}");
+        assert!(!line.contains("macOS"), "{line}");
     }
 
     /// `aterm update status|check` SAYS ONE PLAIN LINE (2026-09-23 audit): the version a
@@ -2145,15 +2678,55 @@ mod tests {
         // Linux build names the verb that installs it — never "only on macOS".
         let mut unenrolled = update_status();
         unenrolled.enabled = false;
-        unenrolled.outcome = "Linux self-update is not enrolled; run aterm update enable \
-                              explicitly for this installed copy"
-            .into();
+        unenrolled.outcome = "Run `aterm update enable` to turn on updates for this copy".into();
         let (line, trouble) = say(&unenrolled, true, true);
         assert_eq!(
             line,
-            "aterm 0.91.0 doesn\u{2019}t update itself on this machine"
+            "This copy of aterm 0.91.0 doesn\u{2019}t update itself"
         );
         assert!(trouble.is_some_and(|t| t.contains("aterm update enable")));
+        // A replaced executable waits for its first window, and its checks with it:
+        // never "up to date" over a check that read no channel.
+        let mut waiting = update_status();
+        waiting.linux = Some(aterm_update::LinuxUpdateStatus {
+            installed_build: 100,
+            staged_build: None,
+            staged_version: None,
+            staged_commit: None,
+            trial_phase: Some("Installed".into()),
+            trial_starts: 0,
+            trial_healthy: false,
+        });
+        assert_eq!(
+            say(&waiting, true, true),
+            (
+                "aterm 0.91.0 is installed \u{2014} launch an aterm window once to finish; \
+                 update checks wait until then"
+                    .to_string(),
+                None
+            )
+        );
+        // -v: nothing about the budget right after the install, then how much is used.
+        assert_eq!(trial_launches_words(0), "");
+        assert_eq!(
+            trial_launches_words(1),
+            " (1 of 3 launches used before it rolls back)"
+        );
+        waiting.linux.as_mut().expect("linux").trial_healthy = true;
+        assert!(say(&waiting, true, true).0.contains("is up to date"));
+        // A Linux failure carries one class that names no cause: no tautology after it.
+        let mut linux_failing = update_status();
+        linux_failing.failing_checks = 1;
+        linux_failing.failing_checks_kind = "linux-update".into();
+        assert_eq!(
+            say(&linux_failing, true, true).0,
+            "aterm 0.91.0 \u{b7} the last check didn\u{2019}t finish; aterm will try again"
+        );
+        linux_failing.failing_persistent = true;
+        assert_eq!(
+            say(&linux_failing, true, true).0,
+            "aterm 0.91.0 \u{b7} update checks keep failing; aterm keeps trying"
+        );
         let mut native = update_status();
         native.linux = Some(aterm_update::LinuxUpdateStatus {
             installed_build: 100,
@@ -2416,6 +2989,13 @@ mod tests {
             .into_iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
+        // The progress file is `layout.progress_file()`, a native join: `/p/…` on
+        // Unix and `/p\…` on Windows, so the expected spelling is per host.
+        let progress = if cfg!(windows) {
+            r"/p\progress.json"
+        } else {
+            "/p/progress.json"
+        };
         assert_eq!(
             words,
             [
@@ -2425,7 +3005,7 @@ mod tests {
                 "--wait-lock",
                 "1800",
                 "--progress-file",
-                "/p/progress.json"
+                progress
             ]
         );
     }
@@ -2660,6 +3240,308 @@ mod tests {
             );
             assert_eq!(alias_route(name, ""), AliasRoute::FrontDoor, "{name}");
         }
+    }
+
+    /// `aterm-windowed` — the cargo target name of the WINDOWED image, which a
+    /// dev tree runs under that name before `build.ps1` renames it to
+    /// `aterm-gui.exe` — routes exactly as `aterm-gui` does, verb for verb: the
+    /// jump list committed by a dev-tree window names that image.
+    #[test]
+    fn the_windowed_target_name_is_the_gui_alias() {
+        for verb in aterm_cli::Verb::ALL {
+            assert_eq!(
+                alias_route("aterm-windowed", verb.name()),
+                alias_route("aterm-gui", verb.name()),
+                "aterm-windowed {}",
+                verb.name()
+            );
+        }
+        assert_eq!(
+            alias_route("aterm-windowed", "new-window"),
+            AliasRoute::AliasWindowVerb
+        );
+        for operand in ["", "--window", "-d", "--headless", "--diagnose"] {
+            assert_eq!(
+                alias_route("aterm-windowed", operand),
+                AliasRoute::AliasWindow,
+                "aterm-windowed {operand:?}"
+            );
+        }
+    }
+
+    /// THE TWO IMAGES ARE ONE BODY (Windows, 2026-09-22). The PE subsystem is a
+    /// per-file header field, so the console image (this file) must carry NO
+    /// `windows_subsystem` attribute, and the windowed image (`windowed.rs`)
+    /// must carry it and include THIS file — not a copy of it — as its body.
+    /// And every window the front door opens must go through the one call that
+    /// knows which image is running (`run_window`): a second direct
+    /// `aterm_gui::main_entry` call is a window that would run in the console
+    /// process and hold the shell's prompt. A scrape, in the idiom of the
+    /// session-lane tests above.
+    #[test]
+    fn the_windowed_image_is_this_file_plus_the_subsystem_attribute() {
+        let console = include_str!("main.rs");
+        let windowed = include_str!("windowed.rs");
+        let code_lines = |src: &str| -> Vec<String> {
+            src.lines()
+                .map(str::trim_start)
+                .filter(|l| !l.starts_with("//"))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert!(
+            !code_lines(console)
+                .iter()
+                .any(|l| l.starts_with("#![") && l.contains("windows_subsystem")),
+            "the console image must not carry a subsystem attribute"
+        );
+        assert!(
+            code_lines(windowed).iter().any(|l| {
+                l.starts_with("#![cfg_attr(") && l.contains("windows_subsystem = \"windows\"")
+            }),
+            "the windowed image carries the GUI subsystem"
+        );
+        assert!(
+            code_lines(windowed)
+                .iter()
+                .any(|l| l == "#[path = \"main.rs\"]"),
+            "the windowed image shares this file's body"
+        );
+        // ... on Windows only: off Windows the include would make every release
+        // build link the whole front door twice (review 2026-09-27).
+        let windowed_code = code_lines(windowed);
+        let include = windowed_code
+            .iter()
+            .position(|l| l == "#[path = \"main.rs\"]")
+            .expect("the include line, asserted above");
+        assert_eq!(
+            windowed_code
+                .get(include.wrapping_sub(1))
+                .map(String::as_str),
+            Some("#[cfg(all(windows, not(test)))]"),
+            "the front door is included into the windowed image on Windows alone"
+        );
+        // The needle is assembled so THIS line does not count itself (the
+        // first run of the test found 2: the call, and this literal).
+        let entry_call = concat!("aterm_gui::", "main_entry(");
+        assert_eq!(
+            code_lines(console)
+                .iter()
+                .filter(|l| l.contains(entry_call))
+                .count(),
+            1,
+            "every window route goes through `run_window`"
+        );
+    }
+
+    /// THE HOST TABLE for a window-shaped front-door launch. On Windows the
+    /// console image hands a real window to the windowed sibling, and keeps
+    /// the WINDOW in-process only for the launches whose output a harness
+    /// reads through its pipes: `--headless` (its one spelling) and
+    /// `--diagnose`. A flag the window's parser answers by printing takes the
+    /// sibling route too — whose first step is that parser, run in this
+    /// process (`aterm_gui::check_window_args`), so it still prints here; the
+    /// end-to-end proof is `tests/windows_console_image.rs`. Off Windows there
+    /// is one image and one answer.
+    #[test]
+    fn a_console_window_launch_goes_to_the_sibling_unless_a_harness_reads_it() {
+        let osv = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+        let window = if cfg!(windows) {
+            WindowHost::WindowedSibling
+        } else {
+            WindowHost::ThisProcess
+        };
+        assert_eq!(window_host_for(&osv(&[])), window, "the no-TTY launch");
+        assert_eq!(window_host_for(&osv(&["--window"])), window);
+        assert_eq!(
+            window_host_for(&osv(&["--window", "-d", ".", "--hold"])),
+            window
+        );
+        for flag in [
+            "--help",
+            "--version",
+            "--list-fonts",
+            "--install-context-menu",
+        ] {
+            assert_eq!(
+                window_host_for(&osv(&["--window", flag])),
+                window,
+                "{flag} is answered by the parser run before the handoff"
+            );
+        }
+        for flag in ["--headless", "--diagnose"] {
+            assert_eq!(
+                window_host_for(&osv(&["--window", flag])),
+                WindowHost::ThisProcess,
+                "{flag}: a harness reads this process's output"
+            );
+        }
+    }
+
+    /// A window the routing policy decided to SPAWN is handed to the windowed
+    /// sibling as `new-window [-d <dir>]` — the verb the policy never
+    /// redirects — so the sibling, the whole front door under the `aterm-gui`
+    /// alias, cannot route it a second time. Handed a bare `[-d <dir>]` it
+    /// took the plain-launch route, whose gate ACCEPTS that list, and under
+    /// `attach` with an instance up `aterm new-window` opened a TAB (review
+    /// 2026-09-27). Every intent, with and without a directory.
+    #[test]
+    fn a_spawn_is_handed_to_the_sibling_as_new_window_never_as_a_plain_launch() {
+        for intent in [
+            aterm_cli::LaunchIntent::NewTab,
+            aterm_cli::LaunchIntent::NewWindow,
+            aterm_cli::LaunchIntent::SplitPane,
+            aterm_cli::LaunchIntent::Plain,
+        ] {
+            for dir in [None, Some(String::from(r"C:\work dir"))] {
+                let request = aterm_cli::WindowRequest {
+                    intent,
+                    dir: dir.clone(),
+                    split: aterm_cli::SplitOrientation::Horizontal,
+                };
+                let argv = spawn_handoff_argv(&request);
+                let (verb, rest) = argv.split_first().expect("the verb leads");
+                assert_eq!(verb.to_string_lossy(), "new-window", "{intent:?}");
+                assert_eq!(
+                    alias_route("aterm-gui", "new-window"),
+                    AliasRoute::AliasWindowVerb
+                );
+                let reparsed =
+                    aterm_cli::parse_window_request("new-window", rest, |raw| Ok(raw.to_owned()))
+                        .expect("the sibling's grammar accepts the handoff");
+                assert_eq!(reparsed.intent, aterm_cli::LaunchIntent::NewWindow);
+                assert_eq!(reparsed.dir, dir, "{intent:?}: the directory travels");
+                assert_eq!(
+                    aterm_cli::route_launch(
+                        reparsed.intent,
+                        aterm_cli::WindowingBehavior::Attach,
+                        true
+                    ),
+                    aterm_cli::WindowRoute::Spawn,
+                    "attach with an instance up still spawns"
+                );
+                assert!(
+                    !aterm_cli::plain_launch_is_policy_eligible(
+                        &argv,
+                        aterm_cli::LaunchEnv::default()
+                    ),
+                    "the handoff is never a plain launch the policy could forward"
+                );
+            }
+        }
+    }
+
+    /// THE NESTED-SESSION TABLE (defect b of the 2026-09-22 audit): a BARE
+    /// launch typed inside a tab opens a tab; the `aterm-cli` alias, a launch
+    /// carrying anything at all (`--sandbox`, `--containment`, a `-e` payload,
+    /// a typo — review 2026-09-27: those were silently dropped for a plain
+    /// tab), a launch outside aterm, and a piped launch each keep the session
+    /// they asked for.
+    #[test]
+    fn a_bare_launch_inside_a_tab_opens_a_tab_and_anything_else_nests() {
+        assert!(nests_inside_aterm(true, false, true, true));
+        assert!(
+            !nests_inside_aterm(false, false, true, true),
+            "flags, a -e payload or a typo go to the session parser"
+        );
+        assert!(
+            !nests_inside_aterm(true, true, true, true),
+            "aterm-cli nests on purpose"
+        );
+        assert!(
+            !nests_inside_aterm(true, false, false, true),
+            "not inside aterm at all"
+        );
+        assert!(
+            !nests_inside_aterm(true, false, true, false),
+            "a piped launch is a harness and gets what it asked for"
+        );
+    }
+
+    /// WHICH windowed image the console image hands a window to, against a
+    /// real folder: the shipped name in an install folder, only as a FILE; the
+    /// cargo target name first; and in a build tree (cargo's `.fingerprint`
+    /// beside the exe) never the `aterm-gui.exe` there, which is crate
+    /// aterm-gui's thin dev bin — the window library with none of this front
+    /// door. The rule itself is `aterm_gui`'s, shared with the jump list and
+    /// the Explorer verb. And the detach flag is `DETACHED_PROCESS`, never
+    /// `CREATE_NEW_PROCESS_GROUP` (0x200), which would start the window — and
+    /// every shell under it — with Ctrl+C off.
+    #[cfg(windows)]
+    #[test]
+    fn the_windowed_sibling_is_the_shipped_image_or_a_build_trees_own() {
+        let dir = scratch_dir("windowed-sibling");
+        let exe = dir.join("aterm.exe");
+        let found = || aterm_gui::windowed_front_door_beside(&exe);
+        assert_eq!(found(), None);
+        std::fs::create_dir_all(dir.join("aterm-gui.exe")).expect("a decoy directory");
+        assert_eq!(found(), None, "a directory of that name is not an image");
+        std::fs::remove_dir(dir.join("aterm-gui.exe")).expect("drop the decoy");
+        std::fs::write(dir.join("aterm-gui.exe"), b"").expect("the shipped name");
+        assert_eq!(found(), Some(dir.join("aterm-gui.exe")));
+        std::fs::create_dir_all(dir.join(".fingerprint")).expect("a build tree");
+        assert_eq!(
+            found(),
+            None,
+            "a build tree's aterm-gui.exe is the thin dev bin, never the sibling"
+        );
+        std::fs::write(dir.join("aterm-windowed.exe"), b"").expect("the target name");
+        assert_eq!(found(), Some(dir.join("aterm-windowed.exe")));
+        assert_eq!(windowed_sibling::DETACHED_PROCESS, 0x8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A BUILD TREE'S windowed image stands for this build only when it is as
+    /// new as this image, give or take the two bins' link spread (measured
+    /// 6 ms, in either order): `cargo run -p aterm` relinks the console image
+    /// alone, and a window handed to the stale sibling runs old code while a
+    /// developer validates new (review 2026-09-27).
+    #[cfg(windows)]
+    #[test]
+    fn a_build_trees_windowed_image_older_than_this_one_is_not_used() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let before = |secs: u64| now - Duration::from_secs(secs);
+        assert!(
+            !windowed_sibling::is_stale(now, now),
+            "same instant: one build"
+        );
+        assert!(
+            !windowed_sibling::is_stale(now - Duration::from_millis(6), now),
+            "the measured link spread of one build"
+        );
+        assert!(
+            !windowed_sibling::is_stale(now + Duration::from_secs(30), now),
+            "newer than this image"
+        );
+        assert!(
+            !windowed_sibling::is_stale(before(60), now),
+            "within a minute"
+        );
+        assert!(
+            windowed_sibling::is_stale(before(61), now),
+            "past the spread"
+        );
+        assert!(
+            windowed_sibling::is_stale(before(4 * 24 * 3600), now),
+            "an earlier build's"
+        );
+    }
+
+    /// THE SHELL'S PIPES STAY OUT OF THE DETACHED WINDOW. Under `cargo test` the
+    /// harness hands this process inheritable pipes as its std handles — the
+    /// same shape a capturing shell hands `aterm.exe` — and after the call none
+    /// of them may be inheritable any more, or a `$o = & aterm --window` would
+    /// hang until the window closed (measured; see the function). Harmless to
+    /// the harness: the flag governs children, and this test spawns none.
+    #[cfg(windows)]
+    #[test]
+    fn the_std_handles_are_not_inheritable_once_the_sibling_is_about_to_start() {
+        windowed_sibling::stop_inheriting_std_handles();
+        assert!(
+            !windowed_sibling::a_std_handle_is_inheritable(),
+            "a std handle would still be carried into the detached window"
+        );
     }
 
     /// THE OS-DRIVEN RELAUNCH. `RegisterApplicationRestart` fires after a

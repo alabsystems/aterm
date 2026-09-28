@@ -234,7 +234,7 @@ impl App {
         }
         // The Security panel's buttons open System Settings, raise consent
         // dialogs, clear saved answers and move copies of the app to the Trash,
-        // and `app act` — a semantic press by name — never presses them. `key`
+        // and `act` — a semantic press by name — never presses them. `key`
         // still drives the page like a hand, by design, so the fence for the
         // three that change this Mac is their alert (default Cancel, which no
         // control verb can answer), and what the two Open buttons record never
@@ -244,9 +244,8 @@ impl App {
             .starts_with(crate::native_settings::MACOS_ACCESS_GESTURE_PREFIX)
         {
             return Err(
-                "`app act` does not press the macOS access buttons in Settings ▸ Security: they \
-                 are owner gestures, and the three that change this Mac ask the owner in an \
-                 alert first"
+                "`act` does not press Settings ▸ Security's macOS access buttons; press them in \
+                 the window"
                     .to_string(),
             );
         }
@@ -600,10 +599,16 @@ impl App {
                     .tab_chrome_titles_by_tab
                     .get(&tab.id)
                     .map_or(stable_fallback, |(_, title)| title.as_str());
+                // `index=` is 0-BASED: the number `tab <N>` / `tab close <N>`
+                // take (the wire's documented base). It used to print
+                // `index + 1` — the strip's 1-based ordinal — so an agent that
+                // read `index=3` off this line and sent `tab 3` was refused
+                // with `this window has 3` (measured, audit 2026-09-22). One
+                // base on the wire; the chip ordinals stay a painted thing.
                 lines.push(format!(
                     "  tab id={} index={} kind={} title={:?} state={} active={}",
                     tab.id.get(),
-                    index + 1,
+                    index,
                     tab_kind(self, tab),
                     title,
                     indicator_state(tab),
@@ -1416,6 +1421,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// ONE BASE ON THE WIRE. `inspect app/v1 tabs` used to print `index=`
+    /// 1-based (the strip's painted ordinal) while `tab <N>` / `tab close <N>`
+    /// take a 0-based N — so an agent that read `index=3` and sent `tab 3` was
+    /// refused (audit 2026-09-22). The line now prints the number the verb
+    /// takes, and the refusal for the number past the end names the range.
+    #[test]
+    fn tabs_inspection_prints_the_index_the_tab_verb_takes() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        let count = app.windows[&wid].tab_set.len();
+        assert_eq!(count, 3, "fixture: three tabs");
+        let lines = app.inspect_app(InspectRequest::Tabs).unwrap();
+        let indexes: Vec<usize> = lines
+            .iter()
+            .filter(|line| line.starts_with("  tab id="))
+            .map(|line| {
+                line.split_whitespace()
+                    .find_map(|field| field.strip_prefix("index="))
+                    .unwrap_or_else(|| panic!("index= in {line:?}"))
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(indexes, [0, 1, 2], "0-based, in tab order: {lines:?}");
+        // Every printed index is accepted by the verb; the one past the end
+        // is refused, and the refusal spells the printed range.
+        for index in &indexes {
+            assert_eq!(
+                app.apply_tab_cmd_in(wid, crate::TabAction::Select(*index)),
+                Ok((*index, count)),
+                "`tab {index}` selects the tab inspect printed as index={index}"
+            );
+        }
+        assert_eq!(
+            app.apply_tab_cmd_in(wid, crate::TabAction::Select(count)),
+            Err("no tab at index 3: this window has 3 tabs, indexes 0..2".to_string())
+        );
+    }
+
     #[test]
     fn tabs_inspection_uses_effective_smart_title_with_stable_fallback() {
         let mut app = App::headless_for_test();
@@ -1569,7 +1615,13 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("README.md");
         std::fs::write(&path, "# Native app\n").unwrap();
-        let request = format!("app markdown file://{}", path.to_string_lossy());
+        // The shipping encoder, not a hand-rolled `file://{}`: on Windows the
+        // latter puts `C:\…` where the authority goes and the document host
+        // refuses it as malformed (`app_tabs::mixed_tab_tests::file_uri`).
+        let request = format!(
+            "app markdown {}",
+            crate::native_document_host::path_to_file_uri(&path).expect("a file uri")
+        );
         let opened = app.open_app(parse_open(&request).unwrap()).unwrap();
         assert!(opened.starts_with("app markdown file://"));
         assert!(
@@ -1669,7 +1721,7 @@ mod tests {
         );
     }
 
-    /// The Security panel's buttons are the owner's. `app act` refuses every
+    /// The Security panel's buttons are the owner's. `act` refuses every
     /// one of them before the reducer runs, while the same action dispatched as
     /// a press still works, so the refusal is the fence and not an absent
     /// button.
@@ -1745,7 +1797,7 @@ mod tests {
                     value: None,
                 })
                 .unwrap_err();
-            assert!(refused.contains("owner gestures"), "{refused}");
+            assert!(refused.contains("does not press"), "{refused}");
         }
         let panel = state(&mut app, view);
         assert!(
@@ -2028,7 +2080,9 @@ mod tests {
         let path = dir.join("notes.md");
         let original = "alpha needle\nbeta line\n";
         std::fs::write(&path, original).unwrap();
-        app.open_app(parse_open(&format!("app editor file://{}", path.to_string_lossy())).unwrap())
+        // The shipping encoder (see `document_open_uses_host_grant_and_native_tab_path`).
+        let uri = crate::native_document_host::path_to_file_uri(&path).expect("a file uri");
+        app.open_app(parse_open(&format!("app editor {uri}")).unwrap())
             .unwrap();
         let (instance, view) = app.active_native_view(wid).unwrap();
         let document = app.native_runtime.document_id(instance).unwrap();
@@ -2258,6 +2312,12 @@ mod tests {
     /// aterm's name whatever the owner has granted. Everything else stays
     /// openable, because a held Full Disk Access grant reaches it and refusing
     /// would cost the owner function for no consent benefit.
+    ///
+    /// Unix-only: the two domains are macOS's (`Library/Mobile Documents`,
+    /// `Library/CloudStorage`), and the fixture canonicalises `$HOME`, which on
+    /// Windows is the verbatim `\\?\C:\…` spelling the fence does not compare
+    /// against. Windows' own cloud providers are a fence of their own.
+    #[cfg(unix)]
     #[test]
     fn the_control_surface_refuses_only_cloud_storage_opens() {
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {

@@ -48,8 +48,8 @@
 //!    skips and refuses the merge-contract sentence for any narrowed run. That is
 //!    the single most important property in the gate and [`verdict`] is where it
 //!    lives — one function, one sentence constant, exhaustively tested.
-//!  * The flag spellings `--fast` / `--full` / `--scope <crate>` / `--selftest`,
-//!    so docs/PROCESS.md and every agent instruction keep working unedited.
+//!  * The flag spellings `--fast` / `--full` / `--scope <crate>`, so
+//!    docs/PROCESS.md and every agent instruction keep working unedited.
 //!  * The change-scoped tier `--changed [--base <ref>]` ([`changed`]), including
 //!    the part that makes it safe rather than merely fast: THE DIRECTION OF
 //!    FAILURE IS FIXED. Anything the selection cannot answer honestly — absent
@@ -90,15 +90,16 @@
 //!    stop. `--base=` is a usage error for the same reason: in bash it set an
 //!    empty ref, which then failed to find a merge-base and WIDENED the run
 //!    without the caller ever learning the flag was malformed.
-//!  * A run in a git checkout verifies a pinned SNAPSHOT of the caller's tree
-//!    ([`snapshot`], 2026-09-13; `--in-place` opts out, and `--selftest` runs
-//!    in place), and a compiler (or, in a git checkout, the source tree) that
-//!    moves under a run stops every stage not yet started and adds a `source
-//!    identity` COULD NOT RUN row ([`identity`]): a run with nothing failed ends
-//!    COULD NOT RUN (exit 3), and a stage that already FAILED keeps FAIL (exit
-//!    1). The 14 h `--fast` run that motivated both was pulled four times
-//!    mid-ladder in a live, shared checkout and still printed one verdict.
-//!    Neither changes any stage's argv.
+//!  * Every run verifies a pinned SNAPSHOT of the caller's git checkout
+//!    ([`snapshot`], 2026-09-13; a root git cannot open is COULD NOT RUN, and
+//!    the `--in-place` and `--selftest` modes are gone since 2026-09-27), and
+//!    a compiler or source tree that moves under a run stops every stage not
+//!    yet started and adds a `source identity` COULD NOT RUN row
+//!    ([`identity`]): a run with nothing failed ends COULD NOT RUN (exit 3),
+//!    and a stage that already FAILED keeps FAIL (exit 1). The 14 h `--fast`
+//!    run that motivated both was pulled four times mid-ladder in a live,
+//!    shared checkout and still printed one verdict. Neither changes any
+//!    stage's argv.
 //!  * The change-scoped SELECTION is a pure function of (diff paths, manifests,
 //!    members, inverted graph), so its seeds, its reverse-dependency closure and
 //!    every one of its widening triggers are unit-testable without a repo. In
@@ -118,7 +119,12 @@ pub mod plan;
 pub mod receipt;
 pub mod sched;
 pub mod scope;
+// The smokes drive a unix control socket with unix process plumbing, and the
+// ladder that runs them is a unix program (`tools/verify.sh`); off unix the
+// two smoke rows are named skips (`stages::run_stage`).
+#[cfg(unix)]
 pub mod smoke;
+#[cfg(unix)]
 pub mod smoke_stages;
 pub mod snapshot;
 pub mod stages;
@@ -171,7 +177,6 @@ pub mod exit {
 pub struct EnvSnapshot {
     pub path: OsString,
     pub home: PathBuf,
-    pub cargo_target_dir: Option<OsString>,
     pub trust_stage2_bin: Option<PathBuf>,
     pub trust_mc_sysroot: Option<PathBuf>,
     pub ay_bin_dir: Option<PathBuf>,
@@ -209,7 +214,6 @@ impl EnvSnapshot {
         Self {
             path: std::env::var_os("PATH").unwrap_or_default(),
             home: var_path("HOME").unwrap_or_default(),
-            cargo_target_dir: std::env::var_os("CARGO_TARGET_DIR"),
             trust_stage2_bin: var_path("TRUST_STAGE2_BIN"),
             trust_mc_sysroot: var_path("TRUST_MC_SYSROOT"),
             ay_bin_dir: var_path("AY_BIN_DIR"),
@@ -236,7 +240,6 @@ pub struct Ctx {
     pub root: PathBuf,
     pub mode: Mode,
     pub scope: Scope,
-    pub selftest: bool,
     pub tools: Toolchain,
     /// PATH handed to every child: the resolved stage2 directory first, when a
     /// `targo` actually lives there, exactly as the script's `PATH=…` export did.
@@ -252,14 +255,16 @@ pub struct Ctx {
     /// tallied like any other stage, and subject to the same rule that a stage
     /// recording no outcome cannot be counted.
     pub prelude: Vec<Report>,
-    /// Where the stages run: the caller's checkout, or a snapshot of it.
-    pub source_mode: snapshot::SourceMode,
-    /// `verify: …` header lines — the snapshot's (cold or pruned lanes), or why
-    /// a root that is not a git checkout runs in place — printed under the
-    /// source line.
+    /// The caller's checkout this run's root is a SNAPSHOT of
+    /// ([`Ctx::in_snapshot_of`]) — every run of the gate binary. `None` only
+    /// for a context the gate's own tests build in-process on a root of their
+    /// making, whose ladder runs on that root.
+    pub snapshot_of: Option<PathBuf>,
+    /// `verify: …` header lines — the snapshot's (cold or pruned lanes) and
+    /// the pinned child facts — printed under the source line.
     pub notes: Vec<String>,
     /// Variables removed from every child's inherited environment
-    /// ([`exec::ExecEnv::remove_env`]).
+    /// ([`exec::ExecEnv::remove_env`]): [`CHILD_ENV_REMOVED`], always.
     pub child_env_remove: Vec<&'static str>,
     /// Variables given to every child ([`exec::ExecEnv::add_env`]): the
     /// constants in [`CHILD_ENV`], seeded here at construction, plus the run's
@@ -273,8 +278,6 @@ pub struct Ctx {
     /// them — the 36 GB -> 55 GB lane growth would come back with nothing in
     /// the tree saying why.
     pub child_env_add: Vec<(std::ffi::OsString, std::ffi::OsString)>,
-    /// The `--timings` sink, when one was opened.
-    pub timings: Option<exec::Timings>,
     /// The wall-clock ceiling on one stage child: [`exec::DEFAULT_CHILD_CEILING`]
     /// unless `--stage-timeout` moved it, `None` for `--stage-timeout off`.
     pub child_ceiling: Option<std::time::Duration>,
@@ -321,11 +324,19 @@ pub const GIT_STAMP_ENV: [&str; 3] = [
     "ATERM_BUILD_DEV_COMMITS",
 ];
 
-/// Variables SET in every child's environment, in every mode — after a
-/// snapshot run's `CARGO_TARGET_DIR` is removed and
-/// before a stage's own [`exec::Cmd::envs`], so the gate's setting beats the
-/// caller's shell and a stage that names the variable itself still wins
-/// ([`exec::ExecEnv::add_env`]).
+/// Variables REMOVED from every child's inherited environment, in every run.
+///
+/// `CARGO_TARGET_DIR` (2026-09-13; unconditional since 2026-09-27, when every
+/// run became a snapshot). Every lane names its own directory under the run's
+/// root ([`plan::lane_dir`]), and a caller's redirect reaching a main-lane
+/// cargo child would build in the caller's contended target dir while the
+/// stages looked for its binaries in the snapshot's.
+pub const CHILD_ENV_REMOVED: [&str; 1] = ["CARGO_TARGET_DIR"];
+
+/// Variables SET in every child's environment, in every run — after
+/// [`CHILD_ENV_REMOVED`] and before a stage's own [`exec::Cmd::envs`], so the
+/// gate's setting beats the caller's shell and a stage that names the variable
+/// itself still wins ([`exec::ExecEnv::add_env`]).
 ///
 /// These seed [`Ctx::child_env_add`] at construction, so they hold on EVERY
 /// context — including one that never called
@@ -395,12 +406,11 @@ impl Ctx {
         root: PathBuf,
         mode: Mode,
         scope: Scope,
-        selftest: bool,
         env: EnvSnapshot,
         scratch: PathBuf,
     ) -> Self {
         let tools = run_toolchain(&env, &root);
-        Self::new_with_tools(root, mode, scope, selftest, env, scratch, tools)
+        Self::new_with_tools(root, mode, scope, env, scratch, tools)
     }
 
     /// [`Self::new`] with the run's ONE toolchain already discovered
@@ -411,7 +421,6 @@ impl Ctx {
         root: PathBuf,
         mode: Mode,
         scope: Scope,
-        selftest: bool,
         env: EnvSnapshot,
         scratch: PathBuf,
         tools: Toolchain,
@@ -421,20 +430,18 @@ impl Ctx {
             root,
             mode,
             scope,
-            selftest,
             tools,
             path_env,
             scratch,
             env,
             prelude: Vec::new(),
-            source_mode: snapshot::SourceMode::InPlace,
+            snapshot_of: None,
             notes: Vec::new(),
-            child_env_remove: Vec::new(),
+            child_env_remove: CHILD_ENV_REMOVED.to_vec(),
             child_env_add: CHILD_ENV
                 .iter()
                 .map(|(k, v)| ((*k).into(), (*v).into()))
                 .collect(),
-            timings: None,
             child_ceiling: Some(exec::DEFAULT_CHILD_CEILING),
             skip_gui_smoke: false,
             source_baseline: None,
@@ -445,14 +452,8 @@ impl Ctx {
         }
     }
 
-    /// This run's root is a snapshot of `caller`. The caller's
-    /// `CARGO_TARGET_DIR` stops applying: the snapshot's lanes are its own
-    /// directories, so the redirect is dropped from the snapshot AND removed
-    /// from every child's environment — otherwise cargo would build in the
-    /// caller's contended target dir while the stages looked for binaries in
-    /// the snapshot's.
-    ///
-    /// `tree` is the state the sync verified; the run's tripwire arms on it.
+    /// This run's root is a snapshot of `caller`. `tree` is the state the
+    /// sync verified; the run's tripwire arms on it.
     #[must_use]
     pub fn in_snapshot_of(
         mut self,
@@ -460,10 +461,8 @@ impl Ctx {
         tree: identity::TreeState,
         notes: Vec<String>,
     ) -> Self {
-        self.source_mode = snapshot::SourceMode::Snapshot { caller };
+        self.snapshot_of = Some(caller);
         self.source_baseline = Some(tree);
-        self.env.cargo_target_dir = None;
-        self.child_env_remove.push("CARGO_TARGET_DIR");
         self.notes.extend(notes);
         self
     }
@@ -493,7 +492,7 @@ impl Ctx {
     /// * THE TOOLCHAIN (2026-09-24). The run resolves ONE physical stage2
     ///   directory ([`Toolchain`]) and prepends it to every child's PATH, but
     ///   the xtask verbs it drives — the Formatting stage's `gate lint
-    ///   --fmt-only`, `gate counts`, `gate drift` — call `Toolchain::discover`
+    ///   --fmt-only`, `gate forge`, `gate cells-foreign` — call `Toolchain::discover`
     ///   AGAIN in the child, and discovery ranks the rustup entry and the
     ///   store's MOVING `current` ahead of PATH. So an atpkg update landing
     ///   mid-run (runs of 33 min to 14 h are on record) formatted with the new
@@ -579,13 +578,6 @@ impl Ctx {
         self
     }
 
-    /// Write per-child timing rows to `timings`.
-    #[must_use]
-    pub fn with_timings(mut self, timings: Option<exec::Timings>) -> Self {
-        self.timings = timings;
-        self
-    }
-
     /// Move the stage-child ceiling (`--stage-timeout`; `None` is `off`).
     #[must_use]
     pub fn with_child_ceiling(mut self, ceiling: Option<std::time::Duration>) -> Self {
@@ -655,7 +647,6 @@ impl Ctx {
             child_ceiling: self.child_ceiling,
             remove_env: &self.child_env_remove,
             add_env: &self.child_env_add,
-            timings: self.timings.as_ref(),
         }
     }
 
@@ -726,33 +717,26 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
     out
 }
 
-/// Run the whole gate: the retired-hook migration, ladder, verdict. Returns the
-/// process exit code.
+/// Run the whole gate: ladder and verdict. Returns the process exit code.
 ///
-/// `out` receives, in this order: the [`toolchain_header`] line, the prelude rungs,
-/// the `hooks:` note when [`unpin_retired_hook`] had to unset the `core.hooksPath`
-/// an older gate pinned, the
-/// `verify: source …` line (a git root only) and any `verify:` notes (the
-/// snapshot's lanes, or why the run is in place), `verify: lanes over the cap:
-/// …` lines naming any lane the cap could not remove, the `verify: disk …`
-/// line (the free space on the volume holding the run's root, what its lanes
-/// hold, and what this run needs — with the terms of the sum, or as the
-/// `--disk-floor` in force),
-/// the ladder in declared order
-/// with a `  time  ` line under each stage — or, in its place, a `source
-/// identity` COULD NOT RUN row for a git checkout the gate cannot read, or a
-/// `disk preflight` COULD NOT RUN row for a volume with less free than that
-/// ([`disk`]),
-/// each except
-/// under `--selftest`, which keeps its own ladder — the `source identity` row
-/// when the toolchain (or, in a git checkout, the source tree) moved mid-run,
-/// and the verdict
-/// (or the gate-defect `FAIL` and `VERIFY: COULD NOT RUN` lines) — byte-for-byte
-/// in the vocabulary `tools/verify.sh` established.
-/// Live progress goes to stderr so a long stage is not silent without polluting the
-/// scannable part, and every stage's [`finish_line`] — its outcome word included —
-/// goes to [`Ctx::progress_log`] the moment the stage ends, in the order stages
-/// FINISH rather than the order they print.
+/// `out` receives, in this order: the [`toolchain_header`] line, the lease line,
+/// the prelude rungs, the `verify: source …` line (a git root only) and any
+/// `verify:` notes (the snapshot's lanes, the pinned child facts), `verify:
+/// lanes over the cap: …` lines naming any lane the cap could not remove, the
+/// `verify: disk …` line (the free space on the volume holding the run's root,
+/// what its lanes hold, and what this run needs — with the terms of the sum,
+/// or as the `--disk-floor` in force), the ladder in declared order with a
+/// `  time  ` line under each stage — or, in its place, a `source identity`
+/// COULD NOT RUN row for a git checkout the gate cannot read, or a `disk
+/// preflight` COULD NOT RUN row for a volume with less free than that
+/// ([`disk`]) — the `source identity` row when the toolchain or the source
+/// tree moved mid-run, and the verdict (or the gate-defect `FAIL` and
+/// `VERIFY: COULD NOT RUN` lines) — byte-for-byte in the vocabulary
+/// `tools/verify.sh` established. Live progress goes to stderr so a long stage
+/// is not silent without polluting the scannable part, and every stage's
+/// [`finish_line`] — its outcome word included — goes to [`Ctx::progress_log`]
+/// the moment the stage ends, in the order stages FINISH rather than the order
+/// they print.
 ///
 /// # Errors
 /// Propagates write failures on `out`.
@@ -773,8 +757,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // its gc reclaimed a superseded build a long run still needed (COULD NOT RUN),
     // and an unattended trust update re-laid the rustup view between two stages.
     // Said in one line either way; a lease that cannot be taken never stops the run.
-    // A selftest builds nothing and holds nothing.
-    let _lease = if !ctx.selftest && ctx.tools.have_targo() {
+    let _lease = if ctx.tools.have_targo() {
         let prefix = toolchain::atpkg_prefix(&ctx.env.home, ctx.env.xdg_config_home.as_deref());
         let who = format!(
             "aterm-verify (pid {}) \u{2014} the merge contract in {}",
@@ -792,9 +775,6 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     for r in &ctx.prelude {
         out.write_all(r.render().as_bytes())?;
     }
-    if !ctx.selftest && unpin_retired_hook(&ctx.root, &ctx.path_env) {
-        writeln!(out, "{UNPINNED_NOTE}")?;
-    }
 
     // WHAT THIS RUN IS VERIFYING, captured before anything is planned and
     // re-checked while it runs (2026-09-13). The 14 h run this answers was
@@ -805,7 +785,9 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         ctx.source_baseline.clone(),
         ctx.tools.identity(&ctx.path_env, &ctx.scratch),
     );
-    if let Some(line) = tripwire.header_line(&ctx.source_mode.place(&ctx.root)) {
+    if let Some(line) =
+        tripwire.header_line(&snapshot::place(&ctx.root, ctx.snapshot_of.as_deref()))
+    {
         out.write_all(line.as_bytes())?;
     }
     for note in &ctx.notes {
@@ -814,20 +796,14 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 
     // A GIT CHECKOUT THE GATE CANNOT READ is not a root without a source
     // (2026-09-13): with no identity there is no tripwire, and a run on it
-    // could go green on a tree nothing watched. No stage runs. A selftest
-    // builds nothing and claims nothing about the tree, so it keeps its own
-    // ladder: turning it into SELFTEST FAIL over one unreadable file would be a
-    // finding about the driver that is not true.
-    if !ctx.selftest
-        && let identity::SourceIdentity::Unreadable(why) = &tripwire.source
-    {
+    // could go green on a tree nothing watched. No stage runs.
+    if let identity::SourceIdentity::Unreadable(why) = &tripwire.source {
         let mut r = Report::new("source identity");
         r.cannot_run(identity::unreadable_label(why));
         out.write_all(r.render().as_bytes())?;
         let mut reports = ctx.prelude.clone();
         reports.push(r);
-        let verdict =
-            verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &ladder::tally(&reports));
+        let verdict = verdict::verdict(ctx.mode, &ctx.scope, &ladder::tally(&reports));
         out.write_all(verdict.text.as_bytes())?;
         out.flush()?;
         return Ok(verdict.exit);
@@ -838,22 +814,17 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // budgets what it will write (2026-09-23: from what its lanes already
     // hold, where it used to demand a flat 40 GiB of every run) and refuses —
     // COULD NOT RUN, never a skip — when the volume has less free, printing
-    // the arithmetic and the regenerable dirs. A snapshot's lanes over the cap
-    // are removed first, so the reading after it counts their bytes as free.
-    // A refusal leaves no receipt: nothing was decided, so the last real
-    // judgement of the commit stands. A selftest builds nothing, so it
-    // measures no lanes, removes nothing, prints the reading and refuses on
-    // nothing — the same rule as the unreadable-source arm above.
-    let owner = match &ctx.source_mode {
-        snapshot::SourceMode::Snapshot { .. } if !ctx.selftest => disk::Owner::Snapshot,
-        _ => disk::Owner::InPlace,
-    };
-    let lanes = if ctx.selftest {
-        disk::Lanes::Unknown("not measured: a selftest builds nothing".to_string())
-    } else {
-        disk::measure_lanes(&ctx.root)
-    };
-    let mut plan = disk::plan(ctx.disk_budget, ctx.disk_floor, &lanes, owner);
+    // the arithmetic and the regenerable dirs. Lanes over the cap are removed
+    // first, so the reading after it counts their bytes as free. A refusal
+    // leaves no receipt: nothing was decided, so the last real judgement of
+    // the commit stands.
+    let lanes = disk::measure_lanes(&ctx.root);
+    let mut plan = disk::plan(
+        ctx.disk_budget,
+        ctx.disk_floor,
+        &lanes,
+        disk::Owner::Snapshot,
+    );
     if plan.remove {
         plan.unremoved = snapshot::remove_lanes(&ctx.root);
         for why in &plan.unremoved {
@@ -864,27 +835,26 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         .disk_free
         .map_or_else(|| disk::read_free(&ctx.root), |read| read(&ctx.root));
     out.write_all(disk::header_line(&reading, &plan, &ctx.root).as_bytes())?;
-    if !ctx.selftest
-        && let Err(why) = disk::decide(&reading, &plan, &ctx.root)
-    {
+    if let Err(why) = disk::decide(&reading, &plan, &ctx.root) {
         let mut r = Report::new("disk preflight");
         r.cannot_run(why);
-        let caller = match &ctx.source_mode {
-            snapshot::SourceMode::Snapshot { caller } => Some(caller.as_path()),
-            snapshot::SourceMode::InPlace => None,
-        };
         // After a removal the remedy sizes what is left, not what was.
         let lanes = if plan.remove {
             disk::measure_lanes(&ctx.root)
         } else {
             lanes
         };
-        r.raw(disk::remedy(&ctx.root, &plan, &lanes, &reading, caller));
+        r.raw(disk::remedy(
+            &ctx.root,
+            &plan,
+            &lanes,
+            &reading,
+            ctx.snapshot_of.as_deref(),
+        ));
         out.write_all(r.render().as_bytes())?;
         let mut reports = ctx.prelude.clone();
         reports.push(r);
-        let verdict =
-            verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &ladder::tally(&reports));
+        let verdict = verdict::verdict(ctx.mode, &ctx.scope, &ladder::tally(&reports));
         out.write_all(verdict.text.as_bytes())?;
         out.flush()?;
         return Ok(verdict.exit);
@@ -916,23 +886,20 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
         |spec| {
             let started = Instant::now();
             let begun = t0.elapsed();
-            let stamp_start = ctx.timings.as_ref().map(exec::Timings::now);
             if progress {
                 eprintln!("verify: start  {}", spec.title);
             }
-            let lane = format!("{:?}", spec.lane);
-            let report = exec::with_stage(&spec.title, &lane, || {
-                // A stage that would build or drive something must not start
-                // on a tree or a compiler other than the one this run named.
-                if spec.lane != plan::Lane::Pure
-                    && let Some(why) = tripwire.check(identity::CHECK_CACHE)
-                {
-                    let mut r = Report::new(spec.title.clone());
-                    r.cannot_run(format!("not run: {}", identity::tripped_label(&why)));
-                    return r;
-                }
+            // A stage that would build or drive something must not start on a
+            // tree or a compiler other than the one this run named.
+            let report = if spec.lane != plan::Lane::Pure
+                && let Some(why) = tripwire.check(identity::CHECK_CACHE)
+            {
+                let mut r = Report::new(spec.title.clone());
+                r.cannot_run(format!("not run: {}", identity::tripped_label(&why)));
+                r
+            } else {
                 stages::run_stage(ctx, spec)
-            });
+            };
             tripwire.stage_finished();
             let ran = started.elapsed();
             let finished = finish_line(&spec.title, outcome_word(&report), begun, ran);
@@ -948,18 +915,6 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
                 && let Ok(mut c) = clocks.lock()
             {
                 c[i] = Some((begun, ran));
-            }
-            if let (Some(t), Some(start)) = (&ctx.timings, stamp_start) {
-                t.row(&exec::TimingRow {
-                    stage: &spec.title,
-                    child: "(stage)",
-                    lane: &lane,
-                    start,
-                    end: t.now(),
-                    how: outcome_word(&report),
-                    load_start: None,
-                    load_end: None,
-                });
             }
             report
         },
@@ -1024,7 +979,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     }
 
     let tally = ladder::tally(&reports);
-    let verdict = verdict::verdict(ctx.mode, &ctx.scope, ctx.selftest, &tally);
+    let verdict = verdict::verdict(ctx.mode, &ctx.scope, &tally);
     write_receipt(ctx, &tripwire, &verdict, &tally);
     out.write_all(verdict.text.as_bytes())?;
     out.flush()?;
@@ -1036,11 +991,11 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
 /// it ([`receipt`]).
 ///
 /// Only a run with a SOURCE IDENTITY over a CLEAN tree leaves one: a root
-/// that is not a git checkout has no commit to key a receipt by, a run over
-/// uncommitted work verified bytes no commit holds, and a selftest decided
-/// nothing about the tree. A weaker receipt never replaces the commit's
-/// whole-tree one ([`receipt::write`]). Failures are announced on stderr and
-/// cost the commit its record — never this run its verdict.
+/// that is not a git checkout has no commit to key a receipt by, and a run
+/// over uncommitted work verified bytes no commit holds. A weaker receipt
+/// never replaces the commit's whole-tree one ([`receipt::write`]). Failures
+/// are announced on stderr and cost the commit its record — never this run its
+/// verdict.
 ///
 /// WHAT A RECEIPT SAYS ABOUT A RUN THAT COULD NOT RUN (2026-09-21). A verdict
 /// of COULD NOT RUN is written as `verdict COULD-NOT-RUN`, `merge-contract no`
@@ -1064,9 +1019,6 @@ fn write_receipt(
     let identity::SourceIdentity::Git(tree) = &tripwire.source else {
         return;
     };
-    if ctx.selftest {
-        return;
-    }
     if !tree.dirty.is_empty() {
         eprintln!(
             "verify: no gate receipt — this run verified {} plus uncommitted work, which no \
@@ -1106,10 +1058,7 @@ fn write_receipt(
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_secs()),
     };
-    let caller = match &ctx.source_mode {
-        snapshot::SourceMode::Snapshot { caller } => caller.clone(),
-        snapshot::SourceMode::InPlace => ctx.root.clone(),
-    };
+    let caller = ctx.snapshot_of.clone().unwrap_or_else(|| ctx.root.clone());
     match receipt::write(&caller, &r) {
         Ok(receipt::Written::Stored(_)) => {}
         Ok(receipt::Written::KeptWholeTree(path)) => eprintln!(
@@ -1173,56 +1122,6 @@ pub fn outcome_word(report: &Report) -> &'static str {
 /// [`identity::GATE_STATE_DIR`]. Named here because `main` writes it and the
 /// tripwire's remedy sentence points at it.
 pub const LOG_DIR: &str = "logs";
-
-/// The `core.hooksPath` value an older gate pinned — the directory the retired
-/// push hook lived in.
-pub const RETIRED_HOOKS_PATH: &str = ".githooks";
-
-/// THE ONE MIGRATION THE RETIRED PUSH HOOK LEAVES BEHIND (2026-09-25).
-///
-/// From 2026-07-16 until 2026-09-25 the gate PINNED `core.hooksPath =
-/// .githooks` at the top of every run (`tools/verify.sh`'s stage 0, then this
-/// driver's `pin_hooks`), so that a clone ran the committed
-/// `.githooks/pre-push`. The owner never asked for that hook and had already
-/// rejected hooks outright on 2026-07-06 — "I DONT WANT HOOKS! NO HOOKS NO CI",
-/// "never set core.hooksPath" — so it was deleted, and with it the pin and the
-/// claim it printed. Quality gates live INLINE in the tool being run: the
-/// build's own L0 gate (`tools/freeze-safety-gate`'s build script) and the
-/// release cutter's preflight, which reads this run's receipt ([`receipt`])
-/// itself.
-///
-/// A repository an older gate touched still carries the pin, now naming a
-/// directory that does not exist. Git treats a missing hooks directory as no
-/// hooks, so the pin is inert — but it also masks `.git/hooks`, and it is
-/// configuration nobody asked for. This UNSETS it, and only when it is exactly
-/// the value the old gate wrote, in the repository's own (`--local`) config: a
-/// `core.hooksPath` the operator chose — any other value, or one set globally —
-/// is not this gate's to touch. It never SETS anything.
-///
-/// Answers whether it unset anything; idempotent, and a no-op outside a git
-/// repository. [`run`] calls it on every run except `--selftest`, which writes
-/// nothing, exactly as the pin was skipped there, and prints [`UNPINNED_NOTE`]
-/// when it did something.
-#[must_use]
-pub fn unpin_retired_hook(root: &Path, path_env: &OsStr) -> bool {
-    let git = |args: &[&str]| -> Option<std::process::Output> {
-        Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("PATH", path_env)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-    };
-    let pinned = git(&["config", "--local", "--get", "core.hooksPath"])
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-    pinned.as_deref() == Some(RETIRED_HOOKS_PATH)
-        && git(&["config", "--local", "--unset", "core.hooksPath"]).is_some()
-}
-
-/// The ladder's note when [`unpin_retired_hook`] undid an older gate's pin.
-pub const UNPINNED_NOTE: &str = "  hooks: unset core.hooksPath = .githooks — an older gate's pin \
-     for the retired push hook; git's default hooks directory is back";
 
 /// Find the repo root by walking up from `start` until a directory holds both a
 /// `Cargo.toml` and `tools/verify.sh`.
@@ -1388,17 +1287,11 @@ mod tests {
             demoted: None,
         };
         let ctx = |tools: Option<Toolchain>| {
-            let args = (
-                tmp.clone(),
-                Mode::Fast,
-                Scope::Workspace,
-                true,
-                EnvSnapshot::default(),
-                tmp.clone(),
-            );
+            let (root, scratch) = (tmp.clone(), tmp.clone());
+            let env = EnvSnapshot::default();
             match tools {
-                Some(t) => Ctx::new_with_tools(args.0, args.1, args.2, args.3, args.4, args.5, t),
-                None => Ctx::new(args.0, args.1, args.2, args.3, args.4, args.5),
+                Some(t) => Ctx::new_with_tools(root, Mode::Fast, Scope::Workspace, env, scratch, t),
+                None => Ctx::new(root, Mode::Fast, Scope::Workspace, env, scratch),
             }
         };
         assert_eq!(
@@ -1411,23 +1304,6 @@ mod tests {
             handed,
             "a discovery of its own finds another"
         );
-        // The entrypoint: one discovery, handed to the stamp, the scope and
-        // the context; no consumer discovers again.
-        let code: String = include_str!("main.rs")
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert_eq!(code.matches("run_toolchain(").count(), 1, "discovered once");
-        assert!(!code.contains("Toolchain::discover"), "no second discovery");
-        assert!(!code.contains("Ctx::new("), "the context is handed the one");
-        for handed_to in [
-            "choose_source(&parsed, &root, &env, &scratch, &tools)",
-            "resolve_scope(&parsed, &run_root, &env, &tools)",
-            "Ctx::new_with_tools(",
-        ] {
-            assert!(code.contains(handed_to), "{handed_to}");
-        }
         std::fs::remove_dir_all(&tmp).ok();
     }
 
@@ -1444,7 +1320,6 @@ mod tests {
                 tmp.clone(),
                 Mode::Fast,
                 Scope::Workspace,
-                true,
                 EnvSnapshot::default(),
                 tmp.clone(),
             )
@@ -1468,8 +1343,9 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The wiring for [`CHILD_ENV`]: the value every stage child is launched
-    /// with carries `CARGO_INCREMENTAL=0`, in a snapshot run and in place
+    /// The wiring for [`CHILD_ENV`] and [`CHILD_ENV_REMOVED`]: every stage child
+    /// is launched with `CARGO_INCREMENTAL=0` and without the caller's
+    /// `CARGO_TARGET_DIR`, in a snapshot run and in an in-process context
     /// alike, and nothing the gate REMOVES is also something it sets. A gate
     /// whose children quietly compiled incrementally again would refill the
     /// 55 GB lane this exists to bound, and nothing else in the tree would
@@ -1481,7 +1357,6 @@ mod tests {
             tmp.clone(),
             Mode::Fast,
             Scope::Workspace,
-            false,
             EnvSnapshot::default(),
             tmp.clone(),
         );
@@ -1504,7 +1379,6 @@ mod tests {
             tmp.clone(),
             Mode::Fast,
             Scope::Workspace,
-            false,
             EnvSnapshot::default(),
             tmp.clone(),
         )
@@ -1528,7 +1402,6 @@ mod tests {
             tmp.clone(),
             Mode::Fast,
             Scope::Workspace,
-            false,
             EnvSnapshot::default(),
             tmp.clone(),
         )
@@ -1542,6 +1415,13 @@ mod tests {
             assert!(
                 !snap.exec_env().remove_env.contains(&k),
                 "{k} is both set and removed"
+            );
+        }
+        for c in [&ctx, &snap, &pinned] {
+            assert!(
+                c.exec_env().remove_env.contains(&"CARGO_TARGET_DIR"),
+                "a caller's target dir reaches a child: {:?}",
+                c.child_env_remove
             );
         }
         assert_eq!(ctx.disk_floor, None, "a real run estimates");
@@ -1574,15 +1454,8 @@ mod tests {
                 home: tmp.join("empty-home"),
                 ..EnvSnapshot::default()
             };
-            Ctx::new(
-                tmp.clone(),
-                Mode::Fast,
-                Scope::Workspace,
-                true,
-                env,
-                tmp.clone(),
-            )
-            .with_pinned_child_facts(None)
+            Ctx::new(tmp.clone(), Mode::Fast, Scope::Workspace, env, tmp.clone())
+                .with_pinned_child_facts(None)
         };
 
         let pinned = ctx(&stage2);
@@ -1663,7 +1536,6 @@ mod tests {
                 tmp.clone(),
                 Mode::Fast,
                 Scope::Workspace,
-                false,
                 EnvSnapshot::default(),
                 tmp.clone(),
             )

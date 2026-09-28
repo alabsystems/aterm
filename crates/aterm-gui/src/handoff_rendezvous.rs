@@ -1810,6 +1810,11 @@ mod tests {
         close_tx.send(()).expect("tell the dialer to close");
         closed_rx.recv().expect("the dialer closed");
         dialer.join().expect("dialer thread");
+        // `closed_rx` proves the dialer ran `drop`, not that its socket is gone:
+        // a child another test is forking holds a copy until it execs, and while
+        // it does the send below is buffered, not refused. Only the hang-up the
+        // parent itself observes says every copy is closed.
+        wait_for_hangup(|| peer.poll_hangup());
         let borrowed = fake_master_rd.as_fd();
         let error = peer
             .transfer(
@@ -2316,18 +2321,27 @@ mod tests {
         assert!(!peer.poll_hangup(), "alive while it holds the stream");
         let _ = seen_alive.send(());
         dialer.join().expect("dialer thread");
-        let mut saw_hangup = false;
-        for _ in 0..50 {
-            if peer.poll_hangup() {
-                saw_hangup = true;
-                break;
-            }
+        wait_for_hangup(|| peer.poll_hangup());
+    }
+
+    /// Wait, bounded, for a dialer's close to reach the parent as a hang-up.
+    ///
+    /// A dropped `CtlStream` is closed only when every copy of its descriptor
+    /// is: a child another test in this binary is forking holds one until it
+    /// execs, longer on a loaded machine, and a descriptor made close-on-exec
+    /// non-atomically (macOS `socket` + `FIOCLEX`) can ride through the exec
+    /// itself. So a hang-up is waited for, not expected at once: 10 s, where it
+    /// was ~0.5 s of polls, or none — the fd-copy sweep of 2026-09-27, the class
+    /// `claude_lights`' gesture tests failed a gate on.
+    fn wait_for_hangup(hung_up: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !hung_up() {
+            assert!(
+                Instant::now() < deadline,
+                "the closed dialer never read as a hangup"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert!(
-            saw_hangup,
-            "the closed peer reads as a hangup within a poll or two"
-        );
     }
 
     fn bind_for_test() -> Option<Rendezvous> {

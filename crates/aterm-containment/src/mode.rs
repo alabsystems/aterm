@@ -4,38 +4,26 @@
 
 //! Containment mode enum — the 4 security levels.
 //!
-//! Mirrors the mode encoding of the INTENDED `tla/Containment.tla` model
-//! (not in-tree and on no build/CI path — see the crate-root note; this enum
-//! and its tests are the source of truth):
-//! Master=3, User=2, Safety=1, Containment=0.
-//! Higher value = more capability. Non-escalation means mode can
+//! Level encoding: Master=3, User=2, Safety=1, Containment=0 (pinned by the
+//! tests below). Higher value = more capability. Non-escalation means mode can
 //! only decrease or stay the same.
 
 use std::fmt;
 
 /// The 4 containment modes, ordered by decreasing capability.
 ///
-/// These describe the POLICY intent per mode. As of the OS-sandbox actuator
-/// increment, the Containment policy's NETWORK denial AND a conservative
-/// SECRET-directory read/write denial are OS-ENFORCED on macOS (a real Seatbelt
-/// `(deny network*)` + `(deny file-read* file-write* …)` over `~/.ssh`, `~/.aws`,
-/// `~/.gnupg`, `~/.config/gh`, `~/.config/aterm`, `~/.netrc`, applied via
-/// `sandbox-exec`; see [`crate::actuator`] / [`crate::sbpl`] / `ATERM_DESIGN`
-/// §5.6). GENERAL OS FILESYSTEM scoping (beyond that secret set) is still a
-/// follow-up; the other axes (fork, MCP, plugins, I/O) remain spawn-seam
-/// capability-gate + rlimit posture in this crate.
+/// What each mode actually enforces is stated once, in [`crate::actuator`]; the
+/// crate-root table summarises it.
 ///
-/// - **Master**: Full trust — developer mode. All capabilities unrestricted.
-/// - **User**: Normal usage — standard safeguards. Output shadow-scanned.
-/// - **Safety**: Reduced capability — allowlisted operations only.
-/// - **Containment**: Hostile agent — most restrictive POLICY: no network, no
-///   fork, filtered I/O (policy intent only — I/O filtering is NOT enforced at
-///   runtime), no MCP, no
-///   plugins. The NO-NETWORK part AND a conservative
-///   SECRET-directory read/write deny are OS-enforced on macOS (Seatbelt `deny
-///   network*` + `deny file-read*/file-write*` over the credential set); the rest
-///   is the policy data model + the capability gate (GENERAL OS filesystem scoping
-///   is the deferred follow-up).
+/// - **Master**: Full trust — developer mode. No confinement.
+/// - **User**: The default. No confinement; the shell keeps the launching
+///   shell's resource limits.
+/// - **Safety**: Hardened resource limits (rlimits; the Job Object on Windows)
+///   and no OS sandbox.
+/// - **Containment**: Hostile agent. The macOS Seatbelt sandbox: no network,
+///   writes confined to the temp roots, no read or write of the credential and
+///   private-data stores, plus the hardened resource limits. Refuses to start
+///   where no OS sandbox exists.
 ///
 /// Mode is set ONLY by the launcher (its `--containment` / `--sandbox` /
 /// `--no-sandbox` flag). aterm cannot upgrade its own mode. Mode is immutable
@@ -44,13 +32,9 @@ use std::fmt;
 #[repr(u8)]
 #[non_exhaustive]
 pub enum ContainmentMode {
-    /// Hostile agent — most restrictive policy. Network denial AND a conservative
-    /// secret-directory read/write denial are OS-enforced on macOS (Seatbelt `deny
-    /// network*` + `deny file-read*/file-write*` over the credential set); GENERAL
-    /// filesystem scoping is the deferred follow-up. See the enum-level doc and
-    /// [`crate::actuator`] / [`crate::sbpl`].
+    /// Hostile agent — the OS-sandboxed mode; see [`crate::actuator`].
     Containment = 0,
-    /// Reduced capability — allowlisted operations only.
+    /// Hardened resource limits, no OS sandbox.
     Safety = 1,
     /// Normal usage — standard safeguards.
     User = 2,
@@ -59,7 +43,7 @@ pub enum ContainmentMode {
 }
 
 impl ContainmentMode {
-    /// Numeric capability level (TLA+ encoding). Higher = more capability.
+    /// Numeric capability level. Higher = more capability.
     #[must_use]
     pub const fn level(self) -> u8 {
         self as u8
@@ -79,7 +63,7 @@ impl ContainmentMode {
         }
     }
 
-    /// Parse from string (case-insensitive). Used for env var / CLI parsing.
+    /// Parse from string (case-insensitive). Used for flag parsing.
     #[must_use]
     pub(crate) fn from_str_loose(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
@@ -153,7 +137,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_level_encoding_matches_tla() {
+    fn test_level_encoding() {
         assert_eq!(ContainmentMode::Containment.level(), 0);
         assert_eq!(ContainmentMode::Safety.level(), 1);
         assert_eq!(ContainmentMode::User.level(), 2);
@@ -195,7 +179,7 @@ mod tests {
     /// values, padding, or similar to escalate.
     #[test]
     fn test_parse_rejects_bypass_attempts() {
-        // Numeric values (TLA+ encoding) must not be accepted
+        // Numeric values (the level encoding) must not be accepted
         assert!("0".parse::<ContainmentMode>().is_err());
         assert!("1".parse::<ContainmentMode>().is_err());
         assert!("2".parse::<ContainmentMode>().is_err());

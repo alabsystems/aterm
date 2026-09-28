@@ -17,7 +17,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     VK_NUMPAD8, VK_NUMPAD9, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
     VK_RWIN, VK_SCROLL, VK_SHIFT, VK_SUBTRACT, VK_UP,
 };
-use windows_sys::Win32::UI::TextServices::HKL;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::HKL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     PeekMessageW, MSG, PM_NOREMOVE, WM_CHAR, WM_DEADCHAR, WM_KEYDOWN, WM_KEYFIRST, WM_KEYLAST,
     WM_KEYUP, WM_KILLFOCUS, WM_SETFOCUS, WM_SYSCHAR, WM_SYSDEADCHAR, WM_SYSKEYDOWN, WM_SYSKEYUP,
@@ -346,7 +346,7 @@ impl KeyEventBuilder {
                 key_state,
                 caps_lock_on,
                 num_lock_on,
-                locale_id as HKL,
+                super::handle::from_usize(locale_id as usize),
                 &mut layouts,
             );
             if let Some(event) = event {
@@ -368,7 +368,7 @@ impl KeyEventBuilder {
                     key_state,
                     caps_lock_on,
                     num_lock_on,
-                    locale_id as HKL,
+                    super::handle::from_usize(locale_id as usize),
                     layouts,
                 );
                 if let Some(event) = event {
@@ -386,7 +386,7 @@ impl KeyEventBuilder {
                         key_state,
                         caps_lock_on,
                         num_lock_on,
-                        locale_id as HKL,
+                        super::handle::from_usize(locale_id as usize),
                         layouts,
                     );
                     if let Some(event) = event {
@@ -429,7 +429,7 @@ impl KeyEventBuilder {
         let physical_key = scancode_to_physicalkey(scancode as u32);
         let mods =
             if caps_lock_on { WindowsModifiers::CAPS_LOCK } else { WindowsModifiers::empty() };
-        let layout = layouts.layouts.get(&(locale_id as u64)).unwrap();
+        let layout = layouts.layouts.get(&(super::handle::to_usize(locale_id) as u64)).unwrap();
         let logical_key = layout.get_key(mods, num_lock_on, vk, &physical_key);
         let key_without_modifiers =
             layout.get_key(WindowsModifiers::empty(), false, vk, &physical_key);
@@ -506,12 +506,12 @@ impl PartialKeyEventInfo {
         let scancode = if lparam_struct.scancode == 0 {
             // In some cases (often with media keys) the device reports a scancode of 0 but a
             // valid virtual key. In these cases we obtain the scancode from the virtual key.
-            unsafe { MapVirtualKeyExW(vkey as u32, MAPVK_VK_TO_VSC_EX, layout.hkl as HKL) as u16 }
+            unsafe { MapVirtualKeyExW(vkey as u32, MAPVK_VK_TO_VSC_EX, super::handle::from_usize(layout.hkl as usize)) as u16 }
         } else {
             new_ex_scancode(lparam_struct.scancode, lparam_struct.extended)
         };
         let physical_key = scancode_to_physicalkey(scancode as u32);
-        let location = get_location(scancode, layout.hkl as HKL);
+        let location = get_location(scancode, super::handle::from_usize(layout.hkl as usize));
 
         let kbd_state = get_kbd_state();
         let mods = WindowsModifiers::active_modifiers(&kbd_state);
@@ -906,7 +906,7 @@ pub(crate) fn physicalkey_to_scancode(physical_key: PhysicalKey) -> Option<u32> 
 
     let hkl = unsafe { GetKeyboardLayout(0) };
 
-    let primary_lang_id = primarylangid(loword(hkl as u32));
+    let primary_lang_id = primarylangid(loword(super::handle::to_usize(hkl) as u32));
     let is_korean = primary_lang_id as u32 == LANG_KOREAN;
 
     let code = match physical_key {

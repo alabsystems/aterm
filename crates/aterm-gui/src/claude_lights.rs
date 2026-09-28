@@ -3,10 +3,10 @@
 
 //! THE CLAUDE CODE LIGHTS, host side: a row of lights at the right end of
 //! aterm's Claude Code footer (`crate::claude_footer`) — auto-approve, auto
-//! mode, fast mode, thinking (owner direction, 2026-09-24). What
-//! each light means, where it is read from and which of Claude's own inputs
-//! flips it are decided in `aterm_agent::harness::lights`; this module puts
-//! them on the glass and carries the gestures.
+//! mode, fast mode (owner direction, 2026-09-24). What each light means,
+//! where it is read from and which of Claude's own inputs flips it are
+//! decided in `aterm_agent::harness::lights`; this module puts them on the
+//! glass and carries the gestures.
 //!
 //! * HOVER a light: its title and state replace nothing — they appear just
 //!   left of the lights. CLICK it: it toggles.
@@ -55,8 +55,6 @@ enum Refusal {
     /// The mode cycle came back round without the mode: this session's
     /// shift+tab cycle does not hold it. The person's mode is restored.
     NotInCycle,
-    /// A light aterm shows and never switches (`lights::read_only`).
-    ReadOnly,
     /// Claude is mid-turn; a slash command waits for it to finish.
     Busy,
     /// Claude's screen moved (a box opened) before the next press could go.
@@ -140,7 +138,7 @@ pub(crate) struct Typed {
 struct SessionLights {
     /// The last state each light was SEEN in — kept while a box covers the
     /// composer, so the row does not flicker grey under every dialog.
-    shown: [LightState; 4],
+    shown: [LightState; 3],
     pending: Option<Pending>,
     refused: Option<(Light, Refusal, Instant)>,
 }
@@ -148,7 +146,7 @@ struct SessionLights {
 impl Default for SessionLights {
     fn default() -> Self {
         Self {
-            shown: [LightState::Unknown; 4],
+            shown: [LightState::Unknown; 3],
             pending: None,
             refused: None,
         }
@@ -249,7 +247,6 @@ impl WindowLights {
         &mut self,
         session: u64,
         rows: &[String],
-        thinking: Option<bool>,
         read: impl FnOnce(&[String]) -> Option<Screen>,
         now: Instant,
     ) -> Step {
@@ -261,7 +258,7 @@ impl WindowLights {
         ) else {
             return Step::default();
         };
-        self.observe(session, screen.as_ref(), thinking, now)
+        self.observe(session, screen.as_ref(), now)
     }
 
     /// Fold one frame's reading of `session`'s screen in: remember what each
@@ -270,14 +267,8 @@ impl WindowLights {
     /// by the loop, `App::drain_claude_lights`, not from a frame.) What the
     /// caller must do: wake the loop to send a queued step, and time a
     /// refusal's end.
-    fn observe(
-        &mut self,
-        session: u64,
-        screen: Option<&Screen>,
-        thinking: Option<bool>,
-        now: Instant,
-    ) -> Step {
-        let states = lights::states(screen, thinking);
+    fn observe(&mut self, session: u64, screen: Option<&Screen>, now: Instant) -> Step {
+        let states = lights::states(screen);
         let s = self.sessions.entry(session).or_default();
         for (slot, state) in s.shown.iter_mut().zip(states) {
             if state != LightState::Unknown {
@@ -366,7 +357,7 @@ impl WindowLights {
     }
 
     /// `session`'s light block: its TITLE (when a light is selected, hovered,
-    /// switching or refused — empty otherwise) and its LIGHTS (the four
+    /// switching or refused — empty otherwise) and its LIGHTS (the three
     /// lights, then one cell of margin), with the column of each light within
     /// the lights. Apart, because only the lights must fit: a pane too narrow
     /// for the title keeps its lights and drops the title.
@@ -394,7 +385,6 @@ impl WindowLights {
                     Refusal::Draft => "clear the prompt first",
                     Refusal::NoChange => "Claude did not switch",
                     Refusal::NotInCycle => "not in this session's cycle",
-                    Refusal::ReadOnly => "set it in Claude (Alt+T)",
                     Refusal::Busy => "wait for Claude to finish",
                     Refusal::Moved => "screen changed, try again",
                     Refusal::OutsideCycle => "leave don't-ask in Claude first",
@@ -597,19 +587,13 @@ impl App {
     /// step was queued. Called for EVERY Claude Code pane each frame, painted
     /// footer or not: a pasted slash command opens Claude's completion list
     /// where the mode row was, and the toggle must still see the command land.
-    pub(crate) fn observe_claude_lights(
-        &mut self,
-        wid: WindowId,
-        session: u64,
-        rows: &[String],
-        thinking: Option<bool>,
-    ) {
+    pub(crate) fn observe_claude_lights(&mut self, wid: WindowId, session: u64, rows: &[String]) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        let step =
-            ws.claude_lights
-                .observe_rows(session, rows, thinking, read_lights, Instant::now());
+        let step = ws
+            .claude_lights
+            .observe_rows(session, rows, read_lights, Instant::now());
         if step.queued {
             crate::claude_footer::post_changed(session);
         }
@@ -729,11 +713,11 @@ impl App {
     }
 
     /// Flip `light` of `session` with Claude's own input (see the module
-    /// header): refused, with the reason on the light, when the light is
-    /// read-only, its state is not on screen, or a slash command would land on
-    /// a draft, on a turn in flight or in a driver's prompt. Decided from the
-    /// ENGINE's screen as it is now, not from the last painted frame: a mode
-    /// that changed since is the one the toggle starts from.
+    /// header): refused, with the reason on the light, when its state is not
+    /// on screen, or a slash command would land on a draft, on a turn in
+    /// flight or in a driver's prompt. Decided from the ENGINE's screen as it
+    /// is now, not from the last painted frame: a mode that changed since is
+    /// the one the toggle starts from.
     #[cfg_attr(
         test,
         aterm_spec::refines(
@@ -766,9 +750,6 @@ impl App {
         {
             return;
         }
-        let Some(ws) = self.windows.get_mut(&wid) else {
-            return;
-        };
         let refuse = |ws: &mut crate::WindowState, why: Refusal| {
             ws.claude_lights
                 .sessions
@@ -780,10 +761,6 @@ impl App {
             }
             wake_after(session, REFUSAL_SHOWN);
         };
-        if lights::read_only(light) {
-            refuse(ws, Refusal::ReadOnly);
-            return;
-        }
         let reading = self.claude_screen_now(session);
         let driven = self.session_driven(session);
         let ordering = self
@@ -797,7 +774,7 @@ impl App {
             refuse(ws, Refusal::NotShown);
             return;
         };
-        let from = lights::states(Some(&screen), None)[index(light)];
+        let from = lights::states(Some(&screen))[index(light)];
         let Some(drive) = lights::drive(light, from) else {
             refuse(ws, Refusal::NotShown);
             return;
@@ -1241,7 +1218,7 @@ impl App {
             &rows,
             || {
                 read_screen_now(&rows, cursor, &dim_col2).map(|(screen, empty)| {
-                    let now = lights::states(Some(&screen), None)[index(typed.light)];
+                    let now = lights::states(Some(&screen))[index(typed.light)];
                     TypedView {
                         stamp,
                         readable: true,
@@ -1406,7 +1383,7 @@ mod tests {
     fn inert_session_history_does_not_change_the_lights_repaint_key() {
         let now = Instant::now();
         let mut w = WindowLights {
-            hover: Some((7, Light::Thinking)),
+            hover: Some((7, Light::AutoMode)),
             ..WindowLights::default()
         };
         w.sessions.insert(7, SessionLights::default());
@@ -1435,7 +1412,7 @@ mod tests {
         const SAMPLES: u128 = 50_000;
         let now = Instant::now();
         let mut short = WindowLights {
-            hover: Some((7, Light::Thinking)),
+            hover: Some((7, Light::AutoMode)),
             ..WindowLights::default()
         };
         short.sessions.insert(7, SessionLights::default());
@@ -1491,7 +1468,7 @@ mod tests {
     const ACCEPT: &str = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
 
     fn observe(w: &mut WindowLights, rows: &[String]) -> Step {
-        w.observe_rows(7, rows, Some(true), read_lights, Instant::now())
+        w.observe_rows(7, rows, read_lights, Instant::now())
     }
 
     /// The lights read behind the reader's panic fence: a panicking reader
@@ -1518,10 +1495,7 @@ mod tests {
         let shown = w.sessions[&7].shown;
         let boom = |_: &[String]| -> Option<Screen> { panic!("stand-in reader panic") };
         let plan = screen(&rule, PLAN, "");
-        assert_eq!(
-            w.observe_rows(7, &plan, Some(true), boom, now),
-            Step::default()
-        );
+        assert_eq!(w.observe_rows(7, &plan, boom, now), Step::default());
         assert!(w.outbox.is_empty(), "no step off an unread screen");
         let s = &w.sessions[&7];
         assert_eq!(s.shown, shown, "the lights keep what they showed");
@@ -1696,11 +1670,11 @@ mod tests {
         );
     }
 
-    /// Four lights, one cell apart, each in its own hue when on; the title
+    /// Three lights, one cell apart, each in its own hue when on; the title
     /// comes APART from the lights (only the lights must fit); a box over the
     /// composer keeps the last states rather than greying the row.
     #[test]
-    fn the_block_is_four_lights_and_keeps_what_it_saw() {
+    fn the_block_is_three_lights_and_keeps_what_it_saw() {
         let now = Instant::now();
         // An effort tag (`workspace` stands in for the vendor's word) beside
         // fast mode's `↯`: the tag lights nothing, `↯` lights fast mode.
@@ -1710,13 +1684,13 @@ mod tests {
         let block = w.block(7, blank(), now);
         assert!(block.title.is_empty(), "nothing asked for a title");
         let text: String = block.lights.iter().map(|c| c.ch).collect();
-        assert_eq!(text, "\u{25CF} \u{25CB} \u{25CF} \u{25CF} ");
+        assert_eq!(text, "\u{25CF} \u{25CB} \u{25CF} ");
         assert_eq!(
             block.cols.iter().map(|(at, _)| *at).collect::<Vec<_>>(),
-            [0, 2, 4, 6]
+            [0, 2, 4]
         );
         assert_eq!(block.lights[4].fg, Light::Fast.hue());
-        w.observe(7, None, None, now);
+        w.observe(7, None, now);
         assert_eq!(
             w.block(7, blank(), now).lights,
             block.lights,
@@ -1747,14 +1721,14 @@ mod tests {
         let now = Instant::now();
         let mut w = WindowLights::default();
         observe(&mut w, &screen(&"\u{2500}".repeat(60), BYPASS, ""));
-        w.hover = Some((7, Light::Thinking));
+        w.hover = Some((7, Light::AutoMode));
         w.selected = Some((7, Light::Fast));
         let block = w.block(7, blank(), now);
         let title: String = block.title.iter().map(|c| c.ch).collect();
         assert!(title.starts_with("Fast mode:"), "{title:?}");
         let at = |l: Light| block.cols.iter().find(|(_, x)| *x == l).unwrap().0;
         assert!(block.lights[at(Light::Fast)].bold);
-        assert!(!block.lights[at(Light::Thinking)].bold);
+        assert!(!block.lights[at(Light::AutoMode)].bold);
     }
 
     #[test]
@@ -1764,7 +1738,7 @@ mod tests {
         assert_eq!(w.fingerprint(now), 0);
         w.hover = Some((7, Light::Fast));
         let a = w.fingerprint(now);
-        w.hover = Some((7, Light::Thinking));
+        w.hover = Some((7, Light::AutoMode));
         assert_ne!(a, 0);
         assert_ne!(a, w.fingerprint(now));
     }
@@ -1801,8 +1775,6 @@ mod gesture_tests {
     /// Claude Code's foreground process group, as the resolver names it.
     const PGID: i32 = 4242;
 
-    /// A headless App whose one session writes its PTY input to a private
-    /// socket (the `pointer_license_tests` fixture's observer).
     /// Close the private PTY observer FOR REAL, so the next write through the
     /// session's sink genuinely fails. Dropping `reader` closes only this
     /// process's descriptor: while another test is forking, the child holds a
@@ -1835,6 +1807,8 @@ mod gesture_tests {
         }
     }
 
+    /// A headless App whose one session writes its PTY input to a private
+    /// socket (the `pointer_license_tests` fixture's observer).
     fn app() -> (App, WindowId, u64, UnixStream) {
         let (reader, writer) = UnixStream::pair().expect("private PTY observer");
         reader.set_nonblocking(true).expect("nonblocking observer");
@@ -1842,6 +1816,21 @@ mod gesture_tests {
         let wid = WindowId(0);
         let session = app.focused_session_id(wid).expect("the front session");
         (app, wid, session, reader)
+    }
+
+    /// Wait (bounded) for the light's initial paste to leave the ordered
+    /// writer, so the follow-up reaches the real write instead of waiting
+    /// behind it. The bytes arrive before the writer retires its slot.
+    fn ordering_retired(app: &App, session: u64) {
+        let sink = app.pool.get(session).expect("session").ctx.sink.clone();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while crate::app_input::paste_order::is_ordering(&sink) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            !crate::app_input::paste_order::is_ordering(&sink),
+            "the follow-up reaches the real write"
+        );
     }
 
     /// The facts the resolver publishes for the session's Claude Code
@@ -1856,9 +1845,9 @@ mod gesture_tests {
             Some(FooterFacts {
                 model: Some("Opus 5.5".into()),
                 effort: Some("xhigh".into()),
-                repo: Some("aterm".into()),
+                path: Some("~/aterm".into()),
                 branch: Some("main".into()),
-                thinking: Some(true),
+                repo_read_denied: None,
                 version: None,
             }),
         ));
@@ -2189,7 +2178,7 @@ mod gesture_tests {
     /// PENDING auto-approve toggle's title (`Auto-approve (bypass
     /// permissions): switching…  `, 47 cells) never pushes the lights off
     /// the row — only the lights must fit; the title comes along where it
-    /// fits too, and beside four lights it does (the reason-only fallback is
+    /// fits too, and beside three lights it does (the reason-only fallback is
     /// held by the don't-ask refusal below, whose title does not).
     #[test]
     fn a_pending_auto_approve_toggle_keeps_its_lights_in_an_80_column_pane() {
@@ -2212,7 +2201,7 @@ mod gesture_tests {
         let text = row_text(&app, wid, approve.0);
         assert!(
             text.contains("Auto-approve (bypass permissions): switching\u{2026}"),
-            "room for the whole title beside four lights: {text:?}"
+            "room for the whole title beside three lights: {text:?}"
         );
     }
 
@@ -2382,6 +2371,18 @@ mod gesture_tests {
         if t.cleared.is_some() {
             t.cleared = Some(past);
         }
+    }
+
+    /// Hold `session`'s typed command well BEFORE its deadline, however
+    /// slowly the test reached its drain: a loaded machine (a whole workspace
+    /// run, the tiered checks' `ty` spawns) can spend all of `SETTLE_MS`
+    /// between the click and the drain, which then takes the deadline's
+    /// take-back instead of the Return the case is about (measured
+    /// 2026-09-27: the accepted case failed 25 of 96 runs under a 96-way
+    /// overload, its drain on the ctrl+u path).
+    fn not_due(app: &mut App, session: u64) {
+        let t = app.claude_typed.get_mut(&session).expect("a typed command");
+        t.deadline = Instant::now() + Duration::from_secs(60);
     }
 
     fn refusal(app: &App, wid: WindowId, session: u64) -> Option<(Light, super::Refusal)> {
@@ -2601,9 +2602,12 @@ mod gesture_tests {
             drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
             assert_eq!(pty(reader.as_mut().unwrap(), 8), b"/fast on");
             check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
+            ordering_retired(&app, session);
             echo_draft(&app, session, "/fast on");
             if take_back {
                 past_due(&mut app, session);
+            } else {
+                not_due(&mut app, session);
             }
             if failed {
                 // Genuine PTY-sink write failure, no fake receipt.
@@ -2930,8 +2934,15 @@ mod gesture_tests {
         frame(&mut app, wid);
         click(&mut app, wid, Light::Fast);
         assert_eq!(pty(&mut reader, 8), b"/fast on");
-        let armed = app.claude_typed[&session].next_poll;
-        assert!(armed.is_some());
+        assert!(app.claude_typed[&session].next_poll.is_some());
+        // The real poll is TYPED_POLL away and can come due while a loaded
+        // machine runs this loop: pin its instant ahead, so every wake below
+        // is one before it (the mirror of `past_due`).
+        let armed = Some(Instant::now() + Duration::from_secs(60));
+        app.claude_typed
+            .get_mut(&session)
+            .expect("waiting")
+            .next_poll = armed;
         for _ in 0..5 {
             app.on_claude_footer_changed(session);
         }
@@ -2943,9 +2954,10 @@ mod gesture_tests {
             .get_mut(&session)
             .expect("waiting")
             .next_poll = Some(Instant::now() - Duration::from_millis(1));
+        let fired = Instant::now();
         app.on_claude_footer_changed(session);
         assert!(
-            app.claude_typed[&session].next_poll > Some(Instant::now()),
+            app.claude_typed[&session].next_poll >= Some(fired + super::TYPED_POLL),
             "the poll that fired is re-armed, once"
         );
     }
@@ -3084,11 +3096,7 @@ mod gesture_tests {
         check_admission_transition(&app, wid, session, "Wait", &mut state);
         assert!(app.claude_typed[&session].late);
         echo_draft(&app, session, "/fast on");
-        let sink = app.pool.get(session).unwrap().ctx.sink.clone();
-        assert!(
-            !crate::app_input::paste_order::is_ordering(&sink),
-            "the cleanup reaches the real write"
-        );
+        ordering_retired(&app, session);
         hang_up(&app, session, reader);
         past_due(&mut app, session);
         drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
@@ -3103,6 +3111,61 @@ mod gesture_tests {
         );
         app.on_claude_footer_changed(session);
         assert!(app.claude_typed.is_empty());
+    }
+
+    /// The two tests above flaked under load (the gate of 2026-09-27): a
+    /// child another test was spawning held a copy of the observer across
+    /// its close, so the follow-up write was really accepted. Force that
+    /// interleaving — a live child keeps the observer open for a moment
+    /// after this test drops its own — and each failed follow-up (Return,
+    /// ctrl+u take-back, late cleanup) must still be rejected with the
+    /// notice: [`hang_up`] waits the copy out instead of letting the write
+    /// land in a socket it keeps connected. A `drop` alone fails this every
+    /// time.
+    #[test]
+    fn a_failed_follow_up_is_rejected_though_a_child_briefly_holds_the_observer() {
+        for (take_back, late) in [(false, false), (true, false), (false, true)] {
+            let case = format!("take_back={take_back} late={late}");
+            let (mut app, wid, session, mut reader) = app();
+            publish_facts(&app, session);
+            draw_claude(&app, session, BYPASS);
+            frame(&mut app, wid);
+            let mut state = aterm_spec::derive::claude_light_admission_model().init_state();
+            drive_admission_action("StartAccepted", || click(&mut app, wid, Light::Fast));
+            assert_eq!(pty(&mut reader, 8), b"/fast on");
+            check_admission_transition(&app, wid, session, "StartAccepted", &mut state);
+            if late {
+                past_due(&mut app, session);
+                drive_admission_action("Wait", || app.on_claude_footer_changed(session));
+                check_admission_transition(&app, wid, session, "Wait", &mut state);
+            }
+            ordering_retired(&app, session);
+            echo_draft(&app, session, "/fast on");
+            if take_back || late {
+                past_due(&mut app, session);
+            } else {
+                not_due(&mut app, session);
+            }
+            let copy = reader.try_clone().expect("a second reference");
+            let mut holder = std::process::Command::new("/bin/sleep")
+                .arg("0.3")
+                .stdin(std::os::fd::OwnedFd::from(copy))
+                .spawn()
+                .expect("a child holding the observer");
+            hang_up(&app, session, reader);
+            // The drain runs while an unreaped child could still hold the
+            // copy: only `hang_up`'s wait for the hang-up keeps its write
+            // from landing (reaped first, even a bare drop would pass).
+            drive_admission_action("FollowRejected", || app.on_claude_footer_changed(session));
+            let _ = holder.wait();
+            check_admission_transition(&app, wid, session, "FollowRejected", &mut state);
+            assert!(app.claude_typed.is_empty(), "{case}: no read-back");
+            assert_eq!(
+                refusal(&app, wid, session),
+                Some((Light::Fast, super::Refusal::LeftTyped)),
+                "{case}"
+            );
+        }
     }
 
     /// Under a box (the composer not on screen) at the deadline nothing is

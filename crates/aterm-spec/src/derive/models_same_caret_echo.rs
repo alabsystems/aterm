@@ -164,7 +164,7 @@ pub fn same_caret_typed_echo_model() -> Model {
 /// reset closes the remainder. The PTY cannot distinguish a delayed key from
 /// program output that exactly mimics its glyphs and transition; the model
 /// rejects every distinguishable program move. Tier-1 drives the genuine
-/// CursorGlow seam in `cursor_glow::tests`.
+/// CursorGlow seam in `cursor_glow::tests::unknown_insert`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn unknown_insert_orphan_key_model() -> Model {

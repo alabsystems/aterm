@@ -1056,11 +1056,23 @@ impl Grid {
         result
     }
 
-    /// Monotonic count of history lines LOST to non-user-requested truncation
-    /// (audit E10a, out-of-band — no sentinel is ever injected into content):
+    /// Monotonic count of history lines LOST to non-user-requested truncation:
     /// flood-backpressure staged-line drops + detached-reflow-window cap drops
     /// (this grid) + memory-pressure store evictions (the attached tiered
-    /// store). User-requested limit shrinks are intentional and not counted.
+    /// store). User-requested limit shrinks and ordinary retention eviction —
+    /// including the rows a flood pushes past the configured line limit,
+    /// which the flood path evicts early rather than drops — are intentional
+    /// and not counted.
+    ///
+    /// The out-of-band half of the loss signal, for `metrics`/`lines`. The
+    /// flood drops this grid makes are ALSO marked in band: one dim
+    /// `— aterm dropped N lines here …` row stands in the history at each cut
+    /// (`scroll_convert::FloodCut`), naming the lines missing there that the
+    /// limit would still hold; each cut adds its PEAK count here, so for one
+    /// flood the two figures agree until the limit's window slides past part
+    /// of the hole or retention evicts a marker with the history around it.
+    /// The store's own memory-pressure evictions take the oldest lines and
+    /// leave no marker (the top of history moving is not a hole).
     #[must_use]
     pub fn truncated_lines(&self) -> u64 {
         self.storage.flood_truncated_lines

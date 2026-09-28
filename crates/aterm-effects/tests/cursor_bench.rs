@@ -140,7 +140,8 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
     );
     assert!(
         max_total_quads > min_total_quads,
-        "fixture must exercise substantial geometry ({max_total_quads} quads)"
+        "fixture must exercise substantial geometry ({max_total_quads} quads, floor \
+         {min_total_quads})"
     );
     assert!(
         p90.as_micros() < u128::from(p90_bound_us),
@@ -149,6 +150,21 @@ fn benchmark_with(style: GlowStyle, label: &str, fixture: GlowFixture, min_total
     );
 }
 
+/// The frozen sweep's VACUITY floor is 3,600 quads: under it the fixture no
+/// longer exercises substantial geometry and its timing proves nothing.
+///
+/// RE-BASED 2026-09-27. The floor was 5,000 from `c754baa5f` (2026-08-29),
+/// when the sweep drew 5,584, and this ignored gate had been red on it — not
+/// on its timing — for four weeks. A first-parent bisection over
+/// `c754baa5f..facd8f805` puts the step at `5d1c440af` (2026-08-30), the merge
+/// that brought the tall band's redesign (a plateau above the row-boundary
+/// spine instead of an underline-shaped wash): 5,559 on its first parent,
+/// 4,041 on it. The fixture did not change there, and the seven readings the
+/// bisection took after it sit in 4,041-4,274 (4,273 on `facd8f805`, M5 Max,
+/// 4,226 under + 47 over). A changed band shape, not a sweep that stopped
+/// saturating — the hot-ribbon gate below reads 10,013 under quads the same
+/// day — so the floor follows the design: 3,600 is 11% under the lowest
+/// post-merge reading.
 #[test]
 #[ignore = "perf gate: run manually in --release with --ignored --nocapture"]
 fn bench_cursor_rainbow_frozen_sweep_baseline() {
@@ -156,7 +172,7 @@ fn bench_cursor_rainbow_frozen_sweep_baseline() {
         GlowStyle::RainbowKitty,
         "bench_cursor_rainbow_frozen_sweep_baseline",
         saturated_sweep,
-        5_000,
+        3_600,
     );
 }
 

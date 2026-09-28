@@ -4518,8 +4518,10 @@ impl NativeAppModel for MarkdownApp {
                 MarkdownBlock::Table { .. } => MarkdownBlockKind::Table,
                 MarkdownBlock::ThematicBreak { .. } => MarkdownBlockKind::Rule,
             };
+            let (text, inline) = bounded_markdown_block_paint(&self.parsed, index, block);
             let node = UiContent::MarkdownBlock(MarkdownBlockSpec {
-                text: bounded_markdown_block_text(block),
+                text,
+                inline,
                 kind,
                 dense: false,
                 selectable: !matches!(block, MarkdownBlock::ThematicBreak { .. }),
@@ -4597,6 +4599,7 @@ impl NativeAppModel for MarkdownApp {
                 estimated_height: (cx.viewport.height - header_height - 36.0).max(80.0),
                 visual_row: 0,
                 total_visual_rows: source_visual_rows,
+                inline: Vec::new(),
             }),
         )
         .layout(Layout::default().width(Length::Fill).height(Length::Fill));
@@ -5114,6 +5117,40 @@ fn markdown_images_in_range(
         .take(limit.min(8))
         .map(|(index, _)| index)
         .collect()
+}
+
+/// Block `index`'s bounded display text and its styled spans (recorded by the
+/// parse that produced the text; prose kinds only — code and tables paint
+/// verbatim). The spans are clipped to the part of the display text that is the
+/// block's OWN: when the 128 KiB bound cut the block, the `…` it appended is not
+/// the block's, and a span clipped to the display length would end inside that
+/// three-byte ellipsis — a slice the painter cannot take.
+pub(crate) fn bounded_markdown_block_paint(
+    parsed: &crate::native_markdown::MarkdownDocument,
+    index: usize,
+    block: &crate::native_markdown::MarkdownBlock,
+) -> (
+    String,
+    Vec<(std::ops::Range<usize>, crate::native_markdown::InlineStyle)>,
+) {
+    use crate::native_markdown::MarkdownBlock;
+    let text = bounded_markdown_block_text(block);
+    let own = match block {
+        MarkdownBlock::Heading { text, .. }
+        | MarkdownBlock::Paragraph { text, .. }
+        | MarkdownBlock::ListItem { text, .. }
+        | MarkdownBlock::Quote { text, .. } => text.len(),
+        // No styled spans: nothing to clip.
+        _ => 0,
+    };
+    // `bounded_markdown_text` only ever shortens: a shorter copy is a cut one.
+    let kept = if text.len() < own {
+        text.len() - '…'.len_utf8()
+    } else {
+        text.len().min(own)
+    };
+    let inline = parsed.block_styles(index, kept);
+    (text, inline)
 }
 
 fn bounded_markdown_block_text(block: &crate::native_markdown::MarkdownBlock) -> String {
@@ -6660,7 +6697,7 @@ mod markdown_reader_tests {
 
     #[test]
     fn manual_host_diagnostics_are_exact_revision_latest_and_idempotent() {
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let document = documents.open(
             "file:///tmp/aterm.toml".to_string(),
             "theme = \"Default\"\n".to_string(),
@@ -6735,7 +6772,7 @@ mod markdown_reader_tests {
 
     #[test]
     fn manual_host_diagnostic_replacement_at_capacity_reports_presentation_damage() {
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let document = documents.open(
             "file:///tmp/aterm-capped.toml".to_string(),
             "theme = \"Default\"\n".to_string(),
@@ -6789,7 +6826,7 @@ mod markdown_reader_tests {
 
     #[test]
     fn canonical_document_identity_disambiguates_duplicate_basenames_without_splitting_one_uri() {
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let one_uri = "file:///Users//alice/one/README.md";
         let two_uri = "file:///Users//alice/two/README.md";
         let one = documents.open(one_uri.to_string(), "one".to_string());
@@ -6906,7 +6943,7 @@ mod markdown_reader_tests {
 
     fn markdown_runtime(source: &str) -> (NativeRuntime, AppInstanceId, ViewId) {
         let mut runtime = NativeRuntime::new();
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let document = documents.open("file:///Guide.md".to_string(), source.to_string());
         let instance = runtime
             .insert_instance(NativeApp::Markdown(MarkdownApp::new(
@@ -7006,7 +7043,7 @@ mod markdown_reader_tests {
         let source = (0..1_000)
             .map(|line| format!("line-{line:04} carries readable paragraph words\n"))
             .collect::<String>();
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let document = documents.open("file:///Long.md".to_string(), source.clone());
         let snapshot = documents.snapshot(document).unwrap();
         let mut runtime = NativeRuntime::new();
@@ -7984,7 +8021,7 @@ mod markdown_reader_tests {
         EditorViewState,
         crate::document_store::DocumentSnapshot,
     ) {
-        let mut store = crate::document_store::DocumentStore::new();
+        let mut store = crate::document_store::DocumentStore::for_test();
         let document = store.open("file:///visual-editor.md".to_string(), text.to_string());
         let snapshot = store.snapshot(document).unwrap();
         let buffer = crate::native_editor::EditorBufferView::new(
@@ -9151,7 +9188,7 @@ mod markdown_reader_tests {
         );
         crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
         let title = "aterm-native-final-sample-with-a-distinguishing-suffix.md";
-        let mut documents = crate::document_store::DocumentStore::new();
+        let mut documents = crate::document_store::DocumentStore::for_test();
         let document = documents.open(
             "file:///long-title.md".to_string(),
             "# Reader\n".to_string(),

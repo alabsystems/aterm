@@ -102,6 +102,7 @@ pub use history_carry::{
 };
 pub(crate) use scroll_convert::ScrolledRowExtras;
 pub use scroll_materialize::{MaterializedRow, materialize_from_line};
+pub use scrollback_access::HistoryLines;
 pub use scrollback_offload::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 pub use visible_row_view::{CellDataView, VisibleRowView};
 

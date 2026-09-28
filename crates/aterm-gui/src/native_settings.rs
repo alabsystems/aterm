@@ -2802,7 +2802,7 @@ impl SettingsApp {
             // The macOS access block's owner gestures (§3.4, §3.7).
             //
             // Every one of them requires this press. None is a `VERBS` row and
-            // `app act` refuses them (`MACOS_ACCESS_GESTURE_PREFIX`). `key`
+            // `act` refuses them (`MACOS_ACCESS_GESTURE_PREFIX`). `key`
             // drives this page like a hand, by design, so the warm-up, the
             // reset and *Move to Trash* also ask the owner in an AppKit alert
             // that no control verb can answer and whose default is Cancel
@@ -6859,6 +6859,9 @@ fn feedback_bar(
         );
     }
     let feedback = state.feedback.as_ref()?;
+    if messages_feedback_inline(state) {
+        return None;
+    }
     if state.reset_all_confirmation {
         let line_height = 22.0_f32.max(16.0 * settings_text_scale());
         let visual_lines = [
@@ -7045,11 +7048,28 @@ fn feedback_bar_height(state: &SettingsViewState) -> f32 {
     } else if state.reset_all_confirmation {
         let line_height = 22.0_f32.max(16.0 * settings_text_scale());
         20.0 + line_height * 4.0 + scaled_control_height() + 16.0
-    } else if state.feedback.is_some() {
+    } else if state.feedback.is_some() && !messages_feedback_inline(state) {
         scaled_control_height()
     } else {
         0.0
     }
+}
+
+/// THE MESSAGES PAGE SAYS ITS OWN CONFIRMATION ON ITS COUNT LINE (ruling
+/// 270; day three: `Copied` in the page's bottom bar took the list's room
+/// for five seconds, so an open entry that fitted no longer did, and the
+/// list dropped from seven rows to four and grew back). A plain status line
+/// on the Messages route — no draft recovery, no Reset All confirmation, no
+/// Undo to offer, no search results in place of the page — is drawn beside
+/// the count (`9 messages · Copied`) and takes no height from the list.
+fn messages_feedback_inline(state: &SettingsViewState) -> bool {
+    state.route == SettingsRoute::Messages
+        && state.feedback.is_some()
+        && state.search.trim().is_empty()
+        && !state.compact_navigation
+        && !state.has_unsaved_field_drafts()
+        && !state.reset_all_confirmation
+        && !(state.last_undo.is_some() && !state.config_patch_pending())
 }
 
 fn config_watch_status_bar_height(state: &SettingsViewState) -> f32 {
@@ -7232,6 +7252,9 @@ fn compact_feedback_parts(
     }
 
     let feedback = state.feedback.as_ref()?;
+    if messages_feedback_inline(state) {
+        return None;
+    }
     if state.reset_all_confirmation {
         let actions = UiNode::new(
             "settings/reset-all/actions",
@@ -15497,7 +15520,7 @@ fn macos_access_reset_lines(report: &MacosAccessReset, warmup_offered: bool) -> 
 
 /// The action ids this block owns. They are the ONLY way to reach the warm-up
 /// (§3.5), the reset and *Move to Trash* (§3.7): none is a `VERBS` row, no
-/// config key or environment variable invokes one, `app act` refuses every id
+/// config key or environment variable invokes one, `act` refuses every id
 /// under [`MACOS_ACCESS_GESTURE_PREFIX`], and the three that change this Mac
 /// ask the owner in an alert first — a consent-raising or destructive action a
 /// program inside a session could fire would be a surface an agent controls.
@@ -20481,6 +20504,12 @@ fn messages_row_height() -> f32 {
     30.0 * settings_text_scale()
 }
 
+/// A DAY HEADER over a day's entries (design ruling 273): 26·s pt, its
+/// caption sitting low, near the rows it names.
+fn messages_day_height() -> f32 {
+    26.0 * settings_text_scale()
+}
+
 /// One meta or sentence line of an expanded entry: 22·s pt.
 fn messages_line_height() -> f32 {
     22.0 * settings_text_scale()
@@ -20596,8 +20625,27 @@ fn messages_small_button(key: &str, label: &str, semantic: &str, enabled: bool) 
 
 /// THE COUNT LINE (ruling 262): the count on the left, Copy All and Open Log
 /// Folder small on the right. An empty log has no count, and nothing to copy.
-fn messages_count_line(words: Option<String>, content_width: f32) -> (UiNode, f32) {
+fn messages_count_line(
+    words: Option<String>,
+    note: Option<&str>,
+    content_width: f32,
+) -> (UiNode, f32) {
     let empty = words.is_none();
+    let (spx, sface) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
+    // Where the buttons go is the COUNT's decision alone (round 17 review,
+    // V4): a note that joined it first (`The log folder is <path>`, `Sent
+    // Skip version; …`) pushed both buttons under the count for five
+    // seconds — the list lost a row and the button just pressed moved from
+    // under the pointer. The note is fitted into the status width left.
+    let words_w = words.as_deref().map_or(0.0, |w| {
+        crate::tray_raster::ui_text_width_for(sface, w, spx) + 8.0
+    });
+    // The page's own confirmation rides the count (ruling 270).
+    let words = match (words, note) {
+        (Some(words), Some(note)) => Some(format!("{words} \u{00b7} {note}")),
+        (None, Some(note)) => Some(note.to_string()),
+        (words, None) => words,
+    };
     let (copy, copy_w) = messages_small_button(
         MESSAGES_COPY_ALL,
         "Copy All",
@@ -20611,10 +20659,6 @@ fn messages_count_line(words: Option<String>, content_width: f32) -> (UiNode, f3
         true,
     );
     let button_h = messages_small_button_height();
-    let (spx, sface) = crate::native_ui::text_paint_metrics(SemanticRole::Status, StyleRef::Quiet);
-    let words_w = words.as_deref().map_or(0.0, |w| {
-        crate::tray_raster::ui_text_width_for(sface, w, spx) + 8.0
-    });
     // The buttons beside the count where both fit; else under it, right-aligned.
     let beside = words_w + copy_w + folder_w + 16.0 <= content_width;
     let status_w = if beside {
@@ -21131,11 +21175,82 @@ fn messages_rule(key: &str) -> UiNode {
     .paint_only()
 }
 
+/// THE LOG'S CALENDAR (design ruling 273): the reader's local day, and
+/// whether any admitted entry is from an EARLIER day — only then does the
+/// list carry day headers (a list all of today would spend a line saying what
+/// every row's time already says). Under the headers a row older than today
+/// says its local time (`9:41 PM`), since its header already names the day;
+/// today's rows, and every row of an unheaded list, keep their relative
+/// words (`3 h ago`). Round 18, day four (D12): headers came only when the
+/// entries spanned two days, so a filter that left ONE past day showed no
+/// heading and a raw `2026-09-24` in the time column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MessagesClock {
+    now_unix_ms: u64,
+    offset_s: i64,
+    /// Today, as an `aterm_messages::words::local_day`.
+    today: i64,
+    headed: bool,
+}
+
+impl MessagesClock {
+    fn of(visible: &[&MessageView], now_unix_ms: u64, offset_s: i64) -> Self {
+        let day = |e: &&MessageView| aterm_messages::words::local_day(e.at_unix_ms, offset_s);
+        let today = aterm_messages::words::local_day(now_unix_ms, offset_s);
+        // EARLIER, never merely other: an entry stamped past midnight by a
+        // writer whose clock runs ahead is today's (ruling 281) — it heads
+        // no list of today alone, and its section is today's.
+        let headed = visible.iter().any(|e| day(e) < today);
+        Self {
+            now_unix_ms,
+            offset_s,
+            today,
+            headed,
+        }
+    }
+
+    /// The lead column's words for an entry stamped `at`.
+    fn when(self, at_unix_ms: u64) -> String {
+        if self.headed && aterm_messages::words::local_day(at_unix_ms, self.offset_s) < self.today {
+            aterm_messages::words::clock_words(at_unix_ms, self.offset_s)
+        } else {
+            aterm_messages::words::relative_words(self.now_unix_ms, at_unix_ms)
+        }
+    }
+
+    /// Each entry's SECTION day, newest first, when the list is headed: its
+    /// local day, never newer than the section above it — a record whose
+    /// stamp runs ahead of its neighbours' (another writer's clock) stays in
+    /// the section it is listed in, so every day has one header — and never
+    /// newer than today (ruling 281: a stamp from tomorrow opened a section
+    /// that read `Today` above today's own).
+    fn sections(self, visible: &[&MessageView]) -> Option<Vec<i64>> {
+        if !self.headed {
+            return None;
+        }
+        let mut floor = self.today;
+        Some(
+            visible
+                .iter()
+                .map(|e| {
+                    floor = floor.min(aterm_messages::words::local_day(
+                        e.at_unix_ms,
+                        self.offset_s,
+                    ));
+                    floor
+                })
+                .collect(),
+        )
+    }
+}
+
 /// THE LEAD COLUMN (ruling 262): the severity mark, when, and the tag's chip
 /// name — one fixed width for every row of the page, so every title begins at
 /// the same x. `when` is the widest the relative words take (measured); `tag`
 /// the longest chip name the log holds, capped at about twelve ems and
-/// ellipsized past it.
+/// ellipsized past it. Measured over the WHOLE log, never the filtered list
+/// (round 18, day four, D13: the titles moved from x 816 to 788 to 718 as
+/// the filter changed, the list jumping sideways under the pointer).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MessagesLead {
     mark: f32,
@@ -21147,7 +21262,7 @@ struct MessagesLead {
 impl MessagesLead {
     fn measure(
         visible: &[&MessageView],
-        now_unix_ms: u64,
+        clock: MessagesClock,
         compact: bool,
         content_width: f32,
     ) -> Self {
@@ -21156,15 +21271,19 @@ impl MessagesLead {
         let width = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px);
         // Each distinct word measured once: a full ring (512 entries, ruling
         // 264) says a few dozen times and a handful of tags.
-        let whens: std::collections::BTreeSet<String> = visible
-            .iter()
-            .map(|e| aterm_messages::words::relative_words(now_unix_ms, e.at_unix_ms))
-            .collect();
-        let when = ["yesterday", "2026-09-22", "59 min ago", "23 h ago"]
-            .into_iter()
-            .chain(whens.iter().map(String::as_str))
-            .map(width)
-            .fold(0.0_f32, f32::max)
+        let whens: std::collections::BTreeSet<String> =
+            visible.iter().map(|e| clock.when(e.at_unix_ms)).collect();
+        let when = [
+            "yesterday",
+            "2026-09-22",
+            "59 min ago",
+            "23 h ago",
+            "12:59 PM",
+        ]
+        .into_iter()
+        .chain(whens.iter().map(String::as_str))
+        .map(width)
+        .fold(0.0_f32, f32::max)
             + 4.0;
         let cap = if compact { 7.0 } else { 12.0 } * px;
         let tags: std::collections::BTreeSet<&str> =
@@ -21218,8 +21337,9 @@ fn messages_head_node(
     expanded: bool,
     lead: MessagesLead,
     content_width: f32,
-    now_unix_ms: u64,
+    clock: MessagesClock,
 ) -> UiNode {
+    let now_unix_ms = clock.now_unix_ms;
     let key = format!("settings/messages/row/{}", entry.id);
     let row_h = messages_row_height();
     let title_key = format!("{key}/title");
@@ -21299,7 +21419,7 @@ fn messages_head_node(
             mark,
             text(
                 format!("{key}/when"),
-                aterm_messages::words::relative_words(now_unix_ms, entry.at_unix_ms),
+                clock.when(entry.at_unix_ms),
                 StyleRef::Quiet,
                 Length::Fixed(lead.when),
             ),
@@ -21732,6 +21852,62 @@ fn messages_body_node(entry: &MessageView, body: &MessagesBody, indent: f32) -> 
     .children(children)
 }
 
+/// A day header's words: whole where they fit the card from the time column
+/// on, else the date's weekday and month abbreviated (`Fri, 12 Sep` — a
+/// phone at twice the text size), else cut to the room.
+fn messages_day_words(plan: &MessagesPlan, day: i64) -> String {
+    let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
+    let room = plan.content_width - plan.lead.mark - plan.lead.gap - 12.0 - 2.0;
+    let fits = |s: &str| crate::tray_raster::ui_text_width_for(face, s, px) <= room;
+    let whole = aterm_messages::words::day_heading(plan.clock.today, day, false);
+    if fits(&whole) {
+        return whole;
+    }
+    let short = aterm_messages::words::day_heading(plan.clock.today, day, true);
+    if fits(&short) {
+        short
+    } else {
+        crate::native_ui::elide_text_label(&short, room.max(8.0), px, face)
+    }
+}
+
+/// A DAY HEADER (design ruling 273): the day's name — `Today`, `Yesterday`,
+/// `Thursday`, `Friday, 18 September` — in the caption heading (the page's
+/// quiet caption ink, bold), from the lead column's time words' x so it
+/// stands over the times it dates. A heading for a screen reader, never a
+/// control: the keyboard steps from entry to entry past it, and it takes no
+/// stop of the list's scroll — the list's top entry always carries its own
+/// day's header, so the view never loses its date.
+fn messages_day_node(day: i64, plan: &MessagesPlan) -> UiNode {
+    let key = format!("settings/messages/day/{day}");
+    UiNode::new(
+        format!("{key}/group"),
+        UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
+    )
+    .layout(
+        Layout::column()
+            .width(Length::Fill)
+            .height(Length::Fixed(plan.day_h))
+            .padding(Insets {
+                top: 6.0 * settings_text_scale(),
+                right: 12.0,
+                bottom: 0.0,
+                left: plan.lead.mark + plan.lead.gap,
+            }),
+    )
+    .children(vec![
+        UiNode::new(
+            key,
+            UiContent::Text(TextSpec {
+                text: messages_day_words(plan, day),
+                role: SemanticRole::Heading,
+                style: StyleRef::Quiet,
+            }),
+        )
+        .layout(Layout::default().width(Length::Fill).height(Length::Fill)),
+    ])
+}
+
 /// The log's CARD (rulings 262 and 264): the entries the view shows, one line
 /// each with hairlines between them, the open one with its body under it —
 /// its technical details already bounded to the room by the plan that seated
@@ -21740,9 +21916,9 @@ fn messages_body_node(entry: &MessageView, body: &MessagesBody, indent: f32) -> 
 /// ([`SemanticRole::List`]).
 fn messages_list_node(
     rows: &[&MessageView],
+    first: usize,
     plan: &MessagesPlan,
     selected: Option<u64>,
-    now_unix_ms: u64,
 ) -> (UiNode, f32) {
     let row_h = messages_row_height();
     let indent = plan.indent();
@@ -21759,8 +21935,12 @@ fn messages_list_node(
             )));
             height += 1.0;
         }
+        if let Some(day) = plan.day_before(first + k, first) {
+            children.push(messages_day_node(day, plan));
+            height += plan.day_h;
+        }
         let expanded = selected == Some(entry.id);
-        let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, now_unix_ms);
+        let head = messages_head_node(entry, expanded, plan.lead, plan.content_width, plan.clock);
         let key = format!("settings/messages/row/{}", entry.id);
         match plan
             .body
@@ -21977,7 +22157,11 @@ fn messages_filter_items(
         items.extend(tag_rows.into_iter().map(|row| (row, chip_h + 6.0)));
     }
     let words = (total > 0).then(|| messages_status_words(total, visible, filter.is_all()));
-    items.push(messages_count_line(words, content_width));
+    let note = state
+        .feedback
+        .as_deref()
+        .filter(|_| messages_feedback_inline(state));
+    items.push(messages_count_line(words, note, content_width));
     items
 }
 
@@ -22009,6 +22193,13 @@ struct MessagesPlan {
     heights: Vec<f32>,
     /// The open entry and its body, fitted to the room.
     body: Option<(u64, MessagesBody)>,
+    /// The reader's calendar (ruling 273).
+    clock: MessagesClock,
+    /// Each admitted entry's section day when the list carries day headers
+    /// ([`MessagesClock::sections`]); `None` for a log of one day.
+    sections: Option<Vec<i64>>,
+    /// A day header's height.
+    day_h: f32,
 }
 
 /// What the list shows with one stop at its top: the header items it seats
@@ -22042,13 +22233,30 @@ impl MessagesPlan {
     }
 
     /// The card's height holding `rows`: its padding, the rows, a hairline
-    /// between each two.
+    /// between each two, and the day headers among them (ruling 273).
     fn card_height(&self, rows: std::ops::Range<usize>) -> f32 {
         if rows.is_empty() {
             return 0.0;
         }
         let hairlines = rows.len() - 1;
-        2.0 * MESSAGES_LIST_PAD + self.heights[rows].iter().sum::<f32>() + hairlines as f32
+        let days = rows
+            .clone()
+            .filter(|&k| self.day_before(k, rows.start).is_some())
+            .count();
+        2.0 * MESSAGES_LIST_PAD
+            + self.heights[rows].iter().sum::<f32>()
+            + hairlines as f32
+            + days as f32 * self.day_h
+    }
+
+    /// The day whose HEADER stands above entry `k` in a view whose first
+    /// entry is `first` (ruling 273): where the section's day changes, and
+    /// over the view's first entry whatever its place in its day. `None` in
+    /// a list of one day.
+    fn day_before(&self, k: usize, first: usize) -> Option<i64> {
+        let sections = self.sections.as_ref()?;
+        let day = *sections.get(k)?;
+        (k == first || k == 0 || sections.get(k - 1) != Some(&day)).then_some(day)
     }
 
     /// What the list shows with stop `top` at its top: on a compact page the
@@ -22221,7 +22429,13 @@ fn messages_plan(
             gap,
         )
     };
-    let lead = MessagesLead::measure(visible, messages.now_unix_ms, compact, content_width);
+    let clock = MessagesClock::of(visible, messages.now_unix_ms, messages.utc_offset_s);
+    // The lead column is the LOG's, whatever the filter admits (D13): the
+    // whole log's words under its own calendar are every word a filtered
+    // list can say (a list is headed only when the log is).
+    let all: Vec<&MessageView> = messages.entries.iter().collect();
+    let log_clock = MessagesClock::of(&all, messages.now_unix_ms, messages.utc_offset_s);
+    let lead = MessagesLead::measure(&all, log_clock, compact, content_width);
     let row_h = messages_row_height();
     let mut plan = MessagesPlan {
         compact,
@@ -22233,6 +22447,9 @@ fn messages_plan(
         lead,
         heights: Vec::new(),
         body: None,
+        clock,
+        sections: clock.sections(visible),
+        day_h: messages_day_height(),
     };
     // The open entry's body at the card's measure, bounded to what the card
     // has with the entry alone in it: it is read whole wherever the list
@@ -22248,7 +22465,13 @@ fn messages_plan(
                 messages.utc_offset_s,
                 messages.now_unix_ms,
             );
-            body.fit(room - row_h - 2.0 * MESSAGES_LIST_PAD);
+            // An entry at the list's top carries its day's header too.
+            let day_h = if plan.sections.is_some() {
+                plan.day_h
+            } else {
+                0.0
+            };
+            body.fit(room - row_h - day_h - 2.0 * MESSAGES_LIST_PAD);
             (entry.id, body)
         });
     plan.heights = visible
@@ -22293,7 +22516,7 @@ fn messages_page(
     let view = plan.view(top);
     let shown: Vec<&MessageView> = visible[view.rows.clone()].to_vec();
     let list = (!shown.is_empty()).then(|| {
-        let (card, height) = messages_list_node(&shown, &plan, selected, messages.now_unix_ms);
+        let (card, height) = messages_list_node(&shown, view.rows.start, &plan, selected);
         messages_scroll_node(card, height, view.rows.clone(), visible.len())
     });
     let MessagesPlan {
@@ -22895,6 +23118,12 @@ fn packages_activity_pager(
     )
 }
 
+/// A Packages verb button's width in a row, the gap between two, and the
+/// hero card's horizontal padding: the row's measure (ruling 270).
+const PACKAGES_ACTION_WIDTH: f32 = 196.0;
+const PACKAGES_ACTION_GAP: f32 = 8.0;
+const PACKAGES_HERO_PAD_X: f32 = 22.0;
+
 fn packages_page(
     state: &SettingsViewState,
     packages: &PackagesProjection,
@@ -22907,7 +23136,16 @@ fn packages_page(
     let headline_height = 42.0_f32.max(30.0 * text_scale);
     let detail_height = 24.0_f32.max(20.0 * text_scale);
     let action_control_height = 36.0_f32.max(32.0 * text_scale);
-    let stack_actions = width == SettingsWidth::Compact;
+    // The three verbs sit in a row only where the hero card holds them whole
+    // (ruling 270; day three: at 100 columns the Medium page cut the third to
+    // `Remove ALab T…` at the card's edge); anywhere narrower they stack.
+    let hero_inner = settings_page_content_width(
+        viewport_width,
+        width,
+        page_maximum(SettingsRoute::Packages, width),
+    ) - 2.0 * PACKAGES_HERO_PAD_X;
+    let stack_actions = width == SettingsWidth::Compact
+        || hero_inner < 3.0 * PACKAGES_ACTION_WIDTH + 2.0 * PACKAGES_ACTION_GAP;
 
     // Action row: the two verbs through the host executor (co-located atpkg,
     // off the UI thread). Disabled with an honest reason whenever the manager
@@ -22934,7 +23172,7 @@ fn packages_page(
                 .width(if stack_actions {
                     Length::Fill
                 } else {
-                    Length::Fixed(196.0)
+                    Length::Fixed(PACKAGES_ACTION_WIDTH)
                 })
                 .height(Length::Fill),
         )
@@ -22976,9 +23214,11 @@ fn packages_page(
     .layout(if stack_actions {
         Layout::column()
             .height(Length::Fixed(action_height))
-            .gap(8.0)
+            .gap(PACKAGES_ACTION_GAP)
     } else {
-        Layout::row().height(Length::Fixed(action_height)).gap(8.0)
+        Layout::row()
+            .height(Length::Fixed(action_height))
+            .gap(PACKAGES_ACTION_GAP)
     })
     .children(actions.clone());
 
@@ -23056,7 +23296,7 @@ fn packages_page(
     .layout(
         Layout::column()
             .height(Length::Fixed(hero_height))
-            .padding(Insets::symmetric(22.0, 20.0))
+            .padding(Insets::symmetric(PACKAGES_HERO_PAD_X, 20.0))
             .gap(8.0),
     )
     .children(hero_children);
@@ -25794,7 +26034,6 @@ mod tests {
             installable: true,
             failing_since: String::new(),
             failing_persistent: false,
-            rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
         }
@@ -28117,7 +28356,7 @@ mod tests {
                 .and_then(|n| n.to_str())
                 .unwrap_or_default()
                 .to_string();
-            // `app_control.rs` hosts `app act`, the generic semantic-press
+            // `app_control.rs` hosts `act`, the generic semantic-press
             // dispatcher, so it is scanned beside the control modules.
             if !(name.starts_with("control") || name == "app_control.rs") || !name.ends_with(".rs")
             {
@@ -38930,6 +39169,56 @@ mod tests {
         }
     }
 
+    /// RULING 270 (round 17, day three): at 100 columns (a 774 pt Medium
+    /// page) the third Packages verb was cut to `Remove ALab T…` at the hero
+    /// card's edge. The three sit in a row only where the card holds them
+    /// whole and stack anywhere narrower — every button inside the card at
+    /// every width. NEGATIVE CONTROL: a wide page keeps them in one row.
+    #[test]
+    fn the_packages_verbs_stay_inside_their_card_at_every_width() {
+        let (mut runtime, instance, view) = setup();
+        assert!(runtime.replace_settings_packages(live_packages_state(None), 2));
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.navigate(SettingsRoute::Packages);
+        }
+        for width in [774.0_f32, 860.0, 1_040.0, 1_300.0] {
+            let compiled =
+                compile_settings_view(&runtime, instance, view, &view_cx_at(width, 900.0));
+            let hero = compiled
+                .semantic(&UiKey::new("packages/hero"))
+                .unwrap_or_else(|| panic!("the hero at {width}"))
+                .rect;
+            let rects: Vec<_> = [
+                "packages/check",
+                "packages/install-default",
+                "packages/uninstall-all",
+            ]
+            .iter()
+            .map(|key| {
+                compiled
+                    .semantic(&UiKey::new(*key))
+                    .unwrap_or_else(|| panic!("{key} at {width}"))
+                    .rect
+            })
+            .collect();
+            for (key, rect) in ["check", "install", "remove"].iter().zip(&rects) {
+                assert!(
+                    rect.x >= hero.x && rect.right() <= hero.right() + 0.5,
+                    "{key} leaves the card at {width}: {rect:?} in {hero:?}"
+                );
+            }
+            if width >= 1_300.0 {
+                assert!(
+                    rects.iter().all(|r| (r.y - rects[0].y).abs() < 0.5),
+                    "one row on a wide page: {rects:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn numeric_slider_preserves_cursor_trail_default_and_both_endpoints() {
         let state = SettingsViewState::new(&Config::default());
@@ -39788,13 +40077,19 @@ mod tests {
         // fits its box — no renderer text overflow, no semantic node clipped
         // below the viewport, paint and semantics in parity — and the expanded
         // entry's detail, action and Copy, and the next entry, are all reached.
-        {
+        // The log of one day, and the same log spread over five days, so its
+        // day headers (ruling 273) ride every view too.
+        for (log, fixture) in [
+            (sample_messages(), "one day"),
+            (multi_day_messages(), "days"),
+        ] {
             let (mut runtime, instance, view) = setup_with_messages();
+            assert!(runtime.replace_settings_messages(log, 8));
             select_message(&mut runtime, instance, view, 40);
             let mut seen = BTreeSet::new();
             scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
                 compiled.validate_parity().unwrap();
-                assert_fits(compiled, &format!("Messages view {k}"));
+                assert_fits(compiled, &format!("Messages ({fixture}) view {k}"));
                 for node in &compiled.semantics {
                     if node.key.as_str().starts_with("settings/messages/") {
                         assert!(
@@ -39813,8 +40108,17 @@ mod tests {
                 "settings/messages/row/40/copy",
                 "settings/messages/row/1/title",
             ] {
-                assert!(seen.contains(key), "missing {key} at {scale}\u{00d7}");
+                assert!(
+                    seen.contains(key),
+                    "missing {key} ({fixture}) at {scale}\u{00d7}"
+                );
             }
+            assert_eq!(
+                seen.iter()
+                    .any(|key| key.starts_with("settings/messages/day/")),
+                fixture == "days",
+                "day headers only on the log of days ({scale}\u{00d7})"
+            );
         }
 
         for route in [SettingsRoute::About] {
@@ -43678,8 +43982,8 @@ enabled = true
     }
 
     /// THE SOUND MENU, on the NATIVE surface (owner ask: "add the volume and
-    /// SFX menu to settings"). `settings.rs` pins the in-grid box; this pins the
-    /// native Advanced pane, where the routing actually has to hold: every
+    /// SFX menu to settings"). This pins the native Advanced pane, where the
+    /// routing actually has to hold: every
     /// audible key reachable at all is reachable on ONE route under ONE caption,
     /// and nothing audible is left behind in Manual except where the platform
     /// has no host for it.
@@ -48363,6 +48667,44 @@ enabled = true
         }
     }
 
+    /// [`sample_messages`] spread over the reader's calendar (design ruling
+    /// 273), newest first, the reader at UTC on Sunday 2025-09-21 15:53:20:
+    /// #40–#38 today, #37–#31 yesterday, #30–#21 on Thursday, #20–#11 on
+    /// Friday 12 September, #10–#1 on 17 August 2024 — each group a minute
+    /// apart from 3:10 PM down.
+    fn multi_day_messages() -> MessagesState {
+        const DAY: u64 = 86_400_000;
+        let mut state = sample_messages();
+        let now = state.now_unix_ms;
+        // 15:10:00 UTC on the reader's day.
+        let afternoon = now - (43 * 60 + 20) * 1000;
+        for entry in &mut state.entries {
+            let (days, first) = match entry.id {
+                38..=40 => continue,
+                31..=37 => (1, 37),
+                21..=30 => (3, 30),
+                11..=20 => (9, 20),
+                _ => (400, 10),
+            };
+            entry.at_unix_ms = afternoon - days * DAY - (first - entry.id) * 60_000;
+            entry.retired_unix_ms = entry.retired_unix_ms.map(|_| entry.at_unix_ms + 30_000);
+        }
+        state
+    }
+
+    /// The day headers a compiled page shows, top to bottom.
+    fn message_days(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
+        compiled
+            .semantics
+            .iter()
+            .filter(|node| {
+                node.key.as_str().starts_with("settings/messages/day/")
+                    && !node.key.as_str().ends_with("/group")
+            })
+            .map(|node| node.label.clone())
+            .collect()
+    }
+
     /// A Settings controller holding [`sample_messages`], its view on the
     /// Messages route.
     fn setup_with_messages() -> (
@@ -48478,6 +48820,265 @@ enabled = true
             }
         }
         panic!("the list never reached its end");
+    }
+
+    /// DAY HEADERS (design ruling 273): a log that spans more than one of
+    /// the reader's local days is sectioned newest first — `Today`,
+    /// `Yesterday`, the weekday within the week, then the date, with the year
+    /// only off this year. A header is a heading for a screen reader and
+    /// never a control (no action, not in the focus order, skipped by the
+    /// arrow keys); it stands at the lead column's time x, every title keeps
+    /// one origin, and a row under a past day says its local time. The list's
+    /// top entry always carries its day's header, wherever the scroll stands.
+    /// A filter hides a day it admits nothing from; a log of one day carries
+    /// none.
+    #[test]
+    fn the_log_is_sectioned_by_the_readers_local_day() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        assert!(runtime.replace_settings_messages(multi_day_messages(), 8));
+        let cx = view_cx_at(1_200.0, 820.0);
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        compiled.validate_parity().unwrap();
+        let days = message_days(&compiled);
+        assert_eq!(days.first().map(String::as_str), Some("Today"), "{days:?}");
+        assert!(days.len() >= 2, "a multi-day view shows two days: {days:?}");
+        let rows = message_rows(&compiled);
+        let paint = |key: String| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == key)
+                .unwrap_or_else(|| panic!("{key} paints"))
+                .clone()
+        };
+        let origins: Vec<f32> = rows
+            .iter()
+            .map(|id| paint(format!("settings/messages/row/{id}/label")).rect.x)
+            .collect();
+        assert!(
+            origins.iter().all(|x| (x - origins[0]).abs() < 0.01),
+            "one title origin under the headers: {origins:?}"
+        );
+        let when_x = paint(format!("settings/messages/row/{}/when", rows[0]))
+            .rect
+            .x;
+        for node in compiled.semantics.iter().filter(|node| {
+            node.key.as_str().starts_with("settings/messages/day/")
+                && !node.key.as_str().ends_with("/group")
+        }) {
+            assert_eq!(node.role, SemanticRole::Heading, "{}", node.label);
+            assert!(node.action.is_none(), "a header is no control");
+            assert!(
+                !compiled.focus_order.contains(&node.key),
+                "the keyboard never lands on a header"
+            );
+            assert!(
+                (node.rect.x - when_x).abs() < 0.01,
+                "the header stands over the times: {} vs {when_x}",
+                node.rect.x
+            );
+        }
+        let when = |compiled: &crate::native_ui::CompiledUi, id: u64| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == format!("settings/messages/row/{id}/when"))
+                .map(|node| match &node.content {
+                    UiContent::Text(spec) => spec.text.clone(),
+                    other => panic!("{other:?}"),
+                })
+        };
+        assert_eq!(when(&compiled, 40).as_deref(), Some("1 min ago"), "today");
+        assert_eq!(when(&compiled, 37).as_deref(), Some("3:10 PM"), "yesterday");
+
+        // Scrolled end to end: every day once, in order, each view's first
+        // entry under its own day's header.
+        let mut seen: Vec<String> = Vec::new();
+        scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
+            let days = message_days(compiled);
+            let top_day = compiled
+                .semantics
+                .iter()
+                .find(|node| node.key.as_str().starts_with("settings/messages/day/"))
+                .unwrap_or_else(|| panic!("view {k} opens under a header"));
+            let first_row = message_rows(compiled)[0];
+            let row = compiled
+                .semantic(&UiKey::new(format!(
+                    "settings/messages/row/{first_row}/title"
+                )))
+                .expect("the first row");
+            assert!(top_day.rect.y < row.rect.y, "view {k}: the header leads");
+            for day in days {
+                if !seen.contains(&day) {
+                    seen.push(day);
+                }
+            }
+        });
+        assert_eq!(
+            seen,
+            [
+                "Today",
+                "Yesterday",
+                "Thursday",
+                "Friday, 12 September",
+                "Saturday, 17 August 2024",
+            ],
+        );
+
+        // The arrow keys step from today's last entry to yesterday's first,
+        // past the header between them.
+        let (mut runtime, instance, view) = setup_with_messages();
+        assert!(runtime.replace_settings_messages(multi_day_messages(), 8));
+        let _ = compile_settings_view(&runtime, instance, view, &cx);
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!()
+            };
+            state.common.last_focus = Some(UiKey::new("settings/messages/row/38/title"));
+        }
+        runtime
+            .dispatch(instance, view, AppEvent::ScrollLines(1))
+            .unwrap();
+        assert_eq!(
+            messages_view_state(&runtime, view)
+                .common
+                .last_focus
+                .as_ref()
+                .map(UiKey::as_str),
+            Some("settings/messages/row/37/title")
+        );
+
+        // A filter hides a day it admits nothing from: the config warnings
+        // start yesterday.
+        let _ = messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/filter/tag/config",
+        );
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(
+            message_days(&compiled).first().map(String::as_str),
+            Some("Yesterday")
+        );
+
+        // A log of one day: no header, and the rows keep their relative words.
+        let (runtime, instance, view) = setup_with_messages();
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(message_days(&compiled).is_empty());
+        assert_eq!(when(&compiled, 40).as_deref(), Some("1 min ago"));
+    }
+
+    /// A STAMP FROM TOMORROW IS TODAY'S (ruling 281): a writer whose clock
+    /// runs ahead stamps a record past the reader's midnight. It heads no
+    /// list of today alone (ruling 277: a list all of today carries none),
+    /// and in a headed list it opens no section of its own — before 281 it
+    /// did, and read `Today` above today's own `Today`. NEGATIVE CONTROL: a
+    /// past entry still heads the list, into two sections.
+    #[test]
+    fn a_stamp_from_tomorrow_is_todays() {
+        const DAY: u64 = 86_400_000;
+        let state = sample_messages();
+        let now = state.now_unix_ms;
+        let mut entries: Vec<MessageView> = state.entries.into_iter().take(3).collect();
+        // Past the reader's midnight (the reader is at 15:53 UTC).
+        entries[0].at_unix_ms = now + 9 * 3_600_000;
+        entries[1].at_unix_ms = now - 60_000;
+        entries[2].at_unix_ms = now - 120_000;
+        let refs: Vec<&MessageView> = entries.iter().collect();
+        let today = aterm_messages::words::local_day(now, 0);
+        let clock = MessagesClock::of(&refs, now, 0);
+        assert!(
+            !clock.headed,
+            "a list of today and tomorrow carries no header"
+        );
+        assert_eq!(clock.sections(&refs), None);
+
+        entries[2].at_unix_ms = now - 3 * DAY;
+        let refs: Vec<&MessageView> = entries.iter().collect();
+        let clock = MessagesClock::of(&refs, now, 0);
+        assert!(clock.headed, "a past entry heads it");
+        assert_eq!(
+            clock.sections(&refs),
+            Some(vec![today, today, today - 3]),
+            "tomorrow's stamp is in today's section"
+        );
+    }
+
+    /// ONE PAST DAY IS STILL HEADED, AND THE TITLES NEVER MOVE WITH THE
+    /// FILTER (round 18, day four, D12/D13): a filter that left one past day
+    /// showed no header and a raw `2026-09-24` in the time column, and the
+    /// title column stood at x 816, 788 or 718 as the filter changed.
+    /// NEGATIVE CONTROL: a list of only today still carries no header (the
+    /// test above).
+    #[test]
+    fn one_past_day_is_headed_and_the_titles_hold_their_x_across_filters() {
+        const DAY: u64 = 86_400_000;
+        let cx = view_cx_at(1_200.0, 820.0);
+        // Every entry on ONE past local day (Thursday, three days back), a
+        // minute apart: the rule before D12's fix (headed only when the
+        // entries span two days) heads none of it.
+        let mut past = sample_messages();
+        let thursday = past.now_unix_ms - 3 * DAY;
+        for entry in &mut past.entries {
+            entry.at_unix_ms = thursday - (40 - entry.id) * 60_000;
+            entry.retired_unix_ms = entry.retired_unix_ms.map(|_| entry.at_unix_ms + 30_000);
+        }
+        let (mut runtime, instance, view) = setup_with_messages();
+        assert!(runtime.replace_settings_messages(past, 8));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        let days = message_days(&compiled);
+        assert_eq!(
+            days.len(),
+            1,
+            "one past day carries its one header: {days:?}"
+        );
+        let rows = message_rows(&compiled);
+        let when_of = |compiled: &crate::native_ui::CompiledUi, id: u64| {
+            compiled
+                .paint
+                .iter()
+                .find(|node| node.key.as_str() == format!("settings/messages/row/{id}/when"))
+                .map(|node| match &node.content {
+                    UiContent::Text(spec) => spec.text.clone(),
+                    other => panic!("{other:?}"),
+                })
+                .expect("a time")
+        };
+        let first = when_of(&compiled, rows[0]);
+        assert!(
+            !first.contains('-') && (first.ends_with("AM") || first.ends_with("PM")),
+            "a clock under its day, never a date: {first}"
+        );
+
+        // The titles' x across the filters.
+        let (mut runtime, instance, view) = setup_with_messages();
+        assert!(runtime.replace_settings_messages(multi_day_messages(), 8));
+        let title_x = |runtime: &NativeRuntime| {
+            let compiled = compile_settings_view(runtime, instance, view, &cx);
+            let rows = message_rows(&compiled);
+            compiled
+                .paint
+                .iter()
+                .find(|node| {
+                    node.key.as_str() == format!("settings/messages/row/{}/label", rows[0])
+                })
+                .expect("a title")
+                .rect
+                .x
+        };
+        let all = title_x(&runtime);
+        let _ = messages_action(
+            &mut runtime,
+            instance,
+            view,
+            "settings/messages/filter/tag/config",
+        );
+        let filtered = title_x(&runtime);
+        assert!(
+            (all - filtered).abs() < 0.01,
+            "the titles hold their x: {all} vs {filtered}"
+        );
     }
 
     /// Settings ▸ Messages's TOP switch (design §10.14, ruling 212): "Explain
@@ -49465,14 +50066,14 @@ enabled = true
                 AppEvent::MessageActFinished {
                     operation,
                     outcome: MessageActOutcome::Performed {
-                        feedback: "Opened crash log".to_string(),
+                        feedback: "Opened the log".to_string(),
                     },
                 },
             )
             .unwrap();
         assert_eq!(
             messages_view_state(&runtime, view).feedback.as_deref(),
-            Some("Opened crash log")
+            Some("Opened the log")
         );
         // A spent button: the page says so and asks the host for nothing.
         let effects = messages_action(
@@ -49915,6 +50516,114 @@ enabled = true
         );
     }
 
+    /// RULING 270 (round 17, day three): `Copied` in the page's bottom bar
+    /// took the list's room, so an open entry that fitted no longer did and
+    /// the list fell from seven rows to four for five seconds. The page's
+    /// own confirmation rides its count line: the same rows before and
+    /// after, no status bar, and the words still said (the count line is a
+    /// Status node). At the day's geometry (100 columns, 774×612 pt).
+    #[test]
+    fn the_messages_pages_confirmation_takes_no_room_from_the_list() {
+        let (mut runtime, instance, view) = setup_with_messages();
+        let cx = view_cx_at(774.0, 612.0);
+        let first = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
+        assert!(first.len() >= 5, "{first:?}");
+        select_message(&mut runtime, instance, view, first[4]);
+        let before = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
+        {
+            let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                unreachable!();
+            };
+            state.show_messages_feedback_for_test("Copied");
+        }
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert_eq!(message_rows(&compiled), before, "the list keeps its rows");
+        assert!(
+            compiled
+                .semantic(&UiKey::new("settings/feedback"))
+                .is_none(),
+            "no bar under the page"
+        );
+        let status = compiled
+            .semantic(&UiKey::new("settings/messages/status"))
+            .expect("the count line");
+        assert!(
+            status.label.ends_with("\u{00b7} Copied"),
+            "{:?}",
+            status.label
+        );
+        // ROUND 17 REVIEW (V4): a LONG note — Open Log Folder's path, a sent
+        // word — is fitted beside the count, never a reason to move the
+        // buttons under it: the list keeps its rows, and the whole note is
+        // still the count line's label.
+        let long = "The log folder is /Users//someone/Library/Application Support/aterm/messages";
+        for (w, h) in [(774.0, 612.0), (474.0, 572.0)] {
+            let cx = view_cx_at(w, h);
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.feedback = None;
+            }
+            let quiet = message_rows(&compile_settings_view(&runtime, instance, view, &cx));
+            {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!();
+                };
+                state.show_messages_feedback_for_test(long);
+            }
+            let compiled = compile_settings_view(&runtime, instance, view, &cx);
+            assert_eq!(
+                message_rows(&compiled),
+                quiet,
+                "{w} pt: the list keeps its rows"
+            );
+            let status = compiled
+                .semantic(&UiKey::new("settings/messages/status"))
+                .expect("the count line");
+            assert!(status.label.ends_with(long), "{w} pt: {:?}", status.label);
+        }
+    }
+
+    /// The count line's height and button placement are the COUNT's alone
+    /// (round 17 review, V4): at every width, a note leaves both unchanged.
+    /// NEGATIVE CONTROL: a count too wide for the buttons does move them —
+    /// the sweep reaches both placements.
+    #[test]
+    fn a_count_lines_note_never_moves_its_buttons() {
+        let shape = |node: &UiNode| {
+            node.children
+                .iter()
+                .map(|c| c.key.as_str().to_string())
+                .collect::<Vec<_>>()
+        };
+        let notes = [
+            "Copied",
+            "Sent Skip version; what it did shows in this log",
+            "The log folder is /Users//someone/Library/Application Support/aterm/messages",
+        ];
+        let mut placements = std::collections::BTreeSet::new();
+        for w in (120..=900).step_by(10) {
+            let w = w as f32;
+            let (bare, bare_h) = messages_count_line(Some("1,234 of 5,678".into()), None, w);
+            placements.insert(shape(&bare).len());
+            for note in notes {
+                let (with, with_h) =
+                    messages_count_line(Some("1,234 of 5,678".into()), Some(note), w);
+                assert_eq!(with_h, bare_h, "{w} pt, {note:?}: the height moved");
+                assert_eq!(
+                    shape(&with),
+                    shape(&bare),
+                    "{w} pt, {note:?}: the buttons moved"
+                );
+            }
+        }
+        assert!(
+            placements.len() >= 2,
+            "the sweep saw one placement: {placements:?}"
+        );
+    }
+
     /// ROUND 16, DAY TWO (ruling 267): `Copied` stood on the page for five
     /// minutes and across filters. The next action on the page clears it, and
     /// so does the first projection five seconds after one has seen it; a
@@ -50076,49 +50785,63 @@ enabled = true
     #[test]
     fn messages_page_seats_no_item_it_clips_at_584x348() {
         let cx = view_cx_at(584.0, 348.0);
-        let (mut runtime, instance, view) = setup_with_messages();
-        select_message(&mut runtime, instance, view, 40);
-        let control = messages_small_button_height();
-        let head = messages_row_height();
-        let line = messages_line_height();
-        let views = scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
-            compiled.validate_parity().unwrap();
-            let section = compiled
-                .semantic(&UiKey::new("settings/messages/section"))
-                .expect("the 80\u{d7}24 window is a compact host: one scrolling section");
-            let bottom = section.rect.bottom();
-            for node in &compiled.semantics {
-                let key = node.key.as_str();
-                let Some(rest) = key.strip_prefix("settings/messages/row/") else {
-                    continue;
-                };
-                assert!(
-                    node.rect.bottom() <= bottom + 0.01,
-                    "{key} hangs past its section in view {k}: {:?} (section {:?})",
-                    node.rect,
-                    section.rect
-                );
-                let authored = if !rest.contains('/') || rest.ends_with("/title") {
-                    Some(("a head", head))
-                } else if rest.contains("/meta/") || rest.contains("/detail/") {
-                    Some(("a line", line))
-                } else if rest.ends_with("/copy") || rest.contains("/action/") {
-                    Some(("a control", control))
-                } else {
-                    None
-                };
-                if let Some((what, height)) = authored {
-                    assert!(
-                        node.rect.height >= height - 0.01,
-                        "{key} is laid out short of its authored height in view {k}: {:?} \
+        // The one-day log, and the same log over five days, whose day headers
+        // (ruling 273) are seated whole as well.
+        for log in [sample_messages(), multi_day_messages()] {
+            let (mut runtime, instance, view) = setup_with_messages();
+            assert!(runtime.replace_settings_messages(log, 8));
+            select_message(&mut runtime, instance, view, 40);
+            let control = messages_small_button_height();
+            let head = messages_row_height();
+            let line = messages_line_height();
+            let views =
+                scroll_messages_through(&mut runtime, instance, view, &cx, 1, |compiled, k| {
+                    compiled.validate_parity().unwrap();
+                    let section = compiled
+                        .semantic(&UiKey::new("settings/messages/section"))
+                        .expect("the 80\u{d7}24 window is a compact host: one scrolling section");
+                    let bottom = section.rect.bottom();
+                    for node in &compiled.semantics {
+                        let key = node.key.as_str();
+                        if key.starts_with("settings/messages/day/") {
+                            assert!(
+                                node.rect.bottom() <= bottom + 0.01,
+                                "{key} hangs past its section in view {k}: {:?}",
+                                node.rect
+                            );
+                            continue;
+                        }
+                        let Some(rest) = key.strip_prefix("settings/messages/row/") else {
+                            continue;
+                        };
+                        assert!(
+                            node.rect.bottom() <= bottom + 0.01,
+                            "{key} hangs past its section in view {k}: {:?} (section {:?})",
+                            node.rect,
+                            section.rect
+                        );
+                        let authored = if !rest.contains('/') || rest.ends_with("/title") {
+                            Some(("a head", head))
+                        } else if rest.contains("/meta/") || rest.contains("/detail/") {
+                            Some(("a line", line))
+                        } else if rest.ends_with("/copy") || rest.contains("/action/") {
+                            Some(("a control", control))
+                        } else {
+                            None
+                        };
+                        if let Some((what, height)) = authored {
+                            assert!(
+                                node.rect.height >= height - 0.01,
+                                "{key} is laid out short of its authored height in view {k}: {:?} \
                          ({what} is {height} pt; section {:?})",
-                        node.rect,
-                        section.rect
-                    );
-                }
-            }
-        });
-        assert!(views > 1, "the sample log scrolls at 584\u{d7}348");
+                                node.rect,
+                                section.rect
+                            );
+                        }
+                    }
+                });
+            assert!(views > 1, "the sample log scrolls at 584\u{d7}348");
+        }
     }
 
     /// A log at its RING CAP ([`aterm_messages::LOG_CAP`], 512 records): the
@@ -50676,6 +51399,112 @@ enabled = true
         std::fs::write(path, &out).expect("write png");
         crate::logging::stderr_line!("wrote {} ({pw}x{ph})", path.display());
         compiled
+    }
+
+    /// VISUAL CAPTURE of the log's DAY HEADERS (design ruling 273): the
+    /// realistic log ([`realistic_messages`]) spread over five local days, at
+    /// the Settings pages a 100- and a 60-column window open (774 and 470 pt
+    /// wide, 612 tall), dark and GitHub Light — the list's top, one scrolled
+    /// to the middle of a day, the end, the Problems filter, an entry opened
+    /// under a past day, and High Contrast. Not a gate: `#[ignore]`d.
+    ///
+    /// ```sh
+    /// SETTINGS_MESSAGES_PNG_DIR=<dir> targo --unverified test -p aterm-gui --lib \
+    ///     settings_messages_day_headers_capture -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "visual capture: needs a system UI face; run with --ignored"]
+    fn settings_messages_day_headers_capture() {
+        const DAY: u64 = 86_400_000;
+        let dir = std::env::var("SETTINGS_MESSAGES_PNG_DIR").map_or_else(
+            |_| std::env::temp_dir().join("settings-messages"),
+            std::path::PathBuf::from,
+        );
+        std::fs::create_dir_all(&dir).expect("output dir");
+        let light = {
+            let parts = aterm_types::scheme::builtin("GitHub Light")
+                .expect("a builtin scheme")
+                .to_theme_parts();
+            aterm_render::Theme {
+                fg: parts.fg,
+                bg: parts.bg,
+                cursor: parts.cursor,
+                selection: parts.selection,
+            }
+        };
+        let mut log = realistic_messages();
+        let n = log.entries.len();
+        for (k, entry) in log.entries.iter_mut().enumerate() {
+            let days = match k * 10 / n.max(1) {
+                0..=1 => 0,
+                2..=3 => 1,
+                4..=5 => 3,
+                6..=8 => 12,
+                _ => 400,
+            };
+            entry.at_unix_ms -= days * DAY;
+            entry.retired_unix_ms = entry.retired_unix_ms.map(|t| t - days * DAY);
+        }
+        let past = log.entries[n / 2].id;
+        for (ground, theme) in [("dark", aterm_render::Theme::default()), ("light", light)] {
+            for (cols, width) in [(100, 774.0_f32), (60, 470.0)] {
+                let at = (width, 612.0);
+                let path = |name: &str| dir.join(format!("d-{name}-{ground}-{cols}.png"));
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                let _ = compile_settings_view(&runtime, instance, view, &view_cx_at(at.0, at.1));
+                let limit = messages_view_state(&runtime, view)
+                    .result_page_limit
+                    .get()
+                    .expect("the render bounds the list");
+                for (slug, top) in [("top", 0), ("middle", limit / 2 + 1), ("end", limit)] {
+                    {
+                        let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view)
+                        else {
+                            unreachable!();
+                        };
+                        state.page_scroll = top;
+                    }
+                    let compiled = shoot_settings(
+                        &runtime,
+                        instance,
+                        view,
+                        at,
+                        theme,
+                        &path(&format!("log-{slug}")),
+                    );
+                    crate::logging::stderr_line!(
+                        "{ground} {cols} {slug}: days {:?}",
+                        message_days(&compiled)
+                    );
+                }
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                messages_action(
+                    &mut runtime,
+                    instance,
+                    view,
+                    &format!("{MESSAGES_ACTION_PREFIX}filter/warn"),
+                );
+                shoot_settings(&runtime, instance, view, at, theme, &path("problems"));
+                let (mut runtime, instance, view) = setup_with_these_messages(log.clone());
+                select_message(&mut runtime, instance, view, past);
+                shoot_settings(&runtime, instance, view, at, theme, &path("open-past"));
+            }
+        }
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences {
+                high_contrast: true,
+                ..crate::native_appearance::current_preferences()
+            },
+        );
+        let (runtime, instance, view) = setup_with_these_messages(log.clone());
+        shoot_settings(
+            &runtime,
+            instance,
+            view,
+            (774.0, 612.0),
+            aterm_render::Theme::default(),
+            &dir.join("d-log-top-hc-dark-100.png"),
+        );
     }
 
     /// VISUAL CAPTURE of Settings ▸ Messages (round 14): on the default dark

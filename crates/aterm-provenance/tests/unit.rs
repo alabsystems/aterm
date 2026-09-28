@@ -60,7 +60,8 @@ fn provenance_from_t_only_for_host() {
     // `From<T>` is implemented only for the Host origin (§4.1 audit
     // ergonomics — every non-Host tag must be opted into explicitly).
     let _: Provenance<u8, Host> = 5u8.into();
-    // Compile-fail coverage for other origins lives in tests/compile_fail/ui.
+    // Compile-fail coverage for the other origins is the `compile_fail`
+    // doctests on `Provenance` (src/provenance.rs).
 }
 
 // -- Authorize ceremony -------------------------------------------------

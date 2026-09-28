@@ -27,11 +27,28 @@
 //! the case where the prefix is the most valuable text in the tab — an ssh
 //! session into `prod-db-01` must keep saying so — and it is left untouched.
 //!
+//! ## The second shape: the console's own program path (Windows)
+//!
+//! ConPTY reports the console title to the terminal as OSC 0/2, and a fresh
+//! console's title is the FULL PATH of the program it was created for —
+//! measured on this machine at 0.90.0: a new pane's first title was
+//! `C:\Program Files\WindowsApps\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\pwsh.exe`,
+//! which the strip painted whole and `ls` printed percent-encoded, until the
+//! prompt's own title (`~\aterm`) replaced it a moment later. A shell that sets
+//! no title (stock `cmd.exe`, `pwsh` without a prompt hook) keeps that path for
+//! its whole life. The path names only the program the user just launched, so
+//! it is dropped the same way the local identity is
+//! ([`without_console_program_path`]) and the cwd rung labels the tab.
+//! `cmd.exe` appends the running command to its title (`C:\…\cmd.exe - ping x`);
+//! that suffix IS information and is kept.
+//!
 //! The title is display-only chrome. The terminal's OSC 0/2 title remains
-//! authoritative identity and is not rewritten: `ctl title`, `meta`, and every
-//! protocol surface still report exactly what the program set. A title a person
-//! or a program actually chose (`vim README.md`, a TUI's own name) matches none
-//! of the shapes below and survives in full.
+//! authoritative identity and is not rewritten: `ctl title` and `meta` still
+//! report exactly what the program set (the roster's `ls` title drops only
+//! the console program path, keeping `user@host:` — see
+//! `control_session::roster_title`). A title a person or a program
+//! actually chose (`vim README.md`, a TUI's own name) matches none of the
+//! shapes below and survives in full.
 
 use std::sync::OnceLock;
 
@@ -82,6 +99,63 @@ pub(crate) fn without_local_identity(title: &str) -> &str {
     without_identity_of(title, full, short)
 }
 
+/// The title with everything that names only what the user already knows
+/// removed: a `user@host:` prefix naming this machine
+/// ([`without_local_identity`]) and the console's own program path
+/// ([`without_console_program_path`]). THE strip's rung, used by both label
+/// paths (`app_tabs::resolved_terminal_title_rung` and the per-frame refill),
+/// so the painted strip and the chrome push cannot label one tab differently.
+/// `""` is the fall-through signal to the cwd rung, as for either shed alone.
+#[must_use]
+pub(crate) fn informative(title: &str) -> &str {
+    without_console_program_path(without_local_identity(title))
+}
+
+/// The title with a bare Windows executable path removed — ConPTY's title for
+/// a console whose program set none (see the module docs for the measurement).
+///
+/// The shape is an ABSOLUTE Windows path (`X:\…` or a UNC `\\…`) whose first
+/// `.exe` (ASCII case-insensitive) either ends the title, which yields `""`
+/// (the caller's fall-through to the cwd rung), or is followed by `cmd.exe`'s
+/// ` - <command>` convention, which yields the command alone. Any other title
+/// is returned unchanged: a relative or POSIX path, an `.exe` mid-path
+/// (`C:\apps\foo.exe.bak\bar.txt`), or prose that merely contains one. The
+/// shape cannot occur on Unix, so that platform's labels are untouched.
+///
+/// No allocation: the per-frame refill calls this on every terminal tab.
+#[must_use]
+pub(crate) fn without_console_program_path(title: &str) -> &str {
+    let trimmed = title.trim();
+    let bytes = trimmed.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    if !drive && !trimmed.starts_with("\\\\") {
+        return title;
+    }
+    for (at, _) in trimmed.match_indices('.') {
+        let Some(ext) = trimmed.get(at..at + 4) else {
+            continue;
+        };
+        if !ext.eq_ignore_ascii_case(".exe") {
+            continue;
+        }
+        let rest = &trimmed[at + 4..];
+        if rest.is_empty() {
+            return "";
+        }
+        // ` - <command>`. The outer trim has already taken the space after a
+        // dash with nothing behind it, so a bare ` -` is the same shape.
+        if let Some(command) = rest.strip_prefix(" -")
+            && (command.is_empty() || command.starts_with(' '))
+        {
+            return command.trim();
+        }
+    }
+    title
+}
+
 /// [`without_local_identity`] with this machine's names handed in.
 ///
 /// The decision is the whole subject and it turns on which host the title names,
@@ -127,7 +201,7 @@ fn host_is_local(host: &str, local_full: &str, local_short: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{host_is_local, without_identity_of};
+    use super::{host_is_local, informative, without_console_program_path, without_identity_of};
 
     const FULL: &str = "m17-tower.local";
     const SHORT: &str = "m17-tower";
@@ -200,5 +274,74 @@ mod tests {
         assert!(host_is_local("M17-Tower", FULL, SHORT));
         assert!(host_is_local("m17-tower.lan", FULL, SHORT));
         assert!(!host_is_local("m17-towerx", FULL, SHORT));
+    }
+
+    /// The measured defect: ConPTY's title for a fresh console is the program's
+    /// own path, which names nothing the user did not just choose. Empty is the
+    /// fall-through to the cwd rung, exactly as for the local identity.
+    #[test]
+    fn a_console_program_path_leaves_nothing_to_show() {
+        for path in [
+            "C:\\Program Files\\WindowsApps\\Microsoft.PowerShell_7.6.6.0_x64__8wekyb3d8bbwe\\pwsh.exe",
+            "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+            "C:\\Windows\\system32\\cmd.exe",
+            "c:/windows/system32/CMD.EXE",
+            "\\\\build-01\\tools\\shell.exe",
+            "  C:\\Windows\\system32\\cmd.exe  ",
+        ] {
+            assert_eq!(without_console_program_path(path), "", "{path:?}");
+            assert_eq!(informative(path), "", "{path:?}");
+        }
+    }
+
+    /// `cmd.exe` writes `<path> - <command>` while a command runs: the path
+    /// goes, the command — the half that says what the tab is doing — stays.
+    #[test]
+    fn a_command_after_the_program_path_is_the_part_worth_reading() {
+        assert_eq!(
+            without_console_program_path("C:\\Windows\\system32\\cmd.exe - ping  build-01"),
+            "ping  build-01"
+        );
+        assert_eq!(
+            without_console_program_path("C:\\Windows\\system32\\cmd.exe - C:\\tools\\run.exe"),
+            "C:\\tools\\run.exe"
+        );
+        // A dash with nothing after it says nothing either.
+        assert_eq!(
+            without_console_program_path("C:\\Windows\\system32\\cmd.exe - "),
+            ""
+        );
+    }
+
+    /// Only the bare console shape is dropped: every title that is not an
+    /// absolute Windows path to an `.exe` — including ones that CONTAIN one —
+    /// is returned byte-identical, so nothing a program chose is rewritten and
+    /// Unix labels (which never take the shape) cannot change at all.
+    #[test]
+    fn a_title_that_is_not_a_bare_program_path_is_never_touched() {
+        for title in [
+            "~\\aterm",
+            "~/aterm",
+            "vim README.md",
+            "/usr/bin/bash",
+            "pwsh.exe",
+            "bin\\tool.exe",
+            "C:\\apps\\foo.exe.bak\\notes.txt",
+            "C:\\Users\\x\\aterm",
+            "running C:\\tools\\run.exe now",
+            "C:\\tools\\run.exe.",
+            "C:\\tools\\run.exe -v",
+            "C:",
+            "",
+            "user@m17-tower: ~/aterm",
+        ] {
+            assert_eq!(
+                without_console_program_path(title),
+                title,
+                "rewrote {title:?}"
+            );
+        }
+        // The two sheds compose: identity first, then the path shape.
+        assert_eq!(informative("vim README.md"), "vim README.md");
     }
 }

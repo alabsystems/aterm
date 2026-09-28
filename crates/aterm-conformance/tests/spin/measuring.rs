@@ -24,7 +24,7 @@ fn workspace_root() -> PathBuf {
 /// Serialized: each row launches its own instance and then MEASURES ITS
 /// IDLENESS, and two concurrent rows would contend for the CPU — a gate about
 /// quiet must never be disturbed by its own harness.
-fn probe(shape: &str) {
+fn probe(shape: &str, window: &str, extra: &[&str]) {
     static SERIAL: Mutex<()> = Mutex::new(());
     let _take_turns = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -37,8 +37,9 @@ fn probe(shape: &str) {
         .arg(&script)
         .arg(&bin)
         .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .args(["--shape", shape, "--settle", "3", "--window", "6"])
+        .args(["--shape", shape, "--settle", "3", "--window", window])
         .args(["--max-arms", "100", "--budget", "120"])
+        .args(extra)
         .output()
         .unwrap_or_else(|e| panic!("could not spawn {}: {e}", script.display()));
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -70,17 +71,20 @@ fn probe(shape: &str) {
 
 /// Matrix row 1 — THE REGRESSION'S OWN SHAPE, and the row that can go red.
 /// The alt-screen steady repainter arrives on the instance inside the measured
-/// window: DEC-2026 bracketed, DECTCEM hide, the caret parked, and the SAME
-/// BYTES rewritten ~6x/s. Output without grid movement is exactly what split
-/// `StatusFsm::owed_wake`'s movement clock from `classify`'s output clock and
-/// left the loop re-arming a dead deadline.
+/// window: one second of real writes, then bytes that mark no cell ~6x/s.
+/// Output without grid movement is exactly what split `StatusFsm::owed_wake`'s
+/// movement clock from `classify`'s output clock and left the loop re-arming a
+/// dead deadline. The window is 10 s because the split bites `quiet_after`
+/// (5 s) after the last real write.
 ///
-/// MEASURED 2026-08-24, both arms, RELEASE profile, headless, 6 s window:
-///   healthy HEAD                    past_deadline_arms=0     PASS
-///   420e4164 reverted               past_deadline_arms=7929  FAIL  (1321/s)
+/// MEASURED 2026-09-25, RELEASE profile, headless, 10 s window (3/3 each):
+///   healthy HEAD                              arms=0    timer_wakes=5   PASS
+///   420e41648's owed_wake hunk reverted       arms=0    timer_wakes=21  FAIL
+///   ...and next_wake's structural clamp too   arms=105  timer_wakes=75  FAIL
+/// (2026-08-24, the old fixture, 6 s: 420e4164 wholly reverted banked 7929.)
 #[test]
 fn an_idle_claude_shaped_client_banks_no_past_deadline_arms() {
-    probe("claude");
+    probe("claude", "10", &["--max-timer-wakes", "12"]);
 }
 
 /// Matrix row 2, the floor: a bare `/bin/sh` prompt with nothing running. If
@@ -93,5 +97,5 @@ fn an_idle_claude_shaped_client_banks_no_past_deadline_arms() {
 /// burden.
 #[test]
 fn a_bare_idle_instance_banks_no_past_deadline_arms() {
-    probe("idle");
+    probe("idle", "6", &[]);
 }

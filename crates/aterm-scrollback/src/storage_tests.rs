@@ -812,3 +812,157 @@ fn streaming_iter_matches_get_line_walk_disk() {
         assert_eq!(via_iter, original[60 - keep..], "keep={keep}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// DENSE walk (`ScrollbackStorage::dense_from`) — conformance against the
+// per-line oracle. Product readers key every line by its absolute row, so the
+// dense walk must yield EXACTLY one item per logical line: `Some` wherever
+// `get_line` answers a line, `None` wherever it errors or answers nothing.
+// ---------------------------------------------------------------------------
+
+/// The per-line oracle: what `get_line(i)` answers for every `i` from `start`,
+/// with a read failure folded to `None` — exactly how the product readers
+/// (`Grid::get_history_line` → empty text) treat one.
+fn dense_oracle(storage: &ScrollbackStorage, start: usize) -> Vec<Option<Vec<u8>>> {
+    (start..storage.line_count())
+        .map(|i| storage.get_line(i).ok().flatten().map(|l| l.serialize()))
+        .collect()
+}
+
+fn dense_walk(storage: &ScrollbackStorage, start: usize) -> Vec<Option<Vec<u8>>> {
+    let iter = storage.dense_from(start);
+    assert_eq!(
+        iter.len(),
+        storage.line_count().saturating_sub(start),
+        "the dense walk announces one item per remaining line"
+    );
+    iter.map(|l| l.map(|l| l.serialize())).collect()
+}
+
+/// Every start position — tier boundaries, block interiors, the hot tail —
+/// over a store populated in all three tiers, before and after a
+/// non-block-aligned front truncation (the non-zero front offsets are where
+/// segment slicing can go wrong).
+#[test]
+fn dense_walk_matches_per_line_oracle_across_tiers_and_front_truncation() {
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..60 {
+        sb.push_line(streaming_parity_line(i));
+    }
+    let mut storage: ScrollbackStorage = sb.into();
+    for keep in [60, 53, 13] {
+        storage.set_line_limit(Some(keep));
+        assert_eq!(storage.line_count(), keep);
+        for start in 0..=keep + 2 {
+            assert_eq!(
+                dense_walk(&storage, start),
+                dense_oracle(&storage, start),
+                "keep={keep} start={start}"
+            );
+        }
+        // A healthy store has no placeholders at all.
+        let mut iter = storage.dense_from(0);
+        assert!(iter.by_ref().all(|l| l.is_some()));
+        assert_eq!(iter.placeholders(), 0);
+    }
+}
+
+/// The hot tail is BORROWED — the dense walk clones no hot line (the
+/// streaming `iter()` clones each one into a one-line segment).
+#[test]
+fn dense_walk_borrows_hot_lines() {
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..30 {
+        sb.push_line(streaming_parity_line(i));
+    }
+    let hot = sb.hot_line_count();
+    assert!(hot > 0);
+    let storage: ScrollbackStorage = sb.into();
+    let n = storage.line_count();
+    let items: Vec<_> = storage.dense_from(0).collect();
+    for (i, item) in items.iter().enumerate() {
+        let borrowed = matches!(item, Some(std::borrow::Cow::Borrowed(_)));
+        assert_eq!(
+            borrowed,
+            i >= n - hot,
+            "line {i}: hot lines borrow, decoded lines own"
+        );
+    }
+}
+
+/// CORRUPTION + GAP: a corrupt warm block sits between the cold tier and the
+/// healthy warm blocks. The dense walk yields one placeholder per line it
+/// spans and keeps every later line on its own coordinate, for every start —
+/// including starts INSIDE the corrupt block.
+///
+/// Negative control: the skipping streaming walk, keyed the way the product
+/// used to key lines (by position), puts later lines on the wrong rows — the
+/// exact defect the dense reader exists to rule out, so this test could not
+/// pass against a reader that skipped.
+#[test]
+fn dense_walk_yields_placeholders_for_a_corrupt_segment_and_keeps_coordinates() {
+    let mut sb = Scrollback::with_block_size(4, 12, 10_000_000, 4);
+    for i in 0..40 {
+        sb.push_line(streaming_parity_line(i));
+    }
+    let cold_before = sb.cold_line_count();
+    assert!(
+        cold_before > 0,
+        "the corrupt block must sit after a cold tier"
+    );
+    let corrupt_lines = 5;
+    sb.inject_corrupted_warm_block(corrupt_lines);
+    let storage: ScrollbackStorage = sb.into();
+    let total = storage.line_count();
+
+    for start in 0..=total {
+        let dense = dense_walk(&storage, start);
+        assert_eq!(dense, dense_oracle(&storage, start), "start={start}");
+    }
+    let mut iter = storage.dense_from(0);
+    let items: Vec<_> = iter.by_ref().collect();
+    assert_eq!(iter.placeholders(), corrupt_lines);
+    let holes: Vec<usize> = (0..total).filter(|&i| items[i].is_none()).collect();
+    assert_eq!(
+        holes,
+        (cold_before..cold_before + corrupt_lines).collect::<Vec<_>>(),
+        "the placeholders sit exactly on the corrupt block's rows"
+    );
+
+    // Negative control: position-keying the SKIPPING walk misplaces rows.
+    let skipping: Vec<_> = storage.iter().map(|l| Some(l.serialize())).collect();
+    let oracle = dense_oracle(&storage, 0);
+    assert_eq!(skipping.len(), total - corrupt_lines);
+    assert_ne!(
+        skipping[cold_before], oracle[cold_before],
+        "a skipping walk shifts the first line after the corrupt block onto its row"
+    );
+}
+
+/// Disk-backed twin: cold pages live in the `.dtrm` file.
+#[cfg(feature = "disk-tier")]
+#[test]
+fn dense_walk_matches_per_line_oracle_disk() {
+    let temp_dir = aterm_tempfile::tempdir().expect("Failed to create temp dir");
+    let path = temp_dir.path().join("dense-parity.dtrm");
+    let config = DiskBackedScrollbackConfig::new(&path)
+        .with_hot_limit(4)
+        .with_warm_limit(12)
+        .with_block_size(4);
+    let mut storage: ScrollbackStorage = DiskBackedScrollback::with_config(config)
+        .expect("store")
+        .into();
+    for i in 0..60 {
+        storage.push_line(streaming_parity_line(i)).unwrap();
+    }
+    for keep in [60, 53, 13] {
+        storage.set_line_limit(Some(keep));
+        for start in 0..=keep {
+            assert_eq!(
+                dense_walk(&storage, start),
+                dense_oracle(&storage, start),
+                "disk keep={keep} start={start}"
+            );
+        }
+    }
+}

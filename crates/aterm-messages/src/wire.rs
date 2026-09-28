@@ -188,7 +188,7 @@ pub(crate) fn message_row(
     // finished is not an action anyone can take.
     let labels: Vec<&str> = actions
         .iter()
-        .filter(|intent| live.is_some() || !intent.ends_with_row())
+        .filter(|intent| live.is_some() || rec.still_offers(intent))
         .map(Intent::label)
         .collect();
     let ago_ms = now_unix_ms.saturating_sub(rec.stamp.unix_ms);

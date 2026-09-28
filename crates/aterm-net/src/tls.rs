@@ -934,22 +934,18 @@ mod tests {
         let scfg = server_config(TEST_CERT_DER.to_vec(), TEST_KEY_DER.to_vec()).unwrap();
         let pin = cert_fingerprint(TEST_CERT_DER);
         let (svc_a, mut svc_b) = CtlStream::pair().unwrap();
-        // LIVENESS, NOT LATENCY — the bound the deterministic siblings carry
-        // and this test, re-introduced by checkpoint 3373fe738 from the racy
-        // original that f32765ec0's re-land had replaced, did not. Without it
-        // the two `read_to_end`s below and the client's `read_exact` can block
-        // forever, and they did: measured 2026-09-21 inside the merge gate on
-        // the fleet's Intel Mac, this test wedged for the ceiling's full three
-        // hours with the client in FIN_WAIT_2, the relay's three clones of the
-        // accepted socket in CLOSE_WAIT, and the downloader parked on
-        // `up.join()` behind the directional half-close — the request and the
-        // client's close_notify race through the relay unsequenced, which the
-        // re-land's own message says a test cannot assume. A bound turns that
-        // into a named failure in a minute. It passes alone in 0.02 s and
-        // 30/30 under six CPU spinners; the race needs whole-workspace
-        // scheduling, so sequencing it like
-        // `graceful_local_eof_half_closes_without_killing_the_request_direction`
-        // is the durable fix and is still owed.
+        // SEQUENCED, like
+        // `graceful_local_eof_half_closes_without_killing_the_request_direction`.
+        // The request and the client's close_notify used to race through the
+        // relay unsequenced (the service `read_to_end` the request and the EOF in
+        // one read), and under whole-workspace scheduling the race wedged this
+        // test: measured 2026-09-21 in the merge gate on the fleet's Intel Mac, for
+        // the ceiling's full three hours, with the client in FIN_WAIT_2 and the
+        // relay's socket clones in CLOSE_WAIT. Now the service `read_exact`s the
+        // request and says so on a channel, and the client sends its close_notify
+        // only after that signal; the service then reads the EOF, and only then
+        // writes the response. The liveness bound stays, so a regression is a
+        // named failure in a minute rather than a hang.
         svc_b
             .set_read_timeout(Some(NET_TEST_LIVENESS_BOUND))
             .unwrap();
@@ -963,10 +959,19 @@ mod tests {
         let expected_response = response.clone();
         let (ack_attempted_tx, ack_attempted_rx) = std::sync::mpsc::channel();
 
+        let (request_seen_tx, request_seen_rx) = std::sync::mpsc::channel();
         let service = std::thread::spawn(move || {
-            let mut request = Vec::new();
-            svc_b.read_to_end(&mut request).unwrap();
-            assert_eq!(request, b"one-shot request\n");
+            const REQUEST: &[u8] = b"one-shot request\n";
+            let mut request = vec![0u8; REQUEST.len()];
+            svc_b
+                .read_exact(&mut request)
+                .expect("the relay must deliver the request within the read timeout");
+            assert_eq!(request, REQUEST);
+            request_seen_tx.send(()).unwrap();
+            // The request direction's EOF: the client's close_notify, relayed.
+            let mut rest = Vec::new();
+            svc_b.read_to_end(&mut rest).unwrap();
+            assert!(rest.is_empty(), "nothing follows the one-shot request");
             svc_b.write_all(&response).unwrap();
             svc_b.flush().unwrap();
             ack_attempted_rx
@@ -992,6 +997,10 @@ mod tests {
         let mut client = connect(tcp, test_server_name(), client_config(pin)).unwrap();
         client.stream().write_all(b"one-shot request\n").unwrap();
         client.stream().flush().unwrap();
+        // Sequenced: the service holds the whole request before the close_notify.
+        request_seen_rx
+            .recv_timeout(NET_TEST_LIVENESS_BOUND)
+            .expect("the service should announce the request");
         // Directional request EOF must not tear down the still-live response
         // direction. The peer service writes only after observing this EOF.
         client.stream().conn.send_close_notify();
@@ -1010,8 +1019,8 @@ mod tests {
                  The measured shape of this stall: the client in FIN_WAIT_2, the relay's three \
                  clones of the accepted socket (tcp_down / tcp_wr / tcp_up) in CLOSE_WAIT, \
                  svc_a half-closed for writing by the downloader, and the downloader parked on \
-                 `up.join()` because the reverse direction never reached EOF — the unsequenced \
-                 request-vs-close_notify race this test carries"
+                 `up.join()` because the reverse direction never reached EOF — the shape the \
+                 request-before-close_notify sequencing above exists to rule out"
             )
         });
         assert_eq!(

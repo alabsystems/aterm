@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-26, `subscribe … screen,events,ts` of a private headless aterm (150x50), the managed 2.1.283 launched by path with `--model haiku --dangerously-skip-permissions` · the REPL drawn whole: the composer between its two rules and the mode footer; a draft typed within 6 ms of this frame landed in the composer 5 of 5 · cursor=47,2: on the caret row, measured on this frame in a repeat on 2026-09-27 (`subscribe … screen,cursor`) · user, host and scratch-path UUID redacted at equal length
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/idle-repl/m1/proj-O2
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how does <filepath> work?"
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents

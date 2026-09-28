@@ -722,6 +722,79 @@ pub fn flash_limiter_window_model() -> Model {
     }
 }
 
+/// The §3.2 two-way GLOBAL BURST MUTEX over the shared `nova_add` channel
+/// (sparkle words, `aterm-effects` `supernova.rs` / `word_decorations.rs`).
+///
+/// A supernova's per-frame decoration quads are bounded by `S_MAX_BOUND` (900)
+/// and a classic nova's by 392; the channel funds at most `MAX_NOVA_QUADS`
+/// (1536) of them. `MAX_ACTIVE_SUPERNOVAE = 1` plus the TWO-WAY mutex — a
+/// supernova grant defers behind any live classic window, and classic grants
+/// defer behind a live supernova — is what keeps the funded share inside the
+/// budget without the funding clamp ever truncating a live effect. The
+/// const-asserts in `supernova.rs` are over CONSTANTS and cannot see a second
+/// live instance; this machine states the instance count. The mutex is
+/// window-wide over every pane's episode shard (the scope census's
+/// `supernova-burst-mutex` claim, whose `machine` this is).
+///
+/// `Buggy = 1` is the regression family: a second supernova admitted while one
+/// is live (2 x 900 = 1800), and a classic admitted beside a live supernova
+/// (900 + 2 x 392 = 1684) — each falsifies a named invariant.
+///
+/// Tier-1 binding: `aterm_effects` `word_decorations` test
+/// `real_burst_grants_conform_to_the_supernova_mutex_model` drives the real
+/// `super_prepass`/`nova_prepass` grants over a bound pane AND a parked one and
+/// checks every observed grant against `action_enabled`, with a negative control.
+/// The bind is TEST-ONLY: the grant sites carry no `#[refines]` anchor
+/// (aterm-effects has no `spec-anchors` feature), so spec-link closure does not
+/// see it; the model is in `xref::model_registry()` so the non-vacuity sweep
+/// covers its invariants.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn supernova_burst_mutex_model() -> Model {
+    crate::ty_model! {
+        SupernovaBurstMutex {
+            const Buggy = 0;
+            const MaxNovaQuads = 1536;
+            const SuperQuads = 900;
+            const ClassicQuads = 392;
+            const MaxActiveNovas = 3;
+            // Live supernova windows, window-wide (every pane's shard).
+            var supers = 0;
+            // Live classic nova windows.
+            var classics = 0;
+            // The decoration share of `nova_add` those windows fund per frame.
+            var funded = 0;
+
+            action IgniteSuper when (
+                if Buggy == 1 { supers <= 1 } else { supers + classics <= 0 }
+            ) {
+                supers = supers + 1;
+                funded = funded + SuperQuads;
+            }
+            action IgniteClassic when (
+                classics <= MaxActiveNovas - 1
+                    && (if Buggy == 1 { classics <= MaxActiveNovas } else { supers <= 0 })
+            ) {
+                classics = classics + 1;
+                funded = funded + ClassicQuads;
+            }
+            action RetireSuper when (supers > 0) {
+                supers = supers - 1;
+                funded = funded - SuperQuads;
+            }
+            action RetireClassic when (classics > 0) {
+                classics = classics - 1;
+                funded = funded - ClassicQuads;
+            }
+
+            invariant AtMostOneSupernova: supers <= 1;
+            invariant BurstsExclude:
+                if supers > 0 { classics <= 0 } else { classics <= MaxActiveNovas };
+            invariant DecorationShareFunded: funded <= MaxNovaQuads;
+        }
+    }
+}
+
 /// Ownership/cardinality lifecycle for delayed sparkle-word ignition slots.
 ///
 /// A future reservation is one-to-one with a live persist episode. Once its
@@ -1670,7 +1743,7 @@ pub fn cursor_cat_motion_pulse_routing_model() -> Model {
 ///   exactly one of `licensed`/`declined`, and a `licensed` row means light was
 ///   actually minted.
 ///
-/// Tier-1 (`cursor_glow.rs`, `app_input.rs`) drives the REAL `CursorGlow`
+/// Tier-1 (`cursor_glow/tests/licence.rs`, `app_input.rs`) drives the REAL `CursorGlow`
 /// through press, echo, cold echo, expiry and delayed paste/key frames.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]

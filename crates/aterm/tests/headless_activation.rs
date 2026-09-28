@@ -24,7 +24,7 @@
 //! reply, three times over a second, so an activation that lands through the
 //! WindowServer a beat late is still caught.
 //!
-//! ISOLATION and SKIP discipline are `conn_live_headless.rs`'s, compacted: the
+//! ISOLATION and BOOT discipline are the shared fixtures' (`support/headless_boot.rs`): the
 //! shared `support/launch_isolation.rs` fixture (a private HOME and every XDG
 //! root, no inherited `ATERM_*`/`ATPKG_*`, the auto-update / priming / packages
 //! fences, `SHELL=/bin/sh`), and every client call pinned with `--sock`. That
@@ -35,17 +35,25 @@
 #![cfg(target_os = "macos")]
 
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The socket-bind budget for the headless boot (the verify smoke's 100 ms
-/// grid, generous) and the per-client-call exit bound.
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
+use headless_boot::{Instance, log_tail};
+
+/// Boot one real headless instance under the scratch world, 40x120
+/// ([`headless_boot::boot`]: `None` is an environment refusal — no scratch base,
+/// no log, no spawn, or a bind the OS refuses; an instance that exits or never
+/// listens FAILS the test, a startup regression rather than a skip).
+fn boot() -> Option<Instance> {
+    headless_boot::boot("athl", &["--lines", "40", "--columns", "120"])
+}
+
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
 /// A `swift -e` fallback can spend 5-15 s building its module cache cold; GENEROUS.
 const PROBE_DEADLINE: Duration = Duration::from_secs(60);
@@ -54,135 +62,12 @@ const PROBE_DEADLINE: Duration = Duration::from_secs(60);
 const PROBE_SAMPLES: usize = 3;
 const PROBE_GAP: Duration = Duration::from_millis(500);
 
-/// `sockaddr_un.sun_path` is ~104 bytes on macOS; refuse bases that would
-/// overflow it (with margin) instead of failing deep inside bind/connect.
-const MAX_SOCK_PATH: usize = 100;
-
-/// One booted headless instance plus its scratch world, torn down (kill, reap,
-/// remove) on every exit path — Drop runs on panic too.
-struct Instance {
-    child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    tmp: PathBuf,
-    log: PathBuf,
-    sock: String,
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
-    }
-}
-
-/// The tail of the instance log, for skip/failure diagnostics.
-fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(15);
-    lines[start..].join("\n")
-}
-
-/// Whether `path` exists as a unix socket or a symlink (the `latest` alias).
-fn is_socket_or_symlink(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_socket() || m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// Pick a scratch base whose socket path fits `sun_path`: `$TMPDIR` (via
-/// `temp_dir`), else `/tmp`. `None` when neither fits — an environment refusal,
-/// reported as a clean SKIP by the caller.
-fn scratch_root() -> Option<PathBuf> {
-    let name = format!("athl-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
-    }
-    None
-}
-
 /// The hermetic environment shared by the server and every client call: the
 /// fixture strips every inherited `ATERM_*` (so the `--headless` FLAG — the
 /// spelling every probe script uses — is what arms the mode) and points HOME
 /// and every XDG root into the scratch world.
 fn hermetic_env(cmd: &mut Command, tmp: &Path) {
     launch_isolation::apply(cmd, tmp);
-}
-
-/// Boot one real headless instance under the scratch world. `None` means the
-/// binary cannot boot headless in this sandbox (announced as a SKIP with the
-/// log tail) — reserved for environmental refusals.
-fn boot() -> Option<Instance> {
-    let Some(tmp) = scratch_root() else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
-    let log = tmp.join("gui.log");
-    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    hermetic_env(&mut cmd, &tmp);
-    // AFTER the fixture: `apply` strips every `ATERM_*`, explicit ones included.
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .args(launch_isolation::control_sock(&tmp))
-        .args(["--lines", "40", "--columns", "120"])
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let sock_path = tmp.join("run/aterm/aterm.sock");
-    let mut inst = Instance {
-        child,
-        _lifeline: lifeline,
-        sock: sock_path.to_string_lossy().into_owned(),
-        tmp,
-        log,
-    };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!(
-                "SKIP: aterm --headless exited before binding its socket; log tail:\n{}",
-                log_tail(&inst.log)
-            );
-            return None;
-        }
-        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!(
-        "SKIP: control socket never started listening; log tail:\n{}",
-        log_tail(&inst.log)
-    );
-    None
 }
 
 /// Drain a child's pipe on its own thread so a chatty child can never wedge
@@ -371,8 +256,11 @@ fn probe(tool: &ProbeTool, pid: u32) -> Result<Posture, String> {
 /// rung it would copy never fires, and skipping on `SSH_CONNECTION` would
 /// silently un-guard the regression in a developer's tmux or ssh shell on a
 /// Mac that does have one. Without a WindowServer the probe reads
-/// `frontmost=-1`, the policy half still runs, and `boot()` SKIPs by itself if
-/// AppKit refuses to start; the test says which case it saw.
+/// `frontmost=-1`, the policy half still runs; an instance that cannot start
+/// FAILS in `boot()` — unless its log carries AppKit's own refusal to connect
+/// to the WindowServer (a login with no GUI session), which `boot()` reports as
+/// a SKIP naming it (`support/headless_boot.rs`); the test says which case it
+/// saw.
 fn cannot_present() -> Option<String> {
     if probe_tool().is_none() {
         return Some("neither /usr/bin/osascript nor /usr/bin/swift is available".into());

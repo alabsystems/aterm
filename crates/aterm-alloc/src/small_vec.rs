@@ -3,10 +3,11 @@
 
 //! `SmallVec<T, N>`: inline storage with heap fallback.
 
-use std::fmt;
-use std::iter::FusedIterator;
-use std::mem::MaybeUninit;
-use std::ops::{Deref, DerefMut};
+use alloc::vec::Vec;
+use core::fmt;
+use core::iter::FusedIterator;
+use core::mem::MaybeUninit;
+use core::ops::{Deref, DerefMut};
 
 /// A vector that stores up to `N` elements inline before spilling to the heap.
 ///
@@ -221,7 +222,7 @@ impl<T, const N: usize> SmallVec<T, N> {
                 // pointer and length come from the same in-bounds subslice
                 // `init`, and elements `0..len` are initialized (`n <= len`),
                 // so reading them as `T` is sound.
-                unsafe { std::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
+                unsafe { core::slice::from_raw_parts(init.as_ptr().cast::<T>(), init.len()) }
             }
             SmallVecData::Heap(vec) => vec.as_slice(),
         }
@@ -245,7 +246,9 @@ impl<T, const N: usize> SmallVec<T, N> {
                 // pointer and length come from the same in-bounds subslice
                 // `init`, and elements `0..len` are initialized (`n <= len`),
                 // so reading them as `T` is sound.
-                unsafe { std::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len()) }
+                unsafe {
+                    core::slice::from_raw_parts_mut(init.as_mut_ptr().cast::<T>(), init.len())
+                }
             }
             SmallVecData::Heap(vec) => vec.as_mut_slice(),
         }
@@ -424,7 +427,7 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
 /// For inline storage this drains the inline `MaybeUninit` buffer in place with
 /// no heap allocation, restoring the non-allocating `IntoIter` property of the
 /// upstream `smallvec` crate. For heap storage it delegates to the inner
-/// [`std::vec::IntoIter`].
+/// [`alloc::vec::IntoIter`].
 ///
 /// The live (not-yet-yielded) range is always `start..end`; `next` advances
 /// `start`, `next_back` retreats `end`, and [`Drop`] disposes of the remainder
@@ -437,7 +440,7 @@ pub enum IntoIter<T, const N: usize> {
         end: usize,
     },
     /// Heap elements delegated to the standard `Vec` iterator.
-    Heap(std::vec::IntoIter<T>),
+    Heap(alloc::vec::IntoIter<T>),
 }
 
 impl<T, const N: usize> Iterator for IntoIter<T, N> {
@@ -544,7 +547,7 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
                 }
             }
         }
-        // Heap variant: `std::vec::IntoIter` drops its own remaining elements.
+        // Heap variant: `alloc::vec::IntoIter` drops its own remaining elements.
     }
 }
 
@@ -560,7 +563,7 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
         // source `SmallVec`'s Drop is a harmless no-op (len 0). This avoids the
         // heap allocation a detour through `Vec` would perform for the inline
         // case.
-        let data = std::mem::replace(
+        let data = core::mem::replace(
             &mut self.data,
             SmallVecData::Inline {
                 buf: [const { MaybeUninit::uninit() }; N],
@@ -582,7 +585,7 @@ impl<T, const N: usize> IntoIterator for SmallVec<T, N> {
 
 impl<'a, T, const N: usize> IntoIterator for &'a SmallVec<T, N> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = core::slice::Iter<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.as_slice().iter()
@@ -591,7 +594,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a SmallVec<T, N> {
 
 impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVec<T, N> {
     type Item = &'a mut T;
-    type IntoIter = std::slice::IterMut<'a, T>;
+    type IntoIter = core::slice::IterMut<'a, T>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.as_mut_slice().iter_mut()
@@ -603,6 +606,9 @@ impl<'a, T, const N: usize> IntoIterator for &'a mut SmallVec<T, N> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::string::{String, ToString};
+    use std::vec::Vec;
+    use std::{format, vec};
 
     // Drop-counting element for verifying `IntoIter` drop-once semantics under
     // partial/full/no consume, in both inline and heap modes. The shared `Rc`

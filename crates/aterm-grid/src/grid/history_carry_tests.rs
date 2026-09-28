@@ -227,6 +227,44 @@ fn older_history_lands_before_the_oldest_line_and_keeps_every_key() {
     );
 }
 
+/// A grid that CONTINUES the source's numbering (the checkpoint restore) has
+/// the imported lines' own keys free below its oldest row, so the reserve
+/// raises nothing and a key recorded before the handoff (a carried shell
+/// mark) keeps naming its line through the import. Past the free keys only
+/// the shortfall is raised (2026-09-27 review: raising by the whole import
+/// renumbered every restored row while the carried marks stayed put).
+#[test]
+fn a_continued_numbering_reserves_only_the_shortfall() {
+    let mut grid = tiered(4, 20);
+    write_lines(&mut grid, "carried", 0, 6);
+    grid.continue_absolute_numbering(1_000);
+    let oldest = grid.oldest_absolute_row();
+    let marked = grid.base_y();
+    let marked_text = grid.row_text(0).unwrap_or_default();
+    let lines: Vec<Line> = (0..50)
+        .map(|i| Line::from(format!("old{i}").as_str()))
+        .collect();
+    let claim = grid.reserve_older_history_keys(lines.len() as u64);
+    assert_eq!(grid.absolute_row_counter(), 1_000, "no key moved");
+    assert_eq!(grid.base_y(), marked);
+    grid.attach_older_history(OlderHistory::build(&lines, 20, 20), claim)
+        .expect("attached");
+    assert_eq!(grid.base_y(), marked, "the top row keeps its key");
+    assert_eq!(grid.row_text(0).unwrap_or_default(), marked_text);
+    assert_eq!(grid.oldest_absolute_row(), oldest - lines.len() as u64);
+    assert_eq!(history(&grid)[0], "old0");
+
+    // Fewer free keys than lines: only the difference is raised.
+    let mut short = tiered(4, 20);
+    write_lines(&mut short, "carried", 0, 6);
+    let floor = u64::from(short.rows()) + short.scrollback_lines() as u64;
+    short.continue_absolute_numbering(floor + 20);
+    assert_eq!(short.oldest_absolute_row(), 20);
+    let _ = short.reserve_older_history_keys(50);
+    assert_eq!(short.absolute_row_counter(), floor + 50);
+    assert_eq!(short.oldest_absolute_row(), 50);
+}
+
 #[test]
 fn an_unreserved_import_raises_the_counter_and_says_it_renumbered() {
     let mut grid = tiered(4, 20);

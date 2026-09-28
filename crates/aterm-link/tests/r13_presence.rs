@@ -171,7 +171,10 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str, budget: Duration) ->
     }
 }
 
-/// The fake Claude: Claude Code's live zone painted by `printf`, advanced by
+/// The fake Claude: Claude Code's live zone painted by `printf`, with the
+/// terminal's cursor left on the prompt box's caret row as Claude Code keeps it
+/// (measured 2026-09-27; the server reads `idle` only at a box holding the
+/// cursor), advanced by
 /// Enter. 120 columns (the harness's `--columns`), so the rules are
 /// full-width and the context indicator ends two columns short of them,
 /// where Claude Code parks it.
@@ -198,14 +201,17 @@ fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
          printf '\\033[2J\\033[H'\n\
          printf '%s\\n' '⏺ {SENTINEL} the plan' '' '✶ Deliberating… (3s · esc to interrupt)' '' \
          '{rule}' '❯ ' '{rule}' '  ? for shortcuts'\n\
+         printf '\\033[6;3H'\n\
          read _x\n\
          printf '\\033[2J\\033[H'\n\
          printf '%s\\n' '⏺ {SENTINEL} the plan' '' '✻ Cooked for 3s · done 2:41 PM' '{indicator}' \
          '{rule}' '❯ ' '{rule}' '  ? for shortcuts'\n\
+         printf '\\033[6;3H'\n\
          read _y\n\
          printf '\\033[2J\\033[H'\n\
          printf '%s\\n' '⏺ {SENTINEL} — keep the harness or rewrite it?' '' \
          '{rule}' '❯ ' '{rule}' '  ? for shortcuts'\n\
+         printf '\\033[4;3H'\n\
          read _z\n"
     );
     let path = dir.join("fake-claude.sh");

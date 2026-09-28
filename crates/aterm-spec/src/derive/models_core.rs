@@ -1725,7 +1725,7 @@ pub fn inject_floor_model() -> Model {
 /// reachable from untrusted code (any `unsafe { Authority::root_authority() }` an
 /// untrusted path could execute), and `ty` must drive the untrusted actor to `Top`,
 /// violating `NoUntrustedTop`. At `Buggy = 0` the mint is launcher-only and the
-/// invariant holds. Bound to real code by the `mint_sites_are_launcher_only`
+/// invariant holds. Bound to real code by the `aterm-cap/tests/mint_reachability.rs`
 /// source-scan conformance test (Tier-1): the sealed constructor is named in exactly
 /// one product location and no engine crate can reach it.
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor (see the sibling

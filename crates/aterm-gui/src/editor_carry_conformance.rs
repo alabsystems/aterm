@@ -556,6 +556,10 @@ fn a_failed_successor_restore_leaves_the_draft_in_the_journal() {
         .unwrap();
     let lock = crate::native_document_journal::hold_journal_lock_for_test(&path);
     rig.successor_restores("restore refused busy", "RestoreFails");
+    // Released by LOCK_UN, not by the close alone: a child another test is
+    // forking holds this descriptor until it execs, and the successor's open
+    // below has the event loop's 25 ms journal-lock budget (the fd-copy sweep of 2026-09-27).
+    lock.unlock().expect("release the journal lock");
     drop(lock);
     assert!(
         rig.commit("commit"),
@@ -899,6 +903,8 @@ fn a_draft_still_being_journaled_is_waited_out() {
 /// shutdown barrier, the preflight).
 #[test]
 fn a_journal_that_keeps_refusing_holds_the_update_out_loud() {
+    // A blocked attempt writes the shared apply ledger (`record_apply_outcome_in_ledger`).
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut rig = Rig::new("refusing-journal");
     rig.parent.hold_journal_appends_for_test();
     rig.parent

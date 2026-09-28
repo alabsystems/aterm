@@ -13,6 +13,18 @@
 //!
 //! Evidence is read from files Claude Code already keeps; no model call is
 //! ever made to decide anything here.
+//!
+//! SAME FAMILY FIRST, THEN THE PRIORITY LIST (owner decision, 2026-09-27; the
+//! incident behind it: a session restarted 2.1.282 -> 2.1.283 still on
+//! `claude-opus-5` while that build's own newest Opus was `claude-opus-5-5`).
+//! A restart moves a conversation to the NEWEST model of ITS OWN family that
+//! the build offers ([`family_successor`]) — Opus 5 -> Opus 5.5, never down.
+//! Only when nothing newer of its family is on offer does the list's order
+//! move it ACROSS families ([`list_target`]), and then only a model nobody
+//! chose, only up the list — the 2026-09-23 decision, scoped as it was. Both
+//! steps choose among ONE set of candidates ([`offered`]): the installed
+//! build's own `latest_per_family`, which needs no aterm release to name a new
+//! model, and the list's entries, each available and allowed.
 
 use std::path::{Path, PathBuf};
 
@@ -722,28 +734,14 @@ pub fn model_moves_now(cold: bool, build_restart: bool, due_for_s: u64) -> Optio
     }
 }
 
-/// Unix seconds of an RFC 3339 UTC stamp (`2026-09-24T04:18:02.796Z`).
+/// Unix seconds of an RFC 3339 UTC stamp (`2026-09-24T04:18:02.796Z`, the
+/// shape Claude Code's transcript stamps carry). The workspace's one parser,
+/// [`aterm_types::rfc3339::parse_utc_fractional`]: a zone offset (`…+05:30`)
+/// is refused rather than read as UTC, which would move the instant by up to
+/// 14 h; a stamp before the epoch is `None`.
 #[must_use]
 pub fn parse_utc(s: &str) -> Option<u64> {
-    let b = s.as_bytes();
-    if b.len() < 20 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' {
-        return None;
-    }
-    let n = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d) = (n(0..4)?, n(5..7)?, n(8..10)?);
-    let (h, mi, se) = (n(11..13)?, n(14..16)?, n(17..19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 60 {
-        return None;
-    }
-    // Days from civil (Howard Hinnant's algorithm).
-    let y = if mo <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = (mo + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    u64::try_from(days * 86_400 + h * 3600 + mi * 60 + se).ok()
+    u64::try_from(aterm_types::rfc3339::parse_utc_fractional(s)?).ok()
 }
 
 /// Unix seconds of the last MAIN-CHAIN answer in a transcript tail (`None`: no
@@ -827,7 +825,9 @@ pub fn live_model_at(
 /// (`~/.claude/settings.json`): the saved default and the allowlist.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UserModelSettings {
-    /// `model`: the default new sessions start on (an id or a family alias).
+    /// `model`: the default new sessions start on (an id or a family alias) —
+    /// a choice of the person's, which the list never moves across families
+    /// ([`model_due`]).
     pub default: Option<String>,
     /// `availableModels`: when present, the only models a session may use.
     pub allowed: Option<Vec<String>>,
@@ -856,8 +856,11 @@ pub fn parse_user_settings(text: &str) -> UserModelSettings {
     }
 }
 
-/// THE TARGET the live upgrade moves to: the first entry of the list that is
-/// available ([`target`]) AND allowed by the person's `availableModels`.
+/// THE LIST'S TARGET — the second step of the rule ([`model_due`]): the first
+/// entry of the list that is available ([`availability`]) AND allowed by the
+/// person's `availableModels`, i.e. the best-ranked entry [`offered`] holds
+/// ([`list_target`]), so the fallback and the same-family step read ONE set
+/// of candidates.
 #[must_use]
 pub fn target_allowed(
     list: &Priority,
@@ -866,17 +869,94 @@ pub fn target_allowed(
     baked: Option<&Baked>,
     allowed: Option<&[String]>,
 ) -> Option<String> {
-    let (_, verdicts) = target(list, cc_version, ev, baked);
-    verdicts
+    list_target(list, &offered(list, cc_version, ev, baked, allowed)).map(str::to_string)
+}
+
+/// The best-ranked entry of `list` that `offered` holds (the `[1m]` tag
+/// ignored), as the list spells it; `None` when it holds none.
+#[must_use]
+pub fn list_target<'a>(list: &'a Priority, offered: &[String]) -> Option<&'a str> {
+    list.ids.iter().map(String::as_str).find(|id| {
+        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        offered.iter().any(|o| o == base)
+    })
+}
+
+/// Whether the person's `availableModels` (`None`: they set none) admits
+/// `id`, as itself or in its `[1m]` form.
+fn allowed_by(allowed: Option<&[String]>, id: &str) -> bool {
+    allowed.is_none_or(|ok| {
+        ok.iter()
+            .any(|x| x == id || x.strip_suffix("[1m]") == Some(id))
+    })
+}
+
+/// EVERY MODEL A RESTART ON THE BUILD `cc_version` MAY ASK FOR — the ONE set
+/// of candidates both steps of the rule choose among ([`family_successor`],
+/// then [`list_target`]): the build's own newest
+/// model of each family (`latest_per_family`, read out of the INSTALLED
+/// Claude Code, so a new model needs no aterm release to be named) and every
+/// entry of the list (which Claude Code's own announcements grow), each one
+/// AVAILABLE ([`availability`]: known to the build, offered by the served
+/// catalog, not denied or switched off for the account) and allowed by the
+/// person's `availableModels`. Bare ids (no `[1m]`), each once, in that order.
+/// A model the build does not know is never among them: nothing here is
+/// guessed.
+#[must_use]
+pub fn offered(
+    list: &Priority,
+    cc_version: &str,
+    ev: &Evidence,
+    baked: Option<&Baked>,
+    allowed: Option<&[String]>,
+) -> Vec<String> {
+    let latest = baked
         .into_iter()
-        .find(|(id, a)| {
-            a.ok()
-                && allowed.is_none_or(|ok| {
-                    ok.iter()
-                        .any(|x| x == id || x.strip_suffix("[1m]") == Some(id))
-                })
+        .flat_map(|b| b.latest_per_family.iter().map(|(_, id)| id.as_str()));
+    let mut out: Vec<String> = Vec::new();
+    for id in latest.chain(list.ids.iter().map(String::as_str)) {
+        let base = id.strip_suffix("[1m]").unwrap_or(id);
+        if family_version(base).is_some()
+            && !out.iter().any(|o| o == base)
+            && availability(base, cc_version, ev, baked).ok()
+            && allowed_by(allowed, base)
+        {
+            out.push(base.to_string());
+        }
+    }
+    out
+}
+
+/// THE SAME-FAMILY RESOLVER — the one place a model id is read for "what does
+/// this conversation move to": the NEWEST of `offered` in `current`'s own
+/// family ([`family_version`]), when it is STRICTLY newer than `current`,
+/// with the `[1m]` context tag appended when `one_m` (the conversation runs
+/// the 1M window: `claude-opus-5[1m]` -> `claude-opus-5-5[1m]`). `None`, and
+/// nothing moves, for everything else:
+///
+/// * another family — never Sonnet -> Opus, never Opus -> Fable or Haiku;
+/// * an older or equal version — never down, never sideways (a dated id is
+///   its undated version: `claude-haiku-4-5-20251001` is Haiku 4.5);
+/// * a `current` outside the grammar — a family alias (`opus`), a provider's
+///   id (`us.anthropic.…`), an id from before it (`claude-3-5-sonnet-…`), a
+///   model newer than this reader: never guessed at.
+#[must_use]
+pub fn family_successor(current: &str, one_m: bool, offered: &[String]) -> Option<String> {
+    let (family, version) = family_version(current)?;
+    let (_, newest) = offered
+        .iter()
+        .filter_map(|id| {
+            let base = id.strip_suffix("[1m]").unwrap_or(id);
+            family_version(base)
+                .filter(|(f, v)| *f == family && *v > version)
+                .map(|(_, v)| (v, base))
         })
-        .map(|(id, _)| id.to_string())
+        .max_by_key(|(v, _)| *v)?;
+    Some(if one_m {
+        format!("{newest}[1m]")
+    } else {
+        newest.to_string()
+    })
 }
 
 /// What the harness remembers about ONE conversation's model, beside main's
@@ -896,7 +976,7 @@ pub struct ModelRecord {
     pub failed: Vec<String>,
     /// The model a PERSON last chose for this conversation with `/model` (the
     /// harness never types `/model`), remembered past the answers that follow
-    /// it: that choice is moved only within its family.
+    /// it: the list never moves that choice across families.
     pub human: String,
     /// The screen sequence last seen, and since when (the quiet gate).
     pub last_seq: u64,
@@ -983,37 +1063,112 @@ pub enum ModelVerdict {
     Due {
         /// The live model.
         from: String,
-        /// The list's best available model.
+        /// The newest model of its family on offer ([`family_successor`],
+        /// `[1m]` kept) — or, with none newer, the list's target
+        /// ([`list_target`]).
         to: String,
     },
     /// Leave it, and why (one word for the report).
     Keep(&'static str),
 }
 
-/// THE MODEL RULE: move a conversation to the list's best available model
-/// when that model ranks ABOVE the live one — never down, never sideways, never
-/// onto a model this harness already applied or saw fail for it, and never
-/// off a model not on the list (a person's own pick). A person's choice (a
-/// launch `--model` this harness did not put there, or a `/model` it did not
-/// type) is moved only within its FAMILY: Opus 5 → Opus 5.5, never Opus →
-/// Fable.
+/// THE MODEL RULE — SAME FAMILY FIRST, THEN THE PRIORITY LIST (owner
+/// decision, 2026-09-27). Both steps choose among `offered` ([`offered`]:
+/// only models the build knows and the account and the person's
+/// `availableModels` allow), and neither ever moves a conversation down.
+///
+/// 1. **Its own family.** The NEWEST offered model of the live model's family,
+///    strictly newer ([`family_successor`]) — Opus 5 -> Opus 5.5, its `[1m]`
+///    window kept. Whoever chose the model, this is the move: aterm cannot
+///    tell a pin made on purpose from one made before the newer model existed
+///    (Claude Code's own `/model` saves its choice as the default for every
+///    new session), and the live proof of design §9 took it for a person's
+///    `--model claude-opus-5`. When a newer model of the family is on offer,
+///    nothing ever crosses families, whatever the list ranks above it.
+/// 2. **Then the list** — ONLY when nothing newer of its family is on offer:
+///    the list's target ([`list_target`]), when it is of ANOTHER family and
+///    ranks ABOVE the live model, and only for a model NOBODY CHOSE — the
+///    2026-09-23 decision, scoped as it was. A person's choice is any of: a
+///    launch `--model` this harness did not put there, a `/model` (now, or
+///    remembered from before its answers, [`ModelRecord::human`]), or the
+///    saved default in their settings of the live model's family (an id, or
+///    an alias like `opus`). A list entry of the live model's own family is
+///    never a move here: it is no newer (step 1 found none), so it could only
+///    be a step sideways or down.
+///
+/// Each `Keep` word:
+///
+/// * `no-model-available` — the build offers nothing (no catalog to read);
+/// * `model-alias` — the launch's `--model` is not an id this grammar reads: a
+///   family ALIAS (`opus`, `sonnet[1m]`), which the build already resolves to
+///   the newest of its family by its own table, or a provider's id. The flag
+///   is carried verbatim, never replaced with a guess, and — a person's
+///   choice of family — never moved across;
+/// * `model-unknown` — what the conversation runs could not be read now;
+/// * `model-unreadable` — it runs an id outside the grammar: never guessed;
+/// * `model-applied-before` — the harness already moved this conversation to
+///   that model once: a person who moved back from it has decided;
+/// * `model-failed-before` — it was asked for once and did not take;
+/// * `model-current` — nothing newer of its family, and the list offers
+///   nothing of another family (or it is what runs);
+/// * `model-off-list` — nothing newer of its family, and the live model is not
+///   on the list: a model the list does not name is left alone;
+/// * `model-ranks-higher` — nothing newer of its family, and the list's
+///   target does not rank above the live model: never down, never sideways;
+/// * `model-chosen-by-hand` — nothing newer of its family, and a person chose
+///   the live model: the list never moves it across families.
 #[must_use]
 pub fn model_due(
     list: &Priority,
     live: Option<&LiveModel>,
-    target: Option<&str>,
+    offered: &[String],
     launch_model: Option<&str>,
     default_model: Option<&str>,
     record: &ModelRecord,
 ) -> ModelVerdict {
-    let Some(target) = target else {
+    if offered.is_empty() {
         return ModelVerdict::Keep("no-model-available");
-    };
+    }
+    if launch_model.is_some_and(|m| family_version(m).is_none()) {
+        return ModelVerdict::Keep("model-alias");
+    }
     let Some(live) = live else {
         return ModelVerdict::Keep("model-unknown");
     };
+    let Some((family, _)) = family_version(&live.id) else {
+        return ModelVerdict::Keep("model-unreadable");
+    };
     let base = |m: &str| m.strip_suffix("[1m]").unwrap_or(m).to_string();
-    if base(&live.id) == base(target) {
+    // Never twice, never after a failure — for either step's target.
+    let spent = |to: &str| {
+        if record.applied.iter().any(|a| base(a) == base(to)) {
+            Some(ModelVerdict::Keep("model-applied-before"))
+        } else if record.failed.iter().any(|a| base(a) == base(to)) {
+            Some(ModelVerdict::Keep("model-failed-before"))
+        } else {
+            None
+        }
+    };
+    // 1. SAME FAMILY FIRST. The 1M window rides the move: the live id's tag,
+    // or — a transcript names the bare API id — the launch `--model`'s, when
+    // that is the same family and no `/model` has chosen since.
+    let tagged = |m: &str| m.ends_with("[1m]");
+    let one_m = tagged(&live.id)
+        || (!live.by_command
+            && launch_model
+                .is_some_and(|m| tagged(m) && family_version(m).is_some_and(|(f, _)| f == family)));
+    if let Some(to) = family_successor(&live.id, one_m, offered) {
+        return spent(&to).unwrap_or(ModelVerdict::Due {
+            from: live.id.clone(),
+            to,
+        });
+    }
+    // 2. THEN THE PRIORITY LIST: across families, up the list, for a model
+    // nobody chose.
+    let Some(target) = list_target(list, offered) else {
+        return ModelVerdict::Keep("model-current");
+    };
+    if family_version(target).is_some_and(|(f, _)| f == family) {
         return ModelVerdict::Keep("model-current");
     }
     let (Some(rl), Some(rt)) = (list.rank(&live.id), list.rank(target)) else {
@@ -1022,31 +1177,67 @@ pub fn model_due(
     if rt >= rl {
         return ModelVerdict::Keep("model-ranks-higher");
     }
-    if record.applied.iter().any(|a| base(a) == base(target)) {
-        return ModelVerdict::Keep("model-applied-before");
-    }
-    if record.failed.iter().any(|a| base(a) == base(target)) {
-        return ModelVerdict::Keep("model-failed-before");
+    if let Some(keep) = spent(target) {
+        return keep;
     }
     let ours = |m: &str| !record.set.is_empty() && base(m) == base(&record.set);
-    let family = |m: &str| {
+    let family_of = |m: &str| {
         family_version(&base(m))
             .map(|f| f.0)
-            .or_else(|| Some(base(m).to_ascii_lowercase()))
+            .unwrap_or_else(|| base(m).to_ascii_lowercase())
     };
-    // A PERSON's choice: a launch `--model` this harness did not put there, a
-    // `/model` (now, or remembered from before its answers), or the saved
-    // default in their settings — an id, or a family alias like `opus`.
-    let human = launch_model.is_some_and(|m| !ours(m))
+    let chosen = launch_model.is_some_and(|m| !ours(m))
         || (live.by_command && !ours(&live.id))
         || (!record.human.is_empty() && base(&record.human) == base(&live.id))
-        || default_model.is_some_and(|d| family(d) == family(&live.id));
-    if human && family(&live.id) != family(target) {
+        || default_model.is_some_and(|d| family_of(d) == family);
+    if chosen {
         return ModelVerdict::Keep("model-chosen-by-hand");
     }
     ModelVerdict::Due {
         from: live.id.clone(),
         to: target.to_string(),
+    }
+}
+
+/// WHY a relaunch asks for `to` over `before` (the model the conversation ran),
+/// read back from the two ids — which the rule makes exact: [`model_due`]
+/// crosses families only by the list's step, so the same family is the first
+/// step's move and another family the list's. `Unknown` when either id is
+/// outside the grammar (or `before` is not known). The words every notice
+/// says it in are [`MoveWhy::words`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoveWhy {
+    /// The newest model of the conversation's own family.
+    Family,
+    /// The priority list's target, nothing newer of its family being on offer.
+    List,
+    /// Not known from the ids.
+    Unknown,
+}
+
+impl MoveWhy {
+    /// The reason as the notices say it, after the model's id.
+    #[must_use]
+    pub fn words(self) -> &'static str {
+        match self {
+            MoveWhy::Family => "the newest model of its family",
+            MoveWhy::List => {
+                "the best available model on aterm's priority list, nothing newer of its own \
+                 family being on offer"
+            }
+            MoveWhy::Unknown => "the model aterm's upgrade chose for it",
+        }
+    }
+}
+
+/// [`MoveWhy`] for a move from `before` to `to`.
+#[must_use]
+pub fn move_why(before: Option<&str>, to: &str) -> MoveWhy {
+    let family = |m: &str| family_version(m).map(|(f, _)| f);
+    match (before.and_then(family), family(to)) {
+        (Some(a), Some(b)) if a == b => MoveWhy::Family,
+        (Some(_), Some(_)) => MoveWhy::List,
+        _ => MoveWhy::Unknown,
     }
 }
 
@@ -1326,8 +1517,341 @@ mod tests {
         );
     }
 
+    fn ids(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|x| (*x).to_string()).collect()
+    }
+
+    /// THE SAME-FAMILY RESOLVER, one row per case the rule names.
     #[test]
-    fn the_model_rule_moves_up_the_list_only_and_respects_a_hand_choice() {
+    fn the_resolver_moves_to_the_newest_of_the_same_family_and_nowhere_else() {
+        let offered = ids(&[
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+        ]);
+        let next = |current: &str, one_m: bool| family_successor(current, one_m, &offered);
+        // The incident: Opus 5 -> Opus 5.5.
+        assert_eq!(
+            next("claude-opus-5", false).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        // The 1M window rides the move, whether the id carried it or the
+        // caller says so; a tag on an offered id is not what decides it.
+        assert_eq!(
+            next("claude-opus-5[1m]", true).as_deref(),
+            Some("claude-opus-5-5[1m]")
+        );
+        assert_eq!(
+            family_successor("claude-opus-5", false, &ids(&["claude-opus-5-5[1m]"])).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        // An older major of the family moves too; a dated id is its version.
+        assert_eq!(
+            next("claude-opus-4-1", false).as_deref(),
+            Some("claude-opus-5-5")
+        );
+        assert_eq!(
+            next("claude-sonnet-4-20250514", false).as_deref(),
+            Some("claude-sonnet-5-5")
+        );
+        // The NEWEST of the family, whatever order the candidates come in.
+        assert_eq!(
+            family_successor(
+                "claude-opus-5",
+                false,
+                &ids(&["claude-opus-5-5", "claude-opus-5-6", "claude-opus-5-1"])
+            )
+            .as_deref(),
+            Some("claude-opus-5-6")
+        );
+        // NEVER ACROSS FAMILIES, whatever else is on offer.
+        assert_eq!(
+            family_successor("claude-sonnet-5", false, &ids(&["claude-opus-5-5"])),
+            None
+        );
+        assert_eq!(
+            family_successor(
+                "claude-opus-5",
+                false,
+                &ids(&["claude-fable-5-1", "claude-haiku-4-5"])
+            ),
+            None
+        );
+        // NEVER DOWN, NEVER SIDEWAYS.
+        assert_eq!(next("claude-opus-5-5", false), None, "already the newest");
+        assert_eq!(
+            next("claude-opus-6", false),
+            None,
+            "newer than anything offered"
+        );
+        assert_eq!(
+            family_successor(
+                "claude-haiku-4-5-20251001",
+                false,
+                &ids(&["claude-haiku-4-5"])
+            ),
+            None,
+            "the dated and undated ids are one version"
+        );
+        // NEVER GUESSED: an alias, a provider's id, an id from before the
+        // grammar, a shape this reader does not know, another vendor's.
+        for current in [
+            "opus",
+            "sonnet[1m]",
+            "us.anthropic.claude-opus-5-v1:0",
+            "claude-3-5-sonnet-20241022",
+            "claude-opus-5-5-v2",
+            "gpt-5.5",
+            "",
+        ] {
+            assert_eq!(next(current, false), None, "{current:?}");
+        }
+        assert_eq!(family_successor("claude-opus-5", false, &[]), None);
+    }
+
+    /// WHERE "NEWEST OF THE FAMILY" COMES FROM: the INSTALLED build's own
+    /// `latest_per_family` (so a family the list never named — Sonnet here —
+    /// still moves) and the list, each only when the build knows it and the
+    /// account may run it. Nothing the build does not know is ever offered.
+    #[test]
+    fn what_is_offered_is_what_the_installed_build_knows_and_the_person_allows() {
+        let list = Priority::seed(0);
+        let b = baked(
+            &[
+                "claude-opus-5-5",
+                "claude-fable-5-1",
+                "claude-opus-5",
+                "claude-sonnet-5-5",
+                "claude-sonnet-5",
+            ],
+            &[
+                ("opus", "claude-opus-5-5"),
+                ("sonnet", "claude-sonnet-5-5"),
+                ("fable", "claude-fable-5-1"),
+            ],
+        );
+        let none = Evidence::default();
+        let got = offered(&list, "2.1.283", &none, Some(&b), None);
+        assert_eq!(
+            got,
+            [
+                "claude-opus-5-5",
+                "claude-sonnet-5-5",
+                "claude-fable-5-1",
+                "claude-opus-5"
+            ],
+            "the build's newest of each family first, then the list, each once"
+        );
+        assert_eq!(
+            family_successor("claude-sonnet-5", false, &got).as_deref(),
+            Some("claude-sonnet-5-5"),
+            "a family off the list moves by the build's own word"
+        );
+        // A listed id the build does not know is not offered (never guessed).
+        let hand = Priority {
+            ids: ids(&["claude-opus-5-6", "claude-opus-5-5"]),
+            history: vec![],
+        };
+        assert!(
+            !offered(&hand, "2.1.283", &none, Some(&b), None).contains(&"claude-opus-5-6".into())
+        );
+        // Denied for the account, or outside the person's availableModels.
+        let denied = Evidence {
+            denied: ids(&["claude-opus-5-5"]),
+            ..Evidence::default()
+        };
+        let got = offered(&list, "2.1.283", &denied, Some(&b), None);
+        assert!(!got.contains(&"claude-opus-5-5".into()), "{got:?}");
+        assert_eq!(family_successor("claude-opus-5", false, &got), None);
+        let only = ids(&["claude-opus-5-5[1m]"]);
+        assert_eq!(
+            offered(&list, "2.1.283", &none, Some(&b), Some(&only)),
+            ["claude-opus-5-5"]
+        );
+        // No catalog at all: nothing is offered.
+        assert!(offered(&list, "2.1.283", &none, None, None).is_empty());
+    }
+
+    /// STEP 1, SAME FAMILY FIRST: whatever the list ranks, a newer model of the
+    /// conversation's own family on offer is the move.
+    #[test]
+    fn the_model_rule_moves_within_the_family_first() {
+        let list = Priority::seed(0);
+        let offer = ids(&[
+            "claude-opus-5-5",
+            "claude-fable-5-1",
+            "claude-sonnet-5-5",
+            "claude-opus-5",
+        ]);
+        let live = |id: &str, by_command: bool| LiveModel {
+            id: id.into(),
+            by_command,
+        };
+        let none = ModelRecord::default();
+        let due = |from: &str, to: &str| ModelVerdict::Due {
+            from: from.into(),
+            to: to.into(),
+        };
+        let rule = |l: &str, by_command: bool, launch: Option<&str>| {
+            model_due(
+                &list,
+                Some(&live(l, by_command)),
+                &offer,
+                launch,
+                None,
+                &none,
+            )
+        };
+        // THE INCIDENT (2026-09-25): no --model, the transcript on Opus 5, the
+        // build's newest Opus is Opus 5.5.
+        assert_eq!(
+            rule("claude-opus-5", false, None),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        // An EXACT id the launch named moves the same way (a pin cannot be
+        // told from a stale one), and so does a /model and a saved default.
+        assert_eq!(
+            rule("claude-opus-5", false, Some("claude-opus-5")),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        assert_eq!(
+            rule("claude-opus-5", true, None),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        for default in ["claude-opus-5", "opus"] {
+            assert_eq!(
+                model_due(
+                    &list,
+                    Some(&live("claude-opus-5", false)),
+                    &offer,
+                    None,
+                    Some(default),
+                    &none
+                ),
+                due("claude-opus-5", "claude-opus-5-5"),
+                "{default}"
+            );
+        }
+        // A family the list never named moves by the build's own newest.
+        assert_eq!(
+            rule("claude-sonnet-5", false, None),
+            due("claude-sonnet-5", "claude-sonnet-5-5")
+        );
+        // NEGATIVE CONTROL for the order: a hand list that ranks Fable 5.1
+        // ABOVE Opus 5.5 — the list's step alone would take Opus 5 to Fable.
+        // A newer Opus is on offer, so the move stays in the family.
+        let fable_first = Priority {
+            ids: ids(&["claude-fable-5-1", "claude-opus-5-5", "claude-opus-5"]),
+            history: vec![],
+        };
+        assert_eq!(list_target(&fable_first, &offer), Some("claude-fable-5-1"));
+        assert_eq!(
+            model_due(
+                &fable_first,
+                Some(&live("claude-opus-5", false)),
+                &offer,
+                None,
+                None,
+                &none
+            ),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        // THE 1M WINDOW: kept from the live id, or from the launch flag the
+        // transcript's bare API id stands for — but not from a launch of
+        // another family, nor once a /model chose since.
+        assert_eq!(
+            rule("claude-opus-5[1m]", true, None),
+            due("claude-opus-5[1m]", "claude-opus-5-5[1m]")
+        );
+        assert_eq!(
+            rule("claude-opus-5", false, Some("claude-opus-5[1m]")),
+            due("claude-opus-5", "claude-opus-5-5[1m]")
+        );
+        assert_eq!(
+            rule("claude-opus-5", false, Some("claude-sonnet-5[1m]")),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        assert_eq!(
+            rule("claude-opus-5", true, Some("claude-opus-5[1m]")),
+            due("claude-opus-5", "claude-opus-5-5")
+        );
+        // Already the newest of its family, and the newest ranks first: no
+        // move, and never down or sideways.
+        assert_eq!(
+            rule("claude-opus-5-5[1m]", false, None),
+            ModelVerdict::Keep("model-current")
+        );
+        // AN ALIAS IS KEPT: it already names the newest of its family, by the
+        // build's own table, and the relaunch carries it verbatim. So is any
+        // launch id this grammar does not read.
+        for alias in ["opus", "sonnet[1m]", "us.anthropic.claude-opus-5-v1:0"] {
+            assert_eq!(
+                rule("claude-opus-5", false, Some(alias)),
+                ModelVerdict::Keep("model-alias"),
+                "{alias}"
+            );
+        }
+        // UNKNOWN IDS ARE UNTOUCHED.
+        assert_eq!(
+            rule("us.anthropic.claude-opus-5-v1:0", false, None),
+            ModelVerdict::Keep("model-unreadable")
+        );
+        assert_eq!(
+            model_due(&list, None, &offer, None, None, &none),
+            ModelVerdict::Keep("model-unknown")
+        );
+        assert_eq!(
+            model_due(
+                &list,
+                Some(&live("claude-opus-5", false)),
+                &[],
+                None,
+                None,
+                &none
+            ),
+            ModelVerdict::Keep("no-model-available")
+        );
+        // Never twice, never after a failure — and a same-family move spent
+        // that way never falls through to the list's step (Fable here).
+        let applied = ModelRecord {
+            applied: ids(&["claude-opus-5-5"]),
+            ..ModelRecord::default()
+        };
+        assert_eq!(
+            model_due(
+                &list,
+                Some(&live("claude-opus-5", false)),
+                &offer,
+                None,
+                None,
+                &applied
+            ),
+            ModelVerdict::Keep("model-applied-before")
+        );
+        let failed = ModelRecord {
+            failed: ids(&["claude-opus-5-5[1m]"]),
+            ..ModelRecord::default()
+        };
+        assert_eq!(
+            model_due(
+                &list,
+                Some(&live("claude-opus-5", false)),
+                &offer,
+                None,
+                None,
+                &failed
+            ),
+            ModelVerdict::Keep("model-failed-before")
+        );
+    }
+
+    /// STEP 2, THEN THE PRIORITY LIST (owner, 2026-09-27; the list is the
+    /// owner's of 2026-09-23): only when nothing newer of its family is on
+    /// offer, a model NOBODY CHOSE moves UP the list across families — and a
+    /// deliberate choice never does.
+    #[test]
+    fn with_nothing_newer_in_its_family_the_list_moves_only_a_model_nobody_chose() {
         let list = Priority::seed(0);
         let live = |id: &str, by_command: bool| LiveModel {
             id: id.into(),
@@ -1338,160 +1862,277 @@ mod tests {
             from: from.into(),
             to: to.into(),
         };
-        // The ordinary case: Opus 5 → Opus 5.5.
+        // Opus 5.5 is NOT on offer (denied, say): nothing newer of Opus 5's
+        // family, and the list ranks Fable 5.1 above Opus 5.
+        let no_opus55 = ids(&["claude-fable-5-1", "claude-opus-5"]);
         assert_eq!(
             model_due(
                 &list,
                 Some(&live("claude-opus-5", false)),
-                Some("claude-opus-5-5"),
+                &no_opus55,
                 None,
                 None,
                 &none
             ),
-            due("claude-opus-5", "claude-opus-5-5")
+            due("claude-opus-5", "claude-fable-5-1")
         );
-        // Across families too, when nobody chose the live one...
+        // The 2026-09-23 case: a Fable 5.1 nobody chose, the newest Fable
+        // there is, moves up to the Opus 5.5 the list ranks above it.
+        let offer = ids(&["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"]);
+        let fable = |by_command: bool| live("claude-fable-5-1", by_command);
         assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-fable-5-1", false)),
-                Some("claude-opus-5-5"),
-                None,
-                None,
-                &none
-            ),
+            model_due(&list, Some(&fable(false)), &offer, None, None, &none),
             due("claude-fable-5-1", "claude-opus-5-5")
         );
-        // ...but a hand choice (a /model this harness did not type, or a launch
-        // --model it did not put there) moves only within its family.
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-fable-5-1", true)),
-                Some("claude-opus-5-5"),
-                None,
-                None,
-                &none
-            ),
-            ModelVerdict::Keep("model-chosen-by-hand")
-        );
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-fable-5-1", false)),
-                Some("claude-opus-5-5"),
-                Some("claude-fable-5-1"),
-                None,
-                &none
-            ),
-            ModelVerdict::Keep("model-chosen-by-hand")
-        );
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-opus-5", true)),
-                Some("claude-opus-5-5"),
-                None,
-                None,
-                &none
-            ),
-            due("claude-opus-5", "claude-opus-5-5"),
-            "same family"
-        );
-        // The harness's own earlier /model is not a hand choice.
+        // ...and so does one the harness itself put there (its own earlier
+        // `--model`, the record's `set`), and one whose saved default is of
+        // ANOTHER family.
         let ours = ModelRecord {
             set: "claude-fable-5-1".into(),
             ..ModelRecord::default()
         };
+        for (by_command, launch) in [(false, Some("claude-fable-5-1")), (true, None)] {
+            assert_eq!(
+                model_due(&list, Some(&fable(by_command)), &offer, launch, None, &ours),
+                due("claude-fable-5-1", "claude-opus-5-5"),
+                "the harness's own model, by_command={by_command}"
+            );
+        }
         assert_eq!(
             model_due(
                 &list,
-                Some(&live("claude-fable-5-1", true)),
-                Some("claude-opus-5-5"),
+                Some(&fable(false)),
+                &offer,
                 None,
-                None,
-                &ours
+                Some("opus"),
+                &none
             ),
             due("claude-fable-5-1", "claude-opus-5-5")
         );
-        // Never down, never sideways, never off-list, never twice, never after a failure.
+        // A DELIBERATE CHOICE never moves across: a launch --model the harness
+        // did not put there, a /model now, a /model remembered past its
+        // answers, the saved default of the live model's family (an id or an
+        // alias) — and a launch alias, kept as it is.
+        let remembered = ModelRecord {
+            human: "claude-fable-5-1".into(),
+            ..ModelRecord::default()
+        };
+        let chosen: [(bool, Option<&str>, Option<&str>, &ModelRecord); 5] = [
+            (false, Some("claude-fable-5-1"), None, &none),
+            (true, None, None, &none),
+            (false, None, None, &remembered),
+            (false, None, Some("claude-fable-5-1"), &none),
+            (false, None, Some("fable"), &none),
+        ];
+        for (by_command, launch, default, record) in chosen {
+            assert_eq!(
+                model_due(
+                    &list,
+                    Some(&fable(by_command)),
+                    &offer,
+                    launch,
+                    default,
+                    record
+                ),
+                ModelVerdict::Keep("model-chosen-by-hand"),
+                "by_command={by_command} launch={launch:?} default={default:?}"
+            );
+        }
+        assert_eq!(
+            model_due(
+                &list,
+                Some(&fable(false)),
+                &offer,
+                Some("fable"),
+                None,
+                &none
+            ),
+            ModelVerdict::Keep("model-alias")
+        );
+        // NEVER DOWN. The live model ranks first: nothing above it.
         assert_eq!(
             model_due(
                 &list,
                 Some(&live("claude-opus-5-5", false)),
-                Some("claude-fable-5-1"),
+                &no_opus55,
                 None,
                 None,
                 &none
             ),
             ModelVerdict::Keep("model-ranks-higher")
         );
+        // A hand list that ranks an OLDER model of the live model's own family
+        // first: that is a step down, never taken.
+        let older_first = Priority {
+            ids: ids(&["claude-opus-5", "claude-opus-5-5", "claude-fable-5-1"]),
+            history: vec![],
+        };
         assert_eq!(
             model_due(
-                &list,
-                Some(&live("claude-opus-5-5[1m]", false)),
-                Some("claude-opus-5-5"),
+                &older_first,
+                Some(&live("claude-opus-5-5", false)),
+                &ids(&["claude-opus-5", "claude-fable-5-1"]),
                 None,
                 None,
                 &none
             ),
             ModelVerdict::Keep("model-current")
         );
+        // A model the list does not name is left alone.
         assert_eq!(
             model_due(
                 &list,
                 Some(&live("claude-sonnet-5", false)),
-                Some("claude-opus-5-5"),
+                &offer,
                 None,
                 None,
                 &none
             ),
             ModelVerdict::Keep("model-off-list")
         );
-        let applied = ModelRecord {
-            applied: vec!["claude-opus-5-5".into()],
-            ..ModelRecord::default()
-        };
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-opus-5", true)),
-                Some("claude-opus-5-5"),
-                None,
-                None,
-                &applied
-            ),
-            ModelVerdict::Keep("model-applied-before")
-        );
-        let failed = ModelRecord {
-            failed: vec!["claude-opus-5-5".into()],
-            ..ModelRecord::default()
-        };
+        // Nothing of another family on offer: nothing moves.
         assert_eq!(
             model_due(
                 &list,
                 Some(&live("claude-opus-5", false)),
-                Some("claude-opus-5-5"),
-                None,
-                None,
-                &failed
-            ),
-            ModelVerdict::Keep("model-failed-before")
-        );
-        assert_eq!(
-            model_due(&list, None, Some("claude-opus-5-5"), None, None, &none),
-            ModelVerdict::Keep("model-unknown")
-        );
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&live("claude-opus-5", false)),
-                None,
+                &ids(&["claude-opus-5"]),
                 None,
                 None,
                 &none
             ),
-            ModelVerdict::Keep("no-model-available")
+            ModelVerdict::Keep("model-current")
+        );
+        // Never twice, never after a failure, for the list's target too.
+        for record in [
+            ModelRecord {
+                applied: ids(&["claude-opus-5-5"]),
+                ..ModelRecord::default()
+            },
+            ModelRecord {
+                failed: ids(&["claude-opus-5-5"]),
+                ..ModelRecord::default()
+            },
+        ] {
+            assert!(matches!(
+                model_due(&list, Some(&fable(false)), &offer, None, None, &record),
+                ModelVerdict::Keep("model-applied-before" | "model-failed-before")
+            ));
+        }
+    }
+
+    /// THE LIST'S STEP OBEYS THE SAME AVAILABILITY as the family's, because it
+    /// reads the same candidates ([`offered`]): an entry the build does not
+    /// know, one the account is denied, one outside `availableModels` is never
+    /// its target.
+    #[test]
+    fn the_lists_step_reads_the_same_offered_set_as_the_familys() {
+        let list = Priority::seed(0);
+        let b = baked(
+            &["claude-opus-5-5", "claude-fable-5-1", "claude-opus-5"],
+            &[("opus", "claude-opus-5-5"), ("fable", "claude-fable-5-1")],
+        );
+        let opus5 = LiveModel {
+            id: "claude-opus-5".into(),
+            by_command: false,
+        };
+        let rule = |ev: &Evidence, allowed: Option<&[String]>| {
+            let offer = offered(&list, "2.1.283", ev, Some(&b), allowed);
+            model_due(
+                &list,
+                Some(&opus5),
+                &offer,
+                None,
+                None,
+                &ModelRecord::default(),
+            )
+        };
+        let deny = |xs: &[&str]| Evidence {
+            denied: ids(xs),
+            ..Evidence::default()
+        };
+        // Opus 5.5 denied: the list's step takes Fable 5.1 ...
+        assert_eq!(
+            rule(&deny(&["claude-opus-5-5"]), None),
+            ModelVerdict::Due {
+                from: "claude-opus-5".into(),
+                to: "claude-fable-5-1".into()
+            }
+        );
+        // ... unless Fable is denied too, or not in `availableModels`.
+        assert_eq!(
+            rule(&deny(&["claude-opus-5-5", "claude-fable-5-1"]), None),
+            ModelVerdict::Keep("model-current")
+        );
+        let only_opus = ids(&["claude-opus-5", "claude-opus-5-5"]);
+        assert_eq!(
+            rule(&deny(&["claude-opus-5-5"]), Some(&only_opus)),
+            ModelVerdict::Keep("model-current")
+        );
+        // A listed id the build does not know is never the list's target.
+        // NEGATIVE CONTROL: the build that knows it takes it.
+        let hand = Priority {
+            ids: ids(&["claude-sonnet-6", "claude-opus-5"]),
+            history: vec![],
+        };
+        let only_opus5 = baked(&["claude-opus-5"], &[("opus", "claude-opus-5")]);
+        let knows = baked(
+            &["claude-opus-5", "claude-sonnet-6"],
+            &[("opus", "claude-opus-5")],
+        );
+        let none = Evidence::default();
+        let with = |bk: &Baked| {
+            let offer = offered(&hand, "2.1.283", &none, Some(bk), None);
+            model_due(
+                &hand,
+                Some(&opus5),
+                &offer,
+                None,
+                None,
+                &ModelRecord::default(),
+            )
+        };
+        assert_eq!(with(&only_opus5), ModelVerdict::Keep("model-current"));
+        assert_eq!(
+            with(&knows),
+            ModelVerdict::Due {
+                from: "claude-opus-5".into(),
+                to: "claude-sonnet-6".into()
+            }
+        );
+        // The Tier-1 bind's reader IS this step's target.
+        assert_eq!(
+            target_allowed(
+                &list,
+                "2.1.283",
+                &deny(&["claude-opus-5-5"]),
+                Some(&b),
+                None
+            )
+            .as_deref(),
+            Some("claude-fable-5-1")
+        );
+    }
+
+    /// WHY, in the notices: a move within the family is the family's, a move
+    /// across it can only be the list's, and an id outside the grammar says
+    /// neither.
+    #[test]
+    fn the_reason_a_move_is_said_with_is_read_from_the_two_ids() {
+        assert_eq!(
+            move_why(Some("claude-opus-5"), "claude-opus-5-5[1m]"),
+            MoveWhy::Family
+        );
+        assert_eq!(
+            move_why(Some("claude-fable-5-1"), "claude-opus-5-5"),
+            MoveWhy::List
+        );
+        assert_eq!(move_why(None, "claude-opus-5-5"), MoveWhy::Unknown);
+        assert_eq!(move_why(Some("opus"), "claude-opus-5-5"), MoveWhy::Unknown);
+        assert!(MoveWhy::List.words().contains("priority list"));
+        assert!(
+            MoveWhy::Family
+                .words()
+                .contains("newest model of its family")
         );
     }
 
@@ -1584,6 +2225,11 @@ mod tests {
         assert_eq!(parse_utc("2026-09-24T04:18:02.796Z"), Some(1_790_223_482));
         assert_eq!(parse_utc("2026-13-01T00:00:00Z"), None);
         assert_eq!(parse_utc("garbage"), None);
+        // An offset names a different instant than its digits: refused, never
+        // read as UTC (this reader's private copy took it as 04:18:02Z).
+        assert_eq!(parse_utc("2026-09-24T04:18:02+05:30"), None);
+        assert_eq!(parse_utc("2026-09-24T04:18:02.796"), None);
+        assert_eq!(parse_utc("2026-09-24T04:18:02Z"), Some(1_790_223_482));
         let a = |ts: &str, side: bool| {
             format!(
                 r#"{{"type":"assistant","isSidechain":{side},"timestamp":"{ts}","message":{{"model":"claude-opus-5-5"}}}}"#
@@ -1633,64 +2279,78 @@ mod tests {
         );
     }
 
+    /// AN EXPLICIT PIN, as designed: a person's exact id — a launch
+    /// `--model`, a `/model`, the saved default Claude Code's `/model` writes —
+    /// cannot be told from one made before the newer model existed, so it
+    /// moves within its FAMILY like any other; the person's ANSWER is what is
+    /// kept. Moved once and moved back by hand, the conversation stays where
+    /// they put it — and the list's step never takes it elsewhere instead. A
+    /// person's pick is never moved ACROSS families, however the list ranks
+    /// it.
     #[test]
-    fn a_persons_standing_choice_is_moved_only_within_its_family() {
+    fn a_pin_moves_within_its_family_once_and_a_move_back_by_hand_stands() {
         let list = Priority::seed(0);
-        let fable = LiveModel {
-            id: "claude-fable-5-1".into(),
-            by_command: false,
+        let offer = vec![
+            "claude-opus-5-5".to_string(),
+            "claude-fable-5-1".to_string(),
+        ];
+        let live = |id: &str, by_command: bool| LiveModel {
+            id: id.into(),
+            by_command,
         };
-        let none = ModelRecord::default();
-        // Remembered /model: the answers after it do not end the protection.
-        let remembered = ModelRecord {
-            human: "claude-fable-5-1".into(),
-            ..ModelRecord::default()
-        };
+        let fresh = ModelRecord::default();
         assert_eq!(
             model_due(
                 &list,
-                Some(&fable),
-                Some("claude-opus-5-5"),
+                Some(&live("claude-opus-5", false)),
+                &offer,
+                Some("claude-opus-5"),
                 None,
-                None,
-                &remembered
-            ),
-            ModelVerdict::Keep("model-chosen-by-hand")
-        );
-        // The saved default in the person's settings, as an id or an alias.
-        for default in ["claude-fable-5-1", "fable"] {
-            assert_eq!(
-                model_due(
-                    &list,
-                    Some(&fable),
-                    Some("claude-opus-5-5"),
-                    None,
-                    Some(default),
-                    &none
-                ),
-                ModelVerdict::Keep("model-chosen-by-hand"),
-                "{default}"
-            );
-        }
-        // A default in the TARGET's family does not hold back a move within it.
-        let opus5 = LiveModel {
-            id: "claude-opus-5".into(),
-            by_command: false,
-        };
-        assert_eq!(
-            model_due(
-                &list,
-                Some(&opus5),
-                Some("claude-opus-5-5"),
-                None,
-                Some("opus"),
-                &none
+                &fresh
             ),
             ModelVerdict::Due {
                 from: "claude-opus-5".into(),
                 to: "claude-opus-5-5".into()
             }
         );
+        // The harness moved it once; the person then typed `/model` back to
+        // Opus 5 (a `/model` newer than the last answer: `by_command`), and
+        // later answered on it: neither is moved again, by either step.
+        let moved = ModelRecord {
+            applied: vec!["claude-opus-5-5".into()],
+            set: "claude-opus-5-5".into(),
+            human: "claude-opus-5".into(),
+            ..ModelRecord::default()
+        };
+        for by_command in [true, false] {
+            assert_eq!(
+                model_due(
+                    &list,
+                    Some(&live("claude-opus-5", by_command)),
+                    &offer,
+                    Some("claude-opus-5-5"),
+                    None,
+                    &moved
+                ),
+                ModelVerdict::Keep("model-applied-before"),
+                "by_command={by_command}"
+            );
+        }
+        // A person's Fable, by /model or by launch, is never moved to the
+        // Opus the list ranks above it.
+        for (by_command, launch) in [(true, None), (false, Some("claude-fable-5-1"))] {
+            assert_eq!(
+                model_due(
+                    &list,
+                    Some(&live("claude-fable-5-1", by_command)),
+                    &offer,
+                    launch,
+                    None,
+                    &fresh
+                ),
+                ModelVerdict::Keep("model-chosen-by-hand")
+            );
+        }
     }
 
     #[test]

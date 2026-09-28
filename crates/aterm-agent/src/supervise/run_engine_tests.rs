@@ -7,6 +7,8 @@
 // (questions, the fabric's state), and the hosted entry. Included into
 // `run.rs`'s test module (`mod engine`), where `Mock` and its helpers live.
 
+use crate::supervise::policy::WorkerEnv;
+
 /// The measured 2.1.280 rm circuit-breaker box (`policy/fixtures/cap-rm.txt`)
 /// with its command row replaced by `cmd`.
 fn rm_box(cmd: &str) -> Vec<String> {
@@ -30,12 +32,13 @@ fn bypass_busy() -> Vec<String> {
     r
 }
 
-/// The owner's process inputs, fixed.
+/// The owner's process inputs, fixed: a hermetic worker.
 fn owner_env() -> ApprovalEnv {
     ApprovalEnv {
         home: Some(PathBuf::from("/Users/_owner")),
         uid: 502,
         tmpdir: None,
+        worker: WorkerSource::Fixed(Ok(WorkerEnv::hermetic(None))),
     }
 }
 
@@ -284,6 +287,7 @@ fn a_read_box_under_a_ticking_screen_is_approved_within_one_wake() {
             "await gone esc.to.interrupt timeout 20000",
             "text --json tail=40",
             "status",
+            "meta",
             "help key",
         ]
     );
@@ -550,6 +554,615 @@ fn the_rm_breaker_is_approved_under_a_scratch_root_and_escalated_otherwise() {
             .expect("escalated");
         assert!(set.contains(why), "{why}: {set}");
     }
+}
+
+/// An idle bypass session as Claude Code draws it: a reply, the composer,
+/// and the footer that names the mode.
+fn bypass_idle() -> Vec<String> {
+    let mut r = rows(&["⏺ Ready.", ""]);
+    r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
+    r
+}
+
+/// THE FOOTER RACE (host_live's
+/// `the_host_hands_over_what_it_cannot_prove_and_types_nothing`, red under a
+/// loaded gate on 2026-09-26 and 2026-09-27 with `the rm circuit breaker
+/// outside a bypass session`). The rm breaker's bypass proof is the mode an
+/// EARLIER read's footer showed (a 2.1.280 box is drawn where the footer
+/// was). An idle point read before that footer was on the screen — an agent
+/// still starting (its first frame later than the loop's idle window), or a
+/// frame caught between the composer and its footer row — was waited on by
+/// the server's verdict alone, and the verdict does not move on the frame
+/// that draws the footer (idle to idle): the loop slept through that frame,
+/// read the box with no mode known, and handed a scratch removal to a
+/// person. Now an idle point that shows no mode, with none read yet, is
+/// waited on by its CONTENT ([`Session::agent_wake`]): the footer's frame is
+/// read and the breaker is pressed. The script's verdict passes over every
+/// frame whose phase is not waited for, as the server's does, so the old
+/// wait loses the race here every time.
+///
+/// NEGATIVE CONTROL: a session whose footer was read at its first idle point
+/// is waited on by the verdict (one `await agent`), its idle twin passed over
+/// unread, and pressed the same.
+#[test]
+fn an_idle_point_read_before_the_footer_waits_for_the_footer_frame() {
+    // Still starting: blank on the first read and again once the idle
+    // window has passed. Mid-draw: the composer drawn, its footer row not yet.
+    let blank = rows(&["", ""]);
+    let mut mid_draw = bypass_idle();
+    mid_draw.pop();
+    for (why, before) in [
+        ("still starting", vec![blank.clone(), blank]),
+        ("mid-draw", vec![mid_draw]),
+    ] {
+        let mut script = before;
+        script.extend([bypass_idle(), rm_box(SCRATCH_RM), busy_screen()]);
+        let mut m = fenced(script);
+        m.agent_pushes = true;
+        m.cwd = Some("/Users/_owner/proj".to_string());
+        m.vanish_after = Some(0);
+        let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_approval_env(owner_env());
+        });
+        assert!(
+            lines.iter().any(|l| l.starts_with("APPROVED seq=")),
+            "{why}: {lines:?}\n{:?}",
+            m.requests
+        );
+        assert_eq!(m.presses().len(), 1, "{why}: {:?}", m.requests);
+        assert_eq!(
+            count(&m, "meta set attention"),
+            0,
+            "{why}: {:?}",
+            m.requests
+        );
+        // The point with no footer was waited on by its content, and the
+        // footer's frame by the verdict.
+        let waits: Vec<&str> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("await seq") || r.starts_with("await agent"))
+            .map(|r| {
+                if r.starts_with("await seq") {
+                    "seq"
+                } else {
+                    "agent"
+                }
+            })
+            .collect();
+        assert_eq!(waits[..2], ["seq", "agent"], "{why}: {:?}", m.requests);
+    }
+
+    let mut m = fenced(vec![
+        bypass_idle(),
+        bypass_idle(),
+        rm_box(SCRATCH_RM),
+        busy_screen(),
+    ]);
+    m.agent_pushes = true;
+    m.cwd = Some("/Users/_owner/proj".to_string());
+    m.vanish_after = Some(0);
+    let (lines, _) = watch_lines_with(&mut m, &auto(30, None), |s| {
+        s.set_approval_env(owner_env());
+    });
+    assert!(
+        lines.iter().any(|l| l.starts_with("APPROVED seq=")),
+        "{lines:?}"
+    );
+    let first_wait = m
+        .requests
+        .iter()
+        .find(|r| r.starts_with("await seq") || r.starts_with("await agent"))
+        .expect("the idle point's wait");
+    assert!(
+        first_wait.starts_with("await agent busy,prompt"),
+        "{:?}",
+        m.requests
+    );
+}
+
+/// THE CONTENT WAIT IS THE START'S ALONE (the 2026-09-27 review of the
+/// footer race above): the wait on the content holds only until the session
+/// shows its mode OR a busy frame. A busy footer names every mode but the
+/// default, so a session read busy with no mode named has no footer race
+/// left: its idle points are reached by a verdict that moves (busy to idle).
+/// Here a session that never names a mode — its idle footer row not drawn,
+/// its busy one `esc to interrupt` alone — gets the verdict wait back at its
+/// first busy read: the idle point after it is waited on by ONE `await
+/// agent`, and a screen change that moves no verdict wakes nothing. Without
+/// the bound it was waited on by its content for the session's whole life.
+/// NEGATIVE CONTROL: the same idle point read before any busy frame — the
+/// agent still starting — is waited on by its content.
+#[test]
+fn a_session_naming_no_mode_gets_the_verdict_wait_back_at_its_first_busy_read() {
+    let mut no_mode = idle_screen();
+    no_mode.pop();
+    assert_eq!(footer_mode(&no_mode), None, "the idle point names no mode");
+    assert_eq!(footer_mode(&busy_screen()), None, "nor does the busy frame");
+    for (why, script, expected) in [
+        (
+            "after a busy read",
+            vec![busy_screen(), no_mode.clone(), no_mode.clone()],
+            "await agent busy,prompt",
+        ),
+        (
+            "still starting",
+            vec![no_mode.clone(), no_mode.clone()],
+            "await seq",
+        ),
+    ] {
+        let mut m = fenced(script);
+        m.agent_pushes = true;
+        m.vanish_after = Some(0);
+        let _ = watch_lines_with(&mut m, &auto(30, None), |s| {
+            s.set_approval_env(owner_env());
+        });
+        // The idle point's wait: the first after the first read of it.
+        let idle_read = m
+            .requests
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.starts_with("text"))
+            .map(|(i, _)| i)
+            .nth(usize::from(why == "after a busy read"))
+            .unwrap_or_else(|| panic!("{why}: the idle point's read: {:?}", m.requests));
+        let wait = m.requests[idle_read..]
+            .iter()
+            .find(|r| r.starts_with("await seq") || r.starts_with("await agent"))
+            .unwrap_or_else(|| panic!("{why}: the idle point's wait: {:?}", m.requests));
+        assert!(
+            wait.starts_with(expected),
+            "{why}: {wait}\n{:#?}",
+            m.requests
+        );
+    }
+}
+
+/// A git box, in the loop, is judged where the session's Bash tool stands as
+/// its Claude Code transcript last recorded it — the directory an earlier
+/// `cd sub` left it in, which neither the box nor `meta cwd=` shows (the
+/// 2026-09-26 review). The loop reads `~/.claude` (here a scratch one) for
+/// the live session launched in the reported directory: this test process
+/// stands in for it. NEGATIVE CONTROL: with no Claude directory to read —
+/// what the loop did before — the same box is pressed, the nested
+/// repository's fsmonitor unseen.
+#[test]
+fn a_git_box_is_judged_where_the_transcript_puts_the_bash_tool() {
+    let git = |dir: &Path, args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}");
+    };
+    let root = std::env::temp_dir().join(format!("aterm-loop-shell-cwd-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("scratch");
+    let root = std::fs::canonicalize(&root).expect("canonical");
+    let launch = root.join("w");
+    let nested = launch.join("sub");
+    std::fs::create_dir_all(&nested).expect("dirs");
+    git(&launch, &["init", "-q", "."]);
+    git(&nested, &["init", "-q", "."]);
+    git(&nested, &["config", "core.fsmonitor", "./evil.sh"]);
+    let claude = root.join("claude");
+    std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
+    std::fs::write(
+        claude
+            .join("sessions")
+            .join(format!("{}.json", std::process::id())),
+        format!(
+            r#"{{"pid":{},"sessionId":"t-1","cwd":"{}"}}"#,
+            std::process::id(),
+            launch.display()
+        ),
+    )
+    .expect("session file");
+    let project = claude
+        .join("projects")
+        .join(crate::harness::footer::project_slug(&launch));
+    std::fs::create_dir_all(&project).expect("project");
+    std::fs::write(
+        project.join("t-1.jsonl"),
+        format!(
+            "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n{{\"type\":\"assistant\",\"cwd\":\"{}\"}}\n",
+            launch.display(),
+            nested.display()
+        ),
+    )
+    .expect("transcript");
+    let run = |claude_dir: Option<PathBuf>| {
+        let mut m = Mock::new(true, vec![bash_one_row()]);
+        m.cwd = Some(launch.display().to_string());
+        let mut s = session(&mut m, None);
+        let mut worker = WorkerEnv::hermetic(None);
+        if let Some(dir) = claude_dir {
+            worker = worker.with(&format!("CLAUDE_CONFIG_DIR={}", dir.display()));
+        }
+        s.set_approval_env(ApprovalEnv {
+            worker: WorkerSource::Fixed(Ok(worker)),
+            ..owner_env()
+        });
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                approve: Approve::Safe,
+                ..auto(30, None).policy
+            },
+            ..auto(30, None)
+        };
+        s.supervise(&opts).expect("supervise");
+        m.presses().len()
+    };
+    assert_eq!(
+        run(None),
+        1,
+        "the launch directory alone loads nothing that runs"
+    );
+    assert_eq!(
+        run(Some(claude)),
+        0,
+        "the Bash tool's repository runs its fsmonitor on the read"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// What tells [`park_as_worker`] to park.
+const WORKER_PARK: &str = "SUPERVISE_ENGINE_TEST_PARK";
+
+/// The stand-in worker's body: idle unless asked to park.
+#[test]
+fn park_as_worker() {
+    if std::env::var_os(WORKER_PARK).is_some() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+}
+
+/// A stand-in worker: THIS test binary, parked, with exactly `env` (and the
+/// word that parks it) — not `/bin/sleep`, whose environment macOS hides as
+/// a platform binary's. Killed on drop.
+struct StandIn(std::process::Child);
+
+impl StandIn {
+    fn spawn(env: &[(String, String)]) -> Self {
+        let mut c = std::process::Command::new(std::env::current_exe().expect("exe"));
+        c.args(["supervise::run::tests::engine::park_as_worker", "--exact"])
+            .env_clear()
+            .env(WORKER_PARK, "1")
+            .envs(env.iter().map(|(k, v)| (k, v)))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        // Owned at once, so every path out of here reaps it.
+        let worker = Self(c.spawn().expect("the stand-in worker"));
+        // Until the exec, the kernel shows this process's environment.
+        for _ in 0..500 {
+            if atpkg::caller_shell::process_args(worker.pid())
+                .is_some_and(|a| a.env_var(WORKER_PARK).is_some())
+            {
+                return worker;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the stand-in worker {} never started", worker.pid());
+    }
+
+    fn pid(&self) -> u32 {
+        self.0.id()
+    }
+}
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A scratch directory for a loop test, canonical, removed by the caller.
+fn loop_scratch(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("aterm-loop-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("scratch");
+    std::fs::canonicalize(&dir).expect("canonical")
+}
+
+/// `git <args>` in `dir`, hermetic, asserted ok.
+fn loop_git(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .expect("git");
+    assert!(out.status.success(), "git {args:?}");
+}
+
+/// A worker's hermetic environment in the session `sid`: this process's
+/// `PATH`, no system or global git config.
+fn worker_vars(sid: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "PATH".to_string(),
+            std::env::var("PATH").unwrap_or_default(),
+        ),
+        ("GIT_CONFIG_NOSYSTEM".to_string(), "1".to_string()),
+        ("GIT_CONFIG_GLOBAL".to_string(), "/dev/null".to_string()),
+        ("ATERM_PARENT_SESSION_ID".to_string(), sid.to_string()),
+    ]
+}
+
+/// One `approve = "safe"` loop over a `git log` box in `cwd`, the session
+/// `3`/`sid` on the roster with `worker` as its foreground process, the
+/// worker read from the session ([`WorkerSource::Session`]): the presses and
+/// the approval ledger's rows (an escalation's carries its reason).
+fn judge_git_box_with(worker: &StandIn, sid: &str, cwd: &Path) -> (usize, Vec<String>) {
+    let (ldir, ledger) = ledger_file(&format!("worker-{}", worker.pid()));
+    let mut m = Mock::new(true, vec![bash_one_row()]);
+    m.cwd = Some(cwd.display().to_string());
+    m.status_sid = "3";
+    m.who = Some(format!(
+        "2 s-00000000000000000002 driving=- watchers=0 turns=0 alive nonce=0 fgpgid=77\n\
+         3 {sid} driving=- watchers=0 turns=0 alive nonce=0 fgpgid={}\n",
+        worker.pid()
+    ));
+    let mut s = session(&mut m, None);
+    s.set_approval_env(ApprovalEnv {
+        worker: WorkerSource::Session,
+        ..owner_env()
+    });
+    s.set_approval_ledger(Some(ledger.clone()));
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            approve: Approve::Safe,
+            ..auto(30, None).policy
+        },
+        ..auto(30, None)
+    };
+    s.supervise(&opts).expect("supervise");
+    assert!(
+        m.requests.iter().any(|r| r == "who"),
+        "the worker is read from the roster: {:?}",
+        m.requests
+    );
+    let rows = ledger_rows(&ledger);
+    let _ = std::fs::remove_dir_all(&ldir);
+    (m.presses().len(), rows)
+}
+
+/// THE WORKER'S OWN ENVIRONMENT (the landing's gap, 2026-09-27): a git box is
+/// judged in the environment the command will run with — the worker's, read
+/// from the session's foreground process (`who`'s `fgpgid=`, bound by its
+/// `ATERM_PARENT_SESSION_ID`) — so the worker's own `GIT_CONFIG_*` is seen,
+/// though this process has none. A process that names another session is
+/// not taken for the worker. NEGATIVE CONTROL: the same box, the worker
+/// without the variables, is pressed.
+#[test]
+fn a_git_box_is_judged_in_the_workers_own_environment() {
+    let repo = loop_scratch("worker-env");
+    loop_git(&repo, &["init", "-q", "."]);
+    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 1);
+    let clean = StandIn::spawn(&worker_vars(&sid));
+    assert_eq!(
+        judge_git_box_with(&clean, &sid, &repo).0,
+        1,
+        "a worker whose configuration runs nothing: pressed"
+    );
+    drop(clean);
+
+    let mut vars = worker_vars(&sid);
+    for (k, v) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+        ("GIT_CONFIG_VALUE_0", "./evil.sh"),
+    ] {
+        vars.push((k.to_string(), v.to_string()));
+    }
+    let configured = StandIn::spawn(&vars);
+    let (presses, rows) = judge_git_box_with(&configured, &sid, &repo);
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("core.fsmonitor")),
+        "escalated naming the worker's key: {rows:?}"
+    );
+    drop(configured);
+
+    // Another session's process is no worker of this one.
+    let stranger = StandIn::spawn(&worker_vars("s-99999999999999999999"));
+    let (presses, rows) = judge_git_box_with(&stranger, &sid, &repo);
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("belongs to session")),
+        "{rows:?}"
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// THE WORKER'S OWN CLAUDE DIRECTORY (the landing's gap, 2026-09-27): where
+/// the Bash tool stands is read from the transcripts under the WORKER's
+/// `CLAUDE_CONFIG_DIR` — a session started under another one (an identity
+/// spawn) — not this process's `~/.claude`. NEGATIVE CONTROL: the same
+/// worker without the variable (its `$HOME` holds no Claude directory) is
+/// judged by its launch directory alone, and pressed.
+#[test]
+fn a_git_box_reads_the_transcripts_under_the_workers_claude_config_dir() {
+    let root = loop_scratch("worker-claude-dir");
+    let launch = root.join("w");
+    let nested = launch.join("sub");
+    std::fs::create_dir_all(&nested).expect("dirs");
+    loop_git(&launch, &["init", "-q", "."]);
+    loop_git(&nested, &["init", "-q", "."]);
+    loop_git(&nested, &["config", "core.fsmonitor", "./evil.sh"]);
+    let home = root.join("home");
+    std::fs::create_dir_all(&home).expect("home");
+    let claude = root.join("identity-claude");
+    let sid = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 2);
+    let register = |pid: u32| {
+        std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
+        std::fs::write(
+            claude.join("sessions").join(format!("{pid}.json")),
+            format!(
+                r#"{{"pid":{pid},"sessionId":"t-1","cwd":"{}"}}"#,
+                launch.display()
+            ),
+        )
+        .expect("session file");
+        let project = claude
+            .join("projects")
+            .join(crate::harness::footer::project_slug(&launch));
+        std::fs::create_dir_all(&project).expect("project");
+        std::fs::write(
+            project.join("t-1.jsonl"),
+            format!(
+                "{{\"type\":\"user\",\"cwd\":\"{}\"}}\n{{\"type\":\"assistant\",\"cwd\":\"{}\"}}\n",
+                launch.display(),
+                nested.display()
+            ),
+        )
+        .expect("transcript");
+    };
+
+    let mut plain = worker_vars(&sid);
+    plain.push(("HOME".to_string(), home.display().to_string()));
+    let worker = StandIn::spawn(&plain);
+    register(worker.pid());
+    assert_eq!(
+        judge_git_box_with(&worker, &sid, &launch).0,
+        1,
+        "no Claude directory of the worker's: the launch directory alone"
+    );
+    drop(worker);
+
+    let mut identity = plain.clone();
+    identity.push((
+        "CLAUDE_CONFIG_DIR".to_string(),
+        claude.display().to_string(),
+    ));
+    let worker = StandIn::spawn(&identity);
+    register(worker.pid());
+    let (presses, rows) = judge_git_box_with(&worker, &sid, &launch);
+    assert_eq!(
+        presses, 0,
+        "the Bash tool's repository runs its fsmonitor on the read: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("core.fsmonitor")),
+        "{rows:?}"
+    );
+    drop(worker);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Which `who` row is the session's, and the process group it names: by the
+/// `s-…` id the loop addresses where it has one, else by the local id
+/// `status` gave; refused when the group is unknown or another session's too,
+/// and when the roster is not one.
+#[test]
+fn the_sessions_foreground_group_is_read_off_the_roster() {
+    let rows = "0 s-aaaaaaaaaaaaaaaaaaaa driving=- watchers=1 turns=0 alive nonce=00 fgpgid=101\n\
+                1 s-bbbbbbbbbbbbbbbbbbbb driving=- watchers=0 turns=0 alive nonce=00 fgpgid=-\n\
+                2 s-cccccccccccccccccccc driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
+                3 s-dddddddddddddddddddd driving=- watchers=0 turns=0 alive nonce=00 fgpgid=303\n\
+                4 s-eeeeeeeeeeeeeeeeeeee driving=- watchers=0 turns=0 alive nonce=00 fgpgid=505\n";
+    let group = approval_loop::session_group;
+    assert_eq!(
+        group(rows, None, Some("0")),
+        Ok(("s-aaaaaaaaaaaaaaaaaaaa".to_string(), 101))
+    );
+    assert!(group(rows, None, Some("1")).is_err(), "unknown group");
+    assert!(group(rows, None, Some("2")).is_err(), "a shared group");
+    assert!(group(rows, None, Some("9")).is_err(), "not on the roster");
+    assert!(group(rows, None, None).is_err(), "no id at all");
+    assert!(
+        group("OK 1\nnot a roster\n", None, Some("0")).is_err(),
+        "no roster"
+    );
+    // The stable id wins over a local one: a `status` another instance
+    // answered (local ids are per instance, and reused) cannot pick this
+    // session's row for it.
+    assert_eq!(
+        group(rows, Some("s-eeeeeeeeeeeeeeeeeeee"), Some("0")),
+        Ok(("s-eeeeeeeeeeeeeeeeeeee".to_string(), 505))
+    );
+    assert!(
+        group(rows, Some("s-ffffffffffffffffffff"), Some("0")).is_err(),
+        "an addressed session missing from the roster is not stood in for by the local id"
+    );
+    assert!(
+        group(rows, Some("s-dddddddddddddddddddd"), None).is_err(),
+        "a shared group"
+    );
+}
+
+/// THE ADDRESSED SESSION (review, 2026-09-27): a loop that addresses its
+/// session by its `s-…` id binds the worker by that id — the row, and the
+/// process's `ATERM_PARENT_SESSION_ID` — not by the local id `status`
+/// answered, which another instance's session may hold. Here `status` names
+/// local `3`, whose row is a STRANGER's; the addressed session is `2`'s. The
+/// worker's configuration is seen (escalated); NEGATIVE CONTROL: the same loop
+/// by local id alone takes the stranger's clean row and process and presses.
+#[test]
+fn a_loop_addressing_its_session_binds_the_worker_by_that_id() {
+    let repo = loop_scratch("worker-stable-id");
+    loop_git(&repo, &["init", "-q", "."]);
+    let ours = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 3);
+    let theirs = format!("s-{:020x}", u64::from(std::process::id()) << 8 | 4);
+    let mut vars = worker_vars(&ours);
+    for (k, v) in [
+        ("GIT_CONFIG_COUNT", "1"),
+        ("GIT_CONFIG_KEY_0", "core.fsmonitor"),
+        ("GIT_CONFIG_VALUE_0", "./evil.sh"),
+    ] {
+        vars.push((k.to_string(), v.to_string()));
+    }
+    let worker = StandIn::spawn(&vars);
+    let stranger = StandIn::spawn(&worker_vars(&theirs));
+    let run = |selector: Option<String>| {
+        let (ldir, ledger) = ledger_file(&format!("stable-{}", worker.pid()));
+        let mut m = Mock::new(true, vec![bash_one_row()]);
+        m.cwd = Some(repo.display().to_string());
+        m.status_sid = "3";
+        m.who = Some(format!(
+            "2 {ours} driving=- watchers=0 turns=0 alive nonce=0 fgpgid={}\n\
+             3 {theirs} driving=- watchers=0 turns=0 alive nonce=0 fgpgid={}\n",
+            worker.pid(),
+            stranger.pid()
+        ));
+        let mut s = session(&mut m, selector);
+        s.set_approval_env(ApprovalEnv {
+            worker: WorkerSource::Session,
+            ..owner_env()
+        });
+        s.set_approval_ledger(Some(ledger.clone()));
+        let opts = SuperviseOpts {
+            policy: SupervisorConfig {
+                approve: Approve::Safe,
+                ..auto(30, None).policy
+            },
+            ..auto(30, None)
+        };
+        s.supervise(&opts).expect("supervise");
+        let rows = ledger_rows(&ledger);
+        let _ = std::fs::remove_dir_all(&ldir);
+        (m.presses().len(), rows)
+    };
+    let (presses, rows) = run(Some(format!("@{ours}")));
+    assert_eq!(presses, 0, "{rows:?}");
+    assert!(
+        rows.iter().any(|r| r.contains("core.fsmonitor")),
+        "the addressed session's worker is the one judged: {rows:?}"
+    );
+    let (presses, rows) = run(None);
+    assert_eq!(
+        presses, 1,
+        "by local id the stranger's row is taken: {rows:?}"
+    );
+    drop(worker);
+    drop(stranger);
+    let _ = std::fs::remove_dir_all(&repo);
 }
 
 /// Under `answer_questions = false` (the owner's limit) a QUESTION is
@@ -2580,6 +3193,22 @@ struct TestHost {
     /// Breaks of the agent's own background work offered
     /// ([`IdleHost::at_background`]), each answered with the notice.
     backgrounds: std::sync::atomic::AtomicUsize,
+    /// Its word that nobody has asked the session anything
+    /// ([`IdleHost::taskless`]).
+    taskless: AtomicBool,
+    /// Its step lets the turn ends go: `owns` cleared by `at_idle`.
+    lets_go: AtomicBool,
+    /// The turns the loop said ran ([`IdleHost::turn_ran`]).
+    turns_ran: std::sync::atomic::AtomicUsize,
+    /// Its step TYPES into the agent and owns nothing after it — a
+    /// relaunch's carry-on ([`HostStep::moved`]).
+    types: AtomicBool,
+    /// Its moving step ENDS the agent and types nothing into it — a restart
+    /// ([`HostStep::typed`] false).
+    ends: AtomicBool,
+    /// Steps it asks for again after the one taken (the upgrade parked for
+    /// the next idle point after its notice).
+    again: std::sync::atomic::AtomicUsize,
     /// The limit episodes the loop told of ([`IdleHost::limited`]), in order.
     limits: std::sync::Mutex<Vec<bool>>,
     /// How many times the loop asked whether the host owns a turn end — the
@@ -2591,10 +3220,33 @@ impl IdleHost for TestHost {
     fn wants(&self) -> bool {
         self.wants.load(Ordering::SeqCst)
     }
-    fn at_idle(&self) -> Option<String> {
-        self.wants.store(false, Ordering::SeqCst);
+    fn at_idle(&self) -> Option<HostStep> {
+        let again = self.again.load(Ordering::SeqCst) > 0;
+        if again {
+            self.again.fetch_sub(1, Ordering::SeqCst);
+        }
+        self.wants.store(again, Ordering::SeqCst);
         self.steps.fetch_add(1, Ordering::SeqCst);
-        Some("upgrade step=announced:1".to_string())
+        let step = |line: &str, moved: bool| {
+            Some(HostStep {
+                line: line.to_string(),
+                moved,
+                typed: moved && !line.contains("done:fresh"),
+            })
+        };
+        if self.ends.load(Ordering::SeqCst) {
+            self.owns.store(false, Ordering::SeqCst);
+            return step("upgrade step=done:fresh", true);
+        }
+        if self.types.load(Ordering::SeqCst) {
+            self.owns.store(false, Ordering::SeqCst);
+            return step("carry-on step=continued", true);
+        }
+        if self.lets_go.load(Ordering::SeqCst) {
+            self.owns.store(false, Ordering::SeqCst);
+            return step("upgrade step=wait:settling", false);
+        }
+        step("upgrade step=announced:1", true)
     }
     fn owns_turn_end(&self) -> bool {
         self.turn_ends.fetch_add(1, Ordering::SeqCst);
@@ -2616,6 +3268,12 @@ impl IdleHost for TestHost {
     fn at_background(&self) -> Option<String> {
         self.backgrounds.fetch_add(1, Ordering::SeqCst);
         Some("upgrade step=announced:1".to_string())
+    }
+    fn taskless(&self) -> bool {
+        self.taskless.load(Ordering::SeqCst)
+    }
+    fn turn_ran(&self) {
+        self.turns_ran.fetch_add(1, Ordering::SeqCst);
     }
     fn limited(&self, open: bool) {
         self.limits.lock().unwrap().push(open);
@@ -2666,6 +3324,68 @@ fn a_limit_episode_is_told_to_the_host_and_waited_out_over_its_turn_ends() {
     assert_eq!(*host.limits.lock().unwrap(), [true, false], "{lines:#?}");
     assert_eq!(host.steps.load(Ordering::SeqCst), 0, "no step at a wall");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// THE HOST TAKES NO STEP AT THE LOGIN WALL (the incident of 2026-09-27):
+/// the screen the session showed for nine hours — the supervisor's
+/// `continue` answered by `⏺ Login expired · Please run /login` — is no
+/// idle point for the host, so the live upgrade's notice is never typed
+/// into it (main read it idle with no wall, the host took its step there,
+/// and four notices went into the wall, each met by the same row). Once the
+/// person's `/login` is done (`⎿  Login successful`) the point is the
+/// host's — the NEGATIVE CONTROL: the host does step there.
+#[test]
+fn the_host_takes_no_step_at_the_login_wall_and_steps_once_it_is_back() {
+    use aterm_phase::prompt::fixtures::{LOGIN_EXPIRED, screen};
+    let walled = || {
+        let mut r = screen(LOGIN_EXPIRED);
+        let at = r
+            .iter()
+            .position(|row| row.starts_with("⏺ Login expired"))
+            .expect("the wall row");
+        r.splice(
+            at + 1..at + 1,
+            rows(&["", "✻ Worked for 3m 2s · done 5:00 AM"]),
+        );
+        r
+    };
+    let back = || {
+        let mut r = screen(LOGIN_EXPIRED);
+        let at = r
+            .iter()
+            .position(|row| row.starts_with("⏺ Login expired"))
+            .expect("the wall row");
+        r.splice(
+            at + 1..at + 1,
+            rows(&["", "❯ /login", "  ⎿  Login successful"]),
+        );
+        r
+    };
+    let run = |screens: Vec<Vec<String>>| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        let (dir, journal) = journal_file("login-wall-host");
+        let mut m = Mock::new(true, screens);
+        m.vanish_after = Some(3);
+        // The cursor in the prompt box, where Claude Code keeps it at an idle
+        // point: main reads `idle` only where the box holds the cursor.
+        m.cursor_on_caret = true;
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            journal: Some(journal.clone()),
+            ..auto(30, None)
+        };
+        let _ = watch_lines(&mut m, &opts);
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&dir);
+        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        (host.steps.load(Ordering::SeqCst), lines)
+    };
+    let (steps, lines) = run(vec![busy_screen(), walled(), walled()]);
+    assert_eq!(steps, 0, "no step at the wall: {lines:#?}");
+    assert!(!lines.iter().any(|l| l.starts_with("HOST")), "{lines:#?}");
+    let (steps, lines) = run(vec![busy_screen(), back()]);
+    assert_eq!(steps, 1, "the login back is the host's point: {lines:#?}");
 }
 
 /// THE AGENT'S OWN BACKGROUND WORK IS A BREAK THE HOST IS OFFERED (the
@@ -2910,6 +3630,83 @@ fn a_memory_banner_is_the_hosts_restart_and_escalated_only_when_it_cannot_be() {
     }
 }
 
+/// A RESTART THAT TYPED ITS CARRY-ON (the review of the N1 fix, 2026-09-26):
+/// a host whose restart types the relaunched agent's carry-on itself says
+/// `continued` ([`IdleHost::restart`]) — a turn it typed, whose answer is
+/// the harness's: answered short, it is no short turn of the worker's. Here
+/// the memory banner's point starts no streak (a wall's point leaves it as
+/// it was); the host restarts and types the carry-on, and after its short
+/// answer the point is continued at once. NEGATIVE CONTROL: a restart that
+/// typed nothing (`adopted`) leaves the next turn the worker's own — a
+/// short turn, backed off.
+#[test]
+fn a_restart_that_typed_its_carry_on_typed_a_harness_turn() {
+    use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
+    let run = |word: &'static str| {
+        let host = Arc::new(TestHost::default());
+        *host.restarts.lock().unwrap() = vec![Some(word)].into();
+        let (jdir, journal) = journal_file("restart-typed");
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            journal: Some(journal.clone()),
+            ..SuperviseOpts::hosted()
+        };
+        let mut m = Mock::new(
+            true,
+            vec![
+                busy_screen(),
+                screen(MEMORY_BANNER_IDLE),
+                busy_screen(),
+                idle_screen(),
+            ],
+        );
+        m.stall_sleep = Some(Duration::from_millis(5));
+        // The restart at the banner's point, then the carry-on's answer at
+        // the next (the host told a second turn ran), and a tail for what is
+        // decided there.
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &opts,
+            &host,
+            Stop::reached(
+                |h| h.turns_ran.load(Ordering::SeqCst) >= 2,
+                Duration::from_millis(300),
+            ),
+            Some(TurnEndTiming {
+                min_work: Duration::from_secs(3600),
+                short_backoff: Duration::from_secs(3600),
+                ..TurnEndTiming::default()
+            }),
+        );
+        assert_eq!(r, Ok(()));
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        records.into_iter().map(|r| r.line).collect::<Vec<String>>()
+    };
+    let waiting = |lines: &[String], n: u32| {
+        lines.iter().any(|l| {
+            l.starts_with("WAITING ") && l.contains(&format!(" {n} short turn(s) in a row"))
+        })
+    };
+    let continued = |lines: &[String]| {
+        lines
+            .iter()
+            .any(|l| l.starts_with("CONTINUED ") && l.contains("rule=continue@v1"))
+    };
+    let lines = run("continued");
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.ends_with("restart:memory step=continued")),
+        "{lines:#?}"
+    );
+    assert!(continued(&lines), "the carry-on's answer: {lines:#?}");
+    assert!(!waiting(&lines, 1), "{lines:#?}");
+    let lines = run("adopted");
+    assert!(waiting(&lines, 1), "the worker's own turn: {lines:#?}");
+    assert!(!continued(&lines), "{lines:#?}");
+}
+
 /// D7 IN THE LOOP: a model bucket's fallback and its way back are RELAUNCHES
 /// the host makes — `--model` on the relaunch line, session-only — never
 /// Claude's own `/model`. The Fable limit is relaunched on opus
@@ -3051,6 +3848,9 @@ fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
         busy_screen(),
         idle_screen(),
     ]);
+    // The cursor in the prompt box, where Claude Code keeps it at an idle
+    // point: the host's step reads the point with it.
+    m.cursor_on_caret = true;
     m.stall_sleep = Some(Duration::from_millis(5));
     let (jdir, journal) = journal_file("idle-host");
     let journaled = SuperviseOpts {
@@ -3149,6 +3949,499 @@ fn the_hosts_step_is_taken_at_the_idle_point_and_the_loop_runs_on() {
     assert_eq!(count(&m, "@s-1 turn"), 0, "{:?}", m.requests);
 }
 
+/// THE INLINE REPL IS AN IDLE POINT (the review of 2026-09-26): Claude
+/// Code's inline renderer draws its REPL at the top of the pane, blank rows
+/// below it, and the loop's 40-row tail read of a 150x50 pane held the
+/// prompt box's bottom rule, its footer and blank rows — never its caret —
+/// so its `idle` was no evidence and the host's idle-point step (the
+/// upgrade, a relaunch's carry-on) never ran there. That tail — the cursor
+/// on the caret row above it ([`tail_misses_the_live_rows`]), its last row
+/// blank — is read again whole and cut to the screen's live zone, its last 40
+/// rows of content (the server's own cut): the measured inline REPL is the
+/// idle point, and the host's step is taken. (The caret on the tail's first
+/// row, its top rule cut: [`drawn_above_tail`], the next test.) The point is read with the
+/// terminal's cursor ([`aterm_phase::read_at`]), each screen's measured one.
+/// NEGATIVE CONTROLS: the fullscreen REPL, drawn to its last row, is read
+/// from the tail alone and is the idle point as before; the inline REPL half
+/// drawn (its bottom rule begun) is read whole and is no idle point; and the
+/// inline renderer RELAUNCHED IN THE SAME TAB (2026-09-27) — the previous
+/// run's prompt box whole above the new launch line, the cursor under that
+/// line — is no idle point until the new REPL is drawn, where it is.
+#[test]
+fn an_inline_repl_above_the_tail_is_the_hosts_idle_point() {
+    use aterm_phase::prompt::fixtures::{
+        INLINE_RELAUNCH_BEFORE_REPL, INLINE_RELAUNCH_REPL_READY, INLINE_REPL_HALF_DRAWN,
+        INLINE_REPL_READY, LAUNCH_REPL_READY, cursor, screen,
+    };
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    // A step expected: stop once it is taken (a positive arm must not race a fixed
+    // window under load); none expected: a fixed window, which a longer run can only
+    // fail by finding one.
+    let run = |text: &str, step: bool| {
+        let repl = screen(text);
+        assert_eq!(repl.len(), 50, "a 50-row pane");
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![busy_screen(), repl]);
+        let (row, _) = cursor(text).expect("a measured cursor");
+        m.screen_cursors.insert(1, row);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let stop = if step {
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(300),
+            )
+        } else {
+            Stop::After(Duration::from_millis(400))
+        };
+        let (r, _) = hosted_with_host(&mut m, &full, &host, stop, None);
+        assert_eq!(r, Ok(()));
+        let reads: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.contains(" text ") || r.starts_with("text "))
+            .map(|r| r.trim_start_matches("@s-1 ").to_string())
+            .collect();
+        (host.steps.load(Ordering::SeqCst), reads, m.requests.clone())
+    };
+    let (steps, reads, requests) = run(INLINE_REPL_READY, true);
+    assert_eq!(
+        steps, 1,
+        "the host's step at the inline REPL: {requests:#?}"
+    );
+    assert!(
+        reads
+            .windows(2)
+            .any(|w| w[0] == "text --json tail=40" && w[1] == "text --json"),
+        "a blank tail read again whole: {reads:#?}"
+    );
+    // NEGATIVE CONTROLS.
+    let (steps, reads, requests) = run(LAUNCH_REPL_READY, true);
+    assert_eq!(steps, 1, "the fullscreen REPL: {requests:#?}");
+    assert!(
+        !reads.iter().any(|r| r == "text --json"),
+        "drawn to its last row: the tail alone: {reads:#?}"
+    );
+    let (steps, _, requests) = run(INLINE_REPL_HALF_DRAWN, false);
+    assert_eq!(steps, 0, "the REPL half drawn: {requests:#?}");
+    let (steps, _, requests) = run(INLINE_RELAUNCH_BEFORE_REPL, false);
+    assert_eq!(steps, 0, "the previous run's box: {requests:#?}");
+    let (steps, _, requests) = run(INLINE_RELAUNCH_REPL_READY, true);
+    assert_eq!(steps, 1, "the relaunched REPL: {requests:#?}");
+}
+
+/// THE TAIL THAT CUTS THE PROMPT BOX'S TOP RULE (the merge of the branch's
+/// live-zone read with main's `tail_misses_the_live_rows`, 2026-09-27): the
+/// measured inline REPL one row lower in its 50-row pane, so its caret row —
+/// the cursor on it — is the tail's FIRST row and its top rule the row above
+/// the tail. Main's rules do not see it: the cursor is not above the tail,
+/// the tail is not blank, and it holds no box. The tail, read with the
+/// cursor, decides nothing (the prompt box that holds the cursor has no top
+/// rule on it), and it ends on a blank row: it is read again whole and cut to
+/// the live zone ([`drawn_above_tail`]), where the REPL is the idle point
+/// and the host's step is taken. CONTROL: one row lower again, the whole box
+/// is in the tail with the cursor on its caret — decided, so the tail
+/// stands and is read once, no whole read.
+#[test]
+fn a_tail_that_cuts_the_prompt_boxs_top_rule_is_read_in_the_live_zone() {
+    use aterm_phase::prompt::fixtures::{INLINE_REPL_READY, cursor, screen};
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let (caret, _) = cursor(INLINE_REPL_READY).expect("a measured cursor");
+    let measured = screen(INLINE_REPL_READY);
+    assert_eq!(measured.len(), 50, "a 50-row pane");
+    let run = |down: usize| {
+        let mut repl = vec![String::new(); down];
+        repl.extend_from_slice(&measured[..measured.len() - down]);
+        assert!(
+            repl[caret + down].starts_with('❯'),
+            "{:?}",
+            repl[caret + down]
+        );
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![busy_screen(), repl]);
+        m.screen_cursors.insert(1, caret + down);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &full,
+            &host,
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(300),
+            ),
+            None,
+        );
+        assert_eq!(r, Ok(()));
+        let reads: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.contains(" text ") || r.starts_with("text "))
+            .map(|r| r.trim_start_matches("@s-1 ").to_string())
+            .collect();
+        (host.steps.load(Ordering::SeqCst), reads, m.requests.clone())
+    };
+    // The caret on the tail's first row (row 10 of 50), the top rule above.
+    let down = 50 - 40 - caret;
+    let (steps, reads, requests) = run(down);
+    assert_eq!(steps, 1, "the host's step at the REPL: {requests:#?}");
+    assert!(
+        reads
+            .windows(2)
+            .any(|w| w[0] == "text --json tail=40" && w[1] == "text --json"),
+        "the undecided tail read again whole: {reads:#?}"
+    );
+    // CONTROL: the whole box in the tail, the cursor on its caret.
+    let (steps, reads, requests) = run(down + 1);
+    assert_eq!(steps, 1, "the REPL in the tail: {requests:#?}");
+    assert!(
+        !reads.iter().any(|r| r == "text --json"),
+        "a decided tail stands: {reads:#?}"
+    );
+}
+
+/// D3(c) OF THE LIVE E2E OF 2026-09-26: A TURN END THE HOST LET GO IS DECIDED
+/// AGAIN. The point was decided once, as it came: while the upgrade owned the
+/// session's turn ends (its settle), or passed over for the host's step — and
+/// once the upgrade owned nothing (its ownership lapsed after
+/// `OWNED_SETTLE_LOOKS`), nobody decided it again: from 18:37:44 to 18:42:49 the
+/// E2E's Stage-1 end sat, neither continued nor upgraded. Now the loop decides
+/// the point again the moment the host owns nothing: continued. Both ways in:
+/// decided under the host's ownership that its step then lets go, and passed
+/// over for a step that owns nothing. NEGATIVE CONTROLS: a host that keeps
+/// owning it gets nothing typed; nor does a point a host step MOVED — its
+/// carry-on typed, owning nothing after it, the screen still showing the old
+/// point (the review of 2026-09-26: that point was decided again at once,
+/// while the agent began its answer). TIER-1 for `SupervisorHostTurnEnd`
+/// (aterm-spec `supervisor_host_turn_end_model`): each run is a path of the
+/// model's, and the real loop continues exactly where the model's `Redecide`
+/// is enabled at its end — and the `Buggy` loop is caught at each: stranded
+/// where it waits on a let-go point, deciding a point that is gone where it
+/// decides a moved one.
+#[test]
+fn a_turn_end_the_host_let_go_is_decided_again() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |owns: bool, step: &str| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.owns.store(owns, Ordering::SeqCst);
+        host.lets_go.store(step == "HostLetsGo", Ordering::SeqCst);
+        host.types.store(step == "HostMoves", Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![busy_screen(), idle_screen()]);
+        // The cursor in the prompt box, where Claude Code keeps it at an idle
+        // point (the server's idle is the box that holds the cursor).
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.turn_releases = Some(1);
+        // Every arm takes the host's step: stop once it is taken, then long
+        // enough for the point decided again to be typed — or, where nothing
+        // is typed, for a turn typed in error to show.
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &full,
+            &host,
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(300),
+            ),
+            Some(TurnEndTiming {
+                short_backoff: Duration::from_millis(10),
+                ..TurnEndTiming::default()
+            }),
+        );
+        assert_eq!(r, Ok(()));
+        assert_eq!(host.steps.load(Ordering::SeqCst), 1, "{:?}", m.requests);
+        count(&m, "@s-1 turn")
+    };
+    let model = aterm_spec::derive::supervisor_host_turn_end_model();
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    // (owns at the turn end, the host's step — the model's action — why)
+    for (owns, step, why) in [
+        (true, "HostLetsGo", "owned, then let go"),
+        (false, "HostLetsGo", "passed over, owns nothing"),
+        (true, "HostKeeps", "the upgrade keeps it"),
+        (false, "HostMoves", "a carry-on typed: the point is gone"),
+    ] {
+        let mut st = model.init_state();
+        st.insert("owns", i64::from(owns));
+        for action in ["TurnEnds", step] {
+            assert!(model.fire(action, &mut st), "{why}: {action} at {st:?}");
+        }
+        let typed = run(owns, step);
+        assert_eq!(
+            typed == 1,
+            model.action_enabled("Redecide", &st),
+            "{why}: the real loop typed {typed} at {st:?}"
+        );
+        let mut waited = st.clone();
+        if model.action_enabled("Redecide", &st) {
+            // NEGATIVE CONTROL: the loop that waits there is stranded.
+            assert!(!model.action_enabled("LoopWaits", &st), "{why}");
+            assert!(buggy.fire("LoopWaits", &mut waited), "{why}");
+            assert!(
+                !buggy.check_invariant("NoTurnEndLeftToNobody", &waited),
+                "{why}"
+            );
+        } else if step == "HostMoves" {
+            // NEGATIVE CONTROL: the loop that decides it again decides a
+            // point that is gone.
+            assert_eq!(typed, 0, "{why}: the step's turn is under way");
+            let mut decided = st.clone();
+            assert!(buggy.fire("Redecide", &mut decided), "{why}");
+            assert!(
+                !buggy.check_invariant("NeverDecideAPointAStepMoved", &decided),
+                "{why}"
+            );
+        } else {
+            assert_eq!(typed, 0, "{why}: still the host's");
+        }
+    }
+}
+
+/// D3(a) IN THE LOOP: the host is told when a turn RAN since the last point
+/// ([`IdleHost::turn_ran`]) — at the point a busy read came before — so the
+/// looks it counted at the point before start over. NEGATIVE CONTROL: a point
+/// read again with no busy read between (a repaint) tells it nothing.
+#[test]
+fn the_host_is_told_a_turn_ran_only_when_one_did() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |screens: Vec<Vec<String>>, stop: Stop| {
+        let host = Arc::new(TestHost::default());
+        host.owns.store(true, Ordering::SeqCst);
+        let mut m = Mock::new(true, screens);
+        m.stall_sleep = Some(Duration::from_millis(5));
+        m.vanish_after = Some(0);
+        // The script's end is the session's (`ERR exited`): what was said
+        // before it is what counts.
+        let _ = hosted_with_host(&mut m, &full, &host, stop, None);
+        host.turns_ran.load(Ordering::SeqCst)
+    };
+    // A turn expected: stop once the host is told, then long enough for a
+    // second telling to show; none expected: a fixed window, which a longer
+    // run can only fail by finding one.
+    let ran = run(
+        vec![idle_screen(), busy_screen(), idle_screen()],
+        Stop::reached(
+            |h| h.turns_ran.load(Ordering::SeqCst) >= 1,
+            Duration::from_millis(300),
+        ),
+    );
+    assert_eq!(ran, 1, "one turn between two points");
+    let ticking = |i: u32| {
+        let mut r = rows(&["⏺ Done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
+        r.extend(composer(&format!("  ? for shortcuts · {i}s")));
+        r
+    };
+    assert_eq!(
+        run(
+            vec![ticking(0), ticking(1), ticking(2)],
+            Stop::After(Duration::from_millis(300)),
+        ),
+        0,
+        "repaints only"
+    );
+}
+
+/// N1 OF THE LIVE E2E OF 2026-09-26, IN THE LOOP: a turn the host TYPED —
+/// a carry-on, a notice ([`HostStep::typed`]) — is the harness's own, and
+/// its SHORT answer is no short turn of the worker's: the streak stands as
+/// the worker's turns left it. Here the streak is one (the first point
+/// seen, its work unknown) and the answer is short (`min_work` an hour):
+/// were it the worker's own turn, the streak would be two; it stays one,
+/// and the back-off is the first point's. Its answer of REAL WORK
+/// (`min_work` zero: the carry-on's answer is the worker's own work,
+/// resumed) ends the streak as any turn of real work does: continued at
+/// once. NEGATIVE CONTROL: after a step that ENDED the agent and typed
+/// nothing (`done:fresh`), the short turn is the worker's own — a streak of
+/// two.
+#[test]
+fn a_turn_the_host_typed_is_no_short_turn_of_the_workers() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let run = |ends: bool, min_work: Duration| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.types.store(true, Ordering::SeqCst);
+        host.ends.store(ends, Ordering::SeqCst);
+        let mut m = Mock::new(true, vec![idle_screen(), busy_screen(), idle_screen()]);
+        // The cursor in the prompt box, where Claude Code keeps it at an idle
+        // point (the server's idle is the box that holds the cursor).
+        m.cursor_on_caret = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let (jdir, journal) = journal_file("host-typed");
+        let opts = SuperviseOpts {
+            journal: Some(journal.clone()),
+            ..full.clone()
+        };
+        // The host's step at the first point, then its answer's point (a
+        // busy read before it: the host is told a turn ran), and a tail for
+        // what is decided there.
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &opts,
+            &host,
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1 && h.turns_ran.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(300),
+            ),
+            Some(TurnEndTiming {
+                min_work,
+                short_backoff: Duration::from_secs(3600),
+                ..TurnEndTiming::default()
+            }),
+        );
+        let (records, _) = journal_records(&journal);
+        let _ = std::fs::remove_dir_all(&jdir);
+        assert_eq!(r, Ok(()));
+        assert_eq!(host.steps.load(Ordering::SeqCst), 1, "{:?}", m.requests);
+        let lines: Vec<String> = records.into_iter().map(|r| r.line).collect();
+        (count(&m, "@s-1 turn"), lines)
+    };
+    let waiting = |lines: &[String], n: u32| {
+        lines.iter().any(|l| {
+            l.starts_with("WAITING ") && l.contains(&format!(" {n} short turn(s) in a row"))
+        })
+    };
+    let hour = Duration::from_secs(3600);
+    let (typed, lines) = run(false, hour);
+    assert_eq!(typed, 0, "the first point's back-off stands: {lines:#?}");
+    assert!(waiting(&lines, 1), "the streak stays one: {lines:#?}");
+    assert!(
+        !waiting(&lines, 2),
+        "no short turn of the worker's: {lines:#?}"
+    );
+    let (typed, lines) = run(false, Duration::ZERO);
+    assert_eq!(typed, 1, "real work ends the streak: {lines:#?}");
+    let (typed, lines) = run(true, hour);
+    assert_eq!(typed, 0, "{lines:#?}");
+    assert!(
+        waiting(&lines, 2),
+        "the worker's own short turn after a restart: {lines:#?}"
+    );
+}
+
+/// A TURN THE HOST TYPED HOLDS THE POLICY'S ACTS, NEVER THE HOST'S OWN NEXT
+/// STEP: the upgrade's step after its notice reads its own evidence (the
+/// READY answer in the conversation's record), and an answer no read saw
+/// busy — the screen never moved — must not hold it until the screen moves
+/// (the live headless fake's READY, which draws nothing: the upgrade sat
+/// announced for the whole run). Here the host types its notice and asks for
+/// the next idle point on a screen that never changes: its second step is
+/// taken — and the policy types nothing meanwhile (the upgrade owns the
+/// point). With the host's turn counted as an act of the policy's in flight,
+/// the second step never comes (checked in place).
+#[test]
+fn a_turn_the_host_typed_never_holds_the_hosts_next_step() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let host = Arc::new(TestHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    host.owns.store(true, Ordering::SeqCst);
+    host.again.store(1, Ordering::SeqCst);
+    let mut m = Mock::new(true, vec![idle_screen()]);
+    // The cursor in the prompt box, where Claude Code keeps it at an idle
+    // point (the server's idle is the box that holds the cursor).
+    m.cursor_on_caret = true;
+    m.stall_sleep = Some(Duration::from_millis(5));
+    // Stop once the second step is taken, then long enough for a turn the
+    // policy must not type to show.
+    let (r, _) = hosted_with_host(
+        &mut m,
+        &full,
+        &host,
+        Stop::reached(
+            |h| h.steps.load(Ordering::SeqCst) >= 2,
+            Duration::from_millis(300),
+        ),
+        None,
+    );
+    assert_eq!(r, Ok(()));
+    assert_eq!(
+        host.steps.load(Ordering::SeqCst),
+        2,
+        "the step after its own typed turn: {:?}",
+        m.requests
+    );
+    assert_eq!(count(&m, "@s-1 turn"), 0, "the upgrade owns the point");
+}
+
+/// D1 OF THE LIVE E2E OF 2026-09-26, IN THE LOOP: a session its host says
+/// nobody has asked anything ([`IdleHost::taskless`]: its conversation holds
+/// only the harness's own turns, whatever the screen shows of them) gets
+/// NOTHING at its turn ends — the report after a turn of work is not
+/// continued, the question is not answered — and nothing is escalated.
+/// NEGATIVE CONTROL: the same points on a host that says nothing of it are
+/// continued and answered, as before.
+#[test]
+fn a_session_its_host_says_nobody_asked_anything_gets_nothing_typed() {
+    let full = SuperviseOpts {
+        max: Duration::from_secs(30),
+        ..SuperviseOpts::hosted()
+    };
+    let asked = || {
+        let mut r = rows(&["⏺ What would you like me to help you with?", ""]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    for (what, point) in [("a report", idle_screen()), ("a question", asked())] {
+        let run = |taskless: bool| {
+            let host = Arc::new(TestHost::default());
+            host.taskless.store(taskless, Ordering::SeqCst);
+            let mut m = Mock::new(true, vec![busy_screen(), point.clone()]);
+            m.stall_sleep = Some(Duration::from_millis(5));
+            m.turn_releases = Some(1);
+            // Both arms reach the turn end (the host asked whether it owns
+            // it): the tail is where the point's act — or its absence — shows.
+            let (r, _) = hosted_with_host(
+                &mut m,
+                &full,
+                &host,
+                Stop::reached(
+                    |h| h.turn_ends.load(Ordering::SeqCst) >= 1,
+                    Duration::from_millis(300),
+                ),
+                Some(TurnEndTiming {
+                    short_backoff: Duration::from_millis(10),
+                    ..TurnEndTiming::default()
+                }),
+            );
+            assert_eq!(r, Ok(()), "{what}");
+            m
+        };
+        let m = run(true);
+        assert_eq!(
+            count(&m, "@s-1 turn") + count(&m, "@s-1 send"),
+            0,
+            "{what}: nothing typed: {:?}",
+            m.requests
+        );
+        assert!(
+            !m.requests.iter().any(|r| r.contains("meta set attention")),
+            "{what}: nothing escalated: {:?}",
+            m.requests
+        );
+        // NEGATIVE CONTROL: asked something, the point is acted on.
+        let m = run(false);
+        assert_eq!(count(&m, "@s-1 turn"), 1, "{what}: {:?}", m.requests);
+    }
+}
+
 /// THE WAKE, measured: one turn — busy, the idle point, then the idle screen
 /// repainting (a timer ticking, nothing the point is made of changing) —
 /// and the next turn, under a policy that acts on nothing (so only the
@@ -3218,6 +4511,72 @@ fn the_idle_wait_wakes_on_the_servers_verdict_not_on_every_repaint() {
         "ROUND TRIPS for one turn and six idle repaints: {without} requests ({reads_without} \
          screen reads) waking on the content, {with} ({reads_with}) waking on the verdict"
     );
+}
+
+/// A POINT READ BEFORE THE AGENT DREW ITSELF IS WAITED ON BY ITS CONTENT,
+/// never by the server's verdict (the harness's live tests of 2026-09-26,
+/// under load: the loop's first point caught the tab with the agent's launch
+/// line still at the shell's prompt, the program not named yet — a screen
+/// the loop's reader cannot vouch for, so no host step goes there — and the
+/// server's verdict, already `idle`, never moved as the agent's composer came
+/// up: the loop waited on it for ever and a fresh session's upgrade was
+/// never taken). Here the host asks for a point from the start; the first
+/// screen is the shell's, the next the agent's idle composer, and the host
+/// pushes its verdict: the host's step is taken on the composer. NEGATIVE
+/// CONTROL: a first screen the reader vouches for (the agent's idle
+/// composer) takes the step as it comes.
+#[test]
+fn a_point_read_before_the_agent_drew_itself_is_waited_on_by_its_content() {
+    let launch = rows(&["% cd /w && '/Users//a/pkg/agents/claude' --model opus", ""]);
+    let run = |screens: Vec<Vec<String>>| {
+        let host = Arc::new(TestHost::default());
+        host.wants.store(true, Ordering::SeqCst);
+        host.lets_go.store(true, Ordering::SeqCst);
+        let mut m = fenced(screens);
+        // The cursor in the prompt box, where Claude Code keeps it at an idle
+        // point (the server's idle is the box that holds the cursor).
+        m.cursor_on_caret = true;
+        m.agent_pushes = true;
+        m.stall_sleep = Some(Duration::from_millis(5));
+        let opts = SuperviseOpts {
+            max: Duration::from_secs(30),
+            ..SuperviseOpts::hosted()
+        };
+        let (r, _) = hosted_with_host(
+            &mut m,
+            &opts,
+            &host,
+            Stop::reached(
+                |h| h.steps.load(Ordering::SeqCst) >= 1,
+                Duration::from_millis(300),
+            ),
+            None,
+        );
+        assert_eq!(r, Ok(()));
+        (host.steps.load(Ordering::SeqCst), m.requests)
+    };
+    // The launch line stands through the loop's settling reads (each read
+    // serves the next screen), then the composer comes up.
+    let mut drawn = vec![launch; 8];
+    drawn.push(idle_screen());
+    let (steps, requests) = run(drawn);
+    assert_eq!(steps, 1, "the step on the composer: {requests:#?}");
+    let composer_read = requests
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.starts_with("@s-1 text "))
+        .nth(1)
+        .map(|(i, _)| i)
+        .unwrap_or_else(|| panic!("the composer read: {requests:#?}"));
+    assert!(
+        !requests[..composer_read]
+            .iter()
+            .any(|r| r.starts_with("@s-1 await agent ")),
+        "no verdict wait on a point the reader cannot vouch for: {requests:#?}"
+    );
+    // NEGATIVE CONTROL: the composer from the start.
+    let (steps, _) = run(vec![idle_screen()]);
+    assert_eq!(steps, 1);
 }
 
 /// THE VENDOR'S KEY GUARD (measured live 2026-09-24: plan mode's approval,
@@ -3386,11 +4745,7 @@ fn the_owners_subagent_rm_box_is_pressed_once_by_the_hosts_default() {
         owners_box().iter().any(|r| r == first_row),
         "the fixture's first command row"
     );
-    let owner = || ApprovalEnv {
-        home: Some(PathBuf::from("/Users/_owner")),
-        uid: 502,
-        tmpdir: None,
-    };
+    let owner = owner_env;
     let guard = crate::supervise::policy::row_guard(first_row);
     let focus = owners_box()
         .iter()

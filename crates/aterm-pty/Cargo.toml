@@ -42,7 +42,7 @@ libc = { workspace = true }
 # tests/windows_smoke.rs). `launcher-mint` makes the sealed
 # `aterm_cap::Authority::root_authority()` nameable for this crate's OWN test build
 # only — the production spawn seam never mints, it receives `Cap`s by argument. See
-# aterm-cap's `mint_sites_are_launcher_only` gate.
+# aterm-cap's tests/mint_reachability.rs gate.
 [dev-dependencies]
 aterm-cap = { workspace = true, features = ["launcher-mint"] }
 

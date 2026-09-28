@@ -146,6 +146,15 @@ impl Cue {
 
     /// The host side-car for this press.
     fn meta(self) -> EventMeta {
+        // A KEY AT A PASSWORD PROMPT (2026-09-27): the host's one stamp —
+        // class `SECRET`, rank 0 — whatever the key was.
+        if self.ch == SECRET_CH {
+            return EventMeta {
+                at_ms: self.at_ms(),
+                glyph_class: aterm_effects::trail_sound::glyph_class::SECRET,
+                ..EventMeta::default()
+            };
+        }
         EventMeta {
             at_ms: self.at_ms(),
             // THE GLYPH CLASS and THE ALPHABET RANK — what the derived melody
@@ -173,6 +182,12 @@ impl Cue {
         }
     }
 }
+
+/// [`Cue::ch`] for a key typed at a canonical no-echo prompt (2026-09-27;
+/// owner: *"password: fix to all same tone"*). Not a glyph — the bench's
+/// spelling of the host's `SECRET` stamp, in the private-use area so no
+/// script text can type it by accident.
+const SECRET_CH: char = '\u{E000}';
 
 /// The glyphs a US layout cannot produce without Shift.
 fn needs_shift(ch: char) -> bool {
@@ -685,7 +700,7 @@ struct Script {
 const SCRIPT_PROSE: &str =
     "Hello, World! Is this it? Yes; it is: 3.14 (roughly) - well-known, done.\n";
 
-/// THE FIXED SCRIPTS. `shift-space` and `prose-lower` are not text constants
+/// THE FIXED SCRIPTS. `shift-space`, `prose-lower` and `password` are not text constants
 /// and are built in [`script_scenario`].
 const SCRIPTS: [Script; 4] = [
     Script {
@@ -857,6 +872,68 @@ fn script_shift_space(name: String) -> ScriptTake {
     }
 }
 
+/// `password`: a `sudo` line typed at the shell, a password typed at its
+/// no-echo prompt, the Return, and a line typed after it. The password is
+/// what the host sends since 2026-09-27 (owner: *"password: fix to all same
+/// tone"*): every key a `Typed` cue stamped `SECRET` — the space too —
+/// unshifted, at one pan (the caret does not move at a prompt that does not
+/// echo), and no bare Shift before its capitals. The line after it should
+/// sound as if the password had never been typed.
+const PASSWORD_BEFORE: &str = "sudo make install\n";
+const PASSWORD: &str = "Correct Horse 42!";
+const PASSWORD_AFTER: &str = "done, it built.\n";
+
+fn script_password(name: String, cps: f32, seed: u32) -> ScriptTake {
+    let before = type_script(String::new(), PASSWORD_BEFORE, cps, seed);
+    let mut cues = before.scenario.cues;
+    let mut crest_windows = before.crest_windows;
+    let mut t = before.scenario.seconds - SCRIPT_TAIL_S;
+    let mut hand = Hand::new(cps, 0.0, seed);
+    for _ in PASSWORD.chars() {
+        cues.push(Cue {
+            t,
+            gesture: SoundGesture::Trail(SoundKind::Typed),
+            pan: -0.9,
+            heat: 0.5,
+            shifted: false,
+            ch: SECRET_CH,
+        });
+        t += hand.dt();
+    }
+    cues.push(Cue {
+        t,
+        gesture: SoundGesture::Trail(SoundKind::Enter { cells: 0 }),
+        pan: -0.9,
+        heat: 0.5,
+        shifted: false,
+        ch: '\0',
+    });
+    t += hand.dt() + 0.35;
+    // `type_script` starts its first key at 0.5 s.
+    let after = type_script(String::new(), PASSWORD_AFTER, cps, seed);
+    let shift = t - 0.5;
+    cues.extend(after.scenario.cues.into_iter().map(|c| Cue {
+        t: c.t + shift,
+        ..c
+    }));
+    crest_windows.extend(
+        after
+            .crest_windows
+            .into_iter()
+            .map(|(a, b)| (a + shift, b + shift)),
+    );
+    let seconds = after.scenario.seconds + shift;
+    ScriptTake {
+        scenario: Scenario {
+            name,
+            cues,
+            seconds,
+            window: (0.4, seconds - SCRIPT_TAIL_S + 1.0),
+        },
+        crest_windows,
+    }
+}
+
 /// THE REEL: every script at every rate and both volumes, one WAV and one
 /// TSV row per take. `text` is `--text`'s one line, rendered INSTEAD of the
 /// fixed scripts; `rates` is [`SCRIPT_CPS`] unless `--cps` named one.
@@ -890,6 +967,7 @@ fn script_reel(
                 // reel is one grid of files.
                 .chain([script_shift_space(label("shift-space"))])
                 .chain([type_script(label("prose-lower"), &lower, cps, seed)])
+                .chain([script_password(label("password"), cps, seed)])
                 .collect(),
         };
         for take in &takes {

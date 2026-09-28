@@ -427,7 +427,13 @@ struct IndexWatch {
     probe: Arc<IndexProbe>,
     eligible: Arc<dyn Fn(&Layout) -> bool + Send + Sync>,
     pending: Option<PendingIndex>,
+    /// A failed local work check is cheap to repeat at the next park slice;
+    /// it is not a completed network probe and must not start its cooldown.
+    last_ineligible: Option<Duration>,
     last_completed: Option<Duration>,
+    /// A sibling's fresh shared stamp can expire sooner (or, after an error,
+    /// later) than one more local thirty-second interval.
+    shared_retry_at: Option<Duration>,
     ready: u64,
     /// An incomplete or untrusted release cannot run a full pass every HEAD
     /// cooldown. Its retry lengthens from five to fifteen to sixty minutes;
@@ -443,7 +449,9 @@ impl IndexWatch {
                 crate::index_probe::probes_this_source() && crate::cli::update_pass_has_work(layout)
             }),
             pending: None,
+            last_ineligible: None,
             last_completed: None,
+            shared_retry_at: None,
             ready: 0,
             last_attempt: None,
         }
@@ -452,8 +460,15 @@ impl IndexWatch {
     fn due(&self, now: Duration) -> bool {
         self.pending.is_none()
             && self
-                .last_completed
-                .is_none_or(|last| now.saturating_sub(last) >= crate::index_probe::INTERVAL)
+                .last_ineligible
+                .is_none_or(|last| now.saturating_sub(last) >= SLICE)
+            && self.shared_retry_at.map_or_else(
+                || {
+                    self.last_completed
+                        .is_none_or(|last| now.saturating_sub(last) >= crate::index_probe::INTERVAL)
+                },
+                |due| now >= due,
+            )
     }
 
     fn start(&mut self, layout: &Layout, now: Duration) -> io::Result<()> {
@@ -506,6 +521,7 @@ impl IndexWatch {
         // Pending owns the slot; harvest replaces this start time with the
         // worker's completion time before the next due check.
         self.last_completed = Some(now);
+        self.shared_retry_at = None;
         Ok(())
     }
 
@@ -521,18 +537,21 @@ impl IndexWatch {
             return;
         }
         let pending = self.pending.take().expect("checked pending");
-        self.last_completed = Some(
-            pending
-                .completed_at
-                .get()
-                .and_then(|at| at.checked_duration_since(pending.started_at))
-                .map(|elapsed| pending.started_mono.saturating_add(elapsed))
-                .unwrap_or(now),
-        );
-        if let Ok(crate::index_probe::Probe::Published(build)) = pending.worker.join()
-            && build > pending.offered
-        {
-            self.ready = self.ready.max(build);
+        let completed = pending
+            .completed_at
+            .get()
+            .and_then(|at| at.checked_duration_since(pending.started_at))
+            .map(|elapsed| pending.started_mono.saturating_add(elapsed))
+            .unwrap_or(now);
+        self.last_completed = Some(completed);
+        match pending.worker.join() {
+            Ok(crate::index_probe::Probe::Published(build)) if build > pending.offered => {
+                self.ready = self.ready.max(build);
+            }
+            Ok(crate::index_probe::Probe::Suppressed(remaining)) => {
+                self.shared_retry_at = Some(completed.saturating_add(remaining));
+            }
+            _ => {}
         }
     }
 
@@ -895,12 +914,13 @@ impl Runner {
             let owns_watch = self.begin_update_look(wall);
             if owns_watch {
                 if !(self.index.eligible)(&self.layout) {
-                    // An empty or non-public source needs no worker, and checking
-                    // its store eligibility every five seconds buys nothing.
-                    self.index.last_completed = Some(now);
+                    // No HEAD was sent. Recheck cheap local eligibility after
+                    // one park: a managed install may make this source useful.
+                    self.index.last_ineligible = Some(now);
                     self.watch.end_session_update_look();
                     return false;
                 }
+                self.index.last_ineligible = None;
                 if let Err(error) = self.index.start(&self.layout, now) {
                     self.index.last_completed = Some(now);
                     (self.log)(&format!("atpkg index probe could not start: {error}"));
@@ -2014,6 +2034,157 @@ mod tests {
         );
         drop(second);
         drop(first);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// Tier-1 for `AtpkgSessionIndexEligibility`: an empty store gets cheap
+    /// local looks at park slices but sends no HEAD. Once work appears, the
+    /// next slice starts a probe without an artificial thirty-second warmup.
+    #[test]
+    fn an_empty_index_source_becomes_probe_eligible_on_the_next_slice() {
+        use aterm_spec::derive::atpkg_session_index_eligibility_model;
+        use std::sync::mpsc;
+
+        let l = layout("session-index-eligibility");
+        let time = Time::default();
+        let vendors = Vendors::new("2.1.280");
+        let passes = Passes::default();
+        let eligible = Arc::new(AtomicBool::new(false));
+        let checks = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(AtomicU64::new(0));
+        let (started_tx, started_rx) = mpsc::channel();
+        let probe_requests = Arc::clone(&requests);
+        let mut runner = session(&l, &time, &vendors, "session", &passes, &on()).with_index_probe(
+            move |_, _| {
+                probe_requests.fetch_add(1, Ordering::SeqCst);
+                started_tx.send(()).unwrap();
+                crate::index_probe::Probe::Missing
+            },
+        );
+        let eligible_for_runner = Arc::clone(&eligible);
+        let checks_for_runner = Arc::clone(&checks);
+        runner.index.eligible = Arc::new(move |_| {
+            checks_for_runner.fetch_add(1, Ordering::SeqCst);
+            eligible_for_runner.load(Ordering::SeqCst)
+        });
+        let model = atpkg_session_index_eligibility_model();
+        let mut state = model.init_state();
+
+        assert!(!runner.check_index(time.wall()));
+        assert!(model.fire("EmptyLook", &mut state));
+        assert_eq!(checks.load(Ordering::SeqCst), 1);
+        assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
+        assert_eq!(runner.index.last_completed, None);
+        assert_eq!(runner.index.last_ineligible, Some(Duration::ZERO));
+
+        time.advance(SLICE / 2);
+        assert!(!runner.check_index(time.wall()));
+        assert_eq!(
+            checks.load(Ordering::SeqCst),
+            1,
+            "local look is slice-paced"
+        );
+        time.advance(SLICE / 2);
+        assert!(model.fire("Tick", &mut state));
+        assert!(!runner.check_index(time.wall()));
+        assert!(model.fire("EmptyLook", &mut state));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
+        assert_eq!(runner.index.last_completed, None);
+
+        eligible.store(true, Ordering::SeqCst);
+        assert!(model.fire("Enable", &mut state));
+        time.advance(SLICE / 2);
+        assert!(!runner.check_index(time.wall()));
+        assert_eq!(checks.load(Ordering::SeqCst), 2);
+        assert!(runner.index.pending.is_none());
+        time.advance(SLICE / 2);
+        assert!(model.fire("Tick", &mut state));
+        assert!(!runner.check_index(time.wall()));
+        assert!(model.fire("FirstEligibleLook", &mut state));
+        assert!(
+            runner.index.pending.is_some(),
+            "the HEAD worker starts at the next slice"
+        );
+        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        assert_eq!(checks.load(Ordering::SeqCst), 3);
+        assert_eq!(requests.load(Ordering::SeqCst), state["requests"] as u64);
+        assert_eq!(runner.index.last_ineligible, None);
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while runner.index.pending.is_some() {
+            runner
+                .index
+                .harvest(Duration::from_millis(time.mono_ms.load(Ordering::SeqCst)));
+            assert!(Instant::now() < deadline, "the injected HEAD completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let completed = runner
+            .index
+            .last_completed
+            .expect("network completion stamp");
+        assert!(
+            !runner
+                .index
+                .due(completed + crate::index_probe::INTERVAL - Duration::from_millis(1))
+        );
+        assert!(runner.index.due(completed + crate::index_probe::INTERVAL));
+        assert!(passes.launched().is_empty());
+        drop(runner);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// Tier-1 for `AtpkgIndexSharedHandoff`: a seated session that arrived
+    /// just before a sibling's stamp expires retries at that shared expiry,
+    /// without another full local interval or an early network request.
+    #[test]
+    fn a_suppressed_session_index_probe_uses_the_shared_expiry() {
+        use aterm_spec::derive::atpkg_index_shared_handoff_model;
+
+        let l = layout("session-index-shared-handoff");
+        let time = Time::default();
+        time.advance(SLICE * 5);
+        let now = || Duration::from_millis(time.mono_ms.load(Ordering::SeqCst));
+        let probes = Arc::new(AtomicU64::new(0));
+        let asked = Arc::clone(&probes);
+        let mut index = IndexWatch::new();
+        index.probe = Arc::new(move |_, _| {
+            if asked.fetch_add(1, Ordering::SeqCst) == 0 {
+                crate::index_probe::Probe::Suppressed(SLICE)
+            } else {
+                crate::index_probe::Probe::Missing
+            }
+        });
+        let model = atpkg_index_shared_handoff_model();
+        let mut state = model.init_state();
+        assert!(model.fire("Stamp", &mut state));
+        for _ in 0..5 {
+            assert!(model.fire("TickBeforeHandoff", &mut state));
+        }
+        assert!(index.due(now()));
+        index.start(&l, now()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while index.pending.is_some() {
+            index.harvest(now());
+            assert!(Instant::now() < deadline, "the suppressed worker completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(model.fire("Handoff", &mut state));
+        let completed = index.last_completed.expect("worker completion");
+        assert_eq!(index.shared_retry_at, Some(completed + SLICE));
+        assert!(!index.due(completed + SLICE - Duration::from_millis(1)));
+        time.advance(SLICE);
+        assert!(model.fire("TickAfterHandoff", &mut state));
+        assert!(index.due(completed + SLICE));
+        assert!(model.fire("AtExpiry", &mut state));
+        index.start(&l, completed + SLICE).unwrap();
+        while index.pending.is_some() {
+            index.harvest(completed + SLICE);
+            assert!(Instant::now() < deadline, "the due worker completed");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(probes.load(Ordering::SeqCst) - 1, state["requests"] as u64);
+        drop(index);
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 

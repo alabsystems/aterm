@@ -88,7 +88,7 @@ web-sys = { version = "0.3", features = ["HtmlCanvasElement", "OffscreenCanvas"]
 # NO getrandom ROW — see crates/aterm-wasm/Cargo.toml for the measurement. Its
 # only parents on this cell were aterm's own manifests, so the defensive line
 # was the dependency: -1 package / -1,997 lines here (js-sys stays, held by
-# web-sys and wgpu). Guarded by tools/grep_guard.sh B13.
+# web-sys and wgpu). Guarded by tools/grep_guard.sh B18.
 
 # NOTE: no per-crate [profile.release] — profiles only take effect from the
 # workspace root, which already sets lto/codegen-units=1/strip for release. A wasm

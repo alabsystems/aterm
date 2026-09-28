@@ -491,12 +491,13 @@ fn commit_layout_topology(
     for window in &mut topology.windows {
         window.outer_x = None;
         window.outer_y = None;
-        // Same class as the position: live SHOW STATE, not topology. Captures
-        // currently write it on Windows only (this fn is unix-gated), but the
-        // derived `PartialEq` covers the field, so normalize it here too —
-        // otherwise the day a unix capture starts recording it, zooming the
-        // window during the successor's boot would kill a healthy Commit
-        // exactly the way dragging it used to.
+        // Same class as the position: live SHOW STATE, not topology. Linux and
+        // Windows captures record it (macOS does not — see
+        // `app_restore::TRACKS_NORMAL_FRAME`), and the derived `PartialEq`
+        // covers the field, so normalize it here: maximizing the window during
+        // the successor's boot must not kill a healthy Commit, exactly the way
+        // dragging it used to. (The GRID stays compared: a maximized capture
+        // persists its tracked normal grid, which a maximize does not move.)
         window.maximized = None;
         // …and the rest of the macOS SHOW STATE (gap #29), which the unix
         // capture DOES record now: full screen, minimized, the window's place in
@@ -1003,45 +1004,6 @@ pub(crate) fn contain_own_process_group() -> ProcessGroupContainment {
     }
 }
 
-/// SIGKILL the candidate, before anything waits on it.
-///
-/// The GROUP sweep (`-pid`) is the pre-existing behaviour and the reason
-/// `pre_exec` puts the candidate in a group of its own: it is what stops the
-/// candidate's ditto/codesign/spctl descendants from continuing to mutate fixed
-/// updater paths after the leader is gone.
-///
-/// WHICH CONTAINMENT THE SWEEP RELIES ON — the two are not equally strong, and a
-/// reader must not assume the second one is the first:
-///
-/// * A CANDIDATE WE FORKED (today's `spawn`). `run_handoff_worker`'s `pre_exec`
-///   `setpgid(0, 0)` runs between fork and exec, so the candidate leads its own
-///   group BEFORE its image runs: `-pid` is a valid handle from the instant
-///   `spawn` returns, and there is provably no instant at which a helper of the
-///   candidate's exists outside that group.
-/// * A CANDIDATE WE DID NOT FORK (the LaunchServices lane B3 exists for). The
-///   candidate contains ITSELF with [`contain_own_process_group`] on entry,
-///   before its own update logic can fork the first helper, and refuses to
-///   continue when it cannot — so the "no helper outside the group" property is
-///   the same one. What is NOT the same is our knowledge of it: the readiness
-///   wire is a fixed proof record with no field for a process-group id, so this
-///   process cannot distinguish "the successor contained itself" from "the
-///   successor never reached that instruction". On that lane `-pid` is an
-///   UNPROVEN sweep and nothing may be concluded from it; what licenses rollback
-///   is [`handoff_candidate_terminated`], never the group signal. Carrying an
-///   attested pgid is B4's control-socket work.
-///
-/// The DIRECT signal is what a candidate this process did not fork needs. Such a
-/// candidate may not be a group leader at all, and then `-pid` names no group and
-/// sweeps nothing. It is withheld unless the identity is CORROBORATED, because a
-/// bare pid that has been recycled names a stranger and this lane must never
-/// SIGKILL one. With no witness the behaviour is exactly what it has always been:
-/// the group sweep alone, aimed at a pid that today's unreaped fork child keeps
-/// pinned. That PIN is what keeps an unwitnessed sweep aimed at us, and it is
-/// precisely what a candidate launchd owns lacks — once launchd reaps it the
-/// number is free, and `-pid` then names whatever group its new owner leads. So
-/// on that lane an unwitnessed sweep is not merely unproven, it is unsafe, and
-/// the candidate has to arrive with an identity (B2/B4) rather than as a bare
-/// pid.
 /// Is `pid` still a CHILD of this process, and therefore pinned to its number?
 ///
 /// `false` is the safe direction: it only ever withholds a signal. A child that
@@ -1274,6 +1236,87 @@ impl CandidateExitWatch {
     }
 }
 
+/// Does `pid` lead a process group of its own — is `-pid` a handle on the
+/// candidate's helpers rather than on nothing? A kernel read at the moment of
+/// use; `false` (including a failed read) only ever withholds the group sweep.
+#[cfg(unix)]
+fn candidate_leads_its_own_group(pid: libc::pid_t) -> bool {
+    // SAFETY: `getpgid` is a side-effect-free libc getter.
+    pid > 1 && unsafe { libc::getpgid(pid) } == pid
+}
+
+/// SIGKILL a candidate whose identity was just CORROBORATED — its group when
+/// `-pid` provably names the candidate's own group, then the candidate itself.
+///
+/// Two proofs license the group signal, and either suffices:
+/// * [`candidate_leads_its_own_group`] — the kernel reports the candidate leads
+///   group `pid` (the launched lane, whose candidate contained itself);
+/// * [`candidate_is_our_child`] — the fork lane's pin. `pre_exec` put the child in
+///   group `pid` before its image ran, and an unreaped child owns its number, so
+///   `-pid` names that group or nothing. This one is not redundant with the
+///   first: a leader that exited between the identity read and here is a zombie,
+///   and Darwin answers `getpgid` on a zombie with ESRCH (measured) — without the
+///   pin the helpers it left in its group would outlive the reject.
+#[cfg(unix)]
+fn kill_corroborated_candidate(pid: libc::pid_t) {
+    if pid <= 1 {
+        return;
+    }
+    if candidate_leads_its_own_group(pid) || candidate_is_our_child(pid) {
+        // SAFETY: SIGKILL to the process group one of the two proofs above just
+        // showed is the candidate's own, against a pid just proven to name it.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    } else {
+        aterm_log::warn!(
+            "handoff candidate {pid} leads no process group of its own (it never \
+             reached its containment); sending the direct signal only"
+        );
+    }
+    // SAFETY: SIGKILL to the candidate itself, a pid just proven to name it.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+}
+
+/// SIGKILL the candidate, before anything waits on it.
+///
+/// The GROUP sweep (`-pid`) is the pre-existing behaviour and the reason
+/// `pre_exec` puts the candidate in a group of its own: it is what stops the
+/// candidate's ditto/codesign/spctl descendants from continuing to mutate fixed
+/// updater paths after the leader is gone.
+///
+/// WHICH CONTAINMENT THE SWEEP RELIES ON — the two are not equally strong, and a
+/// reader must not assume the second one is the first:
+///
+/// * A CANDIDATE WE FORKED (today's `spawn`). `run_handoff_worker`'s `pre_exec`
+///   `setpgid(0, 0)` runs between fork and exec, so the candidate leads its own
+///   group BEFORE its image runs: `-pid` is a valid handle from the instant
+///   `spawn` returns, and there is provably no instant at which a helper of the
+///   candidate's exists outside that group.
+/// * A CANDIDATE WE DID NOT FORK (the LaunchServices lane B3 exists for). The
+///   candidate contains ITSELF with [`contain_own_process_group`] on entry,
+///   before its own update logic can fork the first helper, and refuses to
+///   continue when it cannot — so the "no helper outside the group" property is
+///   the same one. Our KNOWLEDGE of it is a kernel read at the moment of use:
+///   the pid is identity-corroborated in that arm, so `getpgid(pid) == pid`
+///   ([`candidate_leads_its_own_group`]; no same-session restriction on Darwin
+///   or Linux) says whether the candidate leads a group of its own. The group
+///   SIGKILL is sent only then — or when the candidate is our own unreaped child,
+///   the fork lane's pin ([`kill_corroborated_candidate`]); a candidate that
+///   never reached its containment gets the direct signal alone, and the log
+///   says so. What licenses rollback
+///   is still [`handoff_candidate_terminated`], never the group signal.
+///
+/// The DIRECT signal is what a candidate this process did not fork needs. Such a
+/// candidate may not be a group leader at all, and then `-pid` names no group and
+/// sweeps nothing. It is withheld unless the identity is CORROBORATED, because a
+/// bare pid that has been recycled names a stranger and this lane must never
+/// SIGKILL one. With no witness the behaviour is exactly what it has always been:
+/// the group sweep alone, aimed at a pid that today's unreaped fork child keeps
+/// pinned. That PIN is what keeps an unwitnessed sweep aimed at us, and it is
+/// precisely what a candidate launchd owns lacks — once launchd reaps it the
+/// number is free, and `-pid` then names whatever group its new owner leads. So
+/// on that lane an unwitnessed sweep is not merely unproven, it is unsafe, and
+/// the candidate has to arrive with an identity (B2/B4) rather than as a bare
+/// pid.
 #[cfg(unix)]
 fn signal_handoff_candidate(candidate: HandoffCandidate) {
     let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
@@ -1288,14 +1331,7 @@ fn signal_handoff_candidate(candidate: HandoffCandidate) {
         // Somebody else answers to the number now. There is nothing of ours to
         // signal, and signalling would land on them.
         HandoffCandidateIdentity::Recycled => (),
-        HandoffCandidateIdentity::Corroborated => {
-            // SAFETY: SIGKILL to the candidate's process group and then to the
-            // candidate itself, both against a pid just proven to name it.
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-                libc::kill(pid, libc::SIGKILL);
-            }
-        }
+        HandoffCandidateIdentity::Corroborated => kill_corroborated_candidate(pid),
         HandoffCandidateIdentity::Unwitnessed => {
             // A GROUP KILL IS ONLY SOUND WHILE THE PID IS PINNED, and unwitnessed
             // means we cannot tell from the candidate alone. The fork lane pins it:
@@ -2367,14 +2403,13 @@ fn run_handoff_worker(mut job: HandoffWorkerJob, proxy: winit::event_loop::Event
     // `run_handoff_decision` so nothing about the Commit decision can drift
     // between them.
     //
-    // B3's RESIDUAL, on the launched lane only: `pre_exec` establishes the
-    // candidate's process group before `spawn` returns, so on THIS lane
-    // `kill(-pid)` is a valid handle from that instant. A launched successor
-    // contains itself instead, and reports nothing, so there `-pid` is an
-    // unproven sweep — `signal_handoff_candidate` states what each reaper may
-    // conclude. What the rendezvous did close is the identity half: the accept
-    // hands back a kernel-attested `LOCAL_PEERPID`, so the DIRECT signal is
-    // aimed at a corroborated candidate rather than withheld for lack of one.
+    // B3 on the launched lane: `pre_exec` establishes the candidate's process
+    // group before `spawn` returns, so on THIS lane `kill(-pid)` is a valid
+    // handle from that instant. A launched successor contains itself instead
+    // and reports nothing, so there the group sweep is gated on a kernel read
+    // at the moment of use (`getpgid(pid) == pid`, against a pid the
+    // rendezvous's kernel-attested `LOCAL_PEERPID` corroborated) —
+    // `signal_handoff_candidate` states what each reaper may conclude.
     let child = match job.command.spawn() {
         Ok(child) => child,
         Err(error) => {
@@ -7226,6 +7261,22 @@ impl App {
                     if let Some(host) = self.harness.as_ref() {
                         host.suspend();
                     }
+                    // THE HANDOFF WINDOW: between this process's `_exit` and the
+                    // successor publishing its own entries, name the successor as
+                    // the holder of every carried id, so a launch landing there is
+                    // refused (`identity_claim` module header, the third gate).
+                    // Withdrawn below if the Commit fails and we keep the ids.
+                    let carried: Vec<aterm_session::SessionId> = self
+                        .store
+                        .read()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .snapshot()
+                        .into_iter()
+                        .map(|h| h.sid.clone())
+                        .collect();
+                    if let Some(pid) = child_pid {
+                        crate::identity_claim::mark_successor(&carried, pid);
+                    }
                     let commit_result = match operator_quiesce.as_ref() {
                         Some(quiesce) => quiesce.with_commit_permit(|| {
                             crate::seamless::commit_and_exit(commit_fd, proof)
@@ -7234,6 +7285,9 @@ impl App {
                     };
                     if let Some(host) = self.harness.as_ref() {
                         host.resume();
+                    }
+                    if let Some(pid) = child_pid {
+                        crate::identity_claim::withdraw_successor_markers(&carried, pid);
                     }
                     match commit_result {
                         Ok(Err(_)) => commit_write_failed = true,
@@ -9860,6 +9914,13 @@ mod handed_set_and_mid_sequence_tests {
             )
         };
         assert_eq!(opened, 0, "openpty");
+        // openpty(3) opens both ends inheritable: a child another test spawns
+        // meanwhile would keep the slave open past its exec, for its whole
+        // life, and a closed slave would never read as hung up (the fd-copy
+        // sweep of 2026-09-27).
+        for fd in [master, slave] {
+            aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+        }
         (master, slave)
     }
 
@@ -9998,7 +10059,10 @@ mod handed_set_and_mid_sequence_tests {
         write_all(exited_slave, b"build finished\r\n");
         aterm_pty::close_fd(exited_slave);
         let probe = [(1u64, exited_master, 0i32)];
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // 10 s, not 2: the hang-up arrives only once every copy of the slave is
+        // closed, and a child another test is forking holds one until it execs
+        // (the fd-copy sweep of 2026-09-27). A slave that never closes still fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !handoff_masters_closed(&probe) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -10566,6 +10630,13 @@ mod dry_run_capture_tests {
             )
         };
         assert_eq!(opened, 0, "openpty");
+        // openpty(3) opens both ends inheritable: a child another test spawns
+        // meanwhile would keep the slave open past its exec, for its whole
+        // life, and a closed slave would never read as hung up (the fd-copy
+        // sweep of 2026-09-27).
+        for fd in [master, slave] {
+            aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+        }
         app.pool
             .sessions
             .get_mut(&0)
@@ -10725,6 +10796,13 @@ mod dry_run_capture_tests {
             )
         };
         assert_eq!(opened, 0, "openpty");
+        // openpty(3) opens both ends inheritable: a child another test spawns
+        // meanwhile would keep the slave open past its exec, for its whole
+        // life, and a closed slave would never read as hung up (the fd-copy
+        // sweep of 2026-09-27).
+        for fd in [master, slave] {
+            aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+        }
         app.pool
             .sessions
             .get_mut(&0)
@@ -11026,6 +11104,7 @@ mod commit_layout_topology_tests {
                     attention: None,
                     questions: None,
                     identity: None,
+                    agent: None,
                 })),
                 focused_path: Vec::new(),
                 zoomed: false,
@@ -11154,6 +11233,7 @@ mod commit_layout_topology_tests {
                 attention: None,
                 questions: None,
                 identity: None,
+                agent: None,
             }));
         assert_ne!(
             commit_layout_topology(&committed),
@@ -12278,6 +12358,13 @@ mod handoff_process_group_tests {
             )
         };
         assert_eq!(opened, 0, "openpty");
+        // openpty(3) opens both ends inheritable: a child another test spawns
+        // meanwhile would keep the slave open past its exec, for its whole
+        // life, and a closed slave would never read as hung up (the fd-copy
+        // sweep of 2026-09-27).
+        for fd in [master, slave] {
+            aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+        }
         let live = [(1u64, master, 4242i32)];
 
         assert!(!handoff_masters_have_activity(&live), "quiet pty is quiet");
@@ -12305,9 +12392,11 @@ mod handoff_process_group_tests {
         // macOS can surface the HUP edge a quantum after close(2), which is
         // exactly where the same-instant version of this assert flaked (twice,
         // never solo). The bounded retry keeps the teeth: a REAL stale-
-        // identity bug never reports closed, and two seconds of grace cannot
-        // mask it.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // identity bug never reports closed, and ten seconds of grace cannot
+        // mask it. Ten, not two: the hang-up waits for every copy of the slave,
+        // and a child another test is forking holds one until it execs (the
+        // fd-copy sweep of 2026-09-27).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !handoff_masters_closed(&live) {
             assert!(
                 std::time::Instant::now() < deadline,
@@ -12342,6 +12431,13 @@ mod handoff_process_group_tests {
                 )
             };
             assert_eq!(opened, 0, "openpty");
+            // openpty(3) opens both ends inheritable: a child another test spawns
+            // meanwhile would keep the slave open past its exec, for its whole
+            // life, and a closed slave would never read as hung up (the fd-copy
+            // sweep of 2026-09-27).
+            for fd in [master, slave] {
+                aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
+            }
             (master, slave)
         };
         let (exited, exited_slave) = open();
@@ -12355,8 +12451,9 @@ mod handoff_process_group_tests {
         aterm_pty::close_fd(exited_slave);
         let dead = [(1u64, exited, 4242i32)];
         // PROMPT-EVENTUAL, as in the sibling test above: the HUP edge can
-        // surface a scheduler quantum after close(2).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        // surface a scheduler quantum after close(2), or a sibling's exec after
+        // it when a fork holds a copy of the slave — so 10 s, not 2.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !handoff_masters_closed(&dead) {
             assert!(std::time::Instant::now() < deadline, "the slave hung up");
             std::thread::sleep(std::time::Duration::from_millis(10));
@@ -13038,6 +13135,121 @@ mod handoff_process_group_tests {
         // SAFETY: SIGKILL to the test's own child.
         assert_eq!(unsafe { libc::kill(pid, libc::SIGKILL) }, 0, "kill fixture");
         bystander.wait().expect("reap the test child");
+    }
+
+    /// The launched lane's group-sweep gate is a kernel read: a process that
+    /// set up its own group (what `contain_own_process_group` does on a
+    /// launched successor's entry) is reported as leading it, and one that
+    /// inherited its parent's group is not — so `-pid` is sent only when it
+    /// names the candidate's own group.
+    ///
+    /// Fixture cleanup is the `sleep` itself: both exit on their own within
+    /// 30 s even if an assertion panics before the explicit kills.
+    #[cfg(unix)]
+    #[test]
+    fn the_group_sweep_gate_reads_whether_the_candidate_leads_its_own_group() {
+        use std::os::unix::process::CommandExt as _;
+        let spawn = |own_group: bool| {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command
+                .arg("30")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            if own_group {
+                command.process_group(0);
+            }
+            command.spawn().expect("spawn a group fixture")
+        };
+        let mut leader = spawn(true);
+        let mut member = spawn(false);
+        let leader_pid = i32::try_from(leader.id()).expect("bounded pid");
+        let member_pid = i32::try_from(member.id()).expect("bounded pid");
+
+        assert!(
+            super::candidate_leads_its_own_group(leader_pid),
+            "a process that called setpgid(0, 0) leads group {leader_pid}"
+        );
+        assert!(
+            !super::candidate_leads_its_own_group(member_pid),
+            "a process that inherited our group leads no group numbered {member_pid}"
+        );
+        for refused in [-1, 0, 1] {
+            assert!(
+                !super::candidate_leads_its_own_group(refused),
+                "pid {refused} is never a sweep target"
+            );
+        }
+
+        leader.kill().expect("kill the leader fixture");
+        member.kill().expect("kill the member fixture");
+        leader.wait().expect("reap the leader fixture");
+        member.wait().expect("reap the member fixture");
+    }
+
+    /// The corroborated arm's group sweep still reaches the helpers of a FORK-lane
+    /// candidate whose leader exited between the identity read and the sweep.
+    /// The leader is then an unreaped zombie of ours, and Darwin answers `getpgid`
+    /// on a zombie with ESRCH, so the `getpgid(pid) == pid` read alone withheld
+    /// the group SIGKILL and the helper it left in its group outlived the reject.
+    /// The fork lane's pin (`candidate_is_our_child`) licenses the sweep.
+    ///
+    /// Fixture cleanup: the helper is `sleep 30` and exits on its own.
+    #[cfg(unix)]
+    #[test]
+    fn a_corroborated_candidate_whose_leader_already_exited_still_has_its_group_swept() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 </dev/null >/dev/null 2>&1 & echo $!"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("spawn a group leader with a helper");
+        let leader_pid = i32::try_from(leader.id()).expect("bounded pid");
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().expect("leader stdout"))
+            .read_line(&mut line)
+            .expect("read the helper pid");
+        let helper: libc::pid_t = line.trim().parse().expect("helper pid");
+        // The leader exits right after the echo: wait for its zombie, UNREAPED.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while super::probe_handoff_candidate(leader_pid) != super::HandoffCandidateProbe::Exited {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the leader never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // SAFETY: getpgid is a side-effect-free getter.
+        assert_eq!(
+            unsafe { libc::getpgid(helper) },
+            leader_pid,
+            "the helper is in the leader's group"
+        );
+
+        super::kill_corroborated_candidate(leader_pid);
+
+        let alive = |pid: libc::pid_t| {
+            // SAFETY: signal 0 is kill(2)'s existence check; it delivers nothing.
+            unsafe { libc::kill(pid, 0) == 0 }
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while alive(helper) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let survived = alive(helper);
+        if survived {
+            // SAFETY: SIGKILL to the fixture's own helper, just seen alive.
+            unsafe { libc::kill(helper, libc::SIGKILL) };
+        }
+        leader.wait().expect("reap the leader fixture");
+        assert!(
+            !survived,
+            "the group sweep must reach the helper of an exited, unreaped fork-lane leader"
+        );
     }
 
     /// Run [`contain_own_process_group`] in a FORKED CHILD and report whether the
@@ -14326,7 +14538,7 @@ mod handoff_lane_tests {
         // The removal now names something this process really carries. Scoped
         // through the workspace's one lock-scoped env helper so no concurrent
         // test observes the mutation.
-        aterm_log::env::scoped("ATERM_LANE_TEST_PRESENT_KEY", "set", || {
+        crate::test_env::scoped("ATERM_LANE_TEST_PRESENT_KEY", "set", || {
             let mut command = std::process::Command::new("/bin/echo");
             command.env_remove("ATERM_LANE_TEST_PRESENT_KEY");
             assert!(

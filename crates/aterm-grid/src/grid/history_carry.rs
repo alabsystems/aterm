@@ -28,9 +28,11 @@
 //!   few hundred lines the screen carry brought), never the imported depth.
 //!
 //! [`Grid::reserve_older_history_keys`] is the fourth, smaller piece: the
-//! successor raises its absolute-row counter by the lines it expects to
-//! import BEFORE anything reads an absolute row, so the import later lands
-//! under keys nobody has used and the live screen's keys never move. It hands
+//! successor makes room below its oldest row for the lines it expects to
+//! import BEFORE anything reads an absolute row (raising its counter by what
+//! the free keys there fall short of — nothing, when the restore continued
+//! the source's numbering), so the import later lands under keys nobody has
+//! used and the live screen's keys never move. It hands
 //! back an [`OlderHistoryClaim`], the successor's own fence: the attach is
 //! refused once the pane's scrollback was CLEARED after the reserve (ED3, a
 //! reset), so an import that lands late never puts back history the user
@@ -276,20 +278,33 @@ impl Grid {
         Ok(lines)
     }
 
-    /// Raise the absolute-row counter by `lines`, so history later placed in
-    /// front of the oldest line ([`Self::attach_older_history`]) lands under
-    /// keys nothing has used, and no retained or visible row's key moves.
+    /// Make room for `lines` keys below the oldest retained line, so history
+    /// later placed in front of it ([`Self::attach_older_history`]) lands
+    /// under keys nothing has used, and no retained or visible row's key moves.
+    ///
+    /// Only the SHORTFALL is raised: the keys already free below the oldest
+    /// row (`oldest_absolute_row()` of them) are used first. A grid that
+    /// CONTINUES the source's numbering (`Self::continue_absolute_numbering`,
+    /// the checkpoint restore) already sits exactly on the source's keys, and
+    /// the lines the import brings are the source's lines right below them —
+    /// so nothing moves, and the shell marks and blocks the restore installed
+    /// at the source's absolute rows keep naming their lines (2026-09-27
+    /// review: raising by the whole import renumbered every restored row up
+    /// by it while the marks stayed put). A grid numbered from zero (a parent
+    /// that named no counter) has no free key, and is raised by all of it.
     ///
     /// ONLY for a grid that was just built from a checkpoint, before anything
-    /// has read an absolute row from it — the successor's adopt path, ahead of
-    /// its reader. Raised there, the rows below the oldest retained line read
-    /// as evicted until the import fills them, which is exactly what they are
-    /// if it never does.
+    /// has read an absolute row from it but the restore itself — the
+    /// successor's adopt path, ahead of its reader. Raised there, the rows
+    /// below the oldest retained line read as evicted until the import fills
+    /// them, which is exactly what they are if it never does.
     ///
     /// Returns the claim the import must present ([`OlderHistoryClaim`]).
     #[must_use]
     pub fn reserve_older_history_keys(&mut self, lines: u64) -> OlderHistoryClaim {
-        self.storage.absolute_row_counter = self.storage.absolute_row_counter.saturating_add(lines);
+        let shortfall = lines.saturating_sub(self.oldest_absolute_row());
+        self.storage.absolute_row_counter =
+            self.storage.absolute_row_counter.saturating_add(shortfall);
         OlderHistoryClaim {
             clear_gen: self.storage.scrollback_clear_gen,
         }

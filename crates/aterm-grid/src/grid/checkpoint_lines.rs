@@ -35,8 +35,9 @@ impl Grid {
     /// Project the full grid content into a flat list of [`Line`]s.
     ///
     /// Layout of the returned vector is **scrollback-then-visible**:
-    /// 1. `0..scrollback_lines()` history lines, oldest first (via
-    ///    [`try_get_history_line`](Self::try_get_history_line)).
+    /// 1. `0..scrollback_lines()` history lines, oldest first (via the dense
+    ///    [`history_lines_from`](Self::history_lines_from) walk, whose item `i`
+    ///    is [`try_get_history_line(i)`](Self::try_get_history_line)).
     /// 2. `0..rows()` visible rows, top to bottom, each converted with the
     ///    same stored-extras path the ring buffer uses for scroll-off.
     ///
@@ -51,15 +52,14 @@ impl Grid {
         let scrollback_count = self.scrollback_lines();
         let mut lines = Vec::with_capacity(scrollback_count + self.rows() as usize);
 
-        // 1) Scrollback history, oldest (idx 0) → newest.
-        for idx in 0..scrollback_count {
-            match self.try_get_history_line(idx) {
-                Ok(Some(cow)) => lines.push(cow.into_owned()),
-                // Out-of-bounds (racey shrink) or decode failure: keep the slot
-                // dense with an empty line so the visible split stays exact.
-                Ok(None) | Err(_) => lines.push(Line::new()),
-            }
-        }
+        // 1) Scrollback history, oldest (idx 0) → newest, through the dense
+        // walk: a decode failure is a placeholder, which keeps the slot dense
+        // with an empty line so the visible split stays exact.
+        lines.extend(
+            self.history_lines_from(0)
+                .take(scrollback_count)
+                .map(|line| line.map_or_else(Line::new, std::borrow::Cow::into_owned)),
+        );
 
         // 2) Visible rows, top → bottom, via the stored-extras scroll path.
         lines.extend(self.checkpoint_visible_lines());
@@ -94,15 +94,15 @@ impl Grid {
         // indices are never fetched, so a cold/compressed block is never touched.
         let first = scrollback_count - keep;
         let mut lines = Vec::with_capacity(keep + self.rows() as usize);
-        for idx in first..scrollback_count {
-            match self.try_get_history_line(idx) {
-                Ok(Some(cow)) => lines.push(cow.into_owned()),
-                // Same dense-slot posture as `checkpoint_lines`: a corrupt or
-                // racily-shrunk slot becomes an empty line so the visible split
-                // stays exact.
-                Ok(None) | Err(_) => lines.push(Line::new()),
-            }
-        }
+        // The dense history walk from `first`: one decode per warm block /
+        // cold page rather than a per-line tier lookup + clone, and the same
+        // dense-slot posture as `checkpoint_lines` — an unreadable line is a
+        // placeholder, emitted as an empty line so the visible split stays exact.
+        lines.extend(
+            self.history_lines_from(first)
+                .take(keep)
+                .map(|line| line.map_or_else(Line::new, std::borrow::Cow::into_owned)),
+        );
         lines.extend(self.checkpoint_visible_lines());
         lines
     }

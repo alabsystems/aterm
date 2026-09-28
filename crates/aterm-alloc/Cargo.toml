@@ -10,7 +10,7 @@ repository.workspace = true
 description = "Inline-optimized collections for aterm: SmallVec + ArrayVec with zero external deps"
 
 [dependencies]
-# None — pure std
+# None — `#![no_std]`, core + alloc only
 
 [dev-dependencies]
 # THE DIFFERENTIAL ORACLE for `ArrayVec` — the real crates.io `arrayvec`,

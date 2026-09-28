@@ -1,0 +1,13 @@
+# claude-code 2.1.281 · HAND-BUILT 2026-09-27 · synthesized from the 2.1.281 render code (an `isApiErrorMessage` row the message renderer's switch has no case for goes to `du`: the `Lr` bullet `⏺` at column 0, aria-label `error:`, then the text; `Login expired · Please run /login` is `u$n`, which has no case, where `Not logged in · …` and `OAuth token revoked · …` are drawn under the `⎿` gutter) and the owner's report of the incident screen (session 03396a15…, 2026-09-27: `⏺ Login expired · Please run /login` after every turn from 05:00 to 14:33 UTC); the rows above it are assembled · the supervisor's continuation answered by the login wall
+⏺ Nothing new has landed since the gate passed. I'll check again in about 30 minutes.
+
+✻ Worked for 13s · done 9:31 PM
+
+❯ continue
+
+⏺ Login expired · Please run /login
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle)

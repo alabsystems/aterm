@@ -6,10 +6,12 @@
 //! Codex-style —
 //!
 //! ```text
-//!   ◆ Opus 5.5 xhigh   ⌂ aterm   ⎇ main
+//!   ◆ Opus 5.5 xhigh   ⌂ ~/aterm   ⎇ main
 //! ```
 //!
-//! model and effort under one mark, then the repository, then the branch.
+//! model and effort under one mark, then the session's working directory
+//! (home as `~`; owner, 2026-09-27: the repository's name alone "isn't
+//! enough"), then the branch.
 //! The vendor row it replaces (`⏵⏵ bypass permissions on (shift+tab to
 //! cycle) · ← for agents`) cannot be switched off from outside: measured on
 //! 2.1.282, no setting or environment variable removes it, and a statusLine
@@ -18,7 +20,7 @@
 //! files Claude Code already keeps:
 //!
 //! * `<claude dir>/sessions/<pid>.json` maps the Claude Code PROCESS to its
-//!   session id and working directory — which is how a pane finds ITS
+//!   session id and working directory — the path the footer shows, and how a pane finds ITS
 //!   transcript when several sessions share one directory ([`session_of_pid`]);
 //! * the session's transcript carries the model (`message.model`) and the
 //!   effort (`effort`) of every turn ([`tail_facts`]) — but the transcript is
@@ -45,9 +47,10 @@
 //! `--resume`d one shows no model until it has answered, never the model of
 //! the process before it ([`tail_facts`]).
 
-use std::fs::File;
+use std::fs::{File, Metadata};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use aterm_json::Value;
 
@@ -70,13 +73,10 @@ const MAX_GIT_CLIMB: usize = 64;
 /// Longest `HEAD` or `.git` file read: both are one short line.
 const MAX_GIT_FILE_BYTES: u64 = 4096;
 
-/// Longest Claude `settings.json` read for the thinking setting.
-const MAX_SETTINGS_BYTES: u64 = 256 * 1024;
-
 /// The mark before model + effort.
 pub const MODEL_MARK: char = '\u{25C6}'; // ◆
-/// The mark before the repository.
-pub const REPO_MARK: char = '\u{2302}'; // ⌂
+/// The mark before the working directory.
+pub const PATH_MARK: char = '\u{2302}'; // ⌂
 /// The mark before the branch.
 pub const BRANCH_MARK: char = '\u{2387}'; // ⎇
 
@@ -111,14 +111,15 @@ pub struct FooterFacts {
     pub model: Option<String>,
     /// The effort level (`xhigh`).
     pub effort: Option<String>,
-    /// The repository's directory name.
-    pub repo: Option<String>,
+    /// The session's working directory, home shown as `~` (`~/aterm`).
+    pub path: Option<String>,
     /// The checked-out branch, or a short commit id when HEAD is detached.
     pub branch: Option<String>,
-    /// The session's thinking setting (`alwaysThinkingEnabled` in its Claude
-    /// `settings.json`, on when absent) — not shown in the footer's text; the
-    /// thinking light reads it (`harness::lights`).
-    pub thinking: Option<bool>,
+    /// The session's working directory when the kernel REFUSED the repository
+    /// read with `EPERM` — on macOS, a folder privacy consent (TCC) aterm does not
+    /// hold. Never shown; the host raises its consent attention for the session
+    /// ([`GitHeadRead::Denied`]).
+    pub repo_read_denied: Option<PathBuf>,
     /// The Claude Code build this process runs (`2.1.283`) — not shown; it
     /// names the vendor build in the host's drift log when a row it draws
     /// is not one this build reads.
@@ -128,7 +129,7 @@ pub struct FooterFacts {
 /// One marked value in the footer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Segment {
-    /// The mark ([`MODEL_MARK`], [`REPO_MARK`], [`BRANCH_MARK`]).
+    /// The mark ([`MODEL_MARK`], [`PATH_MARK`], [`BRANCH_MARK`]).
     pub mark: char,
     /// The value after it.
     pub text: String,
@@ -166,7 +167,7 @@ fn open_regular(path: &Path) -> Option<File> {
 }
 
 /// At most `cap` bytes of the regular file at `path`, as text.
-fn read_small(path: &Path, cap: u64) -> Option<String> {
+pub(crate) fn read_small(path: &Path, cap: u64) -> Option<String> {
     let mut text = String::new();
     open_regular(path)?
         .take(cap)
@@ -282,23 +283,238 @@ pub fn transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<PathBu
 /// The latest main-thread model and effort in the last [`TAIL_BYTES`] of the
 /// transcript at `path`, written no earlier than `since` ([`tail_facts`]).
 pub fn read_tail_facts(path: &Path, since: Option<u64>) -> Option<TailFacts> {
+    Some(tail_facts(&read_tail(path)?, since))
+}
+
+/// The resolver's one-session transcript memo. The session registry and the
+/// repository are still read on every refresh; only an unchanged,
+/// successfully read transcript tail is reused. The process and image start
+/// are part of the key, so a resumed or exec'd Claude cannot inherit an old
+/// model even when it keeps the same transcript path and file revision.
+#[derive(Debug, Default)]
+pub struct TailCache {
+    entry: Option<(TailKey, TailFacts)>,
+    #[cfg(test)]
+    reads: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TailKey {
+    path: PathBuf,
+    pid: u32,
+    started: Option<u64>,
+    since: u64,
+    len: u64,
+    modified: SystemTime,
+    // A same-length rewrite can preserve mtime, while a replacement can
+    // preserve both mtime and length. On Unix, ctime and inode cover them.
+    // Other targets keep reading rather than trusting an incomplete stamp.
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(unix)]
+    ctime: i64,
+    #[cfg(unix)]
+    ctime_nsec: i64,
+}
+
+impl TailKey {
+    fn of(
+        path: &Path,
+        pid: u32,
+        started: Option<u64>,
+        since: u64,
+        metadata: &Metadata,
+    ) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt as _;
+        // Without a change-time and file identity, a same-length rewrite or
+        // replacement could keep the key unchanged. Cache on Unix only.
+        #[cfg(not(unix))]
+        {
+            let _ = (path, pid, started, since, metadata);
+            return None;
+        }
+        #[cfg(unix)]
+        Some(Self {
+            path: path.to_owned(),
+            pid,
+            started,
+            since,
+            len: metadata.len(),
+            modified: metadata.modified().ok()?,
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            ctime: metadata.ctime(),
+            ctime_nsec: metadata.ctime_nsec(),
+        })
+    }
+}
+
+impl TailCache {
+    /// Read the current tail, or reuse the previous parse only after opening
+    /// and identifying this exact regular file. A read that races a writer is
+    /// returned for this refresh but never remembered; the next one retries.
+    fn read(
+        &mut self,
+        path: &Path,
+        pid: u32,
+        started: Option<u64>,
+        since: u64,
+    ) -> Option<TailFacts> {
+        let mut file = match open_regular(path) {
+            Some(file) => file,
+            None => {
+                self.entry = None;
+                return None;
+            }
+        };
+        let before = match file.metadata() {
+            Ok(before) => before,
+            Err(_) => {
+                self.entry = None;
+                return None;
+            }
+        };
+        let key = TailKey::of(path, pid, started, since, &before);
+        if let Some(key) = key.as_ref()
+            && let Some((old, facts)) = self.entry.as_ref()
+            && old == key
+            && file
+                .metadata()
+                .ok()
+                .and_then(|after| TailKey::of(path, pid, started, since, &after))
+                .as_ref()
+                == Some(key)
+        {
+            return Some(facts.clone());
+        }
+        self.entry = None;
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        let body = read_tail_open(&mut file, before.len())?;
+        let facts = tail_facts(&body, Some(since));
+        if let (Some(key), Some(after)) = (key, file.metadata().ok())
+            && TailKey::of(path, pid, started, since, &after).as_ref() == Some(&key)
+        {
+            self.entry = Some((key, facts.clone()));
+        }
+        Some(facts)
+    }
+
+    fn clear(&mut self) {
+        self.entry = None;
+    }
+}
+
+/// The whole rows in the last [`TAIL_BYTES`] of the transcript at `path`.
+fn read_tail(path: &Path) -> Option<Vec<u8>> {
     let mut file = open_regular(path)?;
     let len = file.metadata().ok()?.len();
+    read_tail_open(&mut file, len)
+}
+
+fn read_tail_open(file: &mut File, len: u64) -> Option<Vec<u8>> {
     let start = len.saturating_sub(TAIL_BYTES);
     file.seek(SeekFrom::Start(start)).ok()?;
     let mut bytes = Vec::with_capacity(usize::try_from(len - start).unwrap_or(0));
     file.take(TAIL_BYTES).read_to_end(&mut bytes).ok()?;
     // A tail that starts mid-file starts mid-line: that first fragment is
     // never a whole row.
-    let body = if start > 0 {
-        match bytes.iter().position(|&b| b == b'\n') {
-            Some(nl) => &bytes[nl + 1..],
-            None => &[][..],
-        }
-    } else {
-        &bytes[..]
+    if start > 0 {
+        let first = bytes
+            .iter()
+            .position(|&b| b == b'\n')
+            .map_or(bytes.len(), |nl| nl + 1);
+        bytes.drain(..first);
+    }
+    Some(bytes)
+}
+
+/// How many `sessions/<pid>.json` files [`shell_cwds`] reads at most.
+const MAX_SESSION_FILES: usize = 256;
+
+/// Where the Bash tool of each live Claude Code session LAUNCHED in `launch`
+/// stands, as its transcript last recorded it ([`last_cwd`]) — the directory
+/// the session's next command starts in, which neither the box nor the
+/// terminal shows: the shell's own directory (`meta cwd=`, OSC 7) stays where
+/// Claude Code was started while its Bash tool moves. A session is one whose
+/// `<claude dir>/sessions/<pid>.json` names that launch directory and whose
+/// pid is alive; every such session counts (several may share a launch
+/// directory, and a superset is what a check that only ADDS directories
+/// wants). `launch` itself is left out. Empty when nothing could be read.
+pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
+    let Ok(dir) = std::fs::read_dir(claude_dir.join("sessions")) else {
+        return Vec::new();
     };
-    Some(tail_facts(body, since))
+    let mut out: Vec<PathBuf> = Vec::new();
+    for file in dir.filter_map(Result::ok).take(MAX_SESSION_FILES) {
+        let name = file.file_name();
+        let Some(pid) = name
+            .to_str()
+            .and_then(|n| n.strip_suffix(".json"))
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Some(entry) = read_small(&file.path(), MAX_SESSION_FILE_BYTES)
+            .and_then(|text| parse_session_entry(&text, pid, None))
+        else {
+            continue;
+        };
+        if entry.cwd != launch || !super::upgrade_drive::alive(pid) {
+            continue;
+        }
+        if let Some(cwd) = transcript_path(claude_dir, &entry)
+            .and_then(|path| read_tail(&path))
+            .and_then(|body| last_cwd(&body))
+            && cwd != launch
+            && !out.contains(&cwd)
+        {
+            out.push(cwd);
+        }
+    }
+    out
+}
+
+/// The `cwd` of the newest main-thread row of a transcript tail that carries
+/// one: where the session's Bash tool stood when the row was written. Claude
+/// Code stamps every row with its working directory, and that directory
+/// follows the Bash tool — a `cd x; …` command's rows carry `x` (measured on
+/// the owner's 2.1.28x transcripts, 2026-09-27). SIDECHAIN rows (a subagent's
+/// turns, with their own directory) are skipped; a relative or empty value is
+/// not a directory.
+pub fn last_cwd(body: &[u8]) -> Option<PathBuf> {
+    for raw in body.rsplit(|&b| b == b'\n') {
+        if raw.is_empty() || raw.len() > MAX_LINE_BYTES {
+            continue;
+        }
+        let Ok(line) = std::str::from_utf8(raw) else {
+            continue;
+        };
+        if !line.contains("\"cwd\"") {
+            continue;
+        }
+        let Ok(value) = aterm_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
+        if obj.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        if let Some(cwd) = obj.get("cwd").and_then(Value::as_str) {
+            let cwd = PathBuf::from(cwd);
+            if cwd.is_absolute() {
+                return Some(cwd);
+            }
+        }
+    }
+    None
 }
 
 /// What the end of a transcript says about the model and effort.
@@ -443,28 +659,102 @@ pub fn model_display(id: &str) -> String {
     name
 }
 
-/// The repository (its top directory's name) and the branch that `cwd` is in,
-/// read straight from `.git` — no `git` process. A worktree's `.git` FILE
-/// (`gitdir: …`) is followed; a detached HEAD shows its first seven hex
-/// digits. `None` outside a repository.
-pub fn git_head(cwd: &Path) -> Option<(String, String)> {
+/// The branch that `cwd` is in, read straight from `.git` — no `git`
+/// process. A worktree's `.git` FILE (`gitdir: …`) is followed; a detached
+/// HEAD shows its first seven hex digits. `None` outside a repository, or
+/// when the read was refused.
+pub fn git_head(cwd: &Path) -> Option<String> {
+    match read_git_head(cwd) {
+        GitHeadRead::Found(branch) => Some(branch),
+        GitHeadRead::Absent | GitHeadRead::Denied => None,
+    }
+}
+
+/// What [`read_git_head`] found for a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GitHeadRead {
+    /// The branch.
+    Found(String),
+    /// Not inside a repository (or not one this bounded read can parse).
+    Absent,
+    /// The kernel refused a read on the way with `EPERM` — on macOS, a folder
+    /// privacy consent (TCC) aterm does not hold. Not `Absent`: the host raises
+    /// its consent attention for the session instead of silently showing nothing.
+    Denied,
+}
+
+/// `EPERM`, the kernel's answer to a read a privacy consent refuses (distinct
+/// from an ordinary `EACCES` permission bit).
+fn is_eperm(error: &std::io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        error.raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = error;
+        false
+    }
+}
+
+/// [`git_head`], saying WHY there is no answer when the kernel refused a read.
+pub fn read_git_head(cwd: &Path) -> GitHeadRead {
     let mut dir = cwd;
     for _ in 0..MAX_GIT_CLIMB {
         let dot_git = dir.join(".git");
-        if let Some(git_dir) = resolve_git_dir(&dot_git) {
-            let repo = printable(&dir.file_name()?.to_string_lossy())?;
-            let head = read_small(&git_dir.join("HEAD"), MAX_GIT_FILE_BYTES)?;
-            return Some((repo, branch_of_head(&head)?));
+        match std::fs::metadata(&dot_git) {
+            Err(error) if is_eperm(&error) => return GitHeadRead::Denied,
+            Err(_) => {}
+            Ok(meta) => {
+                let Some(git_dir) = resolve_git_dir_of(&dot_git, &meta) else {
+                    return GitHeadRead::Absent;
+                };
+                return match read_head(&git_dir.join("HEAD")) {
+                    Err(()) => GitHeadRead::Denied,
+                    Ok(Some(head)) => {
+                        branch_of_head(&head).map_or(GitHeadRead::Absent, GitHeadRead::Found)
+                    }
+                    Ok(None) => GitHeadRead::Absent,
+                };
+            }
         }
-        dir = dir.parent()?;
+        let Some(parent) = dir.parent() else {
+            return GitHeadRead::Absent;
+        };
+        dir = parent;
     }
-    None
+    GitHeadRead::Absent
+}
+
+/// The `HEAD` file's text (bounded, regular files only, like [`read_small`]);
+/// `Err(())` when the open was refused with `EPERM`.
+fn read_head(path: &Path) -> Result<Option<String>, ()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if is_eperm(&error) => return Err(()),
+        Err(_) => return Ok(None),
+    };
+    if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+        return Ok(None);
+    }
+    let mut text = String::new();
+    Ok(file
+        .take(MAX_GIT_FILE_BYTES)
+        .read_to_string(&mut text)
+        .ok()
+        .map(|_| text))
 }
 
 /// The git directory `.git` names: itself when it is a directory, the
 /// `gitdir:` target when it is a worktree's file.
-fn resolve_git_dir(dot_git: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(dot_git).ok()?;
+fn resolve_git_dir_of(dot_git: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
     if meta.is_dir() {
         return Some(dot_git.to_path_buf());
     }
@@ -506,35 +796,77 @@ fn printable(name: &str) -> Option<String> {
 /// may speak for this process ([`tail_facts`]): with no start known at all,
 /// model and effort stay out rather than risk a predecessor's.
 pub fn facts_for_pid(claude_dir: &Path, pid: u32, started: Option<u64>) -> Option<FooterFacts> {
-    let entry = session_of_pid(claude_dir, pid, started)?;
+    facts_for_pid_cached(claude_dir, pid, started, &mut TailCache::default())
+}
+
+/// [`facts_for_pid`] with a transcript cache owned by the host's one
+/// background resolver. Every other source is still read live on every ask.
+/// An unreadable registry or transcript cannot preserve a cached tail for a
+/// later process; the next successful request reads it afresh.
+pub fn facts_for_pid_cached(
+    claude_dir: &Path,
+    pid: u32,
+    started: Option<u64>,
+    cache: &mut TailCache,
+) -> Option<FooterFacts> {
+    let Some(entry) = session_of_pid(claude_dir, pid, started) else {
+        cache.clear();
+        return None;
+    };
     let floor = match (started.or(entry.proc_start), entry.started_at) {
         (Some(process), Some(image)) => Some(process.max(image)),
         (process, image) => process.or(image),
     };
-    let tail = floor
-        .and_then(|since| {
-            transcript_path(claude_dir, &entry).and_then(|path| read_tail_facts(&path, Some(since)))
-        })
-        .unwrap_or_default();
-    let (repo, branch) = match git_head(&entry.cwd) {
-        Some((repo, branch)) => (Some(repo), Some(branch)),
-        None => (None, None),
+    let tail = match floor.and_then(|since| transcript_path(claude_dir, &entry).map(|p| (since, p)))
+    {
+        Some((since, path)) => cache.read(&path, pid, started, since).unwrap_or_default(),
+        None => {
+            cache.clear();
+            TailFacts::default()
+        }
     };
-    let thinking = read_small(&claude_dir.join("settings.json"), MAX_SETTINGS_BYTES)
-        .as_deref()
-        .map_or(Some(true), crate::harness::lights::thinking_setting);
+    let (branch, repo_read_denied) = match read_git_head(&entry.cwd) {
+        GitHeadRead::Found(branch) => (Some(branch), None),
+        GitHeadRead::Absent => (None, None),
+        GitHeadRead::Denied => (None, Some(entry.cwd.clone())),
+    };
     Some(FooterFacts {
         model: tail.model_id.as_deref().map(model_display),
         effort: tail.effort,
-        repo,
+        path: home_path(&entry.cwd, aterm_types::dirs::home_dir().as_deref()),
         branch,
-        thinking,
+        repo_read_denied,
         version: entry.version,
     })
 }
 
+/// `cwd` as the footer shows it: under `home`, `~` and the rest (`~/aterm`);
+/// elsewhere, whole. A home of `/` is no home to abbreviate (every path is
+/// under it). `None` for a path that would put a control character on the
+/// glass.
+#[must_use]
+pub fn home_path(cwd: &Path, home: Option<&Path>) -> Option<String> {
+    let home = home.filter(|home| home.parent().is_some());
+    let shown = match home.and_then(|home| cwd.strip_prefix(home).ok()) {
+        Some(rest) if rest.as_os_str().is_empty() => "~".to_owned(),
+        Some(rest) => format!("~/{}", rest.to_string_lossy()),
+        None => cwd.to_string_lossy().into_owned(),
+    };
+    (!shown.is_empty() && !shown.chars().any(char::is_control)).then_some(shown)
+}
+
+/// `path` cut from the front to its last directory (`~/src/aterm` →
+/// `…/aterm`), for a pane too narrow for all of it. `None` when that is no
+/// shorter, or there is no directory to keep.
+#[must_use]
+pub fn elide_path(path: &str) -> Option<String> {
+    let (_, last) = path.trim_end_matches('/').rsplit_once('/')?;
+    let short = format!("\u{2026}/{last}");
+    (!last.is_empty() && short.chars().count() < path.chars().count()).then_some(short)
+}
+
 /// The footer's marked values, in order: model and effort under one mark,
-/// then repository, then branch. A value the facts lack is left out, not
+/// then the working directory, then the branch. A value the facts lack is left out, not
 /// shown as a placeholder.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
     let mut out = Vec::with_capacity(3);
@@ -549,10 +881,10 @@ pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
             text,
         });
     }
-    if let Some(repo) = &facts.repo {
+    if let Some(path) = &facts.path {
         out.push(Segment {
-            mark: REPO_MARK,
-            text: repo.clone(),
+            mark: PATH_MARK,
+            text: path.clone(),
         });
     }
     if let Some(branch) = &facts.branch {
@@ -711,6 +1043,199 @@ pub fn plan_row(row: &str) -> Option<Vec<Piece>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    fn cache_test_dir(name: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "aterm-footer-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[cfg(unix)]
+    fn assistant_row(model: &str, timestamp: &str) -> String {
+        format!(
+            r#"{{"type":"assistant","timestamp":"{timestamp}","effort":"high","message":{{"model":"{model}"}}}}"#
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tail_cache_reuses_only_one_process_and_one_unchanged_file() {
+        let root = cache_test_dir("tail-cache");
+        let path = root.join("session.jsonl");
+        let before = "2026-09-27T11:00:00Z";
+        let during = "2026-09-27T13:00:00Z";
+        let after = "2026-09-27T15:00:00Z";
+        let start = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+        let old = format!("{}\n", assistant_row("claude-opus-5", before));
+        std::fs::write(&path, &old).unwrap();
+        let mut cache = TailCache::default();
+        let read = |cache: &mut TailCache, started, since| {
+            cache.read(&path, 4242, started, since).unwrap()
+        };
+
+        // An old conversation row cannot become this process's model merely
+        // because the unchanged tail is served from memory on a later tick.
+        assert_eq!(read(&mut cache, Some(start), start), TailFacts::default());
+        assert_eq!(read(&mut cache, Some(start), start), TailFacts::default());
+        assert_eq!(cache.reads, 1, "unchanged tail is read once");
+
+        let newer = format!("{}\n", assistant_row("claude-opus-6", during));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(newer.as_bytes())
+            .unwrap();
+        assert_eq!(
+            read(&mut cache, Some(start), start).model_id.as_deref(),
+            Some("claude-opus-6")
+        );
+        assert_eq!(cache.reads, 2, "append invalidates the tail");
+
+        let whole = format!("{old}{}\n", assistant_row("claude-opus-7", during));
+        assert_eq!(whole.len(), old.len() + newer.len());
+        let old_modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(&path, &whole).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))
+            .unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            old_modified
+        );
+        assert_eq!(
+            read(&mut cache, Some(start), start).model_id.as_deref(),
+            Some("claude-opus-7")
+        );
+        assert_eq!(
+            cache.reads, 3,
+            "same-size, same-mtime rewrite invalidates the tail"
+        );
+
+        let replacement = root.join("replacement.jsonl");
+        std::fs::write(
+            &replacement,
+            format!("{old}{}\n", assistant_row("claude-opus-8", during)),
+        )
+        .unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old_modified))
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(
+            read(&mut cache, Some(start), start).model_id.as_deref(),
+            Some("claude-opus-8")
+        );
+        assert_eq!(
+            cache.reads, 4,
+            "same-size, same-mtime replacement invalidates"
+        );
+
+        // A process restart on the identical transcript path must move the
+        // floor even before the new process has written a row of its own.
+        let new_start = crate::harness::upgrade_models::parse_utc("2026-09-27T14:00:00Z").unwrap();
+        assert_eq!(
+            read(&mut cache, Some(new_start), new_start),
+            TailFacts::default()
+        );
+        assert_eq!(cache.reads, 5, "process start changes the key");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{}\n", assistant_row("claude-opus-9", after)).as_bytes())
+            .unwrap();
+        assert_eq!(
+            read(&mut cache, Some(new_start), new_start)
+                .model_id
+                .as_deref(),
+            Some("claude-opus-9")
+        );
+        assert_eq!(cache.reads, 6);
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            cache
+                .read(&path, 4242, Some(new_start), new_start)
+                .is_none()
+        );
+        assert!(cache.entry.is_none(), "failed opens must never be cached");
+        std::fs::write(
+            &path,
+            format!("{}\n", assistant_row("claude-opus-8", after)),
+        )
+        .unwrap();
+        assert_eq!(
+            read(&mut cache, Some(new_start), new_start)
+                .model_id
+                .as_deref(),
+            Some("claude-opus-8")
+        );
+        assert_eq!(cache.reads, 7, "recovered file is read anew");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_tail_does_not_freeze_live_repository_facts() {
+        let root = cache_test_dir("live-head");
+        let cwd = root.join("work");
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+        std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        let claude = root.join("claude");
+        std::fs::create_dir_all(claude.join("sessions")).unwrap();
+        let project = claude.join("projects").join(project_slug(&cwd));
+        std::fs::create_dir_all(&project).unwrap();
+        let started = crate::harness::upgrade_models::parse_utc("2026-09-27T12:00:00Z").unwrap();
+        std::fs::write(
+            claude.join("sessions/4242.json"),
+            format!(
+                r#"{{"pid":4242,"sessionId":"cache-demo","cwd":"{}","procStart":"{}"}}"#,
+                cwd.display(),
+                lstart_utc(started)
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("cache-demo.jsonl"),
+            format!(
+                "{}\n",
+                assistant_row("claude-opus-5", "2026-09-27T13:00:00Z")
+            ),
+        )
+        .unwrap();
+        let mut cache = TailCache::default();
+        let first = facts_for_pid_cached(&claude, 4242, Some(started), &mut cache).unwrap();
+        assert_eq!(first.model.as_deref(), Some("Opus 5"));
+        assert_eq!(first.branch.as_deref(), Some("main"));
+        assert_eq!(cache.reads, 1);
+
+        std::fs::write(cwd.join(".git/HEAD"), "ref: refs/heads/topic\n").unwrap();
+        let second = facts_for_pid_cached(&claude, 4242, Some(started), &mut cache).unwrap();
+        assert_eq!(second.model, first.model);
+        assert_eq!(second.branch.as_deref(), Some("topic"));
+        assert_eq!(
+            cache.reads, 1,
+            "git still re-reads while transcript does not"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn model_ids_read_as_the_vendor_spells_them() {
@@ -910,6 +1435,12 @@ mod tests {
         assert_eq!(model(None), None, "the registry's start floors it");
         entry(None);
         assert_eq!(model(None), None, "no start known: no model");
+        // The path is the registry's `cwd`, whatever the transcript says.
+        assert_eq!(
+            facts_for_pid(&claude, 4242, None).and_then(|f| f.path),
+            home_path(&cwd, aterm_types::dirs::home_dir().as_deref())
+        );
+        assert!(home_path(&cwd, None).is_some());
         // Negative control: a floor older than the answer reads it.
         entry(Some(start - 3 * 86_400));
         assert_eq!(model(None).as_deref(), Some("Opus 5"));
@@ -959,18 +1490,48 @@ mod tests {
         std::fs::create_dir_all(main.join(".git")).unwrap();
         std::fs::write(main.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
         std::fs::create_dir_all(main.join("crates/deep")).unwrap();
-        assert_eq!(
-            git_head(&main.join("crates/deep")),
-            Some(("repo".to_owned(), "main".to_owned()))
-        );
+        assert_eq!(git_head(&main.join("crates/deep")), Some("main".to_owned()));
         let wt_git = root.join("gitdirs/wt");
         std::fs::create_dir_all(&wt_git).unwrap();
         std::fs::write(wt_git.join("HEAD"), "ref: refs/heads/feature\n").unwrap();
         let wt = root.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
         std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
-        assert_eq!(git_head(&wt), Some(("wt".to_owned(), "feature".to_owned())));
+        assert_eq!(git_head(&wt), Some("feature".to_owned()));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A kernel REFUSAL is its own answer, not "no repository": `EPERM` (what a
+    /// macOS folder privacy consent returns) classifies as denied, while an
+    /// ordinary `EACCES` permission bit and a missing file do not. Measured on
+    /// the real primitive: a directory stripped of its search bit gives EACCES,
+    /// which must stay `Absent` — only a consent refusal raises the host's
+    /// consent attention.
+    #[cfg(unix)]
+    #[test]
+    fn only_an_eperm_refusal_reads_as_denied() {
+        assert!(is_eperm(&std::io::Error::from_raw_os_error(libc::EPERM)));
+        assert!(!is_eperm(&std::io::Error::from_raw_os_error(libc::EACCES)));
+        assert!(!is_eperm(&std::io::Error::from_raw_os_error(libc::ENOENT)));
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("aterm-footer-eacces-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let repo = root.join("repo");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        assert_eq!(read_git_head(&repo), GitHeadRead::Found("main".into()));
+        std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o000))
+            .unwrap();
+        let locked = read_git_head(&repo);
+        std::fs::set_permissions(repo.join(".git"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            locked,
+            GitHeadRead::Absent,
+            "an EACCES permission bit is not a privacy-consent refusal"
+        );
     }
 
     #[test]
@@ -978,9 +1539,9 @@ mod tests {
         let full = FooterFacts {
             model: Some("Opus 5.5".into()),
             effort: Some("xhigh".into()),
-            repo: Some("aterm".into()),
+            path: Some("~/aterm".into()),
             branch: Some("main".into()),
-            thinking: None,
+            repo_read_denied: None,
             version: None,
         };
         assert_eq!(
@@ -991,8 +1552,8 @@ mod tests {
                     text: "Opus 5.5 xhigh".into()
                 },
                 Segment {
-                    mark: REPO_MARK,
-                    text: "aterm".into()
+                    mark: PATH_MARK,
+                    text: "~/aterm".into()
                 },
                 Segment {
                     mark: BRANCH_MARK,
@@ -1001,11 +1562,46 @@ mod tests {
             ]
         );
         let fresh = FooterFacts {
-            repo: Some("aterm".into()),
+            path: Some("~/aterm".into()),
             branch: Some("main".into()),
             ..FooterFacts::default()
         };
         assert_eq!(segments(&fresh).len(), 2, "no model until the first turn");
+    }
+
+    #[test]
+    fn a_long_path_keeps_its_last_directory() {
+        assert_eq!(
+            elide_path("~/src/github.com/aterm").as_deref(),
+            Some("\u{2026}/aterm")
+        );
+        assert_eq!(elide_path("/opt/work/").as_deref(), Some("\u{2026}/work"));
+        assert_eq!(elide_path("~/aterm"), None, "no shorter");
+        assert_eq!(elide_path("~"), None);
+        assert_eq!(elide_path("/"), None);
+    }
+
+    #[test]
+    fn the_path_shows_home_as_a_tilde() {
+        let home = Path::new("/Users//ana");
+        let path = |cwd: &str| home_path(Path::new(cwd), Some(home));
+        assert_eq!(path("/Users//ana/aterm").as_deref(), Some("~/aterm"));
+        assert_eq!(path("/Users//ana/src/aterm").as_deref(), Some("~/src/aterm"));
+        assert_eq!(path("/Users//ana").as_deref(), Some("~"));
+        assert_eq!(path("/Users//anabel/x").as_deref(), Some("/Users//anabel/x"));
+        assert_eq!(path("/opt/work").as_deref(), Some("/opt/work"));
+        assert_eq!(
+            home_path(Path::new("/w"), None).as_deref(),
+            Some("/w"),
+            "no home: the path whole"
+        );
+        assert_eq!(
+            home_path(Path::new("/opt/work"), Some(Path::new("/"))).as_deref(),
+            Some("/opt/work"),
+            "a home of / abbreviates nothing"
+        );
+        assert_eq!(path("/Users//ana/a\nb"), None);
+        assert_eq!(path("/Users//ana/a\u{1b}[2J"), None);
     }
 
     /// The rows are verbatim from the phase fixtures and the 2.1.282 probe.
@@ -1220,5 +1816,72 @@ mod tests {
             Some(4),
             "a statusLine row may sit between"
         );
+    }
+
+    /// The Bash tool's directory is the newest main-thread row's `cwd`: a
+    /// subagent's row and a row with no directory are passed over, and a
+    /// relative value is no directory.
+    #[test]
+    fn the_last_cwd_is_the_newest_main_thread_rows() {
+        let body = [
+            r#"{"type":"user","cwd":"/w"}"#,
+            r#"{"type":"assistant","cwd":"/w/nested"}"#,
+            r#"{"type":"assistant","cwd":"/w/agent","isSidechain":true}"#,
+            r#"{"type":"summary","summary":"no directory here"}"#,
+            r#"{"type":"user","cwd":"relative"}"#,
+        ]
+        .join("\n");
+        assert_eq!(last_cwd(body.as_bytes()), Some(PathBuf::from("/w/nested")));
+        assert_eq!(last_cwd(br#"{"type":"user"}"#), None);
+        assert_eq!(last_cwd(b""), None);
+    }
+
+    /// [`shell_cwds`] reads each LIVE session launched in the directory the
+    /// box's session reports, and only those: a session launched elsewhere,
+    /// a dead pid's leftover file and a transcript still in the launch
+    /// directory add nothing.
+    #[test]
+    fn shell_cwds_reads_the_live_sessions_launched_in_the_directory() {
+        let root = std::env::temp_dir().join(format!("aterm-footer-shell-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let claude = root.join("claude");
+        let launch = root.join("w");
+        std::fs::create_dir_all(claude.join("sessions")).expect("sessions");
+        let session = |pid: u32, id: &str, cwd: &Path, last: &Path| {
+            std::fs::write(
+                claude.join("sessions").join(format!("{pid}.json")),
+                format!(
+                    r#"{{"pid":{pid},"sessionId":"{id}","cwd":"{}"}}"#,
+                    cwd.display()
+                ),
+            )
+            .expect("session file");
+            let project = claude.join("projects").join(project_slug(cwd));
+            std::fs::create_dir_all(&project).expect("project dir");
+            std::fs::write(
+                project.join(format!("{id}.jsonl")),
+                format!(
+                    "{}\n{}\n",
+                    format_args!(r#"{{"type":"user","cwd":"{}"}}"#, cwd.display()),
+                    format_args!(r#"{{"type":"assistant","cwd":"{}"}}"#, last.display()),
+                ),
+            )
+            .expect("transcript");
+        };
+        let me = std::process::id();
+        // Nothing registered yet: nothing learned.
+        assert!(shell_cwds(&claude, &launch).is_empty());
+        // This process stands in for a live Claude Code whose Bash tool moved.
+        session(me, "a-live", &launch, &launch.join("nested"));
+        assert_eq!(shell_cwds(&claude, &launch), [launch.join("nested")]);
+        // Another launch directory is another session's business.
+        assert!(shell_cwds(&claude, &root.join("elsewhere")).is_empty());
+        // NEGATIVE CONTROL: a pid no process holds is a leftover file.
+        session(999_999_990, "b-dead", &launch, &root.join("dead"));
+        assert_eq!(shell_cwds(&claude, &launch), [launch.join("nested")]);
+        // A Bash tool still in the launch directory adds nothing new.
+        session(me, "a-live", &launch, &launch);
+        assert!(shell_cwds(&claude, &launch).is_empty());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

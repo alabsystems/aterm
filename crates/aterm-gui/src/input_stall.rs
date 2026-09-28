@@ -58,7 +58,8 @@ use crate::menu::MenuAction;
 /// A SUBSET of `fabric::is_pty_reaching`, the halt's set, minus the verbs that
 /// reach a PTY without writing input to it: `resize` (a winsize), `signal` (a
 /// signal), `close` (a hangup), `pane` and `tab` (which session the keyboard
-/// drives, or retiring one). Those are exactly the remedies for a program that
+/// drives, or retiring one) and `confirm` (the answer to a parked close, whose
+/// `yes` is a hangup too). Those are exactly the remedies for a program that
 /// is not reading, so they must stay answerable while this gate refuses.
 /// `invoke` writes input only for an action whose
 /// [`MenuAction::writes_pty_input`] says so (today, `Paste`).
@@ -155,9 +156,15 @@ pub(crate) fn refusal(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool)
     } else {
         Liveness::Unobserved
     };
+    // A refused `^C` (a raw program reads it as a byte) names the signal that
+    // interrupts instead (S4 review, 2026-09-24) — the legacy encoding, so a
+    // kitty-mode `ctrl+c` counts too.
+    let interrupt =
+        written_bytes(verb, rest, KeyboardMode::default()).as_deref() == Some(b"\x03".as_slice());
     Some(refusal_text(
         &backlog,
         input_backlog::classify(Some(&backlog), stopped, liveness),
+        interrupt,
     ))
 }
 
@@ -194,24 +201,26 @@ fn written_bytes(verb: &str, rest: &str, mode: KeyboardMode) -> Option<Vec<u8>> 
 }
 
 /// The refusal line for one reading and its word: `ERR busy input-unread
-/// bytes=<n> wait_ms=<ms> input=<word> (<why and what to do>)`. PURE, so its
-/// wording is pinned without a pty. `bytes=` is every unread input byte (the
-/// kernel's queue plus aterm's spill); `wait_ms=` is a lower bound on how long
-/// the oldest has waited.
-pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord) -> String {
+/// bytes=<n> wait_ms=<ms> input=<word> (<what is true> ; <the one thing to do>)`.
+/// PURE, so its wording is pinned without a pty. `bytes=` is every unread input
+/// byte (the kernel's queue plus aterm's spill); `wait_ms=` is a lower bound on
+/// how long the oldest has waited. ONE remedy: a stopped job is resumed; a
+/// refused `^C` (`interrupt`) names `signal int`; a published stall is
+/// restarted (the attention line's remedy — a program that lives through it
+/// earns [`restart_refusal_text`]'s `signal kill`); input not yet a stall is
+/// retried. `unread=ok` stays in `help key`.
+pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord, interrupt: bool) -> String {
     let wait_ms = b.wait.as_millis();
-    let why = if word == InputWord::Stopped {
-        "the program is stopped with input queued: resume it with signal cont, or lead \
-         send/key with unread=ok to queue anyway"
-            .to_string()
-    } else {
-        format!(
-            "the program has not read input queued {} ago: a key sent now is read after it, \
-             against a screen the program has not drawn — retry later, interrupt it with \
-             signal int, restart a frozen program with signal term (signal kill if it \
-             survives), or lead send/key with unread=ok to queue anyway",
-            crate::presence::fmt_dur(b.wait)
-        )
+    let queued = crate::presence::fmt_dur(b.wait);
+    let why = match word {
+        InputWord::Stopped => "the program is stopped; resume it: signal cont".to_string(),
+        _ if interrupt => {
+            format!("the program has not read input queued {queued} ago; interrupt it: signal int")
+        }
+        InputWord::Stalled => {
+            format!("the program has not read input queued {queued} ago; restart it: signal term")
+        }
+        _ => format!("the program has not read input queued {queued} ago; retry in a moment"),
     };
     format!(
         "ERR busy input-unread bytes={} wait_ms={wait_ms} input={} ({why})\n",
@@ -223,13 +232,11 @@ pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord) -> String {
 /// The refusal line while a stall is HELD through a restart ([`Restart`]):
 /// the same `ERR busy input-unread … input=stalled` shape, so every driver's
 /// back-off and the supervisor's hold read it as they read the other, with
-/// the reason the queue is empty and the remedy it has come to. PURE.
+/// the remedy it has come to — the attention line's own words. PURE.
 pub(crate) fn restart_refusal_text(b: &InputBacklog) -> String {
     format!(
-        "ERR busy input-unread bytes={} wait_ms={} input={} (the program has not ended since \
-         its restart signal and read none of the input aterm dropped before it: a key sent \
-         now queues into a program that is not reading — wait for it to end, end it with \
-         signal kill, or lead send/key with unread=ok to queue anyway)\n",
+        "ERR busy input-unread bytes={} wait_ms={} input={} (the program is still running \
+         after its restart signal; end it: signal kill)\n",
         b.unread(),
         b.wait.as_millis(),
         InputWord::Stalled.as_str()
@@ -1551,7 +1558,7 @@ pub(crate) mod tests {
 
     /// The gate's verb set is a SUBSET of the halt's (`fabric::is_pty_reaching`)
     /// over every verb the table ships, and what it leaves out is EXACTLY the
-    /// remedies — `resize signal close pane tab` — plus `invoke` of an action
+    /// remedies — `resize signal close pane tab confirm` — plus `invoke` of an action
     /// that writes no input. A verb added to the halt set later lands in one
     /// list or the other on purpose, or this fails.
     #[test]
@@ -1570,7 +1577,10 @@ pub(crate) mod tests {
             }
         }
         exempt.sort_unstable();
-        assert_eq!(exempt, ["close", "pane", "resize", "signal", "tab"]);
+        assert_eq!(
+            exempt,
+            ["close", "confirm", "pane", "resize", "signal", "tab"]
+        );
         // `invoke` is input-writing only for an action that writes input.
         assert!(is_input_writing("invoke", "Paste"));
         assert!(is_input_writing("invoke", "Paste extra"));
@@ -1613,7 +1623,7 @@ pub(crate) mod tests {
     #[test]
     fn refusal_text_is_a_busy_refusal_naming_the_facts_and_the_remedy() {
         let b = backlog(1, TICK, false);
-        let line = refusal_text(&b, InputWord::Pending);
+        let line = refusal_text(&b, InputWord::Pending, false);
         assert!(line.starts_with("ERR busy input-unread "), "{line}");
         // `CtlReply::is_err("busy")` is `err_text().starts_with("ERR busy")`.
         assert!(line.starts_with("ERR busy"));
@@ -1626,28 +1636,29 @@ pub(crate) mod tests {
             "{line}"
         );
         assert!(line.contains("queued 1s ago"), "{line}");
-        assert!(
-            line.contains("signal term (signal kill if it survives)"),
-            "a program can live through signal term (third round): {line}"
-        );
-        assert!(
-            line.contains("interrupt it with signal int"),
-            "a raw program's ^C is a byte the gate refuses; the signal is not: {line}"
-        );
-        assert!(line.contains("unread=ok"), "{line}");
+        // Not yet a stall: one remedy, and it is waiting.
+        assert!(line.contains("; retry in a moment)"), "{line}");
+        assert!(!line.contains("signal"), "{line}");
+        // A refused `^C`: a raw program's ^C is a byte the gate refuses; the
+        // signal is not.
+        let line = refusal_text(&b, InputWord::Pending, true);
+        assert!(line.ends_with("; interrupt it: signal int)\n"), "{line}");
         // The spill counts toward bytes=.
         let spilled = InputBacklog {
             spilled: Some(5),
             ..backlog(2, Duration::from_secs(700), false)
         };
-        let line = refusal_text(&spilled, InputWord::Stalled);
+        let line = refusal_text(&spilled, InputWord::Stalled, false);
         assert!(
             line.starts_with("ERR busy input-unread bytes=7 wait_ms=700000 input=stalled ("),
             "{line}"
         );
         assert!(line.contains("queued 11m40s ago"), "{line}");
+        // A published stall: the attention line's remedy (a program that lives
+        // through it earns `signal kill`, below).
+        assert!(line.ends_with("; restart it: signal term)\n"), "{line}");
         // Stopped: the remedy is `signal cont`, not a restart.
-        let line = refusal_text(&b, InputWord::Stopped);
+        let line = refusal_text(&b, InputWord::Stopped, false);
         assert!(
             line.contains("input=stopped (the program is stopped"),
             "{line}"
@@ -1656,7 +1667,7 @@ pub(crate) mod tests {
         assert!(!line.contains("signal term"), "{line}");
         // No wire word the gate prints is `frozen`: that is `path=frozen`'s.
         for word in [InputWord::Pending, InputWord::Stalled, InputWord::Stopped] {
-            assert!(!refusal_text(&b, word).contains("input=frozen"));
+            assert!(!refusal_text(&b, word, false).contains("input=frozen"));
         }
         // A stall held through a restart ([`Restart`]): the same busy shape
         // and word, with nothing unread, the reason and `signal kill`.
@@ -1670,11 +1681,10 @@ pub(crate) mod tests {
             "{line}"
         );
         assert!(
-            line.contains("has not ended since its restart signal"),
+            line.contains("still running after its restart signal"),
             "{line}"
         );
-        assert!(line.contains("end it with signal kill"), "{line}");
-        assert!(line.contains("unread=ok"), "{line}");
+        assert!(line.contains("end it: signal kill"), "{line}");
         assert!(!line.contains("signal term"), "{line}");
     }
 
@@ -3688,7 +3698,7 @@ pub(crate) mod tests {
             app.publish_input_stall(77, &ctx, Some(fact), t0);
             assert!(record(&app).contains(" agent=wall:unresponsive "));
 
-            let reply = crate::control::cmd_signal(master, "term", &sink);
+            let reply = crate::control::cmd_signal(master, "term", &sink, None);
             assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
             // Past PROBE_MIN_GAP of the entry probe, so the wake-driven probe runs.
             std::thread::sleep(Duration::from_millis(300));
@@ -3781,7 +3791,7 @@ pub(crate) mod tests {
 
             // `signal kill` ends it (nothing left to drop), the job is reaped
             // as its shell would, and the probe withdraws everything.
-            let reply = crate::control::cmd_signal(master, "kill", &sink);
+            let reply = crate::control::cmd_signal(master, "kill", &sink, None);
             assert_eq!(reply, format!("OK signalled pgrp {leader}\n"));
             let _ = job.0.wait();
             assert_eq!(
@@ -3894,7 +3904,7 @@ pub(crate) mod tests {
             // `signal term`: the Enter is dropped, the job lives on, held. The
             // probes run on instants past t0 by less than a spin window, so
             // they keep the entry's verdict whatever the machine's load.
-            let reply = crate::control::cmd_signal(master, "term", &sink);
+            let reply = crate::control::cmd_signal(master, "term", &sink, None);
             assert_eq!(reply, format!("OK signalled pgrp {leader} discarded=1\n"));
             let t1 = t0 + Duration::from_millis(300);
             assert!(app.observe_input_stalls(t1, Some(78)).is_empty(), "held");

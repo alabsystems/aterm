@@ -77,6 +77,21 @@
 //!   with a small `max_redraw_total_ms` is a park outside the redraw, named by
 //!   its owner.
 //! - `backend_gpu` — `true` when the live renderer is the GPU (Metal) path.
+//! - `scrollback_truncated_lines` (summary only; read from the active terminal
+//!   under `try_lock`, `busy`/`null` like `rows`/`cols`) — history lines the
+//!   engine has LOST since the session began that the configured line limit
+//!   would have kept: output that arrived faster than the scrollback
+//!   compression worker could retain it once the staged backlog filled the
+//!   scrollback's memory headroom (`Grid::flood_overflow`), plus store
+//!   evictions under memory pressure. Lines past the line limit are ordinary
+//!   eviction and never count; each cut adds the most lines it was missing
+//!   inside the limit at once. Not a latency figure and not zeroed by
+//!   `metrics reset` — it is the engine's own monotone counter, published here
+//!   because the 2026-09-22 audit found it reached no surface at all: 120k
+//!   lines printed into a 100k scrollback kept 28.5k, and nothing said the
+//!   other 91k were gone. The same drops leave one dim `— aterm dropped N
+//!   lines here …` row in the history at each cut, naming the lines missing
+//!   there now; `lines` reports `truncated=<n>` when nonzero.
 //!
 //! A driver detects lag without OS profilers: `metrics reset`, drive the workload,
 //! then `metrics` — if `slow_frames > 0`, or `max_frame_render_ms` is large, or
@@ -96,7 +111,13 @@
 //! last-writer label over a min-fold of ~35 candidates points at whichever one
 //! happened to win; that is how the 2026-08 event-loop spin was reported against
 //! `title_summary` for its first hour. `DEADLINE_ARMS_BY_OWNER` books arms — and
-//! past arms — per owner instead.
+//! past arms — per owner instead, and `DEADLINE_FIRES_BY_OWNER` the timers that
+//! actually woke the loop (`deadline_fires_by_owner`: an arm is a fold win, not a
+//! wake). `wakes_by_variant` counts the delivered proxy events by `Wake` variant,
+//! `metrics percentiles` carries each main-loop root's turn distribution
+//! (`turns_by_root`), and `gpu_scissor_taken` / `gpu_full_repaints` /
+//! `gpu_scroll_rescues` publish the renderer's repaint scope (2026-09-25,
+//! responsiveness audit items 2, 3 and 5).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -295,6 +316,22 @@ static FRAME_REFILLS_SKIPPED: AtomicU64 = AtomicU64::new(0);
 // the 2026-09-24 audit, with no way to ask a RUNNING aterm which was right.
 static PET_WORLD_OBSERVATIONS: AtomicU64 = AtomicU64::new(0);
 static PET_WORLD_CELLS: AtomicU64 = AtomicU64::new(0);
+// THE COMPOSE-SIDE PRIM COUNTERS (docs/RELEASE-PROOF-DISCIPLINE.md, "still
+// owed" item 6): what the cursor-effect tick handed the frame, read off a live
+// instance without a pixel capture. Every tick — the live single-pane and
+// composed presents and the explicit capture — goes through
+// `App::tick_cursor_fx`, so these see all three. The three `_last` readings
+// are momentary, like every `last_*`: the additive `glow_add` quads (every
+// style's halo, the momentum glow on ANY style, the rod, the bodies), the
+// `glow_under` quads, and the comet's trail cells. `fx_under_frames` (reset
+// with the window stats) counts ticks whose `glow_under` stream was non-empty:
+// that stream is the rainbow ribbon body's own (with its jump zooms, and
+// water's wake), so it reads 0 under the `off` style, whose momentum glow
+// still lights `glow_add` — the witness a count of ANY quad could not be.
+static FX_GLOW_QUADS_LAST: AtomicU64 = AtomicU64::new(0);
+static FX_UNDER_QUADS_LAST: AtomicU64 = AtomicU64::new(0);
+static FX_TRAIL_CELLS_LAST: AtomicU64 = AtomicU64::new(0);
+static FX_UNDER_FRAMES: AtomicU64 = AtomicU64::new(0);
 // …and WHICH continuity clause refused, per clause. `frame_refills_full` says
 // the chain broke; this says what broke it, which is the difference between an
 // actionable number and a worrying one — a host mutator that forgot its
@@ -398,11 +435,42 @@ static SLOW_EPISODE_RESET: AtomicBool = AtomicBool::new(false);
 // fold with, `past_arms` the subset already in the past when it was armed. The
 // cost is one extra relaxed `fetch_add` (two on a past arm) per event-loop
 // turn, on a line only this thread writes.
-const DEADLINE_OWNER_SLOTS: usize = 43;
+const DEADLINE_OWNER_SLOTS: usize = 44;
 static DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
 static PAST_DEADLINE_ARMS_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
     [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
+// …AND THE FIRES, COUNTED APART (responsiveness audit item 2). An arm is a fold
+// WIN per park; a fire is a timer that actually woke the loop for that owner
+// (`EventWakeKind::Timer`). "cursor_effect 59/s" was read as 59 wakes a second
+// by three agents during that audit; it was 59 arms, most interrupted by output.
+static DEADLINE_FIRES_BY_OWNER: [AtomicU64; DEADLINE_OWNER_SLOTS] =
+    [const { AtomicU64::new(0) }; DEADLINE_OWNER_SLOTS];
+
+// THE USER-EVENT WAKES BY `Wake` VARIANT (responsiveness audit item 2).
+// `event_wakes` counts every loop iteration; nothing said which proxy event
+// drove them. One entry per variant seen (the enum is ~150 variants; an idle
+// instance delivers a handful), its name read once from its `Debug` spelling.
+static WAKES_BY_VARIANT: std::sync::Mutex<
+    Vec<(std::mem::Discriminant<crate::Wake>, &'static str, u64)>,
+> = std::sync::Mutex::new(Vec::new());
+
+// THE GPU REPAINT SCOPE (responsiveness audit item 5): the renderer's own
+// cumulative counters, stored after every GPU present by the main thread, and
+// the values they had at the last `metrics reset`, so the published figures are
+// window stats like the rest of the line.
+static GPU_SCISSOR_TAKEN: AtomicU64 = AtomicU64::new(0);
+static GPU_FULL_REPAINTS: AtomicU64 = AtomicU64::new(0);
+static GPU_SCROLL_RESCUES: AtomicU64 = AtomicU64::new(0);
+static GPU_SCISSOR_TAKEN_BASE: AtomicU64 = AtomicU64::new(0);
+static GPU_FULL_REPAINTS_BASE: AtomicU64 = AtomicU64::new(0);
+static GPU_SCROLL_RESCUES_BASE: AtomicU64 = AtomicU64::new(0);
+
+// THE MAIN-LOOP TURN DISTRIBUTION PER ROOT (responsiveness audit item 3): the
+// watchdog's census keeps last/max/count only, so a p95 key-queue tail could not
+// be attributed to a main-thread root. Indexed by `watchdog::Breadcrumb as u8`.
+pub(crate) const TURN_ROOT_SLOTS: usize = 8;
+static H_TURN_BY_ROOT: [Histogram; TURN_ROOT_SLOTS] = [const { Histogram::new() }; TURN_ROOT_SLOTS];
 
 // STALE-ARM HEAL (busy-rearm audit, item 3): the SAME owner arming a deadline
 // more than [`STALE_ARM_HEAL_FLOOR`] in the past on CONSECUTIVE turns is a
@@ -712,6 +780,11 @@ pub(crate) enum DeadlineOwner {
     /// main's `SystemStrain` (40) and `SessionWaits` (41) reached main first.
     /// The table is an APPEND-ONLY WIRE CONTRACT, so this one moves.
     InputWatch = 42,
+    /// THE CRASH JOURNAL (`crate::crash_journal::Lane::next_wake`, PTY keeper
+    /// P1): the trailing edge of a capture a change inside the write interval
+    /// owes, and the end of a reopened layout's probation, when the image still
+    /// carries its mark. An idle window owes neither.
+    CrashJournal = 43,
 }
 
 impl DeadlineOwner {
@@ -759,6 +832,7 @@ impl DeadlineOwner {
             40 => Self::SystemStrain,
             41 => Self::SessionWaits,
             42 => Self::InputWatch,
+            43 => Self::CrashJournal,
             _ => Self::None,
         }
     }
@@ -809,6 +883,7 @@ impl DeadlineOwner {
             Self::SystemStrain => "system_strain",
             Self::SessionWaits => "session_waits",
             Self::InputWatch => "input_watch",
+            Self::CrashJournal => "crash_journal",
         }
     }
 }
@@ -1630,12 +1705,15 @@ static STARTUP_PRESENT: OnceLock<StartupPresentSample> = OnceLock::new();
 // (FASTER_THAN_GHOSTTY_PLAN.md §4/LAT-3). Three log-linear histograms record
 // every sample the scalars already see — same funnel, no new stamps, so the
 // honesty bounds documented on the scalars apply to the distributions too.
-// KNOWN LIMIT: each window's `PendingInputStamp` (like the session-routed
-// `INPUT_STAMP_NS` CAS) keeps only the OLDEST edge of a coalesced input burst:
-// a group's sample is its worst edge, but the keystrokes coalesced into it are
-// absent (coordinated omission is NOT corrected), so under a stall p99 can read
-// LOW. The per-edge ring that would correct it is WINDOWS_PARAGON_DESIGN.md
-// item 2.5; nothing else schedules it.
+// COORDINATED OMISSION: each window's `PendingInputStamp` is a bounded EDGE RING
+// (`INPUT_EDGE_RING` keystrokes), and a content present drains EVERY edge into
+// the input histogram, so the keys typed during a stall are each a sample
+// rather than hidden behind the burst's oldest (docs/WINDOWS_PARAGON_DESIGN.md
+// item 2.5, landed 2026-09-25). A burst past the ring's capacity keeps its
+// OLDEST edges and counts the rest in `input_edges_dropped` (published beside
+// the percentiles), so the loss is visible. The session-routed `INPUT_STAMP_NS`
+// CAS — input that names a session but no window — remains the one keep-oldest
+// lane, since which window presents it is unknown at the stamp.
 
 /// 8 linear sub-buckets below 2^16 ns (8.2 µs grain), then 8 per octave up
 /// through 2^36 ns (~69 s): 168 buckets ≈ ±6% relative error, 1.3 KiB each.
@@ -1927,9 +2005,9 @@ pub(crate) fn acquire_wait_distribution() -> &'static Histogram {
 }
 
 /// The UI-thread sites that BLOCK on a session's terminal mutex on the hot
-/// paths — the redraw's LOCK A and LOCK B fallback and the key press's
+/// paths — the single-pane redraw's one hold per frame and the key press's
 /// consolidated scope. The seam's own acquisition is gone (it reads the
-/// lock-free `ModeMirror`), so these three are the whole set.
+/// lock-free `ModeMirror`), so these two are the whole set.
 ///
 /// Each acquisition books its wait here so the reader's slice-boundary handoff
 /// (`yield_to_ui_waiter`) is MEASURABLE: the `term_wait_*` percentiles under
@@ -1938,26 +2016,23 @@ pub(crate) fn acquire_wait_distribution() -> &'static Histogram {
 /// at hundreds of microseconds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TermWaitSite {
-    /// `redraw_window`'s first, unconditional acquisition.
-    RedrawA = 0,
-    /// `redraw_window`'s second acquisition, on its blocking fallback arm.
-    RedrawB = 1,
+    /// The single-pane `redraw_window`'s ONE terminal hold per frame.
+    Redraw = 0,
     /// The key press's one consolidated scope in `input_to_session`.
-    Press = 2,
+    Press = 1,
 }
 
 impl TermWaitSite {
     /// Number of sites — the histogram array length.
-    pub(crate) const COUNT: usize = 3;
+    pub(crate) const COUNT: usize = 2;
     /// Every site, in report order.
-    pub const ALL: [Self; Self::COUNT] = [Self::RedrawA, Self::RedrawB, Self::Press];
+    pub const ALL: [Self; Self::COUNT] = [Self::Redraw, Self::Press];
 
     /// The `metrics` field stem for this site.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
-            Self::RedrawA => "redraw_a",
-            Self::RedrawB => "redraw_b",
+            Self::Redraw => "redraw",
             Self::Press => "press",
         }
     }
@@ -2199,15 +2274,21 @@ pub(crate) fn record_present(
         // Only the OUTPUT slice above measures an interval nobody asked for.
         let now = now_ns();
         let reset_at = INPUT_RESET_AT_NS.load(Ordering::Relaxed);
-        if let Some((d, hardware)) =
-            window_input.and_then(|pending| pending.take_attributed(now, reset_at))
+        let slices =
+            window_input.map_or_else(Vec::new, |pending| pending.drain_attributed(now, reset_at));
+        // EVERY edge is a sample (coordinated omission corrected); the strain
+        // engine keeps its one sample per present: the OLDEST edge's, which is
+        // the longest wait. The strain sample IS taint-gated, unlike the
+        // metric: an occluded or captured window's echo describes the episode,
+        // not the machine.
+        if let Some(&(d, hardware)) = slices.first()
+            && hardware
+            && !present_latency_tainted()
         {
+            hardware_slice = Some(d);
+        }
+        for (d, _) in slices {
             book_input_present(d);
-            // The strain sample IS taint-gated, unlike the metric: an occluded
-            // or captured window's echo describes the episode, not the machine.
-            if hardware && !present_latency_tainted() {
-                hardware_slice = Some(d);
-            }
         }
         // The session-routed stamp (no window known at arm time): any content
         // present closes it, as before.
@@ -2555,6 +2636,165 @@ fn note_present_glass(report: aterm_gpu::present_glass::GlassReport) {
     }
 }
 
+// THE INPUT LEGS the typing audit named as unmeasured
+// (docs/AUDIT-typing-to-pixels-2026-08-26.md, P1 "measure the matching key and
+// matching frame"), plus the refusal count of the 2026-09-25 input contract.
+//
+// OUTPUT → REDRAW REQUEST. `present_*` runs from a PTY burst's leading edge to
+// the frame that presents it, and until this leg existed nothing said how much
+// of that was the wake reaching the event loop (the reader's post, the loop's
+// queue, whatever the UI thread was busy with) and how much was pacing,
+// compose and present after the loop had asked for the frame. This is the
+// first half: the burst's leading edge (the same `last_output_ns` stamp) →
+// the `Wake::Output` turn that admits the visible session's redraw — the
+// instant a frame is owed. Booked once per burst (a second wake before the
+// present finds the same stamp already booked) and only for a visible
+// session: a hidden one requests nothing. The 5 s honesty cap of
+// `present_latency` applies: a stamp older than that aged unwatched.
+static H_OUTPUT_REDRAW_REQUEST: Histogram = Histogram::new();
+static LAST_OUTPUT_REDRAW_REQUEST_NS: AtomicU64 = AtomicU64::new(0);
+static MAX_OUTPUT_REDRAW_REQUEST_NS: AtomicU64 = AtomicU64::new(0);
+/// The `present_latency` honesty cap, shared: see `present_latency_ns_with_plan`.
+pub(crate) const OUTPUT_REDRAW_REQUEST_CAP_NS: u64 = 5_000_000_000;
+// IME PREEDIT → COMMIT. How long a composition stays open, from the preedit
+// that starts it to the commit that ends it — the clock a CJK or dead-key
+// typist feels as "how long until my character is typed", which no key slice
+// can see (the key events inside a composition write nothing). A composition
+// that ends without a commit (cleared, focus lost, disabled) books no duration
+// and is counted as cancelled.
+static H_IME_COMPOSE: Histogram = Histogram::new();
+static IME_CANCELLED: AtomicU64 = AtomicU64::new(0);
+// Input REFUSED because its session's input queue was full: the program has
+// stopped reading and the key (or paste) was refused — said once per session,
+// `App::refuse_input` — instead of parking the event loop or queueing without
+// bound (decided 2026-09-25).
+static INPUT_REFUSED: AtomicU64 = AtomicU64::new(0);
+// Terminal query REPLIES dropped at submission (`spawn::ReplyLane::submit`):
+// the program floods queries it never reads the answers to, and the reply
+// lane's byte budget or count cap is full.
+static REPLY_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// Book one output → redraw-request span (see `H_OUTPUT_REDRAW_REQUEST`).
+/// Spans past the honesty cap are discarded, never booked.
+pub(crate) fn note_output_redraw_request(ns: u64) {
+    if ns > OUTPUT_REDRAW_REQUEST_CAP_NS {
+        return;
+    }
+    H_OUTPUT_REDRAW_REQUEST.record(ns);
+    LAST_OUTPUT_REDRAW_REQUEST_NS.store(ns, Ordering::Relaxed);
+    MAX_OUTPUT_REDRAW_REQUEST_NS.fetch_max(ns, Ordering::Relaxed);
+}
+
+/// Book one committed IME composition: preedit start → commit, in ns.
+pub(crate) fn note_ime_compose(ns: u64) {
+    H_IME_COMPOSE.record(ns);
+}
+
+/// A composition ended without a commit.
+pub(crate) fn note_ime_cancelled() {
+    IME_CANCELLED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Input was refused because its session's input queue is full: a key or
+/// paste (said once per session, `App::refuse_input`), or a mouse, wheel,
+/// focus or colour-scheme report (silently).
+pub(crate) fn note_input_refused() {
+    INPUT_REFUSED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A terminal query reply was dropped because its session's reply lane is
+/// full.
+pub(crate) fn note_reply_dropped() {
+    REPLY_DROPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Replies dropped by a full reply lane since the last reset.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn reply_dropped() -> u64 {
+    REPLY_DROPPED.load(Ordering::Relaxed)
+}
+
+/// Inputs refused by a full input queue since the last reset.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn input_refused() -> u64 {
+    INPUT_REFUSED.load(Ordering::Relaxed)
+}
+
+/// The output→redraw-request distribution (see `H_OUTPUT_REDRAW_REQUEST`).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn output_redraw_request_distribution() -> &'static Histogram {
+    &H_OUTPUT_REDRAW_REQUEST
+}
+
+/// The IME preedit→commit distribution (see `H_IME_COMPOSE`).
+#[cfg(test)]
+#[must_use]
+pub(crate) fn ime_compose_distribution() -> &'static Histogram {
+    &H_IME_COMPOSE
+}
+
+/// The input-leg fields of `metrics percentiles`, text form: the
+/// output→redraw-request leg with its last/max, the IME composition clock
+/// with its cancel count, and the refused-input count. One fragment, so the
+/// text and JSON forms cannot drift apart.
+#[must_use]
+pub(crate) fn input_legs_fields_text() -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let out = &H_OUTPUT_REDRAW_REQUEST;
+    let ime = &H_IME_COMPOSE;
+    let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        " n_out_req={} out_req_p50_ms={:.2} out_req_p95_ms={:.2} out_req_p99_ms={:.2} \
+         last_out_req_ms={:.2} max_out_req_ms={:.2} \
+         n_ime={} ime_p50_ms={:.2} ime_p95_ms={:.2} ime_p99_ms={:.2} ime_cancelled={} \
+         input_refused={} reply_dropped={}",
+        out.count(),
+        p(out, 0.50),
+        p(out, 0.95),
+        p(out, 0.99),
+        ms(LAST_OUTPUT_REDRAW_REQUEST_NS.load(Ordering::Relaxed)),
+        ms(MAX_OUTPUT_REDRAW_REQUEST_NS.load(Ordering::Relaxed)),
+        ime.count(),
+        p(ime, 0.50),
+        p(ime, 0.95),
+        p(ime, 0.99),
+        IME_CANCELLED.load(Ordering::Relaxed),
+        INPUT_REFUSED.load(Ordering::Relaxed),
+        REPLY_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
+/// Field-for-field JSON twin of [`input_legs_fields_text`].
+#[must_use]
+pub(crate) fn input_legs_fields_json() -> String {
+    let ms = |ns: u64| ns as f64 / 1e6;
+    let out = &H_OUTPUT_REDRAW_REQUEST;
+    let ime = &H_IME_COMPOSE;
+    let p = |h: &Histogram, q: f64| ms(h.percentile(q).unwrap_or(0));
+    format!(
+        ",\"n_out_req\":{},\"out_req_p50_ms\":{:.2},\"out_req_p95_ms\":{:.2},\
+         \"out_req_p99_ms\":{:.2},\"last_out_req_ms\":{:.2},\"max_out_req_ms\":{:.2},\
+         \"n_ime\":{},\"ime_p50_ms\":{:.2},\"ime_p95_ms\":{:.2},\"ime_p99_ms\":{:.2},\
+         \"ime_cancelled\":{},\"input_refused\":{},\"reply_dropped\":{}",
+        out.count(),
+        p(out, 0.50),
+        p(out, 0.95),
+        p(out, 0.99),
+        ms(LAST_OUTPUT_REDRAW_REQUEST_NS.load(Ordering::Relaxed)),
+        ms(MAX_OUTPUT_REDRAW_REQUEST_NS.load(Ordering::Relaxed)),
+        ime.count(),
+        p(ime, 0.50),
+        p(ime, 0.95),
+        p(ime, 0.99),
+        IME_CANCELLED.load(Ordering::Relaxed),
+        INPUT_REFUSED.load(Ordering::Relaxed),
+        REPLY_DROPPED.load(Ordering::Relaxed),
+    )
+}
+
 /// The present→glass fields of `metrics percentiles`, text form.
 #[must_use]
 pub(crate) fn present_glass_fields_text() -> String {
@@ -2669,74 +2909,132 @@ fn book_input_present(d: u64) {
     H_INPUT_PRESENT.record(d);
 }
 
-/// One window's pending input→present stamp: the arrival of the OLDEST
-/// unpresented keystroke routed to that window. Owned by the window's state (UI
-/// thread only, so plain integers), armed by [`note_window_input`] and closed by
-/// that window's own content present in [`record_present`] — never by another
-/// window's. See the PER-WINDOW ATTRIBUTION note on `INPUT_STAMP_NS`.
+/// How many unpresented keystrokes one window's [`PendingInputStamp`] holds.
+/// A fast typist's burst through a multi-second stall fits; past it the OLDEST
+/// edges are kept and the rest counted in `input_edges_dropped`.
+pub(crate) const INPUT_EDGE_RING: usize = 32;
+
+/// Keystrokes a full edge ring could not hold (see [`INPUT_EDGE_RING`]). Their
+/// slices are missing from the input histogram; this count says how many.
+static INPUT_EDGES_DROPPED: AtomicU64 = AtomicU64::new(0);
+
+/// One unpresented keystroke routed to a window.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct PendingInputStamp {
+struct InputEdge {
     /// The key's arrival (`now_ns` clock, possibly backdated by NSEvent queue
-    /// age); 0 = nothing pending.
+    /// age); never 0 for a held edge.
     arrival_ns: u64,
-    /// When the stamp was armed — compared against the last [`reset`], because a
+    /// When the edge was armed — compared against the last [`reset`], because a
     /// backdated arrival can precede a reset the key itself followed.
     armed_ns: u64,
-    /// The key that armed it came through the HARDWARE path (the winit
-    /// `KeyboardInput` arm — a physical key, or `ctl hwkey`'s real `NSEvent`),
-    /// never a control `send`/`feed`/`key`. Only such a slice is a sample for the
-    /// strain engine's FELT (design §10.14, ruling 206): a controller's key is
-    /// not a person waiting.
+    /// The key came through the HARDWARE path (the winit `KeyboardInput` arm — a
+    /// physical key, or `ctl hwkey`'s real `NSEvent`), never a control
+    /// `send`/`feed`/`key`. Only such a slice is a sample for the strain engine's
+    /// FELT (design §10.14, ruling 206): a controller's key is not a person
+    /// waiting.
     hardware: bool,
 }
 
+/// One window's pending input→present EDGES: every unpresented keystroke routed
+/// to that window, oldest first, up to [`INPUT_EDGE_RING`]. Owned by the
+/// window's state (UI thread only, so plain integers), armed by
+/// [`note_window_input`] and drained by that window's own content present in
+/// [`record_present`] — never by another window's. See the PER-WINDOW
+/// ATTRIBUTION note on `INPUT_STAMP_NS`, and COORDINATED OMISSION above the
+/// histograms for why every edge is a sample.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PendingInputStamp {
+    edges: [InputEdge; INPUT_EDGE_RING],
+    len: usize,
+}
+
 impl PendingInputStamp {
-    /// Keep-oldest arm: a burst does not shrink the measured slice.
+    /// Arm one edge (a controller key); `false` when the ring was full.
     #[cfg(test)]
-    fn arm(&mut self, arrival_ns: u64, armed_ns: u64) {
-        self.arm_from(arrival_ns, armed_ns, false);
+    fn arm(&mut self, arrival_ns: u64, armed_ns: u64) -> bool {
+        self.arm_from(arrival_ns, armed_ns, false)
     }
 
     /// [`Self::arm`], saying whether the key came through the hardware path.
-    /// Keep-oldest, and so is the flag: the slice measures the OLDEST key, and
-    /// that key's path is the one that says whether a person waited on it.
-    fn arm_from(&mut self, arrival_ns: u64, armed_ns: u64, hardware: bool) {
-        if self.arrival_ns == 0 {
-            self.arrival_ns = arrival_ns.max(1);
-            self.armed_ns = armed_ns;
-            self.hardware = hardware;
+    /// Appends. A full ring first lets go of the edges already past
+    /// `INPUT_SLICE_CAP_NS` (keys that never echoed: the drain would discard
+    /// them anyway, so they must not hold the slots a fresh key needs); a ring
+    /// still full keeps its oldest edges, counts this one in
+    /// `input_edges_dropped` and answers `false`.
+    fn arm_from(&mut self, arrival_ns: u64, armed_ns: u64, hardware: bool) -> bool {
+        if self.len == INPUT_EDGE_RING {
+            self.evict_aged(armed_ns);
         }
+        let Some(slot) = self.edges.get_mut(self.len) else {
+            INPUT_EDGES_DROPPED.fetch_add(1, Ordering::Relaxed);
+            return false;
+        };
+        *slot = InputEdge {
+            arrival_ns: arrival_ns.max(1),
+            armed_ns,
+            hardware,
+        };
+        self.len += 1;
+        true
+    }
+
+    /// Drop every edge whose slice would already exceed `INPUT_SLICE_CAP_NS` at
+    /// `now_ns`, keeping the rest in order.
+    fn evict_aged(&mut self, now_ns: u64) {
+        let mut kept = 0;
+        for index in 0..self.len {
+            let edge = self.edges[index];
+            if now_ns.saturating_sub(edge.arrival_ns) <= INPUT_SLICE_CAP_NS {
+                self.edges[kept] = edge;
+                kept += 1;
+            }
+        }
+        for edge in &mut self.edges[kept..self.len] {
+            *edge = InputEdge::default();
+        }
+        self.len = kept;
     }
 
     /// Whether a keystroke in this window is still waiting on a content present.
     #[cfg(test)]
     pub(crate) const fn is_pending(self) -> bool {
-        self.arrival_ns != 0
+        self.len != 0
     }
 
-    /// Whether the pending stamp was armed by a HARDWARE key.
+    /// Whether the OLDEST pending edge was armed by a HARDWARE key.
     #[cfg(test)]
     pub(crate) const fn armed_by_hardware(self) -> bool {
-        self.hardware
+        self.len != 0 && self.edges[0].hardware
     }
 
-    /// Consume the stamp at a content present of THIS window. `None` when nothing
-    /// was pending, when it was armed before the last reset (`reset_at_ns`), or
-    /// when it aged past `INPUT_SLICE_CAP_NS` (a keystroke that never echoed).
-    #[cfg(test)]
-    fn take_slice(&mut self, now_ns: u64, reset_at_ns: u64) -> Option<u64> {
-        self.take_attributed(now_ns, reset_at_ns).map(|(d, _)| d)
-    }
-
-    /// [`Self::take_slice`] with the arming key's path: `(slice, hardware)`.
-    fn take_attributed(&mut self, now_ns: u64, reset_at_ns: u64) -> Option<(u64, bool)> {
+    /// Drain every edge at a content present of THIS window, oldest first, as
+    /// `(slice, hardware)`. An edge armed before the last reset (`reset_at_ns`)
+    /// or aged past `INPUT_SLICE_CAP_NS` (a keystroke that never echoed) yields
+    /// nothing; the ring is empty afterwards either way.
+    fn drain_attributed(&mut self, now_ns: u64, reset_at_ns: u64) -> Vec<(u64, bool)> {
         let taken = std::mem::take(self);
-        if taken.arrival_ns == 0 || taken.armed_ns < reset_at_ns {
-            return None;
-        }
-        let d = now_ns.saturating_sub(taken.arrival_ns);
-        (d <= INPUT_SLICE_CAP_NS).then_some((d, taken.hardware))
+        taken.edges[..taken.len]
+            .iter()
+            .filter(|edge| edge.armed_ns >= reset_at_ns)
+            .map(|edge| (now_ns.saturating_sub(edge.arrival_ns), edge.hardware))
+            .filter(|&(d, _)| d <= INPUT_SLICE_CAP_NS)
+            .collect()
     }
+
+    /// The drained slices alone (tests).
+    #[cfg(test)]
+    fn drain_slices(&mut self, now_ns: u64, reset_at_ns: u64) -> Vec<u64> {
+        self.drain_attributed(now_ns, reset_at_ns)
+            .into_iter()
+            .map(|(d, _)| d)
+            .collect()
+    }
+}
+
+/// Keystrokes the edge rings could not hold (the `input_edges_dropped` field).
+#[must_use]
+pub(crate) fn input_edges_dropped() -> u64 {
+    INPUT_EDGES_DROPPED.load(Ordering::Relaxed)
 }
 
 /// The arrival a PTY-bound input stamps: the pending TRUE key arrival when one is
@@ -2760,7 +3058,8 @@ fn input_arrival_ns(now: u64) -> u64 {
 /// [`record_present`] for the strain engine.
 pub(crate) fn note_window_input(pending: &mut PendingInputStamp, hardware: bool) {
     let now = now_ns();
-    pending.arm_from(input_arrival_ns(now), now, hardware);
+    // A full ring counts the edge itself (`input_edges_dropped`).
+    let _ = pending.arm_from(input_arrival_ns(now), now, hardware);
     note_typing_hot();
 }
 
@@ -3178,6 +3477,18 @@ pub(crate) fn note_pet_world_observation(cells: usize) {
     PET_WORLD_CELLS.fetch_add(cells as u64, Ordering::Relaxed);
 }
 
+/// One cursor-effect tick's output: the `glow_add` quads, the `glow_under`
+/// quads and the trail cells it composed for the frame (see the `FX_*`
+/// statics). Only a non-empty `glow_under` stream books an under frame.
+pub(crate) fn note_fx_composed(glow_quads: usize, under_quads: usize, trail_cells: usize) {
+    FX_GLOW_QUADS_LAST.store(glow_quads as u64, Ordering::Relaxed);
+    FX_UNDER_QUADS_LAST.store(under_quads as u64, Ordering::Relaxed);
+    FX_TRAIL_CELLS_LAST.store(trail_cells as u64, Ordering::Relaxed);
+    if under_quads > 0 {
+        FX_UNDER_FRAMES.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// A synchronized-output hold intentionally retained the previous frame.
 pub(crate) fn note_redraw_sync_hold() {
     REDRAW_SYNC_HOLDS.fetch_add(1, Ordering::Relaxed);
@@ -3463,6 +3774,94 @@ pub(crate) fn past_arm_streak_heal_attribution() -> Vec<(&'static str, u64)> {
         .collect()
 }
 
+/// Per-owner timer FIRES — wakes a deadline actually caused — sparse, non-zero
+/// owners only; the twin of [`deadline_arm_attribution`], which counts arms.
+#[must_use]
+pub(crate) fn deadline_fire_attribution() -> Vec<(&'static str, u64)> {
+    (0..DEADLINE_OWNER_SLOTS)
+        .filter_map(|slot| {
+            let fires = DEADLINE_FIRES_BY_OWNER[slot].load(Ordering::Relaxed);
+            (fires != 0).then(|| (DeadlineOwner::from_raw(slot as u64).as_str(), fires))
+        })
+        .collect()
+}
+
+/// Count one delivered proxy event by its `Wake` variant. The variant's name is
+/// read ONCE from its `Debug` spelling (the leading identifier) and kept; every
+/// later delivery of the variant is a lookup by discriminant.
+pub(crate) fn note_user_wake(ev: &crate::Wake) {
+    let d = std::mem::discriminant(ev);
+    let mut seen = WAKES_BY_VARIANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(entry) = seen.iter_mut().find(|e| e.0 == d) {
+        entry.2 = entry.2.saturating_add(1);
+        return;
+    }
+    let spelled = format!("{ev:?}");
+    let name: String = spelled
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    // Bounded: one short string per variant, for the life of the process.
+    let name: &'static str = Box::leak(name.into_boxed_str());
+    seen.push((d, name, 1));
+}
+
+/// The delivered proxy events by `Wake` variant since the last reset, busiest
+/// first, zero entries omitted.
+#[must_use]
+pub(crate) fn user_wake_attribution() -> Vec<(&'static str, u64)> {
+    let mut out: Vec<(&'static str, u64)> = WAKES_BY_VARIANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .filter(|e| e.2 != 0)
+        .map(|e| (e.1, e.2))
+        .collect();
+    out.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    out
+}
+
+/// Store the GPU renderer's cumulative repaint-scope counters (main thread,
+/// after each GPU present).
+pub(crate) fn note_gpu_repaint_totals(scissor_taken: u64, full_repaints: u64, scroll_rescues: u64) {
+    GPU_SCISSOR_TAKEN.store(scissor_taken, Ordering::Relaxed);
+    GPU_FULL_REPAINTS.store(full_repaints, Ordering::Relaxed);
+    GPU_SCROLL_RESCUES.store(scroll_rescues, Ordering::Relaxed);
+}
+
+/// `(scissor_taken, full_repaints, scroll_rescues)` since the last reset: the
+/// presents that took the scissored dirty-row path, the full repaints, and the
+/// rigid scrolls the band blit rescued (a subset of the scissored ones). A
+/// renderer rebuilt since the reset counts from its own start.
+#[must_use]
+pub(crate) fn gpu_repaint_counts() -> (u64, u64, u64) {
+    let since = |total: &AtomicU64, base: &AtomicU64| {
+        total
+            .load(Ordering::Relaxed)
+            .saturating_sub(base.load(Ordering::Relaxed))
+    };
+    (
+        since(&GPU_SCISSOR_TAKEN, &GPU_SCISSOR_TAKEN_BASE),
+        since(&GPU_FULL_REPAINTS, &GPU_FULL_REPAINTS_BASE),
+        since(&GPU_SCROLL_RESCUES, &GPU_SCROLL_RESCUES_BASE),
+    )
+}
+
+/// Book one main-loop turn to its root's distribution (`watchdog`'s census).
+pub(crate) fn note_turn(root: u8, span_ns: u64) {
+    if let Some(h) = H_TURN_BY_ROOT.get(usize::from(root)) {
+        h.record(span_ns);
+    }
+}
+
+/// The turn distribution of root `root` (`watchdog::Breadcrumb as u8`).
+#[must_use]
+pub(crate) fn turn_distribution(root: u8) -> Option<&'static Histogram> {
+    H_TURN_BY_ROOT.get(usize::from(root))
+}
+
 /// Record why winit began this event-loop iteration and attribute a timer wake
 /// to the owner published by the preceding `about_to_wait` pass.
 pub(crate) fn note_event_wake(kind: EventWakeKind) {
@@ -3480,6 +3879,9 @@ pub(crate) fn note_event_wake(kind: EventWakeKind) {
     match kind {
         EventWakeKind::Timer => {
             TIMER_WAKES.fetch_add(1, Ordering::Relaxed);
+            if let Some(fires) = DEADLINE_FIRES_BY_OWNER.get(owner as usize) {
+                fires.fetch_add(1, Ordering::Relaxed);
+            }
             let due = LAST_DEADLINE_DUE_NS.load(Ordering::Relaxed);
             let at = now_ns();
             let late = if due == 0 { 0 } else { at.saturating_sub(due) };
@@ -3607,6 +4009,7 @@ pub(crate) fn reset() {
     SHED_TRANSITIONS.store(0, Ordering::Relaxed);
     MAX_INPUT_PRESENT_NS.store(0, Ordering::Relaxed);
     MAX_INPUT_PRESENT_AT_NS.store(0, Ordering::Relaxed);
+    INPUT_EDGES_DROPPED.store(0, Ordering::Relaxed);
     MAX_KEY_WRITE_NS.store(0, Ordering::Relaxed);
     WAKE_HEALS.store(0, Ordering::Relaxed);
     MAX_REDRAW_TOTAL_NS.store(0, Ordering::Relaxed);
@@ -3619,6 +4022,7 @@ pub(crate) fn reset() {
     FRAME_REFILLS_SKIPPED.store(0, Ordering::Relaxed);
     PET_WORLD_OBSERVATIONS.store(0, Ordering::Relaxed);
     PET_WORLD_CELLS.store(0, Ordering::Relaxed);
+    FX_UNDER_FRAMES.store(0, Ordering::Relaxed);
     for slot in &FRAME_REFILL_FULL_BY_CAUSE {
         slot.store(0, Ordering::Relaxed);
     }
@@ -3640,6 +4044,22 @@ pub(crate) fn reset() {
     LAST_PRESENT_DROP_REASON.store(0, Ordering::Relaxed);
     LAST_PRESENT_DROP_PARKED.store(false, Ordering::Relaxed);
     EVENT_WAKES.store(0, Ordering::Relaxed);
+    for entry in WAKES_BY_VARIANT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter_mut()
+    {
+        entry.2 = 0;
+    }
+    GPU_SCISSOR_TAKEN_BASE.store(GPU_SCISSOR_TAKEN.load(Ordering::Relaxed), Ordering::Relaxed);
+    GPU_FULL_REPAINTS_BASE.store(GPU_FULL_REPAINTS.load(Ordering::Relaxed), Ordering::Relaxed);
+    GPU_SCROLL_RESCUES_BASE.store(
+        GPU_SCROLL_RESCUES.load(Ordering::Relaxed),
+        Ordering::Relaxed,
+    );
+    for h in &H_TURN_BY_ROOT {
+        h.reset();
+    }
     TIMER_WAKES.store(0, Ordering::Relaxed);
     WAIT_CANCELLED_WAKES.store(0, Ordering::Relaxed);
     POLL_WAKES.store(0, Ordering::Relaxed);
@@ -3656,6 +4076,7 @@ pub(crate) fn reset() {
     for slot in 0..DEADLINE_OWNER_SLOTS {
         DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
         PAST_DEADLINE_ARMS_BY_OWNER[slot].store(0, Ordering::Relaxed);
+        DEADLINE_FIRES_BY_OWNER[slot].store(0, Ordering::Relaxed);
     }
     // The heal counter clears like `wake_heals`; the streak/episode latches are
     // live detection state, reset so a fresh window re-logs a still-live spin.
@@ -3734,6 +4155,13 @@ pub(crate) fn reset() {
     for slot in &PRESENT_GLASS_SKIPPED_BY {
         slot.store(0, Ordering::Relaxed);
     }
+    H_OUTPUT_REDRAW_REQUEST.reset();
+    LAST_OUTPUT_REDRAW_REQUEST_NS.store(0, Ordering::Relaxed);
+    MAX_OUTPUT_REDRAW_REQUEST_NS.store(0, Ordering::Relaxed);
+    H_IME_COMPOSE.reset();
+    IME_CANCELLED.store(0, Ordering::Relaxed);
+    INPUT_REFUSED.store(0, Ordering::Relaxed);
+    REPLY_DROPPED.store(0, Ordering::Relaxed);
     // The main-loop turn census is a window stat like every other `max_` on this
     // line: a driver that resets, drives a workload and reads must see THAT
     // workload's worst main-thread turn, not the launch storm's.
@@ -3800,6 +4228,13 @@ pub(crate) struct Snapshot {
     /// presented frames paid for it. See [`note_pet_world_observation`].
     pub pet_world_observations: u64,
     pub pet_world_cells: u64,
+    /// The compose-side prim counters: the last cursor-effect tick's
+    /// `glow_add` quads, `glow_under` quads and trail cells, and how many
+    /// ticks composed a `glow_under` (ribbon) stream. See [`note_fx_composed`].
+    pub fx_glow_quads_last: u64,
+    pub fx_under_quads_last: u64,
+    pub fx_trail_cells_last: u64,
+    pub fx_under_frames: u64,
     /// OFFSCREEN rasterizations (the `image` / `window` / `snapshot`
     /// introspection path): how many, the last one's cost, and the worst.
     ///
@@ -4078,6 +4513,10 @@ pub(crate) fn snapshot() -> Snapshot {
         frame_refills_skipped: FRAME_REFILLS_SKIPPED.load(Ordering::Relaxed),
         pet_world_observations: PET_WORLD_OBSERVATIONS.load(Ordering::Relaxed),
         pet_world_cells: PET_WORLD_CELLS.load(Ordering::Relaxed),
+        fx_glow_quads_last: FX_GLOW_QUADS_LAST.load(Ordering::Relaxed),
+        fx_under_quads_last: FX_UNDER_QUADS_LAST.load(Ordering::Relaxed),
+        fx_trail_cells_last: FX_TRAIL_CELLS_LAST.load(Ordering::Relaxed),
+        fx_under_frames: FX_UNDER_FRAMES.load(Ordering::Relaxed),
         offscreen_rasters: OFFSCREEN_RASTERS.load(Ordering::Relaxed),
         last_offscreen_raster_ns: LAST_OFFSCREEN_RASTER_NS.load(Ordering::Relaxed),
         max_offscreen_raster_ns: MAX_OFFSCREEN_RASTER_NS.load(Ordering::Relaxed),
@@ -5121,6 +5560,10 @@ mod histogram_tests {
         // wake it owes is never read as the status observer's.
         assert_eq!(DeadlineOwner::from_raw(42), DeadlineOwner::InputWatch);
         assert_eq!(DeadlineOwner::InputWatch.as_str(), "input_watch");
+        // Slot 43 is the crash journal's (PTY keeper P1): a capture's trailing
+        // edge is never charged to another owner.
+        assert_eq!(DeadlineOwner::from_raw(43), DeadlineOwner::CrashJournal);
+        assert_eq!(DeadlineOwner::CrashJournal.as_str(), "crash_journal");
         // Slot 22 is a tombstone (2026-09-22): the config banner's owner
         // retired with `config_notice.rs`, and the number stays taken under a
         // label no live owner wears, so an older wire reader never attributes
@@ -5393,7 +5836,7 @@ mod window_input_attribution_tests {
         typed_into.arm(1_000, 1_000);
 
         // Window B presents its own streaming output 3 ms later.
-        assert_eq!(streaming.take_slice(4_000_000, 0), None);
+        assert_eq!(streaming.drain_slices(4_000_000, 0), Vec::<u64>::new());
         assert!(
             typed_into.is_pending(),
             "window B's frame closed window A's keystroke: the slice would read LOW"
@@ -5401,29 +5844,81 @@ mod window_input_attribution_tests {
 
         // Window A's real echo, 90 ms after the key.
         let echo_at = 1_000 + 90_000_000;
-        assert_eq!(typed_into.take_slice(echo_at, 0), Some(90_000_000));
+        assert_eq!(typed_into.drain_slices(echo_at, 0), vec![90_000_000]);
         assert!(
             !typed_into.is_pending(),
             "a content present consumes the stamp"
         );
-        assert_eq!(typed_into.take_slice(echo_at + 1, 0), None, "consumed once");
+        assert!(
+            typed_into.drain_slices(echo_at + 1, 0).is_empty(),
+            "consumed once"
+        );
     }
 
+    /// COORDINATED OMISSION, corrected: N keystrokes typed before one (slow)
+    /// present are N samples, each its own wait — not one sample for the
+    /// oldest with the other N-1 hidden, which is what let a stall read LOW.
     #[test]
-    fn a_burst_keeps_its_oldest_arrival() {
+    fn a_burst_before_one_present_books_every_edge() {
         let mut pending = PendingInputStamp::default();
-        pending.arm(10, 10);
-        pending.arm(20, 20);
-        assert_eq!(pending.take_slice(110, 0), Some(100));
+        for arrival in [10, 20, 30, 40] {
+            pending.arm(arrival, arrival);
+        }
+        assert_eq!(pending.drain_slices(110, 0), vec![100, 90, 80, 70]);
+        assert!(!pending.is_pending());
+    }
+
+    /// A burst past the ring keeps its OLDEST edges (the longest waits) and
+    /// refuses the rest — each refusal counted in `input_edges_dropped`, so the
+    /// loss is published rather than silent.
+    #[test]
+    fn a_full_ring_keeps_the_oldest_edges_and_refuses_the_rest() {
+        let mut pending = PendingInputStamp::default();
+        let held: Vec<bool> = (1..=(super::INPUT_EDGE_RING as u64 + 3))
+            .map(|arrival| pending.arm(arrival, arrival))
+            .collect();
+        assert!(held[..super::INPUT_EDGE_RING].iter().all(|&h| h));
+        assert_eq!(&held[super::INPUT_EDGE_RING..], &[false, false, false]);
+        let slices = pending.drain_slices(1_000, 0);
+        assert_eq!(slices.len(), super::INPUT_EDGE_RING);
+        assert_eq!(slices.first(), Some(&999), "the oldest edge is kept");
+    }
+
+    /// A ring filled by keys that never echoed (a password prompt, an app
+    /// ignoring input) does not refuse the next fresh key: the edges already
+    /// past the discard cap — which the drain would throw away — give up their
+    /// slots first, so the key that actually produces the present is the one
+    /// counted, not the one in `input_edges_dropped`.
+    #[test]
+    fn a_full_ring_of_aged_out_edges_takes_a_fresh_key() {
+        let mut pending = PendingInputStamp::default();
+        for arrival in 1..=super::INPUT_EDGE_RING as u64 {
+            assert!(pending.arm(arrival, arrival));
+        }
+        let fresh = super::INPUT_EDGE_RING as u64 + INPUT_SLICE_CAP_NS + 1;
+        assert!(
+            pending.arm(fresh, fresh),
+            "a full ring of never-echoed keys refused the fresh one"
+        );
+        assert_eq!(
+            pending.drain_slices(fresh + 7, 0),
+            vec![7],
+            "only the fresh key books a slice"
+        );
+        // The control: a full ring of edges still inside the cap keeps them all
+        // and refuses the newcomer, exactly as before.
+        for arrival in 1..=super::INPUT_EDGE_RING as u64 {
+            assert!(pending.arm(arrival, arrival));
+        }
+        assert!(!pending.arm(1_000, 1_000), "live edges are never evicted");
     }
 
     #[test]
     fn a_stamp_armed_before_reset_is_discarded_not_booked() {
         let mut pending = PendingInputStamp::default();
         pending.arm(50, 60);
-        assert_eq!(
-            pending.take_slice(10_000, 61),
-            None,
+        assert!(
+            pending.drain_slices(10_000, 61).is_empty(),
             "armed before the reset"
         );
         assert!(!pending.is_pending(), "discarded, not left armed");
@@ -5431,24 +5926,26 @@ mod window_input_attribution_tests {
         // Armed at the reset instant or later counts, even if the backdated
         // arrival precedes it (the key sat in the OS queue across the reset).
         pending.arm(50, 61);
-        assert_eq!(pending.take_slice(10_050, 61), Some(10_000));
+        assert_eq!(pending.drain_slices(10_050, 61), vec![10_000]);
     }
 
-    /// Only a HARDWARE key's slice is a strain sample, and the flag is the
-    /// oldest key's: a controller key that armed first keeps the slice its own
-    /// even when a hardware key follows inside the same unpresented burst.
+    /// Every edge carries its OWN key's path: a controller key never becomes a
+    /// hardware sample by sharing a burst with a real key, and vice versa.
     #[test]
-    fn the_hardware_flag_is_the_arming_keys() {
+    fn each_edge_carries_its_own_keys_path() {
         let mut pending = PendingInputStamp::default();
         pending.arm_from(10, 10, true);
         pending.arm_from(20, 20, false);
-        assert_eq!(pending.take_attributed(110, 0), Some((100, true)));
+        assert_eq!(
+            pending.drain_attributed(110, 0),
+            vec![(100, true), (90, false)]
+        );
         pending.arm_from(10, 10, false);
         pending.arm_from(20, 20, true);
         assert_eq!(
-            pending.take_attributed(110, 0),
-            Some((100, false)),
-            "a ctl send/feed/key never counts, even ahead of a real key"
+            pending.drain_attributed(110, 0),
+            vec![(100, false), (90, true)],
+            "a ctl send/feed/key never counts as hardware, even ahead of a real key"
         );
     }
 
@@ -5456,11 +5953,15 @@ mod window_input_attribution_tests {
     fn a_keystroke_that_never_echoed_ages_out() {
         let mut pending = PendingInputStamp::default();
         pending.arm(1, 1);
-        assert_eq!(pending.take_slice(1 + INPUT_SLICE_CAP_NS + 1, 0), None);
+        assert!(
+            pending
+                .drain_slices(1 + INPUT_SLICE_CAP_NS + 1, 0)
+                .is_empty()
+        );
         pending.arm(1, 1);
         assert_eq!(
-            pending.take_slice(1 + INPUT_SLICE_CAP_NS, 0),
-            Some(INPUT_SLICE_CAP_NS)
+            pending.drain_slices(1 + INPUT_SLICE_CAP_NS, 0),
+            vec![INPUT_SLICE_CAP_NS]
         );
     }
 }
@@ -5474,10 +5975,12 @@ mod lateness_attribution_tests {
         MAX_WAKE_LATE_AT_NS, MAX_WAKE_LATE_NS, MAX_WAKE_LATE_OWNER, PRESENT_TAINT_UNTIL_NS,
         SCHEDULER_STATE, SLOW_EPISODE_RESET, SLOW_EPISODE_SAMPLES, SLOW_EPISODE_START_NS,
         SLOW_PRESENT_EPISODE_QUIET_NS, SLOW_PRESENT_LOG_THRESHOLD_NS, SlowEpisode, SlowEpisodeStep,
-        StartupPresentTiming, clear_key_arrival, key_queue_distribution, key_queue_last_max_ns,
-        lateness_fields_json, lateness_fields_text, log_span, note_event_wake,
-        note_key_arrival_queued, note_slow_episode_quiet, note_slow_present, now_ns,
+        StartupPresentTiming, clear_key_arrival, deadline_fire_attribution, gpu_repaint_counts,
+        key_queue_distribution, key_queue_last_max_ns, lateness_fields_json, lateness_fields_text,
+        log_span, note_event_wake, note_gpu_repaint_totals, note_key_arrival_queued,
+        note_slow_episode_quiet, note_slow_present, note_turn, note_user_wake, now_ns,
         record_deadline, record_present, reset, slow_episode_close, slow_episode_step,
+        turn_distribution, user_wake_attribution,
     };
     use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
@@ -5492,6 +5995,58 @@ mod lateness_attribution_tests {
         while now_ns() < LATE_NS + 50_000_000 {
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// RESPONSIVENESS AUDIT ITEMS 2, 3 AND 5 (2026-09-21), published. A timer
+    /// that WOKE the loop is counted for its owner apart from the fold wins
+    /// (`deadline_fires_by_owner` beside `deadline_arms_by_owner`); every
+    /// delivered proxy event is counted by its `Wake` variant; each main-loop
+    /// turn lands in its root's distribution; and the GPU's repaint-scope
+    /// counters are window stats that `reset` rebases. Before, none of these
+    /// was readable from a live instance.
+    #[test]
+    fn fires_wake_variants_turn_roots_and_gpu_scope_are_published() {
+        let _serial = SCHEDULER_STATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        reset();
+        let now = Instant::now();
+        let soon = now + Duration::from_millis(5);
+        let _ = record_deadline(DeadlineOwner::FrameCap, Some(soon), now);
+        note_event_wake(EventWakeKind::Timer);
+        let fires = deadline_fire_attribution();
+        assert!(
+            fires
+                .iter()
+                .any(|(owner, n)| *owner == "frame_cap" && *n >= 1),
+            "a timer wake is a fire for its owner: {fires:?}"
+        );
+        // A WaitCancelled interrupting the same deadline is not a fire.
+        let before: u64 = deadline_fire_attribution().iter().map(|(_, n)| n).sum();
+        note_event_wake(EventWakeKind::WaitCancelled);
+        let after: u64 = deadline_fire_attribution().iter().map(|(_, n)| n).sum();
+        assert_eq!(before, after, "an interrupted deadline did not fire");
+
+        note_user_wake(&crate::Wake::TitleSummaryReady);
+        note_user_wake(&crate::Wake::TitleSummaryReady);
+        let wakes = user_wake_attribution();
+        assert!(
+            wakes
+                .iter()
+                .any(|(name, n)| *name == "TitleSummaryReady" && *n >= 2),
+            "{wakes:?}"
+        );
+
+        note_turn(crate::watchdog::Breadcrumb::UserEvent as u8, 3_000_000);
+        let h = turn_distribution(crate::watchdog::Breadcrumb::UserEvent as u8).expect("a slot");
+        assert!(h.count() >= 1);
+
+        note_gpu_repaint_totals(10, 4, 2);
+        reset();
+        assert_eq!(gpu_repaint_counts(), (0, 0, 0), "reset rebases the window");
+        note_gpu_repaint_totals(13, 5, 3);
+        assert_eq!(gpu_repaint_counts(), (3, 1, 1));
+        reset();
     }
 
     /// THE ERASURE THIS FIXES. A 400 ms late timer wake is recorded, and the

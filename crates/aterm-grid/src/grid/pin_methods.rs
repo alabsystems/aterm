@@ -30,6 +30,22 @@ impl Grid {
         self.storage.absolute_row_counter
     }
 
+    /// Continue another grid's absolute row numbering: a checkpoint restore
+    /// builds a fresh grid, which numbers its rows from `rows + carried
+    /// history`, and this raises the counter to the one the source grid had,
+    /// so an absolute row a shell mark or a pin recorded before the handoff
+    /// names the same line after it. Only for a grid nothing has observed yet.
+    ///
+    /// Bounded both ways: never below what this grid already holds (`oldest
+    /// absolute row` stays non-negative), and never within `2^16` rows of
+    /// `u64::MAX`, so a forged counter cannot make a later scroll overflow.
+    pub fn continue_absolute_numbering(&mut self, counter: u64) {
+        const CEILING: u64 = u64::MAX >> 16;
+        let floor =
+            u64::from(self.storage.visible_rows).saturating_add(self.scrollback_lines() as u64);
+        self.storage.absolute_row_counter = counter.min(CEILING).max(floor);
+    }
+
     /// Convert visible coordinates to absolute row number.
     /// Formula: `absolute_row_counter - visible_rows + visible_row`.
     #[must_use]
@@ -117,20 +133,19 @@ mod tests;
 mod proofs {
     use super::*;
 
-    // TODO(#7932): tautology — strengthen or delete — T1: constructor round-trip field == any-binding
+    /// The storage-format contract: an absolute row splits into a page id (the
+    /// high 32 bits) and a row offset (the low 32) and recombines losslessly.
+    /// `row >> 32` always fits a 32-bit `usize`, so this holds on wasm32 too.
     #[kani::proof]
-    fn pin_absolute_row_roundtrip() {
+    fn pin_absolute_row_packing_is_lossless() {
         let row: u64 = kani::any();
-        let col: u16 = kani::any();
-        let generation: Generation = kani::any();
-
-        let pin = Pin::from_absolute(row, col, generation);
-        kani::assert(pin.absolute_row() == row, "absolute row should roundtrip");
-        kani::assert(pin.col() == col, "col should be preserved");
+        let pin = Pin::from_absolute(row, kani::any(), kani::any());
         kani::assert(
-            pin.generation() == generation,
-            "generation should be preserved",
+            pin.page_id() == (row >> 32) as usize,
+            "page id is the high half",
         );
+        kani::assert(pin.row_offset() == row as u32, "row offset is the low half");
+        kani::assert(pin.absolute_row() == row, "the split recombines losslessly");
     }
 
     #[kani::proof]

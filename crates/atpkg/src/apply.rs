@@ -27,7 +27,7 @@
 //! ([`TxnOutcome::Deferred`], [`crate::quiet`]).
 //!
 //! The production adapter wires stage = download + [`crate::install::verify_and_stage`],
-//! flip = [`crate::activate::activate_channel`] + [`crate::activate::install_shims`], and
+//! flip = [`crate::activate::activate_build`] + [`crate::activate::install_shims`], and
 //! rollback = re-point to the retained previous build.
 
 use std::collections::BTreeMap;

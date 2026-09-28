@@ -487,7 +487,7 @@ impl Store {
 /// `fabric_launch::filter_child_env` ON PURPOSE, which that file states in as
 /// many words. So the variable survives the PTY child-shell seam, a login
 /// profile, a launchd plist and a nested-aterm hop, and what it buys an attacker
-/// here is worse than a doc defect: [`Fault::fire`] calls `abort()` between the
+/// here is worse than a doc defect: [`Fault::fire`] kills the process between the
 /// operator's escalation command and the journal line that records it, and A10
 /// is the fabric's ONLY outbound path — an `attention` raised on a headless box
 /// at 3 a.m. reaches nobody until somebody looks. One env var turned the
@@ -526,13 +526,14 @@ impl Fault {
         }
     }
 
-    /// Die HERE, running no destructors — `abort` rather than `exit` for the
-    /// reason the bridge gives, and rather than a raw `kill(2)` because it keeps
-    /// this module free of `unsafe`.
+    /// Die HERE, running no destructors — by `SIGKILL` through the `aterm-uds`
+    /// cordon, for the reasons the bridge's twin gives: not `exit` (it would run
+    /// destructors), not a raw `kill(2)` (it would put `unsafe` in this module),
+    /// and not `abort` (its `SIGABRT` made macOS write a crash report per fault).
     fn fire(self, store: &Store) -> ! {
         let _ = std::fs::write(store.root.join("fault-fired"), b"1\n");
         eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?} — dying here");
-        std::process::abort();
+        aterm_uds::process::kill_self_now()
     }
 }
 

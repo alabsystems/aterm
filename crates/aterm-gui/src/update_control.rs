@@ -220,7 +220,6 @@ mod tests {
             failing_applies: 0,
             failing_since: String::new(),
             failing_persistent: false,
-            rescues: 0,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
             linux: None,

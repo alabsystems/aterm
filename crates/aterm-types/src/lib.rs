@@ -261,8 +261,9 @@ impl Rgb {
 
     /// Calculate relative luminance per WCAG 2.0.
     fn luminance(self) -> f64 {
-        // Skip: f64 arithmetic — the float-interval lane (the verifier's
-        // native float theory does not yet discharge these).
+        // Skip: f64 arithmetic with `powf`. Needs the Trust verifier's native
+        // float theory ($HOME/trust, docs/TRUST_100PCT_PLAN.md T5); delete this skip
+        // when a promoted seal discharges it.
         #[cfg_attr(trust_verify, trust::skip)]
         fn linearize(c: u8) -> f64 {
             let c = f64::from(c) / 255.0;
@@ -292,8 +293,9 @@ impl Rgb {
 impl std::ops::Mul<f32> for Rgb {
     type Output = Self;
 
-    // Skip: f32 arithmetic — the float-interval lane (the verifier's native
-    // float theory does not yet discharge these).
+    // Skip: f32 arithmetic. Needs the Trust verifier's native float theory
+    // ($HOME/trust, docs/TRUST_100PCT_PLAN.md T5); delete this skip when a promoted
+    // seal discharges it.
     #[cfg_attr(trust_verify, trust::skip)]
     fn mul(self, rhs: f32) -> Self::Output {
         Self {

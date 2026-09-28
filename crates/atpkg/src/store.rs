@@ -172,8 +172,10 @@ impl Layout {
 
     /// `reroute/` — the SESSION-SCOPED directory of upstream-name stubs
     /// ([`crate::reroute`]), prepended FIRST only to the PATH aterm hands its own
-    /// children; never `bin/`, never the rc hook, so [`shim_allowed`]'s deny-list
-    /// keeps meaning exactly what it means for the managed `bin/`.
+    /// children — and, since 2026-09-27, moved first by the rc hook's GATED arm, inside an
+    /// aterm session only ([`crate::hooks`]; outside one the hook takes it out); never
+    /// `bin/`, so [`shim_allowed`]'s deny-list keeps meaning exactly what it means for the
+    /// managed `bin/`.
     #[must_use]
     pub fn reroute_dir(&self) -> PathBuf {
         crate::reroute::dir(self)
@@ -228,30 +230,17 @@ impl Layout {
         self.bin_dir().join(tool.shim_file())
     }
 
-    /// `channels/<name>/current` — the per-coherence-group active-set symlink (§10).
-    ///
-    /// **One symlink per CHANNEL, not per program.** Every released-tool install passes the
-    /// same config-resolved channel name (`[packages].channel`, default `stable`), and every
-    /// coherence-group member flips through it too, so activating `ny` overwrites the link
-    /// `ay` just wrote. It therefore answers "what did this channel activate LAST", which is
-    /// what `uninstall`'s dangling-link sweep needs and what a GC witness must never be built
-    /// on — see [`Layout::program_current`].
-    #[must_use]
-    pub fn channel_current(&self, channel: &str) -> PathBuf {
-        self.prefix.join("channels").join(channel).join("current")
-    }
-
     /// `store/<program>/current` — the PER-PROGRAM active-build symlink, pointing at
     /// `store/<program>/<build>/`.
     ///
-    /// This is the authority [`crate::gc::live_builds`] resolves. It exists because the
-    /// channel link above cannot answer "which build of *this* program is live": with N
-    /// programs on one channel it holds exactly one answer, so N−1 programs would have no
-    /// witness and GC would abstain on them forever, growing the store without bound.
+    /// This is the ONE activation link, and the authority [`crate::gc::live_builds`]
+    /// resolves. (A per-channel `channels/<name>/current` was written beside it until
+    /// 2026-09-25: shared by every program on the channel, it answered only "what was
+    /// activated last", so it could witness nothing per program; it is gone, and
+    /// [`crate::gc::sweep_retired_channel_links`] removes what an older prefix still has.)
     ///
-    /// It lives INSIDE `store/<program>/` rather than beside the channel link on purpose:
-    /// there is then exactly one per program by construction (no channel can contest
-    /// another's claim about the same program), `uninstall`'s `remove_dir_all` of the program
+    /// It lives INSIDE `store/<program>/` on purpose: there is exactly one per program by
+    /// construction, `uninstall`'s `remove_dir_all` of the program
     /// tree takes it away with the builds it names, and it can never collide with a build dir
     /// (`current` does not parse as a `u64`, so [`crate::ops::list_installed`] skips it).
     #[must_use]
@@ -1122,6 +1111,161 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
     }
 }
 
+/// The suffix of the DECLARED-MODE record beside a build dir: `store/<program>/<build>.modes`.
+///
+/// A SIBLING, like `<build>.ready` and `<build>.shim-env`, so it never perturbs the
+/// build's `tree_root`. It lists the permission bits the stage DECLARED for every regular
+/// file it laid — the mode slot of each signed `tree_root` line — for the one platform
+/// whose filesystem stores none and reads every mode back as `0`: Windows. Without it a
+/// later on-disk walk there (`atpkg verify`) folds `0` for every file and can agree with
+/// no root any producer signed (measured 2026-09-22, `crate::tree`'s module docs). On
+/// Unix the inode stores the bits and the walk reads them back, so nothing is written or
+/// read: [`write_declared_modes`] is a no-op and [`declared_modes`] answers empty.
+pub const DECLARED_MODES_SUFFIX: &str = ".modes";
+
+/// The record's first line, the schema gate a reader refuses anything else on.
+const DECLARED_MODES_HEADER: &str = "declared-modes v1";
+
+/// Upper bound on a declared-mode record: one line per regular file — the shipped
+/// `trust` sysroot lays 4114 — so 16 MiB is orders of magnitude above any real tree
+/// while keeping the read strictly finite.
+const MAX_DECLARED_MODES_BYTES: usize = 16 * 1024 * 1024;
+
+/// `store/<program>/<build>.modes` for `build_dir`, or `None` for a path with no name.
+#[must_use]
+pub fn declared_modes_path(build_dir: &Path) -> Option<PathBuf> {
+    let name = crate::call1(std::path::Path::file_name, build_dir)?;
+    let name = crate::call1(std::ffi::OsStr::to_str, name)?;
+    let mut sidecar = String::from(name);
+    sidecar.push_str(DECLARED_MODES_SUFFIX);
+    Some(build_dir.with_file_name(sidecar))
+}
+
+/// Write the declared-mode record beside `build_dir` DURABLY, as the stage's other
+/// sidecars are ([`write_sidecar_durably`]: temp + flush + rename): one `<relpath bytes>
+/// 0x00 <octal mode> 0x0A` line per regular file, the same framing as the `tree_root`
+/// line minus its digest, so a reader splits on the same bytes the fold does. A no-op
+/// where the filesystem stores permission bits ([`crate::platform::HAS_POSIX_MODES`]):
+/// the walk there reads the inode and would never consult the record. Called by the
+/// stage BEFORE the build is marked complete, so a record that could not be written
+/// leaves an unmarked (re-stageable) build rather than a marked one `verify` can never
+/// attest — and `.ready` implies the record's bytes, not just its name, reached the disk.
+///
+/// # Errors
+/// The record could not be written.
+pub fn write_declared_modes(
+    build_dir: &Path,
+    modes: &crate::tree::DeclaredModes,
+) -> std::io::Result<()> {
+    if crate::platform::HAS_POSIX_MODES {
+        return Ok(());
+    }
+    if let Some(parent) = build_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut body: Vec<u8> = Vec::with_capacity(modes.len().saturating_mul(48).saturating_add(32));
+    body.extend_from_slice(DECLARED_MODES_HEADER.as_bytes());
+    body.push(b'\n');
+    for (rel, mode) in modes {
+        body.extend_from_slice(rel);
+        body.push(0);
+        // Octal, minimal digits — the very spelling the tree line carries (`0` for a
+        // zero mode), so a record and a line never disagree on a number.
+        body.extend_from_slice(oct_mode_digits(*mode).as_bytes());
+        body.push(b'\n');
+    }
+    write_sidecar_durably(build_dir, DECLARED_MODES_SUFFIX, &body)
+}
+
+/// Minimal-digit octal of `mode & 0o7777`, `"0"` for zero — no `format!` (the strict
+/// Trust gate cannot lower its `fmt::Arguments` expansion), digit by constant shift.
+fn oct_mode_digits(mode: u32) -> String {
+    let mode = mode & 0o7777;
+    let mut out = String::new();
+    let mut started = false;
+    for shift in [9u32, 6, 3] {
+        let d = (mode.wrapping_shr(shift) & 0x7) as u8;
+        if started || d != 0 {
+            started = true;
+            out.push(char::from(b'0'.wrapping_add(d)));
+        }
+    }
+    out.push(char::from(b'0'.wrapping_add((mode & 0x7) as u8)));
+    out
+}
+
+/// The declared-mode record beside `build_dir`, for [`crate::tree::tree_root_declared`].
+///
+/// Where the filesystem stores permission bits ([`crate::platform::HAS_POSIX_MODES`])
+/// this answers EMPTY without touching the disk: the walk reads the inode and ignores the
+/// map, so a record is neither written nor wanted there. Where it stores none, the record
+/// is REQUIRED — a missing, oversized, symlinked or malformed one is an error, never an
+/// empty map: an empty map would fold `0` for every file and report a healthy build as
+/// drifted, and a walk that cannot say what it folded must not pretend to attest.
+///
+/// # Errors
+/// The record is absent (a build staged by an atpkg before 0.90.1 on this platform —
+/// `aterm pkg install <program>` re-stages it and writes one), unreadable, or malformed.
+pub fn declared_modes(build_dir: &Path) -> std::io::Result<crate::tree::DeclaredModes> {
+    if crate::platform::HAS_POSIX_MODES {
+        return Ok(crate::tree::DeclaredModes::new());
+    }
+    let path = declared_modes_path(build_dir).ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
+    })?;
+    let bytes =
+        crate::metadata_io::read_bounded_regular(&path, MAX_DECLARED_MODES_BYTES).map_err(|e| {
+            let mut m = String::from("no declared-mode record beside the build (");
+            m.push_str(&e.to_string());
+            m.push_str("): staged before this platform kept one; `aterm pkg install` re-stages it");
+            std::io::Error::new(e.kind(), m)
+        })?;
+    parse_declared_modes(&bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the declared-mode record beside the build is malformed",
+        )
+    })
+}
+
+/// [`declared_modes`]'s parser, split out so the schema gate and every malformed shape
+/// are testable without a filesystem. Fail-closed to `None`.
+fn parse_declared_modes(bytes: &[u8]) -> Option<crate::tree::DeclaredModes> {
+    let mut lines = bytes.split(|&b| b == b'\n');
+    if lines.next()? != DECLARED_MODES_HEADER.as_bytes() {
+        return None;
+    }
+    let mut modes = crate::tree::DeclaredModes::new();
+    for line in lines {
+        if line.is_empty() {
+            // The trailing newline's empty tail; an empty line anywhere else is
+            // equally content-free.
+            continue;
+        }
+        let nul = line.iter().position(|&b| b == 0)?;
+        let (rel, digits) = (line.get(..nul)?, line.get(nul.saturating_add(1)..)?);
+        if rel.is_empty() || digits.is_empty() || digits.len() > 4 {
+            return None;
+        }
+        let mut mode: u32 = 0;
+        for &d in digits {
+            if !(b'0'..=b'7').contains(&d) {
+                return None;
+            }
+            mode = mode.wrapping_shl(3) | u32::from(d.wrapping_sub(b'0'));
+        }
+        modes.insert(rel.to_vec(), mode);
+    }
+    Some(modes)
+}
+
+/// Remove the declared-mode record beside `build_dir`, if any.
+pub fn clear_declared_modes(build_dir: &Path) {
+    if let Some(sidecar) = declared_modes_path(build_dir) {
+        let _ = std::fs::remove_file(sidecar);
+    }
+}
+
 /// The suffix of the stage-refusal memo beside a build dir (`<build>.refused`).
 pub const STAGE_REFUSAL_SUFFIX: &str = ".refused";
 
@@ -1129,7 +1273,8 @@ pub const STAGE_REFUSAL_SUFFIX: &str = ".refused";
 /// read at all, so a future shape can never be half-understood by this reader.
 const STAGE_REFUSAL_HEADER: &str = "stage-refusal v1";
 
-/// Bound on a memo read: it holds six short lines.
+/// Bound on a memo read: it holds eight short lines at most (`signer=`/`hold=` and
+/// `client=` joined the original six).
 const MAX_REFUSAL_BYTES: usize = 4 * 1024;
 
 /// How long the SECOND consecutive refusal of a build's signed digests holds the next
@@ -1189,7 +1334,26 @@ pub struct StageRefusal {
     /// ([`crate::install::StageError::SignerRefused`]): a re-download can only fetch the
     /// same bytes, so the memo binds until the digests change, with no cooldown to lapse.
     pub signer: bool,
+    /// Whether the row is HELD rather than cooled down: a `tree_root` mismatch. The
+    /// archive passed the signed `sha256` gate, so the bytes are exactly the ones the
+    /// row names, the extraction is deterministic, and no retry over the same archive
+    /// and the same row can reach a different verdict — there is no wire to blame and
+    /// nothing to wait out. A held memo binds until the pin's signed digests move or a
+    /// person asks (`aterm pkg install <p>`, `aterm pkg update --retry`); the archive
+    /// is kept beside it so that retry costs no download. Measured 2026-09-14..22: 41
+    /// unattended re-stages on one Windows box, every one the same verdict.
+    pub held: bool,
+    /// The atpkg version that reached the verdict ([`CLIENT_VERSION`]). A memo binds
+    /// only the client that wrote it: a verdict about "these bytes, this row" is also a
+    /// verdict by THIS extractor and THIS fold, and the one fix a held row can ever get
+    /// on the client side ships as a new atpkg — which must then be allowed one attempt.
+    /// Empty from a memo written before the field existed, which therefore binds
+    /// nothing once, and is re-recorded with the version on its next verdict.
+    pub client: String,
 }
+
+/// The version of the atpkg reaching a verdict — [`StageRefusal::client`].
+pub const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 impl StageRefusal {
     /// The cooldown this record's attempt count buys — ZERO for a first refusal, then
@@ -1221,20 +1385,22 @@ impl StageRefusal {
         self.at.saturating_add(self.cooldown_secs())
     }
 
-    /// Whether this record still stands in the way of re-fetching an artifact with these
+    /// Whether this record still stands in the way of re-staging an artifact with these
     /// SIGNED digests at `now_unix`. Fail-OPEN by construction: a memo with no `sha256`,
     /// one whose digests differ from the pin's (the publisher moved them — the repair
-    /// this memo must not hide), or one whose cooldown has lapsed binds nothing, and a
-    /// clock that cannot be read (`i64::MAX`) makes every memo look lapsed. The only
-    /// thing a memo can do is skip a download that would fail again.
-    ///
-    /// A [`StageRefusal::signer`] memo has no cooldown: it binds while the digests hold.
+    /// this memo must not hide), one another atpkg version wrote ([`Self::client`]), or
+    /// a cooled-down one whose cooldown has lapsed binds nothing, and a clock that
+    /// cannot be read (`i64::MAX`) makes every cooled-down memo look lapsed. A
+    /// [`Self::signer`] memo and a HELD memo ([`Self::held`]) have no cooldown to lapse:
+    /// they bind while the digests and the client hold. The only thing a memo can do is
+    /// skip a transfer or a stage that would fail again.
     #[must_use]
     pub fn binds(&self, sha256: &str, tree_root: &str, now_unix: i64) -> bool {
         !self.sha256.is_empty()
             && self.sha256.eq_ignore_ascii_case(sha256)
             && self.tree_root.eq_ignore_ascii_case(tree_root)
-            && (self.signer || now_unix < self.retry_after())
+            && self.client == CLIENT_VERSION
+            && (self.signer || self.held || now_unix < self.retry_after())
     }
 }
 
@@ -1269,7 +1435,14 @@ pub fn record_stage_refusal(
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
-    write_stage_refusal(build_dir, sha256, tree_root, why, now_unix, false)
+    write_stage_refusal(
+        build_dir,
+        sha256,
+        tree_root,
+        why,
+        now_unix,
+        RefusalKind::Cooldown,
+    )
 }
 
 /// [`record_stage_refusal`] for a platform signer refusal ([`StageRefusal::signer`]).
@@ -1283,7 +1456,49 @@ pub(crate) fn record_signer_refusal(
     why: &str,
     now_unix: i64,
 ) -> std::io::Result<()> {
-    write_stage_refusal(build_dir, sha256, tree_root, why, now_unix, true)
+    write_stage_refusal(
+        build_dir,
+        sha256,
+        tree_root,
+        why,
+        now_unix,
+        RefusalKind::Signer,
+    )
+}
+
+/// [`record_stage_refusal`] for a `tree_root` mismatch: a HELD memo
+/// ([`StageRefusal::held`]) that binds from its first verdict until the pin's signed
+/// digests or the client move, or a person asks (`aterm pkg install <p>`,
+/// `aterm pkg update --retry`).
+///
+/// # Errors
+/// As [`record_stage_refusal`].
+pub(crate) fn record_held_refusal(
+    build_dir: &Path,
+    sha256: &str,
+    tree_root: &str,
+    why: &str,
+    now_unix: i64,
+) -> std::io::Result<()> {
+    write_stage_refusal(
+        build_dir,
+        sha256,
+        tree_root,
+        why,
+        now_unix,
+        RefusalKind::Held,
+    )
+}
+
+/// Which of the three memos [`write_stage_refusal`] writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefusalKind {
+    /// A signed-`sha256` mismatch: it cools down ([`StageRefusal::cooldown_secs`]).
+    Cooldown,
+    /// A platform signer refusal: `signer=1` ([`StageRefusal::signer`]).
+    Signer,
+    /// A `tree_root` mismatch: `hold=1` ([`StageRefusal::held`]).
+    Held,
 }
 
 fn write_stage_refusal(
@@ -1292,7 +1507,7 @@ fn write_stage_refusal(
     tree_root: &str,
     why: &str,
     now_unix: i64,
-    signer: bool,
+    kind: RefusalKind,
 ) -> std::io::Result<()> {
     let dest = stage_refusal_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
@@ -1319,10 +1534,15 @@ fn write_stage_refusal(
     body.push_str(&crate::dec_u64(u64::from(attempts)));
     body.push_str("\nat=");
     body.push_str(&crate::dec_u64(u64::try_from(now_unix).unwrap_or(0)));
-    // Only when set: a reader that predates it sees a digest memo, which fails open.
-    if signer {
-        body.push_str("\nsigner=1");
+    // Only when set: a reader that predates them sees a digest memo, which fails open,
+    // and a cooled-down memo's bytes are what they were.
+    match kind {
+        RefusalKind::Signer => body.push_str("\nsigner=1"),
+        RefusalKind::Held => body.push_str("\nhold=1"),
+        RefusalKind::Cooldown => {}
     }
+    body.push_str("\nclient=");
+    body.push_str(CLIENT_VERSION);
     // One line: the reader takes the `why=` line whole.
     body.push_str("\nwhy=");
     let one_line: String = why
@@ -1381,6 +1601,7 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
     }
     let (mut sha256, mut tree_root, mut why) = (None, None, None);
     let (mut at, mut attempts, mut signer) = (None, None, false);
+    let (mut held, mut client) = (false, String::new());
     for line in lines {
         if let Some(v) = line.strip_prefix("sha256=") {
             sha256 = Some(v.to_string());
@@ -1394,6 +1615,10 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
             attempts = v.trim().parse::<u32>().ok().filter(|n| *n >= 1);
         } else if let Some(v) = line.strip_prefix("signer=") {
             signer = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("hold=") {
+            held = v.trim() == "1";
+        } else if let Some(v) = line.strip_prefix("client=") {
+            client = v.trim().to_string();
         }
     }
     Some(StageRefusal {
@@ -1403,6 +1628,8 @@ fn parse_stage_refusal(text: &str) -> Option<StageRefusal> {
         at: at?,
         attempts: attempts?,
         signer,
+        held,
+        client,
     })
 }
 
@@ -1418,11 +1645,15 @@ pub fn clear_stage_refusal(build_dir: &Path) {
 /// was verified, against which anchor, written by the stage before `.ready`.
 pub(crate) const VENDOR_SIDECAR_SUFFIX: &str = ".vendor";
 
-/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`]:
-/// exactly those [`discard_build`] removes and `gc` sweeps once their build is gone, so a
-/// sidecar can never outlive its tree.
-pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] =
-    &[VENDOR_SIDECAR_SUFFIX, crate::shim_env::SIDECAR_SUFFIX];
+/// The sidecars a stage may write through [`crate::install::StageHooks::sidecars`] — and
+/// the declared-mode record ([`DECLARED_MODES_SUFFIX`]) the stage writes itself: exactly
+/// those [`discard_build`] removes and `gc` sweeps once their build is gone, so a sidecar
+/// that describes a tree can never outlive it.
+pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
+    VENDOR_SIDECAR_SUFFIX,
+    crate::shim_env::SIDECAR_SUFFIX,
+    DECLARED_MODES_SUFFIX,
+];
 
 /// `<build><suffix>` beside `build_dir`, or `None` for a path with no UTF-8 file name.
 pub(crate) fn sidecar_path(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
@@ -1476,11 +1707,19 @@ pub(crate) fn clear_vendor_sidecar(build_dir: &Path) {
 /// (`aterm pkg install <program>`) does before it installs, so a person who has just
 /// fixed the publish (or the proxy that corrupted the transfer) never waits out a
 /// cooldown meant for an unattended six-hourly loop.
-pub fn clear_stage_refusals(layout: &Layout, program: &str) {
+///
+/// A `program` that is not ONE directory name ([`crate::ops::uninstall_name_shape`])
+/// forgets nothing: the name arrives from argv, and `store/..\..\x` is a directory
+/// outside the store whose `*.refused` files are not this store's to delete.
+pub fn clear_stage_refusals(layout: &Layout, program: &str) -> usize {
+    if crate::ops::uninstall_name_shape(program).is_err() {
+        return 0;
+    }
     let dir = layout.prefix.join("store").join(program);
     let Ok(entries) = std::fs::read_dir(&dir) else {
-        return;
+        return 0;
     };
+    let mut forgotten = 0usize;
     for entry in entries.flatten() {
         if !entry.file_type().is_ok_and(|t| t.is_file()) {
             continue;
@@ -1489,10 +1728,32 @@ pub fn clear_stage_refusals(layout: &Layout, program: &str) {
             .file_name()
             .to_str()
             .is_some_and(|n| n.ends_with(STAGE_REFUSAL_SUFFIX))
+            && std::fs::remove_file(entry.path()).is_ok()
         {
-            let _ = std::fs::remove_file(entry.path());
+            forgotten = forgotten.saturating_add(1);
         }
     }
+    forgotten
+}
+
+/// [`clear_stage_refusals`] for EVERY program the store has a directory for — what
+/// `aterm pkg update --retry` does before its pass, so a held `tree_root` verdict
+/// ([`StageRefusal::held`]), which never lapses on its own, can be asked again by the
+/// person who believes the publish is fixed. Returns how many memos were forgotten.
+pub fn clear_all_stage_refusals(layout: &Layout) -> usize {
+    let Ok(entries) = std::fs::read_dir(layout.prefix.join("store")) else {
+        return 0;
+    };
+    let mut forgotten = 0usize;
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if let Some(program) = entry.file_name().to_str() {
+            forgotten = forgotten.saturating_add(clear_stage_refusals(layout, program));
+        }
+    }
+    forgotten
 }
 
 /// The sibling scratch directory a stage extracts INTO before it swaps: `<build>.incoming-<pid>`.
@@ -1765,7 +2026,12 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
             if ft.is_dir() {
                 stack.push(path);
             } else if ft.is_file() {
-                match std::fs::File::open(&path) {
+                // Opened the way the platform's flush needs it
+                // (`platform::open_for_sync`): read-only on Unix, where `fsync(2)` takes
+                // any fd; with write access on Windows, where `FlushFileBuffers` refuses
+                // a read-only handle with `Access is denied` — which is what every stage
+                // there died of once the digest gates let it through (2026-09-22).
+                match crate::platform::open_for_sync(&path) {
                     Ok(f) => {
                         sync_contents_or_accept_refusal(&f)?;
                         counts.files = counts.files.saturating_add(1);
@@ -1776,8 +2042,8 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
             }
         }
         // The directory's own entries, AFTER the contents they name. Best-effort on the
-        // open alone: Windows cannot open a directory as a file at all, and that platform
-        // has no store to strand.
+        // open alone: Windows cannot open a directory as a file at all (NTFS journals
+        // directory metadata itself), so that arm is skipped there.
         if let Ok(handle) = std::fs::File::open(&dir) {
             sync_contents_or_accept_refusal(&handle)?;
             counts.dirs = counts.dirs.saturating_add(1);
@@ -1866,6 +2132,10 @@ pub(crate) fn discard_build(build_dir: &Path) {
     // And the vendor record (`<build>.vendor`): it vouches for a verified tree, and the
     // tree is gone.
     clear_vendor_sidecar(build_dir);
+    // And the declared-mode record (`<build>.modes`): it describes the modes of a tree
+    // that is gone, and a later stage under this build number writes its own before it
+    // is marked complete — a stale one must never be what `verify` folds.
+    clear_declared_modes(build_dir);
 }
 
 /// The default prefix under `home`. On macOS `…/Library/Application Support/aterm/pkg`
@@ -2462,6 +2732,83 @@ mod tests {
         let _ = std::fs::remove_dir_all(&h);
     }
 
+    /// The declared-mode record: written beside the build (a sibling, outside the
+    /// tree) on the platform whose inode stores no permission bits, read back as the
+    /// map the walk folds, and taken by `discard_build`. Where the inode stores the bits
+    /// (Unix) nothing is written and the read answers empty without touching the disk —
+    /// asserted on both sides so neither platform's contract drifts.
+    #[test]
+    fn the_declared_mode_record_round_trips_and_goes_with_the_build() {
+        let h = temp_home("declared-modes");
+        let l = Layout { prefix: h.clone() };
+        let build = l.build_dir("claude", 2026092201);
+        std::fs::create_dir_all(build.join("bin")).unwrap();
+        let mut modes = crate::tree::DeclaredModes::new();
+        modes.insert(b"bin/claude.exe".to_vec(), 0o755);
+        modes.insert(b"lib/data".to_vec(), 0o644);
+        write_declared_modes(&build, &modes).unwrap();
+        let sidecar = build.with_file_name("2026092201.modes");
+        if crate::platform::HAS_POSIX_MODES {
+            assert!(
+                !sidecar.exists(),
+                "Unix reads the inode: no record is written"
+            );
+            assert!(declared_modes(&build).unwrap().is_empty());
+        } else {
+            assert!(sidecar.is_file(), "a sibling, outside the tree");
+            assert_eq!(
+                std::fs::read(&sidecar).unwrap(),
+                b"declared-modes v1\nbin/claude.exe\x00755\nlib/data\x00644\n".to_vec(),
+                "the line framing is the tree line's, minus its digest"
+            );
+            assert_eq!(declared_modes(&build).unwrap(), modes);
+            clear_declared_modes(&build);
+            let err = declared_modes(&build).unwrap_err().to_string();
+            assert!(
+                err.contains("no declared-mode record") && err.contains("re-stages"),
+                "{err}"
+            );
+            write_declared_modes(&build, &modes).unwrap();
+        }
+        discard_build(&build);
+        assert!(
+            !build.exists() && !sidecar.exists(),
+            "the discard takes the record"
+        );
+        let _ = std::fs::remove_dir_all(&h);
+    }
+
+    /// The record's parser fails CLOSED on every malformed shape — a wrong header, a
+    /// line with no `\0`, an empty path, a non-octal or oversized digit run — and reads
+    /// the octal spelling the tree line uses (`0` for a zero mode).
+    #[test]
+    fn the_declared_mode_record_parser_fails_closed() {
+        let ok =
+            parse_declared_modes(b"declared-modes v1\nbin/a\x00755\nb\x000\nc\x00644\n").unwrap();
+        assert_eq!(ok.get(&b"bin/a"[..]), Some(&0o755));
+        assert_eq!(ok.get(&b"b"[..]), Some(&0));
+        assert_eq!(ok.get(&b"c"[..]), Some(&0o644));
+        assert!(
+            parse_declared_modes(b"declared-modes v1\n")
+                .unwrap()
+                .is_empty()
+        );
+        for bad in [
+            &b"declared-modes v2\nbin/a\x00755\n"[..],
+            b"bin/a\x00755\n",
+            b"declared-modes v1\nbin/a 755\n",
+            b"declared-modes v1\n\x00755\n",
+            b"declared-modes v1\nbin/a\0\n",
+            b"declared-modes v1\nbin/a\x00758\n",
+            b"declared-modes v1\nbin/a\x0007555\n",
+        ] {
+            assert!(parse_declared_modes(bad).is_none(), "{bad:?}");
+        }
+        assert_eq!(oct_mode_digits(0o755), "755");
+        assert_eq!(oct_mode_digits(0), "0");
+        assert_eq!(oct_mode_digits(0o4755), "4755");
+    }
+
     /// The refusal's PURE half: what it binds, and for how long. A memo binds only the
     /// digests it was recorded for, only from the SECOND identical verdict, and only
     /// until its cooldown lapses — the three escapes that keep a bandwidth cooldown from
@@ -2477,6 +2824,8 @@ mod tests {
             at: 1_000,
             attempts,
             signer: false,
+            held: false,
+            client: CLIENT_VERSION.into(),
         };
         // THE FIRST RETRY IS FREE: one mismatch can be a truncated transfer, and the next
         // pass must still be able to find the publisher's repair. From the second
@@ -2527,6 +2876,43 @@ mod tests {
             .binds("", "bb", 1_000),
             "a memo with no digest binds nothing"
         );
+        // ANOTHER CLIENT'S VERDICT BINDS NOTHING: the fix a held row can get on the
+        // client side ships as a new atpkg, which must be allowed its one attempt — and
+        // a memo written before the field existed (empty client) is that case too.
+        assert!(
+            !StageRefusal {
+                client: "0.0.0".into(),
+                ..memo(2)
+            }
+            .binds("aa", "bb", 1_000),
+            "a memo another atpkg wrote binds nothing"
+        );
+        assert!(
+            !StageRefusal {
+                client: String::new(),
+                ..memo(2)
+            }
+            .binds("aa", "bb", 1_000),
+            "a pre-field memo binds nothing"
+        );
+        // A HELD memo (a tree_root mismatch: same bytes, same row, same verdict every
+        // time) has no cooldown to lapse — it binds from the FIRST verdict, at any
+        // clock, until the digests or the client move.
+        let held = StageRefusal {
+            held: true,
+            ..memo(1)
+        };
+        assert!(held.binds("aa", "bb", 1_000), "held from the first verdict");
+        assert!(held.binds("aa", "bb", i64::MAX), "no cooldown to lapse");
+        assert!(!held.binds("dd", "bb", 1_000), "a re-cut pin releases it");
+        assert!(
+            !StageRefusal {
+                client: "0.0.0".into(),
+                ..held.clone()
+            }
+            .binds("aa", "bb", 1_000),
+            "a new client gets its attempt"
+        );
     }
 
     /// A SIGNER refusal judged bytes that matched their digests, so a re-download can only
@@ -2541,6 +2927,8 @@ mod tests {
             at: 1_000,
             attempts: 1,
             signer: true,
+            held: false,
+            client: CLIENT_VERSION.into(),
         };
         assert!(
             m.binds("aa", "BB", 1_000),
@@ -2574,6 +2962,8 @@ mod tests {
         record_signer_refusal(&build, "aa", "bb", "signer refused: x", 1_000).unwrap();
         let m = stage_refusal(&build).unwrap();
         assert!(m.signer);
+        assert!(!m.held, "a signer memo is its own kind, not a hold");
+        assert_eq!(m.client, CLIENT_VERSION);
         assert_eq!((m.attempts, m.why.as_str()), (1, "signer refused: x"));
         assert!(m.binds("aa", "bb", i64::MAX));
         record_stage_refusal(&build, "aa", "bb", "asset sha256 mismatch", 2_000).unwrap();
@@ -2610,6 +3000,16 @@ mod tests {
         assert_eq!((m.sha256.as_str(), m.tree_root.as_str()), ("AA", "bb"));
         assert_eq!(m.at, 1_000);
         assert_eq!(m.attempts, 1);
+        assert!(!m.held, "a sha256 mismatch cools down; it is not held");
+        assert_eq!(
+            m.client, CLIENT_VERSION,
+            "the memo names the client that wrote it"
+        );
+        let text = std::fs::read_to_string(&marker).unwrap();
+        assert!(
+            !text.contains("hold="),
+            "a cooled-down memo carries no hold line: {text}"
+        );
         assert_eq!(
             m.why, "asset sha256 mismatch: expected aa",
             "one line: the newline is folded"
@@ -2623,6 +3023,19 @@ mod tests {
         // Digests that MOVED are a different question: the count starts again.
         record_stage_refusal(&build, "cc", "bb", "new pin, new verdict", 60_000).unwrap();
         assert_eq!(stage_refusal(&build).unwrap().attempts, 1);
+        // A HELD verdict (tree_root mismatch) round-trips its hold line and binds at
+        // once, whatever the clock.
+        record_held_refusal(&build, "cc", "bb", "tree_root mismatch", 70_000).unwrap();
+        let m = stage_refusal(&build).unwrap();
+        assert!(m.held, "the hold line reads back");
+        assert_eq!(m.attempts, 2, "the same digests: the count still advances");
+        assert!(m.binds("cc", "bb", i64::MAX), "held: no cooldown to lapse");
+        assert!(
+            std::fs::read_to_string(&marker)
+                .unwrap()
+                .contains("\nhold=1\n"),
+            "the memo carries the hold"
+        );
 
         // One memo per program: recording the next build's reclaims the last build's.
         let next = l.build_dir("trust", 4901);
@@ -2668,8 +3081,8 @@ mod tests {
             PathBuf::from(format!("/p/bin/ay{}", crate::platform::SHIM_SUFFIX))
         );
         assert_eq!(
-            l.channel_current("stable"),
-            PathBuf::from("/p/channels/stable/current")
+            l.program_current("ay"),
+            PathBuf::from("/p/store/ay/current")
         );
         assert_eq!(l.staging_dir("ay"), PathBuf::from("/p/staging/ay"));
         assert_eq!(l.floor(), PathBuf::from("/p/floor"));
@@ -3426,7 +3839,16 @@ mod tests {
             synced.files, 3,
             "every regular file, and the symlink is not one"
         );
-        assert_eq!(synced.dirs, 4, "the root, bin, lib and lib/nested");
+        // Windows cannot open a directory as a file (`File::open` answers `Access is
+        // denied`), so the directory arm is best-effort there and flushes none — NTFS
+        // journals directory metadata itself, and PostgreSQL skips directory fsync on
+        // Windows for the same reason. The FILE count above is the half that matters:
+        // until 2026-09-22 it was the file flush that failed there, with the same error.
+        let dirs_expected = if cfg!(windows) { 0 } else { 4 };
+        assert_eq!(
+            synced.dirs, dirs_expected,
+            "the root, bin, lib and lib/nested — where a directory can be opened"
+        );
 
         // A tree that is not there is an ERROR, not a quiet success: this runs on the path
         // an install is about to publish, so "nothing to flush" must never read as

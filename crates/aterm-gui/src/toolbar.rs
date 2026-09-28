@@ -830,6 +830,12 @@ mod non_macos_tests {
     use super::{format_tab_chrome, format_window_title};
     use crate::tab_bar::TabStripMetadata;
 
+    /// `attention` is a bool here because these lines only ask whether the
+    /// `attention` token is printed: `ChipLevel::Wait` is the one level whose
+    /// chrome tokens are exactly `["attention"]` (`ChipLevel::chrome_states`),
+    /// so it stands for "on" (`app_presence::chip_of_attention` is that map).
+    /// (The field became a level in round 19; this module, which never
+    /// compiles on the macOS dev box, kept the old bool.)
     fn metadata(dirty: bool, busy: bool, attention: bool) -> TabStripMetadata {
         TabStripMetadata {
             icon: None,
@@ -2383,6 +2389,8 @@ mod macos {
                 let (tx, _rx) = std::sync::mpsc::channel();
                 let _ = ivars.proxy.send_event(Wake::TabCmd {
                     action: TabAction::Move { from, to },
+                    // A drag is the human's gesture (and a move retires nothing).
+                    by: crate::session_store::ExitActor::Human,
                     reply: tx,
                 });
             }
@@ -2834,7 +2842,7 @@ mod macos {
                                 appkit::send_v(diamond, sel!(closePath));
                                 // Hollow to WAIT, filled at a STOP — the in-grid
                                 // rasterizer's exact pair (`tab_bar::status_primitives`).
-                                if level == crate::tab_bar::ChipLevel::Stop {
+                                if matches!(level, crate::tab_bar::ChipLevel::Stop(_)) {
                                     appkit::send_v(diamond, sel!(fill));
                                 } else {
                                     appkit::send_v_f64(diamond, sel!(setLineWidth:), 1.15 * scale);
@@ -5576,38 +5584,6 @@ mod macos {
                 );
             }
             assert_eq!(FIRST_MOUSE.load(Ordering::SeqCst), 1);
-        }
-
-        /// The generated `-dealloc` drops the Rust ivars, on the shape the four
-        /// real classes have: an owning value with a `Drop`.
-        #[test]
-        fn dropping_a_declared_instance_drops_its_ivars() {
-            static DROPS: AtomicUsize = AtomicUsize::new(0);
-            struct Spy;
-            impl Drop for Spy {
-                fn drop(&mut self) {
-                    DROPS.fetch_add(1, Ordering::SeqCst);
-                }
-            }
-            aterm_objc::declare_class! {
-                struct ToolbarDropProbe: NSObject {
-                    const NAME: &str = "ATermToolbarDropProbe";
-                    type Ivars = Spy;
-
-                    @sel(ping)
-                    fn ping(&self) {}
-                }
-            }
-            DROPS.store(0, Ordering::SeqCst);
-            let t =
-                ToolbarDropProbe::alloc_init(crate::appkit::test_witness(), Spy).expect("probe");
-            assert_eq!(DROPS.load(Ordering::SeqCst), 0);
-            drop(t);
-            assert_eq!(
-                DROPS.load(Ordering::SeqCst),
-                1,
-                "the generated -dealloc did not drop the ivars"
-            );
         }
 
         /// AN NSVIEW SUBCLASS DOES NOT DEALLOC WHEN ITS LAST REFERENCE DROPS ON

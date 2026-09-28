@@ -425,14 +425,17 @@ impl Scrollback {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 impl Scrollback {
     /// Inject a corrupted warm block at the front of the warm tier.
     ///
     /// The block reports `line_count` lines but its compressed data is invalid,
     /// causing decompression and warm→cold eviction to fail. Used by quarantine
-    /// behavioral tests (#5947).
-    pub(crate) fn inject_corrupted_warm_block(&mut self, line_count: usize) {
+    /// behavioral tests (#5947) and, through the `testing` feature, by the
+    /// grid's dense-history conformance tests. Never compiled into a product
+    /// build: only this crate's tests and a dev-dependency turn it on.
+    #[doc(hidden)]
+    pub fn inject_corrupted_warm_block(&mut self, line_count: usize) {
         self.warm.push_front_corrupt(line_count);
         self.line_count += line_count;
         self.sync_accounting();

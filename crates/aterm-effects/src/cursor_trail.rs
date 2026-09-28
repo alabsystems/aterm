@@ -110,9 +110,10 @@ pub const HIDE_BRIDGE_TYPED_MAX_DIST: u16 = 8;
 pub const HIDE_BRIDGE_NAV_MAX_ROWS: u16 = 4;
 
 /// Columns a NAV-witnessed landing may cross when the host never named a pane.
-/// Every shipped path names one (`note_pane_columns`, at LOCK A and at the
-/// composed splice alike), so this is the reach for a caller that never said
-/// how wide its pane is — the classic terminal width, never the whole grid.
+/// Every shipped path names one (`note_pane_columns`, under the single-pane
+/// frame hold and at the composed splice alike), so this is the reach for a
+/// caller that never said how wide its pane is — the classic terminal width,
+/// never the whole grid.
 pub const HIDE_BRIDGE_NAV_UNPANED_COLS: u16 = 80;
 
 /// The window, after a NAVIGATION press, in which the caret may still be seen
@@ -298,26 +299,6 @@ pub struct BridgeTally {
     pub bridged: u64,
     /// Relocations the bridge declined (no source cell: `spawn` never ran).
     pub declined: u64,
-}
-
-/// Identity of one terminal content generation, as the HOST reads it.
-/// `process_sequence` advances once per parser batch; `terminal_id` is the
-/// render identity, so equal numeric sequences from two tabs/panes cannot be
-/// confused; `alternate_screen` stops a main/alt swap from looking like the
-/// same stream.
-///
-/// PURE DATA — the engines never look at it. It is the identity the host's
-/// frame projection compares between its two locks to notice a torn frame
-/// (see `app_render`'s `CursorFxProjection`). The proof era used the same
-/// triple as an admission fence, whose `UnownedRelocation` verdict wiped
-/// resident light whenever a program moved its caret; that fence and its
-/// ownership verdicts are gone (docs/design/EFFECTS-LICENSE-REDESIGN.md), and
-/// what survives here carries no authority over light at all.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContentGeneration {
-    pub process_sequence: u32,
-    pub terminal_id: u64,
-    pub alternate_screen: bool,
 }
 
 /// Integer linear interpolation `a + (b-a)*q` for `q` in `0..=1` (endpoints
@@ -2315,7 +2296,8 @@ mod tests {
     /// Enter's response landed (SSH, a slow prompt) LENT the response its
     /// stamp: the response drew as the glyph's re-anchor, and the glyph's
     /// own +1 was unlicensed and dark — the shape `CursorGlow` closed on
-    /// 2026-09-14 (b434123cc), still open in this engine. A glyph now keeps
+    /// 2026-09-14 (b434123cc) and this engine closed the same day
+    /// (6c612eaa2). A glyph now keeps
     /// the one-shots (their echoes are still owed), and a fresh generic
     /// licence paired with any move but a same-row forward hop takes that
     /// move and leaves the stamp for the glyph's echo.

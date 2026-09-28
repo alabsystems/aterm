@@ -125,16 +125,21 @@ pub struct GridStorage {
     /// session (set once at session setup). While true, the reader-thread ingest
     /// path does NOT drain the lazy buffer inline on `should_drain` — it lets the
     /// worker drain it in bounded batches via [`Grid::drain_lazy_bounded`], so the
-    /// LZ4/zstd promotion spike stays off the PTY-drain critical path. The reader
-    /// still drains inline as a bounded fallback once the backlog exceeds
-    /// `Grid::ASYNC_COMPRESS_BACKPRESSURE` (the worker fell behind), so memory
-    /// stays bounded and history is never lost.
+    /// LZ4/zstd promotion spike stays off the PTY-drain critical path. Once the
+    /// backlog exceeds the flood staging cap (`Grid::flood_overflow`: the
+    /// worker fell behind) the reader DROPS its oldest staged lines rather than
+    /// promote inline, so memory stays bounded — rows the configured limit
+    /// would evict anyway go silently, and any other loss is counted and
+    /// marked in place (`flood_truncated_lines`, the lazy buffer's flood cut).
     pub(crate) compress_offload_active: bool,
     /// Monotonic count of STAGED history lines dropped by flood backpressure
-    /// (the lazy-buffer THRU-5 cap while a compress worker is behind, and the
-    /// detached-reflow-window cap) — real retention loss, surfaced OUT-OF-BAND
-    /// (audit E10a: never a sentinel line in content). User-requested limit
-    /// shrinks are NOT counted.
+    /// (the lazy-buffer staging cap while a compress worker is behind, and the
+    /// detached-reflow-window cap) that the configured limit would have kept —
+    /// real retention loss. Surfaced two ways: this counter (out of band, for
+    /// `metrics`/`lines`), which adds each cut's peak, and ONE dim marker row
+    /// IN the history at each cut, naming the lines missing there now
+    /// (`scroll_convert::FloodCut`). Ordinary retention eviction and
+    /// user-requested limit shrinks are NOT counted.
     pub(crate) flood_truncated_lines: u64,
     /// Ring-byte watermark budget (audit E10a): an approximate byte budget the
     /// host sets so ring-only "unlimited" retention still reports memory
@@ -166,7 +171,9 @@ pub struct GridStorage {
     ///   re-attach reaches both outside one;
     /// * a ROWS-ONLY resize that adds or removes rows at the BOTTOM — the
     ///   grow's blank append and the shrink's trailing-blank trim
-    ///   (`Grid::note_bottom_end_renumbered`). Rows moved ACROSS the
+    ///   (`Grid::note_bottom_end_renumbered`) — under the native resize policy;
+    ///   the ConPTY policy moves the counter with those rows and renumbers
+    ///   nothing. Rows moved ACROSS the
     ///   live/history boundary (reveal, top-demote) leave the total unchanged
     ///   and are pure relabels that do NOT bump this.
     ///
@@ -1129,6 +1136,103 @@ mod tests {
         let mut g = make_storage(5, 10);
         g.storage.shift_visible_rows_down(0, 2, 5);
         // Just verify no panic
+    }
+
+    /// Every ring row's slice identity — `(cell pointer, cells length, page id)`,
+    /// the tuple PROOF_CARRYING_PERFORMANCE.md A3 names — as a sorted multiset.
+    fn ring_slice_identities(g: &Grid) -> Vec<(usize, usize, usize)> {
+        let mut v: Vec<(usize, usize, usize)> = g
+            .storage
+            .rows
+            .iter()
+            .map(|r| (r.as_slice().as_ptr() as usize, r.cells_len(), r.page_id()))
+            .collect();
+        v.sort_unstable();
+        v
+    }
+
+    /// A3, BOUNDED AND EXHAUSTIVE: at steady state — the ring full
+    /// (`total_lines == rows.len()`) with its head rotated through every
+    /// position — every `shift_visible_rows_up/down(top, bottom, n)` a 6-row
+    /// screen admits, applied in sequence, leaves the multiset of live row
+    /// slices exactly as it was and allocates nothing from the page store. The
+    /// swap chain is a PERMUTATION of `Row` structs: no slice is lost,
+    /// duplicated (two rows aliasing one arena slice) or freshly allocated.
+    ///
+    /// The all-sizes lemma is the Kani pair in `grid/proofs_kani_scroll.rs`
+    /// (`shift_visible_rows_{up,down}_permutes_row_slices`), for trust-mc.
+    #[test]
+    fn shift_visible_rows_permutes_row_slices_and_allocates_nothing_at_capacity() {
+        const ROWS: u16 = 6;
+        const SCROLLBACK: usize = 4;
+        let capacity = usize::from(ROWS) + SCROLLBACK;
+        let mut shifts = 0usize;
+        for rotate in 0..capacity {
+            let mut g = Grid::with_scrollback(ROWS, 8, SCROLLBACK);
+            for line in 0..(capacity + rotate) {
+                g.write_char(char::from(b'a' + (line % 26) as u8));
+                g.carriage_return();
+                g.line_feed();
+            }
+            assert_eq!(g.storage.display_offset, 0);
+            assert_eq!(
+                g.storage.total_lines,
+                g.storage.rows.len(),
+                "steady state: the ring is full (rotate {rotate})"
+            );
+            assert_eq!(g.storage.rows.len(), capacity, "rotate {rotate}");
+            let identities = ring_slice_identities(&g);
+            let allocations = g.storage.pages.stats().allocations;
+            for top in 0..usize::from(ROWS) {
+                for bottom in top..usize::from(ROWS) {
+                    for n in 0..=usize::from(ROWS) {
+                        for down in [false, true] {
+                            if down {
+                                g.storage.shift_visible_rows_down(top, bottom, n);
+                            } else {
+                                g.storage.shift_visible_rows_up(top, bottom, n);
+                            }
+                            shifts += 1;
+                            assert_eq!(
+                                ring_slice_identities(&g),
+                                identities,
+                                "rotate {rotate}: shift {} ({top}, {bottom}, {n}) changed the \
+                                 multiset of row slices",
+                                if down { "down" } else { "up" }
+                            );
+                            assert_eq!(
+                                g.storage.pages.stats().allocations,
+                                allocations,
+                                "rotate {rotate}: a shift allocated"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(shifts > 0);
+    }
+
+    /// The negative control: the multiset check is not vacuous. Overwriting one
+    /// ring row with a fresh allocation — what a copy-based shift that
+    /// allocated a new row would do — changes both readings the lemma test
+    /// compares.
+    #[test]
+    fn a_row_replaced_by_a_fresh_allocation_is_seen_by_both_readings() {
+        let mut g = Grid::with_scrollback(6, 8, 4);
+        for _ in 0..10 {
+            g.write_char('x');
+            g.carriage_return();
+            g.line_feed();
+        }
+        let identities = ring_slice_identities(&g);
+        let allocations = g.storage.pages.stats().allocations;
+        // SAFETY: the new row's slice comes from this grid's own page store,
+        // which outlives every row (`rows` drops before `pages`).
+        let fresh = unsafe { crate::Row::new(8, &mut g.storage.pages) };
+        g.storage.rows[0] = fresh;
+        assert_ne!(ring_slice_identities(&g), identities);
+        assert_ne!(g.storage.pages.stats().allocations, allocations);
     }
 
     // =========================================================================

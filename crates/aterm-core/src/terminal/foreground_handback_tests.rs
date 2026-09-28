@@ -422,3 +422,79 @@ fn foreground_handback_main_screen_kitty_flags_under_the_alt_screen_are_evidence
         "no push, no input bit: a bare smcup/civis is display only"
     );
 }
+
+/// The ASSERTED evidence (2026-09-27, the handback lane under load 59-65):
+/// every setter of an evidence bit is reported, even over a mode already in
+/// force, and each call takes what it reports. The host gives a re-armed bit
+/// to the group that re-armed it; before, a job that armed mouse tracking
+/// over a stale `?1000h` was invisible (the evidence stayed `MOUSE`), so it
+/// never owned the bit and its death handed nothing back.
+#[test]
+fn foreground_handback_asserted_evidence_reports_every_setter_even_a_re_arm() {
+    use super::evidence::{
+        ALT_SCREEN, COLOR_SCHEME_REPORTS, CURSOR_HIDDEN, FOCUS, FORMAT_OTHER_KEYS, KITTY,
+        MODIFY_OTHER_KEYS, MOUSE, SIZE_REPORTS, SYNC, VT52,
+    };
+    let mut t = Terminal::new(24, 80);
+    assert_eq!(
+        t.take_evidence_asserted(),
+        0,
+        "a fresh terminal asserted nothing"
+    );
+    t.process(b"\x1b[?1000h");
+    assert_eq!(t.program_evidence(), MOUSE);
+    assert_eq!(t.take_evidence_asserted(), MOUSE);
+    assert_eq!(t.take_evidence_asserted(), 0, "taken");
+    // The re-arm: the evidence does not move, the assertion does.
+    t.process(b"\x1b[?1003h");
+    assert_eq!(t.program_evidence(), MOUSE, "the evidence cannot see it");
+    assert_eq!(t.take_evidence_asserted(), MOUSE, "the assertion can");
+    t.process(b"\x1b[?1003h");
+    assert_eq!(
+        t.take_evidence_asserted(),
+        MOUSE,
+        "an identical re-send too"
+    );
+
+    // Every setter, one per bit.
+    for (bytes, bit) in [
+        (&b"\x1b[?1049h"[..], ALT_SCREEN),
+        (b"\x1b[?47h", ALT_SCREEN),
+        (b"\x1b[?1047h", ALT_SCREEN),
+        (b"\x1b[?9h", MOUSE),
+        (b"\x1b[?1002h", MOUSE),
+        (b"\x1b[?25l", CURSOR_HIDDEN),
+        (b"\x1b[?2026h", SYNC),
+        (b"\x1b[?2048h", SIZE_REPORTS),
+        (b"\x1b[?2031h", COLOR_SCHEME_REPORTS),
+        (b"\x1b[?1004h", FOCUS),
+        (b"\x1b[>1u", KITTY),
+        (b"\x1b[>0u", KITTY),
+        (b"\x1b[=5;1u", KITTY),
+        (b"\x1b[>4;2m", MODIFY_OTHER_KEYS),
+        (b"\x1b[>4;1f", FORMAT_OTHER_KEYS),
+        (b"\x1b[?2l", VT52),
+    ] {
+        let mut t = Terminal::new(24, 80);
+        t.process(bytes);
+        assert_eq!(t.take_evidence_asserted(), bit, "{bytes:?}");
+    }
+    // One CSI with several modes asserts each.
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b[?1049;1003;25l\x1b[?1049;1003h");
+    assert_eq!(
+        t.take_evidence_asserted(),
+        ALT_SCREEN | MOUSE | CURSOR_HIDDEN
+    );
+
+    // NEGATIVE CONTROL: disarms, a kitty pop, a kitty set to zero flags, a
+    // zero modifyOtherKeys and evidence-free modes assert nothing.
+    let mut t = Terminal::new(24, 80);
+    t.process(b"\x1b[?1049h\x1b[>1u\x1b[?1003h\x1b[>4;2m");
+    t.take_evidence_asserted();
+    t.process(
+        b"\x1b[?1003l\x1b[?1000l\x1b[?1049l\x1b[?25h\x1b[?2026l\x1b[<u\x1b[=0;1u\x1b[>4;0m\
+          \x1b[>4m\x1b[>4;0f\x1b[?2004h\x1b[?1006h\x1b[?1h\x1b=\x1b[?7l\x1b[?1007h",
+    );
+    assert_eq!(t.take_evidence_asserted(), 0);
+}

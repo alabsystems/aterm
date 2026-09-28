@@ -874,19 +874,21 @@ fn procedural_cells_match_cpu_exactly() {
     cpu.debug_block_on_lazy_fallbacks();
     gpu.debug_block_on_lazy_fallbacks();
 
-    let (rows, cols) = (4usize, 16usize);
+    let (rows, cols) = (5usize, 16usize);
     let mut term = Terminal::new(rows as u16, cols as u16);
     // Hide the cursor so no cell mixes in cursor styling; every pixel is then
     // a solid bg fill or hard procedural coverage. Row 2 paints a red double
     // junction run to exercise the fg tint path; the rest uses default fg.
     // Row 4 covers dashes, eighth blocks, and the legacy orthogonal
-    // eighth-block ranges (U+1FB70–1FB8B).
+    // eighth-block ranges (U+1FB70–1FB8B); row 5 the Unicode 16 block
+    // octants (U+1CD00–1CDE5), first to last.
     term.process(
         "\x1b[?25l\
 \u{250C}\u{2500}\u{252C}\u{2500}\u{2510}\u{2554}\u{2550}\u{2566}\u{2550}\u{2557}\u{2501}\u{2513}\u{2517}\u{2503}\u{254B}\r\n\
 \u{251C}\u{2500}\u{253C}\u{2500}\u{2524}\x1b[31m\u{2560}\u{2550}\u{256C}\u{2550}\u{2563}\x1b[0m\u{2580}\u{2584}\u{258C}\u{2590}\u{2588}\r\n\
 \u{2514}\u{2500}\u{2534}\u{2500}\u{2518}\u{255A}\u{2550}\u{2569}\u{2550}\u{255D}\u{2591}\u{2592}\u{2593}\u{2847}\u{28FF}\r\n\
-\u{2504}\u{2508}\u{254C}\u{2581}\u{2582}\u{258E}\u{1FB13}\u{1FB70}\u{1FB76}\u{1FB7C}\u{1FB80}\u{1FB81}\u{1FB82}\u{1FB87}\u{1FB8B}"
+\u{2504}\u{2508}\u{254C}\u{2581}\u{2582}\u{258E}\u{1FB13}\u{1FB70}\u{1FB76}\u{1FB7C}\u{1FB80}\u{1FB81}\u{1FB82}\u{1FB87}\u{1FB8B}\r\n\
+\u{1CD00}\u{1CD01}\u{1CD17}\u{1CD2E}\u{1CD45}\u{1CD5C}\u{1CD73}\u{1CD8A}\u{1CDA1}\u{1CDB8}\u{1CDCF}\u{1CDDD}\u{1CDE4}\u{1CDE5}"
             .as_bytes(),
     );
 

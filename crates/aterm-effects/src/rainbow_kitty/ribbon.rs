@@ -114,16 +114,19 @@
 //!   the bar's alone: a floor against the GROUND was tried here and taken
 //!   out again, because wherever it exceeds the bar it lifts the bed over
 //!   the luminance the text can bear (One Dark's `#ABB2BF` over `#282C34`
-//!   went 5.29:1 → 4.69:1), and that trade is the owner's, not this
-//!   module's — `the_warm_stops_frontier_table` prints what each theme's
-//!   bed reads at over its own ground beside what a lift would cost. What
-//!   this does NOT do: brighten yellow, green or the crossing's green half.
-//!   At a fixed
+//!   went 5.29:1 → 4.69:1). Decided 2026-09-25 under the owner's standing
+//!   direction: the bar wins, and a dark-foreground theme's dim bed
+//!   (Solarized Dark's 1.00:1 over its page) is the documented exception.
+//!   What this does NOT do: brighten yellow, green or the crossing's green
+//!   half. At a fixed
 //!   `Y` the sRGB transfer caps their peak channel (yellow `(90, 90, 0)`,
 //!   green `(0, 102, 0)`, cyan `(0, 98, 97)` at Nord's `0.097`), and they
 //!   are already at full chroma — the only lever left is the bar itself,
-//!   and that is the owner's ruling, not this module's;
-//!   `the_warm_stops_frontier_table` prints what each step up would cost.
+//!   and the bar stands over every glyph pixel: `RAINBOW-PATH-V3.md` D-1
+//!   option B, decided 2026-09-25 as shipped, carries the warm ink on the
+//!   rail below the row bottom ([`RAIL_LUMA_CEIL`]) and the strike instead.
+//!   The `#[ignore]`d per-step cost table was retired 2026-09-25; its source
+//!   is at `01ac0f37a`.
 //!   Pinned by `the_bed_s_dark_stops_arrive_at_full_chroma_not_walked_grey`,
 //!   `the_crossing_composites_no_greyer_than_its_flanks`,
 //!   `the_ground_never_lifts_the_bed_over_the_bar` and
@@ -560,6 +563,80 @@
 //! before, lit or dark, and a cold jump over dark ground still lays the
 //! cap and never the row.
 //!
+//! ## 2026-09-23 — the soft-wrapped caret (the indent stub, the dark `a`)
+//!
+//! The owner, typing ` already` INTO a Claude Code 2.1.280 composer line at
+//! the fold: a detached stub in the continuation row's blank indent, the
+//! reflowed word's `a` dark, and its band starting red under the `l`
+//! (`tests/claude_wrap_band.rs`, real bytes). The key that fills row `r`'s
+//! last text column is drawn THERE and the caret alone wraps to
+//! `(r + 1, 2)`; the next key erases the partial word from row `r` and
+//! rewrites it from the indent. The composer wrap laws assumed the text
+//! moved WITH the caret, the wrap key's glyph at `landing − 1`, which here
+//! is the blank indent.
+//!
+//! * **The key is laid where its glyph is** (`CursorGlow::soft_wrapped_caret`,
+//!   [`SoftWrap`]). The seam reads it off the probes: the landing row blank
+//!   up to the landing, the origin cell blank before and a glyph now. It
+//!   sweeps and spends that one cell, the engine replays a same-frame key
+//!   there, and `Ribbon::leave_row` flows the row as a fold and relays
+//!   nothing.
+//! * **The word comes down with its text** (`Ribbon::settle_carry`). The
+//!   next key's hop is the word plus one glyph for one press, refused by the
+//!   press budget; the word's lit cells are relaid from the indent on the
+//!   walk they had, with that key's own glyph.
+//!
+//! What did NOT move: the 2.1.278 box-growth wrap, a shell fold and every
+//! re-wrap whose landing row holds the moved word keep the `landing − 1`
+//! law; a Space typed at the last text column (no glyph to read) stays on
+//! it, unmeasured. The trail ring still logs the reflow key `no-credits`,
+//! which is the seam's true verdict on its presses.
+//!
+//! ## 2026-09-23 — the same insert's neighbouring shapes
+//!
+//! Three more composer shapes of the owner's insert at the fold, each its
+//! own root cause (`tests/wrap_code_reflow.rs`, real bytes and a synthetic
+//! composer built on them):
+//!
+//! * **The key that pushes the word down is judged, not parked**
+//!   (`CursorGlow::key_pushed_text_down`). When the first key sends the word
+//!   at the caret to the next row, Ink erases the row from the caret and
+//!   the caret goes one row down. The row's prefix is untouched, so the
+//!   seam's cross-row park read a background footer and swallowed the whole
+//!   insert for ten seconds. It is judged at once when the source row's
+//!   tail was erased AND the key's own stamped glyph stands left of the
+//!   landing; either alone keeps the footer's custody.
+//! * **The moved word is measured from where the hand's run began**
+//!   ([`Ribbon::arrived`], [`Ribbon::moved_word_len`]): the later of its
+//!   last typed Space and where it last arrived by a deliberate move. From
+//!   the Space alone, a word begun at a navigated caret measured `0`: the
+//!   reflowed word's first letter dark, its old cell left on the row above.
+//!   And a Space typed before the hand navigated relaid a stub onto the
+//!   continuation row's blank indent.
+//! * **A lifted word goes up with its light** ([`Lift`],
+//!   [`Ribbon::lift_word`]): a Space that splits a word off the chip it was
+//!   glued to lets it fit the row above again, and the ribbon relays its lit
+//!   cells there on the walk they had instead of draining them under the
+//!   caret.
+//!
+//! ## 2026-09-23 — review of the above: what the witnesses must not read
+//!
+//! * **An arrow inside the hand's own live word is no new run**
+//!   ([`Ribbon::moved_word_len`]). Every arrow set [`Ribbon::arrived`], so a
+//!   typo fixed mid-word or a scrub cut the measure at the arrow and the
+//!   word a re-wrap then moved came down with its head dark; the arrival
+//!   now reaches back over the contiguous live TYPED cells left of it, and
+//!   the typed Space still bounds it.
+//! * **A key drawn over the glyph it pushed on is a soft-wrapped caret too**
+//!   (`CursorGlow::soft_wrapped_caret`): a token the box hard-breaks at the
+//!   row's end leaves the key's glyph at the origin and moves nothing down,
+//!   where the re-wrap relay measured the whole row as a moved word.
+//! * **The soft-wrapped word comes down on the glass's word, not the hop's**
+//!   ([`Ribbon::settle_carry`], [`Ribbon::reflow_move`]): a burst after a
+//!   one-letter word hops as far as a reflow and leaves the word standing,
+//!   so the relay waits for the seam's reading that the word's columns are
+//!   blank on its row.
+//!
 //! ## 2026-09-23 — the walk's odometer (the owner's smoosh)
 //!
 //! The owner, on v0.91.0 with Claude Code's composer wrapped onto a third
@@ -601,7 +678,8 @@ use std::mem;
 use aterm_time::Instant;
 
 use aterm_render::{
-    BeamVertex, GlowBlend, RibbonVertex, comet_beam, over_premul, premul_rgb, ribbon_beam,
+    BeamClip, BeamVertex, GlowBlend, GlowQuad, RibbonVertex, comet_beam, over_premul, premul_rgb,
+    ribbon_beam,
 };
 
 use crate::cursor_glow::{InkRole, band_pos, band_row};
@@ -1135,12 +1213,12 @@ pub const BED_SAT_FLOOR: f32 = 1.0;
 // `#ABB2BF` over `#282C34` went from 5.29:1 to 4.69:1 under the text, and 54
 // (fg, ground) pairs of the 67-theme sweep were bar-violating by
 // construction. A floor that must never exceed the bar collapses to the bar,
-// so it cannot exist as a law beside it; how dark a bed a dark-foreground
-// theme is handed is a ruling for the owner, and
-// `the_warm_stops_frontier_table` prints it (Solarized Dark's bed sits 1.00:1
-// over its page at the `BED_LUMA_MIN` clamp, its text at 4.70:1 — the
-// documented exception; lifting it to 1.4:1 would cost that text 3.39:1, and
-// One Dark's 5.29:1 → 4.69:1). Pinned by
+// so it cannot exist as a law beside it. Decided 2026-09-25 under the owner's
+// standing direction: the bar wins. Solarized Dark's bed sits 1.00:1 over its
+// page at the `BED_LUMA_MIN` clamp, its text at 4.70:1 — the documented
+// exception; lifting it to 1.4:1 would cost that text 3.39:1, and One Dark's
+// 5.29:1 → 4.69:1 (the per-theme table that printed these was retired
+// 2026-09-25; its source is at `01ac0f37a`). Pinned by
 // `the_ground_never_lifts_the_bed_over_the_bar`.
 
 /// Entries in the bed-ink lookup table. The recipe below is a bisection over
@@ -1423,7 +1501,7 @@ pub const SEAM_LEVEL: f32 = (1.0 - 1.0 / HOT_EDGE_CELLS) * (1.0 - 1.0 / HOT_EDGE
 /// held park judged `typing` for one cell and flushed as such
 /// (`cursor_glow::flush_park`), a repaint parking the caret one column
 /// left of the trailing space it has just drawn — is PINNED AT UNIT LEVEL
-/// (`cursor_glow.rs`, the flushed one-cell park; here, the floor and the
+/// (`cursor_glow/tests/park.rs`, the flushed one-cell park; here, the floor and the
 /// trade) and was not measured at the host seam: the owner's dark boundary
 /// spaces (one dark cell inside a lit line, the glyphs either side lit)
 /// are that shape, but no host-seam take reproduced them through this path.
@@ -3472,16 +3550,15 @@ struct Run {
     hi: usize,
     /// The head cell's column (see [`Ribbon::head_col`]).
     head_col: u16,
-    /// Index into [`Ribbon::plan`] of the HEAD boundary — the head cell's
-    /// RIGHT edge, where the hot edge ends.
+    /// Index into [`Ribbon::plan`] of the head boundary: the head cell's
+    /// right edge for a left-streaming run, or the landing's left edge for
+    /// a right-streaming leftward wake. The hot edge starts here.
     ///
-    /// The head is always the run's right-hand side and the tail its left:
-    /// a run is one cohort, and a cohort's walk is a monotone function of the
-    /// column ([`Cohort::t_at`]), so the oldest light — the reach, the first
-    /// typed cells — is always the left end. There is no "which end is the
-    /// head" heuristic: one resolved from the head's POSITION flipped the tail
-    /// onto the erased cells whenever a backspace carried the caret past the
-    /// run's midpoint, and drew the hot edge over them.
+    /// Typed runs and rightward wakes stream left from this boundary. A
+    /// leftward wake starts at the run's first boundary and streams right
+    /// ([`Run::stream_dir`]). On a capped frame the emitter starts here,
+    /// even when the head is inside a run after a backward edit, so a far
+    /// tail cannot survive while light by the hand is dropped.
     head: usize,
     /// True when the head cell is real, un-retracting light — the hot edge's
     /// "still wet at the hand" condition (§4.1). A run whose every cell is
@@ -3762,6 +3839,17 @@ pub struct Ribbon {
     /// The cell of the last typed Space, `(row, col)` — what tells a
     /// re-anchor how long the word an app moved to the next row was.
     last_space: Option<(u16, u16)>,
+    /// **WHERE THE HAND ARRIVED** — `(row, col)`, the caret its last
+    /// deliberate relocation (the non-echo arm of `Event::Move`, the same
+    /// test [`Ribbon::pen`] takes) left it at. The hand's typed run on that
+    /// row begins there as surely as it begins after a typed Space, so the
+    /// word a composer's re-wrap moved is measured from the LATER of the two
+    /// ([`Ribbon::moved_word_len`]): a hand that navigated into program text
+    /// and typed there has no Space of its own on the row, and a Space it
+    /// typed before navigating is not the start of what it typed since.
+    /// Cleared with `last_space` by the moves that consume the measure, and
+    /// ridden, dropped and reset exactly as the pen is.
+    arrived: Option<(u16, u16)>,
     /// **THE SPACE BEFORE IT** (2026-09-24, the review of the follow
     /// landing): the `last_space` a newer Space replaced, kept so a Space
     /// HELD right after a wrap key — remembered at the engine's stale
@@ -3773,6 +3861,22 @@ pub struct Ribbon {
     /// A re-anchor's moved word, waiting for the landing that reveals where
     /// it went (see [`Relocate`]).
     relocate: Option<Relocate>,
+    /// The seam's soft-wrap verdict for the `Move` being replayed — set only
+    /// for the length of that one replay ([`Ribbon::soft_wrap_move`]) and
+    /// read by [`Ribbon::leave_row`].
+    soft_wrap: Option<SoftWrap>,
+    /// A soft-wrapped word waiting for the key that reflows it
+    /// ([`Ribbon::settle_carry`]), with the wrap's clock.
+    carry: Option<(SoftWrap, Instant)>,
+    /// The seam's verdict that the soft-wrapped word `carry` names LEFT its
+    /// row on the glass (`CursorGlow::carried_word_left`), for the `Move`
+    /// being replayed — set only for the length of that one replay
+    /// ([`Ribbon::reflow_move`]) and read by [`Ribbon::settle_carry`].
+    reflow: Option<SoftWrap>,
+    /// The seam's lift verdict for the `Move` being replayed — set only for
+    /// the length of that one replay ([`Ribbon::lift_move`]) and read by the
+    /// `Move` arm's same-row retreat.
+    lift: Option<Lift>,
     /// **WHERE THE RELAID TEXT STARTS, AS THE ROW SHOWS IT** (2026-09-27):
     /// for the same-row re-anchor `from → to` the engine is about to replay,
     /// the first column the landing row's sample holds text at
@@ -3989,6 +4093,39 @@ struct Relocate {
 
 /// How long a [`Relocate`] waits for the caret to reveal the moved word.
 pub const RELOCATE_PATIENCE_S: f32 = 2.0;
+
+/// **THE SOFT-WRAPPED CARET** (`CursorGlow::soft_wrapped_caret`): the seam's
+/// content verdict that a typed `Move` `origin → landing`, exactly one row
+/// down, is a key whose glyph was drawn AT `origin` while the caret alone
+/// wrapped to the continuation row's indent (`landing`) — Claude Code
+/// 2.1.280's insert at the fold. The key after it reflows the word the glyph
+/// ends, `word_col0..=origin.1` on the origin row, down to the indent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SoftWrap {
+    /// Where the key's glyph stands, and where the caret was.
+    pub origin: (u16, u16),
+    /// Where the caret alone wrapped to.
+    pub landing: (u16, u16),
+    /// The first column of the word the key ends, on the origin row.
+    pub word_col0: u16,
+}
+
+/// **THE LIFTED WORD** (`CursorGlow::lifted_word`): the seam's content
+/// verdict that a typed `Move` `origin → landing`, backward on one row, is
+/// the composer re-wrapping the word `landing.1..origin.1` UP onto the end
+/// of the row above, where it now stands from `dst` — Claude Code 2.1.280's
+/// Space typed after a word glued to the text that follows it (`already[Image`
+/// splits and `already` fits the row above again). The caret stays before
+/// the text that did not move, at the word's old first column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lift {
+    /// The caret before the key: one past the word's last column.
+    pub origin: (u16, u16),
+    /// The caret after it: the word's old first column.
+    pub landing: (u16, u16),
+    /// Where the word's first glyph stands now, on the row above.
+    pub dst: (u16, u16),
+}
 
 /// **THE RUN THE FOLLOW PASS SPLIT, AND WHERE ITS WALK WENT** (2026-09-24 —
 /// the owner: *"the spectrum is smooshed on the next line. I want smooth
@@ -4421,6 +4558,7 @@ impl Ribbon {
                 // line above does to the MIRROR.
                 if !licence.is_echo() {
                     self.pen = Some(to);
+                    self.arrived = Some(to);
                     // ...and with it the hand's floor on the row it is on
                     // ([`Ribbon::hand_floor`]): an arrow or a ^A is the hand
                     // REACHING a column, so it frees that column for the
@@ -4482,7 +4620,13 @@ impl Ribbon {
                             self.leave_row(from, to, at, licence);
                         }
                     } else if to.1 < from.1 {
-                        if self.pending_erase > 0 {
+                        if let Some(lift) =
+                            self.lift.filter(|l| l.origin == from && l.landing == to)
+                        {
+                            // THE WORD WENT UP WITH ITS TEXT, not back under
+                            // the caret ([`Ribbon::lift_word`]).
+                            self.lift_word(lift, at);
+                        } else if self.pending_erase > 0 {
                             // THE ERASE'S RETREAT: the erased cells are the
                             // ones at and past the landing, whatever tick
                             // the `Erase` itself was replayed on.
@@ -4502,6 +4646,7 @@ impl Ribbon {
                             self.short_reanchor = None;
                         }
                     } else if to.1 > from.1 {
+                        self.settle_carry(to.0, from.1, to.1, at);
                         self.settle_relocate(to.0, from.1, at, ctx);
                     }
                 } else {
@@ -4701,7 +4846,11 @@ impl Ribbon {
         // place a key in the new space can be brought back to. Its floor
         // goes with it for the same reason ([`Ribbon::hand_floor`]).
         self.pen = None;
+        self.arrived = None;
         self.hand_floor = None;
+        // …and a soft-wrapped word waiting for its reflow: the curtain is
+        // the same coordinate-space cut ([`Ribbon::settle_carry`]).
+        self.carry = None;
         if self.cells.is_empty() || self.curtain.is_some() {
             return;
         }
@@ -5644,6 +5793,38 @@ impl Ribbon {
     /// ([`Relocate`]); a landing at the pane's edge is a plain fold, whose
     /// cells the host's fold sweep already lays.
     fn leave_row(&mut self, from: (u16, u16), to: (u16, u16), at: Instant, licence: Licence) {
+        // **A SOFT-WRAPPED CARET MOVED NO TEXT** ([`SoftWrap`], 2026-09-23):
+        // the key's glyph stands at `from`, laid there by the replay or the
+        // seam's sweep, and only the caret wrapped. So nothing is retracted
+        // or relaid here: the row flows as a fold, and the word the key ends
+        // waits on the row for the key that reflows it
+        // ([`Ribbon::settle_carry`]). The re-wrap path below read it as the
+        // app moving the word down WITH the caret: it measured the word from
+        // the last typed Space (the wrap key's glyph left out) and relaid it
+        // before `landing − 1`, the blank indent.
+        let soft_wrap = self
+            .soft_wrap
+            .filter(|sw| sw.origin == from && sw.landing == to);
+        self.carry = None;
+        if let Some(sw) = soft_wrap
+            && Self::folded_down(from, to, licence)
+        {
+            // The input CONTINUES onto the new row, as on any fold: the
+            // seam (2026-09-23) is armed there too. It draws from the first
+            // cell the HAND lays on the row ([`Ribbon::hand_floor_on`]) —
+            // never over the word the reflow relays from the indent, nor the
+            // indent (pinned 2026-09-26,
+            // `the_seam_marks_a_continued_line_s_tail_and_spends_with_the_row_above`).
+            self.arm_seam(to.0, at);
+            self.flow_row(from.0, at);
+            self.pending_erase = 0;
+            self.last_space = None;
+            self.prev_space = None;
+            self.arrived = None;
+            self.relocate = None;
+            self.carry = Some((sw, at));
+            return;
+        }
         // **A FOLD IS NOT A DEPARTURE — IT IS A FLOW** (2026-09-15, the
         // owner: *"awkward transitions when going to a new line"*; restated
         // 2026-09-21: *"when typing wraps to a new line the previous row's
@@ -5707,7 +5888,7 @@ impl Ribbon {
         // terminal fold lands ON the pane's first column and moves no glyph
         // at all: it takes nothing, and the row keeps every cell it has.
         let pane_col0 = self.pane.map_or(0, |(c0, _)| c0);
-        let w = self.moved_word_len(from);
+        let w = self.moved_word_len(from, at);
         let held_after = self.space_held_after_the_wrap(from);
         let re_wrapped = licence == Licence::Typed && to.1 > pane_col0.saturating_add(1);
         // The origin is read BEFORE the retract stamps the word's cells.
@@ -5743,6 +5924,7 @@ impl Ribbon {
         }
         self.pending_erase = 0;
         self.reseat_spaces(held_after, to);
+        self.arrived = None;
         self.relocate = None;
         if re_wrapped {
             self.begin_relocate(to, w, at, origin);
@@ -5900,7 +6082,7 @@ impl Ribbon {
     /// The row change is the discriminator.
     fn re_anchor(&mut self, from: (u16, u16), to: (u16, u16), at: Instant) {
         let n = from.1 - to.1;
-        let w = self.moved_word_len(from);
+        let w = self.moved_word_len(from, at);
         let held_after = self.space_held_after_the_wrap(from);
         // The origin is read BEFORE the retract stamps the word's cells.
         let origin = self.relay_origin(from, w);
@@ -5930,6 +6112,7 @@ impl Ribbon {
         // their own.
         self.retract_suffix(to.0, to.1, n, at, RETRACT_DUR_S);
         self.reseat_spaces(held_after, to);
+        self.arrived = None;
         // The span `begin_relocate` would lay is `[landing − 1 − w,
         // landing − 1)`. An unknown floor bounds nothing, as everywhere else
         // it is read (main's hand floor, 2026-09-22).
@@ -6013,15 +6196,195 @@ impl Ribbon {
         self.last_space = held_after.then_some(to);
     }
 
-    /// Cells of the word the app moved off `from`'s row: everything typed
-    /// after the row's last Space ([`Ribbon::word_space`]), up to the
-    /// origin column. `0` with no Space on the row (a line that is one word
-    /// wraps mid-word: the app moved nothing).
-    fn moved_word_len(&self, from: (u16, u16)) -> u16 {
-        match self.word_space(from) {
-            Some((row, s)) if row == from.0 && s < from.1 => from.1 - s - 1,
-            _ => 0,
+    /// Replay the `Move` the seam judged a SOFT-WRAPPED CARET
+    /// ([`SoftWrap`]): the verdict stands for exactly this one event.
+    pub(super) fn soft_wrap_move(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, sw: SoftWrap) {
+        self.soft_wrap = Some(sw);
+        self.on_event(ev, at, ctx);
+        self.soft_wrap = None;
+    }
+
+    /// Replay the `Move` the seam judged a LIFTED WORD ([`Lift`]): the
+    /// verdict stands for exactly this one event.
+    pub(super) fn lift_move(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, lift: Lift) {
+        self.lift = Some(lift);
+        self.on_event(ev, at, ctx);
+        self.lift = None;
+    }
+
+    /// Replay the `Move` whose echo the seam saw carry the soft-wrapped word
+    /// `sw` off its row ([`Ribbon::settle_carry`]): the verdict stands for
+    /// exactly this one event.
+    pub(super) fn reflow_move(&mut self, ev: &Event, at: Instant, ctx: &Ctx<'_>, sw: SoftWrap) {
+        self.reflow = Some(sw);
+        self.on_event(ev, at, ctx);
+        self.reflow = None;
+    }
+
+    /// The soft-wrapped word waiting for the key that reflows it, if any —
+    /// what the seam reads the glass for (`CursorGlow::carried_word_left`).
+    #[must_use]
+    pub(super) fn carry(&self) -> Option<SoftWrap> {
+        self.carry.map(|(sw, _)| sw)
+    }
+
+    /// **THE LIFTED WORD GOES UP WITH ITS TEXT** (2026-09-23, the owner's
+    /// composer, the reverse of the re-wrap `leave_row` relays: a Space
+    /// typed after `already` in `already[Image #1]` at the start of the
+    /// continuation row lets `already` fit the row above again, and Ink
+    /// rewrites it at that row's end while the caret stays before `[Image`,
+    /// at the word's old first column). Read as a same-row re-anchor, the
+    /// word's cells drained into the caret under the chip's text and the
+    /// word stood unlit on the row above — nothing follows text to other
+    /// columns (the follow pass carries runs vertically, at their own).
+    /// The word's LIT cells leave its old row on the retract's fade and
+    /// are relaid under its glyphs on the row above on the walk they had
+    /// ([`Ribbon::relay_origin`]), as the soft-wrapped word comes down
+    /// ([`Ribbon::settle_carry`]); that row is one the hand has left by
+    /// typing, so it flows into the fold ([`Ribbon::flow_row`]). The
+    /// word's measure is consumed with it.
+    fn lift_word(&mut self, lift: Lift, at: Instant) {
+        let (row, end) = lift.origin;
+        let col0 = lift.landing.1;
+        self.last_space = None;
+        self.prev_space = None;
+        self.arrived = None;
+        self.relocate = None;
+        let Some(lit0) = (col0..end)
+            .rev()
+            .take_while(|&col| self.owned(row, col, at))
+            .last()
+        else {
+            return;
+        };
+        let lit = end - lit0;
+        let t0 = self.relay_origin((row, end), lit);
+        self.retract_span(row, lit0, lit, at, RETRACT_FADE_S);
+        let (dst_row, dst0) = lift.dst;
+        self.relay_word(
+            dst_row,
+            dst0.saturating_add(lit0 - col0),
+            dst0.saturating_add(end - col0),
+            at,
+            t0,
+        );
+        self.flow_row(dst_row, at);
+    }
+
+    /// **THE SOFT-WRAPPED WORD COMES DOWN WITH ITS TEXT** (2026-09-23, the
+    /// owner's composer: the reflowed word's first letter dark, its band
+    /// starting under the second). The first same-row forward typed echo
+    /// from a soft-wrapped caret's landing is the next key, and when it
+    /// advanced past the word the wrap key ended plus its own glyph, the app
+    /// erased that partial word from the end of the origin row and rewrote
+    /// it from the indent. That hop is the word and one glyph for one press,
+    /// which the press budget refuses (`no-credits`, or past the sweep cap:
+    /// the word's cells were paid on the row above, not by this press), so
+    /// nothing else lays it. The word's LIT cells leave the origin row and
+    /// are relaid from the indent on the walk they had
+    /// ([`Ribbon::relay_origin`]), with the reflowing key's own glyph beside
+    /// them: a key HELD on its press frame has no other path to a cell when
+    /// the budget refuses its hop. A forward echo that did not carry the
+    /// word drops the carry, and so does one later than the relocation's
+    /// patience ([`RELOCATE_PATIENCE_S`]).
+    ///
+    /// **THE HOP IS NOT THE WITNESS; THE GLASS IS** (2026-09-23 review,
+    /// `tests/wrap_code_reflow.rs`, D). A hop past the word is what a reflow
+    /// looks like, and also what a burst or a paste after a short word looks
+    /// like: a soft-wrapped `I`, then ` b` answered in one chunk, hops the
+    /// caret two cells while the `I` stays where it was. Read from the hop
+    /// alone, that retracted the `I`'s light under a glyph that never moved
+    /// and relaid it under the Space. So the relay needs the seam's verdict
+    /// for this very `Move` ([`Ribbon::reflow_move`]): the word's columns on
+    /// its row are blank on the glass now (`CursorGlow::carried_word_left`).
+    fn settle_carry(&mut self, row: u16, from_col: u16, to_col: u16, at: Instant) {
+        let Some((sw, wrapped_at)) = self.carry else {
+            return;
+        };
+        let (landing_row, landing) = sw.landing;
+        if landing_row != row || from_col != landing {
+            return;
         }
+        self.carry = None;
+        let (src_row, src_end) = (sw.origin.0, sw.origin.1.saturating_add(1));
+        let n = src_end.saturating_sub(sw.word_col0);
+        if n == 0
+            || self.reflow != Some(sw)
+            || at.saturating_duration_since(wrapped_at).as_secs_f32() > RELOCATE_PATIENCE_S
+            || to_col <= landing.saturating_add(n)
+        {
+            return;
+        }
+        // Only the hand's own light moves: the lit suffix of the word (a
+        // word the hand finished rather than began keeps its unlit head).
+        let Some(lit0) = (sw.word_col0..src_end)
+            .rev()
+            .take_while(|&col| self.owned(src_row, col, at))
+            .last()
+        else {
+            return;
+        };
+        let lit = src_end - lit0;
+        let t0 = self.relay_origin((src_row, src_end), lit);
+        self.retract_span(src_row, lit0, lit, at, RETRACT_FADE_S);
+        let dst0 = landing + (lit0 - sw.word_col0);
+        self.relay_word(row, dst0, to_col.min(landing + n + 1), at, t0);
+    }
+
+    /// Cells of the word the app moved off `from`'s row: everything the hand
+    /// typed on the row up to the origin column since the LATER of its last
+    /// typed Space ([`Ribbon::word_space`]: not one held after the wrap key)
+    /// and where it last arrived ([`Ribbon::arrived`]). `0` with
+    /// neither on the row (a line that is one word wraps mid-word: the app
+    /// moved nothing).
+    ///
+    /// **THE HAND'S RUN BEGINS WHERE IT ARRIVED, TOO** (2026-09-23, the
+    /// owner's Claude Code composer, `tests/wrap_code_reflow.rs`). Measured
+    /// from the typed Space alone, a word begun at a caret the hand walked
+    /// into program text measured `0` — the letters typed before the wrap
+    /// key were never relaid (the reflowed word's first letter dark, the
+    /// band starting under its second) and their old cells flowed in place
+    /// on the row the word left (a scrap on its blank tail) — and a Space
+    /// typed before the hand navigated measured a word reaching back past
+    /// the arrival, relaid down to the continuation row's blank indent.
+    ///
+    /// **…BUT A MOVE INSIDE ITS OWN LIVE RUN DOES NOT CUT IT** (2026-09-23,
+    /// review of the above, `tests/wrap_code_reflow.rs` B3: a typo fixed
+    /// mid-word, a scrub). Every arrow sets [`Ribbon::arrived`], and an
+    /// arrow that walks back over the letters the hand is still typing
+    /// does not begin a new run: the letters left of it are the same word,
+    /// lit by the same hand. Cut there, the word a re-wrap then moved
+    /// measured only what was typed after the arrow (`0` for the typo's
+    /// insert): its head dark on the new row, its old cells flowing on the
+    /// blank tail of the row it left. So the arrival reaches back over the
+    /// contiguous LIVE TYPED cells left of it ([`Ribbon::typed_live`] — a
+    /// wake's cells are no run) to where the hand's run really began, and
+    /// the typed Space still bounds it. An arrival into unlit program text
+    /// (B1, B2) finds no live typed cell beside it and stands.
+    fn moved_word_len(&self, from: (u16, u16), at: Instant) -> u16 {
+        let after_space = match self.word_space(from) {
+            Some((row, s)) if row == from.0 && s < from.1 => Some(s + 1),
+            _ => None,
+        };
+        let arrived = self
+            .arrived
+            .filter(|&(row, col)| row == from.0 && col <= from.1)
+            .map(|(row, col)| {
+                (0..col)
+                    .rev()
+                    .take_while(|&c| self.typed_live(row, c, at))
+                    .last()
+                    .unwrap_or(col)
+            });
+        after_space.max(arrived).map_or(0, |start| from.1 - start)
+    }
+
+    /// Whether a live TYPED cell owns `(row, col)` at `at` — the hand's
+    /// own light, as [`Ribbon::owned`] reads any light (a wake's included).
+    fn typed_live(&self, row: u16, col: u16, at: Instant) -> bool {
+        self.cells
+            .iter()
+            .any(|c| c.row == row && c.col == col && c.typing && self.alive_at(c, at))
     }
 
     /// Relay a re-anchor's moved word (`w` cells) before the wrap key's own
@@ -9452,14 +9815,14 @@ impl Ribbon {
     /// law) and before stardust — so a truncation sheds sky before it sheds
     /// the laid rainbow.
     ///
-    /// ONE `aterm_render::ribbon_beam` CALL PER RUN for the body, with the
+    /// Normally one `aterm_render::ribbon_beam` call per run for the body, with the
     /// shoulder taken from [`BodyProfile`] and `GlowBlend::Over` on both
     /// grounds: the bed is the one stream in the family that composites
     /// SOURCE-OVER, which is why its ceiling is a luminance rather than an
     /// additive budget, and why the light theme's fork is a change of INK
     /// and of nothing else (§3.3, L6: never additive light on white).
     ///
-    /// **AND A SECOND CALL PER RUN FOR THE VIVID RAIL** (2026-09-13, §30,
+    /// **NORMALLY A SECOND CALL PER RUN FOR THE VIVID RAIL** (2026-09-13, §30,
     /// dark themes, [`Ribbon::rail_lit`]): the same slabs, the same `x`, a
     /// polyline whose top is the row bottom — `max(spine, row bottom)`, so
     /// the wave's crest never lifts it into the typed row's descenders —
@@ -9522,12 +9885,15 @@ impl Ribbon {
                     lift_span,
                 });
             }
-            // HEAD FIRST: `ribbon_beam` walks the polyline in order and stops
-            // at the budget, so starting from the run's RIGHT end — the head's
-            // side, always (see `Run::head`) — sheds the left, older light
-            // when it runs out.
+            // Preserve the historical byte order on every uncapped frame.
+            // Only when the budget actually cuts a run whose head is LEFT of
+            // its far right edge do we discard that partial run and repaint
+            // outward from the head. This covers a leftward wake and a long
+            // typed row edited in its middle. The retry starts at the same
+            // stream length, with the same cap, and can never exceed it.
             verts.reverse();
-            if !ribbon_beam(
+            let start = frame.under.len();
+            let mut complete = ribbon_beam(
                 frame.under,
                 clip,
                 &verts,
@@ -9535,7 +9901,22 @@ impl Ribbon {
                 stride,
                 budget,
                 GlowBlend::Over,
-            ) {
+            );
+            let head = run.head - run.lo;
+            if !complete && head + 1 < verts.len() {
+                frame.under.truncate(start);
+                verts.reverse();
+                complete = Self::repaint_capped_run_from_head(
+                    frame.under,
+                    clip,
+                    &mut verts,
+                    head,
+                    shoulder,
+                    stride,
+                    budget,
+                );
+            }
+            if !complete {
                 break;
             }
             if !rail {
@@ -9583,7 +9964,8 @@ impl Ribbon {
                 });
             }
             verts.reverse();
-            if !ribbon_beam(
+            let start = frame.under.len();
+            let mut complete = ribbon_beam(
                 frame.under,
                 clip,
                 &verts,
@@ -9591,7 +9973,21 @@ impl Ribbon {
                 stride,
                 budget,
                 GlowBlend::Over,
-            ) {
+            );
+            if !complete && head + 1 < verts.len() {
+                frame.under.truncate(start);
+                verts.reverse();
+                complete = Self::repaint_capped_run_from_head(
+                    frame.under,
+                    clip,
+                    &mut verts,
+                    head,
+                    1.0,
+                    stride,
+                    budget,
+                );
+            }
+            if !complete {
                 break;
             }
         }
@@ -9606,6 +10002,44 @@ impl Ribbon {
             .iter()
             .filter(|q| reads_as_ink(over_premul(bg, q.color, q.alpha)))
             .count();
+    }
+
+    /// Retry only a run that the quad budget actually cut, starting at its
+    /// head and walking both sides without a synthetic segment between them.
+    fn repaint_capped_run_from_head(
+        out: &mut Vec<GlowQuad>,
+        clip: BeamClip,
+        verts: &mut [RibbonVertex],
+        head: usize,
+        shoulder: f32,
+        stride: usize,
+        budget: usize,
+    ) -> bool {
+        debug_assert!(head < verts.len());
+        // Both halves share exactly one boundary vertex. They own disjoint
+        // pixel slabs, so the head is drawn once while the two paint calls
+        // walk outward from it without a bridge across the far ends.
+        verts[..=head].reverse();
+        let left_complete = ribbon_beam(
+            out,
+            clip,
+            &verts[..=head],
+            shoulder,
+            stride,
+            budget,
+            GlowBlend::Over,
+        );
+        verts[..=head].reverse();
+        left_complete
+            && ribbon_beam(
+                out,
+                clip,
+                &verts[head..],
+                shoulder,
+                stride,
+                budget,
+                GlowBlend::Over,
+            )
     }
 
     /// How many of the last frame's ribbon quads read as band ink on the
@@ -10538,6 +10972,10 @@ impl Ribbon {
             .pen
             .filter(|&(row, _)| row >= rows)
             .map(|(row, col)| (row - rows, col));
+        self.arrived = self
+            .arrived
+            .filter(|&(row, _)| row >= rows)
+            .map(|(row, col)| (row - rows, col));
         // The hand's floor rides with the text it bounds; a row scrolled off
         // the top takes it, because the hand was never on the row that
         // replaced it.
@@ -10564,6 +11002,10 @@ impl Ribbon {
             row: r.row - rows,
             ..r
         });
+        // A soft-wrapped word waiting for its reflow is dropped, not carried:
+        // the reflow is the NEXT key's echo, and a scroll between the two is
+        // no shape any take has measured ([`Ribbon::settle_carry`]).
+        self.carry = None;
         // The row the new line's gate says the hand LEFT is the old line's
         // row, and rides with its text; carried off the top it is dropped
         // and the gate reads its instant alone ([`FreshLine::left_row`]).
@@ -10641,6 +11083,9 @@ impl Ribbon {
         self.pen = self
             .pen
             .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
+        self.arrived = self
+            .arrived
+            .and_then(|(row, col)| band_row(row, top, bottom, delta).map(|row| (row, col)));
         // …and the hand's floor rides with the text it bounds, as the scroll
         // twin carries it (2026-09-25, the review of the drift): left on the
         // old row it bounded nothing on the moved one — the reach's floor
@@ -10662,6 +11107,9 @@ impl Ribbon {
         self.relocate = self
             .relocate
             .and_then(|r| band_row(r.row, top, bottom, delta).map(|row| Relocate { row, ..r }));
+        // …and a soft-wrapped word is dropped, as the whole-grid scroll drops
+        // it ([`Ribbon::translate_scroll`]).
+        self.carry = None;
         if let Some(gate) = &mut self.fresh_line {
             gate.left_row = gate
                 .left_row
@@ -10687,10 +11135,12 @@ impl Ribbon {
         self.rearm = None;
         self.pending_erase = 0;
         self.pen = None;
+        self.arrived = None;
         self.hand_floor = None;
         self.last_space = None;
         self.prev_space = None;
         self.relocate = None;
+        self.carry = None;
         self.split_off = None;
         self.last_walk = None;
         self.fresh_line = None;
@@ -11489,129 +11939,6 @@ mod tests {
                     "Nord at cov {cov}, t {t:.3}: #{lit:06X} is under the scanner's colour floor"
                 );
             }
-        }
-    }
-
-    /// **THE WARM STOPS' FRONTIER** — not a pin: a table for the owner.
-    ///
-    /// Yellow, green and the crossing's cyan are at full chroma already; at
-    /// the bar's luminance the sRGB transfer sets their peak channel (Nord:
-    /// 90 / 102 / 98 ink, 87 / 98 / 95 composited). The only lever left is
-    /// the bar, and that is a ruling. This prints, per stop and per step of
-    /// the peak channel, what the foreground reads at over the composited
-    /// bed at the body's cap and at the ledger's frame top, on Nord and the
-    /// default theme, and names the pins each step would move.
-    ///
-    /// `targo --unverified test -p aterm-effects --lib -- --ignored --nocapture the_warm_stops_frontier_table`
-    #[test]
-    #[ignore = "a table for the owner's ruling, not a pin"]
-    fn the_warm_stops_frontier_table() {
-        type InkOf = fn(u32) -> u32;
-        let stops: [(&str, InkOf); 3] = [
-            ("yellow", |p| (p << 16) | (p << 8)),
-            ("green", |p| p << 8),
-            ("cyan", |p| (p << 8) | p),
-        ];
-        let themes = [
-            ("Nord", NORD_FG, NORD_BG),
-            ("default", DEFAULT_FG, DEFAULT_BG),
-        ];
-        println!();
-        println!(
-            "bar {BODY_CONTRAST_BAR}:1 (+{BODY_CONTRAST_GUARD} guard); fg over the composited bed, at cov {} (the body's cap) and {} (the frame top)",
-            UNDER_COV_CAP as u32, BODY_FRAME_TOP as u32
-        );
-        for (name, ink_of) in stops {
-            for (theme, fg, bg) in themes {
-                let budget = bed_luma_budget(fg);
-                let at_bar = match name {
-                    "yellow" => bed_ink(0x00FF_FF00, budget),
-                    "green" => bed_ink(0x0000_FF00, budget),
-                    _ => bed_ink(0x0000_FFFF, budget),
-                };
-                let p0 = max_channel(at_bar);
-                println!();
-                println!(
-                    "{name} on {theme}: the bar's own ink is #{at_bar:06X} (peak {p0}); one level per row for the first six, then five"
-                );
-                println!(
-                    "  ink peak | composited@236 (peak) | fg/bed @236 | fg/bed @251 | Y ink  | pins that move"
-                );
-                let mut p = p0;
-                while p <= p0 + 45 && p <= 255 {
-                    let ink = ink_of(p);
-                    let cap = UNDER_COV_CAP as u8;
-                    let top = BODY_FRAME_TOP as u8;
-                    let c236 = over_premul(bg, premul_rgb(ink, cap), cap);
-                    let c251 = over_premul(bg, premul_rgb(ink, top), top);
-                    let (r236, r251) = (contrast(fg, c236), contrast(fg, c251));
-                    let mut moves = Vec::new();
-                    if r251 < BODY_CONTRAST_BAR {
-                        moves.push("letters_stay_legible_* (5.25:1 at the frame top)");
-                    }
-                    if r236 < BODY_CONTRAST_BAR {
-                        moves.push("…and at the body's cap");
-                    }
-                    if theme == "default"
-                        && name == "yellow"
-                        && !(79..=81).contains(&max_channel(c236))
-                    {
-                        moves.push("the_dimmest_stop_… (79..=81)");
-                    }
-                    if relative_luminance(ink) - budget > 0.004 {
-                        moves.push("every_stop_of_the_arc_composites_at_one_weight (±0.004 Y)");
-                    }
-                    println!(
-                        "  {p:8} | #{c236:06X} ({:3})        | {r236:8.3}    | {r251:8.3}    | {:.4} | {}",
-                        max_channel(c236),
-                        relative_luminance(ink),
-                        if moves.is_empty() {
-                            "none".to_string()
-                        } else {
-                            moves.join("; ")
-                        }
-                    );
-                    p += if p < p0 + 6 { 1 } else { 5 };
-                }
-            }
-        }
-        // THE GROUND. The bed's budget is the bar's answer against the
-        // foreground; how far it sits over the theme's own page is not a
-        // law (a 1.4:1 floor was tried on 2026-09-09 and removed — it
-        // overrode the bar wherever it exceeded it). Per theme: the bar's
-        // bed over the ground, and what lifting the bed to 1.4:1 over the
-        // ground would cost the text over it.
-        println!();
-        println!(
-            "the bed over its ground (no law — a ruling): bar's bed / ground, and the cost of a 1.4:1 lift"
-        );
-        println!(
-            "  theme                     fg      bg      budget  bed/ground  fg/bed worst | lifted to  fg/bed worst"
-        );
-        let one_dark = (0x00AB_B2BFu32, 0x0028_2C34u32);
-        for (theme, fg, bg) in [
-            ("Nord", NORD_FG, NORD_BG),
-            ("default", DEFAULT_FG, DEFAULT_BG),
-            ("One Dark", one_dark.0, one_dark.1),
-            ("One Dark (alt ground)", one_dark.0, 0x0032_3844),
-            ("Solarized Dark", 0x0083_9496, 0x0000_2B36),
-            ("Gruvbox Dark", 0x00EB_DBB2, 0x0028_2828),
-            ("Dracula", 0x00F8_F8F2, 0x0028_2A36),
-            ("Tokyo Night", 0x00C0_CAF5, 0x001A_1B26),
-        ] {
-            let budget = bed_luma_budget(fg);
-            let over = (budget + 0.05) / (relative_luminance(bg) + 0.05);
-            let lifted = ((relative_luminance(bg) + 0.05) * 1.4 - 0.05).max(budget);
-            println!(
-                "  {theme:24} #{fg:06X} #{bg:06X} {budget:.4}  {over:6.3}:1  {:8.3}:1 | {lifted:.4}     {:8.3}:1{}",
-                worst_bed_contrast_at(fg, bg, budget),
-                worst_bed_contrast_at(fg, bg, lifted),
-                if lifted > budget + 1e-6 {
-                    "  (lift would bind)"
-                } else {
-                    "  (bar already above 1.4:1)"
-                }
-            );
         }
     }
 
@@ -20060,7 +20387,7 @@ mod tests {
     /// last laid cell. The trigger that reaches this arm — a held park
     /// judged `typing` for one cell and flushed as such, a repaint parking
     /// the caret on the trailing space it has just drawn — is pinned at
-    /// unit level (`cursor_glow.rs`, the flushed one-cell park), not
+    /// unit level (`cursor_glow/tests/park.rs`, the flushed one-cell park), not
     /// measured at the host seam.
     ///
     /// RED before the floor: `stamped=[15]`.
@@ -20121,7 +20448,7 @@ mod tests {
     /// arms (blank under it) — then the caret observed ONE cell left of
     /// where it stood, as a same-row backward `Typed` echo with no erase
     /// behind it (the flushed one-cell park's shape, pinned at unit level
-    /// in `cursor_glow.rs`). Under [`RE_ANCHOR_MIN_CELLS`] the ribbon
+    /// in `cursor_glow/tests/park.rs`). Under [`RE_ANCHOR_MIN_CELLS`] the ribbon
     /// drains nothing: the space past the caret stands — not leaving, no
     /// retract stamp — the cohort's clock is still the last key's, and the
     /// cell is lit on the frames after on that clock. Before the floor the
@@ -21084,12 +21411,37 @@ mod tests {
     /// of it in the same run. The seam starts at the key's column: RED
     /// with `seg.x >= floor_x` removed from [`Ribbon::emit_hot_edge`] (it
     /// then ran over the relaid word from column 2).
+    ///
+    /// **…AND A SOFT-WRAPPED CARET IS A CONTINUATION TOO** (pinned
+    /// 2026-09-26, the review of the trail merge: `leave_row`'s soft-wrap
+    /// branch arms the seam, and nothing drove it). Claude Code 2.1.280's
+    /// insert at the fold ([`SoftWrap`]): the wrap key's `e` stands at the
+    /// origin `(2, 119)`, the caret alone wraps to the indent `(3, 2)`, and
+    /// the NEXT key reflows `abcde` down — the app rewrites it from the
+    /// indent with the key's glyph after it, the caret at 8
+    /// ([`Ribbon::reflow_move`], [`Ribbon::settle_carry`]). The relaid word
+    /// is the app's text and the indent no key's, so the seam may cover
+    /// neither: it reaches back to the first cell the HAND laid on the row
+    /// — the reflow key's own glyph at 7 when its echo lands in its own
+    /// tick (laid at the frame's caret), the key after it when the reflow
+    /// key was HELD for a late echo (its glyph is relaid with the word, and
+    /// [`Ribbon::relay_word`] touches no floor, exactly as main's pending
+    /// re-wrap relay lays its wrap key's glyph). Non-vacuous as the re-wrap
+    /// is: the hand's run starts at the indent's end, column 2, left of the
+    /// floor. RED with `seg.x >= floor_x` removed (the hairline then ran
+    /// over `abcde` from column 2).
     #[test]
     fn the_seam_marks_a_continued_line_s_tail_and_spends_with_the_row_above() {
         #[derive(Clone, Copy, PartialEq, Eq, Debug)]
         enum Line {
             Wrap,
             ReWrap,
+            /// `held`: the reflow key's echo lands a tick after it (the key
+            /// held at the landing, its glyph relaid with the word), or in
+            /// its own tick (the key laid at the frame's caret).
+            SoftWrap {
+                held: bool,
+            },
             Return,
         }
         // `(far-tail light, its leftmost px, the hand's floor on row 3, the
@@ -21100,8 +21452,15 @@ mod tests {
             let g = geom();
             let t0 = Instant::now();
             let mut rib = Ribbon::new();
-            let fold = if line == Line::ReWrap {
-                // Fourteen glyphs, a Space at 114 and `abcde` at 115..119.
+            let soft = SoftWrap {
+                origin: (2, 119),
+                landing: (3, 2),
+                word_col0: 115,
+            };
+            let fold = if matches!(line, Line::ReWrap | Line::SoftWrap { .. }) {
+                // Fourteen glyphs, a Space at 114 and `abcde` at 115..119 —
+                // for the soft wrap, the `e` is the wrap key, its glyph laid
+                // at the origin as the engine's replay lays it.
                 let keys = Keys {
                     g,
                     row: 2,
@@ -21131,8 +21490,18 @@ mod tests {
                 type_keys(&mut rib, t0, keys, &c);
                 at(t0, 20 * 60)
             };
-            let landing = if line == Line::ReWrap { 8 } else { 0 };
-            let cx = ctx(fold, &c, (3, landing), 0.9);
+            // Where the row-3 keys start: after the relaid word and the
+            // key's glyph beside it for the re-wrap and the soft wrap.
+            let landing = if matches!(line, Line::ReWrap | Line::SoftWrap { .. }) {
+                8
+            } else {
+                0
+            };
+            let fold_caret = match line {
+                Line::SoftWrap { .. } => soft.landing,
+                _ => (3, landing),
+            };
+            let cx = ctx(fold, &c, fold_caret, 0.9);
             match line {
                 Line::Wrap => rib.on_event(&typed_move((2, 120), (3, 0)), fold, &cx),
                 Line::ReWrap => {
@@ -21141,6 +21510,10 @@ mod tests {
                     // glyph.
                     rib.on_event(&typed(), fold, &cx);
                     rib.on_event(&typed_move((2, 120), (3, landing)), fold, &cx);
+                }
+                Line::SoftWrap { .. } => {
+                    // The wrap key's echo: only the caret wrapped.
+                    rib.soft_wrap_move(&typed_move(soft.origin, soft.landing), fold, &cx, soft);
                 }
                 Line::Return => {
                     rib.on_event(&Event::Return, fold, &cx);
@@ -21154,6 +21527,32 @@ mod tests {
                 }
             }
             rib.plan(&cx);
+            if let Line::SoftWrap { held } = line {
+                // The reflow key, and at +10 ms its echo: the app erased
+                // `abcde` off row 2 and rewrote it from the indent, the
+                // key's glyph after it and the caret at 8 — the hop the
+                // seam's content witness hands the ribbon as a reflow.
+                let (press, echo) = if held {
+                    (at(fold, 4), at(fold, 10))
+                } else {
+                    (at(fold, 10), at(fold, 10))
+                };
+                let echo_cx = ctx(echo, &c, (3, landing), 0.9);
+                if held {
+                    let cx = ctx(press, &c, soft.landing, 0.9);
+                    rib.hold_typed(&typed(), press, &cx, Some(soft.landing));
+                    rib.plan(&cx);
+                } else {
+                    rib.on_event(&typed(), press, &echo_cx);
+                }
+                rib.reflow_move(
+                    &typed_move(soft.landing, (3, landing)),
+                    echo,
+                    &echo_cx,
+                    soft,
+                );
+                rib.plan(&echo_cx);
+            }
             // Twelve keys on the new row, done by +0.26 s; the reads come
             // after them.
             let keys = Keys {
@@ -21177,7 +21576,12 @@ mod tests {
             (far, left, rib.hand_floor_on(3), run_col0)
         };
         let cw = geom().cw as f32;
-        for line in [Line::Wrap, Line::ReWrap] {
+        for line in [
+            Line::Wrap,
+            Line::ReWrap,
+            Line::SoftWrap { held: false },
+            Line::SoftWrap { held: true },
+        ] {
             let (early, left, floor, run_col0) = tail_light(line, false, 300);
             assert!(
                 early > 0.0,
@@ -21207,7 +21611,25 @@ mod tests {
                 0.0,
                 "{line:?}: reduced motion: no seam"
             );
-            if line == Line::ReWrap {
+            if let Line::SoftWrap { held } = line {
+                // The reflowed word lies at 2..7 and the reflow key's glyph
+                // at 7; the first cell the hand itself laid is that glyph,
+                // or — held — the key after it at 8. Never the word, never
+                // the indent.
+                let hand_first = if held { 8 } else { 7 };
+                assert_eq!(
+                    floor, hand_first,
+                    "{line:?}: the seam's floor is the first cell the hand laid on the row"
+                );
+                // NOT VACUOUS: the hand's run starts at the indent's end —
+                // the relaid word is in it, left of the floor.
+                assert_eq!(
+                    run_col0,
+                    Some(2),
+                    "{line:?}: the reflow relaid `abcde` from the indent's end into the \
+                     hand's run"
+                );
+            } else if line == Line::ReWrap {
                 // NOT VACUOUS: the run the hand is on starts LEFT of the
                 // floor (the relaid word), so a seam without its floor
                 // clause would run on over it.
@@ -24237,6 +24659,207 @@ mod tests {
         );
     }
 
+    /// **THE HAND'S RUN BEGINS WHERE IT ARRIVED** (2026-09-23,
+    /// `tests/wrap_code_reflow.rs`, B1 and B2): the hand walks into program
+    /// text at column 72 of row 2 and types `ab` there; the wrap key `c`
+    /// moves `abc` down, the caret landing after it at (3, 5). The moved
+    /// word is measured from the arrival: `ab` is relaid at 2..4 beside the
+    /// wrap key's own cell, nothing lands on the indent, and the old cells
+    /// leave row 2 with their glyphs. Twice: with no typed Space on the row
+    /// (it measured `0` — nothing relaid, the old cells left in place), and
+    /// with a Space typed at 60 before the hand navigated (it measured 13 —
+    /// a relocation that could only settle onto the indent).
+    #[test]
+    fn a_word_begun_where_the_hand_arrived_is_measured_from_the_arrival() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        for stale_space in [false, true] {
+            let mut rib = Ribbon::new();
+            let mut now = t0;
+            if stale_space {
+                // `x ` typed at 59..61: the Space's cell is 60.
+                for (i, ev) in [typed(), typed_space()].iter().enumerate() {
+                    now = at(t0, i as u64 * 60);
+                    let cx = ctx(now, &c, (2, 60 + i as u16), 0.9);
+                    rib.on_event(ev, now, &cx);
+                    rib.plan(&cx);
+                }
+            }
+            now = at(now, 300);
+            let cx = ctx(now, &c, (2, 72), 0.9);
+            rib.on_event(&nav((2, 61), (2, 72)), now, &cx);
+            rib.plan(&cx);
+            for i in 0..2u16 {
+                now = at(now, 60);
+                let cx = ctx(now, &c, (2, 73 + i), 0.9);
+                rib.on_event(&typed(), now, &cx);
+                rib.on_event(&typed_move((2, 72 + i), (2, 73 + i)), now, &cx);
+                rib.plan(&cx);
+            }
+            let k = at(now, 60);
+            let cx = ctx(k, &c, (3, 5), 0.9);
+            rib.on_event(&typed(), k, &cx);
+            rib.on_event(&typed_move((2, 74), (3, 5)), k, &cx);
+            rib.plan(&cx);
+            for col in 2..5u16 {
+                assert!(
+                    rib.cells()
+                        .iter()
+                        .any(|l| l.row == 3 && l.col == col && l.typing && !l.leaving()),
+                    "stale space {stale_space}: the moved word's cell {col} is lit on the new row"
+                );
+            }
+            assert!(
+                !rib.cells().iter().any(|l| l.row == 3 && l.col < 2),
+                "stale space {stale_space}: nothing on the indent"
+            );
+            for col in 72..74u16 {
+                assert!(
+                    rib.cells()
+                        .iter()
+                        .filter(|l| l.row == 2 && l.col == col)
+                        .all(|l| l.retract_at.is_some()),
+                    "stale space {stale_space}: the moved cell {col} stayed on the old row"
+                );
+            }
+        }
+    }
+
+    /// **AN ARROW INSIDE THE HAND'S OWN LIVE WORD DOES NOT CUT ITS MEASURE**
+    /// (2026-09-23 review, `tests/wrap_code_reflow.rs`, B3): `x ` typed at
+    /// 59..61 (the Space's cell is 60) and `abcd` at 61..65; Left ×2 over the
+    /// lit `cd` to (2, 63); the `X` inserted there makes `abXcd` too long for
+    /// the row, and it goes down whole, the caret after the `X` at (3, 5).
+    /// The arrow's arrival reaches back over the live typed `ab` to the
+    /// typed Space, so the moved word measures 2: `ab` relaid at 2..4 beside
+    /// the key's own cell, nothing on the indent, the old `ab` cells leaving
+    /// row 2. Cut at the arrival it measured `0` — nothing relaid.
+    #[test]
+    fn an_arrow_inside_the_hands_live_word_does_not_cut_its_measure() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        let mut rib = Ribbon::new();
+        let mut now = t0;
+        for (i, ev) in [typed(), typed_space()].iter().enumerate() {
+            now = at(t0, i as u64 * 60);
+            let cx = ctx(now, &c, (2, 60 + i as u16), 0.9);
+            rib.on_event(ev, now, &cx);
+            rib.plan(&cx);
+        }
+        for i in 0..4u16 {
+            now = at(now, 60);
+            let cx = ctx(now, &c, (2, 62 + i), 0.9);
+            rib.on_event(&typed(), now, &cx);
+            rib.on_event(&typed_move((2, 61 + i), (2, 62 + i)), now, &cx);
+            rib.plan(&cx);
+        }
+        now = at(now, 120);
+        let cx = ctx(now, &c, (2, 63), 0.9);
+        rib.on_event(&nav((2, 65), (2, 63)), now, &cx);
+        rib.plan(&cx);
+        let k = at(now, 120);
+        let cx = ctx(k, &c, (3, 5), 0.9);
+        rib.on_event(&typed(), k, &cx);
+        rib.on_event(&typed_move((2, 63), (3, 5)), k, &cx);
+        rib.plan(&cx);
+        for col in 2..5u16 {
+            assert!(
+                rib.cells()
+                    .iter()
+                    .any(|l| l.row == 3 && l.col == col && l.typing && !l.leaving()),
+                "the moved word's cell {col} is lit on the new row"
+            );
+        }
+        assert!(
+            !rib.cells().iter().any(|l| l.row == 3 && l.col < 2),
+            "nothing on the indent"
+        );
+        for col in 61..63u16 {
+            assert!(
+                rib.cells()
+                    .iter()
+                    .filter(|l| l.row == 2 && l.col == col)
+                    .all(|l| l.retract_at.is_some()),
+                "the moved cell {col} stayed on the old row"
+            );
+        }
+    }
+
+    /// **THE LIFTED WORD GOES UP WITH ITS LIGHT** (2026-09-23,
+    /// `tests/wrap_code_reflow.rs`, C): `abc` typed at 2..5 on row 3; the
+    /// Space after it lets the word fit row 2 again, where the composer
+    /// rewrites it at 70..73, the caret staying at (3, 2). With the seam's
+    /// verdict ([`Lift`]) the word's cells leave row 3 and are relaid under
+    /// its glyphs on row 2 on the walk they had, flowing; replayed WITHOUT
+    /// it — the same-row re-anchor — nothing reaches row 2 (the control).
+    #[test]
+    fn a_lifted_word_goes_up_with_its_light_on_the_walk_it_had() {
+        let c = cfg(true, true);
+        let t0 = Instant::now();
+        for verdict in [true, false] {
+            let mut rib = Ribbon::new();
+            let mut now = t0;
+            for i in 0..3u16 {
+                now = at(t0, u64::from(i) * 60);
+                let cx = ctx(now, &c, (3, 3 + i), 0.9);
+                rib.on_event(&typed(), now, &cx);
+                rib.plan(&cx);
+            }
+            let walk: Vec<f32> = (2..5u16)
+                .map(|col| rib.field_at(3, col).expect("the typed word's walk"))
+                .collect();
+            let k = at(now, 60);
+            let cx = ctx(k, &c, (3, 2), 0.9);
+            let lift = typed_move((3, 5), (3, 2));
+            if verdict {
+                rib.lift_move(
+                    &lift,
+                    k,
+                    &cx,
+                    Lift {
+                        origin: (3, 5),
+                        landing: (3, 2),
+                        dst: (2, 70),
+                    },
+                );
+            } else {
+                rib.on_event(&lift, k, &cx);
+            }
+            rib.plan(&cx);
+            let up: Vec<u16> = (70..73u16)
+                .filter(|&col| {
+                    rib.cells()
+                        .iter()
+                        .any(|l| l.row == 2 && l.col == col && l.typing && !l.leaving())
+                })
+                .collect();
+            assert!(
+                rib.cells().iter().filter(|l| l.row == 3).all(Cell::leaving),
+                "verdict {verdict}: the word's old cells stayed live under the caret"
+            );
+            if !verdict {
+                assert!(up.is_empty(), "the control lifted {up:?} with no verdict");
+                continue;
+            }
+            assert_eq!(up, [70, 71, 72], "the lifted word's cells on row 2");
+            for (i, t) in walk.iter().enumerate() {
+                let col = 70 + i as u16;
+                let now_t = rib.field_at(2, col).expect("the relaid walk");
+                assert!(
+                    (now_t - t).abs() < 1e-4,
+                    "cell {col} took t {now_t}, the word had {t}"
+                );
+            }
+            assert!(
+                rib.cohorts()
+                    .iter()
+                    .filter(|k| k.row == 2)
+                    .all(|k| k.flow.is_some()),
+                "the row the word went up to flows into the fold"
+            );
+        }
+    }
+
     /// **A RELAID WORD IS ONE RUN** (2026-09-23, [`Ribbon::relay_word`]).
     /// A composer's relay settled on a row where the old line's run still
     /// STANDS past the word (its cells under the word melted by the
@@ -25419,6 +26042,92 @@ mod tests {
         assert!(
             worst <= 3,
             "the top edge steps {worst} rows at one slab per cell"
+        );
+    }
+
+    /// A wide window at the owner's retina cell size, with one planned run
+    /// that exceeds the real `ribbon_beam` ceiling. This isolates emission
+    /// order from the content and motion laws that built the plan; their
+    /// `head` and `stream_dir` values are pinned by the move tests above.
+    fn capped_wide_run(head_col: u16, head: usize, stream_dir: i8) -> (Vec<GlowQuad>, u16) {
+        let c = cfg_owner();
+        let mut g = geom_owner();
+        g.cols = 180;
+        g.win_w = 5400;
+        let now = Instant::now();
+        let cx = ctx_in(now, &c, (OWNER_ROW, head_col), 0.7, g);
+        let mut rib = Ribbon::new();
+        rib.plan(&cx); // Sync the real theme ink table.
+        rib.slabs = 1;
+        rib.plan = (0..=179)
+            .map(|col| Segment {
+                x: col as f32 * g.cw as f32,
+                spine: (f32::from(OWNER_ROW) + 1.0) * g.ch as f32,
+                up: g.ch as f32,
+                dn: 0.30 * g.ch as f32,
+                t: 0.4,
+                cov: 220,
+            })
+            .collect();
+        rib.runs.push(Run {
+            row: OWNER_ROW,
+            col0: 0,
+            col1: 178,
+            lo: 0,
+            hi: rib.plan.len(),
+            head_col,
+            head,
+            wet: true,
+            at_caret: true,
+            born: now,
+            stream_dir,
+        });
+
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        assert!(
+            sink.under.len() + 2 >= RIBBON_QUAD_BUDGET,
+            "precondition: the real quad ceiling was reached ({})",
+            sink.under.len()
+        );
+        (sink.under, g.cw as u16)
+    }
+
+    /// A leftward wake starts at the landing, so saturation must keep its
+    /// first columns. Repeated leftward navigations can extend one wake
+    /// cohort past the per-navigation 32-cell cap.
+    #[test]
+    fn a_capped_leftward_wake_keeps_the_light_at_its_landing() {
+        let (quads, cw) = capped_wide_run(0, 0, 1);
+        let low_x_lit = quads.iter().any(|q| q.x < cw);
+        let high_x_lit = quads.iter().any(|q| q.x >= 178 * cw);
+        assert!(
+            low_x_lit,
+            "the leftward wake went dark at its caret landing"
+        );
+        assert!(
+            !high_x_lit,
+            "saturation should shed the distant tail, not light at the hand"
+        );
+    }
+
+    /// A backward edit places the typed run's head inside the row. The old
+    /// high-X-first cap could spend every quad on the text to the RIGHT of
+    /// that edit, leaving a hole beside the typing caret.
+    #[test]
+    fn a_capped_midline_edit_keeps_the_ribbon_beside_the_typing_caret() {
+        let (quads, cw) = capped_wide_run(30, 31, -1);
+        assert!(
+            quads.iter().any(|q| q.x >= 30 * cw && q.x < 31 * cw),
+            "the edited cell next to the caret went dark under the cap"
+        );
+        assert!(
+            quads.iter().any(|q| q.x < cw),
+            "the nearer left side of the run must connect to the head"
+        );
+        assert!(
+            !quads.iter().any(|q| q.x >= 178 * cw),
+            "the distant right tail should pay the budget, not the edit head"
         );
     }
 }

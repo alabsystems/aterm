@@ -1650,6 +1650,7 @@ pub(crate) fn spawn_session(
         child_proxy,
         output_wake_pending,
         last_output_ns,
+        output_request_booked_ns: AtomicU64::new(0),
         latest_output_activity_ns,
         // `attach_reader` installs the real wake pipe alongside the reader.
         wake_wr: -1,
@@ -1990,7 +1991,7 @@ mod agent_prime_tests {
         // test) otherwise lends this pass a second detected agent — and this
         // pass writes into THAT test's scratch "human" tree. Measured
         // 2026-09-22: both failed together, 2 runs in 3.
-        let AgentPrimeOutcome::Ran(pass) = aterm_log::env::scoped_unset("XDG_CONFIG_HOME", || {
+        let AgentPrimeOutcome::Ran(pass) = crate::test_env::scoped_unset("XDG_CONFIG_HOME", || {
             run_agent_prime(true, false, Some(home.path().to_path_buf()))
         }) else {
             panic!("enabled with a home must run");
@@ -2388,6 +2389,17 @@ fn attach_reader_inner(
         let _ = old_writer.join();
     }
     let (temporal_tx, temporal_writer_join) = if factory.temporal_recording {
+        // The spine records each resize's geometry only; the seam policy the
+        // engine resizes with is the backend's, so the replay takes it from
+        // here. Asked BEFORE the recorder lock: the answer takes the PTY
+        // registry's own lock, which must not nest under this one.
+        let policy = crate::app_render::pty_resize_policy(session.master);
+        session
+            .ctx
+            .temporal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .set_resize_policy(policy);
         let (tx, join) = spawn_temporal_writer(session.ctx.temporal.clone())?;
         (Some(tx), Some(join))
     } else {
@@ -3463,35 +3475,64 @@ fn spawn_temporal_writer(
 /// against every other writer. An idle terminal parks on `recv()`; the thread
 /// ends when every sender is gone — the reader's at EOF, and the spill
 /// arranger's when the sink's last strong clone drops (it holds the sink weakly).
-/// MEM-L3: the reply queue is BOUNDED. The writer drains it with a BLOCKING
-/// `write_frame`, so if a local child floods DA/DSR/CPR queries yet never reads its
-/// own stdin the write parks and the always-draining reader would otherwise pile
-/// replies up without limit. A `sync_channel` cap + `try_send`-and-drop on the
-/// producer (the reader) bounds it; a reply is dropped only under that pathological,
-/// self-inflicted flood (the child isn't reading the replies it asked for anyway,
-/// and it's recoverable by closing the tab). Sized generously so no real
-/// capability-probe burst ever drops.
+/// MEM-L3: the reply queue is BOUNDED, in count and in bytes. The writer drains
+/// it with a write that parks at the sink's spill cap, so if a local child floods
+/// DA/DSR/CPR queries yet never reads its own stdin the write parks and the
+/// always-draining reader would otherwise pile replies up without limit. A
+/// `sync_channel` cap bounds the count, and each queued reply holds its bytes
+/// against the sink's reply budget ([`ReplyLane::submit`],
+/// [`aterm_session::sink::REPLY_BUDGET_BYTES`]) — a count cap alone admitted 1024
+/// replies of any size, and a colour or clipboard query's reply is not tiny. A
+/// reply that finds either full is DROPPED (and counted: `reply_dropped` under
+/// `metrics percentiles`): only under
+/// that pathological, self-inflicted flood (the child isn't reading the replies
+/// it asked for anyway, and it's recoverable by closing the tab). Sized
+/// generously so no real capability-probe burst ever drops.
 const REPLY_QUEUE_CAP: usize = 1024;
 
 /// What the reply-writer thread is asked to do. Terminal replies are its job;
 /// arranging the sink's spill drainer is the second, so a keystroke that
 /// concedes the fd lock never `dup`s and `pthread_create`s on the UI thread.
 pub(crate) enum ReplyJob {
-    /// A DA/DSR/CPR/kitty-query reply from the parser, written in order.
-    Bytes(std::sync::Arc<[u8]>),
+    /// A DA/DSR/CPR/kitty-query reply from the parser, written in order, with
+    /// its bytes held against the sink's reply budget until it is written.
+    Bytes(std::sync::Arc<[u8]>, aterm_session::sink::ReplyPermit),
     /// A non-parking writer spilled with no drainer live: spawn it from here.
     ArrangeSpillDrainer,
 }
 
+/// The reader's end of the reply lane: hands a reply to the writer thread
+/// without ever blocking. It holds the sink's BUDGET, never the sink: the
+/// reader must never keep its own session's master alive — nor, even for an
+/// instant, be the thread that drops its last clone (on Windows closing the
+/// pseudo console drains through this very reader).
+#[derive(Debug)]
+pub(crate) struct ReplyLane {
+    tx: std::sync::mpsc::SyncSender<ReplyJob>,
+    budget: aterm_session::sink::ReplyBudget,
+}
+
+impl ReplyLane {
+    /// Queue one reply: reserve its bytes against the sink's reply budget,
+    /// then `try_send` — never `send`, the reader must return to `read()`. A
+    /// full budget or a full queue drops the reply (the flood above), as does
+    /// a severed (closing) session, and the drop is counted (`reply_dropped`
+    /// under `metrics percentiles`). `true` when the reply was queued.
+    pub(crate) fn submit(&self, reply: std::sync::Arc<[u8]>) -> bool {
+        let queued = self
+            .budget
+            .try_reserve(reply.len())
+            .is_some_and(|permit| self.tx.try_send(ReplyJob::Bytes(reply, permit)).is_ok());
+        if !queued {
+            crate::metrics::note_reply_dropped();
+        }
+        queued
+    }
+}
+
 fn spawn_reply_writer(
     sink: Arc<SinkWriter>,
-) -> Result<
-    (
-        std::sync::mpsc::SyncSender<ReplyJob>,
-        std::thread::JoinHandle<()>,
-    ),
-    String,
-> {
+) -> Result<(ReplyLane, std::thread::JoinHandle<()>), String> {
     let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<ReplyJob>(REPLY_QUEUE_CAP);
     // LIFETIME. The spill-arranger `poke` installed below is a sender of THIS
     // thread's channel and lives inside the sink's `Shared`, so the thread may
@@ -3520,8 +3561,11 @@ fn spawn_reply_writer(
                 // (no poll under the lock); a full tty spills the tail to the
                 // ordered drainer instead of parking here with the lock held.
                 // Oversized replies fall back to the blocking path inside.
-                ReplyJob::Bytes(resp) => {
+                ReplyJob::Bytes(resp, permit) => {
                     let _ = sink.write_frame_nonparking(&resp);
+                    // Written (or failed with a dying session): the reply
+                    // budget has these bytes back.
+                    drop(permit);
                 }
                 ReplyJob::ArrangeSpillDrainer => sink.arrange_pending_drainer(),
             }
@@ -3553,7 +3597,22 @@ fn spawn_reply_writer(
             let _ = poke.try_send(ReplyJob::ArrangeSpillDrainer);
         });
     }
-    Ok((reply_tx, join))
+    Ok((
+        ReplyLane {
+            tx: reply_tx,
+            budget: sink.reply_budget(),
+        },
+        join,
+    ))
+}
+
+/// Test seam: a real reply writer over `sink`, for the egress-contract tests
+/// that drive replies and pastes through one session's sink.
+#[cfg(test)]
+pub(crate) fn spawn_reply_writer_for_test(
+    sink: Arc<SinkWriter>,
+) -> (ReplyLane, std::thread::JoinHandle<()>) {
+    spawn_reply_writer(sink).expect("spawn the reply writer")
 }
 
 /// The reply writer's ONE thread creation, behind a seam
@@ -3597,7 +3656,7 @@ mod reply_writer_lifetime_tests {
     //! the closed session's spill state and PTY master (`Session::drop` closes
     //! the master by dropping the LAST `Arc<SinkWriter>`). Both tests fail red
     //! on that tree: the writer never exits and the peer never sees EOF.
-    use super::{ReplyJob, spawn_reply_writer};
+    use super::spawn_reply_writer;
     use aterm_session::sink::SinkWriter;
     use std::io::Read as _;
     use std::os::unix::net::UnixStream;
@@ -3664,9 +3723,7 @@ mod reply_writer_lifetime_tests {
         let (sink, mut peer) = sink_and_peer();
         let weak = Arc::downgrade(&sink);
         let (reply_tx, join) = spawn_reply_writer(sink.clone()).expect("spawn");
-        reply_tx
-            .send(ReplyJob::Bytes(Arc::from(&b"ok"[..])))
-            .expect("queued");
+        assert!(reply_tx.submit(Arc::from(&b"ok"[..])), "queued");
         let mut buf = [0u8; 2];
         peer.read_exact(&mut buf).expect("the reply is written");
         assert_eq!(&buf, b"ok");
@@ -3733,9 +3790,7 @@ mod reply_writer_lifetime_tests {
         );
         // The retry — a fresh writer into the same sink.
         let (retry_tx, retry_join) = spawn_reply_writer(sink.clone()).expect("the retry spawns");
-        retry_tx
-            .send(ReplyJob::Bytes(Arc::from(&b"ok"[..])))
-            .expect("queued");
+        assert!(retry_tx.submit(Arc::from(&b"ok"[..])), "queued");
         let mut buf = [0u8; 2];
         peer.read_exact(&mut buf)
             .expect("the retry's writer writes");
@@ -3822,13 +3877,19 @@ fn spawn_compress_worker(
                 // for the signals to go quiet before draining, with a once-per-
                 // TRICKLE_INTERVAL single batch so a perpetual flood still makes
                 // slow progress. Memory stays bounded meanwhile: past the
-                // backpressure cap the reader drops its oldest staged lines
-                // (throughput-over-depth under extreme floods; the retained
-                // ring+backlog still exceeds ghostty's default cap ~3x).
+                // staging cap the reader drops its oldest staged lines
+                // (throughput-over-depth under extreme floods, marked in the
+                // history where it cuts). The trickle is an OPPORTUNITY, not a
+                // promise: while the reader is cutting AND the stream delivered
+                // a batch or more since the last one, it skips — its batch
+                // would promote the marker and the rows after it, and the next
+                // drop would open another cut behind them, one marker per
+                // batch instead of one per flood — and a slower tail is
+                // promoted as before (`Grid::trickle_lazy_bounded`).
                 let mut last_trickle = std::time::Instant::now();
                 while let Ok(()) = rx.recv_timeout(COMPRESS_QUIET_WINDOW) {
                     if last_trickle.elapsed() >= COMPRESS_TRICKLE_INTERVAL {
-                        term_lock(&term).drain_lazy_bounded(COMPRESS_BUDGET);
+                        term_lock(&term).trickle_lazy_bounded(COMPRESS_BUDGET);
                         last_trickle = std::time::Instant::now();
                         // Same slice-boundary handoff as the reader (P63).
                         crate::yield_to_ui_waiter(&ui_waiting);
@@ -4102,7 +4163,7 @@ struct PtyReaderWiring {
     /// Query-reply sink: the reader hands DA/DSR/CPR replies to the dedicated
     /// reply-writer thread over this FIFO instead of writing them inline (the
     /// inline write could block on the input pipe and deadlock the session).
-    reply_tx: std::sync::mpsc::SyncSender<ReplyJob>,
+    reply_tx: ReplyLane,
     /// THRU-5 compression-worker signal (`None` when the worker could not spawn ⇒
     /// offload inactive, reader drains inline). The reader `try_send`s a token
     /// after a burst once its lazy backlog crosses `COMPRESS_SIGNAL_AT`; the
@@ -4351,7 +4412,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     //     exactly the sluggish-typing starvation the chunking exists for;
                     //   * no key in flight (the pure `cat`/`yes` flood) ⇒ the REST of the
                     //     burst in ONE hold: 8x fewer lock round-trips against the renderer's
-                    //     LOCK A/B on this same mutex. A key landing mid-hold waits at most
+                    //     per-frame hold on this same mutex. A key landing mid-hold waits at most
                     //     one whole-burst process (~75-185µs for 64 KiB — sub-frame), and the
                     //     very next hold is fine-sliced again.
                     // The VT parser is a streaming state machine, so any slicing is
@@ -4431,7 +4492,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                             // distinct group once.
                             if let (Some(e), Some(v)) = (edge, verdicts) {
                                 handback_at = None;
-                                fg_owners.observe(e.from, t.program_evidence());
+                                fg_owners.observe(
+                                    e.from,
+                                    t.program_evidence(),
+                                    t.take_evidence_asserted(),
+                                );
                                 let orphaned = fg_owners.orphaned_by(e.to, |p| v.gone(p)).is_some();
                                 let run = if orphaned || v.gone(e.from) {
                                     t.foreground_handback_scoped(orphaned)
@@ -4442,7 +4507,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 // What the handback cleared belongs to nobody now,
                                 // so the new holder re-arming it is the new
                                 // holder's (fish's kitty push after the cut).
-                                fg_owners.observe(e.to, t.program_evidence());
+                                fg_owners.observe(
+                                    e.to,
+                                    t.program_evidence(),
+                                    t.take_evidence_asserted(),
+                                );
                                 if let Some(h) = run {
                                     if let Some(tx) = &temporal_tx {
                                         record_raw_in(
@@ -4457,7 +4526,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 }
                             }
                             t.process(&bytes[off..end]);
-                            fg_owners.observe(slice_holder, t.program_evidence());
+                            // A mode this slice armed AGAIN is its holder's
+                            // too (the 2026-09-27 lane: a stale owner hid
+                            // every later death): `take_evidence_asserted`.
+                            fg_owners.observe(
+                                slice_holder,
+                                t.program_evidence(),
+                                t.take_evidence_asserted(),
+                            );
                             if let Some(r) = t.take_response() {
                                 match &mut acc {
                                     Some(a) => a.extend_from_slice(&r),
@@ -4551,10 +4627,11 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                     // inline. A blocking sink write on the input pipe would park this
                     // reader, stop it draining output, and deadlock the session (see
                     // `spawn_reply_writer`). The reader returns straight to `read()`.
-                    // `try_send` (never `send`): on the full BOUNDED queue (MEM-L3) this
-                    // DROPS the reply rather than blocking the reader — only reachable when a
-                    // child floods queries without draining stdin, which is self-inflicted.
-                    let _ = reply_tx.try_send(ReplyJob::Bytes(resp));
+                    // `submit` never blocks: on the full BOUNDED lane (MEM-L3: count
+                    // and bytes) it DROPS the reply rather than parking the reader —
+                    // only reachable when a child floods queries without draining
+                    // stdin, which is self-inflicted.
+                    let _ = reply_tx.submit(resp);
                 }
                 // Coalesce wakes: post `Wake::Output` only on the latch's clear->armed
                 // edge (see [`gated_output_wake`] for the protocol's guarantees).
@@ -5408,17 +5485,30 @@ mod reroute_path_env_tests {
         assert_eq!(dir, layout.agents_dir().to_str().unwrap());
         assert!(layout.agents_dir().is_dir());
         assert_eq!(managed_agents_dir(&layout).as_deref(), Some(dir.as_str()));
-        // A symlink at agents/ — even one resolving to a real directory — is refused
-        // and never handed, the front door's rule.
+        // A symlink at `agents/` — even one that resolves to a real directory — and a
+        // regular file there are REFUSED, the front door's rule: before this the window
+        // warned and handed the linked directory all the same (`Path::is_dir` follows).
         #[cfg(unix)]
-        {
-            let linked = atpkg::store::Layout {
-                prefix: prefix.path().join("linked"),
+        for (tag, plant) in [("link", true), ("file", false)] {
+            let prefix = aterm_tempfile::tempdir().expect("scratch prefix");
+            let layout = atpkg::store::Layout {
+                prefix: prefix.path().join("pkg"),
             };
-            std::fs::create_dir_all(&linked.prefix).expect("linked prefix");
-            std::os::unix::fs::symlink(&dir, linked.agents_dir()).expect("link agents/");
-            assert!(linked.agents_dir().is_dir(), "the link resolves");
-            assert_eq!(managed_agents_dir(&linked), None);
+            std::fs::create_dir_all(&layout.prefix).expect("prefix");
+            let elsewhere = prefix.path().join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).expect("target");
+            if plant {
+                std::os::unix::fs::symlink(&elsewhere, layout.agents_dir()).expect("link");
+            } else {
+                std::fs::write(layout.agents_dir(), b"x").expect("file");
+            }
+            assert_eq!(
+                managed_agents_dir(&layout),
+                None,
+                "{tag} at agents/ is refused"
+            );
+            let md = std::fs::symlink_metadata(layout.agents_dir()).expect("left alone");
+            assert_eq!(md.file_type().is_symlink(), plant, "{tag} left as it was");
         }
         // And it is what the seam front-inserts, ahead of the foreign homes.
         // (Unix-only: the fixture PATH and the `:` join are a Unix login

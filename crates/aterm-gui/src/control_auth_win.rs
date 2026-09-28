@@ -10,15 +10,21 @@
 //! directory the current user does NOT own (the Windows twin of the Unix SEC-3
 //! owner gate) and rewrites its DACL to a PROTECTED (non-inheriting) grant to
 //! the user + SYSTEM + Administrators, so an explicit `--control-sock` placed
-//! in a world-writable location — or a pre-existing loosely-ACL'd `%LOCALAPPDATA%`
-//! subtree — cannot leave the socket + token world-readable/-writable. There is
-//! still NO peer-uid gate (AF_UNIX on Windows has no `SO_PEERCRED`/`getpeereid`
-//! analog); the per-launch capability token remains the MANDATORY, fail-closed
-//! gate on every connection, exactly as on Unix. Follow-up hardening (documented,
-//! not v1): the undocumented `SIO_AF_UNIX_GETPEERPID` ioctl + token-SID compare,
-//! enforced only when it succeeds.
+//! in a world-writable location — or a pre-existing loosely-ACL'd control
+//! directory — cannot leave the socket + token world-readable/-writable. The
+//! per-launch capability token remains the MANDATORY, fail-closed gate on every
+//! connection, exactly as on Unix. On top of it, [`peer_check`] asks afunix for
+//! the peer's pid (`SIO_AF_UNIX_GETPEERPID`) and compares that process's token
+//! user SID with ours: a different user, or a process this user may not even
+//! query (another principal's — the DACL admits Administrators), is refused.
+//! Where the ioctl is unavailable, or the peer's token cannot be read (an
+//! elevated same-user client seen from an unelevated server), the DACL + token
+//! posture stands alone, and the startup notice says so. A same-user SID compare
+//! cannot tell an elevated token from an unelevated one, so this narrows the
+//! elevation law (`docs/WINDOWS_PARAGON_DESIGN.md` §5.7) and does not replace
+//! it.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use aterm_uds::CtlStream;
 
@@ -39,6 +45,24 @@ pub(crate) fn ensure_private_dir(dir: &Path) -> std::io::Result<()> {
 /// access-denied mirrors `EPERM`'s "alive").
 pub(crate) fn pid_alive(pid: u32) -> bool {
     aterm_uds::process::pid_alive(pid)
+}
+
+/// The directory every build before eb0a37b3b (2026-07-05) bound the control
+/// socket in — `%LOCALAPPDATA%\aterm`, falling back to
+/// `%USERPROFILE%\AppData\Local\aterm`, the resolution that code used — so the
+/// launch sweep can retire what those builds left there. The 2026-09-22 audit
+/// counted twelve zero-byte `.sock` files dated July 2026 in it:
+/// nothing has bound there since the move to `%TEMP%\aterm`, and nothing swept
+/// it, because `sweep_stale_instances` only ever walks the CURRENT directory.
+/// It is still a live directory — `logs\` and the atpkg store live under it —
+/// so a sweep of it touches `*.sock` entries and nothing else. Empty when the
+/// per-user base cannot be resolved at all.
+pub(crate) fn legacy_socket_dirs() -> Vec<PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| aterm_types::dirs::home_dir().map(|h| h.join("AppData").join("Local")));
+    base.map(|b| b.join("aterm")).into_iter().collect()
 }
 
 /// Atomically (re)point the `latest` alias — a regular POINTER FILE on
@@ -94,17 +118,25 @@ pub(crate) fn provision_token(path: &Path) -> Option<String> {
 /// mandatory token are the in-force gates.
 pub(crate) fn lock_socket_file(_path: &str) {}
 
-/// The accept-time peer gate. Windows AF_UNIX has NO peer-credential
-/// primitive, so this always passes — a "refuse when unverifiable" posture
-/// here would refuse EVERY connection. The mandatory per-launch token (plus
-/// the directory ACL) is the gate; the reduction is disclosed by the startup
-/// notice, per the never-overstate-security rule.
-#[allow(
-    clippy::unnecessary_wraps,
-    reason = "signature shared with the Unix peer-uid gate"
-)]
-pub(crate) fn peer_check(_stream: &CtlStream) -> Result<(), String> {
-    Ok(())
+/// The accept-time peer gate: the peer pid afunix recorded, and the user its
+/// token runs as. Refuses a peer running as another user, and one this user
+/// may not query at all (`ERROR_ACCESS_DENIED` — another principal's process).
+/// Enforced only where it can decide: an afunix without
+/// `SIO_AF_UNIX_GETPEERPID`, or a peer whose token cannot be read, passes —
+/// the mandatory per-launch token and the directory ACL are then the gates,
+/// as the startup notice discloses. ("Cannot verify ⇒ refuse" here would
+/// refuse every connection on a Windows build without the ioctl.)
+pub(crate) fn peer_check(stream: &CtlStream) -> Result<(), String> {
+    let Ok(pid) = aterm_uds::fdpass::peer_pid(stream) else {
+        return Ok(());
+    };
+    match acl::peer_user(pid) {
+        acl::PeerUser::Same | acl::PeerUser::Unreadable => Ok(()),
+        acl::PeerUser::Other => Err(format!("connect (peer pid {pid} runs as another user)")),
+        acl::PeerUser::Denied => Err(format!(
+            "connect (peer pid {pid} belongs to a principal this user may not query)"
+        )),
+    }
 }
 
 /// Hand-rolled advapi32/kernel32 FFI for the control-directory owner check + DACL
@@ -137,6 +169,12 @@ mod acl {
     /// rejects one owned by a different principal) — where `TokenUser` would wrongly
     /// refuse every elevated launch.
     const TOKEN_OWNER_CLASS: u32 = 4;
+    /// `TOKEN_INFORMATION_CLASS::TokenUser` — the user the token runs as.
+    const TOKEN_USER_CLASS: u32 = 1;
+    /// Enough to open another process's token for a query; granted on a
+    /// same-user process even when it is elevated.
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const ERROR_ACCESS_DENIED: u32 = 5;
     const SDDL_REVISION_1: u32 = 1;
     const ERROR_SUCCESS: u32 = 0;
 
@@ -192,6 +230,8 @@ mod acl {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetCurrentProcess() -> Handle;
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> Handle;
+        fn GetLastError() -> u32;
         fn CloseHandle(hObject: Handle) -> i32;
         fn LocalFree(hMem: *mut c_void) -> *mut c_void;
     }
@@ -217,26 +257,81 @@ mod acl {
     /// The current process token's `TokenOwner` blob (the returned buffer OWNS the
     /// SID the pointer at its head references). `None` on any query failure.
     fn current_token_owner_info() -> Option<Vec<u8>> {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle, always valid.
+        token_info(unsafe { GetCurrentProcess() }, TOKEN_OWNER_CLASS)
+    }
+
+    /// What [`peer_user`] found out about a peer process.
+    pub(super) enum PeerUser {
+        /// Its token runs as this process's user.
+        Same,
+        /// Its token runs as another user.
+        Other,
+        /// This user may not even query it: another principal's process.
+        Denied,
+        /// It could not be read (it exited, or its token is closed to this
+        /// user — an elevated same-user process seen from an unelevated one).
+        Unreadable,
+    }
+
+    /// Whether process `pid` runs as the same user as this one.
+    pub(super) fn peer_user(pid: u32) -> PeerUser {
+        // SAFETY: GetCurrentProcess returns a pseudo-handle, always valid.
+        let Some(ours) = token_info(unsafe { GetCurrentProcess() }, TOKEN_USER_CLASS) else {
+            return PeerUser::Unreadable;
+        };
+        // SAFETY: plain query-access open of a process by id; checked below.
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if process == 0 {
+            // SAFETY: reads this thread's last-error value, set by OpenProcess.
+            return if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
+                PeerUser::Denied
+            } else {
+                PeerUser::Unreadable
+            };
+        }
+        let theirs = token_info(process, TOKEN_USER_CLASS);
+        // SAFETY: `process` is the live handle OpenProcess returned.
+        unsafe { CloseHandle(process) };
+        let Some(theirs) = theirs else {
+            return PeerUser::Unreadable;
+        };
+        let (a, b) = (sid_ptr(&ours), sid_ptr(&theirs));
+        if a.is_null() || b.is_null() {
+            return PeerUser::Unreadable;
+        }
+        // SAFETY: both point at SIDs inside the live `ours`/`theirs` buffers.
+        if unsafe { EqualSid(a, b) } != 0 {
+            PeerUser::Same
+        } else {
+            PeerUser::Other
+        }
+    }
+
+    /// The `class` blob of `process`'s token (the buffer OWNS any SID the
+    /// pointer at its head references). `None` on any query failure.
+    fn token_info(process: Handle, class: u32) -> Option<Vec<u8>> {
         let mut token: Handle = 0;
-        // SAFETY: GetCurrentProcess returns a pseudo-handle; we request TOKEN_QUERY.
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        // SAFETY: `process` is a live (or pseudo) process handle; TOKEN_QUERY only.
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
             return None;
         }
         let mut len: u32 = 0;
         // First call sizes the buffer (expected to "fail" with the needed length).
         // SAFETY: passing a null buffer with length 0 to learn ReturnLength.
-        unsafe { GetTokenInformation(token, TOKEN_OWNER_CLASS, null_mut(), 0, &mut len) };
+        unsafe { GetTokenInformation(token, class, null_mut(), 0, &mut len) };
         if len == 0 {
             // SAFETY: `token` is a live handle from OpenProcessToken.
             unsafe { CloseHandle(token) };
             return None;
         }
         let mut buf = vec![0u8; len as usize];
-        // SAFETY: `buf` has `len` bytes; TokenOwner writes a TOKEN_OWNER + trailing SID.
+        // SAFETY: `buf` has `len` bytes; TokenOwner/TokenUser write their struct
+        // with the SID pointer at its head, plus the trailing SID.
         let ok = unsafe {
             GetTokenInformation(
                 token,
-                TOKEN_OWNER_CLASS,
+                class,
                 buf.as_mut_ptr().cast::<c_void>(),
                 len,
                 &mut len,
@@ -247,8 +342,9 @@ mod acl {
         (ok != 0).then_some(buf)
     }
 
-    /// The `PSID` at the head of a `TokenOwner` blob (`TOKEN_OWNER.Owner`, the
-    /// first pointer-sized field). Points INTO `buf`, valid while `buf` lives.
+    /// The `PSID` at the head of a `TokenOwner`/`TokenUser` blob
+    /// (`TOKEN_OWNER.Owner` / `TOKEN_USER.User.Sid`, the first pointer-sized
+    /// field). Points INTO `buf`, valid while `buf` lives.
     fn sid_ptr(buf: &[u8]) -> *mut c_void {
         if buf.len() < std::mem::size_of::<*mut c_void>() {
             return null_mut();

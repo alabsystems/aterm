@@ -94,18 +94,19 @@ const TOKENS: &[&[u8]] = &[
     b"\x1b[2m",
     b"\x1b[38;2;200;120;40m",
     b"\x1b[4;58:2::255:0:0m",
-    "\u{1F680}".as_bytes(),                  // rocket
-    "\u{2764}\u{FE0F}".as_bytes(),           // VS16 heart
-    "\u{1F468}\u{200D}\u{1F4BB}".as_bytes(), // ZWJ tech
-    "\u{1F1FA}\u{1F1F8}".as_bytes(),         // US flag
-    "\u{1F44D}\u{1F3FD}".as_bytes(),         // skin-tone thumb
-    "\u{65E5}\u{672C}".as_bytes(),           // CJK
-    "e\u{0301}".as_bytes(),                  // é decomposed
-    "\u{250C}\u{2500}\u{2510}".as_bytes(),   // box
-    "\u{2588}\u{2592}".as_bytes(),           // block + shade
-    "\u{2847}".as_bytes(),                   // braille
-    "\u{1FB13}".as_bytes(),                  // sextant
-    "\u{E0B0}\u{E0B6}".as_bytes(),           // powerline
+    "\u{1F680}".as_bytes(),                   // rocket
+    "\u{2764}\u{FE0F}".as_bytes(),            // VS16 heart
+    "\u{1F468}\u{200D}\u{1F4BB}".as_bytes(),  // ZWJ tech
+    "\u{1F1FA}\u{1F1F8}".as_bytes(),          // US flag
+    "\u{1F44D}\u{1F3FD}".as_bytes(),          // skin-tone thumb
+    "\u{65E5}\u{672C}".as_bytes(),            // CJK
+    "e\u{0301}".as_bytes(),                   // é decomposed
+    "\u{250C}\u{2500}\u{2510}".as_bytes(),    // box
+    "\u{2588}\u{2592}".as_bytes(),            // block + shade
+    "\u{2847}".as_bytes(),                    // braille
+    "\u{1FB13}".as_bytes(),                   // sextant
+    "\u{1CD00}\u{1CD71}\u{1CDE5}".as_bytes(), // octants
+    "\u{E0B0}\u{E0B6}".as_bytes(),            // powerline
     b"\r\n",
     b"\r\n",
     b"\x1b#6", // DECDWL (line start)

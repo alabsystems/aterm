@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `TODO(mirror-config-split)` DISCHARGED — `cargo forge mirror config`.
+//! `cargo forge mirror config` — the shippable `[source]` fragment.
 //!
 //! # The split, and why it is a separate file
 //!
@@ -126,11 +126,10 @@ pub fn render(pkgs: &[RegistryPkg]) -> String {
 # `cargo forge check`, and an edit that drifts from the lock fails the gate.
 #
 # WHAT THIS IS. The `[source]` half of aterm's Lane 1 local-registry mirror,
-# split OUT of `.cargo/config.toml` (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1,
-# `TODO(mirror-config-split)`). That file carries `-Ztrust-verify=off`,
-# `--cfg clean_islands` and `rustdoc = \"trustdoc\"` — Trust-toolchain-only
-# settings a stock-Rust clone cannot survive — and `publish/manifest.txt`
-# deliberately does not export it. So the source replacement had to become a
+# split OUT of `.cargo/config.toml` (docs/THIRD_PARTY_SURFACE_PLAN.md, Lane 1).
+# That file carries `-Ztrust-verify=off`, `--cfg clean_islands` and
+# `rustdoc = \"trustdoc\"` — Trust-toolchain-only settings a stock-Rust clone
+# cannot survive — and `publish/manifest.txt` deliberately does not export it. So the source replacement had to become a
 # file of its own, and this is that file.
 #
 # IT IS INERT WHERE IT SITS. Cargo reads source replacement only from a

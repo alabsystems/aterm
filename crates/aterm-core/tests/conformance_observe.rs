@@ -19,7 +19,7 @@
 
 use std::time::{Duration, Instant};
 
-use aterm_core::terminal::{ClockReading, HostBindings, Terminal, WatcherSpec};
+use aterm_core::terminal::{ClockReading, Terminal, WatcherSpec};
 
 /// A fixed clock reading at `base + off_ms` — the injected-clock seam that makes
 /// replay independent of real wall-clock pacing (mirrors `replay_offset_*`).
@@ -211,7 +211,7 @@ fn watchers_are_excluded_from_checkpoint_hydration() {
 
     // Hydrate a fresh engine from this one's checkpoint.
     let cp = t.checkpoint();
-    let hydrated = Terminal::from_checkpoint(&cp, HostBindings::none());
+    let hydrated = Terminal::from_checkpoint(&cp);
     assert!(
         !hydrated.watchers_armed(),
         "hydrated engine has an empty kernel — watchers are not checkpointed"

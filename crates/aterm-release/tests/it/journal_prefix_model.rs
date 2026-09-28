@@ -1,16 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the v5 release journal's exact-prefix authority.
-//! Every one of the 2^12 done-membership subsets is checked against production;
-//! only the 13 canonical prefixes may persist or reload.
+//! Tier-1 conformance for the release journal's exact-prefix authority.
+//! Every one of the 2^6 done-membership subsets of the publish-once step list is
+//! checked against production; only the 7 canonical prefixes may persist or reload.
 
 use crate::publish;
 
 use aterm_spec::derive::{Model, release_journal_prefix_model};
 
 fn journal(done: Vec<String>) -> publish::Journal {
-    let release_id = done.iter().any(|step| step == "draft").then_some(55);
+    let release_id = done.iter().any(|step| step == "publish").then_some(55);
     publish::Journal {
         verify_pubkey: None,
         format: publish::JOURNAL_FORMAT,
@@ -25,13 +25,8 @@ fn journal(done: Vec<String>) -> publish::Journal {
         signature_pubkey: None,
         signature_machine_id: None,
         release_id,
-        draft_create_issued: release_id.is_some(),
+        release_intent: release_id.is_some(),
         upload_intents: Vec::new(),
-        // The public-channel mirror capability is a separate one-shot set; a
-        // prefix model over the private steps never issues against it.
-        mirror_release_id: None,
-        mirror_create_issued: false,
-        mirror_upload_intents: Vec::new(),
         done,
     }
 }
@@ -94,7 +89,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
         assert_eq!(
             real.is_ok(),
             expected,
-            "production journal verdict drifted for done mask {mask:012b}"
+            "production journal verdict drifted for done mask {mask:06b}"
         );
         if expected {
             admitted_masks.push(mask);
@@ -116,13 +111,18 @@ fn every_production_done_subset_matches_exact_prefix_model() {
     );
 
     // Bind the four model boundaries to concrete pipeline prefixes: empty,
-    // lock, preflip-complete, verify-complete, and unlock-complete.
+    // lock, prepared (build, self-check and the origin tag), published (the one
+    // publication — visible-channel convergence), and unlock-complete.
+    assert_eq!(
+        publish::STEPS,
+        ["lock", "build", "selfcheck", "tag", "publish", "unlock"]
+    );
     for (abstract_count, concrete_count, action) in [
         (0, 0, "AdmitEmptyPrefix"),
         (1, 1, "AdmitLockPrefix"),
-        (2, 6, "AdmitPreparePrefix"),
-        (3, 11, "AdmitVisiblePrefix"),
-        (4, 12, "AdmitCompletePrefix"),
+        (2, 4, "AdmitPreparePrefix"),
+        (3, 5, "AdmitVisiblePrefix"),
+        (4, 6, "AdmitCompletePrefix"),
     ] {
         let done = publish::STEPS[..concrete_count]
             .iter()
@@ -165,7 +165,7 @@ fn every_production_done_subset_matches_exact_prefix_model() {
 
     // NEGATIVE CONTROL: the historical gap (later remote mutation pre-marked)
     // is rejected by production and by Buggy=0, but admitted by Buggy=1.
-    let dangerous_gap = vec!["lock".into(), "archive".into()];
+    let dangerous_gap = vec!["lock".into(), "publish".into()];
     assert!(journal(dangerous_gap).save(&path).is_err());
     let mut before = model.init_state();
     assert!(model.fire("InputLock", &mut before));

@@ -23,10 +23,11 @@ use aterm_spec::derive::{
     alt_selection_park_model, anchored_artifact_transaction_model, artifact_handoff_capacity_model,
     artifact_reader_lease_model, artifact_reply_publication_model, asymmetric_pad_layout_model,
     capture_after_present_model, channel_bind_model, chrome_face_gate_model,
-    clipboard_mailbox_model, closed_recovery_ledgers_model, coalesce_model,
-    companion_tenure_flicker_model, composed_sync_hold_model, composite_accessibility_route_model,
-    config_catalog_snapshot_model, config_file_commit_cas_model, contrast_floor_model,
-    control_connection_admission_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
+    claude_footer_watch_model, claude_idle_at_composer_model, clipboard_mailbox_model,
+    closed_recovery_ledgers_model, coalesce_model, companion_tenure_flicker_model,
+    composed_sync_hold_model, composite_accessibility_route_model, config_catalog_snapshot_model,
+    config_file_commit_cas_model, contrast_floor_model, control_connection_admission_model,
+    control_lane_tenure_model, ct_frac_bearing_model, cursor_cat_curse_wince_model,
     cursor_cat_earn_floor_model, cursor_cat_fold_model, cursor_cat_model,
     cursor_cat_motion_pulse_routing_model, cursor_companion_owner_lifecycle_model,
     cursor_cutout_clip_model, cursor_effect_scroll_model, cursor_hint_license_model, cursor_model,
@@ -38,43 +39,44 @@ use aterm_spec::derive::{
     fallback_precedence_model, fallback_scale_clamp_model, fd_handoff_no_leak_model,
     flash_limiter_model, flash_limiter_window_model, focus_modifier_cache_model,
     gpu_loss_recovery_model, gpu_loss_route_model, grid_translate_model, handoff_roundtrip_model,
-    harness_model_priority_model, hdr_present_gate_model, hdr_reconfigure_retag_model,
-    hyperlink_scheme_cap_model, idle_deadline_model, ignition_reservation_lifecycle_model,
-    ignition_reservation_rekey_model, inject_floor_model, input_release_pairing_model,
-    kernel_model, key_injectivity_model, kitty_collectibles_model, kitty_flush_worker_model,
-    kitty_pin_merge_model, kitty_sidecar_durability_model, kitty_sing_detector_model,
-    layout_coordinate_reset_model, ligature_gate_model, manual_config_completion_model,
-    manual_config_diagnostics_lane_model, manual_config_handoff_model,
-    manual_config_problem_navigation_model, mint_reachability_model, motion_policy_model,
-    native_async_delivery_model, native_capture_source_model, native_close_plan_model,
-    native_config_observation_handoff_model, native_config_transaction_model,
-    native_control_routing_model, native_document_publication_model, native_document_queue_model,
-    native_draft_journal_model, native_editor_command_palette_model, native_editor_modal_model,
-    native_editor_viewport_model, native_file_watch_model, native_markdown_history_model,
-    native_markdown_viewport_model, native_packages_worker_model,
-    native_recovery_interaction_model, native_reopen_ledger_model, native_save_intent_latch_model,
-    native_settings_draft_close_model, native_settings_singleton_model, native_tab_identity_model,
-    native_update_admission_model, native_update_apply_ladder_model,
-    native_update_attempt_identity_model, native_update_auto_intent_model,
-    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
-    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
-    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
-    native_update_status_reconciliation_model, native_update_worker_queue_model,
-    native_updater_model, net_capability_grant_model, net_dial_after_grant_model,
-    notify_follow_checkpoint_model, nova_phase_model, one_shot_peek_model,
-    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
-    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
-    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
-    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
-    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
-    program_resolution_retry_model, program_resolver_queue_model, proxy_forward_model,
-    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
-    rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_landing_pool_model,
-    rainbow_typed_continuity_model, read_image_seq_model, recording_model, recovery_redraw_model,
+    harness_model_ladder_model, harness_model_priority_model, hdr_present_gate_model,
+    hdr_reconfigure_retag_model, hyperlink_scheme_cap_model, idle_deadline_model,
+    ignition_reservation_lifecycle_model, ignition_reservation_rekey_model, inject_floor_model,
+    input_release_pairing_model, kernel_model, key_injectivity_model, kitty_collectibles_model,
+    kitty_flush_worker_model, kitty_pin_merge_model, kitty_sidecar_durability_model,
+    kitty_sing_detector_model, layout_coordinate_reset_model, ligature_gate_model,
+    manual_config_completion_model, manual_config_diagnostics_lane_model,
+    manual_config_handoff_model, manual_config_problem_navigation_model, mint_reachability_model,
+    motion_policy_model, native_async_delivery_model, native_capture_source_model,
+    native_close_plan_model, native_config_observation_handoff_model,
+    native_config_transaction_model, native_control_routing_model,
+    native_document_publication_model, native_document_queue_model, native_draft_journal_model,
+    native_editor_command_palette_model, native_editor_modal_model, native_editor_viewport_model,
+    native_file_watch_model, native_markdown_history_model, native_markdown_viewport_model,
+    native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
+    native_save_intent_latch_model, native_settings_draft_close_model,
+    native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
+    native_update_apply_ladder_model, native_update_attempt_identity_model,
+    native_update_auto_intent_model, native_update_disk_transaction_model,
+    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
+    native_update_menu_activation_model, native_update_overlap_handoff_model,
+    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
+    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
+    net_dial_after_grant_model, notify_follow_checkpoint_model, nova_phase_model,
+    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
+    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
+    output_streak_attribution_model, output_streak_episode_delivery_model, pad_absorption_model,
+    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
+    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
+    presented_frame_tap_model, press_custody_model, program_resolution_retry_model,
+    program_resolver_queue_model, proxy_forward_model, rain_band_containment_model,
+    rain_ignition_model, rain_lifecycle_model, rainbow_exit_sampling_model,
+    rainbow_idle_twinkle_model, rainbow_landing_pool_model, rainbow_typed_continuity_model,
+    read_image_seq_model, recording_model, recovery_redraw_model,
     reduced_motion_companion_handoff_model, release_channel_floor_model,
-    release_channel_single_head_model, release_claim_landing_model,
-    release_durable_post_intent_model, release_historical_recovery_model,
-    release_journal_prefix_model, release_published_identity_model, release_publisher_fence_model,
+    release_claim_landing_model, release_durable_post_intent_model,
+    release_historical_recovery_model, release_journal_prefix_model,
+    release_published_identity_model, release_publisher_fence_model,
     release_yank_successor_first_model, restore_manifest_single_use_model, ring_model,
     roster_pair_redo_model, same_caret_typed_echo_model, scroll_glide_model,
     scrollback_maintenance_lane_model, seamless_nonce_model, selection_custody_model,
@@ -85,10 +87,11 @@ use aterm_spec::derive::{
     snapshot_generation_commit_model, snapshot_model, sparkle_identity_model,
     sparkle_persist_capacity_model, sparkle_reflow_cardinality_model, sparkle_retype_rearm_model,
     spawn_locale_model, startup_phase_publication_model, stream_fade_gate_model,
-    strike_selection_model, styled_run_face_model, subscribe_model, surface_coverage_model,
-    sync_reopen_visibility_model, tab_nav_model, tab_stop_handoff_model, tab_strip_model,
-    text_blend_gate_model, tier_residency_model, title_summary_managed_endpoint_model,
-    title_summary_model, title_summary_observation_scheduler_model, title_summary_runtime_model,
+    strike_selection_model, styled_run_face_model, subscribe_model, supernova_burst_mutex_model,
+    surface_coverage_model, sync_reopen_visibility_model, tab_nav_model, tab_stop_handoff_model,
+    tab_strip_model, text_blend_gate_model, tier_residency_model,
+    title_summary_managed_endpoint_model, title_summary_model,
+    title_summary_observation_scheduler_model, title_summary_runtime_model,
     title_summary_socket_owner_retry_model, top_anchored_scroll_history_model,
     trail_audio_lifecycle_model, trail_audio_start_latency_model, transact_model,
     unknown_insert_orphan_key_model, vf_axis_clamp_model, vf_nudge_gate_model,
@@ -157,6 +160,104 @@ fn derived_ring_spec_proves_and_catches_late_eviction() {
     assert!(!buggy.check_invariant("LenBounded", &state));
 }
 
+/// NEW-1 of the live e2e (2026-09-26): the server's `idle` for a Claude
+/// Code is the handshake an orchestrator types its first prompt on. Idle is
+/// published only for the NEW REPL drawn whole, the terminal's cursor in its
+/// prompt box, so a prompt typed on it is never lost, on every path — a new
+/// folder's trust dialog, pressed, or a folder trusted before; in a new tab,
+/// or the inline renderer relaunched in the same tab with the previous run's
+/// prompt box still on the screen. The old reader (`Buggy=1`: idle for any
+/// screen with no box and no spinner) publishes idle on the shell's rows the
+/// dialog's press leaves; the reader of 2026-09-26 (`Buggy=2`: idle at the
+/// last caret's whole box, the cursor not asked) publishes idle on the
+/// previous run's box while nothing of the new launch is drawn under it (the
+/// review of 2026-09-26: a draft lost 3 of 3). The prompt typed there is
+/// lost — each catches both invariants.
+#[test]
+fn derived_claude_is_idle_only_at_its_composer() {
+    let model = claude_idle_at_composer_model();
+    assert_proves_and_catches(&model);
+
+    type State = std::collections::BTreeMap<&'static str, i64>;
+    fn step(m: &Model, state: &State, action: &str) -> State {
+        m.successors(action, state)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("{action} is enabled"))
+    }
+    for relaunched in [false, true] {
+        let start = if relaunched {
+            step(&model, &model.init_state(), "Relaunched")
+        } else {
+            model.init_state()
+        };
+        let asked = step(&model, &start, "AskTrust");
+        let looked = step(&model, &asked, "Look");
+        assert_eq!(looked["published"], 2, "the dialog is a prompt");
+        let pressed = step(&model, &looked, "PressTrust");
+        let erased = step(&model, &pressed, "Look");
+        assert_eq!(erased["published"], 0, "the erased dialog is not idle");
+        assert!(!model.action_enabled("Type", &erased));
+        let half = step(&model, &step(&model, &erased, "DrawHalf"), "Look");
+        assert_eq!(half["published"], 0, "the half-drawn REPL is not idle");
+        let whole = step(&model, &step(&model, &half, "DrawWhole"), "Look");
+        assert_eq!(whole["published"], 1, "the REPL is idle");
+        let typed = step(&model, &whole, "Type");
+        assert_eq!(typed["lost"], 0);
+        // A folder trusted before: no dialog, the same rule.
+        let trusted = step(&model, &start, "AlreadyTrusted");
+        assert_eq!(step(&model, &trusted, "Look")["published"], 0);
+
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let old = step(&buggy, &pressed, "Look");
+        assert_eq!(
+            old["published"], 1,
+            "the old reader: the erased dialog read idle"
+        );
+        assert!(!buggy.check_invariant("IdleIsTheComposer", &old));
+        let lost = step(&buggy, &old, "Type");
+        assert!(!buggy.check_invariant("NoFirstPromptLost", &lost));
+
+        // The reader of 2026-09-26: any whole box on the screen.
+        let framed = aterm_spec::interp::with_buggy(&model, 2);
+        let seen = step(&framed, &pressed, "Look");
+        assert_eq!(
+            seen["published"],
+            i64::from(relaunched),
+            "the previous run's box read idle only in the same tab"
+        );
+        let early = step(&framed, &step(&framed, &start, "AlreadyTrusted"), "Look");
+        assert_eq!(early["published"], i64::from(relaunched));
+        if relaunched {
+            assert!(!framed.check_invariant("IdleIsTheComposer", &seen));
+            let lost = step(&framed, &seen, "Type");
+            assert!(!framed.check_invariant("NoFirstPromptLost", &lost));
+        }
+    }
+    // Both invariants hold over every state the fix reaches, and each buggy
+    // reader reaches a state that breaks them.
+    for bug in [1, 2] {
+        let buggy = aterm_spec::interp::with_buggy(&model, bug);
+        let mut seen = vec![buggy.init_state()];
+        let mut next = 0;
+        let mut broke = [false, false];
+        while next < seen.len() {
+            let state = seen[next].clone();
+            next += 1;
+            broke[0] |= !buggy.check_invariant("IdleIsTheComposer", &state);
+            broke[1] |= !buggy.check_invariant("NoFirstPromptLost", &state);
+            for action in &buggy.actions {
+                for s in buggy.successors(action.name, &state) {
+                    if !seen.contains(&s) {
+                        seen.push(s);
+                    }
+                }
+            }
+        }
+        assert_eq!(broke, [true, true], "Buggy={bug}");
+    }
+}
+
 #[test]
 fn derived_program_resolution_retries_a_static_miss_and_stops_after_a_name() {
     let model = program_resolution_retry_model();
@@ -215,6 +316,22 @@ fn derived_program_resolver_coalesces_replacements_and_recovers_a_crash() {
     assert!(model.fire("Finish", &mut state));
     assert_eq!(state["completed"], 2);
     assert_eq!(state["queued"], 0);
+}
+
+#[test]
+fn derived_claude_footer_watch_retires_and_keeps_a_replacement() {
+    let model = claude_footer_watch_model();
+    assert_proves_and_catches(&model);
+
+    let mut state = model.init_state();
+    for action in ["AskOld", "AskNew", "StopOld"] {
+        assert!(model.fire(action, &mut state), "{action}");
+    }
+    assert_eq!(state["watch"], 2);
+    assert!(model.action_enabled("IdleRead", &state));
+    assert!(model.fire("StopSession", &mut state));
+    assert_eq!(state["watch"], 0);
+    assert!(!model.action_enabled("IdleRead", &state));
 }
 
 /// TERMINAL MODES: `ty` proves that either reset (DECSTR / RIS) leaves the
@@ -1273,7 +1390,7 @@ fn derived_inject_floor_proves_and_catches_overdraft() {
 /// No-mint-reachability (ATERM_DESIGN §5.4): an untrusted actor never reaches `Top`
 /// (the capability MINT) — the mint is launcher-only. PROVES NoUntrustedTop at
 /// Buggy=0, CATCHES the untrusted-reachable mint at Buggy=1. Bound to real code by
-/// `mint_sites_are_launcher_only` (the sealed `aterm_cap::Authority` constructor is
+/// `aterm-cap/tests/mint_reachability.rs` (the sealed `aterm_cap::Authority` constructor is
 /// named in exactly one product location, unreachable from any engine crate).
 #[test]
 fn derived_mint_reachability_proves_and_catches_untrusted_mint() {
@@ -2623,6 +2740,56 @@ fn derived_control_connection_admission_proves_and_catches_overflow() {
     assert_eq!((leaked["outstanding"], leaked["completed"]), (1, 1));
     assert!(!buggy.check_invariant("AcceptedWorkAccounted", &leaked));
     assert_every_invariant_carries_a_mutant(&model, &["ArrivalsBounded"]);
+}
+
+/// A control connection is on a request lane only while it has a request: idle,
+/// it parks; waiting, it moves to a wait lane; so persistent drivers never use
+/// the request lanes up and a fresh client is refused only for work or the
+/// open-connection bound. The mutant is the 2026-09-26 design (and four more
+/// defects), each caught alone; its headline trace is replayed here: two
+/// drivers go idle ON their lanes and the third client is refused for it.
+#[test]
+fn derived_control_lane_tenure_proves_and_catches_the_held_lane() {
+    let model = control_lane_tenure_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &[]);
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let step = |state, action| buggy.successors(action, &state)[0].clone();
+    let first = step(buggy.init_state(), "Admit");
+    let idle_on_lane = step(first, "Finish");
+    assert!(!buggy.check_invariant("NoIdleHold", &idle_on_lane));
+    let second = step(idle_on_lane, "Admit");
+    let both_idle = step(second, "Finish");
+    let refused = step(both_idle, "Refuse");
+    assert!(!buggy.check_invariant("NoRefusalByIdleDriver", &refused));
+
+    // The same two drivers under the shipping design park: both request lanes
+    // are free, yet a third client is still refused — for the open-connection
+    // bound (Cap=2, two open), not for a lane an idle driver holds, so the
+    // refusal leaves `NoRefusalByIdleDriver` intact.
+    let step = |state, action| model.successors(action, &state)[0].clone();
+    let first = step(model.init_state(), "Admit");
+    let parked = step(first, "Finish");
+    let second = step(parked, "Admit");
+    let both_parked = step(second, "Finish");
+    assert_eq!(both_parked["parked"], 2);
+    assert_eq!(
+        both_parked["working"] + both_parked["held"] + both_parked["queued"],
+        0,
+        "no request lane is taken"
+    );
+    assert_eq!(both_parked["open"], 2, "open == Cap");
+    assert!(
+        model.successors("Admit", &both_parked).is_empty(),
+        "Cap=2 bounds the open connections"
+    );
+    let refused = model.successors("Refuse", &both_parked);
+    assert_eq!(refused.len(), 1, "the third client is refused");
+    assert!(
+        model.check_invariant("NoRefusalByIdleDriver", &refused[0]),
+        "a refusal for the open-connection bound is not one an idle driver caused"
+    );
 }
 
 /// Native Settings has one process instance and at most one ordinary implicit
@@ -5543,7 +5710,7 @@ fn derived_roster_pair_redo_proves_crash_recovery_and_foreign_preservation() {
 
 /// A release floor is frozen as channel state, survives resume unchanged, and is
 /// revalidated against a potentially newer live floor immediately before publish.
-/// The exact-commit lease remains held through archive and verify and is
+/// The exact-commit lease remains held until the published head is proved and is
 /// released only by the final unlock. The healthy lifecycle can neither forget an
 /// observed floor, publish through a late ratchet, nor unlock early.
 #[test]
@@ -5584,8 +5751,8 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert!(model.fire("AbandonRejected", &mut frozen));
     assert_eq!(frozen["lease_owned"], 0);
 
-    // A covered cut keeps the same owner after visibility and through every
-    // downstream release step. Only the journaled final unlock releases it.
+    // A covered cut keeps the same owner after the head PATCH and through the proof
+    // of what a stranger sees. Only the journaled final unlock releases it.
     let mut complete = model.init_state();
     assert!(model.fire("RaiseObserved", &mut complete));
     for _ in 0..2 {
@@ -5598,14 +5765,12 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert_eq!(complete["phase"], 3);
     assert_eq!(complete["lease_owned"], 1);
     assert!(model.check_invariant("VisibleWorkOwnsLease", &complete));
-    assert!(model.fire("ArchiveAfterPublish", &mut complete));
-    assert_eq!(complete["lease_owned"], 1);
-    assert!(model.fire("VerifyRelease", &mut complete));
+    assert!(model.fire("ProveHead", &mut complete));
     assert_eq!(complete["lease_owned"], 1);
     assert!(model.fire("Unlock", &mut complete));
-    assert_eq!(complete["phase"], 8);
+    assert_eq!(complete["phase"], 7);
     assert_eq!(complete["lease_owned"], 0);
-    assert!(model.check_invariant("CompletionRequiresPostPublishSteps", &complete));
+    assert!(model.check_invariant("CompletionRequiresProvedHead", &complete));
 
     // Mutant 1: dropping the observed channel input immediately violates the
     // frozen carry-forward invariant.
@@ -5649,17 +5814,17 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
     assert!(buggy.fire("PublishChecked", &mut lease_bug));
     assert!(!buggy.check_invariant("PublishedNeverLowersLatest", &lease_bug));
 
-    // Mutant 4: releasing the remote owner immediately after flip exposes the
-    // archive/verify suffix to a competing cut.
+    // Mutant 4: releasing the remote owner immediately after the head PATCH exposes
+    // the unproved head to a competing cut.
     let mut early_unlock = buggy.init_state();
     assert!(buggy.fire("RaiseClaim", &mut early_unlock));
     assert!(buggy.fire("Resolve", &mut early_unlock));
     assert!(buggy.fire("AcquireLease", &mut early_unlock));
     assert!(buggy.fire("ConfirmCovered", &mut early_unlock));
     assert!(buggy.fire("PublishChecked", &mut early_unlock));
-    assert!(!model.action_enabled("UnlockBeforeVerification", &early_unlock));
-    assert!(buggy.fire("UnlockBeforeVerification", &mut early_unlock));
-    assert!(!buggy.check_invariant("CompletionRequiresPostPublishSteps", &early_unlock));
+    assert!(!model.action_enabled("UnlockBeforeHeadProof", &early_unlock));
+    assert!(buggy.fire("UnlockBeforeHeadProof", &mut early_unlock));
+    assert!(!buggy.check_invariant("CompletionRequiresProvedHead", &early_unlock));
     assert!(!buggy.check_invariant("UnlockCannotBeBypassed", &early_unlock));
 
     // Mutant 5: the claim check applied to the operator's request only, so a
@@ -5702,8 +5867,7 @@ fn derived_release_channel_floor_proves_carry_forward_and_late_guard() {
         "AcquireLease",
         "ConfirmCovered",
         "PublishChecked",
-        "ArchiveAfterPublish",
-        "VerifyRelease",
+        "ProveHead",
         "CompleteWithoutUnlock",
     ] {
         assert!(buggy.fire(action, &mut leaked), "{action}");
@@ -6397,400 +6561,6 @@ fn derived_release_yank_is_successor_first_and_crash_convergent() {
     assert_every_invariant_carries_a_mutant(&model, &["YankStateBounds"]);
 }
 
-/// Metadata-only archive renames preserve every historical appcast object while
-/// converging a flipped channel to one exact current head. Crash/resume retains the
-/// completed rename prefix but must reacquire ownership and revalidate the journal's
-/// exact tag/build. Signed channels require the current signature. Explicit mutants
-/// prove stale resume, wrong-tag resume, competing ownership, head regression,
-/// signature bypass, and premature finalization are all observable.
-#[test]
-fn derived_release_channel_single_head_proves_archive_convergence() {
-    let model = release_channel_single_head_model();
-    assert_proves_and_catches(&model);
-
-    // Signed history can advance after the initial scan but before visibility.
-    // The frozen cut must refuse under its still-held session; silently changing
-    // signing policy/key mid-cut would make the built binary and manifest diverge.
-    let mut late_signature = model.init_state();
-    assert!(model.fire(
-        "DetectSignaturePolicyAdvanceUnderSession",
-        &mut late_signature
-    ));
-    assert!(!model.action_enabled("Flip", &late_signature));
-    assert!(model.fire("RejectSignaturePolicyAdvance", &mut late_signature));
-    assert_eq!(late_signature["phase"], 4);
-    assert_eq!(late_signature["owner"], 1);
-    assert_eq!(late_signature["guard_attached"], 1);
-    assert!(model.fire("ExitAfterRefusal", &mut late_signature));
-    assert_eq!(late_signature["owner"], 1);
-    assert_eq!(late_signature["guard_attached"], 0);
-
-    let mut state = model.init_state();
-    assert_eq!(state["old_exact_manifest"], 2);
-    assert_eq!(state["old_exact_signature"], 0);
-    assert!(model.fire("ConfigureSignatures", &mut state));
-    assert_eq!(state["old_exact_signature"], 2);
-    assert!(model.fire("Flip", &mut state));
-    assert_eq!(state["current_exact_manifest"], 1);
-    assert_eq!(state["current_exact_signature"], 1);
-    assert_eq!(state["head_build"], 2);
-    assert_eq!(state["head_tag"], 2);
-    assert_eq!(state["journal_tag_build"], 2);
-    assert_eq!(state["old_exact_manifest"], 2);
-    assert!(model.fire("BeginArchive", &mut state));
-
-    // Complete a prefix, crash, and resume from the same journaled step. Counts
-    // prove the metadata rename moved—not deleted—the two asset identities. A
-    // process-local resume without reacquiring the shared owner cannot mutate.
-    assert!(model.fire("RenameHistoricalManifest", &mut state));
-    assert!(model.fire("RenameHistoricalSignature", &mut state));
-    assert_eq!(state["old_archived_manifest"], 1);
-    assert_eq!(state["old_archived_signature"], 1);
-    assert!(model.fire("CrashDuringArchive", &mut state));
-    assert_eq!(state["phase"], 1);
-    assert_eq!(state["owner"], 1);
-    assert_eq!(state["guard_attached"], 0);
-    assert_eq!(state["old_archived_manifest"], 1);
-    assert_eq!(state["old_archived_signature"], 1);
-    assert!(!model.action_enabled("BeginArchive", &state));
-    assert!(!model.action_enabled("RenameHistoricalManifest", &state));
-    assert!(!model.action_enabled("AcquireCompetingOwner", &state));
-    assert!(model.check_invariant("NominalCrashPreservesRemoteLease", &state));
-    assert!(model.fire("ReattachJournalOwner", &mut state));
-    assert!(model.fire("BeginArchive", &mut state));
-    assert!(model.fire("RenameHistoricalManifest", &mut state));
-    assert!(model.fire("RenameHistoricalSignature", &mut state));
-    assert!(model.fire("FinalizeArchived", &mut state));
-    assert_eq!(state["phase"], 3);
-    assert_eq!(state["owner"], 1);
-    assert_eq!(state["guard_attached"], 1);
-    assert!(model.check_invariant("StableHasSingleExactHead", &state));
-    assert!(model.check_invariant("HistoricalManifestNeverDeleted", &state));
-    assert!(model.check_invariant("HistoricalSignatureNeverDeleted", &state));
-    assert!(model.check_invariant("StablePreservesArchivedHistory", &state));
-    assert!(model.check_invariant("CurrentHeadNeverRegresses", &state));
-
-    let stable_partition = (
-        state["old_exact_manifest"],
-        state["old_archived_manifest"],
-        state["old_exact_signature"],
-        state["old_archived_signature"],
-        state["current_exact_manifest"],
-        state["current_exact_signature"],
-        state["head_build"],
-        state["head_tag"],
-        state["journal_tag_build"],
-    );
-    assert!(model.fire("RecheckStable", &mut state));
-    assert_eq!(
-        stable_partition,
-        (
-            state["old_exact_manifest"],
-            state["old_archived_manifest"],
-            state["old_exact_signature"],
-            state["old_archived_signature"],
-            state["current_exact_manifest"],
-            state["current_exact_signature"],
-            state["head_build"],
-            state["head_tag"],
-            state["journal_tag_build"],
-        ),
-        "idempotent convergence must produce an empty rename plan"
-    );
-
-    // Unsigned channels carry no historical or current signature. Their manifest
-    // archive still converges, proving the signature rule is conditional rather
-    // than an accidentally mandatory asset.
-    let mut unsigned = model.init_state();
-    assert!(model.fire("Flip", &mut unsigned));
-    assert_eq!(unsigned["current_exact_signature"], 0);
-    assert!(model.fire("BeginArchive", &mut unsigned));
-    assert!(model.fire("RenameHistoricalManifest", &mut unsigned));
-    assert!(model.fire("RenameHistoricalManifest", &mut unsigned));
-    assert!(model.fire("FinalizeArchived", &mut unsigned));
-    assert!(model.check_invariant("StableHasSingleExactHead", &unsigned));
-    assert!(model.check_invariant("StablePreservesArchivedHistory", &unsigned));
-
-    // Source + deterministic archive target is a hard collision. Planning cannot
-    // begin, and abort leaves every historical object untouched.
-    let mut collision = model.init_state();
-    assert!(model.fire("Flip", &mut collision));
-    assert!(model.fire("ExposeCollision", &mut collision));
-    assert!(!model.action_enabled("BeginArchive", &collision));
-    assert!(model.fire("AbortCollision", &mut collision));
-    assert_eq!(collision["phase"], 4);
-    assert_eq!(collision["finalized"], 0);
-    assert!(model.check_invariant("HistoricalManifestNeverDeleted", &collision));
-    assert!(model.check_invariant("HistoricalSignatureNeverDeleted", &collision));
-
-    // Configured signatures are part of the current-head identity. Losing the
-    // current signature disables archive and takes the explicit refusal path.
-    let mut missing_signature = model.init_state();
-    assert!(model.fire("ConfigureSignatures", &mut missing_signature));
-    assert!(model.fire("Flip", &mut missing_signature));
-    assert!(model.fire("ObserveMissingCurrentSignature", &mut missing_signature));
-    assert!(!model.action_enabled("BeginArchive", &missing_signature));
-    assert!(!model.action_enabled("RenameHistoricalManifest", &missing_signature));
-    assert!(model.fire("AbortMissingSignature", &mut missing_signature));
-    assert_eq!(missing_signature["phase"], 4);
-
-    // The current tag's live manifest is a second authority proof. Missing bytes or
-    // any observed build other than the journal claim disables BeginArchive before
-    // the first metadata rename.
-    let mut missing_manifest = model.init_state();
-    assert!(model.fire("Flip", &mut missing_manifest));
-    assert!(model.fire("ObserveMissingCurrentManifest", &mut missing_manifest));
-    assert!(!model.action_enabled("BeginArchive", &missing_manifest));
-    assert!(model.fire("AbortMissingCurrentManifest", &mut missing_manifest));
-    assert_eq!(missing_manifest["owner"], 1);
-    assert_eq!(missing_manifest["guard_attached"], 1);
-    assert!(model.fire("ExitAfterRefusal", &mut missing_manifest));
-    assert_eq!(missing_manifest["owner"], 1);
-    assert_eq!(missing_manifest["guard_attached"], 0);
-
-    let mut wrong_build = model.init_state();
-    assert!(model.fire("Flip", &mut wrong_build));
-    assert!(model.fire("ObserveWrongCurrentBuild", &mut wrong_build));
-    assert_eq!(wrong_build["journal_tag_build"], 1);
-    assert!(!model.action_enabled("BeginArchive", &wrong_build));
-    assert!(!model.action_enabled("RenameHistoricalManifest", &wrong_build));
-    assert!(model.fire("AbortWrongCurrentBuild", &mut wrong_build));
-
-    let mut advanced_build = model.init_state();
-    assert!(model.fire("Flip", &mut advanced_build));
-    assert!(model.fire("ObserveAdvancedCurrentBuild", &mut advanced_build));
-    assert_eq!(advanced_build["journal_tag_build"], 3);
-    assert!(!model.action_enabled("BeginArchive", &advanced_build));
-    assert!(model.fire("AbortAdvancedCurrentBuild", &mut advanced_build));
-
-    // Every unfinished pre-v3 journal fails closed. It cannot be interpreted as
-    // an unleased v3 resume or reacquire mutation authority.
-    let mut legacy = model.init_state();
-    assert!(model.fire("LoadUnfinishedLegacyJournal", &mut legacy));
-    assert!(!model.action_enabled("ReattachJournalOwner", &legacy));
-    assert!(!model.action_enabled("ObserveLegacyJournalWithoutLease", &legacy));
-    assert!(model.fire("RefuseLegacyJournal", &mut legacy));
-    assert_eq!(legacy["phase"], 4);
-    assert_eq!(legacy["owner"], 0);
-    assert_eq!(legacy["guard_attached"], 0);
-
-    let mut newer_head = model.init_state();
-    for action in [
-        "LoadUnfinishedLegacyJournal",
-        "AcquireCompetingOwner",
-        "PublishNewerHead",
-        "AbortNewerHead",
-    ] {
-        assert!(
-            model.fire(action, &mut newer_head),
-            "{action}: {newer_head:?}"
-        );
-    }
-    assert_eq!(newer_head["phase"], 4);
-
-    let mut wrong_tag = model.init_state();
-    for action in [
-        "LoadUnfinishedLegacyJournal",
-        "AcquireCompetingOwner",
-        "ReplaceTagAtSameBuild",
-        "AbortWrongTag",
-    ] {
-        assert!(
-            model.fire(action, &mut wrong_tag),
-            "{action}: {wrong_tag:?}"
-        );
-    }
-    assert_eq!(wrong_tag["phase"], 4);
-
-    // NEGATIVE CONTROL 1: Buggy=1 journals archive complete while historical exact
-    // heads remain. Healthy disables the edge; both stable invariants catch it.
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-
-    let mut late_signature_bypass = buggy.init_state();
-    assert!(buggy.fire(
-        "DetectSignaturePolicyAdvanceUnderSession",
-        &mut late_signature_bypass
-    ));
-    assert!(buggy.fire(
-        "FlipBeforeSignatureRevalidation",
-        &mut late_signature_bypass
-    ));
-    assert_eq!(late_signature_bypass["current_exact_signature"], 0);
-    assert!(!buggy.check_invariant("SignedHistoryRatchetsCurrentPolicy", &late_signature_bypass));
-    assert!(!buggy.check_invariant("SignatureRatchetCannotBeBypassed", &late_signature_bypass));
-
-    let mut premature = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut premature));
-    assert!(buggy.fire("BeginArchive", &mut premature));
-    assert!(!model.action_enabled("FinalizeWithoutArchive", &premature));
-    assert!(buggy.fire("FinalizeWithoutArchive", &mut premature));
-    assert_eq!(premature["phase"], 3);
-    assert_eq!(premature["old_exact_manifest"], 2);
-    assert!(!buggy.check_invariant("StableHasSingleExactHead", &premature));
-    assert!(!buggy.check_invariant("StablePreservesArchivedHistory", &premature));
-
-    // NEGATIVE CONTROL 2: each legacy lease bypass is independently observable.
-    let mut observed_unleased = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut observed_unleased));
-    assert!(buggy.fire("ObserveLegacyJournalWithoutLease", &mut observed_unleased));
-    assert!(!buggy.check_invariant("LegacyJournalCannotResumeMutation", &observed_unleased));
-
-    let mut acquired_unleased = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut acquired_unleased));
-    assert!(buggy.fire("AcquireJournalOwner", &mut acquired_unleased));
-    assert!(!buggy.check_invariant("LegacyJournalCannotResumeMutation", &acquired_unleased));
-
-    // A stale journal cannot enter archive after a newer head wins the crash
-    // handoff; the mutant attempts mutation directly from the unleased state.
-    let mut stale = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut stale));
-    assert!(buggy.fire("AcquireCompetingOwner", &mut stale));
-    assert!(buggy.fire("PublishNewerHead", &mut stale));
-    assert!(!model.action_enabled("BeginArchiveStaleHead", &stale));
-    assert!(buggy.fire("BeginArchiveStaleHead", &mut stale));
-    assert!(!buggy.check_invariant("ArchiveUsesExactJournalHead", &stale));
-    assert!(!buggy.check_invariant("StaleHeadCannotBeBypassed", &stale));
-
-    // NEGATIVE CONTROL 3: exact build with the wrong tag is independently caught.
-    let mut stale_tag = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut stale_tag));
-    assert!(buggy.fire("AcquireCompetingOwner", &mut stale_tag));
-    assert!(buggy.fire("ReplaceTagAtSameBuild", &mut stale_tag));
-    assert!(buggy.fire("BeginArchiveWrongTag", &mut stale_tag));
-    assert!(!buggy.check_invariant("ArchiveUsesExactJournalHead", &stale_tag));
-    assert!(!buggy.check_invariant("StaleHeadCannotBeBypassed", &stale_tag));
-
-    // NEGATIVE CONTROL 4: configured signing cannot be bypassed at archive entry.
-    let mut unsigned_bug = buggy.init_state();
-    assert!(buggy.fire("ConfigureSignatures", &mut unsigned_bug));
-    assert!(buggy.fire("Flip", &mut unsigned_bug));
-    assert!(buggy.fire("ObserveMissingCurrentSignature", &mut unsigned_bug));
-    assert!(buggy.fire("BeginArchiveMissingSignature", &mut unsigned_bug));
-    assert!(!buggy.check_invariant("ConfiguredSignatureRequiredForArchive", &unsigned_bug));
-    assert!(!buggy.check_invariant("SignaturePolicyCannotBeBypassed", &unsigned_bug));
-
-    // NEGATIVE CONTROL 4b: signed historical metadata is itself a monotonic
-    // channel policy. A caller-local false cannot discard that observation;
-    // healthy Flip is disabled, while the mutant is caught immediately.
-    let mut dropped_ratchet = buggy.init_state();
-    assert!(buggy.fire("IgnoreSignedHistory", &mut dropped_ratchet));
-    assert!(buggy.check_invariant("HistoricalSignatureNeverDeleted", &dropped_ratchet));
-    assert!(!buggy.check_invariant("SignedHistoryRatchetsCurrentPolicy", &dropped_ratchet));
-    assert!(!buggy.check_invariant("SignatureRatchetCannotBeBypassed", &dropped_ratchet));
-    assert!(!model.action_enabled("Flip", &dropped_ratchet));
-
-    // NEGATIVE CONTROL 5: a mismatched observed build cannot bypass the production
-    // full validate_live_release_identity guard.
-    let mut wrong_observed_build = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut wrong_observed_build));
-    assert!(buggy.fire("ObserveWrongCurrentBuild", &mut wrong_observed_build));
-    assert!(buggy.fire("BeginArchiveWrongObservedBuild", &mut wrong_observed_build));
-    assert!(!buggy.check_invariant("ArchiveObservedExactJournalBuild", &wrong_observed_build));
-    assert!(!buggy.check_invariant("ObservedBuildGuardCannotBeBypassed", &wrong_observed_build));
-
-    let mut advanced_observed_build = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut advanced_observed_build));
-    assert!(buggy.fire("ObserveAdvancedCurrentBuild", &mut advanced_observed_build));
-    assert!(buggy.fire(
-        "BeginArchiveAdvancedObservedBuild",
-        &mut advanced_observed_build
-    ));
-    assert!(!buggy.check_invariant("ArchiveObservedExactJournalBuild", &advanced_observed_build));
-
-    // NEGATIVE CONTROL 5b: matching tag/build alone is insufficient when the
-    // live manifest's version/commit/DMG/bytes or signed identity drifted.
-    let mut invalid_live_identity = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut invalid_live_identity));
-    assert!(buggy.fire("ObserveLiveIdentityMismatch", &mut invalid_live_identity));
-    assert!(buggy.fire(
-        "BeginArchiveInvalidLiveIdentity",
-        &mut invalid_live_identity
-    ));
-    assert!(!buggy.check_invariant("ArchiveUsesValidatedLiveIdentity", &invalid_live_identity));
-    assert!(!buggy.check_invariant("LiveIdentityGuardCannotBeBypassed", &invalid_live_identity));
-
-    // NEGATIVE CONTROL 6: a competing owner cannot enter archive, nor can it
-    // advance the current head after this journal began mutating history.
-    let mut wrong_owner = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut wrong_owner));
-    assert!(buggy.fire("ObserveLegacyJournalWithoutLease", &mut wrong_owner));
-    assert!(buggy.fire("AcquireCompetingOwner", &mut wrong_owner));
-    assert!(buggy.fire("BeginArchiveAsCompetingOwner", &mut wrong_owner));
-    assert!(!buggy.check_invariant("ArchiveOwnsSharedLease", &wrong_owner));
-    assert!(!buggy.check_invariant("CompetingOwnerCannotBypassLease", &wrong_owner));
-
-    let mut advanced_during_archive = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut advanced_during_archive));
-    assert!(buggy.fire("BeginArchive", &mut advanced_during_archive));
-    assert!(buggy.fire(
-        "CompetingOwnerAdvancesDuringArchive",
-        &mut advanced_during_archive
-    ));
-    assert!(!buggy.check_invariant("ArchiveHeadIsImmutable", &advanced_during_archive));
-    assert!(!buggy.check_invariant("CompetingOwnerCannotBypassLease", &advanced_during_archive));
-
-    // NEGATIVE CONTROL 7: current channel generations never move backward.
-    let mut regressed = buggy.init_state();
-    assert!(buggy.fire("LoadUnfinishedLegacyJournal", &mut regressed));
-    assert!(buggy.fire("ObserveLegacyJournalWithoutLease", &mut regressed));
-    assert!(buggy.fire("AcquireCompetingOwner", &mut regressed));
-    assert!(buggy.fire("RegressCurrentHead", &mut regressed));
-    assert!(!buggy.check_invariant("CurrentHeadNeverRegresses", &regressed));
-
-    // NEGATIVE CONTROL 8: delete+recreate can preserve scalar counts while
-    // replacing the asset object/bytes. Identity invariants catch both asset
-    // classes independently.
-    let mut replaced_manifest = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut replaced_manifest));
-    assert!(buggy.fire("BeginArchive", &mut replaced_manifest));
-    assert!(buggy.fire(
-        "DeleteAndRecreateHistoricalManifest",
-        &mut replaced_manifest
-    ));
-    assert!(buggy.check_invariant("HistoricalManifestNeverDeleted", &replaced_manifest));
-    assert!(!buggy.check_invariant("HistoricalManifestIdentityPreserved", &replaced_manifest));
-
-    let mut replaced_signature = buggy.init_state();
-    assert!(buggy.fire("ConfigureSignatures", &mut replaced_signature));
-    assert!(buggy.fire("Flip", &mut replaced_signature));
-    assert!(buggy.fire("BeginArchive", &mut replaced_signature));
-    assert!(buggy.fire(
-        "DeleteAndRecreateHistoricalSignature",
-        &mut replaced_signature
-    ));
-    assert!(buggy.check_invariant("HistoricalSignatureNeverDeleted", &replaced_signature));
-    assert!(!buggy.check_invariant("HistoricalSignatureIdentityPreserved", &replaced_signature));
-
-    // NEGATIVE CONTROL 9: archive by deletion. A vanished manifest breaks both the
-    // count and the identity; a vanished signature takes its identity with it, so
-    // only the count law sees it.
-    let mut deleted_manifest = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut deleted_manifest));
-    assert!(buggy.fire("BeginArchive", &mut deleted_manifest));
-    assert!(buggy.fire("ArchiveByDeletingHistoricalManifest", &mut deleted_manifest));
-    assert!(!buggy.check_invariant("HistoricalManifestNeverDeleted", &deleted_manifest));
-
-    let mut deleted_signature = buggy.init_state();
-    assert!(buggy.fire("ConfigureSignatures", &mut deleted_signature));
-    assert!(buggy.fire("Flip", &mut deleted_signature));
-    assert!(buggy.fire("BeginArchive", &mut deleted_signature));
-    assert!(buggy.fire(
-        "ArchiveByDeletingHistoricalSignature",
-        &mut deleted_signature
-    ));
-    assert!(buggy.check_invariant("HistoricalSignatureIdentityPreserved", &deleted_signature));
-    assert!(!buggy.check_invariant("HistoricalSignatureNeverDeleted", &deleted_signature));
-
-    // NEGATIVE CONTROL 10: a nominal crash that takes the remote lease with it.
-    let mut unwound = buggy.init_state();
-    assert!(buggy.fire("Flip", &mut unwound));
-    assert!(buggy.fire("BeginArchive", &mut unwound));
-    assert!(buggy.fire("CrashReleasingRemoteLease", &mut unwound));
-    assert_eq!(unwound["owner"], 0);
-    assert!(!buggy.check_invariant("NominalCrashPreservesRemoteLease", &unwound));
-    assert_every_invariant_carries_a_mutant(&model, &["ArchiveStateBounds"]);
-}
-
 #[test]
 fn release_channel_models_are_registered_for_xref_resolution() {
     let registered: std::collections::BTreeSet<_> = aterm_spec::xref::model_registry()
@@ -6804,7 +6574,7 @@ fn release_channel_models_are_registered_for_xref_resolution() {
         "ReleasePublisherFence",
         "ReleasePublishedIdentity",
         "ReleaseYankSuccessorFirst",
-        "ReleaseChannelSingleHead",
+        "ReleasePublishOnce",
         "NativeUpdateHiddenOutputQuiet",
     ] {
         assert!(
@@ -8216,6 +7986,46 @@ fn derived_press_custody_keeps_the_viewport_and_selection_off_inert_presses() {
     assert_eq!(wiped["offset"], 0, "the space the offset named is gone");
     assert_eq!(wiped["owner"], 0);
     assert_eq!(wiped["selection"], 0);
+
+    // An IN-PLACE take — a rewrite over the selected rows that scrolls nothing, or
+    // a fail-closed `post_process` arm — clears the highlight and leaves the
+    // reader exactly where they were (closed 2026-09-25; a KNOWN GAP before).
+    for take in [
+        "OutputDamagesTheSelectedRowsInPlace",
+        "OutputTookTheSelectionUnattributedInPlace",
+    ] {
+        let mut rewritten = model.init_state();
+        for action in ["UserScroll", "UserSelect", take] {
+            assert!(
+                model.fire(action, &mut rewritten),
+                "{action}: {rewritten:?}"
+            );
+        }
+        assert_eq!(rewritten["selection"], 0, "{take}: the highlight goes");
+        assert_eq!(
+            [rewritten["offset"], rewritten["owner"]],
+            [1, 1],
+            "{take}: the view does not move"
+        );
+    }
+
+    // Back TOWARD live without typing — End, a downward scroll, the ⌘-V / IME
+    // snaps — moves the view down and KEEPS the highlight.
+    let mut returned = model.init_state();
+    for action in [
+        "UserScroll",
+        "UserScroll",
+        "UserSelect",
+        "UserScrollTowardLive",
+        "SnapToLive",
+    ] {
+        assert!(model.fire(action, &mut returned), "{action}: {returned:?}");
+    }
+    assert_eq!(
+        [returned["offset"], returned["owner"], returned["selection"]],
+        [0, 0, 1],
+        "at live, tail-owned, and the highlight survived the trip down"
+    );
 
     // …and the one handover is intact: typing still lands at live and deselects.
     let mut typed = model.init_state();
@@ -11993,6 +11803,49 @@ fn derived_session_id_claim_proves_catches_and_multiplies() {
     assert_eq!(st.get("lock"), Some(&0), "the lock dies WITH its holder");
     assert!(m.fire("Launch", &mut st), "and the relaunch adopts again");
     assert_eq!(st.get("holders"), Some(&1));
+
+    // THE HANDOFF WINDOW (closed 2026-09-25): the predecessor has exited, its
+    // lock is gone, and the successor has not published yet. The successor
+    // MARKER is the only gate standing; with it the launch is refused.
+    let handoff = aterm_spec::interp::with_consts(&m, &[("Handoff", 1)]);
+    let mut st = handoff.init_state();
+    for action in ["Launch", "PredecessorExits", "Launch"] {
+        assert!(handoff.fire(action, &mut st), "{action}: {st:?}");
+    }
+    assert_eq!(
+        st.get("lock"),
+        Some(&0),
+        "the predecessor's lock died with it"
+    );
+    assert_eq!(
+        st.get("entry"),
+        Some(&0),
+        "nothing of the successor is published"
+    );
+    assert_eq!(st.get("holders"), Some(&1), "the marker refused the launch");
+    assert!(handoff.fire("SuccessorPublishes", &mut st));
+    assert_eq!(
+        st.get("marker"),
+        Some(&0),
+        "the successor retires its marker"
+    );
+    assert!(handoff.fire("Launch", &mut st));
+    assert_eq!(
+        st.get("holders"),
+        Some(&1),
+        "the entry refuses after publish"
+    );
+    assert!(
+        aterm_spec::interp::bmc(&handoff).is_ok(),
+        "the marked handoff holds AtMostOneHolder over its whole space"
+    );
+    // …and WITHOUT the marker (`Unmarked = 1`, the pre-fix exit) the same window
+    // duplicates the id: the mutant that makes the marker non-vacuous.
+    let unmarked = aterm_spec::interp::with_consts(&m, &[("Handoff", 1), ("Unmarked", 1)]);
+    assert!(
+        aterm_spec::interp::bmc(&unmarked).is_err(),
+        "an unmarked handoff window must admit a second holder"
+    );
 }
 
 /// **A FLICKERING PROGRAM NEVER TAKES THE CURSOR.** The anti-flap law of the
@@ -12339,6 +12192,66 @@ fn derived_log_rotation_proves_and_catches_lost_lines_and_unbounded_growth() {
     );
 }
 
+/// THE MODEL LADDER: every due model move lands. The healthy ladder never
+/// waits past the bound and never wedges before moving; the mutant is the
+/// 2026-09-25 incident's rule (move only on a cold cache), and it walks the
+/// wait past the bound on a session that simply keeps answering.
+#[test]
+fn derived_harness_model_ladder_lands_every_due_move_and_catches_the_cold_only_rule() {
+    let model = harness_model_ladder_model();
+    assert_proves_and_catches(&model);
+
+    let moved = |state: &aterm_spec::interp::State| state["moved"] == 1;
+    assert!(
+        aterm_spec::interp::find_deadlock(&model, moved).is_none(),
+        "the healthy ladder always reaches the move"
+    );
+
+    // The incident, on the healthy ladder: warm, a newer build arrives, the
+    // very next readable visit moves.
+    let warm = model.init_state();
+    let restarting = model.successors("BuildArrives", &warm)[0].clone();
+    assert!(
+        model.successors("VisitWaits", &restarting).is_empty(),
+        "a build restart must not wait for a cold cache"
+    );
+    assert_eq!(model.successors("VisitMoves", &restarting)[0]["moved"], 1);
+
+    // Warm and no restart coming, forever: it waits exactly `Warm` visits and
+    // then moves — never once more.
+    let mut s = warm.clone();
+    for _ in 0..3 {
+        assert!(
+            model.successors("VisitMoves", &s).is_empty(),
+            "moved early: {s:?}"
+        );
+        s = model.successors("VisitWaits", &s)[0].clone();
+    }
+    assert!(
+        model.successors("VisitWaits", &s).is_empty(),
+        "waited past the bound"
+    );
+    assert_eq!(model.successors("VisitMoves", &s)[0]["moved"], 1);
+
+    // A flicker neither moves nor resets: the clock stands across it.
+    let flickered = model.successors("Flicker", &s)[0].clone();
+    assert_eq!(flickered["clock"], s["clock"]);
+    assert!(model.successors("VisitMoves", &flickered).is_empty());
+    assert!(model.successors("VisitWaits", &flickered).is_empty());
+
+    // THE INCIDENT, on the mutant: warm, the build restart in hand, and it
+    // still waits — past the bound.
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut b = buggy.successors("BuildArrives", &buggy.init_state())[0].clone();
+    for _ in 0..4 {
+        b = buggy.successors("VisitWaits", &b)[0].clone();
+    }
+    assert!(
+        !buggy.check_invariant("NeverPastTheBound", &b),
+        "the cold-only rule must be caught waiting past the bound: {b:?}"
+    );
+}
+
 /// The model priority list: `Priority::admit` and `models set` write it,
 /// target selection reads it. Every law carries its own mutant.
 #[test]
@@ -12444,4 +12357,35 @@ fn fire_all(model: &Model, state: &mut aterm_spec::interp::State, actions: &[&st
             model.name
         );
     }
+}
+
+/// The §3.2 two-way burst mutex: proves at `Buggy = 0`, is caught at
+/// `Buggy = 1`, and every named law catches a member of its own. The trace is
+/// the shipped serialization: a live supernova defers a classic grant, and a
+/// live classic defers a supernova grant.
+#[test]
+fn derived_supernova_burst_mutex_keeps_the_nova_share_funded() {
+    let model = supernova_burst_mutex_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_carries_a_mutant(&model, &[]);
+
+    let mut s = model.init_state();
+    assert!(model.fire("IgniteSuper", &mut s));
+    assert!(
+        !model.action_enabled("IgniteClassic", &s),
+        "a live supernova defers classic grants"
+    );
+    assert!(
+        !model.action_enabled("IgniteSuper", &s),
+        "MAX_ACTIVE_SUPERNOVAE = 1"
+    );
+    assert!(model.fire("RetireSuper", &mut s));
+    assert!(model.fire("IgniteClassic", &mut s));
+    assert!(
+        !model.action_enabled("IgniteSuper", &s),
+        "a live classic defers the supernova grant (the mutex is two-way)"
+    );
+    assert!(model.fire("IgniteClassic", &mut s));
+    assert!(model.fire("IgniteClassic", &mut s));
+    assert_eq!(s["funded"], 3 * 392, "three classics fund 1176 <= 1536");
 }

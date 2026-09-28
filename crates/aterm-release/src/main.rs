@@ -6,8 +6,8 @@
 //!
 //! One binary owns the whole cut: pre-claim gates → build-number ledger claim
 //! (fetch/push compare-and-swap on `RELEASES.ledger`) → universal build with
-//! `SOURCE_DATE_EPOCH=n` → .app bundle → sign → DMG → manifest → draft-first
-//! GitHub publish with a late tag → post-publish verify. It is run
+//! `SOURCE_DATE_EPOCH=n` → .app bundle → sign → DMG → manifest → tag → ONE
+//! publication onto the release channel, made the head last. It is run
 //! via the `.cargo/config.toml` alias (`ship = "run -q --release -p
 //! aterm-release --"`), never `cargo install` — a stale installed binary must
 //! not be able to cut a release (spec decision 13).
@@ -31,6 +31,9 @@ mod apple;
 mod buildplan;
 mod bundle;
 mod changelog;
+// The release channel: the one release object a cut publishes onto, its exact asset
+// set, and the order and PATCH that make it the head.
+mod channel;
 mod cli;
 mod dmg;
 mod gates;
@@ -40,7 +43,6 @@ mod ledger;
 // publish.rs — it touches no secret and no upload.
 mod machines;
 mod manifest_out;
-mod mirror;
 // One command from fresh checkout to publishing machine: seed the roster pair from the
 // channel release, drive the atpkg-keys join in-process, audit the Apple/token stack.
 mod provision;

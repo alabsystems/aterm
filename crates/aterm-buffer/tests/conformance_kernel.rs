@@ -32,12 +32,12 @@
 //! NEGATIVE CONTROL — the modelled gap, projected from a real state, is rejected
 //! by the committed model and admitted by `Buggy = 1`.
 
-use aterm_buffer::{
-    Edit, EventLog, LineId, MAX_LOG_EVENTS, Op, ReadCap, Seq, Surface, Ticks, TxnOutcome, WriteCap,
-};
+use aterm_buffer::{Edit, EventLog, LineId, MAX_LOG_EVENTS, Op, Seq, Surface, Ticks, TxnOutcome};
+mod support;
 use aterm_spec::derive::{Model, kernel_model};
 use aterm_spec::{interp, verify};
 use std::collections::BTreeMap;
+use support::{read_cap, write_cap};
 
 type State = BTreeMap<&'static str, i64>;
 
@@ -165,7 +165,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
         Edit::ClearLine(LineId(99)),
     ];
     for edit in edits {
-        let assigned = s.apply(&WriteCap, edit);
+        let assigned = s.apply(&write_cap(), edit);
         spine.emitted(s.log(), 1, assigned, true);
     }
 
@@ -178,7 +178,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
         Edit::SetLine(LineId(2), "t1'".into()),
     ];
     let n = body.len();
-    let TxnOutcome::Committed(committed) = s.transact(&WriteCap, base, body) else {
+    let TxnOutcome::Committed(committed) = s.transact(&write_cap(), base, body) else {
         panic!("a transaction on the current head commits");
     };
     spine.emitted(s.log(), n, committed, true);
@@ -188,7 +188,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
     let stale = Seq(base.0);
     let head = s.seq();
     assert_eq!(
-        s.transact(&WriteCap, stale, vec![Edit::AppendLine("lost?".into())]),
+        s.transact(&write_cap(), stale, vec![Edit::AppendLine("lost?".into())]),
         TxnOutcome::Conflict
     );
     assert_eq!(
@@ -199,8 +199,8 @@ fn real_surface_spine_conforms_to_kernel_model() {
     assert_eq!(state(s.seq().0, spine.count), spine.state);
 
     // A reader never moves the spine either.
-    let _ = s.snapshot(&ReadCap);
-    let _ = s.poll(s.subscribe(&ReadCap));
+    let _ = s.snapshot(&read_cap());
+    let _ = s.poll(s.subscribe(&read_cap()));
     assert_eq!(s.seq(), head, "reads are not events");
 
     // EVICTION REGIME: past MAX_LOG_EVENTS the ring forgets its oldest entries
@@ -208,7 +208,7 @@ fn real_surface_spine_conforms_to_kernel_model() {
     let cap = MAX_LOG_EVENTS as u64;
     let target = cap + 16;
     while spine.count < target {
-        let assigned = s.apply(&WriteCap, Edit::AppendLine("flood".into()));
+        let assigned = s.apply(&write_cap(), Edit::AppendLine("flood".into()));
         let near_edge = spine.count + 4 > cap && spine.count < cap + 4;
         spine.emitted(
             s.log(),
@@ -266,7 +266,7 @@ fn real_append_at_spine_conforms_to_kernel_model() {
 fn a_gapped_append_is_the_buggy_step_the_bind_rejects() {
     let m = kernel_model();
     let mut s = Surface::new();
-    s.apply(&WriteCap, Edit::AppendLine("x".into()));
+    s.apply(&write_cap(), Edit::AppendLine("x".into()));
     let stored = newest_stored(s.log(), 1)[0];
     let prev = state(stored, 1);
     let gapped = state(stored + 2, 2);

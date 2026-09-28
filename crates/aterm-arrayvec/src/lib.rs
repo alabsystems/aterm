@@ -111,22 +111,10 @@
 //!   "leak an `Arc` on every early return" and "double-free the yielded
 //!   elements" failure modes unrepresentable instead of merely untested.
 //!
-//! And one property that is NOT yet what the manifest's `std` feature implies:
-//!
-//! * **`#![no_std]` is true of this crate and not yet of the graph below it.**
-//!   `crates/aterm-alloc/src/array_vec.rs` names only `core` items (re-check:
-//!   `grep -n 'std::' crates/aterm-alloc/src/array_vec.rs` — every hit is
-//!   inside its `#[cfg(test)]` module, bar the line that says so), but
-//!   `aterm-alloc` itself is not
-//!   `#![no_std]`, because its *other* module, `small_vec.rs`, has a heap
-//!   fallback that names `Vec`. So a consumer taking this crate with
-//!   `default-features = false` — which all six do — still links `std`
-//!   transitively. That changes nothing for aterm: all four cells are std
-//!   targets and `naga`/`tiny-skia`/`vte` are compiled into a std binary
-//!   regardless. The remaining work to make the claim unconditional is
-//!   `extern crate alloc` in `aterm-alloc` plus `Vec`/`String` imports in
-//!   `small_vec.rs` and the two test modules; it is not done here because it
-//!   touches a crate on aterm's hot parser path for no measurable gain.
+//! `#![no_std]` holds for the whole graph under this crate: `aterm-alloc` is
+//! `#![no_std]` too (it needs only `core` and `alloc`), so a consumer taking
+//! this crate with `default-features = false` — which all six do — links no
+//! `std` through it.
 //!
 //! # Surface
 //!

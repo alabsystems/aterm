@@ -8,22 +8,6 @@ use crate::HotTier;
 use crate::Scrollback;
 use std::cell::Cell;
 
-impl WarmBlock {
-    /// Create a WarmBlock with corrupt compressed data (invalid LZ4).
-    ///
-    /// The block reports `line_count` lines but its compressed data cannot be
-    /// decompressed. Used to test error paths in cold tier push and warm-to-cold
-    /// eviction where re-compression fails.
-    pub(crate) fn with_corrupt_data(line_count: usize) -> Self {
-        Self {
-            // Invalid LZ4: valid 4-byte size prefix (small) + garbage payload
-            compressed: vec![0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
-            line_count,
-            decompress_failures: Cell::new(0),
-        }
-    }
-}
-
 impl WarmTier {
     pub(crate) fn oldest_block_bytes(&self) -> Option<Vec<u8>> {
         self.blocks.front().map(|block| block.compressed.clone())
@@ -47,15 +31,6 @@ impl WarmTier {
     /// Mutable access to the underlying block deque for test corruption. (#5947)
     pub(crate) fn blocks_mut(&mut self) -> &mut std::collections::VecDeque<WarmBlock> {
         &mut self.blocks
-    }
-
-    /// Insert a corrupted warm block at the front (oldest position).
-    ///
-    /// Used by quarantine tests (#5947) to simulate a corrupt block that
-    /// fails eviction to cold tier.
-    pub(crate) fn push_front_corrupt(&mut self, line_count: usize) {
-        let block = WarmBlock::with_corrupt_data(line_count);
-        self.push_front(block);
     }
 }
 

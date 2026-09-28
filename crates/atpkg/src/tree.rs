@@ -26,11 +26,65 @@
 //! The hash is **content-integrity, not the signature root** (that stays `ring`, §8). It
 //! streams each file, so a multi-GB sysroot is never buffered whole. The exact byte
 //! format below is the contract the publish-side producer (Phase 6) must reproduce.
+//!
+//! **The two slots a platform could get wrong** — measured on Windows, 2026-09-22, where
+//! every install of `claude`/`codex` had failed the re-verify 41 times since 09-14. The
+//! signed row for `claude` build 2026092201 (a `raw-binary` payload of one file, sha256
+//! `0e419552…`) folds to its `tree_root` `15c4346e…` from exactly one line,
+//! `bin/claude.exe \0 755 \0 <sha> \n`; the Windows client folded
+//! `bin\claude.exe \0 0 \0 <sha> \n` and got `3a446f30…`. Both differences are the
+//! client's, not the producer's:
+//!
+//! * **the separator** is `/` by contract, but `Path::join` spells it `\` on Windows and
+//!   the raw OS bytes carried that spelling into the line — [`rel_line_bytes`] is the one
+//!   place a relpath becomes line bytes, and it writes `/` on every platform;
+//! * **the mode** is the permission bits the extractor was asked to apply (`0755`/`0644`
+//!   after `safe_mode`, `0755` for a raw binary); a filesystem that STORES them hands the
+//!   same number back, and the client folds the read-back so a filesystem that quietly
+//!   stores something else fails closed. A filesystem with no POSIX bits at all stores
+//!   nothing and reads back `0`, so a Windows client could never reproduce any signed
+//!   root — the fold there is the DECLARED mode ([`crate::platform::folded_mode`]), and
+//!   the on-disk walk takes it from a [`DeclaredModes`] record the stage leaves beside
+//!   the build ([`tree_root_declared`]). Unix keeps the honest read-back, byte for byte.
 
+use std::collections::BTreeMap;
 use std::io::{self, Read};
 use std::path::Path;
 
 use aterm_digest::Sha256;
+
+/// The permission bits a stage DECLARED for each regular file it laid, keyed by the
+/// file's line bytes ([`rel_line_bytes`]): what the on-disk walk folds into the mode slot
+/// on a filesystem that has no permission bits to read back (see the module docs). On a
+/// filesystem that has them the walk reads the inode and this map is not consulted.
+pub type DeclaredModes = BTreeMap<Vec<u8>, u32>;
+
+/// The line bytes of a path relative to the tree root: its raw OS bytes with the
+/// separator spelled `/` — the ONE producer of the relpath slot, shared by the on-disk
+/// walk and the extraction-time fold ([`crate::extract::rel_bytes_under`]).
+///
+/// On Unix the bytes are exactly what [`crate::platform::os_str_bytes`] returns (a
+/// relative path joined by std is `/`-separated there already), so nothing changes. On
+/// Windows std joins with `\`, and a `\` can never be part of a file name there (the
+/// Win32 namespace forbids it), so every `\` in the WTF-8 bytes is a separator and is
+/// rewritten to `/` — the spelling the contract names and every signed root was folded
+/// with (the module docs have the measured pair).
+#[must_use]
+pub(crate) fn rel_line_bytes(rel: &Path) -> Vec<u8> {
+    // `platform::os_str_bytes` goes via `call1` — see `walk` for why (std's inlined
+    // `unsafe` in the `OsStr` byte-slice cast is otherwise attributed here).
+    let raw = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
+    #[cfg(windows)]
+    {
+        raw.iter()
+            .map(|&b| if b == b'\\' { b'/' } else { b })
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        raw.to_vec()
+    }
+}
 
 /// Compute the [`tree_root`](self) over the directory at `root`.
 ///
@@ -45,7 +99,29 @@ use aterm_digest::Sha256;
 /// other entry type — device, fifo, socket — is **fail-closed**: the extractor never lays
 /// one down, so meeting one here means tampering or a bug, and this returns an error
 /// rather than silently skipping it.
+///
+/// The mode slot is the inode's stored bits. On a filesystem that stores none (Windows)
+/// this folds `0` for every file and so can only reproduce a root that was folded the
+/// same way — which no signed root is (the module docs). Callers that have the stage's
+/// declared modes in hand use [`tree_root_declared`]; this remains the plain walk for
+/// Unix and for the probes that only need a stable digest of a tree.
 pub fn tree_root(root: &Path) -> io::Result<String> {
+    tree_root_declared(root, &DeclaredModes::new())
+}
+
+/// [`tree_root`], with the stage's [`DeclaredModes`] to fold on a filesystem that has no
+/// permission bits of its own.
+///
+/// Where the filesystem stores bits ([`crate::platform::HAS_POSIX_MODES`]) the walk reads
+/// them back and `modes` is never consulted, so on Unix this IS `tree_root`. Where it
+/// stores none, each regular file folds the mode `modes` declares for its line bytes, and
+/// a file the record does not name folds `0` — a file the stage did not lay is drift
+/// whatever its mode slot says, so the miss can only fail closed.
+///
+/// # Errors
+/// The walk's I/O errors, and the fail-closed refusal of a non-file, non-dir, non-link
+/// entry.
+pub fn tree_root_declared(root: &Path, modes: &DeclaredModes) -> io::Result<String> {
     let mut entries: Vec<Vec<u8>> = Vec::new();
     // ONE read buffer for the whole walk, threaded down the recursion. A per-file
     // `[0u8; 64 * 1024]` local would be zero-initialized per call and LLVM cannot elide
@@ -55,7 +131,7 @@ pub fn tree_root(root: &Path) -> io::Result<String> {
     // of the real hashing. Heap `vec!`, not a boxed array literal: `Box::new([0u8; N])`
     // builds the array on the stack first and reintroduces exactly what this removes.
     let mut buf = vec![0u8; 64 * 1024];
-    walk(root, root, &mut entries, &mut buf)?;
+    walk(root, root, modes, &mut entries, &mut buf)?;
     Ok(root_of_entry_lines(entries))
 }
 
@@ -88,11 +164,11 @@ pub(crate) fn root_of_entry_lines(mut entries: Vec<Vec<u8>>) -> String {
 /// Build ONE canonical entry line: `<relpath-bytes> 0x00 <octal-perm-bits> 0x00
 /// <lowercase-hex content sha256> 0x0A` (see [`tree_root`] for the contract).
 ///
-/// `mode` is the value [`crate::platform::permission_mode`] reports for the file,
-/// masked to `0o7777` by the caller — NOT the mode the extractor asked for. The two are
-/// the same on Unix (the extractor `set_mode`s and the filesystem stores it verbatim)
-/// and both are `0` on Windows (no POSIX bits), but reading the mode back is what keeps
-/// the extraction-time twin honest on any filesystem that would answer differently.
+/// `mode` is [`crate::platform::folded_mode`]'s answer for the file, masked to `0o7777`
+/// by the caller: on Unix the value [`crate::platform::permission_mode`] reads BACK — NOT
+/// the mode the extractor asked for, so a filesystem that stores something else moves
+/// the root and fails closed; on Windows, which stores no bits and reads back `0`, the
+/// mode the extractor was asked to apply (the module docs measure why).
 pub(crate) fn entry_line(rel_bytes: &[u8], mode: u32, content_sha_hex: &str) -> Vec<u8> {
     framed_line(rel_bytes, oct_mode(mode).as_bytes(), content_sha_hex)
 }
@@ -144,8 +220,15 @@ fn framed_line(rel_bytes: &[u8], mode_slot: &[u8], digest_hex: &str) -> Vec<u8> 
 }
 
 /// Recursively collect one canonical entry line per regular file under `dir`, hashing
-/// each through the caller's single reusable `buf` (see [`tree_root`]).
-fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::Result<()> {
+/// each through the caller's single reusable `buf` (see [`tree_root`]); `modes` is the
+/// declared-mode record [`tree_root_declared`] folds where the inode stores no bits.
+fn walk(
+    root: &Path,
+    dir: &Path,
+    modes: &DeclaredModes,
+    out: &mut Vec<Vec<u8>>,
+    buf: &mut [u8],
+) -> io::Result<()> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
     // Deterministic recursion order (the final sort over relpaths makes this belt-and-
     // suspenders, but it keeps the walk itself reproducible).
@@ -162,24 +245,32 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<Vec<u8>>, buf: &mut [u8]) -> io::
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
             let target = std::fs::read_link(&path)?;
-            let rel_bytes = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
+            let rel_bytes = rel_line_bytes(rel);
+            // The TARGET stays raw: it is digested, not framed, and it is whatever bytes
+            // `symlink(2)` was handed (a `\` in a target is the target's own business).
+            // `platform::os_str_bytes` goes via `call1`: std's INLINED `unsafe` (the
+            // `OsStr` byte-slice cast) is otherwise attributed to this function's spans
+            // as missing-SAFETY-comment refutations under the strict Trust gate (see
+            // `lib.rs`). Same call, same receiver; behavior identical.
             let target_bytes = crate::call1(crate::platform::os_str_bytes, target.as_os_str());
-            out.push(symlink_line(rel_bytes, &symlink_target_sha(target_bytes)));
+            out.push(symlink_line(&rel_bytes, &symlink_target_sha(target_bytes)));
         } else if ft.is_dir() {
-            walk(root, &path, out, buf)?;
+            walk(root, &path, modes, out, buf)?;
         } else if ft.is_file() {
             let rel = path.strip_prefix(root).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
-            let mode = crate::platform::permission_mode(&meta) & 0o7777;
+            let rel_bytes = rel_line_bytes(rel);
+            // The inode's bits where the filesystem stores them (Unix: what the stage
+            // `fchmod`ed, read back); the stage's declared mode where it stores none
+            // (Windows). See the module docs for the measured pair this reproduces.
+            let mode = if crate::platform::HAS_POSIX_MODES {
+                crate::platform::permission_mode(&meta) & 0o7777
+            } else {
+                modes.get(&rel_bytes).copied().unwrap_or(0) & 0o7777
+            };
             let fsha = file_sha256_with(&path, buf)?;
-            // `platform::os_str_bytes` (the raw OS bytes; `OsStrExt::as_bytes` on Unix)
-            // goes via `call1` (hoisted, used twice below): std's INLINED `unsafe` (the
-            // `OsStr` byte-slice cast) is otherwise attributed to this function's spans
-            // as missing-SAFETY-comment refutations under the strict Trust gate (see
-            // `lib.rs`). Same call, same receiver; behavior identical.
-            let rel_bytes = crate::call1(crate::platform::os_str_bytes, rel.as_os_str());
-            out.push(entry_line(rel_bytes, mode, &fsha));
+            out.push(entry_line(&rel_bytes, mode, &fsha));
         } else {
             // device / fifo / socket — must not be in an extracted bundle.
             // Manual concat of the previous
@@ -357,21 +448,95 @@ mod tests {
     /// equality with a specific number. This is that number, computed
     /// independently of this code from the documented format:
     /// `sort(<relpath> 0x00 <octal mode> 0x00 <hex sha256> 0x0A)`, concatenated,
-    /// SHA-256. Unix-only because the fixture pins real permission bits, which
-    /// Windows reports as 0.
-    #[cfg(unix)]
+    /// SHA-256.
+    ///
+    /// On Unix the fixture pins real permission bits and the plain walk reads them
+    /// back. On Windows the filesystem stores none, so the SAME number has to come out
+    /// of the declared-mode walk over the same files — that equality is the whole
+    /// Windows fix: a root a Mac signed, reproduced byte for byte on a platform that
+    /// reads every mode as `0` (see the module docs for the measured `claude` pair).
     #[test]
     fn tree_root_matches_the_pinned_cross_version_vector() {
+        const GOLDEN: &str = "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0";
         let d = tmp("golden");
         write(&d.join("bin/ay"), b"binary");
         write(&d.join("data"), b"x");
-        std::fs::set_permissions(d.join("bin/ay"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        std::fs::set_permissions(d.join("data"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(d.join("bin/ay"), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+            std::fs::set_permissions(d.join("data"), std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+            assert_eq!(
+                tree_root(&d).unwrap(),
+                GOLDEN,
+                "tree_root moved: every signed manifest in the wild disagrees with this build"
+            );
+        }
+        let mut modes = DeclaredModes::new();
+        modes.insert(b"bin/ay".to_vec(), 0o755);
+        modes.insert(b"data".to_vec(), 0o644);
+        let declared = tree_root_declared(&d, &modes).unwrap();
         assert_eq!(
-            tree_root(&d).unwrap(),
-            "e44608970d54f90c4d54ad7852b174304b86395b89f59b3fcc04a11ae22e38e0",
-            "tree_root moved: every signed manifest in the wild disagrees with this build"
+            declared, GOLDEN,
+            "the declared-mode walk must reproduce the root a Unix producer signed"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The relpath slot is `/`-separated on every platform — `Path::join` spells the
+    /// separator `\` on Windows, and that spelling reached the line bytes (the module
+    /// docs' measured `bin\claude.exe`).
+    #[test]
+    fn rel_line_bytes_spell_the_separator_as_a_slash() {
+        let rel = Path::new("bin").join("sub").join("claude.exe");
+        assert_eq!(rel_line_bytes(&rel), b"bin/sub/claude.exe".to_vec());
+        assert_eq!(
+            rel_line_bytes(Path::new("claude.exe")),
+            b"claude.exe".to_vec()
+        );
+    }
+
+    /// The measured `claude` row (build 2026092201, signed for x86_64-pc-windows-msvc):
+    /// ONE `raw-binary` file, content sha256 `0e419552…`, laid at `bin/claude.exe` with
+    /// mode `0755`. Its signed `tree_root` is the fold of exactly that line — pinned here
+    /// from the row itself, independently of any walk — and the digest the Windows
+    /// client reported instead (`3a446f30…`) is the fold of the SAME content under the
+    /// two client-side spellings this module now rules out: a `\` separator and a `0`
+    /// mode. Both halves are pinned so neither can regress silently.
+    #[test]
+    fn the_measured_windows_claude_row_folds_from_the_declared_line() {
+        const CONTENT: &str = "0e4195524b73eb77efbdf3e2b36de5322a29f0ca575dfd2d9b4f946b1d425469";
+        let signed = root_of_entry_lines(vec![entry_line(b"bin/claude.exe", 0o755, CONTENT)]);
+        assert_eq!(
+            signed,
+            "15c4346e4e80077255d03ad4590b17d834b2853c5b5e013cd7bb1fb656219165"
+        );
+        let former_windows_fold =
+            root_of_entry_lines(vec![entry_line(b"bin\\claude.exe", 0, CONTENT)]);
+        assert_eq!(
+            former_windows_fold,
+            "3a446f3033188e9ec3bdaa0868f30863bc7508d3986290fc803316fa7dcd18b5"
+        );
+        // The declared-mode walk over a stand-in file with that layout folds the
+        // declared line, whatever the platform stores: the relpath is `/`-spelled and
+        // the mode is the one declared, never `0`.
+        let d = tmp("claude-row");
+        write(&d.join("bin/claude.exe"), b"stand-in");
+        let mut modes = DeclaredModes::new();
+        modes.insert(b"bin/claude.exe".to_vec(), 0o755);
+        let expected = root_of_entry_lines(vec![entry_line(
+            b"bin/claude.exe",
+            0o755,
+            &file_sha256(&d.join("bin/claude.exe")).unwrap(),
+        )]);
+        #[cfg(unix)]
+        std::fs::set_permissions(
+            d.join("bin/claude.exe"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        assert_eq!(tree_root_declared(&d, &modes).unwrap(), expected);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -414,6 +579,30 @@ mod tests {
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o644)).unwrap();
             let restored = tree_root(&d).unwrap();
             assert_ne!(changed_mode, restored, "mode change must move the root");
+        }
+        // A DECLARED mode change moves the declared-mode walk on the platform whose
+        // walk folds it (Windows); on Unix the record is not consulted and the two
+        // roots are the read-back root, equal to each other — asserted so the
+        // "ignored where the inode answers" half of the contract is pinned too.
+        {
+            let mut exec = DeclaredModes::new();
+            exec.insert(b"bin/ay".to_vec(), 0o755);
+            let mut plain = DeclaredModes::new();
+            plain.insert(b"bin/ay".to_vec(), 0o644);
+            let as_exec = tree_root_declared(&d, &exec).unwrap();
+            let as_plain = tree_root_declared(&d, &plain).unwrap();
+            if crate::platform::HAS_POSIX_MODES {
+                assert_eq!(
+                    as_exec, as_plain,
+                    "a stored mode is read back, never declared"
+                );
+                assert_eq!(as_exec, tree_root(&d).unwrap());
+            } else {
+                assert_ne!(
+                    as_exec, as_plain,
+                    "a declared mode change must move the root"
+                );
+            }
         }
 
         // Added file.

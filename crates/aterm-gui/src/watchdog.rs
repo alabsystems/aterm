@@ -264,7 +264,7 @@ pub(crate) enum Breadcrumb {
 impl Breadcrumb {
     /// Reconstruct a breadcrumb from its stored `u8` (unknown values fold to
     /// [`Breadcrumb::Startup`], the benign park point).
-    fn from_u8(v: u8) -> Self {
+    pub(crate) fn from_u8(v: u8) -> Self {
         match v {
             1 => Breadcrumb::AboutToWait,
             2 => Breadcrumb::WindowEvent,
@@ -393,6 +393,50 @@ struct Sampler {
     /// Since when every sample found the main thread on-CPU for at least
     /// [`BUSY_PERCENT`] of the interval with no heartbeat in between.
     busy_since: Option<Instant>,
+    /// The REPORTED stall that has not ended yet: the root it was first reported
+    /// at and when it began, until the main thread moves again — a heartbeat, or
+    /// a reported spin at a park point that a CPU reading finds quiet. It
+    /// survives a [`Sampler::resync`]: a stall the process was stopped inside is
+    /// still open when the process runs again.
+    open: Option<OpenStall>,
+    /// A reported stall that has since ENDED, waiting for [`Sampler::take_ended`].
+    /// Without its line, a stall that recovered and one that lasted until the
+    /// process died read the same in `aterm.log`, and the recovery census
+    /// (`recovery_census`) could not tell a wedged death from a run that merely
+    /// had a slow moment.
+    ended: Option<Ended>,
+}
+
+/// A reported stall that has not ended yet ([`Sampler::open`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenStall {
+    /// The root it was first reported at.
+    root: Breadcrumb,
+    /// When it began: the last heartbeat, or, for a spin at a park point, when
+    /// the main thread went on-CPU. A process gap moves it later by the gap, so
+    /// the time it lasted is the main thread's own, never the gap's.
+    since: Instant,
+}
+
+/// A reported stall that ended, as [`Sampler::take_ended`] hands it out once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Ended {
+    /// How long it lasted, a process gap not counted.
+    frozen: Duration,
+    /// The root it was first reported at.
+    root: Breadcrumb,
+    /// What showed it over.
+    by: EndedBy,
+}
+
+/// The evidence that a reported stall is over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EndedBy {
+    /// The heartbeat moved: the main thread entered a root again.
+    Beat,
+    /// A spin reported at a park point went quiet: a CPU reading found the main
+    /// thread off-CPU, parked in the OS event wait again, heartbeat unmoved.
+    Quiet,
 }
 
 impl Sampler {
@@ -406,14 +450,68 @@ impl Sampler {
             threshold,
             cpu_sample: None,
             busy_since: None,
+            open: None,
+            ended: None,
         }
     }
 
-    /// Start over at `now`: the process was not running for a while (see
+    /// Start over at `now`: the process was not running for `gap` (see
     /// [`process_gap`]), and nothing measured across that gap is about the
-    /// main thread.
-    fn resync(&mut self, now: Instant, beat: u64) {
+    /// main thread — except a stall REPORTED before it, which is carried
+    /// across. Dropped here, its end would never be logged, and the recovery
+    /// census would read a stall the run survived as the run's last word
+    /// ("stalled at its end"). If the heartbeat moved across the gap the stall
+    /// ended inside it and is handed to [`Sampler::take_ended`] now; if not,
+    /// it is still open and ends — with its line — when the main thread moves.
+    fn resync(&mut self, now: Instant, beat: u64, gap: Duration) {
+        let moved = beat != self.last_beat;
+        let open = self.open.take().map(|stall| OpenStall {
+            since: stall
+                .since
+                .checked_add(gap)
+                .map_or(now, |since| since.min(now)),
+            ..stall
+        });
+        let ended = self.ended.take();
         *self = Self::with_threshold(now, beat, self.threshold);
+        self.open = open;
+        self.ended = ended;
+        if moved {
+            self.end_open(now, EndedBy::Beat);
+        }
+    }
+
+    /// The reported stall that ended since the last call, once.
+    fn take_ended(&mut self) -> Option<Ended> {
+        self.ended.take()
+    }
+
+    /// One wake of the sampler thread, as the thread takes it: it asked to
+    /// sleep `requested` and was gone `slept`, and read `beat`, `bc` and `cpu`
+    /// on waking. A [`process_gap`] resyncs and judges nothing else.
+    fn wake(
+        &mut self,
+        now: Instant,
+        requested: Duration,
+        slept: Duration,
+        beat: u64,
+        bc: Breadcrumb,
+        cpu: Option<Duration>,
+    ) -> SamplerWake {
+        if let Some(late) = process_gap(requested, slept) {
+            self.resync(now, beat, late);
+            return SamplerWake {
+                gap: Some(late),
+                ended: self.take_ended(),
+                hit: None,
+            };
+        }
+        let hit = self.poll_with(now, beat, bc, cpu);
+        SamplerWake {
+            gap: None,
+            ended: self.take_ended(),
+            hit,
+        }
     }
 
     /// The heartbeat rule alone, with no CPU reading — what every sample was
@@ -434,6 +532,9 @@ impl Sampler {
     /// frozen heartbeat at a park point is expected — unless `cpu` shows the
     /// main thread ON-CPU for a whole threshold there, which a parked thread
     /// never is ([`Breadcrumb::spin_is_a_stall`]).
+    ///
+    /// A reported stall stays [`Sampler::open`] until the main thread moves;
+    /// its end is handed to [`Sampler::take_ended`].
     fn poll_with(
         &mut self,
         now: Instant,
@@ -441,9 +542,11 @@ impl Sampler {
         bc: Breadcrumb,
         cpu: Option<Duration>,
     ) -> Option<Hit> {
-        self.fold_cpu(now, cpu);
+        let judged = self.fold_cpu(now, cpu);
         if cur_beat != self.last_beat {
-            // Progress: the main thread is alive. Reset the stall clock + re-arm.
+            // Progress: the main thread is alive. Reset the stall clock + re-arm —
+            // and when a stall was REPORTED, say that it ended.
+            self.end_open(now, EndedBy::Beat);
             self.last_beat = cur_beat;
             self.last_advance = now;
             self.clear_reports();
@@ -451,24 +554,36 @@ impl Sampler {
             return None;
         }
         if bc.is_park_point() {
-            let spinning = self
-                .busy_since
-                .filter(|_| bc.spin_is_a_stall())
-                .map(|since| now.saturating_duration_since(since));
-            match spinning {
-                Some(spun) => {
+            match self.busy_since.filter(|_| bc.spin_is_a_stall()) {
+                Some(since) => {
+                    let spun = now.saturating_duration_since(since);
                     if spun < self.threshold || !self.report_due(now) {
                         return None;
                     }
-                    return Some(Hit {
-                        root: bc,
-                        frozen: spun,
-                        busy: true,
-                    });
+                    return Some(self.open_stall(
+                        Hit {
+                            root: bc,
+                            frozen: spun,
+                            busy: true,
+                        },
+                        since,
+                    ));
                 }
                 None => {
                     // Idle / startup park: a frozen heartbeat is expected here.
                     // Keep the clock reset so leaving idle starts a fresh span.
+                    // A spin reported here has ended once a reading finds the
+                    // thread quiet; with no reading to go by it stays open
+                    // until the heartbeat moves. A stall reported at a WORK
+                    // root is not ended here: a park point under its unmoved
+                    // heartbeat is the next root's breadcrumb read before its
+                    // beat (the breadcrumb is stamped first), and that beat
+                    // ends it — it was never a spin.
+                    if judged == Some(false)
+                        && self.open.is_some_and(|stall| stall.root.is_park_point())
+                    {
+                        self.end_open(now, EndedBy::Quiet);
+                    }
                     self.last_advance = now;
                     self.clear_reports();
                     return None;
@@ -479,30 +594,62 @@ impl Sampler {
         if !is_stall_at(bc, frozen, self.threshold) || !self.report_due(now) {
             return None;
         }
-        Some(Hit {
-            root: bc,
-            frozen,
-            busy: self.busy_since.is_some(),
-        })
+        let since = self.last_advance;
+        Some(self.open_stall(
+            Hit {
+                root: bc,
+                frozen,
+                busy: self.busy_since.is_some(),
+            },
+            since,
+        ))
     }
 
-    /// Track whether the main thread stayed on-CPU between samples.
-    fn fold_cpu(&mut self, now: Instant, cpu: Option<Duration>) {
+    /// A report is going out: the stall it reports is open until the main
+    /// thread moves. A repeat — or a report of a stall a process gap
+    /// interrupted — keeps the stall's first root and start.
+    fn open_stall(&mut self, hit: Hit, since: Instant) -> Hit {
+        self.open.get_or_insert(OpenStall {
+            root: hit.root,
+            since,
+        });
+        hit
+    }
+
+    /// The open stall, if any, ended at `now`.
+    fn end_open(&mut self, now: Instant, by: EndedBy) {
+        if let Some(stall) = self.open.take() {
+            self.ended = Some(Ended {
+                frozen: now.saturating_duration_since(stall.since),
+                root: stall.root,
+                by,
+            });
+        }
+    }
+
+    /// Track whether the main thread stayed on-CPU between samples. Returns
+    /// whether the interval since the previous sample was busy, or `None` when
+    /// there is no pair of readings to judge it by.
+    fn fold_cpu(&mut self, now: Instant, cpu: Option<Duration>) -> Option<bool> {
         let Some(cpu) = cpu else {
             self.cpu_sample = None;
             self.busy_since = None;
-            return;
+            return None;
         };
+        let mut judged = None;
         if let Some((then, was)) = self.cpu_sample {
             let wall = now.saturating_duration_since(then).as_nanos();
             let used = cpu.saturating_sub(was).as_nanos();
-            if wall > 0 && used * 100 >= wall * BUSY_PERCENT {
+            let busy = wall > 0 && used * 100 >= wall * BUSY_PERCENT;
+            if busy {
                 self.busy_since.get_or_insert(then);
             } else {
                 self.busy_since = None;
             }
+            judged = Some(busy);
         }
         self.cpu_sample = Some((now, cpu));
+        judged
     }
 
     /// Whether a stall that is past the threshold is due a line now, and
@@ -524,6 +671,29 @@ impl Sampler {
         self.reported = false;
         self.last_report = None;
         self.reports = 0;
+    }
+}
+
+/// What one [`Sampler::wake`] decided, before anything is logged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SamplerWake {
+    /// The process was not running for this long ([`process_gap`]).
+    gap: Option<Duration>,
+    /// A reported stall that ended by this wake.
+    ended: Option<Ended>,
+    /// A stall to report now.
+    hit: Option<Hit>,
+}
+
+impl SamplerWake {
+    /// The warn-level lines this wake logs, in order, ahead of any stall
+    /// report: the gap, then a reported stall that ended.
+    fn notices(&self) -> Vec<String> {
+        self.gap
+            .map(gap_message)
+            .into_iter()
+            .chain(self.ended.map(stall_ended_message))
+            .collect()
     }
 }
 
@@ -649,6 +819,7 @@ impl TurnLedger {
     fn close(&self, previous: Breadcrumb, now_ns: u64) -> Option<u64> {
         let open = self.open_ns.swap(now_ns, Ordering::Relaxed);
         let span = Self::attributable_span(previous, open, now_ns)?;
+        crate::metrics::note_turn(previous as u8, span);
         self.last_ns.store(span, Ordering::Relaxed);
         self.turns.fetch_add(1, Ordering::Relaxed);
         if span >= LONG_TURN_THRESHOLD_NS {
@@ -1194,6 +1365,28 @@ fn stall_message(
     }
 }
 
+/// The line when a REPORTED stall ends: how long it lasted, the root it was
+/// reported at, and what showed it over. It is what lets the next launch's
+/// recovery census tell a stall the run survived from one it died in
+/// (`recovery_census::STALL_ENDED_LINE` is its prefix). The root is where the
+/// stall was reported, not a claim that its handler was still on the stack: the
+/// report line already said which (`Locus`).
+fn stall_ended_message(ended: Ended) -> String {
+    let Ended { frozen, root, by } = ended;
+    match by {
+        EndedBy::Beat => format!(
+            "MAIN-THREAD STALL ENDED: the main thread beat again after about {frozen:?} \
+             stalled at `{}`.",
+            root.name()
+        ),
+        EndedBy::Quiet => format!(
+            "MAIN-THREAD STALL ENDED: the main thread stopped spinning at `{}` after about \
+             {frozen:?} on-CPU and is parked in the event wait again.",
+            root.name()
+        ),
+    }
+}
+
 /// The `$ATERM_WATCHDOG` development seam's value; `None` in every shipped binary.
 fn seam() -> Option<String> {
     aterm_types::dev_seam!("ATERM_WATCHDOG").map(|v| v.to_string_lossy().trim().to_string())
@@ -1259,18 +1452,22 @@ pub(crate) fn start() {
             std::thread::sleep(sample);
             let now = Instant::now();
             // A wake far later than asked, on a clock that stops while the
-            // Mac sleeps, is the whole process not running. Say so — it is
-            // the trigger no other line records — and start over: none of the
-            // gap was the main thread's doing.
-            if let Some(late) = process_gap(sample, now.saturating_duration_since(asleep)) {
-                aterm_log::warn!("{}", gap_message(late));
-                sampler.resync(now, HEARTBEAT.load(Ordering::Relaxed));
-                continue;
+            // Mac sleeps, is the whole process not running: `wake` says so —
+            // it is the trigger no other line records — and starts over, since
+            // none of the gap was the main thread's doing. A stall reported
+            // before the gap stays open across it, and its end is still said.
+            let wake = sampler.wake(
+                now,
+                sample,
+                now.saturating_duration_since(asleep),
+                HEARTBEAT.load(Ordering::Relaxed),
+                Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed)),
+                crate::main_thread_probe::cpu_time(),
+            );
+            for line in wake.notices() {
+                aterm_log::warn!("{line}");
             }
-            let cur = HEARTBEAT.load(Ordering::Relaxed);
-            let bc = Breadcrumb::from_u8(BREADCRUMB.load(Ordering::Relaxed));
-            let cpu = crate::main_thread_probe::cpu_time();
-            if let Some(hit) = sampler.poll_with(now, cur, bc, cpu) {
+            if let Some(hit) = wake.hit {
                 // The phase and the locus are read AT the report, just after
                 // the sample that decided it. If the main thread beat in that
                 // instant they read the next root's; either way they describe
@@ -2019,6 +2216,70 @@ mod tests {
         );
     }
 
+    /// A REPORTED stall that ends says so, once, with how long it lasted and where —
+    /// the line that lets the next launch's recovery census tell a stall the run
+    /// survived from one it died in. A freeze that never crossed the bar was never
+    /// reported, so its end is not news either.
+    #[test]
+    fn a_reported_stall_that_ends_says_so_once_and_an_unreported_one_never_does() {
+        let t0 = Instant::now();
+        let mut s = Sampler::with_threshold(t0, 7, STALL_THRESHOLD);
+        // A 300 ms freeze under the bar, then progress: nothing reported, nothing ended.
+        assert_eq!(
+            s.poll(t0 + Duration::from_millis(300), 7, Breadcrumb::UserEvent),
+            None
+        );
+        assert_eq!(
+            s.poll(t0 + Duration::from_millis(400), 8, Breadcrumb::UserEvent),
+            None
+        );
+        assert_eq!(s.take_ended(), None);
+        // A reported stall inside `UserEvent`, still frozen at the next sample.
+        let from = t0 + Duration::from_millis(400);
+        assert_eq!(
+            s.poll(from + Duration::from_millis(600), 8, Breadcrumb::UserEvent),
+            Some(Breadcrumb::UserEvent)
+        );
+        assert_eq!(s.take_ended(), None, "still frozen: nothing has ended");
+        // The heartbeat moves 9 s after it froze: the stall ended, inside the root it
+        // was reported in, and it is handed out exactly once.
+        assert_eq!(
+            s.poll(from + Duration::from_secs(9), 9, Breadcrumb::AboutToWait),
+            None
+        );
+        let ended = Ended {
+            frozen: Duration::from_secs(9),
+            root: Breadcrumb::UserEvent,
+            by: EndedBy::Beat,
+        };
+        assert_eq!(s.take_ended(), Some(ended));
+        assert_eq!(s.take_ended(), None);
+        #[cfg(unix)]
+        for by in [EndedBy::Beat, EndedBy::Quiet] {
+            assert!(
+                stall_ended_message(Ended { by, ..ended })
+                    .starts_with(crate::recovery_census::STALL_ENDED_LINE)
+            );
+        }
+        // The ended line must never read as a stall report to the census, which
+        // checks for the ENDED prefix first; the report itself carries no ENDED.
+        for locus in [Locus::Inside, Locus::Returned] {
+            for reports in [1, 2] {
+                assert!(
+                    !stall_message(
+                        reports,
+                        Duration::from_secs(5),
+                        Breadcrumb::UserEvent,
+                        Phase::None,
+                        locus,
+                        true
+                    )
+                    .contains("ENDED")
+                );
+            }
+        }
+    }
+
     #[test]
     fn sampler_never_fires_while_idle_at_a_park_point() {
         // The heartbeat is frozen for ten minutes because the app is IDLE (parked
@@ -2325,7 +2586,7 @@ mod tests {
         let t0 = Instant::now();
         let mut s = Sampler::with_threshold(t0, 5, RELEASE_STALL_THRESHOLD);
         let back = t0 + Duration::from_secs(95_676);
-        s.resync(back, 5);
+        s.resync(back, 5, Duration::from_secs(95_674));
         assert!(
             s.poll_with(
                 back + Duration::from_secs(1),
@@ -2346,5 +2607,379 @@ mod tests {
             .is_some(),
             "a real wedge after the gap still reports"
         );
+    }
+
+    /// One wake of `s`, driven as the sampler thread drives it (no CPU reading),
+    /// with the lines the thread logs for it appended to `lines`: the notices,
+    /// then the stall line.
+    fn wake_logged(
+        s: &mut Sampler,
+        lines: &mut Vec<String>,
+        now: Instant,
+        slept: Duration,
+        beat: u64,
+        bc: Breadcrumb,
+    ) -> SamplerWake {
+        let wake = s.wake(now, s.threshold / 2, slept, beat, bc, None);
+        lines.extend(wake.notices());
+        if let Some(hit) = wake.hit {
+            lines.push(stall_message(
+                s.reports,
+                hit.frozen,
+                hit.root,
+                Phase::None,
+                Locus::Inside,
+                hit.busy,
+            ));
+        }
+        wake
+    }
+
+    /// THE PORT (keeper P0 onto the 2026-09-26 gap rule). A stall REPORTED
+    /// before a process gap is still open after the resync, so its end is still
+    /// said — and the recovery census, folding the lines the sampler thread
+    /// logs, reads the run as having recovered, not as "stalled at its end".
+    /// Both ways it can end: after the gap, when the heartbeat moves; and
+    /// inside it, when the main thread beat before the sampler woke. The time
+    /// the ENDED line gives is the main thread's own, never the gap's.
+    #[test]
+    fn a_stall_reported_before_a_process_gap_is_still_ended_after_it() {
+        let step = RELEASE_STALL_THRESHOLD / 2;
+        let gap = Duration::from_secs(95_674);
+        let t0 = Instant::now();
+        // Up to a reported stall inside `UserEvent`, heartbeat frozen at 5.
+        let reported = |lines: &mut Vec<String>| {
+            let mut s = Sampler::with_threshold(t0, 5, RELEASE_STALL_THRESHOLD);
+            let w = wake_logged(&mut s, lines, t0 + step, step, 5, Breadcrumb::UserEvent);
+            assert_eq!(w.hit, None, "under the bar");
+            let w = wake_logged(&mut s, lines, t0 + step * 2, step, 5, Breadcrumb::UserEvent);
+            assert_eq!(w.hit.map(|h| h.root), Some(Breadcrumb::UserEvent));
+            s
+        };
+        let back = t0 + step * 3 + gap;
+
+        // 1. Still frozen when the process runs again: the gap ends nothing, and
+        //    the stall ends when the heartbeat moves.
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back,
+            step + gap,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!((w.gap, w.ended, w.hit), (Some(gap), None, None));
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back + step,
+            step,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!((w.ended, w.hit), (None, None), "under the bar again");
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back + step * 2,
+            step,
+            6,
+            Breadcrumb::AboutToWait,
+        );
+        assert_eq!(
+            w.ended,
+            Some(Ended {
+                // Frozen 7.5 s before the wake that found the gap (the sleep it
+                // asked for counts) and 5 s after it; the 26.6 h do not.
+                frozen: step * 5,
+                root: Breadcrumb::UserEvent,
+                by: EndedBy::Beat,
+            }),
+            "the stall reported before the gap ends after it"
+        );
+        assert!(
+            lines
+                .last()
+                .is_some_and(|l| l.starts_with("MAIN-THREAD STALL ENDED:")),
+            "{lines:#?}"
+        );
+        assert_eq!(s.take_ended(), None, "said once");
+        #[cfg(unix)]
+        assert_eq!(
+            crate::recovery_census::stall_at_end(&lines),
+            aterm_update::recovery_ledger::Tri::No,
+            "a stall the run survived is not its last word: {lines:#?}"
+        );
+
+        // 2. The heartbeat moved while the process was stopped (the main thread
+        //    ran first on resume): the wake that finds the gap ends the stall.
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back,
+            step + gap,
+            6,
+            Breadcrumb::AboutToWait,
+        );
+        assert_eq!(w.gap, Some(gap));
+        assert_eq!(
+            w.ended,
+            Some(Ended {
+                frozen: step * 3,
+                root: Breadcrumb::UserEvent,
+                by: EndedBy::Beat,
+            })
+        );
+        assert_eq!(w.notices().len(), 2, "the gap line, then the ENDED line");
+        #[cfg(unix)]
+        assert_eq!(
+            crate::recovery_census::stall_at_end(&lines),
+            aterm_update::recovery_ledger::Tri::No,
+            "{lines:#?}"
+        );
+        assert_eq!(
+            wake_logged(
+                &mut s,
+                &mut lines,
+                back + step,
+                step,
+                7,
+                Breadcrumb::UserEvent
+            )
+            .ended,
+            None,
+            "ended once, not again at the next beat"
+        );
+
+        // And the control: a stall that has NOT ended across the gap is still
+        // the run's last word, as it must be.
+        let mut lines = Vec::new();
+        let mut s = reported(&mut lines);
+        wake_logged(
+            &mut s,
+            &mut lines,
+            back,
+            step + gap,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            crate::recovery_census::stall_at_end(&lines),
+            aterm_update::recovery_ledger::Tri::Yes,
+            "{lines:#?}"
+        );
+    }
+
+    /// A process gap never INVENTS a stall: a freeze under the bar before the
+    /// gap is not reported across it, nothing that was not reported is ended
+    /// after it, a stall that already ended is not ended twice, and the census
+    /// reads the run as unstalled.
+    #[test]
+    fn a_process_gap_does_not_invent_a_stall() {
+        let step = RELEASE_STALL_THRESHOLD / 2;
+        let gap = Duration::from_secs(95_674);
+        let t0 = Instant::now();
+        let mut lines = Vec::new();
+        let mut s = Sampler::with_threshold(t0, 5, RELEASE_STALL_THRESHOLD);
+        // Frozen 2.5 s inside `UserEvent` — under the bar — when the process stops.
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            t0 + step,
+            step,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!(w.hit, None);
+        let back = t0 + step * 2 + gap;
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back,
+            step + gap,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!((w.gap, w.ended, w.hit), (Some(gap), None, None));
+        // Still frozen after it, but only for 2.5 s of the main thread's own time.
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back + step,
+            step,
+            5,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!(
+            (w.ended, w.hit),
+            (None, None),
+            "the gap is not charged to the main thread"
+        );
+        // It beats: nothing was reported, so nothing ends.
+        let w = wake_logged(
+            &mut s,
+            &mut lines,
+            back + step * 2,
+            step,
+            6,
+            Breadcrumb::UserEvent,
+        );
+        assert_eq!((w.ended, w.hit), (None, None));
+        assert_eq!(lines.len(), 1, "the gap line alone: {lines:#?}");
+        #[cfg(unix)]
+        assert_eq!(
+            crate::recovery_census::stall_at_end(&lines),
+            aterm_update::recovery_ledger::Tri::No,
+            "{lines:#?}"
+        );
+
+        // A stall that was reported AND ended before the gap is not ended again
+        // by it, whether or not the heartbeat moves across it.
+        for beat_after in [8, 9] {
+            let mut lines = Vec::new();
+            let mut s = Sampler::with_threshold(t0, 7, RELEASE_STALL_THRESHOLD);
+            wake_logged(
+                &mut s,
+                &mut lines,
+                t0 + step * 2,
+                step,
+                7,
+                Breadcrumb::UserEvent,
+            );
+            let w = wake_logged(
+                &mut s,
+                &mut lines,
+                t0 + step * 3,
+                step,
+                8,
+                Breadcrumb::UserEvent,
+            );
+            assert!(w.ended.is_some());
+            let w = wake_logged(
+                &mut s,
+                &mut lines,
+                t0 + step * 4 + gap,
+                step + gap,
+                beat_after,
+                Breadcrumb::UserEvent,
+            );
+            assert_eq!((w.ended, w.hit), (None, None), "beat {beat_after}");
+            #[cfg(unix)]
+            assert_eq!(
+                crate::recovery_census::stall_at_end(&lines),
+                aterm_update::recovery_ledger::Tri::No,
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// The ported hand-off on the spin rule: a spin REPORTED at the idle park
+    /// has ended once a CPU reading finds the main thread quiet again — its
+    /// heartbeat never moves, so waiting for one would leave a run that went
+    /// idle and was later killed reading as "stalled at its end". With no
+    /// reading to go by it stays open until the heartbeat moves.
+    #[test]
+    fn a_spin_reported_at_the_idle_park_ends_when_a_reading_finds_it_quiet() {
+        let t0 = Instant::now();
+        let step = Duration::from_millis(250);
+        let spin_to_report = |s: &mut Sampler| {
+            let mut hit = None;
+            for tick in 1..=3u32 {
+                hit = hit.or(s.poll_with(
+                    t0 + step * tick,
+                    3,
+                    Breadcrumb::AboutToWait,
+                    Some(step * tick),
+                ));
+            }
+            assert!(hit.is_some_and(|h| h.busy), "{hit:?}");
+            assert_eq!(s.take_ended(), None);
+        };
+        // Quiet: 1 ms of CPU across the next interval.
+        let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+        spin_to_report(&mut s);
+        let cpu = step * 3 + Duration::from_millis(1);
+        assert_eq!(
+            s.poll_with(t0 + step * 4, 3, Breadcrumb::AboutToWait, Some(cpu)),
+            None
+        );
+        assert_eq!(
+            s.take_ended(),
+            Some(Ended {
+                // On-CPU from the first reading's interval, quiet at the fourth.
+                frozen: step * 3,
+                root: Breadcrumb::AboutToWait,
+                by: EndedBy::Quiet,
+            })
+        );
+        assert!(
+            s.poll_with(t0 + step * 5, 4, Breadcrumb::NewEvents, Some(cpu))
+                .is_none()
+                && s.take_ended().is_none(),
+            "ended once: the next heartbeat ends nothing"
+        );
+        // No reading: still open, however long, until the heartbeat moves.
+        let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+        spin_to_report(&mut s);
+        for tick in 4..=40u32 {
+            assert_eq!(
+                s.poll_with(t0 + step * tick, 3, Breadcrumb::AboutToWait, None),
+                None
+            );
+            assert_eq!(s.take_ended(), None, "no reading is no evidence it ended");
+        }
+        s.poll_with(t0 + step * 41, 4, Breadcrumb::NewEvents, None);
+        assert_eq!(
+            s.take_ended().map(|e| (e.root, e.by)),
+            Some((Breadcrumb::AboutToWait, EndedBy::Beat))
+        );
+    }
+
+    /// The quiet rule ends only a SPIN reported at a park point. A stall
+    /// reported at a WORK root while the main thread was parked on a lock
+    /// (quiet readings, `busy` false) can meet a park point under an unmoved
+    /// heartbeat only when a sample reads the next root's breadcrumb before
+    /// its beat — two relaxed atomics, the breadcrumb stamped first — and that
+    /// beat is what ends it. Ended as "quiet", its ENDED line would say the
+    /// thread "stopped spinning … on-CPU" when it never was.
+    #[test]
+    fn a_work_root_stall_ends_by_its_beat_never_as_a_quiet_spin() {
+        let t0 = Instant::now();
+        let step = Duration::from_millis(250);
+        let quiet = |tick: u32| Some(Duration::from_millis(tick.into()));
+        let mut s = Sampler::with_threshold(t0, 3, STALL_THRESHOLD);
+        let mut hit = None;
+        for tick in 1..=3u32 {
+            hit = hit.or(s.poll_with(t0 + step * tick, 3, Breadcrumb::UserEvent, quiet(tick)));
+        }
+        assert!(
+            hit.is_some_and(|h| h.root == Breadcrumb::UserEvent && !h.busy),
+            "a park on a lock inside `UserEvent`, reported: {hit:?}"
+        );
+        // `AboutToWait` stamped, its heartbeat not yet read: nothing has ended.
+        assert_eq!(
+            s.poll_with(t0 + step * 4, 3, Breadcrumb::AboutToWait, quiet(4)),
+            None
+        );
+        assert_eq!(s.take_ended(), None, "not a spin that went quiet");
+        // The beat lands: the stall ended by it, once.
+        assert_eq!(
+            s.poll_with(t0 + step * 5, 4, Breadcrumb::AboutToWait, quiet(5)),
+            None
+        );
+        assert_eq!(
+            s.take_ended(),
+            Some(Ended {
+                frozen: step * 5,
+                root: Breadcrumb::UserEvent,
+                by: EndedBy::Beat,
+            })
+        );
+        assert_eq!(s.take_ended(), None);
     }
 }

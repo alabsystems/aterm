@@ -2702,7 +2702,10 @@ pub struct SpikeEvidence {
     pub fda_coverage_measured: bool,
     /// §7 S2 — what an adopted-across-a-handoff session's attribution and
     /// access actually do. Until this is `true`, an adopted session reports
-    /// `unknown` and NEVER `denied`.
+    /// `unknown` and NEVER `denied`. Measuring it needs a real in-place
+    /// `update apply` of an installed Developer-ID `aterm.app`, run by the owner
+    /// (`docs/DESIGN-macos-tcc-prompts-2026-08-30.md` §7 S2); only then flip it
+    /// where `aterm-gui`'s `control_privacy.rs` passes [`Self::UNMEASURED`].
     pub handoff_attribution_measured: bool,
     /// §7 S1 — how far a grant reaches. Stays [`FdaScope::Unknown`].
     pub fda_scope: FdaScope,

@@ -940,7 +940,6 @@ fn single_line_overlaps_are_streamed_under_the_batch_cap() {
 /// Round-8 codex follow-up: the regex batch path also caps, and must iterate
 /// lines in ascending order so the cap keeps the lowest-line matches
 /// deterministically (self.lines is a hash map).
-#[cfg(feature = "regex")]
 #[test]
 fn regex_batch_search_caps_matches_deterministically() {
     let mut index = SearchIndex::with_capacity(30_000);
@@ -1039,7 +1038,6 @@ fn bloom_rebuild_tracks_trigram_volume_for_bulk_scrollback() {
 // Such matches cause `saturating_sub(1)` in `convert_search_match` to produce
 // backwards (end < start) or incorrect (fake 1-char) Match objects.
 // Part of algorithm audit for #5455 regex find bar.
-#[cfg(feature = "regex")]
 #[test]
 fn regex_search_filters_zero_length_matches() {
     let mut index = SearchIndex::new();
@@ -1081,7 +1079,6 @@ fn regex_search_filters_zero_length_matches() {
 
 // Verify that regex zero-length filtering preserves valid non-zero matches.
 // `x*` on input containing `x` should return the `x` match and drop zero-length positions.
-#[cfg(feature = "regex")]
 #[test]
 fn regex_search_preserves_nonzero_matches_alongside_zero_length() {
     let mut index = SearchIndex::new();
@@ -1503,7 +1500,6 @@ fn terminal_search_option_navigation_is_ordered_and_case_insensitive() {
 /// Prevents ReDoS via compilation by bounding pattern length at the index
 /// layer, matching the streaming engine's existing `max_pattern_len` guard.
 /// Part of #7203.
-#[cfg(feature = "regex")]
 #[test]
 fn regex_pattern_too_long_rejected() {
     let mut index = SearchIndex::new();
@@ -1530,7 +1526,6 @@ fn regex_pattern_too_long_rejected() {
 /// Regex compilation with bounded `size_limit` rejects patterns that would
 /// produce oversized NFA/DFA automata. This verifies the `RegexBuilder`
 /// size limits are effective.
-#[cfg(feature = "regex")]
 #[test]
 fn regex_compilation_size_limit_enforced() {
     let mut index = SearchIndex::new();
@@ -2086,14 +2081,11 @@ fn zero_display_width_matches_are_skipped() {
         "zero-width match must be skipped (reverse iterator)"
     );
 
-    // 5. Regex path (only compiled with the `regex` feature).
-    #[cfg(feature = "regex")]
-    {
-        let re = index
-            .search_with_positions_opts(combining, true, true)
-            .expect("regex search should not error");
-        assert!(re.is_empty(), "zero-width match must be skipped (regex)");
-    }
+    // 5. Regex path.
+    let re = index
+        .search_with_positions_opts(combining, true, true)
+        .expect("regex search should not error");
+    assert!(re.is_empty(), "zero-width match must be skipped (regex)");
 
     // Positive control: a real, non-zero-width query on the SAME line still
     // matches, so the assertions above are not passing vacuously.
@@ -2147,43 +2139,6 @@ fn max_cached_for_retained_protects_the_newest_lines() {
         vec![u32::try_from(total - 8).unwrap()],
         "the oldest of the newest-8 lines survives eviction and stays searchable"
     );
-}
-
-/// Prescription (b): the regex-mode oracle battery (`streaming::regex_tests`
-/// plus the `SearchIndex` regex path) is gated on `feature = "regex"` and
-/// compiles to ZERO cases without it. This tripwire is ALWAYS compiled, so a
-/// silently dropped feature flag on the regex lane becomes a hard failure
-/// instead of an invisible loss of coverage.
-///
-/// - feature ON: a canary drives the real regex search path and REQUIRES a hit,
-///   proving regex cases actually execute (not merely that the module compiled).
-/// - feature OFF + `ATERM_SEARCH_REGEX_LANE=1` (the lane marker `verify.sh` sets):
-///   fail — the lane intended regex coverage but built without the feature.
-/// - feature OFF, no marker: pass — a legitimate default (regex-less) build.
-#[test]
-fn regex_lane_tripwire() {
-    #[cfg(feature = "regex")]
-    {
-        let mut index = SearchIndex::new();
-        index.index_line(0, "order 4567 shipped");
-        let hits = index
-            .search_with_positions_opts("[0-9]+", true, true)
-            .expect("regex feature is compiled in, so a valid pattern must compile");
-        assert!(
-            !hits.is_empty(),
-            "regex feature compiled in but the canary pattern matched nothing — \
-             the regex search path is wired to nothing"
-        );
-    }
-    #[cfg(not(feature = "regex"))]
-    {
-        assert!(
-            std::env::var_os("ATERM_SEARCH_REGEX_LANE").is_none(),
-            "ATERM_SEARCH_REGEX_LANE=1 but aterm-search was built WITHOUT --features \
-             regex: the regex oracle battery compiled out to 0 cases (silent coverage \
-             loss). Run the lane with `--features regex`."
-        );
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2674,4 +2629,24 @@ fn drop_history_below_is_a_noop_at_or_below_the_first_cached_line() {
         .collect();
     assert_eq!(before, after);
     assert!(!idx.results_may_be_incomplete());
+}
+
+/// The executable twin of the `index_length_is_a_high_water_mark` Kani harness:
+/// `len()` is one past the highest line ever indexed (sparse indexing counts
+/// the gap), and re-indexing an existing line does not move it.
+#[test]
+fn len_is_a_high_water_mark() {
+    let mut index = SearchIndex::new();
+    index.index_line(4, "test line");
+    assert_eq!(
+        index.len(),
+        5,
+        "a sparse first line counts the gap below it"
+    );
+    index.index_line(1, "test line");
+    assert_eq!(index.len(), 5, "a lower line does not lower the mark");
+    index.index_line(4, "other text");
+    assert_eq!(index.len(), 5, "re-indexing leaves the mark unchanged");
+    index.index_line(6, "test line");
+    assert_eq!(index.len(), 7);
 }

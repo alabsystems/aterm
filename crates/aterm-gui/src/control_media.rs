@@ -472,10 +472,7 @@ pub(crate) fn cmd_image(
                 aterm_containment::mode_or_containment(),
                 "path escapes images/ subdir or names a nested target",
             );
-            return "ERR path: give a bare filename (no '/'); captures are confined to the \
-                    app's Application Support images/ dir. Omit the path to auto-name one — \
-                    the OK reply prints the full written path.\n"
-                .into();
+            return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n".into();
         }
     };
     // A capture is a main-thread photograph: refused while a dialog stands,
@@ -517,11 +514,11 @@ pub(crate) fn cmd_image(
         std::time::Duration::from_secs(120),
         "image",
     ) {
-        // (0,0) is the render's honest failure reply — no window shows the target
-        // (a background tab, or no window at all) and NO file was written. Report
-        // it as an error instead of an `OK 0 0 <path>` pointing at nothing.
+        // (0,0): a window was found but had nothing to capture this frame, and NO
+        // file was written. Report it as an error instead of an `OK 0 0 <path>`
+        // pointing at nothing. No window at all is the render's own `Err`.
         Ok(retained) if matches!(retained.value, (0, 0, _)) => {
-            "ERR no window displays the target session (background tab?)\n".into()
+            "ERR image: nothing to capture; retry\n".into()
         }
         // `--bytes`: Lines-framed `OK 1\n<w> <h> <nbytes> <base64-png>` — the control
         // dispatch replies TEXT (written as UTF-8), so the binary PNG is base64'd
@@ -682,6 +679,13 @@ fn image_file_reply(
 ///     terminal content. This is the original behavior and closes the gap `image`
 ///     leaves (`image` rasterizes only the content framebuffer, no OS chrome).
 ///   * `prefs` / `settings` — the Settings surface.
+///   * `about` / `update` / `menu` / `tab-menu` / `conn-card` / `session-picker` /
+///     `connections` — a Settings route or an overlay of the front window.
+///
+/// Every target but `front` is photographed IN the front window, so one the front
+/// window is not showing is REFUSED (`App::window_target_refusal`, asked on the main
+/// thread by `capture_aux_window`) rather than answered with a plain front frame under
+/// the target's name.
 ///
 /// A first token that is not a known keyword is treated as the path (so the original
 /// `window [path]` wire shape still works); a literal filename `prefs`/`front`
@@ -699,8 +703,9 @@ fn image_file_reply(
 /// one-shot result channel and BLOCK. The main thread captures, the encode worker writes
 /// and transfers a guarded `Ok((w, h))`, and the socket server retains it through the
 /// client's explicit complete-response ACK; an `Err(msg)` is surfaced verbatim (window
-/// not on screen / window not open / off-macOS — never a missing Screen Recording grant:
-/// aterm photographs its OWN window, which needs none; `capture_window_pixels`).
+/// not on screen / target not open / off macOS and Windows — never a missing Screen
+/// Recording grant: aterm photographs its OWN window, which needs none;
+/// `capture_window_pixels`).
 pub(crate) fn cmd_window(
     proxy: &EventLoopProxy<Wake>,
     rest: &str,
@@ -774,9 +779,7 @@ pub(crate) fn cmd_window(
                     aterm_containment::mode_or_containment(),
                     "path escapes images/ subdir or names a nested target",
                 );
-                return "ERR path: give a bare filename (no '/'); captures are confined to the \
-                    app's Application Support images/ dir. Omit the path to auto-name one — \
-                    the OK reply prints the full written path.\n"
+                return "ERR path: give a bare filename (no '/'), or omit it to auto-name one\n"
                     .into();
             }
         }
@@ -830,6 +833,302 @@ pub(crate) fn cmd_window(
     }
 }
 
+/// The platforms `capture_aux_window` photographs on (its one caller), plus tests.
+#[cfg(any(target_os = "macos", windows, test))]
+impl crate::App {
+    /// `window <target>`'s refusal when the front window is not SHOWING `target`,
+    /// or `None` when it is (always for `front`). Asked on the main thread in the
+    /// same turn as the capture attempt (`capture_aux_window`), so a photograph
+    /// taken in that turn cannot outlive the answer. One is not: when the GPU
+    /// drawable is still pending, `capture_window` queues the request and a LATER
+    /// turn replays it (`resume_deferred_gpu_captures`), and that replay re-checks
+    /// only that the front window is the same one, not this answer. An overlay
+    /// dismissed in the frame between the two can still be photographed under the
+    /// target's name. Closing that needs the target carried in the deferred
+    /// request; the window is one GPU acquire wide, so it is named here instead.
+    ///
+    /// WHY: the keyword selects nothing to photograph — every target lives in the
+    /// front frame, and the capture is the front window's whatever it is called. A
+    /// closed overlay therefore answered `OK <w> <h> <path>` with a plain terminal
+    /// frame: measured on Windows, `window tab-menu`, `prefs`, `session-picker`,
+    /// `connections`, `conn-card`, `about`, `menu` and `update` with nothing open
+    /// all hashed identical to `window front`, while `controls <target>` read
+    /// `open=false` and `controls about` refused. A PNG named after a surface it
+    /// does not show is worse than no PNG to an agent that looks at it.
+    ///
+    /// "Showing" is the photograph's question, not `controls`': Settings counts
+    /// only as the front window's ACTIVE tab (`controls prefs` also reads one in a
+    /// background tab or another window, which the capture cannot see), and
+    /// `about` / `update` only on their own route. The action names the verb that
+    /// opens the target. `open` refuses the session picker and the connection
+    /// card, but both open from the wire through the same menu actions a person
+    /// uses: `invoke ConnectToSession` opens the picker for the front session,
+    /// and `invoke ConfigureConnection` opens the card when the front session has
+    /// one connection (the picker when it has several, nothing when it has none —
+    /// `open_connection_ui`), so that refusal names the connection it needs.
+    pub(crate) fn window_target_refusal(
+        &self,
+        target: crate::app_introspect::AuxTarget,
+    ) -> Option<String> {
+        use crate::app_introspect::AuxTarget;
+        use crate::native_settings::SettingsRoute;
+        let shown = match target {
+            AuxTarget::Front => return None,
+            AuxTarget::Prefs => self.native_settings_front_view_target().is_some(),
+            AuxTarget::About => self
+                .native_settings_route_view_target(SettingsRoute::About)
+                .is_some(),
+            AuxTarget::Update => self
+                .native_settings_route_view_target(SettingsRoute::SoftwareUpdate)
+                .is_some(),
+            AuxTarget::Menu => self.front().is_some_and(|ws| ws.palette().is_some()),
+            AuxTarget::TabMenu => self.front().is_some_and(|ws| ws.tab_menu.is_some()),
+            AuxTarget::ConnCard => self.front().is_some_and(|ws| ws.conn_card().is_some()),
+            AuxTarget::SessionPicker => {
+                self.front().is_some_and(|ws| ws.session_picker().is_some())
+            }
+            AuxTarget::Connections => self.front().is_some_and(|ws| ws.connection_map().is_some()),
+        };
+        if shown {
+            return None;
+        }
+        let name = target.keyword();
+        Some(match target {
+            AuxTarget::SessionPicker => format!(
+                "{name} is not open in the front window; use `invoke ConnectToSession` first"
+            ),
+            AuxTarget::ConnCard => format!(
+                "{name} is not open in the front window; use `invoke ConfigureConnection` first \
+                 (the front session needs a connection)"
+            ),
+            _ => format!("{name} is not open in the front window; use `open {name}` first"),
+        })
+    }
+}
+
+/// `window <target>` refuses a target the front window is not showing and
+/// photographs one it is. Driven through [`crate::App::window_target_refusal`],
+/// the question the main thread asks, because the photograph itself needs a live
+/// window a unit test cannot construct; the source pin at the end binds that
+/// question to `capture_aux_window`, the one place a target is photographed.
+#[cfg(test)]
+mod window_target_refusal_tests {
+    use crate::app_introspect::AuxTarget;
+    use crate::native_settings::SettingsRoute;
+    use crate::session_picker::PickerIntent;
+    use crate::{App, WindowId};
+
+    /// Every target `window` takes except `front`.
+    const OVERLAYS: [AuxTarget; 8] = [
+        AuxTarget::Prefs,
+        AuxTarget::About,
+        AuxTarget::Update,
+        AuxTarget::Menu,
+        AuxTarget::TabMenu,
+        AuxTarget::ConnCard,
+        AuxTarget::SessionPicker,
+        AuxTarget::Connections,
+    ];
+
+    /// THE DEFECT: with nothing open every target answered `OK` and a plain
+    /// front frame. Each is now refused in one sentence — the state, then the
+    /// step that opens it — and `front` never is.
+    /// The expected lines are written out, never rebuilt with the refusal's own
+    /// `format!`: a copy of the implementation cannot catch a wrong step (the
+    /// first cut told an agent to open the picker and the card "in the window",
+    /// when `invoke` opens both from the wire).
+    #[test]
+    fn a_closed_target_is_refused_and_front_never_is() {
+        let app = App::headless_for_test();
+        assert_eq!(app.window_target_refusal(AuxTarget::Front), None);
+        let expected = [
+            "prefs is not open in the front window; use `open prefs` first",
+            "about is not open in the front window; use `open about` first",
+            "update is not open in the front window; use `open update` first",
+            "menu is not open in the front window; use `open menu` first",
+            "tab-menu is not open in the front window; use `open tab-menu` first",
+            "conn-card is not open in the front window; use `invoke ConfigureConnection` \
+             first (the front session needs a connection)",
+            "session-picker is not open in the front window; use `invoke ConnectToSession` \
+             first",
+            "connections is not open in the front window; use `open connections` first",
+        ];
+        for (target, expected) in OVERLAYS.into_iter().zip(expected) {
+            assert_eq!(
+                app.window_target_refusal(target).as_deref(),
+                Some(expected),
+                "{}",
+                target.keyword()
+            );
+        }
+    }
+
+    /// The step each connection refusal names WORKS: its `invoke` token is a
+    /// real menu action, and running that action for the front session — the
+    /// subject `dispatch_menu_action` gives it, resolved the same way here —
+    /// opens exactly the surface the refusal was about. The card's condition
+    /// holds too: with no connection the action opens nothing.
+    #[test]
+    fn a_connection_refusal_names_the_invoke_that_opens_it() {
+        use crate::menu::MenuAction;
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.splice_tab_strip(wid);
+        let subject = app
+            .frontmost_window
+            .and_then(|w| app.front_terminal(w))
+            .and_then(|t| app.pool.get(t.session))
+            .map(|s| s.ctx.self_id.clone())
+            .expect("the front session");
+        let named = |app: &App, target| {
+            let refusal = app.window_target_refusal(target).expect("closed");
+            let token = refusal
+                .split_once("`invoke ")
+                .and_then(|(_, rest)| rest.split_once('`'))
+                .map(|(token, _)| token.to_string())
+                .expect("names an invoke");
+            MenuAction::from_invoke_name(&token).expect("a real invoke name")
+        };
+
+        let picker = named(&app, AuxTarget::SessionPicker);
+        app.open_connection_ui(wid, subject.clone(), picker);
+        assert_eq!(app.window_target_refusal(AuxTarget::SessionPicker), None);
+        app.session_picker_exit(wid);
+
+        let card = named(&app, AuxTarget::ConnCard);
+        app.open_connection_ui(wid, subject.clone(), card);
+        assert!(
+            app.window_target_refusal(AuxTarget::ConnCard).is_some(),
+            "no connection: nothing opens, as the refusal says"
+        );
+        let other = {
+            let g = app.store.read().unwrap();
+            g.snapshot()
+                .into_iter()
+                .map(|h| h.sid)
+                .find(|sid| *sid != subject)
+                .expect("a second session")
+        };
+        let ctx = {
+            let g = app.store.read().unwrap();
+            g.by_sid(&other).unwrap().ctx.clone()
+        };
+        assert!(crate::connections::connect_in(
+            &app.connections,
+            &subject,
+            &other,
+            &ctx.edges,
+            &ctx.nonce,
+            aterm_session::ConnectionKind::Both,
+            "test",
+        ));
+        app.open_connection_ui(wid, subject, card);
+        assert_eq!(app.window_target_refusal(AuxTarget::ConnCard), None);
+    }
+
+    /// Each overlay, once open on the front window, is photographed — and only
+    /// that one: the refusal reads the surface, not a global "something is open".
+    #[test]
+    fn an_open_overlay_is_photographed_and_only_that_one() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.tab_strip_rows = 1;
+        app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        app.splice_tab_strip(wid);
+        let (a, b) = {
+            let g = app.store.read().unwrap();
+            let mut handles = g.snapshot();
+            handles.sort_by_key(|h| h.local_id);
+            (handles[0].sid.clone(), handles[1].sid.clone())
+        };
+        let shown = |app: &App| {
+            OVERLAYS
+                .into_iter()
+                .filter(|&t| app.window_target_refusal(t).is_none())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(shown(&app), vec![], "nothing is open yet");
+
+        app.palette_enter();
+        assert_eq!(shown(&app), vec![AuxTarget::Menu]);
+        app.palette_exit();
+
+        assert!(app.open_active_tab_context_menu(wid));
+        assert_eq!(shown(&app), vec![AuxTarget::TabMenu]);
+        assert!(app.close_tab_menu(wid));
+
+        assert!(app.open_connection_map().is_ok());
+        assert_eq!(shown(&app), vec![AuxTarget::Connections]);
+        app.connection_map_exit(wid);
+
+        assert!(app.open_session_picker(wid, a.clone(), PickerIntent::Connect));
+        assert_eq!(shown(&app), vec![AuxTarget::SessionPicker]);
+        app.session_picker_exit(wid);
+
+        assert!(app.open_confirm_card(wid, a, b, None, "menu"));
+        assert_eq!(shown(&app), vec![AuxTarget::ConnCard]);
+        app.conn_card_exit(wid);
+
+        assert_eq!(shown(&app), vec![], "every overlay closed again");
+    }
+
+    /// Settings is photographed only as the front window's ACTIVE tab, and
+    /// `about` / `update` only on their own route. The background case is the
+    /// one `controls prefs` answers differently — it reads a Settings tab the
+    /// photograph cannot see — so the refusal must not borrow that answer.
+    #[test]
+    fn settings_counts_only_as_the_active_tab_on_its_own_route() {
+        let mut app = App::headless_for_test();
+        assert!(app.open_settings_tab(SettingsRoute::Home));
+        assert_eq!(app.window_target_refusal(AuxTarget::Prefs), None);
+        assert!(
+            app.window_target_refusal(AuxTarget::About).is_some(),
+            "Settings on its home route is not the about page"
+        );
+        assert!(app.window_target_refusal(AuxTarget::Update).is_some());
+
+        assert!(app.open_settings_tab(SettingsRoute::About));
+        assert_eq!(app.window_target_refusal(AuxTarget::About), None);
+        assert_eq!(
+            app.window_target_refusal(AuxTarget::Prefs),
+            None,
+            "any route is the Settings surface"
+        );
+
+        app.switch_tab(0);
+        assert!(
+            app.read_aux_controls(AuxTarget::Prefs)[0].starts_with("state open=true"),
+            "`controls prefs` still reads the background Settings tab"
+        );
+        assert_eq!(
+            app.window_target_refusal(AuxTarget::Prefs).as_deref(),
+            Some("prefs is not open in the front window; use `open prefs` first"),
+            "but the front window shows the terminal"
+        );
+    }
+
+    /// The photograph asks the question before it is taken: `capture_aux_window`
+    /// answers the refusal and returns ahead of `capture_window`. Pinned by
+    /// source because the capture needs a live window.
+    #[test]
+    fn capture_aux_window_asks_before_it_photographs() {
+        let body = include_str!("app_introspect.rs")
+            .split_once("pub(crate) fn capture_aux_window(")
+            .expect("the capturing capture_aux_window")
+            .1;
+        let body = &body[..body.find("\n    }\n").expect("its end")];
+        let asked = body
+            .find("self.window_target_refusal(target)")
+            .expect("the capture asks whether the target is shown");
+        let captured = body
+            .find("self.capture_window(")
+            .expect("and then captures");
+        assert!(asked < captured, "asked before the photograph: {body}");
+    }
+}
+
 /// Parsed `video` verb arguments, every numeric already CLAMPED to its lawful
 /// range (secs 0.5..=60, fps 1..=120, budget 64..=4096 MiB) so the consumer
 /// never re-validates. Split from [`cmd_video`] so the parse laws are pure
@@ -840,13 +1139,15 @@ struct VideoArgs {
     full_res: bool,
     keys: bool,
     pace: bool,
+    /// `trail`: the same-clock admission-verdict ledger (`index.json trail[]`).
+    trail: bool,
     /// `fps=<n>` capture cap; `None` captures every present.
     fps: Option<u32>,
     /// Frame-store RAM budget (from `budget=<MiB>`; default 512 MiB).
     budget_bytes: usize,
 }
 
-const VIDEO_USAGE: &str = "usage: video [<seconds>] [full|half] [keys] [pace] [fps=<n>] [budget=<MiB>] (seconds default 3) | video status|stop | video frames [count=N]";
+const VIDEO_USAGE: &str = "usage: video [<seconds>] [full|half] [keys] [pace] [trail] [fps=<n>] [budget=<MiB>] (seconds default 3) | video status|stop | video frames [count=N]";
 
 /// Default / max frames returned by `video frames` (the top-delta key frames).
 const VIDEO_FRAMES_DEFAULT: usize = 8;
@@ -1421,6 +1722,7 @@ fn parse_video_args(rest: &str) -> Result<VideoArgs, String> {
         full_res: false,
         keys: false,
         pace: false,
+        trail: false,
         fps: None,
         budget_bytes: aterm_gpu::video_tap::DEFAULT_BUDGET,
     };
@@ -1430,6 +1732,7 @@ fn parse_video_args(rest: &str) -> Result<VideoArgs, String> {
             "half" => args.full_res = false,
             "keys" => args.keys = true,
             "pace" => args.pace = true,
+            "trail" => args.trail = true,
             t => {
                 if let Some(v) = t.strip_prefix("fps=") {
                     match v.parse::<u32>() {
@@ -1556,7 +1859,7 @@ pub(crate) fn cmd_video(
         }
         "stop" => {
             if !owner {
-                return "ERR video: stop is owner-only (it truncates a recording)\n".into();
+                return "ERR video: stop is owner-only\n".into();
             }
             return match call_main(proxy, |tx| Wake::VideoStop { reply: tx }) {
                 Ok(line) => line,
@@ -1581,8 +1884,7 @@ pub(crate) fn cmd_video(
         Err(e) => return e.into(),
     };
     if args.keys && !owner {
-        return "ERR video: keys requires owner scope (a keystroke log is not a screen-read)\n"
-            .into();
+        return "ERR video: keys is owner-only\n".into();
     }
     let Some(mut handoff) = crate::control::ReplyRetention::try_reserve_for_path(sock_dir) else {
         return format!("ERR video: {}\n", crate::control::ARTIFACT_HANDOFF_BUSY).into();
@@ -1607,6 +1909,7 @@ pub(crate) fn cmd_video(
             full_res: args.full_res,
             keys: args.keys,
             pace: args.pace,
+            trail: args.trail,
             fps: args.fps,
             budget_bytes: args.budget_bytes,
             handoff,
@@ -1659,7 +1962,11 @@ pub(crate) fn cmd_controls(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     // Native Settings aliases AND the front window's transient overlay have a controls
     // surface.
     // `front` (and a bare/empty arg, which `parse` maps to Front) reports the front
-    // window's open overlay slot (open/closed + kind + fp + scroll extent) — headless-safe.
+    // window's open overlay slot (open/closed + kind + fp + scroll extent) — headless-safe
+    // — and, on Windows, a second line: whether a close/quit confirm is pending, who
+    // asked, and how the wire answers it (`confirm open=true … by=ctl …
+    // answer="confirm yes" cancel="confirm no"`, or `answer="-"` for a person's
+    // question; see `close_confirm`; `confirm open=false` otherwise).
     let target = match AuxTarget::parse(trimmed) {
         Some(
             t @ (AuxTarget::Front
@@ -1673,9 +1980,9 @@ pub(crate) fn cmd_controls(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             | AuxTarget::Update),
         ) => t,
         _ => {
-            return format!(
-                "ERR unsupported target {trimmed:?} (use: front | prefs | about | menu | tab-menu | conn-card | session-picker | connections | update)\n"
-            );
+            return "ERR unknown target (use: front | prefs | about | menu | tab-menu | conn-card | \
+                    session-picker | connections | update)\n"
+                .to_string();
         }
     };
     let lines = match call_main(proxy, |tx| Wake::ReadAuxControls { target, reply: tx }) {
@@ -1783,7 +2090,7 @@ pub(crate) fn cmd_open(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
             | AuxTarget::Update),
         ) => t,
         _ => {
-            return format!("ERR unsupported target {target_tok:?} (use: {AUX_TARGETS})\n");
+            return format!("ERR unknown target (use: {AUX_TARGETS})\n");
         }
     };
     match call_main(proxy, |tx| Wake::OpenAuxWindow {
@@ -1905,11 +2212,7 @@ pub(crate) fn cmd_settings_overlay(proxy: &EventLoopProxy<Wake>, rest: &str) -> 
     // deleted legacy page can never creep back into the advertised choices.
     if word == "section" {
         let Some(route) = parse_settings_section_route(tail) else {
-            return format!(
-                "ERR unknown section {:?} (use: {})\n",
-                tail.trim(),
-                settings_section_usage()
-            );
+            return format!("ERR unknown section (use: {})\n", settings_section_usage());
         };
         return match call_main(proxy, |tx| Wake::SettingsShowSection { route, reply: tx }) {
             Ok(Ok(())) => format!(
@@ -1951,14 +2254,41 @@ fn settings_field_wire_reply(completion: Result<String, String>) -> String {
 /// single dispatch sink the native menu bar and the ⌘K palette use. The live
 /// palette row's `enabled` (the `validateMenuItem:` conditions) gates it: a
 /// disabled action is a named ERR, never a silent no-op. Main-thread hop like
-/// `open`/`controls` (one-shot reply channel); works headless.
-pub(crate) fn cmd_invoke(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+/// `open`/`controls` (one-shot reply channel); works headless. `by` is the
+/// caller ([`super::control_session::caller_actor`]), the exit ledger's `by=`
+/// for a session the action retires ([`crate::App::invoke_attributed`]).
+pub(crate) fn cmd_invoke(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    by: crate::session_store::ExitActor,
+) -> String {
     let name = rest.trim();
     if name.is_empty() || name.split_whitespace().count() != 1 {
         return "ERR usage: invoke <action>   (list actions with `controls menu`)\n".to_string();
     }
     let name = name.to_string();
-    match call_main(proxy, |tx| Wake::InvokeMenuAction { name, reply: tx }) {
+    match call_main(proxy, |tx| Wake::InvokeMenuAction {
+        name,
+        by,
+        reply: tx,
+    }) {
+        Ok(Ok(msg)) => format!("OK {msg}\n"),
+        Ok(Err(e)) => format!("ERR {e}\n"),
+        Err(e) => format!("ERR {e}\n"),
+    }
+}
+
+/// `confirm yes|no` -> answer the close/quit question a control client raised in
+/// the window (`close_confirm`, Windows): `OK answered=<yes|no> kind=<quit|close-window>`,
+/// or `ERR` naming what stands in the way. The grammar is checked here, before the
+/// main-thread hop, so a guess never reaches the question. Main-thread hop like
+/// `invoke`; the event loop is free while a question stands, which is the point.
+pub(crate) fn cmd_confirm(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+    let proceed = match crate::close_confirm::parse_wire_answer(rest) {
+        Ok(proceed) => proceed,
+        Err(usage) => return format!("ERR {usage}\n"),
+    };
+    match call_main(proxy, |tx| Wake::AnswerCloseConfirm { proceed, reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
         Ok(Err(e)) => format!("ERR {e}\n"),
         Err(e) => format!("ERR {e}\n"),
@@ -1986,9 +2316,7 @@ pub(crate) fn cmd_rain(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         "on" => crate::RainCtlOp::On,
         "off" => crate::RainCtlOp::Off,
         "toggle" => crate::RainCtlOp::Toggle,
-        other => {
-            return format!("ERR usage: rain [status|on|off|toggle] (got {other:?})\n");
-        }
+        _ => return "ERR usage: rain [status|on|off|toggle]\n".to_string(),
     };
     match call_main(proxy, |tx| Wake::RainControl { op, reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
@@ -2089,7 +2417,7 @@ pub(crate) fn cmd_fx(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 pub(crate) fn cmd_streak(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     match rest.trim() {
         "" | "status" => {}
-        other => return format!("ERR usage: streak [status] (got {other:?})\n"),
+        _ => return "ERR usage: streak [status]\n".to_string(),
     }
     match call_main(proxy, |tx| Wake::StreakStatus { reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
@@ -2106,7 +2434,7 @@ pub(crate) fn cmd_streak(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 pub(crate) fn cmd_tone(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
     match rest.trim() {
         "" | "status" => {}
-        other => return format!("ERR usage: tone [status] (got {other:?})\n"),
+        _ => return "ERR usage: tone [status]\n".to_string(),
     }
     match call_main(proxy, |tx| Wake::ToneStatus { reply: tx }) {
         Ok(Ok(msg)) => format!("OK {msg}\n"),
@@ -2138,7 +2466,7 @@ pub(crate) fn parse_trail_form(rest: &str) -> Result<TrailForm, String> {
         n => n
             .parse::<usize>()
             .map(|n| TrailForm::Admissions(Some(n)))
-            .map_err(|_| format!("usage: trail [status|<n>] (got {n:?})")),
+            .map_err(|_| "usage: trail [status|<n>]".to_string()),
     }
 }
 
@@ -2275,7 +2603,7 @@ pub(crate) fn cmd_kitty(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
         };
     }
     if !rest.is_empty() {
-        return format!("ERR usage: kitty [wear <key>] (got {rest:?})\n");
+        return "ERR usage: kitty [wear <key>]\n".to_string();
     }
     let rows = match call_main(proxy, |tx| Wake::KittyCollection { reply: tx }) {
         Ok(Ok(rows)) => rows,
@@ -2301,7 +2629,7 @@ pub(crate) fn cmd_kitty(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
 /// end-to-end test assert on a classification at all.
 pub(crate) fn cmd_session_status(proxy: &EventLoopProxy<Wake>, session: u64, rest: &str) -> String {
     if !rest.trim().is_empty() {
-        return format!("ERR usage: status (got {:?})\n", rest.trim());
+        return "ERR usage: status\n".to_string();
     }
     match call_main(proxy, |tx| Wake::ReadSessionStatus { session, reply: tx }) {
         Ok(Ok(record)) => format!("OK {record}\n"),
@@ -2691,14 +3019,22 @@ pub(crate) fn cmd_spawn(proxy: &EventLoopProxy<Wake>, rest: &str, session: Optio
 /// window hosts cannot be driven through one, and an unknown `@<sid>` is
 /// `ERR no such session` — so the main-thread hop ([`Wake::TabCmdAimed`])
 /// replies a `Result` where its sibling replies a pair. A headless instance
-/// drives its one logical window like a real one (no `ERR headless`).
-pub(crate) fn cmd_tab_aimed(proxy: &EventLoopProxy<Wake>, rest: &str, session: u64) -> String {
+/// drives its one logical window like a real one (no `ERR headless`). `by` is
+/// the caller ([`super::control_session::caller_actor`]), the exit ledger's
+/// `by=` for a session `close` retires.
+pub(crate) fn cmd_tab_aimed(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    session: u64,
+    by: crate::session_store::ExitActor,
+) -> String {
     let Some(action) = super::control_input::parse_tab(rest) else {
         return TAB_USAGE.to_string();
     };
     match call_main(proxy, |reply| Wake::TabCmdAimed {
         session,
         action,
+        by,
         reply,
     }) {
         Ok(Ok((active, count))) => format!("OK {active} {count}\n"),
@@ -2810,46 +3146,135 @@ impl crate::App {
             .and_then(|h| h.identity.as_deref().map(str::to_owned))
     }
 
-    /// `@<sid> tab …` on the main thread: the aimed twin of the
-    /// [`Wake::TabCmd`] arm — the same programmatic-close bracket (a
-    /// control-socket `tab close` is a deliberate, non-interactive instruction
-    /// and must NOT pop the blocking native confirm dialog; a last-tab close
-    /// flags `pending_close`, escalated here so the window really tears down)
-    /// applied to the window hosting `session` instead of the front one.
+    /// `@<sid> tab …` on the main thread: [`Self::tab_cmd_bracketed`] applied
+    /// to the window hosting `session` instead of the front one.
     pub(crate) fn tab_cmd_aimed(
         &mut self,
         el: &ActiveEventLoop,
         session: u64,
         action: crate::TabAction,
+        by: crate::session_store::ExitActor,
     ) -> Result<(usize, usize), String> {
         let wid = self.hosting_window(session)?;
-        self.clear_tab_surface_move_license(None);
-        self.close_confirm = crate::app_window::CloseConfirm::Programmatic;
-        // NOT `?`: the programmatic-close bracket below must be unwound even on
-        // a refusal, or a declined close would leave `close_confirm` pinned to
-        // `Programmatic` and the next human gesture would skip its confirm.
-        let state = self.apply_tab_cmd_in(wid, action);
+        self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd_in(wid, action))
+    }
+
+    /// The flagless `tab …` on the main thread (the [`Wake::TabCmd`] arm):
+    /// [`Self::tab_cmd_bracketed`] applied to the FRONT window, resolved by
+    /// [`Self::apply_tab_cmd`] exactly as before so a window-less instance keeps
+    /// its `no window is focused` refusal.
+    pub(crate) fn tab_cmd_front(
+        &mut self,
+        el: &ActiveEventLoop,
+        action: crate::TabAction,
+        by: crate::session_store::ExitActor,
+    ) -> Result<(usize, usize), String> {
+        self.tab_cmd_bracketed(el, by, |app| app.apply_tab_cmd(action))
+    }
+
+    /// THE ONE wire `tab` bracket, shared by the front and aimed forms so the
+    /// two spellings of `tab close` cannot carry different close policies.
+    ///
+    /// A control-socket `tab close` is a non-interactive instruction and must
+    /// NOT pop the blocking native confirm dialog (that wedged the UI thread
+    /// inside `runModal` and the client's blocking reply behind it). It ran
+    /// `Programmatic` — proceed busy or not — which made `tab close` the one
+    /// wire path that killed a running job: on a last tab with a foreground job
+    /// it answered `OK 0 1` and the instance was gone within a second, while
+    /// the sibling `close` refused and `invoke CloseTab` raised the dialog
+    /// (audit 2026-09-22, reproduced twice). It now runs the `close` verb's
+    /// [`CloseConfirm::WireRefuseBusy`](crate::app_window::CloseConfirm): no
+    /// dialog ever, an idle close proceeds, a busy LAST-tab close is refused in
+    /// the `close` verb's words (`ERR close refused (a running job armed the
+    /// last-tab confirm)`) and a busy tab among several as `close` refuses its
+    /// pane (`App::close_tab_via_verb`), carried to the reply by
+    /// `pending_action_refusal`.
+    /// A last-tab close that proceeds flags `pending_close`, escalated here so
+    /// the window really tears down (the close paths hold no `ActiveEventLoop`).
+    ///
+    /// The bracket also names WHO closed: [`Self::tab_cmd_applied`] opens the
+    /// `ctl-close` scope with the caller `by`, so a `tab close` journals `by=ctl`
+    /// (or the edge caller's sid) the way the `close` verb does. It wrote
+    /// `by=-` until 2026-09-22 — the wake carried no caller — beside a `help
+    /// exits` that promised `by=<caller>`.
+    fn tab_cmd_bracketed(
+        &mut self,
+        el: &ActiveEventLoop,
+        by: crate::session_store::ExitActor,
+        apply: impl FnOnce(&mut Self) -> Result<(usize, usize), String>,
+    ) -> Result<(usize, usize), String> {
+        let state = self.tab_cmd_applied(by, apply);
         self.escalate_pending_close(el);
         self.close_confirm = crate::app_window::CloseConfirm::Interactive;
         state
     }
+
+    /// The part of [`Self::tab_cmd_bracketed`] that needs no event loop: arm the
+    /// wire close policy (left armed through the escalation — the bracket
+    /// restores `Interactive` after it) and apply the action inside a
+    /// `ctl-close` scope attributed to `by`. The scope ends with the action: a
+    /// last-tab close has only FLAGGED its window by then, and the window
+    /// stashes this attribution for the deferred teardown, so the escalation
+    /// journals it without a scope of its own — and without lending it to
+    /// another window's pending close.
+    fn tab_cmd_applied(
+        &mut self,
+        by: crate::session_store::ExitActor,
+        apply: impl FnOnce(&mut Self) -> Result<(usize, usize), String>,
+    ) -> Result<(usize, usize), String> {
+        self.clear_tab_surface_move_license(None);
+        self.close_confirm = crate::app_window::CloseConfirm::WireRefuseBusy;
+        let _closing = crate::session_store::CloseAttribution::enter(
+            crate::session_store::ExitReason::CtlClose,
+            by,
+        );
+        // NOT `?`: the wire-policy bracket must be unwound even on a refusal,
+        // or a declined close would leave `close_confirm` pinned to the wire
+        // policy and the next human gesture would skip its dialog.
+        apply(self)
+    }
+
+    /// `invoke <action>` on the main thread (the [`Wake::InvokeMenuAction`]
+    /// arm): the action runs inside a `ctl-close` scope attributed to the
+    /// caller `by`, so a session it retires journals `reason=ctl-close
+    /// by=<caller>` the way the `close` and `tab close` verbs do. `invoke
+    /// CloseTab` lands in `close_active_tab`, Cmd-W's own path, which claims
+    /// `ui-close by=human` for the gestures that reach it directly; the scope
+    /// is outermost-wins, so the wire caller's attribution holds, and a
+    /// last-tab close stashes it on its window for the deferred teardown.
+    /// Until 2026-09-27 the wake carried no caller, and a script's `invoke
+    /// CloseTab` was journalled as a person closing the tab.
+    pub(crate) fn invoke_attributed(
+        &mut self,
+        by: crate::session_store::ExitActor,
+        invoke: impl FnOnce(&mut Self) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let _closing = crate::session_store::CloseAttribution::enter(
+            crate::session_store::ExitReason::CtlClose,
+            by,
+        );
+        invoke(self)
+    }
 }
 
 /// `@<sid> close` -> retire the resolved session by id (the death half of `spawn`):
-/// close the tab hosting it through the same teardown the ✕ uses. Reply
-/// `OK closed <sid>` on success, `ERR <why>` if unknown or the close was refused
-/// (a running job armed the last-tab quit-confirm). Main-thread hop like `spawn`.
+/// close the PANE showing it — a split collapses onto its siblings the way Cmd-W
+/// collapses one, and the tab goes only with its last pane
+/// (`App::close_session_by_id`). Reply `OK closed <sid>` on success, `ERR <why>`
+/// if unknown, if a job running in that pane refused the close, or if another
+/// view still holds the session. Main-thread hop like `spawn`.
 ///
 /// `by` is the CALLER (`control_session::caller_actor`: the session an
-/// edge-scoped connection's token was granted to, `Unknown` for an anonymous
-/// owner-token connection) — it rides the wake so the exit ledger can say who
+/// edge-scoped connection's token was granted to, `Ctl` for an owner-token
+/// connection, which names no session) — it rides the wake so the exit ledger
+/// can say who
 /// closed the session (`exits` → `reason=ctl-close by=<by>`), the one fact the
 /// target's ctx cannot supply: the dispatch resolved `session`/`sid` from the
 /// selector, and the caller is somebody else.
 /// `close` takes NO argument — validate the tail before anything is retired.
 ///
 /// The silent-ignore hole this release closed for `text` (F4's sub-finding) sat
-/// on `close` too, where the cost is not a wasted read but a dead tab: a driver
+/// on `close` too, where the cost is not a wasted read but a dead pane: a driver
 /// guessing `@<sid> close --dry-run` (or `close 2`, aiming at a tab index the
 /// verb has never taken) got the session retired and an `OK closed` that looked
 /// like the guess had been honoured. A guess must fail, and say so.
@@ -2950,19 +3375,13 @@ mod trail_parse_tests {
     }
 
     /// An unknown tail is refused with ONE usage line naming BOTH forms — so
-    /// the error teaches the vocabulary it just rejected.
+    /// the error teaches the vocabulary it just rejected, and does not echo
+    /// back what the person typed.
     #[test]
     fn an_unknown_tail_names_both_forms_in_one_usage_line() {
         for bad in ["stats", "Status", "on", "-1", "3 4"] {
             let err = parse_trail_form(bad).expect_err(&format!("{bad:?} must be refused"));
-            assert!(
-                err.starts_with("usage: trail [status|<n>] (got "),
-                "{bad:?} -> {err}"
-            );
-            assert!(
-                err.contains(bad.trim()),
-                "the usage line echoes the input: {err}"
-            );
+            assert_eq!(err, "usage: trail [status|<n>]", "{bad:?}");
         }
     }
 }
@@ -3497,6 +3916,301 @@ mod close_arg_tests {
     }
 }
 
+/// The wire `tab close` guard (audit 2026-09-22 defect b): a busy LAST-tab
+/// `tab close` is refused in the `close` verb's words, a busy tab among
+/// several is refused as `close` refuses its pane, and an idle one proceeds —
+/// the `close` verb's exact scope. Driven through `tab_cmd_applied`, the part
+/// of `tab_cmd_bracketed` that runs before the escalation, because the bracket
+/// itself needs the `ActiveEventLoop` a unit test cannot construct. Every
+/// guarded case is WINDOWED (`headless = false`): the headless short-circuit
+/// never confirms, so it would keep a dead guard green.
+#[cfg(test)]
+mod wire_tab_close_guard_tests {
+    use crate::app_window::{CloseConfirm, WIRE_CLOSE_REFUSED, WIRE_TAB_CLOSE_REFUSED};
+    use crate::session_store::{ExitActor, ExitReason, RosterChange};
+    use crate::{App, TabAction, WindowId};
+
+    /// Feed shell-integration bytes to `session`'s engine, the way its PTY
+    /// reader would.
+    fn feed(app: &App, session: u64, bytes: &[u8]) {
+        let term = app.pool.get(session).expect("live session").term.clone();
+        term.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .process(bytes);
+    }
+
+    /// The `Start-Sleep 60` shape: a command the shell reports running
+    /// (133;C, no 133;D) with no child process — the stub session's PTY says
+    /// nothing at all (`master`/`pid` = -1), so ONLY the block state can arm
+    /// the guard here.
+    fn start_in_shell_job(app: &App, session: u64) {
+        feed(
+            app,
+            session,
+            b"\x1b]133;A\x07PS> \x1b]133;B\x07Start-Sleep 60\n\x1b]133;C\x07",
+        );
+    }
+
+    fn finish_job(app: &App, session: u64) {
+        feed(app, session, b"\x1b]133;D;0\x07");
+    }
+
+    /// `tab close` from an owner-token client, as the bracket applies it.
+    fn wire_tab_close(app: &mut App, which: Option<usize>) -> Result<(usize, usize), String> {
+        wire_tab_close_by(app, which, ExitActor::Ctl)
+    }
+
+    /// `tab close` from the caller `by`: the bracket's policy and ledger scope
+    /// around the action, then the policy restored as the bracket restores it
+    /// after the escalation.
+    fn wire_tab_close_by(
+        app: &mut App,
+        which: Option<usize>,
+        by: ExitActor,
+    ) -> Result<(usize, usize), String> {
+        let state = app.tab_cmd_applied(by, |app| app.apply_tab_cmd(TabAction::Close(which)));
+        app.close_confirm = CloseConfirm::Interactive;
+        state
+    }
+
+    /// The reason and `by=` of the newest `Exited` journal row.
+    fn last_exit(app: &App) -> (ExitReason, String) {
+        let g = app.store.read().unwrap_or_else(|p| p.into_inner());
+        let row = g
+            .roster_since(0)
+            .filter(|r| r.change == RosterChange::Exited)
+            .last()
+            .expect("an exit row after the close");
+        (row.reason, row.actor.as_wire().to_string())
+    }
+
+    /// `tab close` NAMES ITS CALLER on the exit ledger, the way `close` does:
+    /// `by=ctl` for an owner-token client, the edge caller's sid for an edge.
+    /// Both closes the ledger sees — a non-last tab retired inside the verb's
+    /// turn, and a LAST tab whose window teardown runs on a later turn — wrote
+    /// `by=-` until 2026-09-22 (the wake carried no caller), which is what the
+    /// audit read beside a `help exits` promising `by=<caller>`.
+    #[test]
+    fn a_wire_tab_close_journals_its_caller() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+
+        wire_tab_close(&mut app, Some(1)).expect("a non-last tab closes");
+        assert_eq!(last_exit(&app), (ExitReason::CtlClose, "ctl".to_string()));
+
+        // The last tab only FLAGS its window; the attribution must survive the
+        // scope to the deferred teardown (`escalate_pending_close` ->
+        // `close_window_logical`, driven directly here).
+        wire_tab_close_by(&mut app, None, ExitActor::Sid("s-edge-caller".to_string()))
+            .expect("an idle last-tab close proceeds");
+        assert!(app.windows[&wid].pending_close);
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Exit);
+        assert_eq!(
+            last_exit(&app),
+            (ExitReason::CtlClose, "s-edge-caller".to_string())
+        );
+    }
+
+    /// `invoke CloseTab` NAMES ITS CALLER as well. Its arm lands in
+    /// `close_active_tab`, Cmd-W's own path, which journals `ui-close
+    /// by=human` for the gestures that reach it directly — so until
+    /// 2026-09-27 a script's `invoke CloseTab` was journalled as a person
+    /// closing the tab. The `Wake::InvokeMenuAction` arm needs an
+    /// `ActiveEventLoop`, so this drives the CloseTab arm's call inside
+    /// [`App::invoke_attributed`] the way the arm does, and pins the arm to
+    /// that scope by source.
+    #[test]
+    fn an_invoked_close_tab_journals_its_caller_not_a_human() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+        app.push_stub_tab(wid, crate::stub_session(2));
+
+        // Negative control: the same close with no wire scope is the human's.
+        assert_eq!(app.close_active_tab(), None, "a non-last tab closes");
+        assert_eq!(last_exit(&app), (ExitReason::UiClose, "human".to_string()));
+
+        let invoked = app.invoke_attributed(ExitActor::Ctl, |app| {
+            assert_eq!(app.close_active_tab(), None, "a non-last tab closes");
+            Ok("invoked CloseTab".to_string())
+        });
+        assert_eq!(invoked, Ok("invoked CloseTab".to_string()));
+        assert_eq!(last_exit(&app), (ExitReason::CtlClose, "ctl".to_string()));
+
+        // The last tab only FLAGS its window; the stash carries the caller to
+        // the teardown that runs after the scope has closed.
+        let _ = app.invoke_attributed(ExitActor::Sid("s-edge-caller".to_string()), |app| {
+            assert_eq!(app.close_active_tab(), Some(wid), "the last tab closes");
+            Ok("invoked CloseTab".to_string())
+        });
+        assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Exit);
+        assert_eq!(
+            last_exit(&app),
+            (ExitReason::CtlClose, "s-edge-caller".to_string())
+        );
+
+        // The arm runs the invoked action inside that scope.
+        let arm = include_str!("lib.rs")
+            .split_once("Wake::InvokeMenuAction { name, by, reply } =>")
+            .expect("the InvokeMenuAction arm")
+            .1;
+        let scope = arm.find("self.invoke_attributed(by,").expect("the scope");
+        let action = arm
+            .find("app.invoke_menu_action_by_name(el, &name)")
+            .expect("the action");
+        assert!(
+            scope < action && action < arm.find("Wake::").expect("the next arm"),
+            "the InvokeMenuAction arm runs the action inside the caller's scope"
+        );
+    }
+
+    /// THE DEFECT: `tab close` of a last tab running an in-shell job answered
+    /// `OK 0 1` and ended the instance. It is now refused in the `close`
+    /// verb's words, the tab and the session survive, and the same close
+    /// proceeds the moment the job finishes.
+    #[test]
+    fn a_busy_last_tab_tab_close_is_refused_and_proceeds_once_idle() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        start_in_shell_job(&app, 0);
+
+        assert_eq!(
+            wire_tab_close(&mut app, None),
+            Err(WIRE_CLOSE_REFUSED.to_string()),
+            "a running job refuses the last-tab close on the wire, in `close`'s words"
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), 1, "the tab is still there");
+        assert!(
+            !app.windows[&wid].pending_close,
+            "nothing was flagged for teardown"
+        );
+        assert!(app.pool.get(0).is_some(), "the session was not retired");
+        assert!(
+            app.pending_action_refusal.is_none(),
+            "the refusal was consumed by the reply, not left for the next verb"
+        );
+
+        finish_job(&app, 0);
+        wire_tab_close(&mut app, None).expect("an idle last-tab close proceeds");
+        assert!(
+            app.windows[&wid].pending_close,
+            "the idle close flagged the window for the deferred teardown"
+        );
+    }
+
+    /// `tab close` and `close` refuse the same busy last tab with ONE sentence:
+    /// `close_session_by_id` answers it from the store diff and the `tab`
+    /// verb from `pending_action_refusal`, and the literal in the former is
+    /// pinned to the constant the latter reads.
+    #[test]
+    fn the_tab_verb_and_the_close_verb_refuse_a_busy_last_tab_in_one_voice() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        start_in_shell_job(&app, 0);
+
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        let close_verb = app.close_session_by_id(0);
+        app.close_confirm = CloseConfirm::Interactive;
+        assert_eq!(close_verb, Err(WIRE_CLOSE_REFUSED.to_string()));
+        assert_eq!(
+            wire_tab_close(&mut app, None),
+            Err(WIRE_CLOSE_REFUSED.to_string())
+        );
+    }
+
+    /// A busy tab AMONG SEVERAL is refused too, because `close` of its pane
+    /// is: the window-exit confirm never sees this close (the window stays
+    /// open), so until the review of this guard `tab close 0` answered `OK`
+    /// and hung up the very job `close` of the same session refused. Nothing
+    /// moves on the refusal, and the same close proceeds once the job ends.
+    #[test]
+    fn a_busy_non_last_tab_close_is_refused_as_close_refuses_its_pane() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+        assert_eq!(app.windows[&wid].tab_set.len(), 2);
+        start_in_shell_job(&app, 0);
+
+        assert_eq!(
+            wire_tab_close(&mut app, Some(0)),
+            Err(WIRE_TAB_CLOSE_REFUSED.to_string()),
+            "a running job refuses the close of its tab, last or not"
+        );
+        assert_eq!(app.windows[&wid].tab_set.len(), 2, "both tabs stand");
+        assert!(app.pool.get(0).is_some(), "the session was not retired");
+        assert!(!app.windows[&wid].pending_close);
+        assert!(
+            app.pending_action_refusal.is_none(),
+            "the refusal was consumed by the reply, not left for the next verb"
+        );
+
+        // The sibling verb refuses the same pane: the two spellings agree.
+        app.close_confirm = CloseConfirm::WireRefuseBusy;
+        let close_verb = app.close_session_by_id(0);
+        app.close_confirm = CloseConfirm::Interactive;
+        assert_eq!(
+            close_verb,
+            Err(crate::app_tabs::WIRE_PANE_CLOSE_REFUSED.to_string())
+        );
+        assert!(
+            WIRE_TAB_CLOSE_REFUSED.starts_with("close refused (a running job")
+                && crate::app_tabs::WIRE_PANE_CLOSE_REFUSED
+                    .starts_with("close refused (a running job"),
+            "every busy refusal opens with the same words"
+        );
+
+        finish_job(&app, 0);
+        let state = wire_tab_close(&mut app, Some(0)).expect("an idle non-last tab closes");
+        assert_eq!(state.1, 1, "the tab is gone once its job ended");
+        assert!(app.pool.get(0).is_none(), "and its session with it");
+        assert!(!app.windows[&wid].pending_close, "the window stays open");
+    }
+
+    /// The guard reads the CLOSED tab's panes and nothing else: a job running
+    /// in a sibling tab never refuses the close of an idle one, and a busy
+    /// session another view still shows (Cmd-Shift-O) is not hung up by
+    /// closing this tab, so it does not refuse it either.
+    #[test]
+    fn a_non_last_tab_close_reads_only_the_jobs_it_would_hang_up() {
+        let mut app = App::headless_for_test();
+        app.headless = false;
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+        app.push_stub_tab(wid, crate::stub_session(2));
+        start_in_shell_job(&app, 0);
+
+        let state = wire_tab_close(&mut app, Some(2)).expect("an idle tab beside a busy one");
+        assert_eq!(state.1, 2, "the idle tab closed");
+        assert!(app.pool.get(0).is_some(), "the busy sibling's job runs on");
+
+        start_in_shell_job(&app, 1);
+        app.pool.attach(1); // another view now shows session 1
+        let state = wire_tab_close(&mut app, Some(1)).expect("a co-viewed busy tab closes");
+        assert_eq!(state.1, 1, "the co-viewed tab closed");
+        assert!(
+            app.pool.get(1).is_some(),
+            "its session lives on in the other view"
+        );
+    }
+
+    /// A `--headless` instance never confirms and never refuses, as `close`
+    /// says: the busy non-last tab closes there.
+    #[test]
+    fn a_headless_busy_non_last_tab_close_proceeds() {
+        let mut app = App::headless_for_test();
+        assert!(app.headless);
+        let wid = WindowId(0);
+        app.push_stub_tab(wid, crate::stub_session(1));
+        start_in_shell_job(&app, 0);
+
+        let state = wire_tab_close(&mut app, Some(0)).expect("headless never refuses");
+        assert_eq!(state.1, 1);
+    }
+}
+
 #[cfg(test)]
 mod spawn_aim_app_tests {
     use super::SpawnAim;
@@ -3870,7 +4584,7 @@ mod video_parse_tests {
     fn video_args_defaults() {
         let a = parse_video_args("").expect("defaults parse");
         assert_eq!(a.secs, 3.0);
-        assert!(!a.full_res && !a.keys && !a.pace);
+        assert!(!a.full_res && !a.keys && !a.pace && !a.trail);
         assert_eq!(a.fps, None);
         assert_eq!(a.budget_bytes, aterm_gpu::video_tap::DEFAULT_BUDGET);
     }
@@ -3879,9 +4593,9 @@ mod video_parse_tests {
     /// existing flags and carried through exactly.
     #[test]
     fn video_args_budget_and_fps_accepted() {
-        let a = parse_video_args("5 full keys pace fps=10 budget=1024").expect("parses");
+        let a = parse_video_args("5 full keys pace trail fps=10 budget=1024").expect("parses");
         assert_eq!(a.secs, 5.0);
-        assert!(a.full_res && a.keys && a.pace);
+        assert!(a.full_res && a.keys && a.pace && a.trail);
         assert_eq!(a.fps, Some(10));
         assert_eq!(a.budget_bytes, 1024 << 20);
     }

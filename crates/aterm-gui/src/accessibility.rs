@@ -270,32 +270,28 @@ mod tests {
     }
 
     #[test]
-    fn cursor_offset_none_when_hidden() {
-        assert_eq!(snap("abc\n", None).cursor_offset(), None);
-    }
-
-    #[test]
-    fn cursor_offset_first_line() {
-        // caret at row 0 col 2 in "hello" → offset 2.
-        assert_eq!(
-            snap("hello\nworld\n", Some((0, 2))).cursor_offset(),
-            Some(2)
-        );
-    }
-
-    #[test]
-    fn cursor_offset_second_line_accounts_for_newline() {
-        // "hello\n" is 6 chars; caret at row 1 col 3 → 6 + 3 = 9.
-        assert_eq!(
-            snap("hello\nworld\n", Some((1, 3))).cursor_offset(),
-            Some(9)
-        );
-    }
-
-    #[test]
-    fn cursor_offset_clamps_into_trailing_whitespace() {
-        // Row 0 trimmed to "hi" (len 2); a caret at col 10 clamps to 2.
-        assert_eq!(snap("hi\n", Some((0, 10))).cursor_offset(), Some(2));
+    fn cursor_offset_counts_chars_to_the_caret() {
+        for (label, text, cursor, expected) in [
+            ("hidden caret", "abc\n", None, None),
+            // caret at row 0 col 2 in "hello" → offset 2.
+            ("first line", "hello\nworld\n", Some((0, 2)), Some(2)),
+            // "hello\n" is 6 chars; caret at row 1 col 3 → 6 + 3 = 9.
+            (
+                "second line counts the newline",
+                "hello\nworld\n",
+                Some((1, 3)),
+                Some(9),
+            ),
+            // Row 0 trimmed to "hi" (len 2); a caret at col 10 clamps to 2.
+            (
+                "clamps into trailing whitespace",
+                "hi\n",
+                Some((0, 10)),
+                Some(2),
+            ),
+        ] {
+            assert_eq!(snap(text, cursor).cursor_offset(), expected, "{label}");
+        }
     }
 
     #[test]

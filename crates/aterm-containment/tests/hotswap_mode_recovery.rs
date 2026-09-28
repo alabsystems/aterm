@@ -14,7 +14,7 @@
 //! Regression guard: before #5520 fix, hotswap would silently reset to Master.
 
 use aterm_containment::{
-    ContainmentMode, ContainmentPolicy, McpCapability, NetworkCapability, ProcessCapability,
+    ContainmentMode, ContainmentPolicy, FsCapability, NetworkCapability, ProcessCapability,
 };
 
 /// Simulate the hotswap recovery path: manifest contains "Containment",
@@ -50,7 +50,7 @@ fn hotswap_recovery_preserves_containment_mode() {
         ProcessCapability::NoFork,
         "fork must be denied"
     );
-    assert_eq!(caps.mcp, McpCapability::Disabled, "MCP must be disabled");
+    assert_eq!(caps.fs, FsCapability::TmpOnly, "fs must be TmpOnly");
 
     // Verify: second init attempt fails (OnceLock immutability).
     let result = aterm_containment::init_mode(ContainmentMode::Master);

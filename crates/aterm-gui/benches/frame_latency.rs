@@ -38,7 +38,9 @@
 //     path the split-sparkle unit tests drive headless. The PET-03 gui half
 //     lives on it.
 //   * `present_frame` — the single-pane present modeled as the scout mapped
-//     it: LOCK-A extract (`cell_frame_into` + `take_damage` under one lock),
+//     it: the frame hold's extraction (`cell_frame_into` + `take_damage`
+//     under one lock — the FULL refill, so an upper bound on the shipping
+//     hold's damage-scoped `cell_frame_damage_scoped_into`),
 //     `tick_cursor_fx`, then a REAL CPU raster through the SHIPPING
 //     damage-tracked entry (`Renderer::render_input_cached` over the window's
 //     persistent `WindowCpu` — RE-1): actual pixels, headless, row-scoped
@@ -68,9 +70,9 @@
 // WHAT IS OUT OF REACH (cut honestly, not stubbed): the OS present itself —
 // softbuffer damage-rect blit / GPU swapchain present, frame pacing, EDR/scale
 // binding, tab-strip + native chrome, and `redraw_window`'s own inline
-// single-pane compose (its present-target match bails headless before LOCK A;
-// `present_frame` above is the model of it, not a call into it). Those halves
-// need glass and stay unpriced here rather than mispriced.
+// single-pane compose (its present-target match bails headless before its
+// terminal hold; `present_frame` above is the model of it, not a call into
+// it). Those halves need glass and stay unpriced here rather than mispriced.
 //
 // THE WORKLOADS, in the campaign's priority order:
 //
@@ -588,7 +590,7 @@ fn sb_delta(lines: usize) -> i32 {
 
 /// The scrolled-back fixture (and, at `depth == 0`, its live-bottom control):
 /// a headless window with EVERY cursor effect off — so the timed span is the
-/// LOCK-A extraction plus the damage-tracked raster and nothing else — over a
+/// frame hold's extraction plus the damage-tracked raster and nothing else — over a
 /// real `SB_FILL_LINES`-line history, parked `depth` lines up.
 ///
 /// Effects are off in BOTH arms, not to flatter the number but because the

@@ -2,27 +2,21 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Kani bounded model checking proofs for the containment crate.
-//!
-//! Harnesses for the safety properties named after the INTENDED
-//! `tla/Containment.tla` model — which is NOT in-tree and on no build/CI path
-//! (see the crate-root note).
+//! Kani bounded model checking proofs for the containment policy mapping.
 //!
 //! These harnesses are `#[cfg(kani)]`-gated (the module itself is declared
 //! under `#[cfg(kani)]` in `lib.rs`), so a plain `cargo build`/`cargo test`
 //! COMPILES THEM OUT ENTIRELY and discharges nothing. They are discharged only
-//! by a Kani / trust-mc model checker run deliberately via the opt-in
-//! `scripts/verify-kani-proofs.sh`, which is not wired into any default gate.
-//! The properties:
-//! - Mode immutability (no escalation from Rust code)
+//! by trust-mc run deliberately via the opt-in `scripts/verify-kani-proofs.sh`;
+//! the unit tests in `policy.rs` and `mode.rs` pin the same table in the default
+//! test lane. The properties:
+//! - Mode ordering agrees with the numeric level
 //! - Capabilities match mode (policy consistency)
 //! - Monotonic capabilities (downgrade never increases any capability)
 //! - Containment mode is maximally restrictive
+//! - The policy is total on every mode
 
-use crate::capability::{
-    CommandCapability, FsCapability, InputCapability, McpCapability, NetworkCapability,
-    OutputCapability, PluginCapability, ProcessCapability,
-};
+use crate::capability::{FsCapability, NetworkCapability, ProcessCapability};
 use crate::mode::ContainmentMode;
 use crate::policy::ContainmentPolicy;
 
@@ -41,15 +35,14 @@ fn mode_from_level(level: u8) -> ContainmentMode {
 }
 
 // -----------------------------------------------------------------------
-// Property 1: Mode ordering is consistent with numeric level (TLA+ encoding)
+// Property 1: Mode ordering is consistent with numeric level
 // -----------------------------------------------------------------------
 
-/// For any two valid modes, Rust `Ord` ordering matches TLA+ numeric encoding.
-///
-/// TLA+: Master(3) > User(2) > Safety(1) > Containment(0).
+/// For any two valid modes, Rust `Ord` ordering matches the numeric level:
+/// Master(3) > User(2) > Safety(1) > Containment(0).
 /// Proves `mode_a >= mode_b ⟺ level(mode_a) >= level(mode_b)`.
 #[kani::proof]
-fn mode_ordering_matches_tla_encoding() {
+fn mode_ordering_matches_level_encoding() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
     kani::assume(a <= 3);
@@ -61,28 +54,24 @@ fn mode_ordering_matches_tla_encoding() {
     // Ord impl must agree with numeric level
     kani::assert(
         (mode_a >= mode_b) == (a >= b),
-        "mode ordering must match TLA+ numeric encoding",
+        "mode ordering must match the numeric level",
     );
 }
 
 // -----------------------------------------------------------------------
-// Property 2: Capabilities always match mode (TLA+ CapabilitiesMatchMode)
+// Property 2: Capabilities always match mode (CapabilitiesMatchMode)
 // -----------------------------------------------------------------------
 
-/// For every mode, `ContainmentPolicy::capabilities` returns exactly the
-/// intended policy values (the ones this crate documents — the TLA+ model
-/// naming them is not in-tree).
-///
-/// Encodes that policy table as raw numeric constants and verifies
-/// the Rust implementation matches for all 4 × 8 = 32 mappings.
+/// For every mode, the policy functions return exactly the documented values
+/// for all 4 × 3 = 12 mappings.
 // Asserted via the per-field policy functions directly (not `caps.field as u8`):
 // `capabilities(mode)` is `Capabilities { network: network(mode), .. }` by
 // construction, so the obligation is identical, but trust-mc drops the enum-field
 // discriminant on a `field as u8` cast of a struct returned from an enum-arg fn
-// (`loaded-aggregate-extract-field`). Split into two 4-field harnesses for the
-// superlinear AY blowup over the symbolic mode (8 fields solver-timeout, 4 ~6s).
+// (`loaded-aggregate-extract-field`). Three fields stay under the ≤4-per-harness
+// bound that keeps AY's symbolic-mode blowup well inside the cap.
 #[kani::proof]
-fn capabilities_match_mode_tla_policy_part1() {
+fn capabilities_match_mode_policy() {
     let level: u8 = kani::any();
     kani::assume(level <= 3);
     let mode = mode_from_level(level);
@@ -114,74 +103,16 @@ fn capabilities_match_mode_tla_policy_part1() {
         ContainmentPolicy::process(mode) as u8 == expected_proc,
         "PolicyProcess mismatch",
     );
-    // MCP: Containment=0, Safety=1, User=2, Master=2
-    let expected_mcp: u8 = match level {
-        0 => 0,
-        1 => 1,
-        2 | 3 => 2,
-        _ => unreachable!(),
-    };
-    kani::assert(
-        ContainmentPolicy::mcp(mode) as u8 == expected_mcp,
-        "PolicyMcp mismatch",
-    );
-}
-
-#[kani::proof]
-fn capabilities_match_mode_tla_policy_part2() {
-    let level: u8 = kani::any();
-    kani::assume(level <= 3);
-    let mode = mode_from_level(level);
-
-    // Plugins: Containment=0, Safety=1, User=2, Master=2
-    let expected_plug: u8 = match level {
-        0 => 0,
-        1 => 1,
-        2 | 3 => 2,
-        _ => unreachable!(),
-    };
-    kani::assert(
-        ContainmentPolicy::plugins(mode) as u8 == expected_plug,
-        "PolicyPlugins mismatch",
-    );
-    // Output: Containment=0, Safety=1, User=1, Master=2
-    let expected_out: u8 = match level {
-        0 => 0,
-        1 | 2 => 1,
-        3 => 2,
-        _ => unreachable!(),
-    };
-    kani::assert(
-        ContainmentPolicy::output(mode) as u8 == expected_out,
-        "PolicyOutput mismatch",
-    );
-    // Input: Containment=0, Safety=1, User=1, Master=2
-    let expected_in: u8 = match level {
-        0 => 0,
-        1 | 2 => 1,
-        3 => 2,
-        _ => unreachable!(),
-    };
-    kani::assert(
-        ContainmentPolicy::input(mode) as u8 == expected_in,
-        "PolicyInput mismatch",
-    );
-    // Command: Containment=0, Safety=1, User=2, Master=3
-    kani::assert(
-        ContainmentPolicy::command(mode) as u8 == level,
-        "PolicyCommand mismatch",
-    );
 }
 
 // -----------------------------------------------------------------------
-// Property 3: Monotonic capabilities (TLA+ MonotonicCapabilities)
+// Property 3: Monotonic capabilities (MonotonicCapabilities)
 // -----------------------------------------------------------------------
 
 /// For any two modes where `lower <= higher`, every capability of
 /// `lower` is ≤ the corresponding capability of `higher`.
 ///
-/// TLA+: MonotonicCapabilities — capabilities only decrease when mode decreases.
-/// This proves the contrapositive: no single capability can increase when
+/// Capabilities only decrease when mode decreases. This proves the contrapositive: no single capability can increase when
 /// mode decreases.
 #[kani::proof]
 fn monotonic_capabilities_for_all_mode_pairs() {
@@ -200,22 +131,13 @@ fn monotonic_capabilities_for_all_mode_pairs() {
     kani::assert(cl.network <= ch.network, "network monotonicity violated");
     kani::assert(cl.fs <= ch.fs, "fs monotonicity violated");
     kani::assert(cl.process <= ch.process, "process monotonicity violated");
-    kani::assert(cl.mcp <= ch.mcp, "mcp monotonicity violated");
-    kani::assert(cl.plugins <= ch.plugins, "plugins monotonicity violated");
-    kani::assert(cl.output <= ch.output, "output monotonicity violated");
-    kani::assert(cl.input <= ch.input, "input monotonicity violated");
-    kani::assert(cl.command <= ch.command, "command monotonicity violated");
 }
 
 // -----------------------------------------------------------------------
-// Property 4: Containment mode is maximally restrictive (TLA+ ContainmentMinimal)
+// Property 4: Containment mode is maximally restrictive (ContainmentMinimal)
 // -----------------------------------------------------------------------
 
 /// Containment mode has the minimum value (0) for every capability.
-///
-/// TLA+: ContainmentMinimal — composite of ContainmentHasNoNetwork,
-/// ContainmentOutputFiltered, ContainmentInputFiltered,
-/// ContainmentNoMcpNoPlugins, NoFork, TmpOnly, ContainmentNoCommands.
 #[kani::proof]
 fn containment_mode_is_maximally_restrictive() {
     let caps = ContainmentPolicy::capabilities(ContainmentMode::Containment);
@@ -223,14 +145,6 @@ fn containment_mode_is_maximally_restrictive() {
     kani::assert(caps.network as u8 == 0, "ContainmentHasNoNetwork");
     kani::assert(caps.fs as u8 == 0, "Containment fs = TmpOnly");
     kani::assert(caps.process as u8 == 0, "Containment process = NoFork");
-    kani::assert(caps.mcp as u8 == 0, "ContainmentNoMcpNoPlugins (mcp)");
-    kani::assert(
-        caps.plugins as u8 == 0,
-        "ContainmentNoMcpNoPlugins (plugins)",
-    );
-    kani::assert(caps.output as u8 == 0, "ContainmentOutputFiltered");
-    kani::assert(caps.input as u8 == 0, "ContainmentInputFiltered");
-    kani::assert(caps.command as u8 == 0, "ContainmentNoCommands");
 
     // Cross-check with specific enum variants (not just numeric)
     kani::assert(
@@ -242,23 +156,6 @@ fn containment_mode_is_maximally_restrictive() {
         caps.process == ProcessCapability::NoFork,
         "process must be NoFork",
     );
-    kani::assert(caps.mcp == McpCapability::Disabled, "mcp must be Disabled");
-    kani::assert(
-        caps.plugins == PluginCapability::Disabled,
-        "plugins must be Disabled",
-    );
-    kani::assert(
-        caps.output == OutputCapability::Filtered,
-        "output must be Filtered",
-    );
-    kani::assert(
-        caps.input == InputCapability::Filtered,
-        "input must be Filtered",
-    );
-    kani::assert(
-        caps.command == CommandCapability::NoCommands,
-        "command must be NoCommands",
-    );
 }
 
 // -----------------------------------------------------------------------
@@ -269,7 +166,7 @@ fn containment_mode_is_maximally_restrictive() {
 /// of the target mode is strictly ≤ the source mode. No escalation possible
 /// through mode downgrade.
 ///
-/// TLA+: NonEscalation — mode can NEVER increase in capability.
+/// NonEscalation — mode can NEVER increase in capability.
 #[kani::proof]
 fn downgrade_never_escalates_any_capability() {
     let from: u8 = kani::any();
@@ -287,51 +184,17 @@ fn downgrade_never_escalates_any_capability() {
     kani::assert(ct.network <= cs.network, "network escalated on downgrade");
     kani::assert(ct.fs <= cs.fs, "fs escalated on downgrade");
     kani::assert(ct.process <= cs.process, "process escalated on downgrade");
-    kani::assert(ct.mcp <= cs.mcp, "mcp escalated on downgrade");
-    kani::assert(ct.plugins <= cs.plugins, "plugins escalated on downgrade");
-    kani::assert(ct.output <= cs.output, "output escalated on downgrade");
-    kani::assert(ct.input <= cs.input, "input escalated on downgrade");
-    kani::assert(ct.command <= cs.command, "command escalated on downgrade");
 }
 
 // -----------------------------------------------------------------------
-// Property 6: Mode level roundtrip
+// Property 6: Policy is a total function on all modes
 // -----------------------------------------------------------------------
 
-/// `ContainmentMode::level()` returns the `repr(u8)` discriminant.
-/// Roundtrip: level → mode → level is identity for all valid levels.
-// TODO(#7932): tautology — strengthen or delete — T1: constructor round-trip field == any-binding
+/// The policy functions produce an in-range capability for every mode variant —
+/// no panic, no UB. Per-field functions, not `capabilities(mode).field as u8`,
+/// for the trust-mc `loaded-aggregate-extract-field` reason given at Property 2.
 #[kani::proof]
-fn mode_level_roundtrip() {
-    let level: u8 = kani::any();
-    kani::assume(level <= 3);
-
-    let mode = mode_from_level(level);
-    kani::assert(
-        mode.level() == level,
-        "mode.level() must match construction level",
-    );
-}
-
-// -----------------------------------------------------------------------
-// Property 7: Policy is a total function on all modes
-// -----------------------------------------------------------------------
-
-/// `ContainmentPolicy::capabilities` produces a valid `Capabilities`
-/// for every mode variant — no panic, no UB.
-// Asserted via the per-field policy functions directly rather than building
-// `capabilities(mode)` and reading struct fields. `capabilities(mode)` is by
-// construction `Capabilities { network: network(mode), fs: fs(mode), .. }`, so
-// the obligation is identical — but trust-mc currently drops the enum-field
-// discriminant on a `field as u8` cast when the struct is returned from a fn
-// taking an enum arg (the `loaded-aggregate-extract-field` codegen frontier;
-// monotonicity's `<=` PartialOrd path is unaffected, the `as u8` cast is). Each
-// field read directly is a sound, modelled discriminant comparison. Split into
-// two 4-field harnesses: the symbolic mode × N independent enum-discriminant
-// chains blow up superlinearly in AY (1 field 0.1s, 4 fields ~6s, 8 fields
-// solver-timeout), so ≤4 fields per harness keeps each well under the cap.
-#[kani::proof]
-fn policy_is_total_on_all_modes_part1() {
+fn policy_is_total_on_all_modes() {
     let level: u8 = kani::any();
     kani::assume(level <= 3);
     let mode = mode_from_level(level);
@@ -344,73 +207,4 @@ fn policy_is_total_on_all_modes_part1() {
         ContainmentPolicy::process(mode) as u8 <= 2,
         "process out of range",
     );
-    kani::assert(ContainmentPolicy::mcp(mode) as u8 <= 2, "mcp out of range");
-}
-
-#[kani::proof]
-fn policy_is_total_on_all_modes_part2() {
-    let level: u8 = kani::any();
-    kani::assume(level <= 3);
-    let mode = mode_from_level(level);
-    kani::assert(
-        ContainmentPolicy::plugins(mode) as u8 <= 2,
-        "plugins out of range",
-    );
-    kani::assert(
-        ContainmentPolicy::output(mode) as u8 <= 2,
-        "output out of range",
-    );
-    kani::assert(
-        ContainmentPolicy::input(mode) as u8 <= 2,
-        "input out of range",
-    );
-    kani::assert(
-        ContainmentPolicy::command(mode) as u8 <= 3,
-        "command out of range",
-    );
-}
-
-// -----------------------------------------------------------------------
-// Property 8: Mode immutability via OnceLock semantics
-// -----------------------------------------------------------------------
-
-/// Models `init_mode` behavior: first call succeeds, second call with
-/// any mode returns `AlreadyInitialized` with the original mode.
-///
-/// This proves the OnceLock-based immutability at the API level:
-/// once a mode is set, the error always reports the original mode,
-/// making escalation via repeated `init_mode` calls impossible.
-///
-/// Note: actual OnceLock thread-safety is proven by the stdlib.
-/// This proof verifies our wrapper preserves the invariant.
-#[kani::proof]
-fn init_mode_rejects_second_call_with_correct_existing() {
-    let first: u8 = kani::any();
-    let second: u8 = kani::any();
-    kani::assume(first <= 3);
-    kani::assume(second <= 3);
-
-    let first_mode = mode_from_level(first);
-    let second_mode = mode_from_level(second);
-
-    // Model: after init_mode(first_mode) succeeds,
-    // a second call to init_mode(second_mode) must fail with
-    // AlreadyInitialized { existing: first_mode, attempted: second_mode }
-    let err = crate::InitError::AlreadyInitialized {
-        existing: first_mode,
-        attempted: second_mode,
-    };
-
-    // The error must preserve the original mode exactly
-    match err {
-        crate::InitError::AlreadyInitialized {
-            existing,
-            attempted,
-        } => {
-            kani::assert(existing == first_mode, "must preserve original mode");
-            kani::assert(attempted == second_mode, "must report attempted mode");
-            // Critical: the error does NOT allow reading the attempted mode
-            // as if it were set — the existing mode is the authority.
-        }
-    }
 }

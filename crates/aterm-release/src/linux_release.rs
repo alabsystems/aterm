@@ -776,75 +776,42 @@ mod tests {
     }
 
     #[test]
-    fn draft_and_mirror_require_every_signed_raw_asset_exactly_once() {
+    fn the_channel_release_requires_every_signed_raw_asset_exactly_once() {
         let source = Scratch::new();
-        let dist = Scratch::new();
         let artifact = fixture(&source.0, LinuxTarget::Aarch64);
-        let mut handoff = Handoff::new(&source.0, std::slice::from_ref(&artifact.target)).unwrap();
-        handoff
-            .import(&dist.0, "0.100.0", 100, &"a".repeat(40))
-            .unwrap();
-        let mut manifest = manifest();
-        handoff.stamp(&mut manifest).unwrap();
-        let mut names: Vec<String> = [
-            "aterm-appcast.toml",
-            "aterm-0.100.0.dmg",
-            "aterm-0.100.0.dmg.sha256",
-            "aterm-0.100.0-build.txt",
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+        let mut published = crate::channel::required_asset_names("0.100.0", false, false);
         assert!(
-            crate::publish::validate_draft_asset_set(
-                &names,
-                &manifest,
-                false,
-                "aterm-0.100.0-build.txt",
-                None
-            )
-            .is_err()
-        );
-        names.push(artifact.asset.clone());
-        crate::publish::validate_draft_asset_set(
-            &names,
-            &manifest,
-            false,
-            "aterm-0.100.0-build.txt",
-            None,
-        )
-        .unwrap();
-        names.push(artifact.asset.clone());
-        assert!(
-            crate::publish::validate_draft_asset_set(
-                &names,
-                &manifest,
-                false,
-                "aterm-0.100.0-build.txt",
-                None
-            )
-            .is_err()
-        );
-        let mut mirrored = crate::mirror::required_asset_names("0.100.0", false, false);
-        assert!(
-            crate::mirror::validate_mirror_asset_set_with_linux(
-                &mirrored,
+            crate::channel::validate_channel_asset_set(
+                &published,
                 "0.100.0",
                 false,
                 false,
-                std::slice::from_ref(&artifact.asset)
+                std::slice::from_ref(&artifact.asset),
             )
-            .is_err()
+            .is_err(),
+            "a declared native executable the release does not carry is missing"
         );
-        mirrored.push(artifact.asset.clone());
-        crate::mirror::validate_mirror_asset_set_with_linux(
-            &mirrored,
+        published.push(artifact.asset.clone());
+        crate::channel::validate_channel_asset_set(
+            &published,
             "0.100.0",
             false,
             false,
-            &[artifact.asset],
+            std::slice::from_ref(&artifact.asset),
         )
         .unwrap();
+        published.push(artifact.asset.clone());
+        assert!(
+            crate::channel::validate_channel_asset_set(
+                &published,
+                "0.100.0",
+                false,
+                false,
+                &[artifact.asset],
+            )
+            .is_err(),
+            "a duplicated native executable is refused"
+        );
     }
 
     #[test]

@@ -4,7 +4,8 @@
 //! `atpkg verify [program]` (§12) — an offline drift/integrity audit of the installed store
 //! against the SIGNED `tree_root` recorded at install/update time.
 //!
-//! It recomputes [`crate::tree::tree_root`] over the ACTIVE build dir and compares it to the
+//! It recomputes the ACTIVE build dir's root — [`crate::tree::tree_root_declared`], the
+//! plain [`crate::tree::tree_root`] wherever the inode stores modes — and compares it to the
 //! release-key-verified value persisted in `status.toml` ([`crate::status::ProgramStatus::tree_root`]).
 //! That recorded root came from a manifest whose signature was checked over exact bytes
 //! before parse (verify-before-parse), so this attests that what is on disk still matches
@@ -141,7 +142,7 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
     {
         return VerifyOutcome::WiredSysroot { build };
     }
-    match crate::tree::tree_root(&build_dir) {
+    match walked_root(&build_dir) {
         Ok(got) if got.eq_ignore_ascii_case(&recorded_root) => VerifyOutcome::Match { build },
         Ok(got) => VerifyOutcome::Drift {
             build,
@@ -153,6 +154,25 @@ pub fn verify_program(layout: &Layout, program: &str) -> VerifyOutcome {
             error: e.to_string(),
         },
     }
+}
+
+/// The on-disk root of `build_dir`, folded the way its stage folded it.
+///
+/// The mode slot the walk folds where the filesystem stores no permission bits
+/// (Windows) is the record the stage left beside the build. Where the inode stores them
+/// (Unix) the record is an empty map the walk never consults, and no file is read. A
+/// Windows build with no record cannot be attested — the walk would fold `0` for every
+/// file and call a healthy tree drifted — so its error names the re-stage that writes
+/// one, and the caller reports it as unreadable, never as a false Drift.
+///
+/// ONE walk for both lanes. The vendor lane once walked with the plain
+/// [`crate::tree::tree_root`], so on Windows every vendor build read as drifted: minutes
+/// after the stage recorded claude 2.1.283's declared fold (`4f28d8d2…`, the index's
+/// signed root for the same bytes), `atpkg verify claude` said DRIFT, because the plain
+/// walk folds mode `0` there (`86f1a85e…`); codex 0.157.1 the same (2026-09-27).
+fn walked_root(build_dir: &std::path::Path) -> std::io::Result<String> {
+    let modes = crate::store::declared_modes(build_dir)?;
+    crate::tree::tree_root_declared(build_dir, &modes)
 }
 
 /// The signed root a vendor program's stamp kept for its legacy index `build`, when the
@@ -179,7 +199,7 @@ fn verify_vendor_build(layout: &Layout, program: &str, build: u64) -> VerifyOutc
     let Some(record) = crate::vendor_direct::complete_record(&build_dir) else {
         return VerifyOutcome::NoSignedRoot { build: Some(build) };
     };
-    match crate::tree::tree_root(&build_dir) {
+    match walked_root(&build_dir) {
         Ok(got) => VerifyOutcome::VendorRoot {
             build,
             vendor: record.vendor,
@@ -208,7 +228,7 @@ pub fn verify_all(layout: &Layout) -> Vec<(String, VerifyOutcome)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activate::{activate_channel, install_shims};
+    use crate::activate::{activate_build, install_shims};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -222,11 +242,38 @@ mod tests {
         Layout { prefix: p }
     }
 
+    /// The modes a stage would have DECLARED for the one-file build [`install`] lays —
+    /// what the walk folds on a filesystem without permission bits, and what the record
+    /// beside the build says on Windows. Unix never consults it.
+    fn modes_of(program: &str) -> crate::tree::DeclaredModes {
+        let mut modes = crate::tree::DeclaredModes::new();
+        let mut rel = b"bin/".to_vec();
+        rel.extend_from_slice(exe_name(program).as_bytes());
+        modes.insert(rel, 0o755);
+        modes
+    }
+
+    /// The platform's EXECUTABLE spelling of `program` under `bin/` — `ay` on Unix,
+    /// `ay.exe` on Windows — the file the shim forwards to, without which the shim view
+    /// (`active_builds`) reports no active build and every verdict here is
+    /// `NotInstalled`. Byte-identical on Unix, where the suffix is empty.
+    fn exe_name(program: &str) -> String {
+        crate::store::ToolName::new(program).unwrap().exe_file()
+    }
+
+    /// The root a producer would have SIGNED for the build [`install`] lays: the
+    /// declared-mode walk, which on Unix is the plain walk over the stored bits.
+    fn signed_root(dir: &std::path::Path, program: &str) -> String {
+        crate::tree::tree_root_declared(dir, &modes_of(program)).unwrap()
+    }
+
     /// Lay down a COMPLETE, activated build with `bin/<program>`; return its dir.
     fn install(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join("bin").join(program), b"#!/bin/true\n").unwrap();
+        std::fs::write(dir.join("bin").join(exe_name(program)), b"#!/bin/true\n").unwrap();
+        // The record the real stage leaves beside a build (a no-op on Unix).
+        crate::store::write_declared_modes(&dir, &modes_of(program)).unwrap();
         install_shims(
             layout,
             &dir,
@@ -234,7 +281,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        activate_channel(layout, "stable", &dir).unwrap();
+        activate_build(layout, &dir).unwrap();
         crate::store::mark_build_ready(&dir).unwrap();
         dir
     }
@@ -263,7 +310,7 @@ mod tests {
     fn verify_matches_recorded_signed_root() {
         let l = layout("match");
         let dir = install(&l, "ay", 18);
-        let root = crate::tree::tree_root(&dir).unwrap();
+        let root = signed_root(&dir, "ay");
         record(&l, "ay", Some(18), &root);
         assert_eq!(verify_program(&l, "ay"), VerifyOutcome::Match { build: 18 });
         let _ = std::fs::remove_dir_all(&l.prefix);
@@ -273,7 +320,7 @@ mod tests {
     fn verify_detects_drift() {
         let l = layout("drift");
         let dir = install(&l, "ay", 18);
-        let root = crate::tree::tree_root(&dir).unwrap();
+        let root = signed_root(&dir, "ay");
         record(&l, "ay", Some(18), &root);
         // Mutate the on-disk tree AFTER recording the signed root.
         std::fs::write(dir.join("bin/ay"), b"tampered").unwrap();
@@ -310,7 +357,10 @@ mod tests {
         let l = layout("legacy-kept");
         let legacy = 2_026_091_901;
         let dir = install(&l, "claude", legacy);
-        let root = crate::tree::tree_root(&dir).unwrap();
+        // The root the stamp keeps is the index row's SIGNED root — the declared-mode
+        // fold ([`signed_root`]), which the plain walk reproduces only where the inode
+        // stores the modes.
+        let root = signed_root(&dir, "claude");
         let vendor = crate::vendor_direct::Version::parse("2.1.280")
             .unwrap()
             .build_id();
@@ -344,7 +394,7 @@ mod tests {
             VerifyOutcome::Match { build: legacy },
             "a rollback row recorded with no root"
         );
-        std::fs::write(dir.join("bin/claude"), b"tampered").unwrap();
+        std::fs::write(dir.join("bin").join(exe_name("claude")), b"tampered").unwrap();
         assert!(matches!(
             verify_program(&l, "claude"),
             VerifyOutcome::Drift { build, .. } if build == legacy
@@ -352,11 +402,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// A vendor-direct build is attested by the SAME walk as an index build — the modes its
+    /// stage declared, where the inode stores none. Its `.vendor` record holds the root the
+    /// stage folded, and the plain walk (mode `0` on Windows) called every vendor build
+    /// there drifted: claude 2.1.283 and codex 0.157.1 on the day they staged
+    /// (2026-09-27). A mutated tree still drifts, naming the root it walked.
+    #[test]
+    fn a_vendor_build_is_attested_by_the_walk_its_stage_folded() {
+        let l = layout("vendor-walk");
+        let version = crate::vendor_direct::Version::parse("2.1.283").unwrap();
+        let build = version.build_id();
+        let dir = install(&l, "claude", build);
+        let rec = crate::vendor_direct::VendorRecord {
+            schema: crate::vendor_direct::RECORD_SCHEMA,
+            program: "claude".into(),
+            version,
+            vendor: "Anthropic".into(),
+            source_url:
+                "https://downloads.claude.ai/claude-code-releases/2.1.283/win32-x64/claude.exe"
+                    .into(),
+            sha256: "9dbe16dafed59da5cdabbfe11ad0335738c753fad794989b47f9446accd6de3a".into(),
+            size: 244_960_928,
+            // What the stage records: the fold over the modes it declared.
+            tree_root: signed_root(&dir, "claude"),
+            apple_team: cfg!(target_os = "macos").then(|| {
+                crate::vendor_direct::spec("claude")
+                    .unwrap()
+                    .apple_team
+                    .to_string()
+            }),
+            anchor: crate::vendor_direct::Anchor::AnthropicOpenPgp,
+            build_date: crate::vendor_direct::BuildDate::parse("2026-09-25T01:39:37Z"),
+            verified_at: 1_790_526_112,
+        };
+        crate::vendor_direct::durable::write_durable(
+            &crate::vendor_direct::record_path(&dir).unwrap(),
+            &rec.record_bytes().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            verify_program(&l, "claude"),
+            VerifyOutcome::VendorRoot {
+                build,
+                vendor: "Anthropic".into(),
+                drift: None
+            }
+        );
+        std::fs::write(dir.join("bin").join(exe_name("claude")), b"tampered").unwrap();
+        assert!(
+            matches!(
+                verify_program(&l, "claude"),
+                VerifyOutcome::VendorRoot { drift: Some(_), .. }
+            ),
+            "a mutated vendor tree drifts"
+        );
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn verify_build_mismatch() {
         let l = layout("mismatch");
         let dir = install(&l, "ay", 18);
-        let root = crate::tree::tree_root(&dir).unwrap();
+        let root = signed_root(&dir, "ay");
         record(&l, "ay", Some(17), &root); // recorded for a different build
         assert_eq!(
             verify_program(&l, "ay"),
@@ -375,13 +482,43 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
+    /// The declared-mode record is what the walk folds where the inode stores no bits:
+    /// with it a Windows build attests to the very root a Unix producer signed; without
+    /// it the verdict is UNREADABLE (naming the re-stage), never a false Drift over a
+    /// tree whose every mode would read as `0`. On Unix the record is neither written
+    /// nor read, so removing it changes nothing — asserted, so the "not consulted where
+    /// the inode answers" half stays pinned too.
+    #[test]
+    fn a_missing_declared_mode_record_is_unreadable_only_where_the_inode_has_no_bits() {
+        let l = layout("modes-record");
+        let dir = install(&l, "ay", 18);
+        record(&l, "ay", Some(18), &signed_root(&dir, "ay"));
+        assert_eq!(verify_program(&l, "ay"), VerifyOutcome::Match { build: 18 });
+        crate::store::clear_declared_modes(&dir);
+        let after = verify_program(&l, "ay");
+        if crate::platform::HAS_POSIX_MODES {
+            assert_eq!(after, VerifyOutcome::Match { build: 18 });
+        } else {
+            match after {
+                VerifyOutcome::Unreadable { build: 18, error } => {
+                    assert!(
+                        error.contains("declared-mode record") && error.contains("re-stages"),
+                        "the verdict names the record and the way out: {error}"
+                    );
+                }
+                other => panic!("a build with no mode record must be unreadable, got {other:?}"),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
     #[test]
     fn verify_all_covers_active_programs() {
         let l = layout("all");
         let ay = install(&l, "ay", 18);
         let ny = install(&l, "ny", 9);
-        record(&l, "ay", Some(18), &crate::tree::tree_root(&ay).unwrap());
-        record(&l, "ny", Some(9), &crate::tree::tree_root(&ny).unwrap());
+        record(&l, "ay", Some(18), &signed_root(&ay, "ay"));
+        record(&l, "ny", Some(9), &signed_root(&ny, "ny"));
         // Drift ny.
         std::fs::write(ny.join("bin/ny"), b"tampered").unwrap();
         let outcomes: std::collections::BTreeMap<_, _> = verify_all(&l).into_iter().collect();

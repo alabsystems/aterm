@@ -2295,15 +2295,16 @@ impl PetBrain {
         let selection = world.selection_rect();
         for departure in &mut frame.departures {
             if departure.is_some_and(|d| {
-                let ghost = PetFrame {
-                    alpha: d.alpha,
-                    col: d.col,
-                    row: d.row,
-                    lift: 0.0,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    ..base
-                };
+                // Copying the frame before setting the ghost fields also avoids
+                // a stock-rustc MIR ICE for PetFrame's const-sized arrays on
+                // foreign targets (Linux ARM and Windows).
+                let mut ghost = base;
+                ghost.alpha = d.alpha;
+                ghost.col = d.col;
+                ghost.row = d.row;
+                ghost.lift = 0.0;
+                ghost.scale_x = 1.0;
+                ghost.scale_y = 1.0;
                 ghost
                     .body_px(sense.cell_w, sense.cell_h, sense.cols, sense.rows)
                     .is_none_or(|(x0, x1, y0, y1)| {

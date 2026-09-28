@@ -65,7 +65,12 @@ pub enum WallKind {
     /// continue`, `Prompt is too long`): `/compact` moves it, waiting does not.
     Context,
     /// The login is gone (`Not logged in · Please run /login`, `API Error:
-    /// 401 Invalid API key · Please run /login`): a human's browser moves it.
+    /// 401 Invalid API key · Please run /login`, `Login expired · Please run
+    /// /login` — the row Claude Code 2.1.281 writes as its `<synthetic>`
+    /// `authentication_failed` answer and draws as `⏺ Login expired · …`,
+    /// [`Placement::ErrorRow`]): a human's browser moves it, and until it
+    /// does every turn ends on it in milliseconds, whatever was typed. What
+    /// lifts it on the screen is [`login_restored`].
     Auth,
     /// Any other `API Error: …` the turn ended on. `code` is the HTTP status
     /// when the notice prints one; `retryable` is the vendor's own rule — 408,
@@ -132,6 +137,11 @@ pub enum Placement {
     Banner,
     /// The vendor row: a `⎿` block under the worker's last message.
     Gutter,
+    /// The vendor's error row: an `isApiErrorMessage` row Claude Code 2.1.281
+    /// draws with its `⏺` bullet in column 0, as the last thing said (`⏺
+    /// Login expired · Please run /login`; `crate::phase`'s
+    /// `error_row_notice`).
+    ErrorRow,
 }
 
 /// One wall, read from a screen.
@@ -345,6 +355,34 @@ fn api_error(head: &str) -> WallKind {
 #[must_use]
 pub fn wall(rows: &[String]) -> Option<Wall> {
     memory_wall(rows).or_else(|| crate::phase::notice(rows, &classify_wall))
+}
+
+/// Whether the screen says THE LOGIN IS BACK: the last thing said is the
+/// vendor's own word that a `/login` finished — `⎿  Login successful`, or
+/// `⎿  Login successful · account or organization changed` — hanging from
+/// the `❯ /login` a person typed (what Claude Code writes to the transcript
+/// as `<local-command-stdout>Login successful</local-command-stdout>`,
+/// measured 2026-09-27 at 14:33:36 UTC in the incident's session). It is what
+/// lifts a [`WallKind::Auth`] wall on the screen: the wall's row is no longer
+/// the last thing said, and this says why. A `/login` that did NOT finish —
+/// its dialog dismissed — leaves no such row, and a login finished in ANOTHER
+/// tab says nothing here: the wall's row stays the last thing said until
+/// something is typed into this one.
+#[must_use]
+pub fn login_restored(rows: &[String]) -> bool {
+    let Some(last) = crate::phase::last_said_index(rows) else {
+        return false;
+    };
+    let restored = rows[last]
+        .trim_start()
+        .strip_prefix('⎿')
+        .is_some_and(|out| out.trim_start().starts_with("Login successful"));
+    restored
+        && rows[..last]
+            .iter()
+            .rev()
+            .find(|r| !r.trim().is_empty() && crate::phase::leading_spaces(r) == 0)
+            .is_some_and(|r| r.trim_end() == "❯ /login")
 }
 
 /// How far above the composer's top rule [`memory_wall`] looks: the live
@@ -700,6 +738,171 @@ mod tests {
         assert!(!crate::phase::is_tool_call(
             "⏺ Suites are running (all three)."
         ));
+    }
+
+    /// THE LOGIN WALL OF 2026-09-27 (tab `s-b5cf2faabac5ce5127bd`): Claude
+    /// Code 2.1.281 answered every turn for nine hours with its synthetic
+    /// `authentication_failed` row, drawn `⏺ Login expired · Please run
+    /// /login` in column 0 — and main's reader read that screen idle with NO
+    /// wall (the same words under the `⎿` gutter it read as `auth`), so the
+    /// supervisor continued it and the upgrade announced into it. Read now
+    /// as the auth wall, from the vendor's error row: alone, over a done
+    /// row, wrapped by a narrow window, and in its other measured wording;
+    /// an `API Error` in the same form is its own kind. The screen stays
+    /// idle for every other reader (`worker_phase`, `limit_notice`).
+    #[test]
+    fn the_login_expired_error_row_is_the_auth_wall() {
+        use crate::prompt::fixtures::LOGIN_EXPIRED;
+        let r = screen(LOGIN_EXPIRED);
+        let w = wall(&r).expect("the login wall");
+        assert_eq!(w.kind, WallKind::Auth);
+        assert_eq!(w.placement, Placement::ErrorRow);
+        assert_eq!(w.message, "Login expired · Please run /login");
+        assert_eq!(w.reset, None);
+        assert_eq!(r[w.row], "⏺ Login expired · Please run /login");
+        assert_eq!(worker_phase(&r), Phase::Idle);
+        assert_eq!(limit_notice(&r), None);
+        let reading = crate::reader::read(Some("claude"), &r, None);
+        assert_eq!(reading.phase, Phase::Idle);
+        assert!(reading.phase_authoritative);
+        assert_eq!(reading.wall.map(|w| w.kind), Some(WallKind::Auth));
+        assert!(!login_restored(&r));
+
+        let at = w.row;
+        let with = |tail: &[&str]| {
+            let mut v = r.clone();
+            v.splice(at..=at, tail.iter().map(|s| (*s).to_string()));
+            v
+        };
+        for (name, v, kind) in [
+            (
+                "over a done row",
+                with(&[
+                    "⏺ Login expired · Please run /login",
+                    "",
+                    "✻ Worked for 0s · done 5:00 AM",
+                ]),
+                WallKind::Auth,
+            ),
+            (
+                "wrapped",
+                with(&["⏺ Login expired · Please run", "  /login"]),
+                WallKind::Auth,
+            ),
+            (
+                "the profile wording",
+                with(&[
+                    "⏺ Login expired · Run /login to sign in again, or re-authenticate your \
+                     Anthropic profile",
+                ]),
+                WallKind::Auth,
+            ),
+            (
+                "an API error in the same form",
+                with(&[&format!("⏺ {API_529}")]),
+                WallKind::Overloaded,
+            ),
+        ] {
+            let w = wall(&v).unwrap_or_else(|| panic!("{name}"));
+            assert_eq!((w.kind, w.placement), (kind, Placement::ErrorRow), "{name}");
+        }
+    }
+
+    /// NEGATIVE CONTROLS for the error row: the worker's own `⏺` words
+    /// (a sentence that names a login with no remedy joined on, one that
+    /// quotes the notice deep in it, a block longer than a notice), a tool
+    /// call that echoes it, a tool's output that prints it, and the row made
+    /// history — the person's `/login` finished under it (which
+    /// [`login_restored`] reads), or the worker answering after it — are no
+    /// wall. `login_restored` answers only the vendor's own `Login successful`
+    /// under the `❯ /login` a person typed: not an interrupted login, not the
+    /// words in a tool's output.
+    #[test]
+    fn the_workers_words_and_a_finished_login_are_no_login_wall() {
+        use crate::prompt::fixtures::LOGIN_EXPIRED;
+        let r = screen(LOGIN_EXPIRED);
+        let at = wall(&r).expect("the control").row;
+        let with = |tail: &[&str]| {
+            let mut v = r.clone();
+            v.splice(at..=at, tail.iter().map(|s| (*s).to_string()));
+            v
+        };
+        let login_back = with(&[
+            "⏺ Login expired · Please run /login",
+            "",
+            "❯ /login",
+            "  ⎿  Login successful",
+        ]);
+        assert_eq!(wall(&login_back), None, "the login is back");
+        assert!(login_restored(&login_back));
+        assert!(login_restored(&with(&[
+            "⏺ Login expired · Please run /login",
+            "",
+            "❯ /login",
+            "  ⎿  Login successful · account or organization changed",
+        ])));
+        for (name, v) in [
+            (
+                "a sentence with no remedy joined on",
+                with(&["⏺ Not logged in to gh, so nothing was pushed."]),
+            ),
+            (
+                "the notice quoted deep in a sentence",
+                with(&[
+                    "⏺ Pushed the branch; the other tab said Login expired · Please run /login",
+                ]),
+            ),
+            (
+                "a block longer than a notice",
+                with(&[
+                    "⏺ Login expired · Please run /login is what the other tab said,",
+                    "  and it said it again after the retry,",
+                    "  and a third time after the second,",
+                    "  so I stopped there.",
+                ]),
+            ),
+            (
+                "a tool call that echoes it",
+                with(&["⏺ Bash(echo 'Login expired · Please run /login')"]),
+            ),
+            (
+                "a tool's output",
+                with(&[
+                    "⏺ Bash(tail -1 peer.log)",
+                    "  ⎿  Login expired · Please run /login",
+                ]),
+            ),
+            (
+                "answered after it",
+                with(&[
+                    "⏺ Login expired · Please run /login",
+                    "",
+                    "❯ continue",
+                    "",
+                    "⏺ Back at it: the suites are running.",
+                ]),
+            ),
+        ] {
+            assert_eq!(wall(&v), None, "{name}");
+            assert!(!login_restored(&v), "{name}");
+        }
+        for (name, v) in [
+            (
+                "an interrupted login",
+                with(&[
+                    "⏺ Login expired · Please run /login",
+                    "",
+                    "❯ /login",
+                    "  ⎿  Login interrupted",
+                ]),
+            ),
+            (
+                "the words in a tool's output",
+                with(&["⏺ Bash(grep -c Login auth.log)", "  ⎿  Login successful"]),
+            ),
+        ] {
+            assert!(!login_restored(&v), "{name}");
+        }
     }
 
     /// What placement does NOT decide (module header): a `⎿` block under a

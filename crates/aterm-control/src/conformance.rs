@@ -1680,6 +1680,71 @@ mod tests {
         }
     }
 
+    /// A block's cwd reaches the wire through [`SessionHost::native_cwd`], in
+    /// BOTH `blocks` forms. The default host prints the engine's RFC 8089 path
+    /// verbatim (right on POSIX, and what every host printed before the seam);
+    /// a host that names paths its own way is what the reader sees — which is
+    /// how the Windows GUI prints `C:\Users\x` for pwsh's `file:///C:/Users//x`.
+    #[test]
+    fn a_block_cwd_is_printed_through_the_hosts_native_cwd() {
+        /// [`MemoryHost`] with only the path naming changed, marked so the
+        /// assertion cannot pass by coincidence on any platform.
+        struct Renaming(MemoryHost);
+        impl SessionHost for Renaming {
+            fn capabilities(&self) -> HostCapabilities {
+                self.0.capabilities()
+            }
+            fn sessions(&self) -> Vec<SessionEntry> {
+                self.0.sessions()
+            }
+            fn resolve(&self, selector: Selector<'_>) -> Option<u64> {
+                self.0.resolve(selector)
+            }
+            fn with_terminal<R>(&self, sid: u64, f: impl FnOnce(&Terminal) -> R) -> Option<R> {
+                self.0.with_terminal(sid, f)
+            }
+            fn with_terminal_mut<R>(
+                &self,
+                sid: u64,
+                f: impl FnOnce(&mut Terminal) -> R,
+            ) -> Option<R> {
+                self.0.with_terminal_mut(sid, f)
+            }
+            fn write_input(&self, sid: u64, bytes: &[u8]) -> Option<bool> {
+                self.0.write_input(sid, bytes)
+            }
+            fn request_redraw(&self, sid: u64) {
+                self.0.request_redraw(sid);
+            }
+            fn subscribe(&self, sid: u64) -> Box<dyn ChangeWait + '_> {
+                self.0.subscribe(sid)
+            }
+            fn clipboard_set(&self, text: &str) -> bool {
+                self.0.clipboard_set(text)
+            }
+            fn native_cwd<'p>(&self, reported: &'p str) -> std::borrow::Cow<'p, str> {
+                std::borrow::Cow::Owned(format!("native:{reported}"))
+            }
+        }
+
+        // What pwsh sends: an OSC 7 URI, then the prompt-start mark that
+        // records the block's cwd.
+        let prompt = b"\x1b]7;file:///C:/Users//x\x07\x1b]133;A\x07$ ";
+        let plain = MemoryHost::new(0);
+        plain.feed(prompt);
+        let listed = selection::cmd_blocks(&plain, 0, "");
+        assert!(listed.contains(" cwd=/C:/Users//x "), "{listed}");
+        let json = selection::cmd_blocks_json(&plain, 0, "");
+        assert!(json.contains("\"cwd\":\"/C:/Users//x\""), "{json}");
+
+        let renaming = Renaming(MemoryHost::new(0));
+        renaming.0.feed(prompt);
+        let listed = selection::cmd_blocks(&renaming, 0, "");
+        assert!(listed.contains(" cwd=native:/C:/Users//x "), "{listed}");
+        let json = selection::cmd_blocks_json(&renaming, 0, "");
+        assert!(json.contains("\"cwd\":\"native:/C:/Users//x\""), "{json}");
+    }
+
     /// ONE contract broken, everything else honest — so every failing arm of the
     /// roster/resolve/write checks can be WATCHED going red rather than merely
     /// written. A check nobody has seen fire is decoration.

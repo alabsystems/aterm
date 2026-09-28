@@ -37,7 +37,7 @@
 //!
 //! The host seam, exactly as `scrub_gaps.rs` drives it: a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled as
-//! `app_render.rs`'s LOCK A samples them, fed to `CursorGlow`, ticked on a
+//! `app_render.rs`'s frame hold samples them, fed to `CursorGlow`, ticked on a
 //! 16 ms frame train. The owner's own line is typed at 12 cps into an
 //! Ink-shaped composer (whole-line redraw inside a DECTCEM bracket, split so
 //! a present lands while the caret is hidden) and into a Claude-Code-shaped
@@ -252,7 +252,7 @@ impl Host {
         self.now.saturating_duration_since(self.t0).as_millis() as u64
     }
 
-    /// EXACTLY LOCK A, then the tick.
+    /// EXACTLY the frame hold, then the tick.
     fn frame(&mut self) {
         let c = self.term.cursor();
         let cur = self.term.cursor_visible().then_some((c.row, c.col));

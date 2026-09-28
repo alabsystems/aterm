@@ -3484,6 +3484,12 @@ impl WordDecorations {
         }
     }
 
+    /// The host's last [`Self::set_presentable`] verdict.
+    #[must_use]
+    pub fn presentable(&self) -> bool {
+        !self.away
+    }
+
     /// The versioned atlas paired with this frame's `free_sprites` output
     /// (free-overlay Phase 4: the baker atlas — exact-size tiles, art at tile
     /// row 0). Hosts copy it into `RenderInput::free_atlas` only when free
@@ -21128,6 +21134,171 @@ mod tests {
         );
     }
 
+    /// The live burst windows, window-wide — the bound pane's episodes AND every
+    /// parked shard's — projected onto `SupernovaBurstMutex`'s variables through
+    /// the engine's own mutex predicate (`burst_mutex_end`). A window that ended
+    /// by `now` is retired.
+    fn burst_mutex_projection(
+        wd: &WordDecorations,
+        now: Instant,
+    ) -> std::collections::BTreeMap<&'static str, i64> {
+        let (mut supers, mut classics) = (0i64, 0i64);
+        for ep in wd
+            .persist
+            .values()
+            .chain(wd.parked.values().flat_map(|p| p.persist.values()))
+        {
+            if burst_mutex_end(ep).is_some_and(|end| now < end) {
+                match ep.burst_kind {
+                    Some(BurstKind::SuperNova) => supers += 1,
+                    _ => classics += 1,
+                }
+            }
+        }
+        let funded = supers * supernova::S_MAX_BOUND as i64 + classics * 392;
+        [
+            ("supers", supers),
+            ("classics", classics),
+            ("funded", funded),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    /// Tier-1 bind of `aterm_spec::derive::supernova_burst_mutex_model()`: drive
+    /// the real `super_prepass`/`nova_prepass` grants across a bound pane and a
+    /// PARKED one, and check every grant the engine made against the model's
+    /// `action_enabled` at the state it was made in (retirements first, then
+    /// supernova grants, then classic ones — the engine's own pass order), and
+    /// every observed state against the model's invariants.
+    #[test]
+    fn real_burst_grants_conform_to_the_supernova_mutex_model() {
+        let model = aterm_spec::derive::supernova_burst_mutex_model();
+        let check = |wd: &mut WordDecorations,
+                     now: Instant,
+                     c: &DecoConfig,
+                     g: EffectGeom,
+                     what: &str|
+         -> std::collections::BTreeMap<&'static str, i64> {
+            let mut state = burst_mutex_projection(wd, now);
+            tick_nova(wd, now, c, g, None, None);
+            let after = burst_mutex_projection(wd, now);
+            for (action, var) in [("IgniteSuper", "supers"), ("IgniteClassic", "classics")] {
+                for _ in state[var]..after[var] {
+                    assert!(
+                        model.action_enabled(action, &state),
+                        "{what}: the engine granted {action} at {state:?}, which the \
+                         mutex model does not enable"
+                    );
+                    assert!(model.fire(action, &mut state), "{what}: {action}");
+                }
+            }
+            assert_eq!(state, after, "{what}: a tick only grants (time retires)");
+            let env = model.eval_env(&after);
+            for inv in &model.invariants {
+                assert!(
+                    model.check_invariant_in(inv, &env),
+                    "{what}: {} violated by {after:?}",
+                    inv.name
+                );
+            }
+            after
+        };
+
+        let (table, lex_frag) = custom_table(
+            "[[sparkle_words.custom]]\nwords = [\"boom\"]\nburst = { kind = \"nova\" }\n",
+        );
+        let lexicon = Lexicon::with_languages_and_override(&["en"], Some(&lex_frag))
+            .expect("override parses");
+        let mut c = cfg_rainbow(100);
+        c.spec_table = table;
+        let g = EffectGeom {
+            rows: 8,
+            ..geom20()
+        };
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+
+        // Pane 1: two supernova words and a classic one. Only one supernova may
+        // hold the mutex, and the classic defers behind it.
+        let mut wd = WordDecorations::default();
+        wd.bind_pane(1, (0, 0));
+        let mut term_a = Terminal::new(8, 20);
+        term_a.process(b"fuck\r\nfuck it\r\nboom");
+        wd.rescan(&term_a, 8, 20, &lexicon, &c, 1, t0);
+        let s = check(&mut wd, t0, &c, g, "pane 1 first tick");
+        assert_eq!(
+            (s["supers"], s["classics"]),
+            (1, 0),
+            "one supernova holds the mutex"
+        );
+        let win = |wd: &WordDecorations| {
+            wd.persist
+                .values()
+                .chain(wd.parked.values().flat_map(|p| p.persist.values()))
+                .filter_map(burst_mutex_end)
+                .max()
+                .expect("a live window")
+        };
+        let first_end = win(&wd);
+
+        // Park pane 1 mid-window; pane 2 has a supernova and a classic of its own.
+        wd.bind_pane(2, (400, 0));
+        let mut term_b = Terminal::new(8, 20);
+        term_b.process(b"oh fuck\r\nboom");
+        wd.rescan(&term_b, 8, 20, &lexicon, &c, 1, at(300));
+        let s = check(&mut wd, at(300), &c, g, "pane 2 behind a PARKED supernova");
+        assert_eq!(
+            (s["supers"], s["classics"]),
+            (1, 0),
+            "both of pane 2's grants defer"
+        );
+
+        // The parked window ends: pane 2's supernova takes the mutex, its classic
+        // still waits (super_prepass runs first).
+        let t1 = first_end + Duration::from_millis(100);
+        let s = check(&mut wd, t1, &c, g, "pane 2 after the parked window");
+        assert_eq!(
+            (s["supers"], s["classics"]),
+            (1, 0),
+            "pane 2's supernova granted"
+        );
+        let second_end = win(&wd);
+
+        // Past pane 2's supernova: the classic finally ignites.
+        let t2 = second_end + Duration::from_millis(100);
+        let s = check(&mut wd, t2, &c, g, "pane 2's classic after its supernova");
+        assert_eq!(
+            (s["supers"], s["classics"]),
+            (0, 1),
+            "the mutex released the nova"
+        );
+
+        // Negative control: the grant shapes the engine must never make are
+        // shapes the model rejects, so the checks above are not vacuous.
+        let state = |supers: i64, classics: i64| {
+            [
+                ("supers", supers),
+                ("classics", classics),
+                ("funded", supers * 900 + classics * 392),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        assert!(
+            !model.action_enabled("IgniteSuper", &state(1, 0)),
+            "a second supernova"
+        );
+        assert!(
+            !model.action_enabled("IgniteSuper", &state(0, 1)),
+            "a supernova beside a classic"
+        );
+        assert!(
+            !model.action_enabled("IgniteClassic", &state(1, 0)),
+            "a classic beside a supernova"
+        );
+    }
+
     /// §3.2 selection × wash: full-width detonation wash rows are SPLIT
     /// around the selected span (never washed over, never wholesale-deleted).
     #[test]
@@ -23267,7 +23438,7 @@ mod tests {
         );
         assert!(body.x >= 0 && body.x + i32::from(body.w) <= 210);
 
-        // A host-side LOCK A/B divergence has no new asset or geometry key to
+        // A host-side coordinate-space seam has no new asset or geometry key to
         // force a reset, so its explicit rebase seam must settle the still-live
         // fold token rather than replaying it on the next coherent frame.
         let torn_at = reentered_at + Duration::from_millis(160);

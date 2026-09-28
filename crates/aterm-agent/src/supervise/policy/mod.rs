@@ -20,6 +20,9 @@
 //!   directive of 2026-09-25); what a person has begun answering, and what
 //!   aterm-phase did not read whole, is escalated. [`approval::decide`] hands
 //!   every question to it.
+//! * [`git_config`] — what a git read would load that can run a program:
+//!   the read-only rule's check of the machine a git read runs on (the owner
+//!   ruling of 2026-09-25).
 //! * [`rm_breaker`] — the resolver behind the approval rule for the vendor's
 //!   rm circuit breaker: where every `rm` operand on a line points.
 //! * [`guard`] — the press guard that binds a keystroke to the row that was
@@ -29,6 +32,7 @@
 //!   or escalate).
 
 pub mod approval;
+pub mod git_config;
 pub mod guard;
 pub mod question;
 pub mod rm_breaker;
@@ -42,5 +46,6 @@ pub use approval::{
     decline, decline_step, decline_text, default_secrets, footer_mode, rm_breaker_label,
     roots_from_config,
 };
+pub use git_config::{GitView, WorkerEnv};
 pub use guard::{key_args, row_guard, server_fences_gen, server_fences_send};
 pub use question::{MAX_QUESTION_FOCUS_STEPS, RULE_ANSWER_RECOMMENDED, answer_question};

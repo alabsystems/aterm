@@ -11861,12 +11861,14 @@ impl Renderer {
     /// framebuffer's top (transmittance) byte — a canvas host converts that to
     /// RGBA alpha so the page shows through. SGR-colored bg cells, the selection
     /// band and glyph fg pixels stay opaque so text keeps its contrast
-    /// (Ghostty/iTerm rule). NOTE (M5 partial): that transmittance byte — the
-    /// alpha [`vibrancy::bg_quad_alpha`] defines — is the whole present-side
-    /// story; the native GPU swapchain composites `Opaque` and the window is not
-    /// created transparent, so on native a translucent value does NOT yet
-    /// composite to real see-through glass (the host warns once) — only a canvas
-    /// host realizes it. Appearance-only: the host must force a full repaint
+    /// (Ghostty/iTerm rule). Where it composites: the GPU backend realizes it as
+    /// real see-through glass (the alpha [`vibrancy::bg_quad_alpha`] defines,
+    /// presented through a non-opaque swapchain — wgpu's `PostMultiplied`, the
+    /// Metal arm's `CALayer.opaque = false` — over the window's
+    /// `NSVisualEffectView`; see aterm-gpu `set_background_opacity`); a canvas
+    /// host converts the transmittance byte to RGBA alpha; only the CPU
+    /// softbuffer surface stays solid, and the host warns once there.
+    /// Appearance-only: the host must force a full repaint
     /// (no cell changes). A non-finite request fails safe to solid (M5: keeps
     /// NaN out of [`bg_transmittance`](Self::bg_transmittance)).
     pub fn set_background_opacity(&mut self, opacity: f32) {
@@ -13691,9 +13693,10 @@ impl Renderer {
                     let (m, b) = face.rasterize(ch, self.px);
                     (m.width, m.height, m.xmin, m.ymin, m.advance_width, b)
                 };
-                // CRISPNESS: stem-darken the coverage before it is blended (a no-op
-                // identity LUT once linear-light blending lands; retained as the hook
-                // for the optional aesthetic thickener). Edits the SHARED coverage
+                // CRISPNESS: stem-darken the coverage before it is blended (the
+                // identity LUT by default — linear-light blending lives in `blend`
+                // and the GPU's sRGB target; non-identity only when `stem_gamma`
+                // requests the aesthetic thickener). Edits the SHARED coverage
                 // bytes the GPU atlas pulls, so CPU and GPU stay in lockstep.
                 stem_darken(&mut bytes, &self.stem_lut);
                 // Apply only the synthetic bits the chosen face did NOT supply: a real
@@ -24667,17 +24670,11 @@ pub fn ribbon_lift_profile(d: f32, lift_span: f32, dn: f32) -> f32 {
 /// emitted one way and dropped the other), and the steps a degenerate profile
 /// has by construction (a coreless shouldered one, `core == 0` with
 /// `shoulder < 1`, at its spine; a lifted one whose `lift_span` lerps through
-/// zero). Inside a reversed segment the walk therefore runs tail → head.
-/// Head-first shedding is exact at SEGMENT granularity (every segment nearer
-/// the head than the one the budget ran out in is whole, nothing beyond that
-/// one is emitted), and the one irregularity a cut can leave is inside that
-/// segment, where what survives is its FAR end — a gap never longer than the
-/// segment. A segment of major length `step + e` tiles as a `step` slab and
-/// then at most `ceil(e)` px of trailing slabs, so a producer keeping its
-/// segments within `e` of `step` gets a cut at worst one slab and `ceil(e)`
-/// px short of pixel-exact: the meteor's `e` is its stride's rounding, half a
-/// pixel, plus the ~1 % of the stride its station cap adds on flights past 95
-/// stations — a pixel, two on the longest flights.
+/// zero). An uncapped call keeps the historical lower-to-upper emission order,
+/// including its quad bytes. If the budget cuts a reversed path, that partial
+/// call is discarded and retried over the SAME slabs from the head toward the
+/// tail. The surviving light stays attached to the head instead of leaving a
+/// dark slab between the caret and the ribbon.
 ///
 /// **EVERY PIXEL COLUMN HAS ONE OWNER.** Consecutive segments share their
 /// boundary vertex bit for bit, and the tiling takes it half-open at its
@@ -24722,10 +24719,34 @@ pub fn ribbon_beam(
     max_quads: usize,
     blend: GlowBlend,
 ) -> bool {
+    let start = out.len();
+    if ribbon_beam_ordered(out, clip, verts, shoulder, step, max_quads, blend, false) {
+        return true;
+    }
+    // The ordinary, uncapped path keeps its historical quad order exactly.
+    // Only a truncated run needs the reversed segment's head-side slabs first.
+    if !verts.windows(2).any(|w| w[1].x < w[0].x) {
+        return false;
+    }
+    out.truncate(start);
+    ribbon_beam_ordered(out, clip, verts, shoulder, step, max_quads, blend, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ribbon_beam_ordered(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+    head_first_reversed: bool,
+) -> bool {
     if verts.len() < 2 || clip.cell_h <= 0 {
         return true;
     }
-    let step = step.max(1) as i32;
+    let step = step.clamp(1, i32::MAX as usize) as i32;
     for w in verts.windows(2) {
         let (a, b) = (w[0], w[1]);
         let span = b.x - a.x;
@@ -24749,8 +24770,17 @@ pub fn ribbon_beam(
         // unchanged byte for byte, and a fractional producer keeps every slab
         // it had except the duplicated head column of each segment.
         let (start, end) = (a.x.min(b.x).ceil() as i32, a.x.max(b.x).ceil() as i32);
-        let mut p = start;
-        while p < end {
+        let width = end - start;
+        if width <= 0 {
+            continue;
+        }
+        let slabs = (width - 1) / step + 1;
+        let reverse = head_first_reversed && span < 0.0;
+        let mut p = start + if reverse { (slabs - 1) * step } else { 0 };
+        let advance = if reverse { -step } else { step };
+        for i in 0..slabs {
+            // Preserve the lower-anchored slab partition and its screen-anchored
+            // dither. Only a capped retry walks reversed segments from the head.
             let len = step.min(end - p).max(1);
             // The slab's CENTRE on the segment, for the SHAPE terms (spine,
             // reach, core, lift), the coverage and the admission gate:
@@ -24882,7 +24912,9 @@ pub fn ribbon_beam(
                     }
                 }
             }
-            p += len;
+            if i + 1 < slabs {
+                p += advance;
+            }
         }
     }
     true
@@ -24972,16 +25004,9 @@ pub fn ribbon_beam(
 /// by the same ordinals — bit-identical when the lerps are rounding-free,
 /// otherwise within one level of each truncation (the lerps being the same
 /// reals computed in the other order), with the three gate exceptions the
-/// x-major twin documents. Tiling always starts at the lower coordinate, so
-/// inside a reversed segment the walk runs tail → head and head-first
-/// shedding is exact at SEGMENT granularity — the segments nearer the head
-/// than the one the budget ran out in are whole, nothing beyond it is
-/// emitted, and the one irregularity a cut can leave is inside that segment
-/// (its far end survives; a gap never longer than the segment). A segment of
-/// length `step + e` tiles as a `step` slab and at most `ceil(e)` px of
-/// trailing slabs, so the meteor's — `step` up to its stride's rounding and
-/// station cap, a pixel or two over — leave a cut at worst one slab and that
-/// much short of pixel-exact.
+/// x-major twin documents. An uncapped call keeps historical quad order; a
+/// capped reversed path retries those same lower-anchored slabs from its head,
+/// so a far slab cannot survive while the slab next to the head goes black.
 #[allow(clippy::too_many_arguments)]
 pub fn ribbon_beam_v(
     out: &mut Vec<GlowQuad>,
@@ -24992,10 +25017,32 @@ pub fn ribbon_beam_v(
     max_quads: usize,
     blend: GlowBlend,
 ) -> bool {
+    let start = out.len();
+    if ribbon_beam_v_ordered(out, clip, verts, shoulder, step, max_quads, blend, false) {
+        return true;
+    }
+    if !verts.windows(2).any(|w| w[1].x < w[0].x) {
+        return false;
+    }
+    out.truncate(start);
+    ribbon_beam_v_ordered(out, clip, verts, shoulder, step, max_quads, blend, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ribbon_beam_v_ordered(
+    out: &mut Vec<GlowQuad>,
+    clip: BeamClip,
+    verts: &[RibbonVertex],
+    shoulder: f32,
+    step: usize,
+    max_quads: usize,
+    blend: GlowBlend,
+    head_first_reversed: bool,
+) -> bool {
     if verts.len() < 2 || clip.cell_h <= 0 {
         return true;
     }
-    let step = step.max(1) as i32;
+    let step = step.clamp(1, i32::MAX as usize) as i32;
     for w in verts.windows(2) {
         let (a, b) = (w[0], w[1]);
         let span = b.x - a.x;
@@ -25012,8 +25059,17 @@ pub fn ribbon_beam_v(
         // and it exists for the same reason — the bed composites source-over,
         // and a doubly-owned line composites ~1.8x bright.
         let (start, end) = (a.x.min(b.x).ceil() as i32, a.x.max(b.x).ceil() as i32);
-        let mut p = start;
-        while p < end {
+        let width = end - start;
+        if width <= 0 {
+            continue;
+        }
+        let slabs = (width - 1) / step + 1;
+        let reverse = head_first_reversed && span < 0.0;
+        let mut p = start + if reverse { (slabs - 1) * step } else { 0 };
+        let advance = if reverse { -step } else { step };
+        for i in 0..slabs {
+            // Match the x-major twin: partition and dither stay pinned to the
+            // lower coordinate; only a capped retry walks from the head.
             let len = step.min(end - p).max(1);
             // The slab's CENTRE on the segment: sampling at the leading edge
             // would bias every ramp half a slab toward the tail.
@@ -25126,7 +25182,9 @@ pub fn ribbon_beam_v(
                     }
                 }
             }
-            p += len;
+            if i + 1 < slabs {
+                p += advance;
+            }
         }
     }
     true
@@ -37927,6 +37985,123 @@ mod ribbon_beam_tests {
         assert!(none.is_empty());
     }
 
+    /// A capped frame can arrive at a reversed segment with only one slab's
+    /// room left. At the owner's Retina cell height, the survivor must touch
+    /// the segment's head; otherwise a black slab opens between the caret and
+    /// the older, still-lit ribbon. Keep the actual 10,240-quad ceiling here:
+    /// the leading quads stand for already admitted, newer rows.
+    #[test]
+    fn a_near_cap_reversed_segment_keeps_the_slab_next_to_its_head() {
+        const BUDGET: usize = 10_240;
+        const STEP: usize = 10;
+        let clip = BeamClip::grid(4_320, 3_360, 56);
+        let verts = [
+            vert(90.0, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+            vert(60.0, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+        ];
+        type Extent = fn(&GlowQuad) -> (u16, u16);
+        let beams: [(&str, Beam, Extent); 2] = [
+            ("x-major", ribbon_beam, |q| (q.x, q.w)),
+            ("y-major", ribbon_beam_v, |q| (q.y, q.h)),
+        ];
+        for (name, beam, extent) in beams {
+            let mut full = Vec::new();
+            assert!(beam(
+                &mut full,
+                clip,
+                &verts,
+                1.0,
+                STEP,
+                BUDGET,
+                GlowBlend::Over,
+            ));
+            let head_slab = full.iter().filter(|q| extent(q).0 == 80).count();
+            assert!(
+                head_slab > 30,
+                "fixture must paint a Retina-sized slab ({name})"
+            );
+            let already_admitted = BUDGET - head_slab - 1;
+            let mut near_cap = vec![GlowQuad::default(); already_admitted];
+            assert!(
+                !beam(
+                    &mut near_cap,
+                    clip,
+                    &verts,
+                    1.0,
+                    STEP,
+                    BUDGET,
+                    GlowBlend::Over,
+                ),
+                "fixture must saturate ({name})"
+            );
+            let kept = &near_cap[already_admitted..];
+            assert!(near_cap.len() <= BUDGET);
+            assert!(
+                kept.iter().any(|q| {
+                    let (p, len) = extent(q);
+                    p <= 85 && 85 < p + len
+                }),
+                "the slab next to the head at 90 went black ({name})"
+            );
+            assert!(
+                kept.iter().all(|q| {
+                    let (p, len) = extent(q);
+                    !(p <= 65 && 65 < p + len)
+                }),
+                "a capped frame kept the far slab before the head ({name})"
+            );
+        }
+    }
+
+    /// Changing the walk must not change a full mark's pixels. The fractional
+    /// endpoints give the lower-anchored partition a one-pixel last slab;
+    /// stepping backward from the upper endpoint would shift the other slabs
+    /// and their screen-anchored dither, failing this exact multiset check.
+    #[test]
+    fn a_reversed_walk_keeps_the_uncapped_slab_partition_bit_identical() {
+        let clip = BeamClip::grid(4_320, 3_360, 56);
+        let ascending = [
+            vert(60.5, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+            vert(91.5, 150.0, 36.0, 24.0, 0x00FF_8040, 200.0),
+        ];
+        let descending = [ascending[1], ascending[0]];
+        let beams: [(&str, Beam); 2] = [("x-major", ribbon_beam), ("y-major", ribbon_beam_v)];
+        for (name, beam) in beams {
+            let mut forward = Vec::new();
+            let mut reverse = Vec::new();
+            assert!(beam(
+                &mut forward,
+                clip,
+                &ascending,
+                1.0,
+                10,
+                10_240,
+                GlowBlend::Over,
+            ));
+            assert!(beam(
+                &mut reverse,
+                clip,
+                &descending,
+                1.0,
+                10,
+                10_240,
+                GlowBlend::Over,
+            ));
+            assert!(
+                forward.len() > 100,
+                "fixture must paint a real mark ({name})"
+            );
+            let key = |q: &GlowQuad| {
+                (
+                    q.row, q.x, q.y, q.w, q.h, q.color, q.alpha, q.color2, q.alpha2,
+                )
+            };
+            forward.sort_unstable_by_key(key);
+            reverse.sort_unstable_by_key(key);
+            assert_eq!(forward, reverse, "uncapped pixels moved ({name})");
+        }
+    }
+
     /// **THE TWO AXES ARE EXACT TRANSPOSES OF ONE ANOTHER.** [`ribbon_beam_v`]
     /// exists to draw the paths [`ribbon_beam`] refuses (spec D15), and the
     /// only thing that makes a second rasterizer trustworthy is that it is the
@@ -38750,17 +38925,14 @@ mod ribbon_beam_tests {
 
     /// **A SATURATED BUDGET ON A DOWNWARD FLIGHT SHEDS BY WHOLE SEGMENTS.**
     /// The twin tiles a reversed segment (`b.x < a.x`: a head-first DOWNWARD
-    /// flight, `x` being device Y) from its lower coordinate, so head-first
-    /// shedding is exact at SEGMENT granularity and no finer — the law the
-    /// function documents. Swept over EVERY saturating cap: the primitive
-    /// reports the cut; the cut is a prefix; every segment nearer the head
+    /// flight, `x` being device Y) from its head. Swept over EVERY saturating
+    /// cap: the primitive reports the cut; the cut is a prefix of the
+    /// head-first retry (the uncapped call keeps its historical quad order);
+    /// every segment nearer the head
     /// than the one the budget ran out in is whole; nothing beyond that
-    /// segment is emitted; and what survives of it is ONE contiguous run, so
-    /// the gap is confined to that one segment. (WHERE inside the segment the
-    /// run lies is the lower-coordinate walk's business and deliberately not
-    /// pinned — a producer keeps its segments near `step`, as the meteor does,
-    /// so the difference is one slab plus the excess, the rasterizer doc's
-    /// `step + e` bound.)
+    /// segment is emitted; and what survives of it is ONE contiguous run
+    /// attached to the head, so no dark slab opens between the kept light
+    /// and that segment's head.
     #[test]
     fn a_saturated_budget_on_a_downward_flight_sheds_by_whole_segments() {
         // Head at device y = 64, tail at 0: four 16-px segments of four 4-px
@@ -38780,6 +38952,18 @@ mod ribbon_beam_tests {
             100_000,
             GlowBlend::Add
         ));
+        let mut head_first = Vec::new();
+        assert!(super::ribbon_beam_v_ordered(
+            &mut head_first,
+            clip(),
+            &verts,
+            1.0,
+            4,
+            100_000,
+            GlowBlend::Add,
+            true,
+        ));
+        assert_eq!(head_first.len(), full.len());
         let mut inside_a_segment = 0;
         for cap in 1..full.len() {
             let mut cut = Vec::new();
@@ -38790,8 +38974,8 @@ mod ribbon_beam_tests {
             assert!(cut.len() <= cap && cut.len() < full.len());
             assert_eq!(
                 cut.as_slice(),
-                &full[..cut.len()],
-                "cap {cap}: not a prefix"
+                &head_first[..cut.len()],
+                "cap {cap}: not a head-first prefix"
             );
             let lit: std::collections::BTreeSet<i32> = cut
                 .iter()
@@ -38815,6 +38999,11 @@ mod ribbon_beam_tests {
                             n,
                             hi - lo + 1,
                             "cap {cap}: the cut segment's survivors are not one run: {rows:?}"
+                        );
+                        assert_eq!(
+                            hi,
+                            (k + 1) * SEG - 1,
+                            "cap {cap}: the partial segment must reach its head: {rows:?}"
                         );
                         inside_a_segment += 1;
                     }

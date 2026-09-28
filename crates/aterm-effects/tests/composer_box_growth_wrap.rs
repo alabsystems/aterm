@@ -22,7 +22,7 @@
 //!
 //! Every law below runs at the HOST seam — a real
 //! `aterm_core::terminal::Terminal` driven byte for byte, its rows sampled
-//! exactly as `app_render.rs`'s LOCK A samples them, fed through
+//! exactly as `app_render.rs`'s frame hold samples them, fed through
 //! `CursorGlow::observe_row` / `observe_ribbon_row` / `ribbon_rows` and
 //! ticked through `CursorGlow::tick` at 16.7 ms, keys at 60 ms — and reads
 //! the rows' COVERAGE CENSUS frame by frame, the helpers copied from
@@ -215,7 +215,7 @@ impl Host {
         h
     }
 
-    /// EXACTLY LOCK A, then the tick: sample the cursor, the repaint blink,
+    /// EXACTLY the frame hold, then the tick: sample the cursor, the repaint blink,
     /// the caret row's probe, and the rows the resident ribbon wants — all
     /// from the terminal AFTER the last `process` — then advance the engine
     /// one frame. (`tests/new_line_fade.rs` `Host::frame`, verbatim.)

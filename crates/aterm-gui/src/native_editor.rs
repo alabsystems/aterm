@@ -2584,7 +2584,7 @@ mod tests {
     }
 
     fn editor(text: &str) -> (DocumentStore, EditorWorkspace, EditorBufferView, DocumentId) {
-        let mut store = DocumentStore::new();
+        let mut store = DocumentStore::for_test();
         let document = store.open("mem://editor".into(), text.into());
         let mut workspace = EditorWorkspace::new();
         let view = workspace

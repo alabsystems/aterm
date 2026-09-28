@@ -9,11 +9,11 @@ use std::io;
 
 use crate::Limits;
 
-/// Apply every requested limit BEST-EFFORT: a resource the OS does not support
-/// (e.g. `RLIMIT_AS` on macOS) must NOT prevent the limits that DO work
-/// (`RLIMIT_NOFILE`) from being installed. Every limit is attempted; the first
-/// per-limit error is returned only after all have been tried, so one
-/// unsupported resource can never silently leave the child unconfined.
+/// Apply every requested limit BEST-EFFORT: a limit the OS refuses (e.g. a
+/// 16 GiB `RLIMIT_AS` on macOS, below what every process already maps) must NOT
+/// prevent the limits that DO work (`RLIMIT_NOFILE`) from being installed. Every
+/// limit is attempted; the first per-limit error is returned only after all have
+/// been tried, so one refused limit can never silently leave the child unconfined.
 pub(crate) fn apply_limits(limits: &Limits) -> io::Result<()> {
     let mut first_err: Option<io::Error> = None;
     for (resource, value) in [

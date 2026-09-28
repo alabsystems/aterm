@@ -27,6 +27,16 @@
 //! rewrite or atomic replacement therefore cannot leave the process stale on
 //! macOS/Linux without continuously hashing tens of MiB of theme data.
 //!
+//! THE PATH FEEDS ride the config's own edge. The files `aterm.toml` names by
+//! path whose content is applied state — the Sparkle Words lexicon, Toy Packs
+//! and Trail Packs ([`crate::app_config::Config::path_feed_paths`]) — are
+//! stamped beside it, metadata only, on the same 500 ms poll; a change to one
+//! of them re-posts the current config observation, and the UI's existing
+//! reload admission re-reads the feeds and compares their content
+//! fingerprints (`refresh_path_feeds`). So editing only the lexicon hot-reloads
+//! it, a `touch` that changes no byte stays a no-op, and there is one reload
+//! path, not two.
+//!
 //! Two hard rules borrowed from the notification/clipboard threads:
 //!
 //! 1. **Never block the UI thread.** The watcher performs bounded file
@@ -300,6 +310,13 @@ pub(crate) fn spawn(
             .as_deref()
             .and_then(|path| config_path_stamp(path).ok());
         let initial_config = path.as_deref().map(config_file_observation);
+        // The path feeds the observed config names, and their metadata stamp
+        // taken BEFORE the UI reads them: a later edit is always an edge.
+        let mut feed_paths = match initial_config.as_ref() {
+            Some(Ok(observation)) => feed_paths_of(&observation.text).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        let mut last_feed_stamp = path_feed_stamp(&feed_paths);
         let mut config_needs_retry = initial_config.as_ref().is_some_and(Result::is_err);
         let mut config_failure = FailureLatch::default();
         if let Some(Err(error)) = initial_config.as_ref()
@@ -350,15 +367,27 @@ pub(crate) fn spawn(
                         }
                     }
                     Ok(stamp) => {
+                        // A path feed moved under an unchanged `aterm.toml`: the
+                        // same edge as the config's own, so the current
+                        // observation is re-posted and admission re-reads feeds.
+                        let feeds_moved = path_feed_stamp(&feed_paths) != last_feed_stamp;
                         let candidate = prepare_config_edge_with(
                             last_config_stamp.as_ref(),
                             stamp,
-                            config_needs_retry,
+                            config_needs_retry || feeds_moved,
                             || config_file_observation(path),
                         );
                         if let Some((stamp, observation)) = candidate {
                             match observation {
                                 Ok(observation) => {
+                                    // Re-derive the feed set from THIS text and stamp it
+                                    // before posting, so an edit racing the UI's read is
+                                    // the next poll's edge. An unparseable config keeps
+                                    // the last known set (admission rejects the text).
+                                    if let Some(paths) = feed_paths_of(&observation.text) {
+                                        feed_paths = paths;
+                                    }
+                                    last_feed_stamp = path_feed_stamp(&feed_paths);
                                     // Acknowledge only after the exact sampled generation is
                                     // enqueued. The UI never races a second pathname read.
                                     if proxy
@@ -493,6 +522,39 @@ fn post_status(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigPathStamp(u64);
+
+/// The path feeds a config TEXT names (`Config::path_feed_paths`), or `None`
+/// when the text does not parse.
+fn feed_paths_of(text: &str) -> Option<Vec<std::path::PathBuf>> {
+    crate::app_config::Config::parse(text)
+        .ok()
+        .map(|config| config.path_feed_paths())
+}
+
+/// Metadata-only stamp over the path feeds: the logical entry, a symlink's
+/// target and the followed file for each, or its absence. No feed byte is
+/// opened here — the content fingerprint is admission's job.
+fn path_feed_stamp(paths: &[std::path::PathBuf]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    "aterm-path-feed-metadata-v1".hash(&mut hasher);
+    for path in paths {
+        path.hash(&mut hasher);
+        match std::fs::symlink_metadata(path) {
+            Ok(logical) => {
+                hash_file_metadata(&logical, &mut hasher);
+                if logical.file_type().is_symlink() {
+                    std::fs::read_link(path).ok().hash(&mut hasher);
+                }
+            }
+            Err(_) => "absent".hash(&mut hasher),
+        }
+        match std::fs::metadata(path) {
+            Ok(followed) => hash_file_metadata(&followed, &mut hasher),
+            Err(_) => "target-absent".hash(&mut hasher),
+        }
+    }
+    hasher.finish()
+}
 
 /// Run the exact content observation only for a metadata edge or a prior
 /// observation failure. Keeping this seam tiny makes the healthy-idle no-read
@@ -882,9 +944,101 @@ mod tests {
         FailureLatch, POLL_INTERVAL, THEME_IDLE_POLL_INTERVAL, ThemePollSchedule, WatchFailure,
         WatchFailureKind, WatchStatusEvent, WatchStatusState, WatchTarget,
         coherent_theme_sample_with, config_failure_kind, config_file_observation,
-        config_file_stamp, config_path_stamp, initial_config_observation_changed,
-        prepare_config_edge_with, prepare_theme_edge_with, theme_directory_stamp,
+        config_file_stamp, config_path_stamp, feed_paths_of, initial_config_observation_changed,
+        path_feed_stamp, prepare_config_edge_with, prepare_theme_edge_with, theme_directory_stamp,
     };
+
+    /// EDITING ONLY THE LEXICON HOT-RELOADS IT
+    /// (`docs/sparkle-words-design.md` §non-goals, retired 2026-09-25). The
+    /// feeds the config names are stamped beside it; a rewrite of the lexicon
+    /// file — same length, mtime restored — under an unchanged `aterm.toml`
+    /// moves the feed stamp, which is what re-posts the observation. RED
+    /// before: the watcher stamped `aterm.toml` alone, so the edit waited for
+    /// the next config save. Control: an idle poll moves nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_lexicon_edit_under_an_unchanged_config_is_a_reload_edge() {
+        let dir =
+            std::env::temp_dir().join(format!("aterm-config-watch-lexicon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = dir.join("aterm.toml");
+        let lexicon = dir.join("lexicon.toml");
+        let pack = dir.join("pack.toml");
+        std::fs::write(&lexicon, b"[[entry]]\nword = \"purr\"\n").unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "cursor_trail_packs = [{:?}]\n\n[sparkle_words]\nlexicon = {:?}\n",
+                pack.display().to_string(),
+                lexicon.display().to_string(),
+            ),
+        )
+        .unwrap();
+        let observation = config_file_observation(&config).unwrap();
+        let feeds = feed_paths_of(&observation.text).expect("the config parses");
+        assert_eq!(feeds, vec![lexicon.clone(), pack.clone()]);
+        let config_stamp = config_path_stamp(&config).unwrap();
+        let before = path_feed_stamp(&feeds);
+        assert_eq!(path_feed_stamp(&feeds), before, "control: idle is no edge");
+
+        let metadata = std::fs::metadata(&lexicon).unwrap();
+        let modified = metadata.modified().unwrap();
+        std::fs::write(&lexicon, b"[[entry]]\nword = \"mews\"\n").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&lexicon)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert_eq!(config_path_stamp(&config).unwrap(), config_stamp);
+        let moved = path_feed_stamp(&feeds) != before;
+        assert!(moved, "a lexicon rewrite moves the feed stamp");
+        let mut observed = 0;
+        let edge =
+            prepare_config_edge_with(Some(&config_stamp), config_stamp.clone(), moved, || {
+                observed += 1;
+            });
+        assert!(
+            edge.is_some() && observed == 1,
+            "…and re-observes the config"
+        );
+
+        // A feed that appears is an edge too (it was absent above).
+        let absent = path_feed_stamp(&feeds);
+        std::fs::write(&pack, b"").unwrap();
+        assert_ne!(path_feed_stamp(&feeds), absent);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A DISABLED Sparkle table names no feed (it has no consumer), and the
+    /// lists are capped exactly as their loaders cap them.
+    #[test]
+    fn path_feed_paths_follow_their_consumers() {
+        let off = crate::app_config::Config::parse(
+            "[sparkle_words]\nenabled = false\nlexicon = \"/l.toml\"\ntoy_packs = [\"/t.toml\"]\n",
+        )
+        .unwrap();
+        assert!(off.path_feed_paths().is_empty());
+        let on = crate::app_config::Config::parse(
+            "[sparkle_words]\nlexicon = \"/l.toml\"\ntoy_packs = [\"/t.toml\"]\n",
+        )
+        .unwrap();
+        assert_eq!(
+            on.path_feed_paths(),
+            vec![
+                std::path::PathBuf::from("/l.toml"),
+                std::path::PathBuf::from("/t.toml")
+            ]
+        );
+        let many: Vec<String> = (0..12).map(|i| format!("\"/p{i}.toml\"")).collect();
+        let packs = crate::app_config::Config::parse(&format!(
+            "cursor_trail_packs = [{}]\n",
+            many.join(", ")
+        ))
+        .unwrap();
+        assert_eq!(packs.path_feed_paths().len(), 8, "the loaders' cap");
+    }
 
     #[test]
     fn idle_config_poll_reads_no_content_until_an_identity_edge_or_retry() {

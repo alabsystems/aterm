@@ -31,82 +31,24 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+#[path = "support/headless_boot.rs"]
+mod headless_boot;
 #[path = "support/launch_isolation.rs"]
 mod launch_isolation;
 
-/// The socket-bind budget for the headless boot (matches the verify smoke's
-/// 100 x 100 ms), and the per-client-call exit bound. Both GENEROUS: a healthy
-/// run binds in well under a second and each client call finishes in tens of
-/// milliseconds; the bounds only turn a wedged run into a diagnosable failure
-/// instead of a hung `cargo test`.
-const SOCKET_POLLS: usize = 300;
-const POLL_GAP: Duration = Duration::from_millis(100);
+use headless_boot::{Instance, log_tail};
+
+/// Boot one real headless instance under the scratch world, 40x120
+/// ([`headless_boot::boot`]: `None` is an environment refusal; a product that
+/// cannot start fails the test).
+fn boot() -> Option<Instance> {
+    headless_boot::boot("atconn", &["--lines", "40", "--columns", "120"])
+}
+
 const CLIENT_EXIT_DEADLINE: Duration = Duration::from_secs(90);
-
-/// `sockaddr_un.sun_path` is ~104 bytes on macOS/BSD; refuse bases that would
-/// overflow it (with margin) instead of failing deep inside bind/connect.
-const MAX_SOCK_PATH: usize = 100;
-
-/// One booted headless instance plus its scratch world, torn down (kill, reap,
-/// remove) on every exit path — Drop runs on panic too, so a failing assert
-/// never leaks a live aterm or a scratch dir.
-struct Instance {
-    child: Child,
-    /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
-    /// the kernel if this test process dies first: the instance goes with it.
-    _lifeline: aterm_uds::lifeline::Lifeline,
-    tmp: PathBuf,
-    log: PathBuf,
-    sock: String,
-}
-
-impl Drop for Instance {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        let _ = std::fs::remove_dir_all(&self.tmp);
-    }
-}
-
-/// The tail of the instance log, for skip/failure diagnostics.
-fn log_tail(log: &Path) -> String {
-    let body = std::fs::read_to_string(log).unwrap_or_default();
-    let lines: Vec<&str> = body.lines().collect();
-    let start = lines.len().saturating_sub(15);
-    lines[start..].join("\n")
-}
-
-/// Whether `path` exists as a unix socket or a symlink (the `latest` alias) —
-/// the same readiness probe the verify smoke uses.
-fn is_socket_or_symlink(path: &Path) -> bool {
-    use std::os::unix::fs::FileTypeExt;
-    std::fs::symlink_metadata(path)
-        .map(|m| m.file_type().is_socket() || m.file_type().is_symlink())
-        .unwrap_or(false)
-}
-
-/// Pick a scratch base whose socket path fits `sun_path`: `$TMPDIR` (via
-/// `temp_dir`), else `/tmp`. `None` when neither fits — an environment refusal,
-/// reported as a clean SKIP by the caller.
-fn scratch_root() -> Option<PathBuf> {
-    let name = format!("atconn-{}", std::process::id());
-    for base in [std::env::temp_dir(), PathBuf::from("/tmp")] {
-        let tmp = base.join(&name);
-        let sock = tmp.join("run/aterm/aterm.sock");
-        if sock.as_os_str().len() >= MAX_SOCK_PATH {
-            continue;
-        }
-        if launch_isolation::prepare(&tmp).is_err() {
-            let _ = std::fs::remove_dir_all(&tmp);
-            continue;
-        }
-        return Some(tmp);
-    }
-    None
-}
 
 /// Apply the hermetic environment shared by the server and every client call:
 /// scratch runtime + config dirs, a quiet known shell, and none of the
@@ -238,68 +180,6 @@ fn private_launch_environment_gates_host_maintenance() {
         );
     }
     std::fs::remove_dir_all(base).unwrap();
-}
-
-/// Boot one real headless instance under the scratch world. `None` means the
-/// binary cannot boot headless in this sandbox (announced as a SKIP with the
-/// log tail) — the GPU-test skip idiom, reserved for environmental refusals.
-fn boot() -> Option<Instance> {
-    let Some(tmp) = scratch_root() else {
-        eprintln!("SKIP: no scratch base with a short enough socket path");
-        return None;
-    };
-    let log = tmp.join("gui.log");
-    let (out, err) = match std::fs::File::create(&log).and_then(|f| Ok((f.try_clone()?, f))) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("SKIP: cannot open the instance log ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_aterm"));
-    hermetic_env(&mut cmd, &tmp);
-    cmd.args(["--headless", launch_isolation::NO_REROUTE])
-        .args(launch_isolation::control_sock(&tmp))
-        .args(["--lines", "40", "--columns", "120"])
-        .stdin(Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    let lifeline = launch_isolation::lifeline(&mut cmd, &tmp);
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("SKIP: cannot launch aterm --headless ({e})");
-            let _ = std::fs::remove_dir_all(&tmp);
-            return None;
-        }
-    };
-    let sock_path = tmp.join("run/aterm/aterm.sock");
-    let mut inst = Instance {
-        child,
-        _lifeline: lifeline,
-        sock: sock_path.to_string_lossy().into_owned(),
-        tmp,
-        log,
-    };
-    for _ in 0..SOCKET_POLLS {
-        if matches!(inst.child.try_wait(), Ok(Some(_)) | Err(_)) {
-            eprintln!(
-                "SKIP: aterm --headless exited before binding its socket; log tail:\n{}",
-                log_tail(&inst.log)
-            );
-            return None;
-        }
-        if is_socket_or_symlink(&sock_path) && launch_isolation::control_listening(&sock_path) {
-            return Some(inst);
-        }
-        std::thread::sleep(POLL_GAP);
-    }
-    eprintln!(
-        "SKIP: control socket never started listening; log tail:\n{}",
-        log_tail(&inst.log)
-    );
-    None
 }
 
 /// Run one `aterm <args…>` client call against the instance with the hermetic
@@ -619,4 +499,15 @@ fn conn_round_trips_against_a_live_headless_instance() {
         "conn e2e: ran live against headless pid {} ({sid1} -> {sid2}) at {sock}",
         inst.child.id()
     );
+}
+
+/// NEGATIVE CONTROL for the shared boot (`support/headless_boot.rs`): an
+/// instance that cannot start FAILS the test. Every copy of the boot this file
+/// once carried answered this case with `SKIP` and a green test — so a startup
+/// crash read as a pass. A launch flag the binary refuses is the startup
+/// failure here.
+#[test]
+#[should_panic(expected = "before its control socket listened")]
+fn a_headless_instance_that_cannot_start_fails_the_boot() {
+    let _ = headless_boot::boot("atconn-bad", &["--no-such-launch-flag"]);
 }

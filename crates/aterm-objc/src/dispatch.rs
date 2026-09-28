@@ -62,29 +62,27 @@
 //! So [`run_on_main`] pushes a pool around the closure on both paths. The
 //! resulting rule is one sentence and holds unconditionally: **anything
 //! autoreleased inside the closure is released before `run_on_main` returns,
-//! and the caller cannot tell which path ran.** That is enforced, not asserted:
-//! driver stage 6 autoreleases an object inside the closure on each path and
-//! then asks a WEAK reference whether it was deallocated — a weak slot reads
-//! nil exactly when the object is gone, whereas `-retainCount` on a pointer
-//! that may already be freed is the read that SIGSEGV'd in W9's counterexample.
+//! and the caller cannot tell which path ran.** It was MEASURED when this
+//! module landed (2026-09-02), not merely asserted: a driver autoreleased an
+//! object inside the closure on each path and asked a WEAK reference whether it
+//! was deallocated — a weak slot reads nil exactly when the object is gone,
+//! whereas `-retainCount` on a pointer that may already be freed is the read
+//! that SIGSEGV'd in W9's counterexample. No gate ever ran that driver and it
+//! was deleted on 2026-09-27, so nothing re-measures the pool rule today.
 //!
-//! ## WHICH HALF OF THAT STAGE IS LOAD-BEARING — plant-verified, and only one
+//! ## ONLY THE DIRECT ARM WAS LOAD-BEARING — plant-verified
 //!
-//! Removing the pool from both paths and re-running the driver fails the DIRECT
-//! arm and leaves the DISPATCHED arm passing. The dispatched arm is therefore
-//! **confirmatory, not discriminating**, and the reason is a libdispatch
-//! implementation detail: the main queue's run-loop drain wraps each callback
-//! in its own autorelease pool, so an object autoreleased inside a main-queue
-//! callback is released when that callback ends whether or not this module
-//! pushes anything.
+//! Removing the pool from both paths failed the DIRECT arm and left the
+//! DISPATCHED arm passing. The dispatched arm was therefore **confirmatory, not
+//! discriminating**, and the reason is a libdispatch implementation detail: the
+//! main queue's run-loop drain wraps each callback in its own autorelease pool,
+//! so an object autoreleased inside a main-queue callback is released when that
+//! callback ends whether or not this module pushes anything.
 //!
 //! The pool is kept on that path regardless, and the reason is the F1 lesson
 //! rather than tidiness: the guarantee this module publishes must be OURS,
 //! discharged by code in this file, not inherited from an undocumented property
-//! of the platform's queue drain that no test here would notice changing. What
-//! is recorded — because a stage that cannot fail is worth exactly as much as
-//! the honesty about it — is that only the direct arm can currently catch a
-//! regression.
+//! of the platform's queue drain that no test here would notice changing.
 //!
 //! # THE RE-ENTRANCY TRAP, WHICH IS WHY THE MAIN-THREAD CASE IS A DIRECT CALL
 //!
@@ -98,11 +96,11 @@
 //! ## What actually happens is a TRAP, not a hang — measured, and it matters
 //!
 //! W10's brief called this a deadlock, and on an older libdispatch it was one.
-//! **On this platform it is not.** Measured on Darwin 25.5 by
-//! `examples/objc_dispatch_drive.rs` stage 2: the naive call does not hang, it
-//! raises **SIGTRAP** (the child dies on signal 5, exit 133). Current
-//! libdispatch DETECTS the re-entrancy — it knows which thread owns the queue —
-//! and calls its crash handler rather than blocking for ever.
+//! **On this platform it is not.** Measured on Darwin 25.5 when this module
+//! landed: the naive call does not hang, it raises **SIGTRAP** (the child dies
+//! on signal 5, exit 133). Current libdispatch DETECTS the re-entrancy — it
+//! knows which thread owns the queue — and calls its crash handler rather than
+//! blocking for ever.
 //!
 //! The correction cuts both ways and both halves are worth knowing:
 //!
@@ -117,18 +115,21 @@
 //!   on the main thread in a normal winit app — would kill the process on its
 //!   first call.
 //!
-//! The stage accepts EITHER outcome as proof, because the property being tested
-//! is "the naive call does not return", not "the naive call hangs"; a future
-//! libdispatch that drops the check would still be caught.
+//! That measurement was a differential: the naive `dispatch_sync_f(main_q, …)`
+//! from the main thread, in a CHILD PROCESS, never returned (a hang and a signal
+//! both count — the property is "the naive call does not return"), while
+//! [`run_on_main`] from the same position exited 0; and `dispatch_sync_f` to a
+//! PRIVATE serial queue from the main thread returned normally, so the trap is
+//! about the main queue's thread binding and not about `dispatch_sync` in
+//! general.
 //!
-//! **This is proved rather than asserted**, and the proof is a differential:
-//! the driver runs the naive `dispatch_sync_f(main_q, …)` from the main thread
-//! in a CHILD PROCESS and requires it never to return, then runs
-//! [`run_on_main`] from the same position and requires it to exit 0. Same
-//! binary, same thread, same queue, same watchdog: one dies and one does not.
-//! Stage 4 isolates the cause by showing `dispatch_sync_f` to a PRIVATE serial
-//! queue from the main thread returns normally, so the trap is about the main
-//! queue's thread binding and not about `dispatch_sync` in general.
+//! **What guards the branch now** is the bound drive,
+//! `tests/main_thread_bound_drive.rs`, a `harness = false` test the workspace
+//! test run executes. Its stage 1 drops a [`crate::MainThreadBound`] of a
+//! needs-drop value ON the main thread, which reaches `run_on_main` from
+//! exactly this position — a `run_on_main` that dispatched there would trap
+//! the test's process — and its stages 2, 4 and 6 drive the dispatched path
+//! from a worker.
 //!
 //! # Panics do not cross the C frame
 //!
@@ -381,10 +382,10 @@ where
         //
         // The pool wraps the closure on this path too, so that the pool
         // semantics the module docs state do not depend on which thread the
-        // caller happened to be. THIS is the arm the driver's stage 6 can
-        // actually catch: with it removed, the direct arm fails and the
-        // dispatched arm does not (libdispatch pools its own main-queue
-        // callbacks). Plant-verified, and recorded in the module docs.
+        // caller happened to be. THIS is the arm a pool plant could catch:
+        // with it removed, the direct arm failed and the dispatched arm did
+        // not (libdispatch pools its own main-queue callbacks). Measured, and
+        // recorded in the module docs.
         return autoreleasepool(|_pool| f(mt));
     }
 

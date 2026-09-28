@@ -1,17 +1,15 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Built-in policy profiles (§7 of the design).
+//! Built-in policy profiles.
 //!
 //! Each profile is a complete [`Policy`](crate::Policy) document that ships
-//! inside the crate. Hosts load one at startup; the engine (#7992) may then
-//! apply an operator override.
+//! inside the crate. Hosts load one at startup.
 //!
 //! The three profiles form a refinement chain `Hardened ⊆ Standard ⊆
-//! Permissive` (§4.5). The `refinement::response_rank` helper in this module (test and Kani builds)
-//! provides the numeric ordering used by the tests that assert the chain — the
-//! rank is *not* authoritative policy semantics; it is a scaffold for the
-//! Kani `policy_refinement.rs` harness landing in #7998.
+//! Permissive`. The test-only `refinement::response_rank` helper in this module
+//! provides the numeric ordering the refinement tests assert the chain with —
+//! the rank is *not* authoritative policy semantics.
 //!
 //! ## Builder helpers
 //!
@@ -21,68 +19,6 @@
 //! value rather than mutating it in place.
 
 use crate::{Defaults, OriginTag, Policy, Profile, RateLimit, Response, Rule, SCHEMA_VERSION};
-
-/// Return whether the Hardened built-in profile has an OSC rule for `major`.
-///
-/// Kept as a small allocation-free mirror of [`hardened`] for symbolic proof
-/// harnesses that need to avoid pulling selector string parsing into the
-/// checked trace.
-#[must_use]
-#[cfg(any(kani, test))]
-pub(crate) const fn hardened_covers_osc_major(major: u32) -> bool {
-    matches!(major, 4 | 9 | 52 | 99 | 777)
-}
-
-/// Return the Hardened built-in profile's unmatched fallback response.
-///
-/// This mirrors [`hardened`] without allocating the full profile document, so
-/// symbolic proof harnesses can validate fail-closed defaults without pulling
-/// selector parsing or collection construction into the checked trace.
-#[must_use]
-#[cfg(any(kani, test))]
-pub(crate) const fn hardened_unmatched_response() -> Response {
-    Response::Drop
-}
-
-/// Return the Standard built-in profile's unmatched fallback response.
-///
-/// Allocation-free mirror of [`standard`]`().defaults.unmatched`, same rationale
-/// as [`hardened_unmatched_response`]: lets the monotonicity proof compare the
-/// three built-ins' fallbacks without pulling `String`/`Vec`/`Option<&str>` rule
-/// construction into the model-checked trace. Kept honest by
-/// `unmatched_response_accessors_mirror_builtin_defaults`.
-#[must_use]
-#[cfg(any(kani, test))]
-pub(crate) const fn standard_unmatched_response() -> Response {
-    Response::Warn
-}
-
-/// Return the Permissive built-in profile's unmatched fallback response.
-///
-/// Allocation-free mirror of [`permissive`]`().defaults.unmatched`; see
-/// [`hardened_unmatched_response`]. Guarded against drift by
-/// `unmatched_response_accessors_mirror_builtin_defaults`.
-#[must_use]
-#[cfg(any(kani, test))]
-pub(crate) const fn permissive_unmatched_response() -> Response {
-    Response::Execute
-}
-
-/// Return the Hardened response for an OSC major in allocation-free proof code.
-///
-/// Covered majors return a conservative non-default placeholder because the
-/// full selector parameters and origin gate decide the exact rule result.
-/// Uncovered majors return the unmatched default directly.
-#[must_use]
-#[cfg(any(kani, test))]
-#[inline(never)]
-pub(crate) fn hardened_osc_response_for_proof(major: u32) -> Response {
-    if hardened_covers_osc_major(major) {
-        Response::Execute
-    } else {
-        hardened_unmatched_response()
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -362,13 +298,9 @@ pub fn hardened() -> Policy {
 // Refinement scaffolding
 // ---------------------------------------------------------------------------
 
-/// Refinement helpers for the `Hardened ⊆ Standard ⊆ Permissive` invariant
-/// (§4.5).
-///
-/// The real refinement proof lands in #7998 (Kani + TLA+). This module
-/// provides the scalar rank used by the Phase 0 tests to guard against
-/// accidental inversion while the engine is still being built.
-#[cfg(any(kani, test))]
+/// Refinement helpers for the `Hardened ⊆ Standard ⊆ Permissive` invariant:
+/// the scalar rank the refinement tests (`tests.rs`) use to catch an inversion.
+#[cfg(test)]
 pub(crate) mod refinement {
     use crate::Response;
 
@@ -391,45 +323,5 @@ pub(crate) mod refinement {
             Response::Ask => 1,
             Response::Execute => 0,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        hardened, hardened_covers_osc_major, hardened_osc_response_for_proof,
-        hardened_unmatched_response, permissive, permissive_unmatched_response, standard,
-        standard_unmatched_response,
-    };
-    use crate::Response;
-
-    #[test]
-    fn hardened_osc_coverage_mirror_matches_builtin_rules() {
-        for covered in [4, 9, 52, 99, 777] {
-            assert!(hardened_covers_osc_major(covered));
-        }
-
-        for unknown in [0, 1, 2, 7, 8, 10, 11, 133, 633, 1337] {
-            assert!(!hardened_covers_osc_major(unknown));
-        }
-
-        assert_eq!(hardened_unmatched_response(), Response::Drop);
-        assert_eq!(hardened_osc_response_for_proof(200), Response::Drop);
-        assert_eq!(hardened_osc_response_for_proof(52), Response::Execute);
-    }
-
-    /// Drift guard: the allocation-free `*_unmatched_response()` accessors used
-    /// by `policy_monotonicity` MUST equal the corresponding built-in profile's
-    /// real `defaults.unmatched`. If a profile's fallback is ever retuned, this
-    /// fails until the accessor is updated — so the proof can never silently
-    /// validate a stale constant instead of the shipped policy.
-    #[test]
-    fn unmatched_response_accessors_mirror_builtin_defaults() {
-        assert_eq!(hardened_unmatched_response(), hardened().defaults.unmatched);
-        assert_eq!(standard_unmatched_response(), standard().defaults.unmatched);
-        assert_eq!(
-            permissive_unmatched_response(),
-            permissive().defaults.unmatched
-        );
     }
 }

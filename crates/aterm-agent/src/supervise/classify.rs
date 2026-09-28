@@ -1255,7 +1255,7 @@ fn glued_to_a_word(cur: &str) -> bool {
 }
 
 /// The program name of a token: its basename, so `/bin/rm` and `rm` agree.
-fn program(tok: &str) -> &str {
+pub(crate) fn program(tok: &str) -> &str {
     tok.rsplit('/').next().unwrap_or(tok)
 }
 
@@ -1460,6 +1460,9 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                         // && git status` reaches the same repository.
                         return Some(format!("git {t} (a repository of the line's choosing)"));
                     }
+                    if t == "--help" || t == "-h" {
+                        return Some(format!("git {t} {GIT_HELP_RUNS}"));
+                    }
                     if matches!(t, "-C" | "--git-dir" | "--work-tree" | "--namespace") {
                         j += 2;
                     } else if t.starts_with('-') {
@@ -1486,8 +1489,12 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
                         || t == "--filters"
                         || t.starts_with("--open-files-in-pager")
                         || (t.starts_with("-O") && !t.starts_with("--"))
+                        || (sub == "grep" && grep_opens_pager(t))
                     {
                         return Some(format!("git {sub} {t}"));
+                    }
+                    if t == "--help" {
+                        return Some(format!("git {sub} --help {GIT_HELP_RUNS}"));
                     }
                 }
                 if GIT_DANGER.contains(&sub) {
@@ -1506,12 +1513,58 @@ fn danger_scan(segments: &[Vec<String>]) -> Option<String> {
     None
 }
 
+/// Why `git <sub> --help` (and `git --help <sub>`, `git -h <sub>`) is no
+/// read: it is `git help <sub>`, which runs the man viewer `man.viewer` /
+/// `man.<tool>.cmd` names — or, with `help.format = web`, the browser of
+/// `web.browser` / `browser.<tool>.cmd` — keys a repository's own config may
+/// set (measured with git 2.50.1, 2026-09-27: `git log --help` ran a
+/// repository's `man.<tool>.cmd` with stdout and stdin not a terminal).
+const GIT_HELP_RUNS: &str = "(runs git help: the man or web viewer the config names)";
+
+/// Whether a `git grep` argument turns on `-O` / `--open-files-in-pager`,
+/// which runs the pager on the matching files whether or not there is a
+/// terminal: a short-option cluster holding `O` before any letter that takes
+/// the rest of the cluster as its value (`-nO`, `-iOless`, `-3O`; not `-eO`,
+/// whose `O` is the pattern), or a long option that git's parse-options would
+/// take as an abbreviation of `--open-files-in-pager` (`--open`, `--op`; git
+/// refuses the ambiguous `--o`, counted all the same).
+fn grep_opens_pager(t: &str) -> bool {
+    if let Some(long) = t.strip_prefix("--") {
+        let name = long.split('=').next().unwrap_or("");
+        return !name.is_empty() && "open-files-in-pager".starts_with(name);
+    }
+    let Some(cluster) = t.strip_prefix('-') else {
+        return false;
+    };
+    for c in cluster.chars() {
+        match c {
+            'O' => return true,
+            // `-A<n>` `-B<n>` `-C<n>` `-e<pattern>` `-f<file>` `-m<n>`: the
+            // rest of the cluster is the value.
+            'A' | 'B' | 'C' | 'e' | 'f' | 'm' => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
 /// Whether `tok` names a program by a path in [`SYSTEM_BIN_DIRS`] and nowhere
 /// deeper (`/bin/ls`, not `/bin/x/ls` or `/bin/../tmp/ls`).
 fn is_system_bin(tok: &str) -> bool {
     SYSTEM_BIN_DIRS.iter().any(|dir| {
         tok.strip_prefix(dir)
             .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'))
+    })
+}
+
+/// Whether every entry of the search path `value` is a [`SYSTEM_BIN_DIRS`]
+/// directory (`/bin:/usr/bin`): a program found there is the one its name says.
+fn is_system_search_path(value: &str) -> bool {
+    value.split(':').all(|entry| {
+        let entry = entry.trim_end_matches('/');
+        SYSTEM_BIN_DIRS
+            .iter()
+            .any(|dir| dir.trim_end_matches('/') == entry)
     })
 }
 
@@ -1525,13 +1578,8 @@ fn assignment_hazard(tok: &str) -> Option<String> {
     }
     let (name, value) = tok.split_once('=')?;
     if name == "PATH" {
-        let system = value.split(':').all(|entry| {
-            let entry = entry.trim_end_matches('/');
-            SYSTEM_BIN_DIRS
-                .iter()
-                .any(|dir| dir.trim_end_matches('/') == entry)
-        });
-        return (!system).then(|| format!("{name}= (changes which program a name runs)"));
+        return (!is_system_search_path(value))
+            .then(|| format!("{name}= (changes which program a name runs)"));
     }
     (HAZARD_VARS.contains(&name) || HAZARD_VAR_PREFIXES.iter().any(|p| name.starts_with(p)))
         .then(|| format!("{name}= (changes what a later program runs or reads)"))
@@ -1791,15 +1839,12 @@ fn redirect_span(tok: &str) -> usize {
     }
 }
 
-/// The head check from token `j` on. Re-entered for the command a wrapper
-/// hands its arguments to — `xargs <cmd>`, `env [VAR=v] <cmd>`, `timeout N
-/// <cmd>` — so a wrapper on the read-only list cannot launder the program it
-/// runs: `ls | xargs touch` is `touch`, `env FOO=1 ./deploy.sh` is `deploy.sh`.
-fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) -> Option<String> {
-    // Leading VAR=value assignments, redirects (`2>/dev/null rm x` runs rm),
-    // zsh's `-` precommand modifier (`- rm x` runs rm), a `timeout [flags] N`
-    // or `time [-p]` wrapper, and keyword prefixes (the command after `do` /
-    // `then` / `if` is the one that runs), in any order: `do n=$(…)` assigns.
+/// Where the command of `seg` starts from word `j`: past leading `VAR=value`
+/// assignments, redirects (`2>/dev/null rm x` runs rm), zsh's `-` precommand
+/// modifier (`- rm x` runs rm), a `timeout [flags] N` or `time [-p]` wrapper,
+/// and keyword prefixes (the command after `do` / `then` / `if` is the one that
+/// runs), in any order: `do n=$(…)` assigns.
+fn skip_prefixes(seg: &[String], mut j: usize) -> usize {
     loop {
         let start = j;
         while let Some(t) = seg.get(j).map(String::as_str) {
@@ -1830,6 +1875,174 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
             break;
         }
     }
+    j
+}
+
+/// What the wrapper at `seg[j]` (`xargs`, `env`, by name or from a system
+/// directory) runs. `None`: `seg[j]` is no wrapper. `Some(Ok(None))`: it runs
+/// no word of the line (a bare `env` prints the environment, a bare `xargs`
+/// runs `echo`). `Some(Ok(Some((k, dirs))))`: the command at `k`, in each `env
+/// -C`/`--chdir` directory in `dirs`. `Some(Err(reason))`: the wrapper hides
+/// its command (`env -S` splits a string this scan cannot see) or chooses its
+/// program itself (`env -P` searches a directory of the line's choosing).
+///
+/// `env`'s short options are read as `getopt` reads them: a cluster (`-iu
+/// NAME`, `-iC..`) ends at the first option that takes a value, which is the
+/// rest of the word or else the next word.
+fn wrapper(seg: &[String], j: usize) -> Option<Wrapped<'_>> {
+    let tok = seg.get(j)?.as_str();
+    if tok.contains('/') && !is_system_bin(tok) {
+        return None;
+    }
+    match program(tok) {
+        "xargs" => {
+            // `xargs [flags] [cmd [args]]`: the fed command is the head that
+            // counts.
+            let mut k = j + 1;
+            while k < seg.len() && seg[k].starts_with('-') && seg[k] != "-" {
+                k += if XARGS_VALUE_FLAGS.contains(&seg[k].as_str()) {
+                    2
+                } else {
+                    1
+                };
+            }
+            Some(Ok((k < seg.len()).then(|| (k, Vec::new()))))
+        }
+        "env" => {
+            // `env [-i] [-u NAME] [-C DIR] [VAR=v]... [cmd]`.
+            let mut k = j + 1;
+            let mut dirs = Vec::new();
+            while k < seg.len() {
+                let t = seg[k].as_str();
+                if t == "--split-string" || t.starts_with("--split-string=") {
+                    return Some(Err("env -S".to_string()));
+                }
+                if t == "--" {
+                    k += 1;
+                    break;
+                }
+                if let Some(dir) = t.strip_prefix("--chdir=") {
+                    dirs.push(dir);
+                    k += 1;
+                    continue;
+                }
+                if t == "--chdir" || t == "--unset" {
+                    if t == "--chdir"
+                        && let Some(dir) = seg.get(k + 1)
+                    {
+                        dirs.push(dir.as_str());
+                    }
+                    k += 2;
+                    continue;
+                }
+                if t.starts_with("--") {
+                    k += 1;
+                    continue;
+                }
+                if t.starts_with('-') && t.len() > 1 {
+                    let mut width = 1;
+                    for (at, c) in t.char_indices().skip(1) {
+                        if c == 'S' {
+                            return Some(Err("env -S".to_string()));
+                        }
+                        if !matches!(c, 'u' | 'C' | 'P') {
+                            continue;
+                        }
+                        let glued = &t[at + c.len_utf8()..];
+                        let value = if glued.is_empty() {
+                            width = 2;
+                            seg.get(k + 1).map(String::as_str)
+                        } else {
+                            Some(glued)
+                        };
+                        if c == 'P' && !value.is_some_and(is_system_search_path) {
+                            return Some(Err(format!(
+                                "env -P {} (looks the command up in a directory of the \
+                                 line's choosing)",
+                                value.unwrap_or("")
+                            )));
+                        }
+                        if c == 'C'
+                            && let Some(dir) = value
+                        {
+                            dirs.push(dir);
+                        }
+                        break;
+                    }
+                    k += width;
+                    continue;
+                }
+                if is_assignment(t) {
+                    k += 1;
+                    continue;
+                }
+                break;
+            }
+            Some(Ok((k < seg.len()).then_some((k, dirs))))
+        }
+        _ => None,
+    }
+}
+
+/// What a wrapper runs ([`wrapper`]): the index of its command and the `env
+/// -C` directories on the way, no command, or why it hides one.
+type Wrapped<'s> = Result<Option<(usize, Vec<&'s str>)>, String>;
+
+/// The command a segment RUNS, as [`head_from`] sees it: past what only
+/// prefixes it ([`skip_prefixes`]) and through the wrappers that hand it their
+/// arguments ([`wrapper`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Runs<'s> {
+    /// The index of the command's word in the segment.
+    pub at: usize,
+    /// The `env -C`/`--chdir` directories on the way, outermost first: the
+    /// command runs in one of them, relative to the shell's own.
+    pub chdir: Vec<&'s str>,
+    /// Whether an `xargs` feeds it words the line does not show.
+    pub fed: bool,
+}
+
+/// What segment `seg` runs ([`Runs`]): `Ok(None)` when it runs no word of the
+/// line (only assignments, a bare `env` or `xargs`), `Err` when a wrapper
+/// hides it or picks the program itself ([`wrapper`]). The one reading of a
+/// segment's command that the head check and the git-config check
+/// (`supervise::policy::git_config`) share, so a wrapper one sees through the
+/// other cannot miss.
+pub(crate) fn runs(seg: &[String]) -> Result<Option<Runs<'_>>, String> {
+    let mut j = 0;
+    let mut chdir = Vec::new();
+    let mut fed = false;
+    loop {
+        j = skip_prefixes(seg, j);
+        if j >= seg.len() {
+            return Ok(None);
+        }
+        match wrapper(seg, j) {
+            None => return Ok(Some(Runs { at: j, chdir, fed })),
+            Some(Err(reason)) => return Err(reason),
+            Some(Ok(None)) => return Ok(None),
+            Some(Ok(Some((k, dirs)))) => {
+                fed |= program(&seg[j]) == "xargs";
+                chdir.extend(dirs);
+                j = k;
+            }
+        }
+    }
+}
+
+/// The segments of `line` as shell WORDS ([`program_words`]), read the way
+/// [`classify_command_with`] reads the line first: through [`prelex`] and with
+/// the worker's `perl -e 'alarm N; exec @ARGV'` timeout wrapper removed.
+pub(crate) fn command_words(line: &str) -> Result<Vec<Vec<String>>, String> {
+    Ok(program_words(&strip_alarm_idiom(&prelex(line)?)))
+}
+
+/// The head check from token `j` on. Re-entered for the command a wrapper
+/// hands its arguments to — `xargs <cmd>`, `env [VAR=v] <cmd>`, `timeout N
+/// <cmd>` — so a wrapper on the read-only list cannot launder the program it
+/// runs: `ls | xargs touch` is `touch`, `env FOO=1 ./deploy.sh` is `deploy.sh`.
+fn head_from<S: AsRef<str>>(seg: &[String], j: usize, python_allow: &[S]) -> Option<String> {
+    let j = skip_prefixes(seg, j);
     let head_tok = seg.get(j)?;
     if is_fragment(head_tok) {
         return None;
@@ -1866,56 +2079,13 @@ fn head_from<S: AsRef<str>>(seg: &[String], mut j: usize, python_allow: &[S]) ->
                 });
             (!query).then(|| format!("{head} (compiles)"))
         }
-        "xargs" => {
-            // `xargs [flags] [cmd [args]]`: the fed command is the head that
-            // counts; a bare `xargs` runs echo.
-            let mut k = j + 1;
-            while k < seg.len() && seg[k].starts_with('-') && seg[k] != "-" {
-                k += if XARGS_VALUE_FLAGS.contains(&seg[k].as_str()) {
-                    2
-                } else {
-                    1
-                };
-            }
-            if k < seg.len() {
-                head_from(seg, k, python_allow)
-            } else {
-                None
-            }
-        }
-        "env" => {
-            // `env [-i] [-u NAME] [VAR=v]... [cmd]`: the command is the head;
-            // a bare `env` prints the environment; `-S` splits a string into a
-            // command line this scan cannot see.
-            let mut k = j + 1;
-            while k < seg.len() {
-                let t = seg[k].as_str();
-                if t == "--split-string"
-                    || t.starts_with("--split-string=")
-                    || (t.starts_with('-') && !t.starts_with("--") && t[1..].contains('S'))
-                {
-                    return Some("env -S".to_string());
-                }
-                if matches!(t, "-u" | "-C" | "-P" | "--unset" | "--chdir") {
-                    k += 2;
-                    continue;
-                }
-                if t == "--" {
-                    k += 1;
-                    break;
-                }
-                if (t.starts_with('-') && t.len() > 1) || is_assignment(t) {
-                    k += 1;
-                    continue;
-                }
-                break;
-            }
-            if k < seg.len() {
-                head_from(seg, k, python_allow)
-            } else {
-                None
-            }
-        }
+        "xargs" | "env" => match wrapper(seg, j) {
+            // The command the wrapper runs is the head that counts; a bare
+            // `xargs` runs echo, a bare `env` prints the environment.
+            Some(Err(reason)) => Some(reason),
+            Some(Ok(Some((k, _)))) => head_from(seg, k, python_allow),
+            _ => None,
+        },
         "git" => {
             let Some((sub_idx, sub)) = git_subcommand(seg, j) else {
                 return Some("git without a subcommand".to_string());
@@ -2548,7 +2718,7 @@ fn sed_script_writes(script: &str) -> Option<String> {
 /// read — so that an awk program or a sed script a parameter supplies (`awk
 /// "$x"`, `sed "$s" f`) is refused by [`program_scan`] like one a
 /// substitution supplies.
-fn program_words(src: &str) -> Vec<Vec<String>> {
+pub(crate) fn program_words(src: &str) -> Vec<Vec<String>> {
     let chars: Vec<char> = src.chars().collect();
     let mut scan = WordScan {
         chars: &chars,
@@ -3116,6 +3286,27 @@ mod tests {
         assert!(ro("env | sort"));
         assert!(ro("timeout 5 env FOO=1 git status"));
         assert!(!ro("timeout 5 xargs ./x.sh"));
+        // `env -P` picks the program from a directory: a system one is the
+        // program its name says, any other is a program of the line's choosing
+        // (before 2026-09-26 `env -P /tmp/evil git status` was a read).
+        assert!(ro("env -P /usr/bin git status"));
+        for line in [
+            "env -P /tmp/evil git status",
+            "env -P/tmp/evil git status",
+            "env -iP /tmp/evil ls",
+            "env -P /bin:/tmp/evil ls",
+        ] {
+            assert!(!ro(line), "{line}");
+            assert!(classify_command(line).reason.contains("env -P"), "{line}");
+        }
+        // Short options cluster as getopt reads them: the first that takes a
+        // value ends the cluster, so `-iC..` is `-i -C ..` and the command is
+        // the next word, and a capital S inside a value is no `-S`.
+        assert!(ro("env -iC.. git status"));
+        assert!(ro("env -iC .. git status"));
+        assert!(ro("env -uSOME ls"));
+        assert!(!ro("env -iS 'rm x'"));
+        assert!(!ro("env --split-string='rm x'"));
     }
 
     #[test]
@@ -3241,8 +3432,9 @@ mod tests {
 
     /// Git reads honour the repository's config and `.gitattributes`
     /// (`core.fsmonitor`, `diff.external`, a textconv driver), and a
-    /// worker in accept-edits can write both — the residual gap the
-    /// approval rule's doc names. What IS refused: a repository named on
+    /// worker in accept-edits can write both — which the approval rule
+    /// checks on the machine (`policy::git_config`), since this LINE check
+    /// cannot. What IS refused here: a repository named on
     /// the line (`--git-dir`, `--work-tree`) and the flags that run the
     /// filter and textconv drivers on purpose. `-C` stays a read: `cd X &&
     /// git status` reaches the same repository.
@@ -3489,6 +3681,52 @@ mod tests {
         for cmd in bypasses {
             let v = classify_command(cmd);
             assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+    }
+
+    /// `git grep` starts its pager on the matching files with no terminal
+    /// (`-O` / `--open-files-in-pager`), and git's parse-options takes the
+    /// option inside a short cluster and as a long abbreviation — every such
+    /// spelling ran a repository's `core.pager` in a scratch repository (git
+    /// 2.50.1, 2026-09-27; `--o` is refused by git as ambiguous, counted
+    /// anyway). `git <sub> --help`, `git --help <sub>` and `git -h <sub>` are
+    /// `git help`, which runs the man or web viewer the configuration names.
+    /// NEGATIVE CONTROLS: an `O` that is a pattern or an option's value, and
+    /// other long options, stay reads.
+    #[test]
+    fn git_grep_pager_spellings_and_git_help_are_not_read_only() {
+        for cmd in [
+            "git grep -nO hello",
+            "git grep -iO hello",
+            "git grep -iOless hello",
+            "git grep -3O hello",
+            "git grep --open hello",
+            "git grep --op hello",
+            "git grep --open-files hello",
+            "git grep --o hello",
+            "git grep --open=less hello",
+            "git log --help",
+            "git status --help",
+            "git grep --help",
+            "git stash --help",
+            "git --help log",
+            "git -h log",
+            "git -C . log --help",
+            "git --no-pager log --help",
+        ] {
+            let v = classify_command(cmd);
+            assert!(!v.read_only, "{cmd:?} must not be read-only: {v:?}");
+        }
+        for cmd in [
+            "git grep -eOops x",
+            "git grep -A1 -n hello",
+            "git grep -n hello",
+            "git grep --only-matching hello",
+            "git grep --or -e a -e b",
+            "git log -h",
+            "git log --oneline",
+        ] {
+            assert!(ro(cmd), "{cmd:?} stays a read: {:?}", classify_command(cmd));
         }
     }
 

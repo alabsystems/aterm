@@ -62,27 +62,14 @@ fn fallback_seed() -> u64 {
     nanos ^ pid.rotate_left(32) ^ 0x9E37_79B9_7F4A_7C15
 }
 
-/// WHICH RUNG of [`companion_precedence`] won a verdict — the winner report
-/// the rate law reads at the render sync sites (kitty-motion §2.0.4, Rungs:
-/// *"`companion_precedence` reports which arm won; the sync site maps
-/// `Rung::Program => tenure.arrival()`, every other rung to Quiet"*). The
-/// LOOK still travels alone through `App::companion_verdict`'s bare
-/// `KittyLook` return (five production callers and a locked test suite
-/// compare it directly); the rung rides beside it on `WindowState` so the
-/// sync sites can tell a program-rung win from a favourite or launch win —
-/// only a PROGRAM win may ever carry the tenure gate's arrival ceremony.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum CompanionRung {
-    /// The pinned favourite won. The user's explicit choice announces
-    /// nothing (the USER-ACT-ONLY precedent): always quiet.
-    Favourite,
-    /// The tenured program cat won — the ONE rung whose arrival may be a
-    /// ceremony, as ruled by `app_kitty::KittyTenure::arrival`.
-    Program,
-    /// The launch kitty floor won — "no stronger claim". The base cat is
-    /// always home: always quiet.
-    Launch,
-}
+/// WHICH RUNG won a verdict is the pet owner's
+/// [`aterm_effects::companion::CompanionRung`] — the winner report the rate
+/// law reads at the render sync sites (kitty-motion §2.0.4). The LOOK still
+/// travels alone through `App::companion_verdict`'s bare `KittyLook` return;
+/// the rung rides beside it on `WindowState` so the sync sites can tell a
+/// program-rung win from a favourite or launch win — only a PROGRAM win may
+/// ever carry the tenure gate's arrival ceremony.
+use aterm_effects::companion::CompanionRung;
 
 /// THE COMPANION PRECEDENCE LAW (owner rulings, 2026-08-07 and 2026-08-17),
 /// the ONE place the order is stated — every dressing surface (the

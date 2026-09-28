@@ -2080,6 +2080,14 @@ pub fn no_transitive_authority_model() -> Model {
 ///   held. It therefore needs `Handoff = 1` to bite, which is exactly why the
 ///   entry gate exists beside the lock rather than instead of it.
 ///
+/// * `Unmarked` — the HANDOFF WINDOW (closed 2026-09-25). A handoff is not one
+///   step: the predecessor EXITS (its lock dies), and only then does the
+///   successor bind and PUBLISH its own entry. Between the two, neither gate
+///   answered. The predecessor now names its successor at Commit
+///   (`claims/<sid>.successor`, a third gate a launch consults), and the
+///   successor retires that marker once its entry is published. `Unmarked = 1`
+///   is the pre-fix exit with no marker, and a launch in the window duplicates.
+///
 /// The lock dying with its holder is load-bearing in the other direction: it is
 /// what lets a RELAUNCH adopt, and it is why the claim file is never unlinked
 /// (unlinking a claim a peer holds open is how two processes could both come to
@@ -2087,9 +2095,9 @@ pub fn no_transitive_authority_model() -> Model {
 /// by never adopting would not reproduce the relaunch trace this one does.
 ///
 /// Tier-1 binding: aterm-gui's
-/// `identity_claim::a_second_claim_on_one_id_is_refused_while_the_first_lives`
-/// and `spawn::two_launches_from_one_shell_do_not_share_an_identity` drive the
-/// real `claim_for_adoption` through the same two arms.
+/// `identity_claim::session_id_claim_conformance_real_adoption_projects_onto_model`
+/// and `identity_claim::the_handoff_window_is_held_by_the_successor_marker` drive
+/// the real `claim_for_adoption` through every arm, the window included.
 #[must_use]
 // Skip (T2 vcgen-budget lane): a spec-model DATA constructor — the MODEL it
 // returns is what `ty` machine-checks.
@@ -2101,38 +2109,59 @@ pub fn session_id_claim_model() -> Model {
             const Local = 0;      // 1 = each launch adopts on its own premint read alone
             const Instances = 2;  // launches from one shell (the export outlives the launch)
             const Handoff = 0;    // scenario: a seamless-update successor took the id over
+            const Unmarked = 0;   // 1 = the predecessor exits without naming its successor
             var holders = 0;      // LIVE instances answering to THE id
             var lock = 0;         // the claim flock is held by a live process
             var entry = 0;        // a live process has published graph/<sid>
+            var window = 0;       // predecessor gone, successor not yet published
+            var marker = 0;       // claims/<sid>.successor names the live successor
             var steps = 0;        // run bound
 
             // A launch reads the surviving premint and tries to adopt it.
             action Launch when (steps <= 5 && Instances > holders) {
                 steps = steps + 1;
                 holders = if Local == 1 { holders + 1 }
-                          else { if lock == 0 && (Buggy == 1 || entry == 0)
+                          else { if lock == 0 && (Buggy == 1 || entry == 0) && marker == 0
                                  { holders + 1 } else { holders } };
                 lock = if Local == 1 { 1 }
-                       else { if lock == 0 && (Buggy == 1 || entry == 0)
+                       else { if lock == 0 && (Buggy == 1 || entry == 0) && marker == 0
                               { 1 } else { lock } };
             }
 
             // The holder exits. The lock dies WITH it — that is what makes a
-            // relaunch able to adopt at all, and why nothing is ever unlinked.
+            // relaunch able to adopt at all, and why nothing is ever unlinked. A
+            // successor that dies in the window takes its marker's authority with
+            // it (the marker names a dead pid, which reads as no marker).
             action Exit when (steps <= 5 && holders > 0) {
                 steps = steps + 1;
                 holders = holders - 1;
                 lock = if holders > 1 { 1 } else { 0 };
                 entry = if holders > 1 { entry } else { 0 };
+                window = if holders > 1 { window } else { 0 };
+                marker = if holders > 1 { marker } else { 0 };
             }
 
             // A seamless-update successor takes the id over: a TRANSFER, not a
-            // second holder. It cannot inherit the predecessor's flock, so the
-            // lock goes free while its own graph entry is what holds the id.
-            action Handover when (steps <= 5 && Handoff == 1 && holders == 1 && entry == 0) {
+            // second holder. The predecessor names it at Commit and exits; its
+            // lock dies with it, and nothing of the successor's is published yet.
+            action PredecessorExits
+                when (steps <= 5 && Handoff == 1 && holders == 1 && entry == 0 && window == 0)
+            {
                 steps = steps + 1;
                 lock = 0;
+                window = 1;
+                marker = if Unmarked == 1 { 0 } else { 1 };
+            }
+
+            // The successor binds and PUBLISHES its own entry, which now holds the
+            // id, and retires the marker. It re-attempts the claim too, but the
+            // model takes the worst case — it may not get it — so the entry gate
+            // stays load-bearing.
+            action SuccessorPublishes when (steps <= 5 && window == 1 && holders > 0) {
+                steps = steps + 1;
                 entry = 1;
+                window = 0;
+                marker = 0;
             }
 
             // THE SAFETY PROPERTY. An address that resolves at all resolves to

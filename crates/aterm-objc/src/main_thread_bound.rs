@@ -33,7 +33,7 @@
 //! 3. **The value can only be DROPPED on the main thread.** [`Drop`] reschedules
 //!    through [`run_on_main`]. This is the obligation that has no type-system
 //!    half at all, and the one the counterexample in
-//!    `examples/objc_bound_drive.rs` is built around.
+//!    `tests/main_thread_bound_drive.rs` is built around.
 //! 4. **The value never MOVES while it is being used.** Rust's move is a
 //!    `memcpy`, and a container that is `Send` gets moved across threads by
 //!    definition. A `T` whose ADDRESS is load-bearing — this crate's own
@@ -117,7 +117,7 @@
 //! no `unsafe` token at the call site, by nothing more than moving a `Window`
 //! into a `std::thread::spawn`. That is the same shape as the counterexample
 //! that restored the [`MainThread`] parameter in the first place, and it is
-//! measured rather than argued: `examples/objc_bound_drive.rs` declares a
+//! measured rather than argued: `tests/main_thread_bound_drive.rs` declares a
 //! `NaiveBound<T>` with the identical `unsafe impl Send` and an ordinary drop,
 //! and watches its `T`'s destructor run off the main thread while this type's
 //! runs on it.

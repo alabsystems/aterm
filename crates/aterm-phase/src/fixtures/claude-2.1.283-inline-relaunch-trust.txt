@@ -1,0 +1,51 @@
+# claude-code 2.1.283 · MEASURED 2026-09-27, `subscribe … screen,cursor,events,ts` of a private headless aterm (150x50), the managed 2.1.283 launched by path with `--model haiku --dangerously-skip-permissions` and `CLAUDE_CODE_NO_FLICKER=0` exported: its INLINE renderer (the classic main-screen one) RELAUNCHED IN THE SAME TAB, the previous run exited with two Ctrl-C (its prompt box left on the main grid, its footer `Press Ctrl-C again to exit`), then `cd` into a new folder and the launch line · the folder-trust dialog drawn under the new launch line, the old prompt box above it · cursor=30,1 (hidden): on the dialog's focused option · user, host and scratch-path UUID redacted at equal length
+user@a-mac-host-name-redactedxxxxxx proj-new1 % export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_NO_FLICKER=0
+user@a-mac-host-name-redactedxxxxxx proj-new1 % '/Users/_user0/Library/Application Support/aterm/pkg/store/claude/1000002000001000283/bin/claude' --mo
+del haiku --dangerously-skip-permissions
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Haiku 4.5 · Claude Max
+ ▝▝   ▝▝   /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/fx/live/m-in/proj-new1
+
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "write a test for <filepath>"
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Press Ctrl-C again to exit                                                                                            Ctrl+Y to paste deleted text
+user@a-mac-host-name-redactedxxxxxx proj-new1 % export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_NO_FLICKER=0; cd '/private/tmp/claude-502/-Users-user00-aterm
+/00000000-0000-0000-0000-000000000000/scratchpad/fx/live/m-in/proj-rel2'
+user@a-mac-host-name-redactedxxxxxx proj-rel2 % '/Users/_user0/Library/Application Support/aterm/pkg/store/claude/1000002000001000283/bin/claude' --mo
+del haiku --dangerously-skip-permissions
+
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ Accessing workspace:
+
+ /private/tmp/claude-502/-Users-user00-aterm/00000000-0000-0000-0000-000000000000/scratchpad/fx/live/m-in/proj-rel2
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team).
+ If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+   No, exit
+ ❯ Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -261,22 +261,26 @@ impl<C: Ctl> Session<'_, C> {
             }
             None => None,
         };
+        let r = TurnEndReading::of(
+            &reading,
+            &screen.rows,
+            typed_draft(reader, screen) || self.homed_draft(reader, screen),
+            worked,
+            reset_at,
+            self.rules_text(opts),
+        );
+        let host = opts.idle_host.as_ref();
         TurnEndReading {
             person: self.person_ago(Instant::now()),
             // Never while a limit episode stands: the upgrade types nothing
             // at a limit, and the wall is the loop's to wait out
             // ([`crate::supervise::IdleHost::limited`]).
-            upgrading: self.limit.is_none()
-                && opts.idle_host.as_ref().is_some_and(|h| h.owns_turn_end()),
-            restartable: opts.idle_host.as_ref().is_some_and(|h| h.can_restart()),
-            ..TurnEndReading::of(
-                &reading,
-                &screen.rows,
-                typed_draft(reader, screen) || self.homed_draft(reader, screen),
-                worked,
-                reset_at,
-                self.rules_text(opts),
-            )
+            upgrading: self.limit.is_none() && host.is_some_and(|h| h.owns_turn_end()),
+            restartable: host.is_some_and(|h| h.can_restart()),
+            // The screen's launch card, or the host's record of whose turns
+            // the conversation holds (the harness's own are no task).
+            taskless: r.taskless || host.is_some_and(|h| h.taskless()),
+            ..r
         }
     }
 
@@ -323,6 +327,9 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(TurnEndAction::Nothing);
         }
         let r = self.turn_end_reading(&point.screen, worked, opts);
+        // Decided while the host owns the turn ends: decided again once it
+        // owns nothing ([`Self::host_held`]).
+        self.host_held = r.upgrading;
         let now = Instant::now();
         self.turn_end.observe(&r, now);
         self.decide_to_act(r, opts, now)
@@ -378,6 +385,7 @@ impl<C: Ctl> Session<'_, C> {
             return Ok(());
         }
         let r = self.turn_end_reading(&turn.screen, None, opts);
+        self.host_held = r.upgrading;
         let now = Instant::now();
         self.turn_end.observe(&r, now);
         let action = self.decide_to_act(r, opts, now)?;
@@ -536,6 +544,12 @@ impl<C: Ctl> Session<'_, C> {
                 let r = self.turn_end_reading(&point.screen, None, opts);
                 let now = Instant::now();
                 self.turn_end.restarted(why, true, &r, now);
+                // A host that typed the carry-on inside its restart typed a
+                // turn of its own: its answer is awaited as the harness's,
+                // never a short turn of the worker's.
+                if word == Some("continued") {
+                    self.turn_end.host_typed(now);
+                }
                 self.mail_turn_boundary();
                 let what = match why {
                     Restart::Memory => "the agent, for its critical-memory banner".to_string(),

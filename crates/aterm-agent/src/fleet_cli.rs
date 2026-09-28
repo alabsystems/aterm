@@ -69,7 +69,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    let help = "aterm-fleet — federate a fleet of aterm sessions into one fabric.\n\n\
+    let help = "aterm-fleet — watch and drive the sessions of every aterm window \
+         on this machine.\n\n\
          USAGE:\n\
          \x20 aterm-fleet events     merge the `subscribe events` of every live instance in the\n\
          \x20                        default socket dir to stdout as NDJSON, addressed by astream\n\

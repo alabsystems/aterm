@@ -63,7 +63,7 @@ use crate::ledger::{Error, Result};
 #[cfg(unix)]
 use crate::publish::step;
 #[cfg(unix)]
-use crate::{gates, machines, mirror, publish, sign};
+use crate::{channel, gates, machines, publish, sign};
 
 /// POSIX-only, exactly like the engine it drives: `atpkg-keys` compiles empty on
 /// Windows (`#![cfg(unix)]`), because the master phrase is read from `/dev/tty`.
@@ -91,7 +91,7 @@ pub fn run_provision(
 
     let manifest = std::fs::read_to_string(repo.join("Cargo.toml"))
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))?;
-    let slug = mirror::update_channel_slug(&manifest)?.ok_or_else(|| {
+    let slug = channel::update_channel_slug(&manifest)?.ok_or_else(|| {
         Error::new(
             "no update channel is committed ([workspace.metadata.aterm] update_channel), so \
              there is no release to seed the roster from and no channel to provision for",
@@ -1804,9 +1804,23 @@ fn x86_slice_check() -> Check {
         return Check::Skip("universal DMG builds run on macOS".into());
     }
     match gates::x86_target_probe() {
-        Ok(()) => {
-            Check::Pass("stable x86_64-apple-darwin target installed (universal slice)".into())
-        }
+        // The cut RUNS the slice under Rosetta too, and refuses pre-claim without it
+        // (gates::universal_gate) — so the audit asks the same probe.
+        Ok(()) => match gates::rosetta_runs(&mut |command| command.output()) {
+            Ok(()) => Check::Pass(
+                "stable x86_64-apple-darwin target installed and Rosetta runs it (universal \
+                 slice)"
+                    .into(),
+            ),
+            Err(_) => Check::Fail {
+                what: "Rosetta does not run x86_64 programs here — a universal cut runs its \
+                       x86_64 slice under it before it ships"
+                    .into(),
+                fix: "softwareupdate --install-rosetta --agree-to-license\n\
+                      or:   cut with --arm64-only — an explicit, thinner artifact"
+                    .into(),
+            },
+        },
         // The WHOLE fault, and the shared remedy text. The probe no longer carries a
         // hand-indented `fix:`/`or:` block of its own, so nothing has to be truncated to
         // keep this line on the grid — and truncating it used to throw away the rustup

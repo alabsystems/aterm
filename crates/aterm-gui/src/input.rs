@@ -52,7 +52,7 @@
 //! full tty input buffer).
 //!
 //! `Source` is AUDIT-ONLY: the seam MUST NEVER branch behaviour on it (the
-//! indistinguishability invariant). The byte-producing core [`seam_egress`]
+//! indistinguishability invariant). The byte-producing core [`seam_egress_receipt`]
 //! takes NO `Source` — it is STRUCTURALLY impossible for it to branch — and the
 //! gesture-state arms of `App::input` read ONLY data carried on the event (never
 //! `self.mods`). The Tier-1 tests prove convergence two ways: the two REAL
@@ -413,7 +413,7 @@ pub(crate) enum InputOutcome {
     WriteFailed,
 }
 
-/// Whether [`seam_egress`] actually delivered the event's encoded bytes to the PTY.
+/// Whether [`seam_egress_receipt`] actually delivered the event's encoded bytes to the PTY.
 /// An event that legitimately encodes to NO bytes (a legacy-mode key release, an
 /// un-encodable modifier — faithful to what a real terminal does) is [`Full`]: there
 /// was nothing to deliver and nothing was lost. Only a short/failed write is
@@ -463,21 +463,25 @@ fn delivered(res: std::io::Result<usize>, intended: usize) -> Delivery {
     }
 }
 
+/// One sink write's verdict: the delivery, the accepted order, whether the
+/// frame went whole to the kernel directly, and whether the UI thread's egress
+/// REFUSED it rather than park ([`WriteReceiptError::is_refused`]).
 fn delivered_receipt(
     result: Result<WriteReceipt, WriteReceiptError>,
     intended: usize,
-) -> (Delivery, Option<AcceptedOrder>, bool) {
+) -> (Delivery, Option<AcceptedOrder>, bool, bool) {
     match result {
         Ok(receipt) => (
             delivered(Ok(receipt.accepted()), intended),
             receipt.order(),
             receipt.is_direct(),
+            false,
         ),
-        Err(error) => (Delivery::Failed, error.order(), false),
+        Err(error) => (Delivery::Failed, error.order(), false, error.is_refused()),
     }
 }
 
-/// What [`seam_egress`] did with a mouse/wheel event, so `App::input` knows
+/// What [`seam_egress_receipt`] did with a mouse/wheel event, so `App::input` knows
 /// whether the tracking-OFF local fallback (selection gesture / viewport scroll)
 /// must still run. The byte-producing decision lives ENTIRELY in `seam_egress`;
 /// the viewport/gesture/window side-effects stay in `App::input` (they need the
@@ -532,6 +536,18 @@ pub(crate) struct EgressReceipt {
     /// (`WriteReceipt::is_direct`): the echo tracker can settle its spill debt
     /// without probing the spill mutex. Conservative `false` everywhere else.
     direct: bool,
+    /// The event was REFUSED because its session's input queue is full: the
+    /// program has stopped reading and the UI thread's egress would otherwise
+    /// have parked (`WriteReceiptError::is_refused`), or the ordered writer
+    /// did not admit it (`paste_order`: its queue had no room, or the writer
+    /// is gone). Always with `Delivery::Failed`; the App says so once per
+    /// session (`App::refuse_input`).
+    refused: bool,
+    /// The event was handed to the per-session ordered writer
+    /// ([`Self::deferred_full`]): its bytes, if any, are written there, later.
+    /// A report goes there only with bytes to write (`paste_order`'s report
+    /// route), so for a report this is "bytes are on their way".
+    queued: bool,
 }
 
 impl EgressReceipt {
@@ -546,6 +562,22 @@ impl EgressReceipt {
             egress: Egress::Reported(delivery),
             accepted_order,
             direct: false,
+            refused: false,
+            queued: false,
+        }
+    }
+
+    /// An event the seam decided and nothing wrote: `egress` as the seam
+    /// reported it (tracking off, or a report the mode swallows), no byte
+    /// moved, nothing queued.
+    #[must_use]
+    pub(crate) const fn unwritten(egress: Egress) -> Self {
+        Self {
+            egress,
+            accepted_order: None,
+            direct: false,
+            refused: false,
+            queued: false,
         }
     }
 
@@ -558,7 +590,39 @@ impl EgressReceipt {
             egress: Egress::Reported(Delivery::Full),
             accepted_order: None,
             direct: false,
+            refused: false,
+            queued: true,
         }
+    }
+
+    /// The ordered writer REFUSED the event: its session's input queue has no
+    /// room, or its writer is gone (`paste_order`'s admission). No byte moved
+    /// and none ever will — a failed delivery, never a queued one, and never
+    /// written around the FIFO.
+    #[must_use]
+    pub(crate) const fn queue_full() -> Self {
+        Self {
+            egress: Egress::Reported(Delivery::Failed),
+            accepted_order: None,
+            direct: false,
+            refused: true,
+            queued: false,
+        }
+    }
+
+    /// Whether the event was refused because its session's input queue is
+    /// full (see the field): the program is not reading, and the person should
+    /// be told rather than lose the key silently.
+    #[must_use]
+    pub(crate) const fn input_queue_full(self) -> bool {
+        self.refused
+    }
+
+    /// Whether the event was handed to the per-session ordered writer (see
+    /// the field) rather than written, refused or dropped here.
+    #[must_use]
+    pub(crate) const fn is_queued(self) -> bool {
+        self.queued
     }
 
     /// Whether at least one byte was conclusively accepted by the sink.
@@ -756,7 +820,7 @@ pub(crate) fn wheel_route(
 /// The four FACTS [`wheel_route`] decides on, read from one engine under the
 /// caller's lock. Only reads — the policy is still entirely in `wheel_route`.
 ///
-/// Split out of [`seam_egress`] so the derivation is reachable from a test on
+/// Split out of [`seam_egress_receipt`] so the derivation is reachable from a test on
 /// EVERY platform. The seam's own wheel tests used to need a POSIX pipe fd for
 /// `SinkWriter` and were therefore `#[cfg(unix)]`, which left the SELECTION
 /// CUSTODY Phase-2 Option override — the item the design calls load-bearing,
@@ -798,22 +862,36 @@ fn wheel_scaled_lines(
     notch_lines.saturating_mul(per_notch)
 }
 
-/// How [`seam_egress`] hands the encoded bytes to the [`SinkWriter`] — a TRANSPORT
+/// How [`seam_egress_receipt`] hands the encoded bytes to the [`SinkWriter`] — a TRANSPORT
 /// knob keyed on the CALLING THREAD, never on who produced the event (cf.
 /// `echo_to_window` and the `resize` arm, which key on WHERE the event came from,
 /// not on [`Source`]). It NEVER changes WHICH bytes are produced, so the Tier-1
 /// `bytes_human_eq_controller` byte-equality invariant holds for either variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EgressMode {
-    /// The UI event-loop thread: use the non-parking egress so a wedged foreground
+    /// The UI event-loop thread: use the non-parking egress
+    /// (`SinkWriter::write_frame_interactive_with_receipt`) so a wedged foreground
     /// can NEVER park the loop that serves rendering + input for every window/tab.
+    /// At the sink's spill cap the frame is REFUSED instead ([`Delivery::Failed`],
+    /// [`EgressReceipt::input_queue_full`]; decided 2026-09-25). On Windows, where
+    /// ConPTY has no non-blocking write, keys and reports never take this mode
+    /// inline: they go through the per-session ordered writer (`paste_order`),
+    /// reports as [`Self::Encode`]d bytes, and one it does not admit is refused.
     Interactive,
     /// An expendable egress thread (the per-session egress-order writer thread, the
-    /// detached paste writer, the cross-session control thread): use the blocking,
+    /// cross-session control thread): use the blocking,
     /// `SPILL_CAP`-enforcing egress, so a machine-rate producer into a wedged
     /// foreground feels backpressure on THIS thread instead of growing the spill
     /// without bound. MUST NOT be used on the UI thread.
     Backpressured,
+    /// The UI thread where a write could block it (Windows: ConPTY has no
+    /// non-blocking write), or behind a queued paste: produce exactly the bytes
+    /// `Interactive` would — the same seam, the modes read once under the
+    /// gesture's own lock — and write NOTHING. [`seam_encode`] hands them back
+    /// for the per-session ordered writer to deliver (`paste_order`'s report
+    /// route), so a mouse, wheel or focus report never waits on the kernel on
+    /// the loop that serves every window.
+    Encode,
 }
 
 /// Deliver `bytes` to `sink` per `mode`. Transport only: the bytes are identical
@@ -822,18 +900,24 @@ pub(crate) enum EgressMode {
 /// actuator; ordinary modes preserve their existing `Full`/`Failed` contract.
 fn emit(sink: &SinkWriter, mode: EgressMode, bytes: &[u8], accepted: &mut Accepted) -> Delivery {
     debug_assert!(!bytes.is_empty());
-    let (delivery, order, direct) = match mode {
-        EgressMode::Interactive => {
-            delivered_receipt(sink.write_frame_nonparking_with_receipt(bytes), bytes.len())
-        }
+    let (delivery, order, direct, refused) = match mode {
+        EgressMode::Interactive => delivered_receipt(
+            sink.write_frame_interactive_with_receipt(bytes),
+            bytes.len(),
+        ),
         EgressMode::Backpressured => {
             delivered_receipt(sink.write_frame_with_receipt(bytes), bytes.len())
+        }
+        EgressMode::Encode => {
+            accepted.encoded.extend_from_slice(bytes);
+            (Delivery::Full, None, false, false)
         }
     };
     if order.is_some() {
         accepted.order = order;
         accepted.direct = direct;
     }
+    accepted.refused |= refused;
     delivery
 }
 
@@ -845,7 +929,7 @@ fn emit_metered(
     accepted: &mut Accepted,
     meter: &BulkMeter,
 ) -> Delivery {
-    let (delivery, order, direct) = delivered_receipt(
+    let (delivery, order, direct, _) = delivered_receipt(
         sink.write_frame_metered_with_receipt(bytes, meter),
         bytes.len(),
     );
@@ -857,11 +941,36 @@ fn emit_metered(
 }
 
 /// The seam's accepted-frame accumulator: the order of the LAST accepted
-/// non-empty frame and whether that frame went whole to the kernel directly.
-#[derive(Clone, Copy, Debug, Default)]
+/// non-empty frame, whether that frame went whole to the kernel directly,
+/// whether any frame of the event was refused because the input queue was
+/// full, and — under [`EgressMode::Encode`] only — every frame's bytes, in
+/// order, that nothing wrote.
+#[derive(Clone, Debug, Default)]
 struct Accepted {
     order: Option<AcceptedOrder>,
     direct: bool,
+    refused: bool,
+    encoded: Vec<u8>,
+}
+
+/// [`seam_egress_receipt`] without the receipt: the spelling the byte-level
+/// tests drive. Production reads the receipt (accepted order, refusal), so
+/// every production entry is the receipt-bearing one.
+#[cfg(test)]
+pub(crate) fn seam_egress(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+    mode: EgressMode,
+) -> Egress {
+    debug_assert_ne!(
+        mode,
+        EgressMode::Encode,
+        "an encode-only seam is `seam_encode`"
+    );
+    let mut accepted = Accepted::default();
+    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, None)
 }
 
 /// THE source-blind byte-producing core of the seam (design A.2 / A.7). It is the
@@ -889,20 +998,10 @@ struct Accepted {
 /// Only the byte-producing arms are handled here; the viewport/gesture/clipboard/
 /// blink/snap/resize side-effects (which need the renderer + window + gesture
 /// state) stay in `App::input`, which calls this and then runs those.
-pub(crate) fn seam_egress(
-    term: &Mutex<Terminal>,
-    modes: &ModeMirror,
-    sink: &SinkWriter,
-    ev: &InputEvent,
-    mode: EgressMode,
-) -> Egress {
-    let mut accepted = Accepted::default();
-    seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, None)
-}
-
-/// Receipt-bearing twin of [`seam_egress`]. The byte-producing decision remains
-/// in the one inner seam; this merely preserves accepted-byte evidence that
-/// [`Egress`] intentionally erases for zero-byte and multi-frame contracts.
+///
+/// The receipt preserves the accepted-byte evidence that [`Egress`]
+/// intentionally erases for zero-byte and multi-frame contracts; the
+/// byte-producing decision stays in the one inner seam.
 pub(crate) fn seam_egress_receipt(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -928,13 +1027,44 @@ pub(crate) fn seam_egress_receipt_metered(
     mode: EgressMode,
     meter: Option<&BulkMeter>,
 ) -> EgressReceipt {
+    debug_assert_ne!(
+        mode,
+        EgressMode::Encode,
+        "an encode-only seam is `seam_encode`"
+    );
     let mut accepted = Accepted::default();
     let egress = seam_egress_inner(term, modes, sink, ev, mode, &mut accepted, meter);
     EgressReceipt {
         egress,
         accepted_order: accepted.order,
         direct: accepted.direct,
+        refused: accepted.refused,
+        queued: false,
     }
+}
+
+/// [`seam_egress_receipt`] under [`EgressMode::Encode`]: the event's [`Egress`] — what
+/// the caller's local fallback reads, exactly as an inline write would have
+/// reported it — and the bytes the seam produced for it, which NOTHING has
+/// written. Empty when the event writes nothing (tracking off, a swallowed
+/// wheel, focus reporting off). `sink` is not touched.
+pub(crate) fn seam_encode(
+    term: &Mutex<Terminal>,
+    modes: &ModeMirror,
+    sink: &SinkWriter,
+    ev: &InputEvent,
+) -> (Egress, Vec<u8>) {
+    let mut accepted = Accepted::default();
+    let egress = seam_egress_inner(
+        term,
+        modes,
+        sink,
+        ev,
+        EgressMode::Encode,
+        &mut accepted,
+        None,
+    );
+    (egress, accepted.encoded)
 }
 
 fn seam_egress_inner(
@@ -1769,10 +1899,16 @@ mod tests {
             accepted.direct,
             "a later failed frame accepts nothing and leaves the earlier direct fact alone"
         );
+        assert!(
+            !accepted.refused,
+            "a dead fd is a failure, not a full queue"
+        );
         let receipt = EgressReceipt {
             egress: Egress::Reported(Delivery::Failed),
             accepted_order: accepted.order,
             direct: accepted.direct,
+            refused: accepted.refused,
+            queued: false,
         };
         assert!(receipt.accepted_nonempty());
         assert!(receipt.is_direct());

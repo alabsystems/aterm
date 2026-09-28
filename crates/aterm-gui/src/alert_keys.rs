@@ -449,23 +449,6 @@ mod tests {
         confirm_key(attached, mods, key.0, key.1)
     }
 
-    #[test]
-    fn plain_return_accepts() {
-        assert_eq!(action(true, 0, RETURN), ConfirmKey::Accept);
-    }
-
-    /// THE BUG: ⌘Return (modifierFlags 0x100000) must accept. AppKit's own
-    /// key-equivalent match rejects it because the default button's mask is empty.
-    #[test]
-    fn command_return_accepts() {
-        assert_eq!(action(true, COMMAND, RETURN), ConfirmKey::Accept);
-    }
-
-    #[test]
-    fn shift_return_accepts() {
-        assert_eq!(action(true, SHIFT, RETURN), ConfirmKey::Accept);
-    }
-
     /// The mask is IRRELEVANT, exhaustively over the modifiers a keyboard can hold —
     /// including the combinations a ⌘V/⌘Q gesture can leave behind mid-release.
     #[test]
@@ -475,6 +458,8 @@ mod tests {
             SHIFT,
             CONTROL,
             OPTION,
+            // THE BUG: ⌘Return (modifierFlags 0x100000) must accept. AppKit's own
+            // key-equivalent match rejects it because the default button's mask is empty.
             COMMAND,
             FUNCTION,
             COMMAND | SHIFT,
@@ -489,25 +474,19 @@ mod tests {
         }
     }
 
+    /// With a confirmation attached: keypad Enter accepts, Escape cancels whatever
+    /// the modifiers, and an ordinary character passes through to the terminal.
     #[test]
-    fn keypad_enter_accepts() {
-        assert_eq!(action(true, FUNCTION, KEYPAD_ENTER), ConfirmKey::Accept);
-    }
-
-    #[test]
-    fn escape_cancels() {
-        assert_eq!(action(true, 0, ESCAPE), ConfirmKey::Cancel);
-    }
-
-    #[test]
-    fn command_escape_still_cancels() {
-        assert_eq!(action(true, COMMAND, ESCAPE), ConfirmKey::Cancel);
-    }
-
-    #[test]
-    fn an_ordinary_character_passes_through() {
-        assert_eq!(action(true, 0, LETTER_A), ConfirmKey::PassThrough);
-        assert_eq!(action(true, COMMAND, LETTER_A), ConfirmKey::PassThrough);
+    fn an_attached_confirmation_maps_enter_escape_and_a_character() {
+        for (label, mods, key, expected) in [
+            ("keypad Enter", FUNCTION, KEYPAD_ENTER, ConfirmKey::Accept),
+            ("Escape", 0, ESCAPE, ConfirmKey::Cancel),
+            ("⌘Escape", COMMAND, ESCAPE, ConfirmKey::Cancel),
+            ("a", 0, LETTER_A, ConfirmKey::PassThrough),
+            ("⌘a", COMMAND, LETTER_A, ConfirmKey::PassThrough),
+        ] {
+            assert_eq!(action(true, mods, key), expected, "{label}");
+        }
     }
 
     /// The anti-deafness invariant: with NO confirmation attached, NOTHING is

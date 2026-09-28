@@ -34,16 +34,14 @@
 //!   build. **The rule — live + one rollback — lives in [`reclaimable`], and only there.**
 //!   Hand `discard_superseded` the rollback target and it deletes it.
 //!
-//! **The authority is `store/<program>/current`, not `channels/<c>/current`.** The channel
-//! link is one symlink per CHANNEL and every program shares a channel name (default
-//! `stable`), so it is overwritten by whichever program was activated last: as the sole
-//! authority it witnesses exactly one program and GC abstains on all the others *forever*,
-//! which is a silent unbounded-growth bug rather than a safe one. So
-//! [`crate::activate::activate_channel`] writes a per-program link too, and that is the
-//! authority — where it answers, the channel links are not consulted at all. They are read
-//! only for a program it does NOT answer for, which is exactly a prefix last written by a
-//! manager older than the per-program link: a self-limiting migration that keeps the
-//! last-activated program witnessed across the upgrade and expires at its next activation.
+//! **The authority is `store/<program>/current`**, the one link
+//! [`crate::activate::activate_build`] writes. A second family, `channels/<c>/current`, was
+//! one symlink per CHANNEL shared by every program (default `stable`), so it witnessed only
+//! the last program activated; it survived here as a migration fallback for prefixes older
+//! than the per-program link, and was deleted end to end on 2026-09-25. A prefix that still
+//! carries the directory has it swept at the start of every pass
+//! ([`sweep_retired_channel_links`]); a program whose only link was the retired one has no
+//! witness (GC abstains and `doctor` names it) until its next activation writes its own.
 //!
 //! There is a SECOND destructive path, and it is deliberately NOT witness-guarded, because it
 //! cannot be. An install killed mid-extract leaves a marker-less build tree that
@@ -102,23 +100,19 @@ impl LiveBuild {
 /// would be a guess, so GC abstains and `doctor` explains which of the two views is wrong.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Diverged {
-    /// The activation authority selects one build; the program's `bin/` shims run another.
+    /// The program's `current` link selects one build; its `bin/` shims run another.
     /// Whichever is stale, the user is executing a build activation does not select — and the
     /// *old* retention rule would have deleted whichever of the two the loser superseded.
-    ChannelShimMismatch { channel_says: u64, shims_say: u64 },
+    LinkShimMismatch { link_says: u64, shims_say: u64 },
     /// This program's own tools resolve into different builds. The state
     /// [`crate::activate::install_shims`]' prune exists to prevent, still reachable when its
     /// per-tool loop fails partway through (activate.rs `?`s before the prune runs).
     ShimsDisagree { builds: Vec<u64> },
-    /// Two `channels/<c>/current` links select different builds of the same program, and the
-    /// program has no `store/<program>/current` of its own to break the tie (a prefix older
-    /// than that link). Neither channel outranks the other, so the prefix proves nothing.
-    ChannelsDisagree { builds: Vec<u64> },
     /// The program is live on `PATH` but NO `current` link resolves into it: it was shimmed
     /// without ever being activated, or its `store/<program>/current` dangles because the
     /// build it named was removed. (A prefix last written by a manager older than the
-    /// per-program link lands here too, for every program but the last one activated; the
-    /// next `atpkg update` writes the link and clears it.) Reported rather than swallowed,
+    /// per-program link lands here too; the next `atpkg update` writes the link and clears
+    /// it.) Reported rather than swallowed,
     /// because the cost is silent: that program's superseded builds are never reclaimed and
     /// the disk grows with no explanation anyone can find.
     NoLiveWitness { shims_say: u64 },
@@ -199,8 +193,7 @@ pub enum Retained {
 fn current_target(prefix: &Path, current: &Path) -> Option<(String, u64)> {
     // read_link, NOT platform::resolve_shim: `current` is a directory symlink on Unix and a
     // directory JUNCTION on Windows, both of which std reads back; resolve_shim's Windows
-    // half parses a `.cmd` wrapper and would return None here. Matches `ops::uninstall`'s
-    // channel sweep, which is the only other reader of these links.
+    // half parses a `.cmd` wrapper and would return None here.
     let target = std::fs::read_link(current).ok()?;
     if target
         .strip_prefix(prefix.join("store"))
@@ -217,44 +210,21 @@ fn current_target(prefix: &Path, current: &Path) -> Option<(String, u64)> {
     crate::ops::store_build_of(prefix, &target)
 }
 
-/// Every build the AUTHORITATIVE `current` links select, keyed by program: the per-program
-/// `store/<program>/current` where it answers, and `channels/<c>/current` only for the
-/// programs it does not.
+/// Every build the AUTHORITATIVE `store/<program>/current` links select, keyed by program.
 ///
-/// A program mapping to more than one build is contested and gets no witness. Unreadable
-/// directories yield an empty map — no witnesses at all, which is the fail-closed direction:
-/// GC then reclaims nothing.
+/// One link per program, so a program maps to ONE build here — the type says so, so no
+/// reconciliation can meet two authorities and have to pick. Unreadable
+/// directories yield an empty map — no witnesses at all, which is the fail-closed
+/// direction: GC then reclaims nothing. A dangling or out-of-store link claims nothing,
+/// and the program it belongs to gets no witness until the next activation rewrites it.
 ///
-/// **Preference, not union.** The per-program link is the authority (see the module doc: the
-/// channel link cannot answer per program), and unioning the two families instead would
-/// re-create the abstain-forever bug from the other side: a program activated on `beta`
-/// leaves the older `channels/stable/current` behind still naming its previous build, the two
-/// families "disagree", and GC skips a program whose own link says plainly which build is
-/// live. Channel links are therefore a MIGRATION path only — read for a program with no link
-/// of its own, i.e. a prefix last written before per-program links existed, which is
-/// self-limiting because that program's next activation writes one.
-///
-/// Preferring a link that could itself be stale is safe because it is not the only check: if
-/// an older manager binary re-activated a program without updating its per-program link, that
-/// activation also rewrote the `bin/` shims, so [`live_builds`] sees a channel/shim mismatch
-/// and still refuses a witness.
-fn authority_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
-    let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
-    // Programs whose `store/<p>/current` link EXISTS — resolved or not. The legacy channel
-    // fallback below is suppressed by existence, not by resolution: a dangling or
-    // out-of-store per-program link means "this prefix has the link discipline but this
-    // program's link is broken", and the honest answer is NO witness (GC abstains until the
-    // next activation rewrites it) — not "quietly hand authority back to a channel link that
-    // may name an older build". Keying suppression on resolution was the gap: a broken own
-    // link plus one stale channel link would have minted a witness for the wrong build.
-    let mut has_own_link: BTreeSet<String> = BTreeSet::new();
+/// Preferring a link that could itself be stale is safe because it is not the only check:
+/// if activation moved the link without rewriting the `bin/` shims (or the reverse),
+/// [`live_builds`] sees a link/shim mismatch and still refuses a witness.
+fn authority_claims(layout: &Layout) -> BTreeMap<String, u64> {
+    let mut out: BTreeMap<String, u64> = BTreeMap::new();
     if let Ok(programs) = std::fs::read_dir(layout.prefix.join("store")) {
         for p in programs.flatten() {
-            if std::fs::symlink_metadata(p.path().join("current")).is_ok()
-                && let Some(name) = p.file_name().to_str()
-            {
-                has_own_link.insert(name.to_string());
-            }
             let Some((program, build)) = current_target(&layout.prefix, &p.path().join("current"))
             else {
                 continue;
@@ -262,27 +232,38 @@ fn authority_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
             // The link lives in `store/<dir>/` and must resolve into `store/<dir>/` — a
             // hand-made `store/ay/current -> store/ny/7` claims nothing about either.
             if p.file_name() == std::ffi::OsStr::new(&program) {
-                out.entry(program).or_default().insert(build);
-            }
-        }
-    }
-    if let Ok(channels) = std::fs::read_dir(layout.prefix.join("channels")) {
-        for ch in channels.flatten() {
-            if let Some((program, build)) =
-                current_target(&layout.prefix, &ch.path().join("current"))
-                && !has_own_link.contains(&program)
-            {
-                out.entry(program).or_default().insert(build);
+                out.insert(program, build);
             }
         }
     }
     out
 }
 
+/// Remove the retired `channels/<c>/current` links and the directories that held them — the
+/// stale-dir cleanup for a prefix written before 2026-09-25, when activation still flipped a
+/// per-channel link beside the per-program one. Each link is removed as a LINK
+/// ([`crate::platform::remove_link`]: never followed, so the build it names is untouched),
+/// and a directory is removed only once empty; anything else found there is left alone.
+/// Best-effort and idempotent: a prefix without the directory costs one failed `read_dir`.
+pub(crate) fn sweep_retired_channel_links(layout: &Layout) {
+    let root = layout.prefix.join("channels");
+    let Ok(channels) = std::fs::read_dir(&root) else {
+        return;
+    };
+    for ch in channels.flatten() {
+        let link = ch.path().join("current");
+        if std::fs::symlink_metadata(&link).is_ok() {
+            crate::platform::remove_link(&link);
+        }
+        let _ = std::fs::remove_dir(ch.path());
+    }
+    let _ = std::fs::remove_dir(&root);
+}
+
 /// Every build the DERIVED `bin/` shims point into, keyed by program. Unlike
 /// [`crate::ops::active_builds`] this keeps the whole set instead of folding it with
 /// last-write-wins, so a program whose tools disagree is *visibly* contested rather than
-/// silently resolved by `read_dir` order. Used only to corroborate or contradict a channel
+/// silently resolved by `read_dir` order. Used only to corroborate or contradict a `current`
 /// claim — never as a witness in its own right.
 fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
@@ -320,30 +301,26 @@ pub fn live_builds(layout: &Layout) -> LiveSet {
 /// [`live_builds`]' reconciliation over claim views already read.
 ///
 /// Split out so a caller needing the claim union too ([`run_keeping_pinned_partials`], whose
-/// sweep guard is that union) reads `store/`, `channels/` and every `bin/` shim once per pass
+/// sweep guard is that union) reads `store/` and every `bin/` shim once per pass
 /// instead of twice. Pure: it reads nothing and decides nothing about what may be deleted.
 fn live_from_claims(
-    authority: &BTreeMap<String, BTreeSet<u64>>,
+    authority: &BTreeMap<String, u64>,
     shims: &BTreeMap<String, BTreeSet<u64>>,
 ) -> LiveSet {
     let mut set = LiveSet::default();
     let empty = BTreeSet::new();
     let programs: BTreeSet<&String> = authority.keys().chain(shims.keys()).collect();
     for program in programs {
-        let ch = authority.get(program).unwrap_or(&empty);
+        let own = authority.get(program).copied();
         let sh = shims.get(program).unwrap_or(&empty);
-        let reason = if ch.len() > 1 {
-            Diverged::ChannelsDisagree {
-                builds: ch.iter().copied().collect(),
-            }
-        } else if sh.len() > 1 {
+        let reason = if sh.len() > 1 {
             Diverged::ShimsDisagree {
                 builds: sh.iter().copied().collect(),
             }
         } else {
-            match (ch.first().copied(), sh.first().copied()) {
-                (Some(c), Some(s)) if c != s => Diverged::ChannelShimMismatch {
-                    channel_says: c,
+            match (own, sh.first().copied()) {
+                (Some(c), Some(s)) if c != s => Diverged::LinkShimMismatch {
+                    link_says: c,
                     shims_say: s,
                 },
                 (Some(c), _) => {
@@ -797,9 +774,10 @@ fn run_in(
     // swap was killed midway through, so the claim views see a `current` link that resolves.
     // What it could not put back it names, and the debris scan spares those siblings.
     let parked = recover_interrupted_swaps(layout);
+    sweep_retired_channel_links(layout);
     // The two claim views, read once for both answers below: the witness needs them to agree,
     // the sweep guard needs their union. Reading them twice costs a second walk of `store/`
-    // and `channels/` and a second resolve of every shim, on a pass that runs after every
+    // and a second resolve of every shim, on a pass that runs after every
     // install and update as well as behind `atpkg gc`.
     let authority = authority_claims(layout);
     let shims = shim_claims(layout);
@@ -808,7 +786,10 @@ fn run_in(
     // `live_builds` needs them to agree, the sweep only needs to know that SOMETHING points
     // into a build. A contested build has no witness but is still one the user's next command
     // executes, so it must survive.
-    let mut claimed = authority;
+    let mut claimed: BTreeMap<String, BTreeSet<u64>> = authority
+        .into_iter()
+        .map(|(program, build)| (program, BTreeSet::from([build])))
+        .collect();
     for (program, builds) in shims {
         claimed.entry(program).or_default().extend(builds);
     }
@@ -1090,10 +1071,18 @@ pub(crate) fn running_from(
     running: &dyn Fn() -> Option<Vec<PathBuf>>,
 ) -> Option<Option<PathBuf>> {
     let running = running()?;
+    Some(running_from_table(dir, &running))
+}
+
+/// Search an already-read process table. Quiet toolchain flips check several
+/// build and view directories against the same snapshot; borrowing it avoids
+/// cloning every executable path for each directory.
+pub(crate) fn running_from_table(dir: &Path, running: &[PathBuf]) -> Option<PathBuf> {
     let resolved = std::fs::canonicalize(dir).ok();
-    Some(running.into_iter().find(|exe| {
-        exe.starts_with(dir) || resolved.as_deref().is_some_and(|r| exe.starts_with(r))
-    }))
+    running
+        .iter()
+        .find(|exe| exe.starts_with(dir) || resolved.as_deref().is_some_and(|r| exe.starts_with(r)))
+        .cloned()
 }
 
 /// The live process table ([`running_executables`]) under one ungated name, for another
@@ -1238,7 +1227,7 @@ mod tests {
     }
 
     /// The reconciliation table, over claim views handed in rather than read off a prefix —
-    /// the shape the pass uses so one gc run reads `store/`, `channels/` and `bin/` once.
+    /// the shape the pass uses so one gc run reads `store/` and `bin/` once.
     #[test]
     fn live_from_claims_reconciles_the_two_views() {
         fn claims(pairs: &[(&str, &[u64])]) -> BTreeMap<String, BTreeSet<u64>> {
@@ -1248,26 +1237,29 @@ mod tests {
                 .collect()
         }
         let build_of = |set: &LiveSet| set.live.get("ay").map(|l| l.build);
+        let link = |pairs: &[(&str, u64)]| -> BTreeMap<String, u64> {
+            pairs.iter().map(|(p, b)| ((*p).to_string(), *b)).collect()
+        };
 
         // Agreement mints a witness…
-        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[19])]));
+        let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[("ay", &[19])]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
         // …and so does an authority whose shims are silent: nothing on PATH points elsewhere.
-        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[]));
+        let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[]));
         assert_eq!(build_of(&set), Some(19));
         assert!(set.diverged.is_empty());
 
         // Shims that contradict the authority block the witness: whatever the authority says,
         // the disagreeing shim is what the user's next command executes.
-        let set = live_from_claims(&claims(&[("ay", &[19])]), &claims(&[("ay", &[18])]));
+        let set = live_from_claims(&link(&[("ay", 19)]), &claims(&[("ay", &[18])]));
         assert!(set.live.is_empty());
         assert_eq!(set.diverged.len(), 1);
-        // Two authorities, two shim targets, and a shim with no authority at all: no witness.
+        // Two shim targets, and a shim with no authority at all: no witness. (Two
+        // authorities cannot be written down: one `current` link per program.)
         for (a, sh) in [
-            (claims(&[("ay", &[18, 19])]), claims(&[])),
-            (claims(&[("ay", &[19])]), claims(&[("ay", &[18, 19])])),
-            (claims(&[]), claims(&[("ay", &[19])])),
+            (link(&[("ay", 19)]), claims(&[("ay", &[18, 19])])),
+            (link(&[]), claims(&[("ay", &[19])])),
         ] {
             let set = live_from_claims(&a, &sh);
             assert!(set.live.is_empty(), "no witness from {a:?} / {sh:?}");
@@ -1311,7 +1303,7 @@ mod tests {
 
     // --- the imperative executor -------------------------------------------------------
 
-    use crate::activate::{activate_channel, install_shims};
+    use crate::activate::{activate_build, install_shims};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
@@ -1329,7 +1321,7 @@ mod tests {
     }
 
     /// Lay down a COMPLETE (marker-written) build dir with `bin/<program>`. `shim` also
-    /// installs the shims + activates the channel (making it the LIVE build); otherwise it
+    /// installs the shims + activates the build (making it the LIVE build); otherwise it
     /// is a complete but inactive build on disk.
     fn seed(layout: &Layout, program: &str, build: u64, shim: bool) -> PathBuf {
         let dir = layout.build_dir(program, build);
@@ -1347,7 +1339,7 @@ mod tests {
                 crate::activate::Aliases::Off,
             )
             .unwrap();
-            activate_channel(layout, "stable", &dir).unwrap();
+            activate_build(layout, &dir).unwrap();
         }
         crate::store::mark_build_ready(&dir).unwrap();
         dir
@@ -1403,7 +1395,7 @@ mod tests {
     #[test]
     fn run_skips_a_program_with_no_active_build() {
         let l = layout("run-noactive");
-        // Complete builds on disk but NO shim and NO channel => nothing claims the program
+        // Complete builds on disk but NO shim and NO `current` link => nothing claims the program
         // at all => never reclaim, and nothing to report either (this is an ordinary
         // never-activated program, not a disagreement).
         seed(&l, "ay", 17, false);
@@ -1421,16 +1413,16 @@ mod tests {
 
     /// THE regression for the bricking path. A shim left pointing at an OLDER build made
     /// `ops::active_builds` report that older build as current; `reclaimable` then classified
-    /// the build the channel actually selects as superseded, and `discard_build` — which has
+    /// the build the `current` link actually selects as superseded, and `discard_build` — which has
     /// no liveness check of its own — deleted the live tree. Now the two views disagree, so
     /// no witness exists and nothing is deleted.
     #[test]
-    fn a_stale_shim_never_deletes_the_channels_live_build() {
+    fn a_stale_shim_never_deletes_the_linked_live_build() {
         let l = layout("stale-shim-brick");
         seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
         // The authority says 19 …
-        activate_channel(&l, "stable", &b19).unwrap();
+        activate_build(&l, &b19).unwrap();
         // … but `bin/ay` still forwards into 18 (a shim-install loop that failed partway,
         // or a hand-edited prefix). `bin/` is created here because nothing in this fixture
         // called `install_shims`, which is what normally hardens it.
@@ -1446,15 +1438,15 @@ mod tests {
         );
         assert!(
             l.build_dir("ay", 19).exists(),
-            "the channel's LIVE build must survive a stale shim"
+            "the link's LIVE build must survive a stale shim"
         );
         assert!(l.build_dir("ay", 18).exists(), "and so must the shims'");
         assert_eq!(
             report.diverged,
             vec![Divergence {
                 program: "ay".to_string(),
-                reason: Diverged::ChannelShimMismatch {
-                    channel_says: 19,
+                reason: Diverged::LinkShimMismatch {
+                    link_says: 19,
                     shims_say: 18,
                 },
             }]
@@ -1469,7 +1461,7 @@ mod tests {
         let l = layout("split-shims");
         let b18 = seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
-        activate_channel(&l, "stable", &b19).unwrap();
+        activate_build(&l, &b19).unwrap();
         install_shims(&l, &b19, &["ay".to_string()], crate::activate::Aliases::Off).unwrap();
         // Written AFTER install_shims: the prune would otherwise remove it immediately.
         let aylint = tool("aylint");
@@ -1492,16 +1484,15 @@ mod tests {
 
     /// An authority that cannot be resolved gives NO witness — never a fallback to the shim
     /// view, which is the bug this module exists to close. Covers all three failure shapes:
-    /// dangling, out-of-store, and unreadable link directories. Both link families are
-    /// broken in each step, because either one alone still proves the claim.
+    /// dangling, out-of-store, and absent links.
     #[cfg(unix)] // dangling/out-of-store link fixtures: a Windows junction needs a real target
     #[test]
     fn a_broken_authority_skips_the_program_instead_of_reclaiming() {
         let l = layout("bad-channel");
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
-        seed(&l, "ay", 19, true); // shims + both `current` links at 19
-        let links = [l.channel_current("stable"), l.program_current("ay")];
+        seed(&l, "ay", 19, true); // shims + the `current` link at 19
+        let links = [l.program_current("ay")];
 
         // 1. The links dangle (the build dir was removed out from under them).
         for link in &links {
@@ -1531,8 +1522,7 @@ mod tests {
             "an out-of-store authority proves nothing"
         );
 
-        // 3. Neither link exists at all.
-        std::fs::remove_dir_all(l.prefix.join("channels")).unwrap();
+        // 3. The link does not exist at all.
         std::fs::remove_file(l.program_current("ay")).unwrap();
         assert!(run(&l).reclaimed.is_empty(), "no links => no witnesses");
 
@@ -1570,11 +1560,12 @@ mod tests {
 
     /// THE regression for the second bricking-adjacent bug: GC that abstains forever.
     ///
-    /// Every released-tool install passes the SAME channel name, so `channels/stable/current`
-    /// only ever remembers the last program activated. With that as the sole authority, `ay`
-    /// here has no witness, `run` skips it, and every `atpkg update ay` adds a build that is
-    /// never reclaimed — silent, unbounded growth that no verb reports. The per-program
-    /// `store/<program>/current` is what makes both programs witnessable at once.
+    /// Every released-tool install used to pass the SAME channel name, so the retired
+    /// `channels/stable/current` only ever remembered the last program activated. With that
+    /// as the sole authority, `ay` here had no witness, `run` skipped it, and every
+    /// `atpkg update ay` added a build that was never reclaimed — silent, unbounded growth
+    /// that no verb reported. The per-program `store/<program>/current` is what makes both
+    /// programs witnessable at once.
     #[test]
     fn two_programs_on_one_channel_are_both_reclaimed() {
         let l = layout("two-progs");
@@ -1583,13 +1574,13 @@ mod tests {
         }
         seed(&l, "ay", 19, true); // ay@19 activated …
         seed(&l, "ny", 6, false);
-        seed(&l, "ny", 7, true); // … then ny@7, overwriting channels/stable/current
+        seed(&l, "ny", 7, true); // … then ny@7
 
         let report = run(&l);
         assert_eq!(
             report.reclaimed,
             vec![("ay".to_string(), vec![16u64, 17])],
-            "ay must still be witnessed after ny took over the channel link"
+            "ay must still be witnessed after ny was activated"
         );
         assert!(
             report.diverged.is_empty(),
@@ -1621,95 +1612,26 @@ mod tests {
         );
     }
 
-    /// The migration half of the authority rule: a prefix last written by a manager older
-    /// than the per-program link has ONLY `channels/<c>/current`, and the program it names
-    /// must stay witnessed across the upgrade — otherwise adopting the new link would itself
-    /// stop reclaiming until every program happened to be updated.
+    /// THE RETIRED CHANNEL LINK IS SWEPT AND PROVES NOTHING. A prefix written before
+    /// 2026-09-25 carries `channels/<c>/current`; it used to be read as a migration
+    /// fallback witness. Now a pass removes it (the link, never what it names) and a
+    /// program whose only link was that one abstains until its next activation — the
+    /// fail-closed direction — instead of being reclaimed on the retired link's word.
     #[test]
-    fn a_prefix_older_than_the_per_program_link_is_witnessed_by_its_channel() {
+    fn a_retired_channel_link_is_swept_and_is_never_a_witness() {
         let l = layout("legacy-channel");
         seed(&l, "ay", 17, false);
         seed(&l, "ay", 18, false);
-        seed(&l, "ay", 19, true);
-        unlink_current(&l.program_current("ay")); // the pre-migration on-disk shape
-
-        let report = run(&l);
-        assert_eq!(
-            report.reclaimed,
-            vec![("ay".to_string(), vec![17u64])],
-            "the channel link is still an authority for a program with no link of its own"
-        );
-        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
-        assert!(l.build_dir("ay", 18).exists() && l.build_dir("ay", 19).exists());
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// Preference, not union — and why it matters. A program activated on a second channel
-    /// leaves the first channel's link behind naming its PREVIOUS build. Treating both
-    /// families as co-equal authorities would call that a disagreement and abstain forever on
-    /// a program whose own `current` says plainly which build is live: the same
-    /// silent-unbounded-growth failure the per-program link was added to fix, entered from
-    /// the other side. The tie is only unbreakable when the program has no link of its own.
-    #[test]
-    fn a_stale_other_channel_link_does_not_contest_the_programs_own_current() {
-        let l = layout("stale-channel");
-        seed(&l, "ay", 17, false);
-        let b18 = seed(&l, "ay", 18, false);
-        activate_channel(&l, "beta", &b18).unwrap(); // an earlier activation, another channel
-        seed(&l, "ay", 19, true); // now: beta→18 (stale), stable→19, store/ay/current→19
-
-        let report = run(&l);
-        assert_eq!(
-            report.reclaimed,
-            vec![("ay".to_string(), vec![17u64])],
-            "the program's own link outranks a channel link it superseded"
-        );
-        assert!(report.diverged.is_empty(), "{:?}", report.diverged);
-
-        // Take that link away and the two channels are all that is left: neither outranks the
-        // other, so the prefix proves nothing and GC abstains instead of picking one.
-        unlink_current(&l.program_current("ay"));
-        let report = run(&l);
-        assert!(report.reclaimed.is_empty());
-        assert_eq!(
-            report.diverged,
-            vec![Divergence {
-                program: "ay".to_string(),
-                reason: Diverged::ChannelsDisagree {
-                    builds: vec![18, 19],
-                },
-            }]
-        );
-        assert!(l.build_dir("ay", 18).exists() && l.build_dir("ay", 19).exists());
-        let _ = std::fs::remove_dir_all(&l.prefix);
-    }
-
-    /// Suppression is by link EXISTENCE, not resolution. A program whose own `current` link
-    /// is present but broken gets NO witness — the channel fallback must not answer for it.
-    /// If suppression keyed on resolution instead, a dangling own link would quietly hand
-    /// authority back to a channel link that may name an older build, and `reclaimable`'s
-    /// "above live = staged, delete it" rule would then aim at the NEWER tree. The honest
-    /// answer to a broken link is abstention (`NoLiveWitness`, which `atpkg gc`/`doctor`
-    /// report) until the next activation rewrites it.
-    #[test]
-    fn a_broken_program_link_never_hands_authority_back_to_a_channel() {
-        let l = layout("broken-own-link");
-        seed(&l, "ay", 17, false);
-        seed(&l, "ay", 18, false);
-        seed(&l, "ay", 19, true); // own→19, stable→19, shims→19
-
-        // Break the own link portably: point it at a build dir that exists, then delete
-        // the dir. (A junction may dangle on Windows exactly like a symlink on Unix.)
-        let doomed = l.build_dir("ay", 99);
-        std::fs::create_dir_all(&doomed).unwrap();
-        unlink_current(&l.program_current("ay"));
-        crate::activate::atomic_symlink(&doomed, &l.program_current("ay")).unwrap();
-        std::fs::remove_dir_all(&doomed).unwrap();
+        let b19 = seed(&l, "ay", 19, true);
+        unlink_current(&l.program_current("ay")); // the pre-migration on-disk shape …
+        let legacy = l.prefix.join("channels").join("stable");
+        std::fs::create_dir_all(&legacy).unwrap();
+        crate::activate::atomic_symlink(&b19, &legacy.join("current")).unwrap(); // … its link
 
         let report = run(&l);
         assert!(
             report.reclaimed.is_empty(),
-            "a broken own link must abstain, not fall back to the channel: {:?}",
+            "the retired link is not an authority: {:?}",
             report.reclaimed
         );
         assert_eq!(
@@ -1719,10 +1641,36 @@ mod tests {
                 reason: Diverged::NoLiveWitness { shims_say: 19 },
             }]
         );
-        // Nothing was deleted on either side of the would-be witness.
+        assert!(
+            std::fs::symlink_metadata(l.prefix.join("channels")).is_err(),
+            "the retired directory is swept"
+        );
         for b in [17u64, 18, 19] {
-            assert!(l.build_dir("ay", b).exists(), "{b} must survive");
+            assert!(
+                l.build_dir("ay", b).is_dir(),
+                "{b} is untouched by the sweep"
+            );
         }
+        // The next activation writes the program's own link, and the witness is back.
+        activate_build(&l, &b19).unwrap();
+        assert_eq!(run(&l).reclaimed, vec![("ay".to_string(), vec![17u64])]);
+        let _ = std::fs::remove_dir_all(&l.prefix);
+    }
+
+    /// The sweep removes only what the retired layout put there: a `channels/<c>/` that
+    /// holds anything besides its `current` link keeps that entry and itself.
+    #[test]
+    fn the_channel_sweep_leaves_what_it_did_not_write() {
+        let l = layout("legacy-channel-foreign");
+        let b19 = seed(&l, "ay", 19, true);
+        let beta = l.prefix.join("channels").join("beta");
+        std::fs::create_dir_all(&beta).unwrap();
+        crate::activate::atomic_symlink(&b19, &beta.join("current")).unwrap();
+        std::fs::write(beta.join("notes.txt"), b"mine\n").unwrap();
+        sweep_retired_channel_links(&l);
+        assert!(std::fs::symlink_metadata(beta.join("current")).is_err());
+        assert!(beta.join("notes.txt").is_file(), "a foreign file survives");
+        assert!(b19.is_dir());
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -1798,7 +1746,7 @@ mod tests {
     }
 
     /// The case a witness-gated sweep cannot reach at all: a FIRST install of a program,
-    /// killed mid-extract. There is no live build, no shim and no channel link — `run` skips
+    /// killed mid-extract. There is no live build, no shim and no `current` link — `run` skips
     /// the program for every other purpose, and gating the sweep on a witness too would leak
     /// exactly the tree the sweep exists for.
     #[test]
@@ -1854,7 +1802,7 @@ mod tests {
         let l = layout("marker-less-contested");
         let b18 = seed(&l, "ay", 18, false);
         let b19 = seed(&l, "ay", 19, false);
-        activate_channel(&l, "stable", &b19).unwrap(); // the authority says 19 …
+        activate_build(&l, &b19).unwrap(); // the authority says 19 …
         // … and `bin/ay` says 18, which is the build the user's next command runs.
         crate::platform::ensure_private_dir(&l.bin_dir()).unwrap();
         let ay = tool("ay");
@@ -1868,7 +1816,7 @@ mod tests {
             report.swept_partial
         );
         assert!(b18.exists(), "the tree on PATH must survive");
-        assert!(b19.exists(), "and so must the one the channel selects");
+        assert!(b19.exists(), "and so must the one the link selects");
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
@@ -2198,7 +2146,7 @@ mod tests {
         seed(&l, "ay", 18, false);
         seed(&l, "ay", 19, true);
         let set = live_builds(&l);
-        let witness = set.get("ay").expect("channel + shims agree on 19").clone();
+        let witness = set.get("ay").expect("link + shims agree on 19").clone();
         assert_eq!((witness.program(), witness.build()), ("ay", 19));
 
         assert_eq!(

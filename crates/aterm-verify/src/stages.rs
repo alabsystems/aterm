@@ -12,15 +12,15 @@
 //! (`DocDriver` — private to this module, so named rather than linked:
 //! `RUSTDOC=<stage2>/trustdoc` when the stage2 carries it,
 //! the caller's own export or the PATH farm link otherwise, a diagnosis when
-//! nothing exists), `ATERM_SEARCH_REGEX_LANE=1` on the regex lane, and `--unverified` on
-//! every driver invocation (naming the lane is the point: `targo` REFUSES a bare
-//! verb precisely so a gate cannot be quietly unverified).
+//! nothing exists), and `--unverified` on every driver invocation (naming the
+//! lane is the point: `targo` REFUSES a bare verb precisely so a gate cannot be
+//! quietly unverified).
 
 use crate::exec::{self, Capture, Cmd};
 use crate::ladder::{Outcome, Report, Severity};
 use crate::plan::{Lane, StageId, StageSpec, lane_dir};
 use crate::scope::Scope;
-use crate::smoke::{debug_bin, debug_example};
+#[cfg(unix)]
 use crate::smoke_stages;
 use crate::{Ctx, have_on_path, is_executable_file};
 
@@ -29,29 +29,32 @@ use crate::{Ctx, have_on_path, is_executable_file};
 pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
     let mut r = Report::new(spec.title.clone());
     match spec.id {
-        StageId::Build => build(ctx, &mut r),
+        StageId::TestCompile => test_compile(ctx, &mut r),
         StageId::Test => test(ctx, &mut r),
         StageId::MeasuringTests => measuring_tests(ctx, &mut r),
         StageId::Doctests => doctests(ctx, &mut r),
-        StageId::RegexLane => regex_lane(ctx, &mut r),
         StageId::SealedLane => sealed_lane(ctx, &mut r),
         StageId::Tippy => tippy(ctx, &mut r),
         StageId::Formatting => formatting(ctx, &mut r),
         StageId::GrepGuards => grep_guards(ctx, &mut r),
         StageId::DeliveryTooling => delivery_tooling(ctx, &mut r),
         StageId::AtpkgTooling => atpkg_tooling(ctx, &mut r),
-        StageId::TrustGateVerdict => trust_gate_verdict(ctx, &mut r),
         StageId::TrustContractProbe => trust_contract_probe(ctx, &mut r),
         StageId::StartCompare => start_compare(ctx, &mut r),
-        StageId::LicenseHeaders => license_headers(ctx, &mut r),
-        StageId::FeatureGates => feature_gates(ctx, &mut r),
         StageId::LibcOracle => libc_oracle(ctx, &mut r),
         StageId::FreezeGate => freeze_gate(ctx, &mut r),
-        StageId::ProofInventory => proof_inventory(ctx, &mut r),
         StageId::DriverBuilds => driver_builds(ctx, &mut r),
         StageId::ConformanceRelease => conformance_release(ctx, &mut r),
+        #[cfg(unix)]
         StageId::ControlSocketSmoke => smoke_stages::control_socket_smoke(ctx, &mut r),
+        #[cfg(unix)]
         StageId::GuiSmoke => smoke_stages::gui_typing_smoke(ctx, &mut r),
+        // The smokes drive a unix control socket, and the ladder is a unix
+        // program; off unix the rows are named.
+        #[cfg(not(unix))]
+        StageId::ControlSocketSmoke | StageId::GuiSmoke => {
+            r.skip(format!("{} (unix only)", spec.title));
+        }
         StageId::RedrawConformance => redraw_conformance(ctx, &mut r),
         StageId::ObjcClassAudit => objc_class_audit(ctx, &mut r),
         StageId::ObjcImeDrive => objc_ime_drive(ctx, &mut r),
@@ -63,9 +66,10 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
         StageId::ObjcBoundDrive => objc_bound_drive(ctx, &mut r),
         StageId::WindowServerTests => window_server_tests(ctx, &mut r),
         StageId::ForegroundHandback => foreground_handback(ctx, &mut r),
-        StageId::DifferentialOracle => differential_oracle(ctx, &mut r),
         StageId::KaniFloor => kani_floor(ctx, &mut r),
         StageId::CrossCells => cross_cells(ctx, &mut r),
+        StageId::Forge => forge_gate(ctx, &mut r),
+        StageId::ForeignCells => foreign_cells(ctx, &mut r),
         StageId::CodexLiveUpgrade => codex_live_upgrade(ctx, &mut r),
     }
     r
@@ -75,16 +79,9 @@ pub fn run_stage(ctx: &Ctx, spec: &StageSpec) -> Report {
 // The argv builders. Pure, so the port is a test and not a promise.
 // ---------------------------------------------------------------------------
 
-/// `targo --unverified build <scope>`
-#[must_use]
-pub fn build_args(scope: &Scope) -> Vec<String> {
-    let mut a = vec!["--unverified".to_string(), "build".to_string()];
-    a.extend(scope.args());
-    a
-}
-
 /// `targo --unverified test <scope> --no-fail-fast --no-run` — the test
-/// stage's FIRST child: compile every test target and run nothing.
+/// compile row's one child, and the test stage's FIRST (a fingerprint check by
+/// then): compile every test target and run nothing.
 ///
 /// `--no-fail-fast` IS THE COVERAGE FLAG, the exact analogue of `--keep-going`
 /// on [`tippy_args`] below, and for the same reason: without it cargo stops the
@@ -200,6 +197,24 @@ pub fn doctest_args(scope: &Scope) -> Vec<String> {
     a.extend(scope.args());
     a.push("--no-fail-fast".to_string());
     a
+}
+
+/// `targo --unverified build -q -p aterm-gui -p aterm-ctl` — the two binaries
+/// the smokes and the sealed rung drive.
+#[must_use]
+pub fn smoke_build_args() -> Vec<String> {
+    [
+        "--unverified",
+        "build",
+        "-q",
+        "-p",
+        "aterm-gui",
+        "-p",
+        "aterm-ctl",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// `targo --unverified test -p aterm-link --features sealed --test two_nodes_sealed --no-fail-fast`
@@ -331,23 +346,6 @@ pub fn conformance_release_args() -> Vec<String> {
     .collect()
 }
 
-/// `targo --unverified test -p aterm-search --features regex --no-fail-fast`
-#[must_use]
-pub fn regex_lane_args() -> Vec<String> {
-    [
-        "--unverified",
-        "test",
-        "-p",
-        "aterm-search",
-        "--features",
-        "regex",
-        "--no-fail-fast",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
 /// `<tippy> <scope> --all-targets --keep-going -- -D warnings`
 ///
 /// `--keep-going` IS THE COVERAGE FLAG, not a tuning knob. Without it cargo
@@ -389,9 +387,10 @@ pub fn tippy_args(scope: &Scope) -> Vec<String> {
 /// silently stopped existing.
 ///
 /// The table is checked against the tree by
-/// `xtask`'s `the_gated_feature_table_matches_every_required_features_target`,
-/// so a seventh gated target cannot be added without either extending this or
-/// reddening that test.
+/// `the_gated_feature_table_covers_every_required_features_target` below, so a
+/// seventh gated target cannot be added without either extending this or
+/// reddening that test. An entry no manifest declares any more fails the
+/// `--full` lint itself: cargo refuses a feature a package does not have.
 pub const GATED_LINT_FEATURES: [(&str, &str); 3] = [
     ("aterm-gui", "bench-support"),
     ("aterm-gui", "control-conformance"),
@@ -485,12 +484,21 @@ pub fn freeze_gate_args() -> Vec<String> {
 }
 
 /// The crates carrying a Kani BMC floor, in the order the stage runs them.
-pub const KANI_CRATES: [&str; 3] = ["aterm-parser", "aterm-render", "aterm-uds"];
+/// `aterm-containment` joined 2026-09-25 (its six policy-mapping harnesses
+/// prove in seconds). `aterm-policy` cannot: the bundled trust-mc does not build
+/// its `serde` build scripts, so its harnesses were retired for exhaustive unit
+/// tests.
+pub const KANI_CRATES: [&str; 4] = [
+    "aterm-parser",
+    "aterm-render",
+    "aterm-uds",
+    "aterm-containment",
+];
 
 /// The exact command one Kani floor run spawns. `KANI_CRATE` selects which
 /// crate's proofs the script drives; lose it and every iteration of the loop
-/// runs the same default, so two of the three crates go unproven while the
-/// ladder still prints three green rows. `TRUST_MC_SYSROOT` / `AY_BIN_DIR`
+/// runs the same default, so every other crate goes unproven while the
+/// ladder still prints a green row for each. `TRUST_MC_SYSROOT` / `AY_BIN_DIR`
 /// carry what THIS process resolved ([`trust_mc_sysroot`], [`ay_bin_dir`]) so
 /// the script and the availability decision above it can never disagree
 /// about which trust-mc is being driven.
@@ -821,7 +829,6 @@ pub fn objc_ime_outcome(code: Option<i32>) -> (Outcome, String) {
     }
 }
 
-/// `targo --unverified test -p aterm-bench --test differential`
 /// The event driver's target name — the `[[example]]`, the built file and the
 /// argv below all have to agree, so they read it from here.
 pub const OBJC_EVENT_DRIVE_EXAMPLE: &str = "objc_event_drive";
@@ -1053,21 +1060,6 @@ pub fn objc_bound_outcome(code: Option<i32>) -> (Outcome, String) {
     }
 }
 
-#[must_use]
-pub fn differential_args() -> Vec<String> {
-    [
-        "--unverified",
-        "test",
-        "-p",
-        "aterm-bench",
-        "--test",
-        "differential",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
-}
-
 /// The nested workspace's checked-in driver is the oracle contract. Keeping
 /// this as one argv value (with no cargo fallback or reimplementation here)
 /// means changes to its cell table automatically reach the required merge
@@ -1110,15 +1102,10 @@ pub fn libc_oracle_outcome(code: Option<i32>) -> Outcome {
 // Shared shapes
 // ---------------------------------------------------------------------------
 
-/// The script's `run()`: under `--selftest` say so and execute nothing;
-/// otherwise run, print what the child said, and decide.
+/// The script's `run()`: run, print what the child said, and decide.
 ///
-/// Returns whether the child ran and passed — `false` under `--selftest`.
+/// Returns whether the child ran and passed.
 fn run_labeled(ctx: &Ctx, r: &mut Report, label: &str, cmd: &Cmd) -> bool {
-    if ctx.selftest {
-        r.skip(format!("{label} (selftest: not executed)"));
-        return false;
-    }
     let out = exec::run(cmd, ctx.exec_env());
     r.raw(out.output.as_str());
     r.decide_child(&out, label);
@@ -1157,12 +1144,12 @@ fn targo(ctx: &Ctx, args: Vec<String>) -> Cmd {
 /// of the whole `-p aterm` graph rather than a handful of small ones, and below
 /// the driver lane's eight because the driver lane's binaries gate the
 /// EXCLUSIVE smokes at the tail while this one only has to beat the test
-/// stage's first conformance suite. The lane's own `--timings` row
-/// is what to tune it from.
+/// stage's first conformance suite. The row's `  time  ` line is what to
+/// tune it from.
 #[must_use]
 pub const fn lane_build_jobs(lane: Lane) -> Option<u32> {
     match lane {
-        Lane::RegexTarget | Lane::XtaskTarget => Some(4),
+        Lane::XtaskTarget => Some(4),
         Lane::ConformanceRelease => Some(6),
         Lane::DriverTarget => Some(8),
         _ => None,
@@ -1216,11 +1203,26 @@ pub fn driver_build_cmd(ctx: &Ctx, args: Vec<String>) -> Cmd {
     in_lane(ctx, Lane::DriverTarget, targo(ctx, args)).demoted()
 }
 
-/// The driver lane's target dir: every driven binary is resolved under it,
-/// whatever `CARGO_TARGET_DIR` the caller exported.
+/// The driver lane's target dir: every driven binary is resolved under it.
 #[must_use]
 pub fn drivers_dir(ctx: &Ctx) -> std::path::PathBuf {
     lane_dir(ctx, Lane::DriverTarget).unwrap_or_else(|| ctx.root.join("target-drivers"))
+}
+
+/// A binary the driver lane built: `<target-drivers>/debug/<name>`. The
+/// ordinary debug binaries ARE the driven artifacts; launching them directly
+/// (rather than through `targo run`) keeps the recorded PID attached to the
+/// real process and the driver's lane banner out of a captured reply.
+#[must_use]
+pub fn driver_bin(ctx: &Ctx, name: &str) -> std::path::PathBuf {
+    drivers_dir(ctx).join("debug").join(name)
+}
+
+/// An `[[example]]` the driver lane built — cargo puts those under
+/// `<target>/debug/examples/`, not beside the binaries.
+#[must_use]
+pub fn driver_example(ctx: &Ctx, name: &str) -> std::path::PathBuf {
+    driver_bin(ctx, "examples").join(name)
 }
 
 /// An xtask verb, in the xtask lane.
@@ -1251,8 +1253,8 @@ fn with_trustdoc(ctx: &Ctx, cmd: Cmd) -> Cmd {
 /// children's PATH (the `~/.local/bin` farm link) — fail-closed, real doctest
 /// verdicts. `Absent` means a doctest-compiling run would die at exec with a
 /// raw OS error naming no remedy, so the stage diagnoses instead — unless the
-/// run compiles no lib target (rustdoc is never spawned) or `--selftest`
-/// executes nothing anyway; the stage arms below hold those qualifiers.
+/// run compiles no lib target (rustdoc is never spawned); the stage arms below
+/// hold that qualifier.
 #[derive(Debug, PartialEq, Eq)]
 enum DocDriver {
     Stage2,
@@ -1313,41 +1315,54 @@ fn script_cmd(path: &std::path::Path, root: &std::path::Path) -> Cmd {
 }
 
 // ---------------------------------------------------------------------------
-// 1) BUILD
+// 1) TEST COMPILE — the test stage's `--no-run` child, at t0 (2026-09-27), in
+//    the slot a `targo build --workspace` row held until then. It is the
+//    stage that says COULD NOT RUN when there is no pinned `targo`.
+// 2) TEST — two children since 2026-09-13: compile every test target
+//    (`--no-run`, a fingerprint check after the row above), then run them
+//    (`--tests`), the second only if the first compiled. Doctests are not run
+//    here: the doctests stage is their only runner, so this stage does not
+//    diagnose a missing doc driver. It still binds trustdoc when the stage2
+//    has one, so every child of the two rows carries one environment and the
+//    compile above is the one the run's own `--no-run` finds.
 // ---------------------------------------------------------------------------
-/// The build stage's child. It only compiles, so it is [`Cmd::demoted`].
-fn build_cmd(ctx: &Ctx) -> Cmd {
-    targo(ctx, build_args(&ctx.scope)).demoted()
+
+/// The doc-driver binding the test children share, and the label suffix that
+/// names it: the stage2's trustdoc when it has one, the caller's own export,
+/// or nothing — no test child spawns rustdoc, so an absent driver is the
+/// doctests stage's to diagnose.
+fn test_doc_binding(ctx: &Ctx) -> (&'static str, bool) {
+    match doc_driver(ctx) {
+        DocDriver::Stage2 => (" (trustdoc)", true),
+        DocDriver::Ambient => (" (caller's RUSTDOC)", false),
+        DocDriver::BarePath | DocDriver::Absent => ("", false),
+    }
 }
 
-fn build(ctx: &Ctx, r: &mut Report) {
-    if ctx.tools.have_targo() {
-        run_scoped(
-            ctx,
-            r,
-            &format!("targo build {}", ctx.scope.label()),
-            &build_cmd(ctx),
-        );
-    } else {
+fn test_compile(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
         // Fail-closed, and COULD-NOT-RUN rather than FAILED: nothing about the
         // tree was decided. Never a stock-cargo fallback — that would make the
         // gate quietly unverified, which is what the two-lane driver prevents.
         r.cannot_run(ctx.tools.missing_targo_label());
+        return;
     }
+    let label = format!("targo test {} --no-run", ctx.scope.label());
+    // The empty change-selection outranks the doc-driver binding, as in the
+    // test stage below: a run that compiles NOTHING names no driver.
+    if ctx.scope.selects_nothing() {
+        r.skip(format!("{label} (change-scoped run selected no crates)"));
+        return;
+    }
+    let (suffix, bind) = test_doc_binding(ctx);
+    let [compile, _] = test_cmds(ctx, bind);
+    run_labeled(ctx, r, &format!("{label}{suffix}"), &compile);
 }
 
-// ---------------------------------------------------------------------------
-// 2) TEST — two children since 2026-09-13: compile every test target
-//    (`--no-run`), then run them (`--tests`), the second only if the first
-//    compiled. Doctests are no longer run here: the doctests stage is their
-//    only runner, so this stage no longer diagnoses a missing doc driver. It
-//    still binds trustdoc when the stage2 has one, so both children keep the
-//    environment the single child had.
-// ---------------------------------------------------------------------------
-
 /// The test stage's two children, compile then run, with trustdoc bound when
-/// `bind`. Only the COMPILE is [`Cmd::demoted`]. The run executes the paint and
-/// spin guards, and a QoS clamp would reach the aterm they launch. The run
+/// `bind`. Only the COMPILE is [`Cmd::demoted`]. The run skips the paint and
+/// spin guards ([`MEASURING_TESTS`]; the measuring stage runs them), but it
+/// still runs code, and a QoS clamp would reach whatever it launches. The run
 /// carries [`TRAIL_LAWS_FULL`].
 fn test_cmds(ctx: &Ctx, bind: bool) -> [Cmd; 2] {
     let cmd = |args: Vec<String>| {
@@ -1385,17 +1400,11 @@ fn test(ctx: &Ctx, r: &mut Report) {
         r.skip(format!("{label} (change-scoped run selected no crates)"));
         return;
     }
-    let (suffix, bind) = match doc_driver(ctx) {
-        DocDriver::Stage2 => (" (trustdoc)", true),
-        DocDriver::Ambient => (" (caller's RUSTDOC)", false),
-        // Neither child spawns rustdoc, so no driver is not this stage's
-        // problem: the doctests stage names it.
-        DocDriver::BarePath | DocDriver::Absent => ("", false),
-    };
+    let (suffix, bind) = test_doc_binding(ctx);
     let [compile, run] = test_cmds(ctx, bind);
     let run_label = format!("{label} --tests{suffix}");
     let compiled = run_labeled(ctx, r, &format!("{label} --no-run{suffix}"), &compile);
-    if compiled || ctx.selftest {
+    if compiled {
         run_labeled(ctx, r, &run_label, &run);
     } else {
         // Not a skip: nothing was absent. The FAIL above is the decision, and
@@ -1435,11 +1444,7 @@ fn measuring_tests(ctx: &Ctx, r: &mut Report) {
     }
     // The test run's doc-driver binding and label suffix, so the two children
     // carry one environment and read as one selection split in two.
-    let (suffix, bind) = match doc_driver(ctx) {
-        DocDriver::Stage2 => (" (trustdoc)", true),
-        DocDriver::Ambient => (" (caller's RUSTDOC)", false),
-        DocDriver::BarePath | DocDriver::Absent => ("", false),
-    };
+    let (suffix, bind) = test_doc_binding(ctx);
     let label = format!(
         "targo test {} --tests{suffix} -- {}",
         ctx.scope.label(),
@@ -1495,42 +1500,11 @@ fn doctests(ctx: &Ctx, r: &mut Report) {
         DocDriver::BarePath => {
             run_labeled(ctx, r, &label, &cmd);
         }
-        // Selftest executes nothing — run_labeled prints its uniform skip.
-        DocDriver::Absent if ctx.selftest => {
-            run_labeled(ctx, r, &label, &cmd);
-        }
         // THE ONLY DOCTEST RUNNER since 2026-09-13, so the diagnosis lives
         // here: no doc driver means no doctest was decided, which is
         // COULD-NOT-RUN with the remedy — never a skip pointing elsewhere.
         DocDriver::Absent => r.cannot_run(ctx.tools.missing_trustdoc_label()),
     }
-}
-
-// ---------------------------------------------------------------------------
-// 2.6) REGEX SEARCH LANE. `aterm-search`'s regex-mode oracle battery is gated on
-//    `feature = "regex"`, which the default test stage does NOT enable — without
-//    this stage the whole battery compiles out to ZERO cases and the suite stays
-//    green with no regex coverage. The `ATERM_SEARCH_REGEX_LANE` marker arms the
-//    always-compiled `regex_lane_tripwire`, which hard-fails if the marker is set
-//    but the feature was dropped, so the lane cannot silently lose its coverage.
-//
-//    CORRECTED 2026-09-13: at `--workspace` the default test stage DOES compile
-//    aterm-search with `regex` — feature unification turns it on, alongside
-//    `spec-anchors` (unit graph on 07a76fca7). What only this lane runs is
-//    aterm-search ALONE: `-p aterm-search --features regex`, without
-//    `spec-anchors`. That configuration is why it keeps its exact argv; it now
-//    runs in its own target dir, at t0.
-// ---------------------------------------------------------------------------
-/// The exact command the regex lane spawns — extracted so a test asserts on it
-/// rather than on a replica. The marker is the whole point of the stage: without
-/// `ATERM_SEARCH_REGEX_LANE` the suite still passes, green with no regex
-/// coverage at all.
-fn regex_lane_cmd(ctx: &Ctx) -> Cmd {
-    in_lane(
-        ctx,
-        Lane::RegexTarget,
-        targo(ctx, regex_lane_args()).env("ATERM_SEARCH_REGEX_LANE", "1"),
-    )
 }
 
 /// The sealed rung's two children, labelled, in the order they run — the
@@ -1557,7 +1531,7 @@ pub fn sealed_lane_cmds(ctx: &Ctx) -> [(String, Cmd); 2] {
         (
             "targo build -p aterm-gui -p aterm-ctl (the aterm-gui the sealed rung drives)"
                 .to_string(),
-            driver_build_cmd(ctx, smoke_stages::smoke_build_args()),
+            driver_build_cmd(ctx, smoke_build_args()),
         ),
         (
             "targo test -p aterm-link --features sealed --test two_nodes_sealed".to_string(),
@@ -1572,10 +1546,10 @@ fn sealed_lane(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let [(build_label, build), (run_label, run)] = sealed_lane_cmds(ctx);
-    // An integration-test-only run compiles no doctests, so unlike the regex
-    // lane it has no doc-driver rule to take: both children run as written.
+    // An integration-test-only run compiles no doctests, so it has no
+    // doc-driver rule to take: both children run as written.
     let built = run_labeled(ctx, r, &build_label, &build);
-    if built || ctx.selftest {
+    if built {
         run_labeled(ctx, r, &run_label, &run);
     } else {
         // Not a skip: nothing was absent, and the build's FAIL above is the
@@ -1584,43 +1558,6 @@ fn sealed_lane(ctx: &Ctx, r: &mut Report) {
         r.raw(format!(
             "  not run: {run_label} — the aterm-gui build above failed, so the rung has no fresh binary to drive"
         ));
-    }
-}
-
-fn regex_lane(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("regex search lane (no targo)");
-        return;
-    }
-    let label = "targo test -p aterm-search --features regex";
-    let cmd = regex_lane_cmd(ctx);
-    // This lane compiles aterm-search's doctests too, so it takes the same
-    // doc-driver rule as the test/doctest stages — left on the old two-way
-    // binding it would be the one stage still dying raw at rustdoc exec on a
-    // machine with no doc driver, and worse, dying as a GateFailed that
-    // outranks the test stage's honest COULD-NOT-RUN in the verdict.
-    match doc_driver(ctx) {
-        DocDriver::Stage2 => {
-            run_labeled(
-                ctx,
-                r,
-                &format!("{label} (trustdoc)"),
-                &with_trustdoc(ctx, cmd),
-            );
-        }
-        DocDriver::Ambient => {
-            run_labeled(ctx, r, &format!("{label} (caller's RUSTDOC)"), &cmd);
-        }
-        DocDriver::BarePath => {
-            run_labeled(ctx, r, label, &cmd);
-        }
-        DocDriver::Absent if ctx.selftest => {
-            run_labeled(ctx, r, label, &cmd);
-        }
-        // Planned only when aterm-search (a lib crate) is in scope, so the
-        // doctests stage's Absent arm was a real cannot_run — the pointer never
-        // dangles.
-        DocDriver::Absent => r.skip(format!("{label} (no doc driver — see the doctests line)")),
     }
 }
 
@@ -1653,10 +1590,6 @@ fn tippy_cmd(ctx: &Ctx, bin: &std::path::Path, args: Vec<String>) -> Cmd {
 }
 
 fn tippy(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("tippy lint (selftest: not executed)");
-        return;
-    }
     let Some(bin) = ctx.tools.tippy.clone() else {
         r.skip(ctx.tools.missing_tippy_label());
         return;
@@ -1667,12 +1600,16 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         &format!("tippy {} -D warnings", ctx.scope.label()),
         &tippy_cmd(ctx, &bin, tippy_args(&ctx.scope)),
     );
-    // THE SECOND PASS IS NOT OPTIONAL POLISH. `--all-targets` above built no
-    // target whose `required-features` are off, so without this the six in
-    // [`GATED_LINT_FEATURES`] are linted by nobody — which is how a broken
-    // bench build survived four days. Its own row, so the ladder shows whether
-    // it ran.
-    if let Some(args) = tippy_gated_args(&ctx.scope) {
+    // THE SECOND PASS, `--full` ONLY (2026-09-27; every tier until then).
+    // `--all-targets` above built no target whose `required-features` are
+    // off, so the six in [`GATED_LINT_FEATURES`] are linted here or nowhere —
+    // a broken bench build survived four days that way. It costs a re-lint of
+    // two packages at a wider feature set (139 unit variants the first pass
+    // never builds), and the targets it reaches are benches and a harness bin,
+    // not the shipped build. Its own row, so the ladder shows whether it ran.
+    if ctx.mode == crate::Mode::Full
+        && let Some(args) = tippy_gated_args(&ctx.scope)
+    {
         run_scoped(
             ctx,
             r,
@@ -1682,9 +1619,6 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 3) GREP GUARDS (zero-tolerance, always whole-tree)
-// ---------------------------------------------------------------------------
 /// FORMATTING — `xtask gate lint --fmt-only`, i.e. the formatter lane's BOTH
 /// passes and no other lane.
 ///
@@ -1721,22 +1655,31 @@ fn formatting(ctx: &Ctx, r: &mut Report) {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 3) GREP GUARDS AND LICENSE HEADERS (zero-tolerance, always whole-tree): two
+//    script children, each a decision of its own and each run whatever the
+//    other decided — `license_check.sh` holds every `.rs` to its two-line SPDX
+//    header. A missing script is a cannot-run, never a skip. (The headers were
+//    a stage of their own until 2026-09-27.)
+// ---------------------------------------------------------------------------
+
+/// The scripts the grep-guards stage runs, in order.
+pub const GUARD_SCRIPTS: [&str; 2] = ["grep_guard.sh", "license_check.sh"];
+
 fn grep_guards(ctx: &Ctx, r: &mut Report) {
-    let g = ctx.tools_dir().join("grep_guard.sh");
-    if !is_executable_file(&g) {
-        r.cannot_run(format!(
-            "grep_guard.sh missing or not executable ({})",
-            g.display()
-        ));
-        return;
+    for name in GUARD_SCRIPTS {
+        let script = ctx.tools_dir().join(name);
+        if !is_executable_file(&script) {
+            r.cannot_run(format!(
+                "{name} missing or not executable ({})",
+                script.display()
+            ));
+            continue;
+        }
+        let out = exec::run(&script_cmd(&script, &ctx.root), ctx.exec_env());
+        r.raw(out.output.as_str());
+        r.decide_child(&out, name);
     }
-    if ctx.selftest {
-        r.skip("grep_guard.sh (selftest)");
-        return;
-    }
-    let out = exec::run(&script_cmd(&g, &ctx.root), ctx.exec_env());
-    r.raw(out.output.as_str());
-    r.decide_child(&out, "grep_guard.sh");
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,9 +1694,11 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
 //    signing identity that only `tools/dev-app.sh` uses, and `test-cargo-pin.sh`
 //    pins the cargo gate `dev-app.sh` shares with `install.sh`'s source lane.
 //    A dev build is not a release, so a row titled "release" that ran them
-//    would misname what it had decided. What all nine share is the thing the
+//    would misname what it had decided. What those nine share is the thing the
 //    new name says: the path the app takes from a checkout to someone's
-//    machine — a local dev bundle, the installer, a cut, the site.
+//    machine — a local dev bundle, the installer, a cut, the site. (A tenth,
+//    the fabric demo's cleanup check, rides here for the reason its bullet on
+//    `DELIVERY_SUITES` gives.)
 // ---------------------------------------------------------------------------
 
 /// The delivery-tooling suites, in the order the stage runs them. Every one is
@@ -1804,8 +1749,17 @@ fn grep_guards(ctx: &Ctx, r: &mut Report) {
 ///   on the search list, deleted on exit; measured dialog-free. A PASS of 0
 ///   checks off macOS, where the script has nothing to do.
 ///
+/// AND ONE DEV TOOL'S OWN CONTRACT, joined 2026-09-27 for the same reason:
+///
+/// * `test-agent-fabric-demo.py` — tools/agent-fabric-demo.py keeps its
+///   runtime root (the broker, bridge and aterm logs) when a run FAILS, and
+///   removes it when one passes. It drives the demo's `close` alone: no aterm,
+///   no aterm-link, no broker, a second. Not delivery tooling — the demo drives
+///   an installed aterm — but offline and self-contained like the rest, and a
+///   row of its own for one Python check would cost more than it says.
+///
 /// A suite no gate runs is a test that passes forever.
-pub const DELIVERY_SUITES: [&str; 9] = [
+pub const DELIVERY_SUITES: [&str; 10] = [
     "test-install-channel.sh",
     "test-publish-export.sh",
     "test-release-preflight.sh",
@@ -1815,6 +1769,7 @@ pub const DELIVERY_SUITES: [&str; 9] = [
     "test-check-release-shape.sh",
     "test-site-sync.sh",
     "test-dev-sign-id.sh",
+    "test-agent-fabric-demo.py",
 ];
 
 /// One delivery suite's command. With a `SIGTERM` grace, because each suite
@@ -1959,7 +1914,7 @@ pub const ATPKG_BUILD_LABEL: &str = "targo build -p atpkg (the atpkg the pack su
 /// narrowing never builds it at all.
 #[must_use]
 pub fn atpkg_driven_binary(ctx: &Ctx) -> std::path::PathBuf {
-    debug_bin(&ctx.root, Some(drivers_dir(ctx).as_os_str()), "atpkg")
+    driver_bin(ctx, "atpkg")
 }
 
 /// The build of that binary, in the driver lane. Compile-only, so demoted.
@@ -2005,7 +1960,7 @@ fn atpkg_tooling(ctx: &Ctx, r: &mut Report) {
                 "{name} missing or not executable ({})",
                 t.display()
             ));
-        } else if name != ATPKG_DRIVEN_SUITE || built || ctx.selftest {
+        } else if name != ATPKG_DRIVEN_SUITE || built {
             run_labeled(ctx, r, name, &atpkg_suite_cmd(ctx, name));
         } else if ctx.tools.have_targo() {
             // Not a skip: nothing was absent, and the build's FAIL above is the
@@ -2024,31 +1979,6 @@ fn atpkg_tooling(ctx: &Ctx, r: &mut Report) {
                 "{name} (no targo — nothing built the atpkg its end-to-end pack drives)"
             ));
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 3.55) TRUST-GATE VERDICT SELF-TEST — tools/trust-gate-all.sh prints the
-//    sentence that IS the campaign claim ("100% MACHINE-PROVED (workspace +
-//    every vendored fork, …)") and has several inputs that shrink the run.
-//    Until its self-test existed the verdict logic had never been exercised
-//    against a narrowed run at all, and it printed the workspace sentence for
-//    runs that were not the workspace. It now also covers the gate LIST: that
-//    members are addressed `-p name@version` and forks by manifest path, and
-//    that a fork can neither appear in the resolved graph undeclared nor vanish
-//    from it while the roster still lists it. Hard-required, exactly like
-//    test-install-channel.sh: a missing self-test is not a skip, because the
-//    thing it guards is a claim.
-// ---------------------------------------------------------------------------
-fn trust_gate_verdict(ctx: &Ctx, r: &mut Report) {
-    let t = ctx.tools_dir().join("test-trust-gate-verdict.sh");
-    if is_executable_file(&t) {
-        run_labeled(ctx, r, "test-trust-gate-verdict.sh", &Cmd::new(&t));
-    } else {
-        r.cannot_run(format!(
-            "test-trust-gate-verdict.sh missing or not executable ({})",
-            t.display()
-        ));
     }
 }
 
@@ -2082,9 +2012,10 @@ fn trust_contract_probe(ctx: &Ctx, r: &mut Report) {
 }
 
 // ---------------------------------------------------------------------------
-// 3.6) STARTUP COMPARISON SCHEDULER — the publishable-startup evidence path must
-//    fail closed on malformed samples, mutable harness bytes, uncertain thermal
-//    state, identical-artifact controls, and timed-out process descendants.
+// 3.6) STARTUP COMPARISON SCHEDULER (`--full` only since 2026-09-27) — the
+//    publishable-startup evidence path must fail closed on malformed samples,
+//    mutable harness bytes, uncertain thermal state, identical-artifact
+//    controls, and timed-out process descendants.
 // ---------------------------------------------------------------------------
 fn start_compare(ctx: &Ctx, r: &mut Report) {
     let t = ctx.tools_dir().join("perf-arena/test-start-compare.sh");
@@ -2095,53 +2026,6 @@ fn start_compare(ctx: &Ctx, r: &mut Report) {
             "test-start-compare.sh missing or not executable ({})",
             t.display()
         ));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 4) LICENSE / SPDX HEADERS (every .rs carries the two-line header)
-// ---------------------------------------------------------------------------
-fn license_headers(ctx: &Ctx, r: &mut Report) {
-    let lic = ctx.tools_dir().join("license_check.sh");
-    if !is_executable_file(&lic) {
-        r.cannot_run(format!(
-            "license_check.sh missing or not executable ({})",
-            lic.display()
-        ));
-        return;
-    }
-    if ctx.selftest {
-        r.skip("license_check.sh (selftest)");
-        return;
-    }
-    let out = exec::run(&script_cmd(&lic, &ctx.root), ctx.exec_env());
-    r.raw(out.output.as_str());
-    r.decide_child(&out, "license_check.sh");
-}
-
-// ---------------------------------------------------------------------------
-// 4.5) FEATURE GATES (advertise-vs-implement + dormant-feature detection), plus
-//    the main-loop census: the ONLY enforced net for the multi-line bound-guard
-//    form `let g = term_lock(..); g.resize(..)` that the single-line grep
-//    tripwire cannot see.
-// ---------------------------------------------------------------------------
-fn feature_gates(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("feature gates (no targo)");
-        return;
-    }
-    // `citations` rides here because it is a directory walk — under a second on
-    // this roster — and because `gate all`, which is the only other thing that
-    // runs it, is MANUAL ONLY. A gate nothing automatic invokes is a gate that
-    // catches rot whenever somebody remembers, which is how four documents came
-    // to describe behaviour the code did not have.
-    for gate in ["drift", "dormant", "mainloop", "citations"] {
-        run_labeled(
-            ctx,
-            r,
-            &format!("gate {gate}"),
-            &xtask_cmd(ctx, xtask_gate_args(gate)),
-        );
     }
 }
 
@@ -2183,10 +2067,6 @@ fn libc_oracle(ctx: &Ctx, r: &mut Report) {
         return;
     }
     let label = "libc-oracle/run.sh (this host's native ABI cell; the other cells are decided where they are native)";
-    if ctx.selftest {
-        r.skip(format!("{label} (selftest: not executed)"));
-        return;
-    }
     let out = exec::run(&cmd, ctx.exec_env());
     r.raw(out.output.as_str());
     // THE MACHINE BEFORE THE EXIT CODE. `libc_oracle_outcome` reads run.sh's
@@ -2220,23 +2100,6 @@ fn freeze_gate(ctx: &Ctx, r: &mut Report) {
         r,
         "freeze-safety-gate (6 obligations)",
         &freeze_gate_cmd(ctx),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 4.6) COMPUTED-ONLY PROOF INVENTORY — count the proof attributes, fail on scan
-//    errors or an empty inventory, and reject a hand-maintained README total.
-// ---------------------------------------------------------------------------
-fn proof_inventory(ctx: &Ctx, r: &mut Report) {
-    if !ctx.tools.have_targo() {
-        r.skip("gate counts (no targo)");
-        return;
-    }
-    run_labeled(
-        ctx,
-        r,
-        "gate counts",
-        &xtask_cmd(ctx, xtask_gate_args("counts")),
     );
 }
 
@@ -2304,7 +2167,7 @@ pub fn driver_build_cmds(ctx: &Ctx) -> Vec<(String, Cmd)> {
         ),
         (
             "driver prebuild: targo build -p aterm-gui -p aterm-ctl".to_string(),
-            driver_build_cmd(ctx, smoke_stages::smoke_build_args()),
+            driver_build_cmd(ctx, smoke_build_args()),
         ),
     ];
     if cfg!(target_os = "macos") {
@@ -2326,10 +2189,6 @@ pub fn driver_build_cmds(ctx: &Ctx) -> Vec<(String, Cmd)> {
 }
 
 fn driver_builds(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("driver builds (selftest: not executed)");
-        return;
-    }
     if !ctx.tools.have_targo() {
         r.skip("driver builds (no targo)");
         return;
@@ -2478,12 +2337,8 @@ pub fn redraw_outcome(code: Option<i32>) -> (Outcome, String) {
 }
 
 fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("redraw conformance (selftest: not executed)");
-        return;
-    }
     if !ctx.tools.have_targo() {
-        // The build stage already reported COULD-NOT-RUN for the same absence;
+        // The test compile already reported COULD-NOT-RUN for the same absence;
         // naming it again here keeps the skip counted and the verdict narrowed.
         r.skip("redraw conformance (no targo)");
         return;
@@ -2500,11 +2355,7 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_bin(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        REDRAW_CONFORMANCE_BIN,
-    );
+    let bin = driver_bin(ctx, REDRAW_CONFORMANCE_BIN);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "redraw conformance: just-built harness missing ({})",
@@ -2534,13 +2385,6 @@ fn redraw_conformance(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 
 fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, so the `--selftest` ladder reads the same on every
-    // platform — a mode whose whole contract is "execute nothing" must not
-    // report a different reason per host.
-    if ctx.selftest {
-        r.skip("objc live-class audit (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         // Not a skip for lack of a tool: the class under audit is declared
         // inside `#[cfg(target_os = "macos")]` and does not exist here at all.
@@ -2563,11 +2407,7 @@ fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_CLASS_AUDIT_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_CLASS_AUDIT_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc live-class audit: just-built auditor missing ({})",
@@ -2604,11 +2444,6 @@ fn objc_class_audit(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 
 fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, for the same reason the auditor does it.
-    if ctx.selftest {
-        r.skip("objc IME drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc IME drive (macOS only: the driven class is a macOS one)");
         return;
@@ -2629,11 +2464,7 @@ fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_IME_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_IME_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc IME drive: just-built driver missing ({})",
@@ -2668,13 +2499,6 @@ fn objc_ime_drive(ctx: &Ctx, r: &mut Report) {
 // ---------------------------------------------------------------------------
 
 fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, for the same reason the auditor does it: a mode whose
-    // whole contract is "execute nothing" must not report a different reason
-    // per host.
-    if ctx.selftest {
-        r.skip("objc toolbar drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         // Not a skip for lack of a tool: the tab strip and its four declared
         // classes live inside `#[cfg(target_os = "macos")]`.
@@ -2697,11 +2521,7 @@ fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_TOOLBAR_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_TOOLBAR_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc toolbar drive: just-built driver missing ({})",
@@ -2722,11 +2542,6 @@ fn objc_toolbar_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as its three siblings do.
-    if ctx.selftest {
-        r.skip("objc window drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc window drive (macOS only: the driven window_delegate.rs is a macOS one)");
         return;
@@ -2747,11 +2562,7 @@ fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_WINDOW_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_WINDOW_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc window drive: just-built driver missing ({})",
@@ -2772,11 +2583,6 @@ fn objc_window_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as its three siblings do.
-    if ctx.selftest {
-        r.skip("objc event drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc event drive (macOS only: the driven view.rs is a macOS one)");
         return;
@@ -2797,11 +2603,7 @@ fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_EVENT_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_EVENT_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc event drive: just-built driver missing ({})",
@@ -2822,11 +2624,6 @@ fn objc_event_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as its siblings do.
-    if ctx.selftest {
-        r.skip("objc alert drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc alert drive (macOS only: the driven modal subsystem is a macOS one)");
         return;
@@ -2847,11 +2644,7 @@ fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_ALERT_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_ALERT_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc alert drive: just-built driver missing ({})",
@@ -2872,11 +2665,6 @@ fn objc_alert_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as its siblings do.
-    if ctx.selftest {
-        r.skip("objc swizzle drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc swizzle drive (macOS only: the driven NSApplication is a macOS one)");
         return;
@@ -2900,11 +2688,7 @@ fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
     // An `aterm-objc` example lands under the same `<target>/debug/examples/`
     // as the `aterm-gui` ones: cargo's layout is per target dir, not per crate
     // (and every driver builds into `target-drivers/`).
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_SWIZZLE_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_SWIZZLE_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc swizzle drive: just-built driver missing ({})",
@@ -2923,11 +2707,6 @@ fn objc_swizzle_drive(ctx: &Ctx, r: &mut Report) {
 }
 
 fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as its siblings do.
-    if ctx.selftest {
-        r.skip("objc bound drive (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip("objc bound drive (macOS only: libdispatch's main queue is a Darwin one)");
         return;
@@ -2948,11 +2727,7 @@ fn objc_bound_drive(ctx: &Ctx, r: &mut Report) {
         );
         return;
     }
-    let bin = debug_example(
-        &ctx.root,
-        Some(drivers_dir(ctx).as_os_str()),
-        OBJC_BOUND_DRIVE_EXAMPLE,
-    );
+    let bin = driver_example(ctx, OBJC_BOUND_DRIVE_EXAMPLE);
     if !is_executable_file(&bin) {
         r.cannot_run(format!(
             "objc bound drive: just-built driver missing ({})",
@@ -3014,11 +2789,6 @@ pub fn window_server_run_selected_nothing(transcript: &str) -> bool {
 }
 
 fn window_server_tests(ctx: &Ctx, r: &mut Report) {
-    // SELFTEST FIRST, as the objc stages do.
-    if ctx.selftest {
-        r.skip("window-server unit tests (selftest: not executed)");
-        return;
-    }
     if !cfg!(target_os = "macos") {
         r.skip(
             "window-server unit tests (macOS only: the rows are AppKit's, declared inside \
@@ -3132,7 +2902,7 @@ pub fn live_aterm_build_cmd(ctx: &Ctx) -> Cmd {
 /// lanes' own default, and the path these rows exist to keep them off.
 #[must_use]
 pub fn live_aterm_binary(ctx: &Ctx) -> std::path::PathBuf {
-    debug_bin(&ctx.root, Some(drivers_dir(ctx).as_os_str()), "aterm")
+    driver_bin(ctx, "aterm")
 }
 
 /// One lane's command, with the binary passed the way that lane's header takes
@@ -3259,8 +3029,8 @@ fn codex_live_upgrade(ctx: &Ctx, r: &mut Report) {
     live_aterm_stage(ctx, r, CODEX_LIVE_UPGRADE_SUITE);
 }
 
-/// One live lane's stage, in order: the suite exists, a selftest runs nothing,
-/// the platform, a toolchain, the build of the binary, the binary, the lane.
+/// One live lane's stage, in order: the suite exists, the platform, a
+/// toolchain, the build of the binary, the binary, the lane.
 fn live_aterm_stage(ctx: &Ctx, r: &mut Report, name: &str) {
     let t = ctx.tools_dir().join(name);
     if !is_executable_file(&t) {
@@ -3268,13 +3038,6 @@ fn live_aterm_stage(ctx: &Ctx, r: &mut Report, name: &str) {
             "{name} missing or not executable ({})",
             t.display()
         ));
-        return;
-    }
-    // SELFTEST before the platform check, so the `--selftest` ladder reads the
-    // same on every host: one row for the build, one for the lane.
-    if ctx.selftest {
-        r.skip(format!("{LIVE_ATERM_BUILD_LABEL} (selftest: not executed)"));
-        r.skip(format!("{name} (selftest: not executed)"));
         return;
     }
     if !cfg!(target_os = "macos") {
@@ -3319,26 +3082,6 @@ fn live_aterm_stage(ctx: &Ctx, r: &mut Report, name: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// 6) --full ONLY: differential oracle
-// ---------------------------------------------------------------------------
-fn differential_oracle(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("differential oracle (selftest)");
-        return;
-    }
-    if !ctx.tools.have_targo() {
-        r.skip("differential oracle (no targo)");
-        return;
-    }
-    run_labeled(
-        ctx,
-        r,
-        "targo test -p aterm-bench --test differential",
-        &targo(ctx, differential_args()),
-    );
-}
-
-// ---------------------------------------------------------------------------
 // 6b) --full ONLY: trust-mc / Kani BMC floor.
 //
 //    The real driver is `cargo trust-mc --config-free --harness <name>` via
@@ -3370,12 +3113,9 @@ pub const CELLS_NOT_PROVEN: &str = "gate cells: NOT PROVEN";
 /// [`crate::verdict::discharges_merge_contract`] because a skipped stage claims
 /// nothing.
 #[must_use]
-pub fn cells_outcome(ok: bool, transcript: &str) -> (Outcome, String) {
+pub fn cells_outcome(verb: &str, ok: bool, transcript: &str) -> (Outcome, String) {
     if !ok {
-        return (
-            Outcome::Fail(Severity::GateFailed),
-            "gate cells".to_string(),
-        );
+        return (Outcome::Fail(Severity::GateFailed), verb.to_string());
     }
     // AT COLUMN 0, never `contains`. The gate prints its verdict unindented and
     // everything it echoes from a compiler is indented or carries cargo's own
@@ -3387,12 +3127,13 @@ pub fn cells_outcome(ok: bool, transcript: &str) -> (Outcome, String) {
     {
         return (
             Outcome::Skip,
-            "gate cells (a forge cell had no installed std — NOTHING was compiled for it; the \
-             NOT PROVEN line above names which)"
-                .to_string(),
+            format!(
+                "{verb} (a forge cell had no installed std — NOTHING was compiled for it; the \
+                 NOT PROVEN line above names which)"
+            ),
         );
     }
-    (Outcome::Ok, "gate cells".to_string())
+    (Outcome::Ok, verb.to_string())
 }
 
 /// `--full` only: every forge cell type-checked FOR ITS OWN TRIPLE.
@@ -3416,10 +3157,6 @@ pub fn cells_outcome(ok: bool, transcript: &str) -> (Outcome, String) {
 /// `cshim` rows), and each cell FAILS if any in-repo package in its graph goes
 /// unread — an obligation with no escape hatch in the policy file.
 fn cross_cells(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("cross-cell type-check (selftest)");
-        return;
-    }
     if !ctx.tools.have_targo() {
         r.skip("cross-cell type-check (no targo)");
         return;
@@ -3429,15 +3166,87 @@ fn cross_cells(ctx: &Ctx, r: &mut Report) {
     if r.child_could_not_run(&out, "gate cells") {
         return;
     }
-    let (outcome, label) = cells_outcome(out.ok, out.output.as_str());
+    let (outcome, label) = cells_outcome("gate cells", out.ok, out.output.as_str());
     r.record(outcome, label);
 }
 
-fn kani_floor(ctx: &Ctx, r: &mut Report) {
-    if ctx.selftest {
-        r.skip("trust-mc (selftest)");
+/// Every gate run: the cells NO fleet box hosts (`xtask gate
+/// cells-foreign` — win, the two wasm32 cells, linux-arm, win-arm on today's
+/// matrix), type-checked for their own triples. Decided 2026-09-25 under the
+/// owner's standing direction, because the class it guards has shipped: the
+/// Windows binary did not build from 2026-09-12 (v0.82.0) to 2026-09-14 and no
+/// gate ran that said so, `gate cells` being behind `--full` — and it caught
+/// the next one on 2026-09-26 (the harness upgrade drives' Unix-only process
+/// group, merged to main red for both Windows cells).
+///
+/// THE COST, re-measured 2026-09-27 on this M5 Max at load average 40-65,
+/// with `CARGO_INCREMENTAL=0` as every gate child has it: 432 s cold into 2.6
+/// GiB, 8 s warm with nothing changed, 278 s after `touch
+/// crates/aterm-grid/src/lib.rs` (a hand run with incremental on: 75 s after
+/// the same touch, into 12 GiB). It sits in the xtask lane, which nothing waits
+/// for since the test run waits only for the driver lane, and inherits that
+/// lane's job cap. It was off the test run's critical path even while the run
+/// still waited for this lane: after an edit to aterm-grid's lib.rs a
+/// merge-contract run's cells ended at +275 s, its build at +513 s, and the
+/// test run started at +931 s, when the driver lane finished (2026-09-27,
+/// `--timings`). A snapshot's run builds into
+/// the snapshot's own CELLS LANE beside it ([`foreign_cells_cmd`]), which the
+/// disk preflight counts and caps with the other lanes. The mac and
+/// x86_64-linux cells stay with the native lanes of the boxes that host them
+/// and with `--full`'s whole matrix.
+///
+/// PREREQUISITE: rustup's `stable` with the four foreign std targets. Without
+/// them `xtask` exits 0 naming the missing std, this stage records a SKIP, and
+/// the verdict withholds the merge-contract sentence on that box.
+fn foreign_cells(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("gate cells-foreign (no targo)");
         return;
     }
+    let out = exec::run(&foreign_cells_cmd(ctx), ctx.exec_env());
+    r.raw(out.output.as_str());
+    if r.child_could_not_run(&out, "gate cells-foreign") {
+        return;
+    }
+    let (outcome, label) = cells_outcome("gate cells-foreign", out.ok, out.output.as_str());
+    r.record(outcome, label);
+}
+
+/// `xtask gate cells-foreign`, pointed at the run's CELLS LANE
+/// ([`crate::disk::cells_lane`]) through `$ATERM_CELL_TARGET_DIR`, so what it
+/// writes is on the snapshot's volume, counted by the disk preflight and
+/// removed by its cap. Without it the stage wrote into `xtask`'s per-checkout
+/// default under `~/.cache/aterm/cells`, which no budget counted.
+fn foreign_cells_cmd(ctx: &Ctx) -> Cmd {
+    let cmd = xtask_cmd(ctx, xtask_gate_args("cells-foreign"));
+    match crate::disk::cells_lane(&ctx.root) {
+        Some(cells) => cmd.env("ATERM_CELL_TARGET_DIR", cells),
+        None => cmd,
+    }
+}
+
+/// Every gate run: `xtask gate forge` — the third-party surface (vendored
+/// forks and first-party patch targets live on every cell with no unpatched
+/// sibling, carved paths absent, provenance attested, the `[OB-14]` budget
+/// ratchet, `[OB-16]` mirror honesty, `[OB-17]` the fork ledger). Decided
+/// 2026-09-25 under the owner's standing direction: a flat ~9-14 s with no
+/// compiler and no network, in the xtask lane beside the other gate verbs —
+/// and a gate that only `--full` runs is a gate nothing automatic runs, which
+/// is how `gate cells` missed a Windows break for two days.
+fn forge_gate(ctx: &Ctx, r: &mut Report) {
+    if !ctx.tools.have_targo() {
+        r.skip("gate forge (no targo)");
+        return;
+    }
+    run_labeled(
+        ctx,
+        r,
+        "gate forge",
+        &xtask_cmd(ctx, xtask_gate_args("forge")),
+    );
+}
+
+fn kani_floor(ctx: &Ctx, r: &mut Report) {
     let gate = ctx.root.join("scripts/verify-kani-proofs.sh");
     let mc_root = trust_mc_sysroot(&ctx.env);
     let ay_dir = ay_bin_dir(&ctx.env);
@@ -3535,44 +3344,47 @@ mod tests {
             PathBuf::from("/repo"),
             Mode::Fast,
             scope,
-            false,
             EnvSnapshot::default(),
             PathBuf::from("/tmp"),
         )
     }
 
+    /// A SNAPSHOT'S FOREIGN CELLS BUILD IN ITS CELLS LANE (2026-09-27): the
+    /// stage's child carries `$ATERM_CELL_TARGET_DIR` naming the lane beside
+    /// the snapshot — the directory the disk preflight measures and its cap
+    /// removes — and never `xtask`'s own default under the caller's cache.
     #[test]
-    fn every_driver_invocation_names_its_lane() {
-        // `targo` REFUSES a bare verb on purpose: an artifact is either verified
-        // or explicitly unverified, never implicitly one of them. A ported
-        // command that dropped `--unverified` would not run at all — but one that
-        // grew a bare `cargo` fallback would silently make the gate meaningless.
-        let s = Scope::workspace();
-        for argv in [
-            build_args(&s),
-            test_compile_args(&s),
-            test_run_args(&s),
-            doctest_args(&s),
-            regex_lane_args(),
-            smoke_stages::smoke_build_args(),
-            sealed_lane_args(),
-            atpkg_build_args(),
-            conformance_release_args(),
-            xtask_gate_args("drift"),
-            freeze_gate_args(),
-            differential_args(),
-            redraw_conformance_build_args(),
-            objc_driver_prebuild_args(),
-            window_server_tests_build_args(),
-            window_server_tests_args(),
-            live_aterm_build_args(),
-        ] {
-            assert_eq!(
-                argv.first().map(String::as_str),
-                Some("--unverified"),
-                "{argv:?}"
-            );
-        }
+    fn a_snapshots_foreign_cells_build_in_its_cells_lane() {
+        let target_dir = |c: &Cmd| {
+            c.envs
+                .iter()
+                .find(|(k, _)| k == "ATERM_CELL_TARGET_DIR")
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        let snap = Ctx::new(
+            PathBuf::from("/w/aterm-verify.noindex"),
+            Mode::Fast,
+            Scope::workspace(),
+            EnvSnapshot::default(),
+            PathBuf::from("/tmp"),
+        )
+        .in_snapshot_of(
+            PathBuf::from("/w/aterm"),
+            crate::identity::TreeState {
+                head: "0".repeat(40),
+                dirty: std::collections::BTreeMap::new(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            target_dir(&foreign_cells_cmd(&snap)),
+            Some(PathBuf::from("/w/aterm-verify-cells.noindex"))
+        );
+        assert_eq!(
+            crate::disk::cells_lane(&snap.root),
+            target_dir(&foreign_cells_cmd(&snap)),
+            "the stage builds where the preflight measures"
+        );
     }
 
     /// THE WINDOW-SERVER LANE RUNS EXACTLY ITS ROWS, FROM THE DRIVER LANE
@@ -3613,8 +3425,7 @@ mod tests {
             unit(&window_server_tests_args()),
             "the prebuild compiles the unit the stage runs"
         );
-        let mut c = ctx(Scope::workspace());
-        c.env.cargo_target_dir = Some("/caller/target".into());
+        let c = ctx(Scope::workspace());
         let dir = |cmd: &Cmd| {
             cmd.envs
                 .iter()
@@ -3690,8 +3501,7 @@ mod tests {
     /// is the driver lane's, whatever the caller exported.
     #[test]
     fn sealed_gui_and_tests_share_the_owned_target_without_a_freshness_override() {
-        let mut c = ctx(Scope::workspace());
-        c.env.cargo_target_dir = Some("/caller/target".into());
+        let c = ctx(Scope::workspace());
         let [(_, build), (_, test)] = sealed_lane_cmds(&c);
         assert_eq!(
             build.args,
@@ -3851,20 +3661,17 @@ mod tests {
 
     #[test]
     fn libc_oracle_owns_an_absolute_target_dir_and_suppresses_python_bytecode() {
-        for caller_target in ["caller-relative", "/caller/absolute-target"] {
-            let mut c = ctx(Scope::workspace());
-            c.env.cargo_target_dir = Some(caller_target.into());
-            let cmd = libc_oracle_cmd(&c).expect("the absolute fixture root resolves");
-            assert_eq!(cmd.program, PathBuf::from("/repo/libc-oracle/run.sh"));
-            assert_eq!(
-                cmd.envs,
-                [
-                    ("CARGO_TARGET_DIR".into(), "/repo/libc-oracle/target".into()),
-                    ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
-                ],
-                "the required lane must ignore caller CARGO_TARGET_DIR={caller_target}"
-            );
-        }
+        let c = ctx(Scope::workspace());
+        let cmd = libc_oracle_cmd(&c).expect("the absolute fixture root resolves");
+        assert_eq!(cmd.program, PathBuf::from("/repo/libc-oracle/run.sh"));
+        assert_eq!(
+            cmd.envs,
+            [
+                ("CARGO_TARGET_DIR".into(), "/repo/libc-oracle/target".into()),
+                ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
+            ],
+            "the required lane names its own target dir"
+        );
 
         let mut relative = ctx(Scope::workspace());
         relative.root = PathBuf::from("relative-repo");
@@ -3909,8 +3716,7 @@ mod tests {
         // ONLY doctest runner, so it says COULD-NOT-RUN with the remedy before
         // spawning anything. The test stage's two children (`--no-run`,
         // `--tests`) spawn no rustdoc, so they simply run — `/usr/bin/true`
-        // stands in for targo, and two Ok outcomes prove both ran — and the
-        // regex lane points at the doctests line.
+        // stands in for targo, and two Ok outcomes prove both ran.
         let spec = |id| StageSpec {
             id,
             title: "t".into(),
@@ -3947,33 +3753,6 @@ mod tests {
         assert!(
             outcomes[0].1.contains("~/.local/bin/trustdoc"),
             "the diagnosis names the remedy: {}",
-            outcomes[0].1
-        );
-
-        // The regex lane compiles aterm-search doctests, so it takes the same
-        // rule — a skip pointing at the doctests line, never a raw exec death
-        // that would land as GateFailed and outrank the honest COULD-NOT-RUN.
-        let r = run_stage(&cc, &spec(StageId::RegexLane));
-        let outcomes: Vec<_> = r.outcomes().collect();
-        assert_eq!(outcomes.len(), 1, "regex lane decided once");
-        assert_eq!(outcomes[0].0, Outcome::Skip);
-        assert!(
-            outcomes[0].1.contains("see the doctests line"),
-            "{}",
-            outcomes[0].1
-        );
-
-        // `--selftest` executes nothing, so there is no machine to diagnose:
-        // the ladder keeps its uniform selftest skips and the run stays green.
-        let mut cs = no_driver(Scope::workspace());
-        cs.selftest = true;
-        let r = run_stage(&cs, &spec(StageId::Doctests));
-        let outcomes: Vec<_> = r.outcomes().collect();
-        assert_eq!(outcomes.len(), 1, "selftest doctests decided once");
-        assert_eq!(outcomes[0].0, Outcome::Skip);
-        assert!(
-            outcomes[0].1.contains("(selftest: not executed)"),
-            "{}",
             outcomes[0].1
         );
 
@@ -4057,7 +3836,6 @@ mod tests {
             measuring_args(&Scope::crate_only("aterm-grid")),
             doctest_args(&Scope::workspace()),
             doctest_args(&Scope::crate_only("aterm-grid")),
-            regex_lane_args(),
         ] {
             assert!(
                 argv.iter().any(|a| a == "--no-fail-fast"),
@@ -4068,12 +3846,8 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_reaches_the_build_test_doctest_and_lint_argv_together() {
+    fn a_scope_reaches_the_test_doctest_and_lint_argv_together() {
         let s = Scope::crate_only("aterm-grid");
-        assert_eq!(
-            build_args(&s),
-            ["--unverified", "build", "-p", "aterm-grid"]
-        );
         assert_eq!(
             test_compile_args(&s),
             [
@@ -4108,36 +3882,11 @@ mod tests {
                 "warnings"
             ]
         );
-        // and NOT the whole-tree stages
-        assert_eq!(
-            regex_lane_args(),
-            [
-                "--unverified",
-                "test",
-                "-p",
-                "aterm-search",
-                "--features",
-                "regex",
-                "--no-fail-fast"
-            ],
-            "the regex lane is always that crate, or it is not run at all"
-        );
     }
 
     #[test]
-    fn a_change_scope_reaches_the_same_four_argvs_as_one_dash_p_per_crate() {
+    fn a_change_scope_reaches_the_same_three_argvs_as_one_dash_p_per_crate() {
         let s = Scope::changed("main", vec!["aterm-grid".into(), "aterm-gui".into()], true);
-        assert_eq!(
-            build_args(&s),
-            [
-                "--unverified",
-                "build",
-                "-p",
-                "aterm-grid",
-                "-p",
-                "aterm-gui"
-            ]
-        );
         assert_eq!(
             test_compile_args(&s),
             [
@@ -4187,7 +3936,7 @@ mod tests {
         // build the whole tree under the label `<no crates selected>`.
         let c = ctx(Scope::changed("main", vec![], true));
         for stage in [
-            StageId::Build,
+            StageId::TestCompile,
             StageId::Test,
             StageId::Doctests,
             StageId::Tippy,
@@ -4234,6 +3983,100 @@ mod tests {
             a[..sep].contains(&"--keep-going".to_string()),
             "the lint must not stop at the first failing crate: {a:?}"
         );
+        // …and the `--full` required-features pass holds to the same three.
+        let g = tippy_gated_args(&Scope::workspace()).expect("the workspace selects both");
+        let sep = g.iter().position(|x| x == "--").expect("a -- separator");
+        assert_eq!(&g[sep + 1..], ["-D", "warnings"], "{g:?}");
+        for flag in ["--all-targets", "--keep-going"] {
+            assert!(g[..sep].contains(&flag.to_string()), "{flag}: {g:?}");
+        }
+    }
+
+    /// THE MERGE CONTRACT'S CARGO CHILDREN, SPELLED OUT (2026-09-27; a
+    /// recorded multiset of every spawned argv held this until then). Each word
+    /// is load-bearing, and the regression this catches is a silent narrowing:
+    /// an added `--lib`, `--bins` or `--exclude`, a dropped `--no-fail-fast`
+    /// or `--keep-going`, would still compile and still print a green row —
+    /// over less of the tree than the row's name says.
+    #[test]
+    fn the_workspace_argvs_are_exactly_these() {
+        let ws = Scope::workspace();
+        let words = |a: &[&str]| a.iter().map(|w| (*w).to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            test_compile_args(&ws),
+            words(&[
+                "--unverified",
+                "test",
+                "--workspace",
+                "--no-fail-fast",
+                "--no-run"
+            ])
+        );
+        assert_eq!(
+            test_run_args(&ws),
+            words(&[
+                "--unverified",
+                "test",
+                "--workspace",
+                "--no-fail-fast",
+                "--tests",
+                "--",
+                "--skip",
+                "measuring::",
+                "--skip",
+                "launchd_copy_tests::",
+            ])
+        );
+        assert_eq!(
+            doctest_args(&ws),
+            words(&[
+                "--unverified",
+                "test",
+                "--doc",
+                "--workspace",
+                "--no-fail-fast"
+            ])
+        );
+        assert_eq!(
+            measuring_args(&ws),
+            words(&[
+                "--unverified",
+                "test",
+                "--workspace",
+                "--no-fail-fast",
+                "--tests",
+                "--",
+                "measuring::",
+                "launchd_copy_tests::",
+            ])
+        );
+        assert_eq!(
+            tippy_args(&ws),
+            words(&[
+                "--workspace",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings"
+            ])
+        );
+        assert_eq!(
+            tippy_gated_args(&ws),
+            Some(words(&[
+                "-p",
+                "aterm-gui",
+                "-p",
+                "aterm-scrollback",
+                "--features",
+                "aterm-gui/bench-support,aterm-gui/control-conformance,aterm-scrollback/disk-tier",
+                "--all-targets",
+                "--keep-going",
+                "--",
+                "-D",
+                "warnings",
+            ]))
+        );
     }
 
     #[test]
@@ -4244,13 +4087,6 @@ mod tests {
         let mut c = ctx(Scope::workspace());
         c.tools.tippy = Some(PathBuf::from("/s2/targo-tippy"));
         c.path_env = std::ffi::OsString::from("/usr/bin");
-        let mut r = Report::new("t");
-        // selftest short-circuits before spawning, so this exercises construction
-        // only; the environment is asserted from the same code path below.
-        c.selftest = true;
-        tippy(&c, &mut r);
-        assert_eq!(r.outcomes().count(), 1);
-
         // Assert on the command the STAGE builds, not on one this test spells
         // out again: a replica agrees with itself even after the stage stops
         // setting a variable.
@@ -4288,7 +4124,6 @@ mod tests {
         let mut c = ctx(Scope::workspace());
         c.tools.tippy = Some(PathBuf::from("/s2/targo-tippy"));
 
-        assert!(build_cmd(&c).demoted, "targo build");
         for bind in [false, true] {
             let [compile, run] = test_cmds(&c, bind);
             assert!(compile.demoted, "targo test --no-run");
@@ -4324,31 +4159,63 @@ mod tests {
             atpkg_build_cmd(&c).demoted,
             "the atpkg the pack suite drives is only compiled here"
         );
-        assert!(!regex_lane_cmd(&c).demoted, "the regex lane runs its suite");
     }
 
+    /// THE REACH GUARD FOR THE REACH GUARDS (ported from xtask 2026-09-27, as
+    /// a SUBSET check). `--all-targets` builds no target whose
+    /// `required-features` are off, so every `(package, feature)` a
+    /// `crates/*/Cargo.toml` `required-features` names must be in
+    /// [`GATED_LINT_FEATURES`] or that target is linted by nobody — and any
+    /// count gate or reach guard living in it stops existing silently (the
+    /// four-day bench break). An entry no manifest names any more is not this
+    /// test's to find: the `--full` lint fails on a feature cargo does not know.
     #[test]
-    fn the_gated_pass_names_every_required_features_target_and_only_those() {
-        let argv = tippy_gated_args(&Scope::workspace()).expect("the workspace selects both");
-        assert_eq!(
-            argv,
-            [
-                "-p",
-                "aterm-gui",
-                "-p",
-                "aterm-scrollback",
-                "--features",
-                "aterm-gui/bench-support,aterm-gui/control-conformance,\
-                 aterm-scrollback/disk-tier",
-                "--all-targets",
-                "--keep-going",
-                "--",
-                "-D",
-                "warnings",
-            ],
-            "the second pass turns on exactly the features that unlock the six \
-             `required-features` targets, and keeps going past a red one"
+    fn the_gated_feature_table_covers_every_required_features_target() {
+        let crates = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut found: Vec<(String, String)> = Vec::new();
+        for entry in std::fs::read_dir(&crates)
+            .expect("crates/ is readable")
+            .flatten()
+        {
+            let Ok(text) = std::fs::read_to_string(entry.path().join("Cargo.toml")) else {
+                continue;
+            };
+            // The PACKAGE name, from the `[package]` table: `-p` takes it, and
+            // neither the directory nor a `[[bin]]`'s `name =` has to equal it.
+            let Some(pkg) = text
+                .lines()
+                .map(str::trim)
+                .skip_while(|l| *l != "[package]")
+                .find_map(|l| l.strip_prefix("name = "))
+                .map(|n| n.trim().trim_matches('"').to_string())
+            else {
+                continue;
+            };
+            // The DECLARATION only, never the prose beside it.
+            for list in text.lines().filter_map(|l| {
+                l.trim()
+                    .strip_prefix("required-features")
+                    .and_then(|r| r.trim_start().strip_prefix('='))
+            }) {
+                for feat in list.trim().trim_matches(['[', ']']).split(',') {
+                    let feat = feat.trim().trim_matches('"');
+                    if !feat.is_empty() {
+                        found.push((pkg.clone(), feat.to_string()));
+                    }
+                }
+            }
+        }
+        assert!(
+            !found.is_empty(),
+            "the manifest scan found nothing — it broke"
         );
+        for (pkg, feat) in &found {
+            assert!(
+                GATED_LINT_FEATURES.contains(&(pkg.as_str(), feat.as_str())),
+                "{pkg}/{feat} gates a target that GATED_LINT_FEATURES does not name, so \
+                 no lint pass builds it: {found:?}"
+            );
+        }
     }
 
     #[test]
@@ -4415,31 +4282,6 @@ mod tests {
     }
 
     #[test]
-    fn the_regex_lane_carries_the_marker_that_arms_the_regex_tests() {
-        // Without `ATERM_SEARCH_REGEX_LANE` the aterm-search suite still runs
-        // and still passes — green, with no regex coverage. The marker IS the
-        // stage; asserting it on the command the stage builds is the only way
-        // to notice it going missing.
-        let c = ctx(Scope::workspace());
-        let cmd = regex_lane_cmd(&c);
-        assert_eq!(
-            env_names(&cmd),
-            [
-                "ATERM_SEARCH_REGEX_LANE",
-                "CARGO_TARGET_DIR",
-                "CARGO_BUILD_JOBS"
-            ]
-        );
-        assert_eq!(cmd.envs[0].1.to_string_lossy(), "1");
-        let args: Vec<String> = cmd
-            .args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(args, regex_lane_args());
-    }
-
-    #[test]
     fn the_doc_running_stages_bind_trusts_renamed_doc_driver() {
         // Trust renames rustdoc to `trustdoc`. Unbound, doctests either fail to
         // launch or run under whatever rustdoc the ambient PATH offers — which
@@ -4456,9 +4298,9 @@ mod tests {
 
     #[test]
     fn every_kani_crate_gets_its_own_selector() {
-        // One script, three runs, distinguished ONLY by `KANI_CRATE`. Drop it
-        // and all three iterations prove the same crate while the ladder still
-        // prints three green rows — three claims, one of them true.
+        // One script, one run per crate, distinguished ONLY by `KANI_CRATE`.
+        // Drop it and every iteration proves the same crate while the ladder
+        // still prints a green row each — N claims, one of them true.
         let gate = std::path::Path::new("/repo/tools/verify-kani-proofs.sh");
         let mc = std::path::Path::new("/store/trust-mc/current");
         let ay = std::path::Path::new("/store/bin");
@@ -4533,34 +4375,15 @@ mod tests {
         assert_eq!(trust_mc_sysroot(&env), PathBuf::from("/explicit/sysroot"));
         assert_eq!(ay_bin_dir(&env), PathBuf::from("/explicit/ay"));
         std::fs::remove_dir_all(&home).ok();
-
-        // …and the script's own defaults, for a run by hand with neither variable set,
-        // are that same order: it fell back to the $HOME/trust/first-party trees until
-        // 2026-09-24, a month after they left the delivery, where the gate never would.
-        let script = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/verify-kani-proofs.sh"),
-        )
-        .expect("the kani lane's script ships");
-        for default in [
-            r#"TRUST_MC_SYSROOT="${TRUST_MC_SYSROOT:-$STORE_TMC}""#,
-            r#"AY_BIN_DIR="${AY_BIN_DIR:-$PKG_PREFIX/bin}""#,
-        ] {
-            assert!(script.contains(default), "the script's default: {default}");
-        }
-        assert!(
-            !script.contains("first-party/trust-mc/target")
-                && !script.contains("ay/target/release"),
-            "the script probes no build tree"
-        );
     }
 
     #[test]
-    fn no_targo_is_fail_closed_at_the_build_and_honest_everywhere_after() {
+    fn no_targo_is_fail_closed_at_the_test_compile_and_honest_everywhere_after() {
         let c = ctx(Scope::workspace());
         assert!(!c.tools.have_targo());
 
-        let mut r = Report::new("build");
-        build(&c, &mut r);
+        let mut r = Report::new("test compile");
+        test_compile(&c, &mut r);
         let (outcome, label) = r.outcomes().next().expect("a decision");
         assert_eq!(outcome, crate::Outcome::Fail(crate::Severity::CouldNotRun));
         assert!(label.starts_with("targo not found"), "{label}");
@@ -4571,13 +4394,10 @@ mod tests {
 
         // The dependent stages then skip — honestly, and named, so the verdict
         // refuses the merge contract for the whole run.
-        let dependent: [fn(&Ctx, &mut Report); 8] = [
+        let dependent: [fn(&Ctx, &mut Report); 5] = [
             test,
             doctests,
-            regex_lane,
-            feature_gates,
             freeze_gate,
-            proof_inventory,
             driver_builds,
             redraw_conformance,
         ];
@@ -4591,15 +4411,63 @@ mod tests {
         }
     }
 
+    /// AN UNAVAILABLE PROVER IS SAID PROMINENTLY AND NEVER DESCRIBED AS
+    /// DISCHARGED (`--full`'s trust-mc / Kani floor): a NOTICE naming what did
+    /// not run and its repair, one named skip, and so no merge-contract claim.
+    #[cfg(unix)]
+    #[test]
+    fn an_unavailable_prover_is_a_named_skip_that_forfeits_the_claim() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = crate::mktemp_dir("atv-kani-absent").expect("mktemp");
+        let script = tmp.join("scripts/verify-kani-proofs.sh");
+        std::fs::create_dir_all(tmp.join("scripts")).expect("mkdir");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let mut c = ctx(Scope::workspace());
+        c.root = tmp.clone();
+        c.env.trust_mc_sysroot = Some(tmp.join("no-trust-mc"));
+        c.env.ay_bin_dir = Some(tmp.join("no-ay"));
+        let r = run_stage(
+            &c,
+            &StageSpec {
+                id: StageId::KaniFloor,
+                title: "trust-mc / Kani BMC floor".into(),
+                lane: Lane::MainTarget,
+                exclusive: false,
+                after_lanes: Vec::new(),
+            },
+        );
+        let text = r.render();
+        assert!(
+            text.contains(
+                "  NOTICE: Tier-2 trust-mc/Kani obligations were NOT RUN: trust-mc is unavailable"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "  skip  trust-mc / Kani BMC floor (tool unavailable; `aterm pkg install trust-mc`)"
+            ),
+            "the skip names the repair: {text}"
+        );
+        assert!(
+            !text.contains("verify-kani-proofs.sh (aterm-parser)"),
+            "never described as discharged: {text}"
+        );
+        let t = crate::ladder::tally(std::slice::from_ref(&r));
+        assert_eq!(t.skipped(), 1, "{text}");
+        assert!(!crate::verdict::discharges_merge_contract(
+            &Scope::workspace(),
+            &t
+        ));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
     #[test]
     fn a_missing_helper_script_can_never_pass() {
         let c = ctx(Scope::workspace());
-        let script_stages: [fn(&Ctx, &mut Report); 4] = [
-            grep_guards,
-            delivery_tooling,
-            start_compare,
-            license_headers,
-        ];
+        let script_stages: [fn(&Ctx, &mut Report); 4] =
+            [grep_guards, delivery_tooling, start_compare, libc_oracle];
         for stage in script_stages {
             let mut r = Report::new("s");
             stage(&c, &mut r);
@@ -4690,19 +4558,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    /// The roster names suites this tree carries, so the stage runs them rather
-    /// than reporting its own roster as broken. Negative control: a name the
-    /// tree does not carry is not found by the same check.
-    #[cfg(unix)]
-    #[test]
-    fn every_delivery_suite_is_an_executable_file_in_this_tree() {
-        let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
-        for name in DELIVERY_SUITES {
-            assert!(is_executable_file(&tools.join(name)), "tools/{name}");
-        }
-        assert!(!is_executable_file(&tools.join("test-no-such-suite.sh")));
-    }
-
     #[test]
     fn the_redraw_gate_builds_the_feature_without_which_it_builds_nothing() {
         // `aterm-redraw-conformance` carries `required-features =
@@ -4729,7 +4584,7 @@ mod tests {
             "{CELLS_NOT_PROVEN} — 5 of the 5 cell(s) this run selected had no installed std, \
              so NO COMPILER READ THEM: mac-arm (aarch64-apple-darwin), …\n"
         );
-        let (outcome, label) = cells_outcome(true, &unproven);
+        let (outcome, label) = cells_outcome("gate cells", true, &unproven);
         assert_eq!(outcome, Outcome::Skip);
         assert_ne!(outcome, Outcome::Ok);
         assert!(label.contains("NOTHING was compiled"), "{label}");
@@ -4737,16 +4592,16 @@ mod tests {
         // A run that really did discharge it is still a pass.
         let green = "gate cells: GREEN — all 5 cells type-check, with nothing excused or \
                      shimmed: every one of the 312 in-repo crate-instances …\n";
-        assert_eq!(cells_outcome(true, green).0, Outcome::Ok);
+        assert_eq!(cells_outcome("gate cells", true, green).0, Outcome::Ok);
 
         // A failure stays a failure however the transcript reads — including one
         // that also carries the marker, which a partly-skipped red run does.
         assert_eq!(
-            cells_outcome(false, &unproven).0,
+            cells_outcome("gate cells", false, &unproven).0,
             Outcome::Fail(Severity::GateFailed)
         );
         assert_eq!(
-            cells_outcome(false, green).0,
+            cells_outcome("gate cells", false, green).0,
             Outcome::Fail(Severity::GateFailed)
         );
 
@@ -4756,7 +4611,7 @@ mod tests {
             "   |     pub const CELLS_NOT_PROVEN: &str = \"{CELLS_NOT_PROVEN}\";\n\
              gate cells: GREEN — all 5 cells type-check…\n"
         );
-        assert_eq!(cells_outcome(true, &quoted).0, Outcome::Ok);
+        assert_eq!(cells_outcome("gate cells", true, &quoted).0, Outcome::Ok);
     }
 
     #[test]
@@ -4765,13 +4620,16 @@ mod tests {
         // verdict: one skipped stage, whole-tree scope, nothing failed — and the
         // sentence is still withheld.
         let mut r = Report::new("cross-cell type-check");
-        let (outcome, label) = cells_outcome(true, &format!("{CELLS_NOT_PROVEN} — 5 of 5 …\n"));
+        let (outcome, label) = cells_outcome(
+            "gate cells-foreign",
+            true,
+            &format!("{CELLS_NOT_PROVEN} — 5 of 5 …\n"),
+        );
         r.record(outcome, label);
         let t = crate::ladder::tally(&[r]);
         assert_eq!(t.skipped(), 1);
         assert!(!crate::verdict::discharges_merge_contract(
             &crate::scope::Scope::workspace(),
-            false,
             &t
         ));
     }
@@ -4863,47 +4721,6 @@ mod tests {
         }
     }
 
-    /// THE TEST RUN RUNS TESTS; ONLY THE DOCTESTS STAGE RUNS DOCTESTS.
-    ///
-    /// Measured 2026-09-13 on 07a76fca7 with dry unit graphs, units keyed
-    /// recursively on package, target, profile (less its name), features, mode,
-    /// platform and dependencies:
-    /// `targo --unverified test --workspace --no-fail-fast
-    /// <sel> --config profile.dev.build-override.debug=2 --unit-graph -Z
-    /// unstable-options --offline`.
-    ///  * `--no-run` = the old single child: 1131 units, identical keys.
-    ///  * `--tests` adds 0 units to that and keeps all 500 test-mode units; it
-    ///    leaves out 86 doctest units and 78 build units (75 examples, 3 extra
-    ///    crate types) that run no test.
-    ///  * `test --doc --workspace --no-fail-fast` adds 3 units, all doctest (89
-    ///    crates against the old child's 86); without the pin, 117 build units.
-    #[test]
-    fn the_test_run_selects_tests_only() {
-        for s in [
-            Scope::workspace(),
-            Scope::crate_only("aterm-grid"),
-            Scope::changed("main", vec!["aterm-gui".into()], true),
-        ] {
-            let compile = test_compile_args(&s);
-            let full = test_run_args(&s);
-            // The libtest arguments after `--` choose which COMPILED tests run;
-            // they change nothing cargo builds, so they sit outside this law.
-            let sep = full.iter().position(|a| a == "--").expect("libtest args");
-            let run = &full[..sep];
-            assert_eq!(compile.last().map(String::as_str), Some("--no-run"));
-            assert_eq!(run.last().map(String::as_str), Some("--tests"));
-            assert_eq!(
-                compile[..compile.len() - 1],
-                run[..run.len() - 1],
-                "the two children differ only in the selector"
-            );
-            for a in [compile.as_slice(), run] {
-                assert!(!a.iter().any(|x| x == "--doc"), "{a:?}");
-            }
-            assert!(!run.iter().any(|x| x == "--no-run"), "{run:?}");
-        }
-    }
-
     /// THE TEST RUN AND THE MEASURING STAGE ARE COMPLEMENTS (2026-09-23): the
     /// same cargo selection in every scope, one skipping each filter and one
     /// running exactly those, so no test can fall between the two stages
@@ -4962,16 +4779,11 @@ mod tests {
     #[test]
     fn a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes() {
         use std::ffi::OsStr;
-        for lane in [Lane::RegexTarget, Lane::XtaskTarget] {
-            assert_eq!(lane_jobs(lane, None), Some(4));
-            assert_eq!(lane_jobs(lane, Some(OsStr::new("2"))), Some(2), "{lane:?}");
-            assert_eq!(
-                lane_jobs(lane, Some(OsStr::new(" 3 "))),
-                Some(3),
-                "{lane:?}"
-            );
-            assert_eq!(lane_jobs(lane, Some(OsStr::new("16"))), Some(4), "{lane:?}");
-        }
+        let xtask = Lane::XtaskTarget;
+        assert_eq!(lane_jobs(xtask, None), Some(4));
+        assert_eq!(lane_jobs(xtask, Some(OsStr::new("2"))), Some(2));
+        assert_eq!(lane_jobs(xtask, Some(OsStr::new(" 3 "))), Some(3));
+        assert_eq!(lane_jobs(xtask, Some(OsStr::new("16"))), Some(4));
         assert_eq!(lane_jobs(Lane::DriverTarget, None), Some(8));
         assert_eq!(
             lane_jobs(Lane::DriverTarget, Some(OsStr::new("4"))),
@@ -5016,7 +4828,8 @@ mod tests {
             );
         }
         assert!(
-            envs(&regex_lane_cmd(&c)).contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string()))
+            envs(&xtask_cmd(&c, xtask_gate_args("forge")))
+                .contains(&("CARGO_BUILD_JOBS".to_string(), "3".to_string()))
         );
     }
 
@@ -5040,64 +4853,56 @@ mod tests {
             }
             v
         };
-        for caller in [None, Some("/elsewhere"), Some("relative")] {
-            let mut c = ctx(Scope::workspace());
-            c.env.cargo_target_dir = caller.map(Into::into);
+        let c = ctx(Scope::workspace());
 
+        for cmd in [
+            xtask_cmd(&c, xtask_gate_args_with("lint", &["--fmt-only"])),
+            xtask_cmd(&c, xtask_gate_args("forge")),
+        ] {
+            assert_eq!(env(&cmd), lane("/repo/target-xtask", Some("4")));
+        }
+        for (label, cmd) in driver_build_cmds(&c)
+            .into_iter()
+            .chain(sealed_lane_cmds(&c))
+            .chain([(ATPKG_BUILD_LABEL.to_string(), atpkg_build_cmd(&c))])
+        {
             assert_eq!(
-                env(&regex_lane_cmd(&c))[1..],
-                lane("/repo/target-regex", Some("4"))[..]
-            );
-            for cmd in [
-                xtask_cmd(&c, xtask_gate_args_with("lint", &["--fmt-only"])),
-                xtask_cmd(&c, xtask_gate_args("drift")),
-                xtask_cmd(&c, xtask_gate_args("counts")),
-            ] {
-                assert_eq!(env(&cmd), lane("/repo/target-xtask", Some("4")));
-            }
-            for (label, cmd) in driver_build_cmds(&c)
-                .into_iter()
-                .chain(sealed_lane_cmds(&c))
-                .chain([(ATPKG_BUILD_LABEL.to_string(), atpkg_build_cmd(&c))])
-            {
-                assert_eq!(
-                    env(&cmd),
-                    lane("/repo/target-drivers", Some("8")),
-                    "{label}"
-                );
-            }
-            for args in [
-                redraw_conformance_build_args(),
-                objc_class_audit_build_args(),
-                objc_bound_drive_build_args(),
-            ] {
-                assert_eq!(
-                    env(&driver_build_cmd(&c, args)),
-                    lane("/repo/target-drivers", Some("8"))
-                );
-            }
-            assert_eq!(drivers_dir(&c), PathBuf::from("/repo/target-drivers"));
-            assert_eq!(
-                env(&conformance_release_cmd(&c)),
-                lane("/repo/target/conformance-release", Some("6")),
-                "the prime names the helper's dir, never the caller's"
-            );
-            assert_eq!(
-                env(&freeze_gate_cmd(&c)),
-                lane("/repo/tools/freeze-safety-gate/target", None),
-                "the L0 gate names the dir cargo used when nothing was exported"
-            );
-            // The main lane is handed nothing: its children keep inheriting
-            // the caller's target dir, exactly as before.
-            assert!(
-                env(&in_lane(
-                    &c,
-                    Lane::MainTarget,
-                    targo(&c, build_args(&c.scope))
-                ))
-                .is_empty()
+                env(&cmd),
+                lane("/repo/target-drivers", Some("8")),
+                "{label}"
             );
         }
+        for args in [
+            redraw_conformance_build_args(),
+            objc_class_audit_build_args(),
+            objc_bound_drive_build_args(),
+        ] {
+            assert_eq!(
+                env(&driver_build_cmd(&c, args)),
+                lane("/repo/target-drivers", Some("8"))
+            );
+        }
+        assert_eq!(drivers_dir(&c), PathBuf::from("/repo/target-drivers"));
+        assert_eq!(
+            env(&conformance_release_cmd(&c)),
+            lane("/repo/target/conformance-release", Some("6")),
+            "the prime names the helper's dir, never the caller's"
+        );
+        assert_eq!(
+            env(&freeze_gate_cmd(&c)),
+            lane("/repo/tools/freeze-safety-gate/target", None),
+            "the L0 gate names the dir cargo used when nothing was exported"
+        );
+        // The main lane is handed nothing: its children keep inheriting
+        // the caller's target dir, exactly as before.
+        assert!(
+            env(&in_lane(
+                &c,
+                Lane::MainTarget,
+                targo(&c, test_compile_args(&c.scope))
+            ))
+            .is_empty()
+        );
     }
 
     /// THE SEALED RUNG BUILDS THE aterm-gui IT DRIVES WHERE ITS HARNESS LOOKS
@@ -5117,27 +4922,24 @@ mod tests {
                 .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
                 .map(|(_, v)| PathBuf::from(v))
         };
-        for caller in [None, Some("/elsewhere"), Some("relative")] {
-            let mut c = ctx(Scope::workspace());
-            c.env.cargo_target_dir = caller.map(Into::into);
-            let [(_, build), (_, run)] = sealed_lane_cmds(&c);
-            assert_eq!(build.argv()[1..], smoke_stages::smoke_build_args()[..]);
-            assert!(
-                build
-                    .argv()
-                    .windows(2)
-                    .any(|w| w[0] == "-p" && w[1] == "aterm-gui"),
-                "the first child must build aterm-gui"
-            );
-            assert_eq!(run.argv()[1..], sealed_lane_args()[..]);
-            assert_eq!(dir(&build), dir(&run), "caller {caller:?}");
-            let spec = crate::plan::plan(&c)
-                .into_iter()
-                .find(|s| s.id == StageId::SealedLane)
-                .expect("the sealed rung is planned whole-tree");
-            assert_eq!(dir(&run), lane_dir(&c, spec.lane), "caller {caller:?}");
-            assert_eq!(dir(&run), Some(drivers_dir(&c)), "caller {caller:?}");
-        }
+        let c = ctx(Scope::workspace());
+        let [(_, build), (_, run)] = sealed_lane_cmds(&c);
+        assert_eq!(build.argv()[1..], smoke_build_args()[..]);
+        assert!(
+            build
+                .argv()
+                .windows(2)
+                .any(|w| w[0] == "-p" && w[1] == "aterm-gui"),
+            "the first child must build aterm-gui"
+        );
+        assert_eq!(run.argv()[1..], sealed_lane_args()[..]);
+        assert_eq!(dir(&build), dir(&run));
+        let spec = crate::plan::plan(&c)
+            .into_iter()
+            .find(|s| s.id == StageId::SealedLane)
+            .expect("the sealed rung is planned whole-tree");
+        assert_eq!(dir(&run), lane_dir(&c, spec.lane));
+        assert_eq!(dir(&run), Some(drivers_dir(&c)));
     }
 
     /// THE PACK SUITE DRIVES THE atpkg THIS STAGE BUILT (2026-09-16).
@@ -5159,45 +4961,38 @@ mod tests {
                 .find(|(k, _)| k.to_str() == Some(key))
                 .map(|(_, v)| PathBuf::from(v))
         };
-        for caller in [None, Some("/elsewhere"), Some("relative")] {
-            let mut c = ctx(Scope::workspace());
-            c.env.cargo_target_dir = caller.map(Into::into);
+        let c = ctx(Scope::workspace());
 
-            let build = atpkg_build_cmd(&c);
+        let build = atpkg_build_cmd(&c);
+        assert_eq!(build.argv()[1..], atpkg_build_args()[..]);
+        let dir = env_of(&build, "CARGO_TARGET_DIR");
+        assert_eq!(dir, Some(drivers_dir(&c)));
+
+        let bin = atpkg_driven_binary(&c);
+        assert_eq!(bin, drivers_dir(&c).join("debug").join("atpkg"));
+        assert!(
+            !bin.starts_with(c.root.join("target")),
+            "the workspace build's own dir is exactly the stale path: {}",
+            bin.display()
+        );
+
+        for name in ATPKG_SUITES {
+            let cmd = atpkg_suite_cmd(&c, name);
+            assert_eq!(cmd.program, c.tools_dir().join(name));
             assert_eq!(
-                build.argv()[1..],
-                atpkg_build_args()[..],
-                "caller {caller:?}"
+                env_of(&cmd, "ATPKG"),
+                (name == ATPKG_DRIVEN_SUITE).then(|| bin.clone()),
+                "{name}"
             );
-            let dir = env_of(&build, "CARGO_TARGET_DIR");
-            assert_eq!(dir, Some(drivers_dir(&c)), "caller {caller:?}");
-
-            let bin = atpkg_driven_binary(&c);
-            assert_eq!(bin, drivers_dir(&c).join("debug").join("atpkg"));
-            assert!(
-                !bin.starts_with(c.root.join("target")),
-                "the workspace build's own dir is exactly the stale path: {}",
-                bin.display()
-            );
-
-            for name in ATPKG_SUITES {
-                let cmd = atpkg_suite_cmd(&c, name);
-                assert_eq!(cmd.program, c.tools_dir().join(name));
-                assert_eq!(
-                    env_of(&cmd, "ATPKG"),
-                    (name == ATPKG_DRIVEN_SUITE).then(|| bin.clone()),
-                    "{name}, caller {caller:?}"
-                );
-            }
-
-            // …and the dir that build writes is the dir this stage's LANE
-            // names, which is what orders it behind the driver builds.
-            let spec = crate::plan::plan(&c)
-                .into_iter()
-                .find(|s| s.id == StageId::AtpkgTooling)
-                .expect("the atpkg publish tooling is planned whole-tree");
-            assert_eq!(dir, lane_dir(&c, spec.lane), "caller {caller:?}");
         }
+
+        // …and the dir that build writes is the dir this stage's LANE
+        // names, which is what orders it behind the driver builds.
+        let spec = crate::plan::plan(&c)
+            .into_iter()
+            .find(|s| s.id == StageId::AtpkgTooling)
+            .expect("the atpkg publish tooling is planned whole-tree");
+        assert_eq!(dir, lane_dir(&c, spec.lane));
     }
 
     #[test]
@@ -5209,7 +5004,7 @@ mod tests {
             .map(|(_, cmd)| cmd.argv()[1..].to_vec())
             .collect();
         assert_eq!(children[0], redraw_conformance_build_args());
-        assert_eq!(children[1], crate::smoke_stages::smoke_build_args());
+        assert_eq!(children[1], smoke_build_args());
         // In the order OBJC_DRIVER_EXAMPLES lists them, which is stage order.
         let stage_builds = [
             objc_class_audit_build_args(),
@@ -5368,61 +5163,54 @@ mod tests {
     /// rather than silently falling back to its default.
     #[test]
     fn each_live_lane_is_handed_the_driver_lanes_aterm_in_the_spelling_its_header_takes() {
-        for caller in [None, Some("/elsewhere"), Some("relative")] {
-            let mut c = ctx(Scope::workspace());
-            c.env.cargo_target_dir = caller.map(Into::into);
-            let bin = live_aterm_binary(&c);
-            assert_eq!(bin, drivers_dir(&c).join("debug").join("aterm"));
-            assert!(
-                !bin.starts_with(c.root.join("target")),
-                "the lanes' own default is exactly the stale path: {}",
-                bin.display()
-            );
-            let build = live_aterm_build_cmd(&c);
-            assert_eq!(build.argv()[1..], live_aterm_build_args()[..]);
-            assert!(build.demoted, "the build only compiles");
-            let lane = |cmd: &Cmd| {
-                cmd.envs
-                    .iter()
-                    .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
-                    .map(|(_, v)| PathBuf::from(v))
-            };
-            // Both live stages — the handback in every tier, the Codex lane in
-            // `--full` — are in the lane whose dir that build writes.
-            c.mode = Mode::Full;
-            for id in [StageId::ForegroundHandback, StageId::CodexLiveUpgrade] {
-                let spec = crate::plan::plan(&c)
-                    .into_iter()
-                    .find(|s| s.id == id)
-                    .expect("the live lanes are planned whole-tree under --full");
-                assert_eq!(
-                    lane(&build),
-                    lane_dir(&c, spec.lane),
-                    "{id:?}, caller {caller:?}"
-                );
-            }
+        let mut c = ctx(Scope::workspace());
+        let bin = live_aterm_binary(&c);
+        assert_eq!(bin, drivers_dir(&c).join("debug").join("aterm"));
+        assert!(
+            !bin.starts_with(c.root.join("target")),
+            "the lanes' own default is exactly the stale path: {}",
+            bin.display()
+        );
+        let build = live_aterm_build_cmd(&c);
+        assert_eq!(build.argv()[1..], live_aterm_build_args()[..]);
+        assert!(build.demoted, "the build only compiles");
+        let lane = |cmd: &Cmd| {
+            cmd.envs
+                .iter()
+                .find(|(k, _)| k.to_str() == Some("CARGO_TARGET_DIR"))
+                .map(|(_, v)| PathBuf::from(v))
+        };
+        // Both live stages — the handback in every tier, the Codex lane in
+        // `--full` — are in the lane whose dir that build writes.
+        c.mode = Mode::Full;
+        for id in [StageId::ForegroundHandback, StageId::CodexLiveUpgrade] {
+            let spec = crate::plan::plan(&c)
+                .into_iter()
+                .find(|s| s.id == id)
+                .expect("the live lanes are planned whole-tree under --full");
+            assert_eq!(lane(&build), lane_dir(&c, spec.lane), "{id:?}");
+        }
 
-            let fh = live_aterm_suite_cmd(&c, FOREGROUND_HANDBACK_SUITE);
-            assert_eq!(fh.program, c.tools_dir().join(FOREGROUND_HANDBACK_SUITE));
-            assert_eq!(
-                fh.argv()[1..],
-                ["--binary".to_string(), bin.display().to_string()]
+        let fh = live_aterm_suite_cmd(&c, FOREGROUND_HANDBACK_SUITE);
+        assert_eq!(fh.program, c.tools_dir().join(FOREGROUND_HANDBACK_SUITE));
+        assert_eq!(
+            fh.argv()[1..],
+            ["--binary".to_string(), bin.display().to_string()]
+        );
+        let cx = live_aterm_suite_cmd(&c, CODEX_LIVE_UPGRADE_SUITE);
+        assert_eq!(cx.program, c.tools_dir().join(CODEX_LIVE_UPGRADE_SUITE));
+        assert_eq!(cx.argv()[1..], [bin.display().to_string()]);
+        for cmd in [&fh, &cx] {
+            assert!(
+                !cmd.demoted,
+                "the lanes RUN code and keep the inherited tier"
             );
-            let cx = live_aterm_suite_cmd(&c, CODEX_LIVE_UPGRADE_SUITE);
-            assert_eq!(cx.program, c.tools_dir().join(CODEX_LIVE_UPGRADE_SUITE));
-            assert_eq!(cx.argv()[1..], [bin.display().to_string()]);
-            for cmd in [&fh, &cx] {
-                assert!(
-                    !cmd.demoted,
-                    "the lanes RUN code and keep the inherited tier"
-                );
-                assert!(cmd.envs.is_empty(), "nothing but the binary is handed over");
-                assert_eq!(
-                    cmd.term_grace,
-                    Some(exec::TERM_GRACE),
-                    "a killed lane is sent SIGTERM first, so its EXIT trap tears down"
-                );
-            }
+            assert!(cmd.envs.is_empty(), "nothing but the binary is handed over");
+            assert_eq!(
+                cmd.term_grace,
+                Some(exec::TERM_GRACE),
+                "a killed lane is sent SIGTERM first, so its EXIT trap tears down"
+            );
         }
         let tools = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tools");
         let read = |name: &str| std::fs::read_to_string(tools.join(name)).expect(name);
@@ -5451,21 +5239,5 @@ mod tests {
         // Negative control: the same check does not find a spelling a lane
         // does not read.
         assert!(!cx.contains("--binary)"));
-    }
-
-    #[test]
-    fn selftest_executes_nothing_heavy_and_says_so() {
-        let mut c = ctx(Scope::workspace());
-        c.selftest = true;
-        c.tools.targo = PathBuf::from("/bin/sh"); // pretend a driver exists
-        let mut r = Report::new("build");
-        build(&c, &mut r);
-        assert_eq!(
-            r.outcomes().collect::<Vec<_>>(),
-            [(
-                crate::Outcome::Skip,
-                "targo build --workspace (selftest: not executed)"
-            )]
-        );
     }
 }
