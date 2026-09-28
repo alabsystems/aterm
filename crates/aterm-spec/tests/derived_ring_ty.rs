@@ -4390,6 +4390,99 @@ fn derived_claude_light_admission_proves_and_catches_ignored_rejections() {
     assert_every_invariant_breaks_first(&model, &[]);
 }
 
+/// The mode light's return (owner, 2026-09-27: "when I toggle auto-approve,
+/// it turns off auto mode (what?!)"): proved at `Buggy=0`, and each defect it
+/// was written for is its own law's counterexample at `Buggy=1` — a press
+/// from an expected mode, a press into a box or mid-turn, a stop that does
+/// not say where. The paths, pinned: from manual, three presses reach the
+/// expected mode and nothing presses on; from don't ask, four; a turn in
+/// flight holds aterm's own next press (and a box can then open over the
+/// session without taking one); a cycle without bypass or auto laps back and
+/// is NAMED; a rejected press is named.
+#[test]
+fn derived_claude_mode_return_proves_and_catches_overshoot_box_and_silent_stop() {
+    let model = aterm_spec::derive::claude_mode_return_model();
+    assert_proves_and_catches(&model);
+    assert_every_invariant_breaks_first(&model, &[]);
+
+    let mut state = model.init_state();
+    assert!(model.fire("Click", &mut state));
+    for _ in 0..2 {
+        assert!(model.fire("Answer", &mut state));
+        assert!(model.fire("Press", &mut state));
+    }
+    assert!(model.fire("Answer", &mut state));
+    assert_eq!((state["mode"], state["presses"]), (0, 3));
+    assert!(
+        model.successors("Press", &state).is_empty(),
+        "no press from an expected mode"
+    );
+    assert!(model.fire("Arrive", &mut state));
+    assert!(model.fire("Rest", &mut state));
+
+    // From don't ask: four presses, forward through manual.
+    assert!(model.fire("DontAsk", &mut state));
+    assert!(model.fire("Click", &mut state));
+    for _ in 0..3 {
+        assert!(model.fire("Answer", &mut state));
+        assert!(model.fire("Press", &mut state));
+    }
+    assert!(model.fire("Answer", &mut state));
+    assert_eq!((state["mode"], state["presses"]), (0, 4));
+    assert!(model.fire("Arrive", &mut state));
+
+    // Mid-turn: the click presses, the answer comes, and aterm's own next
+    // press waits — a box may open, and takes nothing.
+    let mut turn = model.init_state();
+    assert!(model.fire("TurnStarts", &mut turn));
+    assert!(model.fire("Click", &mut turn));
+    assert!(model.fire("Answer", &mut turn));
+    assert!(model.successors("Press", &turn).is_empty(), "held mid-turn");
+    assert!(model.fire("Cover", &mut turn));
+    assert!(model.fire("Expire", &mut turn));
+    assert_eq!(turn["named"], 1);
+
+    // A cycle without bypass or auto: back at the start, named.
+    let mut ring = model.init_state();
+    assert!(model.fire("Narrow", &mut ring));
+    assert!(model.fire("Click", &mut ring));
+    for _ in 0..2 {
+        assert!(model.fire("Answer", &mut ring));
+        assert!(model.fire("Press", &mut ring));
+    }
+    assert!(model.fire("Answer", &mut ring));
+    assert_eq!(ring["mode"], ring["start"]);
+    assert!(model.fire("Lap", &mut ring));
+    assert!(model.check_invariant("AStopIsNamed", &ring));
+
+    let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let mut stuck = buggy.init_state();
+    assert!(buggy.fire("Click", &mut stuck));
+    assert!(buggy.fire("Expire", &mut stuck));
+    assert!(
+        !buggy.check_invariant("AStopIsNamed", &stuck),
+        "the retired generic refusal"
+    );
+    let mut rejected = buggy.init_state();
+    assert!(buggy.fire("Click", &mut rejected));
+    assert!(buggy.fire("Answer", &mut rejected));
+    assert!(buggy.fire("Reject", &mut rejected));
+    assert!(
+        !buggy.check_invariant("AStopIsNamed", &rejected),
+        "the old \"input was not accepted\" stop, after the session had moved"
+    );
+    let mut raced = buggy.init_state();
+    assert!(buggy.fire("TurnStarts", &mut raced));
+    assert!(buggy.fire("Click", &mut raced));
+    assert!(buggy.fire("Answer", &mut raced));
+    assert!(buggy.fire("Press", &mut raced), "a press mid-turn");
+    assert!(buggy.fire("Cover", &mut raced));
+    assert!(
+        !buggy.check_invariant("NoPressIntoABox", &raced),
+        "the box opened before Claude read aterm's own key"
+    );
+}
+
 /// Queue replacement carries the unique renderer base before worker start, and
 /// completion requires the latest request/candidate identity. A current failed
 /// candidate clears the active renderer rather than retaining mismatched pixels.

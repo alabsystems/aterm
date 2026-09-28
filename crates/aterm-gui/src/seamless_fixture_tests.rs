@@ -54,6 +54,13 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.94.0", "incident-55x149"),
     ("v0.94.0", "shell-integration"),
     ("v0.94.0", "twelve-panes"),
+    ("v0.95.0", "claude-code-1049"),
+    ("v0.95.0", "colour-and-shell"),
+    ("v0.95.0", "history"),
+    ("v0.95.0", "history-carry"),
+    ("v0.95.0", "incident-55x149"),
+    ("v0.95.0", "shell-integration"),
+    ("v0.95.0", "twelve-panes"),
 ];
 
 /// What one desk's producer committed to (`parent.toml`, written beside the

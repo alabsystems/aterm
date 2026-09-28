@@ -33,9 +33,13 @@
 //! Claude settings — the retired "decision B" install is not revived.
 //!
 //! The permission MODE is not dropped with the row: when it is anything but
-//! bypass, the footer keeps the vendor's own pill for it ([`plan_row`]), so
-//! shift+tab into plan mode still shows. Only the steady-state bypass line —
-//! the part the owner asked to hide — disappears.
+//! a mode the owner expects — bypass or auto, the two positions of Claude's
+//! one permission mode that the owner always wants (`harness::lights`,
+//! `Mode::is_expected`) — the footer keeps the vendor's own pill for it
+//! ([`plan_row`]), so shift+tab into plan mode still shows. Only the
+//! steady-state pill — the part the owner asked to hide — disappears. (In a
+//! window the lights' mode chip, which names the mode and returns it, takes
+//! that pill's place wherever the pane has room for the chip.)
 //!
 //! VERSION DRIFT. Claude Code is replaced under a running aterm, and a
 //! session can be relaunched onto a newer build mid-tab (`harness::upgrade`).
@@ -970,7 +974,8 @@ const STATIC_HINTS: [&str; 2] = ["\u{2190} for agents", "? for shortcuts"];
 pub enum Piece {
     /// The footer's three marked values ([`segments`]).
     Footer,
-    /// A mode pill that is not bypass, kept as the vendor drew it.
+    /// A mode pill the owner does not expect (not bypass, not auto), kept as
+    /// the vendor drew it.
     Mode(std::ops::Range<usize>),
     /// A live-status item, kept as the vendor drew it, after a ` · `.
     Item(std::ops::Range<usize>),
@@ -979,14 +984,15 @@ pub enum Piece {
 }
 
 /// How to rewrite the mode row `row`, or `None` when it is not one. The plan
-/// always opens with [`Piece::Footer`]; the bypass pill, its
-/// `(<key> to cycle)` hint and the [`STATIC_HINTS`] are what it leaves out.
+/// always opens with [`Piece::Footer`]; the pill of an EXPECTED mode (bypass
+/// or auto, `lights::Mode::is_expected`), its `(<key> to cycle)` hint and the
+/// [`STATIC_HINTS`] are what it leaves out.
 ///
-/// Only a row that OPENS WITH A PILL is planned. The pill-less row — default
-/// mode's `? for shortcuts`, which becomes `esc to clear` the moment the
-/// composer holds text — is left to the vendor: rewriting it would make the
-/// footer blink with every first keystroke, and a footer with no pill must
-/// keep meaning exactly one thing, bypass.
+/// Only a row that OPENS WITH A PILL is planned. The pill-less row — an old
+/// build's default mode, `? for shortcuts`, which becomes `esc to clear` the
+/// moment the composer holds text — is left to the vendor: rewriting it would
+/// make the footer blink with every first keystroke, and a footer with no
+/// pill must keep meaning exactly one thing: a mode the owner expects.
 pub fn plan_row(row: &str) -> Option<Vec<Piece>> {
     let chars: Vec<char> = row.chars().collect();
     let text = |r: std::ops::Range<usize>| chars[r].iter().collect::<String>();
@@ -1002,7 +1008,9 @@ pub fn plan_row(row: &str) -> Option<Vec<Piece>> {
         rest.starts_with(&head)
             .then(|| (head.chars().count(), *indicator))
     })?;
-    if indicator != "bypass permissions" {
+    if !crate::harness::lights::Mode::of_indicator(indicator)
+        .is_some_and(crate::harness::lights::Mode::is_expected)
+    {
         plan.push(Piece::Mode(at..at + len));
     }
     at += len;
@@ -1622,8 +1630,8 @@ mod tests {
         let auto = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to interrupt \u{00B7} \u{2190} for agents        /rc active";
         let plan = plan_row(auto).unwrap();
         assert!(
-            matches!(plan[1], Piece::Mode(_)),
-            "a non-bypass mode keeps its pill: {plan:?}"
+            !plan.iter().any(|p| matches!(p, Piece::Mode(_))),
+            "auto is as expected as bypass: its pill goes too: {plan:?}"
         );
         assert!(plan.iter().any(|p| matches!(p, Piece::Item(r) if auto.chars().skip(r.start).take(r.len()).collect::<String>() == "esc to interrupt")));
         assert!(
@@ -1635,14 +1643,19 @@ mod tests {
         let manual = "  \u{23F8} manual mode on (shift+tab to cycle)";
         assert!(
             matches!(plan_row(manual).unwrap()[1], Piece::Mode(_)),
-            "manual mode is a mode the footer shows, never reads as bypass"
+            "manual mode is a mode the footer shows, never reads as expected"
+        );
+        let accept = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle)";
+        assert!(
+            matches!(plan_row(accept).unwrap()[1], Piece::Mode(_)),
+            "a \u{23F5}\u{23F5} pill is not expected by its glyph alone"
         );
     }
 
     /// The pill-less row is the vendor's: default mode's hint turns into
     /// `esc to clear` as soon as the composer holds text, so painting over it
     /// would blink the footer on and off with typing — and a footer without a
-    /// pill must keep meaning bypass.
+    /// pill must keep meaning an expected mode.
     #[test]
     fn a_row_without_a_pill_is_left_to_the_vendor() {
         assert_eq!(plan_row("  ? for shortcuts"), None);
@@ -1748,8 +1761,9 @@ mod tests {
 
     /// EVERY RECORDED CLAUDE CODE SCREEN in `aterm-phase`'s fixtures (measured
     /// sessions and the 2.1.280 box captures): a screen with a composer and a
-    /// mode row gets a plan whose kept pieces are live status, never the bypass
-    /// pill or a static hint; a screen with a box up (no composer) gets none.
+    /// mode row gets a plan whose kept pieces are live status, never an
+    /// expected mode's pill or a static hint; a screen with a box up (no
+    /// composer) gets none.
     #[test]
     fn every_recorded_screen_plans_honestly() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-phase/src/fixtures");
@@ -1769,7 +1783,7 @@ mod tests {
                 };
                 let kept: String = rows[i].chars().skip(r.start).take(r.len()).collect();
                 assert!(
-                    !kept.contains("bypass permissions"),
+                    !kept.contains("bypass permissions") && !kept.contains("auto mode on"),
                     "{}: {kept:?}",
                     path.display()
                 );

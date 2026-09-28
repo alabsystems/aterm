@@ -16879,6 +16879,11 @@ struct App {
     /// held here rather than on a window, so closing the window that started
     /// the toggle does not strand one.
     claude_typed: HashMap<u64, claude_lights::Typed>,
+    /// What Claude said of fast mode that outlives one toggle
+    /// (`claude_lights::FastLatch`): its lasting refusals per Claude build
+    /// and model, and the builds on which fast mode took auto mode off. In
+    /// memory only — until aterm restarts; a new build tries once more.
+    claude_fast_latch: claude_lights::FastLatch,
     /// The View ▸ Presence Band / Rim bits AS APPLIED (round 19): seeded from
     /// `[presence]`, flipped at the click, re-adopted on every config reload.
     /// Read by the presence projection (`refresh_presence_window`), the palette
@@ -20224,6 +20229,7 @@ impl App {
             presence: app_presence::PresenceTable::default(),
             last_ledger_plan: None,
             claude_typed: HashMap::new(),
+            claude_fast_latch: claude_lights::FastLatch::default(),
             presence_band_on: true,
             presence_rim_on: true,
             last_fabric_plan: None,
@@ -40048,6 +40054,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         presence: app_presence::PresenceTable::default(),
         last_ledger_plan: None,
         claude_typed: HashMap::new(),
+        claude_fast_latch: claude_lights::FastLatch::default(),
         presence_band_on: config.presence_band_enabled(),
         presence_rim_on: config.presence_rim_enabled(),
         last_fabric_plan: None,

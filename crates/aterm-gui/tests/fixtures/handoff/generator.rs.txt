@@ -2,25 +2,25 @@
 // Copyright 2026 Andrew Yates
 //
 // THE HANDOFF FIXTURE GENERATOR — not compiled here. This is the exact code
-// that wrote `v0.94.0/`: it was appended, uncommitted, to
-// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.94.0
+// that wrote `v0.95.0/`: it was appended, uncommitted, to
+// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.95.0
 // tag, where it reuses that file's `FakeApp`, `old_session`, `ENV_LOCK`,
 // `RestoreVar`, `pipe_pair`, `env_guard`, `this_build` and `child_proof_from`,
 // and runs that release's own capture ladder, history carry, writer and
-// consumer. It differs from what wrote `v0.92.0/` in the release strings and
-// nonce seeds; the capture (`carry_for_wire` per session at the budgets
-// `App::capture_parked_screens` prices, then `settle_wire_carries`, where
-// v0.92.0 still ran the v0.91.0 loop); the foreground holder the park stamps
-// on every record; the fork lane's history carry (the export, then
-// `stamp_manifest`, so a session with more history than its checkpoint holds
-// names a `.s<id>.hist` sidecar); `write_outgoing`'s repaint set and
-// `Result`; a self-check that also runs the adoption proof and the history
-// import; and a sixth desk, `history-carry`, for the record fields
-// v0.93.0/v0.94.0 added. It ran with `ATERM_BUILD_GIT_COMMIT` set to the tag's
-// short commit, so `parent.toml`'s `producer_commit` names the release rather
-// than `<commit>-dirty` (the appended generator is the worktree's only
-// change). README.md in this directory says how to adapt it for the next
-// release.
+// consumer. v0.95.0's capture, worker order and writer are v0.94.0's, so it
+// differs from what wrote `v0.94.0/` only in the release strings, the target
+// build and the nonce seeds; the layout leaf's `agent` field (added in
+// v0.95.0, and `None` on a handoff layout, which never fills it); the
+// parent's session rows, which also record the absolute row counters and the
+// colour and shell-integration state the meta now carries; a self-check that
+// also asserts those cross, that after the history import every carried
+// shell mark still names its line, and that a command running across the
+// handoff completes on the successor; and a seventh desk, `colour-and-shell`,
+// for the meta v0.95.0 changed. It ran with `ATERM_BUILD_GIT_COMMIT` set to
+// the tag's short commit, so `parent.toml`'s `producer_commit` names the
+// release rather than `<commit>-dirty` (the appended generator is the
+// worktree's only change). README.md in this directory says how to adapt it
+// for the next release.
 
 // ------------------------------------------ HANDOFF FIXTURE GENERATOR (P0-7)
 //
@@ -29,12 +29,12 @@
 // `$ATERM_HANDOFF_FIXTURE_OUT/<desk>/` for the main tree's cross-version
 // guard (`seamless_fixture_tests.rs`). See the fixture README.
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
-/// A successor NEWER than v0.94.0 (build 1790526323): the hop these desks
+/// A successor NEWER than v0.95.0 (build 1790563767): the hop these desks
 /// stand for. It decides the wire caps (`WireCaps::for_target`) and that the
 /// history is exported at all (`handoff_history::exports_for_target`).
-const FIXTURE_TARGET_BUILD: u64 = 1_790_600_000;
+const FIXTURE_TARGET_BUILD: u64 = 1_790_700_000;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
-/// v0.94.0's decode-authority budget (`app_update_handoff`'s private
+/// v0.95.0's decode-authority budget (`app_update_handoff`'s private
 /// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`), copied: the capture prices history
 /// against it.
 const FX_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -62,7 +62,7 @@ struct FxDesk {
 fn fx_record(local_id: u64, title: &str) -> SessionRecord {
     SessionRecord {
         local_id,
-        sid: format!("s-{:020x}", 0x0094_0000_0000_u64 + local_id * 0x1_0101),
+        sid: format!("s-{:020x}", 0x0095_0000_0000_u64 + local_id * 0x1_0101),
         parent: None,
         state: "alive".to_string(),
         title: title.to_string(),
@@ -110,6 +110,9 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         attention: None,
         identity: None,
         questions: None,
+        // v0.95.0: filled only by the crash journal and a system quit's
+        // layout, never by the handoff's (`capture_restore_manifest`).
+        agent: None,
     }))
 }
 
@@ -167,7 +170,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
     // and hands it over.
     let carried = if installing {
         let mut app = crate::App::headless_for_test();
-        app.post_message(crate::update_words::installing("0.95.0"));
+        app.post_message(crate::update_words::installing("0.96.0"));
         app.carried_messages()
     } else {
         crate::session_store::MessagesCarry::default()
@@ -178,7 +181,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         outer_x: Some(96),
         outer_y: Some(48),
         status_bar_rows: u16::from(installing),
-        update_verified_unix_ms: installing.then_some(1_790_530_000_000),
+        update_verified_unix_ms: installing.then_some(1_790_690_000_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
     }
@@ -268,7 +271,7 @@ fn fx_optional_carry_fits(
         .is_some_and(|total| total <= ceiling)
 }
 
-/// What v0.94.0's park capture hands the worker for one desk.
+/// What v0.95.0's park capture hands the worker for one desk.
 struct FxCapture {
     screens: Vec<(u64, TerminalCheckpoint)>,
     repaint: Vec<u64>,
@@ -277,7 +280,7 @@ struct FxCapture {
     screen_digest: [u8; 32],
 }
 
-/// v0.94.0's capture (`App::capture_parked_screens`) over a desk whose time
+/// v0.95.0's capture (`App::capture_parked_screens`) over a desk whose time
 /// is ample: the pool's mandatory visible grids reserved first, then each
 /// session carried by `carry_for_wire` with 256 lines of history when the
 /// cell and byte budgets admit it after that reserve, its history head and
@@ -366,7 +369,7 @@ fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
         });
     }
     let screen_digest =
-        settle_wire_carries(&mut wire, caps).expect("the v0.94.0 park commits this desk");
+        settle_wire_carries(&mut wire, caps).expect("the v0.95.0 park commits this desk");
     sources.retain(|source: &crate::handoff_carry::CarrySource| {
         wire.iter()
             .any(|carry| carry.local_id == source.local_id() && carry.rung.keeps_control_carry())
@@ -400,6 +403,26 @@ fn fx_history_text(t: &Terminal) -> Vec<String> {
                 .unwrap_or_default()
         })
         .collect()
+}
+
+/// The text of absolute row `abs` of `t`'s history-holding grid (the saved
+/// primary under an alternate screen), history or visible; `None` once the
+/// row is evicted or past the screen.
+fn fx_text_at(t: &Terminal, abs: u64) -> Option<String> {
+    let grid = t.main_grid();
+    let oldest = grid.oldest_absolute_row();
+    let top = oldest + u64::try_from(grid.scrollback_lines()).unwrap();
+    if abs < oldest {
+        return None;
+    }
+    if abs < top {
+        let index = usize::try_from(abs - oldest).unwrap();
+        return grid
+            .get_history_line(index)
+            .map(|l| l.to_string().trim_end().to_string());
+    }
+    let row = u16::try_from(abs - top).ok()?;
+    grid.row_text(row).map(|text| text.trim_end().to_string())
 }
 
 fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
@@ -480,7 +503,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             crate::running_build_number(),
             FIXTURE_TARGET_BUILD
         ),
-        "v0.94.0 exports history to this successor"
+        "v0.95.0 exports history to this successor"
     );
     let results = crate::handoff_history::HistoryPlan::Deferred(
         desk.sessions
@@ -515,7 +538,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         &controls,
         &nonce,
     )
-    .expect("the v0.94.0 writer publishes this desk");
+    .expect("the v0.95.0 writer publishes this desk");
     assert_eq!(
         outgoing.screen_digest, capture.screen_digest,
         "{}: the written bytes are the committed ones",
@@ -631,6 +654,17 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             rec.history_lost,
             rec.fg_holder.unwrap_or(0),
         ));
+        // v0.95.0's meta additions: the numbering the successor continues,
+        // and the colour and shell-integration state it carries.
+        session_rows.push_str(&format!(
+            "absolute_row_counter = {}\nalt_absolute_row_counter = {}\ncolor = {}\nshell_phase = {}\nshell_marks = {}\nshell_completed_seq = {}\n",
+            cp.absolute_row_counter,
+            cp.alt_absolute_row_counter,
+            !cp.color.is_default(),
+            cp.shell.phase,
+            cp.shell.command_marks.len(),
+            cp.shell.completed_seq,
+        ));
         session_rows.push('\n');
     }
     let identities = fds
@@ -640,9 +674,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         .collect::<Vec<_>>()
         .join(", ");
     let parent = format!(
-        "# What the v0.94.0 producer committed to for this desk. Generated by a\n\
-         # throwaway test in a v0.94.0 worktree; see ../../README.md.\n\
-         producer_version = \"0.94.0\"\n\
+        "# What the v0.95.0 producer committed to for this desk. Generated by a\n\
+         # throwaway test in a v0.95.0 worktree; see ../../README.md.\n\
+         producer_version = \"0.95.0\"\n\
          producer_commit = \"{commit}\"\n\
          outgoing_build = {build}\n\
          manifest = \"{manifest_name}\"\n\
@@ -719,6 +753,17 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             "{}",
             desk.name
         );
+        // v0.95.0's meta: the numbering, the application's colours and the
+        // shell-integration state cross the wire intact.
+        assert_eq!(
+            (restored.absolute_row_counter, restored.alt_absolute_row_counter),
+            (carried.absolute_row_counter, carried.alt_absolute_row_counter),
+            "{}: session {}'s absolute numbering crosses",
+            desk.name,
+            adopted.local_id
+        );
+        assert_eq!(restored.color, carried.color, "{}: session {}'s colours cross", desk.name, adopted.local_id);
+        assert_eq!(restored.shell, carried.shell, "{}: session {}'s shell state crosses", desk.name, adopted.local_id);
         assert_eq!(adopted.control.is_some(), rec.control.is_some(), "{}", desk.name);
         assert_eq!(
             adopted.history.carry.is_some(),
@@ -781,6 +826,95 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
+        // v0.95.0: after the import, every shell mark the restore installed
+        // still names its line (the successor continues the parent's
+        // numbering); the shell state and the application's colours are the
+        // parent's; and a command running across the handoff completes on
+        // the successor.
+        let source = desk
+            .sessions
+            .iter()
+            .find(|s| s.record.local_id == item.local_id)
+            .unwrap()
+            .term
+            .lock()
+            .unwrap();
+        let mut successor = successor.lock().unwrap();
+        assert_eq!(
+            successor.command_marks().len(),
+            checkpoint.shell.command_marks.len(),
+            "{}: session {}'s carried marks are installed",
+            desk.name,
+            item.local_id
+        );
+        for mark in successor.command_marks() {
+            for row in [Some(mark.prompt_start_row), mark.output_end_row]
+                .into_iter()
+                .flatten()
+            {
+                let text = fx_text_at(&successor, row);
+                assert!(
+                    text.is_some(),
+                    "{}: session {}'s mark row {row} is readable",
+                    desk.name,
+                    item.local_id
+                );
+                assert_eq!(
+                    text,
+                    fx_text_at(&source, row),
+                    "{}: session {}'s mark at row {row} names its line",
+                    desk.name,
+                    item.local_id
+                );
+            }
+        }
+        assert_eq!(successor.shell_state(), source.shell_state(), "{}", desk.name);
+        assert_eq!(
+            successor.completed_command_seq(),
+            source.completed_command_seq(),
+            "{}",
+            desk.name
+        );
+        for index in 0..=u8::MAX {
+            assert_eq!(
+                successor.palette_color(index),
+                source.palette_color(index),
+                "{}: session {}'s palette entry {index}",
+                desk.name,
+                item.local_id
+            );
+        }
+        assert_eq!(
+            (
+                successor.default_foreground(),
+                successor.default_background(),
+                successor.cursor_color()
+            ),
+            (
+                source.default_foreground(),
+                source.default_background(),
+                source.cursor_color()
+            ),
+            "{}: session {}'s dynamic colours",
+            desk.name,
+            item.local_id
+        );
+        if checkpoint.shell.phase == 3 {
+            let sign = checkpoint
+                .shell_integration_nonce
+                .map_or_else(String::new, |nonce| format!(";id={}", nonce.to_hex()));
+            if successor.is_alternate_screen() {
+                successor.process(b"\x1b[?1049l");
+            }
+            successor.process(format!("\x1b]133;D;0{sign}\x07").as_bytes());
+            assert_eq!(
+                successor.completed_command_seq(),
+                source.completed_command_seq() + 1,
+                "{}: session {}'s running command completes",
+                desk.name,
+                item.local_id
+            );
+        }
     }
     for fd in slaves
         .into_iter()
@@ -815,7 +949,7 @@ fn fx_incident_desk() -> FxDesk {
     let shell = fx_session(1, "zsh", fx_shell(55, 149, 400, "/home/dev/src/aterm", 1));
     FxDesk {
         name: "incident-55x149",
-        nonce_seed: 0x0094_0001,
+        nonce_seed: 0x0095_0001,
         window: fx_window_carry(55, 149, true),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -843,7 +977,7 @@ fn fx_claude_desk() -> FxDesk {
     let shell = fx_session(1, "zsh", fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2));
     FxDesk {
         name: "claude-code-1049",
-        nonce_seed: 0x0094_0002,
+        nonce_seed: 0x0095_0002,
         window: fx_window_carry(ROWS, COLS * 2 + 1, false),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -879,7 +1013,7 @@ fn fx_history_desk() -> FxDesk {
     sessions[1].record.user_title = Some("logs".to_string());
     FxDesk {
         name: "history",
-        nonce_seed: 0x0094_0003,
+        nonce_seed: 0x0095_0003,
         window: fx_window_carry(40, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -977,7 +1111,7 @@ fn fx_twelve_pane_desk() -> FxDesk {
         .collect();
     FxDesk {
         name: "twelve-panes",
-        nonce_seed: 0x0094_0004,
+        nonce_seed: 0x0095_0004,
         window: fx_window_carry(46, 168, false),
         sessions,
         layout: RestoreManifest::new(vec![window_a, window_b]),
@@ -1027,7 +1161,7 @@ fn fx_shell_integration_desk() -> FxDesk {
     }
     FxDesk {
         name: "shell-integration",
-        nonce_seed: 0x0094_0005,
+        nonce_seed: 0x0095_0005,
         window: fx_window_carry(30, 200, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1079,7 +1213,7 @@ fn fx_history_carry_desk() -> FxDesk {
     }
     FxDesk {
         name: "history-carry",
-        nonce_seed: 0x0094_0006,
+        nonce_seed: 0x0095_0006,
         window: fx_window_carry(40, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1089,6 +1223,153 @@ fn fx_history_carry_desk() -> FxDesk {
                 SplitKind::Vertical,
                 fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
                 pager,
+            ))],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
+/// A shell under OSC 133/633 integration with `commands` finished commands
+/// (prompt, command line, a few lines of output, an exit status), its marks
+/// signed with `nonce` when it has one (aterm's own integration) and unsigned
+/// otherwise (a shell that sources its own script, with aterm's injection
+/// off), ending at a fresh prompt. `theme` is what its rc file writes at
+/// start, and `palette_opt_in` the host's `allow_palette_reconfigure`.
+#[allow(clippy::too_many_arguments, reason = "a throwaway fixture builder")]
+fn fx_marked_shell(
+    rows: u16,
+    cols: u16,
+    nonce: Option<[u8; 32]>,
+    palette_opt_in: bool,
+    theme: &[u8],
+    commands: usize,
+    cwd: &str,
+    flavour: u8,
+) -> (Terminal, String) {
+    let mut t = Terminal::new(rows, cols);
+    t.set_alt_archive_enabled(true);
+    t.set_alt_archive_origin(0x5eed_0200 + u64::from(flavour));
+    t.set_allow_palette_reconfigure(palette_opt_in);
+    let sign = match nonce {
+        Some(nonce) => {
+            t.authorize_shell_integration(nonce);
+            t.set_require_shell_integration_nonce(true);
+            format!(";id={}", fx_hex(&nonce))
+        }
+        None => String::new(),
+    };
+    t.process(format!("\x1b]7;file://devhost{cwd}\x07\x1b]0;zsh\x07").as_bytes());
+    t.process(theme);
+    for i in 0..commands {
+        let command = format!("cargo test -p crate{i}");
+        t.process(
+            format!(
+                "\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \
+                 \x1b]633;E;{command}{sign}\x07\x1b]133;B{sign}\x07{command}\r\n\
+                 \x1b]133;C{sign}\x07"
+            )
+            .as_bytes(),
+        );
+        for j in 0..(1 + (i + usize::from(flavour)) % 6) {
+            t.process(
+                format!(
+                    "\x1b[32mok\x1b[0m  crate{i}::case_{j:02} \x1b[2m({} ms)\x1b[0m\r\n",
+                    i * 7 + j
+                )
+                .as_bytes(),
+            );
+        }
+        let code = if i % 5 == 4 { 101 } else { 0 };
+        t.process(format!("\x1b]133;D;{code}{sign}\x07").as_bytes());
+    }
+    t.process(
+        format!("\x1b]133;A{sign}\x07\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % \x1b]133;B{sign}\x07")
+            .as_bytes(),
+    );
+    (t, sign)
+}
+
+/// THE SHAPE v0.95.0 CHANGED: the meta carries the absolute row counters,
+/// the colours an application set (a diff from the configured theme, and the
+/// XTPUSHCOLORS stack whole) and the OSC 133/633 state, running command
+/// included. Session 0 is a shell with aterm's signed integration, a base16
+/// theme (OSC 4, which its owner opted into with `allow_palette_reconfigure`,
+/// and OSC 10/11/12), 150 finished commands (so its history is deeper than
+/// the checkpoint carries and names a `.hist` sidecar) and a `cargo build`
+/// still running. Session 1 is a shell whose own script sends unsigned marks,
+/// running vim in 1049, which pushed the colours (OSC 30001) and set its
+/// background, cursor and selection colours: its checkpoint carries none of
+/// the shell's history, and the marks it carries sit on the saved primary.
+fn fx_colour_and_shell_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    // base16-shell's theme, as its rc hook writes it at shell start
+    // (ST-terminated): sixteen palette entries, then foreground, background
+    // and cursor.
+    let base16 = [
+        "28/2c/34", "e0/6c/75", "98/c3/79", "e5/c0/7b", "61/af/ef", "c6/78/dd", "56/b6/c2",
+        "ab/b2/bf", "54/58/62", "e0/6c/75", "98/c3/79", "e5/c0/7b", "61/af/ef", "c6/78/dd",
+        "56/b6/c2", "c8/cc/d4",
+    ];
+    let mut theme = String::new();
+    for (index, rgb) in base16.iter().enumerate() {
+        theme.push_str(&format!("\x1b]4;{index};rgb:{rgb}\x1b\\"));
+    }
+    theme.push_str("\x1b]10;rgb:ab/b2/bf\x1b\\\x1b]11;rgb:28/2c/34\x1b\\\x1b]12;rgb:52/8b/ff\x1b\\");
+    let (mut build, sign) = fx_marked_shell(
+        42,
+        120,
+        Some([0x95; 32]),
+        true,
+        theme.as_bytes(),
+        150,
+        "/home/dev/src/aterm",
+        1,
+    );
+    build.process(
+        format!(
+            "\x1b]633;E;cargo build --release{sign}\x07cargo build --release\r\n\
+             \x1b]133;C{sign}\x07"
+        )
+        .as_bytes(),
+    );
+    for k in 0..12 {
+        build.process(
+            format!(
+                "\x1b[1;32m   Compiling\x1b[0m crate{k} v0.1.0 (/home/dev/src/aterm/crates/crate{k})\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    build.process(b"\x1b[1;36m    Building\x1b[0m [=====>        ] 12/40: crate12");
+
+    let (mut edit, _) = fx_marked_shell(42, 119, None, false, b"", 40, "/home/dev/notes", 2);
+    edit.process(
+        b"\x1b]633;E;vim notes.md\x07vim notes.md\r\n\x1b]133;C\x07\
+          \x1b[?1049h\x1b[?1h\x1b=\x1b]30001\x07\
+          \x1b]11;rgb:1d/20/21\x07\x1b]12;rgb:fa/bd/2f\x07\x1b]17;rgb:50/49/45\x07\
+          \x1b[H\x1b[2J",
+    );
+    for r in 2..42 {
+        edit.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+    }
+    edit.process(b"\x1b[1;1H# notes\x1b[42;1H\x1b[7m notes.md [+] \x1b[0m\x1b[1;8H");
+
+    let mut sessions = vec![fx_session(0, "cargo", build), fx_session(1, "vim", edit)];
+    sessions[0].record.rekey = true;
+    sessions[0].record.loader = true;
+    FxDesk {
+        name: "colour-and-shell",
+        nonce_seed: 0x0095_0007,
+        window: fx_window_carry(42, 240, false),
+        sessions,
+        layout: RestoreManifest::new(vec![fx_window(
+            42,
+            240,
+            vec![fx_tab(fx_split(
+                SplitKind::Vertical,
+                fx_leaf(0, "cargo", Some("/home/dev/src/aterm")),
+                fx_leaf(1, "vim", Some("/home/dev/notes")),
             ))],
         )]),
         connections: Vec::new(),
@@ -1110,6 +1391,7 @@ fn generate_handoff_fixtures() {
         fx_twelve_pane_desk(),
         fx_shell_integration_desk(),
         fx_history_carry_desk(),
+        fx_colour_and_shell_desk(),
     ] {
         fx_write(&desk, &scratch);
     }

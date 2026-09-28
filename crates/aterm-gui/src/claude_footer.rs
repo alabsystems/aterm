@@ -18,8 +18,11 @@
 //! * THE ROW. [`App::splice_claude_footer`] runs with the chrome splices, per
 //!   visible pane and inside that pane's own columns — a split's sibling on
 //!   the same window row is untouched. It copies the vendor's cells for every
-//!   piece the plan keeps (`esc to interrupt`, a non-bypass mode pill, the
-//!   right-aligned tail), so live status keeps its own colours.
+//!   piece the plan keeps (`esc to interrupt`, the pill of a mode the owner
+//!   does not expect unless the lights' mode chip is drawn in its place, the
+//!   right-aligned tail), so live status keeps its own colours. The Claude
+//!   lights (`crate::claude_lights`) go at the row's end, and only while one
+//!   is drawn does the footer give up columns for them.
 //! * WHAT IS NOT TOUCHED. The terminal GRID. `text`/`screen` read the engine
 //!   and keep Claude Code's real row, because aterm's own supervisor reads it
 //!   (`aterm_phase` busy detection keys on `esc to interrupt` there). `image`
@@ -45,6 +48,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use aterm_agent::harness::footer::{self, FooterFacts, Piece};
+use aterm_agent::harness::lights::Light;
 use aterm_core::render::RenderInput;
 use aterm_core::terminal::RenderCell;
 use winit::event_loop::EventLoopProxy;
@@ -60,8 +64,9 @@ pub(crate) const RECHECK: Duration = Duration::from_secs(2);
 /// The gap between the footer's marked values, as the owner's layout draws it.
 const GAP: usize = 3;
 
-/// The fewest columns the footer keeps beside the lights before a narrow pane
-/// drops the lights instead.
+/// The fewest columns the footer keeps beside a drawn chip before a narrow
+/// pane drops the chips instead. With no chip drawn (everything as expected)
+/// the footer has the whole row.
 const MIN_BESIDE_LIGHTS: usize = 24;
 
 /// One pane's painted light block, held until the write says whether its row
@@ -605,25 +610,11 @@ pub(crate) fn fingerprint(facts: Option<&FooterFacts>) -> u64 {
     h.finish() | 1
 }
 
-/// `plan` with every mode pill a light already shows left out — the row's
-/// plan once the lights are painted on it, so the auto-mode pill and the
-/// auto-mode light do not say the same thing twice
-/// (`aterm_agent::harness::lights::pill_has_light`). A pane too narrow for
-/// the lights keeps its pill.
-fn plan_beside_lights(vendor: &[RenderCell], plan: &[Piece]) -> Vec<Piece> {
+/// `plan` with its mode pill left out: the row's plan once the mode chip —
+/// which names the mode — is painted on it, so the mode is not said twice.
+fn plan_beside_mode_chip(plan: &[Piece]) -> Vec<Piece> {
     plan.iter()
-        .filter(|piece| match piece {
-            Piece::Mode(r) => {
-                let pill: String = vendor
-                    .iter()
-                    .skip(r.start)
-                    .take(r.len())
-                    .map(|c| c.ch)
-                    .collect();
-                !aterm_agent::harness::lights::pill_has_light(&pill)
-            }
-            _ => true,
-        })
+        .filter(|piece| !matches!(piece, Piece::Mode(_)))
         .cloned()
         .collect()
 }
@@ -999,8 +990,10 @@ fn write_edits(
 
 impl App {
     /// The footer facts of every Claude Code session in `wid`'s visible plan,
-    /// and the lights' GUI state (`crate::claude_lights`), folded into one
-    /// repaint-key term (`0` when none shows).
+    /// and the lights' GUI state (`crate::claude_lights`) — the window's own,
+    /// and the fast latch kept on `App` (`App::claude_fast_latch`) wherever a
+    /// Claude Code pane shows — folded into one repaint-key term (`0` when none
+    /// shows).
     pub(crate) fn claude_footer_fp(
         &self,
         wid: WindowId,
@@ -1009,6 +1002,7 @@ impl App {
         let mut fp = self.windows.get(&wid).map_or(0, |ws| {
             ws.claude_lights.fingerprint(std::time::Instant::now())
         });
+        let mut claude = false;
         for leaf in &plan.leaves {
             let Some(session) = self
                 .view_store
@@ -1022,7 +1016,14 @@ impl App {
                 continue;
             };
             let timeline = entry.ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+            claude |= timeline.claude_footer().is_some();
             fp = fp.rotate_left(7) ^ fingerprint(timeline.claude_footer());
+        }
+        // The fast latch is App-wide: taken in one window, it changes the
+        // chips of every other window's Claude Code panes, which must repaint
+        // for it — an idle one would otherwise keep a stale, clickable chip.
+        if claude {
+            fp ^= self.claude_fast_latch.generation().rotate_left(29);
         }
         fp
     }
@@ -1170,15 +1171,16 @@ impl App {
         }
         let mut edits: Vec<(usize, usize, Vec<RenderCell>)> = Vec::with_capacity(panes.len());
         let mut lit: Vec<Lit> = Vec::new();
+        let mut painted: Vec<(usize, usize, u64, usize)> = Vec::with_capacity(panes.len());
         for pane in panes {
-            // The lights take the pane's right end when the footer keeps room
+            // The chips take the pane's right end when the footer keeps room
             // beside them; a pane too narrow for both keeps the footer alone.
-            // Only the LIGHTS must fit: the title (a hover, a selection, a
+            // Only the CHIPS must fit: the title (a hover, a selection, a
             // toggle's progress or refusal) comes along only where it fits
-            // too, so pointing at a light can never push the lights off.
-            let block = self
-                .claude_lights_block(wid, pane.session, pane.blank)
-                .filter(|b| pane.pane_cols >= b.lights.len() + MIN_BESIDE_LIGHTS);
+            // too, so pointing at a chip can never push the chips off. No
+            // chip drawn — everything as expected — and there is no block.
+            let room = pane.pane_cols.saturating_sub(MIN_BESIDE_LIGHTS);
+            let block = self.claude_lights_block(wid, pane.session, pane.blank, room);
             // The full title where it fits; else the reason alone (the light
             // is marked beside it); else none.
             let title: &[RenderCell] = block.as_ref().map_or(&[], |b| {
@@ -1192,11 +1194,16 @@ impl App {
                 }
             });
             let width = pane.pane_cols - block.as_ref().map_or(0, |b| title.len() + b.lights.len());
-            let plan: std::borrow::Cow<'_, [Piece]> = if block.is_some() {
-                plan_beside_lights(&pane.vendor, &pane.plan).into()
-            } else {
-                pane.plan.as_slice().into()
-            };
+            // The plan already left an expected mode's pill out
+            // (`footer::plan_row`); any other mode's pill gives way to the
+            // mode chip, which names it — a pane too narrow for the chip keeps
+            // the pill.
+            let plan: std::borrow::Cow<'_, [Piece]> =
+                if block.as_ref().is_some_and(|b| b.shows(Light::Mode)) {
+                    plan_beside_mode_chip(&pane.plan).into()
+                } else {
+                    pane.plan.as_slice().into()
+                };
             let mut row = paint_row(&pane.vendor, &plan, &pane.facts, pane.blank, mark_fg, width);
             if let Some(block) = &block {
                 row.extend_from_slice(title);
@@ -1213,6 +1220,7 @@ impl App {
                     block,
                 });
             }
+            painted.push((pane.frame_row, pane.col_off, pane.session, room));
             edits.push((pane.frame_row, pane.col_off, row));
         }
         let written: Vec<(usize, usize)> = {
@@ -1234,6 +1242,11 @@ impl App {
         // Only a light the glass shows can be pointed at: a pane whose write
         // was skipped (`write_edits`) records none — keyed by the pane's row
         // AND column, since two panes side by side share a frame row.
+        for (frame_row, col_off, session, room) in painted {
+            if written.contains(&(frame_row, col_off)) {
+                self.note_claude_footer_row(wid, session, room);
+            }
+        }
         for l in lit {
             if written.contains(&(l.frame_row, l.col_off)) {
                 self.note_claude_light_hits(
@@ -1677,18 +1690,18 @@ mod tests {
     /// Live status keeps the VENDOR'S cells — its words and its colours.
     #[test]
     fn live_status_is_copied_with_its_own_colours() {
-        let vendor_text = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to interrupt \u{00B7} \u{2190} for agents";
+        let vendor_text = "  \u{23F5}\u{23F5} accept edits on (shift+tab to cycle) \u{00B7} esc to interrupt \u{00B7} \u{2190} for agents";
         let mut vendor = row_of(vendor_text, [120, 120, 120]);
-        for c in vendor.iter_mut().skip(2).take(15) {
-            c.fg = [255, 200, 0]; // the auto-mode pill's warning ink
+        for c in vendor.iter_mut().skip(2).take(18) {
+            c.fg = [255, 200, 0]; // the pill's own ink
         }
         let plan = footer::plan_row(vendor_text).unwrap();
         let blank = cell(' ', [200, 200, 200]);
         let row = paint_row(&vendor, &plan, &facts(), blank, [0, 128, 255], 120);
         let text = text_of(&row);
         assert!(
-            text.contains("\u{23F5}\u{23F5} auto mode on"),
-            "a non-bypass mode stays: {text:?}"
+            text.contains("\u{23F5}\u{23F5} accept edits on"),
+            "a mode the owner does not expect stays: {text:?}"
         );
         assert!(text.contains("\u{00B7} esc to interrupt"), "{text:?}");
         assert!(!text.contains("for agents"), "{text:?}");
@@ -1756,13 +1769,13 @@ mod tests {
     /// live status survives whole, and the footer gives way from the back.
     #[test]
     fn a_short_row_drops_footer_values_never_the_vendors_status() {
-        let vendor_text = "  \u{23F5}\u{23F5} auto mode on \u{00B7} 5 shells \u{00B7} esc to interrupt \u{00B7} \u{2190} for agents \u{00B7} \u{2193} to manage";
+        let vendor_text = "  \u{23F8} plan mode on \u{00B7} 5 shells \u{00B7} esc to interrupt \u{00B7} \u{2190} for agents \u{00B7} \u{2193} to manage";
         let vendor = row_of(vendor_text, [120, 120, 120]);
         let plan = footer::plan_row(vendor_text).unwrap();
         let blank = cell(' ', [200, 200, 200]);
         let text = text_of(&paint_row(&vendor, &plan, &facts(), blank, [1, 2, 3], 80));
         for kept in [
-            "auto mode on",
+            "plan mode on",
             "5 shells",
             "esc to interrupt",
             "\u{2193} to manage",
@@ -2014,21 +2027,17 @@ mod tests {
         assert_eq!(unread_pill_row(&["$ ls".to_owned()]), None, "no composer");
     }
 
-    /// Beside the lights the auto-mode pill gives way to its light; plan
-    /// mode, which no light shows, keeps its pill.
+    /// An expected mode's pill (bypass, and auto just the same) is never
+    /// painted: at rest the row is the footer and the live status alone.
+    /// Plan mode, which the owner does not expect, keeps its pill.
     #[test]
-    fn a_pill_a_light_shows_is_not_shown_twice() {
+    fn an_expected_modes_pill_is_not_painted() {
         let auto = "  \u{23F5}\u{23F5} auto mode on (shift+tab to cycle) \u{00B7} esc to interrupt";
         let vendor = row_of(auto, [9, 9, 9]);
         let plan = footer::plan_row(auto).unwrap();
-        let beside = plan_beside_lights(&vendor, &plan);
-        assert!(
-            !beside.iter().any(|p| matches!(p, Piece::Mode(_))),
-            "{beside:?}"
-        );
         let text = text_of(&paint_row(
             &vendor,
-            &beside,
+            &plan,
             &facts(),
             cell(' ', [1, 1, 1]),
             [2, 2, 2],
@@ -2041,11 +2050,32 @@ mod tests {
         );
         let plan_mode = "  \u{23F8} plan mode on (shift+tab to cycle)";
         let plan = footer::plan_row(plan_mode).unwrap();
-        assert_eq!(
-            plan_beside_lights(&row_of(plan_mode, [9, 9, 9]), &plan),
-            plan,
-            "a mode no light shows keeps its pill"
+        let text = text_of(&paint_row(
+            &row_of(plan_mode, [9, 9, 9]),
+            &plan,
+            &facts(),
+            cell(' ', [1, 1, 1]),
+            [2, 2, 2],
+            60,
+        ));
+        assert!(
+            text.contains("\u{23F8} plan mode on"),
+            "a mode the owner does not expect keeps its pill: {text:?}"
         );
+    }
+
+    /// Beside the mode chip, which names the mode, the pill gives way; live
+    /// status stays.
+    #[test]
+    fn the_mode_chip_takes_the_pills_place() {
+        let plan_mode = "  \u{23F8} plan mode on (shift+tab to cycle) \u{00B7} esc to interrupt";
+        let plan = footer::plan_row(plan_mode).unwrap();
+        let beside = plan_beside_mode_chip(&plan);
+        assert!(
+            !beside.iter().any(|p| matches!(p, Piece::Mode(_))),
+            "{beside:?}"
+        );
+        assert_eq!(beside.len(), plan.len() - 1, "only the pill goes");
     }
 
     #[test]

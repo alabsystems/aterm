@@ -42,7 +42,7 @@ lenient (law L3 of the 2026-09-22/23 audit).
 | `seamless-<pid>-<nonce>.s<id>.ctl` | Each session's control-carry sidecar, exactly as written. |
 | `seamless-<pid>-<nonce>.s<id>.hist` | Each session's history-carry sidecar, exactly as written (from v0.94.0, for a session whose history is deeper than its checkpoint carries). |
 | `s<id>.meta.json` | A copy of the meta JSON the manifest embeds for session `<id>`, extracted so it can be reviewed. The guard checks that it equals the embedded copy. |
-| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, which the guard does not read yet. |
+| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). The guard does not read these yet. |
 
 The bytes are unchanged with one exception. The manifest names each grid
 sidecar by its absolute path in the producer's private directory, and the
@@ -117,7 +117,43 @@ The new desk:
   `questions` word, which is also on its layout leaf. The `shell-integration`
   desk's shells carry `rekey` and `loader` as well.
 
-`generator.rs.txt` is the v0.94.0 generator, the template for the next
+## The v0.95.0 desks
+
+The same six desks, written by v0.95.0's producer, plus one desk for the
+shape v0.95.0 changed.
+
+v0.95.0's capture, worker order and writer are v0.94.0's. What changed is the
+meta each session's screen carries (`CheckpointMeta`):
+
+- `absolute_row_counter`, on every session, and `alt_absolute_row_counter`
+  for a session with an inactive grid. The successor continues the parent's
+  row numbering, so an absolute row names the same line after the handoff.
+  Every session's meta therefore differs from what v0.94.0 wrote.
+- `color`: the colours an application set, as a diff from the configured
+  theme (OSC 4 palette entries, OSC 10/11/12/17/19), and the XTPUSHCOLORS
+  stack whole. Absent when nothing is overridden.
+- `shell`: the OSC 133/633 state: the phase, the command marks and output
+  blocks still readable in the carried history, the one being built, and the
+  counters. A command running across the handoff completes on the
+  successor. The `shell-integration` desk's shells carry it now.
+
+The self-check also asserts that these cross the wire intact, that after the
+history import every carried mark still names its line, and that a running
+command completes on the successor. The layout leaf gained `agent`, which a
+handoff layout never fills, so it writes no bytes here.
+
+The new desk:
+
+- `colour-and-shell`: a shell with aterm's signed integration, a base16
+  theme (OSC 4, with `allow_palette_reconfigure` on, and OSC 10/11/12), 150
+  finished commands, so its history is deeper than its checkpoint carries,
+  and a `cargo build` still running. Beside it, a shell whose own script
+  sends unsigned marks, running vim in 1049, which pushed the colours
+  (OSC 30001) and set its background, cursor and selection colours. Its
+  checkpoint carries none of the shell's history, and the marks it carries
+  sit on the saved primary.
+
+`generator.rs.txt` is the v0.95.0 generator, the template for the next
 release.
 
 ## Adding the next release's fixtures
@@ -153,17 +189,18 @@ fresh. A `--dry-run` of the next cut shows whether they are in.
    `crates/aterm-gui/src/seamless_carry_tests.rs`, and adapt it to that
    release's API:
    - `fx_capture` must be that release's own capture path. The template
-     copies v0.94.0's: `carry_for_wire` for each session at the budgets
-     `App::capture_parked_screens` prices, then `settle_wire_carries` over
-     the pool. The repaint set is the sessions whose rung has
-     `CarryRung::needs_repaint`. If the release changed the capture, copy
-     the change.
+     copies v0.95.0's (unchanged from v0.94.0): `carry_for_wire` for each
+     session at the budgets `App::capture_parked_screens` prices, then
+     `settle_wire_carries` over the pool. The repaint set is the sessions
+     whose rung has `CarryRung::needs_repaint`. If the release changed the
+     capture, copy the change.
    - `fx_write` must run the release's own worker steps in its order. In
-     v0.94.0 that is the control carry's export, then the history carry's
-     export and `stamp_manifest`, then `write_outgoing`, then the layout.
+     v0.94.0 and v0.95.0 that is the control carry's export, then the history
+     carry's export and `stamp_manifest`, then `write_outgoing`, then the
+     layout.
    - Give every record field the release added a value that a real session
      would carry, and keep the generator's self-check passing.
-   - Keep the six desks, and add a desk for any shape that release changed.
+   - Keep the seven desks, and add a desk for any shape that release changed.
 3. Run the generator, still in the worktree:
 
    ```sh
@@ -176,7 +213,10 @@ fresh. A `--dry-run` of the next cut shows whether they are in.
    its own consumer would not adopt exactly. `ATERM_BUILD_GIT_COMMIT` keeps
    `producer_commit` the release's commit: without it, the appended generator
    makes the build read the tree as dirty and write `<commit>-dirty`. It
-   reaches no fixture byte except that `parent.toml` field.
+   reaches no fixture byte except that `parent.toml` field. The tag is
+   annotated, so take the commit it points at
+   (`git rev-parse --short=12 'vX.Y.0^{commit}'`), not the tag object's own
+   sha.
 4. In the main tree, add the new `(release, desk)` rows to `PINNED_DESKS` in
    `seamless_fixture_tests.rs` and run the guard:
 

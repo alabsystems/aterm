@@ -889,6 +889,7 @@ mod models_gui;
 mod models_harness;
 mod models_harness_host;
 mod models_input;
+mod models_lights;
 mod models_misc;
 mod models_native;
 mod models_notify_follow;
@@ -970,6 +971,7 @@ pub use models_harness_host::{
     harness_worker_lifecycle_model,
 };
 pub use models_input::input_unread_gate_model;
+pub use models_lights::*;
 pub use models_misc::*;
 pub use models_native::*;
 pub use models_notify_follow::notify_follow_checkpoint_model;

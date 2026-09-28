@@ -394,7 +394,12 @@ pub(crate) fn jump_prompt_target(t: &Terminal, prev: bool) -> Option<u64> {
 pub(crate) enum Source {
     /// An in-thread winit handler (real keyboard/mouse/focus on this window).
     Human,
-    /// A control-socket verb.
+    /// A control-socket verb — or an input aterm sends ON ITS OWN after a
+    /// person's gesture: the Claude Code lights' follow-up keys (a mode
+    /// return's next shift+tab, a typed command's Enter or ctrl+u,
+    /// `crate::claude_lights`). No person made those at that instant, and
+    /// stamping them would hold the supervisor off the session for its whole
+    /// person grace after every automatic step.
     Controller,
 }
 

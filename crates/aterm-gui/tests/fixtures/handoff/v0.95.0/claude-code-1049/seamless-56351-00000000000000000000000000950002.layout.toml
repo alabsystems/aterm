@@ -1,0 +1,36 @@
+schema = 2
+
+[[windows]]
+rows = 30
+cols = 201
+active_tab = 0
+outer_x = 96
+outer_y = 48
+active_item = 0
+
+[[windows.restored_tabs]]
+focused_path = ["first"]
+zoomed = false
+
+[windows.restored_tabs.root]
+node = "split"
+axis = "vertical"
+ratio = 0.5
+
+[windows.restored_tabs.root.first]
+node = "leaf"
+
+[windows.restored_tabs.root.first.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "claude"
+local_id = 0
+
+[windows.restored_tabs.root.second]
+node = "leaf"
+
+[windows.restored_tabs.root.second.view]
+kind = "terminal"
+cwd = "/home/dev/src/aterm"
+title = "zsh"
+local_id = 1

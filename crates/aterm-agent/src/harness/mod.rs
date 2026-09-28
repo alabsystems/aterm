@@ -32,9 +32,10 @@
 //! * [`footer`] — the Claude Code footer aterm paints in place of the vendor's
 //!   permission-mode row: model + effort, working directory, branch, read
 //!   from the files Claude Code already keeps (owner direction, 2026-09-24).
-//! * [`lights`] — the row of lights at the footer's end (auto-approve, auto
-//!   mode, fast mode): read from what Claude Code draws,
-//!   toggled through its own inputs, read back after every toggle.
+//! * [`lights`] — the lights at the footer's end (the permission mode, fast
+//!   mode), drawn only while one differs from what the owner expects: read
+//!   from what Claude Code draws, toggled through its own inputs, read back
+//!   after every toggle — Claude's own answer to `/fast` included.
 //! * [`cli`] — THE COMMAND: `aterm harness usage|limits|disk|ledger`, the
 //!   read views, `upgrade` (one hand-run pass of the live upgrade) and
 //!   `upgrade models` (its model priority list), plus the retired hook-bridge

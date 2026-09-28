@@ -34,7 +34,8 @@
 //! push per burst (`crate::app_input::note_person`), so a person at work is
 //! one row however long they stay. A controller's input
 //! ([`crate::input::Source::Controller`] — every control verb, the session
-//! owner's included) is never stamped: that is the whole point.
+//! owner's included, and the keys the Claude Code lights send on their own
+//! after a person's click) is never stamped: that is the whole point.
 //!
 //! **What it never does**: gate a byte. The seam records `src` for audit and
 //! never branches its egress on it (`bytes_human_eq_controller`); this stamp

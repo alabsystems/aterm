@@ -1492,6 +1492,13 @@ pub fn model_registry() -> Vec<Model> {
         // Claude light commands must observe that admission receipt before
         // owning a paste or retiring its guarded follow-up input.
         claude_light_admission_model(),
+        // The Claude mode light's return to bypass or auto: a click starts its
+        // presses at once, each next press is decided from the engine's read
+        // on its own deadline and only while Claude is idle, none goes from an
+        // expected mode or into a box, and every stop — deadline, lap,
+        // rejected press — names its mode. Tier-1 drives the real click,
+        // drain, expiry, lap and rejection in aterm-gui/src/claude_lights.rs.
+        claude_mode_return_model(),
         // A queued key's fast-present wake requires a direct kernel receipt;
         // Tier-1 drives the GUI decision over real direct, spill and failed
         // sink receipts in aterm-gui/src/app_input.rs.

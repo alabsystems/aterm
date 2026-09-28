@@ -733,15 +733,34 @@ KEY USAGE
 THE WINDOW'S CLAUDE CODE FOOTER AND LIGHTS
   In a window, Claude Code's mode row (`⏵⏵ … (shift+tab to cycle)`) is painted as
   `◆ <model> <effort>   ⌂ <path>   ⎇ <branch>` (the path with home as `~`, cut from
-  the front to `…/<dir>` in a narrow pane) and a row of three lights: auto-approve
-  (bypass), auto mode, fast. It is GLASS ONLY: `ctl text` and every reader keep
-  Claude's real row, `ctl image` shows the footer as the window does. The facts come
-  from files Claude keeps (its `sessions/<pid>.json`, the transcript, `.git/HEAD`),
-  read for THIS process only — a resumed session shows no model until it answers. A
-  light is Claude's own input: shift+tab for modes, a pasted `/fast` plus Return
-  (only while the prompt holds exactly that command and nobody has typed since; taken
-  back with one ctrl+u if it did not go; refused while a `turn` or `lease` holds the
-  session). A mode row a new Claude Code draws differently makes the footer step
+  the front to `…/<dir>` in a narrow pane). It is GLASS ONLY: `ctl text` and every
+  reader keep Claude's real row, `ctl image` shows the footer as the window does.
+  The facts come from files Claude keeps (its `sessions/<pid>.json`, the transcript,
+  `.git/HEAD`), read for THIS process only — a resumed session shows no model until
+  it answers. Lights appear beside it ONLY when a setting differs from what you
+  expect; at rest nothing is drawn. They are:
+  * the permission mode — bypass and auto are both expected. In manual, accept
+    edits, plan or don't ask a chip (`⏸ plan`) takes the place of Claude's pill; a
+    click presses shift+tab forward through Claude's own cycle to the nearest of
+    bypass and auto (from don't ask through manual), each press waiting for its
+    own answer, decided from the session itself (a background tab finishes too).
+    The click's press goes at once; aterm's next presses wait for Claude to be
+    idle, because a shift+tab that lands in a permission box answers it. One
+    that stops early names the mode it stopped in; mid-turn, click again.
+  * fast mode — `○ fast` while off. A click pastes `/fast on` plus Return, mid-turn
+    too (only while the prompt holds exactly that command and nobody has typed
+    since; taken back with one ctrl+u if it did not go; refused while a `lease`
+    holds the session, or a `turn` whose prompt an idle Claude has not taken).
+    Claude itself then saves fast mode in its settings, so every session follows.
+    Claude's own reason is shown if it refuses; a refusal a retry cannot change
+    hides the chip for that Claude build and model until aterm restarts. Where
+    Claude turns auto mode off while fast mode is on (its server setting), the
+    light says so the first time and stops offering fast mode in auto mode.
+    Claude's answers are read from its own strings; no live run has shown them.
+  A light also shows while it switches and for a few seconds after. On macOS
+  ctrl+shift+tab reveals and selects the lights that fit the pane (Return or
+  Space presses the selected one — nothing on an expected mode; ←/→ move, Escape
+  lets go). A mode row a new Claude Code draws differently makes the footer step
   aside and is named once in aterm.log. The footer follows
   `tab_status`.
   A restart the harness makes (relaunch, stall, memory banner, model move, upgrade)
