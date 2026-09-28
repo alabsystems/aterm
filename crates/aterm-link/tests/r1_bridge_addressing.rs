@@ -292,7 +292,7 @@ fn a_refusal_reaches_the_senders_own_lane_and_raises_no_false_alarm() {
         let (rows, _) = w.god().last(&peer_lane, "", 8).ok()?;
         rows.into_iter()
             .find(|(_, s, _)| *s == peer_lane)
-            .filter(|(_, _, x)| String::from_utf8_lossy(x).contains("state=refused"))
+            .filter(|(_, _, x)| String::from_utf8_lossy(x).contains("not%20delivered"))
             .map(|_| ())
     });
 
@@ -312,10 +312,7 @@ fn a_refusal_reaches_the_senders_own_lane_and_raises_no_false_alarm() {
             .into_iter()
             .find(|r| r.contains("kind=undeliverable"))
     });
-    assert!(
-        told.contains("state=refused") || told.contains("refused"),
-        "{told}"
-    );
+    assert!(told.contains("not%20delivered"), "{told}");
     let ev = w.ev();
     assert!(
         !ev.iter().any(|e| e.starts_with("cap-compromised")),

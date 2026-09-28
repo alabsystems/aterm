@@ -1701,7 +1701,10 @@ impl App {
         }
     }
 
-    /// Whether this process's update successor reopens its document tabs. The
+    /// Whether this process's update successor reopens its document tabs — and
+    /// its Settings tabs, from the same layout, with their carried field drafts
+    /// (plan P2-2): the one predicate every carried piece of unsaved native
+    /// state rides by. The
     /// seamless successor restores the handed-over layout — every editor leaf
     /// by reopening its file, which replays the draft — only when it has a
     /// window to put them in (`main_entry` takes the handoff layout only when

@@ -124,8 +124,8 @@ pub(crate) fn refusal(ctx: &SessionCtx, verb: &str, rest: &str, unread_ok: bool)
             .agent()
             .input
             .clone();
-        if published.is_some_and(|fact| restart_held_now(&fact, &ctx.sink)) {
-            return (!signals()).then(|| restart_refusal_text(&backlog));
+        if let Some(fact) = published.filter(|fact| restart_held_now(fact, &ctx.sink)) {
+            return (!signals()).then(|| restart_refusal_text(&backlog, fact.restart.survived));
         }
     }
     if backlog.queued == 0 {
@@ -231,12 +231,19 @@ pub(crate) fn refusal_text(b: &InputBacklog, word: InputWord, interrupt: bool) -
 
 /// The refusal line while a stall is HELD through a restart ([`Restart`]):
 /// the same `ERR busy input-unread … input=stalled` shape, so every driver's
-/// back-off and the supervisor's hold read it as they read the other, with
-/// the remedy it has come to — the attention line's own words. PURE.
-pub(crate) fn restart_refusal_text(b: &InputBacklog) -> String {
+/// back-off and the supervisor's hold read it as they read the other. It
+/// names `signal kill` once the program has `survived` [`RESTART_GRACE`]
+/// ([`Restart::survived`]), as [`attention_text`] then does. Before that it
+/// alone asks for a retry, while a handler may still be ending the program:
+/// the attention line keeps its `signal term` words through the grace. PURE.
+pub(crate) fn restart_refusal_text(b: &InputBacklog, survived: bool) -> String {
+    let why = if survived {
+        "the program is still running after its restart signal; end it: signal kill"
+    } else {
+        "the program has not ended since its restart signal; retry in a moment"
+    };
     format!(
-        "ERR busy input-unread bytes={} wait_ms={} input={} (the program is still running \
-         after its restart signal; end it: signal kill)\n",
+        "ERR busy input-unread bytes={} wait_ms={} input={} ({why})\n",
         b.unread(),
         b.wait.as_millis(),
         InputWord::Stalled.as_str()
@@ -1669,9 +1676,17 @@ pub(crate) mod tests {
         for word in [InputWord::Pending, InputWord::Stalled, InputWord::Stopped] {
             assert!(!refusal_text(&b, word, false).contains("input=frozen"));
         }
-        // A stall held through a restart ([`Restart`]): the same busy shape
-        // and word, with nothing unread, the reason and `signal kill`.
-        let line = restart_refusal_text(&backlog(0, Duration::ZERO, false));
+        // Held through a restart inside RESTART_GRACE: the same busy shape and
+        // word, and a retry — the program may still be ending.
+        let line = restart_refusal_text(&backlog(0, Duration::ZERO, false), false);
+        assert!(
+            line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
+            "{line}"
+        );
+        assert!(line.ends_with("; retry in a moment)\n"), "{line}");
+        assert!(!line.contains("signal kill"), "{line}");
+        // Survived: the reason and `signal kill`, as the attention line says.
+        let line = restart_refusal_text(&backlog(0, Duration::ZERO, false), true);
         assert!(
             line.starts_with("ERR busy input-unread bytes=0 wait_ms=0 input=stalled ("),
             "{line}"
@@ -3744,14 +3759,16 @@ pub(crate) mod tests {
                 "{:?}",
                 attention()
             );
-            // The resume command typed into it is refused, naming the remedy;
-            // `unread=ok` and the signals stay open.
+            // The resume command typed into it is refused; inside the grace it
+            // asks for a retry, never the `signal kill` the attention line does
+            // not name yet. `unread=ok` and the signals stay open.
             let refused = refusal(&ctx, "send", "claude --continue", false).expect("refused");
             assert!(
                 refused.starts_with("ERR busy input-unread bytes=0 "),
                 "{refused}"
             );
-            assert!(refused.contains("signal kill"), "{refused}");
+            assert!(refused.contains("retry in a moment"), "{refused}");
+            assert!(!refused.contains("signal kill"), "{refused}");
             assert_eq!(refusal(&ctx, "send", "claude --continue", true), None);
             assert_eq!(refusal(&ctx, "signal", "kill", false), None);
 
@@ -3781,6 +3798,9 @@ pub(crate) mod tests {
                 shown.starts_with("claude is still running after its restart signal, "),
                 "{shown}"
             );
+            // The refusal moves on with it.
+            let refused = refusal(&ctx, "send", "claude --continue", false).expect("refused");
+            assert!(refused.contains("; end it: signal kill)"), "{refused}");
             assert!(
                 shown.contains(&format!(
                     "aterm ctl @{} signal kill, then claude --continue",

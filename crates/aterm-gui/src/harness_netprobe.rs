@@ -307,7 +307,19 @@ impl NetProbe {
 
     /// Stop the thread at its next look (the host's shutdown). Nothing joins
     /// it.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "netprobe_shutdown_park",
+            action = "Stop",
+            project = "harness_netprobe::tests::project_shutdown_park"
+        )
+    )]
     pub(crate) fn stop(&self) {
+        // Publish under the waiter's mutex: notifying between its stop check
+        // and Condvar's atomic unlock-and-park would otherwise lose this wake.
+        // The worker never holds this lock across resolver or socket I/O.
+        let _state = self.lock();
         self.stop.store(true, Ordering::SeqCst);
         self.wake.notify_all();
     }
@@ -333,6 +345,13 @@ impl NetProbe {
     /// The thread: parked while no lease lives, a probe when one is due, one
     /// at a time.
     fn run(&self) {
+        self.run_before_park(|| {});
+    }
+
+    /// The shipping loop, with an observation seam immediately before parking
+    /// under the state mutex. Tests hold this boundary to replay a lost wake;
+    /// production's callback is empty.
+    fn run_before_park(&self, mut before_park: impl FnMut()) {
         loop {
             {
                 let mut st = self.lock();
@@ -341,29 +360,51 @@ impl NetProbe {
                         return;
                     }
                     let now = Instant::now();
-                    match st.next_probe(now, SystemTime::now()) {
-                        None => {
-                            st = self.wake.wait(st).unwrap_or_else(PoisonError::into_inner);
-                        }
-                        Some(at) if at > now => {
-                            st = self
-                                .wake
-                                .wait_timeout(st, at - now)
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .0;
-                        }
+                    let wait = match st.next_probe(now, SystemTime::now()) {
+                        None => None,
+                        Some(at) if at > now => Some(at - now),
                         Some(_) => {
                             if st.begin(now) {
                                 break;
                             }
+                            continue;
                         }
-                    }
+                    };
+                    before_park();
+                    st = self.park(st, wait);
                 }
             }
             let budget = self.lock().budget();
             let outcome = probe_once(&*self.probe, budget);
             self.lock()
                 .finish(outcome, Instant::now(), SystemTime::now());
+        }
+    }
+
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "netprobe_shutdown_park",
+            action = "Park",
+            project = "harness_netprobe::tests::project_shutdown_park"
+        )
+    )]
+    fn park<'a>(
+        &self,
+        state: MutexGuard<'a, NetState>,
+        wait: Option<Duration>,
+    ) -> MutexGuard<'a, NetState> {
+        match wait {
+            None => self
+                .wake
+                .wait(state)
+                .unwrap_or_else(PoisonError::into_inner),
+            Some(wait) => {
+                self.wake
+                    .wait_timeout(state, wait)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0
+            }
         }
     }
 }
@@ -498,6 +539,167 @@ mod tests {
     use std::sync::mpsc;
 
     const BUDGET: Duration = Duration::from_secs(2);
+
+    /// The implementation exercised by the fixture, never a claimed fact
+    /// about whether another thread is currently parked.
+    #[derive(Clone, Copy)]
+    enum ShutdownPublisher {
+        MutexGuarded,
+        HistoricalUnlocked,
+    }
+
+    #[derive(Debug)]
+    struct ShutdownObservation {
+        action: &'static str,
+        stopped: bool,
+    }
+
+    impl ShutdownObservation {
+        fn read(action: &'static str, probe: &NetProbe) -> Self {
+            Self {
+                action,
+                stopped: probe.stop.load(Ordering::SeqCst),
+            }
+        }
+    }
+
+    /// Project the actual observed park/stop order, independently of the
+    /// model's transition function. The fixture begins only once the real
+    /// worker has checked its predicate under the mutex. A notification can
+    /// release that wait only when its publisher follows the park boundary.
+    fn project_shutdown_park(observed: &[ShutdownObservation]) -> aterm_spec::interp::State {
+        let park = observed.iter().position(|step| step.action == "Park");
+        let stop = observed.iter().position(|step| step.action == "Stop");
+        aterm_spec::interp::State::from([
+            ("checked", i64::from(park.is_none())),
+            ("parked", i64::from(park.is_some())),
+            (
+                "stopped",
+                i64::from(observed.last().is_some_and(|step| step.stopped)),
+            ),
+            (
+                "notified",
+                i64::from(park.zip(stop).is_some_and(|(park, stop)| park < stop)),
+            ),
+        ])
+    }
+
+    /// Replay shutdown after the real worker checked its predicate but before
+    /// it parks. The old publisher deliberately skips the mutex; an explicit
+    /// second wake cleans up that negative control, so neither arm leaks.
+    fn shutdown_at_park_trace(publisher: ShutdownPublisher) -> Vec<ShutdownObservation> {
+        let probe = Arc::new(Seam::new(
+            Err(io::Error::other("this fixture must never resolve")),
+            Dial::Unreachable,
+            Dial::Unreachable,
+        ));
+        let np = NetProbe::with(probe, BUDGET);
+        let released = Arc::downgrade(&np);
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let (checked_tx, checked_rx) = mpsc::channel();
+        let (park_tx, park_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = {
+            let np = Arc::clone(&np);
+            let trace = Arc::clone(&trace);
+            std::thread::spawn(move || {
+                let mut first_park = true;
+                np.run_before_park(|| {
+                    if first_park {
+                        first_park = false;
+                        checked_tx.send(()).unwrap();
+                        park_rx.recv().unwrap();
+                        trace
+                            .lock()
+                            .unwrap()
+                            .push(ShutdownObservation::read("Park", &np));
+                    }
+                });
+                done_tx.send(()).unwrap();
+            })
+        };
+        checked_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("worker reached its checked, mutex-held park boundary");
+        let stopper = match publisher {
+            ShutdownPublisher::HistoricalUnlocked => {
+                // The exact old publisher: the wake precedes the worker's park.
+                np.stop.store(true, Ordering::SeqCst);
+                np.wake.notify_all();
+                trace
+                    .lock()
+                    .unwrap()
+                    .push(ShutdownObservation::read("Stop", &np));
+                None
+            }
+            ShutdownPublisher::MutexGuarded => {
+                let np = Arc::clone(&np);
+                let trace = Arc::clone(&trace);
+                Some(std::thread::spawn(move || {
+                    np.stop();
+                    trace
+                        .lock()
+                        .unwrap()
+                        .push(ShutdownObservation::read("Stop", &np));
+                }))
+            }
+        };
+        park_tx.send(()).unwrap();
+        if matches!(publisher, ShutdownPublisher::HistoricalUnlocked) {
+            // Acquiring the mutex proves the waiter has atomically released
+            // it into Condvar::wait. Rescue only the historical mutant.
+            let _state = np.lock();
+            np.wake.notify_all();
+        }
+        if let Some(stopper) = stopper {
+            stopper.join().unwrap();
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("stopped worker exits without another ask or probe");
+        worker.join().unwrap();
+        drop(np);
+        assert!(released.upgrade().is_none(), "no worker retains the probe");
+        Arc::try_unwrap(trace).unwrap().into_inner().unwrap()
+    }
+
+    /// Tier-1 at the real park boundary: the checked predicate and shutdown
+    /// cannot straddle a lost notification. The derived mutant admits and
+    /// rejects exactly the old unlocked publisher's observed ordering.
+    #[test]
+    fn shutdown_cannot_lose_the_park_wake_or_retain_the_worker() {
+        let model = aterm_spec::derive::netprobe_shutdown_park_model();
+        let observed = shutdown_at_park_trace(ShutdownPublisher::MutexGuarded);
+        assert_eq!(
+            observed.iter().map(|step| step.action).collect::<Vec<_>>(),
+            ["Park", "Stop"]
+        );
+        let mut state = project_shutdown_park(&[]);
+        assert_eq!(state, model.init_state());
+        for (index, step) in observed.iter().enumerate() {
+            assert!(model.fire(step.action, &mut state), "{step:?}: {state:?}");
+            assert_eq!(state, project_shutdown_park(&observed[..=index]));
+            assert!(model.check_invariant("StoppedWaiterHasWake", &state));
+        }
+
+        let old_order = shutdown_at_park_trace(ShutdownPublisher::HistoricalUnlocked);
+        assert_eq!(
+            old_order.iter().map(|step| step.action).collect::<Vec<_>>(),
+            ["Stop", "Park"]
+        );
+        assert!(!model.action_enabled(old_order[0].action, &project_shutdown_park(&[])));
+        let mutant = aterm_spec::interp::with_buggy(&model, 1);
+        let mut state = project_shutdown_park(&[]);
+        assert_eq!(state, mutant.init_state());
+        for (index, step) in old_order.iter().enumerate() {
+            assert!(mutant.fire(step.action, &mut state));
+            assert_eq!(state, project_shutdown_park(&old_order[..=index]));
+        }
+        assert!(
+            !mutant.check_invariant("StoppedWaiterHasWake", &state),
+            "the old notification before parking must be caught"
+        );
+    }
 
     /// A loopback port nothing listens on: a real connect is refused.
     ///

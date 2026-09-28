@@ -392,6 +392,23 @@ fn failure_words(reply: &supervise::CtlReply) -> String {
     }
 }
 
+/// The longest single `await` the host runs: it caps every wait there, so a
+/// longer `--timeout` ends at this (`aterm-gui`'s `control_session`).
+const HOST_AWAIT_CAP_MS: u128 = 600_000;
+
+/// The line for a turn whose screen did not settle, naming the wait that ran.
+/// Both transports print it, so they say the same thing.
+fn unsettled(timeout: Duration) -> String {
+    let ms = timeout.as_millis();
+    if ms > HOST_AWAIT_CAP_MS {
+        format!(
+            "the screen did not settle within {HOST_AWAIT_CAP_MS} ms (the host's cap on --timeout)"
+        )
+    } else {
+        format!("the screen did not settle within {ms} ms (--timeout)")
+    }
+}
+
 impl ControlClient for CtlClient {
     type Error = String;
     fn send(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
@@ -416,10 +433,7 @@ impl ControlClient for CtlClient {
         //     is named here.
         let settled = self.run_raw(&["await", "idle", &idle_ms, "timeout", &to_ms])?;
         if settled.timed_out() {
-            return Err(format!(
-                "the screen did not settle within {} ms (--timeout)",
-                timeout.as_millis()
-            ));
+            return Err(unsettled(timeout));
         }
         if !settled.ok() {
             return Err(failure_words(&settled));
@@ -740,7 +754,15 @@ impl<S: Read + Write> ControlClient for RelayClient<S> {
         let idle_ms = idle.as_millis();
         let to_ms = timeout.as_millis();
         // (1) Authoritative settle — the remote's own `await idle` on its WatcherSet.
-        self.request_status(&format!("await idle {idle_ms} timeout {to_ms}"))?;
+        //     A timed-out wait still answers `OK …` (`OK timeout`), so it is
+        //     named here, as `CtlClient` names aterm-ctl's exit 124.
+        let settled = self.request_status(&format!("await idle {idle_ms} timeout {to_ms}"))?;
+        if settled == "OK timeout" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                unsettled(timeout),
+            ));
+        }
         // (2) Best-effort prompt-ready confirm. The reply is DISCARDED, but MUST be
         //     consumed before `text` or the persistent stream desyncs (the one
         //     non-obvious correctness point vs the shell-out CtlClient).
@@ -2092,5 +2114,60 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("remove the scratch directory");
+    }
+
+    /// The same turn over a persistent connection: the server answers a wait
+    /// past its timeout with `OK timeout`, which the relay used to take as
+    /// settled and print the mid-turn screen. NEGATIVE CONTROL: `OK idle`
+    /// drives it to the screen.
+    #[test]
+    fn a_relay_turn_that_does_not_settle_names_the_timeout() {
+        let turn = Turn {
+            idle: Duration::from_millis(7),
+            timeout: Duration::from_millis(1000),
+            ready_pattern: String::new(),
+        };
+
+        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
+        gov.enable_self_write();
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK\nOK\nOK timeout\nOK 1\nmid-turn\n",
+        ));
+        let err = turn
+            .run(&mut client, &mut gov, b"hi")
+            .expect_err("a turn past its timeout fails");
+        assert_eq!(
+            err.to_string(),
+            "the screen did not settle within 1000 ms (--timeout)"
+        );
+
+        // The host caps every wait at 600000 ms, so a longer --timeout ends
+        // there and the line names the wait that ran.
+        let long = Turn {
+            idle: Duration::from_millis(7),
+            timeout: Duration::from_millis(900_000),
+            ready_pattern: String::new(),
+        };
+        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
+        gov.enable_self_write();
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK\nOK\nOK timeout\nOK 1\nmid-turn\n",
+        ));
+        assert_eq!(
+            long.run(&mut client, &mut gov, b"hi")
+                .expect_err("a turn past the host's cap fails")
+                .to_string(),
+            "the screen did not settle within 600000 ms (the host's cap on --timeout)"
+        );
+
+        let mut gov = SelfGovernor::disabled(64, 8, 5_000_000);
+        gov.enable_self_write();
+        let mut client = RelayClient::new(RecordingTransport::new(
+            b"OK\nOK\nOK idle 7\nOK 1\nsettled\n",
+        ));
+        assert_eq!(
+            turn.run(&mut client, &mut gov, b"hi").expect("it settles"),
+            "settled\n"
+        );
     }
 }

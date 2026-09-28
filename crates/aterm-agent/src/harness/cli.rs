@@ -380,7 +380,10 @@ agent to carry on. A launch it cannot resume (`--print`, `--worktree`, an
 unknown flag) is refused, not guessed; an unanswered notice, or a READY
 answer that work under the agent outlives, is asked again every 30 minutes
 (at a break of the agent's background work too), four notices at most, and
-then that ROUND gives up and names what still runs. NO STOP IS FOR GOOD: a
+then that ROUND gives up, names what still runs, and types ONE line telling the
+agent the upgrade is off and to carry on — wherever a notice may go, a break of
+its background work included, until the round's rest ends (past it the new
+round's first notice supersedes it). NO STOP IS FOR GOOD: a
 round that gave up, was refused, or whose restart stopped rests two hours
 (one round's worth of asking: four notices, 30 minutes apart; the same stop
 again rests four hours, then eight) and then a NEW ROUND starts by itself —
@@ -400,7 +403,13 @@ wait untaken in the conversation; from then on it waits `queued` until the
 session goes on, `--now` (one copy more), or a rest after the limit's word
 ran out (one copy more): two hours, doubling with every further copy the
 model has not read, up to a day — so a limit that lasts for days adds one
-copy a day.
+copy a day. A READY answer is consent only from the process the notice
+reached, in its tab: a conversation resumed by hand is never restarted on it,
+and waits while that process lives (`wait:notice-owned-by-other-process`);
+once it is gone, the upgrade is pending again in a new round, with nothing
+owed to the gone one (`reopened:notice-process-gone`), and the process that
+holds the conversation now is asked afresh, under every gate a first notice
+is, only while it is still behind.
 A SESSION IS MOVED ONLY WHILE THE
 AGENT IS ITS SHELL'S FOREGROUND JOB ON A TERMINAL AN ATERM TAB OWNS: an agent
 in a multiplexer pane (tmux, screen, zellij) or on any other pty the tab does
@@ -413,7 +422,12 @@ one waits. Each session's step lands in
 `<state>/upgrade/`, with a ledger of every act beside it, so the next sweep
 picks up where this one stopped — between the exit and the relaunch too, for
 5 minutes and while the agent's shell lives; past that the restart is
-recorded as failed and nothing more is typed into the tab.
+recorded as failed and nothing more is typed into the tab. A restart that
+stops after its SIGTERM ended the agent stays listed though no Claude Code
+holds it any more (in the window for a day): `claude --resume <session>` in
+the tab takes the conversation back. One under way that has not moved for 5
+minutes — the agent still ending, its prompt not free, the new one never
+idle — reads stalled (`stuck:<what>`); nothing is forced.
 THE WINDOW DOES IT BY DEFAULT, with no sweep: each of its own tabs' supervisors
 takes the step at its session's idle points once atpkg, or Claude Code's own
 updater, installs a newer build, while aterm.toml's `[harness] enabled` and
@@ -421,7 +435,16 @@ updater, installs a newer build, while aterm.toml's `[harness] enabled` and
 apart. It hands the relaunched agent straight back to its supervisor, which types
 the carry-on at its first idle point. It also RELAUNCHES an agent that crashed
 (its session record left behind, read as the exit is seen — a graceful exit is
-someone's), on its conversation (`[harness] relaunch`).
+someone's), on its conversation (`[harness] relaunch`). An agent the HARNESS'S
+OWN restart ended — its step returned with the relaunch still to type (someone
+at the returned prompt, a hold) — is never read as someone's exit, a limit's
+or a graceful one: the restart is carried at least every minute, Claude Code's
+and Codex's, whatever `[harness] relaunch` says, the line typed only once
+nobody types at the prompt and no hold stands — and a line once typed never
+typed again — until it lands or its 5 minutes run out, said on the tab either
+way. Claude Code's count from the agent's exit, however long it took to shut
+down; Codex's from its typed `/exit`, since a TUI still running a minute after
+its `/exit` is one the `/exit` did not take.
 THE MODEL goes with it: a session behind the newest model of its OWN family that
 the managed build offers (`aterm harness upgrade models`) is moved onto it on the
 relaunch line (`--model`, session-only — never `/model`, which also saves the
@@ -436,7 +459,16 @@ there, and again only after a whole 30 minutes with that work still running,
 four notices at most before the round gives up (and two hours later a new round
 asks again, there too). The restart still waits for an idle point with nothing
 running under the agent, so running work is never ended; a READY answer a
-person held past the drain is void at a break as at an idle point.
+person held past the drain is void at a break as at an idle point, and the line
+that releases the agent is typed there too. CLAUDE'S OWN STATUS is read against
+its screen: a `busy` or `shell` status that has stood 20 s over a screen read
+idle two looks in a row (of the same agent, no more than about ten minutes
+apart) lets the notice and the release go as at a break, whether work runs
+under the agent (a shell whose count the screen does not draw) or nothing does.
+The restart waits for Claude's own `idle` all the same — work inside the
+agent's own process is no process under it — asking a READY it holds again
+after 30 minutes, and releasing the agent once the round gives up; that wait
+is `status-stale:<status>`.
 A HAND-RUN sweep obeys `[harness] enabled` too: with it off it prints `step=refused:bypassed`, types and signals nothing
 and exits 1 (a `--dry-run` says so on stderr, still prints its plan, and
 exits 0); naming the verb is the consent `[harness] upgrade` would give.
@@ -519,19 +551,25 @@ leaves its file behind; it is not listed) — the tab, the conversation, from
 and to, the phase, `pending_for=`,
 `wait=` (what the last step waited on: `settling`, `awaiting-ready`,
 `background`, `draft`, `attended`, `held`, `terminal:<owner>`, `not-idle:busy`
-for a turn a hand-run sweep found in progress …) with `wait_for=`, the owner's
-`request=`, `next_round=` (for a round that stopped: how long until the new
-round it starts by itself, `due` once it has rested, `-` for any other, one
-the owner's `--skip` holds, or one that gave up and acts on a late READY —
-no new round starts while that answer stands), and `stalled=` — `-` while
-the upgrade will move on its own, else why it will not: `refused:<why>` (it
-stays said through the new round's first look, which meets it again unless
+for a turn a hand-run sweep found in progress, `status-stale:<status>` for a status
+the idle screen does not bear out — the restart's until Claude says `idle` …) with
+`wait_for=`, the owner's `request=`, `next_round=` (for a round that stopped: how
+long until the new round it starts by itself, `due` once it has rested, `-` for
+any other, one the owner's `--skip` holds, or one that gave up and acts on a
+late READY — no new round starts while that answer stands), `stalled=` — `-`
+while the upgrade will move on its own, else why it will not: `refused:<why>`
+(it stays said through the new round's first look, which meets it again unless
 something changed), `failed:<why>`, `held-back:<owner>` (a multiplexer pane),
-or `overdue` (6 hours behind, whatever it waits on, unless the owner's `--now`
-came in the last 30 minutes). A round that GAVE UP is no stall: it rests
-until its `next_round=`, and its column reads
-`pending/<to>/next-round:<span>/<age>` — `pending/<to>/ready/<age>` while it
-acts on a late READY instead. The window shows the same per tab as `upgrade=`
+`stuck:<exiting|exited|relaunched>` (a restart under way that has not moved for
+5 minutes — the agent still ending, its prompt not free to type at, the new one
+never idle: nothing is forced, and no word moves it), or `overdue` (6 hours
+behind, whatever it waits on, unless the owner's `--now` came in the last 30
+minutes) — and `held_by=` (what ran under the agent at the last look that
+waited, by pid, name and age — `63492(zsh:5d4h),…`, `-` for nothing; never a
+command). A round that GAVE UP is no stall: it rests until its `next_round=`,
+and its column reads `pending/<to>/next-round:<span>/<age>` —
+`pending/<to>/ready/<age>` while it acts on a late READY instead.
+The window shows the same per tab as `upgrade=`
 in `aterm ctl status`/`sessions`, records it in Settings ▸ Messages, and marks
 a STALLED tab (`meta attention owner=upgrade`) — never a tab that is merely
 waiting for its turn end.
@@ -1787,7 +1825,17 @@ fn upgrade_ledger_line(row: &str) -> String {
         .get("t")
         .and_then(Value::as_i64)
         .map_or_else(|| "-".to_string(), rfc3339_utc);
-    let detail = super::one_line(s("detail"), 200);
+    // A give-up's row is its list of what held the move, after words that
+    // alone run past the cut (the review of 2026-09-27: the view showed none
+    // of the list). That list is bounded where it is written — at most
+    // `upgrade::HELD_NAMED` processes named, each command in
+    // `upgrade::HELD_COMMAND_CHARS` — and 8 KiB holds it whole.
+    let cap = if s("step") == "gave-up" {
+        8 * 1024
+    } else {
+        200
+    };
+    let detail = super::one_line(s("detail"), cap);
     let head = format!(
         "{ts} {} tab={} session={} {} -> {}",
         s("step"),
@@ -2066,7 +2114,7 @@ fn run_upgrade_owner(
                     writeln!(
                         err,
                         "aterm harness: the word is recorded, but `[harness] enabled` reads off \
-                         in {} (Settings ▸ Harness): nothing moves until it is back on",
+                         in {} (Settings: search \"harness\"): nothing moves until it is back on",
                         path.display()
                     )
                 };
@@ -2144,8 +2192,8 @@ fn upgrade_pass(
         );
         let _ = writeln!(
             err,
-            "aterm harness: upgrade refused: `[harness] enabled` reads off in {} (Settings ▸ \
-             Harness){}{}",
+            "aterm harness: upgrade refused: `[harness] enabled` reads off in {} (Settings: \
+             search \"harness\"){}{}",
             path.display(),
             stranded(&super::upgrade_drive::in_flight(opts)),
             if opts.dry_run {

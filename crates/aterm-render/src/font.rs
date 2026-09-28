@@ -255,7 +255,47 @@ pub enum FaceBytes {
     Static(&'static [u8]),
 }
 
+/// A discovery index's non-owning key. Vec payloads and mappings are released
+/// with their final live face; dead entries are pruned on the next lookup.
+/// A weak slice retains its inline Arc allocation until that pruning, unlike
+/// the Vec/mapping arms used by file admission.
+pub(crate) enum WeakFaceBytes {
+    Slice(std::sync::Weak<[u8]>),
+    Vec(std::sync::Weak<Vec<u8>>),
+    Mapped(std::sync::Weak<crate::font_file::MappedFontFile>),
+    Static(&'static [u8]),
+}
+
+impl WeakFaceBytes {
+    pub(crate) fn upgrade(&self) -> Option<FaceBytes> {
+        match self {
+            Self::Slice(bytes) => bytes.upgrade().map(FaceBytes::Slice),
+            Self::Vec(bytes) => bytes.upgrade().map(FaceBytes::Vec),
+            Self::Mapped(bytes) => bytes.upgrade().map(FaceBytes::Mapped),
+            Self::Static(bytes) => Some(FaceBytes::Static(bytes)),
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            Self::Slice(bytes) => bytes.strong_count() != 0,
+            Self::Vec(bytes) => bytes.strong_count() != 0,
+            Self::Mapped(bytes) => bytes.strong_count() != 0,
+            Self::Static(_) => true,
+        }
+    }
+}
+
 impl FaceBytes {
+    pub(crate) fn downgrade(&self) -> WeakFaceBytes {
+        match self {
+            Self::Slice(bytes) => WeakFaceBytes::Slice(Arc::downgrade(bytes)),
+            Self::Vec(bytes) => WeakFaceBytes::Vec(Arc::downgrade(bytes)),
+            Self::Mapped(bytes) => WeakFaceBytes::Mapped(Arc::downgrade(bytes)),
+            Self::Static(bytes) => WeakFaceBytes::Static(bytes),
+        }
+    }
+
     /// Whether both handles are the SAME allocation or mapping — the O(1)
     /// identity every pointer-keyed cache in the crate relies on, and the
     /// fast path in front of any byte comparison.
@@ -396,6 +436,12 @@ impl core::fmt::Debug for Font {
 }
 
 impl Font {
+    /// The live face owns its source; a weak parsed-face index recovers the
+    /// byte key through this handle without retaining a separate strong copy.
+    pub(crate) fn source_bytes(&self) -> &FaceBytes {
+        &self.data
+    }
+
     /// Parse a face out of `data`.
     ///
     /// The error is a `&'static str` (fontdue's shape, so the call sites'

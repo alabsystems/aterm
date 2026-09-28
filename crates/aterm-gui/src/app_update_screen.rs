@@ -1101,7 +1101,7 @@ impl App {
                     // An UNATTENDED attempt is a record (audit 2026-09-24, as
                     // §10.3 U14): the artifact is gone, nothing can be pressed,
                     // the next check re-stages it, and the health lane raises
-                    // `aterm can't install updates` if it keeps failing. A
+                    // `Couldn't install updates` if it keeps failing. A
                     // person's own press is told.
                     if source_is_automatic(source) {
                         self.note_update_outcome(crate::update_words::outcome(

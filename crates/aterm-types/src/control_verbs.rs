@@ -506,9 +506,12 @@ pub const VERBS: &[VerbSpec] = &[
         "Every line: enabled= current_build= commit= staged_build= staged_version= staged_commit= \
          staged_is_same_commit= (the stage is the running commit: a churn relaunch, not a source \
          change) relaunch_ready= (a newer stage exists) apply_posture= failing=<n>:<kind> \
-         failing_applies= rescues= persistent= outcome=\"…\". Only when true: \
+         failing_applies= persistent= outcome=\"…\". Only when known or true: \
          stale_check=<rfc3339> or check_unrecorded=true (no completed check in 4 h / none \
-         recorded), apply_phase= (automatic postures only), apply_policy_reason=, \
+         recorded), checked_at=<rfc3339> (the last completed check) next_check=<rfc3339> \
+         (this process's next one), checker_stalled=<s>:<phase> checker_respawns=<n> \
+         checker_deferred=<n> (the check loop's own health), apply_phase= (automatic \
+         postures only), apply_policy_reason=, \
          delivery=deferred|blocked, installable=false (a disk-image, translocated or dev copy \
          never updates), apply_refusal= apply_refusal_at= apply_failure=, changelog=, and on \
          macOS freeze_seed_ms= handoff_capture_ms= (once a seamless handoff has timed its \

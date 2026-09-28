@@ -1525,6 +1525,16 @@ pub struct RollbackReport {
     pub roster_seq: u64,
     /// The program's coherence group, if it is in one (a per-program rollback splits it).
     pub coherence_group: Option<String>,
+    /// The local pins that keep it on `to_build` through the next update: its own, or — in
+    /// a coherence group — any member's, since one pinned member holds the whole tuple (the
+    /// update pass's pin gate). Only pins that gate reads: never an uninstalled member's
+    /// ([`deliberately_absent`]), and none while [`Self::revoked_member`] is set. Empty when
+    /// the next update moves it forward again.
+    pub held_by: Vec<String>,
+    /// A member of its group whose current build is revoked (yanked or below the floor), with
+    /// that build: the next update then moves the whole group forward whatever is pinned
+    /// (the pin gate's `all_current_valid`).
+    pub revoked_member: Option<(String, u64)>,
 }
 
 /// Update EVERY program the channel pins, **group by group**, each coherence group applied
@@ -1752,6 +1762,44 @@ pub(crate) fn tombstoned_in_place<'a>(
     })
 }
 
+/// Whether the update pass drops `m` from its coherence group before any gate reads the
+/// group ([`apply_group`]): recorded removed, on a machine that declined the set, or named by
+/// `[packages].exclude` — AND absent from `installed`. [`rollback`]'s pin report reads the
+/// same test, so it never names a pin the pass does not read.
+fn deliberately_absent<'a>(
+    layout: &Layout,
+    installed: &'a BTreeMap<String, u64>,
+    excluded: &'a [String],
+) -> impl Fn(&String) -> bool + use<'a> {
+    let removed = layout.removed_programs();
+    // `uninstall --all` writes `declined` — the durable "this machine does not want the
+    // bundled toolset" — and clears nothing per-program. The flow layer never read it,
+    // so `uninstall --all` followed by installing ONE program let the next unattended
+    // pass pull the rest of its coherence tuple back, gigabytes, unannounced. A machine
+    // that declined the set is not asking for the set (2026-08-20 independent
+    // derivation).
+    let declined = layout.declined().is_file();
+    // `[packages].exclude` arrives as the `excluded` PARAMETER, the same way the
+    // layout's own records do — never via `config::cached()`. That distinction is
+    // load-bearing: the global is a process-wide OnceLock over the INVOKING user's
+    // aterm.toml, and this layer decides against a caller-supplied `layout`. An
+    // earlier wiring read the global here, which made a synthetic-layout call apply
+    // some other prefix's exclusions and made this file's own unit tests depend on
+    // the developer's real config — in a module that refuses to touch the real
+    // `~/.aterm` for exactly that reason (2026-08-20 round-13 audit; the gap it
+    // left documented is what this parameter closes). The CALLER (cli.rs) owns the
+    // decision of whose config speaks.
+    //
+    // The absence guard applies to exclusions exactly as it does to removals:
+    // exclude means "do not PULL THIS IN as a sibling", and `uninstall` names it
+    // as the way to drop one program while staying adopted. A member the user has
+    // since explicitly installed is present, so the ordinary update path keeps it
+    // current — an exclusion never freezes or drops what is deliberately here.
+    move |m: &String| {
+        (declined || removed.contains(m) || excluded.contains(m)) && !installed.contains_key(m)
+    }
+}
+
 /// Apply ONE coherence group as an all-or-nothing transaction (the per-group body factored
 /// out of [`apply_channel`], shared with the transactional [`apply_program`] update path).
 /// `None` ⇒ the group has no installed member and was skipped (that would be a fresh
@@ -1860,40 +1908,15 @@ fn apply_group(
     // upgrades, the pin gate, tombstoning and reporting all take their normal path —
     // there is no second implementation of them here to get wrong. The trigger also
     // requires actual ABSENCE: a stale record for a member that a signed `requires`
-    // pull-in has since reinstalled is not a reason to hold anything.
-    let removed = layout.removed_programs();
-    // `uninstall --all` writes `declined` — the durable "this machine does not want the
-    // bundled toolset" — and clears nothing per-program. The flow layer never read it,
-    // so `uninstall --all` followed by installing ONE program let the next unattended
-    // pass pull the rest of its coherence tuple back, gigabytes, unannounced. A machine
-    // that declined the set is not asking for the set (2026-08-20 independent
-    // derivation).
-    let declined = layout.declined().is_file();
-    // `[packages].exclude` arrives as the `excluded` PARAMETER, the same way the
-    // layout's own records do — never via `config::cached()`. That distinction is
-    // load-bearing: the global is a process-wide OnceLock over the INVOKING user's
-    // aterm.toml, and this layer decides against a caller-supplied `layout`. An
-    // earlier wiring read the global here, which made a synthetic-layout call apply
-    // some other prefix's exclusions and made this file's own unit tests depend on
-    // the developer's real config — in a module that refuses to touch the real
-    // `~/.aterm` for exactly that reason (2026-08-20 round-13 audit; the gap it
-    // left documented is what this parameter closes). The CALLER (cli.rs) owns the
-    // decision of whose config speaks.
-    //
-    // The absence guard applies to exclusions exactly as it does to removals:
-    // exclude means "do not PULL THIS IN as a sibling", and `uninstall` names it
-    // as the way to drop one program while staying adopted. A member the user has
-    // since explicitly installed is present, so the ordinary update path keeps it
-    // current — an exclusion never freezes or drops what is deliberately here.
-    let deliberately_absent = |m: &String| {
-        (declined || removed.contains(m) || excluded.contains(m)) && !installed.contains_key(m)
-    };
-    if group.members.iter().any(deliberately_absent) {
+    // pull-in has since reinstalled is not a reason to hold anything. Declined machines and
+    // `[packages].exclude` join the same test ([`deliberately_absent`]).
+    let absent = deliberately_absent(layout, installed, excluded);
+    if group.members.iter().any(&absent) {
         let present = Group {
             members: group
                 .members
                 .iter()
-                .filter(|m| !deliberately_absent(m))
+                .filter(|m| !absent(m))
                 .cloned()
                 .collect(),
             ..group.clone()
@@ -3265,12 +3288,14 @@ pub fn last_resolve() -> Option<ResolveProvenance> {
 /// is untouched). The index is resolved + verify-selected so the floor/yank state is
 /// authoritative: the target predicate is EXACTLY the one [`decide`] tombstones on (at/above
 /// THIS program's [`Channel::min_build_for`] AND not yanked), so a rollback can never land
-/// below the floor or on a revoked build — it errors instead.
+/// below the floor or on a revoked build — it errors instead. `excluded` is the caller's
+/// `[packages].exclude`, read only to report which pins the next update honours.
 #[allow(
     clippy::too_many_arguments,
     reason = "rollback needs the fetcher, layout, pinned root key, channel + program \
-              selectors, and the floor + clock the freshness/floor gates read — the same \
-              irreducible set the install/apply entry points take"
+              selectors, the exclusions the update pass reads, and the floor + clock the \
+              freshness/floor gates read — the same irreducible set the install/apply entry \
+              points take"
 )]
 pub fn rollback(
     fetcher: &dyn Fetcher,
@@ -3278,6 +3303,7 @@ pub fn rollback(
     anchor: &Anchor,
     channel: &str,
     program: &str,
+    excluded: &[String],
     floor: BuildFloor,
     now_unix: i64,
 ) -> Result<RollbackReport, FlowError> {
@@ -3364,6 +3390,30 @@ pub fn rollback(
         aliases: Aliases::for_program(program, index.program(program)),
     };
     rollback_member(layout, program, &staged);
+    // 8. What the next update does with it, read as that pass's pin gate reads its planned
+    //    group (itself alone when ungrouped): less the members the pass drops unread
+    //    ([`deliberately_absent`] — an uninstalled sibling's pin is never read), a member's
+    //    revoked current build moves the whole group whatever is pinned
+    //    (`all_current_valid`), and otherwise the members pinned here hold it.
+    let active = crate::ops::active_builds(layout);
+    let absent = deliberately_absent(layout, &active, excluded);
+    let members: Vec<String> = plan_groups(&index, ch)
+        .into_iter()
+        .find(|g| g.members.iter().any(|m| m == program))
+        .map_or_else(|| vec![program.to_string()], |g| g.members)
+        .into_iter()
+        .filter(|m| !absent(m))
+        .collect();
+    let revoked_member = members.iter().find_map(|m| {
+        let build = active.get(m).copied()?;
+        (!crate::gate::current_build_ok(ch, m, Some(build))).then(|| (m.clone(), build))
+    });
+    let pins = crate::pin::pinned_set(layout);
+    let held_by = if revoked_member.is_some() {
+        Vec::new()
+    } else {
+        members.into_iter().filter(|m| pins.contains(m)).collect()
+    };
     Ok(RollbackReport {
         program: program.to_string(),
         from_build: current,
@@ -3371,6 +3421,8 @@ pub fn rollback(
         index_build: index.index_build,
         roster_seq: index.roster_seq(),
         coherence_group,
+        held_by,
+        revoked_member,
     })
 }
 
@@ -8377,7 +8429,7 @@ mod tests {
         seed_build(&layout, "ay", 16, false);
         seed_build(&layout, "ay", 17, false);
         seed_build(&layout, "ay", 18, true); // active
-        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap();
+        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0).unwrap();
         assert_eq!(r.from_build, 18);
         assert_eq!(r.to_build, 17);
         assert_eq!(
@@ -8436,7 +8488,7 @@ mod tests {
             "the fixture must leave 17 looking installed, or it proves nothing"
         );
 
-        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap();
+        let r = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0).unwrap();
         assert_eq!(
             r.to_build, 16,
             "the gutted build is skipped and the rollback lands on one that can run"
@@ -8463,7 +8515,7 @@ mod tests {
             crate::activate::Aliases::Off,
         )
         .unwrap();
-        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0)
+        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0)
             .expect_err("no landable build below current");
         // The refusal names the build that cannot run and what stays — a fact a person
         // can act on, not the gate's mechanism (audit, 2026-09-25).
@@ -8495,6 +8547,7 @@ mod tests {
                 &anchor(),
                 "stable",
                 "ay",
+                &[],
                 fl(0),
                 0,
             )
@@ -8515,6 +8568,7 @@ mod tests {
                 &anchor(),
                 "stable",
                 "ay",
+                &[],
                 fl(0),
                 0,
             )
@@ -8535,6 +8589,7 @@ mod tests {
                 &anchor(),
                 "stable",
                 "ay",
+                &[],
                 fl(0),
                 0,
             )
@@ -8563,6 +8618,7 @@ mod tests {
                 &anchor(),
                 "stable",
                 "ay",
+                &[],
                 fl(0),
                 0,
             )
@@ -8583,6 +8639,7 @@ mod tests {
                 &anchor(),
                 "stable",
                 "ay",
+                &[],
                 fl(0),
                 0,
             )
@@ -8598,7 +8655,7 @@ mod tests {
         let fake = rollback_index(0, &[]);
         let layout = layout(&dir);
         seed_build(&layout, "ay", 18, true); // only 18 present
-        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", fl(0), 0).unwrap_err();
+        let err = rollback(&fake, &layout, &anchor(), "stable", "ay", &[], fl(0), 0).unwrap_err();
         // What stays, and why: no older build is kept — the gate's mechanism is not the
         // sentence (audit, 2026-09-25).
         assert!(
@@ -8606,6 +8663,168 @@ mod tests {
             "got {err:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE PINS THAT HOLD A ROLLED-BACK PROGRAM where it lands, as the update pass's pin
+    /// gate reads them: its own when ungrouped, any member's of its coherence group, never an
+    /// uninstalled or excluded sibling's (the pass drops that member unread), none while a
+    /// member's current build is revoked (the pass moves the tuple whatever is pinned), and
+    /// none when nothing is pinned. Each case then runs that pass: it holds the group on
+    /// exactly the reported pins, or not at all.
+    #[test]
+    fn rollback_reports_the_pins_that_hold_it() {
+        type Next = (Vec<String>, Option<(String, u64)>);
+        fn next(
+            label: &str,
+            fixture: fn(&Path) -> Fake,
+            trust: Option<u64>,
+            pinned: &[&str],
+            removed: &[&str],
+            excluded: &[&str],
+        ) -> Next {
+            let dir = scratch(label);
+            let lay = layout(&dir);
+            let fake = fixture(&dir);
+            seed_build(&lay, "ay", 17, false);
+            seed_build(&lay, "ay", 18, true);
+            if let Some(build) = trust {
+                seed_build(&lay, "trust", build, true);
+            }
+            for p in pinned {
+                crate::pin::set_pinned(&lay, p, true).unwrap();
+            }
+            if !removed.is_empty() {
+                std::fs::write(lay.removed(), removed.join("\n")).unwrap();
+            }
+            let excluded: Vec<String> = excluded.iter().map(ToString::to_string).collect();
+            let r = rollback(&fake, &lay, &anchor(), "stable", "ay", &excluded, fl(0), 0).unwrap();
+            assert_eq!(r.to_build, 17);
+            let pass = apply_channel(
+                &fake,
+                &lay,
+                &anchor(),
+                "stable",
+                TRIPLE,
+                &crate::ops::active_builds(&lay),
+                &excluded,
+                fl(0),
+                0,
+            );
+            let pass_held = pass
+                .ok()
+                .into_iter()
+                .flat_map(|report| report.groups)
+                .find_map(|(_, outcome)| match outcome {
+                    TxnOutcome::Pinned(held) => Some(held),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            assert_eq!(pass_held, r.held_by, "{label}: the update pass disagrees");
+            let _ = std::fs::remove_dir_all(&dir);
+            (r.held_by, r.revoked_member)
+        }
+        fn ungrouped(_: &Path) -> Fake {
+            rollback_index(0, &[])
+        }
+        fn yanking_trust_4820(dir: &Path) -> Fake {
+            let mut f = group_fixture(dir);
+            let index_body = format!(
+                "schema = 2\nindex_build = 41\nvalid_until = \"2026-07-05T12:00:00Z\"\n{attr}\
+                 [programs.trust]\nrepo = \"trust\"\ncoherence_group = \"rustc\"\n\
+                 [programs.ay]\nrepo = \"ay\"\ncoherence_group = \"rustc\"\n\
+                 [[channels]]\nname = \"stable\"\nchannel_build = 1\nmin_build = 0\n\
+                 yanked = [\"trust@4820\"]\n\
+                 pin = {{ trust = 4821, ay = 18 }}\n",
+                attr = attribution()
+            );
+            f.index = index_body.clone().into_bytes();
+            f.index_sig = sign(&RELEASE_SEED, index_body.as_bytes());
+            f
+        }
+        let held = |v: &[&str]| -> Next { (v.iter().map(ToString::to_string).collect(), None) };
+        assert_eq!(
+            next("rb-held-none", ungrouped, None, &[], &[], &[]),
+            held(&[])
+        );
+        assert_eq!(
+            next("rb-held-self", ungrouped, None, &["ay"], &[], &[]),
+            held(&["ay"])
+        );
+        assert_eq!(
+            next("rb-held-other", ungrouped, None, &["trust"], &[], &[]),
+            held(&[]),
+            "an ungrouped program is held by its own pin alone"
+        );
+        assert_eq!(
+            next(
+                "rb-held-group-none",
+                group_fixture,
+                Some(4821),
+                &[],
+                &[],
+                &[]
+            ),
+            held(&[])
+        );
+        assert_eq!(
+            next(
+                "rb-held-sibling",
+                group_fixture,
+                Some(4821),
+                &["trust"],
+                &[],
+                &[]
+            ),
+            held(&["trust"]),
+            "one pinned member holds the whole tuple"
+        );
+        assert_eq!(
+            next(
+                "rb-held-both",
+                group_fixture,
+                Some(4821),
+                &["ay", "trust"],
+                &[],
+                &[]
+            ),
+            held(&["ay", "trust"])
+        );
+        // A sibling uninstalled (or excluded) with its pin left behind: the pass drops the
+        // member before its pin gate, so that pin holds nothing.
+        assert_eq!(
+            next(
+                "rb-held-removed",
+                group_fixture,
+                None,
+                &["trust"],
+                &["trust"],
+                &[]
+            ),
+            held(&[])
+        );
+        assert_eq!(
+            next(
+                "rb-held-excluded",
+                group_fixture,
+                None,
+                &["trust"],
+                &[],
+                &["trust"]
+            ),
+            held(&[])
+        );
+        // A pinned sibling whose current build is revoked: the pass moves the whole tuple.
+        assert_eq!(
+            next(
+                "rb-held-revoked",
+                yanking_trust_4820,
+                Some(4820),
+                &["trust"],
+                &[],
+                &[]
+            ),
+            (Vec::new(), Some(("trust".to_string(), 4820)))
+        );
     }
 
     // The step-11 fix: an `update <grouped-member>` routes through apply_program, which moves

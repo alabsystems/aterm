@@ -300,11 +300,6 @@ pub fn stage_report(base: &str, sel: &Selection) -> (Scope, Report) {
     let mut r = Report::new(format!("change scope (--changed --base {base})"));
     match sel {
         Selection::Widened(why) => {
-            r.raw(format!(
-                "  NOTICE: --changed could NOT narrow honestly ({why}).\n\
-                 \x20         Widening to the WHOLE workspace: a narrower that cannot compute its\n\
-                 \x20         scope must do MORE work, never less."
-            ));
             r.pass(format!(
                 "change scope: WIDENED to the whole workspace ({why})"
             ));
@@ -922,15 +917,12 @@ mod tests {
     }
 
     #[test]
-    fn a_widened_stage_prints_the_notice_and_hands_back_the_whole_workspace() {
+    fn a_widened_stage_says_why_once_and_hands_back_the_whole_workspace() {
         let (scope, report) = stage_report("main", &Selection::Widened("because".into()));
         let text = report.render();
         assert_eq!(
             text,
             "\n=== change scope (--changed --base main) ===\n\
-             \x20 NOTICE: --changed could NOT narrow honestly (because).\n\
-             \x20         Widening to the WHOLE workspace: a narrower that cannot compute its\n\
-             \x20         scope must do MORE work, never less.\n\
              \x20 ok    change scope: WIDENED to the whole workspace (because)\n"
         );
         assert!(scope.is_workspace());

@@ -8,10 +8,13 @@
 //! single-boot handoff that models no window/tab/pane tree and no cwd). This manifest is
 //! the durable, human-inspectable layout written on graceful quit and applied on the
 //! next cold launch: the window grid, each terminal tab's pane tree, and the stable
-//! descriptors needed to reopen first-party native tabs. Native descriptors never
-//! contain process-local ids, document bytes, config values, or secrets; bounded
+//! descriptors needed to reopen first-party native tabs. Durable native descriptors
+//! never contain process-local ids, document bytes, config values, or secrets; bounded
 //! source-addressed view selections and viewport anchors are persisted so a reopened
-//! document returns to the same reading/editing position.
+//! document returns to the same reading/editing position. The one exception is the
+//! seamless update's attempt-bound handoff layout, and only its Settings leaves: they
+//! carry the view's unsaved field drafts ([`SettingsDraftRestore`]) so the successor
+//! reopens them — see [`NativeLeafRestore::settings_drafts`].
 //!
 //! Process-local `u64` session ids are NOT persisted — a Leaf stores the shell's cwd +
 //! title so a FRESH session can be respawned in the same place, and the pane tree is
@@ -42,6 +45,37 @@ const MAX_LEAVES_PER_TAB: usize = 256;
 const MAX_SPLIT_DEPTH: usize = 32;
 const MAX_VIEW_METADATA_BYTES: usize = 16 * 1024;
 const MAX_EDITOR_SELECTIONS: usize = 256;
+/// The longest Settings field key a carried draft may name. Keys are the
+/// `aterm.toml` paths the Settings rows edit (`sparkle_words.lexicon`), far
+/// shorter than this; the bound exists so a malformed layout cannot make the
+/// successor hash or compare an unbounded key.
+const MAX_SETTINGS_DRAFT_KEY_BYTES: usize = 128;
+/// The longest unsaved Settings field text an update carries. A field longer
+/// than this is not carried; the update waits for it as it always did
+/// ([`settings_draft_is_carriable`]).
+pub(crate) const MAX_SETTINGS_DRAFT_TEXT_BYTES: usize = 16 * 1024;
+/// The most drafts one Settings view carries: above the number of rows the
+/// Settings pages edit (`prefs::editable_fields`, pinned below it by a test),
+/// so a real capture never meets it and only a malformed layout is cut by it.
+pub(crate) const MAX_SETTINGS_DRAFTS_PER_VIEW: usize = 256;
+
+/// Whether one unsaved Settings field draft can ride a seamless update — the
+/// ONE rule the outgoing preflight counts a draft as carried by, the handoff
+/// capture writes by, and the layout's sanitize (capture and parse alike)
+/// keeps by. A draft it refuses is not carried: the preflight holds the update
+/// for it, exactly as every draft was held before drafts were carried.
+///
+/// A NUL is refused because no string a layout carries may hold one (the
+/// capture must be a fixed point of the parse); the bounds keep the layout
+/// sidecar far below the successor's `MAX_HANDOFF_LAYOUT_BYTES`.
+#[must_use]
+pub(crate) fn settings_draft_is_carriable(key: &str, text: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= MAX_SETTINGS_DRAFT_KEY_BYTES
+        && !key.contains('\0')
+        && text.len() <= MAX_SETTINGS_DRAFT_TEXT_BYTES
+        && !text.contains('\0')
+}
 
 /// A pane's working directory as a layout may carry it — at most
 /// `MAX_DOCUMENT_URI_BYTES` and no NUL — else `None`. The one rule both leaf
@@ -285,10 +319,63 @@ impl TerminalLeafRestore {
     }
 }
 
+/// One Settings text field's unsaved draft: the `aterm.toml` key its row edits and
+/// the text the person typed but did not save. Carried by a seamless update's
+/// handoff layout only ([`NativeLeafRestore::settings_drafts`]).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+pub(crate) struct SettingsDraftRestore {
+    pub key: String,
+    pub text: String,
+}
+
+/// Read a layout's `settings_drafts` LENIENTLY: a carry this build cannot read
+/// costs the drafts, never the layout. Every entry that is not a
+/// `{ key, text }` table — and the whole field, when it is not a list — becomes
+/// an entry with an empty key, which no draft can have, so the sanitize that
+/// every parse runs ([`NativeLeafRestore::sanitize_settings_drafts`]) drops it
+/// and COUNTS it, and the successor says how many it could not reopen.
+///
+/// Why not a plain `Vec`: a strict field fails the whole manifest's parse, and
+/// a handoff layout that does not parse costs every native tab and the whole
+/// pane arrangement (`seamless::take_incoming`'s orphan net) — to save the text
+/// of a Settings field.
+fn lenient_settings_drafts<'de, D>(deserializer: D) -> Result<Vec<SettingsDraftRestore>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entry {
+        Draft(SettingsDraftRestore),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Entries {
+        List(Vec<Entry>),
+        Unreadable(serde::de::IgnoredAny),
+    }
+    let unreadable = || SettingsDraftRestore {
+        key: String::new(),
+        text: String::new(),
+    };
+    Ok(match Entries::deserialize(deserializer)? {
+        Entries::List(entries) => entries
+            .into_iter()
+            .map(|entry| match entry {
+                Entry::Draft(draft) => draft,
+                Entry::Unreadable(_) => unreadable(),
+            })
+            .collect(),
+        Entries::Unreadable(_) => vec![unreadable()],
+    })
+}
+
 /// Per-view native state. Canonical document bytes and draft contents deliberately do not
 /// appear here: Editor durability is addressed by the document journal and `durable_seq`.
-/// Unknown app versions may put a bounded, copyable description in `metadata`; it is data,
-/// never executable input.
+/// The one exception is [`Self::settings_drafts`], carried by a seamless update's handoff
+/// layout and by nothing else. Unknown app versions may put a bounded, copyable
+/// description in `metadata`; it is data, never executable input.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
 pub(crate) struct NativeLeafRestore {
     pub restore_tag: String,
@@ -314,6 +401,36 @@ pub(crate) struct NativeLeafRestore {
     pub durable_seq: u64,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub metadata: String,
+    /// A Settings view's unsaved field drafts, in key order — carried ONLY by a
+    /// seamless update's handoff layout (`App::capture_handoff_layout`), so the
+    /// successor reopens the view with the text the person typed and it stays
+    /// unsaved there. A durable manifest (quit, crash journal, closed-tab
+    /// recovery) never holds one: those outlive the process, and an unsaved
+    /// draft was never promised to (only the handoff is a continuation of the
+    /// same session).
+    ///
+    /// ADDITIVE AND LENIENT ON PURPOSE. Absent in every layout that carries no
+    /// draft, so an older consumer's bytes are unchanged; an older consumer
+    /// that meets one ignores it (this struct denies no unknown field) — which
+    /// is why the outgoing process refuses to carry drafts to an OLDER build
+    /// (`App::start_unix_update_handoff`). A value this build cannot read is
+    /// dropped and counted ([`lenient_settings_drafts`]), never a refusal of
+    /// the layout.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "lenient_settings_drafts"
+    )]
+    pub settings_drafts: Vec<SettingsDraftRestore>,
+    /// How many carried drafts the parse had to drop — unreadable, not
+    /// carriable ([`settings_draft_is_carriable`]), repeated, past
+    /// [`MAX_SETTINGS_DRAFTS_PER_VIEW`], or on a leaf that is not Settings. Never
+    /// written: it exists so the successor says a draft was lost out loud
+    /// instead of reopening the view as if there had been none. Always zero in
+    /// a capture, whose drafts are carriable by construction, so the capture is
+    /// still a fixed point of the parse.
+    #[serde(skip)]
+    pub settings_drafts_unreadable: usize,
 }
 
 impl NativeLeafRestore {
@@ -330,6 +447,8 @@ impl NativeLeafRestore {
             viewport_anchor: 0,
             durable_seq: 0,
             metadata: String::new(),
+            settings_drafts: Vec::new(),
+            settings_drafts_unreadable: 0,
         }
     }
 
@@ -346,7 +465,51 @@ impl NativeLeafRestore {
             viewport_anchor: 0,
             durable_seq: 0,
             metadata: String::new(),
+            settings_drafts: Vec::new(),
+            settings_drafts_unreadable: 0,
         }
+    }
+
+    /// Whether [`Self::settings_drafts`] is what
+    /// [`Self::sanitize_settings_drafts`] leaves: carriable, one per key, within
+    /// the cap, and only on a Settings leaf. Part of the layout's shape check,
+    /// so a manifest built around the sanitize is refused rather than carried.
+    fn settings_drafts_are_canonical(&self) -> bool {
+        let mut keys = std::collections::BTreeSet::new();
+        self.settings_drafts.is_empty()
+            || (self.restore_tag == "settings"
+                && self.settings_drafts.len() <= MAX_SETTINGS_DRAFTS_PER_VIEW
+                && self.settings_drafts.iter().all(|draft| {
+                    settings_draft_is_carriable(&draft.key, &draft.text)
+                        && keys.insert(draft.key.as_str())
+                }))
+    }
+
+    /// Keep exactly the carried drafts this build can reopen and count the
+    /// rest into [`Self::settings_drafts_unreadable`]: carriable
+    /// ([`settings_draft_is_carriable`]), the first for its key, at most
+    /// [`MAX_SETTINGS_DRAFTS_PER_VIEW`], and only on a Settings leaf.
+    /// Idempotent, and a no-op over a capture (whose drafts pass by
+    /// construction), so the capture stays a fixed point of the parse.
+    fn sanitize_settings_drafts(&mut self) {
+        if self.settings_drafts.is_empty() {
+            return;
+        }
+        let on_settings = self.restore_tag == "settings";
+        let mut seen = std::collections::BTreeSet::new();
+        let mut kept = Vec::with_capacity(self.settings_drafts.len());
+        for draft in std::mem::take(&mut self.settings_drafts) {
+            if on_settings
+                && kept.len() < MAX_SETTINGS_DRAFTS_PER_VIEW
+                && settings_draft_is_carriable(&draft.key, &draft.text)
+                && seen.insert(draft.key.clone())
+            {
+                kept.push(draft);
+            } else {
+                self.settings_drafts_unreadable = self.settings_drafts_unreadable.saturating_add(1);
+            }
+        }
+        self.settings_drafts = kept;
     }
 
     fn validation_error(&self) -> Option<&'static str> {
@@ -440,6 +603,9 @@ impl RestoredView {
         match self {
             Self::Terminal(terminal) => terminal.sanitize(),
             Self::Native(native) => {
+                // Before the validation: a draft this build cannot reopen costs
+                // that draft (counted), never the leaf.
+                native.sanitize_settings_drafts();
                 let Some(reason) = native.validation_error() else {
                     return;
                 };
@@ -467,7 +633,9 @@ impl RestoredView {
                     })
                     && terminal.user_metadata_is_canonical()
             }
-            Self::Native(native) => native.validation_error().is_none(),
+            Self::Native(native) => {
+                native.validation_error().is_none() && native.settings_drafts_are_canonical()
+            }
             Self::Placeholder(placeholder) => {
                 !placeholder.restore_tag.is_empty()
                     && placeholder.restore_tag.len() <= MAX_RESTORE_TAG_BYTES
@@ -560,6 +728,61 @@ impl RestoredSplitTree {
                         && second.shape_is_bounded()
                 }
             }
+    }
+
+    /// Every terminal leaf of this tree whose `local_id` is in `unhanded`
+    /// becomes a [`RestoredView::Placeholder`] saying no session was carried
+    /// for it — the pane, its place in the split and the tab's focus path all
+    /// kept. See [`RestoreManifest::placed_for_handed`].
+    fn retire_unhanded_terminals(&mut self, unhanded: &[u64]) {
+        match self {
+            Self::Leaf { view } => {
+                let RestoredView::Terminal(terminal) = &*view else {
+                    return;
+                };
+                if !terminal.local_id.is_some_and(|id| unhanded.contains(&id)) {
+                    return;
+                }
+                // The pane's directory and title, as the Recovery view's
+                // copyable metadata — bounded in CHARACTERS so the bytes stay
+                // under the leaf's own cap whatever the script.
+                let metadata = format!("cwd={:?}\ntitle={:?}", terminal.cwd, terminal.title)
+                    .chars()
+                    .take(MAX_VIEW_METADATA_BYTES / 4)
+                    .collect();
+                *view = RestoredView::Placeholder(PlaceholderLeafRestore {
+                    restore_tag: "terminal".to_string(),
+                    reason: crate::update_words::PANE_NOT_CARRIED.to_string(),
+                    metadata,
+                });
+            }
+            Self::Split { first, second, .. } => {
+                first.retire_unhanded_terminals(unhanded);
+                second.retire_unhanded_terminals(unhanded);
+            }
+        }
+    }
+
+    /// Every Settings leaf's carried drafts in this tree, and how many the
+    /// parse had to drop — see [`RestoreManifest::carried_settings_drafts`].
+    fn collect_settings_drafts(
+        &self,
+        drafts: &mut Vec<SettingsDraftRestore>,
+        unreadable: &mut usize,
+    ) {
+        match self {
+            Self::Leaf {
+                view: RestoredView::Native(native),
+            } => {
+                drafts.extend(native.settings_drafts.iter().cloned());
+                *unreadable = unreadable.saturating_add(native.settings_drafts_unreadable);
+            }
+            Self::Leaf { .. } => {}
+            Self::Split { first, second, .. } => {
+                first.collect_settings_drafts(drafts, unreadable);
+                second.collect_settings_drafts(drafts, unreadable);
+            }
+        }
     }
 
     /// The first TERMINAL leaf in the order a rebuild walks this tree (first
@@ -687,6 +910,24 @@ impl PaneLayout {
             PaneLayout::Split { first, second, .. } => {
                 first.sanitize_leaf_metadata();
                 second.sanitize_leaf_metadata();
+            }
+        }
+    }
+
+    /// The legacy mirror's half of [`RestoreManifest::placed_for_handed`]: a
+    /// leaf naming a session that was not handed names none, so no reader of
+    /// this projection (`WindowLayout::bootstrap_local_id`'s fallback) can pick
+    /// it as a shell to adopt.
+    fn forget_local_ids(&mut self, unhanded: &[u64]) {
+        match self {
+            PaneLayout::Leaf { local_id, .. } => {
+                if local_id.is_some_and(|id| unhanded.contains(&id)) {
+                    *local_id = None;
+                }
+            }
+            PaneLayout::Split { first, second, .. } => {
+                first.forget_local_ids(unhanded);
+                second.forget_local_ids(unhanded);
             }
         }
     }
@@ -1262,6 +1503,79 @@ impl RestoreManifest {
                 fill(&mut tab.root, hosted);
             }
         }
+    }
+
+    /// The layout a seamless successor PLACES, given the sessions the outgoing
+    /// process actually handed (`expected`) — or the layout back, unplaced,
+    /// when it cannot be made to name exactly them.
+    ///
+    /// WHY A LAYOUT MAY NAME MORE THAN WAS HANDED (round three of the 2026-09
+    /// update robustness work). The outgoing process hands only its LIVE
+    /// sessions (`App::handoff_live_sessions`): an exited pane kept open under
+    /// `--hold` has no process to carry. But its layout capture stamps a
+    /// `local_id` on every terminal view, exited ones included, so the layout
+    /// names one id more than the handoff — and a successor that demanded an
+    /// exact match dropped the WHOLE layout for it: every window collapsed
+    /// into tabs of the first, and every unsaved Settings draft (which rides
+    /// only in this layout, plan P2-2) was gone with a log line. Every build
+    /// that shipped the capture does this, so it is answered here, where the
+    /// layout is placed, rather than only in a capture a newer build writes.
+    ///
+    /// A leaf naming a session that was NOT handed becomes a placeholder
+    /// saying no session was carried for it; its split, its tab and every
+    /// other leaf are placed as they were. That keeps both guarantees the
+    /// exact check exists for: each handed PTY is still named exactly once
+    /// (nothing ambiguous), and no terminal leaf is left to be backed by a
+    /// shell spawned during the overlap (the unhanded one is no terminal any
+    /// more). A layout that MISSES a handed session, names one twice, or has a
+    /// terminal leaf with no id at all is still unplaced: those are not a pane
+    /// the outgoing process chose not to hand, and the orphan net answers them.
+    pub(crate) fn placed_for_handed(mut self, expected: &[u64]) -> Result<Self, Self> {
+        let Some(named) = self.seamless_terminal_ids() else {
+            return Err(self);
+        };
+        let mut handed = expected.to_vec();
+        handed.sort_unstable();
+        if handed.windows(2).any(|pair| pair[0] == pair[1])
+            || !handed.iter().all(|id| named.binary_search(id).is_ok())
+        {
+            return Err(self);
+        }
+        let unhanded = named
+            .into_iter()
+            .filter(|id| handed.binary_search(id).is_err())
+            .collect::<Vec<_>>();
+        if !unhanded.is_empty() {
+            for window in &mut self.windows {
+                for tab in &mut window.restored_tabs {
+                    tab.root.retire_unhanded_terminals(&unhanded);
+                }
+                for tab in &mut window.tabs {
+                    tab.forget_local_ids(&unhanded);
+                }
+            }
+        }
+        if self.covers_exact_seamless_ids(expected) {
+            Ok(self)
+        } else {
+            Err(self)
+        }
+    }
+
+    /// Every unsaved Settings draft this layout carries, in window, tab and
+    /// tree order, with how many the parse had to drop — what a successor that
+    /// cannot PLACE the layout says it lost, with the text, rather than
+    /// dropping it with the layout (round three).
+    pub(crate) fn carried_settings_drafts(&self) -> (Vec<SettingsDraftRestore>, usize) {
+        let mut drafts = Vec::new();
+        let mut unreadable = 0usize;
+        for window in &self.windows {
+            for tab in &window.restored_tabs {
+                tab.root
+                    .collect_settings_drafts(&mut drafts, &mut unreadable);
+            }
+        }
+        (drafts, unreadable)
     }
 
     /// True only when this layout names every authenticated inherited terminal
@@ -1855,6 +2169,198 @@ fn store_cell_metrics_to(
 mod tests {
     use super::*;
 
+    /// A terminal leaf naming session `id`.
+    fn terminal(id: Option<u64>, title: &str) -> RestoredSplitTree {
+        RestoredSplitTree::leaf(RestoredView::Terminal(TerminalLeafRestore {
+            cwd: Some("/tmp/work".to_string()),
+            title: title.to_string(),
+            profile: None,
+            local_id: id,
+            user_title: None,
+            description: None,
+            icon: None,
+            role: None,
+            attention: None,
+            questions: None,
+            identity: None,
+            agent: None,
+        }))
+    }
+
+    /// The `--hold` desk of the round-three review, as the outgoing capture
+    /// writes it: a live shell (0) split with an exited pane (7) the handoff
+    /// does not hand, beside a Settings tab carrying an unsaved draft — in both
+    /// projections, the canonical tree and the legacy terminal mirror.
+    fn held_desk(exited: Option<u64>) -> RestoreManifest {
+        let mut settings = NativeLeafRestore::settings("/text-fonts".to_string());
+        settings.settings_drafts = vec![SettingsDraftRestore {
+            key: "font_family".to_string(),
+            text: "Carried Mono".to_string(),
+        }];
+        RestoreManifest::new(vec![WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            show: WindowShow::UNKNOWN,
+            tabs: vec![PaneLayout::Split {
+                dir: SplitKind::Vertical,
+                ratio: 0.5,
+                first: Box::new(PaneLayout::Leaf {
+                    cwd: Some("/tmp/work".to_string()),
+                    title: "zsh".to_string(),
+                    focused: false,
+                    local_id: Some(0),
+                }),
+                second: Box::new(PaneLayout::Leaf {
+                    cwd: Some("/tmp/work".to_string()),
+                    title: "build".to_string(),
+                    focused: true,
+                    local_id: exited,
+                }),
+            }],
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(1),
+            restored_tabs: vec![
+                RestoredTab {
+                    root: RestoredSplitTree::Split {
+                        axis: SplitKind::Vertical,
+                        ratio: 0.5,
+                        first: Box::new(terminal(Some(0), "zsh")),
+                        second: Box::new(terminal(exited, "build")),
+                    },
+                    focused_path: vec![RestoreBranch::Second],
+                    zoomed: false,
+                },
+                RestoredTab {
+                    root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
+                    focused_path: Vec::new(),
+                    zoomed: false,
+                },
+            ],
+        }])
+    }
+
+    /// A LAYOUT THAT NAMES A PANE THE HANDOFF DID NOT HAND IS PLACED (round
+    /// three of the 2026-09 update robustness work). The outgoing process
+    /// hands only live sessions, but stamps every terminal view's id on the
+    /// layout, so an exited `--hold` pane made the layout name one session more
+    /// than was handed — and the successor, demanding an exact match, dropped
+    /// the whole layout: the split, the tab order and the carried Settings
+    /// draft with it. Now that one pane becomes a placeholder, and everything
+    /// else is placed as it was.
+    ///
+    /// The CONTROL is the old acceptance, `covers_exact_seamless_ids`, which
+    /// refuses this very layout.
+    #[test]
+    fn a_layout_naming_an_unhanded_pane_is_placed_with_that_pane_retired() {
+        let wire = held_desk(Some(7))
+            .to_toml()
+            .expect("the outgoing capture serializes");
+        let parsed = RestoreManifest::from_toml(&wire).expect("the successor parses it");
+        assert!(
+            !parsed.covers_exact_seamless_ids(&[0]),
+            "CONTROL: the exact check refuses the layout for the exited pane"
+        );
+        let placed = parsed
+            .clone()
+            .placed_for_handed(&[0])
+            .expect("placed, with the unhanded pane retired");
+        assert_eq!(placed.seamless_terminal_ids(), Some(vec![0]));
+        assert!(placed.covers_exact_seamless_ids(&[0]));
+        let window = &placed.windows[0];
+        assert!(
+            window.shape_is_valid(),
+            "the placed layout is one from_toml admits"
+        );
+        let tab = &window.restored_tabs[0];
+        assert_eq!(
+            tab.focused_path,
+            vec![RestoreBranch::Second],
+            "the focus is kept"
+        );
+        let RestoredSplitTree::Split { first, second, .. } = &tab.root else {
+            panic!("the split is kept: {:?}", tab.root);
+        };
+        assert!(matches!(
+            &**first,
+            RestoredSplitTree::Leaf { view: RestoredView::Terminal(live) } if live.local_id == Some(0)
+        ));
+        let RestoredSplitTree::Leaf {
+            view: RestoredView::Placeholder(retired),
+        } = &**second
+        else {
+            panic!("the unhanded pane is a placeholder: {second:?}");
+        };
+        assert_eq!(retired.restore_tag, "terminal");
+        assert_eq!(retired.reason, crate::update_words::PANE_NOT_CARRIED);
+        assert!(retired.metadata.contains("build"), "{}", retired.metadata);
+        assert_eq!(
+            placed.carried_settings_drafts(),
+            (
+                vec![SettingsDraftRestore {
+                    key: "font_family".to_string(),
+                    text: "Carried Mono".to_string(),
+                }],
+                0
+            ),
+            "the Settings draft is placed with its tab"
+        );
+        let PaneLayout::Split { first, second, .. } = &window.tabs[0] else {
+            panic!("the legacy mirror is kept");
+        };
+        assert_eq!(
+            (first.local_id(), second.local_id()),
+            (Some(0), None),
+            "the legacy mirror names no session that was not handed"
+        );
+        assert_eq!(
+            window.bootstrap_local_id(),
+            Some(0),
+            "the bootstrap pick is the handed shell"
+        );
+
+        // An exact layout is placed unchanged.
+        let exact = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
+        assert_eq!(exact.clone().placed_for_handed(&[0, 7]), Ok(exact));
+    }
+
+    /// What is NOT a pane the outgoing process chose not to hand stays
+    /// unplaced, for the orphan net: a handed session the layout does not
+    /// name, a handed id listed twice, or a terminal leaf with no id.
+    #[test]
+    fn a_layout_missing_a_handed_session_stays_unplaced() {
+        let parsed = RestoreManifest::from_toml(&held_desk(Some(7)).to_toml().unwrap()).unwrap();
+        assert!(
+            parsed.clone().placed_for_handed(&[0, 5]).is_err(),
+            "5 is not named"
+        );
+        assert!(
+            parsed.clone().placed_for_handed(&[0, 0]).is_err(),
+            "0 twice"
+        );
+        let unnamed = RestoreManifest::from_toml(&held_desk(None).to_toml().unwrap()).unwrap();
+        assert!(
+            unnamed.placed_for_handed(&[0]).is_err(),
+            "a leaf with no id"
+        );
+    }
+
+    /// The placeholder's reason fits the leaf it is written into: a reason over
+    /// the cap would be a layout `from_toml` refuses.
+    #[test]
+    fn the_unhanded_pane_reason_fits_a_placeholder() {
+        let reason = crate::update_words::PANE_NOT_CARRIED;
+        assert!(
+            !reason.is_empty()
+                && reason.len() <= MAX_SETTINGS_ROUTE_BYTES
+                && !reason.contains('\0')
+        );
+    }
+
     fn sample() -> RestoreManifest {
         // A two-window manifest: window 0 has one plain tab + one split tab; window 1 a
         // single tab. Exercises every variant + per-leaf cwd/title/focus + active_tab.
@@ -1924,6 +2430,139 @@ mod tests {
             active_item: Some(2),
             restored_tabs: Vec::new(),
         }])
+    }
+
+    fn draft(key: &str, text: &str) -> SettingsDraftRestore {
+        SettingsDraftRestore {
+            key: key.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// A handoff layout whose Settings leaf carries `drafts`, as
+    /// `App::capture_handoff_layout` builds it (through `RestoreManifest::new`,
+    /// the capture's sanitize).
+    fn settings_handoff_layout(drafts: Vec<SettingsDraftRestore>) -> RestoreManifest {
+        let mut leaf = NativeLeafRestore::settings("/text-fonts".to_string());
+        leaf.settings_drafts = drafts;
+        RestoreManifest::new(vec![WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            show: WindowShow::UNKNOWN,
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(0),
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        }])
+    }
+
+    /// A Settings leaf's carried drafts are part of the handoff layout's wire and
+    /// the capture stays a FIXED POINT of the parse — the property the update
+    /// worker checks (`from_toml(to_toml(layout)) == layout`) and the layout
+    /// digest is taken over. Text with quotes, newlines and non-ASCII survives.
+    #[test]
+    fn settings_drafts_ride_the_handoff_layout_as_a_fixed_point() {
+        let layout = settings_handoff_layout(vec![
+            draft("font_family", "Menlo \"Nerd\"\nFont"),
+            draft("shell", "/bin/zsh -l \u{3042}"),
+        ]);
+        let wire = layout.to_toml().expect("serialize");
+        let parsed = RestoreManifest::from_toml(&wire).expect("the layout parses");
+        assert_eq!(parsed, layout, "the capture is a fixed point of the parse");
+        assert_eq!(parsed.to_toml().unwrap(), wire);
+        let RestoredSplitTree::Leaf {
+            view: RestoredView::Native(native),
+        } = &parsed.windows[0].restored_tabs[0].root
+        else {
+            panic!("the Settings leaf");
+        };
+        assert_eq!(native.settings_drafts.len(), 2);
+        assert_eq!(native.settings_drafts_unreadable, 0);
+        assert!(
+            !settings_handoff_layout(Vec::new())
+                .to_toml()
+                .unwrap()
+                .contains("settings_drafts"),
+            "a layout with no draft is byte-identical to what an older consumer reads"
+        );
+    }
+
+    /// THE LENIENT CONSUMER: a carried draft this build cannot read or reopen
+    /// costs that draft — counted, so the successor says so — never the leaf,
+    /// the layout, or the handoff.
+    #[test]
+    fn an_unreadable_settings_draft_costs_the_draft_not_the_layout() {
+        let parse = |tag: &str, extra: &str| -> NativeLeafRestore {
+            let route = if tag == "settings" {
+                "route = \"/home\"\n"
+            } else {
+                "uri = \"file:///tmp/notes.md\"\n"
+            };
+            let wire = format!("kind = \"native\"\nrestore_tag = \"{tag}\"\n{route}{extra}");
+            let mut view: RestoredView = aterm_toml::from_str(&wire)
+                .unwrap_or_else(|error| panic!("a draft never fails the leaf: {error:?}\n{wire}"));
+            view.sanitize();
+            let RestoredView::Native(native) = view else {
+                panic!("the leaf stays native");
+            };
+            assert!(view_is_bounded(&native), "{native:?}");
+            native
+        };
+        let garbage = parse("settings", "settings_drafts = \"garbage\"\n");
+        assert!(garbage.settings_drafts.is_empty());
+        assert_eq!(garbage.settings_drafts_unreadable, 1);
+
+        let long = "x".repeat(MAX_SETTINGS_DRAFT_TEXT_BYTES + 1);
+        let mixed = parse(
+            "settings",
+            &format!(
+                "settings_drafts = [{{ key = \"font_family\", text = \"Mono\" }}, {{ key = 7, \
+                 text = \"x\" }}, \"loose\", {{ key = \"font_family\", text = \"again\" }}, \
+                 {{ key = \"shell\", text = \"a\\u0000b\" }}, {{ key = \"padding\", text = \
+                 \"{long}\" }}, {{ key = \"\", text = \"keyless\" }}]\n"
+            ),
+        );
+        assert_eq!(mixed.settings_drafts, vec![draft("font_family", "Mono")]);
+        assert_eq!(
+            mixed.settings_drafts_unreadable, 6,
+            "a wrong type, a stray value, a repeat, a NUL, an overlong text and an empty key"
+        );
+
+        let editor = parse(
+            "editor",
+            "settings_drafts = [{ key = \"font_family\", text = \"Mono\" }]\n",
+        );
+        assert!(
+            editor.settings_drafts.is_empty(),
+            "only a Settings leaf carries drafts"
+        );
+        assert_eq!(editor.settings_drafts_unreadable, 1);
+
+        let over = parse(
+            "settings",
+            &format!(
+                "settings_drafts = [{}]\n",
+                (0..=MAX_SETTINGS_DRAFTS_PER_VIEW)
+                    .map(|index| format!("{{ key = \"k{index}\", text = \"v\" }}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        assert_eq!(over.settings_drafts.len(), MAX_SETTINGS_DRAFTS_PER_VIEW);
+        assert_eq!(over.settings_drafts_unreadable, 1);
+    }
+
+    fn view_is_bounded(native: &NativeLeafRestore) -> bool {
+        RestoredView::Native(native.clone()).bounded()
     }
 
     /// The manifest survives a TOML round-trip byte-for-byte (structure + order + cwd +

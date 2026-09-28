@@ -1020,15 +1020,29 @@ pub struct Held {
     /// What it runs, one line. Empty unless it is the agent's own Bash-tool
     /// shell, a direct child of the agent. The notice is a user turn, so it
     /// quotes only what the agent itself ran, never a line a script it ran
-    /// put deeper down (`upgrade_drive::held_of`).
+    /// put deeper down (`upgrade_drive::held_of`). A long one is quoted with
+    /// the middle of its long paths elided ([`HELD_PATH_CHARS`]).
     pub command: String,
 }
 
 /// The most processes [`running_clause`] names; the rest are counted.
 pub const HELD_NAMED: usize = 5;
 
-/// The longest command [`running_clause`] quotes, in characters.
+/// The longest command [`running_clause`] quotes, in characters. A longer one
+/// has the middle of each long path elided first ([`HELD_PATH_CHARS`]), and
+/// what is still over is cut here, the cut marked with `…`.
 pub const HELD_COMMAND_CHARS: usize = 160;
+
+/// The longest path a command over [`HELD_COMMAND_CHARS`] keeps whole, in
+/// characters. A longer one keeps its root through its first name, and its
+/// last name, the middle elided (`D=/Users/…/wf_examplerun-1;`); the pid the
+/// notice names gives the rest (`ps -o args= -p <pid>`). Measured 2026-09-27:
+/// two shells held a tab five days on a closer whose `D=` path alone was 119
+/// characters, and the cut quoted each as that path and then `; tail -f -n +1
+/// "$D/journal.jsonl" | /us…`, the `grep -m1` that made its `tail -f` a wait
+/// that can never end cut away. An ordinary path is shorter than this, and a
+/// URL is never a path here (`path_middle`): both are quoted whole.
+pub const HELD_PATH_CHARS: usize = 64;
 
 /// THE NOTICE'S LIST OF WHAT RUNS UNDER THE AGENT (the same 2026-09-26 tab as
 /// [`STOPPING_POINT`]). Every notice appends it when anything runs, a re-ask
@@ -1051,8 +1065,8 @@ pub fn running_clause(held: &[Held]) -> String {
 /// period: `pid 63492 (zsh, 5d4h): <command>; pid …; and 2 more`. The notice
 /// wraps it for the agent ([`running_clause`]) and the give-up's ledger row
 /// for the owner. At most [`HELD_NAMED`] processes are named and the rest
-/// counted, and each command is cut to [`HELD_COMMAND_CHARS`]. Empty when
-/// nothing runs.
+/// counted, and each command is quoted in [`HELD_COMMAND_CHARS`], its long
+/// paths elided before the cut (`command_words`). Empty when nothing runs.
 #[must_use]
 pub fn held_list(held: &[Held]) -> String {
     let mut out = String::new();
@@ -1060,7 +1074,7 @@ pub fn held_list(held: &[Held]) -> String {
         if i > 0 {
             out.push_str("; ");
         }
-        let command = one_line(&h.command, HELD_COMMAND_CHARS);
+        let command = command_words(&h.command, HELD_COMMAND_CHARS);
         let _ = write!(
             out,
             "pid {} ({}, {})",
@@ -1092,6 +1106,109 @@ fn one_line(text: &str, max: usize) -> String {
     let mut cut: String = flat.chars().take(max.saturating_sub(1)).collect();
     cut.push('…');
     cut
+}
+
+/// A held command as [`held_list`] quotes it: [`one_line`], and when that
+/// is over `max`, each long path's middle elided first ([`path_middle`]),
+/// so what a long path would push past the cut stays in view. The cut stays
+/// the backstop. Every character is still the agent's own, or the `…` the cut
+/// already uses, in the agent's order: the notice quotes only what the agent
+/// itself ran ([`Held::command`]). A word inside a quote is never elided,
+/// whatever it looks like: there a path can be the very pattern a wait turns
+/// on (`grep -m1 -F "wrote <path>"`).
+fn command_words(text: &str, max: usize) -> String {
+    let flat = one_line(text, usize::MAX);
+    if flat.chars().count() <= max {
+        return flat;
+    }
+    let mut quote = None;
+    let words: Vec<String> = flat
+        .split(' ')
+        .map(|word| {
+            let elided = quote.is_none().then(|| path_middle(word)).flatten();
+            quote = quote_after(quote, word);
+            elided.unwrap_or_else(|| word.to_string())
+        })
+        .collect();
+    one_line(&words.join(" "), max)
+}
+
+/// The quote a shell word leaves open, given the one open before it: `'`
+/// opens and closes a single quote, `"` a double one, and outside a single
+/// quote a `\` escapes the character after it.
+fn quote_after(mut quote: Option<char>, word: &str) -> Option<char> {
+    let mut escaped = false;
+    for c in word.chars() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote != Some('\'') {
+            escaped = true;
+        } else if quote.is_none() && matches!(c, '\'' | '"') {
+            quote = Some(c);
+        } else if quote == Some(c) {
+            quote = None;
+        }
+    }
+    quote
+}
+
+/// `word` with its path's middle elided (`D=/Users/…/wf_examplerun-1;`),
+/// when it is a PATH over [`HELD_PATH_CHARS`]: after at most an assignment
+/// (`D=`, `--out=`) or a redirection (`>`, `2>>`), a `/` or `~/` root, then
+/// only letters, digits and `/._-+@,`, then at most a shell separator
+/// (`;`, `&`, `|`, `)`). A URL, a glob, a variable, a quote or an escape is
+/// none of that, so it is never elided. `None` for any other word, and for a
+/// path that would come out no shorter.
+fn path_middle(word: &str) -> Option<String> {
+    if word.chars().count() <= HELD_PATH_CHARS {
+        return None;
+    }
+    let lead = match word.split_once('=') {
+        Some((name, _))
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) =>
+        {
+            name.len() + 1
+        }
+        _ => {
+            let redirect = word
+                .trim_start_matches(|c: char| c.is_ascii_digit() || matches!(c, '&' | '<' | '>'));
+            let redirect = &word[..word.len() - redirect.len()];
+            if redirect.contains(['<', '>']) {
+                redirect.len()
+            } else {
+                0
+            }
+        }
+    };
+    let rest = &word[lead..];
+    let path = rest.trim_end_matches([';', '&', '|', ')']);
+    let root = usize::from(path.starts_with("~/"));
+    let rooted = &path[root..];
+    if !rooted.starts_with('/')
+        || !rooted.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '@' | ',')
+        })
+    {
+        return None;
+    }
+    // Every byte is ASCII from here, so each index below is a character's.
+    let named = path.len() - rooted.trim_start_matches('/').len();
+    let first = named + path[named..].find('/')?;
+    let last = path.trim_end_matches('/').rfind('/')?;
+    if last <= first {
+        return None;
+    }
+    let elided = format!(
+        "{}{}/…{}{}",
+        &word[..lead],
+        &path[..first],
+        &path[last..],
+        &rest[path.len()..]
+    );
+    (elided.chars().count() < word.chars().count()).then_some(elided)
 }
 
 /// [`prepare_prompt`] for a restart that ALSO moves the conversation to
@@ -2460,12 +2577,15 @@ pub struct Facts {
     /// its turn is over and all that runs is work it started — a dynamic
     /// workflow, a background agent, a shell, a Codex background terminal —
     /// as the session's own loop read it and saw it stand [`QUIET_S`]
-    /// (`supervise`'s `BACKGROUND_SETTLE`). There, and only there, Claude's
-    /// own `busy`/`shell` status is no wait for a NOTICE: the first one, or a
+    /// (`supervise`'s `BACKGROUND_SETTLE`). There — and where that status
+    /// only lags an idle screen ([`status_lags`]) — Claude's own
+    /// `busy`/`shell` status is no wait for a NOTICE: the first one, or a
     /// re-ask once [`REASK_S`] has passed since the last. The loop's settle
     /// stands for the screen's, since a workflow's progress line never holds
     /// still. The restart is an idle point's ([`next_step`]: `background`);
-    /// a READY a person held past the drain is voided here as there.
+    /// a READY a person held past the drain is voided here as there, and the
+    /// release a give-up, a void or a stop owes is typed here as there
+    /// ([`gate_release`]).
     pub background_point: bool,
     /// THE CONVERSATION HAS NO TASK ([`TaskScan`]: nobody but the harness has
     /// asked it anything): there is nothing to preserve and no answer a
@@ -2556,6 +2676,14 @@ pub struct Facts {
     /// alone could give up on a READY answered seconds before, when the agent
     /// wound down past the interval as the notice itself asks).
     pub ready_s: u64,
+    /// How many of the driver's looks in a row, this one included, read the
+    /// screen AUTHORITATIVELY IDLE by the session's own reader
+    /// ([`aterm_phase::read_at`]: the prompt box drawn and holding the
+    /// cursor, no spinner, no busy footer, no box, no wall — the reading the
+    /// window's loop vets an idle point by); 0 for a look that read anything
+    /// else. What Claude's own `busy`/`shell` status is read against
+    /// ([`IDLE_LOOKS`], [`gate_announce`]).
+    pub idle_looks: u32,
     /// Seconds since the upgrade's round STOPPED ([`Phase::Failed`]), the
     /// driver's stamp (`upgrade_drive::St::failed_at`; 0: not stopped, or
     /// stopped at this very look). A stop an older build recorded carries no
@@ -2563,6 +2691,14 @@ pub struct Facts {
     /// re-armed ([`Step::Rearm`]): no stop is for good.
     pub failed_s: u64,
 }
+
+/// How many looks in a row must read the screen authoritatively idle
+/// ([`Facts::idle_looks`]), Claude's own status standing [`QUIET_S`], before
+/// that status is read against the screen and the work under the agent
+/// ([`gate_announce`]): the second look at an idle point — one look is a
+/// moment, and a status Claude has not written yet at the very end of a
+/// turn is no disagreement.
+pub const IDLE_LOOKS: u32 = 2;
 
 /// THE LIMIT FACT ([`Facts::limited`]) of a screen of `agent`'s, by the ONE
 /// recogniser the supervisor reads a usage or rate limit with — never a
@@ -2649,7 +2785,8 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 /// background work and nothing else, stood [`QUIET_S`]
 /// ([`Facts::background_point`]; the owner's answer of 2026-09-26: an agent
 /// that orchestrates all day would otherwise never hear of its upgrade). A
-/// step taken anywhere else still waits `not-idle` there.
+/// step taken anywhere else still waits `not-idle` there, unless the status
+/// lags an idle screen (below).
 ///
 /// AT A BREAK OF THE AGENT'S OWN BACKGROUND WORK ([`Facts::background_point`])
 /// the notice is typed all the same (the owner's answer of 2026-09-26). It
@@ -2673,8 +2810,37 @@ pub fn attended_by(human: crate::supervise::screen::HumanInput, grace_s: u32) ->
 /// ([`Facts::queued`]): it waits `queued` — the driver lifts that fact
 /// itself for the owner's `--now` given since the latest notice, and once
 /// the queue has rested.
+///
+/// CLAUDE'S OWN STATUS IS READ AGAINST ITS SCREEN (2026-09-27). The status
+/// is a third party's record, and a break was read off the screen's words
+/// alone: a build whose idle screen draws no shell count, over shells that
+/// ran under the agent with its status at `shell`, waited `not-idle` at every
+/// idle point — no notice, so no re-ask and no give-up, for as long as the
+/// shells ran — and a status left behind over an idle screen waited the
+/// same. Once the status LAGS a turn that is over ([`status_lags`]: `busy`
+/// or `shell`, standing [`QUIET_S`], over a screen the session's own reader
+/// read authoritatively idle [`IDLE_LOOKS`] looks in a row), it is no wait
+/// for ONE LINE — the notice, as at a break, or the release a stop owes
+/// ([`gate_release`]): each types one turn and ends nothing. It is never read
+/// past for the RESTART ([`gate_restart`]): the Drain step asks Claude's own
+/// `idle` of the signal, and work inside the agent's own process — a
+/// background agent, a workflow — is no process under it, the status the
+/// one word that says it runs (the review of 2026-09-27). The restart waits
+/// `background` while work runs under the agent and `status-stale` while
+/// only the status holds, and the re-ask and the drain bound both waits
+/// ([`next_step`]). Short of a lag, a status the idle screen does not bear
+/// out waits `status-stale` too, named for the owner. A turn still running —
+/// a foreground Bash call among them — never reads authoritatively idle (its
+/// spinner, its busy footer), and a person's `waiting` is never read past.
 #[must_use]
 pub fn gate_announce(f: &Facts) -> Gate {
+    gate(f, status_lags(f))
+}
+
+/// [`gate_announce`] with Claude's own `busy`/`shell` read past where
+/// `lags` — its [`status_lags`] for a line, never for the restart
+/// ([`gate_restart`]).
+fn gate(f: &Facts, lags: bool) -> Gate {
     if f.held {
         return Gate::Wait("held");
     }
@@ -2690,9 +2856,14 @@ pub fn gate_announce(f: &Facts) -> Gate {
     if f.queued {
         return Gate::Wait("queued");
     }
-    let at_break = f.background_point && matches!(f.status.as_str(), "idle" | "busy" | "shell");
+    let own_work = matches!(f.status.as_str(), "busy" | "shell");
+    let at_break = (f.background_point || lags) && (f.status == "idle" || own_work);
     if f.status != "idle" && !at_break {
-        return Gate::Wait("not-idle");
+        return Gate::Wait(if own_work && f.idle_looks > 0 {
+            "status-stale"
+        } else {
+            "not-idle"
+        });
     }
     if f.busy_footer {
         return Gate::Wait("busy");
@@ -2712,6 +2883,21 @@ pub fn gate_announce(f: &Facts) -> Gate {
     Gate::Go
 }
 
+/// Whether Claude's own status LAGS A TURN THAT IS OVER ([`gate_announce`]):
+/// it reads `busy` or `shell` — the agent's own work, never a person's
+/// `waiting` — has stood [`QUIET_S`], and the session's own reader has read
+/// the screen authoritatively idle [`IDLE_LOOKS`] looks in a row
+/// ([`Facts::idle_looks`]). What runs under the agent then is its own work;
+/// with nothing there, the status is stale — for a line. Never for the
+/// restart ([`gate_restart`]): what may still run in the agent's own
+/// process is no process under it, and only this status says it runs.
+#[must_use]
+pub fn status_lags(f: &Facts) -> bool {
+    matches!(f.status.as_str(), "busy" | "shell")
+        && f.status_age_s >= QUIET_S
+        && f.idle_looks >= IDLE_LOOKS
+}
+
 /// May the agent be ended now? Everything [`gate_announce`] asks, plus the
 /// agent's READY answer and NOTHING running under it. Nothing is ever killed to
 /// reach this gate: background work is waited for. What bounds that wait is
@@ -2722,6 +2908,27 @@ pub fn gate_announce(f: &Facts) -> Gate {
 /// answer or not, and only the owner's own `--now` waives it
 /// ([`Facts::owner_now`]). A SIGTERM in front of a person reading the answer is
 /// the one act the upgrade cannot take back.
+///
+/// CLAUDE'S OWN `idle`, NEVER A STATUS THAT ONLY LAGS (the Drain step; the
+/// review of 2026-09-27): a `busy` or `shell` the idle screen does not bear
+/// out ([`status_lags`]) lets one line go, and holds the signal here —
+/// `status-stale` — whatever runs under the agent: work inside its own
+/// process is no process under it, the status the one word that says it
+/// runs, and the restart never kills running work. The READY such a wait
+/// holds is bounded as one the agent's work holds is ([`next_step`]: asked
+/// again, given up on, a gave-up upgrade's voided), so the agent is released,
+/// never left stopped. A conversation with no task is not restarted afresh
+/// on it either ([`Step::Fresh`]).
+///
+/// NEVER AT A BREAK OF THE AGENT'S OWN WORK ([`Facts::background_point`]):
+/// where [`gate`] lets a line go there, the restart waits `background` —
+/// the work the break stands for runs, and work inside the agent's own
+/// process is no process under it, so [`Facts::background`] alone never
+/// names it. [`next_step`]'s break arm answers every phase there before this
+/// gate is asked, and the drivers' [`break_step`] turns an end into a wait;
+/// the gate says the same (the merge review of 2026-09-27: the merge left it
+/// answering `Go` there, on the owner's `--now` too), so no caller that asks
+/// it at a break is handed the restart.
 #[must_use]
 pub fn gate_restart(f: &Facts, ready: bool) -> Gate {
     if !ready {
@@ -2730,7 +2937,21 @@ pub fn gate_restart(f: &Facts, ready: bool) -> Gate {
     if !f.background.is_empty() {
         return Gate::Wait("background");
     }
-    gate_announce(f)
+    match gate(f, false) {
+        Gate::Go if f.background_point => Gate::Wait("background"),
+        gate => gate,
+    }
+}
+
+/// Whether the restart's gate waits on the AGENT'S OWN WORK (`w`, the
+/// gate's wait): what runs under it, or what a break of its own work stands
+/// for (`background`: [`gate_restart`] at a break, and [`next_step`]'s break
+/// arm before it), or what Claude's own status says still runs over an idle
+/// screen (`status-stale`). Neither is ever ended; both are bounded — a
+/// READY they hold is asked again once [`REASK_S`] has passed, and a gave-up
+/// upgrade's is void past [`DRAIN_S`] ([`next_step`], [`void_of`]).
+fn own_work_holds(w: &str) -> bool {
+    matches!(w, "background" | "status-stale")
 }
 
 /// Which of the gates' facts only a PERSON can clear, if one holds now: `box` — an
@@ -3058,9 +3279,20 @@ pub fn retry_due(phase: &Phase, failed_s: u64, ready: bool) -> bool {
 /// ([`Facts::background_point`]) only a NOTICE is taken: the first one, and
 /// a re-ask once a whole [`REASK_S`] has passed since the last one
 /// ([`reask`]) — or, its asks spent, the give-up. A READY a person held past
-/// the drain is voided there as at an idle point. The restart, and a gave-up
-/// upgrade's late READY, wait for an idle point (`background`: the agent's
-/// own work runs); [`break_step`] is the one rule both drivers hold a break to.
+/// the drain is voided there as at an idle point. The restart waits for an
+/// idle point (`background`: the agent's own work runs): the break arm
+/// answers every phase but a pending one's before [`gate_restart`] is asked,
+/// [`break_step`] is the one rule both drivers hold a break to, and
+/// [`gate_restart`] itself waits `background` there. The break arm's words
+/// (2026-09-27: two widowed `tail -f` shells made every screen a break for
+/// days, and a break answered `background` for any phase before looking at
+/// it — the release a give-up owed was never typed, and a late READY the
+/// shells outlived was never voided): an announced upgrade within its window
+/// waits `background`; a stopped round waits `failed`, its release next
+/// ([`gate_release`] types it at a break too); a gave-up upgrade's late READY
+/// waits `background` until the drain voids it ([`void_of`], below); and any
+/// other phase — a move done, or a restart in flight, which the drivers
+/// carry and never step — waits `background`.
 ///
 /// THE AGENT'S OWN WORK BOUNDS NO WAIT, BUT IT DOES BOUND THE SILENCE
 /// (2026-09-26). A tab sat four days on an old Claude Code: behind
@@ -3075,10 +3307,17 @@ pub fn retry_due(phase: &Phase, failed_s: u64, ready: bool) -> bool {
 /// work under the agent still outlives by a whole [`REASK_S`] of the answer's
 /// own ([`Facts::ready_s`]): the new notice SUPERSEDES that answer — it is no
 /// longer the agent's last word after the latest notice — where a void would
-/// type the release line ("no restart is coming now") only for the next
+/// type the release line ("the upgrade is off for now") only for the next
 /// notice to follow it on its heels. Each re-ask names what runs (the driver's
 /// [`running_clause`]), and past [`MAX_ASKS`] the upgrade gives up and says
 /// what held it. `gave-up` is what the owner's `--now` re-arms.
+///
+/// A STATUS OF CLAUDE'S OWN THAT ONLY LAGS ITS IDLE SCREEN is held the same
+/// way (the review of 2026-09-27): the restart waits `status-stale` for
+/// Claude's own `idle` ([`gate_restart`]), and a READY that wait outlives by
+/// a whole [`REASK_S`] is superseded by a new notice, the asks spent a
+/// give-up, and a gave-up upgrade's void past [`DRAIN_S`] ([`void_of`]): the
+/// agent is released, never ended on a word that says work still runs.
 ///
 /// A conversation with NO TASK ([`Facts::taskless`]) is never announced to:
 /// once [`gate_restart`] would let a READY agent go — its settle waived — it
@@ -3223,9 +3462,10 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
                     Gate::Go => Step::Terminate,
                     Gate::Wait(w) => match person_void(f, since >= DRAIN_S) {
                         Some(who) => Step::Void(who),
-                        // The agent's own work outlives the answer: asked
+                        // The agent's own work outlives the answer — what
+                        // runs under it, or what its status says runs: asked
                         // again, naming what runs, or given up on.
-                        None if w == "background" && clock(since, f, ready) >= REASK_S => {
+                        None if own_work_holds(w) && clock(since, f, ready) >= REASK_S => {
                             reask(f, *asks)
                         }
                         None => Step::Wait(w),
@@ -3287,9 +3527,15 @@ fn person_void(f: &Facts, drained: bool) -> Option<&'static str> {
 /// BACKGROUND work ([`Facts::background`]) still running under it
 /// [`DRAIN_S`] after the answer ([`Facts::ready_s`]) — the agent said
 /// nothing of its own still runs, and whatever does (a `run_in_background`
-/// server, a watcher) will not end on its own. Anything else the gate waits
-/// on — the settle, the agent's own turn, a person's hand, aterm's hold, the
-/// limit — passes, and the restart follows it.
+/// server, a watcher) will not end on its own — or at a break
+/// ([`Facts::background_point`]) that long, whatever runs there, inside the
+/// agent's own process too (a workflow it waits on: `background`,
+/// [`next_step`]'s break arm) — or Claude's own status still
+/// saying work runs over an idle screen that long (`status-stale`, the review
+/// of 2026-09-27: the restart never takes it for idle, so the answer it holds
+/// is voided the same way). Anything else the gate waits on — the settle,
+/// the agent's own turn, a person's hand, aterm's hold, the limit — passes,
+/// and the restart follows it.
 ///
 /// The review of 2026-09-26 found the gave-up arm with no bound at all: a
 /// READY a person's box held for hours ended the agent seconds after the box
@@ -3302,7 +3548,7 @@ fn person_void(f: &Facts, drained: bool) -> Option<&'static str> {
 /// the next notice would contradict.
 fn void_of(f: &Facts, w: &'static str, drained: bool) -> Option<&'static str> {
     person_void(f, drained)
-        .or_else(|| (drained && w == "background" && f.ready_s >= DRAIN_S).then_some("background"))
+        .or_else(|| (drained && own_work_holds(w) && f.ready_s >= DRAIN_S).then_some(w))
 }
 
 /// Since when the READY answer the upgrade acts on has stood, for
@@ -3380,21 +3626,25 @@ pub fn release_is_next(why: &str) -> bool {
 /// ACTS ON — an announced upgrade's, or a late one a gave-up upgrade still
 /// hears; the restart goes first, and its carry-on is what tells the agent to
 /// continue), and otherwise under exactly the gate the notice is typed under
-/// ([`gate_announce`]) at an idle point: no hold, no person, no limit, Claude
-/// idle and settled, no box, no draft, no busy footer. A READY no phase acts
-/// on — the answer to an upgrade that has since stopped — holds nothing: the
-/// review of 2026-09-26 found a restart refused after READY waiting
-/// `ready` here for ever, the agent it had asked neither restarted nor
-/// released.
+/// ([`gate_announce`]): no hold, no person, no limit, Claude idle and settled
+/// — or a break of the agent's own work the loop settled
+/// ([`Facts::background_point`]) — no box, no draft, no busy footer. A READY
+/// no phase acts on — the answer to an upgrade that has since stopped —
+/// holds nothing: the review of 2026-09-26 found a restart refused after
+/// READY waiting `ready` here for ever, the agent it had asked neither
+/// restarted nor released.
+///
+/// AT A BREAK TOO (2026-09-27): the line types one turn and ends nothing, as
+/// a notice does. Kept to idle points, it was never typed into a session
+/// whose background shells never ended — two widowed `tail -f` made every
+/// screen a break for days — and the agent the upgrade gave up on was left
+/// stopped for as long as they ran.
 #[must_use]
 pub fn gate_release(f: &Facts, ready: bool) -> Gate {
     if ready {
         return Gate::Wait("ready");
     }
-    gate_announce(&Facts {
-        background_point: false,
-        ..f.clone()
-    })
+    gate_announce(f)
 }
 
 /// How [`release_prompt`] opens: the harness's tag, and words no notice
@@ -3430,9 +3680,10 @@ pub fn release_prompt(agent: Agent) -> String {
 /// WHAT A BREAK OF THE AGENT'S OWN BACKGROUND WORK MAY DO
 /// ([`Facts::background_point`]): type a notice, void a READY answer a person
 /// or the agent's own work held, give up asking, start a new round of a
-/// stopped one, or wait. All of them type at most a notice and end
-/// nothing. Any other step (the end) becomes a wait on that work
-/// (`background`), whatever the plan says. There is one rule, and both
+/// stopped one, or wait — and, after a give-up, a void or a stop, the one
+/// release line (`upgrade_drive::release`). All of them type at most one
+/// line and end nothing. Any other step (the end) becomes a wait on that
+/// work (`background`), whatever the plan says. There is one rule, and both
 /// drivers apply it: `upgrade_drive` and the Codex lane.
 #[must_use]
 pub fn break_step(step: Step) -> Step {
@@ -3629,10 +3880,12 @@ pub fn rearm_held(request: &Request, step: Step, target: &str, now_s: u64) -> St
 /// shell and a question waiting on a person, which `not-idle` alone erased
 /// (measured 2026-09-24: `step=wait:not-idle` for 8h22m on two sessions, and
 /// nothing said which). The status is a third party's word, so it is cut to
-/// `[a-z-]`, 16 bytes; nothing else is added to it.
+/// `[a-z-]`, 16 bytes; nothing else is added to it. So is `status-stale`
+/// (`status-stale:busy`): the status an idle screen does not bear out
+/// ([`gate_announce`]).
 #[must_use]
 pub fn wait_word(why: &str, status: &str) -> String {
-    if why != "not-idle" {
+    if why != "not-idle" && why != "status-stale" {
         return why.to_string();
     }
     let status: String = status

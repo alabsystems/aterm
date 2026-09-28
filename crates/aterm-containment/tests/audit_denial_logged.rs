@@ -236,3 +236,40 @@ fn decide_permit_is_not_logged_as_denied() {
         );
     }
 }
+
+#[test]
+fn posture_claims_resource_limits_only_for_the_mode_that_has_them() {
+    // Both launchers give Master and User aterm's own limits
+    // (`Limits::inherit`) and Safety the hardened ones (`Limits::shell_default`),
+    // so only Safety's no-sandbox record may claim resource limits. A single
+    // wording for all three once told every default (User) launch it had limits.
+    let _lock = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _ = aterm_log::set_logger(&LOGGER);
+    aterm_log::set_max_level(aterm_log::LevelFilter::Info);
+
+    for (mode, hardened) in [
+        (ContainmentMode::Master, false),
+        (ContainmentMode::User, false),
+        (ContainmentMode::Safety, true),
+    ] {
+        captured().lock().unwrap().clear();
+        assert!(
+            aterm_containment::decide_spawn(mode).is_permitted(),
+            "{mode}"
+        );
+        let records = captured().lock().unwrap();
+        assert_eq!(records.len(), 1, "one posture line for {mode}");
+        let message = &records[0].message;
+        assert!(message.contains("OS sandbox not applied"), "{message}");
+        assert_eq!(
+            message.contains("resource limits + process-cap gate only"),
+            hardened,
+            "{message}"
+        );
+        assert_eq!(
+            message.contains("resource limits inherited from aterm's own process"),
+            !hardened,
+            "{message}"
+        );
+    }
+}

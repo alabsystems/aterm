@@ -1010,7 +1010,7 @@ fn connect_for_reader(
 
 /// Usage, printed to stderr on a usage error (exit 2, aterm's convention).
 const USAGE: &str = "\
-aterm-link notify — run a command when the fabric needs a human (§9.3)
+aterm-link notify — run a command when the fabric needs a human
 
   aterm-link notify --fleet <F> --broker <ep> --cap-file <path>...
                     --on <attention|ask:<p>|halt>,... --exec <cmd> [options]
@@ -1025,7 +1025,7 @@ aterm-link notify — run a command when the fabric needs a human (§9.3)
   --exec-timeout <ms>    how long the command may run before it is killed (30000)
   --state <dir>          the state dir; the journal lives in <dir>/notify/
   --tcp                  reach the broker over TCP — PLAINTEXT unless --key-file
-  --key-file <path>      astream's sealed wire (needs --tcp; see `ls` for the build note)
+  --key-file <path>      the sealed wire's key (needs --tcp and a `sealed` build)
 
 The command runs once per matching OFFSET, deduped durably across a restart. The
 one window that cannot be closed is the exec itself: a crash between the spawn
@@ -1040,6 +1040,13 @@ arrives twice is the failure this verb chooses; one that never arrives is not.
 /// Never: every failure is an exit code and a line on stderr.
 #[must_use]
 pub fn main(args: &[String]) -> ExitCode {
+    // A BUILD WITHOUT THE SEALED WIRE refuses it by name, before the key file
+    // is read and without the usage under it, rather than following selectors
+    // whose every subscribe fails, every 5 s, for ever — `serve`'s rule.
+    if let Some(refusal) = transport::sealed_flags_refusal(args) {
+        eprintln!("aterm-link notify: --key-file: {refusal}");
+        return ExitCode::from(2);
+    }
     let cfg = match parse(args) {
         Ok(cfg) => cfg,
         Err(e) => {
@@ -1168,7 +1175,8 @@ fn parse(args: &[String]) -> Result<Config, String> {
             Transport::Tcp
         }
         (true, Some(path)) => Transport::Sealed(Box::new(
-            transport::read_key_file(&path).map_err(|e| format!("--key-file {path}: {e}"))?,
+            transport::read_key_file(&path)
+                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
         )),
         (false, Some(_)) => {
             return Err("--key-file needs --tcp (the sealed wire is a TCP transport)".to_string())
@@ -1208,6 +1216,25 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A BUILD WITHOUT THE SEALED WIRE refuses notify's `--tcp --key-file` by
+    /// name in `main`, before `parse` reads the key file (which does not exist
+    /// here, so the refusal is the only answer that can name the feature).
+    #[cfg(not(feature = "sealed"))]
+    #[test]
+    fn a_default_build_refuses_the_sealed_wire_by_name() {
+        let args: Vec<String> =
+            "--fleet f1 --broker 127.0.0.1:7000 --on halt --exec true --tcp --key-file /none/k"
+                .split(' ')
+                .map(str::to_string)
+                .collect();
+        let why = transport::sealed_flags_refusal(&args).expect("a default build refuses");
+        assert!(why.contains("`sealed` cargo feature"), "{why}");
+        let Err(e) = parse(&args) else {
+            panic!("a key file that does not exist parsed");
+        };
+        assert!(e.starts_with("--key-file /none/k: "), "{e}");
+    }
 
     /// A slow `--exec` leaves the consumer unavailable. Readers must stop at
     /// their current row rather than queue broker bodies while it runs. Once

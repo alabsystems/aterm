@@ -1101,6 +1101,10 @@ pub fn model_registry() -> Vec<Model> {
         // before retrying a waiting tab. Tier-1 drives the real restored
         // worker with a waiting first tab and a healthy second one.
         harness_restored_first_attempt_model(),
+        // The shared API probe's shutdown takes the waiter's mutex so its
+        // notification cannot be lost before parking. Tier-1 drives the real
+        // loop at this boundary, including the historical unlocked publisher.
+        netprobe_shutdown_park_model(),
         // The package pass record: the atpkg pass as the WRITER of `status.toml`'s stamps
         // and the schedulers that read them. Tier-1 drives the real pass and the real
         // `pkg_check` readers over a real record (atpkg `cli` tests).
@@ -1110,10 +1114,12 @@ pub fn model_registry() -> Vec<Model> {
         // (src/net/index_publish_conformance.rs); no `#[refines]` anchors.
         atpkg_index_publish_walk_model(),
         harness_upgrade_notice_owner_model(),
-        // The host's relaunch of an agent that left its tab: a person's or a
-        // holder's exit is theirs, the launch's own end is left, a limited one
-        // is said, any other is relaunched on a growing back-off or said to a
-        // person. Tier-1 in aterm-agent's `harness::relaunch` tests.
+        // The host's relaunch of an agent that left its tab: an exit the
+        // harness's own restart made is carried whoever is at the tab (S0 of
+        // the in-flight review, 2026-09-27), a person's or a holder's exit is
+        // theirs, the launch's own end is left, a limited one is said, any
+        // other is relaunched on a growing back-off or said to a person.
+        // Tier-1 in aterm-agent's `harness::relaunch` tests.
         harness_relaunch_on_exit_model(),
         // What an exit left of Claude Code's own record, read as the exit is seen
         // and kept: a crash is never read as a graceful exit because another Claude
@@ -1130,12 +1136,16 @@ pub fn model_registry() -> Vec<Model> {
         // the real classifier (`due_among`, `no_record`); no `#[refines]`
         // anchors.
         harness_upgrade_look_model(),
-        // The drain's bound against a person: Tier-1 bound to `upgrade::next_step`
-        // in aterm-agent's upgrade tests.
+        // The drain's bound against a person, and the agent's own work — a
+        // status of Claude's own that only lags an idle screen among it (the
+        // review of 2026-09-27): never ended on, never waited on in silence.
+        // Tier-1 bound to `upgrade::next_step` in aterm-agent's upgrade tests.
         harness_upgrade_drain_bound_model(),
         // The live upgrade never strands the agent it asked: never a notice
         // into a session at its usage limit, a late READY honoured after it
-        // gave up asking, and one release line for every notice it abandons.
+        // gave up asking, and one release line for every notice it abandons,
+        // at a break of the agent's own work too, and no stopped round a
+        // permanent wait (each re-armed once rested).
         // Tier-1 in aterm-agent's `harness::upgrade_drive` tests over the real
         // reducer, gates and record transitions; no `#[refines]` anchors.
         harness_upgrade_never_strands_model(),
@@ -1352,12 +1362,14 @@ pub fn model_registry() -> Vec<Model> {
         // crash-loop poison class). Tier-1 conformance + #[refines] anchors
         // live in aterm-update::manifest.
         native_update_failed_mark_suppression_model(),
-        // A STRUCTURAL convergence's latch (gap 14, 2026-09-26): one re-sample
-        // after a day, one attempt per newer verified release, never the launch
-        // the boot trial reverts on, and build N stays covered whatever the
-        // digest. Tier-1 + #[refines] anchors live in aterm-gui
-        // (`native_updater_conformance.rs` over the real `structural_latch`,
-        // `spend_physical_failure_budget` and `AutoApplyManualOnly::covers`).
+        // A STRUCTURAL convergence's latch (gap 14, 2026-09-26; round three): one
+        // re-sample after a day, never the launch the boot trial reverts on, a
+        // newer verified release takes the activation's place without launching
+        // it, and build N stays covered whatever the digest. Tier-1 + #[refines]
+        // anchors live in aterm-gui (`native_updater_conformance.rs` over the real
+        // `structural_latch`, `spend_physical_failure_budget`,
+        // `AutoApplyManualOnly::covers` and the retire's two answers,
+        // `finish_activation_supersede` / `say_activation_supersede_refused`).
         native_update_structural_latch_model(),
         trail_audio_lifecycle_model(),
         // The D5 reopen ladder between a device fault and exhaustion, and the
@@ -1550,6 +1562,16 @@ pub fn model_registry() -> Vec<Model> {
         // real successor App over one journal directory in
         // aterm-gui/src/editor_carry_conformance.rs.
         native_update_editor_carry_model(),
+        // An unsaved Settings draft rides a seamless self-update (2026-09-27,
+        // plan P2-2): the handoff layout carries each Settings view's field
+        // drafts, the successor reopens the view holding them (or says which it
+        // could not), the Commit re-captures and compares Settings leaves in
+        // full so a key typed during the overlap keeps the outgoing process, and
+        // neither the cold lane nor an older successor may spend a token that
+        // carries one. Tier-1 drives a real outgoing App and a real successor
+        // App over the real layout wire in
+        // aterm-gui/src/settings_draft_carry_conformance.rs.
+        native_update_settings_draft_carry_model(),
         // The crash journal's claim (2026-09-26, PTY keeper P1): a window's
         // layout journal is taken once, never while its owner runs, reopened
         // only after an unclean end the crash marker attests, never when the
@@ -1583,6 +1605,31 @@ pub fn model_registry() -> Vec<Model> {
         // the OSC-8 acceptance handler; Tier-1 conformance in aterm-core
         // (conformance_hyperlink_scheme_cap.rs).
         hyperlink_scheme_cap_model(),
+    ]
+}
+
+/// Every LIVENESS obligation, beside the registered model it is stated over.
+///
+/// The invariant ratchet (`tests/non_vacuity_ratchet.rs`) finds every invariant
+/// through [`model_registry`]; a liveness obligation is a companion value, not a
+/// model field (see [`crate::derive::Liveness`]), so this is where the sweep
+/// finds IT. Registering here puts the obligation under the workspace sweep:
+/// proved at the committed config, broken by each of its named mutants alone,
+/// on a model that is itself in [`model_registry`].
+// Skip: builds the registry by calling the (T2-classified) `*_model()` data
+// constructors — the vec! alloc + their absent bodies. Spec tooling, same tier
+// as `model_registry`.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn liveness_registry() -> Vec<(Model, crate::derive::Liveness)> {
+    use crate::derive::*;
+    vec![
+        // Law 1 of the apply ladder: the staged build lands (round three of the
+        // 2026-09 update robustness work, plan P1-7). Tier-0 in
+        // tests/derived_ring_ty.rs, interpreter and `ty` both.
+        (
+            native_update_apply_ladder_model(),
+            native_update_apply_ladder_liveness(),
+        ),
     ]
 }
 

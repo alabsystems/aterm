@@ -1413,9 +1413,9 @@ impl Plan {
             Self::Judge(found) => {
                 let n = found.receipt.failures.as_ref().map_or(0, Vec::len);
                 format!(
-                    "verify: base {} (the merge-base with {MAIN_REF}) — main's {} lists {n} red(s): \
-                     a red this run shares with it (same test, same failure) is INHERITED — named, \
-                     not blocking, until main has been red on it for {cap} h; any other red blocks\n",
+                    "verify: base {} (the merge-base with {MAIN_REF}) — main's {} lists {n} red(s); \
+                     the same red here is inherited, not blocking, until main has been red on it \
+                     {cap} h\n",
                     short(&found.commit),
                     found.source
                 )
@@ -1539,12 +1539,18 @@ pub fn resolve(root: &Path, head: &str, baseline: bool, tools: &Tools) -> Plan {
         },
         Err(e) => why.push_str(&format!("; published notes unavailable ({e})")),
     }
-    let hint = nearest(root, MAIN_REF).map_or_else(String::new, |n| {
-        format!(
-            "; the newest main commit with one is {} — merge it to be judged against it",
-            short(&n.commit)
-        )
-    });
+    // Named only when it is NEWER than the base: the walk from main's tip
+    // passes the base, which has no usable receipt, and finds an ancestor of
+    // it whenever nothing after it was baselined — and merging an ancestor
+    // leaves the merge-base where it is.
+    let hint = nearest(root, MAIN_REF)
+        .filter(|n| git_status(root, &["merge-base", "--is-ancestor", &n.commit, &base]).is_err())
+        .map_or_else(String::new, |n| {
+            format!(
+                "; the newest main commit with one is {} — merge it to be judged against it",
+                short(&n.commit)
+            )
+        });
     chained(format!(
         "no usable receipt for the base {} (the merge-base with {MAIN_REF}): {why}{hint}; \
          `tools/verify.sh --baseline` on {} records one",

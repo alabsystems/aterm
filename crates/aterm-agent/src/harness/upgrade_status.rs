@@ -45,8 +45,8 @@ use std::path::Path;
 use aterm_json::{Map, Value};
 
 use super::{
-    LiveTab, Opts, Phase, Report, Request, St, Version, connect, conversation_live, ledger, load,
-    now_s, process_group, save, session_files, state_dir, sweep_lock, tab_is_live,
+    LiveTab, Opts, Phase, Report, Request, STALE_S, St, Version, connect, conversation_live,
+    ledger, load, now_s, process_group, save, session_files, state_dir, sweep_lock, tab_is_live,
     unique_tab_for_group, upgrade,
 };
 
@@ -61,10 +61,11 @@ pub const STALLED_AFTER_S: u64 = 6 * 3_600;
 /// the window to record it once, and across a handoff.
 const DONE_SHOWN_S: u64 = 10 * 60;
 
-/// How long a Codex move that FAILED AFTER ITS EXIT stays in the host's
-/// summary — its band row, its `upgrade=` column, its tab's mark — once no
-/// process is left to vet it by ([`Row::exited_at`]): a day, so an owner away
-/// overnight still finds it, and not for good (the ledger keeps it).
+/// How long a move that FAILED AFTER ITS EXIT — a Codex `/exit`, a Claude
+/// Code SIGTERM — stays in the host's summary — its band row, its `upgrade=`
+/// column, its tab's mark — once no process is left to vet it by
+/// ([`Row::exited_at`]): a day, so an owner away overnight still finds it,
+/// and not for good (the ledger keeps it).
 pub const EXITED_FAILURE_SHOWN_S: u64 = 24 * 3_600;
 
 /// The keyed attention owner the host raises on a stalled tab.
@@ -78,6 +79,22 @@ pub const ATTENTION_OWNER: &str = "upgrade";
 /// of 2026-09-25: `Request::Now` never lapses, and it lowered the band row
 /// and the tab's mark for thirty days in a probe).
 pub const NOW_QUIETS_S: u64 = upgrade::REASK_S;
+
+/// ONE PROCESS UNDER THE AGENT THAT HELD THE MOVE at the last look that
+/// waited, as the owner is shown it ([`Row::held_by`]): its pid, its name and
+/// when it started. Its age is read off `since` at every look, so the same
+/// process reads the same row and the window is sent it once. Never what it
+/// runs: a command is the agent's own words, quoted to the agent alone
+/// ([`upgrade::running_clause`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldBy {
+    /// Its pid.
+    pub pid: u32,
+    /// Its executable's basename (`zsh`, `caffeinate`).
+    pub name: String,
+    /// When it started (unix seconds).
+    pub since: u64,
+}
 
 /// ONE CONVERSATION'S UPGRADE as the owner sees it, from its state file.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -131,14 +148,20 @@ pub struct Row {
     /// Which agent the upgrade moves: Claude Code, or Codex
     /// ([`super::codex`], filed per tab as `codex-<tab>`).
     pub agent: upgrade::Agent,
-    /// A Codex move: when the TUI its `/exit` was typed into was seen gone
-    /// (unix seconds; `0`: it lives, or no exit was typed). A move that
-    /// failed after it — no hint to resume, a relaunch refused or never come
-    /// up, a stale exit — has no process left to hold it, so it is not
-    /// vetted against one ([`Self::standing`]): until 2026-09-26 every such
-    /// failure was dropped from `--status`, the band and the `upgrade=`
+    /// When the agent the move ended was seen gone — the TUI a Codex `/exit`
+    /// was typed into, the Claude Code a SIGTERM was sent to (unix seconds;
+    /// `0`: it lives, or nothing ended it). A move that failed after it — no
+    /// hint to resume, a relaunch refused or never come up, a stale exit —
+    /// has no process left to hold it, so it is not vetted against one
+    /// ([`Self::standing`]): until 2026-09-26 every such Codex failure, and
+    /// until 2026-09-27 every such Claude Code one (S1 of the in-flight
+    /// review), was dropped from `--status`, the band and the `upgrade=`
     /// column, and the owner learned of it from the ledger alone.
     pub exited_at: u64,
+    /// What ran under the agent at the last look whose step waited
+    /// ([`HeldBy`], [`St::held_by`]): empty when nothing did, and once a
+    /// step acted.
+    pub held_by: Vec<HeldBy>,
     /// When a STOPPED round starts the next one (unix seconds): the stop's
     /// stamp plus [`upgrade::RETRY_S`] (`St::failed_at`; the owner,
     /// 2026-09-27: "you should NEVER have upgrades stalled"). `0` for a round
@@ -190,6 +213,7 @@ impl Row {
             model: st.model_list.clone(),
             agent: st.agent,
             exited_at: st.exited_at,
+            held_by: st.held_by.clone(),
             retry_at: if matches!(st.phase, Phase::Failed(_)) {
                 st.failed_at.saturating_add(upgrade::RETRY_S)
             } else {
@@ -206,6 +230,53 @@ impl Row {
         };
         row.stalled = row.stall(now);
         row
+    }
+
+    /// WHAT HELD THE MOVE at the last look that waited ([`Self::held_by`]),
+    /// in the owner's words at `now`: `pid 63492 (zsh, 5d4h); pid 63493
+    /// (zsh, 5d4h)`, at most [`upgrade::HELD_NAMED`] named and the rest
+    /// counted ([`upgrade::held_list`]) — no command. `None` when nothing
+    /// did.
+    #[must_use]
+    pub fn held_words(&self, now: u64) -> Option<String> {
+        let held: Vec<upgrade::Held> = self
+            .held_by
+            .iter()
+            .map(|h| upgrade::Held {
+                pid: h.pid,
+                name: h.name.clone(),
+                age_s: now.saturating_sub(h.since),
+                command: String::new(),
+            })
+            .collect();
+        let words = upgrade::held_list(&held);
+        (!words.is_empty()).then_some(words)
+    }
+
+    /// [`Self::held_words`] as one `--status` value: `63492(zsh:5d4h),…`,
+    /// `,+<n>` for the rest past [`upgrade::HELD_NAMED`], `-` for none.
+    fn held_token(&self, now: u64) -> String {
+        let mut out: Vec<String> = self
+            .held_by
+            .iter()
+            .take(upgrade::HELD_NAMED)
+            .map(|h| {
+                format!(
+                    "{}({}:{})",
+                    h.pid,
+                    word(&h.name),
+                    upgrade::span(now.saturating_sub(h.since))
+                )
+            })
+            .collect();
+        if self.held_by.len() > upgrade::HELD_NAMED {
+            out.push(format!("+{}", self.held_by.len() - upgrade::HELD_NAMED));
+        }
+        if out.is_empty() {
+            "-".to_string()
+        } else {
+            out.join(",")
+        }
     }
 
     /// Seconds until this stopped round's next one ([`Self::retry_at`]):
@@ -273,7 +344,9 @@ impl Row {
     /// the round a re-arm starts after it, [`Self::last_stop`]),
     /// `failed:<why>` (a restart that stopped),
     /// `held-back:<owner>` (the agent runs under a multiplexer or another pty
-    /// the tab's typing does not reach), and `overdue` — behind for
+    /// the tab's typing does not reach), `stuck:<what>` — a restart under way
+    /// that has not moved for [`STALE_S`] ([`Self::stuck`]) — and `overdue` —
+    /// behind for
     /// [`STALLED_AFTER_S`] or more, whatever it waits on, UNLESS the owner's
     /// `--now` was given within [`NOW_QUIETS_S`]: the owner has acted (review
     /// of 2026-09-25: a session already hurried still read `overdue`, the band
@@ -320,8 +393,33 @@ impl Row {
                     overdue
                 }
             }
-            Phase::Exiting { .. } | Phase::Relaunched { .. } | Phase::Done => None,
+            Phase::Exiting { .. } | Phase::Relaunched { .. } => {
+                self.stuck(now).map(|what| format!("stuck:{what}"))
+            }
+            Phase::Done => None,
         }
+    }
+
+    /// A RESTART UNDER WAY THAT HAS NOT MOVED (S2 of the in-flight review,
+    /// 2026-09-27): what it waits on, one word, once its phase has stood
+    /// longer than [`STALE_S`] from the phase's own start — `exiting` (the
+    /// agent was asked to end and has not: a SIGTERMed Claude Code hung in
+    /// its shutdown, a Codex that has not taken its `/exit`), `exited` (it
+    /// ended, and the line that resumes it is not typed: a person at the
+    /// prompt, a hold) or `relaunched` (the line was typed, and the agent it
+    /// started has not held the conversation or reached an idle point: a box
+    /// on its screen, most often). Until then neither phase ever read
+    /// stalled, and the column read `restarting` for as long as the file
+    /// lived. NOTHING IS FORCED: no harder signal, no kill — the stall only
+    /// names the wait. `None` for any other phase, and within the bound.
+    fn stuck(&self, now: u64) -> Option<&'static str> {
+        let (at_s, what) = match self.phase {
+            Phase::Exiting { at_s } if self.exited_at == 0 => (at_s, "exiting"),
+            Phase::Exiting { at_s } => (at_s, "exited"),
+            Phase::Relaunched { at_s } => (at_s, "relaunched"),
+            _ => return None,
+        };
+        (now.saturating_sub(at_s) > STALE_S).then_some(what)
     }
 
     /// Whether the owner's `--now` still quiets an overdue stall at `now`:
@@ -390,8 +488,9 @@ impl Row {
     /// owner, 2026-09-27: "you should NEVER have upgrades stalled"; ruling
     /// 283): one that gave up — the agent gave no READY it could act on —
     /// and the FIRST stop of any other reason that is not a refusal (which a
-    /// new round meets again) nor a Codex move whose TUI is gone
-    /// ([`Self::failed_after_exit`]: nothing runs in the tab to ask). Each
+    /// new round meets again) nor a move whose agent is gone — a Codex's
+    /// `/exit`, a Claude Code's SIGTERM ([`Self::failed_after_exit`]: nothing
+    /// runs in the tab to ask). Each
     /// rests until [`Self::retry_at`] and the next round asks again. A stop
     /// that repeats ([`Self::repeating_stop`]) is no longer the upgrade
     /// working: a row.
@@ -514,6 +613,9 @@ impl Row {
             "overdue" if now_moves_past(&self.wait) => Remedy::Now,
             "overdue" => Remedy::Waits,
             s if s.starts_with("held-back:") => Remedy::InItsPane,
+            // A restart under way: nothing the owner says moves it
+            // ([`ask`] refuses a word then), and nothing is forced.
+            s if s.starts_with("stuck:") => Remedy::Waits,
             _ if self.failed_after_exit() => Remedy::ResumeInTab,
             _ => Remedy::ByHand,
         })
@@ -523,8 +625,8 @@ impl Row {
     /// to mean anything ([`Self::standing`]). A finished move and a restart
     /// in flight are not — a record, and a move bounded by
     /// [`super::STALE_S`] whose old process is meant to be gone — and nor is
-    /// a Codex move that failed after its TUI was seen gone
-    /// ([`Self::failed_after_exit`]): the TUI a holder would be is gone by
+    /// a move that failed after its agent was seen gone
+    /// ([`Self::failed_after_exit`]): the agent a holder would be is gone by
     /// construction.
     fn held_by_a_process(&self) -> bool {
         matches!(
@@ -533,14 +635,30 @@ impl Row {
         ) && !self.failed_after_exit()
     }
 
-    /// A Codex move that FAILED after its `/exit` ended the TUI
-    /// ([`Self::exited_at`]): the tab's record, shown for
-    /// [`EXITED_FAILURE_SHOWN_S`] by the host.
+    /// A move that FAILED after the agent it ended was seen gone — a Codex
+    /// `/exit`, a Claude Code SIGTERM ([`Self::exited_at`]): the tab's
+    /// record, shown for [`EXITED_FAILURE_SHOWN_S`] by the host. Until
+    /// 2026-09-27 only a Codex move's (S1 of the in-flight review).
     #[must_use]
     pub fn failed_after_exit(&self) -> bool {
-        self.agent == upgrade::Agent::Codex
-            && self.exited_at != 0
-            && matches!(self.phase, Phase::Failed(_))
+        self.exited_at != 0 && matches!(self.phase, Phase::Failed(_))
+    }
+
+    /// A CLAUDE CODE MOVE THAT FAILED AFTER ITS EXIT, HELD AGAIN: once a live
+    /// process holds its conversation — resumed by hand, in its tab or
+    /// another, on whichever build — there is a process to vet it by, and it
+    /// is an ordinary stopped upgrade again: shown only for a holder on a
+    /// build older than its target in its tab ([`Self::standing`]), with the
+    /// remedy by hand, and no longer the tab's record of an agent nothing
+    /// runs. (A Codex move's holder is the tab's Codex TUI, whose own lane
+    /// retires the record once it is current.)
+    fn held_again(&mut self, holders: &[Holder]) {
+        if self.agent == upgrade::Agent::Claude
+            && self.failed_after_exit()
+            && holders.iter().any(|h| h.session == self.session)
+        {
+            self.exited_at = 0;
+        }
     }
 
     /// WHETHER THE OWNER SEES OR COUNTS THIS UPGRADE NOW: a finished move or a
@@ -608,9 +726,12 @@ impl Row {
                 "-".to_string(),
                 upgrade::span(now.saturating_sub(self.finished_at())),
             ),
-            Phase::Exiting { .. } | Phase::Relaunched { .. } => {
-                ("restarting", self.phase.word(), behind)
-            }
+            // A restart under way that has not moved reads stalled, checked
+            // before it reads `restarting` (S2 of the in-flight review).
+            Phase::Exiting { .. } | Phase::Relaunched { .. } => match self.stall(now) {
+                Some(stall) => ("stalled", stall, behind),
+                None => ("restarting", self.phase.word(), behind),
+            },
             _ if self.owner_holds(now) => (
                 if matches!(self.request, Request::Skip(_)) {
                     "skipped"
@@ -698,7 +819,7 @@ impl Row {
         };
         format!(
             "upgrade tab={} session={} from={} to={}({}) phase={} pending_for={} wait={} \
-             wait_for={wait_for} request={} next_round={next_round} stalled={}",
+             wait_for={wait_for} request={} next_round={next_round} stalled={} held_by={}",
             dash(&self.tab),
             dash(&self.session),
             dash(&self.from),
@@ -710,6 +831,7 @@ impl Row {
             self.request.word(),
             self.stall(now)
                 .map_or_else(|| "-".to_string(), |s| word(&s)),
+            self.held_token(now),
         )
     }
 
@@ -755,6 +877,20 @@ impl Row {
         ] {
             o.insert(k.into(), Value::from(v));
         }
+        // What held the move at the last look that waited, each by pid, name
+        // and age — never its command.
+        let held = self
+            .held_by
+            .iter()
+            .map(|h| {
+                let mut p = Map::new();
+                p.insert("pid".into(), Value::from(u64::from(h.pid)));
+                p.insert("name".into(), Value::from(h.name.as_str()));
+                p.insert("age_s".into(), Value::from(now.saturating_sub(h.since)));
+                Value::Object(p)
+            })
+            .collect();
+        o.insert("held_by".into(), Value::Array(held));
         Value::Object(o)
     }
 
@@ -830,10 +966,11 @@ pub enum Remedy {
     /// ([`Row::retry_at`]); to move it sooner, quit it and resume it by hand,
     /// or `--skip`.
     ByHand,
-    /// A Codex move that stopped AFTER its `/exit` ended the TUI
+    /// A move that stopped AFTER the agent it ended was seen gone
     /// ([`Row::failed_after_exit`]): nothing runs in the tab to quit, and the
-    /// conversation is kept (in the daemon, or its rollout) — `codex resume`
-    /// in the tab takes it back.
+    /// conversation is kept — a Codex's in the daemon or its rollout (`codex
+    /// resume` in the tab takes it back), a Claude Code's in its transcript
+    /// (`claude --resume <conversation>` in the tab).
     ResumeInTab,
 }
 
@@ -846,8 +983,10 @@ pub enum Remedy {
 /// owner says: the READY answer, a draft, a box, a hold, work under the
 /// agent, a process proof — and Claude's status off `idle` for anything but a
 /// turn (`not-idle:shell`, a background shell; `not-idle:waiting`, a question
-/// waiting on a person; a bare `not-idle`, a status nobody read): `--now`
-/// still asks Claude idle, so nothing ends those but the session itself.
+/// waiting on a person; a bare `not-idle`, a status nobody read;
+/// `status-stale:<status>`, a status an idle screen does not bear out —
+/// 2026-09-27): `--now` still asks Claude idle, so nothing ends those but the
+/// session itself.
 /// A Codex act that left its text typed and backs off (`left-typed-backoff`)
 /// is tried again at once on `--now`, which lifts the back-off. A Claude
 /// notice waiting behind a FULL QUEUE of notices the model has not taken
@@ -873,8 +1012,12 @@ fn now_moves_past(wait: &str) -> bool {
 /// The words are SHORT: the band's first line holds 64 characters, so what
 /// the upgrade does about the wait is on its remedy line
 /// (`message_reporters::agent_upgrade_stalled`). They say only what is true
-/// before a notice too (`not-idle:shell` is also a pending wait). `None` for
-/// every other wait, whose word says it.
+/// before a notice too (`not-idle:shell` is also a pending wait). Claude's own
+/// status that its idle screen does not bear out (`status-stale:<status>`,
+/// 2026-09-27) is said so: the owner cannot move it. A line moves once the
+/// status has stood; the restart only once Claude says `idle`, a READY it
+/// holds asked again meanwhile ([`upgrade::next_step`]). `None` for every
+/// other wait, whose word says it.
 ///
 /// Round 18, day four (D3): EVERY wait a Claude step records has words now —
 /// the band read `waiting (not-idle:busy)` for a turn still running.
@@ -895,6 +1038,7 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
         "queued" => "it has not read the upgrade's question yet",
         "login" => "it is not logged in",
         "in-flight" => "a step is under way",
+        w if w.starts_with("status-stale") => "its status lags",
         w if w.starts_with("not-idle") => "it has not gone idle",
         _ => return None,
     })
@@ -923,12 +1067,18 @@ fn behind_words(since: u64, now: u64) -> Option<String> {
 /// Why a stall of `kind` ([`Row::stall`], every kind but `overdue`) will not
 /// move on its own — words that depend on the kind alone, so the tab's mark
 /// built from them is sent once per stall. A Codex move that stopped after
-/// its `/exit` says where its conversation is ([`codex_failure`]).
+/// its `/exit` says where its conversation is ([`codex_failure`]); a Claude
+/// Code move that stopped after its SIGTERM ended it says so in
+/// [`stop_words`], its remedy naming `claude --resume`. A restart under way
+/// that has not moved says what it waits on ([`stuck_words`]).
 fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
     if agent == upgrade::Agent::Codex
         && let Some(words) = kind.strip_prefix("failed:").and_then(codex_failure)
     {
         return words.to_string();
+    }
+    if let Some(what) = kind.strip_prefix("stuck:") {
+        return stuck_words(agent, what).to_string();
     }
     match kind {
         "refused:not-a-shell-job" => {
@@ -1010,6 +1160,29 @@ fn codex_failure(why: &str) -> Option<&'static str> {
         "resumed-elsewhere" => "another Codex, not the one this upgrade resumed, runs in the tab",
         _ => return None,
     })
+}
+
+/// What a restart under way that has not moved waits on ([`Row::stuck`]), in
+/// a person's words that ask for nothing: nothing is forced, and no word of
+/// the owner's moves a move under way. Stable per kind, for the tab's mark.
+fn stuck_words(agent: upgrade::Agent, what: &str) -> &'static str {
+    match (agent, what) {
+        (upgrade::Agent::Codex, "exiting") => {
+            "the /exit typed into it for the upgrade has not ended it yet; nothing is forced"
+        }
+        (_, "exiting") => {
+            "it was asked to end for the upgrade and has not exited, its own shutdown still \
+             running; nothing is forced"
+        }
+        (_, "exited") => {
+            "it ended for the upgrade, and the line that resumes it waits until a person or a \
+             hold lets go of its prompt; nothing is forced"
+        }
+        _ => {
+            "the line that resumes it was typed, and the agent it started has not reached an \
+             idle point, perhaps behind a box that waits on a person; nothing is forced"
+        }
+    }
 }
 
 /// What a held-back agent runs under, for a line: the terminal owner's name
@@ -1135,6 +1308,10 @@ pub fn status_rows(opts: &Opts) -> (Vec<Row>, bool) {
         match holders(&opts.home, &vet, None) {
             Some(held) => (
                 all.into_iter()
+                    .map(|mut r| {
+                        r.held_again(&held);
+                        r
+                    })
                     .filter(|r| r.standing(&held, true))
                     .map(|mut r| {
                         if r.tab.is_empty() {
@@ -1152,10 +1329,14 @@ pub fn status_rows(opts: &Opts) -> (Vec<Row>, bool) {
     (shown, vetted)
 }
 
-/// The conversations whose rows [`Row::standing`] must vet.
+/// The conversations whose rows [`Row::standing`] must vet — a Claude Code
+/// move that failed after its exit among them, for a process that holds it
+/// again ([`Row::held_again`]).
 fn sessions_to_vet(rows: &[Row]) -> BTreeSet<String> {
     rows.iter()
-        .filter(|r| r.held_by_a_process())
+        .filter(|r| {
+            r.held_by_a_process() || (r.agent == upgrade::Agent::Claude && r.failed_after_exit())
+        })
         .map(|r| r.session.clone())
         .collect()
 }
@@ -1397,8 +1578,10 @@ fn ask_within(
         !st.tab.is_empty() || Row::of(session, st, now).proven_tab(&held).as_deref() == Some(sid)
     });
     candidates.sort_by_key(|(session, st)| {
+        let mut row = Row::of(session, st, now);
+        row.held_again(&held);
         (
-            Row::of(session, st, now).standing(&held, true),
+            row.standing(&held, true),
             !matches!(st.phase, Phase::Failed(_)),
             st.salt,
         )
@@ -1441,6 +1624,20 @@ fn ask_within(
                          re-arms only one that gave up — `codex resume` in the tab takes its \
                          conversation back, and `--skip` quiets this record",
                         word(why)
+                    ));
+                }
+                // A Claude Code move that stopped after its SIGTERM ended the
+                // agent, nothing holding the conversation again: nothing runs
+                // in the tab to quit (S1 of the in-flight review).
+                Phase::Failed(why)
+                    if st.exited_at != 0 && !held.iter().any(|h| h.session == session) =>
+                {
+                    return Err(format!(
+                        "the upgrade in tab {sid} stopped after its SIGTERM ended the agent \
+                         ({}): `--now` re-arms only one that gave up — `claude --resume {}` in \
+                         the tab takes its conversation back, and `--skip` quiets this record",
+                        word(why),
+                        word(&session)
                     ));
                 }
                 Phase::Failed(why) => {
@@ -1643,15 +1840,26 @@ impl View {
                     || r.restarting(now)
                     || now.saturating_sub(r.finished_at()) <= DONE_SHOWN_S
             })
-            .filter(|r| {
-                !r.failed_after_exit() || now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S
-            })
             .collect();
-        let next = next_change(&mine, now);
         let vet = sessions_to_vet(&mine);
-        if !vet.is_empty() {
-            let held = holders(&vet)?;
-            mine.retain(|r| r.standing(&held, false));
+        let held = if vet.is_empty() {
+            None
+        } else {
+            Some(holders(&vet)?)
+        };
+        // A Claude Code move that failed after its exit and is held again is
+        // an ordinary stopped upgrade, whatever the day it is shown for says.
+        if let Some(held) = &held {
+            for r in &mut mine {
+                r.held_again(held);
+            }
+        }
+        mine.retain(|r| {
+            !r.failed_after_exit() || now.saturating_sub(r.exited_at) <= EXITED_FAILURE_SHOWN_S
+        });
+        let next = next_change(&mine, now);
+        if let Some(held) = &held {
+            mine.retain(|r| r.standing(held, false));
         }
         if self.sent.as_ref() != Some(&mine) {
             summary(&mine);
@@ -1736,14 +1944,20 @@ impl View {
 /// the owner's `--now` no longer quieting it ([`NOW_QUIETS_S`]), a `--defer`
 /// running out, a restart's carry-on no longer waited on for its model
 /// ([`Row::confirm_by`]: `restarting` turns `done`), a finished move leaving
-/// the summary ([`DONE_SHOWN_S`]), and
-/// a Codex move that failed after its `/exit` leaving it
-/// ([`EXITED_FAILURE_SHOWN_S`]).
+/// the summary ([`DONE_SHOWN_S`]),
+/// a move that failed after its exit leaving it
+/// ([`EXITED_FAILURE_SHOWN_S`]), and a restart under way turning `stuck`
+/// ([`STALE_S`] from its phase's start: S2 of the in-flight review).
 fn next_change(rows: &[Row], now: u64) -> Option<u64> {
     rows.iter()
         .flat_map(|r| {
             let waiting = matches!(r.phase, Phase::Pending | Phase::Announced { .. });
+            let under_way = match r.phase {
+                Phase::Exiting { at_s } | Phase::Relaunched { at_s } => Some(at_s),
+                _ => None,
+            };
             [
+                under_way.map(|at_s| at_s.saturating_add(STALE_S + 1)),
                 waiting.then(|| r.behind_since.saturating_add(STALLED_AFTER_S)),
                 (waiting && r.request == Request::Now)
                     .then(|| r.request_at.saturating_add(NOW_QUIETS_S)),

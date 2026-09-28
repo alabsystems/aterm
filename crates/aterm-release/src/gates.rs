@@ -124,8 +124,7 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
     match atpkg::lease::take_for_dir(prefix, dir, &who) {
         Ok(Some(lease)) => {
             eprintln!(
-                "release: toolchain lease held on {} for this cut \u{2014} atpkg keeps it and an \
-                 unattended trust update waits for it",
+                "release: {} held for this cut; an unattended trust update waits for it",
                 lease.subject().describe()
             );
             Some(lease)
@@ -133,8 +132,8 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
         Ok(None) => None,
         Err(e) => {
             eprintln!(
-                "release: warn \u{2014} the toolchain lease was NOT taken ({e}); this cut goes on \
-                 unprotected: an update landing mid-cut can reclaim or re-lay {}",
+                "release: warn \u{2014} toolchain not held ({e}); an update during this cut can \
+                 replace {}",
                 dir.display()
             );
             None
@@ -1961,9 +1960,9 @@ pub fn tag_free(git: &dyn GitRunner, version: &str) -> Result<()> {
     )?;
     if !remote.stdout_utf8().trim().is_empty() {
         return Err(Error::new(format!(
-            "tag {tag} is on origin: v{version} was cut. The next release is v{}: bump \
-             [workspace.package] version in Cargo.toml on main, then `pub stage aterm` and \
-             `pub publish aterm`, then cut",
+            "tag {tag} is on origin: v{version} was cut. The next release is v{}: `pub bump \
+             aterm --minor --write` on main, commit and push, then `pub stage aterm` and `pub \
+             publish aterm`, then cut",
             crate::publish::bump_minor_release(version)?
         )));
     }
@@ -4418,6 +4417,76 @@ mod native_lane_flag_tests {
              was made against; without an obligation verification_off_verdict is \
              unfalsifiable: {PROBE_SRC}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tag_free_tests {
+    use super::*;
+    use crate::ledger::RunOut;
+
+    /// A checkout whose tag `v…` is (or is not) here and on origin.
+    struct Tags {
+        local: bool,
+        on_origin: bool,
+    }
+
+    impl GitRunner for Tags {
+        fn git(&self, args: &[&str]) -> Result<RunOut> {
+            let (status, stdout) = match args.first().copied() {
+                Some("rev-parse") => (i32::from(!self.local), String::new()),
+                Some("ls-remote") if self.on_origin => {
+                    (0, format!("{:040x}\t{}\n", 1, args[args.len() - 1]))
+                }
+                Some("ls-remote") => (0, String::new()),
+                _ => panic!("tag_free asks only rev-parse and ls-remote, not {args:?}"),
+            };
+            Ok(RunOut {
+                status,
+                stdout: stdout.into_bytes(),
+                stderr: vec![],
+            })
+        }
+    }
+
+    /// A cut tag's remedy is the bump its preflight twin names
+    /// (`tools/release-preflight.sh`: `fix "pub bump aterm --minor --write"`): a hand
+    /// edit of `Cargo.toml` leaves `Cargo.lock` behind, and the cutter's own
+    /// locked-metadata gate then refuses.
+    #[test]
+    fn a_tag_on_origin_names_the_pub_bump_its_preflight_twin_names() {
+        let cut = Tags {
+            local: true,
+            on_origin: true,
+        };
+        let refusal = tag_free(&cut, "0.97.0")
+            .expect_err("a cut version is refused")
+            .to_string();
+        assert!(
+            refusal
+                .contains("The next release is v0.98.0: `pub bump aterm --minor --write` on main"),
+            "{refusal}"
+        );
+        assert!(
+            refusal.contains(
+                "on main, commit and push, then `pub stage aterm` and `pub publish aterm`"
+            ),
+            "`pub stage` refuses a dirty tree and exports only main's history: {refusal}"
+        );
+        assert!(!refusal.contains("Cargo.toml"), "{refusal}");
+        let leftover = Tags {
+            local: true,
+            on_origin: false,
+        };
+        let refusal = tag_free(&leftover, "0.97.0")
+            .expect_err("a leftover local tag is refused")
+            .to_string();
+        assert!(refusal.contains("`git tag -d v0.97.0`"), "{refusal}");
+        let free = Tags {
+            local: false,
+            on_origin: false,
+        };
+        tag_free(&free, "0.97.0").expect("a free tag passes");
     }
 }
 

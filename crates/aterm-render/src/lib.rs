@@ -111,8 +111,9 @@ thread_local! {
     /// every `Renderer`/embedder in this address space. In the wasm renderer all
     /// terminal panes share ONE linear memory and inject the SAME OS fonts, so
     /// without interning each pane held its own copy. Share one `Arc` keyed by
-    /// content; bounded by the handful of distinct fonts ever injected.
-    static FONT_BYTES_INTERN: std::cell::RefCell<Vec<std::sync::Arc<Vec<u8>>>> =
+    /// content among live owners. Weak entries let replaced fonts release their
+    /// bytes, and every lookup removes dead metadata.
+    static FONT_BYTES_INTERN: std::cell::RefCell<Vec<std::sync::Weak<Vec<u8>>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -121,8 +122,11 @@ thread_local! {
 /// share ONE parsed face instead of paying ~370MB each. PROCESS-GLOBAL (a `Mutex`,
 /// not a thread_local) so a background warm thread's parse is the SAME instance the
 /// render thread later looks up — the lock is touched only on the rare face-load
-/// path, never per glyph. On single-threaded wasm the uncontended `Mutex` is free.
-static PARSED_FONT_INTERN: std::sync::Mutex<Vec<InternedFace>> = std::sync::Mutex::new(Vec::new());
+/// path, never per glyph. Entries are weak: active faces and prepared generations
+/// own their sources, and replacing the last owner frees the parse and bytes.
+/// On single-threaded wasm the uncontended `Mutex` is free.
+static PARSED_FONT_INTERN: std::sync::Mutex<Vec<std::sync::Weak<crate::font::Font>>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Return a shared `Arc` for `bytes`, reusing an already-interned identical blob so
 /// N panes injecting the same font cost one copy, not N. The byte-equality check
@@ -131,14 +135,16 @@ static PARSED_FONT_INTERN: std::sync::Mutex<Vec<InternedFace>> = std::sync::Mute
 pub fn intern_font_bytes(bytes: Vec<u8>) -> std::sync::Arc<Vec<u8>> {
     FONT_BYTES_INTERN.with(|cell| {
         let mut store = cell.borrow_mut();
+        store.retain(|entry| entry.strong_count() != 0);
         if let Some(existing) = store
             .iter()
+            .filter_map(std::sync::Weak::upgrade)
             .find(|a| a.len() == bytes.len() && a.as_slice() == bytes.as_slice())
         {
-            return existing.clone();
+            return existing;
         }
         let arc = std::sync::Arc::new(bytes);
-        store.push(arc.clone());
+        store.push(std::sync::Arc::downgrade(&arc));
         arc
     })
 }
@@ -150,14 +156,16 @@ pub fn intern_font_bytes(bytes: Vec<u8>) -> std::sync::Arc<Vec<u8>> {
 pub fn intern_font_bytes_slice(bytes: &[u8]) -> std::sync::Arc<Vec<u8>> {
     FONT_BYTES_INTERN.with(|cell| {
         let mut store = cell.borrow_mut();
+        store.retain(|entry| entry.strong_count() != 0);
         if let Some(existing) = store
             .iter()
+            .filter_map(std::sync::Weak::upgrade)
             .find(|a| a.len() == bytes.len() && a.as_slice() == bytes)
         {
-            return existing.clone();
+            return existing;
         }
         let arc = std::sync::Arc::new(bytes.to_vec());
-        store.push(arc.clone());
+        store.push(std::sync::Arc::downgrade(&arc));
         arc
     })
 }
@@ -179,8 +187,10 @@ pub const MISSING_FONT_CLASS_EMOJI: u8 = 1 << 1;
 /// host-INJECTION path: that store's job is "N panes injecting the same font on the
 /// same thread cost one copy". Discovery runs on short-lived worker threads, so a
 /// thread-local store is empty every time and each generation re-allocates a 23 MB
-/// blob. Keyed by byte equality, like every other intern here.
-static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<crate::font::FaceBytes>> =
+/// blob. Keyed by byte equality, like every other intern here. Weak handles
+/// preserve sharing among live generations without pinning replaced configured
+/// faces for the process lifetime; each admission prunes dead entries.
+static DISCOVERED_FONT_BYTES: std::sync::Mutex<Vec<crate::font::WeakFaceBytes>> =
     std::sync::Mutex::new(Vec::new());
 
 /// Intern a just-READ font file in [`DISCOVERED_FONT_BYTES`], reusing an
@@ -231,17 +241,22 @@ fn intern_discovered_font_bytes(bytes: &crate::font::FaceBytes) -> crate::font::
     let mut store = DISCOVERED_FONT_BYTES
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(existing) = store.iter().find(|a| a.same_bytes(bytes)) {
-        return existing.clone();
+    store.retain(crate::font::WeakFaceBytes::is_live);
+    if let Some(existing) = store
+        .iter()
+        .filter_map(crate::font::WeakFaceBytes::upgrade)
+        .find(|a| a.same_bytes(bytes))
+    {
+        return existing;
     }
-    store.push(bytes.clone());
+    store.push(bytes.downgrade());
     bytes.clone()
 }
 
 ///
 /// The observable for "a refused face left nothing behind". It asks about ONE
 /// file rather than counting the store, and that difference is load-bearing:
-/// the store is process-global and never evicts, sibling tests in the same
+/// the store is process-global, sibling tests in the same
 /// binary publish into it concurrently (`windows_fallback_chain_covers_hangul`
 /// alone publishes nine faces), so a before/after LENGTH comparison is a race
 /// and failed about two runs in three. Absence of a specific file is a stable
@@ -252,6 +267,7 @@ fn discovered_font_bytes_contains(bytes: &[u8]) -> bool {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .iter()
+        .filter_map(crate::font::WeakFaceBytes::upgrade)
         .any(|held| held[..] == *bytes)
 }
 
@@ -273,9 +289,8 @@ fn intern_parsed_font(bytes: &[u8]) -> Result<InternedFace, String> {
 
 /// [`intern_parsed_font`] for a caller that ALREADY owns the source bytes in the
 /// store's handle type — the DISCOVERED fallback/symbol faces, whose bytes live
-/// in [`DISCOVERED_FONT_BYTES`] from the moment they are read
-/// ([`FallbackFace::from_path_bytes`]) and stay there for the life of the
-/// process.
+/// indexed in [`DISCOVERED_FONT_BYTES`] from the moment they are read
+/// ([`FallbackFace::from_path_bytes`]) and owned by their live face/generation.
 ///
 /// WHY THIS EXISTS, in bytes. [`LazyFontdue::get`] materialises a deferred chain
 /// face by handing its bytes to the slice entry point, which copied them —
@@ -338,10 +353,10 @@ fn intern_parsed_font_keyed(
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Re-check under the lock: a racing thread may have interned identical bytes
     // while we parsed; converge on ITS entry so identical faces share one parse.
-    if let Some((src, existing)) = store.iter().find(|(s, _)| same_slice(s, bytes)) {
-        return Ok((src.clone(), existing.clone()));
+    if let Some(existing) = interned_parsed_font_lookup_in(&mut store, bytes) {
+        return Ok(existing);
     }
-    store.push((src.clone(), font.clone()));
+    store.push(std::sync::Arc::downgrade(&font));
     Ok((src, font))
 }
 
@@ -357,13 +372,22 @@ fn same_slice(a: &[u8], b: &[u8]) -> bool {
 /// length pre-filters the compare). Lock held only for the scan. Returns the
 /// interned SOURCE bytes alongside the parsed face (W8 needs both).
 fn interned_parsed_font_lookup(bytes: &[u8]) -> Option<InternedFace> {
-    let store = PARSED_FONT_INTERN
+    let mut store = PARSED_FONT_INTERN
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    interned_parsed_font_lookup_in(&mut store, bytes)
+}
+
+fn interned_parsed_font_lookup_in(
+    store: &mut Vec<std::sync::Weak<crate::font::Font>>,
+    bytes: &[u8],
+) -> Option<InternedFace> {
+    store.retain(|entry| entry.strong_count() != 0);
     store
         .iter()
-        .find(|(src, _)| same_slice(src, bytes))
-        .map(|(src, font)| (src.clone(), font.clone()))
+        .filter_map(std::sync::Weak::upgrade)
+        .find(|font| same_slice(font.source_bytes(), bytes))
+        .map(|font| (font.source_bytes().clone(), font))
 }
 
 /// One entry of [`SHARED_PARSED_FACES`]: the source bytes that were parsed, the
@@ -396,7 +420,7 @@ struct SharedFace {
 /// `Arc`-shared for the styled and fallback tiers ([`StyledFace`],
 /// [`intern_parsed_font`]); this extends the same sharing to the primary tier.
 ///
-/// WEAK, not strong, unlike [`PARSED_FONT_INTERN`]: the primary face is
+/// WEAK, like [`PARSED_FONT_INTERN`]: the primary face is
 /// USER-CHOSEN and a settings font picker can walk dozens of families in one
 /// session. A strong store would retain every face the user ever previewed;
 /// weak handles bound the store to what is actually live, and each call prunes
@@ -1503,7 +1527,7 @@ pub struct ChromeBleed {
     /// Chrome rows whose two side gutters wear their OWN tones instead of
     /// [`Self::color`] — the message band's full-width meter, whose fill
     /// reaches the window's left edge from the first lit cell and its right
-    /// edge only at 100 % (`aterm-gui` `message_band::MeterSpan`). `None`
+    /// edge only at 100 % (`aterm_messages::paint::MeterSpan`). `None`
     /// entries, and rows no entry names, keep [`Self::color`]; the strip above
     /// row 0 keeps it too, and the seam is drawn over either.
     ///
@@ -4072,8 +4096,8 @@ impl LazyFontdue {
     ///
     /// Takes the caller's own byte HANDLE, not a slice, and hands it to the parsed
     /// store as that entry's key ([`intern_parsed_font_owned`]): the bytes this
-    /// cell is materialising are already resident in [`DISCOVERED_FONT_BYTES`] for
-    /// the life of the process, so a slice here made the file resident twice —
+    /// cell is materialising are already indexed in [`DISCOVERED_FONT_BYTES`]
+    /// while a live face owns them, so a slice here made the file resident twice —
     /// measured on this Linux host at −3,907 kB (broad tier) + −647 kB (symbol
     /// slot) of RSS. That arithmetic does NOT carry to macOS's much bigger chain
     /// faces: `select_rasterizer` returns CoreText by default there, and CoreText
@@ -4230,9 +4254,9 @@ impl FallbackFace {
         // nature, so they belong in a process-wide store.
         //
         // ADMISSION FIRST, PUBLISH SECOND, and the order is load-bearing: the
-        // store has no eviction, so publishing before the verdict left a REFUSED
-        // face's whole file resident for the life of the process, with nothing
-        // holding a handle to it and no path back. The verdict is a pure function
+        // former strong store had no eviction, so publishing before the verdict
+        // left a REFUSED face's whole file resident for the life of the process.
+        // The weak index still admits only usable faces. The verdict is a pure function
         // of the bytes, so asking it of the caller's handle is the same question.
         //
         // The admission verdict being pure is also why a path-backed face can
@@ -11053,7 +11077,17 @@ impl Renderer {
     /// the instance actually rasterized/shaped. `var_coords == None` (every
     /// non-variable font) keeps the pre-W9 sources byte-identically.
     fn geometry_metrics(&self, px: f32) -> Option<(f32, f32, f32)> {
-        if let Some(m) = self.varied_metrics(px) {
+        self.geometry_metrics_at_coords(px, self.var_coords.as_deref())
+    }
+
+    fn geometry_metrics_at_coords(
+        &self,
+        px: f32,
+        coords: Option<&[(u32, f32)]>,
+    ) -> Option<(f32, f32, f32)> {
+        if let Some(m) = coords.and_then(|coords| {
+            variation::varied_metrics_px(self.rb_primary_bytes.as_deref()?, 0, coords, px)
+        }) {
             return Some((m.ascent, m.descent, m.line_gap));
         }
         if let Some(t) = self.typo_lm {
@@ -11356,6 +11390,14 @@ impl Renderer {
     /// primary; `var_coords` also collapses to `None` when the resolution
     /// lands exactly on the `fvar` defaults (nothing to instantiate).
     fn compute_variations(&self) -> (VarCoords, VarCoords) {
+        self.compute_variations_for(&self.cfg_font_variations, self.font_weight_dark_nudge)
+    }
+
+    fn compute_variations_for(
+        &self,
+        requests: &[(u32, f32)],
+        dark_nudge: f32,
+    ) -> (VarCoords, VarCoords) {
         let Some(bytes) = self.rb_primary_bytes.as_deref() else {
             return (None, None);
         };
@@ -11364,7 +11406,7 @@ impl Renderer {
         };
         let axes = &probe.axes;
         let base = variation::resolve_default_coords(axes, probe.regular_coords.as_deref());
-        let base = variation::apply_requests(axes, base, &self.cfg_font_variations);
+        let base = variation::apply_requests(axes, base, requests);
         let pair = |coords: &[f32]| -> Vec<(u32, f32)> {
             axes.iter().zip(coords).map(|(a, &v)| (a.tag, v)).collect()
         };
@@ -11374,13 +11416,13 @@ impl Renderer {
             let Some(wi) = wght_idx else {
                 break 'nudge base;
             };
-            if self.font_weight_dark_nudge <= 0.0 || !theme_is_dark(self.theme.bg) {
+            if dark_nudge <= 0.0 || !theme_is_dark(self.theme.bg) {
                 break 'nudge base;
             }
             let nudged = variation::apply_requests(
                 axes,
                 base.clone(),
-                &[(variation::WGHT_TAG, base[wi] + self.font_weight_dark_nudge)],
+                &[(variation::WGHT_TAG, base[wi] + dark_nudge)],
             );
             // Gate 1: 'M' advance at the NUDGED coords must equal the
             // DEFAULT instance's within 0.25px (mono VFs hold advances
@@ -11703,6 +11745,30 @@ impl Renderer {
             Some((cell_h, baseline)) => (cell_w, cell_h, baseline),
             None => (self.cell_w, self.cell_h, self.baseline),
         }
+    }
+
+    /// The row height a semantic specimen will paint with its candidate line
+    /// height and variation requests. This is a read-only metric projection:
+    /// it neither forks a renderer nor changes the live font or glyph caches.
+    /// Specimens use no theme weight nudge, just as their paint path does.
+    #[must_use]
+    pub fn specimen_cell_height(
+        &self,
+        px: f32,
+        line_height: f32,
+        requests: &[(u32, f32)],
+    ) -> usize {
+        let px = self.fitted_px(px);
+        let metrics = if self.cfg_font_variations == requests && self.font_weight_dark_nudge == 0.0
+        {
+            self.geometry_metrics(px)
+        } else {
+            let (coords, _) = self.compute_variations_for(requests, 0.0);
+            self.geometry_metrics_at_coords(px, coords.as_deref())
+        };
+        metrics.map_or(self.cell_h, |(ascent, descent, gap)| {
+            cell_h_baseline(ascent, descent, gap, line_height.max(0.5)).0
+        })
     }
 
     /// FONT-DISPLAY-FIT: the rasterization size for a host request of `px` — scaled
@@ -26250,12 +26316,140 @@ mod tests {
         );
     }
 
+    /// A replaced configured fallback is no longer owned by either intern.
+    /// Two live faces share both bytes and parse, including a deferred face
+    /// whose parse has not been needed yet. The extra live holder is the
+    /// negative control: dropping only one face must release nothing.
+    #[test]
+    fn font_interns_release_replaced_fallback_sources_and_parses() {
+        let mut unique = embedded_font().to_vec();
+        unique.extend_from_slice(b"font-intern-replaced-fallback-lifetime");
+        let source = std::sync::Arc::new(unique);
+        let source_weak = std::sync::Arc::downgrade(&source);
+        let bytes = crate::font::FaceBytes::Vec(source);
+        let face = FallbackFace::from_path_bytes(&bytes, None).expect("admitted face");
+        let independent = crate::font::FaceBytes::Vec(std::sync::Arc::new(bytes.to_vec()));
+        let peer = FallbackFace::from_path_bytes(&independent, None).expect("same face");
+        assert!(face.bytes.ptr_eq(&peer.bytes), "live source dedup");
+        let parsed = face.font.get(&face.bytes).expect("materialized face");
+        let parsed_weak = std::sync::Arc::downgrade(parsed);
+        assert!(
+            std::sync::Arc::ptr_eq(parsed, peer.font.get(&peer.bytes).unwrap()),
+            "live parsed-face dedup"
+        );
+        drop(independent);
+        drop(bytes);
+        drop(face);
+        assert!(
+            source_weak.upgrade().is_some(),
+            "peer still owns the source"
+        );
+        assert!(parsed_weak.upgrade().is_some(), "peer still owns the parse");
+        drop(peer);
+        assert!(
+            parsed_weak.upgrade().is_none(),
+            "index must not own retired parse"
+        );
+        assert!(
+            source_weak.upgrade().is_none(),
+            "index must not own retired bytes"
+        );
+
+        // A later admission reclaims this entry's weak metadata, without
+        // relying on global lengths that unrelated parallel tests can change.
+        let next = crate::font::FaceBytes::Static(embedded_font());
+        let _next = intern_discovered_font_bytes(&next);
+        let _ = interned_parsed_font_lookup(embedded_font());
+        assert!(!DISCOVERED_FONT_BYTES.lock().unwrap().iter().any(|entry| {
+            matches!(entry, crate::font::WeakFaceBytes::Vec(weak)
+                if std::sync::Weak::ptr_eq(weak, &source_weak))
+        }));
+        assert!(
+            !PARSED_FONT_INTERN
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|entry| { std::sync::Weak::ptr_eq(entry, &parsed_weak) })
+        );
+    }
+
+    /// Exercise the shipping setter, not just the index: switching away from
+    /// an injected fallback releases its parse/file, while a renderer still
+    /// using it keeps both and still resolves the same glyph.
+    #[test]
+    fn font_interns_follow_renderer_fallback_replacement() {
+        let mut bytes = embedded_font().to_vec();
+        bytes.extend_from_slice(b"font-intern-renderer-replacement");
+        let mut first = Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).unwrap();
+        let mut second = Renderer::from_bytes(embedded_font(), 16.0, Theme::default()).unwrap();
+        first.set_fallback_bytes(&bytes).unwrap();
+        second.set_fallback_bytes(&bytes).unwrap();
+        let face = &first.fallback_chain[0];
+        let parsed = face.font.get(&face.bytes).unwrap();
+        let weak = std::sync::Arc::downgrade(parsed);
+        let glyph = parsed.lookup_glyph_index('A');
+        assert_ne!(glyph, 0, "fixture has a real glyph");
+        first.set_fallback_bytes(embedded_font()).unwrap();
+        assert_eq!(weak.upgrade().unwrap().lookup_glyph_index('A'), glyph);
+        assert!(
+            !first.set_config_fallback_fonts(&[]),
+            "unchanged config is inert"
+        );
+        second.set_fallback_bytes(embedded_font()).unwrap();
+        assert!(
+            weak.upgrade().is_none(),
+            "neither renderer uses the old fallback"
+        );
+    }
+
+    /// Force both lookups to miss before either parse starts. The publish
+    /// re-check must converge on one live face, despite the index being weak.
+    #[test]
+    fn font_interns_converge_on_racing_publish_and_allow_retry() {
+        let mut bytes = embedded_font().to_vec();
+        bytes.extend_from_slice(b"font-intern-publish-race");
+        let barrier = std::sync::Barrier::new(2);
+        let faces = std::thread::scope(|scope| {
+            let spawn = || {
+                scope.spawn(|| {
+                    intern_parsed_font_keyed(&bytes, || {
+                        barrier.wait();
+                        crate::font::FaceBytes::Vec(std::sync::Arc::new(bytes.clone()))
+                    })
+                    .unwrap()
+                })
+            };
+            let first = spawn();
+            let second = spawn();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert!(
+            faces[0].0.ptr_eq(&faces[1].0),
+            "publish adopts winning bytes"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&faces[0].1, &faces[1].1),
+            "one live parse"
+        );
+        let weak = std::sync::Arc::downgrade(&faces[0].1);
+        drop(faces);
+        assert!(
+            weak.upgrade().is_none(),
+            "racing publish owns no retired face"
+        );
+        let retry = intern_parsed_font(&bytes).expect("reparse after final release");
+        assert_ne!(retry.1.lookup_glyph_index('A'), 0);
+        for _ in 0..2 {
+            assert!(intern_parsed_font(b"invalid-font-intern-retry").is_err());
+        }
+        assert!(interned_parsed_font_lookup(b"invalid-font-intern-retry").is_none());
+    }
+
     /// MEMORY: a face the chain REFUSES must leave nothing in the discovery
     /// store.
     ///
-    /// [`DISCOVERED_FONT_BYTES`] has no eviction — it is a `Vec<Arc<Vec<u8>>>`
-    /// that only ever grows, by design, because a discovered face is process-wide
-    /// and permanent. `from_path_bytes` used to publish into it BEFORE asking
+    /// [`DISCOVERED_FONT_BYTES`] used to own its entries permanently.
+    /// `from_path_bytes` used to publish into it BEFORE asking
     /// `face_admissible`, so a refused candidate's whole file stayed resident
     /// for the life of the process with no handle to it and no path back. Every
     /// built-in Windows candidate is admissible on this host, so the cost here is
@@ -26287,16 +26481,16 @@ mod tests {
         );
         assert!(
             !discovered_font_bytes_contains(&patched),
-            "a refused face must not leave its file in the un-evictable discovery store"
+            "a refused face must not enter the discovery index"
         );
     }
 
     /// MEMORY: materialising a DISCOVERED chain face must not put a SECOND copy
     /// of the file in the process.
     ///
-    /// A discovery-path face already holds its bytes in [`DISCOVERED_FONT_BYTES`]
-    /// from the moment they are read, and holds them there for the life of the
-    /// process. [`LazyFontdue::get`] used to hand a SLICE to the parsed store,
+    /// A discovery-path face already owns its bytes and indexes them in
+    /// [`DISCOVERED_FONT_BYTES`] from the moment they are read.
+    /// [`LazyFontdue::get`] used to hand a SLICE to the parsed store,
     /// which copied it — so the first CJK cell (or `⏸`) made the file resident
     /// twice, permanently, with nothing ever reading the second copy. MEASURED on
     /// this Linux host as 3,907 kB on a 4 MB chain face
@@ -33197,6 +33391,84 @@ mod tests {
         assert_eq!(again.source, FaceId::BoldPrimary);
     }
 
+    #[test]
+    fn specimen_cell_height_matches_candidate_activation_without_mutating_source() {
+        let mut source = Renderer::from_bytes(embedded_font(), 14.0, Theme::default()).unwrap();
+        source.set_runtime_font_discovery(false);
+        source.set_line_height(1.7);
+        let original = source.cell_size();
+        for requested_px in [6.0, 12.0, 21.5, 24.0, 36.0, 72.0] {
+            for dpi in [1.0, 1.25, 2.0, 3.0] {
+                for line_height in [0.8, 1.0, 1.3, 2.0] {
+                    let px = requested_px * dpi;
+                    let measured = source.specimen_cell_height(px, line_height, &[]);
+                    let mut painted = source.fork_semantic_surface(px, Theme::default()).unwrap();
+                    painted.set_line_height(line_height);
+                    painted.set_font_variations(&[], 0.0);
+                    painted.activate_px(px);
+                    assert_eq!(
+                        measured,
+                        painted.cell_size().1,
+                        "{requested_px}px at {dpi}dpi with leading {line_height}"
+                    );
+                }
+            }
+        }
+        assert_eq!(source.cell_size(), original);
+        assert_eq!(source.line_height(), 1.7);
+        assert_ne!(
+            source.specimen_cell_height(24.0, 1.0, &[]),
+            source.cell_geometry(24.0).1,
+            "the source's old leading is not the candidate's geometry"
+        );
+    }
+
+    #[test]
+    fn specimen_cell_height_matches_variable_and_default_candidate_activation() {
+        use crate::variation::WGHT_TAG;
+        let Some((bytes, axis, _, _)) = crate::variation::inked_wght_font() else {
+            eprintln!("SKIP: no installed variable font with an inked weight axis");
+            return;
+        };
+        let mut source = Renderer::from_bytes(embedded_font(), 14.0, Theme::default()).unwrap();
+        source.set_runtime_font_discovery(false);
+        source.set_primary_font(&bytes).expect("variable primary");
+        let nondefault = if axis.max != axis.def {
+            axis.max
+        } else {
+            axis.min
+        };
+        source.set_font_variations(&[(WGHT_TAG, nondefault)], 0.0);
+        assert!(
+            source.var_coords.is_some(),
+            "source carries a nondefault instance"
+        );
+        let original = source.var_coords.clone();
+        // Empty/default requests must not reuse the source's nondefault coordinates.
+        for requests in [
+            vec![],
+            vec![(WGHT_TAG, axis.def)],
+            vec![(WGHT_TAG, axis.min)],
+        ] {
+            for px in [12.0, 30.0, 72.0] {
+                let measured = source.specimen_cell_height(px, 1.3, &requests);
+                let mut painted = source.fork_semantic_surface(px, Theme::default()).unwrap();
+                painted.set_line_height(1.3);
+                painted.set_font_variations(&requests, 0.0);
+                painted.activate_px(px);
+                assert_eq!(
+                    measured,
+                    painted.cell_size().1,
+                    "candidate {requests:?} at {px}px"
+                );
+            }
+        }
+        assert_eq!(
+            source.var_coords, original,
+            "measurement leaves the source instance intact"
+        );
+    }
+
     /// Line-height (P3): `set_line_height(scale)` grows the cell BOX height (and the
     /// footprint) proportionally WITHOUT changing the glyph px — the rasterized
     /// glyph stays the same size, only the row spacing changes. `1.0` round-trips to
@@ -37206,6 +37478,31 @@ mod tests {
             !std::sync::Arc::ptr_eq(&a1, &b),
             "different font bytes must not be aliased"
         );
+    }
+
+    /// Owned and borrowed injection share live bytes; a sequence of replaced
+    /// blobs frees each payload and culls its weak entry on the next call.
+    #[test]
+    fn font_interns_release_injected_bytes_and_prune_churn() {
+        std::thread::spawn(|| {
+            for n in 0..128_u8 {
+                let bytes = vec![n; 1024];
+                let owned = intern_font_bytes(bytes.clone());
+                let borrowed = intern_font_bytes_slice(&bytes);
+                assert!(std::sync::Arc::ptr_eq(&owned, &borrowed));
+                let weak = std::sync::Arc::downgrade(&owned);
+                drop(owned);
+                assert!(weak.upgrade().is_some(), "another pane retains its font");
+                drop(borrowed);
+                assert!(
+                    weak.upgrade().is_none(),
+                    "the index must not retain font bytes"
+                );
+                FONT_BYTES_INTERN.with(|store| assert_eq!(store.borrow().len(), 1));
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     /// A published font generation is self-contained: deleting its sole source

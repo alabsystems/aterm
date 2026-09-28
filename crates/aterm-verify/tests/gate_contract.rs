@@ -18,6 +18,8 @@
 //! are compiled for a non-unix target instead of being lost with it.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -34,8 +36,7 @@ struct FakeRepo {
     stage2: PathBuf,
     scratch: PathBuf,
     /// The control socket the answering smoke's `aterm-gui` links to, held
-    /// listening for the fixture's life: the smoke waits for a socket that
-    /// accepts a connect, not for a file.
+    /// listening for the fixture's life.
     ctl_sock: PathBuf,
     _listener: std::os::unix::net::UnixListener,
 }
@@ -121,68 +122,14 @@ impl FakeRepo {
         fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).expect("chmod");
     }
 
-    /// A stage2 whose driver also produces the two binaries the smokes drive:
-    /// an `aterm-gui` that links its control socket to the fixture's listening
-    /// one and stays up, and an `aterm-ctl` that answers the protocol. This is what lets the control-socket
-    /// smoke — launch, poll, round-trip, burst, teardown — run for real in a test.
+    /// A stage2 whose driver also produces the two binaries the headless smoke
+    /// drives ([`common::answering_smoke`]), so the smoke — launch, poll, burst,
+    /// teardown — runs for real in a test.
     fn with_answering_smoke(&self) -> &Self {
-        self.with_stage2(
-            &r#"echo "argv: $*"
-case "$*" in
-  *aterm-gui*aterm-ctl*)
-    mkdir -p "$CARGO_TARGET_DIR/debug"
-    cat >"$CARGO_TARGET_DIR/debug/aterm-gui" <<'GUI'
-#!/bin/sh
-# These are real spawn-time fixture preconditions, not runner-wide overrides:
-# an absent machine table still authorizes the product's per-user defaults.
-test -z "${ATERM_NO_REROUTE+set}${ATERM_NO_AUTO_UPDATE+set}" || exit 81
-test "$1" = --control-sock && test "$2" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
-# A headless launch carries its lifeline: `--lifeline-fd 0` on a FIFO stdin.
-if test "$3" = --headless; then
-  test "$4" = --lifeline-fd && test "$5" = 0 && test -p /dev/stdin || exit 92
-fi
-test "$HOME" = "${XDG_CONFIG_HOME%/cfg}/home" || exit 89
-test -d "$HOME" || exit 90
-config="$XDG_CONFIG_HOME/aterm/aterm.toml"
-# One builtin pass, not seven `grep` spawns: every spawn before the socket is up
-# counts against the smoke's 10 s budget, and at load ~150 with 30 ladders in
-# this binary, nine of them missed it (2026-09-27). Same lines, same codes.
-seen=
-while IFS= read -r line || test -n "$line"; do
-  case "$line" in
-    'agents_auto_prime = false') seen="$seen a" ;;
-    '[update]') seen="$seen u" ;;
-    '[packages]') seen="$seen p" ;;
-    'enabled = false') seen="$seen e" ;;
-    '[machine]') seen="$seen m" ;;
-    'spotlight_noindex = false') seen="$seen s" ;;
-    'universal_control = "leave"') seen="$seen c" ;;
-  esac
-done <"$config" || exit 87
-for want in a:87 u:91 p:82 e:83 m:84 s:85 c:86; do
-  case "$seen " in *" ${want%%:*} "*) ;; *) exit "${want#*:}" ;; esac
-done
-mkdir -p "$XDG_RUNTIME_DIR/aterm"
-ln -s '@LISTENER@' "$XDG_RUNTIME_DIR/aterm/aterm.sock"
-exec sleep 300
-GUI
-    cat >"$CARGO_TARGET_DIR/debug/aterm-ctl" <<'CTL'
-#!/bin/sh
-test "$1" = --sock && test "$2" = "$XDG_RUNTIME_DIR/aterm/aterm.sock" || exit 88
-shift 2
-case "$1" in
-  cursor)  echo "OK row=0 col=0" ;;
-  metrics) echo "OK frames=41 max_input_present_ms=8.100 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0 perf_reduced=0 wake_heals=0 " ;;
-  send|key) echo "OK accepted" ;;
-  *) echo "ERR unknown verb"; exit 1 ;;
-esac
-CTL
-    chmod 755 "$CARGO_TARGET_DIR/debug/aterm-gui" "$CARGO_TARGET_DIR/debug/aterm-ctl"
-    ;;
-esac
-exit 0"#
-            .replace("@LISTENER@", &self.ctl_sock.display().to_string()),
-        )
+        self.with_stage2(&format!(
+            "echo \"argv: $*\"\n{}\nexit 0",
+            common::answering_smoke(&self.ctl_sock)
+        ))
     }
 
     /// Install a stand-in Trust stage2. `targo_body` decides what the driver does.
@@ -201,46 +148,9 @@ exit 0"#
 
     /// [`Self::ctx`] with one last say over the environment the stages read —
     /// for the cases that MEASURE a variable's effect instead of being at its
-    /// mercy (see the `cargo_build_jobs` pin below).
+    /// mercy (`a_callers_job_count_caps_the_side_lane_child_it_reaches`).
     fn ctx_with(&self, mode: Mode, scope: Scope, tweak: impl FnOnce(&mut EnvSnapshot)) -> Ctx {
-        let mut env = EnvSnapshot::capture();
-        env.trust_stage2_bin = Some(self.stage2.clone());
-        // Point the Tier-2 prover locations inside the sandbox so these tests
-        // decide the same thing on a machine that has trust-mc built and on one
-        // that does not.
-        env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
-        env.ay_bin_dir = Some(self.root.join("no-ay"));
-        // …and the caller's job count. `lane_jobs` makes an exported
-        // `CARGO_BUILD_JOBS` a CEILING on the side lanes, so the value a stage
-        // hands its child is a function of
-        // the ambient environment — and two fixtures here pin that value to a
-        // lane's own cap (`test "$CARGO_BUILD_JOBS" = 8 || exit 71`). Measured
-        // 2026-09-16: the merge gate itself exports `CARGO_BUILD_JOBS=4` on a
-        // 4-core Mac, so inside that run the driver lane capped 8 to 4 and the
-        // driven-binary fixtures (today's
-        // `every_driven_suite_drives_the_binary_its_stage_just_built`) failed
-        // at exit 71 — their stubs never reaching the build arm, so the trace
-        // was missing rows and the driven binary missing entirely. The
-        // stages were right and the fixture was reading the shell. `None` is
-        // the pin because these tests assert the CAPS; the ceiling itself is
-        // measured by `a_callers_job_count_caps_the_side_lane_child_it_reaches`,
-        // which sets the variable through [`Self::ctx_with`] rather than
-        // inheriting whatever ran the suite.
-        env.cargo_build_jobs = None;
-        tweak(&mut env);
-        // THE DISK FLOOR IS ZERO HERE. A fixture with a fake toolchain builds
-        // nothing, and the real floor made these tests' ladders refuse at the
-        // disk preflight whenever the HOST volume held less than it — measured
-        // 2026-09-23 inside a merge-contract run at 17.6 GiB free: 11 failures
-        // here, 12 in environment_contract.rs, every one a `disk preflight`
-        // COULD NOT RUN. The estimate that replaced that floor would refuse them
-        // too, since a fixture's empty lanes are budgeted cold. The preflight
-        // itself is measured by its own laws, which set the requirement they need.
-        Ctx::new(self.root.clone(), mode, scope, env, self.scratch.clone())
-            .with_disk_floor(0)
-            // The GUI smoke measures a real window; a synthetic repo has none, so it
-            // takes its honest skip instead of trying to open one.
-            .with_gui_smoke_skipped(true)
+        common::fixture_ctx(&self.root, &self.stage2, &self.scratch, mode, scope, tweak)
     }
 
     fn run(&self, mode: Mode, scope: Scope) -> (String, i32) {
@@ -531,9 +441,10 @@ fn a_failing_driver_fails_every_stage_that_drives_it_and_nothing_else() {
 #[test]
 fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
     let repo = FakeRepo::new();
-    // Everything green — including a control-socket smoke that really launches,
-    // really answers and really tears down — so the only thing standing between
-    // this run and the merge-contract sentence is that it was narrowed.
+    // Everything green — including a control-socket smoke that really launches
+    // under every precondition it promises, really types and really tears down —
+    // so the only thing standing between this run and the merge-contract
+    // sentence is that it was narrowed.
     repo.with_answering_smoke();
     let (ladder, code) = repo.run(Mode::Fast, Scope::crate_only("aterm-grid"));
 
@@ -544,19 +455,26 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
         !ladder.contains("--workspace"),
         "nothing whole-tree was driven"
     );
-    assert!(ladder.contains("  ok    smoke: aterm-ctl cursor -> OK row=0 col=0"));
-    assert!(ladder.contains("  ok    smoke: typing burst pacing counters clean"));
+    assert!(
+        ladder.contains("  ok    smoke: aterm-ctl cursor -> OK 0 0 1 blinking_block"),
+        "{ladder}"
+    );
+    assert!(
+        ladder.contains(
+            "  ok    smoke: 30/30 keys accepted over the control socket, no lost-wake heals"
+        ),
+        "{ladder}"
+    );
 
     assert!(
         !ladder.contains(MERGE_CONTRACT_SENTENCE),
         "THE regression: a scoped run claiming it all"
     );
     assert!(ladder.contains("NOT the merge contract"));
-    assert!(
-        ladder.contains(
-            "- scoped to -p aterm-grid: the rest of the workspace was not built or tested"
-        )
-    );
+    assert!(ladder.contains(
+        "- scoped to -p aterm-grid: the per-crate test, doctest and lint stages covered \
+             no other crate"
+    ));
     // The pacing smoke is the MEASURE tier's (2026-09-26): this run did not
     // plan it, so it is no skip — the verdict names it as not part of the
     // contract instead.
@@ -566,6 +484,40 @@ fn a_scoped_run_narrows_the_driver_and_is_refused_the_contract() {
             && ladder.contains("      - gui typing-pacing smoke\n"),
         "{ladder}"
     );
+}
+
+/// A BURST THAT BARELY HAPPENED PROVES NO WAKE WAS LOST. A heal is booked only
+/// when a later echo finds a lost wake's latch past its 100 ms expiry, so one
+/// accepted key cannot register one: the stand-in instance takes the first
+/// `send` and refuses the rest, and `wake_heals=0` after it is no pass. The
+/// round trip before the burst keeps its own row, whatever the burst does.
+#[test]
+fn a_burst_the_instance_mostly_refused_proves_no_wake_was_lost() {
+    let repo = FakeRepo::new();
+    let every_send = "  send) echo \"OK\" ;;";
+    let smoke = common::answering_smoke(&repo.ctl_sock);
+    assert!(smoke.contains(every_send), "the stand-in's send arm moved");
+    let first_send_only = smoke.replace(
+        every_send,
+        "  send) test -e \"$XDG_RUNTIME_DIR/sent\" && { echo 'ERR busy'; exit 1; }\n    \
+         : >\"$XDG_RUNTIME_DIR/sent\"; echo OK ;;",
+    );
+    repo.with_stage2(&format!("echo \"argv: $*\"\n{first_send_only}\nexit 0"));
+    let (ladder, code) = repo.run(Mode::Fast, Scope::crate_only("aterm-grid"));
+
+    assert_eq!(code, exit::FAILED, "{ladder}");
+    assert!(
+        ladder.contains("  ok    smoke: aterm-ctl cursor -> OK 0 0 1 blinking_block"),
+        "{ladder}"
+    );
+    assert!(
+        labels_with(&ladder, "FAIL")
+            .iter()
+            .any(|l| l
+                == "smoke: only 1/30 keys accepted (< 15), too few for a lost wake to register"),
+        "{ladder}"
+    );
+    assert!(!ladder.contains("no lost-wake heals"), "{ladder}");
 }
 
 /// Every driven stage reads its driver's EXIT CODE, and nothing that decided

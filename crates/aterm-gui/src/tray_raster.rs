@@ -724,6 +724,21 @@ impl PreparedSemanticFont {
         self.renderer.is_some()
     }
 
+    /// Pure geometry from the already prepared face; no request, worker poll,
+    /// font lock, fork, or rasterization is needed while laying out a specimen.
+    pub(crate) fn specimen_cell_height(
+        &self,
+        px: f32,
+        line_height: f32,
+        variations: &[(u32, f32)],
+    ) -> Option<usize> {
+        Some(
+            self.renderer
+                .as_ref()?
+                .specimen_cell_height(px, line_height, variations),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn renderer_ready(&self) -> bool {
         self.renderer.is_some()

@@ -994,6 +994,10 @@ impl App {
     /// and the fast latch kept on `App` (`App::claude_fast_latch`) wherever a
     /// Claude Code pane shows — folded into one repaint-key term (`0` when none
     /// shows).
+    ///
+    /// scope-waiver: this is a derived repaint fingerprint of existing App
+    /// state. The function owns no latch or budget; copying its scalar result
+    /// cannot multiply an enforcing instance.
     pub(crate) fn claude_footer_fp(
         &self,
         wid: WindowId,

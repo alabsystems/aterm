@@ -44,8 +44,10 @@ fn main() {
     let parsed = match cli::parse(args) {
         Ok(a) => a,
         Err(e) => {
+            // The one wrong flag, not the whole usage after it: that scrolls
+            // the fact off a terminal, and `--help` prints it on request.
             eprintln!("{}", e.message());
-            print!("{}", cli::usage());
+            eprintln!("verify: tools/verify.sh --help lists every flag");
             std::process::exit(exit::USAGE);
         }
     };

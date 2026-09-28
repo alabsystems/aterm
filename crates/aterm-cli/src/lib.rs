@@ -614,7 +614,10 @@ fn explain_config_report() -> String {
     );
     #[cfg(windows)]
     out.push_str(&windows_config_paragraph());
+    // Both tables are macOS settings that do nothing on Windows.
+    #[cfg(not(windows))]
     out.push_str(PRIVACY_CONFIG_PARAGRAPH);
+    #[cfg(not(windows))]
     out.push_str(MACHINE_CONFIG_PARAGRAPH);
     out
 }
@@ -658,6 +661,7 @@ fn windows_config_paragraph() -> String {
 /// `defaults` writes the
 /// ACCOUNT's per-host domain and ignores `$HOME`, so a redirected home is refused
 /// rather than written through; and every change is undoable by one printed line.
+#[cfg(not(windows))]
 const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      [machine] — macOS host settings (aterm.toml; applied by the co-located atpkg):\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
@@ -701,6 +705,7 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
 /// What it must NOT say is that the grant ends macOS consent dialogs. Which
 /// services a grant covers is unmeasured (design §7 S4), so this text describes
 /// the grant by what it is and stops there.
+#[cfg(not(windows))]
 const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      [privacy] — macOS consent (aterm.toml; the window reads it, the passthrough CLI does not):\n\
      \x20 enabled / check         the silent Full Disk Access probe. It reads state that already\n\
@@ -969,9 +974,7 @@ fn probe_reason(label: ProbeLabel) -> String {
         }
         ProbeLabel::RefusedNoHome => "$HOME is not set".to_string(),
         ProbeLabel::RefusedBadPath => "the store path is not usable".to_string(),
-        ProbeLabel::UnsupportedPlatform => {
-            "this is not macOS, which has no such consent".to_string()
-        }
+        ProbeLabel::UnsupportedPlatform => "macOS only".to_string(),
     }
 }
 
@@ -1085,8 +1088,13 @@ fn recovery_facts() -> RecoveryFacts {
 /// The `recovery:` row, pure over the ledger: how the runs before each recorded
 /// windowed launch ended, and the last unexpected end in detail. A NOTE when any run
 /// ended unexpectedly (a kill, a fatal signal, a panic) — a past crash is a fact to
-/// report, never a reason for `doctor` to fail — and OK otherwise.
+/// report, never a reason for `doctor` to fail — and OK otherwise. On Windows the
+/// window writes no ledger (its recovery census is Unix-only), so the row says so
+/// rather than promise a census that never starts.
 fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
+    if cfg!(windows) {
+        return (Mark::Note, "not recorded on Windows".to_string());
+    }
     let Some((rows, path)) = facts else {
         return (
             Mark::Note,
@@ -3989,7 +3997,8 @@ mod tests {
     /// The `recovery:` row: an empty ledger is OK and says where the census will
     /// write; a recorded kill is a NOTE that names it — never a FAIL, so a past crash
     /// does not make `aterm doctor && aterm` refuse to launch; no log directory is
-    /// "not measured", never "none".
+    /// "not measured", never "none". Unix only: Windows records no ledger.
+    #[cfg(unix)]
     #[test]
     fn the_recovery_row_reports_the_ledger_and_never_fails() {
         use aterm_update::recovery_ledger::{

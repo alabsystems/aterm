@@ -168,7 +168,8 @@ pub use verdict::{MERGE_CONTRACT_SENTENCE, Verdict};
 /// `exec`s this binary, passes ours through untouched, and returns `3` itself
 /// whenever the gate could not be built at all.
 pub mod exit {
-    /// Everything that ran was green (the verdict text says *which* green).
+    /// Nothing NEW failed: everything that ran was green, or every red was
+    /// inherited from main's receipt (the verdict text says *which* green).
     pub const PASS: i32 = 0;
     /// A gate FAILED — a real finding about the tree.
     pub const FAILED: i32 = 1;
@@ -594,11 +595,8 @@ impl Ctx {
     ///   diagnosis into "TRUST_STAGE2_BIN names no toolchain".
     #[must_use]
     pub fn with_pinned_child_facts(mut self, test_threads: Option<std::num::NonZeroU32>) -> Self {
+        // Not said as a note: the toolchain header already names the directory.
         if self.tools.have_targo() {
-            self.notes.push(format!(
-                "child env: toolchain pinned to {} (TRUST_STAGE2_BIN)",
-                self.tools.stage2_dir.display()
-            ));
             self.child_env_add.push((
                 "TRUST_STAGE2_BIN".into(),
                 self.tools.stage2_dir.clone().into_os_string(),
@@ -775,8 +773,7 @@ pub fn toolchain_header_line(
         );
     }
     format!(
-        "verify: toolchain {} (channel \"{channel}\", absolute and resolved once — every \
-         stage below ran this targo)\n",
+        "verify: toolchain {} (channel \"{channel}\", resolved once for this run)\n",
         stage2_dir.display()
     )
 }
@@ -807,13 +804,13 @@ pub fn toolchain_header(ctx: &Ctx) -> String {
 
 /// Run the whole gate: ladder and verdict. Returns the process exit code.
 ///
-/// `out` receives, in this order: the [`toolchain_header`] line, the lease line,
+/// `out` receives, in this order: the [`toolchain_header`] line, any lease line,
 /// the prelude rungs, the `verify: NARROWED …` line ([`narrowing_note`]) for a
 /// `--changed` or `--scope` run, the `verify: source …` line (a git root only),
 /// the `verify: checkers …` line ([`checkers`]) and any `verify:` notes (the
 /// snapshot's lanes, the pinned child facts), the `verify: base …` line (what
 /// the run is judged against, [`differential`]; a git root only), `verify:
-/// lanes over the cap: …` lines naming any lane the cap could not remove, the
+/// build dirs over the cap: …` lines naming any the cap could not remove, the
 /// `verify: disk …` line (the free space on the volume holding the run's root,
 /// what its lanes hold, and what this run needs — with the terms of the sum,
 /// or as the `--disk-floor` in force), the ladder in declared order with a
@@ -851,7 +848,8 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     // the pinned directory, so without it atpkg could not tell the run was using it:
     // its gc reclaimed a superseded build a long run still needed (COULD NOT RUN),
     // and an unattended trust update re-laid the rustup view between two stages.
-    // Said in one line either way; a lease that cannot be taken never stops the run.
+    // Said in one line when held or refused (nothing for a toolchain atpkg does not
+    // manage); a lease that cannot be taken never stops the run.
     let _lease = if ctx.tools.have_targo() {
         let prefix = toolchain::atpkg_prefix(&ctx.env.home, ctx.env.xdg_config_home.as_deref());
         let who = format!(
@@ -991,7 +989,7 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
     if plan.remove {
         plan.unremoved = snapshot::remove_lanes(&ctx.root);
         for why in &plan.unremoved {
-            writeln!(out, "verify: lanes over the cap: {why}")?;
+            writeln!(out, "verify: build dirs over the cap: {why}")?;
         }
     }
     let reading = ctx
@@ -1060,12 +1058,17 @@ pub fn run(ctx: &Ctx, out: &mut dyn Write) -> std::io::Result<i32> {
                 eprintln!("verify: start  {}", spec.title);
             }
             // A stage that would build or drive something must not start on a
-            // tree or a compiler other than the one this run named.
+            // tree or a compiler other than the one this run named. Its row
+            // names the stage; why is said once, by the `source identity` row
+            // the trip (it latches) adds after the ladder.
             let report = if spec.lane != plan::Lane::Pure
-                && let Some(why) = tripwire.check(identity::CHECK_CACHE)
+                && tripwire.check(identity::CHECK_CACHE).is_some()
             {
                 let mut r = Report::new(spec.title.clone());
-                r.cannot_run(format!("not run: {}", identity::tripped_label(&why)));
+                r.cannot_run(format!(
+                    "not run: the tree or the toolchain moved before `{}` started",
+                    spec.title
+                ));
                 r
             } else {
                 stages::run_stage(ctx, spec)
@@ -1234,9 +1237,7 @@ fn epoch_secs() -> u64 {
 }
 
 /// Why a `--measure` run has no base: the `verify: base …` line's reason.
-pub const MEASURE_IS_ABSOLUTE: &str = "a --measure run is judged by the absolute rule: the \
-     MEASURE tier is not part of the merge contract, and a release cut takes its receipt \
-     only when nothing in it was red";
+pub const MEASURE_IS_ABSOLUTE: &str = "a --measure run has no base";
 
 /// How a run was judged, for its receipt.
 struct Judged<'a> {
@@ -1404,9 +1405,9 @@ fn write_receipt(
         Ok(receipt::Written::Stored(_)) => Some(r.render()),
         Ok(receipt::Written::KeptWholeTree(path)) => {
             eprintln!(
-                "verify: {} keeps its whole-tree receipt ({}); this run ({}, scope {}) does not \
+                "verify: {} keeps its stronger receipt ({}); this run ({}, scope {}) does not \
                  replace it",
-                r.head,
+                differential::short(&r.head),
                 path.display(),
                 r.verdict,
                 r.scope
@@ -1427,19 +1428,14 @@ fn write_receipt(
 
 /// The line a NARROWED run prints at its start, before any stage: why it is
 /// narrower than the merge contract, and that even a green verdict will not
-/// discharge it — its receipt will say `scope <scope>` and `merge-contract
-/// no`, which the release cutter does not count as gated. `None` for the
-/// whole-tree run. The verdict still says the same at the end; this is so a
-/// reader does not learn it an hour late.
+/// discharge it. `None` for the whole-tree run. The verdict still says the
+/// same at the end; this is so a reader does not learn it an hour late. It
+/// says nothing of the receipt: a run over uncommitted work writes none.
 #[must_use]
 pub fn narrowing_note(scope: &Scope) -> Option<String> {
     let why = scope.narrowing()?;
     Some(format!(
-        "verify: NARROWED — {why}. Even green, this run CANNOT discharge the merge contract \
-         (the whole tree with nothing skipped: `tools/verify.sh` with no --changed or --scope); \
-         its receipt will say `scope {}` and `merge-contract no`, which the release cutter does \
-         not count as gated.",
-        scope.receipt_word()
+        "verify: NARROWED — {why}. Even green, this run is not the merge contract."
     ))
 }
 
@@ -1862,14 +1858,6 @@ mod tests {
             physical.display().to_string(),
             "the child must be handed the run's own resolved directory"
         );
-        assert!(
-            pinned
-                .notes
-                .iter()
-                .any(|n| n.contains("toolchain pinned to") && n.contains("TRUST_STAGE2_BIN")),
-            "{:?}",
-            pinned.notes
-        );
 
         let none = ctx(&tmp.join("nothing-here"));
         assert!(!none.tools.have_targo());
@@ -1968,7 +1956,7 @@ mod tests {
         assert!(line.starts_with("verify: toolchain /Users//x/toolchains/trust-current/bin "));
         assert!(line.contains("channel \"trust\""));
         assert!(
-            line.contains("absolute and resolved once"),
+            line.contains("resolved once"),
             "the line must say the path is PINNED, not merely print one: {line}"
         );
         assert!(line.ends_with('\n') && line.matches('\n').count() == 1);
@@ -1993,7 +1981,6 @@ mod tests {
             its: "2026-08-20".into(),
             store: "2026-09-17".into(),
             linked: true,
-            view: false,
         });
         assert!(
             note.starts_with("verify: toolchain note — rustup `trust` ("),

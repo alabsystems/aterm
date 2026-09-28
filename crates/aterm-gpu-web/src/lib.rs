@@ -679,7 +679,7 @@ impl AtermGpuTerminal {
     /// glyphs the primary face lacks render real shapes instead of `.notdef` tofu.
     /// Applies to the CPU face (metrics) and the live GPU face if `init` already
     /// ran; the bytes are also remembered so `init` re-applies them to the fresh
-    /// GPU face it builds. No-throw: a bad blob leaves the existing faces untouched.
+    /// GPU face it builds. Throws on a bad blob; the existing faces stay.
     pub fn set_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
         self.cpu.set_fallback_bytes(bytes)?;
@@ -702,7 +702,7 @@ impl AtermGpuTerminal {
     /// `init` already ran; the bytes are also remembered so `init` re-applies the
     /// whole chain to the fresh GPU face. Lets the host push a CJK fallback then
     /// Arabic/Devanagari/Thai/Hebrew faces so a glyph the earlier faces miss still
-    /// reaches a covering face. No-throw: a bad blob leaves the chain untouched.
+    /// reaches a covering face. Throws on a bad blob; the chain stays.
     pub fn add_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
         self.cpu.add_fallback_bytes(bytes)?;
@@ -717,8 +717,8 @@ impl AtermGpuTerminal {
     }
 
     /// Inject a colour-emoji (sbix) face from font bytes, driving the existing
-    /// ColorEmoji colour path. Same wiring as [`set_fallback_font`]. No-throw
-    /// (the `String` Err surfaces as a catchable JS exception).
+    /// ColorEmoji colour path. Same wiring as [`set_fallback_font`]. Throws on a
+    /// bad blob; the existing face stays.
     pub fn set_emoji_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
                                         // Intern ONCE up front and install/retain that shared Arc, mirroring the
@@ -727,7 +727,7 @@ impl AtermGpuTerminal {
                                         // were pure waste: `set_color_font_bytes` already interned the blob, so the
                                         // retention intern only memcmp'd a fresh copy against that very entry and
                                         // dropped it. `set_color_font_arc` runs the identical `ttf_parser` validation
-                                        // and ends in the identical `install_color_font`, so the no-throw contract
+                                        // and ends in the identical `install_color_font`, so the throw-on-bad-blob contract
                                         // and the installed face are unchanged — only the copies are gone. (A
                                         // MALFORMED blob now lands in the intern store before validation rejects it,
                                         // exactly as `register_font` above already does; no new class of retention.)
@@ -747,7 +747,7 @@ impl AtermGpuTerminal {
     /// Inject a REAL bold weight of the primary family so SGR-bold cells render as a
     /// true heavier weight instead of synthetic embolden. Applies to the CPU face
     /// and the live GPU face if `init` already ran; remembered so `init` re-applies
-    /// it to the fresh GPU face. No-throw: a bad blob leaves the existing weight.
+    /// it to the fresh GPU face. Throws on a bad blob; the existing weight stays.
     pub fn set_bold_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
         self.cpu.set_bold_font(bytes)?;
@@ -763,8 +763,7 @@ impl AtermGpuTerminal {
     /// Inject a broad-coverage SYMBOL fallback face from font bytes (the
     /// byte-injection sibling of the config `symbol_font` path). Applies to the
     /// CPU face and the live GPU face if `init` already ran; remembered so `init`
-    /// re-applies it to the fresh GPU face. No-throw: a bad blob leaves the
-    /// existing faces untouched.
+    /// re-applies it to the fresh GPU face. Throws on a bad blob.
     pub fn set_symbol_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
         self.cpu.set_symbol_fallback_bytes(bytes)?;
@@ -873,7 +872,7 @@ impl AtermGpuTerminal {
     /// re-rasterize, on the CPU face and the live GPU face. The injected bytes
     /// REPLACE `font_bytes` so a later `init` builds the GPU face from the new
     /// family directly. The host re-reads cell metrics + resizes the grid after.
-    /// No-throw: a bad blob leaves the existing face untouched.
+    /// Throws on a bad blob; the existing face stays.
     pub fn set_primary_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.note_host_visual_change(); // WF-1 gate
         self.cpu.set_primary_font(bytes)?;

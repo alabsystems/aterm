@@ -8,7 +8,7 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "aterm — the one-command release cutter behind the `cargo ship` alias: ledger claim, universal build, bundle/sign/DMG, draft-first GitHub publish, post-publish verify."
+description = "aterm — the one-command release cutter behind the `cargo ship` alias: ledger claim, universal build, bundle/sign/DMG, tag, one publication onto the release channel."
 
 # Binary-only on purpose (no lib.rs; src/main.rs says why): every module is a private
 # `mod` of this binary, so dead_code judges each item against what main() can reach.

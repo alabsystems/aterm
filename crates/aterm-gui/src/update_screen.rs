@@ -966,6 +966,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         }
     }
 
@@ -992,6 +993,11 @@ mod tests {
         assert_eq!(
             crate::native_settings::compact_update_headline(&projection),
             "Downloaded"
+        );
+        // The tersest rung keeps the command whole: `update apply` alone runs nothing.
+        assert_eq!(
+            crate::native_settings::compact_update_detail_minimum(&projection),
+            "aterm update apply"
         );
     }
 

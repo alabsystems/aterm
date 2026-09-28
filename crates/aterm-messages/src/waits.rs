@@ -455,14 +455,15 @@ fn ends_unread((done0, at0): (u64, Duration), s: &WaitSample) -> bool {
     left < PROGRESS_GRACE.saturating_sub(s.elapsed) + REVEAL_MIN_LEFT
 }
 
-/// A paste's excerpt while its program takes none of it: `program not
-/// reading for 37 s` — short enough that its figure survives at 100 columns
-/// (live, the longer `the program has read nothing for 13…` lost it).
+/// A paste's excerpt while its program takes none of it: `not read for 37
+/// s` — short enough that its figure survives at 60 columns beside the
+/// title, the percent and `Stop` (ruling 316, day eight E4: `program not
+/// reading for 37 s` kept its figure at 100 columns only and read `program
+/// not reading…` at 60; live, the longer `the program has read nothing for
+/// 13…` lost it at 100). The title names the paste, so what was not read is
+/// the paste, and `Stop paste` is still what ends the wait.
 fn unread_words(stuck: Duration) -> String {
-    format!(
-        "program not reading for {}",
-        crate::strain::span_words(stuck)
-    )
+    format!("not read for {}", crate::strain::span_words(stuck))
 }
 
 /// Whether a paste of `bytes` is watched at all ([`LARGE_PASTE_BYTES`]).
@@ -508,8 +509,45 @@ mod tests {
             panic!("restated");
         };
         assert!(row.excerpt);
-        assert_eq!(row.detail, ["program not reading for 37 s"]);
+        assert_eq!(row.detail, ["not read for 37 s"]);
         assert_eq!(row.title, "Pasting 12 MB", "the title is the job's");
+        // Ruling 316 (day eight E4): the figure survives at 60 columns,
+        // beside the percent and the capsule, on the widest paste title and
+        // the widest span words; `program not reading for 37 s` lost it.
+        let figure_at = |row: &Message, cols: usize| {
+            let now = crate::Instant::now();
+            let mut c = crate::center::MessageCenter::new(crate::log::MessageLog::empty(), now);
+            let _ = c.post(row.clone(), crate::model::WallStamp { unix_ms: 1_000 }, now);
+            let _ = c.settle(now, true);
+            c.commit_rows(now, 3);
+            let p = c.presentation(
+                cols,
+                &crate::text::char_width,
+                None,
+                crate::glass::Links::Painted,
+            );
+            p.rows
+                .first()
+                .and_then(|r| r.detail.clone())
+                .map(|(_, d)| d)
+        };
+        let mut big = SessionWait::paste(3, 9);
+        let _ = big.step(&sample(0, 999_000_000, 2_000, true));
+        let WaitStep::Restate(wide) = big.step(&sample(0, 999_000_000, 3_601_000, true)) else {
+            panic!("restated");
+        };
+        assert_eq!(wide.title, "Pasting 999 MB");
+        assert_eq!(
+            figure_at(&wide, 60).as_deref(),
+            Some("not read for 59m 59s")
+        );
+        let mut old = row.clone();
+        old.detail = vec!["program not reading for 37 s".to_string()];
+        assert_ne!(
+            figure_at(&old, 60).as_deref(),
+            Some("program not reading for 37 s"),
+            "the control: the old words are cut at 60"
+        );
         // It reads again: the words go at once.
         let WaitStep::Restate(row) = w.step(&sample(1_000_000, total, 39_250, true)) else {
             panic!("restated");

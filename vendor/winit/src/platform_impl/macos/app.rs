@@ -239,12 +239,12 @@ unsafe fn send_event_body(app: Id, cmd: Sel, event: Id) {
 /// own `Method`, so this patches `NSApplication` process-wide, which was true
 /// of upstream too and silently.
 ///
-/// Upstream's `#[cfg(test)] mod tests` (`test_override`, `test_custom_class`,
-/// and the containment's `the_event_constants_match_the_binding`) is DELETED,
-/// not ported — `winit` is not a workspace member, so no compiler here would
-/// ever see it. The first two cases run for real in `aterm-objc`'s
-/// `tests/swizzle.rs` (and on this fork's install in `aterm-gui`'s window and event
-/// drives); the constants by `aterm-objc`'s `winit_seam_constants.rs`; see the roadmap.
+/// This dependency's own tests do not run in the workspace. Swizzle coverage
+/// lives in `aterm-objc/tests/swizzle.rs`, which exercises libobjc directly.
+/// The fork's install runs in `aterm-gui/examples/objc_window_drive.rs`
+/// (stage 15) and `aterm-gui/examples/objc_event_drive.rs` (stage 8).
+/// SDK constants are checked by `aterm-objc/tests/winit_seam_constants.rs`;
+/// see `docs/THIRD_PARTY_ROAD_TO_ZERO.md` for the coverage rationale.
 ///
 /// # Panics
 ///

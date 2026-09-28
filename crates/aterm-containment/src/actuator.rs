@@ -16,7 +16,7 @@
 //!
 //! | Mode | Enforced |
 //! |---|---|
-//! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps the launching shell's resource limits. |
+//! | Master, User | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | Safety | Hardened resource limits (`aterm-sandbox`: rlimits on Unix, the Job Object on Windows). No OS sandbox, on any platform. |
 //! | Containment | The hardened limits PLUS the OS sandbox below — and on a platform without one, NO SHELL (see "Fail closed"). |
 //!
@@ -61,9 +61,8 @@ const SUBSYSTEM: &str = "spawn";
 
 /// Why [`decide`] refuses a `Containment` spawn on a platform with no OS sandbox.
 /// Both launchers print it verbatim.
-pub const NO_OS_SANDBOX_REASON: &str = "no OS sandbox on this platform (only macOS has one: \
-     Seatbelt via sandbox-exec); containment mode refuses to start rather than run a shell \
-     without network and filesystem confinement";
+pub const NO_OS_SANDBOX_REASON: &str =
+    "aterm sandboxes a shell only on macOS, so no shell was started";
 
 /// Whether THIS BUILD/PLATFORM can actuate a real OS sandbox at the spawn seam:
 /// `true` only on macOS (Seatbelt via `sandbox-exec`). What that sandbox enforces
@@ -202,17 +201,20 @@ fn decide_on(mode: ContainmentMode, sandbox_available: bool) -> SpawnDecision {
         );
     } else {
         // Explicit, non-silent record that no OS sandbox is in force for this mode
-        // (its policy permits network). Platform-selected reason: on Windows the
-        // rlimit half is ALSO absent, and the record must never overstate the
-        // posture.
+        // (its policy permits network). Safety's hardened limits apply as rlimits
+        // on Unix and through the Job Object on Windows
+        // (`aterm_sandbox::Limits::shell_default`); Master and User keep
+        // aterm's own (`Limits::inherit`, chosen by both launchers) — the
+        // launching shell's for a session, launchd's for the window — so their
+        // record claims no limits.
         log_posture(
             SUBSYSTEM,
             "os-network-sandbox",
             mode,
-            if cfg!(windows) {
-                "OS sandbox not applied (network permitted by policy); process-cap gate only (resource limits unavailable on this platform)"
+            if matches!(mode, ContainmentMode::Master | ContainmentMode::User) {
+                "OS sandbox not applied (network permitted by policy); process-cap gate only (resource limits inherited from aterm's own process)"
             } else {
-                "OS sandbox not applied (network permitted by policy); rlimits + process-cap gate only"
+                "OS sandbox not applied (network permitted by policy); resource limits + process-cap gate only"
             },
         );
     }
@@ -298,7 +300,7 @@ mod tests {
                 reason: NO_OS_SANDBOX_REASON,
             }
         );
-        assert!(NO_OS_SANDBOX_REASON.contains("no OS sandbox on this platform"));
+        assert!(NO_OS_SANDBOX_REASON.contains("only on macOS"));
         // The other modes never demanded a sandbox, so its absence changes nothing.
         for mode in [
             ContainmentMode::Master,

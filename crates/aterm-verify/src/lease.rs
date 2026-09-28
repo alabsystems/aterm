@@ -133,21 +133,19 @@ pub enum Taken {
 }
 
 impl Taken {
-    /// The `verify:` header line that says it, under the toolchain line.
+    /// The `verify:` header line that says it, under the toolchain line —
+    /// nothing for a toolchain atpkg does not manage, since nothing happened.
     #[must_use]
     pub fn header_line(&self) -> String {
         match self {
             Self::Held(lease) => format!(
-                "verify: toolchain lease — held on {} for this run: atpkg's gc keeps it and an \
-                 unattended trust update waits for it (4 h at the most)\n",
+                "verify: {} held for this run; an unattended trust update waits for it \
+                 (4 h at most)\n",
                 lease.what
             ),
-            Self::NotManaged => "verify: toolchain lease — none: not a toolchain atpkg manages, \
-                                 so nothing of atpkg's can reclaim it\n"
-                .to_string(),
+            Self::NotManaged => String::new(),
             Self::Failed(why) => format!(
-                "verify: toolchain lease — NOT taken ({why}); this run goes on unprotected: an \
-                 update landing mid-run can reclaim or re-lay its toolchain\n"
+                "verify: toolchain not held ({why}); an update during this run can replace it\n"
             ),
         }
     }
@@ -344,13 +342,13 @@ mod tests {
         assert!(
             Taken::Held(lease)
                 .header_line()
-                .contains("held on trust build 9192")
+                .contains("verify: trust build 9192 held for this run")
         );
         assert!(!file.exists(), "dropped with its run");
         let elsewhere = prefix("elsewhere");
         let other = take(&p, &elsewhere, "x", WAIT);
         assert!(matches!(other, Taken::NotManaged));
-        assert!(other.header_line().contains("none"));
+        assert_eq!(other.header_line(), "");
         let _ = std::fs::remove_dir_all(&p);
         let _ = std::fs::remove_dir_all(&elsewhere);
     }
@@ -370,7 +368,7 @@ mod tests {
             panic!("a held gate is waited out: {taken:?}");
         };
         assert!(why.contains("reclaiming"), "{why}");
-        assert!(taken.header_line().contains("NOT taken"));
+        assert!(taken.header_line().contains("not held"));
         gate.unlock().unwrap();
         assert!(matches!(take(&p, &bin, "x", WAIT), Taken::Held(_)));
         let _ = std::fs::remove_dir_all(&p);

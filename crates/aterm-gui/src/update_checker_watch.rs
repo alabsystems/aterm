@@ -263,7 +263,8 @@ impl App {
             replacement.is_some(),
             stall.holds_lane,
         );
-        let announced = self.note_update_health(title, &body);
+        let announced =
+            self.note_update_health_as(crate::update_words::HealthKind::Stalled, title, &body);
         if announced {
             self.update_checker_watch.announced_at_checks = Some(stall.checks);
         }
@@ -285,28 +286,15 @@ impl App {
     /// of its healing — goes, and nothing else does: a ledger warning under
     /// another title is the ledger's to heal.
     pub(crate) fn heal_update_checker_stall(&mut self) {
-        let title = crate::update_words::CHECKER_STALLED_TITLE;
+        let stalled = crate::update_words::HealthKind::Stalled;
         aterm_log::info!(
             "update checker: a check completed after the stall; the warning is healed"
         );
-        self.update_health_latched
-            .retain(|latched| latched != title);
-        if let Some(id) = self
-            .messages
-            .live_by_key(crate::update_words::KEY_HEALTH)
-            .filter(|live| live.msg.title == title)
-            .map(|live| live.id)
-        {
+        self.update_health_latched.retain(|kind| *kind != stalled);
+        for id in self.live_update_health(|kind| kind == stalled) {
             self.resolve_message(id, aterm_messages::Outcome::Warn);
         }
-        if self
-            .update_health_said
-            .as_ref()
-            .is_some_and(|(said, _)| said == title)
-            && let Some((said, line0)) = self.update_health_said.take()
-        {
-            self.record_message(crate::update_words::health_recovered(&said, &line0));
-        }
+        self.record_update_health_healed(|kind| kind == stalled);
     }
 
     /// The one wake the watchdog owes the event loop ([`next_look_in`], over the
@@ -326,6 +314,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_words::LiveHealth as _;
     use aterm_update::checker_watch::{
         CHECK_PHASE_BUDGET, CHECKER_LOCK_WAIT, LaneHolder, STALL_CONFIRM, STALL_SLACK,
         stall_threshold_secs,
@@ -548,7 +537,7 @@ mod tests {
         app.announce_update_checker_stall(stall, Some(2));
         let live = app
             .messages
-            .live_by_key(crate::update_words::KEY_HEALTH)
+            .live_health()
             .expect("the health warning is up");
         assert_eq!(live.msg.title, crate::update_words::CHECKER_STALLED_TITLE);
         let words = live.msg.detail.join(" ");
@@ -557,10 +546,7 @@ mod tests {
                 && words.contains("started a fresh one in its place"),
             "{words}"
         );
-        let before = app
-            .messages
-            .live_by_key(crate::update_words::KEY_HEALTH)
-            .map(|l| l.id);
+        let before = app.messages.live_health().map(|l| l.id);
         app.announce_update_checker_stall(
             CheckerStall {
                 generation: 2,
@@ -569,9 +555,7 @@ mod tests {
             None,
         );
         assert_eq!(
-            app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
-                .map(|l| l.id),
+            app.messages.live_health().map(|l| l.id),
             before,
             "announced once per launch"
         );
@@ -602,7 +586,7 @@ mod tests {
         );
         let words = app
             .messages
-            .live_by_key(crate::update_words::KEY_HEALTH)
+            .live_health()
             .expect("the warning is up")
             .msg
             .detail
@@ -625,15 +609,13 @@ mod tests {
         let stale = stall_threshold_secs(CheckerPhase::Settings, 1_100) + 1;
         app.look_at_update_checker(Some(stuck), stale);
         assert!(
-            app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
-                .is_none(),
+            app.messages.live_health().is_none(),
             "one stale look only suspects"
         );
         app.look_at_update_checker(Some(stuck), stale + CONFIRM);
         assert!(
             app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
+                .live_health()
                 .is_some_and(|live| live.msg.title == crate::update_words::CHECKER_STALLED_TITLE),
             "the confirmed stall is announced"
         );
@@ -643,23 +625,18 @@ mod tests {
         replacement.respawns = 1;
         app.look_at_update_checker(Some(replacement), stale + CONFIRM + 20);
         assert!(
-            app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
-                .is_some(),
+            app.messages.live_health().is_some(),
             "no check has completed since: the warning stands"
         );
         replacement.checks = 5;
         app.look_at_update_checker(Some(replacement), stale + CONFIRM + 700);
         assert!(
-            app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
-                .is_none(),
+            app.messages.live_health().is_none(),
             "a completed check healed it"
         );
         assert!(
             !app.update_health_latched
-                .iter()
-                .any(|title| title == crate::update_words::CHECKER_STALLED_TITLE),
+                .contains(&crate::update_words::HealthKind::Stalled),
             "and its latch: a later stall is announced again"
         );
     }
@@ -671,10 +648,6 @@ mod tests {
         let mut app = App::headless_for_test();
         app.watch_update_checker();
         assert!(app.update_checker_deadline().is_none());
-        assert!(
-            app.messages
-                .live_by_key(crate::update_words::KEY_HEALTH)
-                .is_none()
-        );
+        assert!(app.messages.live_health().is_none());
     }
 }

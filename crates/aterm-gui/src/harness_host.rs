@@ -96,11 +96,14 @@
 //!   parks next, as a Claude Code's is. A session busy only with its OWN
 //!   BACKGROUND WORK (a workflow it waits on, a shell it left, a Codex
 //!   background terminal) is at a natural break: its loop offers that break
-//!   ([`IdleHost::at_background`]) and the worker types only a NOTICE there,
-//!   and ends nothing (owner, 2026-09-26: "The notice interrupts the
-//!   agent's orchestration once, and the restart still never kills running
-//!   work"). Only a whole `REASK_S` of that work running on earns a re-ask
-//!   there, naming what runs. After `MAX_ASKS` notices the upgrade gives up.
+//!   ([`IdleHost::at_background`]) and the worker types only a line that
+//!   ends nothing there — a NOTICE, or the RELEASE LINE a give-up, a void or
+//!   a stop owes (2026-09-27: a break that never ends is the only point such
+//!   a session has) — and ends nothing (owner, 2026-09-26: "The notice
+//!   interrupts the agent's orchestration once, and the restart still never
+//!   kills running work"). Only a whole `REASK_S` of that work running on
+//!   earns a re-ask there, naming what runs. After `MAX_ASKS` notices the
+//!   upgrade gives up.
 //!   A tab whose poll loops could never end was otherwise told once and then
 //!   waited on for days (2026-09-26). While the agent
 //!   winds down (READY given, the restart imminent) the upgrade OWNS the
@@ -145,7 +148,16 @@
 //!   conversation ([`aterm_agent::harness::relaunch::after_exit`]) on a
 //!   growing back-off kept per session ([`Relaunches`]); the session's keyed
 //!   attention says a relaunch the owner limited, one that cannot be made
-//!   and one that keeps failing — never a silent give-up.
+//!   and one that keeps failing — never a silent give-up. AN EXIT THE
+//!   HARNESS'S OWN RESTART MADE is read first, and is no one else's (S0 and
+//!   S3 of the in-flight review, 2026-09-27): a restart — the upgrade's,
+//!   Claude Code's or Codex's, or the restart in place's — whose step
+//!   returned with its relaunch still to type, and whose agent then left
+//!   ([`aterm_agent::harness::relaunch::restarted`]), is carried
+//!   ([`aterm_agent::harness::relaunch::carry_restart`]) whoever is at the
+//!   tab and whatever `[harness] relaunch` says — the relaunch line's own
+//!   look still waits on a person and a hold — at least every
+//!   [`relaunch::CARRY_EVERY`], until it lands or is said.
 //! * THE RESTART IN PLACE (`[harness] relaunch`). Where the loop meets a
 //!   point nothing typed can answer — Claude Code's critical-memory banner —
 //!   it asks its worker to restart the agent there ([`IdleHost::restart`]):
@@ -682,6 +694,12 @@ type FollowFn = dyn Fn(&str, &mut Snapshot) -> Foreground + Send + Sync;
 type StatusFn = dyn Fn(&str) -> Option<String> + Send + Sync;
 type ExitLookFn = dyn Fn(&str, &Snapshot) -> Option<ExitLook> + Send + Sync;
 type RelaunchFn = dyn Fn(&str, u32, &Snapshot, &ExitRecord, bool, bool) -> String + Send + Sync;
+/// Whether the harness's own restart ended the agent that left
+/// ([`Acts::restarted`]): `(sid, codex, pid)`.
+type RestartedFn = dyn Fn(&str, bool, Option<u32>) -> bool + Send + Sync;
+/// One attempt at carrying that restart on ([`Acts::carry`]): `(sid, grace,
+/// codex, pid)`.
+type CarryFn = dyn Fn(&str, u32, bool, Option<u32>) -> String + Send + Sync;
 /// The relaunch of an agent whose tab a crash of aterm took, in the tab the
 /// next launch reopened ([`relaunch::after_host_ended`]): `(sid, snapshot,
 /// upgrade)` to the step's word.
@@ -771,6 +789,14 @@ pub(crate) struct Acts {
     /// as the exit is seen, before the back-off ([`on_agent_left`]).
     pub(crate) exit_look: Arc<ExitLookFn>,
     pub(crate) relaunch: Arc<RelaunchFn>,
+    /// Whether the harness's OWN restart ended the agent that left — the
+    /// upgrade's, or the restart in place's, left in flight by its step
+    /// ([`relaunch::restarted`]: a Codex's by its tab, a Claude Code's by the
+    /// snapshot's pid) — read as the exit is seen, before whose exit it was.
+    pub(crate) restarted: Arc<RestartedFn>,
+    /// One attempt at carrying that restart on
+    /// ([`relaunch::carry_restart`]).
+    pub(crate) carry: Arc<CarryFn>,
     /// The relaunch of a restored tab's agent after aterm itself ended
     /// ([`HostHandle::relaunch_restored`]).
     pub(crate) relaunch_restored: Arc<RestoredFn>,
@@ -1429,10 +1455,15 @@ impl IdleHost for WorkerIdle {
     /// days). Past `MAX_ASKS` the upgrade gives up here. Nothing is ended.
     /// Once a notice is typed, the upgrade owns the session's turn ends, as
     /// after any notice. A last word, or a word that holds the upgrade,
-    /// releases them ([`upgrade_drive::released_at_break`]). The restart and a
-    /// carry-on stay
-    /// the next idle point's (the park is left set for it). A break that
-    /// typed nothing is looked at again after [`BACKGROUND_LOOK`].
+    /// releases them ([`upgrade_drive::released_at_break`]). So does the
+    /// RELEASE LINE a give-up, a void or a stop owes, typed here as at an
+    /// idle point (2026-09-27: a break that never ended is the only point
+    /// such a session has): the agent is told to go on. Every turn typed here
+    /// is said to the loop ([`upgrade_drive::typed`]), which journals it and
+    /// awaits its answer as the harness's own — never the worker's work. The
+    /// restart and a carry-on stay the next idle point's (the park is left
+    /// set for it). A break that typed nothing is looked at again after
+    /// [`BACKGROUND_LOOK`].
     fn at_background(&self) -> Option<String> {
         if !upgrades(self.agent) || !self.switches.upgrade() {
             return None;
@@ -1460,12 +1491,15 @@ impl IdleHost for WorkerIdle {
         if upgrade_drive::released_at_break(&step) {
             self.owns.store(false, Ordering::SeqCst);
         }
-        if !step.starts_with("announced:") {
+        if !upgrade_drive::typed(&step) {
             return None;
         }
         // Typed: the answer and the restart are the idle point's — a later
-        // break has nothing to add before the pause.
-        self.owns.store(true, Ordering::SeqCst);
+        // break has nothing to add before the pause. A notice's answer is the
+        // upgrade's; a release's is the agent going on.
+        if step.starts_with("announced:") {
+            self.owns.store(true, Ordering::SeqCst);
+        }
         Some(format!("upgrade step={step}"))
     }
 
@@ -1754,28 +1788,50 @@ fn with_kept<R>(job: &WorkerJob, f: impl FnOnce(&mut Kept) -> R) -> R {
 }
 
 /// RELAUNCH ON EXIT: the session's agent left a tab that lives on. Whose
-/// exit it was decides ([`relaunch::on_exit`]): a person's (a keystroke
-/// within the grace) or a holder's (a halt, a lease, a named driver's turn)
-/// is theirs, and the tab is left to them; one the owner limited — `[harness]
-/// relaunch = false`, or an agent the relaunch is not written for — is said
-/// once on the session's attention; any other is relaunched on its
-/// conversation after the session's back-off, cut short when the agent is
-/// back or the worker is stopped for good, and asked about again before each
-/// try — trying again on the growing pause until it lands, until the exit
-/// proves to be the launch's own end (journaled, nothing said), or until it
-/// can never land (said).
+/// exit it was decides ([`relaunch::on_exit`]): the harness's OWN restart's
+/// first — the upgrade's, or the restart in place's, left in flight by its
+/// step ([`Acts::restarted`]; S0 and S3 of the in-flight review, 2026-09-27)
+/// — which is carried whoever is at the tab and whatever the owner's switch
+/// says ([`OnExit::Restarted`]); a person's (a keystroke within the grace)
+/// or a holder's (a halt, a lease, a named driver's turn) is theirs, and the
+/// tab is left to them; one the owner limited — `[harness] relaunch =
+/// false`, or an agent the relaunch is not written for — is said once on the
+/// session's attention; any other is relaunched on its conversation after
+/// the session's back-off, cut short when the agent is back or the worker is
+/// stopped for good, and asked about again before each try — trying again
+/// on the growing pause until it lands, until the exit proves to be the
+/// launch's own end (journaled, nothing said), or until it can never land
+/// (said).
 fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
     let sid = job.sid.as_str();
     let grace = job.opts.policy.human_grace_s;
     // Its loop held for a stall when it left: the stall's remedy ended it
     // (U1). Taken: the next agent's stall is its own.
     let stalled = job.stalled.swap(false, Ordering::SeqCst);
+    let snap = with_kept(job, |k| k.snapshot.clone());
+    // THE HARNESS'S OWN RESTART ENDED IT, read before whose exit it was: the
+    // step that signalled it returned with its relaunch still to type (a
+    // person at the returned prompt, a hold, a shell slow to take the
+    // terminal back), and no step watches the tab once its agent is gone.
+    // Asked as a person's exit, a holder's or a limited one, the agent the
+    // upgrade ended was never brought back — the owner who pressed Upgrade
+    // now had typed within the grace. A Codex worker keeps no snapshot: its
+    // tab's record is its restart's.
+    let codex = job.agent == Program::Codex;
+    let pid = snap.as_ref().map(|s| s.pid);
+    let restarted = (hooks.acts.restarted)(sid, codex, pid);
     let decide = || {
         let allowed = job.agent == Program::Claude && job.switches.relaunch();
-        relaunch::on_exit(allowed, (hooks.acts.status)(sid).as_deref(), grace, stalled)
+        relaunch::on_exit(
+            allowed,
+            (hooks.acts.status)(sid).as_deref(),
+            grace,
+            stalled,
+            restarted,
+        )
     };
     let decision = decide();
-    let mut pause = match with_kept(job, |k| k.relaunches.exited(decision, Instant::now())) {
+    let pause = match with_kept(job, |k| k.relaunches.exited(decision, Instant::now())) {
         Ok(pause) => pause,
         Err(said) => {
             forget_snapshot(job);
@@ -1783,7 +1839,16 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             return;
         }
     };
-    let snap = with_kept(job, |k| k.snapshot.clone());
+    if restarted {
+        aterm_log::info!(
+            "harness @{sid}: the agent exited; the harness's own restart ended it, and its \
+             relaunch is carried"
+        );
+        relaunch_until(job, hooks, pause, &decide, true, || {
+            (hooks.acts.carry)(sid, grace, codex, pid)
+        });
+        return;
+    }
     let Some(snap) = snap else {
         let why = "nothing-recorded";
         with_kept(job, |k| {
@@ -1814,13 +1879,42 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
         "harness @{sid}: the agent exited; its session record {} (read at the exit)",
         left.word()
     );
+    // On the build the upgrade would move it to only while `[harness]
+    // upgrade` allows (read live, as the relaunch switch is).
+    relaunch_until(job, hooks, pause, &decide, false, || {
+        (hooks.acts.relaunch)(sid, grace, &snap, &left, job.switches.upgrade(), stalled)
+    });
+}
+
+/// THE RELAUNCH'S ATTEMPTS after an agent left ([`on_agent_left`]): each
+/// after its pause — cut short when the agent is back or the worker is
+/// stopped for good — asked about again ([`relaunch::on_exit`], `decide`),
+/// then `attempt`ed, until it lands, is left, or can never land. `restarted`:
+/// the harness's own restart is carried ([`OnExit::Restarted`]), never paused
+/// longer than [`relaunch::CARRY_EVERY`] — the back-off's ten minutes
+/// outlasted its record, which expired between two attempts — and said in
+/// the restart's words.
+fn relaunch_until(
+    job: &WorkerJob,
+    hooks: &Hooks,
+    mut pause: Duration,
+    decide: &dyn Fn() -> OnExit,
+    restarted: bool,
+    mut attempt: impl FnMut() -> String,
+) {
+    let sid = job.sid.as_str();
     loop {
-        if wait_for(Instant::now() + (hooks.pause)(pause), || {
+        let wait = if restarted {
+            pause.min(relaunch::CARRY_EVERY)
+        } else {
+            pause
+        };
+        if wait_for(Instant::now() + (hooks.pause)(wait), || {
             !job.left.load(Ordering::SeqCst)
         }) {
             if (hooks.still_wanted)(sid) {
                 let said = with_kept(job, |k| k.relaunches.running());
-                tell(hooks, sid, said, "");
+                tell(hooks, sid, said, "", restarted);
             }
             return;
         }
@@ -1830,13 +1924,11 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
             left_alone(job, hooks, decision, said);
             return;
         }
-        // On the build the upgrade would move it to only while
-        // `[harness] upgrade` allows (read live, as the relaunch switch is).
-        let step = (hooks.acts.relaunch)(sid, grace, &snap, &left, job.switches.upgrade(), stalled);
+        let step = attempt();
         note_upgrade_act();
         let outcome = relaunch::outcome(&step);
         let said = with_kept(job, |k| k.relaunches.attempted(&outcome, Instant::now()));
-        tell(hooks, sid, said, &step);
+        tell(hooks, sid, said, &step, restarted);
         match outcome {
             Outcome::NotYet(_) => pause = with_kept(job, |k| k.relaunches.pause()),
             Outcome::Busy => pause = relaunch::BUSY,
@@ -1844,7 +1936,9 @@ fn on_agent_left(job: &WorkerJob, hooks: &Hooks) {
                 // What a relaunch of the NEW agent needs, read while it runs
                 // (if it is already gone, the one kept still names its
                 // conversation and its shell).
-                refresh_snapshot(&job.sid, &job.kept, hooks);
+                if job.agent == Program::Claude {
+                    refresh_snapshot(&job.sid, &job.kept, hooks);
+                }
                 return;
             }
             Outcome::Left(why) => {
@@ -1877,21 +1971,23 @@ fn left_alone(job: &WorkerJob, hooks: &Hooks, decision: OnExit, said: Say) {
             "`codex resume` in this tab takes its conversation back"
         }
         OnExit::Limited => "[harness] relaunch = false",
-        OnExit::Relaunch => "",
+        OnExit::Relaunch | OnExit::Restarted => "",
     };
     aterm_log::info!(
         "harness @{sid}: {} exited; not relaunched: {why}",
         job.agent.name()
     );
-    tell(hooks, sid, said, why);
+    tell(hooks, sid, said, why, false);
 }
 
 /// Say a relaunch's word on the session's attention (`why`: the step, or the
 /// limit, that said it). A step word (`refused:shell-gone`, `wait:resume`) is
 /// the log's; the attention says the state and what a person can do — for a
 /// relaunch that keeps failing, the cause when it is one only a person clears
-/// ([`failing_text`]).
-fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str) {
+/// ([`failing_text`]) — and, for a restart of the harness's own
+/// (`restarted`), that aterm ended the agent, and has not brought it back yet,
+/// or cannot.
+fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str, restarted: bool) {
     let why: String = why.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut end = why.len().min(80);
     while !why.is_char_boundary(end) {
@@ -1904,11 +2000,17 @@ fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str) {
             (hooks.badge)(sid, None);
             return;
         }
+        Say::Cannot if restarted => (
+            "aterm ended the agent to upgrade or restart it and cannot bring it back; resume it \
+             by hand"
+                .to_string(),
+            why,
+        ),
         Say::Cannot => (
             "the agent exited and cannot be relaunched; resume it by hand".to_string(),
             why,
         ),
-        Say::Failing => (failing_text(why), why),
+        Say::Failing => (failing_text(why, restarted), why),
         Say::Limited => (format!("the agent exited and is not relaunched: {why}"), ""),
     };
     if step.is_empty() {
@@ -1923,15 +2025,22 @@ fn tell(hooks: &Hooks, sid: &str, said: Say, why: &str) {
 /// when it is one only a person clears — a hold or a hand on the tab
 /// (`wait:held`), a foreground job keeping the shell from its prompt
 /// (`wait:shell-prompt`), the conversation open in another tab. Any other
-/// step the retry gets past on its own, and it stays in the log.
-fn failing_text(step: &str) -> String {
+/// step the retry gets past on its own, and it stays in the log. A restart of
+/// the harness's own (`restarted`) says aterm ended the agent and has not
+/// brought it back yet.
+fn failing_text(step: &str, restarted: bool) -> String {
+    let head = if restarted {
+        "aterm ended the agent to upgrade or restart it and has not brought it back yet"
+    } else {
+        "the agent exited and its relaunch keeps failing"
+    };
     let cause = match step {
         "wait:held" => "the session is held",
         "wait:shell-prompt" => "the shell prompt is not back",
         "wait:conversation-in-other-tab" => "the conversation is open in another tab",
-        _ => return "the agent exited and its relaunch keeps failing (still trying)".to_string(),
+        _ => return format!("{head} (still trying)"),
     };
-    format!("the agent exited and its relaunch keeps failing (still trying: {cause})")
+    format!("{head} (still trying: {cause})")
 }
 
 struct Worker {
@@ -3178,8 +3287,9 @@ fn live_acts(store: Store, sock: String) -> Acts {
         Arc::clone(&opts),
         Arc::clone(&opts),
         Arc::clone(&opts),
-        opts,
+        Arc::clone(&opts),
     );
+    let (o14, o15) = (Arc::clone(&opts), opts);
     Acts {
         open: Arc::new(move |sid| open(&store, sid)),
         due: Arc::new(move |sid| o1(sid, 0).map_or(Due::No, |o| upgrade_drive::due(&o))),
@@ -3255,6 +3365,17 @@ fn live_acts(store: Store, sock: String) -> Acts {
             };
             let r = relaunch::after_exit(&o, snap, left, upgrade, stalled);
             aterm_log::info!("harness @{sid}: {}", r.line_as("relaunch"));
+            r.step
+        }),
+        restarted: Arc::new(move |sid, codex, pid| {
+            o14(sid, 0).is_some_and(|o| relaunch::restarted(&o, codex, pid))
+        }),
+        carry: Arc::new(move |sid, grace, codex, pid| {
+            let Some(o) = o15(sid, grace) else {
+                return "refused:no-home".to_string();
+            };
+            let r = relaunch::carry_restart(&o, codex, pid);
+            aterm_log::info!("harness @{sid}: {}", r.line_as("carry-restart"));
             r.step
         }),
         relaunch_restored: Arc::new(move |sid, snap, upgrade| {
@@ -3799,6 +3920,8 @@ mod tests {
                 status: Arc::new(|_| None),
                 exit_look: Arc::new(|_, _| None),
                 relaunch: Arc::new(|_, _, _, _, _, _| "refused:inert".to_string()),
+                restarted: Arc::new(|_, _, _| false),
+                carry: Arc::new(|_, _, _, _| "refused:inert".to_string()),
                 relaunch_restored: Arc::new(|_, _, _| "refused:inert".to_string()),
                 restart: Arc::new(|_, _, _| "refused:inert".to_string()),
                 tasked: Arc::new(|_, _, _| None),
@@ -4455,6 +4578,117 @@ mod tests {
         assert_eq!(*a.relaunched.lock().unwrap(), ["s-k"]);
     }
 
+    /// S0 AND S3 OF THE IN-FLIGHT REVIEW (2026-09-27): AN AGENT THE HARNESS'S
+    /// OWN RESTART ENDED is that restart's to carry, read before whose exit
+    /// it was. The owner who pressed Upgrade now had typed within the grace,
+    /// so the exit read as theirs; a hold, `[harness] relaunch = false` or a
+    /// Codex (`relaunch not built for this agent yet`) left it too — and the
+    /// agent the upgrade ended was never brought back. Now it is carried — a
+    /// Claude Code by its snapshot's pid, a Codex by its tab — never by the
+    /// relaunch on exit's own attempt; tried again at least every
+    /// `CARRY_EVERY` while it misses (the back-off's ten minutes outlasted
+    /// its record); and said in the restart's own words once it keeps
+    /// missing and once it can never land. NEGATIVE CONTROL: the same exits
+    /// with no restart of the harness's own are left to the person, and a
+    /// Codex's names the way back (`codex resume` in its tab).
+    #[test]
+    fn an_agent_the_harness_own_restart_ended_is_carried_whoever_is_at_the_tab() {
+        let a = Arc::new(Acting::default());
+        let hooks = a.hooks();
+        let job = |agent: Program, relaunch: bool| {
+            let mut cfg = on();
+            if !relaunch {
+                cfg.set("relaunch", "false").unwrap();
+            }
+            let switches = Arc::new(Switches::default());
+            switches.set(&cfg);
+            WorkerJob {
+                sid: "s-k".to_string(),
+                agent,
+                opts: SuperviseOpts::hosted(),
+                stop: Arc::new(AtomicBool::new(true)),
+                interrupt: Arc::default(),
+                handover: Arc::default(),
+                clear_badge: false,
+                faults: Arc::default(),
+                park: Arc::default(),
+                look_at: Arc::default(),
+                left: Arc::new(AtomicBool::new(true)),
+                acting: Arc::default(),
+                stalled: Arc::default(),
+                switches,
+                kept: Arc::default(),
+                note: Arc::default(),
+            }
+        };
+        let with_snapshot = |job: WorkerJob| {
+            with_kept(&job, |k| k.snapshot = Some(snap("s-k")));
+            job
+        };
+        // The owner typed just before the SIGTERM, and a hold stands.
+        *a.human_ms.lock().unwrap() = Some(800);
+        a.held.store(true, Ordering::SeqCst);
+        a.restart_in_flight.store(true, Ordering::SeqCst);
+        on_agent_left(&with_snapshot(job(Program::Claude, false)), &hooks);
+        assert_eq!(*a.carries.lock().unwrap(), [(false, Some(4242))]);
+        assert!(
+            a.relaunched.lock().unwrap().is_empty(),
+            "never the relaunch on exit's attempt"
+        );
+        assert!(a.badges.lock().unwrap().is_empty(), "landed: nothing said");
+        on_agent_left(&job(Program::Codex, true), &hooks);
+        assert_eq!(a.carries.lock().unwrap()[1], (true, None), "by its tab");
+        assert_eq!(a.restarted_asked.lock().unwrap()[1], (true, None));
+        assert!(
+            a.badges.lock().unwrap().is_empty(),
+            "never `not built`: {:?}",
+            a.badges.lock().unwrap()
+        );
+        // It keeps missing (a person at the prompt), then can never land.
+        a.pauses.lock().unwrap().clear();
+        *a.carry_steps.lock().unwrap() =
+            VecDeque::from(["wait:held", "wait:held", "wait:held", "refused:stale-exit"]);
+        on_agent_left(&with_snapshot(job(Program::Claude, true)), &hooks);
+        assert_eq!(a.carries.lock().unwrap().len(), 6, "every attempt carried");
+        let pauses = a.pauses.lock().unwrap().clone();
+        assert!(
+            pauses.len() == 4 && pauses.iter().all(|p| *p <= relaunch::CARRY_EVERY),
+            "never a pause its record outlives: {pauses:?}"
+        );
+        let badges = a.badges.lock().unwrap().clone();
+        // In aterm's words, the state and what a person can do: the step
+        // word (`wait:held`, `refused:stale-exit`) is the log's.
+        assert!(
+            matches!(&badges[..], [Some(failing), Some(cannot)]
+                if failing.starts_with("aterm ended the agent")
+                    && failing.contains("has not brought it back yet (still trying: the session \
+                                         is held)")
+                    && cannot.contains("cannot bring it back; resume it by hand")
+                    && !failing.contains("wait:")
+                    && !cannot.contains("refused:")
+                    && !cannot.contains("the harness")),
+            "{badges:?}"
+        );
+        // NEGATIVE CONTROLS: no restart of the harness's own.
+        a.restart_in_flight.store(false, Ordering::SeqCst);
+        a.badges.lock().unwrap().clear();
+        on_agent_left(&with_snapshot(job(Program::Claude, true)), &hooks);
+        assert_eq!(a.carries.lock().unwrap().len(), 6, "nothing carried");
+        assert!(
+            a.relaunched.lock().unwrap().is_empty(),
+            "left to the person"
+        );
+        assert!(a.badges.lock().unwrap().is_empty());
+        *a.human_ms.lock().unwrap() = None;
+        a.held.store(false, Ordering::SeqCst);
+        on_agent_left(&job(Program::Codex, true), &hooks);
+        let badges = a.badges.lock().unwrap().clone();
+        assert!(
+            matches!(&badges[..], [Some(b)] if b.contains("`codex resume` in this tab")),
+            "{badges:?}"
+        );
+    }
+
     #[test]
     fn a_reload_restarts_workers_and_switching_off_stops_them() {
         let world = Arc::new(World::default());
@@ -5084,6 +5318,14 @@ mod tests {
         noticed: AtomicUsize,
         /// What the host said at each break it acted at.
         break_said: Mutex<Vec<String>>,
+        /// The harness's own restart ended the agent that left
+        /// ([`Acts::restarted`]), and what each look asked it with.
+        restart_in_flight: AtomicBool,
+        restarted_asked: Mutex<Vec<(bool, Option<u32>)>>,
+        /// What carrying it answers, in turn; `adopted` once spent — and
+        /// what each attempt asked it with.
+        carry_steps: Mutex<VecDeque<&'static str>>,
+        carries: Mutex<Vec<(bool, Option<u32>)>>,
         /// What the conversation's record says of its task (`None`: nobody
         /// can say), and each conversation it was asked about.
         tasked: Mutex<Option<bool>>,
@@ -5137,6 +5379,7 @@ mod tests {
             let (a1, a2, a3, a4, a5, a6) = (w(self), w(self), w(self), w(self), w(self), w(self));
             let (a7, a8, a9, a10, a11) = (w(self), w(self), w(self), w(self), w(self));
             let (a12, a13, a14, a15) = (w(self), w(self), w(self), w(self));
+            let (a16, a17) = (w(self), w(self));
             Hooks {
                 roster: Arc::new(move || {
                     w1.roster
@@ -5322,6 +5565,23 @@ mod tests {
                             .unwrap_or("adopted");
                         if step == "adopted" {
                             a5.owed.store(true, Ordering::SeqCst);
+                        }
+                        step.to_string()
+                    }),
+                    restarted: Arc::new(move |_, codex, pid| {
+                        a16.restarted_asked.lock().unwrap().push((codex, pid));
+                        a16.restart_in_flight.load(Ordering::SeqCst)
+                    }),
+                    carry: Arc::new(move |_, _, codex, pid| {
+                        a17.carries.lock().unwrap().push((codex, pid));
+                        let step = a17
+                            .carry_steps
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or("adopted");
+                        if step == "adopted" {
+                            a17.owed.store(true, Ordering::SeqCst);
                         }
                         step.to_string()
                     }),
@@ -6094,6 +6354,45 @@ mod tests {
             0,
             "not written for it"
         );
+    }
+
+    /// THE RELEASE TYPED AT A BREAK IS THE HARNESS'S OWN TURN (2026-09-27: a
+    /// break that never ends is where a give-up's release is typed, for want
+    /// of an idle point): the worker says it took it, so the loop journals it
+    /// (`HOST seq=<n> background upgrade step=released:<why>`) and awaits its
+    /// answer as the harness's, never as the worker's own turn — and the
+    /// upgrade gives the session's turn ends back at once, the agent told to
+    /// go on. NEGATIVE CONTROL: a release still owed there (a person's draft
+    /// holds it) typed nothing and says nothing.
+    #[test]
+    fn a_release_typed_at_a_break_is_said_and_gives_the_turn_ends_back() {
+        let said = |notice: &'static str| {
+            let a = Arc::new(Acting::default());
+            a.due.store(true, Ordering::SeqCst);
+            *a.steps.lock().unwrap() = ["announced:4"].into();
+            *a.notices.lock().unwrap() = [notice].into();
+            *a.owns_seen.lock().unwrap() = Some(Vec::new());
+            // The shells never end: breaks, and no idle point, from the
+            // notice's step on.
+            let flip = Arc::clone(&a);
+            *a.during_step.lock().unwrap() = Some(Box::new(move || {
+                flip.at_break.store(true, Ordering::SeqCst);
+            }));
+            a.set(&[("s-rb", Program::Claude)]);
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("the break's step", || a.noticed.load(Ordering::SeqCst) == 1);
+            std::thread::sleep(Duration::from_millis(50));
+            host.shutdown_and_join();
+            let owns = a.owns_seen.lock().unwrap().clone().unwrap_or_default();
+            let broke = a.break_said.lock().unwrap().clone();
+            (broke, owns)
+        };
+        let (broke, owns) = said("released:gave-up");
+        assert_eq!(broke, ["upgrade step=released:gave-up"]);
+        assert_eq!(owns, [true, false], "the notice's claim, then given back");
+        let (broke, owns) = said("wait:release:draft");
+        assert!(broke.is_empty(), "{broke:?}");
+        assert_eq!(owns, [true]);
     }
 
     /// A CODEX SESSION'S UPGRADE IS THE SAME STEP OF THE SAME WORKER: parked
@@ -6883,13 +7182,13 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                failing_text(step),
+                failing_text(step, false),
                 format!("the agent exited and its relaunch keeps failing (still trying: {cause})")
             );
         }
         // NEGATIVE CONTROL: a step the retry gets past alone stays in the log.
         assert_eq!(
-            failing_text("wait:resume"),
+            failing_text("wait:resume", false),
             "the agent exited and its relaunch keeps failing (still trying)"
         );
     }

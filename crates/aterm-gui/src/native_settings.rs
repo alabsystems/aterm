@@ -422,6 +422,17 @@ pub fn settings_page_scroll_transition(
     }
 }
 
+/// One Settings view's unsaved field drafts, split the way a seamless update
+/// treats them ([`SettingsViewState::carried_field_drafts`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CarriedFieldDrafts {
+    /// The drafts the handoff layout carries, in key order.
+    pub(crate) carried: Vec<crate::restore::SettingsDraftRestore>,
+    /// Drafts no update carries — still being composed, or too long — for
+    /// which the update waits.
+    pub(crate) held: usize,
+}
+
 /// Honest per-view Settings state. Route, search, focus, transient form state,
 /// and About text selection are view-local; committed configuration and updater
 /// work remain process-global.
@@ -1255,6 +1266,79 @@ impl SettingsViewState {
             .count()
     }
 
+    /// This view's unsaved field drafts as a seamless update would carry them
+    /// (`App::capture_handoff_layout`, `App::native_update_close_preflight`):
+    /// every draft whose committed text is carriable
+    /// ([`crate::restore::settings_draft_is_carriable`]) rides, in key order;
+    /// a draft still being composed by an input method, or too long to carry,
+    /// is HELD — the update waits for it as it waited for every draft before.
+    ///
+    /// A composing draft is held rather than carried as its committed text:
+    /// the marked text is on screen and not yet the field's, and carrying the
+    /// value without it would reopen something the person never saw.
+    pub(crate) fn carried_field_drafts(&self) -> CarriedFieldDrafts {
+        let mut carried = Vec::new();
+        let mut held = 0usize;
+        for (key, input) in &self.field_inputs {
+            if !self.field_has_unsaved_draft(key) {
+                continue;
+            }
+            if Self::draft_is_carriable(key, input) {
+                carried.push(crate::restore::SettingsDraftRestore {
+                    key: key.clone(),
+                    text: input.value().to_string(),
+                });
+            } else {
+                held = held.saturating_add(1);
+            }
+        }
+        CarriedFieldDrafts { carried, held }
+    }
+
+    /// Whether any unsaved draft of this view is one no update carries — the
+    /// allocation-free half of [`Self::carried_field_drafts`] that the close
+    /// projection asks after every reducer event.
+    fn holds_uncarriable_draft(&self) -> bool {
+        self.field_inputs.iter().any(|(key, input)| {
+            self.field_has_unsaved_draft(key) && !Self::draft_is_carriable(key, input)
+        })
+    }
+
+    fn draft_is_carriable(key: &str, input: &crate::native_text_input::TextInputState) -> bool {
+        input.preedit().is_none() && crate::restore::settings_draft_is_carriable(key, input.value())
+    }
+
+    /// Take the drafts a seamless update carried into this freshly reopened
+    /// view: each key this build still edits as text becomes a draft holding
+    /// exactly the carried text, unsaved. A key this build does not edit as
+    /// text (a row removed, or turned into a switch or a slider since) is
+    /// skipped — the host reads back which drafts landed and says which did not
+    /// (`App::reopen_carried_settings_drafts`).
+    ///
+    /// The rule is [`field_accepts_text_input`] — the one `settings/set/<key>`,
+    /// focus and pointer entry open a text draft by, and the one
+    /// `replace_snapshot` keeps a draft by. It used to be every kind but a
+    /// switch, a choice or a theme, which also took a draft for a numeric
+    /// SLIDER row: the host read it back as landed and said nothing, the row
+    /// could neither show nor edit it, and the next config snapshot discarded
+    /// it (round three review). A draft this view cannot hold as the outgoing
+    /// view held it must be said, not taken.
+    fn take_carried_field_drafts(&mut self, drafts: Vec<crate::restore::SettingsDraftRestore>) {
+        for draft in drafts {
+            let holds_text = self
+                .field_by_key(&draft.key)
+                .is_some_and(field_accepts_text_input);
+            if holds_text {
+                self.field_inputs.insert(
+                    draft.key,
+                    crate::native_text_input::TextInputState::new(draft.text),
+                );
+            }
+        }
+        self.draft_discard_confirmation = false;
+        self.invalidate_result_page_limit();
+    }
+
     fn clear_search(&mut self) -> bool {
         let changed = !self.search.is_empty()
             || !self.search_input.value().is_empty()
@@ -1380,6 +1464,7 @@ impl SettingsViewState {
         phase_ms: u64,
         motion: crate::native_app::ViewMotionCx,
         terminal_font_px: f32,
+        terminal_scale: f32,
         terminal_theme: aterm_render::Theme,
         viewport: LogicalRect,
     ) -> PreviewAnimation {
@@ -1421,12 +1506,20 @@ impl SettingsViewState {
                     phase_ms,
                     motion,
                     terminal_font_px,
+                    terminal_scale,
                     terminal_theme,
                     None,
                 )
             })
         } else {
-            renderer_preview_spec(self, phase_ms, motion, terminal_font_px, terminal_theme)
+            renderer_preview_spec(
+                self,
+                phase_ms,
+                motion,
+                terminal_font_px,
+                terminal_scale,
+                terminal_theme,
+            )
         };
         let Some(spec) = spec else {
             return PreviewAnimation::None;
@@ -1512,7 +1605,14 @@ pub(crate) struct SettingsApp {
     /// exact per-view dirty projection produced after every reducer event.
     /// View ids are monotonic and a dirty view cannot detach while this set
     /// blocks its close transaction.
-    draft_views: BTreeSet<crate::native_app::ViewId>,
+    ///
+    /// The value says whether the view holds a draft no seamless update
+    /// carries ([`SettingsViewState::carried_field_drafts`]'s `held`): a
+    /// `CarriedRelaunch` close is Ready for every other drafted view, because
+    /// the handoff layout reopens it with its drafts (plan P2-2). One map, not
+    /// a second set beside it: `SettingsApp` is the variant `NativeApp` is
+    /// sized by.
+    draft_views: BTreeMap<crate::native_app::ViewId, bool>,
 }
 
 impl SettingsApp {
@@ -1539,7 +1639,7 @@ impl SettingsApp {
             // Settings surfaces, and again as the center moves).
             messages_revision: 0,
             messages: MessagesState::empty(),
-            draft_views: BTreeSet::new(),
+            draft_views: BTreeMap::new(),
         }
     }
 
@@ -1549,7 +1649,8 @@ impl SettingsApp {
         view: &SettingsViewState,
     ) {
         if view.has_unsaved_field_drafts() {
-            self.draft_views.insert(view_id);
+            self.draft_views
+                .insert(view_id, view.holds_uncarriable_draft());
         } else {
             self.draft_views.remove(&view_id);
         }
@@ -2753,6 +2854,12 @@ impl SettingsApp {
                     .iter()
                     .map(|(retired, _)| *retired)
                     .filter(|key| view.raw_values.contains_key(*key));
+                // Every other row Modified lists under Manual overrides stays: the
+                // selector that draws that group decides, so the disclosure's
+                // "other Manual overrides stay" cannot drift from this patch.
+                let manual_overrides = authored_manual_override_keys(view)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>();
                 let patch = ConfigPatch {
                     base_revision: self.config_revision,
                     edits: view
@@ -2760,6 +2867,7 @@ impl SettingsApp {
                         .fields
                         .iter()
                         .filter(|field| !prefs::manual_only_key(field.key))
+                        .filter(|field| !manual_overrides.contains(field.key))
                         .filter(|field| view.raw_values.contains_key(field.key))
                         .map(|field| field.key)
                         .chain(retired)
@@ -4110,12 +4218,15 @@ fn counted_value_label(singular: &str, plural: &str, count: usize) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural })
 }
 
-/// What Reset All asks before it clears anything. The confirm handler clears the
-/// Settings controls' keys (and the retired `[packages]` spellings), never a
-/// Manual-only key (`prefs::manual_only_key`, which covers the lists, maps and
-/// asset paths), a Manual-schema key with no control, a custom record, or an
-/// unknown key.
-const RESET_ALL_SCOPE: &str = "Reset every Settings control to its default? Manual-only keys, lists, maps, custom records, and unknown keys stay.";
+/// What Reset All asks before it clears anything. The confirm handler clears
+/// every key Modified draws as a Settings row (`shell` too, which no ordinary
+/// page shows), plus the retired `[packages]` spellings, whose Modified row
+/// names the setting they spell. It keeps every other row Modified lists under
+/// Manual overrides ([`authored_manual_override_keys`]): lists, maps, sprite
+/// paths, custom records, unknown keys, old spellings, and every
+/// `MANUAL_SCHEMA` key with no Settings row — `[operator]`, `[fabric]`,
+/// `[privacy]`, most of `[harness]`, `windowing_behavior` and the rest.
+const RESET_ALL_SCOPE: &str = "Reset every setting to its default? Lists, maps, custom records, and other Manual overrides stay.";
 
 /// What Modified says about a key this build does not read. It never echoes
 /// the value, which may be a secret.
@@ -4849,6 +4960,10 @@ impl NativeAppModel for SettingsApp {
                 view.mark_messages_feedback();
                 true
             }
+            AppEvent::SettingsDraftsCarried(drafts) => {
+                view.take_carried_field_drafts(drafts);
+                true
+            }
             _ => false,
         };
         self.sync_draft_close_projection(view_id, view);
@@ -5020,8 +5135,17 @@ impl NativeAppModel for SettingsApp {
         }
     }
 
-    fn prepare_close(&mut self, _request: CloseRequest, cx: &mut UpdateCx<'_>) -> CloseReadiness {
-        if self.draft_views.contains(&cx.view_id()) {
+    fn prepare_close(&mut self, request: CloseRequest, cx: &mut UpdateCx<'_>) -> CloseReadiness {
+        // A SEAMLESS UPDATE CARRIES THE DRAFTS: its successor reopens this view
+        // from the handoff layout holding them, unsaved (plan P2-2). Every
+        // other scope — a close, a quit, an update whose successor reopens
+        // nothing — would drop them, so it is held for review as before; so is
+        // a view holding a draft the layout cannot carry.
+        let blocked = match self.draft_views.get(&cx.view_id()) {
+            None => false,
+            Some(&held) => held || request.scope != crate::native_app::CloseScope::CarriedRelaunch,
+        };
+        if blocked {
             return CloseReadiness::Blocked {
                 recovery: Self::draft_recovery_commands(),
             };
@@ -5951,20 +6075,24 @@ fn preview_terminal_theme(
     candidate
 }
 
+#[allow(clippy::too_many_arguments)] // Host paint inputs plus the exact paging budget.
 fn renderer_preview(
     state: &SettingsViewState,
     phase_ms: u64,
     motion: crate::native_app::ViewMotionCx,
     terminal_font_px: f32,
+    terminal_scale: f32,
     terminal_theme: aterm_render::Theme,
     prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
     width: SettingsWidth,
+    maximum_height: f32,
 ) -> Option<UiNode> {
     let spec = renderer_preview_spec_with_font(
         state,
         phase_ms,
         motion,
         terminal_font_px,
+        terminal_scale,
         terminal_theme,
         prepared_font,
     )?;
@@ -5973,10 +6101,16 @@ fn renderer_preview(
     } else {
         "/search"
     };
+    let height = if spec.scene == PreviewScene::Typography {
+        spec.preferred_height(renderer_preview_height(width))
+            .min(maximum_height.max(96.0))
+    } else {
+        renderer_preview_height(width)
+    };
     Some(crate::settings_preview::preview_node(
         format!("settings/preview{preview_path}"),
         spec,
-        renderer_preview_height(width),
+        height,
     ))
 }
 
@@ -5988,6 +6122,7 @@ fn renderer_preview_spec(
     phase_ms: u64,
     motion: crate::native_app::ViewMotionCx,
     terminal_font_px: f32,
+    terminal_scale: f32,
     terminal_theme: aterm_render::Theme,
 ) -> Option<SettingsPreviewSpec> {
     renderer_preview_spec_with_font(
@@ -5995,6 +6130,7 @@ fn renderer_preview_spec(
         phase_ms,
         motion,
         terminal_font_px,
+        terminal_scale,
         terminal_theme,
         None,
     )
@@ -6005,6 +6141,7 @@ fn renderer_preview_spec_with_font(
     phase_ms: u64,
     motion: crate::native_app::ViewMotionCx,
     terminal_font_px: f32,
+    terminal_scale: f32,
     terminal_theme: aterm_render::Theme,
     prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
 ) -> Option<SettingsPreviewSpec> {
@@ -6015,6 +6152,7 @@ fn renderer_preview_spec_with_font(
         phase_ms,
         motion,
         terminal_font_px,
+        terminal_scale,
         terminal_theme,
         prepared_font,
     )
@@ -6024,12 +6162,14 @@ fn renderer_preview_spec_with_font(
 /// Top Settings uses this for its three persistent live previews (theme,
 /// system appearance, and cursor trail); ordinary Advanced pages continue to
 /// derive the key from keyboard/pointer focus.
+#[allow(clippy::too_many_arguments)] // One projection shared by paint, inspection and cadence.
 fn renderer_preview_spec_for_key_with_font(
     state: &SettingsViewState,
     focused_key: &str,
     phase_ms: u64,
     motion: crate::native_app::ViewMotionCx,
     terminal_font_px: f32,
+    terminal_scale: f32,
     terminal_theme: aterm_render::Theme,
     prepared_font: Option<&crate::tray_raster::PreparedSemanticFont>,
 ) -> Option<SettingsPreviewSpec> {
@@ -6047,7 +6187,10 @@ fn renderer_preview_spec_for_key_with_font(
                 .is_none_or(|style| !style.eq_ignore_ascii_case("off"))
         });
     let serious_preview_suppression = motion.serious && !previews_serious_mode_exit;
-    let font_px = preview_field_number(state, prefs::EDIT_FONT_PX, terminal_font_px);
+    // Configured, drafted and environment-pinned font sizes are physical pixels,
+    // as is the applied fallback. Native paint applies the display scale once.
+    let font_px = preview_field_number(state, prefs::EDIT_FONT_PX, terminal_font_px)
+        / terminal_scale.max(f32::EPSILON);
     let font_candidate = preview_font_candidate(state);
     let terminal_theme_candidate =
         preview_terminal_theme(state, terminal_theme, motion.system_dark);
@@ -6241,6 +6384,7 @@ fn renderer_preview_spec_for_key_with_font(
         ),
         _ => return None,
     };
+    spec.terminal_scale = terminal_scale;
     spec.scene = match route {
         SettingsRoute::Appearance => PreviewScene::Appearance,
         SettingsRoute::TextFonts => PreviewScene::Typography,
@@ -6920,7 +7064,7 @@ fn feedback_bar(
         let visual_lines = [
             (
                 "settings/status/visual",
-                "Reset every Settings control?",
+                "Reset every setting?",
                 StyleRef::Plain,
             ),
             (
@@ -6935,7 +7079,7 @@ fn feedback_bar(
             ),
             (
                 "settings/status/unknown",
-                "Manual-only and unknown keys stay.",
+                "Other Manual overrides stay.",
                 StyleRef::Quiet,
             ),
         ];
@@ -6999,7 +7143,7 @@ fn feedback_bar(
                     UiContent::Button(
                         Control::new(
                             ButtonSpec::new(
-                                "Confirm Reset All of settings; preserve lists, maps, custom records, and unknown keys",
+                                "Confirm Reset All of settings; keep lists, maps, custom records, and other Manual overrides",
                             )
                             .visual_label("Reset All"),
                             ActionId::new("settings/reset-all-confirm"),
@@ -7328,7 +7472,7 @@ fn compact_feedback_parts(
                 UiContent::Button(
                     Control::new(
                         ButtonSpec::new(
-                            "Confirm Reset All of settings; preserve lists, maps, custom records, and unknown keys",
+                            "Confirm Reset All of settings; keep lists, maps, custom records, and other Manual overrides",
                         )
                         .visual_label("Reset"),
                         ActionId::new("settings/reset-all-confirm"),
@@ -9784,6 +9928,7 @@ fn top_preview(
         cx.animation_phase_ms,
         cx.motion,
         cx.terminal_font_px,
+        cx.terminal_scale,
         cx.terminal_theme,
         cx.semantic_font.as_ref(),
     )?;
@@ -11638,19 +11783,18 @@ fn settings_fields_landscape_page(
             cx.animation_phase_ms,
             cx.motion,
             cx.terminal_font_px,
+            cx.terminal_scale,
             cx.terminal_theme,
             cx.semantic_font.as_ref(),
             SettingsWidth::Compact,
+            budget.content_height,
         )
         .expect("focused visual setting has a renderer preview");
-        return compact_landscape_result_page(
-            label,
-            0,
-            total,
-            preview,
-            renderer_preview_height(SettingsWidth::Compact),
-            budget,
-        );
+        let height = match preview.layout.height {
+            Length::Fixed(height) => height,
+            _ => unreachable!("renderer preview has a measured height"),
+        };
+        return compact_landscape_result_page(label, 0, total, preview, height, budget);
     }
 
     if let Some(access) = macos_access
@@ -11897,28 +12041,6 @@ fn settings_fields_page(
         )
     });
 
-    // THE ONE COUNT ([`SettingsViewState::record_result_total`]), portrait
-    // spelling: the stacked page indexes its leading disclosures and then its
-    // rows, and every pager it authors below reports this same `total`. The
-    // macOS-access and This Mac cards are NOT slices here — the portrait page
-    // never pages past them, it draws them above the rows on page 0 — so
-    // counting them, as the single speculative count this replaces did, bought
-    // Security up to two trailing pages that repeat its last row. The landscape
-    // renderer, which does index those cards, records its own total instead.
-    // Both the floor below and the landscape page record theirs after this, so
-    // the page actually authored always has the last word.
-    let preview_slices = usize::from(preview_disclosure);
-    let search_manual_slices = usize::from(global_search && manual_matches > 0);
-    let leading_slices = preview_slices
-        + search_manual_slices
-        + if modified_only {
-            manual_overrides.len()
-        } else {
-            0
-        };
-    let portrait_total = fields.len() + leading_slices;
-    state.record_result_total(portrait_total);
-
     if compact_smart_title_health && !fields.is_empty() {
         // Short landscape and maximum Dynamic Type can fit the truthful
         // two-line runtime card plus one complete native control, but not the
@@ -11996,9 +12118,11 @@ fn settings_fields_page(
                     cx.animation_phase_ms,
                     cx.motion,
                     cx.terminal_font_px,
+                    cx.terminal_scale,
                     cx.terminal_theme,
                     cx.semantic_font.as_ref(),
                     SettingsWidth::Compact,
+                    budget.content_height,
                 )
             });
             if let Some(page) =
@@ -12094,8 +12218,113 @@ fn settings_fields_page(
         fits
     };
     let page_gap = settings_page_gap(state, width, cx.viewport);
-    let showcase_height = if show_renderer_preview_now {
-        renderer_preview_height(width)
+    // A noncompact Text & Fonts page keeps both the specimen and Display
+    // Faces card. When those leave no room for one complete native row, give
+    // the pair the same leading disclosure slice used on compact hosts. The
+    // decision depends on the whole roster, not the current scroll offset,
+    // so paging cannot change its own result numbering.
+    let text_fonts_row_reserve = display_faces_showcase.as_ref().map_or(0.0, |_| {
+        fields
+            .iter()
+            .map(|(_, _, field)| {
+                width.row_height()
+                    + 4.0
+                    + group_heading_height()
+                    + group_footnote_extra(prefs::group_of(field.key).0)
+            })
+            .fold(0.0, f32::max)
+    });
+    let text_fonts_disclosure = display_faces_showcase.as_ref().is_some_and(|(_, height)| {
+        let minimum = page_heading_height()
+            + if subtitle.is_empty() {
+                0.0
+            } else {
+                page_subtitle_height()
+            }
+            + renderer_preview_height(width)
+            + height
+            + page_navigation_height()
+            + text_fonts_row_reserve
+            + if subtitle.is_empty() { 4.0 } else { 5.0 } * page_gap;
+        minimum > settings_page_body_height(state, width, cx.viewport)
+    });
+    let preview_disclosure = preview_disclosure || text_fonts_disclosure;
+    let show_renderer_preview_now =
+        show_renderer_preview_now && (!text_fonts_disclosure || state.page_scroll == 0);
+    let display_faces_showcase =
+        display_faces_showcase.filter(|_| !text_fonts_disclosure || state.page_scroll == 0);
+
+    // THE ONE COUNT ([`SettingsViewState::record_result_total`]), portrait
+    // spelling: the stacked page indexes its leading disclosures and then its
+    // rows, and every pager it authors below reports this same `total`. The
+    // macOS-access and This Mac cards are NOT slices here — the portrait page
+    // never pages past them, it draws them above the rows on page 0 — so
+    // counting them, as the single speculative count this replaces did, bought
+    // Security up to two trailing pages that repeat its last row. The landscape
+    // renderer, which does index those cards, records its own total instead.
+    // The compact floor and landscape early returns record their own totals;
+    // only the stacked page reaches this count.
+    let preview_slices = usize::from(preview_disclosure);
+    let search_manual_slices = usize::from(global_search && manual_matches > 0);
+    let leading_slices = preview_slices
+        + search_manual_slices
+        + if modified_only {
+            manual_overrides.len()
+        } else {
+            0
+        };
+    let portrait_total = fields.len() + leading_slices;
+    state.record_result_total(portrait_total);
+
+    // The same measured node supplies both the page budget and the painted
+    // card. Typography may need more than the width-class minimum to show
+    // five rows without changing the candidate's font size.
+    let mut renderer_showcase = show_renderer_preview_now
+        .then(|| {
+            let chrome = if preview_disclosure {
+                0.0
+            } else {
+                page_heading_height()
+                    + if subtitle.is_empty() {
+                        0.0
+                    } else {
+                        page_subtitle_height()
+                    }
+            };
+            let other_cards = display_faces_showcase
+                .as_ref()
+                .map_or(0.0, |(_, height)| *height)
+                + cursor_kitty_showcase
+                    .as_ref()
+                    .map_or(0.0, |(_, height)| *height);
+            let maximum = settings_page_body_height(state, width, cx.viewport)
+                - page_navigation_height()
+                - chrome
+                - other_cards
+                - 4.0 * page_gap
+                - if !preview_disclosure && text_fonts_row_reserve > 0.0 {
+                    text_fonts_row_reserve + page_gap
+                } else {
+                    0.0
+                };
+            renderer_preview(
+                state,
+                cx.animation_phase_ms,
+                cx.motion,
+                cx.terminal_font_px,
+                cx.terminal_scale,
+                cx.terminal_theme,
+                cx.semantic_font.as_ref(),
+                width,
+                maximum,
+            )
+        })
+        .flatten();
+    let showcase_height = if let Some(preview) = renderer_showcase.as_ref() {
+        match preview.layout.height {
+            Length::Fixed(height) => height,
+            _ => unreachable!("renderer preview has a measured height"),
+        }
     } else if show_smart_title_health {
         smart_title_health_height(
             state,
@@ -12328,17 +12557,7 @@ fn settings_fields_page(
         // painter.
         spec.style = StyleRef::Plain;
     }
-    if show_renderer_preview_now
-        && let Some(preview) = renderer_preview(
-            state,
-            cx.animation_phase_ms,
-            cx.motion,
-            cx.terminal_font_px,
-            cx.terminal_theme,
-            cx.semantic_font.as_ref(),
-            width,
-        )
-    {
+    if let Some(preview) = renderer_showcase.take() {
         out.push(preview);
     }
     if show_smart_title_health {
@@ -18116,7 +18335,7 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
             .as_ref()
             .is_some_and(|status| status.staged_build.is_some());
         return if update.installable && downloaded {
-            "Run update apply."
+            "aterm update apply"
         } else {
             ""
         }
@@ -20752,9 +20971,16 @@ fn messages_chip(key: &str, label: &str, selected: bool, width: f32) -> UiNode {
 /// The TAG chips (ruling 262): `All tags`, then one chip per chip-name present
 /// — `fabric` and `harness` under Agents, `toolchain` and `packages` under ALab
 /// tools, a script's own tag verbatim — each with its count under the severity
-/// that is down, packed left to right into as few rows as `content_width`
-/// needs. A resting chip wears a faint outline so it reads as a button. Returns
-/// the rows and one row's height.
+/// that is down, in as few rows as `content_width` needs. A resting chip wears
+/// a faint outline so it reads as a button. Returns the rows.
+///
+/// THE CHIPS ARE ONE BLOCK (design ruling 312; round 21 at 1200 pt: the tags
+/// filled the line beside the severity segments, then ran on from the page's
+/// left edge under them, a ragged second line that read as a new group). Where
+/// the segments lead the first row, every row of chips starts at the x the
+/// first chip does; and the rows are BALANCED — each as close to the others'
+/// width as the chips allow, never one full line over a stub — so a wrap reads
+/// as a deliberate two-line block, aligned on its left edge.
 fn messages_tag_chip_rows(
     messages: &MessagesState,
     filter: &MessagesFilter,
@@ -20797,25 +21023,29 @@ fn messages_tag_chip_rows(
         )
     }));
     // The severity segments lead the first row where the page seats them
-    // there (the wider pages: filters in at most two rows, ruling 262).
-    let (mut rows, mut used): (Vec<Vec<UiNode>>, f32) = match first {
-        Some((node, width)) => (vec![vec![node]], width + 6.0),
-        None => (vec![Vec::new()], 0.0),
-    };
-    for (key, label, selected) in chips {
-        let width = measure(&label).min(content_width.max(48.0));
-        if used + 6.0 + width > content_width && !rows.last().is_some_and(Vec::is_empty) {
-            rows.push(Vec::new());
-            used = 0.0;
-        }
-        used += if used > 0.0 { 6.0 } else { 0.0 } + width;
-        rows.last_mut()
-            .expect("a row")
-            .push(messages_tag_chip(&key, &label, selected, width));
-    }
-    rows.into_iter()
+    // there (the wider pages: filters in at most two rows, ruling 262), and
+    // the chips' block starts where they end.
+    let indent = first.as_ref().map_or(0.0, |(_, width)| width + 6.0);
+    let room = (content_width - indent).max(48.0);
+    let widths: Vec<f32> = chips
+        .iter()
+        .map(|(_, label, _)| measure(label).min(room))
+        .collect();
+    let mut chips = chips.into_iter().zip(widths.iter().copied());
+    let mut lead = first.map(|(node, _)| node);
+    messages_chip_row_lengths(&widths, 6.0, room)
+        .into_iter()
         .enumerate()
-        .map(|(index, chips)| {
+        .map(|(index, len)| {
+            let mut children: Vec<UiNode> = lead.take().into_iter().collect();
+            children.extend(
+                chips
+                    .by_ref()
+                    .take(len)
+                    .map(|((key, label, selected), width)| {
+                        messages_tag_chip(&key, &label, selected, width)
+                    }),
+            );
             UiNode::new(
                 format!("settings/messages/filters/row/{index}"),
                 UiContent::Group(GroupSpec::new("Tags")),
@@ -20828,13 +21058,51 @@ fn messages_tag_chip_rows(
                         top: 3.0,
                         right: 0.0,
                         bottom: 3.0,
-                        left: 0.0,
+                        left: if index == 0 { 0.0 } else { indent },
                     })
                     .gap(6.0),
             )
-            .children(chips)
+            .children(children)
         })
         .collect()
+}
+
+/// How many chips each row of the tag block holds: as few rows as `room`
+/// allows, BALANCED — the narrowest row width that still packs the chips into
+/// that many rows, so no row is a full line over a stub (design ruling 312).
+/// A chip is never split, and one wider than `room` has a row of its own.
+fn messages_chip_row_lengths(widths: &[f32], gap: f32, room: f32) -> Vec<usize> {
+    let pack = |cap: f32| {
+        let mut rows: Vec<usize> = Vec::new();
+        let mut used = 0.0_f32;
+        for &width in widths {
+            match rows.last_mut() {
+                Some(len) if used + gap + width <= cap => {
+                    *len += 1;
+                    used += gap + width;
+                }
+                _ => {
+                    rows.push(1);
+                    used = width;
+                }
+            }
+        }
+        rows
+    };
+    let fewest = pack(room).len();
+    let (mut lo, mut hi) = (widths.iter().copied().fold(0.0_f32, f32::max), room);
+    if hi <= lo {
+        return pack(room);
+    }
+    for _ in 0..24 {
+        let mid = f32::midpoint(lo, hi);
+        if pack(mid).len() <= fewest {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    pack(hi)
 }
 
 /// A tag chip: a Secondary button while it rests (the faint outline that says
@@ -21408,12 +21676,16 @@ impl MessagesBody {
             .iter()
             .map(String::as_str)
             .filter(|l| Some(*l) != shown);
+        // The sentence is the entry's leading `sentences` lines (ruling 314:
+        // one, but a tab's upgrade row's why and next step), each wrapped to
+        // at most three lines.
         let sentence = if diagram {
             Vec::new()
         } else {
             lines
-                .next()
-                .map(|first| {
+                .by_ref()
+                .take(entry.sentences.max(1))
+                .flat_map(|first| {
                     let mut wrapped = wrapped_copy_lines(first, ppx, text_width);
                     if wrapped.len() > 3 {
                         wrapped.truncate(3);
@@ -21428,7 +21700,7 @@ impl MessagesBody {
                     }
                     wrapped
                 })
-                .unwrap_or_default()
+                .collect()
         };
         // A diagram's rows are CUT (a column stays a column); a prose line in
         // the monospace face wraps at its spaces.
@@ -21953,19 +22225,31 @@ fn messages_filter_items(
         // tags out as chips only while the segments and the chips fit in two;
         // past that — a script can name any tag it likes, and day two's seven
         // made three lines of chips at 60 columns — it takes the compact
-        // page's `Tag: …` pop-up, which holds any number (ruling 267).
-        let popup_form = compact || {
-            let lead = (segments_h <= chip_h + 6.0).then(|| {
-                let width = match segments.layout.width {
-                    Length::Fixed(width) => width,
-                    _ => content_width,
-                };
-                (segments.clone(), width)
-            });
-            let own_line = usize::from(lead.is_none());
-            let rows = messages_tag_chip_rows(messages, filter, content_width, chip_h, lead).len();
-            rows + own_line > MESSAGES_FILTER_LINES_MAX
+        // page's `Tag: …` pop-up, which holds any number (ruling 267). The
+        // chips' block sits beside the segments where it fits in two rows
+        // there, else on one full line under them (ruling 312).
+        let segments_lead = segments_h <= chip_h + 6.0;
+        let lead_width = match segments.layout.width {
+            Length::Fixed(width) => width,
+            _ => content_width,
         };
+        let beside = !compact
+            && segments_lead
+            && messages_tag_chip_rows(
+                messages,
+                filter,
+                content_width,
+                chip_h,
+                Some((segments.clone(), lead_width)),
+            )
+            .len()
+                <= MESSAGES_FILTER_LINES_MAX;
+        // Under the segments: their own line, and the chips' rows after it.
+        let under = !compact
+            && !beside
+            && messages_tag_chip_rows(messages, filter, content_width, chip_h, None).len()
+                < MESSAGES_FILTER_LINES_MAX;
+        let popup_form = !(beside || under);
         let tag_rows = if popup_form {
             // The pop-up measured to its words and its chevron; beside the
             // severity segments where both fit on one line.
@@ -22029,12 +22313,9 @@ fn messages_filter_items(
             } else {
                 Vec::new()
             }
-        } else if segments_h <= chip_h + 6.0 {
+        } else if beside {
             // The segments lead the tag chips' first row.
-            let width = match segments.layout.width {
-                Length::Fixed(width) => width,
-                _ => content_width,
-            };
+            let width = lead_width;
             let mut segments = segments;
             segments.layout.height = Length::Fill;
             segments.layout.padding = Insets::symmetric(4.0, 0.0);
@@ -24136,6 +24417,7 @@ mod tests {
             720,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             aterm_render::Theme::default(),
         )
         .expect("base preview for window_theme")
@@ -24267,6 +24549,7 @@ mod tests {
                 phase_ms,
                 crate::native_app::ViewMotionCx::default(),
                 13.0,
+                1.0,
                 aterm_render::Theme::default(),
             )
             .unwrap_or_else(|| panic!("base preview for {key}"));
@@ -24275,6 +24558,7 @@ mod tests {
                 phase_ms,
                 crate::native_app::ViewMotionCx::default(),
                 13.0,
+                1.0,
                 aterm_render::Theme::default(),
             )
             .unwrap_or_else(|| panic!("candidate preview for {key}"));
@@ -24463,6 +24747,48 @@ mod tests {
         ] {
             assert!(!absent.is_explicit(key), "{key} absent ⇒ not explicit");
         }
+    }
+
+    /// A carried draft is taken only by a row that takes TEXT — the rule
+    /// `field_accepts_text_input` states for `settings/set/`, focus, pointer
+    /// entry and `replace_snapshot` alike. The font-size row with a numeric
+    /// value is a SLIDER: `take_carried_field_drafts` used to take a draft for
+    /// it anyway (it excluded only switches, choices and themes), so the host
+    /// read the draft back as landed, said nothing, and the next config
+    /// snapshot discarded it (round three review).
+    #[test]
+    fn a_carried_draft_is_taken_only_by_a_row_that_takes_text() {
+        let service = VersionedConfigService::new("font_px = 14\n".into()).unwrap();
+        let mut state = SettingsViewState::from_snapshot(&service.snapshot()).unwrap();
+        let slider = state
+            .field_by_key(prefs::EDIT_FONT_PX)
+            .expect("the font size row");
+        assert!(
+            numeric_slider_value(slider).is_some() && !field_accepts_text_input(slider),
+            "PRECONDITION: the row is a slider, which takes no text"
+        );
+        state.take_carried_field_drafts(vec![
+            crate::restore::SettingsDraftRestore {
+                key: prefs::EDIT_FONT_FAMILY.to_string(),
+                text: "Carried Mono".to_string(),
+            },
+            crate::restore::SettingsDraftRestore {
+                key: prefs::EDIT_FONT_PX.to_string(),
+                text: "17 px, maybe".to_string(),
+            },
+        ]);
+        assert!(
+            !state.field_inputs.contains_key(prefs::EDIT_FONT_PX),
+            "the slider row takes no carried text: the host says it lost"
+        );
+        assert_eq!(
+            state
+                .field_inputs
+                .get(prefs::EDIT_FONT_FAMILY)
+                .map(crate::native_text_input::TextInputState::value),
+            Some("Carried Mono"),
+            "a text row takes its draft"
+        );
     }
 
     // The production snapshot path for a DEPTH-2 leaf: a hand-set
@@ -24820,8 +25146,8 @@ mod tests {
         state.navigate(SettingsRoute::CursorMotion);
         let motion = crate::native_app::ViewMotionCx::default();
         let theme = aterm_render::Theme::default();
-        let before =
-            renderer_preview_spec(&state, 900, motion, 13.0, theme).expect("committed preview");
+        let before = renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme)
+            .expect("committed preview");
 
         let field = state
             .legacy
@@ -24853,8 +25179,8 @@ mod tests {
             prefs::EDIT_CURSOR_TRAIL_STYLE
         )));
 
-        let candidate =
-            renderer_preview_spec(&state, 900, motion, 13.0, theme).expect("candidate preview");
+        let candidate = renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme)
+            .expect("candidate preview");
         assert_eq!(candidate.cursor.trail_style, PreviewTrailStyle::Custom);
         assert_eq!(
             candidate
@@ -24921,7 +25247,7 @@ mod tests {
             .unwrap();
             let mut state = SettingsViewState::new(&config);
             state.navigate(SettingsRoute::CursorMotion);
-            let preview = renderer_preview_spec(&state, 900, motion, 13.0, theme)
+            let preview = renderer_preview_spec(&state, 900, motion, 13.0, 1.0, theme)
                 .unwrap_or_else(|| panic!("preview for {raw}"));
 
             assert_eq!(preview.cursor.trail_style, PreviewTrailStyle::RainbowKitty);
@@ -24947,6 +25273,7 @@ mod tests {
                 100,
                 motion,
                 13.0,
+                1.0,
                 theme,
                 LogicalRect::new(0.0, 0.0, 1_200.0, 720.0),
             ),
@@ -24958,6 +25285,7 @@ mod tests {
                 100,
                 motion,
                 13.0,
+                1.0,
                 theme,
                 LogicalRect::new(0.0, 0.0, 390.0, 568.0),
             ),
@@ -24970,6 +25298,7 @@ mod tests {
                 100,
                 motion,
                 13.0,
+                1.0,
                 theme,
                 LogicalRect::new(0.0, 0.0, 390.0, 568.0),
             ),
@@ -24980,19 +25309,19 @@ mod tests {
         let mut appearance = SettingsViewState::new(&Config::default());
         appearance.navigate(SettingsRoute::Appearance);
         assert_eq!(
-            appearance.preview_animation(100, motion, 13.0, theme, view_cx().viewport),
+            appearance.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
             PreviewAnimation::None,
             "Appearance is a genuinely static renderer sample"
         );
         assert!(
-            renderer_preview_spec(&appearance, 100, motion, 17.5, theme)
+            renderer_preview_spec(&appearance, 100, motion, 17.5, 1.0, theme)
                 .unwrap()
                 .audit_value()
                 .contains("17.5 px"),
             "an unset font-size preview uses the renderer's applied size"
         );
         assert!(
-            renderer_preview_spec(&appearance, 100, motion, 1.0, theme)
+            renderer_preview_spec(&appearance, 100, motion, 1.0, 1.0, theme)
                 .unwrap()
                 .audit_value()
                 .contains("6 px"),
@@ -25012,7 +25341,7 @@ mod tests {
             let mut state = SettingsViewState::new(&config);
             state.navigate(SettingsRoute::CursorMotion);
             assert_eq!(
-                renderer_preview_spec(&state, 100, motion, 13.0, theme)
+                renderer_preview_spec(&state, 100, motion, 13.0, 1.0, theme)
                     .unwrap()
                     .cursor
                     .style,
@@ -25028,7 +25357,7 @@ mod tests {
         let mut hidden = SettingsViewState::new(&hidden);
         hidden.navigate(SettingsRoute::CursorMotion);
         assert_eq!(
-            hidden.preview_animation(100, motion, 13.0, theme, view_cx().viewport),
+            hidden.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
             PreviewAnimation::BlinkEdge { after_ms: 430 },
             "an unknown configured cursor style falls back to the runtime's blinking Block"
         );
@@ -25040,7 +25369,7 @@ mod tests {
         let mut blink = SettingsViewState::new(&blink);
         blink.navigate(SettingsRoute::CursorMotion);
         assert_eq!(
-            blink.preview_animation(100, motion, 13.0, theme, view_cx().viewport),
+            blink.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
             PreviewAnimation::BlinkEdge { after_ms: 430 }
         );
 
@@ -25051,7 +25380,7 @@ mod tests {
         let mut zero = SettingsViewState::new(&zero);
         zero.navigate(SettingsRoute::CursorMotion);
         assert_eq!(
-            zero.preview_animation(100, motion, 13.0, theme, view_cx().viewport),
+            zero.preview_animation(100, motion, 13.0, 1.0, theme, view_cx().viewport),
             PreviewAnimation::None,
             "a zero-intensity trail does not arm invisible work"
         );
@@ -25074,9 +25403,9 @@ mod tests {
         ] {
             let mut state = SettingsViewState::new(&config);
             state.navigate(route);
-            let early = renderer_preview_spec(&state, 100, motion, 13.0, theme)
+            let early = renderer_preview_spec(&state, 100, motion, 13.0, 1.0, theme)
                 .unwrap_or_else(|| panic!("early {route:?} preview"));
-            let late = renderer_preview_spec(&state, 600, motion, 13.0, theme)
+            let late = renderer_preview_spec(&state, 600, motion, 13.0, 1.0, theme)
                 .unwrap_or_else(|| panic!("late {route:?} preview"));
 
             assert_eq!(early.animation(), PreviewAnimation::None, "{route:?}");
@@ -25124,6 +25453,7 @@ mod tests {
             100,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             theme,
         )
         .expect("active cursor preview");
@@ -25141,7 +25471,7 @@ mod tests {
             serious: true,
             ..crate::native_app::ViewMotionCx::default()
         };
-        let serious = renderer_preview_spec(&state, 100, serious_motion, 13.0, theme)
+        let serious = renderer_preview_spec(&state, 100, serious_motion, 13.0, 1.0, theme)
             .expect("serious cursor preview remains available");
         assert!(serious.reduced_motion);
         assert!(!serious.cursor.trail_enabled);
@@ -25209,6 +25539,7 @@ mod tests {
             100,
             serious,
             13.0,
+            1.0,
             theme,
             None,
         )
@@ -25229,6 +25560,7 @@ mod tests {
             100,
             serious,
             13.0,
+            1.0,
             theme,
             None,
         )
@@ -25243,6 +25575,7 @@ mod tests {
             100,
             serious,
             13.0,
+            1.0,
             theme,
             None,
         )
@@ -25746,6 +26079,7 @@ mod tests {
                     100,
                     motion,
                     13.0,
+                    1.0,
                     aterm_render::Theme::default(),
                     None,
                 )
@@ -25941,6 +26275,7 @@ mod tests {
             animation_phase_ms: 720,
             motion: crate::native_app::ViewMotionCx::default(),
             terminal_font_px: 12.0,
+            terminal_scale: 1.0,
             terminal_theme: aterm_render::Theme::default(),
             semantic_font: None,
             document: None,
@@ -30776,6 +31111,7 @@ mod tests {
                 720,
                 crate::native_app::ViewMotionCx::default(),
                 12.0,
+                1.0,
                 host_theme,
             )
             .expect("appearance preview")
@@ -30819,6 +31155,7 @@ mod tests {
             720,
             crate::native_app::ViewMotionCx::default(),
             12.0,
+            1.0,
             host_theme,
         )
         .expect("candidate preview");
@@ -30837,6 +31174,7 @@ mod tests {
             720,
             crate::native_app::ViewMotionCx::default(),
             8.0,
+            1.0,
             host_theme,
         )
         .expect("typography preview");
@@ -30857,6 +31195,7 @@ mod tests {
                 720,
                 crate::native_app::ViewMotionCx::default(),
                 13.0,
+                1.0,
                 host_theme,
                 None,
             )
@@ -30905,6 +31244,7 @@ mod tests {
             720,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             host_theme,
             None,
         )
@@ -30954,6 +31294,7 @@ mod tests {
                 720,
                 motion,
                 13.0,
+                1.0,
                 host_theme,
                 None,
             )
@@ -30990,6 +31331,7 @@ mod tests {
             720,
             motion,
             13.0,
+            1.0,
             host_theme,
             None,
         )
@@ -32314,6 +32656,7 @@ mod tests {
                 trial_phase: None,
                 trial_starts: 0,
                 trial_healthy: false,
+                refused_newer: false,
             });
             assert!(
                 runtime.replace_settings_update(
@@ -32604,6 +32947,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         };
         let mut revision = 1;
         for (state, staged, running, saved) in [
@@ -34506,6 +34850,7 @@ mod tests {
             };
 
         let viewports = [
+            (624.0, 404.0),
             (320.0, 568.0),
             (390.0, 844.0),
             (568.0, 320.0),
@@ -34533,11 +34878,81 @@ mod tests {
                     .unwrap_or_else(|| panic!("{context}: live preview is visible"));
                 let expected_height =
                     renderer_preview_height(SettingsWidth::for_viewport_at_scale(width, scale));
-                assert!(
-                    (preview.rect.height - expected_height).abs() < 0.01,
-                    "{context}: preview height is {:?}, expected {expected_height}",
-                    preview.rect,
-                );
+                if route == SettingsRoute::TextFonts {
+                    assert!(
+                        preview.rect.height >= expected_height,
+                        "{context}: typography keeps its minimum"
+                    );
+                    assert!(
+                        preview.rect.bottom() <= height + 0.01,
+                        "{context}: whole specimen card"
+                    );
+                    let paint = compiled
+                        .paint
+                        .iter()
+                        .find(|paint| paint.key == preview_key)
+                        .unwrap();
+                    let UiContent::SettingsPreview(spec) = &paint.content else {
+                        unreachable!()
+                    };
+                    let mut prims = Vec::new();
+                    spec.paint(
+                        &mut prims,
+                        paint.rect,
+                        aterm_render::Theme::default(),
+                        crate::settings::Roles::from_theme(aterm_render::Theme::default()),
+                    );
+                    let (y, specimen) = prims
+                        .iter()
+                        .find_map(|prim| match prim {
+                            crate::widget::DrawPrim::TerminalSpecimen { y, spec, .. } => {
+                                Some((*y, spec))
+                            }
+                            _ => None,
+                        })
+                        .expect("typography paints complete specimen rows");
+                    if width == 624.0 && height == 404.0 && scale == 1.0 {
+                        assert_eq!(
+                            specimen.input.rows, 5,
+                            "the default desktop viewport shows the complete typography sample"
+                        );
+                    }
+                    let pill_y = prims
+                        .iter()
+                        .find_map(|prim| match prim {
+                            crate::widget::DrawPrim::Panel { y, radius, .. } if *radius == 6.0 => {
+                                Some(*y)
+                            }
+                            _ => None,
+                        })
+                        .expect("separate status band");
+                    for dpi in [1.0, 1.25, 2.0, 3.0] {
+                        let variations = specimen
+                            .variations
+                            .iter()
+                            .map(|v| (v.tag, v.value()))
+                            .collect::<Vec<_>>();
+                        let row_h = specimen
+                            .prepared_font
+                            .specimen_cell_height(
+                                specimen.font_px * dpi,
+                                specimen.line_height,
+                                &variations,
+                            )
+                            .unwrap() as f32
+                            / dpi;
+                        assert!(
+                            y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
+                            "{context} at {dpi}dpi: specimen rows never meet the status badge"
+                        );
+                    }
+                } else {
+                    assert!(
+                        (preview.rect.height - expected_height).abs() < 0.01,
+                        "{context}: preview height is {:?}, expected {expected_height}",
+                        preview.rect,
+                    );
+                }
 
                 if height <= 420.0 {
                     let navigation = compiled
@@ -34872,6 +35287,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             14.0,
+            1.0,
             aterm_render::Theme::default(),
         )
         .expect("Window & Tabs has a renderer preview");
@@ -34905,6 +35321,7 @@ mod tests {
                 0,
                 crate::native_app::ViewMotionCx::default(),
                 14.0,
+                1.0,
                 aterm_render::Theme::default(),
             )
             .expect("Window & Tabs has a renderer preview")
@@ -35411,6 +35828,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         };
         let mut status = update_status(false);
         status.linux = Some(facts(Some(2)));
@@ -35754,6 +36172,7 @@ mod tests {
                 trial_phase: None,
                 trial_starts: 0,
                 trial_healthy: false,
+                refused_newer: false,
             });
             status.failing_checks = 1;
             status.outcome = cause.into();
@@ -35872,6 +36291,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         });
         let idle = |running: bool| {
             compact_update_headline(
@@ -35989,14 +36409,14 @@ mod tests {
 
     /// A HEALTHY UPDATE PAGE (2026-09-23 audit, SB-07/SB-21): "You're up to date." over
     /// "aterm 0.1.0" and when it last checked — no build number (About has it) and no
-    /// updater decision sentence, whose lane and token detail stays in `aterm ctl update
-    /// status` and the log.
+    /// updater decision sentence, whose cadence detail stays in `aterm ctl update status`
+    /// and the log.
     #[test]
     fn a_healthy_update_page_paints_the_version_and_when_it_checked() {
         let mut status = update_status(false);
-        status.outcome = "up to date (latest release build 1) \u{2014} checking over the \
-                          unmetered web lane on a 30-minute interval"
-            .to_string();
+        // The decision sentence the updater writes today (`github::cadence_note`).
+        status.outcome =
+            "up to date (latest release build 1) \u{b7} checks every 30 min".to_string();
         status.updated_at = aterm_types::rfc3339::format_rfc3339(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -37076,6 +37496,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             aterm_render::Theme::default(),
             None,
         )
@@ -39347,6 +39768,142 @@ mod tests {
     }
 
     #[test]
+    fn medium_typography_pager_yields_showcases_and_reaches_every_field() {
+        const CHILD: &str = "ATERM_MEDIUM_TYPOGRAPHY_PAGER_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native_settings::tests::medium_typography_pager_yields_showcases_and_reaches_every_field",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUST_TEST_THREADS", "1")
+                .status()
+                .expect("isolated typography page geometry");
+            assert!(status.success());
+            return;
+        }
+        crate::native_appearance::install_preferences(
+            crate::native_appearance::AppearancePreferences::default(),
+        );
+        let mut renderer = aterm_render::Renderer::from_bytes(
+            include_bytes!("../../aterm-render/tests/fixtures/jetbrains-mono.ttf"),
+            36.0,
+            aterm_render::Theme::default(),
+        )
+        .unwrap();
+        renderer.set_runtime_font_discovery(false);
+        crate::tray_raster::install_settled_chrome_fonts_for_test(renderer);
+        for (width, height) in [(904.0, 600.0), (904.0, 579.0), (1280.0, 800.0)] {
+            let (mut runtime, instance, view) = setup();
+            replace_settings_source(&mut runtime, view, "font_px = 36\n".to_string());
+            let expected: BTreeSet<String> = {
+                let Some(AppViewState::Settings(state)) = runtime.view_state_mut(view) else {
+                    unreachable!()
+                };
+                state.navigate(SettingsRoute::TextFonts);
+                state
+                    .legacy
+                    .fields
+                    .iter()
+                    .filter(|field| prefs::section_of(field.key) == prefs::Section::Typography)
+                    .filter(|field| settings_field_is_visible(field.key, false, false))
+                    .filter(|field| field.key != prefs::EDIT_DISPLAY_FONT)
+                    .map(|field| format!("settings/control/{}", field.key))
+                    .collect()
+            };
+            let mut cx = view_cx_at(width, height);
+            cx.terminal_font_px = 36.0;
+            cx.terminal_scale = 2.0;
+            cx.semantic_font = Some(
+                crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+                    &crate::widget::SemanticFontCandidate::default(),
+                ),
+            );
+            let mut seen = BTreeSet::new();
+            for page in 0..=expected.len() {
+                let compiled = runtime
+                    .render(instance, view, &cx)
+                    .unwrap()
+                    .compile(cx.viewport)
+                    .unwrap();
+                compiled.validate_parity().unwrap();
+                let controls = compiled
+                    .semantics
+                    .iter()
+                    .filter(|node| node.key.as_str().starts_with("settings/control/"))
+                    .collect::<Vec<_>>();
+                if width == 904.0 {
+                    if page == 0 {
+                        assert!(
+                            compiled
+                                .semantic(&UiKey::new("settings/preview/text-fonts"))
+                                .is_some()
+                        );
+                        assert!(
+                            compiled
+                                .semantic(&UiKey::new("settings/top/display-faces"))
+                                .is_some()
+                        );
+                        assert_eq!(
+                            compiled
+                                .semantic(&UiKey::new("settings/results-range"))
+                                .unwrap()
+                                .label,
+                            format!("1–1 of {}", expected.len() + 1),
+                            "the showcase is one real result, never the historical 1–0 window"
+                        );
+                    } else {
+                        assert!(
+                            compiled
+                                .semantic(&UiKey::new("settings/preview/text-fonts"))
+                                .is_none()
+                        );
+                        assert!(
+                            compiled
+                                .semantic(&UiKey::new("settings/top/display-faces"))
+                                .is_none()
+                        );
+                        assert!(
+                            !controls.is_empty(),
+                            "Next must reach native fields at {width}x{height}"
+                        );
+                    }
+                }
+                for control in controls {
+                    assert!(control.rect.bottom() <= height + 0.01);
+                    assert!(
+                        compiled.hits.iter().any(|hit| hit.key == control.key),
+                        "{} must remain actionable",
+                        control.key.as_str()
+                    );
+                    seen.insert(control.key.as_str().to_string());
+                }
+                let Some(next) = compiled
+                    .hits
+                    .iter()
+                    .find(|hit| hit.key.as_str() == "settings/results-window/next")
+                    .map(|hit| hit.action.clone())
+                else {
+                    break;
+                };
+                runtime
+                    .dispatch(
+                        instance,
+                        view,
+                        AppEvent::Action(ActionInvocation {
+                            id: next,
+                            value: None,
+                        }),
+                    )
+                    .unwrap();
+            }
+            assert_eq!(seen, expected, "all fields reachable at {width}x{height}");
+        }
+    }
+
+    #[test]
     fn search_is_global_ranked_and_keeps_category_context() {
         let (mut runtime, instance, view) = setup();
         runtime
@@ -39705,13 +40262,10 @@ mod tests {
             .expect("scope disclosure");
         assert_eq!(status.label, RESET_ALL_SCOPE);
         for (key, preserved) in [
-            ("settings/status/visual", "Reset every Settings control?"),
+            ("settings/status/visual", "Reset every setting?"),
             ("settings/status/collections", "Lists and maps stay."),
             ("settings/status/records", "Custom records stay."),
-            (
-                "settings/status/unknown",
-                "Manual-only and unknown keys stay.",
-            ),
+            ("settings/status/unknown", "Other Manual overrides stay."),
         ] {
             assert!(
                 confirmation.semantic(&UiKey::new(key)).is_none(),
@@ -39813,6 +40367,100 @@ mod tests {
             panic!("Settings view");
         };
         assert!(!state.reset_all_confirmation);
+    }
+
+    /// Reset All keeps exactly what its disclosure names: every row Modified
+    /// lists under Manual overrides stays, and the rest is cleared — `shell`
+    /// too, which no ordinary page shows — with the retired `[packages]`
+    /// spelling the one override it clears, as the setting it spells resets.
+    /// The disclosure once promised "every setting" while `[operator]
+    /// enabled`, `[harness] upgrade` and `windowing_behavior` survived the
+    /// confirm unnamed; the inert `matrix_rain.materialize`, listed under
+    /// Manual overrides, was cleared (the negative control).
+    #[test]
+    fn reset_all_clears_every_setting_and_keeps_every_manual_override() {
+        let source = r#"shell = "/bin/zsh"
+theme = "Nord"
+windowing_behavior = "attach"
+cursor_nyan_sprite = "/aterm/no-such-reset-cat.png"
+[operator]
+enabled = true
+[harness]
+upgrade = false
+[matrix_rain]
+materialize = true
+[packages]
+auto_update = false
+"#;
+        let (mut runtime, instance, view) = setup();
+        let snapshot = VersionedConfigService::new(String::new())
+            .unwrap()
+            .replace_external(source.to_string())
+            .unwrap();
+        runtime
+            .dispatch(instance, view, AppEvent::ConfigChanged(snapshot))
+            .unwrap();
+        let Some(AppViewState::Settings(state)) = runtime.view_state(view) else {
+            panic!("Settings view");
+        };
+        let overrides = authored_manual_override_keys(state)
+            .into_iter()
+            .map(str::to_string)
+            .collect::<BTreeSet<_>>();
+        let mut press = |id: &str| {
+            runtime
+                .dispatch(
+                    instance,
+                    view,
+                    AppEvent::Action(ActionInvocation {
+                        id: ActionId::new(id),
+                        value: None,
+                    }),
+                )
+                .unwrap()
+        };
+        press("settings/reset-all");
+        let confirmed = press("settings/reset-all-confirm");
+        let patch = confirmed
+            .effects
+            .iter()
+            .find_map(|effect| match effect {
+                AppEffect::ConfigPatch { patch, .. } => Some(patch),
+                _ => None,
+            })
+            .expect("the confirm clears");
+        let cleared = patch
+            .edits
+            .iter()
+            .map(|edit| edit.key.as_str())
+            .collect::<BTreeSet<_>>();
+
+        assert!(!settings_field_is_visible(prefs::EDIT_SHELL, false, false));
+        for key in [prefs::EDIT_SHELL, prefs::EDIT_THEME] {
+            assert!(!overrides.contains(key), "{key} is a Settings row");
+            assert!(cleared.contains(key), "Reset All clears {key}: {patch:?}");
+        }
+        assert!(overrides.contains(prefs::RETIRED_PACKAGES_AUTO_UPDATE));
+        assert!(cleared.contains(prefs::RETIRED_PACKAGES_AUTO_UPDATE));
+        for key in [
+            "windowing_behavior",
+            prefs::EDIT_CURSOR_NYAN_SPRITE,
+            "operator.enabled",
+            "harness.upgrade",
+            "matrix_rain.materialize",
+        ] {
+            assert!(overrides.contains(key), "{key} is a Manual override");
+        }
+        for key in &overrides {
+            assert!(
+                !cleared.contains(key.as_str()) || key == prefs::RETIRED_PACKAGES_AUTO_UPDATE,
+                "Reset All keeps the Manual override {key}: {patch:?}"
+            );
+        }
+        assert!(
+            RESET_ALL_SCOPE.ends_with("and other Manual overrides stay."),
+            "{RESET_ALL_SCOPE}"
+        );
     }
 
     #[test]
@@ -40911,6 +41559,7 @@ mod tests {
             720,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             aterm_render::Theme::default(),
         )
         .expect("Typography preview");
@@ -40968,6 +41617,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             aterm_render::Theme::default(),
         )
         .expect("cursor preview");
@@ -41103,6 +41753,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             host,
         )
         .expect("default appearance preview")
@@ -41114,6 +41765,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             host,
         )
         .expect("appearance preview");
@@ -41133,6 +41785,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             host,
         )
         .expect("appearance preview after sibling focus");
@@ -41157,6 +41810,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             host,
         )
         .expect("appearance preview with retained new draft");
@@ -41181,6 +41835,7 @@ mod tests {
             0,
             crate::native_app::ViewMotionCx::default(),
             13.0,
+            1.0,
             aterm_render::Theme::default(),
         )
         .expect("typography preview");
@@ -45074,6 +45729,73 @@ enabled = true
     }
 
     #[test]
+    fn configured_draft_and_pinned_font_sizes_reach_paint_at_physical_size() {
+        for physical_px in [6.0, 36.0, 200.0] {
+            for scale in [1.0, 1.25, 2.0, 3.0] {
+                for source in ["configured", "draft", "environment"] {
+                    let mut state = SettingsViewState::new(&Config {
+                        font_px: Some(if source == "configured" {
+                            physical_px
+                        } else {
+                            14.0
+                        }),
+                        ..Config::default()
+                    });
+                    if source == "draft" {
+                        state.field_inputs.insert(
+                            prefs::EDIT_FONT_PX.to_string(),
+                            crate::native_text_input::TextInputState::new(physical_px.to_string()),
+                        );
+                    } else if source == "environment" {
+                        state.environment_overrides.insert(
+                            prefs::EDIT_FONT_PX.to_string(),
+                            crate::app_config::ActiveEnvironmentOverride {
+                                variable: "--font-px",
+                                effective: physical_px.to_string(),
+                            },
+                        );
+                    }
+                    let spec = renderer_preview_spec_for_key_with_font(
+                        &state,
+                        prefs::EDIT_FONT_PX,
+                        0,
+                        crate::native_app::ViewMotionCx::default(),
+                        24.0,
+                        scale,
+                        aterm_render::Theme::default(),
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(spec.font_px, physical_px / scale);
+                    let height = spec.preferred_height(108.0).min(600.0);
+                    let compiled = UiTree::new(crate::settings_preview::preview_node(
+                        "physical-font-preview",
+                        spec,
+                        height,
+                    ))
+                    .compile(LogicalRect::new(0.0, 0.0, 900.0, 700.0))
+                    .unwrap();
+                    let painted_px = compiled
+                        .tray(aterm_render::Theme::default(), 13.0)
+                        .prims
+                        .into_iter()
+                        .find_map(|prim| match prim {
+                            crate::widget::DrawPrim::TerminalSpecimen { spec, .. } => {
+                                Some(spec.font_px * scale)
+                            }
+                            _ => None,
+                        })
+                        .expect("one complete specimen row reaches paint");
+                    assert!(
+                        (painted_px - physical_px).abs() < 0.001,
+                        "{source} {physical_px}px at {scale}x painted {painted_px}px"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn active_environment_override_drives_row_preview_and_save_feedback() {
         let snapshot = VersionedConfigService::new("font_px = 18\n".to_string())
             .unwrap()
@@ -45117,6 +45839,7 @@ enabled = true
             0,
             crate::native_app::ViewMotionCx::default(),
             12.0,
+            1.0,
             aterm_render::Theme::default(),
             None,
         )
@@ -45246,6 +45969,7 @@ enabled = true
                 0,
                 crate::native_app::ViewMotionCx::default(),
                 13.0,
+                1.0,
                 aterm_render::Theme::default(),
                 None,
             )
@@ -48499,6 +49223,7 @@ enabled = true
             superseded_by: None,
             answer: None,
             actions,
+            sentences: 1,
         };
         let action = |index: u8, label: &'static str, still_actionable: bool| MessageActionView {
             index,
@@ -49641,6 +50366,56 @@ enabled = true
         );
     }
 
+    /// Ruling 314 (day eight E2): a tab's upgrade record set `it asks again on
+    /// its own at 12:55 AM; Upgrade now asks it …` — the next step, for a
+    /// person — as monospace code under Technical details, cut mid-sentence
+    /// across two code lines. The entry's leading `sentences` lines are the
+    /// sentence; the move and the shell spelling stay technical. Control: at
+    /// one sentence line the remedy is technical, as it was.
+    #[test]
+    fn an_upgrade_records_why_and_next_step_are_its_sentence() {
+        let state = sample_messages();
+        let remedy = "it asks again on its own at 12:55 AM; Upgrade now asks it at its next turn \
+                      end; Skip This Version in the tab's menu keeps it on 2.1.280";
+        let entry = MessageView {
+            detail: vec![
+                "behind for 7 h: it has not agreed to the move yet, so the upgrade rests, then \
+                 asks again"
+                    .to_string(),
+                remedy.to_string(),
+                "in tab 3 \u{00b7} Claude Code 2.1.280 \u{2192} 2.1.283".to_string(),
+                "the same in any shell: `aterm harness upgrade s-d35e --now` or `--skip`"
+                    .to_string(),
+            ],
+            sentences: 2,
+            ..state.entries[0].clone()
+        };
+        let body = MessagesBody::of(&entry, 560.0, 0, state.now_unix_ms);
+        let said = body.sentence.join(" ");
+        assert!(said.contains("Upgrade now asks it"), "{:?}", body.sentence);
+        assert!(said.contains("keeps it on 2.1.280"), "{:?}", body.sentence);
+        assert!(
+            body.technical.iter().all(|l| !l.contains("Upgrade now")),
+            "{:?}",
+            body.technical
+        );
+        assert!(body.technical.iter().any(|l| l.contains("in tab 3")));
+        let one = MessagesBody::of(
+            &MessageView {
+                sentences: 1,
+                ..entry
+            },
+            560.0,
+            0,
+            state.now_unix_ms,
+        );
+        assert!(
+            one.technical.iter().any(|l| l.contains("Upgrade now")),
+            "the control: {:?}",
+            one.technical
+        );
+    }
+
     /// A DIAGRAM KEEPS ITS COLUMNS (design ruling 36): a `toml` parse error,
     /// worded by the config lane from the REAL parser, paints every detail
     /// row in the monospace face and reaches the painter row for row — the
@@ -49682,6 +50457,7 @@ enabled = true
                 superseded_by: None,
                 answer: None,
                 actions: Vec::new(),
+                sentences: 1,
             },
         );
         let (mut runtime, instance, view) = setup();
@@ -50595,6 +51371,93 @@ enabled = true
         assert_eq!(messages_view_state(&runtime, view).feedback, None);
     }
 
+    /// THE TAG CHIPS WRAP AS ONE ALIGNED, BALANCED BLOCK (design ruling 312;
+    /// round 21's census at 1200 pt: the chips filled the line beside the
+    /// severity segments, then ran on from the page's left edge under them).
+    /// Eleven tags at 1200 pt: two rows of chips, each row's first chip at the
+    /// x the first row's does, the rows within one chip's width of each other.
+    /// NEGATIVE CONTROLS: the second row does not start at the segments' x,
+    /// and the balancer is no greedy packer (ten equal chips split 5 + 5, where
+    /// filling the first row would leave 6 + 4).
+    #[test]
+    fn the_tag_chips_wrap_as_one_aligned_balanced_block() {
+        let cx = view_cx();
+        let (mut runtime, instance, view) = setup_with_messages();
+        let mut state = sample_messages();
+        for (k, tag) in [
+            "privacy", "session", "window", "render", "a11y", "fabric", "system",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut entry = state.entries[3].clone();
+            entry.id = 100 + k as u64;
+            entry.tag = tag.to_string();
+            state.entries.insert(0, entry);
+            state.tags.push((tag.to_string(), 1));
+        }
+        assert!(runtime.replace_settings_messages(state, 8));
+        let compiled = compile_settings_view(&runtime, instance, view, &cx);
+        assert!(
+            compiled.semantic(&UiKey::new(MESSAGES_TAG_MENU)).is_none(),
+            "eleven tags are chips at 1200 pt"
+        );
+        let rect = |key: &str| {
+            compiled
+                .semantic(&UiKey::new(key))
+                .unwrap_or_else(|| panic!("{key}"))
+                .rect
+        };
+        let mut rows: Vec<Vec<LogicalRect>> = Vec::new();
+        for node in compiled.semantics.iter().filter(|node| {
+            let key = node.key.as_str();
+            key.starts_with("settings/messages/filter/tag/") || key == MESSAGES_TAGS_ALL
+        }) {
+            match rows
+                .iter_mut()
+                .find(|row| (row[0].y - node.rect.y).abs() < 1.0)
+            {
+                Some(row) => row.push(node.rect),
+                None => rows.push(vec![node.rect]),
+            }
+        }
+        assert_eq!(rows.len(), 2, "two rows of chips: {rows:?}");
+        let left = |row: &[LogicalRect]| row.iter().map(|r| r.x).fold(f32::INFINITY, f32::min);
+        let right = |row: &[LogicalRect]| row.iter().map(|r| r.right()).fold(0.0_f32, f32::max);
+        assert!(
+            (left(&rows[0]) - left(&rows[1])).abs() < 0.5,
+            "every row starts where the first chip does: {} vs {}",
+            left(&rows[0]),
+            left(&rows[1])
+        );
+        let segments = rect("settings/messages/filter/all");
+        assert!(
+            left(&rows[1]) > segments.right(),
+            "NEGATIVE: the second row is not run on from the segments' edge"
+        );
+        let widest = rows
+            .iter()
+            .flatten()
+            .map(|r| r.width)
+            .fold(0.0_f32, f32::max);
+        let spans: Vec<f32> = rows.iter().map(|row| right(row) - left(row)).collect();
+        assert!(
+            (spans[0] - spans[1]).abs() < widest,
+            "balanced within one chip: {spans:?} (widest {widest})"
+        );
+        // The balancer, against the greedy packing it replaced.
+        assert_eq!(
+            messages_chip_row_lengths(&[100.0; 10], 6.0, 700.0),
+            vec![5, 5]
+        );
+        assert_eq!(messages_chip_row_lengths(&[100.0; 3], 6.0, 700.0), vec![3]);
+        assert_eq!(
+            messages_chip_row_lengths(&[800.0, 50.0], 6.0, 700.0),
+            vec![1, 1],
+            "a chip wider than the room has its own row"
+        );
+    }
+
     /// ROUND 16, DAY TWO (ruling 267): every script tag is a filter, and a
     /// wider page lays its tags out as chips — seven script tags made three
     /// lines of them. Past two lines the page takes the `Tag: …` pop-up, which
@@ -51112,6 +51975,7 @@ enabled = true
             (
                 226,
                 update_words::health_warning(
+                    update_words::HealthKind::Download,
                     aterm_update::health_failing_title("pipeline"),
                     "20 failed checks in a row since 2026-08-27T22:04:36Z: release manifests \
                      exist but cannot be downloaded. Run `aterm ctl update status` for details.",

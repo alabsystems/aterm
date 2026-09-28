@@ -89,7 +89,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Mutex;
 
-use crate::derive::Model;
+use crate::derive::{Liveness, Model};
 use crate::interp;
 
 /// Discover the Trust `ty` model-checker: the atpkg-managed store's shim, then
@@ -1045,20 +1045,27 @@ fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, Stri
 /// `examples/trust_models.rs` has always tested for and, under the fused
 /// default, never saw.
 ///
-/// The completeness argument is structural, not empirical. Every `.cfg` this
-/// workspace hands `ty` is INVARIANT-only over a finite bounded machine
-/// (`Model::to_cfg` emits CONSTANT / SPECIFICATION / INVARIANT /
-/// CHECK_DEADLOCK and nothing else; `Model::to_tla` emits `Spec == Init /\
-/// [][Next]_vars` with no fairness conjunct; the 14 hand-written specs match).
-/// An exhaustive BFS of a finite reachable space IS the complete proof of a
-/// safety invariant — there is no obligation left for a symbolic lane to
+/// The completeness argument is structural, not empirical. Every model `.cfg`
+/// this workspace hands `ty` is over a finite bounded machine, and all but one
+/// kind are INVARIANT-only (`Model::to_cfg` emits CONSTANT / SPECIFICATION /
+/// INVARIANT / CHECK_DEADLOCK and nothing else; `Model::to_tla` emits `Spec ==
+/// Init /\ [][Next]_vars` with no fairness conjunct; the 14 hand-written specs
+/// match). An exhaustive BFS of a finite reachable space IS the complete proof
+/// of a safety invariant — there is no obligation left for a symbolic lane to
 /// discharge. And a symbolic-only verdict could not be credited here anyway:
 /// [`assert_same_space_explored`] demands a `States found:` count equal to the
 /// interpreter's walk, which only the BFS lane produces.
 ///
-/// The flag is safe for a cfg that grows a temporal PROPERTY, which was checked
-/// rather than assumed: on a `WF_vars`-fair spec with a violated `<>(done)`,
-/// both lanes print the identical four-state counterexample and exit 1.
+/// The one other kind is a LIVENESS cfg (`Liveness::to_cfg_with`: a `PROPERTY
+/// []<>goal` under a `<name>Spec` that conjoins `WF_vars`/`SF_vars`, checked by
+/// [`liveness_proves_and_catches_tiered`]). The explicit-state lane is complete
+/// for it too: the whole finite state graph is built and the fair-cycle search
+/// runs on it. That was checked rather than assumed, twice: on a `WF_vars`-fair
+/// spec with a violated `<>(done)` both lanes print the identical four-state
+/// counterexample and exit 1; and on `NativeUpdateApplyLadder`'s
+/// `TheLadderLands` (2026-09-27, `ty` 0.13.0) both lanes prove it over the
+/// interpreter's 3080 states and reject each of its four isolated mutants with
+/// the same temporal violation over the same state count.
 ///
 /// **`--force`** — bypass `ty`'s local check cache. Load-bearing, and NOT a
 /// speed flag: it is a fail-closed re-derivation flag that closes a hole that
@@ -1913,6 +1920,287 @@ pub fn deadlock_free_and_catches_tiered(
         }
         None => Covered::Interpreter,
     }
+}
+
+/// The interpreter's full discharge of a [`Liveness`] obligation, returned
+/// rather than panicked so the registry sweep can name every failure at once.
+/// `Ok(n)` is the number of mutants that break it; anything this cannot
+/// establish is an `Err`, never a waiver:
+///
+/// 1. the model is scalar and carries the `Buggy` dial committed to 0, and the
+///    obligation names at least one mutant — a liveness property nothing can
+///    break would pass whatever the lane did, a ghost;
+/// 2. every fairness name is an action that FIRES at the committed config (a
+///    fairness assumption about a dead action assumes nothing), and every mutant
+///    is an action that does NOT (it is a negative control, not the lane);
+/// 3. at the committed config no fair behaviour leaves the goal for good;
+/// 4. the `Buggy = 1` baseline with every committed-dead action removed has no
+///    such behaviour either — otherwise an unrelated `Buggy` branch supplies the
+///    counterexample and no mutant's catch is its own;
+/// 5. each named mutant, added back ALONE to that baseline, produces one;
+/// 6. every fairness assumption is LOAD-BEARING: dropped, the committed model
+///    breaks the property, and a strong one demoted to weak breaks it too. The
+///    verdict is only as true as the world is fair, so it may claim to rest on
+///    nothing it does not need — an extra `WF` is a promise about the
+///    environment the proof never used, and a reader could not tell it apart
+///    from one it did.
+///
+/// The property and the fairness are the obligation's own; the model is not
+/// rewritten beyond the `Buggy` flip and the mutant isolation, which are the same
+/// two moves [`audit_dead_negative_controls`] makes for invariants.
+// Skip: verification-harness driver over the interpreter tier (BTreeSet ops,
+// model clones and deliberate audit-failure strings). Not shipping code.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
+    let label = format!("{} liveness `{}`", m.name, live.name);
+    if !m.fn_vars.is_empty() {
+        return Err(format!(
+            "{label}: function-valued model — the interpreter cannot walk it"
+        ));
+    }
+    if !m.consts.iter().any(|(n, v)| *n == "Buggy" && *v == 0) {
+        return Err(format!(
+            "{label}: no committed `Buggy = 0` dial, so no mutant can be isolated"
+        ));
+    }
+    if live.mutants.is_empty() {
+        return Err(format!(
+            "{label}: names no mutant — a liveness property nothing breaks is a ghost"
+        ));
+    }
+    let declared: BTreeSet<&str> = m.actions.iter().map(|a| a.name as &str).collect();
+    for taken in [live.name.to_string(), live.spec_name()] {
+        // `Init`, `Next`, `Spec` and `vars` are the module's own operators.
+        let clashes = ["Init", "Next", "Spec", "vars"].contains(&taken.as_str())
+            || declared.contains(taken.as_str())
+            || m.invariants.iter().any(|i| i.name == taken)
+            || m.vars.iter().any(|v| v.name == taken)
+            || m.consts.iter().any(|(c, _)| *c == taken);
+        if clashes {
+            return Err(format!(
+                "{label}: `{taken}` is already a name in the model; the emitted module \
+                 would define it twice"
+            ));
+        }
+    }
+    let committed = interp::with_buggy(m, 0);
+    let fired = interp::fired_actions(&committed);
+    for name in live.weak.iter().chain(&live.strong) {
+        if !declared.contains(name) {
+            return Err(format!(
+                "{label}: fairness names undeclared action `{name}`"
+            ));
+        }
+        if !fired.contains(name) {
+            return Err(format!(
+                "{label}: fairness names `{name}`, which never fires at the committed \
+                 config — an assumption about a dead action assumes nothing"
+            ));
+        }
+    }
+    let dead: BTreeSet<&str> = declared
+        .iter()
+        .copied()
+        .filter(|a| !fired.contains(a))
+        .collect();
+    for mutant in &live.mutants {
+        if !dead.contains(mutant) {
+            return Err(format!(
+                "{label}: mutant `{mutant}` is not an action dead at the committed config \
+                 (dead: {dead:?}) — a negative control must be one"
+            ));
+        }
+    }
+    if let Some(cycle) = interp::nonprogress_under(&committed, live) {
+        return Err(format!(
+            "{label}: VIOLATED at the committed config (Buggy=0) — a fair behaviour \
+             leaves the goal for good:\n{cycle}"
+        ));
+    }
+    let assumptions = live
+        .weak
+        .iter()
+        .map(|a| (a, "weak"))
+        .chain(live.strong.iter().map(|a| (a, "strong")));
+    for (name, kind) in assumptions {
+        let mut without = live.clone();
+        without.weak.retain(|a| a != name);
+        without.strong.retain(|a| a != name);
+        if interp::nonprogress_under(&committed, &without).is_none() {
+            return Err(format!(
+                "{label}: the {kind} fairness of `{name}` is not needed — the property holds \
+                 without it. Drop it, so the verdict does not claim to rest on it"
+            ));
+        }
+        if kind == "strong" {
+            without.weak.push(name);
+            if interp::nonprogress_under(&committed, &without).is_none() {
+                return Err(format!(
+                    "{label}: `{name}` needs only WEAK fairness — the property holds with it; \
+                     state the weaker assumption"
+                ));
+            }
+        }
+    }
+    let mut baseline = interp::with_buggy(m, 1);
+    baseline.actions.retain(|a| !dead.contains(a.name));
+    if let Some(cycle) = interp::nonprogress_under(&baseline, live) {
+        return Err(format!(
+            "{label}: the Buggy=1 baseline with every committed-dead action removed \
+             already breaks it, so no mutant's catch is its own:\n{cycle}"
+        ));
+    }
+    for mutant in &live.mutants {
+        if interp::nonprogress_under(&buggy_baseline_with(m, mutant), live).is_none() {
+            return Err(format!(
+                "{label}: mutant `{mutant}`, alone on the Buggy=1 baseline, does not break \
+                 it — the property cannot see the defect that mutant is"
+            ));
+        }
+    }
+    Ok(live.mutants.len())
+}
+
+/// The `Buggy = 1` copy of `m` with every committed-dead action removed but
+/// `mutant`: the healthy lane plus that one defect, and nothing another mutant
+/// could lend it. The model a liveness mutant is checked on — by
+/// [`audit_liveness`], and emitted for `ty` by
+/// [`liveness_proves_and_catches_tiered`] — and the one a test drives to show
+/// what that defect does on its own.
+#[must_use]
+// Skip: model clone + BTreeSet filter (absent std bodies). Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn buggy_baseline_with(m: &Model, mutant: &str) -> Model {
+    let fired = interp::fired_actions(&interp::with_buggy(m, 0));
+    let mut isolated = interp::with_buggy(m, 1);
+    isolated
+        .actions
+        .retain(|a| fired.contains(a.name) || a.name == mutant);
+    isolated
+}
+
+/// Run `ty check` on a liveness module (`Liveness::to_tla`) with its cfg, in a
+/// directory of its own per run: the same model's invariant check
+/// (`ty_check_derived`) may be writing `aterm-tier-<model>-<pid>` from a
+/// parallel test at the same moment, and the file must be named after its module.
+// Skip: shells out to `ty` and renders its output (absent std format/io bodies).
+// Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+fn ty_check_liveness(
+    ty: &Path,
+    m: &Model,
+    module: &str,
+    cfg: &str,
+    tag: &str,
+    label: &str,
+) -> (bool, String) {
+    let dir = std::env::temp_dir().join(format!(
+        "aterm-live-{}-{tag}-{}",
+        m.name,
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).expect("mk tempdir");
+    let spec = dir.join(format!("{}.tla", m.name));
+    let cfgp = dir.join(format!("{}.cfg", m.name));
+    std::fs::write(&spec, module).expect("write liveness spec");
+    std::fs::write(&cfgp, cfg).expect("write liveness cfg");
+    let mut cmd = Command::new(ty);
+    cmd.arg("check").arg(&spec).arg("--config").arg(&cfgp);
+    let out = ty_output(arm_whole_space_check(&mut cmd))
+        .unwrap_or_else(|e| panic!("run ty check for {label}: {e}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let evidence = format!(
+        "{}({:?})\n--- ty stdout ---\n{}\n--- ty stderr ---\n{}",
+        ty_evidence_header(ty),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    (out.status.success(), evidence)
+}
+
+/// TIERED liveness: [`audit_liveness`] on the interpreter tier (always; panics on
+/// any `Err`), and `ty` checking the SAME property wherever it is installed —
+/// `PROPERTY <name>` under `<name>Spec == Spec /\ WF_vars(…) /\ SF_vars(…)`, the
+/// module [`Liveness::to_tla`] emits. `ty` must prove it at the committed config
+/// over the same number of states the interpreter walked, and must report a
+/// TEMPORAL violation for each mutant's isolated model; a disagreement panics.
+///
+/// Scalar-only (asserted), so like the `_scalar` forms it returns a [`Covered`]
+/// outright.
+// Skip: a tiered verification DRIVER — shells out to `ty`, renders output, and
+// its asserts are deliberate harness aborts. Verification tooling.
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &str) -> Covered {
+    assert_scalar(m, label, "liveness_proves_and_catches_tiered");
+    let caught = match audit_liveness(m, live) {
+        Ok(n) => n,
+        Err(why) => panic!("{label}: {why}"),
+    };
+    eprintln!(
+        "{label}: {} `{}` proven under its fairness (Buggy=0) and broken by {caught} \
+         mutant(s) alone (interpreter).",
+        m.name, live.name
+    );
+    let Some(ty) = find_ty() else {
+        return Covered::Interpreter;
+    };
+    let committed = interp::with_buggy(m, 0);
+    let (ok, evidence) = ty_check_liveness(
+        &ty,
+        m,
+        &live.to_tla(&committed),
+        &live.to_cfg_with(m, &[("Buggy", 0)]),
+        "committed",
+        label,
+    );
+    assert!(
+        ok,
+        "{label}: ty says {} `{}` FAILS at Buggy=0 — TIER DISAGREEMENT (the interpreter \
+         proved it)\n{evidence}\n--- generated ---\n{}",
+        m.name,
+        live.name,
+        live.to_tla(&committed)
+    );
+    let mut space = committed.clone();
+    space.invariants.clear();
+    let reachable = match interp::bmc(&space) {
+        Ok(n) => n,
+        Err((state, invariant)) => {
+            unreachable!("{label}: no invariants, yet `{invariant}` failed at {state:?}")
+        }
+    };
+    assert_same_space_explored(m, reachable, &evidence, label);
+    for mutant in &live.mutants {
+        let isolated = buggy_baseline_with(m, mutant);
+        let (held, evidence) = ty_check_liveness(
+            &ty,
+            m,
+            &live.to_tla(&isolated),
+            &live.to_cfg_with(m, &[("Buggy", 1)]),
+            mutant,
+            label,
+        );
+        assert!(
+            !held,
+            "{label}: ty found NO violation of {} `{}` with mutant `{mutant}` alone — TIER \
+             DISAGREEMENT (the interpreter found a fair non-progress cycle)\n{evidence}",
+            m.name, live.name
+        );
+        assert!(
+            evidence.contains("Temporal properties were violated")
+                || evidence.contains("Liveness violation"),
+            "{label}: ty rejected {} with mutant `{mutant}` alone, but not with a TEMPORAL \
+             violation — a parse or config failure is not a catch\n{evidence}",
+            m.name
+        );
+    }
+    eprintln!(
+        "{label}: {} `{}` additionally proven (Buggy=0, {reachable} states) and broken by \
+         each mutant by ty.",
+        m.name, live.name
+    );
+    Covered::InterpreterAndTy
 }
 
 /// TIERED per-transition conformance (the Tier-1 `ty trace validate` twin):

@@ -91,8 +91,8 @@ fn remote_derived_cut_mode_decision_table() {
 }
 
 /// Cutting twice without bumping `[workspace.package] version` is refused. The
-/// message must name the Cargo.toml bump (with the exact next version) and keep
-/// the yank escape hatch.
+/// message must name the `pub bump` (with the exact next version) — a hand edit of
+/// `Cargo.toml` leaves `Cargo.lock` behind — and keep the yank escape hatch.
 #[test]
 fn recutting_a_published_version_is_refused() {
     let err = verify::derive_cut_mode(&state("0.2.0", true, true))
@@ -100,12 +100,12 @@ fn recutting_a_published_version_is_refused() {
         .to_string();
     assert!(err.contains("v0.2.0 is already published"), "{err}");
     assert!(
-        err.contains("bump [workspace.package] version in Cargo.toml on main"),
+        err.contains("`pub bump aterm --minor --write` on main"),
         "{err}"
     );
     assert!(err.contains("the next release is v0.3.0"), "{err}");
     assert!(
-        err.contains("`pub stage aterm` and `pub publish aterm`, then cut"),
+        err.contains("commit and push, then `pub stage aterm` and `pub publish aterm`, then cut"),
         "a cut builds the published commit, so the next version must be published \
          first: {err}"
     );

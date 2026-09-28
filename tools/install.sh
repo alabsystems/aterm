@@ -3411,9 +3411,9 @@ install_app() {
 	# re-exec) rides the window entry, so the window is named as the apply path
 	# rather than promising a silence that terminal-only machines cannot cash.
 	echo "  updates: automatic (silent, verified) — public channel, no credential needed; checks run"
-	echo "           in the app and in \`aterm\` sessions; with an aterm window open, an update installs"
-	echo "           within a minute. Health: aterm update status — to switch it off, Settings ▸ Terminal"
-	echo "           ▸ Updates (\`[update] enabled = false\` in ~/.config/aterm/aterm.toml)"
+	echo "           in the app and in \`aterm\` sessions; with an aterm window open, a downloaded update"
+	echo "           installs within a minute. Health: aterm update status — to switch it off, Settings ▸"
+	echo "           Software Update (\`[update] enabled = false\` in ~/.config/aterm/aterm.toml)"
 	INSTALLED_ANY=1
 }
 

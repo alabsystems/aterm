@@ -207,6 +207,13 @@ mod crash_journal_conformance;
 // overlap handoff's.
 #[cfg(all(test, unix))]
 mod editor_carry_conformance;
+// TRUST_NATIVE_TLA Tier-1: the `NativeUpdateSettingsDraftCarry` binding — a
+// real outgoing App and a real successor App over the real handoff layout wire,
+// through the preflight, the park's capture, the successor's restore, the
+// Commit comparison and the lane gate (plan P2-2). Unix: the Commit comparison
+// and the lane gate are the unix overlap handoff's.
+#[cfg(all(test, unix))]
+mod settings_draft_carry_conformance;
 // `mod bench_knobs;` was here, with NO cfg — so ATERM_GATHER_SINK,
 // ATERM_PARSE_SINK, ATERM_CAST_TAP and ATERM_FLOOD_QUIET were live in every
 // shipped aterm despite the module's own header calling them "bench instruments
@@ -4596,6 +4603,14 @@ enum Wake {
     /// preserves rollback authority and re-arms one bounded retry; success closes
     /// the one-shot latch for this process.
     NativeBootHealthConfirmationFinished { confirmed: bool },
+    /// The retire of a latched installed activation for a newer verified release
+    /// finished off the UI thread (`App::request_activation_supersede`), with the
+    /// disk observation read after it. Boxed: the facts are several hundred bytes
+    /// and this is the rare arm. Never built by a unit test: the retire would act
+    /// on this machine's own install, so tests hand their completions straight to
+    /// `App::finish_activation_supersede`.
+    #[cfg_attr(test, allow(dead_code))]
+    NativeActivationSuperseded(Box<app_native::ActivationSupersedeCompletion>),
     /// The overlap-update waiter finished off the UI thread. A proof-ready
     /// completion carries the still-live child so the main thread can repeat
     /// native-state + exact-session-set admission before deciding whether to
@@ -11932,7 +11947,7 @@ struct WindowState {
     /// Per cached band row, its meter's `(left, right)` gutter tones (`None` on
     /// an unmetered row) — handed to the renderer's chrome bleed so a metered
     /// row's fill (or a busy row's comet) runs through the side gutters to the
-    /// window edge (`message_band::MeterSpan`: the edge cells' spans ARE the
+    /// window edge (`aterm_messages::paint::MeterSpan`: the edge cells' spans ARE the
     /// gutters').
     cached_band_edges: Vec<Option<([u8; 3], [u8; 3])>>,
     /// Each cached band row's PIXEL raster (the meter's ground, rail and ink
@@ -14148,15 +14163,16 @@ struct AutoApplyManualOnly {
     /// schedule's next retry, the stand-down between its epochs, or — for a
     /// transient or unexplained failure whose lifetime is spent — the silent
     /// re-sample one epoch cooldown out. A STRUCTURAL convergence gets ONE
-    /// re-sample a day out (gap 14, 2026-09-26; it used to be `None`, and on
-    /// the installed activation — where every launched-lane failure lands — no
-    /// newer release could move it either, so every later release waited for a
-    /// person). Its [`AutoApplyStructuralVerdict`] also lets a verified newer
-    /// release release it early, once. `None` is what is left after that: the
-    /// re-sample spent and failed again, or held because the boot trial could
-    /// not afford the launch — the Version menu or a relaunch moves it — and
-    /// the fail-safe for a policy/outcome mismatch no path is supposed to
-    /// reach.
+    /// re-sample a day out (gap 14, 2026-09-26; it used to be `None`). `None`
+    /// is what is left after that: the re-sample spent and failed again, or
+    /// held because the boot trial could not afford the launch — and the
+    /// fail-safe for a policy/outcome mismatch no path is supposed to reach.
+    ///
+    /// NO DEADLINE IS NOT "STUCK" ON THE ACTIVATION (round three): a verified
+    /// newer release retires the latched activation from the install path and
+    /// takes its place, deadline or none, without launching it
+    /// (`App::request_activation_supersede`); with no newer release the
+    /// convergence notice has said so and the Version menu's apply moves it.
     /// The budget behind the deadline lives on `auto_apply_physical_retry`, NOT
     /// here, because this struct is cleared when the latch lapses.
     retry_at: Option<std::time::Instant>,
@@ -14187,8 +14203,9 @@ impl AutoApplyManualOnly {
 }
 
 /// THE VERDICT BEHIND A STRUCTURAL CONVERGENCE (gap 14, 2026-09-26): which
-/// bytes the lane gave up on, and what may still earn them one more automatic
-/// attempt (`native_update_auto_intent::structural_latch`).
+/// bytes the lane gave up on, what may still earn them one more automatic
+/// attempt, and which newer release was already offered their place at the
+/// install path (`native_update_auto_intent::structural_latch`; round three).
 ///
 /// A separate record because the latch is cleared when it lapses and the
 /// physical budget forgets the bytes after its replenish window, while the
@@ -14203,10 +14220,34 @@ struct AutoApplyStructuralVerdict {
     /// When the ONE re-sample comes due; `None` once it is spent — taken, or
     /// held because the boot trial could not afford the launch.
     resample_at: Option<std::time::Instant>,
-    /// The newest verified download that has already had this verdict's
-    /// attempt, or was already on disk when the verdict was minted (0 = none):
-    /// only a release strictly newer than it earns another.
+    /// The newest verified download offered the install path in the latched
+    /// activation's place — a retire of it running, or landed (0 = none): only
+    /// a release strictly newer than it is offered again. A REFUSED retire
+    /// gives its release back ([`Self::newer_retry`]; round three review): a
+    /// refusal is as often a moment — the verification's budget run out on a
+    /// captive-portal network, the apply lock held past its wait — as a disk
+    /// the retire cannot undo, and a release spent on a moment stranded the
+    /// machine until a still newer build shipped or a person pressed.
     newer_spent: u64,
+    /// The release a refused retire gave back, and when it may be offered
+    /// again. Until then it still outranks the day's re-sample (the latched
+    /// build is not launched while a newer one is on its way); once due, the
+    /// next look offers it. Moot, and dropped, when the release on disk is no
+    /// longer that one.
+    newer_retry: Option<SupersedeRetry>,
+    /// How many retires this verdict has had refused in a row: the retry's
+    /// backoff doubles with each ([`app_native::supersede_retry_after`]).
+    newer_refusals: u32,
+}
+
+/// A refused retire's release, waiting out its backoff (see
+/// [`AutoApplyStructuralVerdict::newer_retry`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SupersedeRetry {
+    /// The verified download the refused retire was for.
+    newer: u64,
+    /// When the lane may offer it the install path again.
+    at: std::time::Instant,
 }
 
 impl AutoApplyStructuralVerdict {
@@ -16120,6 +16161,13 @@ struct App {
     /// (fresh tokens under the adopted sessions' fresh nonces), never
     /// resurrected. Empty on a normal launch and after the re-mint.
     pending_conn_carry: Vec<crate::session_store::ConnectionCarry>,
+    /// Every unsaved Settings draft a seamless update carried, from the moment
+    /// the restore reopens (or fails to reopen) it until the restore is done —
+    /// when [`Self::settle_carried_settings_drafts`] says, ONCE, which of them
+    /// did not survive, with their text. Seeded with a layout the successor
+    /// could not place at all (`IncomingHandoff::unplaced_settings_drafts`).
+    /// Empty on every launch that carried none.
+    carried_settings_drafts: app_restore::CarriedDraftsLedger,
     /// OVERLAP HANDOFF (incoming side): the parked parent's readiness-pipe write
     /// channel. `Some` flips this boot into overlap mode — adopted readers are
     /// deferred and [`Self::maybe_signal_handoff_ready`] writes the exact,
@@ -16783,15 +16831,19 @@ struct App {
     /// from the predecessor that handed over (`update_words::carried_verification`).
     /// Taken at the landing, whose record says how long the update took.
     update_verified: Option<(u64, Instant)>,
-    /// What the update-health warning said when it was announced (title,
-    /// `detail[0]`), so its healing is recorded once against it
-    /// (`App::heal_update_health`).
-    update_health_said: Option<(String, String)>,
-    /// Every update-health TITLE this process has announced and no proof has
-    /// answered since: the one latch the three producers of "aterm can't
-    /// install updates" share (`App::note_update_health`). Separate from
-    /// `update_health_said`, which keeps only the last warning's words.
-    update_health_latched: Vec<String>,
+    /// What each live update-health warning said when it was announced (its
+    /// kind, title and `detail[0]`), ONE ENTRY PER KIND, so each healing is
+    /// recorded once against its own warning (`App::heal_update_health`,
+    /// `App::heal_update_checker_stall`). Two halves failing in one launch are
+    /// two rows (design ruling 311), so they are two entries: a later kind
+    /// never takes an earlier one's record of healing with it (ruling 318).
+    update_health_said: Vec<(update_words::HealthKind, String, String)>,
+    /// Every update-health KIND this process has announced and no proof has
+    /// answered since: the one latch the three producers of "Couldn't install
+    /// updates" share (`App::note_update_health`; keyed by kind, never by the
+    /// words, design ruling 311). Separate from `update_health_said`, which
+    /// keeps each kind's words for its record of healing.
+    update_health_latched: Vec<update_words::HealthKind>,
     /// The update checker's watchdog (`update_checker_watch`, plan P2-1): which
     /// stalled checker generation it has already acted on, so one stall is
     /// logged, warned about and replaced once.
@@ -16928,8 +16980,9 @@ struct App {
     /// `lapse_expired_auto_apply_manual_only`, so the budget actually converges.
     auto_apply_physical_retry: Option<AutoOverlapRetry>,
     /// The STRUCTURAL verdict behind a converged latch — which bytes, whether
-    /// its one re-sample is still owed, and which newer release already had its
-    /// attempt. See [`AutoApplyStructuralVerdict`] (gap 14, 2026-09-26). Like
+    /// its one re-sample is still owed, and which newer release was already
+    /// offered the activation's place. See [`AutoApplyStructuralVerdict`] (gap
+    /// 14, 2026-09-26; round three). Like
     /// the budget above it survives the latch lapsing, and it also survives
     /// that budget's replenish window: the verdict is what converges a
     /// re-sample that fails again, a day after the budget forgot the bytes.
@@ -16947,11 +17000,19 @@ struct App {
     /// revert; it measures nothing for `native_installed_trial` (gap 14 review,
     /// 2026-09-26).
     native_installed_trial_stale_before: Option<std::time::Instant>,
-    /// The newest verified download build any updater observation has named
-    /// (0 = none). Monotonic, so a stage that retires and returns is not a new
-    /// release; a structural verdict records it when minted, so a release that
-    /// was already on disk during the failures buys no extra attempt.
-    native_newest_verified_download: u64,
+    /// The verified download build the last updater observation that could read
+    /// the durable marker found ON DISK (0 = none). What a structural latch on
+    /// the installed activation may offer the install path, compared against the
+    /// release it already offered (`AutoApplyStructuralVerdict::newer_spent`).
+    /// Not a high-water mark any more (round three): gap 14 kept the newest ever
+    /// seen, which was harmless while a newer release only bought another launch
+    /// of the latched build, but a retire asked for on a release that has since
+    /// left the disk would only be refused — and said — for nothing.
+    native_verified_download_on_disk: u64,
+    /// A retire of a latched installed activation for a newer verified release,
+    /// while it runs off the event loop (`App::request_activation_supersede`).
+    /// The latch stands until it answers.
+    native_activation_supersede: Option<app_native::ActivationSupersedeJob>,
     /// The refusal lane's standing record: the park's capture refused this
     /// artifact's handoff deterministically, so the retained intent waits for
     /// the desk to change instead of relaunching into the same refusal. See
@@ -20106,6 +20167,7 @@ impl App {
             pending_restore: None,
             seamless_adopt: Vec::new(),
             pending_conn_carry: Vec::new(),
+            carried_settings_drafts: app_restore::CarriedDraftsLedger::default(),
             handoff_ready: None,
             #[cfg(unix)]
             handoff_claimed_at: None,
@@ -20218,7 +20280,7 @@ impl App {
             update_ctl_checks: 0,
             update_quiet: None,
             update_verified: None,
-            update_health_said: None,
+            update_health_said: Vec::new(),
             update_health_latched: Vec::new(),
             update_checker_watch: update_checker_watch::CheckerWatchState::default(),
             dev_build: None,
@@ -20247,7 +20309,8 @@ impl App {
             auto_apply_structural_verdict: None,
             native_installed_trial: None,
             native_installed_trial_stale_before: None,
-            native_newest_verified_download: 0,
+            native_verified_download_on_disk: 0,
+            native_activation_supersede: None,
             auto_apply_capture_refusal: None,
             apply_schedule_standing: None,
             auto_apply_stranded_announced: None,
@@ -24104,12 +24167,17 @@ impl ApplicationHandler<Wake> for App {
         // blink wake sub-millisecond late, but never early (an early wake would
         // rasterize the same visual half and immediately need a second wake).
         let native_preview_now = Instant::now();
+        let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
         let native_preview_windows: std::collections::BTreeMap<_, _> = self
             .windows
             .keys()
             .filter_map(|wid| {
-                self.active_native_settings_preview(*wid, native_preview_phase_ms)
-                    .map(|(_, animation)| (*wid, animation))
+                self.native_settings_preview_for_tick(
+                    *wid,
+                    native_preview_phase_ms,
+                    native_preview_recording_window == Some(*wid),
+                )
+                .map(|(_, animation)| (*wid, animation))
             })
             .collect();
         // Cursor companions follow the same focused-window motion policy as
@@ -24139,7 +24207,6 @@ impl ApplicationHandler<Wake> for App {
                 && matches!(glow.style, crate::cursor_glow::GlowStyle::RainbowKitty)
                 && serious_policy.allows(crate::motion::SeriousEffect::CursorCat)
         };
-        let native_preview_recording_window = self.video_rec.as_ref().map(|rec| rec.window);
         // R4 (owner, 2026-09-08, twice): *"I don't like the blinking cursor"*.
         // THE RAINBOW OWNS THE CARET: whenever the `rainbow kitty` block body
         // may run at all — the same app-level half of the pair the render
@@ -24744,6 +24811,18 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline,
                 &mut deadline_owner,
                 lapse_at,
+                metrics::DeadlineOwner::AutoApply,
+            );
+        }
+        // A refused retire's release waits out its own deadline beside the
+        // latch's (round three review): the latch of a re-sample held for the
+        // boot trial has none, and an idle machine produces no other wake to
+        // take the retry on.
+        if let Some(retry_at) = self.structural_supersede_retry_at() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                retry_at,
                 metrics::DeadlineOwner::AutoApply,
             );
         }
@@ -26137,6 +26216,9 @@ impl ApplicationHandler<Wake> for App {
             }
             Wake::NativeBootHealthConfirmationFinished { confirmed } => {
                 self.finish_native_boot_health_confirmation(confirmed, Instant::now());
+            }
+            Wake::NativeActivationSuperseded(completion) => {
+                self.finish_activation_supersede(*completion);
             }
             #[cfg(unix)]
             Wake::UpdateHandoffFinished(completion) => {
@@ -37596,6 +37678,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
     // and re-minted once every handed-off session is registered (`about_to_wait`
     // runs `remint_carried_connections` after the restore drains).
     let seamless_conn_carry = incoming_handoff.connections;
+    // The drafts of a layout this build could not place: said, with their
+    // text, once the restore is done (`App::settle_carried_settings_drafts`).
+    let seamless_unplaced_drafts = incoming_handoff.unplaced_settings_drafts;
     let mut seamless_adopt: Vec<crate::spawn::Adopted> = incoming_handoff.adopted;
     // OVERLAP HANDOFF: the parked parent's readiness-pipe write fd (consume +
     // clear, same single-threaded env discipline as `take_incoming` above). Its
@@ -39894,6 +39979,9 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         // leaf's). Empty on a normal launch. `apply_pending_restore` drains it.
         seamless_adopt,
         pending_conn_carry: seamless_conn_carry,
+        carried_settings_drafts: app_restore::CarriedDraftsLedger::unplaced(
+            seamless_unplaced_drafts,
+        ),
         // Stamped where the descriptors arrived, so `claim->proof` measures this
         // successor's own boot rather than anything the parent did. Read BEFORE
         // the signal is moved into the struct below.
@@ -40043,7 +40131,7 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         update_ctl_checks: 0,
         update_quiet: None,
         update_verified: None,
-        update_health_said: None,
+        update_health_said: Vec::new(),
         update_health_latched: Vec::new(),
         update_checker_watch: update_checker_watch::CheckerWatchState::default(),
         dev_build: dev_marked.then_some(crate::update_screen::DevBuildPage { standing: None }),
@@ -40072,7 +40160,8 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) {
         auto_apply_structural_verdict: None,
         native_installed_trial: None,
         native_installed_trial_stale_before: None,
-        native_newest_verified_download: 0,
+        native_verified_download_on_disk: 0,
+        native_activation_supersede: None,
         auto_apply_capture_refusal: None,
         apply_schedule_standing: None,
         auto_apply_stranded_announced: None,

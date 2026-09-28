@@ -56,23 +56,23 @@ use aterm_spec::derive::{
     native_packages_worker_model, native_recovery_interaction_model, native_reopen_ledger_model,
     native_save_intent_latch_model, native_settings_draft_close_model,
     native_settings_singleton_model, native_tab_identity_model, native_update_admission_model,
-    native_update_apply_ladder_model, native_update_attempt_identity_model,
-    native_update_auto_intent_model, native_update_disk_transaction_model,
-    native_update_failed_mark_suppression_model, native_update_hidden_output_quiet_model,
-    native_update_menu_activation_model, native_update_overlap_handoff_model,
-    native_update_seamless_handoff_ownership_model, native_update_status_reconciliation_model,
-    native_update_worker_queue_model, native_updater_model, net_capability_grant_model,
-    net_dial_after_grant_model, notify_follow_checkpoint_model, nova_phase_model,
-    one_shot_peek_model, operator_event_delivery_model, operator_fleet_fault_model,
-    operator_leadership_model, operator_resync_cursor_model, operator_wal_actuator_model,
-    output_streak_attribution_model, output_streak_episode_delivery_model, pad_absorption_model,
-    pane_tree_model, path_feed_snapshot_model, per_window_metrics_model,
-    predictive_echo_visibility_model, present_retry_model, presentation_gate_model,
-    presented_frame_tap_model, press_custody_model, program_resolution_retry_model,
-    program_resolver_queue_model, proxy_forward_model, rain_band_containment_model,
-    rain_ignition_model, rain_lifecycle_model, rainbow_exit_sampling_model,
-    rainbow_idle_twinkle_model, rainbow_landing_pool_model, rainbow_typed_continuity_model,
-    read_image_seq_model, recording_model, recovery_redraw_model,
+    native_update_apply_ladder_liveness, native_update_apply_ladder_model,
+    native_update_attempt_identity_model, native_update_auto_intent_model,
+    native_update_disk_transaction_model, native_update_failed_mark_suppression_model,
+    native_update_hidden_output_quiet_model, native_update_menu_activation_model,
+    native_update_overlap_handoff_model, native_update_seamless_handoff_ownership_model,
+    native_update_status_reconciliation_model, native_update_worker_queue_model,
+    native_updater_model, net_capability_grant_model, net_dial_after_grant_model,
+    notify_follow_checkpoint_model, nova_phase_model, one_shot_peek_model,
+    operator_event_delivery_model, operator_fleet_fault_model, operator_leadership_model,
+    operator_resync_cursor_model, operator_wal_actuator_model, output_streak_attribution_model,
+    output_streak_episode_delivery_model, pad_absorption_model, pane_tree_model,
+    path_feed_snapshot_model, per_window_metrics_model, predictive_echo_visibility_model,
+    present_retry_model, presentation_gate_model, presented_frame_tap_model, press_custody_model,
+    program_resolution_retry_model, program_resolver_queue_model, proxy_forward_model,
+    rain_band_containment_model, rain_ignition_model, rain_lifecycle_model,
+    rainbow_exit_sampling_model, rainbow_idle_twinkle_model, rainbow_landing_pool_model,
+    rainbow_typed_continuity_model, read_image_seq_model, recording_model, recovery_redraw_model,
     reduced_motion_companion_handoff_model, release_channel_floor_model,
     release_claim_landing_model, release_durable_post_intent_model,
     release_historical_recovery_model, release_journal_prefix_model,
@@ -6926,6 +6926,288 @@ fn derived_native_update_apply_ladder_lands_a_busy_terminal_and_catches_the_stan
     // the external `ty` tier).
     ladder_never_retries_a_capture_refusal_as_activity(&model);
     ladder_keeps_a_latch_across_its_own_bundle_swap(&model, &latched);
+    ladder_lets_a_newer_release_clear_a_converged_activation_latch(&model, &latched);
+}
+
+/// LAW 1 OF THE LADDER, MACHINE-CHECKED (round three, plan P1-7): "the staged
+/// build lands" holds on every fair behaviour, on the interpreter always and on
+/// `ty` wherever it is installed (`PROPERTY TheLadderLands` under the stated
+/// `WF_vars` / `SF_vars`); every stated fairness assumption is needed; and each
+/// named mutant, alone on the healthy lane, breaks it.
+///
+/// Why the property and not only the invariants: two of those mutants are
+/// LIVELOCKS. Every state they reach is legal and has a successor — the terminal
+/// can always type, stream or blur — so the deadlock check this model had
+/// passes them. Until this slice the model also let the healthy lane escape each
+/// of them one step later, so the historical "retried every fifteen minutes,
+/// forever" and "the newer release waited forever" were modelled as detours that
+/// land. Both are loops now, and the property is what sees them.
+#[test]
+fn derived_native_update_apply_ladder_lands_under_fairness_and_catches_the_livelocks() {
+    let model = native_update_apply_ladder_model();
+    let live = native_update_apply_ladder_liveness();
+    verify::liveness_proves_and_catches_tiered(&model, &live, "NativeUpdateApplyLadder Law 1");
+    let is_landed = |state: &aterm_spec::interp::State| state["landed"] == 1;
+
+    // THE v0.91 LOOP: the capture refusal re-filed as the machine being busy,
+    // every time the park's gate opens on the same refusing desk.
+    let refiling = verify::buggy_baseline_with(&model, "CaptureRefusedAsActivity");
+    assert_eq!(
+        aterm_spec::interp::find_deadlock(&refiling, is_landed),
+        None,
+        "no state of the loop is stuck, so the deadlock check passes it"
+    );
+    let refiled = aterm_spec::interp::nonprogress_under(&refiling, &live)
+        .expect("the refusal is retried as activity forever and never lands");
+    let entry = refiled.entry();
+    assert_eq!(
+        (entry["refusing"], entry["degraded"], entry["refusals"]),
+        (1, 0, 1),
+        "the loop is the refusing desk nobody answers for:\n{refiled}"
+    );
+    assert!(
+        refiled.moves.contains("CaptureRefusedAsActivity") && refiled.moves.contains("Quiet"),
+        "each time the terminal reads quiet, the re-file makes it busy again:\n{refiled}"
+    );
+    assert!(
+        !refiled.moves.contains("CaptureRefused"),
+        "the lane that re-filed a refusal has no refusal lane to come back to:\n{refiled}"
+    );
+
+    // THE NEWER RELEASE THAT WAITED FOREVER behind a converged activation latch
+    // (every release before gap 14): the look kept the latch, and it is final.
+    let ignoring = verify::buggy_baseline_with(&model, "NewerReleaseIgnored");
+    assert_eq!(
+        aterm_spec::interp::find_deadlock(&ignoring, is_landed),
+        None,
+        "nothing is stuck while the newer release waits, so the deadlock check passes it"
+    );
+    let waits = aterm_spec::interp::nonprogress_under(&ignoring, &live)
+        .expect("the newer release waits behind the latch forever");
+    let entry = waits.entry();
+    assert_eq!(
+        (
+            entry["converged"],
+            entry["newer"],
+            entry["looked"],
+            entry["superseded"],
+            entry["latched"]
+        ),
+        (1, 1, 1, 0, 1),
+        "looked at, never superseded, still latched:\n{waits}"
+    );
+    assert!(
+        waits
+            .stem
+            .iter()
+            .any(|(action, _)| *action == "NewerReleaseIgnored"),
+        "the look that kept the latch is how the run got there:\n{waits}"
+    );
+
+    // THE REFUSAL THAT SPENT THE RELEASE for good (round three as first
+    // shipped): a retire refused for a moment — a verification past its budget
+    // on a captive-portal network — left the release spent, and the machine
+    // waited for a still newer build or a person. The same livelock, reached
+    // through a refusal the healthy lane now answers with a retry.
+    let spending = verify::buggy_baseline_with(&model, "RefusedRetireSpendsTheRelease");
+    assert_eq!(
+        aterm_spec::interp::find_deadlock(&spending, is_landed),
+        None,
+        "nothing is stuck while the spent release waits"
+    );
+    let waits = aterm_spec::interp::nonprogress_under(&spending, &live)
+        .expect("the spent release waits behind the latch forever");
+    let entry = waits.entry();
+    assert_eq!(
+        (
+            entry["converged"],
+            entry["newer"],
+            entry["looked"],
+            entry["superseded"],
+            entry["latched"]
+        ),
+        (1, 1, 1, 0, 1),
+        "spent, never superseded, still latched:\n{waits}"
+    );
+    assert!(
+        waits
+            .stem
+            .iter()
+            .any(|(action, _)| *action == "RefusedRetireSpendsTheRelease"),
+        "the refusal that spent the release is how the run got there:\n{waits}"
+    );
+    // …and the healthy lane, refused on every attempt it is given, still lands
+    // under the stated fairness: `Supersede` is strongly fair, so a retire the
+    // environment lets through infinitely often is taken. Demoted to weak, the
+    // refuse-and-retry loop never lands (the audit above checks that too).
+    let mut weak_supersede = live.clone();
+    weak_supersede
+        .strong
+        .retain(|action| *action != "Supersede");
+    weak_supersede.weak.push("Supersede");
+    let refused_forever = aterm_spec::interp::nonprogress_under(&model, &weak_supersede)
+        .expect("weak fairness alone lets the retire be refused forever");
+    assert!(
+        refused_forever.moves.contains("SupersedeRefused")
+            && refused_forever.moves.contains("SupersedeRetryDue"),
+        "the loop is refuse, wait, refuse:\n{refused_forever}"
+    );
+
+    // THE WEDGES (the 2026-09-20 stand-down, and a park miss filed as a
+    // failure): non-progress too, as a stall — the one shape the deadlock check
+    // already saw, and the two checks agree on it.
+    for wedge in ["StandDown", "ParkMissLatches"] {
+        let wedged = verify::buggy_baseline_with(&model, wedge);
+        let stall = aterm_spec::interp::nonprogress_under(&wedged, &live)
+            .unwrap_or_else(|| panic!("{wedge} wedges the lane before it lands"));
+        assert!(
+            stall.cycle.is_empty() && stall.moves.is_empty(),
+            "{wedge}: a stall, not a loop:\n{stall}"
+        );
+        assert_eq!(stall.entry()["manual_only"], 1, "{wedge}:\n{stall}");
+        assert_eq!(
+            aterm_spec::interp::find_deadlock(&wedged, is_landed).map(|state| state["manual_only"]),
+            Some(1),
+            "{wedge}: the deadlock check sees the same wedge"
+        );
+    }
+
+    // The converged rest the property allows is Law 2's, and only with nothing
+    // newer staged: a newer release there leaves the goal, so the healthy lane
+    // must land it — which the committed proof above says it does.
+    let mut converged_rest = model.init_state();
+    converged_rest.insert("converged", 1);
+    assert!(live.goal_holds(&model, &converged_rest));
+    converged_rest.insert("newer", 1);
+    assert!(!live.goal_holds(&model, &converged_rest));
+}
+
+/// ROUND THREE (2026-09 update robustness): a latch that converged STRUCTURALLY
+/// on the activation the failed candidate installed — no deadline left — is not
+/// a dead end. A verified newer release behind it takes the activation's place:
+/// the latch clears at the look, the newer build is armed on a ladder of its own,
+/// and what lands is the newer build. With no newer release the latch holds
+/// (the convergence notice and the Version menu are the person's).
+///
+/// A retire the environment REFUSES (round three review) moves nothing and
+/// spends nothing: the release waits out its retry deadline and is offered
+/// again.
+///
+/// The mutants are the three shapes that left every later release waiting: the
+/// look that keeps the latch; gap 14's answer — one more attempt at the
+/// activation, whose successor refuses to boot-apply past itself, so the build
+/// that lands is the one that failed; and a refused retire that spends the
+/// release for good (round three as first shipped).
+fn ladder_lets_a_newer_release_clear_a_converged_activation_latch(
+    model: &Model,
+    latched: &aterm_spec::interp::State,
+) {
+    let swapped = model.successors("BundleSwap", latched)[0].clone();
+    let converged = model.successors("Converge", &swapped)[0].clone();
+    assert_eq!((converged["latched"], converged["converged"]), (1, 1));
+    assert!(
+        model.successors("Due", &converged).is_empty()
+            && model.successors("Lapse", &converged).is_empty()
+            && model.successors("Park", &converged).is_empty(),
+        "a converged latch has no deadline left: nothing lapses, nothing parks"
+    );
+    assert!(
+        model.successors("Supersede", &converged).is_empty(),
+        "with no newer release the latch holds"
+    );
+    let waiting = model.successors("NewerRelease", &converged)[0].clone();
+    let superseded = model.successors("Supersede", &waiting)[0].clone();
+    assert_eq!(
+        (
+            superseded["latched"],
+            superseded["superseded"],
+            superseded["phase"]
+        ),
+        (0, 1, 0),
+        "cleared, and the newer build starts a ladder of its own"
+    );
+    for invariant in [
+        "NoEarlyRelease",
+        "ANewerReleaseClearsAConvergedLatch",
+        "TheLadderNeverRestarts",
+    ] {
+        assert!(model.check_invariant(invariant, &superseded), "{invariant}");
+    }
+    // …and it lands: the busy terminal reaches the bound on the NEW ladder, and
+    // the landing is the newer build.
+    let mut at_bound = superseded;
+    for _ in 0..3 {
+        at_bound = model.successors("Advance", &at_bound)[0].clone();
+    }
+    let landed = model.successors("Park", &at_bound)[0].clone();
+    assert_eq!((landed["landed"], landed["parked_newer"]), (1, 1));
+    assert!(model.check_invariant("NeverLandsTheSupersededActivation", &landed));
+
+    // A REFUSED RETIRE (round three review) moves nothing and spends nothing:
+    // the release waits out its retry deadline — no look in the meantime — and
+    // is then offered again, and a retry that lands lands the newer build.
+    let refused = model.successors("SupersedeRefused", &waiting)[0].clone();
+    assert_eq!(
+        (
+            refused["latched"],
+            refused["looked"],
+            refused["superseded"],
+            refused["retry"]
+        ),
+        (1, 0, 0, 1),
+        "latched, unspent, waiting out its retry deadline"
+    );
+    assert!(model.check_invariant("ANewerReleaseClearsAConvergedLatch", &refused));
+    assert!(
+        model.successors("Supersede", &refused).is_empty(),
+        "not offered again before its retry deadline"
+    );
+    let due_again = model.successors("SupersedeRetryDue", &refused)[0].clone();
+    assert_eq!(
+        model.successors("Supersede", &due_again)[0],
+        model.successors("Supersede", &waiting)[0],
+        "at its deadline the retire is offered again, and lands as the first would have"
+    );
+
+    // THE MUTANTS, dead in the healthy ladder.
+    let buggy = aterm_spec::interp::with_buggy(model, 1);
+    for mutant in [
+        "NewerReleaseIgnored",
+        "NewerReleaseRetriesTheActivation",
+        "RefusedRetireSpendsTheRelease",
+    ] {
+        assert!(
+            model.successors(mutant, &waiting).is_empty(),
+            "the healthy ladder has no {mutant}"
+        );
+    }
+    // The refusal that spent the release (round three as first shipped): the
+    // latch stands, the release is never offered again.
+    let spent = buggy.successors("RefusedRetireSpendsTheRelease", &waiting)[0].clone();
+    assert_eq!(
+        (spent["latched"], spent["looked"], spent["retry"]),
+        (1, 1, 0)
+    );
+    assert!(buggy.successors("Supersede", &spent).is_empty());
+    assert!(!buggy.check_invariant("ANewerReleaseClearsAConvergedLatch", &spent));
+    // No newer release can clear it: the look keeps the latch.
+    let ignored = buggy.successors("NewerReleaseIgnored", &waiting)[0].clone();
+    assert_eq!(ignored["latched"], 1);
+    assert!(!buggy.check_invariant("ANewerReleaseClearsAConvergedLatch", &ignored));
+    // Gap 14's retry of the activation: released early, and what lands is the
+    // activation the newer release should have replaced.
+    let retried = buggy.successors("NewerReleaseRetriesTheActivation", &waiting)[0].clone();
+    assert!(!buggy.check_invariant("ANewerReleaseClearsAConvergedLatch", &retried));
+    assert!(!buggy.check_invariant("NoEarlyRelease", &retried));
+    let mut stale = retried;
+    for _ in 0..3 {
+        if let Some(next) = buggy.successors("Advance", &stale).first() {
+            stale = next.clone();
+        }
+    }
+    let landed_stale = buggy.successors("Park", &stale)[0].clone();
+    assert_eq!(landed_stale["parked_newer"], 0);
+    assert!(!buggy.check_invariant("NeverLandsTheSupersededActivation", &landed_stale));
 }
 
 /// THE 2026-09-22/23 UPDATE AUDIT (plan P0-6): a physical latch survives the

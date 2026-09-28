@@ -164,8 +164,12 @@ struct Crossed {
     /// …the adopted sessions that took one (asserted: every named one)…
     history_adopted: usize,
     /// …and the scrollback lines the join counted as left behind, over every
-    /// record (`history_dropped`).
+    /// record (`history_dropped`)…
     history_dropped: u64,
+    /// …of which the successor read as WITHHELD by a handoff policy, off the
+    /// wire (`SessionRecord::history_withheld` → `AdoptedHistory::withheld`):
+    /// what its band row says as the new version's request, not a failure.
+    history_withheld: u64,
 }
 
 /// THE PARK → WRITE → ADOPT PIPELINE over a whole App, with every assertion
@@ -450,6 +454,11 @@ fn hand_over_as(
     crossed.history_sidecars = named;
     crossed.history_adopted = adopted_history;
     crossed.history_dropped = dropped;
+    crossed.history_withheld = incoming
+        .adopted
+        .iter()
+        .map(|adopted| adopted.history.withheld)
+        .sum();
     assert_eq!(
         incoming.screen_digest,
         Some(parked.screen_digest),
@@ -1195,6 +1204,10 @@ fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopt
         exact.history_lines > 0,
         "{at}: with no policy to follow, the sessions carry their scrollback"
     );
+    assert_eq!(
+        exact.history_withheld, 0,
+        "{at}: CONTROL — with no policy to follow, nothing is read as withheld"
+    );
     assert!(
         exact.history_sidecars > 0 && exact.history_adopted == exact.history_sidecars,
         "{at}: CONTROL — with no policy to follow, the history carry crosses in sidecars \
@@ -1234,6 +1247,10 @@ fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopt
         blank.history_dropped, seen,
         "{at}: every line of scrollback the park saw is counted as left behind"
     );
+    assert_eq!(
+        blank.history_withheld, seen,
+        "{at}: and the successor reads every one as the policy's, not a failure"
+    );
     // …and that park never projects a session's grids, the path a repaint
     // policy is sealed to route around: with that projection made to fail
     // (`checkpoint.carry_projection`), the same park still parks every session.
@@ -1267,6 +1284,10 @@ fn a_successor_policy_of_repaint_carries_every_session_blank_and_every_one_adopt
     assert_eq!(
         visible.history_dropped, seen,
         "{at}: every line of scrollback the park saw is counted as left behind"
+    );
+    assert_eq!(
+        visible.history_withheld, seen,
+        "{at}: and the successor reads every one as the policy's, not a failure"
     );
 
     // A verdict that did not pass is never followed, even holding a policy —

@@ -223,6 +223,18 @@ struct StallRow {
     /// The agent it moves: what the stall's end record names
     /// ([`message_reporters::agent_upgrade_stall_over`]).
     agent: aterm_agent::harness::upgrade::Agent,
+    /// What its words say now: `said`, or a restart in flight that has not
+    /// moved for `STALE_S` (`stuck:<what>`), whose words are laid over the
+    /// entry in place ([`App::post_upgrade_stalls`]).
+    shows: String,
+    /// The words a stuck restart's replaced, told again once it moves.
+    beneath: Option<aterm_messages::Restatement>,
+}
+
+/// Whether a stall's `said` is a restart in flight that has not moved
+/// (`stuck:<what>`, `upgrade_drive::Row::stall`).
+fn stuck(said: &str) -> bool {
+    said.starts_with("stuck:")
 }
 
 /// What the window last did with the host's rows.
@@ -535,10 +547,15 @@ impl App {
     ///
     /// Nor when a record came under the key after the row (ruling 307): the
     /// owner's word from the tab menu is recorded there already, and it — not
-    /// the stall — is what a returning stall is read against. `goes_on`:
-    /// the tab still holds a round of this upgrade, so the record says it
-    /// asks again, not that it ended.
-    fn record_stall_over(&mut self, posted: &StallRow, place: &str, goes_on: bool) {
+    /// the stall — is what a returning stall is read against. `end`: what
+    /// became of the upgrade — its round asks again, its stuck restart moves
+    /// again (ruling 327), or its tab left — and so what the record says.
+    fn record_stall_over(
+        &mut self,
+        posted: &StallRow,
+        place: &str,
+        end: message_reporters::StallEnd,
+    ) {
         let Some((key, detail)) = self
             .messages
             .log()
@@ -563,7 +580,7 @@ impl App {
             &key,
             &detail,
             place,
-            goes_on,
+            end,
         ));
     }
 
@@ -597,6 +614,21 @@ impl App {
     /// same way was adopted above, never posted again. A tab whose restart
     /// is in flight keeps its row until the move ends one way or the other
     /// (ruling 283: no recovery yet).
+    ///
+    /// A RESTART IN FLIGHT THAT STICKS (S2, `stuck:<what>` past `STALE_S`)
+    /// says so on the tab's row IN PLACE (ruling 327; the merge review of
+    /// 2026-09-27: it withdrew a repeating stop's row for a new one at every
+    /// change of what it waited on, the same stop next posted yet another,
+    /// and the stuck row the in-flight guard then kept read "has not exited"
+    /// of an agent that had exited and relaunched). The row's own stall stays
+    /// what it was posted for, so the same stop next is that row again
+    /// (ruling 283), and once the restart moves the row tells what it told
+    /// before it stuck. A row only a stuck restart earned is resolved once
+    /// the restart moves: that stall is over — and put down already, its end
+    /// is recorded as the upgrade moving again, never asking again
+    /// ([`Self::record_stall_over`]). A row the person put down is
+    /// not raised again for it: a stuck restart there is news, and posts, as
+    /// any stall said otherwise does.
     fn post_upgrade_stalls(&mut self, rows: &[Row], now: u64) {
         let stalled: BTreeMap<String, (&Row, String)> = rows
             .iter()
@@ -654,12 +686,23 @@ impl App {
             .upgrade_view
             .stalled
             .iter()
-            .filter_map(|(tab, posted)| match stalled.get(tab) {
-                None if in_flight.contains(&tab.as_str()) => None,
-                None if rearmed(tab, posted) => None,
-                None => Some((tab.clone(), true)),
-                Some((_, fresh)) if *fresh != posted.said => Some((tab.clone(), false)),
-                Some(_) => None,
+            .filter_map(|(tab, posted)| {
+                let flying = in_flight.contains(&tab.as_str());
+                match stalled.get(tab) {
+                    // Its restart stuck, and moved again: that stall is over.
+                    None if flying && stuck(&posted.said) => Some((tab.clone(), true)),
+                    None if flying => None,
+                    None if rearmed(tab, posted) => None,
+                    None => Some((tab.clone(), true)),
+                    // Its restart sticks: said on the row, in place (below).
+                    Some((_, fresh))
+                        if flying && stuck(fresh) && self.messages.live(posted.id).is_some() =>
+                    {
+                        None
+                    }
+                    Some((_, fresh)) if *fresh != posted.said => Some((tab.clone(), false)),
+                    Some(_) => None,
+                }
             })
             .collect();
         for (tab, recovered) in gone {
@@ -696,15 +739,72 @@ impl App {
             // Down already, and the tab stalls no more: its end on the
             // record, so the same stall back is news (a stall that changed
             // is another stall, and posts; one that moved is its done
-            // record's).
+            // record's). Worded by what happened (ruling 307(d)): a stuck
+            // restart that moved and is still in flight (the filter's first
+            // arm) carries on, and asks nothing again (ruling 327).
             if recovered && !live && done.is_none() {
+                use message_reporters::StallEnd;
                 let place = self.upgrade_place(&tab);
-                let goes_on = rows.iter().any(|r| r.tab == tab);
-                self.record_stall_over(&posted, &place, goes_on);
+                let end = if in_flight.contains(&tab.as_str()) && stuck(&posted.said) {
+                    StallEnd::MovesAgain
+                } else if rows.iter().any(|r| r.tab == tab) {
+                    StallEnd::AsksAgain
+                } else {
+                    StallEnd::Left
+                };
+                self.record_stall_over(&posted, &place, end);
+            }
+        }
+        // A restart that stuck and moves again, still in flight: its row
+        // tells what it told before it stuck.
+        let moved: Vec<(MessageId, Option<aterm_messages::Restatement>)> = self
+            .upgrade_view
+            .stalled
+            .iter_mut()
+            .filter(|(tab, posted)| {
+                in_flight.contains(&tab.as_str())
+                    && !stalled.contains_key(*tab)
+                    && posted.shows != posted.said
+            })
+            .map(|(_, posted)| {
+                posted.shows.clone_from(&posted.said);
+                (posted.id, posted.beneath.take())
+            })
+            .collect();
+        for (id, beneath) in moved {
+            if let Some(words) = beneath {
+                let _ = self.restate_message(id, words);
             }
         }
         for (tab, (row, said)) in stalled {
-            if let Some(id) = self.upgrade_view.stalled.get(&tab).map(|p| p.id) {
+            if let Some(posted) = self.upgrade_view.stalled.get(&tab) {
+                let id = posted.id;
+                // ANOTHER STALL'S WORDS ON THE ROW: a stuck restart's laid
+                // over it (the words they replace kept beneath, once), or
+                // its own stall back over a stuck restart's — told afresh.
+                if said != posted.shows {
+                    let beneath = (said != posted.said
+                        && posted.shows == posted.said
+                        && !stuck(&posted.said))
+                    .then(|| {
+                        self.messages
+                            .live(id)
+                            .map(|l| crate::messages_host::restatement_of(&l.msg))
+                    })
+                    .flatten();
+                    let place = self.upgrade_place(&row.tab);
+                    let msg = message_reporters::agent_upgrade_stalled(row, now, &place);
+                    let _ = self.restate_message(id, crate::messages_host::restatement_of(&msg));
+                    if let Some(posted) = self.upgrade_view.stalled.get_mut(&tab) {
+                        if said == posted.said {
+                            posted.beneath = None;
+                        } else if beneath.is_some() {
+                            posted.beneath = beneath;
+                        }
+                        posted.shows = said;
+                    }
+                    continue;
+                }
                 // The same stall, never posted again — but an OVERDUE one's
                 // remedy moves with its wait (at work, `--now` moves it;
                 // waiting on the READY answer, a draft or a box, it does
@@ -741,9 +841,11 @@ impl App {
                     tab,
                     StallRow {
                         id,
+                        shows: said.clone(),
                         said,
                         to: row.to.clone(),
                         agent: row.agent,
+                        beneath: None,
                     },
                 );
                 continue;
@@ -753,9 +855,11 @@ impl App {
                 tab,
                 StallRow {
                     id,
+                    shows: said.clone(),
                     said,
                     to: row.to.clone(),
                     agent: row.agent,
+                    beneath: None,
                 },
             );
         }
@@ -1589,6 +1693,197 @@ mod tests {
         assert_eq!(severity, aterm_messages::Severity::Success);
     }
 
+    /// RULING 283 THROUGH A RESTART THAT STICKS (ruling 327, the merge review
+    /// of 2026-09-27): a stop that repeats keeps its ONE row through the
+    /// re-armed round's restart in flight even when that restart stands past
+    /// `STALE_S` — S2 (`stuck:<what>`) lays its words over that row in place,
+    /// never withdrawing it for a new one, and once the restart moves again
+    /// the row says the stop again; the same stop next is still that row, in
+    /// its count's words, and Done resolves it. Before the fix the stuck
+    /// restart withdrew the row for a new one at each word of its wait, the
+    /// last of which the in-flight guard kept up through the relaunch its
+    /// words denied, and the same stop next posted yet another.
+    #[test]
+    fn a_stop_that_repeats_keeps_its_one_row_through_a_restart_that_sticks() {
+        let mut app = App::headless_for_test();
+        let now = now_s();
+        let stale = now - 400;
+        let at = |phase: Phase, streak: u32, last_stop: &str| Row {
+            phase,
+            stop_streak: streak,
+            streak_why: "no-resume".to_string(),
+            last_stop: last_stop.to_string(),
+            retry_at: now + 3_600,
+            wait: String::new(),
+            ..row("s-a", 60)
+        };
+        let failed = || Phase::Failed("no-resume".to_string());
+        let announced = Phase::Announced {
+            at_s: now - 60,
+            asks: 1,
+        };
+        app.apply_agent_upgrades(vec![at(failed(), 2, "")]);
+        let (id, _) = row_of(&app, "s-a").expect("a stop that repeats is a row");
+        app.apply_agent_upgrades(vec![at(Phase::Pending, 2, "no-resume")]);
+        app.apply_agent_upgrades(vec![at(announced, 2, "")]);
+        let said = |app: &App| -> String {
+            let live: Vec<_> = app.messages.live_rows().map(|l| l.id).collect();
+            assert_eq!(live, vec![id], "the same one row");
+            row_of(app, "s-a").expect("live").1.detail.join(" | ")
+        };
+        let steps = [
+            (at(Phase::Exiting { at_s: stale }, 2, ""), "has not exited"),
+            (
+                Row {
+                    exited_at: now - 30,
+                    ..at(Phase::Exiting { at_s: stale }, 2, "")
+                },
+                "it ended for the upgrade",
+            ),
+            (
+                at(Phase::Relaunched { at_s: now }, 2, ""),
+                "stopped this way 2 times in a row",
+            ),
+            (
+                at(Phase::Relaunched { at_s: stale }, 2, ""),
+                "the line that resumes it was typed",
+            ),
+            (at(failed(), 3, ""), "stopped this way 3 times in a row"),
+            (
+                at(Phase::Pending, 3, "no-resume"),
+                "stopped this way 3 times in a row",
+            ),
+        ];
+        for (step, words) in steps {
+            let word = step.phase.word();
+            app.apply_agent_upgrades(vec![step]);
+            let detail = said(&app);
+            assert!(detail.contains(words), "{word}: {detail}");
+            if words.starts_with("stopped") {
+                assert!(
+                    !detail.contains("nothing is forced"),
+                    "{word}: no stuck words once it moved: {detail}"
+                );
+            }
+        }
+        app.apply_agent_upgrades(vec![Row {
+            done_at: now,
+            ..at(Phase::Done, 3, "")
+        }]);
+        assert!(row_of(&app, "s-a").is_none(), "resolved at Done");
+        assert_eq!(record_of(&app, id).0, "Claude upgraded in its tab");
+    }
+
+    /// A RESTART THAT STICKS WITH NO STALL BEFORE IT (S2 of the in-flight
+    /// review; ruling 327) takes one row, which follows what it waits on while it is
+    /// stuck (`exiting`, then `exited`: one row, restated in place) and is
+    /// resolved once the restart moves again — never left up by the host's
+    /// in-flight guard (ruling 283's, for a stall from before the restart)
+    /// saying "has not exited" of an agent that exited and relaunched.
+    /// NEGATIVE CONTROL: within `STALE_S` the restart is no stall and takes
+    /// no row.
+    #[test]
+    fn a_restart_that_sticks_keeps_one_row_while_stuck_and_resolves_once_it_moves() {
+        let mut app = App::headless_for_test();
+        let now = now_s();
+        let at = |phase: Phase| Row {
+            phase,
+            wait: String::new(),
+            ..row("s-a", 60)
+        };
+        app.apply_agent_upgrades(vec![at(Phase::Exiting { at_s: now - 60 })]);
+        assert!(row_of(&app, "s-a").is_none(), "within STALE_S, no row");
+        app.apply_agent_upgrades(vec![at(Phase::Exiting { at_s: now - 400 })]);
+        let (id, first) = row_of(&app, "s-a").expect("a restart that sticks is a row");
+        assert!(
+            first.detail[0].contains("has not exited"),
+            "{:?}",
+            first.detail
+        );
+        app.apply_agent_upgrades(vec![Row {
+            exited_at: now - 30,
+            ..at(Phase::Exiting { at_s: now - 400 })
+        }]);
+        let (again, exited) = row_of(&app, "s-a").expect("still stuck");
+        assert_eq!(again, id, "one row while it is stuck");
+        assert!(
+            exited.detail[0].contains("it ended for the upgrade"),
+            "{:?}",
+            exited.detail
+        );
+        app.apply_agent_upgrades(vec![at(Phase::Relaunched { at_s: now })]);
+        assert!(
+            app.messages.live_rows().next().is_none(),
+            "it moved: no row says it has not"
+        );
+    }
+
+    /// A STUCK ROW PUT DOWN ENDS ON THE RECORD AS WHAT HAPPENED (ruling 327
+    /// with ruling 307(d); the merge review of 2026-09-28). The person
+    /// dismissed the row a stuck restart alone earned, and the restart then
+    /// moved again, still in flight: the row is down, so the stall's end is
+    /// a record under its key — `Claude upgrade moves again in its tab`, the
+    /// stuck words as `was: …`. Before the fix it read `Claude upgrade asks
+    /// again in its tab`, ruling 307's words for a tab whose round goes on,
+    /// of a restart that asks nothing again: it carries on to Done, which
+    /// adds nothing under the key. NEGATIVE CONTROL: the same stuck row left
+    /// up (`s-b`) is resolved when its restart moves, and nothing is
+    /// recorded under its key.
+    #[test]
+    fn a_stuck_row_put_down_ends_on_the_record_as_moving_again_never_asking() {
+        let mut app = App::headless_for_test();
+        let now = now_s();
+        let (a, b) = ("s-a", "s-b");
+        let at = |tab: &str, phase: Phase| Row {
+            phase,
+            wait: String::new(),
+            ..row(tab, 60)
+        };
+        let recorded = |app: &App, tab: &str| -> Vec<(String, Vec<String>)> {
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.key.as_deref() == Some(&*format!("harness.upgrade.{tab}")))
+                .filter(|r| r.retired() == Some(&aterm_messages::Retired::Recorded))
+                .map(|r| (r.title.clone(), r.detail.clone()))
+                .collect()
+        };
+        let stuck = |tab| at(tab, Phase::Exiting { at_s: now - 400 });
+        app.apply_agent_upgrades(vec![stuck(a), stuck(b)]);
+        let (id, row_a) = row_of(&app, a).expect("a restart that sticks is a row");
+        assert!(row_a.detail[0].contains("has not exited"), "{row_a:?}");
+        assert!(row_of(&app, b).is_some(), "s-b's row too");
+        assert!(app.messages.dismiss(id, std::time::Instant::now()));
+        app.sync_messages();
+
+        let moving = |tab| at(tab, Phase::Relaunched { at_s: now });
+        app.apply_agent_upgrades(vec![moving(a), moving(b)]);
+        assert!(
+            app.messages.live_rows().next().is_none(),
+            "both moved: no row says they have not"
+        );
+        let ended = recorded(&app, a);
+        assert_eq!(ended.len(), 1, "{ended:?}");
+        let (title, detail) = &ended[0];
+        assert_eq!(title, "Claude upgrade moves again in its tab", "{detail:?}");
+        assert!(
+            detail[0].starts_with("was: ") && detail[0].contains("has not exited"),
+            "{detail:?}"
+        );
+        assert_eq!(
+            recorded(&app, b),
+            Vec::<(String, Vec<String>)>::new(),
+            "a row left up is resolved, never recorded over"
+        );
+
+        let done = |tab| Row {
+            done_at: now,
+            ..at(tab, Phase::Done)
+        };
+        app.apply_agent_upgrades(vec![done(a), done(b)]);
+        assert_eq!(recorded(&app, a), ended, "Done adds nothing under the key");
+    }
+
     /// Press the capsule labelled `label` on row `id`, the way a click does
     /// (`notice act`: the engine's `act`, then the host's perform).
     fn press(app: &mut App, id: MessageId, label: &str) -> String {
@@ -2205,8 +2500,8 @@ mod tests {
 
     /// ONE SESSION WAITING: its record carries `Upgrade now` and `Not today`
     /// for its tab and build, and Settings ▸ Messages offers them only while
-    /// that upgrade still takes them — a newer target, or the upgrade gone,
-    /// disables them; a press from the page reaches the writer, and what the
+    /// that upgrade still takes them — a newer target disables them, the
+    /// session gone drops them; a press from the page reaches the writer, and what the
     /// word did is recorded. Two waiting: no one tab is the record's, so no
     /// capsule.
     #[test]
@@ -2285,6 +2580,15 @@ mod tests {
         assert_eq!(
             offered(&app),
             [("Upgrade now", false), ("Not today", false)]
+        );
+        // Ruling 315 (day eight E3): the tab's session is gone — no row for
+        // it — so its words are not offered at all, where they stood drawn,
+        // disabled, three relaunches later. Another tab's row does not keep
+        // them.
+        app.apply_agent_upgrades(vec![row("s-b", 60)]);
+        assert!(
+            offered(&app).is_empty(),
+            "a gone session's words are dropped"
         );
     }
 

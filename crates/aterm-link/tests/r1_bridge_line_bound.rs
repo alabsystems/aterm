@@ -93,7 +93,7 @@ fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
         let (rows, _) = c.fetch(0, &lane, 64).ok()?;
         rows.into_iter().find(|(_, _, body)| {
             let body = String::from_utf8_lossy(body);
-            body.contains(&format!("re={poison_off}")) && body.contains("reason=via")
+            body.contains(&format!("re={poison_off}")) && body.contains("not%20delivered:%20via")
         })
     });
 

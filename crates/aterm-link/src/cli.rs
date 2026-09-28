@@ -107,14 +107,7 @@ aterm-link — the aterm fabric bridge
   aterm-link broker --tcp <host:port> --key-file <k> --secret-file <s> <log>
                     the bus on the SEALED TCP wire, always guarded (a `sealed` build)
   aterm-link mint   <grant> --secret-file <path>    one capability line for --cap-file
-  aterm-link fabric [status [--json] | tail [--bodies] [--from <offset>]
-                    | on [--dry-run] [--service ...] [--tcp <bind> --key-file <k>]
-                    | off [--dry-run] | doctor | mint-for <node-id>|new [--out <cap>]
-                    | join --broker <host:port> --tcp --key-file <k> --cap-file <c>]
-                    the fabric's state on one screen, read from aterm's [fabric] command,
-                    the one command that turns it on and proves it, and the two that
-                    bring a SECOND HOST into the fleet over the sealed wire
-                    (`aterm fabric` is the same code; `fabric help` for its usage)
+  aterm-link fabric ...  the same as `aterm fabric` (`fabric help` for its usage)
 
 `ls` defaults its flags from the rendezvous file `aterm fabric on` (or `join`) writes
 beside the instance control sockets (fabric.toml): --fleet, --broker, --cap-file and
@@ -131,58 +124,29 @@ sealed wire. A flag given on the command line wins.
   --sock <path>          hand-started OBSERVER mode against a control socket
   --token-file <path>    the instance token, for --sock
   --presence <mode>      `serve` only: what a session's presence row carries.
-                         meta (the default) adds role= detail= phase= title=
-                         beside attention=. phase= is aterm's own agent verdict
-                         (`status agent=`, pushed as `EVENT … agent` on each
-                         move), relayed; a session running no identified agent
-                         reads phase=- (its detail= says what runs). This bridge
-                         reads no screen. title= is `meta set title` alone —
-                         never the terminal's title, which a program writes
-                         (Claude Code puts a summary of the conversation there)
-                         — and never any transcript text. minimal is attention=
-                         alone. Without the flag, `[fabric] presence` in
-                         aterm.toml, else meta.
-  --receipts             `serve` only: publish a RECEIPT (R8) when one of this
-                         node's sessions runs `inbox seen <id> handled|refused|
-                         deferred` on an ask or task — `kind=ack re=<off>
-                         verdict=<v>` onto the SENDER's inbox lane, so their
-                         `post --wait-ack` returns, their `await inbox re=<off>`
-                         latches and their `inbox` row reads `ack … verdict=`.
-                         A note earns none; a session that only --peeks acks
-                         nothing. ON BY DEFAULT, and that default is the same
-                         one whichever way the bridge was set up (round 21; it
-                         used to be off here and on for a node `aterm fabric on`
-                         had configured). `--no-receipts` turns it off for one
-                         run, `[fabric] receipts = false` in aterm.toml for
-                         good; with neither, that key decides and its absence
-                         means on. Off costs the SENDER: nothing can release a
-                         `post --wait-ack`, so every `ask` waits out its whole
-                         deadline.
-  --attention            `ls` only: keep only rows carrying an `attention=` (§9.3)
+                         meta (the default): role= detail= phase= title= beside
+                         attention=; phase= is aterm's agent verdict, title= the
+                         `meta set title` name only. minimal: attention= alone.
+                         Without the flag, `[fabric] presence` in aterm.toml.
+                         No screen text is published; gen= is a hash of it.
+  --receipts             `serve` only, on by default: when one of this node's
+                         sessions runs `inbox seen <id> handled|refused|deferred`
+                         on an ask or task, tell the sender (`kind=ack`), which
+                         releases their `post --wait-ack`. `--no-receipts` turns
+                         it off for one run, `[fabric] receipts = false` for good;
+                         off, a sender's `post --wait-ack` waits out its deadline.
+  --attention            `ls` only: keep only rows carrying an `attention=`
 
-`ls` prints §7's row — <node> <host> <sid> state= inc= role= detail= driving=
-holder= hold= fabric= attention= — then gen=, observer=, epoch=, phase=,
-context= and title=. `role=`, `detail=`, `phase=` and `title=` are written by a
-round-13 bridge in `meta` mode (a `minimal` or older bridge leaves them `-`);
-`context=` is written by no bridge since 2026-09-23 and reads `-` except on a row
-an older bridge wrote; every column is printed pct-encoded, so `context=12%`
-reads `context=12%25`; `driving=` has no writer in this fabric yet and always reads
-`-`, and since round 21 cut the drive face `holder=` has none either on a row
-this node wrote — it is still PRINTED because the roster is a pass-through and
-an older node on the wire still publishes one;
-`host=` and `fabric=` are on the NODE row only, so a session row reads `-` for
-both and the node's own row above it carries them.
+`ls` prints one line per node and per session: <node> <host> <sid> state= inc=
+role= detail= driving= holder= hold= fabric= attention= gen= observer= epoch=
+phase= context= title=, each value pct-encoded (`12%` reads `12%25`). driving=
+always reads `-`; holder= and context= do too unless an older node wrote them,
+and role= detail= phase= title= do from a `minimal` bridge. <host> and fabric=
+are on the node's own line; a session's line reads `-` for both.
 
-`--tcp` alone is PLAINTEXT and for a trusted network only; `--tcp --key-file` is
-astream's XChaCha20-Poly1305 sealed wire, which is what a cross-host fleet uses —
-compiled only with the `sealed` cargo feature (off by default, and off in the
-shipped `aterm` binary): a default build parses the flags and then refuses with
-`Unsupported`, naming the rebuild. The line below says which this build is.
-astream also builds an ephemeral-X25519 (`handshake`) and a mutual signed-DH
-(`identity`) transport; neither is offered here, because each would add a
-third-party crypto dependency to a crate whose dependency set the design pins,
-and `aterm link broker` serves no `identity` listener to reach.
-
+`--tcp` alone is plaintext: trusted networks only. `--tcp --key-file` is the sealed
+wire a cross-host fleet uses; the shipped `aterm` does not carry it, and a build
+without it refuses the flags. The line below says which this build is.
 
 ",
     build_line!()
@@ -207,7 +171,25 @@ pub fn dispatch(args: &[String]) -> ExitCode {
         // (`crate::enable`); `serve` does not, because aterm launches it with
         // every flag spelled out and a bridge that silently took a different
         // broker than its config names would be the report lying about itself.
-        Some("ls") => run(&crate::enable::with_rendezvous_defaults(&args[1..]), false),
+        //
+        // NO RENDEZVOUS FILE AND NO FLAGS: say exactly what was checked, not
+        // "no fabric" — a hand-written `[fabric] command` or a bridge armed by
+        // `ctl fabric attach` writes no rendezvous file — and not the whole
+        // usage under it.
+        Some("ls") => {
+            let given = |flag: &str| args[1..].iter().any(|a| a == flag);
+            if !given("--fleet")
+                && !given("--broker")
+                && matches!(crate::enable::Rendezvous::read(), Ok(None))
+            {
+                eprintln!(
+                    "aterm-link ls: no --fleet/--broker and no rendezvous file — \
+                     `aterm fabric on` writes one"
+                );
+                return ExitCode::from(2);
+            }
+            run(&crate::enable::with_rendezvous_defaults(&args[1..]), false)
+        }
         Some("notify") => crate::notify::main(&args[1..]),
         Some("broker") => broker(&args[1..]),
         Some("mint") => mint(&args[1..]),
@@ -238,9 +220,9 @@ pub fn dispatch(args: &[String]) -> ExitCode {
 }
 
 /// The one line `aterm link hook …` prints, on stderr ([`retired_hook`]).
-pub const RETIRED_HOOK_LINE: &str = "aterm-link: `hook` was removed (round 25: aterm installs \
-     nothing into the agent) — this hook entry does nothing; delete it from the settings \
-     file that runs it";
+pub const RETIRED_HOOK_LINE: &str =
+    "aterm-link: `hook` is retired and does nothing — delete this entry from the settings file \
+     that runs it";
 
 /// `aterm link hook …`, any arguments: EXIT 0, NOTHING ON STDOUT, one stderr line
 /// ([`RETIRED_HOOK_LINE`]) — KEPT PERMANENTLY. Decided 2026-09-25 under the owner's
@@ -272,6 +254,15 @@ fn retired_hook() -> ExitCode {
 }
 
 fn run(args: &[String], serve: bool) -> ExitCode {
+    // THE SEALED WIRE IN A BUILD WITHOUT IT is refused here, by name, for
+    // `serve` and `ls` alike, and before `parse` reads the key file: `serve`
+    // would otherwise redial a connect that can never succeed, silently, for
+    // ever. Not in `parse`, which `aterm fabric` also reads a sealed host's
+    // `[fabric] command` with.
+    if let Some(refusal) = transport::sealed_flags_refusal(args) {
+        eprintln!("aterm-link: --key-file: {refusal}");
+        return ExitCode::from(2);
+    }
     let parsed = match parse(args) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -286,7 +277,7 @@ fn run(args: &[String], serve: bool) -> ExitCode {
         // this crate refuses everywhere else (`--handshake`, and every unknown
         // subcommand).
         if parsed.attention {
-            eprintln!("aterm-link: --attention is an `ls` filter (§9.3); `serve` has no roster");
+            eprintln!("aterm-link: --attention is an `ls` filter; `serve` has no roster");
             eprint!("{USAGE}");
             return ExitCode::from(2);
         }
@@ -402,7 +393,12 @@ const ELLIPSIS: &str = "%E2%80%A6";
 /// `notify::Sel::Attention` makes, so the two faces of the same question cannot
 /// disagree.
 fn roster(cfg: &Config, attention_only: bool) -> std::io::Result<()> {
-    let (mut client, _closer) = transport::connect(&cfg.transport, &cfg.broker)?;
+    let (mut client, _closer) = transport::connect(&cfg.transport, &cfg.broker).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("cannot connect to the broker at {}: {e}", cfg.broker),
+        )
+    })?;
     for path in &cfg.cap_files {
         for cap in crate::bridge::read_cap_file(path)? {
             client.attach(&cap.grant, &cap.tag)?;
@@ -561,13 +557,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Parsed, String> {
         (false, None) => Transport::Unix,
         (true, None) => {
             eprintln!(
-                "aterm-link: --tcp without --key-file is PLAINTEXT: every keystroke and \
-                 every message crosses the network in the clear. Trusted networks only."
+                "aterm-link: --tcp without --key-file is plaintext — messages and presence \
+                 cross the network unencrypted; trusted networks only"
             );
             Transport::Tcp
         }
         (true, Some(path)) => Transport::Sealed(Box::new(
-            transport::read_key_file(&path).map_err(|e| format!("--key-file {path}: {e}"))?,
+            transport::read_key_file(&path)
+                .map_err(|e| format!("--key-file {}", transport::describe(&path, &e)))?,
         )),
         (false, Some(_)) => {
             return Err("--key-file needs --tcp (the sealed wire is a TCP transport)".to_string());
@@ -821,10 +818,7 @@ second `listening <socket>` line once that is bound too.
         }
         Some(bind) => {
             let Some(key_path) = key_file.as_deref() else {
-                return usage_error(
-                    "--tcp needs --key-file: this verb serves TCP only SEALED — plaintext TCP \
-                     would carry every keystroke and message in the clear",
-                );
+                return usage_error("--tcp needs --key-file: the broker serves TCP only sealed");
             };
             if secret_file.is_none() {
                 return usage_error(
@@ -859,7 +853,10 @@ second `listening <socket>` line once that is bound too.
             // Checked here, before the log is opened, so a bad key never leaves
             // an empty log behind.
             if let Err(e) = transport::read_private_key_file(key_path) {
-                eprintln!("aterm link broker: --key-file {key_path}: {e}");
+                eprintln!(
+                    "aterm link broker: --key-file {}",
+                    transport::describe(key_path, &e)
+                );
                 return ExitCode::FAILURE;
             }
             (bind.clone(), log)
@@ -957,7 +954,8 @@ second `listening <socket>` line once that is bound too.
 /// A mint secret FILE: 0600 and at least 32 bytes — the length `mint` refuses
 /// below, for its reason (HMAC takes any key, and a short one guards nothing).
 fn read_secret(path: &str) -> Result<Vec<u8>, String> {
-    transport::check_private(path).map_err(|e| format!("--secret-file {path}: {e}"))?;
+    transport::check_private(path)
+        .map_err(|e| format!("--secret-file {}", transport::describe(path, &e)))?;
     let secret = std::fs::read(path).map_err(|e| format!("--secret-file {path}: {e}"))?;
     if secret.len() < crate::enable::SECRET_LEN {
         return Err(format!(

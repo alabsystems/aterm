@@ -1451,10 +1451,11 @@ fn test(ctx: &Ctx, r: &mut Report) {
 //        that artifact — never one a previous run left in the lane.
 // ---------------------------------------------------------------------------
 
-/// The variables the paint and spin suites read for a prebuilt artifact
-/// (`release_bin`'s overrides: paint reads the first, spin the second then the
-/// first). The gate sets both, so a caller's export cannot hand spin another.
-pub const RELEASE_BIN_VARS: [&str; 2] = ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"];
+/// The paint and spin suites' prebuilt-artifact overrides. Keep each name at
+/// its child-environment writer so the source guard can distinguish this
+/// handoff from an ambient read. The gate sets both to the same artifact.
+const RELEASE_PAINT_BIN: &str = "ATERM_PAINT_BIN";
+const RELEASE_SPIN_BIN: &str = "ATERM_SPIN_BIN";
 
 /// The release `aterm` [`conformance_release_cmd`] leaves: `<lane>/release/aterm`.
 #[must_use]
@@ -1480,13 +1481,13 @@ fn filtered_test_cmd(ctx: &Ctx, targets: &[&str], filters: &[&str], bind: bool) 
 }
 
 /// The measuring stage's test child: [`measuring_args`], handed the release
-/// artifact through [`RELEASE_BIN_VARS`].
+/// artifact through both child-environment overrides.
 fn measuring_cmd(ctx: &Ctx, bind: bool) -> (String, Cmd) {
     let (label, cmd) = filtered_test_cmd(ctx, &MEASURING_TARGETS, &MEASURING_TESTS, bind);
     let bin = conformance_release_binary(ctx);
-    let cmd = RELEASE_BIN_VARS
-        .iter()
-        .fold(cmd, |c, var| c.env(*var, bin.as_os_str()));
+    let cmd = cmd
+        .env(RELEASE_PAINT_BIN, bin.as_os_str())
+        .env(RELEASE_SPIN_BIN, bin.as_os_str());
     (label, cmd)
 }
 
@@ -1866,7 +1867,10 @@ fn guard_ran_to_end(name: &str) -> crate::differential::RanToEnd {
 /// * `test-atpkg-index-publish.sh` — the indexer's public publish: baseline+1,
 ///   packs first, the compare-and-swap, never-clobber.
 /// * `test-atpkg-spec-catch-up.sh` — the rustc-group lane catches every row
-///   outside its group up to the public baseline, never lower.
+///   outside its group up to the public baseline, never lower, its preflight
+///   refuses a sibling or seal packing below the public pin (or at it,
+///   without `FORCE_SAME_BUILD=1`), and step 2 stops when a sibling checkout
+///   moved after the preflight judged it.
 /// * `test-atpkg-auto-alab.sh` — the ALab lane builds only what was signed
 ///   (a SKIP off macOS).
 /// * `test-linux-auto-atpkg.sh` — the Linux stager serves EVERY Linux triple
@@ -2214,7 +2218,7 @@ fn driver_builds(ctx: &Ctx, r: &mut Report) {
 //    JUDGE, a fat-LTO build of ~326 s cold. This row builds it at t0 in a lane
 //    of its own; the exclusive measuring stage runs the SAME command as its
 //    first child (a fingerprint check by then) and hands the suites the
-//    artifact ([`RELEASE_BIN_VARS`]), so no suite builds it inside the
+//    artifact through both overrides, so no suite builds it inside the
 //    measured stage and none can judge a stale one. A MEASURE-tier row since
 //    2026-09-26 (`plan::MEASURE_TIER`): `--measure` and `--full` build it, the
 //    merge contract does not. The suites' own helper is unchanged — by hand,
@@ -3252,7 +3256,7 @@ mod tests {
             Some(lane)
         );
         let (_, run) = measuring_cmd(&c, false);
-        for var in RELEASE_BIN_VARS {
+        for var in ["ATERM_PAINT_BIN", "ATERM_SPIN_BIN"] {
             assert_eq!(env_of(&run, var), Some(bin.clone()), "{var}");
         }
         let tests =

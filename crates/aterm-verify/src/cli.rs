@@ -450,11 +450,11 @@ way for a reviewer (human or AI) to be wrong about it: run this.
             depends on one of them (the reverse-dependency cone, read from the
             SAME dependency graph the build uses). `--base <ref>` (default
             `main`) picks the merge-base the diff is taken against. Every
-            whole-tree stage still runs. The run never
+            whole-tree stage still runs. A narrowed run never
             claims the merge contract and its receipt vouches for nothing: other
             crates' tests read files no dependency edge names. If the scope
-            cannot be computed honestly the run WIDENS to the whole workspace,
-            because a broken narrower must do MORE work, never less.
+            cannot be computed honestly the run WIDENS to the whole workspace
+            and is then judged as a whole-tree run.
             A --scope or --changed run says so BEFORE any stage runs (a
             `verify: NARROWED` line), and its receipt names the narrowing:
             `scope crate:<crate>` or `scope changed:<base>`.
@@ -503,11 +503,11 @@ JUDGED AGAINST MAIN: a run's reds are compared with main's receipt for its
 --disk-floor <GiB>: before anything is built the run budgets what it will
             write and answers COULD NOT RUN (exit 3), with no receipt, when the
             volume holding its root has less free than max(cold footprint -
-            what a snapshot's lanes already hold, warm growth) + a reserve —
-            {DISK_COLD_NEED} from empty lanes. A snapshot's lanes over
+            what a snapshot's build dirs already hold, warm growth) + a reserve
+            — {DISK_COLD_NEED} from empty build dirs. A snapshot's build dirs over
             {DISK_LANE_CAP} are removed first and the run is budgeted cold. The
-            ladder's `verify: disk …` line prints the free space, the lanes and
-            the requirement with its terms. --disk-floor replaces the estimate
+            ladder's `verify: disk …` line prints the free space, the build dirs
+            and the requirement with its terms. --disk-floor replaces the estimate
             with exactly this many GiB free, and the line says so. Lowering it
             can never make a receipt lie: a run that does run out of space is
             COULD NOT RUN, never a verdict about the tree. The gate's own tests

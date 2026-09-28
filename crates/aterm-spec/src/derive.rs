@@ -380,6 +380,117 @@ pub struct Invariant {
     pub expr: Expr,
 }
 
+/// A named LIVENESS obligation over a derived [`Model`]: `[]<>goal` — on every
+/// fair behaviour the goal keeps being reached, so no fair run leaves it for
+/// good — under the fairness it states.
+///
+/// Why it exists: an invariant says a bad state is never reached and a deadlock
+/// check says no state is stuck, and a machine can pass both while it never does
+/// the one thing it is for. A lane that retries forever has only legal states,
+/// and each has a successor. That is a livelock, and only a property about
+/// whole behaviours can name it.
+///
+/// Why a companion value rather than a [`Model`] field: a model is one
+/// literal written in more than a hundred places, and a liveness obligation is
+/// rare and always hand-stated (its fairness is an assumption someone must own).
+/// It is registered with its model in `xref::liveness_registry`, which is how the
+/// workspace sweep finds it. [`crate::interp::nonprogress_under`] discharges it
+/// in-process; [`Liveness::to_tla`] / [`Liveness::to_cfg_with`] emit the same
+/// property for `ty`, which checks `PROPERTY` formulas under the spec's declared
+/// `WF_vars` / `SF_vars` fairness.
+#[derive(Debug, Clone)]
+pub struct Liveness {
+    /// The property's name; `ty` checks it as the operator of this name, and
+    /// `<name>Spec` is the fair specification it is checked under.
+    pub name: &'static str,
+    /// The goal: a boolean expression over the model's variables and constants.
+    pub goal: Expr,
+    /// Weakly fair actions (`WF_vars`): taken once they stay enabled. What
+    /// each one assumes is the author's to say; see [`crate::interp::Fairness`].
+    pub weak: Vec<&'static str>,
+    /// Strongly fair actions (`SF_vars`): taken once they keep coming enabled.
+    pub strong: Vec<&'static str>,
+    /// The `Buggy` mutants — actions dead at the committed config — each of
+    /// which, added ALONE to the `Buggy = 1` baseline, must break the property.
+    /// An obligation no mutant can break is a ghost: it would pass whatever the
+    /// lane did (`verify::audit_liveness` refuses one).
+    pub mutants: Vec<&'static str>,
+}
+
+impl Liveness {
+    /// Whether the goal holds at `state`, under `m`'s constants.
+    ///
+    /// # Panics
+    ///
+    /// If the goal is not boolean-typed — a model type error, failed closed like
+    /// every other ill-typed evaluation in this module.
+    // Skip: BTreeMap env build + the deliberate model-type-error panic (the
+    // `eval` contract class). Spec-model machinery.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn goal_holds(&self, m: &Model, state: &BTreeMap<&'static str, i64>) -> bool {
+        match self.goal.eval(&m.eval_env(state)) {
+            Value::Bool(holds) => holds,
+            Value::Int(_) => panic!(
+                "liveness goal `{}` of `{}` is an integer — model type error",
+                self.name, m.name
+            ),
+        }
+    }
+
+    /// The fair specification's operator name.
+    #[must_use]
+    pub fn spec_name(&self) -> String {
+        format!("{}Spec", self.name)
+    }
+
+    /// `m`'s TLA+ module with the fair specification and the property appended:
+    /// `<name>Spec == Spec /\ WF_vars(A) /\ … /\ SF_vars(B) …` and
+    /// `<name> == []<>(goal)`. `m` is the model to emit — the committed one, or a
+    /// mutant-isolated copy — so the fairness names must be actions it declares.
+    // Skip: String assembly over the model's rendering (the format/alloc class),
+    // same tier as `Model::to_tla`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn to_tla(&self, m: &Model) -> String {
+        let module = m.to_tla();
+        let body = module.strip_suffix("====\n").unwrap_or(&module);
+        let mut spec = vec!["Spec".to_string()];
+        spec.extend(self.weak.iter().map(|a| format!("WF_vars({a})")));
+        spec.extend(self.strong.iter().map(|a| format!("SF_vars({a})")));
+        format!(
+            "{body}{} == {}\n{} == []<>({})\n====\n",
+            self.spec_name(),
+            spec.join(" /\\ "),
+            self.name,
+            self.goal.to_tla()
+        )
+    }
+
+    /// The `.cfg` that checks the property alone: constants (with `overrides`),
+    /// the fair specification, the `PROPERTY`, and no invariant — so a failure
+    /// can only be the property's, never an invariant a mutant also breaks.
+    // Skip: format/alloc, same tier as `Model::to_cfg_with`.
+    #[cfg_attr(trust_verify, trust::skip)]
+    #[must_use]
+    pub fn to_cfg_with(&self, m: &Model, overrides: &[(&'static str, i64)]) -> String {
+        let mut s = String::new();
+        for (n, default) in &m.consts {
+            let val = overrides
+                .iter()
+                .find(|(o, _)| o == n)
+                .map_or(*default, |(_, v)| *v);
+            s.push_str(&format!("CONSTANT {n} = {val}\n"));
+        }
+        s.push_str(&format!(
+            "SPECIFICATION {}\nPROPERTY {}\nCHECK_DEADLOCK FALSE\n",
+            self.spec_name(),
+            self.name
+        ));
+        s
+    }
+}
+
 /// A state variable with its `Init` value.
 #[derive(Debug, Clone)]
 pub struct StateVar {
@@ -892,6 +1003,7 @@ mod models_input;
 mod models_lights;
 mod models_misc;
 mod models_native;
+mod models_netprobe;
 mod models_notify_follow;
 mod models_operator;
 mod models_paste_order;
@@ -924,6 +1036,7 @@ mod models_update_environment_repair;
 mod models_update_history_carry;
 mod models_update_precommit_input;
 mod models_update_retired_intent;
+mod models_update_settings_draft_carry;
 mod models_update_web_cache;
 mod models_update_window_show;
 
@@ -974,6 +1087,7 @@ pub use models_input::input_unread_gate_model;
 pub use models_lights::*;
 pub use models_misc::*;
 pub use models_native::*;
+pub use models_netprobe::netprobe_shutdown_park_model;
 pub use models_notify_follow::notify_follow_checkpoint_model;
 pub use models_operator::*;
 pub use models_paste_order::*;
@@ -1016,6 +1130,7 @@ pub use models_update_precommit_input::native_update_precommit_input_model;
 pub use models_update_retired_intent::{
     native_update_failure_target_model, native_update_retired_intent_model,
 };
+pub use models_update_settings_draft_carry::native_update_settings_draft_carry_model;
 pub use models_update_web_cache::native_update_web_cache_model;
 pub use models_update_window_show::native_update_window_show_model;
 

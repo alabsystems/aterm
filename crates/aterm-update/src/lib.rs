@@ -119,7 +119,9 @@
 
 #[cfg(target_os = "macos")]
 mod bundle;
-#[cfg(target_os = "macos")]
+// The schedule is portable; every target tests the real cadence against the
+// watchdog budget, even though the background loop currently ships on macOS.
+#[cfg(any(target_os = "macos", test))]
 mod cadence;
 /// The schedule's constants and [`STALE_CHECK_AFTER`], compiled on every target.
 mod cadence_bounds;
@@ -1194,6 +1196,129 @@ pub fn installed_update_facts() -> Option<InstalledUpdateFacts> {
     None
 }
 
+/// What [`supersede_installed_activation`] did: the unconfirmed activation it
+/// retired, the running build it put back at the install path, the verified
+/// stage that applies over it next, and the launches the retired boot trial had
+/// counted — a count the retire READ and never added to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SupersededActivation {
+    pub activation_build: u64,
+    pub restored_build: u64,
+    pub newer_build: u64,
+    pub trial_launches: u32,
+    /// `Some(why)` when the exchange happened — the running build IS back at
+    /// the install path — but the activation's boot trial could not be
+    /// disarmed. That is still a retire, not a refusal (round three review):
+    /// the disk is the crash cut `recover_abandoned_preswap_trial_if_exact`
+    /// finishes on the very next boot apply, which the newer build's own
+    /// candidate runs before it swaps anything, and the lane goes on to stage
+    /// the newer build exactly as after a clean retire. Reporting it as a
+    /// refusal told the owner a press was needed while the lane installed the
+    /// release seconds later.
+    pub trial_disarm_deferred: Option<String>,
+}
+
+/// Why [`supersede_installed_activation`] moved NOTHING — and whether the same
+/// disk could let it through on a later try (round three review).
+///
+/// A refusal used to spend the newer release for good, whatever refused it: a
+/// captive-portal network that ran the verification past its budget, or the
+/// apply lock held a moment too long, stranded the machine until a still newer
+/// build shipped or a person pressed the Version menu. The GUI now offers a
+/// refused release again after a backoff whatever the kind; the kind decides
+/// what it SAYS, since only a [`Self::Settled`] refusal is one a person has to
+/// look at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SupersedeRefusal {
+    /// About the MOMENT: the apply lock was busy past the background wait, a
+    /// bundle's verification failed or ran out of its budget (the Gatekeeper
+    /// assessment rides the network), the stage was being replaced, or the
+    /// exchange's rename failed. Nothing about the disk's shape says the next
+    /// try is refused too.
+    ForNow(String),
+    /// About the DISK: it is not the one shape the retire knows how to undo —
+    /// another bundle installed, the trial armed for another build or another
+    /// install, the retained predecessor not the running build, the stage
+    /// yanked. Only something changing the disk lets a later try through.
+    Settled(String),
+}
+
+impl SupersedeRefusal {
+    /// The words of the refusal, whatever its kind.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::ForNow(reason) | Self::Settled(reason) => reason,
+        }
+    }
+
+    /// Whether the refusal is about the moment rather than the disk.
+    #[must_use]
+    pub fn is_for_now(&self) -> bool {
+        matches!(self, Self::ForNow(_))
+    }
+}
+
+impl std::fmt::Display for SupersedeRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// A NEWER VERIFIED STAGE RETIRES AN UNCONFIRMED ACTIVATION (round three of the
+/// 2026-09 update robustness work). The GUI calls this, off its event loop, when
+/// its automatic lane has converged STRUCTURALLY on the installed activation of
+/// `activation_build` — a bundle this process's own launched-lane candidate
+/// installed and then failed to hand off to, twice — and a verified download of
+/// `newer_build` is staged behind it.
+///
+/// Why it has to exist: nothing else can carry `newer_build` onto the machine.
+/// The running process cannot swap it in (the installed bundle is not the running
+/// build, so the swap would have no rollback source), and the activation's own
+/// successor refuses to boot-apply past the build it was authorized as
+/// (`apply_staged_if_ready`'s "WE ARE THE AUTHORIZED CANDIDATE" branch). So the
+/// running build is put back at the install path — the one inverse exchange the
+/// crash-loop revert already performs — the activation's trial is DISARMED without
+/// a launch of it being counted, and the ordinary staged lane applies
+/// `newer_build` over the running build with a fresh trial of its own. The
+/// activation is never booted again. See `install::supersede_installed_activation`
+/// for the preconditions and the crash cuts.
+///
+/// # Errors
+/// A [`SupersedeRefusal`] when nothing moved; see its kinds.
+#[cfg(target_os = "macos")]
+pub fn supersede_installed_activation(
+    current_build: u64,
+    current_commit: &str,
+    activation_build: u64,
+    activation_commit: &str,
+    newer_build: u64,
+) -> Result<SupersededActivation, SupersedeRefusal> {
+    install::supersede_installed_activation(
+        current_build,
+        current_commit,
+        (activation_build, activation_commit),
+        newer_build,
+    )
+}
+
+/// Non-macOS: there is no installed `.app` activation to retire.
+///
+/// # Errors
+/// Always [`SupersedeRefusal::Settled`].
+#[cfg(not(target_os = "macos"))]
+pub fn supersede_installed_activation(
+    _current_build: u64,
+    _current_commit: &str,
+    _activation_build: u64,
+    _activation_commit: &str,
+    _newer_build: u64,
+) -> Result<SupersededActivation, SupersedeRefusal> {
+    Err(SupersedeRefusal::Settled(
+        "installed-bundle activation is macOS-only".to_string(),
+    ))
+}
+
 /// A GUI-supplied hook the background check uses to SURFACE self-healing events to
 /// the user (`(title, body)` — e.g. posted to the event loop and shown as an OS
 /// notification). Health problems must not stay buried in `status.toml`: the
@@ -1268,12 +1393,51 @@ fn persistent_notice_is_owed(announced: Option<&str>, class: Option<&str>) -> bo
 /// verified build will not start; `pipeline` / `stage`: downloads fail or will
 /// not verify; `manifest` (and any future class): the newest release cannot be
 /// read or trusted.
+///
+/// In the band's failure grammar, `Couldn't …` (design ruling 311, after 309):
+/// the words are no longer anyone's identity — [`health_failing_class`] reads a
+/// title back to the class it names, this wording and the one before it.
 #[must_use]
 pub fn health_failing_title(class: &str) -> &'static str {
+    match health_class_canonical(class) {
+        "apply" => "Couldn't install updates",
+        "pipeline" => "Couldn't download updates",
+        _ => "Couldn't check for updates",
+    }
+}
+
+/// The class a persistent-failure title stands for — `apply`, `pipeline` (its
+/// `stage` sibling shares the title) or `manifest` — for a title
+/// [`health_failing_title`] writes today OR wrote before ruling 311 (`aterm
+/// can't install updates` / `download` / `check for`): a row or a record
+/// carried from an older build still names its class. `None` for any other
+/// title. The reader of the writer above, beside it, so the class a consumer
+/// keys its heal on can never drift from the words the updater sends.
+#[must_use]
+pub fn health_failing_class(title: &str) -> Option<&'static str> {
+    const LEGACY: [(&str, &str); 3] = [
+        ("aterm can't install updates", "apply"),
+        ("aterm can't download updates", "pipeline"),
+        ("aterm can't check for updates", "manifest"),
+    ];
+    ["apply", "pipeline", "manifest"]
+        .into_iter()
+        .find(|class| health_failing_title(class) == title)
+        .or_else(|| {
+            LEGACY
+                .iter()
+                .find(|(said, _)| *said == title)
+                .map(|(_, class)| *class)
+        })
+}
+
+/// The class whose title `class` shares: `stage` is the download half, and any
+/// class this build does not know is the check half.
+fn health_class_canonical(class: &str) -> &'static str {
     match class {
-        "apply" => "aterm can't install updates",
-        "pipeline" | "stage" => "aterm can't download updates",
-        _ => "aterm can't check for updates",
+        "apply" => "apply",
+        "pipeline" | "stage" => "pipeline",
+        _ => "manifest",
     }
 }
 
@@ -1561,7 +1725,7 @@ mod persistent_notice_tests {
             ..super::health::Health::default()
         };
         let (title, body) = super::persistent_failure_notice("apply", 3, &ledger, 1789276245);
-        assert_eq!(title, "aterm can't install updates");
+        assert_eq!(title, "Couldn't install updates");
         assert!(
             !body.contains("checks"),
             "an apply streak is not a run of failed checks — every check that day \
@@ -1582,7 +1746,7 @@ mod persistent_notice_tests {
             ..super::health::Health::default()
         };
         let (title, body) = super::persistent_failure_notice("pipeline", 20, &pipeline, 1);
-        assert_eq!(title, "aterm can't download updates");
+        assert_eq!(title, "Couldn't download updates");
         assert!(
             body.starts_with("20 failed checks in a row since 2026-08-27T22:04:36Z"),
             "{body}"
@@ -1628,8 +1792,40 @@ mod persistent_notice_tests {
         );
         assert_eq!(
             super::health_failing_title("manifest"),
-            "aterm can't check for updates"
+            "Couldn't check for updates"
         );
+    }
+
+    /// A TITLE READS BACK TO ITS CLASS, TODAY'S WORDS AND THE ONES BEFORE THEM
+    /// (design ruling 311): the GUI keys the heal on the class, so a warning an
+    /// older build raised — carried across a handoff in its own words — is
+    /// still healed by the proof that answers it. Negative controls: a title
+    /// that is not a failure notice (the restatement, the recovery, the
+    /// watchdog's) names no class, and neither does a near miss.
+    #[test]
+    fn a_failing_title_reads_back_to_its_class_old_words_and_new() {
+        for class in ["apply", "pipeline", "stage", "manifest", "future"] {
+            let title = super::health_failing_title(class);
+            assert!(title.starts_with("Couldn't "), "{title}");
+            let read = super::health_failing_class(title).expect("today's title");
+            assert_eq!(super::health_failing_title(read), title, "{class}");
+        }
+        for (old, class) in [
+            ("aterm can't install updates", "apply"),
+            ("aterm can't download updates", "pipeline"),
+            ("aterm can't check for updates", "manifest"),
+        ] {
+            assert_eq!(super::health_failing_class(old), Some(class), "{old}");
+        }
+        for other in [
+            super::HEALTH_RESTATED_TITLE,
+            super::HEALTH_RECOVERED_TITLE,
+            "aterm's update check stopped",
+            "Couldn't install update",
+            "",
+        ] {
+            assert_eq!(super::health_failing_class(other), None, "{other:?}");
+        }
     }
 
     /// A NEWER BUILD WAITING FOR AN HOUR IS SAID OUT LOUD, ONCE, WITH ITS CAUSE (the
@@ -1904,6 +2100,9 @@ pub struct LinuxUpdateStatus {
     pub trial_phase: Option<String>,
     pub trial_starts: u32,
     pub trial_healthy: bool,
+    /// This copy rolled back a build newer than the one it runs, and won't install
+    /// it again: "up to date" would hide that it runs an older release on purpose.
+    pub refused_newer: bool,
 }
 
 /// The same single background checker, sampling its source before each cycle so
@@ -2183,8 +2382,8 @@ fn run_checker(
     // Per-process dedup, seeded from the clock at thread start so history
     // never re-notifies on every launch: the persistent-failure notice
     // requires the streak's latest failure to postdate this thread (RFC3339
-    // strings compare chronologically), so a stale streak from a build that
-    // isn't even checking any more (e.g. no token) stays quiet.
+    // strings compare chronologically), so a stale streak an earlier process
+    // left — or a build that no longer checks at all — stays quiet.
     // KEYED on the class that was announced (see `HealthAnnouncer`), not a
     // bare bool. As a bool the latch swallowed every class after the first
     // for the life of the process: a machine whose downloads broke
@@ -2664,7 +2863,7 @@ fn run_checker(
                         }
                         Ok(None) => {
                             // A completed check that found nothing to do is a
-                            // SUCCESS: the network and the token both worked.
+                            // SUCCESS: the network worked and the channel answered.
                             //
                             // Unless it wrote a FAILURE to the ledger on its way
                             // here. The manifest dead-end — an authoritative
@@ -2903,7 +3102,7 @@ pub const PERSISTENT_AFTER: u32 = 3;
 
 /// How long a newer build may wait on this machine — staged, or installed under a
 /// running image that is older — before the updater says so out loud with the
-/// loud notice (`health_failing_title("apply")`, "aterm can't install updates")
+/// loud notice (`health_failing_title("apply")`, "Couldn't install updates")
 /// and the typed cause (the 2026-09-22/23
 /// update audit, plan P1-1(b)).
 ///
@@ -4053,8 +4252,8 @@ pub(crate) mod log_capture {
     }
 }
 
-// The cadence module is macOS-only (the updater lane ships there), and so is the
-// health ledger this reads; the module compiles only where they exist.
+// The channel-failure classifier and health ledger are macOS-only; these
+// integration tests compile only where the background updater lane ships.
 #[cfg(all(test, target_os = "macos"))]
 mod checker_gate_tests {
     use super::unreachable_before_the_channel;

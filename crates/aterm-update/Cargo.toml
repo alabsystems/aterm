@@ -24,8 +24,10 @@ dev-seams = ["aterm-update-core/dev-seams"]
 # Manifest (aterm-appcast.toml) + the on-disk `ready.toml` staging marker.
 aterm-toml = { workspace = true }
 serde = { workspace = true }
-# GitHub Releases API response is JSON; parse it (scoped to this crate only — the
-# core engine crates stay JSON-free).
+# The Linux lane's compiled binary identity crosses as JSON
+# (`binary_identity_json`, and the candidate's identity probe in `linux.rs`). No
+# check reads the GitHub Releases API any more: the one lane reads the download
+# host, whose manifest is TOML.
 # First-party JSON (crates/aterm-json): the serde Deserializer/Serializer plus the
 # untyped `Value` and `json!`. Replaces `serde_json` and the `zmij` float formatter
 # behind it; `serde_json` survives only as that crate's [dev-dependencies] oracle.
@@ -37,7 +39,8 @@ libc = { workspace = true }
 # already in the dependency graph via aterm-update-core.
 aterm-types = { workspace = true }
 # The artifact-agnostic, portable update primitives (Source resolution, FileLock +
-# same_volume, curl/token plumbing, ensure_private_dir, sha256_file, the pin idiom).
+# same_volume, the download host's curl plumbing, ensure_private_dir, sha256_file, the
+# pin idiom).
 aterm-update-core = { workspace = true }
 # Route updater diagnostics through the global logger aterm-gui installs, so they
 # land in the app log file (visible for a Finder-launched .app, unlike stderr).

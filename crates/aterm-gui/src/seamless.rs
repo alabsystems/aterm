@@ -3524,6 +3524,12 @@ pub(crate) struct IncomingHandoff {
     /// once every adopted session is registered — never a token, never a
     /// nonce, so nothing here is authority until the re-mint says so.
     pub connections: Vec<ConnectionCarry>,
+    /// The unsaved Settings drafts a layout carried that this build could not
+    /// PLACE (`layout` is `None` for it), with how many its parse dropped. The
+    /// drafts ride only in the layout (plan P2-2), so with it unplaced they are
+    /// gone — and the restore says so, with their text, instead of a log line
+    /// (`App::settle_carried_settings_drafts`; round three).
+    pub unplaced_settings_drafts: (Vec<crate::restore::SettingsDraftRestore>, usize),
 }
 
 impl IncomingHandoff {
@@ -5114,30 +5120,41 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
     // the first window, and the digest over the bytes read still matches the
     // parent's. Refusing here cost every shell its update for want of a pane
     // arrangement.
-    let Some((layout, layout_digest, unplaced_layout)) = layout_path.and_then(|layout_path| {
-        let layout_path = std::path::Path::new(&layout_path);
-        let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
-        if !layout_path.starts_with(&dir) || layout_path != expected_layout {
-            return None;
-        }
-        let wire = take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
-            .and_then(|bytes| String::from_utf8(bytes).ok())?;
-        // COMMIT TO THE BYTES, NOT TO THE PARSE. `layout` below is only
-        // used to rebuild panes; the digest the parent will compare
-        // against is a pure function of this exact wire.
-        let digest = layout_wire_digest(&wire)?;
-        Some(match crate::restore::RestoreManifest::from_toml(&wire) {
-            Some(layout) if layout.covers_exact_seamless_ids(&expected_ids) => {
-                (Some(layout), digest, None)
+    let Some((layout, layout_digest, unplaced_layout, unplaced_drafts)) =
+        layout_path.and_then(|layout_path| {
+            let layout_path = std::path::Path::new(&layout_path);
+            let expected_layout = std::path::Path::new(&path).with_extension("layout.toml");
+            if !layout_path.starts_with(&dir) || layout_path != expected_layout {
+                return None;
             }
-            Some(_) => (
-                None,
-                digest,
-                Some("does not name exactly the handed-off sessions"),
-            ),
-            None => (None, digest, Some("does not parse in this build")),
+            let wire = take_regular_capped(layout_path, &dir, MAX_HANDOFF_LAYOUT_BYTES)
+                .and_then(|bytes| String::from_utf8(bytes).ok())?;
+            // COMMIT TO THE BYTES, NOT TO THE PARSE. `layout` below is only
+            // used to rebuild panes; the digest the parent will compare
+            // against is a pure function of this exact wire.
+            let digest = layout_wire_digest(&wire)?;
+            // A leaf the outgoing process handed no session for (an exited pane
+            // kept open under `--hold`) is placed as a placeholder, not a reason
+            // to drop the whole layout (`RestoreManifest::placed_for_handed`).
+            Some(match crate::restore::RestoreManifest::from_toml(&wire) {
+                Some(layout) => match layout.placed_for_handed(&expected_ids) {
+                    Ok(layout) => (Some(layout), digest, None, (Vec::new(), 0)),
+                    Err(unplaced) => (
+                        None,
+                        digest,
+                        Some("does not name exactly the handed-off sessions"),
+                        unplaced.carried_settings_drafts(),
+                    ),
+                },
+                None => (
+                    None,
+                    digest,
+                    Some("does not parse in this build"),
+                    (Vec::new(), 0),
+                ),
+            })
         })
-    }) else {
+    else {
         return IncomingHandoff::default();
     };
     let manifest_path = std::path::Path::new(&path);
@@ -5411,6 +5428,7 @@ fn take_incoming_as(shape: ReceiverShape) -> IncomingHandoff {
         layout_digest: Some(layout_digest),
         screen_digest: Some(screen_digest),
         connections: manifest.connections,
+        unplaced_settings_drafts: unplaced_drafts,
     }
 }
 
@@ -6519,6 +6537,7 @@ mod tests {
                 loader: false,
                 history: None,
                 history_dropped: 0,
+                history_withheld: false,
                 history_lost: 0,
                 questions: None,
             }],
@@ -7691,6 +7710,7 @@ mod tests {
                 loader: false,
                 history: None,
                 history_dropped: 0,
+                history_withheld: false,
                 history_lost: 0,
             });
             live.push((local_id, master, 4000 + index as i32));
@@ -8479,6 +8499,183 @@ mod tests {
             proof, staged.expected,
             "the layout digest over the bytes read still matches the parent's"
         );
+
+        drop(ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// A LAYOUT NAMING A PANE THE OUTGOING PROCESS DID NOT HAND IS PLACED
+    /// (round three of the 2026-09 update robustness work). Under `aterm
+    /// --hold` an exited pane stays open, the handoff hands only the live
+    /// sessions, but the layout capture names every terminal view — so the
+    /// layout named one id more than the manifest, and `take_incoming` dropped
+    /// the WHOLE layout: every window collapsed into tabs of the first, and the
+    /// unsaved Settings draft that rides only in the layout was gone with a log
+    /// line. Now the layout is adopted with that one pane a placeholder, the
+    /// draft still on its Settings leaf, and the proof — over the bytes read —
+    /// still matches the parent's.
+    #[test]
+    #[cfg(unix)]
+    fn a_layout_naming_an_exited_pane_is_still_placed_and_proves() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        // The outgoing desk: the two handed sessions, plus a tab whose pane
+        // exited (id 9, never handed) and a Settings tab holding a draft.
+        let held_desk = |wire: &str| {
+            let mut layout = RestoreManifest::from_toml(wire).expect("today's wire parses");
+            let exited = exact_legacy_layout(&[9]).windows[0].restored_tabs[0].clone();
+            let mut settings =
+                crate::restore::NativeLeafRestore::settings("/text-fonts".to_string());
+            settings.settings_drafts = vec![crate::restore::SettingsDraftRestore {
+                key: "font_family".to_string(),
+                text: "Carried Mono".to_string(),
+            }];
+            let window = &mut layout.windows[0];
+            window.restored_tabs.push(exited);
+            window.restored_tabs.push(RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
+                focused_path: Vec::new(),
+                zoomed: false,
+            });
+            layout.to_toml().expect("the desk serializes")
+        };
+        let staged = stage_outgoing_handoff("heldpane", 2, Some(&held_desk));
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert_eq!(incoming.adopted.len(), 2, "both live sessions adopt");
+        let layout = incoming
+            .layout
+            .as_ref()
+            .expect("the layout is PLACED, not dropped for the exited pane");
+        assert_eq!(layout.seamless_terminal_ids(), Some(vec![0, 1]));
+        let tabs = &layout.windows[0].restored_tabs;
+        assert_eq!(tabs.len(), 4, "every tab keeps its place");
+        assert!(
+            matches!(
+                &tabs[2].root,
+                RestoredSplitTree::Leaf { view: RestoredView::Placeholder(retired) }
+                    if retired.reason == crate::update_words::PANE_NOT_CARRIED
+            ),
+            "the exited pane is a placeholder: {:?}",
+            tabs[2].root
+        );
+        assert_eq!(
+            layout.carried_settings_drafts().0.len(),
+            1,
+            "the Settings draft is placed with its tab"
+        );
+        assert_eq!(incoming.unplaced_settings_drafts, (Vec::new(), 0));
+        let ((proof, ready, _adopted), _) =
+            child_proof_from(incoming).expect("the child adopts and proves");
+        assert_eq!(
+            proof, staged.expected,
+            "the layout digest over the bytes read still matches the parent's"
+        );
+
+        drop(ready);
+        for fd in [ready_read, commit_read, commit_write] {
+            aterm_pty::close_fd(fd);
+        }
+        staged.teardown();
+    }
+
+    /// …and a layout that CANNOT be placed — here one that misses a handed
+    /// session — still adopts every shell for the orphan net, but hands the
+    /// drafts it carried to the restore, to be said with their text
+    /// (`App::settle_carried_settings_drafts`) rather than dropped with it.
+    #[test]
+    #[cfg(unix)]
+    fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let _restore = [
+            RestoreVar::new("XDG_RUNTIME_DIR"),
+            RestoreVar::new("HOME"),
+            RestoreVar::new(ENV_MANIFEST),
+            RestoreVar::new(ENV_NONCE),
+            RestoreVar::new(ENV_FDS),
+            RestoreVar::new(ENV_LAYOUT),
+            RestoreVar::new(ENV_TARGET),
+            RestoreVar::new(ENV_READY_FD),
+            RestoreVar::new(ENV_COMMIT_FD),
+            RestoreVar::new(ENV_PARENT_PID),
+            RestoreVar::new(ENV_PARENT_BIRTH),
+        ];
+        let missing_one = |wire: &str| {
+            let mut layout = RestoreManifest::from_toml(wire).expect("today's wire parses");
+            let window = &mut layout.windows[0];
+            window.restored_tabs.truncate(1);
+            let mut settings =
+                crate::restore::NativeLeafRestore::settings("/text-fonts".to_string());
+            settings.settings_drafts = vec![crate::restore::SettingsDraftRestore {
+                key: "font_family".to_string(),
+                text: "Carried Mono".to_string(),
+            }];
+            window.restored_tabs.push(RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Native(settings)),
+                focused_path: Vec::new(),
+                zoomed: false,
+            });
+            layout.to_toml().expect("the desk serializes")
+        };
+        let staged = stage_outgoing_handoff("missingone", 2, Some(&missing_one));
+        let (ready_read, ready_write) = pipe_pair("ready");
+        let (commit_read, commit_write) = pipe_pair("commit");
+        staged.publish_env(
+            ready_write,
+            commit_read,
+            Some(encode_target_identity(
+                crate::build_info::BUILD_NUMBER.parse::<u64>().unwrap_or(0),
+                crate::build_info::GIT_COMMIT,
+            )),
+        );
+        let incoming = take_incoming_as(ReceiverShape::Current);
+        assert!(
+            incoming.layout.is_none(),
+            "a missing handed session is not placed"
+        );
+        assert_eq!(
+            incoming.adopted.len(),
+            2,
+            "every shell adopts for the orphan net"
+        );
+        assert_eq!(
+            incoming.unplaced_settings_drafts,
+            (
+                vec![crate::restore::SettingsDraftRestore {
+                    key: "font_family".to_string(),
+                    text: "Carried Mono".to_string(),
+                }],
+                0
+            ),
+            "the draft it carried is handed to the restore to say"
+        );
+        let ((proof, ready, _adopted), _) =
+            child_proof_from(incoming).expect("the child adopts and proves");
+        assert_eq!(proof, staged.expected);
 
         drop(ready);
         for fd in [ready_read, commit_read, commit_write] {

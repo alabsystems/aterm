@@ -224,19 +224,33 @@ pub fn oklch(c: [u8; 3]) -> (f64, f64, f64) {
     (big_l, a.hypot(bb), h)
 }
 
-/// The WCAG contrast ratio of two sRGB colours.
+/// The WCAG contrast ratio of two sRGB colours — the FUSED variant, kept for
+/// [`MeterHue::pick`] and [`pastel_edge`]; the band's floors use
+/// [`crate::ink::contrast`] (ruling 324).
 #[must_use]
 pub fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
     let (la, lb) = (luminance(a), luminance(b));
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-fn luminance(c: [u8; 3]) -> f64 {
+/// The WCAG relative luminance of an sRGB colour, with a FUSED weighted sum.
+///
+/// [`contrast`] above is the fused variant of the WCAG ratio, kept for
+/// [`MeterHue::pick`] and [`pastel_edge`]; the band's floors read
+/// [`crate::ink::contrast`], `aterm_types::Rgb`'s unfused arithmetic, which
+/// differs from it by one ulp on about a third of all pairs (ruling 324).
+/// The band's SIDE decisions (which end of the scale a word or a fill sits
+/// toward) read this luminance, as they always have.
+#[must_use]
+pub fn luminance(c: [u8; 3]) -> f64 {
     let [r, g, b] = c.map(lin);
     0.2126f64.mul_add(r, 0.7152f64.mul_add(g, 0.0722 * b))
 }
 
-fn lin(v: u8) -> f64 {
+/// An sRGB byte in linear light — the one copy the palette, the band's
+/// resolver ([`crate::ink`]) and the hosts' tests read.
+#[must_use]
+pub fn lin(v: u8) -> f64 {
     let c = f64::from(v) / 255.0;
     if c <= 0.040_45 {
         c / 12.92
@@ -251,7 +265,7 @@ fn lin(v: u8) -> f64 {
     clippy::cast_sign_loss,
     reason = "rounded and clamped to 0..=255 before the cast"
 )]
-fn enc(l: f64) -> u8 {
+pub(crate) fn enc(l: f64) -> u8 {
     let l = l.clamp(0.0, 1.0);
     let c = if l <= 0.003_130_8 {
         12.92 * l

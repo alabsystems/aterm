@@ -10,7 +10,7 @@
 //! launched: never the window a Dock click or a login item starts, never a nested
 //! instance past the deny-list. The owner's rule is that a person's controls are
 //! Settings, not environment ("NOT ENV VARS those are for development"), so the switch
-//! is a key in the SAME `aterm.toml` the window reads — Settings ▸ Terminal ▸ Updates
+//! is a key in the SAME `aterm.toml` the window reads — Settings ▸ Software Update
 //! writes it — and every process that runs the updater (the window, a terminal session, the
 //! `aterm update` verbs) reads it here, identically.
 //!

@@ -152,7 +152,7 @@ every window, tab, split, and live shell survives, and if the handoff cannot
 complete the update lands at the next launch. Settings ▸ Software Update shows
 what is staged plus the release notes; `aterm ctl update status` says the same
 on the command line, and `aterm update` is the headless lane for a machine with
-no window open. Settings ▸ Terminal ▸ Updates ("Check for updates
+no window open. Settings ▸ Software Update ("Check for updates
 automatically", `[update] enabled = false` in `aterm.toml`) stops the background
 checks — Check for Updates and `aterm update check` still check when asked;
 `[update] auto_apply = false` stages the build and leaves
@@ -516,7 +516,7 @@ own verbs cannot be shadowed. On `$PATH` itself the managed tools come last, so
 a `ty` or `clean` you already had (Homebrew core has formulae with those names)
 keeps winning — `alab-<tool>` (`alab-ty`, `alab-clean`, …) always names ALab's
 copy, and `aterm pkg which <tool>` says which one runs. Settings ▸ Packages ▸
-Install ALab Toolset (or `aterm pkg install --default-set`) fetches the whole
+Install ALab Tools Now (or `aterm pkg install --default-set`) fetches the whole
 set at once, and the windowed app keeps installed packages current on a six-hour
 loop.
 

@@ -6353,7 +6353,8 @@ impl App {
         };
         let Some(front) = win else {
             let _ = reply.send(Err(if session.is_some() {
-                "image: no window shows that session; raise its tab first".to_string()
+                "image: no window shows that session; raise its tab (or end the pane zoom in it) first"
+                    .to_string()
             } else {
                 "image: no window to capture".to_string()
             }));

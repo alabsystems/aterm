@@ -1578,6 +1578,10 @@ pub struct InstanceView {
     pub pid: u32,
     /// Its control socket.
     pub sock: String,
+    /// Whether `aterm ctl --pid <pid>` reaches it ([`aterm_ctl::pid_reaches`]).
+    /// False for an explicit-`--control-sock` instance, which a command must
+    /// name by `--sock <sock>`.
+    pub pid_reaches: bool,
     /// Why it could not be asked, when it could not.
     pub error: Option<String>,
     /// `fabric status`'s `state=`.
@@ -1753,6 +1757,7 @@ fn read_instance(pid: u32, sock: &str, procs: &[Proc], sessions: bool) -> Option
     let mut v = InstanceView {
         pid,
         sock: sock.to_string(),
+        pid_reaches: aterm_ctl::pid_reaches(pid, sock),
         ..InstanceView::default()
     };
     v.bridge_pids = procs
@@ -2486,6 +2491,17 @@ fn warnings(
                         format!("reason={} origin={}", safe(reason, 128), safe(origin, 16))
                     },
                 );
+                // The instance's socket rides along when only `--sock`
+                // reaches it, so the remedy can name the instance that holds it.
+                let at = if inst.pid_reaches {
+                    at.clone()
+                } else {
+                    format!(
+                        "@{} (instance {pid}, --sock {})",
+                        s.sid,
+                        safe(&inst.sock, 256)
+                    )
+                };
                 w.push(format!(
                     "{at} is HELD ({why}): every key and turn verb answers ERR halted"
                 ));

@@ -1820,6 +1820,10 @@ pub(super) fn visit(
         queued: false,
         // Stamped below, once the READY is read ([`St::time_ready`]).
         ready_s: 0,
+        // Its status above is already the screen's reading and its rollout's
+        // turn: Claude Code's session-file status, read against the screen
+        // ([`upgrade::IDLE_LOOKS`]), has no Codex counterpart.
+        idle_looks: 0,
         // A stopped round never reaches here (re-armed or waiting, above).
         failed_s: st.failed_for(now),
     };
@@ -1919,7 +1923,7 @@ pub(super) fn visit(
         Step::GiveUp => {
             st.fail(upgrade::GAVE_UP, now);
             let r = said(r, "gave-up");
-            ledger(opts, &r, &gave_up_words(&k.held(tui.pid)));
+            ledger(opts, &r, &gave_up_words(Agent::Codex, &k.held(tui.pid)));
             r
         }
         Step::Announce => announce(opts, r, &mut st, &mut c, tui, target, &mode, proven, k, now),
@@ -2208,6 +2212,11 @@ fn exit_typed(
     st.cwd = k.cwd(tui.pid).unwrap_or_default();
     st.twin = target.twin.to_string_lossy().into_owned();
     st.phase = Phase::Exiting { at_s: now_s() };
+    // A new exit: no TUI of it is up or adopted yet, and its own is not
+    // seen gone (the counterpart of `St::signalled`'s reset).
+    st.resumed_pid = 0;
+    st.relaunched_pid = 0;
+    st.exited_at = 0;
     save(opts, &key(&tui.tab), st);
     match type_text(c, &tui.tab, "/exit", generation.as_deref()) {
         Ok(()) => {}
@@ -2603,6 +2612,15 @@ fn await_held(
     }
 }
 
+/// THE RELAUNCHED TUI `new` FOUND ([`relaunched_by_us`]) — by the wait after
+/// the relaunch line, or by a visit that finds it in the tab — and handed to
+/// [`adopt`] or [`carry_on`]: on the record ([`St::relaunched_pid`]) whatever
+/// becomes of its adoption or its carry-on, so that once it is gone a Codex
+/// leaving the tab is that TUI, its exit its own (`relaunch::restarted`).
+fn found(st: &mut St, new: u32) {
+    st.relaunched_pid = new;
+}
+
 /// How long a relaunched TUI may take to lead its tab's foreground group
 /// before it is handed back ([`adopt`]).
 const ADOPT_WAIT: Duration = Duration::from_secs(30);
@@ -2614,7 +2632,14 @@ const ADOPT_WAIT: Duration = Duration::from_secs(30);
 /// in flight; the loop answers whatever the new Codex opened with (a trust
 /// gate, a new build's notice), and at its next idle point the relaunch
 /// primitive's continuation step ([`super::super::relaunch::resume`]) types
-/// the carry-on ([`carry_on`]).
+/// the carry-on ([`carry_on`]). The adopted TUI is on the record
+/// ([`St::resumed_pid`]): from here a Codex that leaves the tab is that TUI,
+/// its exit its own — a person's `/exit`, a crash — never the restart's
+/// (`relaunch::restarted`, the review of 2026-09-27: read as the restart's, a
+/// person's `/exit` held the harness's hand on the tab for minutes and was
+/// badged as an agent the harness had ended). One whose adoption runs out of
+/// time is on the record too, as the look that found it left it
+/// ([`St::relaunched_pid`]): once it is gone, its exit is its own as well.
 fn adopt(
     opts: &Opts,
     mut r: Report,
@@ -2623,10 +2648,12 @@ fn adopt(
     new: u32,
     k: &dyn CodexKernel,
 ) -> Report {
+    found(st, new);
     let tab = st.tab.clone();
     if !wait_until(ADOPT_WAIT, || k.in_tab(c, new, &tab)) {
         return said(r, "wait:resume");
     }
+    st.resumed_pid = new;
     r.pid = new;
     let r = said(r, "adopted");
     ledger(
@@ -2699,6 +2726,7 @@ fn carry_on(
     new: u32,
     k: &dyn CodexKernel,
 ) -> Report {
+    found(st, new);
     r.pid = new;
     let tab = st.tab.clone();
     let up = wait_until(Duration::from_secs(60), || {

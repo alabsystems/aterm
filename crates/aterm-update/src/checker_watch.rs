@@ -671,7 +671,6 @@ mod tests {
     /// shipping loop registers and restates (`spawn_background_check_with_settings`,
     /// `run_checker`): its schedule's `max_wait`, which is `LONGEST_WAIT`.
     #[test]
-    #[cfg(target_os = "macos")] // `cadence` (the shipping loop's schedule) is macOS-only
     fn the_loop_registers_its_one_cadences_longest_wait() {
         assert_eq!(
             crate::cadence::Cadence::new(Duration::from_secs(crate::cadence::INTERVAL_SECS))

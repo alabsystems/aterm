@@ -20,7 +20,11 @@
 //!   asserts zero hits, so the engine can be driven deterministically and
 //!   on wasm.
 //! * **No platform.** No `std::fs`, no threads, no sockets, no `RenderCell`,
-//!   no theme: the host owns the file, the cells and the colours.
+//!   no theme: the engine paints the band's STRUCTURE — which character in
+//!   which cell, in which ink slot, on which ground ([`paint`], design ruling
+//!   319) — and RESOLVES it to colours over a plain-RGB palette derived from
+//!   a theme's background, foreground and cursor ([`ink`], ruling 324); the
+//!   host owns the file, its cells and the theme and forced-palette reads.
 //! * **Bounded.** [`MAX_LIVE`] unretired messages, [`LOG_CAP`] records in the
 //!   ring, [`PENDING_PERSIST_CAP`] undrained persist lines, every string
 //!   sanitized and capped at ingress — a hostile reporter cannot grow the
@@ -67,8 +71,10 @@ pub mod animate;
 pub(crate) mod carry;
 pub(crate) mod center;
 pub(crate) mod glass;
+pub mod ink;
 pub mod log;
 pub(crate) mod model;
+pub mod paint;
 pub mod palette;
 pub mod progress;
 pub mod strain;
@@ -206,7 +212,7 @@ pub const COMET_PERMILLE: u32 = 250;
 /// the head read as a straight edge — a 172-of-255 step between neighbouring
 /// cells at 114 columns on a 2000 px window, 192 at 80 on 1000 px. At 4 % the
 /// worst step on those windows is 104 and 138 (the merge's build stage,
-/// 2026-09-24; the host's `the_comet_sweeps_the_window_edge_to_edge` pins it).
+/// 2026-09-24; `paint::tests::the_comet_sweeps_the_window_edge_to_edge` pins it).
 /// Eight percent since round 12 (design ruling 242): drawn to the pixel, the
 /// lead is a straight ramp, and two levels a pixel on an 80-column window
 /// needs about this much.
@@ -488,6 +494,8 @@ mod tests {
         ("strain.rs", include_str!("strain.rs")),
         ("waits.rs", include_str!("waits.rs")),
         ("palette.rs", include_str!("palette.rs")),
+        ("paint.rs", include_str!("paint.rs")),
+        ("ink.rs", include_str!("ink.rs")),
     ];
 
     /// Invariant 1: the engine never samples a clock. Family C's C3 walks only
@@ -533,7 +541,7 @@ mod tests {
                     .strip_suffix(';')
             })
             .collect();
-        assert_eq!(modules.len(), 13, "{modules:?}");
+        assert_eq!(modules.len(), 15, "{modules:?}");
         for m in &modules {
             let file = format!("{m}.rs");
             assert!(
@@ -561,6 +569,9 @@ mod tests {
         assert!(TITLE_MIN < TITLE_CAP && DETAIL_FLOOR < DETAIL_LINE_CAP);
     }
 }
+
+#[cfg(test)]
+mod band_tests;
 
 #[cfg(test)]
 mod review_tests;

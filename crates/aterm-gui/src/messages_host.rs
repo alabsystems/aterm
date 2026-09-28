@@ -182,6 +182,10 @@ pub(crate) struct MessageView {
     pub(crate) answer: Option<String>,
     /// The authored intents, re-offered from the page.
     pub(crate) actions: Vec<MessageActionView>,
+    /// How many leading `detail` lines are the plain sentence for a person
+    /// — the cause and the next step — above the technical lines (at least
+    /// one; ruling 314: [`crate::message_reporters::sentence_lines`]).
+    pub(crate) sentences: usize,
 }
 
 /// One authored intent as the page offers it: a button by index, enabled only
@@ -418,6 +422,33 @@ fn still_actionable(
     }
 }
 
+/// THE MARK OF WORK CUT OFF (ruling 317, day eight E5): a row still moving
+/// when aterm stopped (`stale`, replayed open from a process that is gone) or
+/// quit (`quit`) is no longer in flight, so its record does not wear the
+/// working mark it was posted with — `↻ Rendering the video` read, in the
+/// log, as work still under way. Its severity's own mark stands in; every
+/// other mark, and every other state, is kept.
+fn cut_off_mark(
+    glyph: aterm_messages::Glyph,
+    severity: aterm_messages::Severity,
+    state: &str,
+) -> aterm_messages::Glyph {
+    const IN_FLIGHT: [char; 5] = ['\u{21bb}', '\u{21e3}', '\u{2191}', '\u{2296}', '\u{2026}'];
+    if matches!(state, "stale" | "quit") && IN_FLIGHT.contains(&glyph.ch()) {
+        severity.default_glyph()
+    } else {
+        glyph
+    }
+}
+
+/// Whether `intent` is a word for a tab whose upgrade this instance no longer
+/// has at all (ruling 315): the host hands over the upgrade rows of its live
+/// tabs, so none for the intent's tab means its session ended here — a tab id
+/// never comes back — or its move is over. Either way the word is moot.
+fn session_gone(intent: &Intent, upgrades: &crate::upgrade_host::UpgradeView) -> bool {
+    matches!(intent, Intent::AgentUpgrade { tab, .. } if upgrades.row_for(tab).is_none())
+}
+
 /// One record's view (the `wire::message_row` choice of words: the live row's
 /// while it is live, the record's once retired).
 fn message_view(
@@ -450,20 +481,22 @@ fn message_view(
         Some(Retired::Answered { label }) => (None, Some(label.clone())),
         _ => (None, None),
     };
+    let state = wire::state_word(rec, live);
     MessageView {
         id: rec.id.raw(),
         at_unix_ms: rec.stamp.unix_ms,
         tag: rec.tag.as_str().to_string(),
         severity: severity.as_str(),
-        glyph: glyph.ch(),
+        glyph: cut_off_mark(glyph, severity, state).ch(),
         title: title.clone(),
         detail: detail.clone(),
-        state: wire::state_word(rec, live),
+        state,
         on_glass,
         repeats,
         retired_unix_ms: rec.retired_unix_ms,
         superseded_by,
         answer,
+        sentences: crate::message_reporters::sentence_lines(rec.key.as_deref(), detail),
         actions: actions
             .iter()
             .enumerate()
@@ -474,6 +507,13 @@ fn message_view(
             // accent read as the thing to do. An intent that can come back
             // (`Install now`, `Open log`) stays, disabled while it cannot.
             .filter(|(_, intent)| live.is_some() || rec.still_offers(intent))
+            // A WORD FOR A SESSION THAT IS GONE is not offered either (ruling
+            // 315, day eight E3): `Upgrade now` / `Not today` on a record
+            // whose tab's session no longer runs here stood drawn, disabled,
+            // three relaunches later. A session never comes back under its
+            // id, so the word never can; one whose upgrade still stands but
+            // moved to another build stays, disabled while it cannot.
+            .filter(|(_, intent)| live.is_some() || !session_gone(intent, upgrades))
             .filter_map(|(k, intent)| {
                 Some(MessageActionView {
                     index: u8::try_from(k).ok()?,
@@ -2233,7 +2273,7 @@ impl App {
     ///   half is broken and since when, neither of which a count moves, and the
     ///   person was told when it was announced (design ruling 59).
     /// * A CLASS IS FAILING: say what is wrong, where the user is looking — the
-    ///   title names the broken half ("aterm can't install updates"), the excerpt
+    ///   title names the broken half ("Couldn't install updates"), the excerpt
     ///   since when; the whole sentence — count, cause, command — is the row's
     ///   detail behind `Details ›`, and Settings ▸ Software Update, re-read by
     ///   the caller, headlines the same verdict. The row holds the warning's 45 s,
@@ -2243,7 +2283,7 @@ impl App {
     ///   healing is recorded against it.
     ///
     /// THE LATCH IS HERE, AT THE ONE DOOR (the review of the update audit's
-    /// merge onto this surface). Three producers now announce "aterm can't
+    /// merge onto this surface). Three producers now announce "Couldn't
     /// install updates": the updater's persistent streak, its overdue notice
     /// (a newer build waiting over an hour) and the automatic lane's
     /// convergence (`App::announce_automatic_apply_stranded`), each with its
@@ -2253,6 +2293,13 @@ impl App {
     /// (`update_health_latched`), is a log line and `false`: no row, no
     /// banner. A healing that answers the title re-opens it, so a new episode
     /// speaks again.
+    ///
+    /// KEYED BY KIND, NOT BY WORDS (design ruling 311): the failing title is
+    /// read back to the half it names once, here
+    /// ([`update_words::HealthKind::of_updater_title`]), and the latch, the row's
+    /// key, the heal proof and the record of the healing all carry that kind —
+    /// so the words can take the family grammar and a warning an older build
+    /// raised in its own words still heals.
     pub(crate) fn note_update_health(&mut self, title: &str, body: &str) -> bool {
         if title == aterm_update::HEALTH_RECOVERED_TITLE {
             aterm_log::info!("update-health: {title}: {body}");
@@ -2263,15 +2310,46 @@ impl App {
             aterm_log::info!("update-health: {title}: {body}");
             return false;
         }
-        let msg = update_words::health_warning(title, body);
-        if self.update_health_latched.contains(&msg.title) {
+        self.note_update_health_as(
+            update_words::HealthKind::of_updater_title(title),
+            title,
+            body,
+        )
+    }
+
+    /// A failing health warning of `kind` through the one door: once per kind
+    /// per launch until a proof answers it ([`Self::note_update_health`]).
+    pub(crate) fn note_update_health_as(
+        &mut self,
+        kind: update_words::HealthKind,
+        title: &str,
+        body: &str,
+    ) -> bool {
+        if self.update_health_latched.contains(&kind) {
             aterm_log::info!("update-health: already said this launch: {title}: {body}");
             return false;
         }
-        self.update_health_latched.push(msg.title.clone());
+        self.update_health_latched.push(kind);
         aterm_log::warn!("update-health: {title}: {body}");
         self.retire_update_installing();
-        self.update_health_said = Some((
+        let msg = update_words::health_warning(kind, title, body);
+        // The same warning an older build raised under the family key (a
+        // carried row) is this one said again: it leaves for its successor.
+        let now = Instant::now();
+        let older: Vec<MessageId> = self
+            .messages
+            .live_rows()
+            .filter(|l| {
+                l.msg.key.as_deref() == Some(update_words::KEY_HEALTH)
+                    && update_words::HealthKind::of_row(&l.msg) == Some(kind)
+            })
+            .map(|l| l.id)
+            .collect();
+        for id in older {
+            self.messages.withdraw(id, now);
+        }
+        self.remember_update_health_said((
+            kind,
             msg.title.clone(),
             msg.detail.first().cloned().unwrap_or_default(),
         ));
@@ -2285,8 +2363,8 @@ impl App {
     /// episode (after the warning's 45 s fold too), the healing is ON RECORD
     /// against what the warning said ([`update_words::health_recovered`]).
     ///
-    /// ONLY WHERE THE PROOF ANSWERS THE WARNING ([`HealthProof`]). The title
-    /// names the broken half, so a download cannot heal "aterm can't install
+    /// ONLY WHERE THE PROOF ANSWERS THE WARNING ([`HealthProof`]). The kind
+    /// names the broken half, so a download cannot heal "Couldn't install
     /// updates": the record would read "aterm updates work again" while the
     /// install streak the updater's ledger still holds says otherwise — the
     /// ledger itself clears every streak on a whole-pipeline success but an
@@ -2294,23 +2372,57 @@ impl App {
     /// not answer stays up (and remembered), for the proof that does.
     pub(crate) fn heal_update_health(&mut self, proof: HealthProof) {
         self.update_health_latched
-            .retain(|title| proof < HealthProof::needed_for(title));
-        if let Some(id) = self
-            .messages
-            .live_by_key(update_words::KEY_HEALTH)
-            .filter(|l| proof >= HealthProof::needed_for(&l.msg.title))
-            .map(|l| l.id)
-        {
+            .retain(|kind| proof < HealthProof::needed_for(*kind));
+        for id in self.live_update_health(|kind| proof >= HealthProof::needed_for(kind)) {
             self.resolve_message(id, Outcome::Warn);
         }
-        if self
+        self.record_update_health_healed(|kind| proof >= HealthProof::needed_for(kind));
+    }
+
+    /// What a health warning of this kind said, kept for its record of healing
+    /// — ONE ENTRY PER KIND (design ruling 318): the same kind said again
+    /// replaces its own entry, and another kind's stays, so each healing is
+    /// recorded against the warning it answers.
+    fn remember_update_health_said(&mut self, said: (update_words::HealthKind, String, String)) {
+        match self
             .update_health_said
-            .as_ref()
-            .is_some_and(|(title, _)| proof >= HealthProof::needed_for(title))
-            && let Some((title, line0)) = self.update_health_said.take()
+            .iter_mut()
+            .find(|(kind, _, _)| *kind == said.0)
         {
+            Some(entry) => *entry = said,
+            None => self.update_health_said.push(said),
+        }
+    }
+
+    /// The healing of every remembered warning whose kind `healed` picks goes
+    /// ON RECORD — one record per warning, each against its own words, oldest
+    /// first — and leaves the memory; the others stay for the proof that
+    /// answers them (design ruling 318).
+    pub(crate) fn record_update_health_healed(
+        &mut self,
+        healed: impl Fn(update_words::HealthKind) -> bool,
+    ) {
+        let (answered, standing): (Vec<_>, Vec<_>) = std::mem::take(&mut self.update_health_said)
+            .into_iter()
+            .partition(|(kind, _, _)| healed(*kind));
+        self.update_health_said = standing;
+        for (_, title, line0) in answered {
             self.record_message(update_words::health_recovered(&title, &line0));
         }
+    }
+
+    /// The live health warnings whose kind `which` picks — each read by its key,
+    /// or, carried from an older build under the family key, by its words
+    /// ([`update_words::HealthKind::of_row`]).
+    pub(crate) fn live_update_health(
+        &self,
+        which: impl Fn(update_words::HealthKind) -> bool,
+    ) -> Vec<MessageId> {
+        self.messages
+            .live_rows()
+            .filter(|l| update_words::HealthKind::of_row(&l.msg).is_some_and(&which))
+            .map(|l| l.id)
+            .collect()
     }
 
     /// R36 — THE NEW BUILD TOOK OVER (or a cold-lane boot found it already
@@ -2863,21 +2975,26 @@ impl App {
             // record against what the parent's warning said
             // (`post_update_landed` → `heal_update_health`): the parent `_exit`s
             // at Commit and never learns its warning healed.
-            if let Some((health, said)) =
-                self.messages
-                    .live_by_key(update_words::KEY_HEALTH)
-                    .map(|l| {
+            let carried: Vec<_> = self
+                .messages
+                .live_rows()
+                .filter_map(|l| {
+                    let kind = update_words::HealthKind::of_row(&l.msg)?;
+                    Some((
+                        l.id,
                         (
-                            l.id,
-                            (
-                                l.msg.title.clone(),
-                                l.msg.detail.first().cloned().unwrap_or_default(),
-                            ),
-                        )
-                    })
-            {
+                            kind,
+                            l.msg.title.clone(),
+                            l.msg.detail.first().cloned().unwrap_or_default(),
+                        ),
+                    ))
+                })
+                .collect();
+            for (health, said) in carried {
                 self.messages.resolve(health, Outcome::Warn, now);
-                self.update_health_said.get_or_insert(said);
+                // One entry per carried row: two kinds the parent raised are
+                // two records at the landing (ruling 318), never only the first.
+                self.remember_update_health_said(said);
             }
         }
     }
@@ -2892,8 +3009,8 @@ mod band_motion_tests;
 
 /// What a heal of the update-health warning rests on ([`App::heal_update_health`]).
 /// Each proves one more half of updating than the last, so each heals only the
-/// warnings it answers — the warning's title names the broken half
-/// (`aterm_update::health_failing_title`), and the updater's own ledger reads the
+/// warnings it answers — the warning's kind names the broken half
+/// ([`update_words::HealthKind`]), and the updater's own ledger reads the
 /// same way: a whole-pipeline success clears every streak but an install streak.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum HealthProof {
@@ -2920,20 +3037,18 @@ impl HealthProof {
         if class.is_empty() {
             Self::Installed
         } else {
-            Self::needed_for(aterm_update::health_failing_title(class))
+            Self::needed_for(update_words::HealthKind::of_class(class))
         }
     }
 
-    /// The proof a warning titled `title` needs before it may leave and its
-    /// healing be recorded. A title this build does not know needs the least:
+    /// The proof a warning of `kind` needs before it may leave and its healing
+    /// be recorded. The check half and the watchdog's stall need the least:
     /// the lane's old rule, "a check that downloads is a check that works".
-    fn needed_for(title: &str) -> Self {
-        if title == aterm_update::health_failing_title("apply") {
-            Self::Installed
-        } else if title == aterm_update::health_failing_title("pipeline") {
-            Self::Downloaded
-        } else {
-            Self::Checked
+    fn needed_for(kind: update_words::HealthKind) -> Self {
+        match kind {
+            update_words::HealthKind::Install => Self::Installed,
+            update_words::HealthKind::Download => Self::Downloaded,
+            update_words::HealthKind::Check | update_words::HealthKind::Stalled => Self::Checked,
         }
     }
 }
@@ -2941,6 +3056,7 @@ impl HealthProof {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::update_words::LiveHealth as _;
     #[cfg(unix)]
     use aterm_messages::HOLD_SUCCESS;
     use aterm_messages::{HOLD_GESTURE, LogState, Meter, Severity, tags};
@@ -3694,6 +3810,7 @@ mod tests {
         let mut app = App::headless_for_test();
         let render = app.post_message(
             Message::new(tags::SYSTEM, Severity::Info, "Rendering the video")
+                .glyph(aterm_messages::Glyph::or_fallback('\u{21bb}'))
                 .hold(Hold::Live {
                     stale_after: aterm_messages::STALE_TAILED,
                 })
@@ -3713,6 +3830,9 @@ mod tests {
         assert_eq!(r.state, "quit");
         assert_eq!(r.title, "Rendering the video");
         assert_eq!(r.detail, vec!["28% when aterm quit".to_string()]);
+        // Ruling 317 (day eight E5): work cut off no longer wears the working
+        // `↻`; its severity's mark stands in.
+        assert_eq!(r.glyph, '\u{2139}', "the quit record's mark");
         assert!(
             r.state_words().starts_with("still open when aterm quit"),
             "{}",
@@ -3725,7 +3845,8 @@ mod tests {
         let dead = LogRecord::from_posted(
             MessageId::from_raw(900).expect("an id"),
             WallStamp { unix_ms: 1_000 },
-            &Message::new(tags::SYSTEM, Severity::Info, "Rendering the video"),
+            &Message::new(tags::SYSTEM, Severity::Info, "Rendering the video")
+                .glyph(aterm_messages::Glyph::or_fallback('\u{21bb}')),
         );
         let mut log = aterm_messages::MessageLog::empty();
         log.replay(aterm_messages::LogLine::Posted(dead));
@@ -3733,6 +3854,17 @@ mod tests {
         let view = message_view(replayed, None, None, None, &Default::default());
         assert_eq!(view.state, "stale");
         assert_eq!(view.state_words(), "still open when aterm stopped");
+        assert_eq!(view.glyph, '\u{2139}', "the replayed open record's mark");
+        // Control: the same record while live keeps its working mark, and a
+        // mark that is not a working one is kept when cut off.
+        assert_eq!(
+            cut_off_mark(replayed.glyph, Severity::Info, "live").ch(),
+            '\u{21bb}'
+        );
+        assert_eq!(
+            cut_off_mark(Severity::Warn.default_glyph(), Severity::Warn, "stale").ch(),
+            '\u{26a0}'
+        );
         // A row this process retired Stale keeps its words.
         let mut silent = replayed.clone();
         silent.retired_unix_ms = Some(61_000);
@@ -5777,6 +5909,7 @@ mod tests {
         parent.post_message(update_words::staged("0.76.0", 7, None));
         let installing = parent.post_message(update_words::installing("0.76.0"));
         let health = parent.post_message(update_words::health_warning(
+            update_words::HealthKind::Check,
             "Update checks failing",
             "3 consecutive check failures",
         ));
@@ -5907,7 +6040,11 @@ mod tests {
         // No progress row carried: nothing is invented, and the health row
         // stands even for the successor.
         let mut healthy = App::headless_for_test();
-        healthy.post_message(update_words::health_warning("Update checks failing", "x"));
+        healthy.post_message(update_words::health_warning(
+            update_words::HealthKind::Check,
+            "Update checks failing",
+            "x",
+        ));
         let only_health = window_carry(1, healthy.carried_messages());
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&only_health, Some("0.76.0"));
@@ -5917,12 +6054,7 @@ mod tests {
                 .live_by_key(update_words::KEY_PROGRESS)
                 .is_none()
         );
-        assert!(
-            successor
-                .messages
-                .live_by_key(update_words::KEY_HEALTH)
-                .is_some()
-        );
+        assert!(successor.messages.live_health().is_some());
 
         // An OLDER parent's `bars` (the status bars' carry, read until Phase 6):
         // the manifest still decodes — serde skips the key — and seeds nothing,
@@ -5970,8 +6102,12 @@ mod tests {
         // A STANDING row (the health warning holds its 45 s since the merge's
         // ruling 59; a standing row is the GPU-lost and a11y lanes' shape).
         let health = parent.post_message(
-            update_words::health_warning("Update checks failing", "3 consecutive check failures")
-                .hold(Hold::Standing),
+            update_words::health_warning(
+                update_words::HealthKind::Check,
+                "Update checks failing",
+                "3 consecutive check failures",
+            )
+            .hold(Hold::Standing),
         );
         assert_eq!(parent.message_band_rows, 2);
         parent.pending_update_handoff = Some(parked());
@@ -7470,10 +7606,7 @@ mod tests {
         let now = Instant::now();
         let _ = app
             .settle_messages(now + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1));
-        assert!(
-            app.messages.live_by_key(update_words::KEY_HEALTH).is_none(),
-            "folded"
-        );
+        assert!(app.messages.live_health().is_none(), "folded");
         let healed = |app: &App| {
             app.messages
                 .log()
@@ -7491,7 +7624,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             rec.detail[0],
-            "after \"aterm can't download updates\", since Sep 14"
+            "after \"Couldn't download updates\", since Sep 14"
         );
         assert!(!app.note_update_health(aterm_update::HEALTH_RECOVERED_TITLE, ""));
         assert_eq!(healed(&app), 1, "once per episode");
@@ -7508,10 +7641,7 @@ mod tests {
             let mut app = App::headless_for_test();
             let title = aterm_update::health_failing_title(class);
             assert!(app.note_update_health(title, body));
-            let row = app
-                .messages
-                .live_by_key(update_words::KEY_HEALTH)
-                .expect("the warning");
+            let row = app.messages.live_health().expect("the warning");
             assert_eq!(row.msg.title, title);
             assert_eq!(row.msg.detail[0], "since Sep 14");
             assert!(
@@ -7529,7 +7659,7 @@ mod tests {
     /// ONE ANNOUNCEMENT PER TITLE PER LAUNCH, WHOEVER RAISES IT (the review of
     /// the update audit's merge onto main's health door): the updater's
     /// streak, its overdue notice and the automatic lane's convergence all say
-    /// "aterm can't install updates". The first is a row and owed the OS
+    /// "Couldn't install updates". The first is a row and owed the OS
     /// banner (`true`); the same title again, unhealed, posts nothing and owes
     /// nothing — also after the row folded. A different class still speaks, and
     /// a healing re-opens the title for a new episode.
@@ -7554,15 +7684,12 @@ mod tests {
         let _ = app.settle_messages(
             Instant::now() + aterm_messages::HOLD_WARN + std::time::Duration::from_secs(1),
         );
-        assert!(
-            app.messages.live_by_key(update_words::KEY_HEALTH).is_none(),
-            "folded"
-        );
+        assert!(app.messages.live_health().is_none(), "folded");
         assert!(
             !app.note_update_health(apply, streak),
             "folded is still said"
         );
-        assert!(app.messages.live_by_key(update_words::KEY_HEALTH).is_none());
+        assert!(app.messages.live_health().is_none());
         assert!(
             app.note_update_health(aterm_update::health_failing_title("manifest"), streak),
             "another class is other news"
@@ -7593,7 +7720,7 @@ mod tests {
     fn the_ledgers_heal_answers_only_the_class_it_counted() {
         let apply = aterm_update::health_failing_title("apply");
         let body = "automatic apply of build 9 stopped after 2 failed handoffs";
-        let up = |app: &App| app.messages.live_by_key(update_words::KEY_HEALTH).is_some();
+        let up = |app: &App| app.messages.live_health().is_some();
         let healed = |app: &App| {
             app.messages
                 .log()
@@ -7617,7 +7744,7 @@ mod tests {
 
     /// A WARNING HEALS ONLY ON THE PROOF THAT ANSWERS IT: the title names the
     /// broken half, so a download never records "aterm updates work again"
-    /// over "aterm can't install updates" — the updater's ledger keeps an
+    /// over "Couldn't install updates" — the updater's ledger keeps an
     /// install streak through a whole-pipeline success. Checking is answered by
     /// a download starting, downloading by a staged build, installing only by a
     /// landing (or the ledger's own recovery); an unanswered warning stays up
@@ -7637,7 +7764,7 @@ mod tests {
             version: "9.9.9".into(),
             build: 7,
         };
-        let warning_up = |app: &App| app.messages.live_by_key(update_words::KEY_HEALTH).is_some();
+        let warning_up = |app: &App| app.messages.live_health().is_some();
         // Install: neither a download nor a staged build answers it.
         let mut install = App::headless_for_test();
         assert!(install.note_update_health(aterm_update::health_failing_title("apply"), body));
@@ -7689,10 +7816,7 @@ mod tests {
         let mut successor = App::headless_for_test();
         successor.seed_carried_messages(&carry, Some("0.76.0"));
         assert!(
-            successor
-                .messages
-                .live_by_key(update_words::KEY_HEALTH)
-                .is_none(),
+            successor.messages.live_health().is_none(),
             "resolved with the handoff"
         );
         successor.post_update_landed("0.76.0", 7, 0);
@@ -7705,7 +7829,7 @@ mod tests {
             .collect();
         assert_eq!(
             said,
-            vec!["after \"aterm can't install updates\", since Sep 14".to_string()]
+            vec!["after \"Couldn't install updates\", since Sep 14".to_string()]
         );
         // A plain restart carries nothing to heal.
         let mut plain = App::headless_for_test();
@@ -7719,6 +7843,224 @@ mod tests {
                 .all(|r| r.title != "aterm updates work again"),
             "no finishing successor: nothing this process said, so nothing to record"
         );
+    }
+
+    /// THE HEAL IS KEYED BY KIND, AND AN OLDER BUILD'S WORDS STILL HEAL (design
+    /// ruling 311). The health titles took the family grammar (`Couldn't
+    /// download updates`), so nothing may match them word for word any more:
+    /// the row wears its kind's key, and the heal proof, the latch and the
+    /// record read that. A row an older build raised under the family key, in
+    /// its own words (`aterm can't download updates`, carried across a plain
+    /// restart), is read back to its kind — healed by the proof that answers
+    /// it and by no weaker one, and replaced when this build says the same
+    /// warning again.
+    ///
+    /// NEGATIVE CONTROLS: the carried download row is NOT healed by a download
+    /// merely starting (the least proof, which is where an unread title would
+    /// fall); an install-KEYED row worded like a download is healed only by a
+    /// landing — the key, not the words, decides; and a stall row an older
+    /// build carried heals on a completed check, not by a download proof it
+    /// does not need.
+    #[test]
+    fn the_heal_is_keyed_by_kind_and_an_older_builds_words_still_heal() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
+        let staged = aterm_update::Progress::Staged {
+            version: "9.9.9".into(),
+            build: 7,
+        };
+        let health_rows = |app: &App| {
+            app.messages
+                .live_rows()
+                .filter(|l| update_words::HealthKind::of_row(&l.msg).is_some())
+                .map(|l| (l.msg.key.clone().unwrap_or_default(), l.msg.title.clone()))
+                .collect::<Vec<_>>()
+        };
+        // An older build's row: the family key, the words before ruling 311.
+        let older = |title: &str| {
+            let mut msg =
+                update_words::health_warning(update_words::HealthKind::Check, title, body);
+            msg.key = Some(update_words::KEY_HEALTH.to_string());
+            msg
+        };
+        let carried = |title: &str| {
+            let mut parent = App::headless_for_test();
+            parent.post_message(older(title));
+            let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+            let mut app = App::headless_for_test();
+            app.seed_carried_messages(&carry, None);
+            assert_eq!(health_rows(&app).len(), 1, "{title}: carried");
+            app
+        };
+
+        // Download, in the old words: a download starting is no proof…
+        let mut app = carried("aterm can't download updates");
+        app.note_update_progress(&download("9.9.9"));
+        assert_eq!(
+            health_rows(&app).len(),
+            1,
+            "NEGATIVE: the old words are the download half, not the check half"
+        );
+        // …a staged build is.
+        app.note_update_progress(&staged);
+        assert!(health_rows(&app).is_empty(), "healed by a staged build");
+
+        // Install, in the old words: only a landing answers it.
+        let mut app = carried("aterm can't install updates");
+        app.note_update_progress(&download("9.9.9"));
+        app.note_update_progress(&staged);
+        assert_eq!(health_rows(&app).len(), 1, "NEGATIVE: not by a download");
+        app.post_update_landed("9.9.9", 7, 0);
+        assert!(health_rows(&app).is_empty(), "healed by the landing");
+
+        // The watchdog's stall, in its old words: a completed check heals it.
+        let mut app = carried("aterm's update check stopped");
+        app.heal_update_checker_stall();
+        assert!(health_rows(&app).is_empty(), "the stall's own heal");
+
+        // The same warning said again by this build replaces the carried one:
+        // one row, its kind's key, today's words.
+        let mut app = carried("aterm can't download updates");
+        assert!(app.note_update_health(aterm_update::health_failing_title("stage"), body));
+        assert_eq!(
+            health_rows(&app),
+            vec![(
+                update_words::HealthKind::Download.key().to_string(),
+                "Couldn't download updates".to_string()
+            )]
+        );
+        app.note_update_progress(&staged);
+        let said: Vec<String> = app
+            .messages
+            .log()
+            .records()
+            .filter(|r| r.title == "aterm updates work again")
+            .map(|r| r.detail.join(" "))
+            .collect();
+        assert_eq!(
+            said,
+            vec!["after \"Couldn't download updates\", since Sep 14".to_string()]
+        );
+
+        // THE KEY DECIDES, NOT THE WORDS: an install warning worded like a
+        // download is not healed by a staged build.
+        let mut app = App::headless_for_test();
+        app.post_message(update_words::health_warning(
+            update_words::HealthKind::Install,
+            aterm_update::health_failing_title("pipeline"),
+            body,
+        ));
+        app.note_update_progress(&staged);
+        assert_eq!(health_rows(&app).len(), 1, "NEGATIVE: the key says install");
+        app.post_update_landed("9.9.9", 7, 0);
+        assert!(health_rows(&app).is_empty());
+    }
+
+    /// TWO KINDS LIVE, TWO RECORDS OF HEALING (design ruling 318, completing
+    /// 311). Two halves failing in one launch are two rows, so each keeps its
+    /// own words for its own record: a later kind never takes an earlier one's
+    /// record of healing with it, and a proof that answers both writes both.
+    ///
+    /// NEGATIVE CONTROLS: after Download then Install, a staged build records
+    /// the download's healing and NOT the install's (whose row stays up); the
+    /// watchdog's stall heal records only the stall, never a ledger warning
+    /// beside it; and each record is written once — a second landing adds
+    /// nothing.
+    #[test]
+    fn two_health_kinds_live_each_record_their_own_healing() {
+        let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+        let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: the reason.";
+        let staged = aterm_update::Progress::Staged {
+            version: "9.9.9".into(),
+            build: 7,
+        };
+        let healed = |app: &App| -> Vec<String> {
+            app.messages
+                .log()
+                .records()
+                .filter(|r| r.title == "aterm updates work again")
+                .map(|r| r.detail.join(" "))
+                .collect()
+        };
+        let after = |title: &str| format!("after \"{title}\", since Sep 14");
+        let live_kinds = |app: &App| -> Vec<update_words::HealthKind> {
+            app.messages
+                .live_rows()
+                .filter_map(|l| update_words::HealthKind::of_row(&l.msg))
+                .collect()
+        };
+        let download = aterm_update::health_failing_title("stage");
+        let install = aterm_update::health_failing_title("apply");
+
+        // Download, then Install: the staged build answers the download only.
+        let mut app = App::headless_for_test();
+        assert!(app.note_update_health(download, body));
+        assert!(app.note_update_health(install, body));
+        assert_eq!(live_kinds(&app).len(), 2, "two halves, two rows");
+        app.note_update_progress(&staged);
+        assert_eq!(
+            healed(&app),
+            vec![after(download)],
+            "the download's healing is on record — the install warning said \
+             after it did not take it"
+        );
+        assert_eq!(
+            live_kinds(&app),
+            vec![update_words::HealthKind::Install],
+            "NEGATIVE: a staged build is no proof that installing works"
+        );
+        app.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(healed(&app), vec![after(download), after(install)]);
+        app.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(healed(&app).len(), 2, "NEGATIVE: each healing once");
+
+        // Install, then Download: one landing answers both, and both are on
+        // record, oldest first — not only the later, lesser warning.
+        let mut app = App::headless_for_test();
+        assert!(app.note_update_health(install, body));
+        assert!(app.note_update_health(download, body));
+        app.post_update_landed("9.9.9", 7, 0);
+        assert!(live_kinds(&app).is_empty());
+        assert_eq!(healed(&app), vec![after(install), after(download)]);
+
+        // Install, then the watchdog's stall: a completed check records the
+        // stall's healing and leaves the install warning, words and all.
+        let mut app = App::headless_for_test();
+        assert!(app.note_update_health(install, body));
+        assert!(app.note_update_health_as(
+            update_words::HealthKind::Stalled,
+            update_words::CHECKER_STALLED_TITLE,
+            body,
+        ));
+        app.heal_update_checker_stall();
+        assert_eq!(
+            healed(&app),
+            vec![after(update_words::CHECKER_STALLED_TITLE)]
+        );
+        assert_eq!(
+            live_kinds(&app),
+            vec![update_words::HealthKind::Install],
+            "NEGATIVE: the stall's heal is not the ledger's"
+        );
+        app.post_update_landed("9.9.9", 7, 0);
+        assert_eq!(healed(&app).len(), 2);
+        assert_eq!(healed(&app)[1], after(install));
+
+        // Carried across the handoff: the successor seeds one entry per carried
+        // row, so its landing records both of the parent's warnings.
+        let mut parent = App::headless_for_test();
+        parent.post_message(update_words::installing("9.9.9"));
+        assert!(parent.note_update_health(download, body));
+        assert!(parent.note_update_health(install, body));
+        let carry = window_carry(parent.message_band_rows, parent.carried_messages());
+        let mut successor = App::headless_for_test();
+        successor.seed_carried_messages(&carry, Some("9.9.9"));
+        successor.post_update_landed("9.9.9", 7, 0);
+        let mut said = healed(&successor);
+        said.sort();
+        let mut want = vec![after(download), after(install)];
+        want.sort();
+        assert_eq!(said, want, "both of the parent's warnings, each once");
     }
 
     /// EVERY UPDATE MOMENT IS A LINE IN THE LOG (the log area's P3): downloaded,

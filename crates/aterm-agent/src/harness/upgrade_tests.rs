@@ -775,6 +775,114 @@ fn the_notice_lists_what_runs_under_the_agent_in_one_line() {
     assert!(!notice.contains('\n') && notice.starts_with(ANNOUNCE_HEAD));
 }
 
+/// The incident's closer (measured 2026-09-27), as the transcript of the
+/// Claude Code that ran it twice, at 03:09:00Z and 03:19:43Z on 2026-09-22,
+/// records it: 253 characters, 119 of them the one path in `D=`.
+const CLOSER: &str = "D=/Users//person/.claude/projects/-Users-person/\
+    00000000-0000-4000-8000-000000000001/subagents/workflows/wf_examplerun-1; \
+    tail -f -n +1 \"$D/journal.jsonl\" | /usr/bin/grep -m1 -F \
+    '\"agentId\":\"a0000000000000001\",\"result\"' > /dev/null; echo \"closer finished\"";
+
+/// THE NOTICE KEEPS WHAT MAKES A WAIT DEAD (measured 2026-09-27: two shells
+/// held a tab five days on [`CLOSER`], a `tail -f` its `grep -m1` had already
+/// matched and left). Cut at its 160th character, the notice quoted each as
+/// its 119-character path and then `; tail -f -n +1 "$D/journal.jsonl" |
+/// /us…`: the `grep -m1` that made the `tail -f` a wait that can never end
+/// was gone, and what was left read as live work. A
+/// command over [`HELD_COMMAND_CHARS`] now has the middle of each long path
+/// elided before that cut, which stays the backstop.
+#[test]
+fn the_notice_keeps_a_pipeline_a_long_path_would_push_out() {
+    assert_eq!(CLOSER.chars().count(), 253);
+    let quoted = |command: &str| {
+        let clause = running_clause(&[Held {
+            pid: 41234,
+            name: "zsh".to_string(),
+            age_s: 475_200,
+            command: command.to_string(),
+        }]);
+        let (_, quoted) = clause.split_once("): ").expect("a command");
+        let quoted = quoted.strip_suffix('.').expect("the clause's period");
+        assert!(quoted.chars().count() <= HELD_COMMAND_CHARS, "{quoted}");
+        assert!(
+            quoted.chars().all(|c| c == '…' || command.contains(c)),
+            "only what the agent ran, and the cut mark: {quoted}"
+        );
+        quoted.to_string()
+    };
+    let closer = quoted(CLOSER);
+    assert!(
+        closer.contains("grep -m1 -F") && closer.contains("echo \"closer finished\""),
+        "{closer}"
+    );
+    assert_eq!(
+        closer,
+        "D=/Users/…/wf_examplerun-1; tail -f -n +1 \"$D/journal.jsonl\" | /usr/bin/grep -m1 -F \
+         '\"agentId\":\"a0000000000000001\",\"result\"' > /dev/null; echo \"closer finished\""
+    );
+
+    // A long path passed as an argument is elided the same way, the words in
+    // a quote are not: there a path can be the pattern the wait turns on.
+    let dir = "/Users//person/.claude/projects/-Users-person/00000000-0000-4000-8000-000000000001";
+    let pattern = format!("{dir}/subagents/done");
+    let argument = quoted(&format!(
+        "tail -f -n +1 {dir}/subagents/workflows/wf_examplerun-1/journal.jsonl | grep -m1 -F \
+         \"wrote {pattern} ok\""
+    ));
+    assert_eq!(
+        argument,
+        format!("tail -f -n +1 /Users/…/journal.jsonl | grep -m1 -F \"wrote {pattern} ok\"")
+    );
+
+    // NEGATIVE CONTROLS. A command that fits is quoted whole, however long
+    // its paths. A URL is never a path, its query included.
+    let fits = format!("tail -f {dir}/journal.jsonl");
+    assert_eq!(quoted(&fits), fits);
+    let url = "https://api.github.com/repos/people/aterm/actions/runs/123456789/jobs?filter=latest";
+    let fetch = quoted(&format!(
+        "until curl -fsS -o {dir}/jobs.json {url}; do sleep 30; done"
+    ));
+    assert_eq!(
+        fetch,
+        format!("until curl -fsS -o /Users/…/jobs.json {url}; do sleep 30; done")
+    );
+    // Only a ROOTED path is elided: a long relative one is quoted whole, as
+    // the agent wrote it. A redirection's path is elided after its operator.
+    let relative =
+        "crates/aterm-agent/src/harness/subagents/workflows/wf_examplerun-1/journal.jsonl";
+    assert!(relative.chars().count() > HELD_PATH_CHARS);
+    let padded = |word: &str| format!("tail -f {word} {}", "x".repeat(HELD_COMMAND_CHARS));
+    let whole = quoted(&padded(relative));
+    assert!(
+        whole.starts_with(&format!("tail -f {relative} ")),
+        "{whole}"
+    );
+    let redirect = quoted(&padded(&format!("2>>{dir}/subagents/workflows/log")));
+    assert!(
+        redirect.starts_with("tail -f 2>>/Users/…/log "),
+        "{redirect}"
+    );
+    // A word with a quote, a glob or an escape in it is not a path to elide,
+    // and a long path with nothing between its first name and its last is
+    // left as it is.
+    for word in [
+        format!("{dir}/*/journal.jsonl"),
+        format!("{dir}/sub\\ dir/journal.jsonl"),
+        format!("'{dir}/subagents/journal.jsonl'"),
+        format!("/{}/{}", "a".repeat(40), "b".repeat(40)),
+    ] {
+        let command = format!("{word} {}", "x".repeat(HELD_COMMAND_CHARS));
+        assert!(quoted(&command).starts_with(&word), "{word}");
+    }
+    // The fold is unchanged: a line or paragraph separator in the command is
+    // a space, never a break in the one-paste notice.
+    let broken = quoted(&format!("{CLOSER}\u{2028}echo\u{2029}done"));
+    assert!(
+        !broken.contains(['\u{2028}', '\u{2029}']) && !broken.chars().any(char::is_control),
+        "{broken:?}"
+    );
+}
+
 #[test]
 fn the_ready_answer_is_an_assistant_line_never_the_announcement() {
     let marker = ready_marker(ID, &v("2.1.281"), 7);
@@ -871,6 +979,7 @@ fn idle_facts() -> Facts {
         undelivered: false,
         queued: false,
         ready_s: 0,
+        idle_looks: 0,
         failed_s: 0,
     }
 }
@@ -1167,18 +1276,25 @@ const _: () = assert!(DRAIN_S == REASK_S);
 /// - The agent's own work is a background shell.
 /// - A break is a step taken at one ([`Facts::background_point`], Claude's
 ///   status `busy`).
+/// - A lagging status is Claude's own `busy` standing [`QUIET_S`] over a
+///   screen read idle [`IDLE_LOOKS`] looks in a row ([`status_lags`]).
 /// - The model's `waited` looks are the notice's age, and its `aged` looks
 ///   are the READY answer's age ([`Facts::ready_s`]), each in `Bound`
 ///   steps of [`DRAIN_S`] (== [`REASK_S`]).
 /// - Its `MaxAsks` notices are [`MAX_ASKS`], and a notice typed is `ReAsk`.
 ///
-/// An answer is never older than its notice. Negative control: at `Buggy=1`
+/// An answer is never older than its notice. Negative controls: at `Buggy=1`
 /// (no void, a wait in silence on the agent's work, and the notice's clock
-/// for a READY answer) the model disagrees with the reducer.
+/// for a READY answer), at `LagEnds=1` (the restart on a lagging status, the
+/// review of 2026-09-27) and at `LagHolds=1` (a READY behind the lag waited
+/// on in silence) the model disagrees with the reducer.
 #[test]
 fn the_reducer_takes_the_step_the_drain_model_allows() {
     let model = aterm_spec::derive::harness_upgrade_drain_bound_model();
     let buggy = aterm_spec::interp::with_buggy(&model, 1);
+    let lag_ends = aterm_spec::interp::with_consts(&model, &[("LagEnds", 1)]);
+    let lag_holds = aterm_spec::interp::with_consts(&model, &[("LagHolds", 1)]);
+    let (mut ends_caught, mut holds_caught) = (0, 0);
     let bound: i64 = 2;
     let max_asks: i64 = 2;
     let at = |looks: i64| DRAIN_S * u64::try_from(looks).unwrap() / u64::try_from(bound).unwrap();
@@ -1192,7 +1308,7 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
                 for aged in ages {
                     for person in [0, 1] {
                         for agent in [0, 1] {
-                            for brk in [0, 1] {
+                            for (brk, lag) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
                                 let mut state = model.init_state();
                                 for (var, value) in [
                                     ("waited", waited),
@@ -1202,6 +1318,7 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
                                     ("person", person),
                                     ("agent", agent),
                                     ("brk", brk),
+                                    ("lag", lag),
                                 ] {
                                     state.insert(var, value);
                                 }
@@ -1216,6 +1333,11 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
                                 } else {
                                     idle_facts()
                                 };
+                                if lag == 1 {
+                                    f.status = "busy".to_string();
+                                    f.status_age_s = QUIET_S;
+                                    f.idle_looks = IDLE_LOOKS;
+                                }
                                 f.approval_box = person == 1;
                                 f.hold_s = if person == 1 { HOLD_S } else { 0 };
                                 if agent == 1 {
@@ -1255,6 +1377,8 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
                                 ];
                                 assert_eq!(real, decided(&model), "{state:?} -> {step:?}");
                                 disagreements += usize::from(real != decided(&buggy));
+                                ends_caught += usize::from(real != decided(&lag_ends));
+                                holds_caught += usize::from(real != decided(&lag_holds));
                             }
                         }
                     }
@@ -1265,6 +1389,8 @@ fn the_reducer_takes_the_step_the_drain_model_allows() {
     // Every step the reducer can take was driven: the bind is not vacuous.
     assert_eq!(steps.len(), 5, "{steps:?}");
     assert!(disagreements > 0, "the unbounded drain is caught");
+    assert!(ends_caught > 0, "a restart on a lagging status is caught");
+    assert!(holds_caught > 0, "a silent wait behind the lag is caught");
 }
 
 /// A BREAK ENDS NOTHING ([`break_step`]): a notice, a void, a give-up and a
@@ -2435,6 +2561,335 @@ fn a_break_of_background_work_takes_only_notices_and_ends_nothing() {
     );
 }
 
+/// CLAUDE'S OWN STATUS IS READ AGAINST ITS SCREEN AND THE WORK UNDER IT
+/// (2026-09-27). The gates took the session file's `status` as it stood,
+/// and a break only off the screen's words: a build whose idle screen draws
+/// no shell count, over shells that run under the agent with its status at
+/// `shell`, waited `not-idle` at every idle point — no notice, so no re-ask
+/// and no give-up, for as long as the shells ran; and a status Claude left
+/// stale over an idle screen and an empty process tree waited the same.
+/// Now, once the session's own reader has read the screen AUTHORITATIVELY
+/// IDLE for [`IDLE_LOOKS`] looks with the status standing [`QUIET_S`]:
+/// with work under the agent, the turn is over and that work is its own —
+/// the notice goes, as at a break, then the re-ask and the give-up, and the
+/// restart waits `background`; with NOTHING under it, the status is stale,
+/// and the NOTICE and the RELEASE go — each types one line and ends nothing.
+/// THE RESTART STILL WAITS FOR CLAUDE'S OWN `idle` (the Drain step's rule:
+/// work inside the agent's own process — a background agent, a workflow — is
+/// no process under it, and only that status says it runs): the READY it
+/// holds is asked again once [`REASK_S`] has passed, given up on after
+/// [`MAX_ASKS`], and a gave-up upgrade's late READY is void past
+/// [`DRAIN_S`], so the agent is released, never left stopped. A conversation
+/// with no task is not restarted afresh on it either, and the owner's `--now`
+/// waives none of it. NEGATIVE CONTROLS: a live turn (a foreground Bash call)
+/// never reads authoritatively idle, so it still waits `not-idle`; one look
+/// short, or a status younger than [`QUIET_S`], waits `status-stale`, which
+/// names it; a person's `waiting`, a box, a draft, the busy footer and the
+/// settle still hold.
+#[test]
+fn claudes_status_is_read_against_its_idle_screen_and_the_work_under_it() {
+    let own_work = Facts {
+        status: "shell".to_string(),
+        status_age_s: QUIET_S,
+        background: vec!["zsh".to_string(), "zsh".to_string()],
+        idle_looks: IDLE_LOOKS,
+        ..idle_facts()
+    };
+    assert_eq!(gate_announce(&own_work), Gate::Go);
+    assert_eq!(
+        next_step(&Phase::Pending, &own_work, false, 1_000),
+        Step::Announce
+    );
+    assert_eq!(gate_restart(&own_work, true), Gate::Wait("background"));
+    let asked = Phase::Announced { at_s: 0, asks: 1 };
+    assert_eq!(
+        next_step(&asked, &own_work, false, 10),
+        Step::Wait("awaiting-ready")
+    );
+    assert_eq!(next_step(&asked, &own_work, false, REASK_S), Step::Announce);
+    let last = Phase::Announced {
+        at_s: 0,
+        asks: MAX_ASKS,
+    };
+    assert_eq!(next_step(&last, &own_work, false, REASK_S), Step::GiveUp);
+    assert_eq!(
+        next_step(&asked, &own_work, true, 10),
+        Step::Wait("background"),
+        "never an end"
+    );
+    let busy = Facts {
+        status: "busy".to_string(),
+        ..own_work.clone()
+    };
+    assert_eq!(
+        next_step(&Phase::Pending, &busy, false, 1_000),
+        Step::Announce
+    );
+    // THE STALE STATUS: nothing under the agent. One line goes; nothing ends.
+    let stale = Facts {
+        background: Vec::new(),
+        ..busy.clone()
+    };
+    assert_eq!(gate_announce(&stale), Gate::Go);
+    assert_eq!(gate_release(&stale, false), Gate::Go);
+    for status in ["busy", "shell"] {
+        let stale = Facts {
+            status: status.to_string(),
+            ..stale.clone()
+        };
+        assert_eq!(gate_restart(&stale, true), Gate::Wait("status-stale"));
+        assert_eq!(
+            next_step(&asked, &stale, true, 10),
+            Step::Wait("status-stale"),
+            "{status}: never an end on a status that is not idle"
+        );
+        assert_eq!(
+            requested_step(&Request::Now, &asked, &stale, true, 10, "9.9.9"),
+            Step::Wait("status-stale"),
+            "{status}: the owner's --now waives no status"
+        );
+        let taskless = Facts {
+            taskless: true,
+            ..stale.clone()
+        };
+        assert_eq!(
+            next_step(&Phase::Pending, &taskless, false, 1_000),
+            Step::Wait("status-stale"),
+            "{status}: nor a fresh restart"
+        );
+        // The READY it holds: asked again past REASK_S, given up on after
+        // MAX_ASKS, and — given up — void past DRAIN_S, the agent released.
+        let held = Facts {
+            ready_s: REASK_S,
+            ..stale.clone()
+        };
+        assert_eq!(next_step(&asked, &held, true, REASK_S), Step::Announce);
+        assert_eq!(next_step(&last, &held, true, REASK_S), Step::GiveUp);
+        let gave_up = Phase::Failed(GAVE_UP.to_string());
+        assert_eq!(
+            next_step(&gave_up, &stale, true, 10),
+            Step::Wait("status-stale")
+        );
+        let drained = Facts {
+            ready_s: DRAIN_S,
+            ..stale.clone()
+        };
+        assert_eq!(
+            next_step(&gave_up, &drained, true, DRAIN_S),
+            Step::Void("status-stale")
+        );
+    }
+    // NEGATIVE CONTROL: Claude's own `idle` over the same screen restarts.
+    let idle = Facts {
+        status: "idle".to_string(),
+        ..stale.clone()
+    };
+    assert_eq!(next_step(&asked, &idle, true, 10), Step::Terminate);
+    // NEGATIVE CONTROLS.
+    let knocks: [Knock; 8] = [
+        (|f| f.idle_looks = 0, "not-idle"),
+        (|f| f.idle_looks = IDLE_LOOKS - 1, "status-stale"),
+        (|f| f.status_age_s = QUIET_S - 1, "status-stale"),
+        (|f| f.status = "waiting".into(), "not-idle"),
+        (|f| f.busy_footer = true, "busy"),
+        (|f| f.approval_box = true, "box"),
+        (|f| f.composer_empty = false, "draft"),
+        (|f| f.quiet_s = 3, "settling"),
+    ];
+    for base in [&own_work, &stale] {
+        for (edit, word) in knocks {
+            let mut f = base.clone();
+            edit(&mut f);
+            assert_eq!(gate_announce(&f), Gate::Wait(word), "{word}: {f:?}");
+            assert_eq!(
+                next_step(&Phase::Pending, &f, false, 1_000),
+                Step::Wait(word)
+            );
+        }
+    }
+    // The wait that names it carries Claude's word beside it.
+    assert_eq!(wait_word("status-stale", "busy"), "status-stale:busy");
+}
+
+/// A STOPPED UPGRADE TAKES ITS OWN STEP AT A BREAK, NOT A BARE `background`
+/// — save the restart, which waits for an idle point (2026-09-27: two
+/// widowed `tail -f` shells under a Claude Code whose status read `shell`
+/// made every screen a break, and no idle point ever came). Every break after
+/// the give-up answered `background` before the reducer looked at the phase,
+/// so the release the give-up owed was never typed, and a late READY that
+/// work outlived was never voided: the agent the upgrade asked was left
+/// stopped for as long as the shells lived. Now a gave-up upgrade with no
+/// READY waits `failed` at a break (the release it owes is its next act), and
+/// one whose late READY that work outlived past the drain is VOIDED there,
+/// owing the release. The release line goes wherever a notice may go, a
+/// settled break included: it types one line and ends nothing. NEGATIVE
+/// CONTROLS: the restart a READY would take still waits at a break
+/// ([`gate_restart`], [`break_step`]); an announced upgrade still waits
+/// `background` within its window; and a person, a draft, a box, a hold, the
+/// limit and a live turn's footer still hold the release at a break.
+#[test]
+fn a_stopped_upgrade_takes_its_idle_points_step_at_a_break() {
+    let gave_up = Phase::Failed(GAVE_UP.to_string());
+    let brk = Facts {
+        status: "shell".to_string(),
+        status_age_s: 0,
+        quiet_s: 0,
+        background_point: true,
+        background: vec!["zsh".to_string(), "zsh".to_string()],
+        ..idle_facts()
+    };
+    assert_eq!(next_step(&gave_up, &brk, false, 1), Step::Wait("failed"));
+    assert!(release_is_next("failed"), "the release it owes is next");
+    for other in ["signal-refused", "resumed-elsewhere"] {
+        assert_eq!(
+            next_step(&Phase::Failed(other.to_string()), &brk, false, 1),
+            Step::Wait("failed"),
+            "{other}"
+        );
+    }
+    // A late READY the agent's own work outlived past the drain: void.
+    let outlived = Facts {
+        ready_s: DRAIN_S,
+        ..brk.clone()
+    };
+    assert_eq!(
+        next_step(&gave_up, &outlived, true, 1),
+        Step::Void("background")
+    );
+    // Short of the drain, and with nothing left running, the restart it
+    // would take waits for an idle point: nothing is ended at a break.
+    let fresh = Facts {
+        ready_s: DRAIN_S - 1,
+        ..brk.clone()
+    };
+    assert_eq!(
+        break_step(next_step(&gave_up, &fresh, true, 1)),
+        Step::Wait("background")
+    );
+    let done = Facts {
+        background: Vec::new(),
+        ..brk.clone()
+    };
+    assert_eq!(
+        break_step(next_step(&gave_up, &done, true, 1)),
+        Step::Wait("background")
+    );
+    // WORK INSIDE THE AGENT'S OWN PROCESS (the review of 2026-09-27: a
+    // workflow Claude's `busy` says it waits on, dead or alive, and nothing
+    // under the agent): the break arm waits on it as on a shell under the
+    // agent, before the restart's gate is ever asked — so the late READY it
+    // outlives past the drain is voided the same way, whatever Claude's word
+    // for it, the owner's `--now` included.
+    for status in ["busy", "shell", "idle"] {
+        let own = Facts {
+            status: status.to_string(),
+            background: Vec::new(),
+            ..brk.clone()
+        };
+        assert_eq!(
+            next_step(&gave_up, &own, true, 1),
+            Step::Wait("background"),
+            "{status}: short of the drain, waited for"
+        );
+        let outlived = Facts {
+            ready_s: DRAIN_S,
+            ..own.clone()
+        };
+        assert_eq!(
+            next_step(&gave_up, &outlived, true, 1),
+            Step::Void("background"),
+            "{status}: past it, void"
+        );
+        assert_eq!(
+            requested_step(&Request::Now, &gave_up, &outlived, true, 1, "9.9.9"),
+            Step::Void("background"),
+            "{status}: the owner's --now ends nothing at a break"
+        );
+    }
+    // NEGATIVE CONTROL: off a break, Claude's own `idle` with nothing under
+    // the agent is the restart.
+    assert_eq!(gate_restart(&idle_facts(), true), Gate::Go);
+    // THE RELEASE AT A BREAK: the notice's own gate there.
+    assert_eq!(gate_release(&brk, false), Gate::Go);
+    assert_eq!(gate_release(&brk, true), Gate::Wait("ready"));
+    let knocks: [Knock; 6] = [
+        (|f| f.attended = true, "attended"),
+        (|f| f.held = true, "held"),
+        (|f| f.limited = true, "limited"),
+        (|f| f.busy_footer = true, "busy"),
+        (|f| f.approval_box = true, "box"),
+        (|f| f.composer_empty = false, "draft"),
+    ];
+    for (edit, word) in knocks {
+        let mut f = brk.clone();
+        edit(&mut f);
+        assert_eq!(gate_release(&f, false), Gate::Wait(word), "{word}");
+    }
+    // NEGATIVE CONTROL: an announced upgrade within its window still waits
+    // on the agent's own work at a break.
+    let announced = Phase::Announced { at_s: 0, asks: 1 };
+    assert_eq!(
+        next_step(&announced, &brk, false, REASK_S - 1),
+        Step::Wait("background")
+    );
+}
+
+/// THE RESTART'S OWN GATE WAITS AT A BREAK (the merge review of 2026-09-27,
+/// G1a). At a break of the agent's own work ([`Facts::background_point`])
+/// that work runs by definition — a shell under the agent, or a workflow
+/// inside its own process that [`Facts::background`] never names — and the
+/// Drain never ends the agent's own work (the module doc: it "is waited for,
+/// and never ended"). [`next_step`]'s break arm answers every phase there
+/// before this gate is asked, and the drivers' [`break_step`] turns an end
+/// into a wait; the merge with main's break arm had left the gate itself
+/// answering `Go` there — on Claude's `idle`, on a `busy` or `shell` a break
+/// admits, and on the owner's `--now` — while [`next_step`]'s doc said it
+/// never does. Now the gate says what the break arm says. The break arm's
+/// word for a phase the drivers carry instead of stepping (a restart in
+/// flight, a move done) is `background` too. NEGATIVE CONTROLS: a gate that
+/// is shut says its own word first, and off a break the same facts are the
+/// restart.
+#[test]
+fn the_restarts_gate_waits_at_a_break_whatever_else_lets_it_go() {
+    for status in ["idle", "busy", "shell"] {
+        for owner_now in [false, true] {
+            let brk = Facts {
+                status: status.to_string(),
+                background_point: true,
+                owner_now,
+                ..idle_facts()
+            };
+            assert_eq!(
+                gate_restart(&brk, true),
+                Gate::Wait("background"),
+                "{status}, --now {owner_now}"
+            );
+        }
+    }
+    let brk = Facts {
+        background_point: true,
+        ..idle_facts()
+    };
+    assert_eq!(gate_restart(&brk, false), Gate::Wait("not-ready"));
+    let held = Facts {
+        held: true,
+        ..brk.clone()
+    };
+    assert_eq!(gate_restart(&held, true), Gate::Wait("held"));
+    for phase in [
+        Phase::Exiting { at_s: 1 },
+        Phase::Relaunched { at_s: 1 },
+        Phase::Done,
+    ] {
+        assert_eq!(
+            next_step(&phase, &brk, true, 2),
+            Step::Wait("background"),
+            "{phase:?}"
+        );
+    }
+    assert_eq!(gate_restart(&idle_facts(), true), Gate::Go);
+}
+
 /// A main-chain user row saying `text`, as Claude Code 2.1.283 writes a typed
 /// prompt — the harness's and a person's alike (measured on the live E2E of
 /// 2026-09-26: `promptSource` and `origin` cannot tell them apart).
@@ -3008,14 +3463,15 @@ fn the_release_is_typed_where_a_notice_could_be_and_never_over_a_ready() {
         edit(&mut f);
         assert_eq!(gate_release(&f, false), Gate::Wait(word), "{word}");
     }
-    // Only an idle point types it: a break of the agent's own background
-    // work is the notice's alone.
+    // A break of the agent's own background work types it too, where a
+    // notice may go (2026-09-27: a break that never ends reached no idle
+    // point, and the release a give-up owed was never typed).
     let at_break = Facts {
         status: "busy".to_string(),
         background_point: true,
         ..idle_facts()
     };
-    assert_eq!(gate_release(&at_break, false), Gate::Wait("not-idle"));
+    assert_eq!(gate_release(&at_break, false), Gate::Go);
 
     let text = release_prompt(Agent::Claude);
     assert_eq!(

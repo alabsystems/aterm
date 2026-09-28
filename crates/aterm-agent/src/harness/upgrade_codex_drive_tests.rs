@@ -2327,6 +2327,9 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
     let r = rig.visit(None);
     assert_eq!(r.step, "adopted", "{r:?}\n{:#?}", rig.asked());
     assert_eq!(r.pid, NEW);
+    // The adopted TUI is on the record: its own exit is never read as the
+    // restart's (`relaunch::restarted`, the review of 2026-09-27).
+    assert_eq!(rig.state().resumed_pid, NEW);
     assert_eq!(
         rig.typed().len(),
         3,
@@ -2375,6 +2378,91 @@ fn the_window_hands_a_relaunched_codex_back_and_carries_it_on_at_its_next_idle_p
         ]
     );
     assert!(!rig.asked().iter().any(|l| l.contains("signal")));
+}
+
+/// A RELAUNCHED CODEX THE RESTART FOUND IS YOURS ONCE IT IS GONE, ADOPTED OR
+/// NOT (the review of 2026-09-27). Only an adoption stamped the TUI on the
+/// record ([`St::resumed_pid`]), and two paths leave it up in the tab
+/// unstamped: an adopt whose [`ADOPT_WAIT`] ran out (`wait:resume`), and a
+/// carry-on that found a person at the keys (`wait:held`). A person's `/exit`
+/// of that TUI was then read as the restart's: every carry held the
+/// harness's hand on the tab for a TUI that was gone, until the record
+/// expired and the tab was badged as an agent the harness had ended. The
+/// TUI the relaunch brought up is on the record from the look that finds it,
+/// and once it is gone a Codex leaving the tab is that TUI — its own exit.
+/// (`NEW` is the rig's: no process of the real kernel's, so gone to
+/// `relaunch::restarted`, which reads the real one.)
+#[test]
+fn a_relaunched_codex_the_restart_found_is_yours_once_gone_adopted_or_not() {
+    let mut rig = embedded_ready("emb-found", |_| {});
+    rig.opts.hand_back = true;
+    let r = rig.visit(None);
+    assert_eq!(r.step, "adopted", "{r:?}\n{:#?}", rig.asked());
+    assert!(
+        !super::super::alive(NEW),
+        "the rig's TUI is no real process"
+    );
+    let tab = Opts {
+        only_sid: Some(TAB.to_string()),
+        ..rig.opts.clone()
+    };
+    let restarted = || super::super::super::relaunch::restarted(&tab, true, None);
+    // The record an adopt whose ADOPT_WAIT ran out leaves: the new TUI found
+    // and up, and never stamped as adopted.
+    let mut st = rig.state();
+    assert_eq!(
+        st.relaunched_pid, NEW,
+        "on the record from the look that found it"
+    );
+    st.resumed_pid = 0;
+    save(&rig.opts, &key(TAB), &st);
+    assert!(
+        !restarted(),
+        "the relaunched TUI the restart found, gone: its own exit"
+    );
+    // A PERSON AT THE KEYS where the carry-on looks: `wait:held`, the record
+    // still relaunched and unadopted — and that TUI, once gone, still its own.
+    *rig.status_extra.lock().expect("status") = " human_ms=500".to_string();
+    let carry = Opts {
+        hand_back: false,
+        background: false,
+        ..rig.opts.clone()
+    };
+    let r = carry_in_flight_with(&carry, blank(&rig.tui), rig.state(), &key(TAB), &rig.kernel);
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert!(matches!(rig.state().phase, Phase::Relaunched { .. }));
+    assert_eq!(
+        (rig.state().resumed_pid, rig.state().relaunched_pid),
+        (0, NEW),
+        "found, never adopted"
+    );
+    assert!(!restarted(), "the person's `/exit` is theirs");
+    // FOUND BY A VISIT: a relaunched TUI no earlier look recorded (the
+    // relaunch's own wait ran out before it came up) is on the record from
+    // the visit that finds it leading the tab — held at the keys as here, or
+    // its adoption out of time.
+    let mut st = rig.state();
+    st.relaunched_pid = 0;
+    save(&rig.opts, &key(TAB), &st);
+    assert!(restarted(), "none recorded: the old TUI's exit, read late");
+    let relaunched_tui = Tui {
+        pid: NEW,
+        argv: rig.kernel.new_argv.clone(),
+        ..rig.tui.clone()
+    };
+    let r = visit(&carry, &relaunched_tui, &rig.target, None, &rig.kernel);
+    assert_eq!(r.step, "wait:held", "{r:?}");
+    assert_eq!(
+        (rig.state().resumed_pid, rig.state().relaunched_pid),
+        (0, NEW),
+        "found by the visit, never adopted"
+    );
+    assert!(!restarted(), "the person's `/exit` is theirs");
+    assert_eq!(
+        super::super::super::relaunch::carry_restart(&tab, true, None).step,
+        "refused:no-restart-in-flight",
+        "no hand held on the tab for a TUI that is gone"
+    );
 }
 
 #[test]

@@ -2278,7 +2278,7 @@ mod tests {
     }
 
     /// The candidate the check builds for this one release, shaped the way
-    /// [`web_release`] shapes it (the web lane synthesizes exactly one) — for tests
+    /// [`web_release`] shapes it (the check synthesizes exactly one) — for tests
     /// that exercise the roster chain over hand-built releases.
     fn candidate_for(releases: Vec<Release>) -> Result<Option<AuthoritativeRelease>, String> {
         let [release] = <[Release; 1]>::try_from(releases).expect("exactly one release");
@@ -3741,13 +3741,15 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // THE WEB LANE, MEASURED.
+    // THE ONE LANE, MEASURED.
     //
-    // Both transports are injected — the token lane's LIST fetcher and the web lane's
-    // HEAD — and the asset downloader is a closure, so every request a check makes is
-    // COUNTED here rather than claimed. On the web lane the LIST fake panics: "zero
-    // `api.github.com` requests" is then a fact the compiler and the test runner
-    // jointly enforce, on the happy path and on every failure path.
+    // The pointer's HEAD transport is injected and the asset downloader is a closure,
+    // so every request a check makes is COUNTED here rather than claimed: the
+    // pointer's failure paths make exactly their one HEAD, and the downloads the
+    // fixtures make are asserted off `api.github.com` (`cdn::is_api_host`). "Zero
+    // `api.github.com` requests" is then a fact the test runner enforces. (There is no
+    // second lane to fake: the metered API lane, and the cadence it ran on, are
+    // retired — every check is this one, on the one cadence.)
     // ---------------------------------------------------------------------------
 
     /// The release the fixture channel's pointer names.
@@ -3766,7 +3768,7 @@ mod tests {
         url[..url.len() - 1].to_string()
     }
 
-    /// The one evergreen URL a web-lane check is allowed to HEAD.
+    /// The one evergreen URL a check is allowed to HEAD.
     fn evergreen_url() -> String {
         aterm_update_core::pointer::latest_download_url("alabsystems", "aterm", APPCAST_ASSET)
             .unwrap()
@@ -3781,7 +3783,7 @@ mod tests {
         })
     }
 
-    /// The owner side of one web-lane release: a master-signed roster naming m3, and an
+    /// The owner side of one release: a master-signed roster naming m3, and an
     /// appcast for [`WEB_TAG`] signed by m3 whose `url` field is `container_url` — the
     /// derived DMG URL by default, or whatever a test wants to bind against.
     struct WebChannel {
@@ -3853,11 +3855,11 @@ mod tests {
         }
     }
 
-    /// The build every web-lane fixture check runs as.
+    /// The build every fixture check runs as.
     const WEB_BUILD: u64 = 5;
 
-    /// Run the web lane's acquisition against a pointer that answers `answer`, with the
-    /// LIST fake armed. `known` writes a ledger that authorized that tag AS THIS BUILD,
+    /// Run the check's acquisition against a pointer that answers `answer`, counting
+    /// every HEAD it makes. `known` writes a ledger that authorized that tag AS THIS BUILD,
     /// AGAINST THE FIXTURE SOURCE (the only ledger the shortcut may trust). Returns the
     /// outcome and every URL the HEAD transport was asked.
     fn acquire_web(
@@ -3901,7 +3903,7 @@ mod tests {
         (outcome, heads)
     }
 
-    /// **THE measurement.** A web-lane check whose pointer has MOVED costs ONE HEAD of
+    /// **THE measurement.** A check whose pointer has MOVED costs ONE HEAD of
     /// the evergreen URL plus FOUR GETs — appcast, its signature, the roster, its
     /// signature — every one addressed by the DERIVED tag-specific URL, none through
     /// `latest` again, none to `api.github.com`, none with a credential; the armed
@@ -3946,7 +3948,7 @@ mod tests {
         let (manifest, release, _) = fetched
             .selected
             .as_ref()
-            .expect("the armed chain accepts the rostered release over the web lane");
+            .expect("the armed chain accepts the rostered release over the download host");
         assert_eq!(
             fetched
                 .attribution
@@ -4233,7 +4235,7 @@ mod tests {
             ),
             // The evergreen alias, which would let a moving pointer choose.
             Some("https://github.com/alabsystems/aterm/releases/latest/download/aterm.dmg".into()),
-            // No URL at all: the web lane requires the bind.
+            // No URL at all: the check requires the bind.
             None,
         ] {
             let error = web_container_url_agrees(&source, WEB_TAG, &manifest(wrong.as_deref()))
@@ -4304,7 +4306,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&staging.root);
     }
 
-    /// Invariant (c) on the web lane: a roster that cannot be FETCHED refuses the
+    /// Invariant (c) on the download host: a roster that cannot be FETCHED refuses the
     /// release as a transport failure — there is nothing else a client could accept it on.
     #[test]
     fn a_roster_that_cannot_be_fetched_on_the_web_lane_refuses_as_transport() {

@@ -1878,9 +1878,13 @@ fn strip_colors_with_active(theme: Theme, active_override: Option<[u8; 3]>) -> S
 /// appearance-aware `strip_colors` branch never misclassifies a built-in. The ONE
 /// dark/light classifier for all chrome (this strip and the native
 /// toolbar's strip appearance via [`theme_is_dark`]) so they can never disagree.
+///
+/// The one implementation is the engine's ([`aterm_messages::ink::bg_is_light`],
+/// ruling 324) — the band's derivation reads it there — and this is its host path.
+/// Its `f32` luma is kept on purpose: twelve colours at a luma of exactly 150 are
+/// LIGHT in it, where an exact integer test would call them dark.
 pub(crate) fn bg_is_light(bg: [u8; 3]) -> bool {
-    let luma = 0.299 * f32::from(bg[0]) + 0.587 * f32::from(bg[1]) + 0.114 * f32::from(bg[2]);
-    luma > 150.0
+    aterm_messages::ink::bg_is_light(bg)
 }
 
 /// [`bg_is_light`] for a packed-RGB theme colour (`theme.bg`), inverted: `true` when

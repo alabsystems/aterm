@@ -186,14 +186,56 @@ pub fn harness_codex_daemon_update_model() -> Model {
 /// A READY answer is usable only by the process and tab that received the
 /// notice, with a unique live owner of that conversation and a complete
 /// session-file scan. The process-start token represents the kernel PID-reuse
-/// guard. `Buggy=1` replays the old conversation-keyed reducer, which accepts
-/// READY in another tab or after a partial scan.
+/// guard.
+///
+/// AND A NOTICE WHOSE PROCESS IS GONE HOLDS NOTHING FOR EVER (2026-09-27).
+/// Before this, an announced upgrade whose notified process had exited or
+/// crashed without a relaunch waited on it for good once a person resumed the
+/// conversation by hand, in the same tab or another: every visit said
+/// `wait:notice-owned-by-other-process` before any step, and the owner's
+/// `--now` could not move it. Once the kernel proves that process gone (its
+/// pid names no process, or another one: `gone`), the live process holding the
+/// conversation, which was never asked, is ASKED AFRESH (`Reask`). The upgrade
+/// is pending again in a NEW ROUND: the round's markers are forgotten and the
+/// salt minted again, so the READY the gone process left in the transcript the
+/// two share can never answer a notice typed to the new one. While the
+/// notified process lives, a process it never reached still waits.
+///
+/// The processes: A, whose tab is 1, pid 1, start 1, got the first notice. B
+/// (pid 2, start 2) resumes the conversation in A's tab (`Resume`) or in tab 2
+/// (`OtherTab`). A process the kernel started later under A's pid (start 3)
+/// holds it in A's tab (`Recycled`). `pid == 0`: nobody holds the conversation
+/// (A exited, and nobody has resumed it yet). `ready_pid`/`ready_start`: the
+/// process whose notice the transcript's READY answers. `Look` is a visit with
+/// its proofs complete (one live owner, a whole scan) that finds nothing the
+/// upgrade does, derived from the reducer's own guards (enabled exactly where
+/// neither `Reask` nor `Terminate` is). The ghost `stranded` records that such
+/// a wait was on a notice whose process is gone, a wait that can never end on
+/// its own.
+///
+/// Properties: `OnlyIssuerSignaled`, `NoDuplicateOwnerSignal`,
+/// `NoPartialScanSignal`; `OnlyOnItsOwnAnswer`, meaning a restart acts only on
+/// a READY to a notice typed to the process it signals; and
+/// `NeverWaitsOnAGoneNotice`. ONE KNOB PER DEFECT: `NoReask` is the reducer
+/// before this fix, which never asks afresh (the re-arm after a rest reaches
+/// only a stopped round, never an announced one waiting on a gone notice).
+/// `KeepRound` is the tempting wrong fix,
+/// which asks afresh but keeps the round, so the gone process's READY answers
+/// the new notice's marker. `Buggy=1` is the reducers before the fix at once:
+/// the old conversation-keyed one, which accepts READY in another tab or after
+/// a partial scan, and main's, which never asks afresh. Outside the model: the
+/// release a gone process was owed, which nothing can type to it
+/// (`upgrade_drive::St::notice_gone` drops it and the ledger says so). Tier-0
+/// is aterm-spec's `derived_harness_upgrade_notice_owner`; Tier-1 is
+/// aterm-agent's `harness::upgrade_drive` tests, over the real visit.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_upgrade_notice_owner_model() -> Model {
     crate::ty_model! {
         HarnessUpgradeNoticeOwner {
             const Buggy = 0;
+            const NoReask = 0;
+            const KeepRound = 0;
             var phase = 0;
             var tab = 1;
             var pid = 1;
@@ -204,21 +246,51 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
             var owners = 1;
             var scan_complete = 1;
             var ready = 0;
+            var ready_pid = 0;
+            var ready_start = 0;
+            var gone = 0;
             var signaled = 0;
+            var stranded = 0;
 
-            action Announce when (phase == 0 && owners == 1 && scan_complete == 1) {
+            action Announce when (phase == 0 && pid > 0 && owners == 1 && scan_complete == 1) {
                 phase = 1;
                 owner_tab = tab;
                 owner_pid = pid;
                 owner_start = start;
+                gone = 0;
             }
+            // The READY answers the notice it was typed after: the fence's.
             action Ready when (phase == 1 && ready == 0) {
                 ready = 1;
+                ready_pid = owner_pid;
+                ready_start = owner_start;
             }
             action OtherTab when (phase == 1 && tab == 1) {
                 tab = 2;
                 pid = 2;
                 start = 2;
+            }
+            // Resumed by hand in the notice's own tab: after its process
+            // exited, or with it alive and no longer holding the conversation.
+            action Resume when (phase == 1 && tab == 1 && pid <= 1) {
+                pid = 2;
+                start = 2;
+            }
+            // The process the notice reached exits, or crashes, with no
+            // relaunch. The conversation is nobody's until a process resumes
+            // it, unless one already holds it.
+            action OwnerExits when (
+                phase == 1 && gone == 0 && owner_pid == 1 && owner_start == 1
+            ) {
+                gone = 1;
+                pid = if (pid == owner_pid && start == owner_start) { 0 } else { pid };
+                start = if (pid == owner_pid && start == owner_start) { 0 } else { start };
+            }
+            // The notice's pid, recycled: another process holds the
+            // conversation under it.
+            action Recycled when (phase == 1 && gone == 1 && tab == 1 && pid == 0) {
+                pid = 1;
+                start = 3;
             }
             action DuplicateOwner when (phase == 1 && owners == 1) {
                 owners = 2;
@@ -227,7 +299,7 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
                 scan_complete = 0;
             }
             action Terminate when (
-                phase == 1 && ready == 1 &&
+                phase == 1 && pid > 0 && ready == 1 &&
                 (Buggy == 1 ||
                     (owners == 1 && scan_complete == 1 && owner_tab == tab &&
                      owner_pid == pid && owner_start == start))
@@ -235,12 +307,53 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
                 phase = 2;
                 signaled = 1;
             }
+            // THE NOTICE'S PROCESS IS GONE and one it never reached holds the
+            // conversation: asked afresh, pending again in a new round, the
+            // round's markers forgotten (`KeepRound`: kept, and with them the
+            // gone process's READY). Its fence goes, and nothing is owed to it.
+            action Reask when (
+                phase == 1 && pid > 0 && owners == 1 && scan_complete == 1 && gone == 1 &&
+                Buggy == 0 && NoReask == 0 &&
+                (if (owner_tab == tab && owner_pid == pid && owner_start == start) { 0 }
+                 else { 1 }) == 1
+            ) {
+                phase = 0;
+                ready = if KeepRound == 1 { ready } else { 0 };
+                ready_pid = if KeepRound == 1 { ready_pid } else { 0 };
+                ready_start = if KeepRound == 1 { ready_start } else { 0 };
+                owner_tab = 0;
+                owner_pid = 0;
+                owner_start = 0;
+            }
+            // A VISIT that finds nothing to do: neither guard above holds. It
+            // waits on a notice whose process is gone (`stranded`) or on one
+            // that can still be answered.
+            action Look when (
+                phase == 1 && pid > 0 && owners == 1 && scan_complete == 1 && stranded == 0 &&
+                (if (
+                    phase == 1 && pid > 0 && owners == 1 && scan_complete == 1 && gone == 1 &&
+                    Buggy == 0 && NoReask == 0 &&
+                    (if (owner_tab == tab && owner_pid == pid && owner_start == start) { 0 }
+                     else { 1 }) == 1
+                ) { 1 } else { 0 }) +
+                (if (
+                    phase == 1 && pid > 0 && ready == 1 &&
+                    (Buggy == 1 ||
+                        (owners == 1 && scan_complete == 1 && owner_tab == tab &&
+                         owner_pid == pid && owner_start == start))
+                ) { 1 } else { 0 }) == 0
+            ) {
+                stranded = gone;
+            }
 
             invariant OnlyIssuerSignaled:
                 signaled == 0 ||
                 (owner_tab == tab && owner_pid == pid && owner_start == start);
             invariant NoDuplicateOwnerSignal: signaled == 0 || owners == 1;
             invariant NoPartialScanSignal: signaled == 0 || scan_complete == 1;
+            invariant OnlyOnItsOwnAnswer:
+                signaled == 0 || (ready_pid == pid && ready_start == start);
+            invariant NeverWaitsOnAGoneNotice: stranded == 0;
         }
     }
 }
@@ -269,11 +382,27 @@ pub fn harness_upgrade_notice_owner_model() -> Model {
 ///   sat four days behind two poll loops that could never end, told once and
 ///   never again.
 /// - `NeverEndsRunningWork`: aterm never ends the agent while its own work
-///   runs, or at a break (`cut`).
+///   runs, at a break, or on a status of Claude's own that is not `idle`
+///   (`cut`).
 /// - `NoHastySupersede`: a READY answer gets a whole bound of its own before
 ///   work it outlives supersedes it, by a re-ask or a give-up (`hasty`). The
 ///   review of 2026-09-26 found that a notice's clock alone gave up on a READY
 ///   answered seconds before.
+///
+/// CLAUDE'S OWN STATUS LAGGING AN IDLE SCREEN (`lag`, the review of
+/// 2026-09-27): `busy` or `shell` standing over a screen the session's own
+/// reader read idle, looks in a row, with nothing under the agent the kernel
+/// can see. Work in the agent's own process — a background agent, a workflow
+/// — is no process under it, and that status is the one word that says it
+/// runs: the Drain step asks Claude's own `idle` of the signal. So a lag is
+/// held like the agent's work: the agent is never ended on it (`cut`), and
+/// its READY is asked again past the bound, then given up on — never waited
+/// on in silence. The notice and the release it may take type one line and
+/// end nothing; they are the never-strands model's. Two knobs, one defect
+/// each: `LagEnds`, the restart taking the lagging status for idle (caught by
+/// `NeverEndsRunningWork`), and `LagHolds`, the tempting wrong fix — the
+/// restart kept to `idle` but the READY behind the lag waited on for good
+/// (caught by `NoSilentWait`).
 ///
 /// `Buggy=1` is the drain before these bounds. It never voids, so it waits on
 /// the person for good and ends the agent the moment they let go. At a break,
@@ -287,6 +416,8 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
     crate::ty_model! {
         HarnessUpgradeDrainBound {
             const Buggy = 0;
+            const LagEnds = 0;
+            const LagHolds = 0;
             const Bound = 2;
             const MaxAsks = 2;
             var waited = 0;
@@ -296,6 +427,7 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
             var person = 0;
             var agent = 0;
             var brk = 0;
+            var lag = 0;
             var stale = 0;
             var silent = 0;
             var cut = 0;
@@ -313,19 +445,28 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
             }
             action AtBreak when (ended == 0 && gaveup == 0 && brk == 0) { brk = 1; }
             action AtIdle when (ended == 0 && gaveup == 0 && brk == 1) { brk = 0; }
+            // Claude's own status lags an idle screen, or catches up with it.
+            action StatusLags when (ended == 0 && gaveup == 0 && lag == 0) { lag = 1; }
+            action StatusIdle when (ended == 0 && gaveup == 0 && lag == 1) { lag = 0; }
 
+            // At an idle point a READY waits on a person, on the agent's own
+            // work, or on a status that lags (`LagEnds`: never); the re-ask
+            // bounds the work and the lag (`LagHolds`: never the lag).
             action Wait when (
                 ended == 0 && gaveup == 0 &&
-                ((Buggy == 1 && (brk == 1 || (ready == 1 && (person == 1 || agent == 1)))) ||
+                ((Buggy == 1 &&
+                  (brk == 1 || (ready == 1 && (person == 1 || agent == 1 || lag == 1)))) ||
                  (brk == 1 && Buggy == 0 &&
                   ((ready == 0 && waited <= Bound - 1) ||
                    (ready == 0 && person == 1 && asks <= MaxAsks - 1) ||
                    (ready == 1 && aged <= Bound - 1 && (person == 0 || waited <= Bound - 1)))) ||
                  (brk == 0 && ready == 0 &&
                   (waited <= Bound - 1 || (person == 1 && asks <= MaxAsks - 1))) ||
-                 (brk == 0 && ready == 1 && Buggy == 0 && (person == 1 || agent == 1) &&
+                 (brk == 0 && ready == 1 && Buggy == 0 &&
+                  (person == 1 || agent == 1 || (lag == 1 && LagEnds == 0)) &&
                   (person == 0 || waited <= Bound - 1) &&
-                  (agent == 0 || person == 1 || aged <= Bound - 1)))
+                  ((agent == 0 && (lag == 0 || LagEnds == 1 || LagHolds == 1)) ||
+                   person == 1 || aged <= Bound - 1)))
             ) {
                 stale = if ready == 1 && person == 1 && waited > Bound - 1 { 1 } else { stale };
                 silent = if person == 0 &&
@@ -345,7 +486,9 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
                 ((brk == 0 && ready == 0 && waited > Bound - 1) ||
                  (Buggy == 0 && brk == 1 &&
                   ((ready == 0 && waited > Bound - 1) || (ready == 1 && aged > Bound - 1))) ||
-                 (Buggy == 0 && brk == 0 && ready == 1 && agent == 1 && aged > Bound - 1) ||
+                 (Buggy == 0 && brk == 0 && ready == 1 &&
+                  (agent == 1 || (lag == 1 && LagEnds == 0 && LagHolds == 0)) &&
+                  aged > Bound - 1) ||
                  (Buggy == 1 && ready == 1 && agent == 1 && waited > Bound - 1))
             ) {
                 hasty = if ready == 1 && aged <= Bound - 1 { 1 } else { hasty };
@@ -360,18 +503,21 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
                  (Buggy == 0 && brk == 1 &&
                   ((ready == 0 && waited > Bound - 1) ||
                    (ready == 1 && aged > Bound - 1 && person == 0))) ||
-                 (Buggy == 0 && brk == 0 && ready == 1 && agent == 1 && aged > Bound - 1 &&
-                  person == 0) ||
+                 (Buggy == 0 && brk == 0 && ready == 1 &&
+                  (agent == 1 || (lag == 1 && LagEnds == 0 && LagHolds == 0)) &&
+                  aged > Bound - 1 && person == 0) ||
                  (Buggy == 1 && ready == 1 && agent == 1 && person == 0 && waited > Bound - 1))
             ) {
                 hasty = if ready == 1 && aged <= Bound - 1 { 1 } else { hasty };
                 gaveup = 1;
             }
+            // Only on Claude's own `idle` (`LagEnds`: on a lagging status too).
             action Terminate when (
                 ended == 0 && gaveup == 0 && ready == 1 && person == 0 &&
-                ((brk == 0 && agent == 0) || (Buggy == 1 && waited > Bound - 1))
+                ((brk == 0 && agent == 0 && (lag == 0 || LagEnds == 1)) ||
+                 (Buggy == 1 && waited > Bound - 1))
             ) {
-                cut = if brk == 1 || agent == 1 { 1 } else { cut };
+                cut = if brk == 1 || agent == 1 || lag == 1 { 1 } else { cut };
                 ended = 1;
             }
 
@@ -421,6 +567,20 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// owing the release. A person's hold voids in either phase. Both are the
 /// environment's holds; Tier-1 checks each where the model allows it.
 ///
+/// A BREAK THAT MAY NEVER END (`brk`, 2026-09-27): the agent's turn is over
+/// and only work it started runs — two widowed `tail -f` shells under a
+/// Claude Code whose status read `shell`, every screen a break and no idle
+/// point for as long as they lived. The environment enters a break and may
+/// leave it, or never (no fairness back to an idle point). There the upgrade
+/// ends nothing (`Restart` is an idle point's), but everything else goes as
+/// at an idle point: the notice, the give-up, a void — the drain's void of a
+/// gave-up upgrade's late READY stands for the restart a break never takes —
+/// and the release, typed or dropped. The last word there is the step that
+/// repeats for as long as the break lasts. `IdleOnlyRelease` is the defect
+/// the incident ran on: the release, its drop and the gave-up void only at
+/// an idle point, so a give-up at a break that never ends left the agent
+/// holding.
+///
 /// `Look` is DERIVED FROM THE REDUCER'S OWN GUARDS (the review of
 /// 2026-09-26): enabled exactly where neither `Restart` nor `Release` nor
 /// `DropRelease` is — the guards spelled again inside it (the release's
@@ -441,7 +601,9 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// reducer's new round — pending again, its asks, window and markers reset —
 /// taken wherever the rest has run out, except over a gave-up round's late
 /// READY, which is still acted on (`Restart`, or voided). The release still
-/// owed is carried: the new round's first notice supersedes it. The last
+/// owed is carried: typed, or dropped, until the round's rest runs out — at
+/// a break too — and past it the new round's first notice, also a break's,
+/// supersedes it. The last
 /// word (`Look`) is now the upgrade's QUIET word — nothing it would do for
 /// the agent at this look: a stopped round's `wait:failed` while it rests,
 /// which the host looks at again, is one. A fifth ghost, `stalled`: the quiet
@@ -477,16 +639,18 @@ pub fn harness_upgrade_drain_bound_model() -> Model {
 /// before the agent answers it, and a look mid-turn drops the release the
 /// READY it then gives needed), `ReadyOverDirection` (a READY stays the last
 /// word past a direction the agent never answered — an Esc, a message met by
-/// a `<synthetic>` row). `Buggy = 1` is the reducer before the fix, the
+/// a `<synthetic>` row), `IdleOnlyRelease` (the release and a gave-up
+/// upgrade's void only at an idle point, never at a break — the
+/// 2026-09-27 incident). `Buggy = 1` is the reducer before the fix, the
 /// incident's three at once (`NoF1`, `NoF2`, `NoOwe`), and the terminal
 /// `failed` of 2026-09-27 (`Terminal`). Tier-1 in
 /// aterm-agent's `harness::upgrade_drive` tests drives the real reducer,
 /// gates, record transitions, transcript readers and the host's reading of
-/// each step's word over every reachable state — and a gave-up round's late
-/// READY at a BREAK of the agent's own work too, which this model has none
-/// of: the real code must `Void` there exactly where the model voids, so the
-/// break's old `wait:background` is caught — and replays the incident, the
-/// pre-fix trace as the caught negative control.
+/// each step's word over every reachable state — a gave-up round's late
+/// READY at a BREAK of the agent's own work (`brk`) among them: the real code
+/// must `Void` there exactly where the model voids, so the break's old
+/// `wait:background` is caught — and replays the incident, the pre-fix trace
+/// as the caught negative control.
 ///
 /// ONE STATED EXCEPTION, outside the model: an agent found to be no job of a
 /// job-control shell is refused and owed no release
@@ -508,9 +672,11 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             const StaleDirection = 0;
             const UnansweredDirection = 0;
             const ReadyOverDirection = 0;
+            const IdleOnlyRelease = 0;
             const Terminal = 0;
             const MaxAsks = 2;
             var limited = 0;
+            var brk = 0;
             var phase = 0;
             var asks = 0;
             var window = 0;
@@ -567,6 +733,14 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             ) {
                 window = 1;
             }
+            // A break of the agent's own work: its turn over, work it started
+            // still running. It may end, or never.
+            action BreakBegins when (brk == 0) {
+                brk = 1;
+            }
+            action BreakEnds when (brk == 1) {
+                brk = 0;
+            }
             // A stopped round's rest runs out (`RETRY_S` since it stopped),
             // limited or not: the round it lets start types nothing there.
             action Rests when ((phase == 2 || phase == 4) && rest == 0) {
@@ -597,8 +771,9 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 owed = if NoOwe == 1 { owed } else { 1 };
                 rest = 0;
             }
+            // Never at a break: the restart would end the work that runs.
             action Restart when (
-                ready == 1 && live == 1 && limited == 0 &&
+                ready == 1 && live == 1 && limited == 0 && brk == 0 &&
                 (phase == 1 || (phase == 2 && Buggy == 0 && NoF2 == 0))
             ) {
                 phase = 3;
@@ -640,10 +815,13 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             }
             // A person held the READY answer past the drain's bound — an
             // announced upgrade's, or the late answer a gave-up one hears —
-            // or the agent's own background work held a gave-up one's.
+            // or the agent's own background work held a gave-up one's: at an
+            // idle point, and at a break (`IdleOnlyRelease`: a gave-up one's
+            // only at an idle point).
             action Void when (
                 ready == 1 && live == 1 && limited == 0 &&
-                ((phase == 1 && window == 1) || (phase == 2 && Buggy == 0 && NoF2 == 0))
+                ((phase == 1 && window == 1) ||
+                 (phase == 2 && Buggy == 0 && NoF2 == 0 && (brk == 0 || IdleOnlyRelease == 0)))
             ) {
                 ready = 0;
                 live = 0;
@@ -681,9 +859,11 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // The release's point: it waits behind a READY only where the
             // phase acts on it (`KeepReady` waits behind any), and is typed
             // unless the agent took up direction given after its last answer
-            // (`UnansweredDirection`: or was merely given one).
+            // (`UnansweredDirection`: or was merely given one) — at a break
+            // as at an idle point (`IdleOnlyRelease`: never at a break).
             action Release when (
                 owed == 1 && limited == 0 && NoType == 0 &&
+                (brk == 0 || IdleOnlyRelease == 0) &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                 (phase == 2 || phase == 4 || (phase == 1 && window == 0)) &&
                 directed == 0 && ((UnansweredDirection == 0 && Buggy == 0) || told == 0) &&
@@ -701,6 +881,7 @@ pub fn harness_upgrade_never_strands_model() -> Model {
             // word is its stop).
             action DropRelease when (
                 owed == 1 && NoType == 0 &&
+                (brk == 0 || IdleOnlyRelease == 0) &&
                 (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                 (phase == 2 || phase == 4 || (phase == 1 && window == 0 && limited == 0)) &&
                 (directed == 1 || ((UnansweredDirection == 1 || Buggy == 1) && told == 1)) &&
@@ -712,18 +893,22 @@ pub fn harness_upgrade_never_strands_model() -> Model {
                 dropheld = if holding == 1 { 1 } else { dropheld };
             }
             // THE QUIET WORD at a point the agent can read: nothing left the
-            // upgrade would do now — no restart, no release typed or dropped,
-            // no new round (`LastWhileOwed`: a stop's own word said over a
-            // release still owed). Said past a stopped round's rest, it is a
-            // permanent wait (`stalled`).
+            // upgrade would do now — no restart (at a break, where none is
+            // taken, the drain's void of a gave-up upgrade's READY stands for
+            // it), no release typed or dropped, no new round (`LastWhileOwed`:
+            // a stop's own word said over a release still owed). At a break
+            // it is the word the break repeats; said past a stopped round's
+            // rest, it is a permanent wait (`stalled`).
             action Look when (
                 (phase == 2 || phase == 4) && limited == 0 && stuck == 0 &&
                 (if (
                     ready == 1 && live == 1 && limited == 0 &&
-                    (phase == 1 || (phase == 2 && Buggy == 0 && NoF2 == 0))
+                    (phase == 1 || (phase == 2 && Buggy == 0 && NoF2 == 0)) &&
+                    (brk == 0 || IdleOnlyRelease == 0)
                 ) { 1 } else { 0 }) +
                 (if (LastWhileOwed == 1 && phase == 4) { 0 } else if (
                     owed == 1 && limited == 0 && NoType == 0 &&
+                    (brk == 0 || IdleOnlyRelease == 0) &&
                     (ready == 0 || (phase == 4 && KeepReady == 0)) &&
                     (phase == 2 || phase == 4 || (phase == 1 && window == 0))
                 ) { 1 } else { 0 }) +

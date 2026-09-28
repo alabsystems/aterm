@@ -440,6 +440,122 @@ pub fn deserialize_lines_strict(
     (offset == data.len()).then_some(lines)
 }
 
+/// The largest line record [`deserialize_lines_strict_dropping_over_cap_links`]
+/// decodes: `max_record_bytes` plus the most one line's hyperlinks can add at
+/// `max_cells_per_line` columns — one span per column, each at the OSC 8
+/// ingestion ceilings (an 8 KiB URL, a 256-byte id and 12 bytes of framing:
+/// 8,460 bytes a column). At 80 columns and the handoff's record cap
+/// (`16 KiB + cols * 512`) that is 734,144 bytes; at the widest grid (4,096
+/// columns) 36,765,696.
+#[must_use]
+pub const fn max_linked_record_bytes(max_record_bytes: usize, max_cells_per_line: usize) -> usize {
+    max_record_bytes.saturating_add(
+        max_cells_per_line.saturating_mul(super::line_codec::MAX_HYPERLINK_SPAN_BYTES),
+    )
+}
+
+/// [`deserialize_lines_strict`], except that a line record over
+/// `max_record_bytes` BECAUSE OF ITS HYPERLINKS is kept with its hyperlinks
+/// dropped instead of refusing the whole block. Returns the lines and the
+/// index of every line that lost its links, ascending.
+///
+/// Why it exists: an OSC 8 URL may be 8 KiB and a row of a handful of one-cell
+/// links carries each URL once per span, so a dozen such links in an
+/// 80-column row make a ~96 KiB record against a 56 KiB cap. A writer that
+/// did not drop those links first (the update's history-sidecar export through
+/// v0.97.0) wrote such records, and a reader that refused the block for one
+/// of them lost every line beside it. The text was never the problem.
+///
+/// Exactly that refusal is relaxed, and only as far as an honest writer can
+/// reach. A record over `max_record_bytes` is kept only when all of these
+/// hold, and otherwise the block is refused as [`deserialize_lines_strict`]
+/// refuses it:
+///
+/// - it is at most [`max_linked_record_bytes`] — the HARD CEILING: no record
+///   past it is decoded, so one hostile record cannot make a line allocate
+///   more than that;
+/// - it decodes under every other strict bound (content bytes, attrs entries,
+///   hyperlink and underline span columns);
+/// - the line re-serializes to exactly the record's bytes, so nothing in the
+///   record was truncated or skipped by the decode and its size is the line's
+///   own (the round trip the update handoff's `strip_blob_links` also
+///   requires);
+/// - the line has hyperlinks;
+/// - with them dropped ([`Line::clear_hyperlinks`], which keeps the text,
+///   attrs, flags and underline colours) the line re-serializes within
+///   `max_record_bytes`, so what is kept is inside the cap the caller set.
+///
+/// A block [`deserialize_lines_strict`] admits decodes to the very same lines
+/// here, none of them stripped: every record within the cap takes the strict
+/// path unchanged.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn deserialize_lines_strict_dropping_over_cap_links(
+    data: &[u8],
+    max_lines: usize,
+    max_cells_per_line: usize,
+    max_content_bytes_per_line: usize,
+    max_record_bytes: usize,
+) -> Option<(Vec<Line>, Vec<usize>)> {
+    let header = data.get(..4)?;
+    let count = u32::from_le_bytes(header.try_into().ok()?) as usize;
+    if count > max_lines {
+        return None;
+    }
+    let ceiling = max_linked_record_bytes(max_record_bytes, max_cells_per_line);
+    let mut lines = Vec::new();
+    lines.try_reserve_exact(count).ok()?;
+    let mut stripped = Vec::new();
+    let mut offset = 4usize;
+    while lines.len() < count {
+        let record = data.get(offset..)?;
+        let decoded = decode_line_strict(
+            record,
+            max_cells_per_line,
+            max_content_bytes_per_line,
+            max_record_bytes,
+        );
+        let (line, size) = match decoded {
+            Some(decoded) => decoded,
+            None => {
+                let (mut line, size) = decode_line_strict(
+                    record,
+                    max_cells_per_line,
+                    max_content_bytes_per_line,
+                    ceiling,
+                )?;
+                // Within the cap it failed the strict decode for another
+                // reason (the same call cannot pass under a larger cap then);
+                // over it with no link, links are not why it is over.
+                if size <= max_record_bytes || !line.has_hyperlinks() {
+                    return None;
+                }
+                // Only a record the serializer itself would write for this
+                // line: `Line::deserialize` quietly truncates what it does not
+                // keep (underline-colour spans past `MAX_UNDERLINE_SPANS`, for
+                // one), so a size judged on the DECODED line could admit bytes
+                // its links do not account for. Byte for byte, the record's
+                // size is the line's, and dropping the links removes exactly
+                // their bytes and nothing else. `strip_blob_links` in the
+                // update handoff holds its own carry to the same round trip.
+                if line.serialize().as_slice() != record.get(..size)? {
+                    return None;
+                }
+                line.clear_hyperlinks();
+                if line.serialize().len() > max_record_bytes {
+                    return None;
+                }
+                stripped.push(lines.len());
+                (line, size)
+            }
+        };
+        let end = offset.checked_add(size)?;
+        lines.push(line);
+        offset = end;
+    }
+    (offset == data.len()).then_some((lines, stripped))
+}
+
 fn decode_line_strict(
     record: &[u8],
     max_cells_per_line: usize,

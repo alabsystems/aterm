@@ -338,10 +338,9 @@ fn resolve_active(active: &ActiveHandle) -> Option<Target> {
 const NO_ACTIVE_TERMINAL: &str = "ERR no active terminal\n";
 
 /// Every operator verb's answer when this process runs no embedded operator:
-/// off by default, or on but failed to start (the launch log says which). Both
-/// need the key at launch, so the reply names it.
-const OPERATOR_UNAVAILABLE: &str =
-    "ERR operator unavailable: needs [operator] enabled = true in aterm.toml at launch\n";
+/// off by default, or on but failed to start (the launch log says which).
+const OPERATOR_UNAVAILABLE: &str = "ERR operator unavailable: it runs only with [operator] \
+     enabled = true in aterm.toml at launch; if that is set, aterm.log says why it did not start\n";
 
 /// The self-feed floor's refusal ([`crate::inject_floor`]: a 256 KiB burst,
 /// refilled at 256 KiB/s). Drivers key on the `ERR rate` head and back off.
@@ -3875,22 +3874,15 @@ pub(crate) fn spawn(
         crate::logging::stderr_line!(
             "aterm-gui: control socket listening at {sock_path} (token-gated, same-uid only)"
         );
+        // Same `listening at <PATH> (token-gated` shape aterm-nest parses, with
+        // the HONEST posture parenthetical (never silently claim same-uid): a peer
+        // running as another user is refused (SIO_AF_UNIX_GETPEERPID); where the
+        // ioctl or the peer's token is unavailable, the control directory's
+        // owner-only DACL + the per-launch token are the gates.
         #[cfg(windows)]
-        {
-            // Same `listening at <PATH> (token-gated` shape aterm-nest parses,
-            // with the HONEST posture parenthetical, plus the one-line notice of
-            // what the peer check can and cannot decide (never silently claim
-            // same-uid).
-            crate::logging::stderr_line!(
-                "aterm-gui: control socket listening at {sock_path} (token-gated, dir-ACL + peer pid)"
-            );
-            crate::logging::stderr_line!(
-                "aterm-gui: control socket peer check on Windows: a peer (SIO_AF_UNIX_GETPEERPID) \
-                 running as another user is refused; where the ioctl or the peer's token is \
-                 unavailable, the control directory's owner-only DACL + the per-launch token \
-                 are the gates"
-            );
-        }
+        crate::logging::stderr_line!(
+            "aterm-gui: control socket listening at {sock_path} (token-gated, dir-ACL + peer pid)"
+        );
         let listener = publish_discovery(socket, root_identity.as_ref(), &store);
         // THE HANDOFF WINDOW'S CLOSE: our entries are published, so a handed-off id
         // is held by them now — take each transferred claim (the predecessor has

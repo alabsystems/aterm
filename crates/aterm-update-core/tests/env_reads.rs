@@ -737,10 +737,8 @@ fn call_role(code: &[u8], open: usize) -> CallRole {
 /// Tables whose `&str` elements are names a parent STRIPS from, or SETS in, a child's
 /// environment, never reads: a family name listed in one is not a read of it. The
 /// child-env deny list, and the verify gate's git stamp — the `aterm-gui` build
-/// script's inputs, handed to the gate's own child builds (`aterm_verify::GIT_STAMP_ENV`);
-/// and the release artifact the gate hands its paint and spin suites
-/// (`aterm_verify::stages::RELEASE_BIN_VARS`).
-const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS", "GIT_STAMP_ENV", "RELEASE_BIN_VARS"];
+/// script's inputs, handed to the gate's own child builds (`aterm_verify::GIT_STAMP_ENV`).
+const WRITE_TABLES: &[&str] = &["ENV_DENY_VARS", "GIT_STAMP_ENV"];
 
 /// The one place a RETIRED name may be named in shipped code: the doctor's detector,
 /// which reads PRESENCE only (`var_os(name).is_some()`), never acts on it, and tells a
@@ -1401,9 +1399,13 @@ fn the_scanner_reads_calls_not_mentions() {
 use crate::knobs::QUIET_BY_DEREF;
 const KNOB: &str = "ATERM_BY_CONST";
 const QUIET_BY_DEREF: &str = "ATERM_BY_DEREF_CONST";
+const ARTIFACT: &str = "ATERM_WRITTEN_BY_CONST";
+const ALSO_READ: &str = "ATERM_WRITTEN_AND_READ_BY_CONST";
 pub const ENV_DENY_VARS: &[&str] = &["ATERM_IN_THE_DENY_TABLE"];
 fn f(cmd: &mut std::process::Command) {
     cmd.env("ATERM_A_BUILDER_SET", "1").env_remove("ATERM_A_BUILDER_REMOVE");
+    cmd.env(ARTIFACT, "release/aterm").env(ALSO_READ, "release/aterm");
+    let _ = std::env::var_os(ALSO_READ);
     aterm_log::env::set("ATERM_A_SET", "1");
     aterm_log::env::unset("ATERM_AN_UNSET");
     let _ = std::env::var("ATERM_LITERAL_READ");
@@ -1455,6 +1457,7 @@ mod tests {
             ("ATERM_JUST_A_STRING", ReadKind::Runtime),
             ("ATERM_LITERAL_READ", ReadKind::Runtime),
             ("ATERM_LOG_ENV_READ", ReadKind::Runtime),
+            ("ATERM_WRITTEN_AND_READ_BY_CONST", ReadKind::Runtime),
         ])
     );
     // A retired name in a string's CONTENT (an embedded script) is caught as text.

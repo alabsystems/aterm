@@ -350,6 +350,10 @@ impl NetState {
     /// A loop asks for `who` (its session): its lease renewed, and the
     /// verdict now ([`Self::reach`]).
     pub fn ask(&mut self, who: &str, now: Instant, wall: SystemTime) -> Reach {
+        // A resolver can hold the worker indefinitely. Expire old sessions
+        // here too, so tab churn cannot retain every historical lease while
+        // the worker is unable to reach next_probe's cleanup.
+        self.waiting(now);
         self.waiters.insert(who.to_string(), now);
         self.reach(now, wall)
     }
@@ -467,6 +471,41 @@ mod tests {
     fn measured(st: &mut NetState, outcome: Outcome, t: Instant, w: SystemTime) {
         assert!(st.begin(t));
         st.finish(outcome, t, w);
+    }
+
+    /// The worker cannot prune while DNS is stuck. New asks must retire
+    /// expired sessions themselves, including the exact lease boundary,
+    /// while retaining current peers and leaving the single flight alone.
+    #[test]
+    fn asks_expire_churned_sessions_even_while_the_probe_is_stuck() {
+        let (t, w) = t0();
+        let mut st = NetState::default();
+        let mut old = NetState::default();
+        assert!(st.begin(t));
+        assert!(old.begin(t));
+        for n in 0..128_u32 {
+            let elapsed = NET_LEASE * n;
+            let at = t + elapsed;
+            let wall = w + elapsed;
+            assert_eq!(st.ask("live-peer", at, wall), Reach::Unknown);
+            let who = format!("churn-{n}");
+            assert_eq!(st.ask(&who, at, wall), Reach::Unknown);
+            assert_eq!(st.waiters.len(), 2, "old leases retire at their boundary");
+            assert!(st.waiters.contains_key("live-peer"));
+            assert!(st.waiters.contains_key(&who));
+            assert_eq!(st.flight, Some(t), "no second probe is started");
+
+            // Historical ask only inserted. No worker cleanup runs in
+            // either arm, so this control retains every departed session.
+            old.waiters.insert("live-peer".to_string(), at);
+            old.waiters.insert(who, at);
+            assert_eq!(old.reach(at, wall), Reach::Unknown);
+        }
+        assert_eq!(old.waiters.len(), 129, "the old path grows with history");
+
+        let at = t + NET_LEASE * 127;
+        st.ask("new-peer", at + NET_LEASE - S, w + NET_LEASE * 128 - S);
+        assert_eq!(st.waiters.len(), 3, "leases not yet expired stay live");
     }
 
     /// THE SCHEDULE: nothing while nobody waits; a probe at once for the

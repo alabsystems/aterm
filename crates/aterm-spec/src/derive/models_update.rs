@@ -679,6 +679,48 @@ pub fn native_update_auto_intent_model() -> Model {
 /// failure's "confirming retry, ten minutes out" ran 1.4 s after the first
 /// failure — then converged the lane for a day. `NoEarlyRelease` catches it:
 /// once a failure latched the lane, an unlatched lane means the deadline came.
+///
+/// AND A CONVERGED LATCH ON THE ACTIVATION IS NOT A DEAD END (round three of the
+/// 2026-09 update robustness work). `Converge` is the structural verdict on the
+/// swapped bundle's activation with its one re-sample spent or held: no deadline
+/// will come, so `Due` never fires again. `NewerRelease` is a verified newer
+/// build staged behind it, and the healthy lane's look at it is `Supersede`:
+/// the running build takes the install path back, the activation's trial is
+/// disarmed without a launch, and the newer build is armed as a new artifact on
+/// a ladder of its own — which is why the phase starts over there and only
+/// there. Two mutants, each its own dead action: `NewerReleaseIgnored`, the
+/// look that keeps the latch (every release before gap 14, and gap 14 wherever
+/// the activation's trial had no room), and `NewerReleaseRetriesTheActivation`,
+/// gap 14's own answer — the latch opens for one more attempt at the activation,
+/// whose successor refuses to boot-apply past itself, so what lands is the
+/// build that failed. `ANewerReleaseClearsAConvergedLatch` catches both at the
+/// look; `NeverLandsTheSupersededActivation` catches the second at its landing,
+/// and `NoEarlyRelease` there too.
+///
+/// AND THE RETIRE CAN BE REFUSED (round three review). `Supersede` is the look
+/// whose retire LANDS; `SupersedeRefused` is the environment refusing it —
+/// the verification's budget run out on a captive-portal network, the apply
+/// lock held past its wait, a stage being replaced, or a disk the retire
+/// cannot undo — with nothing moved. The healthy lane does not spend the
+/// release on a refusal: it waits out a retry deadline (`retry`, cleared by
+/// `SupersedeRetryDue`) and offers it again. The mutant
+/// `RefusedRetireSpendsTheRelease` is what round three first shipped — the
+/// refused release spent for good, so the machine waited for a still newer
+/// build or a person — and it is caught at the look it spent
+/// (`ANewerReleaseClearsAConvergedLatch`) and, as a livelock, by the liveness.
+///
+/// AND LAW 1 ITSELF IS CHECKED, not only its safety proxies (round three, plan
+/// P1-7): [`native_update_apply_ladder_liveness`] states "the staged build
+/// lands" as a liveness property over whole behaviours. Every invariant above
+/// is a bad STATE, and the deadlock check sees only a state with no way out.
+/// A lane that keeps retrying the same refusal, or keeps waiting behind a latch
+/// no deadline will lift, has neither: the terminal keeps producing output and
+/// every step is legal. The round-one audit found exactly that shape, green
+/// under every check this model had. `CaptureRefusedAsActivity` and
+/// `NewerReleaseIgnored` are now genuine livelocks rather than one-step
+/// detours: the healthy answer is no longer available after the mutant's step,
+/// so the historical "retried forever" and "waited forever" are what the
+/// mutants do.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_apply_ladder_model() -> Model {
@@ -716,6 +758,19 @@ pub fn native_update_apply_ladder_model() -> Model {
             // swap has retired the download for its activation.
             var due = 0;
             var swapped = 0;
+            // THE CONVERGED LATCH (round three): the structural verdict on the
+            // activation with no deadline left, a verified newer release behind
+            // it, whether the lane has looked at that release, whether the
+            // newer build took the activation's place, and whether a landing
+            // was the newer build.
+            var converged = 0;
+            var newer = 0;
+            var looked = 0;
+            var superseded = 0;
+            var parked_newer = 0;
+            // A refused retire's release waits out its retry deadline before
+            // the lane offers it again (round three review).
+            var retry = 0;
             // The wall clock. Not guarded on the latch: the anchor keeps
             // counting while a physical-failure latch holds, and `reached` is
             // the high-water mark the phase may never fall below.
@@ -791,6 +846,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_output = output;
                 parked_focused = focused;
                 parked_warmup = warmup;
+                parked_newer = superseded;
             }
             // A PARK THAT MISSED ITS FREEZE BUDGET: the readers are back, nothing
             // was granted, and the machine was busy. A fact about the moment,
@@ -810,9 +866,16 @@ pub fn native_update_apply_ladder_model() -> Model {
             // refusing session is carried at a degraded rung, and what no rung
             // can lower is typed `CaptureRefused` and retried when the desk
             // changes, never on the activity spacing.
+            //
+            // `refusals == 0` is always true in the healthy lane, which never
+            // re-files a refusal. It is what makes the v0.91 mutant below a
+            // LOOP rather than a detour: a lane that has filed a refusal as
+            // activity is the lane whose classifier sends every refusal there
+            // (every capture `Err` was a park miss), so it has no refusal lane
+            // to come back to.
             action CaptureRefused when (
                 landed == 0 && manual_only == 0 && latched == 0 && warmup == 0 &&
-                refusing == 1 && degraded == 0 &&
+                refusing == 1 && degraded == 0 && refusals == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
@@ -824,18 +887,21 @@ pub fn native_update_apply_ladder_model() -> Model {
             // park miss — the terminal reads as busy, the desk is never
             // answered for, and the same refusal comes back every fifteen
             // minutes forever. Its own dead action, so the closure can credit
-            // it as an independently caught negative control; once, to keep
-            // the space finite.
+            // it as an independently caught negative control. It fires every
+            // time the park's gate opens on the refusing desk, which is the
+            // "forever": `TheLadderLands` catches the loop itself, and
+            // `RefusalNeverRetriesAsActivity` its first step. `refusals` is a
+            // flag, so the loop costs the space nothing.
             action CaptureRefusedAsActivity when (
                 Buggy == 1 && landed == 0 && manual_only == 0 && latched == 0 &&
-                warmup == 0 && refusing == 1 && degraded == 0 && refusals == 0 &&
+                warmup == 0 && refusing == 1 && degraded == 0 &&
                 (phase == Land ||
                     (keys == 1 && (phase == 2 ||
                         (phase == 1 && (focused == 0 || output == 1)) ||
                         (phase == 0 && quiet == 1))))
             ) {
                 quiet = 0;
-                refusals = refusals + 1;
+                refusals = 1;
             }
             // A GENUINE PHYSICAL FAILURE of an admitted park (a successor that
             // died, a proof that did not match): the lane latches for the
@@ -853,7 +919,9 @@ pub fn native_update_apply_ladder_model() -> Model {
             }
             // The latch's deadline passes (its `retry_at`, 600 s out for the
             // first failure).
-            action Due when (landed == 0 && manual_only == 0 && latched == 1 && due == 0) {
+            action Due when (
+                landed == 0 && manual_only == 0 && latched == 1 && due == 0 && converged == 0
+            ) {
                 due = 1;
             }
             // The latch lapses AT its deadline: the intent is re-armed and the
@@ -881,6 +949,85 @@ pub fn native_update_apply_ladder_model() -> Model {
             ) {
                 swapped = 1;
                 latched = 0;
+            }
+            // THE STRUCTURAL CONVERGENCE ON THE ACTIVATION (round three): the
+            // latch the bundle swap re-keyed stands with no deadline left.
+            action Converge when (
+                landed == 0 && manual_only == 0 && latched == 1 && swapped == 1 &&
+                due == 0 && converged == 0
+            ) {
+                converged = 1;
+            }
+            // A verified newer release is staged behind it.
+            action NewerRelease when (
+                landed == 0 && manual_only == 0 && converged == 1 && newer == 0
+            ) {
+                newer = 1;
+            }
+            // THE HEALTHY LOOK: the newer build takes the activation's place
+            // (the running build back at the install path, the activation's
+            // trial disarmed, never launched) and is armed as a new artifact —
+            // on its own ladder, so the phase starts over here and only here.
+            //
+            // `looked == 0`: a LANDED look is the lane's one answer to that
+            // release (`AutoApplyStructuralVerdict::newer_spent`), and the
+            // healthy look sets `looked` and `superseded` together, so this
+            // changes nothing there; it is what makes a look that KEPT the
+            // latch final, as it was in every release before gap 14 — the
+            // newer release waited forever. `retry == 0`: a release waiting out
+            // a refusal's retry deadline is offered only once it passes.
+            action Supersede when (
+                landed == 0 && manual_only == 0 && converged == 1 && newer == 1 &&
+                superseded == 0 && looked == 0 && retry == 0
+            ) {
+                latched = 0;
+                superseded = 1;
+                looked = 1;
+                phase = 0;
+                reached = 0;
+            }
+            // THE RETIRE REFUSED — the environment's, and not assumed away:
+            // nothing moved, the latch stands, and the release is NOT spent.
+            // It waits out a retry deadline and is offered again.
+            action SupersedeRefused when (
+                landed == 0 && manual_only == 0 && converged == 1 && newer == 1 &&
+                superseded == 0 && looked == 0 && retry == 0
+            ) {
+                retry = 1;
+            }
+            // The refused release's retry deadline passes (the lane's own
+            // clock: `AutoApplyStructuralVerdict::newer_retry`).
+            action SupersedeRetryDue when (landed == 0 && manual_only == 0 && retry == 1) {
+                retry = 0;
+            }
+            // THE MUTANTS, each its own dead action. The look that keeps the
+            // latch: the newer release waits behind it, for good (a LIVELOCK:
+            // the terminal keeps doing whatever it does, and nothing is ever
+            // stuck, so no deadlock check can see it — `TheLadderLands` does).
+            action NewerReleaseIgnored when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && converged == 1 &&
+                newer == 1 && looked == 0 && superseded == 0 && retry == 0
+            ) {
+                looked = 1;
+            }
+            // Gap 14's answer: the latch opens for one more attempt at the
+            // activation, which is what then lands.
+            action NewerReleaseRetriesTheActivation when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && converged == 1 &&
+                newer == 1 && looked == 0 && superseded == 0 && retry == 0
+            ) {
+                looked = 1;
+                latched = 0;
+            }
+            // Round three as first shipped: a refused retire SPENDS the release
+            // — whatever refused it, a moment or the disk — so it is never
+            // offered again, and the latch stands over it for good (a
+            // livelock, like the look that kept the latch).
+            action RefusedRetireSpendsTheRelease when (
+                Buggy == 1 && landed == 0 && manual_only == 0 && converged == 1 &&
+                newer == 1 && looked == 0 && superseded == 0 && retry == 0
+            ) {
+                looked = 1;
             }
             // THE 2026-09-21 MUTANTS. A park miss filed as a physical failure
             // with a two-attempt lifetime: the lane latches.
@@ -912,6 +1059,7 @@ pub fn native_update_apply_ladder_model() -> Model {
                 parked_output = output;
                 parked_focused = focused;
                 parked_warmup = warmup;
+                parked_newer = superseded;
             }
             invariant ActivityNeverLatchesManualOnly: manual_only == 0;
             invariant TheLadderNeverRestarts: reached <= phase;
@@ -922,10 +1070,20 @@ pub fn native_update_apply_ladder_model() -> Model {
             // after a physical failure, an unlatched lane is a due one.
             invariant NoEarlyRelease:
                 if failures == 1 && latched == 0 {
-                    due == 1
+                    due == 1 || superseded == 1
                 } else {
                     due <= 1
                 };
+            // A newer release behind a converged latch takes the activation's
+            // place at the look (round three): the look that sees it clears the
+            // latch by superseding, never by keeping it or retrying — and a
+            // refused retire leaves it unspent, to be offered again.
+            invariant ANewerReleaseClearsAConvergedLatch:
+                if looked == 1 { superseded == 1 } else { superseded <= 1 };
+            // …and what lands is the newer build, never the activation it
+            // superseded.
+            invariant NeverLandsTheSupersededActivation:
+                if landed == 1 && newer == 1 { parked_newer == 1 } else { parked_newer <= 1 };
             invariant ParkedOnlyWhenTheLadderAdmits:
                 if landed == 1 {
                     parked_warmup == 0 && (parked_phase == Land ||
@@ -936,6 +1094,77 @@ pub fn native_update_apply_ladder_model() -> Model {
                     landed <= 1
                 };
         }
+    }
+}
+
+/// LAW 1 OF THE APPLY LADDER, as a property of whole behaviours
+/// (docs/DESIGN-auto-apply-ladder-2026-09-21.md, *The law*): "a verified staged
+/// build applies by itself … within a bounded wall-clock time of being armed —
+/// on any machine, including one that is never idle."
+///
+/// The property is `[]<>(landed \/ (converged /\ ~newer))`. The staged build
+/// lands; the one rest the law allows short of that is Law 2's: a genuine
+/// physical failure whose schedule has CONVERGED, with no newer release staged
+/// (the convergence notice and the Version menu are the person's). A newer
+/// release behind that latch leaves the goal, so from there the newer build
+/// must land. It is "again and again" rather than "eventually" because a
+/// behaviour that reaches the converged rest and then leaves it must still land:
+/// under `<>` the first visit would excuse everything after it.
+///
+/// THE ENVIRONMENT IS NOT FAIR. Output, keystrokes, focus, the consent
+/// warm-up's start, the desk refusing or changing, a park missing its freeze
+/// budget, a physical failure, the bundle swap, the convergence verdict and a
+/// newer release are the world's: any of them may happen or not, forever, and
+/// every state may stutter. What the verdict ASSUMES, and nothing more:
+///
+/// * `Advance`, weakly fair — the wall clock moves while the Mac is awake;
+/// * `WarmupEnds`, weakly fair — the consent warm-up hold is capped
+///   (`[privacy] warmup_hold_ms`);
+/// * `Due`, weakly fair — a latch's `retry_at` comes;
+/// * `Lapse`, weakly fair — the lane acts on a due latch; nothing the
+///   environment does disables it once it is enabled;
+/// * `SupersedeRetryDue`, weakly fair — a refused retire's retry deadline
+///   comes (round three review);
+/// * `Park`, `CaptureRefused` and `Supersede`, STRONGLY fair — the lane's poll
+///   re-reads its gate at every instant, so a gate the terminal keeps
+///   re-opening is caught open; and the lane offers a refused release again at
+///   every retry deadline, so a retire the environment keeps letting through
+///   is taken. `Park`'s and `Supersede`'s are also assumptions about the
+///   machine, stated here rather than hidden in the model: a park does not
+///   miss its freeze budget (`ParkMissed`) on every attempt forever, and a
+///   retire is not refused (`SupersedeRefused`) on every attempt forever. A Mac
+///   that cannot freeze for a quarter second, ever, is retried on the activity
+///   spacing without end; a disk the retire can never undo — or a network that
+///   never lets a verification finish — is retried on its backoff without end,
+///   each refusal said in `update status` (and the disk's on glass). Those are
+///   physical facts the law cannot promise past.
+///
+/// The mutants that break it, each alone on the healthy lane: the 2026-09-20
+/// stand-down (`StandDown`) and the park miss filed as a failure
+/// (`ParkMissLatches`) — wedges, which the deadlock check also sees; the v0.91
+/// refusal re-filed as activity forever (`CaptureRefusedAsActivity`), the
+/// newer release left waiting behind a converged latch (`NewerReleaseIgnored`)
+/// and a refused retire that spent the release for good
+/// (`RefusedRetireSpendsTheRelease`) — livelocks, which only this property
+/// sees.
+#[must_use]
+#[cfg_attr(trust_verify, trust::skip)]
+pub fn native_update_apply_ladder_liveness() -> Liveness {
+    Liveness {
+        name: "TheLadderLands",
+        goal: or_(
+            eq(var("landed"), int(1)),
+            and_(eq(var("converged"), int(1)), eq(var("newer"), int(0))),
+        ),
+        weak: vec!["Advance", "WarmupEnds", "Due", "Lapse", "SupersedeRetryDue"],
+        strong: vec!["Park", "CaptureRefused", "Supersede"],
+        mutants: vec![
+            "StandDown",
+            "ParkMissLatches",
+            "CaptureRefusedAsActivity",
+            "NewerReleaseIgnored",
+            "RefusedRetireSpendsTheRelease",
+        ],
     }
 }
 
@@ -2203,7 +2432,8 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 
 /// What a STRUCTURAL convergence of the automatic apply lane may still do: the
 /// latch the lane took on build N's bytes after two handoffs that the bytes
-/// answered for (gap 14, 2026-09-26).
+/// answered for (gap 14, 2026-09-26; round three of the 2026-09 update
+/// robustness work).
 ///
 /// THE STRAND THIS MACHINE EXISTS FOR. A launched-lane candidate installs its
 /// bundle before it dials, so a structural failure lands on the installed
@@ -2211,48 +2441,75 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 /// `retry_at: None`. The activation outranks every newer download while the
 /// bundle is newer than the running process — a swap from the running image
 /// has no rollback source any more, and N's unconfirmed boot trial owns the
-/// fixed rollback path — so the one lane that can carry a newer release onto
-/// the machine is N's activation, whose successor applies the newer stage on
-/// its own terms. With the latch deadline-less, that lane never ran again:
-/// every later release waited for a person's click or a relaunch, the
-/// 20-25 h strand of 0.90/0.91 made permanent.
+/// fixed rollback path — so with the latch deadline-less nothing automatic
+/// ever moved again: every later release waited for a person.
+///
+/// Gap 14 answered a newer release with one more attempt at N, "whose
+/// successor applies the newer stage". That successor is the handoff's
+/// authorized target and refuses to boot-apply past itself, so the attempt
+/// re-ran the handoff that had already failed twice, spent one more counted
+/// launch of N — and once N's trial had no room, held the newer release
+/// forever. Round three lets the newer release take N's place instead: the
+/// running build takes the install path back, N's trial is disarmed at the
+/// count it had, and the newer build is applied over the running one as an
+/// ordinary stage. N is never launched for it.
 ///
 /// The healthy `Decide` is the shipping `structural_latch` decision, taken at
 /// every look the lane has at the latch after something changed:
 ///
-/// * `DayPasses` — the ONE re-sample, 24 h after convergence, is due;
 /// * `NewerArrives` — a verified download strictly newer than N is on disk
-///   that has not yet had an attempt;
+///   that has not yet been offered the install path. `Decide` starts the
+///   retire (`superseding`), whatever the trial's `room`: it launches nothing.
+///   It lands (`Supersede`: the latch goes with N's bytes) or is refused
+///   (`SupersedeRefused`: nothing moved). A refusal does NOT spend the release
+///   (round three review): the verification's budget running out on a
+///   captive-portal network, the apply lock held a moment too long or a stage
+///   being replaced are all refusals, and the release that met one is offered
+///   again once its retry deadline passes (`backoff`, cleared by `RetryDue`).
+///   While it waits, it still outranks the day — N is not launched while a
+///   newer build is on its way — but a promised re-sample the trial cannot
+///   afford is withdrawn all the same;
+/// * `DayPasses` — the ONE re-sample, 24 h after convergence, is due. It is
+///   released only when one more launch of N keeps its boot trial under the
+///   revert threshold (`room`, picked once by `TrialHasRoom`/`TrialIsSpent` —
+///   the sentinel's own count, read after the attempt that converged
+///   returned): a structural `ChildDied` keeps its counted launch, so after
+///   two of them the next launch of N is the one `check_boot_health` reverts
+///   on, and an automatic attempt must never be the thing that spends it.
+///   Without room the re-sample is HELD and SAID (`said`), never taken
+///   silently. The first count is itself a look (gap 14 review, 2026-09-26):
+///   convergence PROMISES the day's re-sample before any count is read, and a
+///   count that rules it out withdraws the promise at once, said.
 ///
-/// either EARNS one attempt, and one attempt answers both. It is released only
-/// when one more launch of N keeps its boot trial under the revert threshold
-/// (`room`, picked once by `TrialHasRoom`/`TrialIsSpent` — the sentinel's own
-/// count, read after the attempt that converged returned): a structural
-/// `ChildDied` keeps its counted launch, so after two of them the next launch
-/// of N is the one `check_boot_health` reverts on, and an automatic attempt
-/// must never be the thing that spends it. Without room the earned attempt is
-/// HELD and SAID (`said`), never taken silently — and the hold spends the
-/// re-sample too, due or not: every launch left is the reverting one, so a
-/// later look could only say the same thing again. The first count is itself a
-/// look (gap 14 review, 2026-09-26): convergence PROMISES the day's re-sample
-/// before any count is read, and a count that rules it out withdraws the
-/// promise at once, said, rather than leaving it on the notice for a day.
-/// `AttemptFails` is that attempt failing structurally again: the verdict
-/// stands, so it re-latches at once with no confirming retry. `ArmSameBuild`
-/// is an artifact of build N — the same bytes, or a re-publish under another
-/// digest — offered while the latch holds: it stays latched.
+/// A newer release outranks the day: a re-sample of N while a newer build
+/// waits would launch the older build for nothing. `AttemptFails` is the
+/// re-sample failing structurally again: the verdict stands, so it re-latches
+/// at once with no confirming retry. `ArmSameBuild` is an artifact of build N —
+/// the same bytes, or a re-publish under another digest — offered while the
+/// latch holds: it stays latched.
 ///
-/// `Buggy=1` reproduces, each catchable ALONE:
+/// `Buggy=1` reproduces, each catchable ALONE, the `Decide` defects scoped to
+/// disjoint runs so none masks another (as `NativeUpdateFailedMarkSuppression`
+/// scopes its writer and reader defects):
 ///
-/// * TODAY'S STRAND, on the runs where the trial has room: `Decide` releases
-///   nothing, spends nothing and says nothing — the newer release is blocked
-///   forever and the re-sample never comes (`NewerReleaseIsTried`,
-///   `ResampleAfterADay`);
-/// * a trial-blind release, on the runs where it has none: the attempt is
-///   taken and is the launch that reverts N, in silence
-///   (`NeverSpendsTheRevertingLaunch`, `ATrialHoldIsSaid`) — and, until a day
-///   or a newer release comes, the convergence notice goes on promising a
-///   retry the trial cannot afford (`NoRetryPromisedPastTheTrial`);
+/// * GAP 14's OWN `Decide` (0.94.0), in the runs where the newer release is
+///   looked at before the day: with room in the trial it releases the latch
+///   for one more attempt at N — N is launched while the newer release waits
+///   behind it (`NeverBootsTheOlderActivation`) — and without room it holds,
+///   says so, and spends the release: the newer release waits for the Version
+///   menu (`ANewerReleaseClearsTheLatch`);
+/// * THE REFUSAL THAT SPENT THE RELEASE (round three as first shipped), in the
+///   runs where the newer release is looked at after the day: the look starts
+///   the retire like the healthy lane, and a refusal keeps the release spent
+///   and schedules no retry, so it is never offered again
+///   (`ANewerReleaseClearsTheLatch`, at the look after the refusal);
+/// * where no newer release is on offer, THE STRAND BEFORE GAP 14 — the latch
+///   had no deadline, so with room in the trial the day changes nothing
+///   (`ResampleAfterADay`) — and, without room, A TRIAL-BLIND RELEASE: the
+///   day's re-sample taken with no look at the trial, spending the launch it
+///   reverts on, in silence (`NeverSpendsTheRevertingLaunch`,
+///   `ATrialHoldIsSaid`), with the first count's promise left standing
+///   (`NoRetryPromisedPastTheTrial`);
 /// * a verdict-less convergence, where every structural failure buys a fresh
 ///   24 h re-sample — the transient lane's re-sample-forever applied to a
 ///   verdict about the bytes (`ResampleAtMostOnce`);
@@ -2260,9 +2517,10 @@ pub fn native_update_seamless_handoff_ownership_model() -> Model {
 ///   releases the latch with no event (`SameBuildStaysLatched`,
 ///   `ReleasedOnlyByAnEvent`).
 ///
-/// The two `Decide` mutants are scoped to disjoint `room` runs so neither
-/// masks the other, as `NativeUpdateFailedMarkSuppression` scopes its writer
-/// and reader defects.
+/// Liveness — that a refused release is, in the end, retired over — is Law
+/// 1's, checked on the apply ladder ([`native_update_apply_ladder_liveness`],
+/// with `RefusedRetireSpendsTheRelease` as its mutant); this machine checks
+/// every look's safety, and that a refused release is never left unoffered.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_structural_latch_model() -> Model {
@@ -2286,12 +2544,24 @@ pub fn native_update_structural_latch_model() -> Model {
             var spent = 0;
             // A verified download strictly newer than N is on disk.
             var newer = 0;
-            // That newer download already had its attempt (or was held).
+            // That newer download is offered the install path (a retire of N
+            // for it is running, or landed) — not merely refused once.
             var newer_spent = 0;
-            // A hold for the boot trial was said (log, `update status`, notice).
+            // A hold was said (log, `update status`, notice).
             var said = 0;
             // An artifact of build N went through while the latch held.
             var escaped = 0;
+            // The retire of N's activation for the newer release is running.
+            var superseding = 0;
+            // …and landed: the running build is back at the install path, N's
+            // trial disarmed, the newer build the lane's stage.
+            var superseded = 0;
+            // …or was refused at least once, and said.
+            var refused = 0;
+            // A refused retire's release waits for its retry deadline.
+            var backoff = 0;
+            // N was launched for an attempt while a newer release waited.
+            var booted_old = 0;
             // The first count read after the attempt that converged — a look
             // like any other observation.
             action TrialHasRoom when (phase == 0) {
@@ -2304,7 +2574,7 @@ pub fn native_update_structural_latch_model() -> Model {
                 phase = 1;
                 pending = 1;
             }
-            action DayPasses when (phase == 1 && day == 0) {
+            action DayPasses when (phase == 1 && day == 0 && superseded == 0) {
                 day = 1;
                 pending = 1;
             }
@@ -2312,42 +2582,101 @@ pub fn native_update_structural_latch_model() -> Model {
                 newer = 1;
                 pending = 1;
             }
-            action Decide when (phase == 1 && latched == 1 && pending == 1) {
-                latched = if ((day == 1 && owed == 1) || (newer == 1 && newer_spent == 0)) &&
-                    ((Buggy == 0 && room == 1) || (Buggy == 1 && room == 0)) {
+            // A newer release is ON OFFER at a look when it is on disk, not
+            // yet offered, and not waiting out a refusal's retry deadline; it
+            // WAITS when a refusal's deadline has not passed. Either way it
+            // outranks the day (`newer == 0 || newer_spent == 1` is "nothing
+            // newer is coming").
+            action Decide when (phase == 1 && latched == 1 && pending == 1 && superseding == 0) {
+                superseding = if newer == 1 && newer_spent == 0 && backoff == 0 &&
+                    (Buggy == 0 || day == 1) {
+                    1
+                } else {
+                    superseding
+                };
+                latched = if (Buggy == 0 && (newer == 0 || newer_spent == 1) &&
+                        day == 1 && owed == 1 && room == 1) ||
+                    (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
+                        day == 0 && room == 1) ||
+                    (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
+                        day == 1 && owed == 1 && room == 0) {
                     0
                 } else {
                     1
                 };
-                owed = if (day == 1 && owed == 1 && (Buggy == 0 || room == 0)) ||
-                    (Buggy == 0 && room == 0) {
+                booted_old = if Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
+                    day == 0 && room == 1 {
+                    1
+                } else {
+                    booted_old
+                };
+                owed = if (Buggy == 0 && (newer == 0 || newer_spent == 1) &&
+                        ((day == 1 && owed == 1) || room == 0)) ||
+                    (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
+                        room == 0) ||
+                    (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
+                        day == 0 && room == 0) ||
+                    (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
+                        day == 1 && owed == 1 && room == 0) {
                     0
                 } else {
                     owed
                 };
-                spent = if (day == 1 && owed == 1 && (Buggy == 0 || room == 0)) ||
-                    (Buggy == 0 && room == 0 && owed == 1) {
+                spent = if (Buggy == 0 && (newer == 0 || newer_spent == 1) && owed == 1 &&
+                        (day == 1 || room == 0)) ||
+                    (Buggy == 0 && newer == 1 && newer_spent == 0 && backoff == 1 &&
+                        owed == 1 && room == 0) ||
+                    (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
+                        day == 0 && owed == 1 && room == 0) ||
+                    (Buggy == 1 && (newer == 0 || newer_spent == 1) &&
+                        day == 1 && owed == 1 && room == 0) {
                     1
                 } else {
                     spent
                 };
-                newer_spent = if newer == 1 && newer_spent == 0 && (Buggy == 0 || room == 0) {
+                newer_spent = if newer == 1 && newer_spent == 0 && backoff == 0 {
                     1
                 } else {
                     newer_spent
                 };
                 // Every look without room says so while there is something to
-                // say: an earned attempt held, or the promised re-sample
-                // withdrawn (`owed` covers the day's, due or not).
-                said = if (owed == 1 || (newer == 1 && newer_spent == 0)) && room == 0 &&
-                    Buggy == 0 {
+                // say: the promised re-sample withdrawn, or a due one held —
+                // and gap 14 said its hold of the newer release too.
+                said = if (Buggy == 0 && (newer == 0 || newer_spent == 1 || backoff == 1) &&
+                        owed == 1 && room == 0) ||
+                    (Buggy == 1 && newer == 1 && newer_spent == 0 && backoff == 0 &&
+                        day == 0 && room == 0) {
                     1
                 } else {
                     said
                 };
                 pending = 0;
             }
-            action AttemptFails when (phase == 1 && latched == 0) {
+            // The retire landed: N's latch goes with N's bytes, and N is never
+            // launched for it.
+            action Supersede when (phase == 1 && superseding == 1) {
+                superseding = 0;
+                superseded = 1;
+                latched = 0;
+            }
+            // The retire was refused and moved nothing: the latch stands, the
+            // refusal is said, the release is offered AGAIN once its retry
+            // deadline passes — and the observation read after it is a look.
+            action SupersedeRefused when (phase == 1 && superseding == 1) {
+                superseding = 0;
+                refused = 1;
+                said = 1;
+                newer_spent = if Buggy == 1 { newer_spent } else { 0 };
+                backoff = if Buggy == 1 { backoff } else { 1 };
+                pending = 1;
+            }
+            // A refused release's retry deadline passes: the next look offers
+            // it again.
+            action RetryDue when (phase == 1 && backoff == 1) {
+                backoff = 0;
+                pending = 1;
+            }
+            action AttemptFails when (phase == 1 && latched == 0 && superseded == 0) {
                 latched = 1;
                 owed = if Buggy == 1 { 1 } else { owed };
                 day = if Buggy == 1 { 0 } else { day };
@@ -2356,26 +2685,31 @@ pub fn native_update_structural_latch_model() -> Model {
                 latched = if Buggy == 1 { 0 } else { latched };
                 escaped = if Buggy == 1 { 1 } else { escaped };
             }
-            // The newer release gets its attempt: once the lane has looked,
-            // a latch still holding over an unspent newer download with room
-            // in the trial is the strand.
-            invariant NewerReleaseIsTried:
-                if pending == 0 && latched == 1 && room == 1 && newer == 1 {
-                    newer_spent == 1
+            // A newer release behind the latch is taken to the install path:
+            // once the lane has looked, a latch still holding over it is
+            // retiring N, or waiting out a refusal's retry deadline to offer
+            // it again — whatever the trial. Never spent without a landing.
+            invariant ANewerReleaseClearsTheLatch:
+                if pending == 0 && latched == 1 && newer == 1 {
+                    superseding == 1 || backoff == 1
                 } else {
-                    newer_spent <= 1
+                    refused <= 1
                 };
-            // …and so does the day: past the deadline, a look spends the
-            // re-sample.
+            // N is never launched for a release that could take its place.
+            invariant NeverBootsTheOlderActivation: booted_old == 0;
+            // Past the deadline, a look spends the re-sample (unless a newer
+            // release is taking N's place, or waiting to, which moots it).
             invariant ResampleAfterADay:
-                if pending == 0 && latched == 1 && room == 1 && day == 1 {
+                if pending == 0 && latched == 1 && room == 1 && day == 1 &&
+                    superseding == 0 && backoff == 0 {
                     owed == 0
                 } else {
                     owed <= 1
                 };
             // An earned attempt the trial cannot afford is said, not dropped.
             invariant ATrialHoldIsSaid:
-                if pending == 0 && phase == 1 && room == 0 && (day == 1 || newer == 1) {
+                if pending == 0 && phase == 1 && room == 0 && superseding == 0 &&
+                    superseded == 0 && (day == 1 || newer == 1) {
                     said == 1
                 } else {
                     said <= 1
@@ -2383,10 +2717,16 @@ pub fn native_update_structural_latch_model() -> Model {
             // Once a count has been looked at, no retry is promised that the
             // trial cannot afford.
             invariant NoRetryPromisedPastTheTrial:
-                if pending == 0 && phase == 1 && room == 0 { owed == 0 } else { owed <= 1 };
-            // No automatic attempt spends the launch the boot trial reverts on.
+                if pending == 0 && phase == 1 && room == 0 && superseding == 0 &&
+                    superseded == 0 {
+                    owed == 0
+                } else {
+                    owed <= 1
+                };
+            // No automatic attempt spends the launch the boot trial reverts on:
+            // without room the latch holds, or N is retired without a launch.
             invariant NeverSpendsTheRevertingLaunch:
-                if room == 0 { latched == 1 } else { latched <= 1 };
+                if room == 0 { latched == 1 || superseded == 1 } else { latched <= 1 };
             // ONE re-sample: once spent it is never owed again.
             invariant ResampleAtMostOnce:
                 if spent == 1 { owed == 0 } else { owed <= 1 };

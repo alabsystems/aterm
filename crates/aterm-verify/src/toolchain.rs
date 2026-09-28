@@ -59,7 +59,18 @@
 //!    lane; the workspace rides `--unverified` until the Trust-Std campaign
 //!    greens, the same statement `.cargo/config.toml`'s off-switch already makes.
 //!
-//! 4. THE STORE PREFIX IS A MIRROR, AND SO IS RUSTUP'S HOME. The prefix is
+//! 4. ATPKG'S VIEW IS READ THROUGH (2026-09-28). When the rustup entry resolves into
+//!    atpkg's own view of its store (`<prefix>/rustup/…`), the candidate is the build the
+//!    view PRESENTS — `store/trust/current`, or a dev-linked sysroot checkout — never the
+//!    view's own clones, exactly as `aterm-release`'s `gates::rustup_entry_source` reads
+//!    it ([`view_presents`]). The receipt names the directory a run built with, and the
+//!    cutter refuses a MEASURE receipt naming another than its own: a gate that built
+//!    through the view named `<prefix>/rustup/trust/bin` while the cut built with
+//!    `<prefix>/store/trust/<build>/bin`, so on a machine whose rustup `trust` is atpkg's
+//!    view the cutter's own remedy — `tools/verify.sh --measure` — filed a receipt the
+//!    cut then refused (v0.97.0, 2026-09-28).
+//!
+//! 5. THE STORE PREFIX IS A MIRROR, AND SO IS RUSTUP'S HOME. The prefix is
 //!    resolved the way atpkg resolves it ([`atpkg_prefix`]: `[packages].prefix`
 //!    from aterm.toml, else the platform default), and rustup's home the way
 //!    `atpkg::seam::rustup_home_with` and `aterm-release` resolve it
@@ -318,25 +329,11 @@ pub struct Demoted {
     /// Whether the rustup entry (`~/.rustup/toolchains/trust` itself) is a SYMLINK — the
     /// one shape `aterm pkg repair` re-points. A real directory it refuses ([`Self::remedy`]).
     pub linked: bool,
-    /// Whether the entry resolves into atpkg's OWN view of its store
-    /// (`<prefix>/rustup/…`, `atpkg::seam::views_root`): the view atpkg left on the build a
-    /// process was still running from when the store moved on. `aterm pkg repair` does not
-    /// re-point that — it adopts the entry and re-lays the view once nothing runs from it —
-    /// so its remedy is neither of the others ([`REMEDY_VIEW`]). aterm-release's
-    /// `gates::discovery_order` answers such an entry with the store itself; both rank the
-    /// store first.
-    pub view: bool,
 }
 
 /// The fix for a demoted entry that is a LINK: atpkg's `repair` replaces a stale foreign
 /// link with its view (`atpkg::seam::repair`).
 const REMEDY_LINK: &str = "`aterm pkg repair` re-points it at the store";
-
-/// What a demoted entry that is atpkg's own VIEW waits on ([`Demoted::view`]): nothing to
-/// run — the view is re-laid once the build running from it exits (review of 2026-09-25:
-/// it was sent to `aterm pkg repair`, which answers "left as it stands" for a view).
-pub const REMEDY_VIEW: &str = "it is atpkg's own view, left on the build still running from \
-     it: atpkg re-lays it once nothing runs from that build";
 
 /// The fix for a demoted entry that is a REAL DIRECTORY. `aterm pkg repair` refuses an
 /// entry that is not a link, whatever its age — a directory atpkg did not lay is not its
@@ -349,13 +346,12 @@ pub const REMEDY_DIRECTORY: &str = "`aterm pkg repair` will not replace a direct
 impl Demoted {
     /// The verb that fixes it, for the entry's SHAPE: `aterm pkg repair` for a link, and
     /// the by-hand removal first for a real directory, which repair refuses — naming repair
-    /// alone there sent a reader to a command that answers "refusing to touch it" — and
-    /// nothing for atpkg's own view, which atpkg re-lays itself ([`REMEDY_VIEW`]).
+    /// alone there sent a reader to a command that answers "refusing to touch it". atpkg's
+    /// own view is never demoted: it is read through to the build it presents
+    /// ([`view_presents`]).
     #[must_use]
     pub fn remedy(&self) -> &'static str {
-        if self.view {
-            REMEDY_VIEW
-        } else if self.linked {
+        if self.linked {
             REMEDY_LINK
         } else {
             REMEDY_DIRECTORY
@@ -451,6 +447,44 @@ fn older_than_store(rustup: &Path, store_prefix: &Path) -> Option<(String, Strin
     (its < theirs).then_some((its, theirs))
 }
 
+/// The `bin` directory the rustup `entry` stands for when it resolves into atpkg's OWN view
+/// of its store (`<store_prefix>/rustup/…`) — the build the view PRESENTS, as
+/// `aterm-release`'s `gates::rustup_entry_source` reads it through `atpkg::seam::view_source`
+/// (mirrored: this crate has no atpkg edge): a dev-linked trust (`<prefix>/links/trust`
+/// naming a sysroot checkout outside the prefix) presents that checkout, and otherwise the
+/// view presents `store/trust/current` — including a link atpkg cannot present, where the
+/// cutter skips the entry and the store is next. A marker that cannot be read is no link,
+/// as atpkg reads it. `None` when the entry is not the view: it is a candidate as it is.
+fn view_presents(entry: &Path, store_prefix: &Path) -> Option<PathBuf> {
+    let resolved = std::fs::canonicalize(entry).ok()?;
+    let views = std::fs::canonicalize(store_prefix.join("rustup")).ok()?;
+    if !resolved.starts_with(&views) {
+        return None;
+    }
+    let store = || Some(store_stage2_bin(store_prefix));
+    let Ok(marker) = std::fs::read_to_string(store_prefix.join("links").join(STORE_CHANNEL)) else {
+        return store();
+    };
+    let Some(checkout) = marker.lines().find_map(|line| {
+        let value = line
+            .trim()
+            .strip_prefix("checkout")?
+            .trim_start()
+            .strip_prefix('=')?;
+        let value = value.trim().strip_prefix('"')?.strip_suffix('"')?;
+        (!value.contains(['"', '\\'])).then(|| PathBuf::from(value))
+    }) else {
+        return store();
+    };
+    let prefix = std::fs::canonicalize(store_prefix).unwrap_or_else(|_| store_prefix.into());
+    let inside = std::fs::canonicalize(&checkout).is_ok_and(|c| c.starts_with(&prefix));
+    if !inside && checkout.join("bin").is_dir() && checkout.join("lib").is_dir() {
+        Some(checkout.join("bin"))
+    } else {
+        store()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Toolchain {
     /// The resolved (physical) stage2 `bin` directory.
@@ -536,10 +570,13 @@ impl Toolchain {
             }
             (dir, None)
         } else {
-            let rustup = rustup_home
+            let entry = rustup_home
                 .join("toolchains")
-                .join(pinned.unwrap_or("trust"))
-                .join("bin");
+                .join(pinned.unwrap_or("trust"));
+            // atpkg's view is read through to the build it presents (rule 4).
+            let rustup = store_prefix
+                .and_then(|prefix| view_presents(&entry, prefix))
+                .unwrap_or_else(|| entry.join("bin"));
             let store_bin = store_prefix.map(store_stage2_bin);
             // The date probes run only where there is a rustup entry to weigh — a
             // store-only machine spawns nothing new here.
@@ -570,13 +607,8 @@ impl Toolchain {
             // Named only when it changed the answer: a demoted entry that won anyway (the
             // store was not the pin) is simply the toolchain, as it was before the rule.
             let rustup_dir = physical(rustup.clone());
-            let linked = rustup
-                .parent()
-                .and_then(|entry| std::fs::symlink_metadata(entry).ok())
-                .is_some_and(|m| m.file_type().is_symlink());
-            let view = store_prefix
-                .and_then(|prefix| std::fs::canonicalize(prefix.join("rustup")).ok())
-                .is_some_and(|views| rustup_dir.starts_with(views));
+            let linked =
+                std::fs::symlink_metadata(&entry).is_ok_and(|m| m.file_type().is_symlink());
             demoted = stale
                 .filter(|_| chosen.as_ref().is_some_and(|c| *c != rustup_dir))
                 .map(|(its, store)| Demoted {
@@ -584,7 +616,6 @@ impl Toolchain {
                     its,
                     store,
                     linked,
-                    view,
                 });
             let reported = chosen.unwrap_or_else(|| store_bin.clone().unwrap_or(rustup));
             (reported, store_bin)
@@ -1204,16 +1235,16 @@ mod tests {
         fs::remove_dir_all(&home).ok();
     }
 
-    /// ATPKG'S OWN VIEW, LEFT BEHIND (review of 2026-09-25): when a build was still
-    /// running from atpkg's view (`<prefix>/rustup/trust`, where it lays rustup's `trust`
-    /// entry) as the store moved on, the view lags the store. The store is still the
-    /// right answer — but the note sent the reader to `aterm pkg repair` "re-points it",
-    /// and repair only adopts a view entry and re-lays the view once nothing runs from
-    /// it. It now says the view is re-laid by atpkg itself. NEGATIVE CONTROL: the same
-    /// older entry as a foreign link keeps the link remedy.
+    /// ATPKG'S VIEW IS READ THROUGH (2026-09-28, the module header's rule 4): a rustup
+    /// entry resolving into atpkg's view (`<prefix>/rustup/trust`) stands for the build the
+    /// view presents — the store's `current`, or a dev-linked sysroot checkout — never the
+    /// view's own clones, whose directory the cutter's MEASURE gate refused as another
+    /// compiler than its own (v0.97.0). So a view LAGGING the store (review of 2026-09-25)
+    /// is no demotion either: the store is the answer, and nothing is said. NEGATIVE
+    /// CONTROL: an older foreign link is still demoted and sent to repair.
     #[cfg(unix)]
     #[test]
-    fn atpkgs_own_lagging_view_is_ranked_below_the_store_and_never_sent_to_repair() {
+    fn atpkgs_view_is_read_through_to_the_build_it_presents() {
         let home = crate::mktemp_dir("atv-view").expect("mktemp");
         let prefix = default_atpkg_prefix(&home);
         let store = dated_bin(&home, &prefix.join("store/trust/9200"), "2026-09-24");
@@ -1236,19 +1267,51 @@ mod tests {
             )
         };
         let t = found();
-        assert_eq!(t.stage2_dir, store, "the store is the answer");
-        let d = t.demoted.clone().expect("the lagging view is said");
-        assert_eq!(d.dir, view);
-        assert!(d.view && d.linked, "{d:?}");
-        let said = d.sentence();
-        assert!(said.ends_with(REMEDY_VIEW), "{said}");
-        assert!(!said.contains("aterm pkg repair"), "{said}");
+        assert_eq!(
+            t.stage2_dir, store,
+            "a lagging view presents the store's build"
+        );
+        assert_ne!(t.stage2_dir, view, "never the view's own clones");
+        assert_eq!(t.demoted, None, "read through, so never demoted");
+        dated_bin(&home, &prefix.join("rustup/trust"), "2026-09-24");
+        assert_eq!(
+            found().stage2_dir,
+            store,
+            "a current view: the store's own directory"
+        );
+        // Dev-linked to a sysroot checkout outside the prefix: the view presents that.
+        let checkout = home.join("trust-checkout");
+        let linked = dated_bin(&home, &checkout, "2026-09-20");
+        fs::create_dir_all(prefix.join("links")).expect("mkdir links");
+        fs::write(
+            prefix.join("links/trust"),
+            format!(
+                "program = \"trust\"\ncheckout = \"{}\"\n",
+                checkout.display()
+            ),
+        )
+        .expect("marker");
+        assert_eq!(
+            found().stage2_dir,
+            linked,
+            "a linked view presents its checkout"
+        );
+        // A checkout atpkg cannot present (no lib/): the cutter skips it, the store is next.
+        fs::remove_dir_all(checkout.join("lib")).expect("rm lib");
+        assert_eq!(
+            found().stage2_dir,
+            store,
+            "an unpresentable link: the store"
+        );
+        fs::write(prefix.join("links/trust"), "not a marker").expect("garbage");
+        assert_eq!(found().stage2_dir, store, "an unreadable marker is no link");
+        fs::remove_file(prefix.join("links/trust")).expect("rm marker");
         // Negative control: a foreign link to an older tree is re-pointed by repair.
         let tree = dated_bin(&home, &home.join("stage2"), "2026-09-17");
         fs::remove_file(&entry).expect("rm link");
         std::os::unix::fs::symlink(home.join("stage2"), &entry).expect("ln foreign");
         let d = found().demoted.expect("a foreign older link is said");
-        assert_eq!((d.dir.as_path(), d.view), (tree.as_path(), false));
+        assert_eq!(d.dir, tree);
         assert!(d.sentence().ends_with(REMEDY_LINK));
         fs::remove_dir_all(&home).ok();
     }

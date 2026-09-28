@@ -32,8 +32,6 @@ use crate::widget::{
     TextFace, TextWeight, rgba, text_prim,
 };
 
-const MIN_FONT_PX: f32 = 6.0;
-const MAX_FONT_PX: f32 = 32.0;
 const MIN_DURATION_MS: u64 = 30;
 const MAX_DURATION_MS: u64 = 2_000;
 const MAX_LENGTH: usize = 512;
@@ -577,8 +575,10 @@ impl From<Theme> for PreviewTerminalTheme {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SettingsPreviewSpec {
     pub(crate) scene: PreviewScene,
-    /// Exact candidate terminal type size, independent of native-app text scale.
+    /// Exact candidate terminal type size in logical points, independent of native-app text scale.
     pub(crate) font_px: f32,
+    /// Host physical pixels per logical point; candidate bounds use terminal pixel units.
+    pub(crate) terminal_scale: f32,
     /// Renderer-native typography geometry and shaping candidates.
     pub(crate) line_height: f32,
     pub(crate) baseline_adjust: i32,
@@ -620,6 +620,7 @@ impl Default for SettingsPreviewSpec {
         Self {
             scene: PreviewScene::CursorMotion,
             font_px: 14.0,
+            terminal_scale: 1.0,
             line_height: 1.0,
             baseline_adjust: 0,
             ligatures: true,
@@ -775,10 +776,17 @@ impl SettingsPreviewSpec {
         self
     }
 
+    fn normalized_font_px(&self) -> f32 {
+        let scale = finite_or(self.terminal_scale, 1.0).max(f32::EPSILON);
+        finite_or(self.font_px, 14.0 / scale)
+            .clamp(crate::FONT_PX_MIN / scale, crate::FONT_PX_MAX / scale)
+    }
+
     fn normalized(&self) -> Self {
         Self {
             scene: self.scene,
-            font_px: finite_or(self.font_px, 14.0).clamp(MIN_FONT_PX, MAX_FONT_PX),
+            font_px: self.normalized_font_px(),
+            terminal_scale: finite_or(self.terminal_scale, 1.0).max(f32::EPSILON),
             line_height: finite_or(self.line_height, 1.0).clamp(0.8, 2.0),
             baseline_adjust: self.baseline_adjust.clamp(-32, 32),
             ligatures: self.ligatures,
@@ -1056,7 +1064,7 @@ impl SettingsPreviewSpec {
             }
             PreviewScene::Typography => format!(
                 "Text sample for {candidate} at {} pixels; ligatures are {} and synthetic styles are {}.",
-                trim_float(spec.font_px),
+                trim_float(spec.font_px * spec.terminal_scale),
                 if spec.ligatures { "on" } else { "off" },
                 if spec.synthetic_styles { "on" } else { "off" },
             ),
@@ -1204,7 +1212,7 @@ impl SettingsPreviewSpec {
         );
         format!(
             "normalized-candidate {candidate}; renderer preview: {} px monospace, {}× line height, baseline {:+} px; ligatures {}, cursor-break ligatures {}, merged ligatures {}, synthetic styles {}; {}; {font_pill} {terminal_theme}; selection foreground {selection_fg}, minimum contrast {}, selection {}; underline position {:+} thickness {:+} skip descenders {}; text blending {:?}, font thicken {}, stem gamma {}, variation requests {}; {} cursor; blink {}; {} trail; raw/effective motion {}/{} because {}; adaptive motion {} load-shed {}; {motion}. {trail_scope} {post_fx}; Rainbow kitty sprite {:?}; window {} columns × {} lines, tab strip {} row(s), build badge {}; static Smart Titles examples keep stable Title `release` separate from authored Description `shipping`; generated Activity fallback `running tests` is {}; tab format {}; window format {}; no live provider-health claim.",
-            trim_float(spec.font_px),
+            trim_float(spec.font_px * spec.terminal_scale),
             trim_float(spec.line_height),
             spec.baseline_adjust,
             if spec.ligatures { "on" } else { "off" },
@@ -1315,10 +1323,7 @@ impl SettingsPreviewSpec {
 
         let mut hash = aterm_hash::FxHasher::default();
         (self.scene as u8).hash(&mut hash);
-        finite_or(self.font_px, 14.0)
-            .clamp(MIN_FONT_PX, MAX_FONT_PX)
-            .to_bits()
-            .hash(&mut hash);
+        self.normalized_font_px().to_bits().hash(&mut hash);
         finite_or(self.line_height, 1.0)
             .clamp(0.8, 2.0)
             .to_bits()
@@ -1470,8 +1475,42 @@ impl SettingsPreviewSpec {
         hash.finish() | 1
     }
 
-    fn terminal_specimen(&self, theme: Theme) -> TerminalSpecimenSpec {
-        let (input, input_fingerprint) = build_terminal_specimen_input(self, theme);
+    /// Typography keeps the candidate's exact size. Buy the five specimen rows
+    /// and a separate font-status band instead of painting a badge over glyphs.
+    pub(crate) fn preferred_height(&self, minimum: f32) -> f32 {
+        if self.scene != PreviewScene::Typography {
+            return minimum;
+        }
+        let spec = self.normalized();
+        minimum.max(
+            preview_header_height(&spec)
+                + 15.0
+                + TYPOGRAPHY_SPECIMEN_ROWS as f32 * spec.typography_row_height()
+                + font_candidate_pill_height(crate::native_appearance::text_scale())
+                + 10.0,
+        )
+    }
+
+    fn typography_row_height(&self) -> f32 {
+        let variations = self
+            .typography
+            .variations
+            .iter()
+            .map(|variation| (variation.tag, variation.value()))
+            .collect::<Vec<_>>();
+        // Native layout is in logical points. One point of rounding headroom
+        // per row covers the renderer's device-pixel rounding at scales >=1;
+        // the authored font size itself is never reduced or rounded here.
+        self.prepared_font
+            .specimen_cell_height(self.font_px, self.line_height, &variations)
+            .map_or(self.font_px * self.line_height * 1.5, |height| {
+                height as f32
+            })
+            + 1.0
+    }
+
+    fn terminal_specimen(&self, theme: Theme, rows: Option<usize>) -> TerminalSpecimenSpec {
+        let (input, input_fingerprint) = build_terminal_specimen_input_rows(self, theme, rows);
         TerminalSpecimenSpec {
             input,
             input_fingerprint,
@@ -1543,7 +1582,7 @@ impl SettingsPreviewSpec {
         });
 
         let inset = 10.0;
-        let header_h = 27.0;
+        let header_h = preview_header_height(&spec);
         let caption_size = TypeStep::Caption
             .px(13.75)
             .scaled(crate::native_appearance::text_scale());
@@ -1652,28 +1691,41 @@ impl SettingsPreviewSpec {
             prims.push(DrawPrim::ClipPop);
             return;
         }
-        let mut terminal_specimen = spec.terminal_specimen(terminal_theme);
-        if spec.scene == PreviewScene::Appearance {
-            terminal_specimen.font_px = appearance_specimen_font_px(
-                terminal,
-                terminal_specimen.font_px,
-                terminal_specimen.line_height,
-            );
-            let specimen_clip = appearance_specimen_clip(terminal);
-            prims.push(DrawPrim::ClipPush {
-                x: specimen_clip.x,
-                y: specimen_clip.y,
-                w: specimen_clip.width,
-                h: specimen_clip.height,
-            });
-        }
-        prims.push(DrawPrim::TerminalSpecimen {
-            x: terminal.x,
-            y: terminal.y,
-            spec: Box::new(terminal_specimen),
+        // The status pill owns its own band. A short host can show fewer
+        // COMPLETE rows at the authored size; it must never expose a clipped
+        // next row or hide its glyphs beneath the status.
+        let typography_rows = (spec.scene == PreviewScene::Typography).then(|| {
+            let available = (terminal.height
+                - font_candidate_pill_height(crate::native_appearance::text_scale())
+                - 10.0)
+                .max(0.0);
+            ((available / spec.typography_row_height()).floor() as usize)
+                .min(TYPOGRAPHY_SPECIMEN_ROWS)
         });
-        if spec.scene == PreviewScene::Appearance {
-            prims.push(DrawPrim::ClipPop);
+        if typography_rows != Some(0) {
+            let mut terminal_specimen = spec.terminal_specimen(terminal_theme, typography_rows);
+            if spec.scene == PreviewScene::Appearance {
+                terminal_specimen.font_px = appearance_specimen_font_px(
+                    terminal,
+                    terminal_specimen.font_px,
+                    terminal_specimen.line_height,
+                );
+                let specimen_clip = appearance_specimen_clip(terminal);
+                prims.push(DrawPrim::ClipPush {
+                    x: specimen_clip.x,
+                    y: specimen_clip.y,
+                    w: specimen_clip.width,
+                    h: specimen_clip.height,
+                });
+            }
+            prims.push(DrawPrim::TerminalSpecimen {
+                x: terminal.x,
+                y: terminal.y,
+                spec: Box::new(terminal_specimen),
+            });
+            if spec.scene == PreviewScene::Appearance {
+                prims.push(DrawPrim::ClipPop);
+            }
         }
         if spec.scene == PreviewScene::Appearance {
             paint_window_theme_sample(prims, terminal, &spec, terminal_theme);
@@ -1829,6 +1881,26 @@ impl SettingsPreviewSpec {
     }
 }
 
+const TYPOGRAPHY_SPECIMEN_ROWS: usize = 5;
+
+fn preview_header_height(spec: &SettingsPreviewSpec) -> f32 {
+    if spec.scene == PreviewScene::Typography {
+        27.0_f32.max(
+            TypeStep::Caption
+                .px(13.75)
+                .scaled(crate::native_appearance::text_scale())
+                .get()
+                + 8.0,
+        )
+    } else {
+        27.0
+    }
+}
+
+fn font_candidate_pill_height(text_scale: f32) -> f32 {
+    (TypeStep::Caption.px(11.5).scaled(text_scale).get() + 7.0).max(19.0)
+}
+
 fn paint_font_candidate_pill(
     prims: &mut Vec<DrawPrim>,
     terminal: LogicalRect,
@@ -1855,9 +1927,7 @@ fn paint_font_candidate_pill_at_scale(
         return;
     };
     let text_size = TypeStep::Caption.px(11.5).scaled(text_scale);
-    let pill_h = (text_size.get() + 7.0)
-        .max(19.0)
-        .min((terminal.height - 8.0).max(1.0));
+    let pill_h = font_candidate_pill_height(text_scale).min((terminal.height - 8.0).max(1.0));
     let max_chars = if terminal.width < 300.0 { 34 } else { 58 };
     let label = bounded_badge(&label, max_chars);
     // The terminal has a 5pt outer inset and the pill has 8pt text padding on
@@ -2094,9 +2164,18 @@ fn packed_rgb(value: u32) -> aterm_types::Rgb {
     )
 }
 
+#[cfg(test)]
 fn build_terminal_specimen_input(
     spec: &SettingsPreviewSpec,
     theme: Theme,
+) -> (Arc<aterm_render::RenderInput>, u64) {
+    build_terminal_specimen_input_rows(spec, theme, None)
+}
+
+fn build_terminal_specimen_input_rows(
+    spec: &SettingsPreviewSpec,
+    theme: Theme,
+    visible_rows: Option<usize>,
 ) -> (Arc<aterm_render::RenderInput>, u64) {
     use std::hash::{Hash, Hasher};
 
@@ -2119,8 +2198,13 @@ fn build_terminal_specimen_input(
     let (rows, source) = if spec.scene == PreviewScene::Appearance {
         (APPEARANCE_SPECIMEN_ROWS, APPEARANCE_SOURCE)
     } else {
-        (5, FULL_SOURCE)
+        (TYPOGRAPHY_SPECIMEN_ROWS, FULL_SOURCE)
     };
+    let rows = visible_rows.unwrap_or(rows).clamp(1, rows);
+    let source = source
+        .match_indices("\r\n")
+        .nth(rows - 1)
+        .map_or(source, |(end, _)| &source[..end]);
 
     // The memo key comes FIRST because it is a total function of this call's
     // inputs — nothing below reads anything that is not hashed here.
@@ -2211,7 +2295,7 @@ fn build_terminal_specimen_input(
     let _ = terminal.apply_config(&terminal_config);
     terminal.process(source.as_bytes());
     let mut input = terminal.cell_frame(rows, COLS);
-    input.cursor_row = 1;
+    input.cursor_row = 1.min(rows - 1);
     // Cursor is inside the `!=` run so cursor-break-ligatures exercises the
     // same shaping split a terminal uses while editing operators.
     input.cursor_col = 1;
@@ -4378,6 +4462,77 @@ mod tests {
             spec.font_candidate_pill(),
             Some(("Live specimen · Regular: default".to_string(), false))
         );
+    }
+
+    #[test]
+    fn typography_reserves_whole_candidate_rows_above_its_status_band() {
+        // Load the real deterministic specimen renderer through the paint
+        // fixture, then keep its immutable snapshot for every geometry probe.
+        let _ = compiled(SettingsPreviewSpec::typography(12.0));
+        let prepared = crate::tray_raster::prepared_semantic_font_for_direct_view_test(
+            &SemanticFontCandidate::default(),
+        );
+        let theme = Theme::default();
+        for width in [254.0, 592.0, 900.0] {
+            for font_px in [12.0, 24.0, 36.0, 72.0] {
+                for line_height in [0.8, 1.0, 2.0] {
+                    let mut spec = SettingsPreviewSpec::typography(font_px)
+                        .with_focus(crate::prefs::EDIT_FONT_FAMILY, "default")
+                        .with_prepared_font(prepared.clone());
+                    spec.line_height = line_height;
+                    let full_height = spec.preferred_height(108.0);
+                    for height in [108.0, full_height] {
+                        let rect = LogicalRect::new(0.0, 0.0, width, height);
+                        let mut prims = Vec::new();
+                        spec.paint(&mut prims, rect, theme, Roles::from_theme(theme));
+                        let pill_y = prims
+                            .iter()
+                            .find_map(|prim| match prim {
+                                DrawPrim::Panel { y, radius, .. } if *radius == 6.0 => Some(*y),
+                                _ => None,
+                            })
+                            .expect("font status has a separate visible band");
+                        let specimen = prims.iter().find_map(|prim| match prim {
+                            DrawPrim::TerminalSpecimen { y, spec, .. } => Some((*y, spec)),
+                            _ => None,
+                        });
+                        if height == full_height {
+                            assert_eq!(
+                                specimen.as_ref().unwrap().1.input.rows,
+                                TYPOGRAPHY_SPECIMEN_ROWS,
+                                "all five intended rows fit {width}px / {font_px}px / {line_height}"
+                            );
+                        }
+                        if let Some((y, specimen)) = specimen {
+                            assert_eq!(specimen.font_px, font_px, "never shrink the authored type");
+                            assert_eq!(specimen.line_height, line_height);
+                            assert!(specimen.input.rows <= TYPOGRAPHY_SPECIMEN_ROWS);
+                            let first: String =
+                                specimen.input.cells[0].iter().map(|cell| cell.ch).collect();
+                            assert!(
+                                first.starts_with("ANSI 4"),
+                                "a short specimen keeps the first rows, not parser-scroll tail: {first}"
+                            );
+                            for dpi in [1.0, 1.25, 2.0, 3.0] {
+                                let row_h = prepared
+                                    .specimen_cell_height(font_px * dpi, line_height, &[])
+                                    .unwrap() as f32
+                                    / dpi;
+                                assert!(
+                                    y + specimen.input.rows as f32 * row_h <= pill_y - 4.0,
+                                    "{width}px/{height}px: {font_px}px at {dpi}dpi overlaps the badge"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Historical negative control: the old compact card held five rows
+        // at24px under a bottom pill, which physically cannot fit.
+        let old_terminal_h = 108.0 - 27.0 - 15.0;
+        let row_h = prepared.specimen_cell_height(48.0, 1.0, &[]).unwrap() as f32 / 2.0;
+        assert!(row_h * TYPOGRAPHY_SPECIMEN_ROWS as f32 > old_terminal_h - 24.0);
     }
 
     #[test]

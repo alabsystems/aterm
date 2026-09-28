@@ -4596,7 +4596,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · a development build only; a shipped build's compiled Team ID always wins"
         }
         "update.auto_apply" => {
-            " · off, a downloaded build installs only when you ask — Update Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"
+            " · off, a downloaded build installs only when you ask — Update to Latest Now on macOS, `aterm update apply` on Linux · the native updater runs on macOS and Linux"
         }
         "sparkle_words.lexicon" => {
             " · loaded on the host; unreadable or rejected files are skipped while built-ins remain active"
@@ -7207,6 +7207,8 @@ expect_nonce = "pin"
         }
         assert!(help_for(crate::prefs::EDIT_UPDATE_ENABLED).contains("`aterm update check`"));
         assert!(help_for("update.auto_apply").contains("`aterm update apply` on Linux"));
+        // The Software Update button's own label (`update_action_label`).
+        assert!(help_for("update.auto_apply").contains("Update to Latest Now on macOS"));
         assert!(help_for(crate::prefs::EDIT_MOTION).contains(crate::prefs::motion_auto_help()));
         // The query help is platform-split and states the WIDEST grant: the
         // system clipboard off-Linux (what the Query arm actually answers

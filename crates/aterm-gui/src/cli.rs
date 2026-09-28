@@ -364,17 +364,16 @@ fn starter_config_for(path: &std::path::Path) -> String {
 /// whose `HKCU\Console\%%Startup` delegation points at a class nothing can
 /// create stops opening consoles entirely, and the way out has to be findable
 /// from the binary — not only from a README the user may not have.
+/// `--set-default-terminal` is not listed: it refuses in every build (no COM
+/// handoff server), so its dispatch arm stays only to answer a script with that
+/// refusal.
 #[cfg(windows)]
 const WINDOWS_HELP_TAIL: &str = concat!(
     "\nWINDOWS:\n",
     "    --install-context-menu     Add 'Open aterm here' to the Explorer right-click menu\n",
     "                               (per-user HKCU; --uninstall-context-menu removes it).\n",
-    "    --set-default-terminal     Register aterm as the Windows 11 default terminal.\n",
-    "                               REFUSES in this build (no COM handoff server yet) and\n",
-    "                               says why; nothing is written.\n",
-    "    --unset-default-terminal   Clear aterm's default-terminal registration — the way\n",
-    "                               back out. Works in every build; leaves another\n",
-    "                               terminal's registration alone and tells you whose it is.\n",
+    "    --unset-default-terminal   Clear aterm's default-terminal registration; another\n",
+    "                               terminal's registration is left alone.\n",
 );
 
 /// A documented starter config written by `--write-config`. Linux-tuned (real
@@ -747,7 +746,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                 // ESCAPE HATCH from a delegation that stops consoles opening;
                 // leaving it discoverable only through the README strands anyone
                 // who reaches that state on a stripped machine. `--set-...`
-                // refuses today and says why, which is more useful than silence.
+                // refuses in every build, so it is not advertised.
                 #[cfg(windows)]
                 print!("{WINDOWS_HELP_TAIL}");
                 std::process::exit(0);
@@ -890,9 +889,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                             },
                         );
                         eprintln!(
-                            "  nothing was written; your console setup is unchanged. \
-                             Set the default terminal in Settings > System > For developers \
-                             until this ships."
+                            "  set the default terminal in Settings > System > For developers > Terminal."
                         );
                         std::process::exit(1);
                     }
@@ -920,8 +917,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                     ),
                     Ok(UnsetOutcome::NotOurs { console, terminal }) => {
                         println!(
-                            "aterm-gui: nothing changed — the default terminal is registered to \
-                             another app, and aterm only removes its own registration."
+                            "aterm-gui: nothing changed — the default terminal is not aterm's."
                         );
                         println!(
                             "  current HKCU\\{}: {}={} {}={}",
@@ -931,10 +927,7 @@ pub(crate) fn parse_cli(argv: Vec<std::ffi::OsString>) -> Cli {
                             crate::defterm_win::VALUE_TERMINAL,
                             terminal.as_deref().unwrap_or("(unset)"),
                         );
-                        println!(
-                            "  change it in Settings > System > For developers > Terminal, \
-                             or with that app's own uninstaller."
-                        );
+                        println!("  change it in Settings > System > For developers > Terminal.");
                     }
                     Err(e) => {
                         eprintln!("aterm-gui: could not clear the default-terminal keys: {e}");
@@ -1359,8 +1352,10 @@ mod tests {
     }
 
     /// An escape hatch nobody can find is not an escape hatch. Every Windows
-    /// verb must be advertised in the Windows help block, that block must
-    /// actually reach `--help`, and each verb must have a dispatch arm.
+    /// verb except `--set-default-terminal` (which refuses in every build and
+    /// keeps only its dispatch arm) must be advertised in the Windows help
+    /// block, that block must actually reach `--help`, and each verb must have
+    /// a dispatch arm.
     #[cfg(windows)]
     #[test]
     fn windows_help_advertises_every_windows_verb() {
@@ -1368,7 +1363,6 @@ mod tests {
         for flag in [
             "--install-context-menu",
             "--uninstall-context-menu",
-            "--set-default-terminal",
             "--unset-default-terminal",
         ] {
             assert!(
@@ -1381,6 +1375,9 @@ mod tests {
                 "{flag} is advertised but has no dispatch arm ({arm})"
             );
         }
+        // The verb that refuses in every build keeps its arm and stays unadvertised.
+        assert!(src.contains("\"--set-default-terminal\" =>"));
+        assert!(!super::WINDOWS_HELP_TAIL.contains("--set-default-terminal"));
         // ...and the block is actually printed by the -h/--help arm.
         let help_arm = src
             .split_once("\"-h\" | \"--help\" => {")

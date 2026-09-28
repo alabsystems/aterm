@@ -37,6 +37,21 @@
 //!   ([`Relaunches`]: a growing back-off, never a silent give-up —
 //!   [`Outcome::Cannot`] is the keyed attention).
 //!
+//!   AN EXIT THE HARNESS'S OWN RESTART MADE is no one else's (S0 and S3 of
+//!   the in-flight review, 2026-09-27): a restart — the upgrade's, Claude
+//!   Code's or Codex's, or the restart in place's — whose step returned
+//!   with its agent ended and the relaunch line not typed yet (a person
+//!   typing at the returned prompt, a hold, a shell slow to take the
+//!   terminal back) leaves its tab with no step watching it. The host reads
+//!   that FIRST ([`restarted`]): the exit is the restart's, never a
+//!   person's, a holder's or the owner's `[harness] relaunch = false`
+//!   ([`OnExit::Restarted`]), and never the graceful exit its own SIGTERM
+//!   made of it. It is carried from where it stopped ([`carry_restart`]),
+//!   tried at least every [`CARRY_EVERY`] — the back-off's ten-minute step
+//!   outlasted [`STALE_S`], and the record expired between two tries — and
+//!   what is typed at the prompt still waits on a person and a hold, the
+//!   relaunch line's own look. It lands, or is said: `refused:<why>`.
+//!
 //! Either way, in the window the new process is its supervisor's the moment
 //! it holds the conversation (`adopted`, [`Opts::hand_back`]): the loop
 //! answers whatever it opened with, and the continuation is typed at that
@@ -413,14 +428,26 @@ pub(super) fn unplanned(opts: &Opts, r: Report, st: &mut St, no: NoPlan) -> Repo
 /// typing at that prompt, or it may be gone with its tab: an exit that old
 /// is never relaunched from this record, a relaunch that old never waited
 /// for again.
+///
+/// THE END IS THE ONE A LOOK SAW ([`St::exited_at`]), and only while none
+/// has the signal that asked for it (the review of 2026-09-27): a Claude
+/// Code whose shutdown outlived the bound — a hung hook, an MCP teardown —
+/// was refused `stale-exit` the moment it exited, its prompt just back, and
+/// the agent the restart had ended stayed down. A look's own FIRST sighting
+/// is no evidence of when the exit came (a sweep run by hand, a host that
+/// was down): it decides on the signal ([`expired`] before the stamp), and
+/// the one look that knows the exit is fresh — the host's carry, on the exit
+/// it just saw — stamps it first ([`carry_restart`]).
 pub const STALE_S: u64 = 300;
 
 /// Why a relaunch in flight whose agent is gone must stop instead of acting
 /// on the tab, `(word, ledger detail)`, or `None` while it may still act.
+/// An exit is stale [`STALE_S`] after its agent was seen gone, or after the
+/// signal while no look has seen it gone yet.
 pub(super) fn expired(st: &St, now: u64) -> Option<(&'static str, &'static str)> {
     use upgrade::Phase;
     match st.phase {
-        Phase::Exiting { at_s } if now.saturating_sub(at_s) > STALE_S => Some((
+        Phase::Exiting { at_s } if now.saturating_sub(at_s.max(st.exited_at)) > STALE_S => Some((
             "stale-exit",
             "the agent ended minutes ago and was never relaunched: the tab is not typed into now",
         )),
@@ -553,6 +580,11 @@ fn relaunch_held(
         // later pass finds the phase and the process as they are.
         return said(r, "wait:exiting");
     }
+    // Gone: whatever stops this restart from here has no process left to vet
+    // it by, and is the tab's record — stamped where the agent is SEEN gone,
+    // never at the signal (S1 of the in-flight review, 2026-09-27; the Codex
+    // lane's relaunch stamps it so).
+    st.seen_gone(now_s());
     hand.keep(c);
     let shell = st.shell;
     let prompt_back = wait_until(Duration::from_secs(15), || {
@@ -1695,6 +1727,23 @@ fn relaunch_cause(cause: &str) -> bool {
         || cause.starts_with(CAUSE_MODEL_BACK)
 }
 
+/// Whether a record of `cause` was filed by a restart that ENDED ITS AGENT
+/// ITSELF — the upgrade's SIGTERM (cause empty, or [`CAUSE_UPGRADE_FRESH`])
+/// or the restart in place's ([`restart_here`]: [`CAUSE_MEMORY`],
+/// [`CAUSE_MODEL`], [`CAUSE_MODEL_BACK`]) — rather than by a relaunch on
+/// exit, whose agent was gone before its record was made ([`CAUSE_EXIT`],
+/// [`CAUSE_FRESH`], [`CAUSE_HOST`], and [`CAUSE_STALL`]: the stall's remedy
+/// is its supervisor's signal, not the record's). An allowlist: a relaunch
+/// cause added later is no restart that ended its agent until it is named
+/// here.
+pub(super) fn ends_its_agent(cause: &str) -> bool {
+    cause.is_empty()
+        || cause == CAUSE_UPGRADE_FRESH
+        || cause == CAUSE_MEMORY
+        || cause.starts_with(CAUSE_MODEL)
+        || cause.starts_with(CAUSE_MODEL_BACK)
+}
+
 /// THE CONTINUATION a relaunched agent is typed once it holds its
 /// conversation again — why it was relaunched (`cause`: an exit nobody asked
 /// for, [`CAUSE_EXIT`]; the host's restart for the memory banner,
@@ -2419,6 +2468,21 @@ fn after_exit_as(
         .map(|sf| sf.cwd.clone())
         .filter(|c| !c.is_empty())
         .unwrap_or_else(|| snap.cwd.clone());
+    // THE HARNESS'S OWN RESTART ENDED THIS VERY AGENT (S0 of the in-flight
+    // review, 2026-09-27): its record names the process that left, in this
+    // tab. The exit is that restart's — carried from where it stopped, or
+    // said — and never the graceful exit its own SIGTERM made of it: until
+    // then a restart the back-off let expire was closed here and fell through
+    // to `ended:graceful-exit`, the agent never relaunched and nothing said.
+    // Not for a tab aterm's own end took ([`ExitCause::HostEnded`]): there
+    // the record too old to act on is closed below and a fresh relaunch made.
+    if cause != ExitCause::HostEnded
+        && let Some(st) =
+            load(opts, &session).filter(|st| ended_by_restart(st, &snap.tab, snap.pid, now_s()))
+    {
+        r.to = format!("{}({})", st.to, st.source);
+        return carry_own(opts, r, st, &session, &snap.tab);
+    }
     // A relaunch already in flight for this conversation is carried on, not
     // typed twice. One too old to act on is closed on the record instead, and
     // this step makes a fresh one: the host decided just now that nobody is
@@ -2445,7 +2509,21 @@ fn after_exit_as(
         };
         if let Some((why, detail)) = overtaken.or_else(|| expired(&st, now_s())) {
             if !opts.dry_run {
-                st.fail(why, now_s());
+                if overtaken.is_some() {
+                    // The exit that closes it is ANOTHER process's — the
+                    // relaunched agent's, or a later one's — never the end
+                    // of the agent this record names, which its relaunch
+                    // had already seen gone: no failure after ITS exit
+                    // (`upgrade_status::Row::failed_after_exit`), so the
+                    // owner's view vets the stop against a holder as any
+                    // stop's, never a day-long stall with `claude --resume`
+                    // for a relaunch that landed (the review of 2026-09-27:
+                    // a graceful `/exit` of the relaunched agent read so).
+                    st.exited_at = 0;
+                } else {
+                    st.seen_gone(now_s());
+                }
+                st.stop(why, now_s());
                 ledger(opts, &said(r.clone(), format!("failed:{why}")), detail);
                 save(opts, &session, &st);
             }
@@ -2461,8 +2539,9 @@ fn after_exit_as(
     // of 2026-09-25: a worker its manager ended over the socket read as
     // "nobody asked" — no window keystroke, no named hand — and was
     // relaunched on its conversation a second later).
-    // The upgrade's own SIGTERM is the record in flight, carried on above;
-    // the stall's remedy is no one's decision about the session (U1).
+    // The harness's own restart's SIGTERM is the record carried or said
+    // above ([`ended_by_restart`]); the stall's remedy is no one's decision
+    // about the session (U1).
     if survivor.is_none() && cause == ExitCause::Exit {
         return said(r, "ended:graceful-exit");
     }
@@ -2578,6 +2657,191 @@ fn carry_in_flight(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str)
     };
     save(opts, session, &st);
     r
+}
+
+// ------------------------------------------------ a restart left in flight
+
+/// How long after its agent was seen gone ([`St::exited_at`]) a restart that
+/// STOPPED is still the one that ended an agent leaving its tab: twice
+/// [`STALE_S`], the longest a carry of it lives (its bound, one pause of
+/// [`CARRY_EVERY`] and one attempt's waits) — so a pid the kernel hands a
+/// later process in the same tab is never read as that agent.
+const STOPPED_OWN_S: u64 = 2 * STALE_S;
+
+/// Whether `st` is the record of a RESTART OF THE HARNESS'S OWN whose signal
+/// ended the agent `pid` that left tab `tab` at `now`: a Claude Code record
+/// of a cause that ends its agent ([`ends_its_agent`]) naming that very
+/// process in that tab — in flight (its signal sent: one refused or never
+/// sent is put back before anything waits on it), or stopped at most
+/// [`STOPPED_OWN_S`] after its agent was seen gone ([`St::exited_at`]). A
+/// stop before any exit — a signal the kernel refused — left the agent
+/// running, and its later exit is someone's.
+pub(super) fn ended_by_restart(st: &St, tab: &str, pid: u32, now: u64) -> bool {
+    st.agent == upgrade::Agent::Claude
+        && st.tab == tab
+        && st.pid == pid
+        && ends_its_agent(&st.cause)
+        && (st.in_flight()
+            || (matches!(st.phase, upgrade::Phase::Failed(_))
+                && st.exited_at != 0
+                && now.saturating_sub(st.exited_at) <= STOPPED_OWN_S))
+}
+
+/// Whether a Codex that left its tab was ended by the restart record `st`
+/// ([`restarted`]): its `/exit` typed and the old TUI not yet replaced —
+/// exiting, or relaunched with no new TUI adopted and none found gone (the
+/// old TUI's exit can be read after the line is typed, while the new one
+/// comes up). Once the relaunched TUI is ADOPTED
+/// (`upgrade_codex_drive::adopt` stamps [`St::resumed_pid`]) a Codex leaving
+/// is that TUI, its exit its own (the review of 2026-09-27: matched on the
+/// tab alone, a person's `/exit` of the adopted TUI was carried as the
+/// restart's, the harness's hand held on the tab until the record expired,
+/// and the tab badged as an agent the harness had ended). So is one the
+/// restart FOUND ([`St::relaunched_pid`]) and never adopted — its adoption
+/// ran out of time, its carry-on found a person at the keys — once it is
+/// gone: only that TUI could have left then, the old one long before it
+/// came up. One found and still alive is not what left.
+fn codex_exit_is_restarts(st: &St) -> bool {
+    match st.phase {
+        upgrade::Phase::Exiting { .. } => true,
+        upgrade::Phase::Relaunched { .. } => {
+            st.resumed_pid == 0 && (st.relaunched_pid == 0 || alive(st.relaunched_pid))
+        }
+        _ => false,
+    }
+}
+
+/// The record of the restart [`restarted`] finds for tab `opts.only_sid`, with
+/// the conversation it is filed under.
+fn restart_record(opts: &Opts, codex: bool, pid: Option<u32>) -> Option<(String, St)> {
+    let tab = opts.only_sid.as_deref()?;
+    let now = now_s();
+    let dir = std::fs::read_dir(state_dir(opts)).ok()?;
+    dir.flatten().find_map(|e| {
+        let path = e.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            return None;
+        }
+        let session = path.file_stem()?.to_string_lossy().into_owned();
+        let st = load(opts, &session)?;
+        let ours = if codex {
+            st.agent == upgrade::Agent::Codex && st.tab == tab && codex_exit_is_restarts(&st)
+        } else {
+            pid.is_some_and(|pid| ended_by_restart(&st, tab, pid, now))
+        };
+        ours.then_some((session, st))
+    })
+}
+
+/// THE HARNESS'S OWN RESTART ENDED THE AGENT THAT LEFT tab `opts.only_sid`
+/// (S0 and S3 of the in-flight review, 2026-09-27): the upgrade's, or the
+/// restart in place's, whose step returned with the relaunch still to type
+/// (`wait:held`, `wait:typing`, `wait:shell-prompt`, `wait:resume` …) and
+/// whose agent then left the tab with no step watching it. `codex`: the
+/// agent that left was a Codex — its worker keeps no snapshot, and the
+/// tab's one Codex record in flight, no relaunched TUI adopted yet nor found
+/// gone, is its restart's (filed per tab, `codex-<tab>`,
+/// [`codex_exit_is_restarts`]); else `pid` is the Claude Code that left (the
+/// host's snapshot of it), and the restart is the record that ended that very
+/// process ([`ended_by_restart`]). Read-only: the state files, and whether the
+/// relaunched Codex TUI a record names still lives; no lock.
+#[must_use]
+pub fn restarted(opts: &Opts, codex: bool, pid: Option<u32>) -> bool {
+    restart_record(opts, codex, pid).is_some()
+}
+
+/// THE RESTART [`restarted`] FOUND, CARRIED ON for its agent's exit: one step
+/// under the one lock every actor on the upgrade state takes. `adopted` (or
+/// `done:fresh`) once the relaunch holds the tab; `wait:<why>` while a
+/// person types at the returned prompt, a hold or a hand is on the tab, the
+/// shell has not taken the terminal back, or the relaunch has not registered
+/// — nothing is typed then, and the host tries again ([`CARRY_EVERY`]);
+/// `busy:<why>` for another actor; and `refused:<why>` once it can never
+/// land ([`carry_own`]), or is no longer to be found
+/// (`refused:no-restart-in-flight`) — the one case a person is asked about,
+/// never the graceful exit the restart's own SIGTERM made of it.
+#[must_use]
+pub fn carry_restart(opts: &Opts, codex: bool, pid: Option<u32>) -> Report {
+    let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
+    let r = Report {
+        pid: pid.unwrap_or(0),
+        tab: tab.clone(),
+        session: "-".to_string(),
+        from: "-".to_string(),
+        to: "-".to_string(),
+        step: String::new(),
+    };
+    let _held = match sweep_lock(opts) {
+        Ok(lock) => lock,
+        Err(why) => return said(r, format!("busy:{why}")),
+    };
+    let Some((session, mut st)) = restart_record(opts, codex, pid) else {
+        return said(r, "refused:no-restart-in-flight");
+    };
+    // THE EXIT THE HOST JUST SAW: this carry follows it by at most one
+    // [`CARRY_EVERY`], so it is when the agent was seen gone, and the
+    // stale-exit bound counts from it ([`STALE_S`]) — never from a signal a
+    // slow shutdown outlived (the review of 2026-09-27). Kept for the next
+    // try, which counts from the same exit. A Codex restart's lane keeps its
+    // own.
+    if st.agent == upgrade::Agent::Claude && st.seen_gone(now_s()) && !opts.dry_run {
+        save(opts, &session, &st);
+    }
+    let r = Report {
+        session: session.clone(),
+        from: st.from.clone(),
+        to: format!("{}({})", st.to, st.source),
+        ..r
+    };
+    carry_own(opts, r, st, &session, &tab)
+}
+
+/// A restart of the harness's own whose signal ended its agent
+/// ([`ended_by_restart`], or a Codex restart in flight), carried from where
+/// it stopped — and FINAL where it can no longer land: one already stopped
+/// says so again, one too old to act on is stopped ([`St::stop`], with when
+/// its agent was seen gone) and one that stops in the carry says so, each
+/// `refused:<why>` (S0 of the in-flight review, 2026-09-27). One relaunched
+/// and never registered is never relaunched afresh: its line was typed once,
+/// and a second minutes later, at a prompt a person may be typing at, is
+/// what [`STALE_S`] exists to prevent. A dry run says `would-refuse:<why>`
+/// and writes nothing.
+fn carry_own(opts: &Opts, r: Report, mut st: St, session: &str, tab: &str) -> Report {
+    let refused = |r: Report, why: &str| {
+        said(
+            r,
+            if opts.dry_run {
+                format!("would-refuse:{why}")
+            } else {
+                format!("refused:{why}")
+            },
+        )
+    };
+    if let upgrade::Phase::Failed(why) = &st.phase {
+        return refused(r, why);
+    }
+    // A Codex restart is its lane's to carry, its own age limit included:
+    // counted from its typed `/exit`, never from the TUI's exit — a TUI still
+    // alive a minute after its `/exit` is one the `/exit` did not take.
+    if st.agent == upgrade::Agent::Claude
+        && let Some((why, detail)) = expired(&st, now_s())
+    {
+        if !opts.dry_run {
+            st.seen_gone(now_s());
+            st.stop(why, now_s());
+            ledger(opts, &said(r.clone(), format!("failed:{why}")), detail);
+            save(opts, session, &st);
+        }
+        return refused(r, why);
+    }
+    let r = match st.agent {
+        upgrade::Agent::Codex => super::upgrade_drive::codex_carry_in_flight(opts, r, st, session),
+        upgrade::Agent::Claude => carry_in_flight(opts, r, st, session, tab),
+    };
+    match r.step.strip_prefix("failed:").map(str::to_string) {
+        Some(why) => refused(r, &why),
+        None => r,
+    }
 }
 
 /// THE CONTINUATION OWED to tab `opts.only_sid`: a relaunch its supervisor
@@ -2730,6 +2994,14 @@ pub enum OnExit {
     Limited,
     /// Nobody asked: relaunch it.
     Relaunch,
+    /// The harness's OWN RESTART ended the agent and left its relaunch in
+    /// flight ([`restarted`]: the upgrade's SIGTERM, a Codex `/exit` it
+    /// typed, the restart in place's): the exit is that restart's — never a
+    /// person's, a holder's or the owner's limit — and it is CARRIED
+    /// ([`carry_restart`]) until it lands or is said. What is typed at the
+    /// prompt still waits on a person and a hold: the relaunch line's own
+    /// look (`held`, the prompt's mark) makes it wait, never this decision.
+    Restarted,
 }
 
 /// THE DECISION: whose exit this was. `allowed` is `[harness] relaunch` for
@@ -2738,11 +3010,25 @@ pub enum OnExit {
 /// `[harness] human_grace_s`; `stalled`: the agent had stopped reading its
 /// input when it exited (its supervisor held for the stall), so a person's
 /// keystroke just before was no `/exit` — nothing read it — and the exit is
-/// the stall's remedy's (U1). A person or a holder owns the exit before the
-/// owner's limit is asked about, so their own exit is never said to them.
+/// the stall's remedy's (U1); `restarted`: the harness's own restart ended
+/// it ([`restarted`]), which is asked FIRST — its exit is that restart's,
+/// whoever is at the tab and whatever the owner's switch says
+/// ([`OnExit::Restarted`]; S0 of the in-flight review, 2026-09-27: the
+/// owner who pressed Upgrade now had typed within the grace, so the exit
+/// read as theirs and the agent the upgrade ended was never relaunched). A
+/// person or a holder owns any other exit before the owner's limit is asked
+/// about, so their own exit is never said to them.
 #[must_use]
-pub fn on_exit(allowed: bool, status: Option<&str>, grace_s: u32, stalled: bool) -> OnExit {
-    if !stalled && status.is_some_and(|s| person_present(s, grace_s)) {
+pub fn on_exit(
+    allowed: bool,
+    status: Option<&str>,
+    grace_s: u32,
+    stalled: bool,
+    restarted: bool,
+) -> OnExit {
+    if restarted {
+        OnExit::Restarted
+    } else if !stalled && status.is_some_and(|s| person_present(s, grace_s)) {
         OnExit::PersonAsked
     } else if status.is_some_and(held_by_someone) {
         OnExit::Held
@@ -2812,6 +3098,14 @@ pub const BUSY: Duration = Duration::from_secs(10);
 /// over: it crashed once, not in a loop.
 pub const HEALTHY: Duration = Duration::from_secs(600);
 
+/// The longest pause before the next attempt at a restart of the harness's
+/// own ([`OnExit::Restarted`]): the back-off's ten-minute step outlasts
+/// [`STALE_S`], so after three misses its record expired between two
+/// attempts, never carried (S0 of the in-flight review, 2026-09-27). Tried
+/// at least this often, it is carried while it may still act and said the
+/// attempt after it cannot.
+pub const CARRY_EVERY: Duration = Duration::from_secs(60);
+
 /// Consecutive relaunch steps that did not relaunch ([`Outcome::NotYet`])
 /// before the session's attention says so. The host keeps trying after it.
 pub const BADGE_AFTER: u32 = 3;
@@ -2855,6 +3149,10 @@ pub struct Relaunches {
     left: bool,
     /// The session's attention carries this relaunch's word.
     badged: bool,
+    /// The exit being handled is a restart of the harness's own
+    /// ([`OnExit::Restarted`]): carried, never left to a person, a holder or
+    /// a limit — the model's `restarted`.
+    restarted: bool,
 }
 
 impl Relaunches {
@@ -2875,8 +3173,9 @@ impl Relaunches {
     /// or a holder may have come back, the owner may have limited it):
     /// `None` while it is still due, else what the attention says.
     pub fn decide(&mut self, decision: OnExit) -> Option<Say> {
+        self.restarted = decision == OnExit::Restarted;
         match decision {
-            OnExit::Relaunch => {
+            OnExit::Relaunch | OnExit::Restarted => {
                 self.pending = true;
                 self.left = false;
                 None
@@ -2920,6 +3219,7 @@ impl Relaunches {
                 self.misses = 0;
                 self.last = Some(now);
                 self.pending = false;
+                self.restarted = false;
                 if std::mem::take(&mut self.badged) {
                     Say::Clear
                 } else {
@@ -2935,6 +3235,16 @@ impl Relaunches {
                 } else {
                     Say::Nothing
                 }
+            }
+            // THE HARNESS'S OWN RESTART IS NEVER LEFT (the model's
+            // `RestartCarried`, the review of 2026-09-27): its carry answers
+            // no launch's own end and no agent that never exited, and were
+            // it to, the tab would be left with nothing said — it is said,
+            // as a relaunch that cannot land.
+            Outcome::Left(_) if self.restarted => {
+                self.pending = false;
+                self.badged = true;
+                Say::Cannot
             }
             Outcome::Left(_) => {
                 self.pending = false;
@@ -2955,6 +3265,7 @@ impl Relaunches {
     pub fn running(&mut self) -> Say {
         self.pending = false;
         self.left = false;
+        self.restarted = false;
         if std::mem::take(&mut self.badged) {
             Say::Clear
         } else {
@@ -2973,6 +3284,13 @@ impl Relaunches {
     #[must_use]
     pub fn counts(&self) -> (bool, bool, u32, u32) {
         (self.left, self.badged, self.streak, self.misses)
+    }
+
+    /// Whether the exit being handled is a restart of the harness's own
+    /// ([`OnExit::Restarted`]): the model's `restarted`.
+    #[must_use]
+    pub fn restarted(&self) -> bool {
+        self.restarted
     }
 }
 

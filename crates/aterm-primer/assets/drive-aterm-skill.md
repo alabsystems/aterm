@@ -288,7 +288,8 @@ aterm ctl "@$SID" image --bytes                # OK 1 + "<w> <h> <nbytes> <base6
   **never** `awk '{print $4}'`; take the rest of the line.
 - Filename must be a **bare filename**; captures are confined to `<socket-dir>/images/`.
 - **A background tab cannot be screenshotted:** `ERR image: no window shows that session;
-  raise its tab first`, and no file is written. `text`/`screen` have no such limit.
+  raise its tab (or end the pane zoom in it) first`, and no file is written. `text`/`screen`
+  have no such limit.
 - `--bytes` is the only capture form a remote (`dial`) driver can use, since a path names
   the *server's* filesystem. PNG is 8-bit RGBA, full device-pixel (Retina 2×) —
   budget ~0.8–1.2 MB of base64 per shot.
@@ -591,7 +592,7 @@ After the ack the connection is **push-only forever**.
 - `EVENT <local> turn <id> submitted= status= dur_ms=` / `block-complete <id> exit=` / `title` / `bell` / `meta`
 - `EVENT <local> closing reason= by=` then `EVENT <local> exited` — the `exits` row, live
 - `BYTES <local> <len>` + raw PTY bytes
-- `MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>]` — `mail` only, one line per row
+- `MAIL <local> id=<n> off=<n> from=<p> kind=<k>[ re=<n>][ topic=<t>]` — `mail` only, one line per row
   DELIVERED into that session's inbox. **Metadata only, never a body** — read the words
   with `inbox get <id>`. Live-only: seeded to the ring's high, so it replays no backlog
   (`await inbox` is what reads history).

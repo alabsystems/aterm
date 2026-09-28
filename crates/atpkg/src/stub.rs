@@ -338,9 +338,10 @@ fn stub_content_cmd(tool: &ToolName, atpkg: &Path) -> String {
     s.push_str(&format!(
         "where atpkg >nul 2>nul\r\nif not errorlevel 1 (\r\n  atpkg __pending \"{name}\"\r\n  exit /b 127\r\n)\r\n"
     ));
-    s.push_str(&format!(
-        "echo {STUB_UNREACHABLE_MSG} 1>&2\r\nexit /b 127\r\n"
-    ));
+    // ASCII only: cmd.exe reads a batch file in the console's OEM code page, where
+    // the UTF-8 em dash prints as mojibake.
+    let unreachable = STUB_UNREACHABLE_MSG.replace('\u{2014}', "-");
+    s.push_str(&format!("echo {unreachable} 1>&2\r\nexit /b 127\r\n"));
     crate::platform::cmd_framed(&s)
 }
 
@@ -954,6 +955,8 @@ mod tests {
         assert_eq!(body.matches("@goto :main").count(), 1);
         assert_eq!(body.matches("\r\n:main\r\n").count(), 1);
         assert!(!body.contains("#!/bin/sh"), "no POSIX in a .cmd file");
+        // cmd.exe reads the file in the console's OEM code page: no UTF-8 in it.
+        assert!(body.is_ascii(), "a .cmd stub is ASCII: {body}");
         let exist = body.find("if exist").unwrap();
         let where_probe = body.find("where atpkg").unwrap();
         let static_msg = body.find("package manager is not reachable").unwrap();

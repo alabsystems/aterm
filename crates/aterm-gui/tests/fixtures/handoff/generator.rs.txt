@@ -2,25 +2,42 @@
 // Copyright 2026 Andrew Yates
 //
 // THE HANDOFF FIXTURE GENERATOR — not compiled here. This is the exact code
-// that wrote `v0.95.0/`: it was appended, uncommitted, to
-// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.95.0
+// that wrote `v0.97.0/`: it was appended, uncommitted, to
+// `crates/aterm-gui/src/seamless_carry_tests.rs` in a worktree at the v0.97.0
 // tag, where it reuses that file's `FakeApp`, `old_session`, `ENV_LOCK`,
-// `RestoreVar`, `pipe_pair`, `env_guard`, `this_build` and `child_proof_from`,
-// and runs that release's own capture ladder, history carry, writer and
-// consumer. v0.95.0's capture, worker order and writer are v0.94.0's, so it
-// differs from what wrote `v0.94.0/` only in the release strings, the target
-// build and the nonce seeds; the layout leaf's `agent` field (added in
-// v0.95.0, and `None` on a handoff layout, which never fills it); the
-// parent's session rows, which also record the absolute row counters and the
-// colour and shell-integration state the meta now carries; a self-check that
-// also asserts those cross, that after the history import every carried
-// shell mark still names its line, and that a command running across the
-// handoff completes on the successor; and a seventh desk, `colour-and-shell`,
-// for the meta v0.95.0 changed. It ran with `ATERM_BUILD_GIT_COMMIT` set to
-// the tag's short commit, so `parent.toml`'s `producer_commit` names the
-// release rather than `<commit>-dirty` (the appended generator is the
-// worktree's only change). README.md in this directory says how to adapt it
-// for the next release.
+// `RestoreVar`, `pipe_pair`, `env_guard`, `this_build` and `child_proof_from`
+// (and `ladder_tests::assert_only_over_cap_links_dropped`), and runs that
+// release's own policy reader, capture ladder, history carry, writer and
+// consumer. It is v0.95.0's generator with what v0.97.0's producer changed:
+//
+// - THE SIGNED HANDOFF POLICY (75f60b08c, eb807651f, 3d6ebfdda). Every park
+//   reads the successor's policy (`App::park_policy`) and captures under its
+//   ceiling (`carry_for_wire_within`); the history plan follows the same
+//   answer (`HistoryPlan::deferred_under`), and the fork lane's worker refuses
+//   a capture taken above the policy it reads (`capture_exceeds_policy`).
+//   Releases ship `publish/handoff-policy.toml` EMPTY, so the generator reads
+//   that file, byte for byte, out of a bundle laid out as the cut lays it
+//   (`read_from_bundle`, `adopt`): no policy to follow, the `Full` ceiling,
+//   the `Deferred` plan: the path every install of v0.97.0 takes to a
+//   release that ships the file empty.
+// - THE CAPTURE WALKS THE POOL IN SESSION-ID ORDER (eb807651f), and a parser
+//   left mid-sequence is carried (abandoned as CAN would) only over a quiet
+//   PTY, else the park misses — so the PTYs are made before the capture, as
+//   the v0.93.0 generator made them, and the `stalled-sequence` desk is back.
+// - THE LINK-STRIPPING RUNG (b2275989d, bounded by 510affa38). A line record
+//   over the wire's per-record cap costs that line its OSC 8 links
+//   (`CarryRung::StrippedLinks`), not the screen: the ninth desk,
+//   `link-dense`, is that shape. Every other session is carried at `Full`.
+//
+// The parent's session rows also record the rung each session was carried at
+// and how many lines lost their links, and the parent records the park's
+// carry ceiling. It ran with `ATERM_BUILD_GIT_COMMIT` set to the tag's short
+// commit and `SOURCE_DATE_EPOCH` to the release's build number from
+// `RELEASES.ledger`, so `parent.toml`'s `producer_commit` names the release
+// rather than `<commit>-dirty` and the manifest's `outgoing_build` is the one
+// the shipped binary writes (the appended generator is the worktree's only
+// change). README.md in this directory says how to adapt it for the next
+// release.
 
 // ------------------------------------------ HANDOFF FIXTURE GENERATOR (P0-7)
 //
@@ -29,12 +46,12 @@
 // `$ATERM_HANDOFF_FIXTURE_OUT/<desk>/` for the main tree's cross-version
 // guard (`seamless_fixture_tests.rs`). See the fixture README.
 const FIXTURE_DIR_PLACEHOLDER: &str = "@HANDOFF_DIR@";
-/// A successor NEWER than v0.95.0 (build 1790563767): the hop these desks
+/// A successor NEWER than v0.97.0 (build 1790585188): the hop these desks
 /// stand for. It decides the wire caps (`WireCaps::for_target`) and that the
 /// history is exported at all (`handoff_history::exports_for_target`).
-const FIXTURE_TARGET_BUILD: u64 = 1_790_700_000;
+const FIXTURE_TARGET_BUILD: u64 = 1_790_800_000;
 const FIXTURE_TARGET_COMMIT: &str = "fedcba987654";
-/// v0.95.0's decode-authority budget (`app_update_handoff`'s private
+/// v0.97.0's decode-authority budget (`app_update_handoff`'s private
 /// `MAX_HANDOFF_CAPTURE_BUDGET_BYTES`), copied: the capture prices history
 /// against it.
 const FX_CAPTURE_BUDGET_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -47,6 +64,11 @@ struct FxSession {
     record: SessionRecord,
     term: Arc<Mutex<Terminal>>,
     turns: Arc<Mutex<TurnLedger>>,
+    /// The rung v0.97.0's ladder carries this session at: `Full` for every
+    /// honest desk, `StrippedLinks` for a screen holding a line record over
+    /// the wire's per-record cap. The capture asserts it, and that the
+    /// self-check (`settle_wire_carries`) lowers nothing.
+    rung: CarryRung,
 }
 
 struct FxDesk {
@@ -62,7 +84,7 @@ struct FxDesk {
 fn fx_record(local_id: u64, title: &str) -> SessionRecord {
     SessionRecord {
         local_id,
-        sid: format!("s-{:020x}", 0x0095_0000_0000_u64 + local_id * 0x1_0101),
+        sid: format!("s-{:020x}", 0x0097_0000_0000_u64 + local_id * 0x1_0101),
         parent: None,
         state: "alive".to_string(),
         title: title.to_string(),
@@ -93,6 +115,7 @@ fn fx_session(local_id: u64, title: &str, t: Terminal) -> FxSession {
         record: fx_record(local_id, title),
         term: Arc::new(Mutex::new(t)),
         turns: Arc::new(Mutex::new(TurnLedger::default())),
+        rung: CarryRung::Full,
     }
 }
 
@@ -110,8 +133,8 @@ fn fx_leaf(local_id: u64, title: &str, cwd: Option<&str>) -> crate::restore::Res
         attention: None,
         identity: None,
         questions: None,
-        // v0.95.0: filled only by the crash journal and a system quit's
-        // layout, never by the handoff's (`capture_restore_manifest`).
+        // Since v0.95.0: filled only by the crash journal and a system
+        // quit's layout, never by the handoff's (`capture_restore_manifest`).
         agent: None,
     }))
 }
@@ -170,7 +193,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
     // and hands it over.
     let carried = if installing {
         let mut app = crate::App::headless_for_test();
-        app.post_message(crate::update_words::installing("0.96.0"));
+        app.post_message(crate::update_words::installing("0.98.0"));
         app.carried_messages()
     } else {
         crate::session_store::MessagesCarry::default()
@@ -181,7 +204,7 @@ fn fx_window_carry(rows: u16, cols: u16, installing: bool) -> WindowCarry {
         outer_x: Some(96),
         outer_y: Some(48),
         status_bar_rows: u16::from(installing),
-        update_verified_unix_ms: installing.then_some(1_790_690_000_000),
+        update_verified_unix_ms: installing.then_some(1_790_790_000_000),
         messages: carried.messages,
         next_message_id: carried.next_message_id,
     }
@@ -254,6 +277,7 @@ fn fx_claude(local_id: u64, rows: u16, cols: u16, before: usize) -> FxSession {
         record: fx_record(local_id, "claude"),
         term: Arc::new(Mutex::new(t)),
         turns: Arc::new(Mutex::new(ledger)),
+        rung: CarryRung::Full,
     }
 }
 
@@ -271,26 +295,112 @@ fn fx_optional_carry_fits(
         .is_some_and(|total| total <= ceiling)
 }
 
-/// What v0.95.0's park capture hands the worker for one desk.
+/// THE PARK'S POLICY, AS AN INSTALL OF v0.97.0 READS IT (plan P0-5,
+/// 75f60b08c, eb807651f). The successor's `publish/handoff-policy.toml` is
+/// copied byte for byte into its bundle as `BUNDLE_PATH` by the cut; the
+/// producer's pre-verification reads it from there
+/// (`handoff_policy::read_from_bundle`, after the codesign check) and keeps
+/// what it must follow (`handoff_policy::adopt`), which every park then reads
+/// by the attempt's key (`App::park_policy`). Releases ship the file EMPTY
+/// (`schema = 1`), so there is nothing to follow and the park captures at
+/// the `Full` ceiling: the ladder as it ships. This lays the checked-in file
+/// out as the cut does and runs that reader, rather than assuming its answer.
+fn fx_park_policy(
+    scratch: &std::path::Path,
+) -> (
+    crate::app_update_handoff::ParkPolicy,
+    Option<aterm_update_core::handoff_policy::HandoffPolicy>,
+) {
+    use aterm_update_core::handoff_policy::{self as policy, CarryCeiling, PolicyRead};
+    let shipped = std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(policy::SOURCE_PATH),
+    )
+    .expect("the release's checked-in handoff policy");
+    let app_root = scratch.join("successor.app");
+    let in_bundle = app_root.join(policy::BUNDLE_PATH);
+    std::fs::create_dir_all(in_bundle.parent().unwrap()).unwrap();
+    std::fs::write(&in_bundle, &shipped).unwrap();
+    let read = policy::read_from_bundle(&app_root);
+    let PolicyRead::Parsed(parsed) = read else {
+        panic!("the release's policy file reads: {read:?}");
+    };
+    assert!(
+        !parsed.asks_anything(),
+        "releases ship the handoff policy empty: {parsed}"
+    );
+    let adopted = policy::adopt(
+        &read,
+        crate::running_build_number(),
+        &format!("fixture successor build {FIXTURE_TARGET_BUILD}"),
+    );
+    assert_eq!(adopted, None, "an empty policy is no policy to follow");
+    let park = crate::app_update_handoff::ParkPolicy {
+        policy: adopted,
+        known: true,
+    };
+    assert_eq!(
+        park.carry_ceiling(),
+        CarryCeiling::Full,
+        "the park captures under the ladder as it ships"
+    );
+    assert!(!park.relaxes_land_gate());
+    (park, adopted)
+}
+
+/// `app_update_handoff::capture_exceeds_policy` (private there), copied: the
+/// fork lane's worker reads the candidate's policy after the park and refuses
+/// a capture taken above it.
+fn fx_capture_exceeds_policy(
+    parked_under: Option<aterm_update_core::handoff_policy::CarryCeiling>,
+    adopted: Option<aterm_update_core::handoff_policy::HandoffPolicy>,
+) -> bool {
+    parked_under
+        .zip(adopted)
+        .is_some_and(|(parked_under, policy)| policy.carry_ceiling() > parked_under)
+}
+
+/// What v0.97.0's park capture hands the worker for one desk.
 struct FxCapture {
     screens: Vec<(u64, TerminalCheckpoint)>,
     repaint: Vec<u64>,
     sources: Vec<crate::handoff_carry::CarrySource>,
     heads: Vec<crate::handoff_history::HistoryHead>,
     screen_digest: [u8; 32],
+    /// The sessions whose parser the capture found mid-sequence over a quiet
+    /// PTY, and the state it was in: carried with that partial sequence left
+    /// out.
+    abandoned: Vec<(u64, &'static str)>,
+    /// The rung each session was carried at, and how many of its lines lost
+    /// their links (`StrippedLinks`).
+    rungs: Vec<(u64, CarryRung, usize)>,
 }
 
-/// v0.95.0's capture (`App::capture_parked_screens`) over a desk whose time
-/// is ample: the pool's mandatory visible grids reserved first, then each
-/// session carried by `carry_for_wire` with 256 lines of history when the
-/// cell and byte budgets admit it after that reserve, its history head and
-/// (at an exact rung) its control carry's head taken under the same lock;
-/// then the pool committed by `settle_wire_carries`. The repaint set is the
-/// sessions whose rung `needs_repaint`.
-fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
+/// v0.97.0's capture (`App::capture_parked_screens`) over a desk whose time
+/// is ample, under the park's policy `ceiling`: the pool walked in
+/// SESSION-ID order (eb807651f), its mandatory visible grids reserved first,
+/// then each session carried by `carry_for_wire_within` with 256 lines of
+/// history (none under a ceiling that carries no scrollback) when the cell
+/// and byte budgets admit it after that reserve, its history head and (at a
+/// rung that keeps it) its control carry's head taken under the same lock;
+/// then the pool committed by `settle_wire_carries`. A parser left
+/// mid-sequence is carried only over a quiet PTY
+/// (`handoff_masters_have_activity` on the session's own entry in `live`);
+/// over queued output v0.97.0's park misses instead
+/// (`CaptureFailure::MidSequence`), which no desk here stands for. The repaint
+/// set is the sessions whose rung `needs_repaint`.
+fn fx_capture(
+    sessions: &[FxSession],
+    live: &[(u64, i32, i32)],
+    caps: WireCaps,
+    ceiling: aterm_update_core::handoff_policy::CarryCeiling,
+) -> FxCapture {
+    let mut order: Vec<&FxSession> = sessions.iter().collect();
+    order.sort_unstable_by_key(|s| s.record.local_id);
     let mut cells_reserve = 0_u64;
     let mut bytes_reserve = 0_u64;
-    for s in sessions {
+    for s in &order {
         let guard = s.term.lock().unwrap();
         let (rows, cols) = (guard.rows(), guard.cols());
         cells_reserve = cells_reserve.saturating_add(mandatory_checkpoint_cells(rows, cols));
@@ -300,19 +410,37 @@ fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
     let mut wire = Vec::new();
     let mut sources = Vec::new();
     let mut heads = Vec::new();
+    let mut abandoned = Vec::new();
+    let mut rungs = Vec::new();
     let mut capture_cells = 0_u64;
     let mut capture_budget = 0_u64;
     let mut history_latched_off = false;
-    for s in sessions {
+    for s in &order {
         let id = s.record.local_id;
         let guard = s.term.lock().unwrap();
-        assert!(guard.partial_sequence_state().is_none(), "session {id} is at Ground");
+        if let Some(state) = guard.partial_sequence_state() {
+            let entry = live
+                .iter()
+                .find(|(local_id, _, _)| *local_id == id)
+                .expect("every session has a PTY");
+            assert!(
+                !crate::app_update_handoff::handoff_masters_have_activity(std::slice::from_ref(
+                    entry
+                )),
+                "session {id}: v0.97.0 carries a mid-sequence parser only over a quiet PTY"
+            );
+            abandoned.push((id, state));
+        }
         let (rows, cols) = (guard.rows(), guard.cols());
         let own_cells = mandatory_checkpoint_cells(rows, cols);
         let own_bytes = checkpoint_capture_budget_bytes(rows, cols, 0).unwrap_or(u64::MAX);
         cells_reserve = cells_reserve.saturating_sub(own_cells);
         bytes_reserve = bytes_reserve.saturating_sub(own_bytes);
-        let carry = max_handoff_history_lines();
+        let carry = if ceiling.carries_scrollback() {
+            max_handoff_history_lines()
+        } else {
+            0
+        };
         let history_cells = u64::from(cols).saturating_mul(u64::from(carry));
         let history_bytes = checkpoint_capture_budget_bytes(rows, cols, carry)
             .map_or(u64::MAX, |carried| carried.saturating_sub(own_bytes));
@@ -342,12 +470,32 @@ fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
             "session {id}: inside the decode-authority budget"
         );
         let (checkpoint, rung, cause) =
-            carry_for_wire(&guard, id, history, &mut capture_cells, caps);
+            carry_for_wire_within(&guard, id, history, &mut capture_cells, caps, ceiling);
         assert_eq!(
-            rung,
-            CarryRung::Full,
-            "session {id}: an honest desk is carried at the top rung ({cause:?})"
+            rung, s.rung,
+            "session {id}: carried at the rung this desk stands for ({cause:?})"
         );
+        let mut stripped = 0;
+        if rung == CarryRung::StrippedLinks {
+            // Only the links of the line records over the wire's cap are
+            // gone, at the whole depth the budget asked for: every scalar,
+            // every other line and every stripped line's text, attributes and
+            // wrap flag are the engine's own exact carry at that depth.
+            let exact = guard
+                .checkpoint_carry(history as usize)
+                .expect("a link-dense desk is at Ground");
+            assert_eq!(
+                checkpoint.history_lines, exact.history_lines,
+                "session {id}: the whole carried scrollback crosses"
+            );
+            stripped = super::ladder_tests::assert_only_over_cap_links_dropped(
+                &format!("session {id}"),
+                &exact,
+                &checkpoint,
+            );
+            assert!(stripped > 0, "session {id}: a line lost its links");
+        }
+        rungs.push((id, rung, stripped));
         if history != 0 && rung == CarryRung::VisibleOnly {
             history_latched_off = true;
         }
@@ -369,7 +517,18 @@ fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
         });
     }
     let screen_digest =
-        settle_wire_carries(&mut wire, caps).expect("the v0.95.0 park commits this desk");
+        settle_wire_carries(&mut wire, caps).expect("the v0.97.0 park commits this desk");
+    for carry in &wire {
+        let (_, rung, _) = rungs
+            .iter()
+            .find(|(id, _, _)| *id == carry.local_id)
+            .unwrap();
+        assert_eq!(
+            carry.rung, *rung,
+            "session {}: the self-check lowers nothing",
+            carry.local_id
+        );
+    }
     sources.retain(|source: &crate::handoff_carry::CarrySource| {
         wire.iter()
             .any(|carry| carry.local_id == source.local_id() && carry.rung.keeps_control_carry())
@@ -389,6 +548,8 @@ fn fx_capture(sessions: &[FxSession], caps: WireCaps) -> FxCapture {
         sources,
         heads,
         screen_digest,
+        abandoned,
+        rungs,
     }
 }
 
@@ -434,11 +595,13 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     let dir = crate::control_auth::socket_dir().expect("control dir");
     std::fs::create_dir_all(&dir).unwrap();
 
-    let caps = WireCaps::for_target(FIXTURE_TARGET_BUILD);
-    let capture = fx_capture(&desk.sessions, caps);
-    let screens = &capture.screens;
-    // Real PTYs: the self-check below adopts them with this release's own
-    // consumer, which refuses a master that is not a tty.
+    // THE SUCCESSOR'S HANDOFF POLICY, read as every park of v0.97.0 reads it
+    // (`App::park_policy`): the ceiling this park captures under.
+    let (park, adopted) = fx_park_policy(&scratch);
+    let ceiling = park.carry_ceiling();
+    // Real PTYs, before the capture: v0.97.0's capture polls a mid-sequence
+    // session's master, and the self-check below adopts them with this
+    // release's own consumer, which refuses a master that is not a tty.
     let mut masters = Vec::new();
     let mut slaves = Vec::new();
     for _ in &desk.sessions {
@@ -471,6 +634,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             })
             .collect(),
     };
+    let caps = WireCaps::for_target(FIXTURE_TARGET_BUILD);
+    let capture = fx_capture(&desk.sessions, &fds.entries, caps, ceiling);
+    let screens = &capture.screens;
     // THE FOREGROUND HOLDER the park reads for every session and stamps on
     // its record (`stamp_fg_holders`): the shell itself at a prompt, else the
     // job it runs.
@@ -492,26 +658,44 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         next_turn_id: desk.next_turn_id,
         outgoing_build: Some(crate::running_build_number()),
     };
-    let nonce = format!("{:032x}", desk.nonce_seed);
-    // The worker, as `prepare_outgoing_artifacts` runs it on the fork lane:
-    // the control carry's export, then the history carry's (the lane's
-    // `HistoryPlan::Deferred`, exported now with every reader parked) and its
-    // join, then the writer.
-    let controls = handoff_carry::export(&capture.sources);
+    // The fork lane's history plan, under the ceiling the park was taken
+    // under (`HistoryPlan::deferred_under`): the handed sessions, exported by
+    // the worker once the capture is done (`App::history_sessions`, which
+    // exports only to a successor at least as new as this build).
     assert!(
         crate::handoff_history::exports_for_target(
             crate::running_build_number(),
             FIXTURE_TARGET_BUILD
         ),
-        "v0.95.0 exports history to this successor"
+        "v0.97.0 exports history to this successor"
     );
-    let results = crate::handoff_history::HistoryPlan::Deferred(
-        desk.sessions
-            .iter()
-            .map(|s| (s.record.local_id, Arc::clone(&s.term)))
-            .collect(),
-    )
-    .results(&dir);
+    let plan = crate::handoff_history::HistoryPlan::deferred_under(ceiling, || {
+        Some(
+            desk.sessions
+                .iter()
+                .map(|s| (s.record.local_id, Arc::clone(&s.term)))
+                .collect(),
+        )
+    });
+    assert!(
+        matches!(plan, crate::handoff_history::HistoryPlan::Deferred(_)),
+        "{}: under the Full ceiling the fork lane exports every history ({plan:?})",
+        desk.name
+    );
+    // The worker's first step on the fork lane: it verifies the candidate,
+    // reads its policy and refuses a capture taken above it
+    // (`capture_exceeds_policy`). The shipped policy asks for nothing.
+    assert!(
+        !fx_capture_exceeds_policy(Some(ceiling), adopted),
+        "{}: the capture was taken under the policy the worker reads",
+        desk.name
+    );
+    let nonce = format!("{:032x}", desk.nonce_seed);
+    // The worker, as `prepare_outgoing_artifacts` runs it on the fork lane:
+    // the control carry's export, then the history carry's (exported now with
+    // every reader parked) and its join, then the writer.
+    let controls = handoff_carry::export(&capture.sources);
+    let results = plan.results(&dir);
     let verdicts = crate::handoff_history::stamp_manifest(
         &mut manifest,
         screens,
@@ -538,7 +722,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         &controls,
         &nonce,
     )
-    .expect("the v0.95.0 writer publishes this desk");
+    .expect("the v0.97.0 writer publishes this desk");
     assert_eq!(
         outgoing.screen_digest, capture.screen_digest,
         "{}: the written bytes are the committed ones",
@@ -665,6 +849,15 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             cp.shell.command_marks.len(),
             cp.shell.completed_seq,
         ));
+        // v0.97.0: the rung the ladder carried the session at (`full`, or
+        // `stripped-links` for a screen holding a line record over the wire's
+        // cap), and how many of its lines lost their links.
+        let (_, rung, stripped) = capture
+            .rungs
+            .iter()
+            .find(|(id, _, _)| *id == rec.local_id)
+            .unwrap();
+        session_rows.push_str(&format!("rung = \"{rung}\"\nlinks_stripped = {stripped}\n"));
         session_rows.push('\n');
     }
     let identities = fds
@@ -674,11 +867,12 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         .collect::<Vec<_>>()
         .join(", ");
     let parent = format!(
-        "# What the v0.95.0 producer committed to for this desk. Generated by a\n\
-         # throwaway test in a v0.95.0 worktree; see ../../README.md.\n\
-         producer_version = \"0.95.0\"\n\
+        "# What the v0.97.0 producer committed to for this desk. Generated by a\n\
+         # throwaway test in a v0.97.0 worktree; see ../../README.md.\n\
+         producer_version = \"0.97.0\"\n\
          producer_commit = \"{commit}\"\n\
          outgoing_build = {build}\n\
+         park_carry_ceiling = \"{ceiling}\"\n\
          manifest = \"{manifest_name}\"\n\
          nonce = \"{nonce}\"\n\
          dir_placeholder = \"{FIXTURE_DIR_PLACEHOLDER}\"\n\
@@ -695,6 +889,7 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
          {session_rows}",
         commit = crate::build_info::GIT_COMMIT,
         build = crate::running_build_number(),
+        ceiling = ceiling.as_str(),
         screen = fx_hex(&outgoing.screen_digest),
         layout = fx_hex(&layout),
         count = proof.count,
@@ -746,6 +941,9 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
         let carried = &screens.iter().find(|(id, _)| *id == adopted.local_id).unwrap().1;
         let restored = adopted.checkpoint.as_ref().unwrap();
         assert_eq!(restored.grid, carried.grid, "{}", desk.name);
+        // Both grids: a link-dense line on the saved primary is stripped in
+        // the inactive grid's bytes.
+        assert_eq!(restored.alt_grid, carried.alt_grid, "{}", desk.name);
         assert_eq!(restored.shell_integration_nonce, carried.shell_integration_nonce, "{}", desk.name);
         assert_eq!(
             restored.modes.require_shell_integration_nonce,
@@ -772,6 +970,27 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             adopted.local_id
         );
+    }
+    // A stalled sequence is left out of the COPY, as CAN would: the carried
+    // checkpoint says Ground, and the live parser still holds the partial
+    // sequence, so a rolled-back handoff resumes byte-exactly.
+    for (id, state) in &capture.abandoned {
+        let carried = &screens.iter().find(|(local_id, _)| local_id == id).unwrap().1;
+        assert!(
+            carried.parser_ground,
+            "{}: session {id} was carried out of {state} as if CAN had ended it",
+            desk.name
+        );
+        let live = desk
+            .sessions
+            .iter()
+            .find(|s| s.record.local_id == *id)
+            .unwrap()
+            .term
+            .lock()
+            .unwrap()
+            .partial_sequence_state();
+        assert_eq!(live, Some(*state), "{}: session {id}'s live parser is untouched", desk.name);
     }
     let ((child, ready, _), adopted) =
         child_proof_from(incoming).unwrap_or_else(|| panic!("{}: the child proves", desk.name));
@@ -826,11 +1045,11 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             desk.name,
             item.local_id
         );
-        // v0.95.0: after the import, every shell mark the restore installed
-        // still names its line (the successor continues the parent's
-        // numbering); the shell state and the application's colours are the
-        // parent's; and a command running across the handoff completes on
-        // the successor.
+        // Since v0.95.0: after the import, every shell mark the restore
+        // installed still names its line (the successor continues the
+        // parent's numbering); the shell state and the application's colours
+        // are the parent's; and a command running across the handoff
+        // completes on the successor.
         let source = desk
             .sessions
             .iter()
@@ -840,6 +1059,13 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
             .lock()
             .unwrap();
         let mut successor = successor.lock().unwrap();
+        assert_eq!(
+            successor.partial_sequence_state(),
+            None,
+            "{}: session {}'s restored parser is at Ground",
+            desk.name,
+            item.local_id
+        );
         assert_eq!(
             successor.command_marks().len(),
             checkpoint.shell.command_marks.len(),
@@ -949,7 +1175,7 @@ fn fx_incident_desk() -> FxDesk {
     let shell = fx_session(1, "zsh", fx_shell(55, 149, 400, "/home/dev/src/aterm", 1));
     FxDesk {
         name: "incident-55x149",
-        nonce_seed: 0x0095_0001,
+        nonce_seed: 0x0097_0001,
         window: fx_window_carry(55, 149, true),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -973,11 +1199,12 @@ fn fx_claude_desk() -> FxDesk {
         record: fx_record(0, "claude"),
         term,
         turns,
+        rung: CarryRung::Full,
     };
     let shell = fx_session(1, "zsh", fx_shell(ROWS, COLS, 120, "/home/dev/src/aterm", 2));
     FxDesk {
         name: "claude-code-1049",
-        nonce_seed: 0x0095_0002,
+        nonce_seed: 0x0097_0002,
         window: fx_window_carry(ROWS, COLS * 2 + 1, false),
         sessions: vec![claude, shell],
         layout: RestoreManifest::new(vec![fx_window(
@@ -1013,7 +1240,7 @@ fn fx_history_desk() -> FxDesk {
     sessions[1].record.user_title = Some("logs".to_string());
     FxDesk {
         name: "history",
-        nonce_seed: 0x0095_0003,
+        nonce_seed: 0x0097_0003,
         window: fx_window_carry(40, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1111,7 +1338,7 @@ fn fx_twelve_pane_desk() -> FxDesk {
         .collect();
     FxDesk {
         name: "twelve-panes",
-        nonce_seed: 0x0095_0004,
+        nonce_seed: 0x0097_0004,
         window: fx_window_carry(46, 168, false),
         sessions,
         layout: RestoreManifest::new(vec![window_a, window_b]),
@@ -1161,7 +1388,7 @@ fn fx_shell_integration_desk() -> FxDesk {
     }
     FxDesk {
         name: "shell-integration",
-        nonce_seed: 0x0095_0005,
+        nonce_seed: 0x0097_0005,
         window: fx_window_carry(30, 200, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1213,7 +1440,7 @@ fn fx_history_carry_desk() -> FxDesk {
     }
     FxDesk {
         name: "history-carry",
-        nonce_seed: 0x0095_0006,
+        nonce_seed: 0x0097_0006,
         window: fx_window_carry(40, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1360,7 +1587,7 @@ fn fx_colour_and_shell_desk() -> FxDesk {
     sessions[0].record.loader = true;
     FxDesk {
         name: "colour-and-shell",
-        nonce_seed: 0x0095_0007,
+        nonce_seed: 0x0097_0007,
         window: fx_window_carry(42, 240, false),
         sessions,
         layout: RestoreManifest::new(vec![fx_window(
@@ -1369,6 +1596,160 @@ fn fx_colour_and_shell_desk() -> FxDesk {
             vec![fx_tab(fx_split(
                 SplitKind::Vertical,
                 fx_leaf(0, "cargo", Some("/home/dev/src/aterm")),
+                fx_leaf(1, "vim", Some("/home/dev/notes")),
+            ))],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
+/// A parser left mid-sequence over a quiet PTY, the shape v0.93.0 changed.
+/// v0.94.0's and v0.95.0's generators asserted every parser was at Ground and
+/// so carried no such desk; v0.97.0's carries it again. Through v0.92.0
+/// such a session refused every in-session update ("a terminal parser was
+/// mid-sequence"). v0.97.0 carries it with the partial sequence left out, as
+/// CAN would (`carry_for_wire` projects
+/// `Terminal::checkpoint_carry_abandoning_partial`), so its meta says Ground
+/// over a live parser that was not; over queued output its park misses
+/// instead. Three stalls a real desk holds: a shell that printed an
+/// unterminated OSC title (`printf '\e]0;building'`); an ssh session stalled
+/// halfway through an SGR; and an editor in 1049 whose kitty-graphics upload
+/// stopped inside its APC payload. v0.93.0's desk, and with v0.94.0's history
+/// carry the title shell's 300 lines and the editor's saved primary each name
+/// a `.hist` sidecar.
+fn fx_stalled_sequence_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    let mut title = fx_shell(30, 100, 300, "/home/dev/src/aterm", 8);
+    title.process(b"printf '\\e]0;building'\r\n\x1b]0;building");
+    assert_eq!(title.partial_sequence_state(), Some("OscString"));
+    let mut ssh = fx_shell(30, 99, 120, "/home/dev", 0);
+    ssh.process(b"ssh build-host\r\n\x1b[1;32mdev@build-host\x1b[0m:~$ \x1b[38;5;");
+    assert_eq!(ssh.partial_sequence_state(), Some("CsiParam"));
+    let mut image = fx_editor(30, 200, 3);
+    image.process(b"\x1b[5;10H\x1b_Gf=100,a=T,i=7,m=1;iVBORw0KGgoAAAANSUhEUgAA");
+    assert_eq!(image.partial_sequence_state(), Some("SosPmApcString"));
+    let sessions = vec![
+        fx_session(0, "zsh", title),
+        fx_session(1, "ssh", ssh),
+        fx_session(2, "vim", image),
+    ];
+    FxDesk {
+        name: "stalled-sequence",
+        nonce_seed: 0x0097_0008,
+        window: fx_window_carry(30, 200, false),
+        sessions,
+        layout: RestoreManifest::new(vec![fx_window(
+            30,
+            200,
+            vec![
+                fx_tab(fx_split(
+                    SplitKind::Vertical,
+                    fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
+                    fx_leaf(1, "ssh", Some("/home/dev")),
+                )),
+                fx_tab(fx_leaf(2, "vim", Some("/home/dev/src"))),
+            ],
+        )]),
+        connections: Vec::new(),
+        next_turn_id: None,
+    }
+}
+
+/// One row of `n` OSC 8 links labelled `<label><k>`, each to a signed URL of
+/// exactly `url_len` bytes: a CI tool's row of log links. The engine keeps a
+/// URL of up to 8 KiB, and a line record carries each URL once per span, so a
+/// dozen 8 KiB links make a record of about 96 KiB, past the wire's
+/// per-record cap (`16 KiB + cols * 512`) at any width under 160 columns; two
+/// stay under it.
+fn fx_link_row(n: usize, url_len: usize, host: &str, label: &str) -> String {
+    const SIGNATURE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut row = String::new();
+    for k in 0..n {
+        let mut url = format!("https://{host}/runs/4242/jobs/{k}/logs?X-Signature=");
+        let mut state = 0x9e37_79b9_u32.wrapping_add(u32::try_from(k).unwrap());
+        while url.len() < url_len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            url.push(char::from(SIGNATURE[(state >> 26) as usize]));
+        }
+        assert_eq!(url.len(), url_len);
+        row.push_str(&format!(
+            "\x1b]8;id={label}{k};{url}\x1b\\{label}{k}\x1b]8;;\x1b\\ "
+        ));
+    }
+    row
+}
+
+/// THE SHAPE v0.97.0 CHANGED: a line record over the wire's per-record cap
+/// costs that line its OSC 8 links, never the screen (b2275989d, plan P2-4;
+/// the strip's work bounded by 510affa38). Through v0.95.0 such a screen went
+/// to the Repaint rung, a blank tab until its program redrew, and such a line
+/// only in the scrollback cost the whole scrollback (and, through the
+/// capture's history latch, every later tab's). v0.97.0 carries both at
+/// `CarryRung::StrippedLinks`: every character, attribute, wrap flag and
+/// scalar exact, only the over-cap lines' link destinations dropped, the
+/// scrollback kept, no repaint and the control carry kept.
+///
+/// Session 0 is a shell that listed two CI runs' signed log links: one row
+/// of a dozen 8 KiB links scrolled into its history, another on screen, and
+/// a row of two links under the cap, which keeps them. Its history is inside
+/// the 256 lines its checkpoint carries, so it names no sidecar. Session 1 is
+/// a shell with 600 lines of history that printed a row of links and then
+/// opened vim in 1049: the link-dense row is on the SAVED PRIMARY (the
+/// inactive grid), which the carry strips, and the `.hist` sidecar carries
+/// the saved primary's whole history beside it.
+fn fx_link_dense_desk() -> FxDesk {
+    use crate::restore::{RestoreManifest, SplitKind};
+    let prompt = |cwd: &str| format!("\x1b[1;38;5;202mdev@devhost\x1b[0m {cwd} % ");
+    let mut runs = fx_shell(32, 110, 100, "/home/dev/src/aterm", 5);
+    runs.process(b"gh run view 4242 --log-links\r\n");
+    runs.process("\x1b[1mRun 4242\x1b[0m  ci.yml  main  \x1b[32m\u{2713} success\x1b[0m\r\n".as_bytes());
+    runs.process(fx_link_row(12, 8192, "ci.example.test", "job").as_bytes());
+    runs.process(b"\r\n");
+    for step in 0..40 {
+        runs.process(
+            format!("  \x1b[32m\u{2713}\x1b[0m step {step:02}: cargo test -p crate{step}\r\n")
+                .as_bytes(),
+        );
+    }
+    runs.process(format!("{}gh run view 4243 --log-links\r\n", prompt("/home/dev/src/aterm")).as_bytes());
+    runs.process("\x1b[1mRun 4243\x1b[0m  ci.yml  main  \x1b[31mX failure\x1b[0m\r\n".as_bytes());
+    runs.process(fx_link_row(12, 8192, "ci.example.test", "run").as_bytes());
+    runs.process(b"\r\n");
+    runs.process(fx_link_row(2, 8192, "docs.example.test", "doc").as_bytes());
+    runs.process(b"\r\n");
+    runs.process(prompt("/home/dev/src/aterm").as_bytes());
+
+    let mut notes = fx_shell(32, 109, 600, "/home/dev/notes", 6);
+    notes.process(b"curl -s https://ci.example.test/api/runs/4242 | jq -r '.jobs[].log' | linkify\r\n");
+    notes.process(fx_link_row(12, 8192, "ci.example.test", "log").as_bytes());
+    notes.process(b"\r\n");
+    notes.process(format!("{}vim ci.md\r\n", prompt("/home/dev/notes")).as_bytes());
+    notes.process(b"\x1b[?1049h\x1b[?1h\x1b=\x1b[H\x1b[2J");
+    for r in 4..32 {
+        notes.process(format!("\x1b[{r};1H\x1b[34m~\x1b[0m").as_bytes());
+    }
+    notes.process(
+        b"\x1b[1;1H# CI runs\x1b[2;1H- 4242: green\x1b[3;1H- 4243: \x1b[31mred\x1b[0m\
+          \x1b[32;1H\x1b[7m ci.md [+] \x1b[0m\x1b[3;9H",
+    );
+
+    let mut sessions = vec![fx_session(0, "zsh", runs), fx_session(1, "vim", notes)];
+    for session in &mut sessions {
+        session.rung = CarryRung::StrippedLinks;
+    }
+    FxDesk {
+        name: "link-dense",
+        nonce_seed: 0x0097_0009,
+        window: fx_window_carry(32, 220, false),
+        sessions,
+        layout: RestoreManifest::new(vec![fx_window(
+            32,
+            220,
+            vec![fx_tab(fx_split(
+                SplitKind::Vertical,
+                fx_leaf(0, "zsh", Some("/home/dev/src/aterm")),
                 fx_leaf(1, "vim", Some("/home/dev/notes")),
             ))],
         )]),
@@ -1392,6 +1773,8 @@ fn generate_handoff_fixtures() {
         fx_shell_integration_desk(),
         fx_history_carry_desk(),
         fx_colour_and_shell_desk(),
+        fx_stalled_sequence_desk(),
+        fx_link_dense_desk(),
     ] {
         fx_write(&desk, &scratch);
     }

@@ -6038,6 +6038,70 @@ mod native_damage_tests {
         );
     }
 
+    #[test]
+    fn ineligible_native_preview_skips_font_polling_then_recording_converges() {
+        let mut app = App::headless_for_test();
+        let wid = WindowId(0);
+        app.windows.get_mut(&wid).unwrap().rows = 50;
+        let mut renderer = aterm_render::Renderer::from_bytes(
+            aterm_render::embedded_font(),
+            14.0,
+            aterm_render::Theme::default(),
+        )
+        .unwrap();
+        renderer.set_runtime_font_discovery(false);
+        let font_job = crate::tray_raster::install_pending_chrome_fonts_for_test(renderer);
+        assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
+        let (_, view) = app.active_native_view(wid).unwrap();
+        assert!(app.prepare_native_input_scratch(wid));
+        let candidate = app
+            .prepare_native_semantic_font(wid, view, 0)
+            .unwrap()
+            .candidate;
+        let before = crate::tray_raster::semantic_font_snapshot_for_test(&candidate);
+        assert!(before.pending);
+        font_job.complete();
+
+        // A queued completion makes polling observable: the historical
+        // unconditional sampler installs it even though this park cannot use
+        // the result. Both focused and unfocused unrecorded headless views skip
+        // the sampler, as does an overlay-covered recording.
+        for focused in [true, false] {
+            app.windows.get_mut(&wid).unwrap().focused = focused;
+            for phase_ms in [33, 66, 99] {
+                assert_eq!(
+                    app.native_settings_preview_for_tick(wid, phase_ms, false),
+                    None
+                );
+                assert_eq!(
+                    crate::tray_raster::semantic_font_snapshot_for_test(&candidate),
+                    before
+                );
+            }
+        }
+        app.palette_enter();
+        assert!(app.windows[&wid].overlay.is_some());
+        assert_eq!(app.native_settings_preview_for_tick(wid, 132, true), None);
+        assert_eq!(
+            crate::tray_raster::semantic_font_snapshot_for_test(&candidate),
+            before
+        );
+        app.windows.get_mut(&wid).unwrap().overlay = None;
+
+        // The existing recording exception must still observe completion on
+        // an unfocused headless window and keep its final ready repaint alive.
+        assert_eq!(
+            app.native_settings_preview_for_tick(wid, 165, true),
+            Some((view, crate::settings_preview::PreviewAnimation::Continuous))
+        );
+        let ready = crate::tray_raster::semantic_font_snapshot_for_test(&candidate);
+        assert!(!ready.pending);
+        assert_ne!(ready.ready_epoch, before.ready_epoch);
+        assert!(app.invalidate_active_native_settings_preview(wid, 165));
+        assert!(app.prepare_native_input_scratch(wid));
+        assert_eq!(app.native_settings_preview_for_tick(wid, 198, true), None);
+    }
+
     fn project_native_preview_font_convergence(
         app: &App,
         wid: WindowId,
@@ -26882,6 +26946,31 @@ impl App {
         Some(crate::tray_raster::prepare_semantic_font(&candidate))
     }
 
+    /// Sample a preview only when the park can use its cadence. Specimen
+    /// projection and semantic-font polling otherwise repeat for unfocused,
+    /// overlay-covered and unrecorded headless views whose result is discarded. Paint
+    /// still prepares fonts independently when such a view is shown again.
+    pub(crate) fn native_settings_preview_for_tick(
+        &self,
+        wid: WindowId,
+        phase_ms: u64,
+        recorded: bool,
+    ) -> Option<(
+        crate::tab_model::ViewId,
+        crate::settings_preview::PreviewAnimation,
+    )> {
+        let window = self.windows.get(&wid)?;
+        if !crate::native_preview_may_tick(
+            window.os_window.is_some(),
+            window.focused,
+            recorded,
+            window.overlay.is_some(),
+        ) {
+            return None;
+        }
+        self.active_native_settings_preview(wid, phase_ms)
+    }
+
     /// The active Settings workbench while it animates or awaits a font frame.
     /// This shared arm/fire predicate returns static, settled previews to idle.
     #[cfg_attr(
@@ -26912,7 +27001,14 @@ impl App {
                     .serious_mode_policy()
                     .allows(crate::motion::SeriousEffect::SettingsPreview)
                 {
-                    state.preview_animation(phase_ms, motion, font_px, self.theme, viewport)
+                    state.preview_animation(
+                        phase_ms,
+                        motion,
+                        font_px,
+                        self.windows[&wid].scale.max(f64::EPSILON) as f32,
+                        self.theme,
+                        viewport,
+                    )
                 } else {
                     crate::settings_preview::PreviewAnimation::None
                 };
@@ -32495,12 +32591,13 @@ impl App {
     ///
     /// LATENCY: each title lives behind its session's Terminal mutex — the same
     /// mutex that session's PTY reader holds for the whole parse of an output
-    /// chunk. This runs on EVERY redraw (pre-early-out: the fingerprint feeds the
-    /// RepaintKey), so a BLOCKING lock here couples the foreground present to every
-    /// background tab's in-flight parse. `try_lock` instead: on contention the slot
-    /// KEEPS its previous contents (the buffer is the window-persistent
-    /// `strip_titles_scratch`, so it holds the last-read title across frames), and
-    /// a freshly-pushed empty slot (brand-new tab) falls back to `"aterm"`.
+    /// chunk — and its operator metadata lives behind a separate mutex. This runs
+    /// on EVERY redraw (pre-early-out: the fingerprint feeds the RepaintKey), so
+    /// BLOCKING either lock couples the foreground present to a background tab's
+    /// in-flight work. `try_lock` both: on contention the slot KEEPS its previous
+    /// contents (the buffer is the window-persistent `strip_titles_scratch`, so it
+    /// holds the last-read title across frames), and a freshly-pushed empty slot
+    /// (brand-new tab) falls back to `"aterm"`.
     /// Staleness is bounded and self-correcting: the `Wake::Output` title-drift
     /// handler epoch-gates background title changes and requests a redraw when the
     /// strip fingerprint drifts, and the fingerprint + painted strip both read this
@@ -32539,9 +32636,11 @@ impl App {
                     // TOP RUNG (byte-identical twin of `tab_titles`): the
                     // operator's `meta set title` outranks the live OSC title.
                     // A LEAF mutex on the session ctx — never the term lock, and
-                    // dropped before the term try-lock below; contended only by
-                    // an actual `meta set`, so the per-frame cost is one
-                    // uncontended lock. When it hits, the term lock is skipped.
+                    // dropped before the term try-lock below. This path runs
+                    // before every redraw's early-out, including the frame
+                    // that carries a typed echo. A concurrent `meta set` must
+                    // not park that frame: retain the last painted slot on
+                    // contention, exactly as the terminal-title rung does.
                     //
                     // The title lands DIRECTLY in the resident slot and the
                     // description in the shared scratch: same guard scope, same
@@ -32550,7 +32649,16 @@ impl App {
                     // untouched — which is precisely what the WouldBlock
                     // keep-stale path below relies on for `slot`.
                     let (has_user_title, has_description) = {
-                        let meta = s.ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+                        let meta = match s.ctx.meta.try_lock() {
+                            Ok(meta) => meta,
+                            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                            Err(std::sync::TryLockError::WouldBlock) => {
+                                if slot.is_empty() {
+                                    slot.push_str(fallback);
+                                }
+                                continue;
+                            }
+                        };
                         let described =
                             meta.presentation_value_into("description", &mut authored_description);
                         (meta.presentation_value_into("title", slot), described)
@@ -38051,7 +38159,9 @@ impl App {
             {
                 ws.input_scratch
                     .chrome_rasters
-                    .push(r.on_frame(row, lo, frame_w, cell_h));
+                    .push(crate::message_band::OnFrame::on_frame(
+                        r, row, lo, frame_w, cell_h,
+                    ));
             }
         }
         // The closing seam goes on whichever row the COMPOSED stack ends with — a
@@ -41087,6 +41197,8 @@ mod reflow_worker_tests {
 #[cfg(test)]
 mod strip_title_lock_tests {
     use crate::{App, WindowId, term_lock};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     /// Tab-strip title reads must NEVER block the present on a busy background
     /// tab's Terminal mutex: `refill_strip_titles` try-locks each tab's term and,
@@ -41131,6 +41243,65 @@ mod strip_title_lock_tests {
         term_lock(&term).process(b"\x1b]2;world\x07");
         app.refill_strip_titles(wid, &mut titles);
         assert_eq!(titles, vec!["world".to_string()]);
+    }
+
+    /// The operator metadata rung is just as much a pre-early-out render read
+    /// as the terminal-title rung. A metadata writer holding its lock must not
+    /// delay a typed echo's present or partially recompose its previous label.
+    #[test]
+    fn strip_titles_keep_stale_when_session_metadata_is_busy() {
+        let app = App::headless_for_test();
+        let wid = WindowId(0);
+        let session = app.pool.get(0).expect("session 0");
+        let mut titles = Vec::new();
+
+        assert_eq!(
+            session
+                .ctx
+                .meta
+                .lock()
+                .unwrap()
+                .set("title", Some("first title".to_string())),
+            Some(true)
+        );
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(titles, vec!["first title".to_string()]);
+
+        std::thread::scope(|scope| {
+            // A second thread holds the metadata lock, so a regression to
+            // blocking `.lock()` costs at most this bounded hold rather than
+            // hanging the entire test suite. It signals only after acquiring
+            // the lock, and the normal path releases it after both refills.
+            let (held_tx, held_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let ctx = session.ctx.clone();
+            let holder = scope.spawn(move || {
+                let mut busy = ctx.meta.lock().unwrap();
+                assert_eq!(
+                    busy.set("title", Some("next title".to_string())),
+                    Some(true)
+                );
+                held_tx.send(()).expect("announce held metadata lock");
+                release_rx.recv_timeout(Duration::from_secs(5)).is_ok()
+            });
+            held_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("metadata holder started");
+
+            app.refill_strip_titles(wid, &mut titles);
+            assert_eq!(titles, vec!["first title".to_string()]);
+            let mut fresh = Vec::new();
+            app.refill_strip_titles(wid, &mut fresh);
+            assert_eq!(fresh, vec!["aterm".to_string()]);
+            release_tx.send(()).expect("release metadata holder");
+            assert!(
+                holder.join().expect("metadata holder"),
+                "refill must not wait for the metadata lock timeout"
+            );
+        });
+
+        app.refill_strip_titles(wid, &mut titles);
+        assert_eq!(titles, vec!["next title".to_string()]);
     }
 
     /// Per-frame Smart-Title composition must be served from the coordinator's
@@ -46010,7 +46181,7 @@ mod message_band_visual_tests {
             .iter()
             .flatten()
             .zip(rows)
-            .map(|(r, row)| r.on_frame(row, 0, geom.win_w, ch))
+            .map(|(r, row)| crate::message_band::OnFrame::on_frame(r, row, 0, geom.win_w, ch))
             .collect();
         // The seam each ring took over from the composed stack
         // (`message_band::floor_rings`, ruling 254) rides along: the cells
@@ -46359,6 +46530,7 @@ mod message_band_visual_tests {
             // mid-move without a host frame counter (ruling 140).
             ("05-health", |app| {
                 app.post_message(update_words::health_warning(
+                    update_words::HealthKind::Download,
                     aterm_update::health_failing_title("pipeline"),
                     HEALTH_BODY,
                 ));

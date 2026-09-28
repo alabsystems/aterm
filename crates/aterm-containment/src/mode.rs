@@ -16,8 +16,8 @@ use std::fmt;
 /// crate-root table summarises it.
 ///
 /// - **Master**: Full trust — developer mode. No confinement.
-/// - **User**: The default. No confinement; the shell keeps the launching
-///   shell's resource limits.
+/// - **User**: The default. No confinement; the shell keeps aterm's own
+///   resource limits.
 /// - **Safety**: Hardened resource limits (rlimits; the Job Object on Windows)
 ///   and no OS sandbox.
 /// - **Containment**: Hostile agent. The macOS Seatbelt sandbox: no network,

@@ -644,10 +644,9 @@ pub fn derive_cut_mode(s: &RemoteState) -> Result<CutMode> {
     if s.published {
         return Err(Error::new(format!(
             "v{version} is already published, and it is the version the newest published \
-             source declares — publish the next one first: bump [workspace.package] version \
-             in Cargo.toml on main (MINOR: the next release is v{}), then `pub stage aterm` \
-             and `pub publish aterm`, then cut; or retire a bad build with \
-             `{} yank <build>`",
+             source declares — publish the next one first: `pub bump aterm --minor --write` \
+             on main (the next release is v{}), commit and push, then `pub stage aterm` and \
+             `pub publish aterm`, then cut; or retire a bad build with `{} yank <build>`",
             publish::bump_minor_release(&version)?,
             publish::SHIP_COMMAND
         )));

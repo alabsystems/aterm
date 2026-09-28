@@ -326,7 +326,7 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )?;
             let owner = it
                 .next()
-                .ok_or("recover needs the full claim SHA printed by the release lease")?
+                .ok_or("recover needs the full claim SHA (the cut's `lock` line prints it)")?
                 .to_string();
             let acknowledgement = it.next().ok_or(
                 "recover requires --old-publisher-stopped after independently proving the old publisher exited",

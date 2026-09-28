@@ -521,7 +521,9 @@ KEY USAGE
   of each the agent itself ran) and asks the agent to
   stop any wait of its own that can never end (a poll loop on a workflow that
   died); it is asked again every 30 minutes while that work runs, four notices at
-  most, and then that round gives up and says what held it. NO STOP IS FOR GOOD: a
+  most, and then that round gives up, says what held it, and types one line
+  telling the agent the upgrade is off and to carry on — at a break of its own
+  background work too, where the notice itself may go. NO STOP IS FOR GOOD: a
   round that gave up, was refused or whose restart stopped rests two hours (one
   round's worth of asking; the same stop again rests four, then eight) and then
   a NEW ROUND starts by itself (`rearmed:<why>` on the ledger, new READY
@@ -533,7 +535,14 @@ KEY USAGE
   untaken; from then on it waits `queued` until the session goes on, `--now`
   (one copy more), or a rest after the limit's word ran out (one copy more):
   two hours, doubling with every further copy the model has not read, up to a
-  day — so a limit that lasts for days adds one copy a day. Claude Code's
+  day — so a limit that lasts for days adds one copy a day. The READY answer is
+  consent only from the process the notice reached, in its tab: a conversation
+  resumed by hand is never restarted on it, and waits while that process lives
+  (`wait:notice-owned-by-other-process`); once it is gone, the upgrade is pending
+  again in a new round, with nothing owed to the gone one
+  (`reopened:notice-process-gone`), and the process that holds the conversation
+  now is asked afresh, under every gate a first notice is, only while it is
+  still behind. Claude Code's
   own keep-awake is not work: the `caffeinate` it starts as its own child every turn
   and stops ~30 s after; one a shell started (a Bash tool's) is. It then sends
   SIGTERM (`signal term pid=<n>`: that one process, and never under a hold), heals
@@ -624,8 +633,19 @@ KEY USAGE
   has stood 20 s the notice is typed there, and again only after a whole 30
   minutes with that work still running (four notices at most, then the round
   gives up and says what held it, and two hours on a new round asks again); the
-  restart still waits for an idle point with
-  nothing running under the agent. Turn it off with `upgrade = false` under
+  restart still waits for an idle point with nothing running under the agent.
+  Claude Code's own `busy`/`shell` status is read against its screen: standing
+  20 s over a screen read idle two looks in a row (of the same agent, no more
+  than about ten minutes apart), it lets the notice and the release go as at a
+  break; the restart still waits for Claude's own `idle`, work inside the
+  agent's own process being no process under it, re-asks a READY it holds after
+  30 minutes and releases the agent once the round gives up
+  (`wait:status-stale:<status>`). `upgrade --status` names what holds a move
+  (`held_by=`: pid, name and age). A restart that stops after its SIGTERM ended
+  the agent stays shown though no Claude Code holds it (for a day; `claude
+  --resume <session>` in the tab takes it back), and one under way that has not
+  moved for 5 minutes reads stalled (`stuck:exiting|exited|relaunched`): nothing
+  is forced, and no word moves it. Turn it off with `upgrade = false` under
   aterm.toml's [harness]. The same supervisors relaunch a Claude Code that crashed
   (its session record left behind) on its own conversation, and tell it to carry
   on at its first idle point; a person's or a holder's exit, a graceful exit
@@ -636,7 +656,16 @@ KEY USAGE
   record read after the pause before a relaunch could pass for a graceful exit.
   `relaunch = false` turns that off, and says so on the tab. A Codex exit is said on
   its tab: its relaunch is not built yet (no [harness] limit) — resume it with the
-  `codex resume` line it printed.
+  `codex resume` line it printed. AN AGENT THE HARNESS'S OWN RESTART ENDED — the
+  upgrade's (Claude Code's SIGTERM or Codex's `/exit`) or a restart in place, whose
+  step returned with the relaunch still to type (you at the returned prompt, a hold)
+  — is none of those: its restart is carried at least every minute, whatever
+  `relaunch` says, the line typed only once nobody types at the prompt and no hold
+  stands, a line once typed never typed again, until it lands or its 5 minutes run
+  out, and said on the tab either way.
+  Claude Code's 5 minutes count from the agent's exit, however long it took to
+  shut down; Codex's from its typed `/exit`, since a TUI still running a minute
+  after its `/exit` is one the `/exit` did not take.
   CODEX, by the same workers and the same step (the same lock, ledger, gates and
   owner's word): a Codex session's worker takes the step's Codex branch at its idle
   points when atpkg installs a newer Codex. Codex 0.157 runs a shared app-server
@@ -1942,12 +1971,13 @@ WHAT THE DIAGNOSTIC SUBCOMMANDS COVER
   show-config prints the runtime values (shell, terminal size, containment default).
   explain-config explains the containment modes and documents two aterm.toml
   tables: [privacy] (nine keys; `auto_accept` is reserved — aterm never answers a
-  macOS consent dialog) and [machine].
-  On Windows, explain-config also prints this file's path and documents `shell`
-  and `font_px`, and the shell show-config and `aterm doctor` report is the one a
-  new tab spawns, never the shell the command was typed into, and each names the
-  input that chose it: `shell` in this file, else pwsh, then powershell, then
-  %COMSPEC%, then cmd.exe (a window launched with --shell uses that instead).
+  macOS consent dialog) and [machine], both macOS settings.
+  On Windows, explain-config leaves those two out, prints this file's path and
+  documents `shell` and `font_px`, and the shell show-config and `aterm doctor`
+  report is the one a new tab spawns, never the shell the command was typed
+  into, and each names the input that chose it: `shell` in this file, else pwsh,
+  then powershell, then %COMSPEC%, then cmd.exe (a window launched with --shell
+  uses that instead).
 "#;
 
 /// `aterm help ship`. Advertised as a front-door verb since the roster existed;
@@ -1979,12 +2009,13 @@ PROVISION — make this machine able to publish
 
 CUT — publish a release
   aterm ship cut [--dry-run] [--resume] [--arm64-only] [--rehearse OWNER/REPO]
-      gates -> ledger claim -> universal build -> bundle/sign/DMG -> draft-first
-      publish -> late tag -> flip -> verify -> mirror.
-      --dry-run builds everything locally and uploads nothing.
+      gates -> ledger claim -> universal build -> bundle/sign/DMG -> tag -> one
+      publication onto the release channel, made the head last.
+      --dry-run builds everything into dist/, notarized by Apple; nothing is
+      committed or published.
 
 THE ORDER IS ENFORCED
-  Publish the SOURCE first (`pub stage aterm && pub promote aterm`), then cut the
+  Publish the SOURCE first (`pub stage aterm && pub publish aterm`), then cut the
   BINARY. A cut whose version the public channel does not already carry is
   refused, and so is a cutter binary older than the tree it is cutting.
 
@@ -4314,10 +4345,10 @@ WHO IS DOING WHAT — PRESENCE WITH MEANING
   beside `attention=`. `phase=` is the session's own `status agent=` verdict, relayed by
   the bridge: it arrives with the server's `EVENT <sid> agent` push (and the 2 s roster
   round's `status` read backstops it), and `role=`/`title=`/`attention=` are re-read on
-  the `EVENT <sid> meta` push. The bridge reads no screen. A session with no identified
-  agent program reads `phase=-`; `wall:<kind>` is the wall the turn ended on (a 529 is
-  `wall:overloaded`), and `unknown` an agent whose screen could not be read — not idle.
-  The row is republished only when a field changed, at
+  the `EVENT <sid> meta` push. No screen text is published (gen= hashes it). A session
+  with no identified agent program reads `phase=-`; `wall:<kind>` is the wall the turn
+  ended on (a 529 is `wall:overloaded`), and `unknown` an agent whose screen could not
+  be read — not idle. The row is republished only when a field changed, at
   most once per 2 s. NEVER any transcript text: every token is a word from a closed set,
   the program name aterm derived, or a `meta` value. `title=` is `meta set
   title`'s title when one is set, else `-` — never the terminal's title, which the
@@ -4707,6 +4738,21 @@ mod tests {
         );
         assert!(precedence.contains("`aterm pkg doctor`"), "{precedence}");
         assert!(!precedence.contains(">  environment"), "{precedence}");
+    }
+
+    /// `aterm help ship` publishes the source the way the cutter's own
+    /// version-disagreement refusal says (`pub stage aterm && pub publish aterm`):
+    /// a bare `pub promote aterm` always dies with "no release remote"
+    /// (docs/RELEASING.md).
+    #[test]
+    fn the_ship_page_publishes_the_source_the_way_the_cutter_says() {
+        let (page, code) = render(Some("ship"), None);
+        assert_eq!(code, 0);
+        assert!(
+            page.contains("(`pub stage aterm && pub publish aterm`)"),
+            "{page}"
+        );
+        assert!(!page.contains("pub promote"), "{page}");
     }
 
     /// `aterm help update` names the Windows lane in the same words

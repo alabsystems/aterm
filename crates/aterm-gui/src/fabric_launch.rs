@@ -360,15 +360,24 @@ fn supervise(argv: &[String]) {
                 let started = Instant::now();
                 let status = child.wait();
                 let ran = started.elapsed();
-                aterm_log::warn!(
-                    "fabric bridge exited after {ran:?} ({status:?}); every session it governed \
-                     is held"
-                );
                 backoff = next_backoff(backoff, Some(ran));
+                let how = match &status {
+                    Ok(s) => s.to_string(),
+                    Err(e) => e.to_string(),
+                };
+                aterm_log::warn!(
+                    "fabric bridge stopped ({how}) after {:.1}s; the sessions it governed are \
+                     held — restarting in {:.1}s",
+                    ran.as_secs_f64(),
+                    backoff.as_secs_f64()
+                );
             }
             Err(e) => {
                 backoff = next_backoff(backoff, None);
-                aterm_log::warn!("fabric bridge could not start ({e}); retrying in {backoff:?}");
+                aterm_log::warn!(
+                    "fabric bridge could not start ({e}); retrying in {:.1}s",
+                    backoff.as_secs_f64()
+                );
             }
         }
         std::thread::sleep(backoff);

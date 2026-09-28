@@ -478,7 +478,7 @@ impl AtermTerminal {
     /// Inject a broad-coverage (CJK + symbols) fallback face from font bytes, so
     /// glyphs the primary face lacks render real shapes instead of `.notdef` tofu.
     /// The canvas renderer can't read the host filesystem, so the host pushes the
-    /// OS font bytes in. No-throw: a bad blob leaves the existing face untouched.
+    /// OS font bytes in. Throws on a bad blob; the existing face stays.
     pub fn set_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.set_fallback_bytes(bytes)
@@ -488,7 +488,7 @@ impl AtermTerminal {
     /// [`set_fallback_font`]). The chain is tried in order, so the host can push a
     /// CJK fallback first then Arabic/Devanagari/Thai/Hebrew faces after it — a
     /// glyph the earlier faces miss still reaches a covering face instead of tofu.
-    /// No-throw: a bad blob leaves the existing chain untouched.
+    /// Throws on a bad blob; the existing chain stays.
     pub fn add_fallback_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.add_fallback_bytes(bytes)
@@ -496,8 +496,7 @@ impl AtermTerminal {
 
     /// Inject a colour-emoji (sbix) face from font bytes, driving the existing
     /// ColorEmoji colour path. Same rationale as [`set_fallback_font`]: the host
-    /// supplies the OS emoji font. No-throw (the `String` Err surfaces as a
-    /// catchable JS exception); a bad blob leaves the slot untouched.
+    /// supplies the OS emoji font. Throws on a bad blob; the slot stays.
     pub fn set_emoji_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.set_color_font_bytes(bytes.to_vec())
@@ -505,8 +504,8 @@ impl AtermTerminal {
 
     /// Inject a REAL bold weight of the primary family so SGR-bold cells render as a
     /// true heavier weight instead of synthetic embolden. The host supplies the
-    /// bold-variant bytes (the canvas can't read the filesystem). No-throw: a bad
-    /// blob surfaces a catchable JS exception and leaves the existing weight intact.
+    /// bold-variant bytes (the canvas can't read the filesystem). Throws on a bad
+    /// blob; the existing weight stays.
     pub fn set_bold_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.set_bold_font(bytes)
@@ -516,8 +515,7 @@ impl AtermTerminal {
     /// glyphs the primary + fallback faces lack render real shapes instead of
     /// tofu. The byte-injection sibling of the config `symbol_font` path: the host
     /// supplies the OS symbol bytes (the canvas can't read the filesystem).
-    /// No-throw: a bad blob surfaces a catchable JS exception and leaves the
-    /// existing face untouched.
+    /// Throws on a bad blob.
     pub fn set_symbol_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.set_symbol_fallback_bytes(bytes)
@@ -525,7 +523,8 @@ impl AtermTerminal {
 
     /// Swap the PRIMARY face (the host's `terminalFontFamily`) from font bytes and
     /// re-rasterize. The host re-reads cell_width/cell_height + recomputes the grid
-    /// after (the new face may have different metrics). No-throw on a bad blob.
+    /// after (the new face may have different metrics). Throws on a bad blob; the
+    /// existing face stays.
     pub fn set_primary_font(&mut self, bytes: &[u8]) -> Result<(), String> {
         self.force_full_repaint = true;
         self.renderer.set_primary_font(bytes)

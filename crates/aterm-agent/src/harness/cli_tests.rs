@@ -1590,6 +1590,53 @@ fn live_holder(
     child
 }
 
+/// A GIVE-UP ROW IN THE LEDGER VIEW NAMES WHAT HELD IT (the review of
+/// 2026-09-27): `ledger upgrade` cuts each row's detail at 200 bytes, and the
+/// give-up's own words ran past that before the list of what still ran under
+/// the agent — the one thing that row is for — so the view showed none of
+/// it: not the widowed `tail -f`, and not the `grep -m1` that made it a wait
+/// that can never end. NEGATIVE CONTROL: any other row is still cut.
+#[test]
+fn a_give_up_row_in_the_ledger_view_names_what_held_it() {
+    let held = [super::super::upgrade::Held {
+        pid: 41234,
+        name: "zsh".to_string(),
+        age_s: 475_200,
+        command: "D=/Users/…/wf_examplerun-1; tail -f -n +1 \"$D/journal.jsonl\" | /usr/bin/grep \
+                  -m1 -F 'agentId' > /dev/null; echo \"closer finished\""
+            .to_string(),
+    }];
+    let detail =
+        super::super::upgrade_drive::gave_up_words(super::super::upgrade::Agent::Claude, &held);
+    let row = |step: &str| {
+        let mut o = Map::new();
+        o.insert("t".into(), Value::from(1_790_000_000_u64));
+        for (k, v) in [
+            ("tab", "s-b5cf2faabac5ce5127bd"),
+            ("session", "03396a15"),
+            ("from", "2.1.281"),
+            ("to", "2.1.283(managed)"),
+            ("step", step),
+            ("detail", detail.as_str()),
+        ] {
+            o.insert(k.into(), Value::from(v));
+        }
+        upgrade_ledger_line(&aterm_json::to_string(&Value::Object(o)).expect("a row"))
+    };
+    let line = row("gave-up");
+    assert!(
+        line.contains("pid 41234 (zsh, 5d12h): D=/Users/…/wf_examplerun-1;")
+            && line.contains("grep -m1")
+            && line.ends_with("echo \"closer finished\""),
+        "{line}"
+    );
+    // The round's rest before the next asks is said whole too.
+    assert!(line.contains("a new round asks again in 2h"), "{line}");
+    // NEGATIVE CONTROL: another row's detail is cut as it was.
+    let other = row("drain-expired:box");
+    assert!(!other.contains("grep -m1"), "{other}");
+}
+
 /// `upgrade --status` PRINTS WHAT THE SWEEP RECORDED — how long behind, what
 /// it waits on, the owner's word, whether it is stalled — sweeping nothing:
 /// no lock is taken — for each upgrade a live Claude Code still holds behind
@@ -1625,7 +1672,8 @@ fn the_owner_reads_the_recorded_upgrades_and_says_their_word() {
         out,
         format!(
             "upgrade tab={tab} session=03396a15 from=2.1.281 to=2.1.282(managed) phase=pending \
-             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- stalled=overdue\n"
+             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- \
+             stalled=overdue held_by=-\n"
         )
     );
     assert!(

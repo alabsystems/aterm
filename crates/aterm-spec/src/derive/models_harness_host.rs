@@ -162,8 +162,17 @@ pub fn harness_worker_lifecycle_model() -> Model {
 /// session's attention says the relaunch is limited, cannot be made or keeps
 /// failing; `step` the back-off step the next attempt waits
 /// (`Relaunches::pause`, `Steps` the last, ten minutes); `misses` the
-/// attempts in a row that did not relaunch, capped at `Badge`.
+/// attempts in a row that did not relaunch, capped at `Badge`; `restarted`
+/// the exit being handled was made by a RESTART OF THE HARNESS'S OWN still
+/// owed its relaunch (S0 of the in-flight review, 2026-09-27).
 ///
+/// * `Restarted` — the agent left because the harness's own restart ended
+///   it (the upgrade's SIGTERM, a Codex `/exit` it typed, the restart in
+///   place's): whoever is at the tab, and whatever the owner's `[harness]
+///   relaunch` says, the relaunch is due — the exit is that restart's, and
+///   what is typed at the prompt still waits on a person or a holder (the
+///   relaunch line's own look). No person returning, no limit and no "end
+///   of the launch" leaves it: it lands, keeps being tried, or is said.
 /// * `Crash` — the agent left with no person asking: a relaunch is due.
 /// * `PersonExit` — a person's `/exit`, ctrl-c twice, or a holder's exit:
 ///   the tab is theirs.
@@ -194,9 +203,18 @@ pub fn harness_worker_lifecycle_model() -> Model {
 /// keyboard wins), and it drops a relaunch it cannot make, or one the owner
 /// limited, without a word (`NeverSilent` — "never give up silently";
 /// escalation is for what configuration limited and what is irreducible).
+/// And it is the host of c4e24cd3e (`RestartCarried` — "an agent the
+/// upgrade asked is never left stopped"): it asked `on_exit` about the
+/// harness's own restart as about any exit, so a person's keystroke or a
+/// hold left it to them (`Restarted`, `PersonReturns`), and a restart its
+/// back-off let expire fell through to the graceful exit the restart's own
+/// SIGTERM made (`Restarted`, `Ended`) — the agent the upgrade ended, never
+/// relaunched and never said.
 /// Tier-1 (`the_real_relaunch_decisions_conform_to_the_model`,
 /// `aterm-agent`) drives the real `on_exit`, `outcome` and `Relaunches`
-/// through every action.
+/// through every action, and at every state a restart holds asks the real
+/// type each exit the guards above refuse it: a person, a limit, and an end
+/// its carry could never answer, which the real type says as `Cannot`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn harness_relaunch_on_exit_model() -> Model {
@@ -211,26 +229,37 @@ pub fn harness_relaunch_on_exit_model() -> Model {
             var badged = 0;
             var step = 0;
             var misses = 0;
+            var restarted = 0;
 
+            action Restarted when (running == 1) {
+                running = 0;
+                pending = 1;
+                asked = 0;
+                restarted = 1;
+            }
             action Crash when (running == 1) {
                 running = 0;
                 pending = 1;
                 asked = 0;
+                restarted = 0;
             }
             action PersonExit when (running == 1) {
                 running = 0;
                 asked = 1;
                 pending = if (Buggy == 1) { 1 } else { 0 };
+                restarted = 0;
             }
-            action Limited when (running == 1 || pending == 1) {
+            action Limited when (running == 1 || (pending == 1 && (restarted == 0 || Buggy == 1))) {
                 running = 0;
                 pending = 0;
                 badged = if (Buggy == 1) { badged } else { 1 };
+                restarted = if (running == 1) { 0 } else { restarted };
             }
             action PersonRuns when (running == 0 && pending == 0) {
                 running = 1;
                 asked = 0;
                 badged = 0;
+                restarted = 0;
             }
             action Land when (pending == 1) {
                 running = 1;
@@ -238,13 +267,14 @@ pub fn harness_relaunch_on_exit_model() -> Model {
                 badged = 0;
                 misses = 0;
                 step = if (step <= Steps - 1) { step + 1 } else { Steps };
+                restarted = 0;
             }
             action Miss when (pending == 1) {
                 misses = if (misses <= Badge - 1) { misses + 1 } else { Badge };
                 badged = if (misses + 1 > Badge - 1) { 1 } else { badged };
                 step = if (step <= Steps - 1) { step + 1 } else { Steps };
             }
-            action Ended when (pending == 1) {
+            action Ended when (pending == 1 && (restarted == 0 || Buggy == 1)) {
                 pending = 0;
                 asked = 1;
             }
@@ -255,13 +285,14 @@ pub fn harness_relaunch_on_exit_model() -> Model {
             action Healthy when (running == 1 && step > 0) {
                 step = 0;
             }
-            action PersonReturns when (pending == 1) {
+            action PersonReturns when (pending == 1 && (restarted == 0 || Buggy == 1)) {
                 pending = 0;
                 asked = 1;
             }
 
             invariant PersonWins: asked == 0 || pending == 0;
             invariant NeverSilent: running == 1 || pending == 1 || badged == 1 || asked == 1;
+            invariant RestartCarried: restarted == 0 || asked == 0;
         }
     }
 }

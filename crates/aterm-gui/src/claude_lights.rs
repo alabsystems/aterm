@@ -577,6 +577,12 @@ impl WindowLights {
             s.notice = Some((Light::Mode, now + REFUSAL_SHOWN, None));
             return Advance::Arrived;
         }
+        // The footer wake may be delayed past this press's deadline. Read the
+        // mode for the stop notice, but do not send another shift+tab (or
+        // restart the deadline) from an answer that arrived too late.
+        if p.deadline <= now {
+            return Advance::Wait;
+        }
         if mode == mode_at_press {
             return Advance::Wait;
         }
@@ -2635,6 +2641,68 @@ mod tests {
             title.starts_with("Permission mode: stopped in accept edits mode"),
             "{title:?}"
         );
+    }
+
+    /// The loop may be busy when Claude answers a press. A late wake must
+    /// not turn the answer into another press with a fresh deadline; the
+    /// expired return stops in the mode Claude actually reached.
+    #[test]
+    fn a_late_mode_answer_cannot_restart_an_expired_return() {
+        let now = Instant::now();
+        let rule = "\u{2500}".repeat(60);
+        let mut w = WindowLights::default();
+        observe(&mut w, &screen(&rule, MANUAL, ""));
+        start(&mut w, Light::Mode, Drive::CycleMode, Mode::Manual, now);
+        let due = now + Duration::from_millis(lights::SETTLE_MS);
+
+        assert_eq!(
+            w.advance(7, engine(&rule, ACCEPT).as_ref(), due),
+            Advance::Wait,
+            "the elapsed deadline forbids a second shift+tab"
+        );
+        let p = w.sessions[&7].pending.as_ref().unwrap();
+        assert_eq!((p.presses, p.deadline), (1, due));
+        assert_eq!(w.expire(due), (true, vec![7]));
+        assert!(matches!(
+            w.sessions[&7].refused,
+            Some((Light::Mode, Refusal::StoppedIn(Mode::AcceptEdits), _))
+        ));
+
+        // The same answer before its deadline still makes the next press.
+        let mut timely = WindowLights::default();
+        start(
+            &mut timely,
+            Light::Mode,
+            Drive::CycleMode,
+            Mode::Manual,
+            now,
+        );
+        assert_eq!(
+            timely.advance(
+                7,
+                engine(&rule, ACCEPT).as_ref(),
+                due - Duration::from_millis(1)
+            ),
+            Advance::Press {
+                expect: Mode::AcceptEdits
+            }
+        );
+
+        // Already at the requested mode: accepting the late observation
+        // sends no key and keeps the actual success visible.
+        let mut arrived = WindowLights::default();
+        start(
+            &mut arrived,
+            Light::Mode,
+            Drive::CycleMode,
+            Mode::Manual,
+            now,
+        );
+        assert_eq!(
+            arrived.advance(7, engine(&rule, BYPASS).as_ref(), due),
+            Advance::Arrived
+        );
+        assert!(arrived.sessions[&7].pending.is_none());
     }
 
     /// A cycle that holds neither bypass nor auto (manual → accept edits →
@@ -4971,11 +5039,13 @@ mod gesture_tests {
         if let Some(p) = &s.pending {
             observed.insert("presses", i64::from(p.presses));
             observed.insert("start", model_mode(p.started));
+            observed.insert("late", i64::from(p.deadline <= now));
             if let Some(mode) = shown {
                 observed.insert("sent", i64::from(mode == p.mode_at_press));
             }
         } else {
             observed.insert("sent", 0);
+            observed.insert("late", 0);
         }
         observed.insert(
             "named",
@@ -5111,6 +5181,53 @@ mod gesture_tests {
                 Some(&[("phase", 1), ("sent", 1), ("overshoot", 1)][..]),
             );
         }
+    }
+
+    /// TIER-1: Claude answered before a stalled loop next drained the
+    /// footer, but that press's deadline had elapsed. The engine reading
+    /// can name the mode it reached; it cannot authorize another key.
+    #[test]
+    fn an_overdue_mode_answer_sends_no_late_follow_up_key() {
+        let (mut app, wid, session, mut reader) = app();
+        publish_facts(&app, session);
+        draw_claude(&app, session, MANUAL);
+        frame(&mut app, wid);
+        let model = aterm_spec::derive::claude_mode_return_model();
+        let mut state = model.init_state();
+        drive_mode_return_action("Click", || click(&mut app, wid, Light::Mode));
+        assert_eq!(pty(&mut reader, 3), lights::SHIFT_TAB);
+        check_mode_return_transition(&app, wid, session, "Click", &mut state, None);
+
+        past_deadline(&mut app, wid, session);
+        check_mode_return_transition(&app, wid, session, "Timeout", &mut state, None);
+        redraw_mode_row(&app, session, ACCEPT);
+        check_mode_return_transition(&app, wid, session, "Answer", &mut state, None);
+        assert!(
+            model.successors("Press", &state).is_empty(),
+            "a timed-out answer cannot enable another press"
+        );
+        drive_mode_return_action("Expire", || app.on_claude_footer_changed(session));
+        assert!(pty(&mut reader, 0).is_empty(), "no late shift+tab");
+        check_mode_return_transition(
+            &app,
+            wid,
+            session,
+            "Expire",
+            &mut state,
+            Some(&[("phase", 1), ("presses", 2)][..]),
+        );
+        assert_eq!(
+            refusal(&app, wid, session),
+            Some((Light::Mode, super::Refusal::StoppedIn(Mode::AcceptEdits)))
+        );
+
+        // Historical behavior rearmed the deadline and sent a second key.
+        let buggy = aterm_spec::interp::with_buggy(&model, 1);
+        let mut late = buggy.init_state();
+        for action in ["Click", "Timeout", "Answer", "Press"] {
+            assert!(buggy.fire(action, &mut late), "{action}");
+        }
+        assert!(!buggy.check_invariant("NoLatePress", &late));
     }
 
     /// Claude answers mid-turn (a plan row with `esc to interrupt`).
@@ -5958,6 +6075,12 @@ mod gesture_tests {
         machine = "claude_mode_return",
         action = "TurnEnds",
         reason = "Claude Code's own step: the turn ends, the busy hint gone from the mode row."
+    )]
+    #[aterm_spec::spec_unmodeled(
+        machine = "claude_mode_return",
+        action = "Timeout",
+        reason = "The clock crosses a press's deadline outside an aterm transition. The Tier-1 \
+                  late-answer test advances the real deadline, then checks the App stops."
     )]
     #[expect(
         dead_code,

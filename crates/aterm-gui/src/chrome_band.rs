@@ -10,6 +10,7 @@ use std::cell::Cell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use aterm_core::terminal::{RenderCell, UnderlineStyle};
+use aterm_messages::ink::{AnsiHues, BarBase, ThemeInks};
 use aterm_render::Theme;
 
 use crate::tab_bar::bg_is_light;
@@ -46,43 +47,11 @@ use crate::tab_bar::bg_is_light;
 // byte-identically to before.
 
 /// The OS-forced chrome palette: the five Win32 system colours every chrome surface
-/// is painted from while a High-Contrast scheme is active.
-///
-/// Stored as plain RGB triples in THEME byte order — the platform arm does the
-/// COLORREF (`0x00BBGGRR`) swap on the way in, so nothing downstream of here has to
-/// know GDI's byte order.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) struct ForcedChrome {
-    /// `COLOR_WINDOW` — the document / editable-field surface. Carries the find
-    /// bar's inset WELL and the tab strip's hover wash.
-    pub window: [u8; 3],
-    /// `COLOR_WINDOWTEXT` — THE ink. An HC palette has no secondary text tone,
-    /// because dimming text is precisely what an HC user opted out of: the band's
-    /// label, value, warn and inactive-tab roles all collapse onto this one colour
-    /// and let WEIGHT (bold) carry what hue and dimming used to.
-    pub window_text: [u8; 3],
-    /// `COLOR_HIGHLIGHT` — the SELECTED surface: the active tab chip, the `↻`
-    /// update CTA, and the accent rule.
-    pub highlight: [u8; 3],
-    /// `COLOR_HIGHLIGHTTEXT` — ink on [`Self::highlight`].
-    pub highlight_text: [u8; 3],
-    /// `COLOR_BTNFACE` — the control-face surface every chrome BAND is painted on.
-    /// Win32's own split is document = `WINDOW`, control = `BTNFACE`; the strip and
-    /// the find/notice bands are controls, the find bar's query field is a document.
-    /// Every stock HC scheme sets the two equal, so in practice they read as one
-    /// surface separated by the seam — which is the HC convention (borders, not
-    /// fills).
-    pub btn_face: [u8; 3],
-}
-
-/// The contrast floor applied on top of an OS-forced palette. Provably INERT on all
-/// four stock Windows HC schemes (their `WINDOWTEXT`/`BTNFACE` and
-/// `HIGHLIGHTTEXT`/`HIGHLIGHT` pairs are 15:1 or better), so it never overrides what
-/// the OS chose. It exists for a hand-edited or third-party HC scheme that pairs two
-/// tones the OS itself never would: reaching for pure black/white there is still a
-/// high-contrast answer, whereas printing the scheme's own unreadable pair is not.
-/// The same 3.0 UI-text floor `tab_bar::STRIP_INK_FLOOR` uses, for the same reason.
-const FORCED_INK_FLOOR: f64 = 3.0;
+/// is painted from while a High-Contrast scheme is active — the engine's
+/// [`aterm_messages::ink::ForcedPalette`] (ruling 324), under the name every call site
+/// here has always used. Stored in THEME byte order: the platform arm does the
+/// COLORREF (`0x00BBGGRR`) swap on the way in.
+pub(crate) type ForcedChrome = aterm_messages::ink::ForcedPalette;
 
 /// Sentinel in slot 0 for "no forced palette" — an RGB triple packs to 24 bits, so
 /// `u32::MAX` cannot collide with a real colour.
@@ -238,284 +207,29 @@ fn unpack(c: u32) -> [u8; 3] {
     ]
 }
 
-/// Floor one OS-forced ink against the OS-forced surface it lands on. See
-/// [`FORCED_INK_FLOOR`] for why a palette the OS chose is floored at all.
-pub(crate) fn forced_ink(ink: [u8; 3], on: [u8; 3]) -> [u8; 3] {
-    ensure_contrast(ink, on, FORCED_INK_FLOOR)
-}
+/// On-theme tones for compact chrome bands — the engine's plain-RGB
+/// [`aterm_messages::ink::BandInks`] (ruling 324), under the name every call site here
+/// has always used. The band's painter names its word inks by SLOT, each one of these
+/// (`BandInks::slot`): `Ink::Label` → `label`, `Value` → `value`, `Warn` → `warn`,
+/// `Error` → `error`, `Accent` → `accent`.
+pub(crate) type BandColors = aterm_messages::ink::BandInks;
 
-/// On-theme tones for compact chrome bands.
-#[derive(Clone, Copy)]
-pub(crate) struct BandColors {
-    pub bar_bg: [u8; 3],
-    pub label: [u8; 3],
-    pub value: [u8; 3],
-    pub warn: [u8; 3],
-    /// The ink of an ERROR row's words and glyph on the message band (design
-    /// ruling 265): a red, floored to AA on the band like [`Self::warn`] —
-    /// an error and a warning shared the warn yellow, so only the glyph told
-    /// `✕ Tests failed on main` from `⚠ Misspelled setting`, while the log
-    /// paints errors red. Collapses to the one ink under an OS-forced
-    /// palette, as `warn` does.
-    pub error: [u8; 3],
-    /// Background of an editable WELL inset in the band (the find bar's query
-    /// field). The terminal's own background, so the band reads as a raised panel
-    /// with a recessed input in it — and so `value` text in the well keeps the
-    /// terminal's own fg/bg contrast rather than the band's smaller one.
-    pub field_bg: [u8; 3],
-    /// Text caret drawn in that well — the theme's CURSOR colour, contrast-floored
-    /// against `field_bg` so it stays visible on a recoloured background.
-    pub caret: [u8; 3],
-    /// A drawn BORDER for the well, for the case where its fill cannot carry the
-    /// boundary on its own — `Some(ink)` exactly when `field_bg == bar_bg`.
-    ///
-    /// Every stock Windows High-Contrast scheme sets `COLOR_WINDOW == COLOR_BTNFACE`,
-    /// so the document/control split the forced mapping honours collapses to one tone
-    /// and the well loses its edge entirely: an editable field indistinguishable from
-    /// the band around it. HC's own convention is that surfaces are separated by
-    /// BORDERS rather than fills, and this is that border — the piece the fill-only
-    /// well was missing. `None` on every theme-derived scheme (`field_bg` is
-    /// `theme.bg` against a 0.10/0.16 blend, which is what makes the well read as an
-    /// inset), so nothing off an OS palette moves.
-    pub well_rule: Option<[u8; 3]>,
-    /// The FILL of a determinate meter drawn in the band (the message band's
-    /// full-row meter, window edge to window edge — design ruling 55): the
-    /// theme's cursor accent, contrast-floored against [`Self::bar_bg`] so a
-    /// pale cursor on a pale band still reads as a fill. Under an OS-forced
-    /// palette it is `COLOR_HIGHLIGHT` — exactly what a native Win32 progress
-    /// bar paints its fill with under High Contrast.
-    pub accent: [u8; 3],
-    /// The FILL a message-band METER wears (design ruling 250): [`Self::accent`]
-    /// — the theme's cursor, the owner's "cursor trail theme" — unless that
-    /// cursor is NEAR-GREY (`aterm_messages::palette`), where the bar borrows
-    /// the theme's own ANSI blue, or its cyan where only cyan carries the
-    /// band's words ([`band_colors_with`]); floored to 3:1 on the band like
-    /// the accent. The owner: *"use the theme's own ANSI blue or cyan when the
-    /// cursor is near-grey, so the bar keeps colour and life; every other
-    /// theme keeps the cursor-trail colour."* A meter row's outlined Primary
-    /// rings in it too (ruling 249). `COLOR_HIGHLIGHT` under an OS-forced
-    /// palette, like the accent. Where the floor would darken the hue into
-    /// brown (`aterm_messages::palette::keeps_pastel` — Catppuccin Latte's
-    /// rosewater, the brick bar), the fill is the theme's own pastel instead
-    /// and [`Self::meter_edge`] draws its boundary (design ruling 264).
-    pub meter: [u8; 3],
-    /// The darker EDGE line a PASTEL fill ends in (design ruling 264): the
-    /// pastel deepened until it stands 3:1 from [`Self::meter_track`]
-    /// (`aterm_messages::palette::pastel_edge`), drawn over the fill's last
-    /// pixels by the row's raster (`message_band::edge_line_px`). `None` on
-    /// every fill the 3:1 floor already carries — every built-in scheme but
-    /// Catppuccin Latte — and under an OS-forced palette.
-    pub meter_edge: Option<[u8; 3]>,
-    /// The TRACK a meter's unfilled remainder is drawn on: [`Self::bar_bg`]
-    /// mixed [`TRACK_TINT`] toward [`Self::meter`] (design ruling 260), so the
-    /// empty part of a metered row reads as the bar's own channel — its hue,
-    /// barely — and never as a chip's ground ([`Self::chip_ground`], which it
-    /// used to equal: a Secondary's block read as part of the bar). Under an
-    /// OS-forced palette it is the document surface (`COLOR_WINDOW`), the HC
-    /// vocabulary's "well".
-    pub meter_track: [u8; 3],
-    /// A resting Secondary chip's FILL on an unmetered row: a step off
-    /// [`Self::bar_bg`] toward the ink (the grey the meter's track used to
-    /// share). Under an OS-forced palette `COLOR_WINDOW`, like the track.
-    pub chip_ground: [u8; 3],
-    /// The hue a metered row's OUTLINED Primary rings and labels in (rulings
-    /// 249 and 260): [`Self::meter`], unless that hue floored to AA for its
-    /// label reads BROWN (`aterm_messages::palette::reads_brown` — Catppuccin
-    /// Latte's rosewater), where the outline borrows the theme's ANSI blue.
-    /// The fill keeps [`Self::meter`]. `COLOR_HIGHLIGHT` under an OS-forced
-    /// palette, like the meter.
-    pub ring: [u8; 3],
-    /// The FILL of the message band's capsule under the pointer
-    /// (`message_band::paint_rows`, design §2.2): [`Self::bar_bg`] moved
-    /// toward the ink — at least 0.30, and on until it stands
-    /// [`HOVER_RISE`]:1 from a resting chip's [`Self::chip_ground`] (design
-    /// ruling 260: the pointer's step was about 1.2:1, a change the eye could
-    /// miss) — while [`Self::capsule_hover_ink`] still clears WCAG AA on it.
-    /// Under an OS-forced palette it is `COLOR_HIGHLIGHT`: HC's own word for
-    /// "the thing the pointer is on".
-    pub capsule_hover: [u8; 3],
-    /// The ink on [`Self::capsule_hover`]: [`Self::value`] theme-derived (full
-    /// contrast, whatever role the chip's resting ink had), lifted toward its
-    /// own end where the risen fill needs it for AA ([`hover_ink`]);
-    /// `COLOR_HIGHLIGHTTEXT` under an OS-forced palette.
-    pub capsule_hover_ink: [u8; 3],
-    /// The FILL of the message band's PRIMARY capsule under the pointer:
-    /// [`Self::accent`] moved [`PRIMARY_HOVER_LIFT`] toward the theme's ink —
-    /// LIT, not dimmed. The resting Primary is the accent chip; painting it
-    /// in the grey [`Self::capsule_hover`] under the pointer read as DISABLED
-    /// (review, 2026-09-22: `Apply now` went from the bright chip to a grey
-    /// block), and the first lift of 0.25 was a step the eye could miss (the
-    /// same review's second pass, ruling 20: unmistakable, at least 0.45).
-    /// Floored so [`Self::capsule_primary_hover_ink`] keeps the 3:1 non-text
-    /// floor the accent itself is held to. Under an OS-forced palette it is
-    /// `COLOR_HIGHLIGHT`, like every hovered chip there.
-    pub capsule_primary_hover: [u8; 3],
-    /// The ink on [`Self::capsule_primary_hover`]: [`Self::bar_bg`]
-    /// theme-derived — the Primary's resting ink, so only the fill moves —
-    /// and `COLOR_HIGHLIGHTTEXT` under an OS-forced palette.
-    pub capsule_primary_hover_ink: [u8; 3],
-    /// What the lit Primary moves [`PRIMARY_HOVER_LIFT`] toward: the theme's
-    /// ink. The band lifts the chip from the accent it actually WEARS — the
-    /// accent deepened to AA for its label (ruling 155) — so a deepened rest
-    /// and the lit form stay a whole lift apart (ruling 160). Under an
-    /// OS-forced palette `COLOR_HIGHLIGHT`, unread there.
-    pub primary_lift_toward: [u8; 3],
-    /// The ink a WORD takes on the [`Self::accent`] fill of a metered band row
-    /// under an OS-forced palette: `COLOR_HIGHLIGHTTEXT`, the system's own
-    /// pairing for `COLOR_HIGHLIGHT` (the message band's full-row meter, ruling
-    /// 55). Theme-derived it is [`Self::bar_bg`] — the resting Primary's ink on
-    /// the accent — but the band floors each word's own ink against the fill
-    /// instead (`message_band::Ground::ink`), so this is read under High
-    /// Contrast only.
-    pub on_accent: [u8; 3],
-}
+// The chrome colour helpers live in the engine (ruling 324: one implementation for the
+// band, the tab strip, the find bar, the notices, Settings and presence), re-exported
+// under the paths their call sites have always used.
+#[cfg(test)]
+pub(crate) use aterm_messages::ink::{
+    HOVER_RISE, PRIMARY_HOVER_LIFT, TRACK_TINT, ensure_contrast_either, hover_ink,
+};
+pub(crate) use aterm_messages::ink::{contrast, ensure_contrast, forced_ink, mix3, warn_mark};
 
-/// How far the lit Primary's fill moves from the resting accent toward the
-/// theme's ink (`mix3` `t`). 0.25 shipped first and was too quiet — a hovered
-/// `Apply now` had to be compared with its resting self to be seen as lit;
-/// ruling 20 (2026-09-22) sets the floor at 0.45: unmistakable on its own.
-pub(crate) const PRIMARY_HOVER_LIFT: f32 = 0.45;
-
+/// A packed `0x00RRGGBB` theme colour as sRGB bytes.
 fn rgb(c: u32) -> [u8; 3] {
     [
         ((c >> 16) & 0xff) as u8,
         ((c >> 8) & 0xff) as u8,
         (c & 0xff) as u8,
     ]
-}
-
-fn blend(a: u32, b: u32, t: f32) -> [u8; 3] {
-    mix3(rgb(a), rgb(b), t)
-}
-
-/// Linear blend of two RGB triples: `a` toward `b` by `t` ∈ [0,1].
-///
-/// `pub(crate)` because the tab strip derives its band, its raised card and its
-/// seam with exactly this blend. It had a byte-identical private copy; two copies
-/// of a colour blend is how two chrome surfaces drift apart by a rounding step.
-pub(crate) fn mix3(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
-    let mix = |x: u8, y: u8| (f32::from(x).mul_add(1.0 - t, f32::from(y) * t)).round() as u8;
-    [mix(a[0], b[0]), mix(a[1], b[1]), mix(a[2], b[2])]
-}
-
-/// WCAG relative-contrast ratio between two RGB triples.
-///
-/// `pub(crate)` because [`ensure_contrast`] is a one-way ratchet — it can only push
-/// ink AWAY from its surface — and the tab strip needs to know when that ratchet has
-/// overshot (a DIMMED label the floor dragged past full strength is no longer a dim).
-/// Answering that needs the ratio itself, not just the floor.
-pub(crate) fn contrast(a: [u8; 3], b: [u8; 3]) -> f64 {
-    aterm_types::Rgb::new(a[0], a[1], a[2]).contrast(aterm_types::Rgb::new(b[0], b[1], b[2]))
-}
-
-/// Nudge ink `c` toward black/white (whichever the background is not) until it
-/// clears `target`:1 against `bg`, in ten steps, returning the best it reached when
-/// the target is unreachable. A no-op when `c` already clears the target, so it is
-/// safe to wrap an ink that is normally fine and only needs a floor on an
-/// exotic user theme.
-///
-/// `pub(crate)` because the tab strip's inks moved OFF the terminal background and
-/// onto the chrome band, where a theme's own fg/bg contrast no longer describes
-/// what the reader sees.
-pub(crate) fn ensure_contrast(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
-    if contrast(c, bg) >= target {
-        return c;
-    }
-    let anchor = if bg_is_light(bg) {
-        [0, 0, 0]
-    } else {
-        [255, 255, 255]
-    };
-    let mut best = c;
-    let mut best_ratio = contrast(c, bg);
-    let mut step = 1u8;
-    while step <= 10 {
-        let mixed = mix3(c, anchor, f32::from(step) / 10.0);
-        let ratio = contrast(mixed, bg);
-        if ratio > best_ratio {
-            best = mixed;
-            best_ratio = ratio;
-        }
-        if ratio >= target {
-            return mixed;
-        }
-        step += 1;
-    }
-    best
-}
-
-/// [`ensure_contrast`] that crosses to the OTHER anchor when the near one
-/// cannot clear `target` — the floor for words on the meter's surface. The
-/// edge cell of a fill, the comet and the glint are MIXES of track and fill
-/// (ruling 138's tone coverage), so a word can land on a mid tone whose luma
-/// [`bg_is_light`] calls dark but that white cannot lift to AA against (the
-/// luma split is not the contrast crossover). One of black and white always
-/// clears √21 ≈ 4.58:1, so a target at or under AA is always met.
-pub(crate) fn ensure_contrast_either(c: [u8; 3], bg: [u8; 3], target: f64) -> [u8; 3] {
-    let near = ensure_contrast(c, bg, target);
-    if contrast(near, bg) >= target {
-        return near;
-    }
-    let far = if bg_is_light(bg) {
-        [255, 255, 255]
-    } else {
-        [0, 0, 0]
-    };
-    let mut best = near;
-    for step in 1..=10u8 {
-        let mixed = mix3(c, far, f32::from(step) / 10.0);
-        if contrast(mixed, bg) >= target {
-            return mixed;
-        }
-        if contrast(mixed, bg) > contrast(best, bg) {
-            best = mixed;
-        }
-    }
-    best
-}
-
-/// The band tones under an OS-forced chrome palette ([`ForcedChrome`]) — today,
-/// Windows High Contrast.
-///
-/// The band is a CONTROL surface (`COLOR_BTNFACE`) and the find bar's query field is
-/// a DOCUMENT one (`COLOR_WINDOW`), which is Win32's own split and the reason those
-/// two system colours exist separately at all. Every ink collapses onto
-/// `COLOR_WINDOWTEXT`: `label` is normally a dim of `value`, and an HC scheme has no
-/// dim — a user who turned High Contrast on asked for exactly one text colour, and
-/// the find panel's hierarchy is carried by weight and position instead. `warn`
-/// collapses too: HC deliberately discards hue as a channel, so a yellow-on-band
-/// warning tone would either be overruled by the scheme or ignore it.
-///
-/// Rejected alternative: mapping `warn` to `COLOR_HIGHLIGHT`. That colour means
-/// SELECTED in the HC vocabulary (it is what the active tab chip uses), and
-/// borrowing it for a severity would make a warning look like a selection.
-fn forced_band_colors(hc: ForcedChrome) -> BandColors {
-    let on_band = forced_ink(hc.window_text, hc.btn_face);
-    let in_well = forced_ink(hc.window_text, hc.window);
-    BandColors {
-        bar_bg: hc.btn_face,
-        label: on_band,
-        value: on_band,
-        warn: on_band,
-        error: on_band,
-        field_bg: hc.window,
-        caret: in_well,
-        // See [`BandColors::well_rule`]: every stock HC scheme has WINDOW == BTNFACE,
-        // so the fill alone leaves the query field with no boundary at all.
-        well_rule: (hc.window == hc.btn_face).then_some(in_well),
-        accent: hc.highlight,
-        meter: hc.highlight,
-        meter_edge: None,
-        meter_track: hc.window,
-        chip_ground: hc.window,
-        ring: hc.highlight,
-        capsule_hover: hc.highlight,
-        capsule_hover_ink: forced_ink(hc.highlight_text, hc.highlight),
-        capsule_primary_hover: hc.highlight,
-        capsule_primary_hover_ink: forced_ink(hc.highlight_text, hc.highlight),
-        primary_lift_toward: hc.highlight,
-        on_accent: forced_ink(hc.highlight_text, hc.highlight),
-    }
 }
 
 /// The CSD headerbar fills the band sits directly under on Linux — sctk-adwaita's
@@ -580,8 +294,9 @@ pub(crate) const CSD_HEADERBAR_LIGHT: [u8; 3] = [0xEB, 0xEB, 0xEB];
 /// Appearance-aware, theme-derived band tones with WCAG-AA text contrast.
 ///
 /// Under an OS-forced chrome palette (Windows High Contrast) this defers wholesale
-/// to [`forced_band_colors`] — the OS owns chrome colour then, and a theme-derived
-/// blend under an OS-palette caption is the seam that made HC support incoherent.
+/// to the forced mapping (`BandInks::forced`) — the OS owns chrome colour then, and a
+/// theme-derived blend under an OS-palette caption is the seam that made HC support
+/// incoherent.
 ///
 /// LINUX: the band's base tone is NOT theme-derived — it is the exact adwaita
 /// headerbar gray of the CSD titlebar directly above it (see
@@ -651,178 +366,37 @@ impl BandPalette {
 /// chosen by `aterm_messages::palette::MeterHue`, the one host-agnostic rule.
 /// A hue the 3:1 floor would darken into brown keeps its own pastel and a
 /// darker edge instead (ruling 264, `aterm_messages::palette::keeps_pastel`).
+///
+/// A pure MAPPING (ruling 324): the latch's forced palette, or the engine's
+/// derivation (`BandInks::derive`) from the theme's background, foreground and
+/// cursor, the ANSI pair, and this platform's band base.
 pub(crate) fn band_colors_with(theme: Theme, ansi: Option<MeterAnsi>) -> BandColors {
-    let mut c = band_colors_base(theme);
-    if forced_chrome().is_some() {
-        return c;
-    }
-    let cursor = rgb(theme.cursor);
-    let mut hue = cursor;
-    if let Some(a) = ansi {
-        let pick = aterm_messages::palette::MeterHue::pick(
-            cursor,
-            a.blue,
-            a.cyan,
-            &[c.field_bg, c.bar_bg, c.value],
-        );
-        hue = pick.of(cursor, a.blue, a.cyan);
-        c.meter = ensure_contrast(hue, c.bar_bg, 3.0);
-        c.meter_track = mix3(c.bar_bg, c.meter, TRACK_TINT);
-        c.ring = c.meter;
-        // THE OUTLINE'S HUE (ruling 260): a warm meter floored to AA for its
-        // label reads brown; the outline borrows the theme's blue.
-        let label = |hue: [u8; 3]| crate::message_band::keep_side(hue, c.bar_bg, 4.5);
-        let blue = ensure_contrast(a.blue, c.bar_bg, 3.0);
-        if aterm_messages::palette::outline_borrows_blue(label(c.meter), blue, label(blue)) {
-            c.ring = blue;
-        }
-    }
-    // THE PASTEL FILL (ruling 264): where the floor turned the hue brown, the
-    // fill is the hue itself — its track tinted toward it as any track is —
-    // and a darker edge line carries the boundary. The outline keeps what it
-    // measured on the floored hue.
-    if aterm_messages::palette::keeps_pastel(hue, c.meter) {
-        c.meter = hue;
-        c.meter_track = mix3(c.bar_bg, hue, TRACK_TINT);
-        c.meter_edge = Some(aterm_messages::palette::pastel_edge(hue, c.meter_track));
-    }
-    c
-}
-
-/// How far a meter's TRACK is mixed from the band toward the meter's hue
-/// (design ruling 260): the bar's own channel, faintly its colour.
-pub(crate) const TRACK_TINT: f32 = 0.10;
-
-/// The least contrast a hovered chip's fill stands from a resting chip's
-/// (design ruling 260).
-pub(crate) const HOVER_RISE: f64 = 1.5;
-
-fn band_colors_base(theme: Theme) -> BandColors {
     if let Some(hc) = forced_chrome() {
-        return forced_band_colors(hc);
+        return BandColors::forced(hc);
     }
-    let light = bg_is_light(rgb(theme.bg));
-    #[cfg(target_os = "linux")]
-    let bar_bg = if light {
-        CSD_HEADERBAR_LIGHT
-    } else {
-        CSD_HEADERBAR_DARK
-    };
-    #[cfg(not(target_os = "linux"))]
-    let bar_bg = blend(theme.bg, theme.fg, if light { 0.10 } else { 0.16 });
-    let warn_base = if light {
-        rgb(0x009A_6700)
-    } else {
-        rgb(0x00F1_FA8C)
-    };
-    let error_base = if light {
-        rgb(0x00CF_222E)
-    } else {
-        rgb(0x00FF_5555)
-    };
-    const AA: f64 = 4.5;
-    let field_bg = rgb(theme.bg);
-    let value = ensure_contrast(rgb(theme.fg), bar_bg, AA);
-    // A meter fill is a SURFACE, not text: the 3:1 non-text floor (the same
-    // one the strip's inks use), so the cursor accent survives on a band it
-    // happens to resemble without being dragged to black/white needlessly.
-    let accent = ensure_contrast(rgb(theme.cursor), bar_bg, 3.0);
-    let chip_ground = mix3(bar_bg, rgb(theme.fg), if light { 0.12 } else { 0.18 });
-    let meter_track = mix3(bar_bg, accent, TRACK_TINT);
-    BandColors {
-        bar_bg,
-        // `label` is the SECONDARY tone, not an optional one: it carries the find
-        // panel's whole hint row, its placeholder, and every inactive toggle. Held to
-        // the same AA floor as `value` — a dim role still has to be readable, and
-        // `value` (bold, full contrast) keeps the hierarchy on its own.
-        label: ensure_contrast(
-            blend(theme.fg, theme.bg, if light { 0.40 } else { 0.48 }),
-            bar_bg,
-            AA,
-        ),
-        value,
-        warn: ensure_contrast(warn_base, bar_bg, AA),
-        error: ensure_contrast(error_base, bar_bg, AA),
-        field_bg,
-        caret: ensure_contrast(rgb(theme.cursor), field_bg, AA),
-        // The theme-derived well is an INSET: `field_bg` is the terminal background
-        // and `bar_bg` a 0.10/0.16 step off it, so the fill already draws the edge.
-        // The equality guard is not dead — a user theme is free to land on a `bg`
-        // that blends to itself.
-        well_rule: (field_bg == bar_bg).then(|| ensure_contrast(rgb(theme.fg), field_bg, AA)),
-        accent,
-        meter: accent,
-        meter_edge: None,
-        meter_track,
-        chip_ground,
-        ring: accent,
-        capsule_hover: capsule_hover_fill(bar_bg, rgb(theme.fg), value, chip_ground),
-        capsule_hover_ink: hover_ink(
-            value,
-            capsule_hover_fill(bar_bg, rgb(theme.fg), value, chip_ground),
-        ),
-        // Toward the ink is AWAY from the band on every theme (the band is a
-        // step off `bg`, the ink its opposite), so the lit accent can only
-        // gain contrast for the `bar_bg` ink on it; the floor is belt and
-        // braces for a theme whose cursor sits between the two.
-        capsule_primary_hover: ensure_contrast(
-            mix3(accent, rgb(theme.fg), PRIMARY_HOVER_LIFT),
-            bar_bg,
-            3.0,
-        ),
-        capsule_primary_hover_ink: bar_bg,
-        primary_lift_toward: rgb(theme.fg),
-        on_accent: bar_bg,
-    }
+    BandColors::derive(
+        ThemeInks {
+            bg: rgb(theme.bg),
+            fg: rgb(theme.fg),
+            cursor: rgb(theme.cursor),
+        },
+        ansi.map(|a| AnsiHues {
+            blue: a.blue,
+            cyan: a.cyan,
+        }),
+        PLATFORM_BAR_BASE,
+    )
 }
 
-/// The hovered capsule's fill: `bar_bg` moved toward `fg` — 0.30, and on in
-/// steps of 0.05 until it stands [`HOVER_RISE`]:1 from `rest` (a resting
-/// chip's fill), while `ink` still clears WCAG AA on it (design ruling 260).
-/// Where no step does both, the old rule: 0.30, stepped back by 0.05 until
-/// `ink` clears AA. A step of 0 is `bar_bg` itself, which `ink` (= `value`)
-/// clears by construction, so the fill is always one the label is legible on
-/// — the floor is on the SURFACE here, because the ink is already at full
-/// contrast and cannot be pushed further.
-fn capsule_hover_fill(bar_bg: [u8; 3], fg: [u8; 3], ink: [u8; 3], rest: [u8; 3]) -> [u8; 3] {
-    const AA: f64 = 4.5;
-    for step in 6..=14u8 {
-        let fill = mix3(bar_bg, fg, f32::from(step) * 0.05);
-        // The ink may lift toward its own end to hold AA on the risen fill
-        // ([`hover_ink`]), never cross to the other side of it.
-        if bg_is_light(fill) != bg_is_light(bar_bg) || contrast(hover_ink(ink, fill), fill) < AA {
-            break;
-        }
-        if contrast(fill, rest) >= HOVER_RISE {
-            return fill;
-        }
-    }
-    for step in (0..=6u8).rev() {
-        let fill = mix3(bar_bg, fg, f32::from(step) * 0.05);
-        if contrast(ink, fill) >= AA {
-            return fill;
-        }
-    }
-    bar_bg
-}
-
-/// The band's WARN hue as a non-text mark on `ground` (Settings ▸ Messages'
-/// severity column, design ruling 262): the amber the band's warn words are
-/// drawn from, floored to the 3:1 non-text contrast on that ground.
-pub(crate) fn warn_mark(ground: [u8; 3]) -> [u8; 3] {
-    let base = if bg_is_light(ground) {
-        rgb(0x009A_6700)
-    } else {
-        rgb(0x00F1_FA8C)
-    };
-    ensure_contrast(base, ground, 3.0)
-}
-
-/// The ink on a hovered chip's `fill` ([`capsule_hover_fill`]): `value`, lifted
-/// toward its own end until it clears AA on the risen fill.
-pub(crate) fn hover_ink(value: [u8; 3], fill: [u8; 3]) -> [u8; 3] {
-    ensure_contrast(value, fill, 4.5)
-}
+/// Where this platform's band ground comes from: on Linux the CSD headerbar grey
+/// ([`CSD_HEADERBAR_DARK`]/[`CSD_HEADERBAR_LIGHT`]), elsewhere the theme blend.
+#[cfg(target_os = "linux")]
+const PLATFORM_BAR_BASE: BarBase = BarBase::Fixed {
+    light: CSD_HEADERBAR_LIGHT,
+    dark: CSD_HEADERBAR_DARK,
+};
+#[cfg(not(target_os = "linux"))]
+const PLATFORM_BAR_BASE: BarBase = BarBase::Blend;
 
 /// The PRESENCE tones (round 19, `crate::presence`): the rim's three hues and
 /// the story dot, as theme tokens. Owner's picks on the approved mocks: teal
@@ -1315,6 +889,18 @@ mod tests {
             let comet = crate::message_band::MeterInks::comet(colors, fill).0;
             let head = crate::message_band::tone_rgb(aterm_messages::Tone::HEAD, &comet);
             let words = crate::message_band::fill_ink(colors, fill);
+            // The glint IS the fill's one step away from those words.
+            assert_eq!(
+                inks.glint,
+                crate::message_band::glint_step(fill, words, false),
+                "{name}"
+            );
+            // One of black and white always clears AA on the fill, so the
+            // floor that may cross to the far one always meets it.
+            assert!(
+                contrast(ensure_contrast_either(colors.label, fill, 4.5), fill) >= 4.5,
+                "{name}: no ink reaches AA on {fill:?}"
+            );
             assert!(
                 contrast(words, inks.glint) >= contrast(words, fill) - 0.02,
                 "{name}: the glint of {fill:?} must never cost its words contrast: \
@@ -1377,6 +963,11 @@ mod tests {
             assert!(
                 contrast(colors.capsule_hover_ink, colors.capsule_hover) >= 4.5,
                 "{name} hovered capsule label must meet WCAG-AA"
+            );
+            assert_eq!(
+                colors.capsule_hover_ink,
+                hover_ink(colors.value, colors.capsule_hover),
+                "{name}: the hovered label is the value ink lifted on the risen fill"
             );
             assert!(
                 contrast(colors.bar_bg, colors.accent) >= 3.0,

@@ -113,6 +113,7 @@ fn record() -> SessionRecord {
         loader: false,
         history: None,
         history_dropped: 0,
+        history_withheld: false,
         history_lost: 0,
     }
 }

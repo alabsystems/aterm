@@ -155,8 +155,9 @@ mod line_codec_block;
 // `TerminalCheckpoint` grid bodies and must be callable from aterm-core.
 pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines};
 pub use line_codec::{
-    deserialize_lines, deserialize_lines_strict, deserialize_lines_tail_strict,
-    deserialize_page_lines, serialize_lines,
+    deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
+    deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
+    serialize_lines,
 };
 
 #[path = "line_content.rs"]

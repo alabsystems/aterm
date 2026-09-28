@@ -1162,8 +1162,9 @@ fn toml_str(s: &str) -> String {
 
 /// `args` with `--fleet --broker --cap-file --state` filled from the rendezvous
 /// file for each one that is absent. No file, or an unreadable one, leaves
-/// `args` as given (the parser's own "required" refusal then names the flags);
-/// an unreadable one is said on stderr first.
+/// `args` as given (the parser's own "required" refusal then names the flags,
+/// except for `ls` with neither flag and no file, which `cli::dispatch` answers
+/// first); an unreadable one is said on stderr first.
 #[must_use]
 pub fn with_rendezvous_defaults(args: &[String]) -> Vec<String> {
     let r = match Rendezvous::read() {
@@ -1766,10 +1767,11 @@ fn wire_step(p: &Paths, out: &mut Out) -> bool {
     else {
         return true;
     };
-    let key = match crate::transport::read_private_key_file(&key_file.to_string_lossy()) {
+    let key_path = key_file.to_string_lossy();
+    let key = match crate::transport::read_private_key_file(&key_path) {
         Ok(k) => k,
         Err(e) => {
-            out.fail("wire", &format!("{}: {e}", key_file.display()));
+            out.fail("wire", &crate::transport::describe(&key_path, &e));
             return false;
         }
     };
@@ -2121,8 +2123,11 @@ struct Instance {
     command: Option<String>,
 }
 
-/// Every instance the rendezvous walk lists that answered `fabric status`.
-fn instances(out: &mut Out) -> Vec<Instance> {
+/// Every instance the rendezvous walk lists that answered `fabric status`, and
+/// how many listed instances are running: those, plus each live one that
+/// could not be asked (its line says why). `None` when the walk itself failed,
+/// so nobody can say none is running.
+fn instances(out: &mut Out) -> (Vec<Instance>, Option<usize>) {
     let listed = match aterm_ctl::local_instances() {
         Ok(l) => l,
         Err(e) => {
@@ -2130,10 +2135,11 @@ fn instances(out: &mut Out) -> Vec<Instance> {
                 "instances",
                 &format!("cannot be listed ({}); none armed", safe(&e.reason, 256)),
             );
-            return Vec::new();
+            return (Vec::new(), None);
         }
     };
     let mut found = Vec::new();
+    let mut unasked = 0;
     for (pid, sock) in listed {
         let token = match aterm_ctl::instance_token(&sock) {
             Ok(t) => t,
@@ -2146,6 +2152,7 @@ fn instances(out: &mut Out) -> Vec<Instance> {
                             safe(&e.to_string(), 128)
                         ),
                     );
+                    unasked += 1;
                 }
                 continue;
             }
@@ -2161,6 +2168,7 @@ fn instances(out: &mut Out) -> Vec<Instance> {
                             safe(&sock, 256)
                         ),
                     );
+                    unasked += 1;
                 }
                 continue;
             }
@@ -2174,10 +2182,12 @@ fn instances(out: &mut Out) -> Vec<Instance> {
                     "instance",
                     &format!("{pid}: fabric status answered {}", safe(r.header(), 128)),
                 );
+                unasked += 1;
                 continue;
             }
             Err(e) => {
                 out.note("instance", &format!("{pid}: fabric status: {e}"));
+                unasked += 1;
                 continue;
             }
         };
@@ -2193,20 +2203,21 @@ fn instances(out: &mut Out) -> Vec<Instance> {
                 .map(crate::pct::decode),
         });
     }
-    found
+    let running = found.len() + unasked;
+    (found, Some(running))
 }
 
-/// Step 9: arm every running instance. Answers the ones that carry this
-/// command (armed now or before), in the order they were listed.
-fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
+/// Step 9: arm every running instance. Answers how many are running (`None`
+/// when they could not be listed), and the ones that carry this command
+/// (armed now or before), in the order they were listed.
+fn arm_instances(argv: &[String], out: &mut Out) -> (Option<usize>, Vec<Instance>) {
     let ours = fabric::serve_flags(&argv.join(" "));
-    let found = instances(out);
-    if found.is_empty() {
+    let (found, running) = instances(out);
+    if running == Some(0) {
         out.note(
             "instances",
             "none running (a later launch reads [fabric] command itself)",
         );
-        return Vec::new();
     }
     let mut armed = Vec::new();
     for mut inst in found {
@@ -2243,8 +2254,8 @@ fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
         );
         if out.dry_run {
             // Listed as armed so the dry run's PROOF line names the session it
-            // would post through, rather than "no armed instance" — the
-            // instance is untouched either way.
+            // would post through, rather than a skip — the instance is
+            // untouched either way.
             armed.push(inst);
             continue;
         }
@@ -2329,15 +2340,30 @@ fn arm_instances(argv: &[String], out: &mut Out) -> Vec<Instance> {
             );
         }
     }
-    armed
+    (running, armed)
 }
 
-/// Every `(instance pid, sid, origin)` whose `status` says `hold=1`, across the
-/// instances the rendezvous walk lists — the origin read off the session's
-/// `timeline` ([`fabric::last_hold`]), `None` when it is no longer there. An
-/// instance that cannot be asked is skipped silently: `off` names what it can
-/// see, and the `instances` line at its end says what is running.
-fn held_sessions() -> Vec<(u32, String, Option<String>)> {
+/// The proof line when nothing is armed to post through. Launching aterm is
+/// the fix only when the walk listed none running; otherwise (an instance that
+/// could not be asked, one armed with another command, a failed arm or
+/// bridge, a walk that failed) the lines above say why.
+fn proof_skipped(running: Option<usize>) -> &'static str {
+    if running == Some(0) {
+        "skipped: no aterm is running — launch one, then run this again"
+    } else {
+        "skipped: no running aterm has a connected bridge for this command — the lines above say \
+         why"
+    }
+}
+
+/// Every `(instance pid, socket, sid, origin)` whose `status` says `hold=1`,
+/// across the instances the rendezvous walk lists — the socket only when
+/// `--pid` does not reach it ([`aterm_ctl::pid_reaches`]), the origin read off
+/// the session's `timeline` ([`fabric::last_hold`]), `None` when it is no
+/// longer there. An instance that cannot be asked is skipped silently: `off`
+/// names what it can see, and the `instances` line at its end says what is
+/// running.
+fn held_sessions() -> Vec<(u32, Option<String>, String, Option<String>)> {
     let mut held = Vec::new();
     for (pid, sock) in aterm_ctl::local_instances().unwrap_or_default() {
         let Ok(token) = aterm_ctl::instance_token(&sock) else {
@@ -2377,7 +2403,8 @@ fn held_sessions() -> Vec<(u32, String, Option<String>)> {
                     .filter(crate::ctl::Reply::ok)
                     .and_then(|t| fabric::last_hold(t.rows()))
                     .map(|(_, origin)| origin);
-                held.push((pid, sid, origin));
+                let explicit = (!aterm_ctl::pid_reaches(pid, &sock)).then(|| sock.clone());
+                held.push((pid, explicit, sid, origin));
             }
         }
     }
@@ -2630,7 +2657,7 @@ fn key_step(key_file: &Path, out: &mut Out) -> bool {
                     &format!(
                         "{}: it is never replaced silently — a joined host holds this key; fix \
                          it, or name a new --key-file and re-join every host",
-                        safe(&e.to_string(), 256)
+                        safe(&crate::transport::describe(&path, &e), 256)
                     ),
                 );
                 false
@@ -3062,15 +3089,11 @@ pub(crate) fn finish(
     }
 
     // 9. the running instances
-    let armed = arm_instances(argv, out);
+    let (running, armed) = arm_instances(argv, out);
 
     // 10. the proof
     let (proof_failed, proof_ran) = if armed.is_empty() {
-        out.note(
-            "proof",
-            "skipped: no armed instance hosts a session to post through — launch aterm, then run \
-             this again",
-        );
+        out.note("proof", proof_skipped(running));
         (false, false)
     } else {
         match prove(&armed, out) {
@@ -3217,11 +3240,12 @@ pub fn off(opts: &OffOpts) -> ExitCode {
         }
     );
     // THE HELD SESSIONS, BEFORE ANYTHING STOPS (module doc, `off`).
-    for (pid, sid, origin) in held_sessions() {
+    for (pid, sock, sid, origin) in held_sessions() {
         let detail = if origin.as_deref() == Some("local") {
             format!(
                 "@{sid} (instance {pid}) is HELD (hold=1 origin=local); off does not lift it \
-                 — `aterm ctl --pid {pid} hold {sid} off` does"
+                 — {} does",
+                lift_hold(&sid, pid, sock.as_deref())
             )
         } else {
             format!(
@@ -3511,17 +3535,21 @@ pub fn fix_for(warning: &str) -> String {
             .to_string()
     } else if s("is HELD") {
         // The warning names the hold's origin and reason when the timeline
-        // still has them, and that decides which remedy applies.
+        // still has them, and that decides which remedy applies. `hold` acts
+        // only on the instance it reaches, so the command names that instance,
+        // as `off` does.
+        let lift = lift_hold_in(w);
         if s("origin=local") {
-            "`aterm ctl hold <sid> off`".to_string()
+            lift
         } else if s("reason=fabric-lost origin=fleet") {
             "it lifts when the bridge reconnects".to_string()
         } else if s("origin=fleet") {
             "only the human who set it can withdraw it".to_string()
         } else {
-            "a local hold lifts with `aterm ctl hold <sid> off`; a fleet hold lifts when a bridge \
-             reconnects (reason=fabric-lost) or the human who set it withdraws it"
-                .to_string()
+            format!(
+                "a local hold lifts with {lift}; a fleet hold lifts when a bridge reconnects \
+                 (reason=fabric-lost) or the human who set it withdraws it"
+            )
         }
     } else if s("lost") && s("evicted") {
         "read mail sooner (`aterm ctl @<sid> await inbox`) and `inbox seen` what is handled; the \
@@ -3564,6 +3592,41 @@ pub fn fix_for(warning: &str) -> String {
     } else {
         "see `aterm help fabric`".to_string()
     }
+}
+
+/// The command that lifts a local hold, for the HELD warning `warning` —
+/// `@<sid> (instance <pid>) is HELD …`, or `@<sid> (instance <pid>, --sock
+/// <sock>) is HELD …` for an instance only its socket reaches.
+fn lift_hold_in(warning: &str) -> String {
+    let (sid, at) = warning
+        .strip_prefix('@')
+        .and_then(|w| w.split_once(" (instance "))
+        .and_then(|(sid, rest)| Some((sid, rest.split_once(") is HELD")?.0)))
+        .unwrap_or_default();
+    let (pid, sock) = at
+        .split_once(", --sock ")
+        .map_or((at, None), |(pid, sock)| (pid, Some(sock)));
+    lift_hold(sid, pid.parse().unwrap_or(0), sock)
+}
+
+/// `aterm ctl <instance> hold <sid> off`: `--pid <pid>`, or `--sock <sock>`
+/// when that is what reaches the instance (`sock` is `Some`). A value a
+/// command line cannot carry as it is, or pid 0, stays a placeholder.
+fn lift_hold(sid: &str, pid: u32, sock: Option<&str>) -> String {
+    let plain = |t: &str, more: &[u8]| {
+        !t.is_empty()
+            && t.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.') || more.contains(&b)
+            })
+    };
+    let sid = if plain(sid, b"") { sid } else { "<sid>" };
+    let instance = match sock {
+        Some(sock) if plain(sock, b"/+~@%,:=") => format!("--sock {sock}"),
+        Some(_) => "--sock <sock>".to_string(),
+        None if pid != 0 => format!("--pid {pid}"),
+        None => "--pid <pid>".to_string(),
+    };
+    format!("`aterm ctl {instance} hold {sid} off`")
 }
 
 /// `aterm fabric doctor`.
@@ -4415,6 +4478,25 @@ mod tests {
         assert_eq!(fix_for("something new"), "see `aterm help fabric`");
     }
 
+    /// **A SKIPPED PROOF NAMES THE FIX FOR ITS CASE.** Launching aterm helps
+    /// only when the walk listed none running; an instance that could not be
+    /// asked, one armed with a different command, or one whose arm or bridge
+    /// failed is running already, and its own line above says what to do. A
+    /// walk that failed cannot say none is running.
+    #[test]
+    fn a_skipped_proof_says_launch_only_when_nothing_runs() {
+        assert_eq!(
+            proof_skipped(Some(0)),
+            "skipped: no aterm is running — launch one, then run this again"
+        );
+        // Running (answered or not), or a walk that could not list them.
+        for running in [Some(1), Some(2), None] {
+            let note = proof_skipped(running);
+            assert!(!note.contains("launch"), "{note}");
+            assert!(note.contains("the lines above say why"), "{note}");
+        }
+    }
+
     /// A SUCCESSFUL RUN UNDER A STATUS WITH WARNINGS says the warnings are not
     /// its failure; with none it adds nothing.
     #[test]
@@ -4436,7 +4518,33 @@ mod tests {
     #[test]
     fn a_fix_picks_the_remedy_the_warning_names() {
         let held = |why: &str| fix_for(&format!("@s-a (instance 1) is HELD ({why})"));
-        assert_eq!(held("reason=x origin=local"), "`aterm ctl hold <sid> off`");
+        // A hold is lifted on the instance that hosts the session: a flagless
+        // `aterm ctl` reaches the caller's own (or the newest) instance, whose
+        // store answers `ERR no such session` for another's.
+        assert_eq!(
+            held("reason=x origin=local"),
+            "`aterm ctl --pid 1 hold s-a off`"
+        );
+        assert_eq!(
+            fix_for("a session is HELD (reason=x origin=local)"),
+            "`aterm ctl --pid <pid> hold <sid> off`"
+        );
+        assert!(held("reason and origin no longer in its timeline")
+            .contains("`aterm ctl --pid 1 hold s-a off`"));
+        // An explicit-`--control-sock` instance: only its socket reaches it.
+        assert_eq!(
+            fix_for("@s-a (instance 1, --sock /tmp/at.x/a.sock) is HELD (reason=x origin=local)"),
+            "`aterm ctl --sock /tmp/at.x/a.sock hold s-a off`"
+        );
+        assert_eq!(
+            fix_for("@s-a (instance 0, --sock /tmp/a b.sock) is HELD (reason=x origin=local)"),
+            "`aterm ctl --sock <sock> hold s-a off`"
+        );
+        // A legacy graph entry's pid 0 reaches nothing by `--pid`.
+        assert_eq!(
+            fix_for("@s-a (instance 0) is HELD (reason=x origin=local)"),
+            "`aterm ctl --pid <pid> hold s-a off`"
+        );
         assert_eq!(
             held("reason=fabric-lost origin=fleet"),
             "it lifts when the bridge reconnects"

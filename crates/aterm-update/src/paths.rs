@@ -111,9 +111,9 @@ impl Staging {
     /// holding [`Self::stage_lock`].
     ///
     /// Also forgets the ledger's authorized tag ([`crate::status::clear_latest_tag`]):
-    /// every caller retires "so the next check re-stages", and on the web lane a check
-    /// whose pointer still names the retired stage's tag would otherwise stop at its
-    /// HEAD with "up to date" forever — the machine stranded on the old build until the
+    /// every caller retires "so the next check re-stages", and a check whose pointer
+    /// still names the retired stage's tag would otherwise stop at its HEAD with "up
+    /// to date" forever — the machine stranded on the old build until the
     /// publisher cut a NEW tag.
     pub fn retire_published(&self) {
         let _ = std::fs::remove_file(&self.ready);

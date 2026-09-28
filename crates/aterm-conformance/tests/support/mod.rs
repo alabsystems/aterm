@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 ///
 /// Under the gate the first arm answers: the measuring stage builds the
 /// release `aterm` itself and hands it over in `ATERM_PAINT_BIN` and
-/// `ATERM_SPIN_BIN` (`aterm-verify`'s `RELEASE_BIN_VARS`), so the suites judge
+/// `ATERM_SPIN_BIN` (`aterm-verify`'s `measuring_cmd`), so the suites judge
 /// the artifact that stage just built and never build one of their own. The
 /// build below is a hand run's. Its dedicated target avoids repeatedly
 /// rebuilding dependencies with the outer integration test's different feature

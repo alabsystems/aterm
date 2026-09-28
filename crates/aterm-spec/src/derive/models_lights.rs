@@ -21,7 +21,9 @@ use super::*;
 /// `2` ended (a notice or a refusal on show). `sent` is a press Claude has
 /// not answered yet, `auto` whether that press is aterm's own (a follow-up)
 /// rather than the click's; `busy` a turn in flight; `covered` a box over
-/// the composer (a permission prompt).
+/// the composer (a permission prompt). `late` says that the current press's
+/// deadline passed before the loop next handled Claude's answer: the loop
+/// may observe the answer, but cannot send another press from it.
 ///
 /// The host's actions: `Click` (the person's press on the chip, which sends
 /// the first shift+tab), `Press` (each next shift+tab, decided from the
@@ -30,7 +32,9 @@ use super::*;
 /// or the presses ran out: stopped, naming the mode), `Reject` (the input
 /// seam took no next press: stopped, naming the mode) and `Expire` (a press
 /// unanswered, a box up, or a turn still running, past that press's OWN
-/// deadline: stopped, naming the mode). Claude's: `Answer` (the pill moves
+/// deadline: stopped, naming the mode). `Timeout` marks a late loop turn,
+/// including one on which Claude's answer is already visible. Claude's:
+/// `Answer` (the pill moves
 /// on), `TurnStarts`/`TurnEnds`, `Cover`/`Uncover`; and the person's own
 /// mode changes in Claude (`Leave`, `DontAsk`) and a session's narrower
 /// cycle (`Narrow`).
@@ -60,6 +64,8 @@ use super::*;
 /// reading the mode (the retired "any mode but this one" toggle), a press
 /// into a box or mid-turn, and a stop — by deadline, lap or rejected press
 /// — that drops the stopped mode's name.
+/// `NoLatePress` catches a return whose delayed wake resets the deadline and
+/// sends another shift+tab after the previous one has elapsed.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn claude_mode_return_model() -> Model {
@@ -80,6 +86,8 @@ pub fn claude_mode_return_model() -> Model {
             var named = 0;
             var overshoot = 0;
             var boxed = 0;
+            var late = 0;
+            var late_press = 0;
 
             action Click when (phase == 0 && mode > 0 && covered == 0) {
                 phase = 1;
@@ -89,6 +97,7 @@ pub fn claude_mode_return_model() -> Model {
                 fresh = 0;
                 presses = 1;
                 named = 0;
+                late = 0;
             }
             action Answer when (sent == 1 && covered == 0) {
                 mode = if mode == 3 && ring == 1 {
@@ -128,6 +137,9 @@ pub fn claude_mode_return_model() -> Model {
             action Narrow when (phase == 0 && ring == 1) {
                 ring = 0;
             }
+            action Timeout when (phase == 1 && late == 0) {
+                late = 1;
+            }
             action Press when (
                 phase == 1
                     && sent == 0
@@ -136,6 +148,7 @@ pub fn claude_mode_return_model() -> Model {
                     && (mode > 0 || Buggy == 1)
                     && (covered == 0 || Buggy == 1)
                     && (busy == 0 || Buggy == 1)
+                    && (late == 0 || Buggy == 1)
             ) {
                 sent = 1;
                 auto = 1;
@@ -143,6 +156,8 @@ pub fn claude_mode_return_model() -> Model {
                 presses = presses + 1;
                 overshoot = if mode == 0 { 1 } else { overshoot };
                 boxed = if covered == 1 { 1 } else { boxed };
+                late_press = if late == 1 { 1 } else { late_press };
+                late = 0;
             }
             action Reject when (
                 phase == 1
@@ -155,6 +170,7 @@ pub fn claude_mode_return_model() -> Model {
             ) {
                 phase = 2;
                 named = if Buggy == 1 { 0 } else { 1 };
+                late = 0;
             }
             action Lap when (
                 phase == 1
@@ -164,24 +180,29 @@ pub fn claude_mode_return_model() -> Model {
             ) {
                 phase = 2;
                 named = if Buggy == 1 { 0 } else { 1 };
+                late = 0;
             }
             action Arrive when (phase == 1 && sent == 0 && mode == 0) {
                 phase = 2;
                 named = 0;
+                late = 0;
             }
-            action Expire when (phase == 1 && (sent == 1 || covered == 1 || busy == 1)) {
+            action Expire when (phase == 1 && (late == 1 || sent == 1 || covered == 1 || busy == 1)) {
                 phase = 2;
                 sent = 0;
                 auto = 0;
                 named = if Buggy == 1 { 0 } else { 1 };
+                late = 0;
             }
             action Rest when (phase == 2) {
                 phase = 0;
                 named = 0;
+                late = 0;
             }
 
             invariant NeverPressesPastExpected: overshoot == 0;
             invariant NoPressIntoABox: boxed == 0;
+            invariant NoLatePress: late_press == 0;
             invariant AStopIsNamed: phase <= 1 || mode == 0 || named == 1;
         }
     }

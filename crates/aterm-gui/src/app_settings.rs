@@ -36,27 +36,45 @@ impl App {
         crate::native_app::AppInstanceId,
         crate::tab_model::ViewId,
     )> {
+        let mut views = Vec::new();
+        self.visit_settings_tabs_in_window(wid, |index, tab, instance, view| {
+            views.push((index, tab, instance, view));
+        });
+        views
+    }
+
+    /// Visit in stable tab/leaf order without materializing each tab's leaves.
+    /// The event-loop park uses this across every window, including windows
+    /// containing only terminal tabs, so temporary leaf lists buy no work.
+    fn visit_settings_tabs_in_window(
+        &self,
+        wid: crate::WindowId,
+        mut visit: impl FnMut(
+            usize,
+            crate::tab_model::TabId,
+            crate::native_app::AppInstanceId,
+            crate::tab_model::ViewId,
+        ),
+    ) {
         let Some(window) = self.windows.get(&wid) else {
-            return Vec::new();
+            return;
         };
-        window
-            .tab_set
-            .tabs()
-            .iter()
-            .enumerate()
-            .flat_map(|(index, tab)| {
-                tab.root.leaves().into_iter().filter_map(move |view| {
-                    let crate::tab_model::View::Native(native) =
-                        self.view_store.get(view).copied()?
-                    else {
-                        return None;
-                    };
-                    (self.native_runtime.app(native.instance)?.kind()
-                        == crate::native_app::AppKind::Settings)
-                        .then_some((index, tab.id, native.instance, view))
-                })
-            })
-            .collect()
+        for (index, tab) in window.tab_set.tabs().iter().enumerate() {
+            tab.root.visit(&mut |&view| {
+                let Some(crate::tab_model::View::Native(native)) =
+                    self.view_store.get(view).copied()
+                else {
+                    return;
+                };
+                if self
+                    .native_runtime
+                    .app(native.instance)
+                    .is_some_and(|app| app.kind() == crate::native_app::AppKind::Settings)
+                {
+                    visit(index, tab.id, native.instance, view);
+                }
+            });
+        }
     }
 
     /// Find the Settings presentation in `wid` by stable native-app identity.
@@ -304,16 +322,10 @@ impl App {
         }
         // EVERY Settings view: a window can hold more than one (a split, a
         // reopened tab), and a request left on the one not chosen would wait.
-        let views = self
-            .windows
-            .keys()
-            .copied()
-            .flat_map(|wid| {
-                self.settings_tabs_in_window(wid)
-                    .into_iter()
-                    .map(move |(_, _, _, view)| (wid, view))
-            })
-            .collect::<Vec<_>>();
+        let mut views = Vec::new();
+        for &wid in self.windows.keys() {
+            self.visit_settings_tabs_in_window(wid, |_, _, _, view| views.push((wid, view)));
+        }
         // Every view shares the process's record of the owner's declines, and
         // every confirmed press is performed now. Both run on every host: a
         // headless view's arms reach no OS, and `begin_*` refuse there.
@@ -764,20 +776,12 @@ impl App {
         // Snapshot stable identities once. A blocked draft is attempted once
         // and remains focused with its recovery UI; successful removals cannot
         // make this loop rediscover and spin on that same blocked view.
-        let targets: Vec<(
-            crate::WindowId,
-            crate::tab_model::TabId,
-            crate::tab_model::ViewId,
-        )> = self
-            .windows
-            .keys()
-            .copied()
-            .flat_map(|wid| {
-                self.settings_tabs_in_window(wid)
-                    .into_iter()
-                    .map(move |(_, tab, _, view)| (wid, tab, view))
-            })
-            .collect();
+        let mut targets = Vec::new();
+        for &wid in self.windows.keys() {
+            self.visit_settings_tabs_in_window(wid, |_, tab, _, view| {
+                targets.push((wid, tab, view));
+            });
+        }
         let mut removed = false;
         for (wid, tab, view) in targets {
             let focused = self.windows.get_mut(&wid).is_some_and(|ws| {
@@ -2705,6 +2709,26 @@ mod tests {
                 )),
             )
             .expect("second Settings presentation");
+        let settings_tab = app.windows[&wid].tab_set.active_id().unwrap();
+        let settings_index = app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .position(|tab| tab.id == settings_tab)
+            .unwrap();
+        // The park discovers background Settings too, in the same stable
+        // split order, without materializing the surrounding terminal leaves.
+        for _ in 0..32 {
+            app.push_stub_tab(wid, crate::stub_session(app.next_session_id));
+        }
+        assert!(app.active_native_view(wid).is_none());
+        assert_eq!(
+            app.settings_tabs_in_window(wid),
+            [
+                (settings_index, settings_tab, instance, first),
+                (settings_index, settings_tab, instance, second),
+            ]
+        );
         for (view, route) in [
             (first, crate::native_settings::SettingsRoute::Security),
             (second, crate::native_settings::SettingsRoute::Appearance),

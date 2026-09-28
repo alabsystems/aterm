@@ -1104,7 +1104,13 @@ pub fn run_with(
     let app_dirs: Vec<PathBuf> = std::iter::once(PathBuf::from("/Applications"))
         .chain(home.map(|h| h.join("Applications")))
         .collect();
-    report_aterm_posture(layout, &app_dirs, p, out);
+    report_aterm_posture(
+        layout,
+        &app_dirs,
+        aterm_update_core::settings::update_auto_apply(),
+        p,
+        out,
+    );
 
     // (1) TRUST ROOT + INDEX SOURCE.
     let _ = writeln!(
@@ -3562,10 +3568,7 @@ fn bounded(
 /// auto-sources the `shell.d` hook that does this already.
 #[cfg(windows)]
 fn manual_path_hint(bin: &Path) -> String {
-    format!(
-        "$env:PATH += \";{}\"  (PowerShell; or add it to your User PATH via System Settings)",
-        bin.display()
-    )
+    format!("$env:PATH += \";{}\"", bin.display())
 }
 #[cfg(not(windows))]
 fn manual_path_hint(bin: &Path) -> String {
@@ -3601,12 +3604,18 @@ fn native_hook_ext() -> &'static str {
 /// And it names WHICH process applies: the window. A terminal session checks and stages
 /// but never applies (a live PTY is not gambled on the trial), so on a Mac with no window
 /// open the note names `aterm --window` — since 2026-09-22 no session launch says so.
+/// `installs_by_itself` is `[update] auto_apply`: off, the window installs nothing until a
+/// person presses Install, and the note names Settings ▸ Software Update, as `aterm update`
+/// does. A staged build whose installs keep failing (health.toml's apply streak) promises no
+/// install either: the note says it did not install and how many tries, as `aterm update`
+/// does.
 ///
 /// Silent when there is no updater state: a bare CLI install is a legitimate posture, not a
 /// fault.
 fn report_aterm_posture(
     layout: &crate::store::Layout,
     app_dirs: &[PathBuf],
+    installs_by_itself: bool,
     p: &str,
     out: &mut dyn std::io::Write,
 ) {
@@ -3628,7 +3637,14 @@ fn report_aterm_posture(
         }))
         .filter_map(|t| Some((plist_bundle_version(&t)?, plist_short_version(&t)?)))
         .collect();
-    report_aterm_posture_at(&support.join("Updates"), bundle_build, &versions, p, out);
+    report_aterm_posture_at(
+        &support.join("Updates"),
+        bundle_build,
+        &versions,
+        installs_by_itself,
+        p,
+        out,
+    );
 }
 
 /// [`report_aterm_posture`] over an explicit updater ledger dir, the SEALED build
@@ -3646,6 +3662,7 @@ fn report_aterm_posture_at(
     updates: &Path,
     bundle_build: Option<u64>,
     versions: &[(u64, String)],
+    installs_by_itself: bool,
     p: &str,
     out: &mut dyn std::io::Write,
 ) {
@@ -3684,31 +3701,62 @@ fn report_aterm_posture_at(
             names => names,
         }
     };
+    // Off `[update] auto_apply`, a build waits for Install — `aterm update`'s words.
+    let by_hand = "install it from Settings \u{25b8} Software Update; your shells keep running";
     match (current, field("status.toml", "staged_build")) {
         (Some(current), Some(staged)) if current != staged => {
             // The staged build is applied IN-SESSION by the WINDOW's overlap handoff
-            // (automatic at the first quiet moment — forced within ~2 min — by default, one
-            // click otherwise); the shells keep running. A terminal session never applies,
-            // so the note names the window for a Mac that has none open, and never asks the
-            // user to reopen anything.
+            // (automatic within a minute by default, one click otherwise); the shells keep
+            // running. A terminal session never applies, so the note names the window for a
+            // Mac that has none open, and never asks the user to reopen anything.
             let (staged, current) = pair(&staged, &current);
-            let _ = writeln!(
-                out,
-                "{p}: note — aterm {staged} is downloaded (running {current}) and an aterm \
-                 window installs it at its next quiet moment — your shells keep running; now: \
-                 aterm ctl update apply, or with no window open: aterm --window"
-            );
+            // The window's installs of it keep failing (health.toml's apply streak, the one
+            // `aterm update` reads): no install is on its way, so none is promised.
+            let tries = field("health.toml", "apply_failures")
+                .and_then(|n| n.parse::<u32>().ok())
+                .filter(|n| *n > 0);
+            if let Some(n) = tries {
+                let tries = if n == 1 {
+                    String::from("1 try")
+                } else {
+                    format!("{n} tries")
+                };
+                let _ = writeln!(
+                    out,
+                    "{p}: note — aterm {staged} is downloaded (running {current}) but \
+                     didn\u{2019}t install ({tries})"
+                );
+            } else if installs_by_itself {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — aterm {staged} is downloaded (running {current}) and installs \
+                     within a minute while an aterm window is open — your shells keep running; \
+                     with no window open: aterm --window"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — aterm {staged} is downloaded (running {current}) — {by_hand}"
+                );
+            }
         }
         (Some(current), _) if newer_on_disk => {
             // A newer bundle is already on disk: the window activates it in place, the same
             // in-session lane — and, as above, only the window.
             let (installed, current) = pair(&installed, &current);
-            let _ = writeln!(
-                out,
-                "{p}: note — aterm {installed} is on disk (running {current}) and an aterm \
-                 window switches to it in place — your shells keep running; with no window \
-                 open: aterm --window"
-            );
+            if installs_by_itself {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — aterm {installed} is on disk (running {current}) and an aterm \
+                     window switches to it in place — your shells keep running; with no window \
+                     open: aterm --window"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "{p}: note — aterm {installed} is on disk (running {current}) — {by_hand}"
+                );
+            }
         }
         _ => {
             // The version a person recognises, read off whichever bundle's sealed build IS
@@ -6429,17 +6477,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// OUTSIDE ATERM WITH THE STUB LAID, THE USER'S OWN COPY IS THE DESIGN — ON ANY PATH
-    /// (2026-09-24). An iTerm shell has no reroute directory on its PATH at all, so no stub
-    /// answers first there, and this report fell back to `SHADOWED in this shell` with the
-    /// rc-hook remedy — a remedy whose own false arm demotes `agents/` outside aterm, i.e.
-    /// advice that does nothing (owner law, 03513b5d7: the managed copy leads inside aterm
-    /// only). Three cases, one per answer: outside aterm with the stub laid (no reroute dir
-    /// on PATH, or one behind the foreign copy) — a note naming this shell's own copy, no
-    /// SHADOWED, no remedy; inside aterm with the stub first — routed, an `ok`; the stub
-    /// absent — outside aterm the same note (review, 2026-09-24: laid or not, no stub
-    /// answers in such a shell), inside aterm SHADOWED with the remedy.
-    #[cfg(unix)]
     /// (10h) Claude Code's session survey: the two switches Claude Code itself reads
     /// turn it off, and nothing else does.
     #[test]
@@ -6509,8 +6546,18 @@ mod tests {
         assert!(rows(None).is_empty(), "no settings read, no row");
     }
 
-    #[test]
+    /// OUTSIDE ATERM WITH THE STUB LAID, THE USER'S OWN COPY IS THE DESIGN — ON ANY PATH
+    /// (2026-09-24). An iTerm shell has no reroute directory on its PATH at all, so no stub
+    /// answers first there, and this report fell back to `SHADOWED in this shell` with the
+    /// rc-hook remedy — a remedy whose own false arm demotes `agents/` outside aterm, i.e.
+    /// advice that does nothing (owner law, 03513b5d7: the managed copy leads inside aterm
+    /// only). Three cases, one per answer: outside aterm with the stub laid (no reroute dir
+    /// on PATH, or one behind the foreign copy) — a note naming this shell's own copy, no
+    /// SHADOWED, no remedy; inside aterm with the stub first — routed, an `ok`; the stub
+    /// absent — outside aterm the same note (review, 2026-09-24: laid or not, no stub
+    /// answers in such a shell), inside aterm SHADOWED with the remedy.
     #[cfg(unix)]
+    #[test]
     fn outside_aterm_with_the_stub_laid_the_users_own_copy_is_a_note_never_shadowed() {
         let l = layout("agent-outside");
         install(&l, "ay", 19);
@@ -7068,11 +7115,12 @@ mod tests {
         let updates = base.prefix.join("Updates");
         std::fs::create_dir_all(&updates).unwrap();
         let forbidden = ["restart", "relaunch", "reopen"];
-        let report = |lay: &Layout| -> String {
+        let report_with = |lay: &Layout, installs_by_itself: bool| -> String {
             let mut out = Vec::new();
-            report_aterm_posture(lay, &[], "atpkg", &mut out);
+            report_aterm_posture(lay, &[], installs_by_itself, "atpkg", &mut out);
             String::from_utf8(out).unwrap()
         };
+        let report = |lay: &Layout| report_with(lay, true);
 
         // A strictly-newer build staged while an older one runs: the in-session apply lane.
         std::fs::write(
@@ -7089,13 +7137,35 @@ mod tests {
         assert_eq!(
             text,
             "atpkg: note — aterm build 1788077184 is downloaded (running build 1788035619) and \
-             an aterm window installs it at its next quiet moment — your shells keep running; \
-             now: aterm ctl update apply, or with no window open: aterm --window\n"
+             installs within a minute while an aterm window is open — your shells keep \
+             running; with no window open: aterm --window\n"
         );
         let lower = text.to_lowercase();
         for w in forbidden {
             assert!(!lower.contains(w), "{w:?} must never appear: {text}");
         }
+        // With `[update] auto_apply = false` the window installs nothing by itself: the note
+        // names the press, as `aterm update` does.
+        assert_eq!(
+            report_with(&lay, false),
+            "atpkg: note — aterm build 1788077184 is downloaded (running build 1788035619) — \
+             install it from Settings \u{25b8} Software Update; your shells keep running\n"
+        );
+        // The window's installs of it keep failing (health.toml's apply streak): no install
+        // is promised, whichever way `auto_apply` reads — `aterm update`'s words.
+        std::fs::write(updates.join("health.toml"), "apply_failures = 3\n").unwrap();
+        for by_itself in [true, false] {
+            assert_eq!(
+                report_with(&lay, by_itself),
+                "atpkg: note — aterm build 1788077184 is downloaded (running build 1788035619) \
+                 but didn\u{2019}t install (3 tries)\n"
+            );
+        }
+        std::fs::write(updates.join("health.toml"), "apply_failures = 1\n").unwrap();
+        assert!(report(&lay).ends_with("but didn\u{2019}t install (1 try)\n"));
+        std::fs::write(updates.join("health.toml"), "apply_failures = 0\n").unwrap();
+        assert!(report(&lay).contains("installs within a minute"));
+        std::fs::remove_file(updates.join("health.toml")).unwrap();
 
         // A newer bundle already on disk (the running process predates it): activation,
         // still in-session and still no reopen.
@@ -7116,6 +7186,11 @@ mod tests {
         for w in forbidden {
             assert!(!lower.contains(w), "{w:?} must never appear: {text}");
         }
+        assert_eq!(
+            report_with(&lay, false),
+            "atpkg: note — aterm build 1788077184 is on disk (running build 1788035619) — \
+             install it from Settings \u{25b8} Software Update; your shells keep running\n"
+        );
 
         // Running what is installed, nothing staged: the plain ok line, no note.
         std::fs::write(updates.join("status.toml"), "current_build = 1788077184\n").unwrap();
@@ -7133,7 +7208,7 @@ mod tests {
         )
         .unwrap();
         let mut out = Vec::new();
-        report_aterm_posture(&lay, &[apps], "atpkg", &mut out);
+        report_aterm_posture(&lay, &[apps], true, "atpkg", &mut out);
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "atpkg: ok — aterm 0.93.0 (build 1788077184) installed\n"
@@ -7156,7 +7231,7 @@ mod tests {
         std::fs::create_dir_all(&updates).unwrap();
         let report_v = |bundle: Option<u64>, versions: &[(u64, String)]| -> String {
             let mut out = Vec::new();
-            report_aterm_posture_at(&updates, bundle, versions, "atpkg", &mut out);
+            report_aterm_posture_at(&updates, bundle, versions, true, "atpkg", &mut out);
             String::from_utf8(out).unwrap()
         };
         let report = |bundle: Option<u64>| report_v(bundle, &[]);

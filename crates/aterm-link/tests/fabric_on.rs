@@ -827,7 +827,7 @@ fn a_rejected_mint_publishes_nothing_and_the_trace_satisfies_the_model() {
         assert!(
             step(&out, "proof")
                 .iter()
-                .any(|l| l.contains("skipped: no armed instance")),
+                .any(|l| l.contains("skipped: no aterm is running")),
             "{out}"
         );
         assert!(

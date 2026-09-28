@@ -469,6 +469,7 @@ impl App {
                     animation_phase_ms,
                     motion: self.native_view_motion_cx(wid, view),
                     terminal_font_px: self.win_font_px(wid),
+                    terminal_scale: self.windows[&wid].scale.max(f64::EPSILON) as f32,
                     terminal_theme: self.theme,
                     semantic_font,
                     document: document.as_ref(),
@@ -2008,18 +2009,42 @@ mod tests {
     }
 
     #[test]
-    fn inactive_settings_inspection_uses_its_own_window_font() {
+    fn settings_preview_and_inactive_inspection_use_logical_window_font_size() {
         let mut app = App::headless_for_test();
         app.windows.get_mut(&WindowId(0)).unwrap().metrics.font_px = 12.0;
         let next_session = app.next_session_id;
         let second = app.insert_logical_window(crate::stub_session(next_session), 50, 140);
         {
             let window = app.windows.get_mut(&second).unwrap();
-            window.metrics.font_px = 24.0;
+            window.metrics.font_px = 36.0;
             window.scale = 2.0;
         }
         assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::TextFonts));
         let (_, view) = app.active_native_view(second).unwrap();
+
+        let specimen_size = |compiled: &crate::native_ui::CompiledUi| {
+            compiled
+                .paint
+                .iter()
+                .find_map(|paint| match &paint.content {
+                    crate::native_ui::UiContent::SettingsPreview(spec) => Some(spec.font_px),
+                    _ => None,
+                })
+                .expect("Typography specimen")
+        };
+        // The native painter converts this logical size back to physical pixels.
+        // The historical physical input would become 72 px instead of 36 px.
+        for scale in [1.0, 1.25, 2.0, 3.0] {
+            let window = app.windows.get_mut(&second).unwrap();
+            window.scale = scale;
+            window.metrics.font_px = 18.0 * scale as f32;
+            let compiled = app.compiled_native_ui(second).unwrap();
+            let logical = specimen_size(&compiled);
+            assert_eq!(logical, 18.0, "display scale {scale}");
+            assert_eq!(logical * scale as f32, app.win_font_px(second));
+        }
+        app.windows.get_mut(&second).unwrap().scale = 2.0;
+        app.windows.get_mut(&second).unwrap().metrics.font_px = 36.0;
 
         // Force the Settings view down compile_view's inactive fallback rather than
         // the active/staged app_native path. The control observer must still resolve
@@ -2038,6 +2063,7 @@ mod tests {
         assert_eq!(inspected.source, InspectionCompileSource::InactiveFallback);
         assert_eq!(inspected.window, second);
         assert_eq!(inspected.scale, 2.0);
+        assert_eq!(specimen_size(&inspected.compiled), 18.0);
         let preview = inspected
             .compiled
             .semantics
@@ -2048,8 +2074,8 @@ mod tests {
             panic!("Typography preview has a text semantic value");
         };
         assert!(
-            value.contains("at 24 pixels"),
-            "inactive inspection must use the owning window's font size: {value}"
+            value.contains("at 36 pixels"),
+            "inactive inspection must report the owning window's physical font size: {value}"
         );
 
         let wire = app
@@ -2059,7 +2085,7 @@ mod tests {
             })
             .unwrap();
         assert!(wire[1].contains("source=inactive-fallback"));
-        assert!(wire.iter().any(|line| line.contains("at 24 pixels")));
+        assert!(wire.iter().any(|line| line.contains("at 36 pixels")));
     }
 
     #[test]

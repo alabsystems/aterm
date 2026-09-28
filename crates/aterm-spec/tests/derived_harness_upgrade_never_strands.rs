@@ -58,7 +58,7 @@ fn reachable(m: &Model) -> Vec<S> {
 
 /// The defects the fix and its reviews found, one knob each, and the
 /// invariant that catches each alone.
-const KNOBS: [(&str, &str); 10] = [
+const KNOBS: [(&str, &str); 11] = [
     ("Terminal", "NeverStalls"),
     ("NoF1", "NoNoticeWhileLimited"),
     ("NoF2", "NeverStranded"),
@@ -69,6 +69,7 @@ const KNOBS: [(&str, &str); 10] = [
     ("StaleDirection", "NeverStranded"),
     ("UnansweredDirection", "NeverStranded"),
     ("ReadyOverDirection", "NoRestartOverDirection"),
+    ("IdleOnlyRelease", "NeverStranded"),
 ];
 
 #[test]
@@ -145,7 +146,8 @@ fn each_defect_is_caught_on_its_own() {
 /// THE LAST WORD IS THE REDUCER'S OWN GUARDS NEGATED: on every reachable state
 /// of the upgrade's last phases (gave up, stopped) at a point the agent can
 /// read, `Look` is enabled exactly where none of `Restart`, `Release`,
-/// `DropRelease` and `Rearm` is —
+/// `DropRelease` and `Rearm` is — at a break, where no restart is taken, the
+/// drain's `Void` of a gave-up upgrade's READY standing for it —
 /// at the committed configuration and under every knob but `LastWhileOwed`,
 /// whose defect IS a last word said over a release (there it fires where
 /// `Release` also does, at a stop — never over a new round). No `Buggy`
@@ -168,7 +170,9 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
                 assert!(!m.action_enabled("Look", &s), "{name}: {s:?}");
                 continue;
             }
-            let last = !m.action_enabled("Restart", &s)
+            let restart = m.action_enabled("Restart", &s)
+                || (s["brk"] == 1 && s["phase"] == 2 && m.action_enabled("Void", &s));
+            let last = !restart
                 && !m.action_enabled("Release", &s)
                 && !m.action_enabled("DropRelease", &s)
                 && !m.action_enabled("Rearm", &s);
@@ -176,9 +180,7 @@ fn the_last_word_is_derived_from_the_reducers_guards() {
             if *name == "LastWhileOwed" {
                 assert_eq!(
                     look,
-                    last || (s["phase"] == 4
-                        && !m.action_enabled("Restart", &s)
-                        && !m.action_enabled("Rearm", &s)),
+                    last || (s["phase"] == 4 && !restart && !m.action_enabled("Rearm", &s)),
                     "{name}: {s:?}"
                 );
             } else {
@@ -362,6 +364,66 @@ fn the_incident_as_it_ran_is_the_caught_negative_control() {
     assert!(!buggy.check_invariant("NeverStranded", &s), "{s:?}");
     let fixed = run(&m, &["LimitHits"]);
     assert!(!m.action_enabled("Announce", &fixed));
+}
+
+/// THE BREAK THAT NEVER ENDS (2026-09-27): two widowed `tail -f` shells under a
+/// Claude Code whose status read `shell` made every screen a break, and no idle
+/// point ever came. Asked to the bound and given up on there, the agent is
+/// released AT THE BREAK — the release types one line and ends nothing — and a
+/// late READY the shells outlive is voided there and the agent released the
+/// same way; the restart itself is never taken at a break. Under
+/// `IdleOnlyRelease` (the release and the gave-up void only at an idle point,
+/// as the incident ran) the break's own last word finds the agent holding.
+#[test]
+fn a_break_that_never_ends_still_releases_the_agent_it_asked() {
+    let m = harness_upgrade_never_strands_model();
+    let tired = [
+        "BreakBegins",
+        "Announce",
+        "Elapse",
+        "Announce",
+        "Elapse",
+        "GiveUp",
+    ];
+    let s = run(&m, &tired);
+    assert_eq!(
+        (s["brk"], s["phase"], s["owed"], s["holding"]),
+        (1, 2, 1, 1)
+    );
+    assert!(!m.action_enabled("Look", &s), "a release is owed: {s:?}");
+    let mut released = s.clone();
+    assert!(m.fire("Release", &mut released), "{s:?}");
+    assert_eq!(released["holding"], 0);
+    assert!(m.fire("Look", &mut released));
+    assert!(m.check_invariant("NeverStranded", &released));
+    // The late READY the shells outlive: no restart at a break; voided,
+    // then released.
+    let mut late = s.clone();
+    assert!(m.fire("AgentReady", &mut late));
+    assert!(!m.action_enabled("Restart", &late), "never at a break");
+    assert!(
+        !m.action_enabled("Look", &late),
+        "the void is still to come"
+    );
+    for action in ["Void", "Release", "Look"] {
+        assert!(m.fire(action, &mut late), "{action}: {late:?}");
+    }
+    assert!(m.check_invariant("NeverStranded", &late), "{late:?}");
+
+    // THE INCIDENT AS IT RAN: the release, and the void, only at an idle point.
+    let idle_only = interp::with_consts(&m, &[("IdleOnlyRelease", 1)]);
+    let mut s = run(&idle_only, &tired);
+    assert!(!idle_only.action_enabled("Release", &s), "{s:?}");
+    assert!(idle_only.fire("Look", &mut s));
+    assert!(!idle_only.check_invariant("NeverStranded", &s), "{s:?}");
+    let mut late = run(&idle_only, &tired);
+    assert!(idle_only.fire("AgentReady", &mut late));
+    assert!(!idle_only.action_enabled("Void", &late), "{late:?}");
+    assert!(idle_only.fire("Look", &mut late));
+    assert!(
+        !idle_only.check_invariant("NeverStranded", &late),
+        "{late:?}"
+    );
 }
 
 /// NO REACHABLE STATE IS A PERMANENT WAIT (the owner, 2026-09-27: "you should

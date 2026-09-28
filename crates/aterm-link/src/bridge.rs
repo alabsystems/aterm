@@ -1309,8 +1309,8 @@ impl Bridge {
             (Attachment::Inherited, true) => Attachment::Inherited,
             (_, _) => {
                 eprintln!(
-                    "aterm-link: OBSERVER MODE — aterm answered `{}` to a bridge-plane verb. \
-                     Presence and ev only: no deliver, no hold, no drive.",
+                    "aterm-link: OBSERVER MODE — aterm refused `outbox` ({}), so this bridge \
+                     carries no mail and applies no fleet halt",
                     probe.header()
                 );
                 Attachment::Observer
@@ -2075,8 +2075,7 @@ impl Bridge {
         match outcome {
             Delivery::Accounted => self.commit_upto(*off),
             Delivery::Unaccounted => eprintln!(
-                "aterm-link: not committing {off}: the aterm lane is gone, so the group \
-                 cursor stays put and a replacement bridge redelivers the record"
+                "aterm-link: record {off} left for the next bridge: the connection to aterm is lost"
             ),
         }
     }
@@ -2720,9 +2719,10 @@ impl Bridge {
     /// Tell a sender their message did not land, ON THEIR OWN LANE.
     ///
     /// §6.2 makes the per-sender quota safe by promising the sender a verdict:
-    /// "the 65th is refused at `deliver` and the bridge records `undeliverable
-    /// re=<off> reason=quota` on the sender's lane". A3 built that lane two ways
-    /// and both were wrong for the traffic that actually arrives:
+    /// the 65th is refused at `deliver` and the bridge records an `undeliverable`
+    /// (`re=<off>`, text `not delivered: quota`) on the sender's lane. A3 built
+    /// that lane two ways and both were wrong for the traffic that actually
+    /// arrives:
     ///
     /// * a non-`s-` sender got `/f/<F>/in/p/<src>/…`, but the `<src>` of a
     ///   message from a session behind a bridge is that node's principal (§6.1),
@@ -2779,7 +2779,7 @@ impl Bridge {
         let mut notice = Body::new(crate::now_ms());
         notice.re = Some(off);
         notice.from = Some(addr.sid.clone());
-        notice.text = format!("state=refused reason={why}");
+        notice.text = format!("not delivered: {why}");
         let encoded = notice.encode(None);
         self.publish_own(&subject, &encoded);
     }
@@ -2855,7 +2855,7 @@ impl Bridge {
         receipt.re = Some(r.off);
         receipt.from = Some(r.sid.clone());
         receipt.verdict = Some(r.verdict.clone());
-        receipt.text = format!("ack re={} verdict={}", r.off, r.verdict);
+        receipt.text = format!("marked {} by the recipient", r.verdict);
         let encoded = receipt.encode(None);
         let (at, deduped) = self.publish_at(seq, &subject, &encoded)?;
         // OURS BEFORE ANYTHING CAN SEE IT, as a post's landing is: a receipt
@@ -3272,7 +3272,7 @@ impl Bridge {
                     let mut verdict = Body::new(now);
                     verdict.re = Some(d.off);
                     verdict.dl = Some(d.dl);
-                    verdict.text = format!("expired re={} dl={}", d.off, d.dl);
+                    verdict.text = format!("no reply within {}", span_of(d.dl));
                     let encoded = verdict.encode(None);
                     match self.publish_own_off(&subject, &encoded) {
                         Ok(at) => {
@@ -3608,9 +3608,12 @@ impl Bridge {
         }
         let (on, reason) = (self.halt_applied, self.halt_reason.clone());
         eprintln!(
-            "aterm-link: {sid}: the endpoint's hold ({}) disagrees with the standing halt ({}); correcting",
-            u8::from(endpoint_holds),
-            u8::from(on)
+            "aterm-link: {sid}: {}",
+            if on {
+                "holding it: the fleet halt stands"
+            } else {
+                "releasing it: no fleet halt stands"
+            }
         );
         self.write_hold(sid, on, &reason);
     }
@@ -4585,7 +4588,9 @@ impl Bridge {
     /// the BROKER cannot take is left exactly where it is — the broker will come
     /// back, and the whole point of the queue is to survive that.
     fn drain_outbox(&mut self) {
-        if self.conn.is_none() {
+        // AN OBSERVER WAS REFUSED `outbox` at attach, and is refused it for
+        // life: asking again every round only repeats the refusal on stderr.
+        if self.conn.is_none() || self.attachment == Attachment::Observer {
             return;
         }
         if self.fault == Fault::DropPostEventWhileMarked
@@ -6012,6 +6017,16 @@ impl Route {
     }
 }
 
+/// A deadline in words for an `expired` body: whole seconds as `30 s`, anything
+/// else exactly, as `1500 ms` — never rounded to a span the asker did not wait.
+fn span_of(ms: u64) -> String {
+    if ms >= 1_000 && ms.is_multiple_of(1_000) {
+        format!("{} s", ms / 1_000)
+    } else {
+        format!("{ms} ms")
+    }
+}
+
 /// `<content_seq>:<fp16>` out of one `text --json` frame — §6.6's `serial=`.
 ///
 /// PUBLIC because the test that proves the fence must compute the value the
@@ -6484,6 +6499,17 @@ fn spawn_event_reader(push: Ctl, mailbox: Arc<Mailbox>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `expired` body names the deadline the asker set, exactly: whole
+    /// seconds in seconds, anything else in milliseconds, never rounded up.
+    #[test]
+    fn an_expired_body_names_the_exact_deadline() {
+        assert_eq!(span_of(30_000), "30 s");
+        assert_eq!(span_of(1_000), "1 s");
+        assert_eq!(span_of(1_500), "1500 ms");
+        assert_eq!(span_of(100), "100 ms");
+        assert_eq!(span_of(0), "0 ms");
+    }
 
     #[test]
     fn replay_scheduler_refines_shared_budget_and_rotation() {

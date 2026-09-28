@@ -407,7 +407,7 @@ pub fn measure_lanes(root: &Path) -> Lanes {
                 .collect(),
         ),
         None => Lanes::Unknown(format!(
-            "du -sk printed no size for each of {} lanes: {:?}",
+            "du -sk printed no size for each of {} dirs: {:?}",
             dirs.len(),
             text.trim()
         )),
@@ -548,19 +548,19 @@ impl Plan {
     /// What the lanes held, and what became of them.
     fn lanes_clause(&self) -> String {
         match (&self.held, self.owner) {
-            (Err(why), _) => format!("lanes unmeasured ({why}), so none credited"),
+            (Err(why), _) => format!("build dirs unmeasured ({why}), so none credited"),
             (Ok(h), Owner::Snapshot) if self.remove && self.unremoved.is_empty() => format!(
-                "lanes {}, over the {} cap, so removed before the free space was read",
+                "build dirs {}, over the {} cap, so removed before the free space was read",
                 gib(*h),
                 gib(self.budget.lane_cap)
             ),
             (Ok(h), Owner::Snapshot) if self.remove => format!(
-                "lanes {}, over the {} cap; removing them failed as the `verify: lanes` \
-                 line(s) above say, and none are credited",
+                "build dirs {}, over the {} cap; removing them failed as the `verify: build \
+                 dirs` line(s) above say, and none are credited",
                 gib(*h),
                 gib(self.budget.lane_cap)
             ),
-            (Ok(h), Owner::Snapshot) => format!("lanes {}", gib(*h)),
+            (Ok(h), Owner::Snapshot) => format!("build dirs {}", gib(*h)),
         }
     }
 
@@ -723,11 +723,11 @@ pub fn remedy(
             .to_string(),
         None => format!(
             "  or free space elsewhere on the volume. The requirement is what this run writes \
-             plus a reserve: a cold footprint less what its lanes already hold, but never less \
-             than a warm run still adds to them (cargo deletes no artifact a later build stops \
-             using), and a {} reserve for its own writes outside them. What other writers put \
-             on the volume while it runs is not in it: no preflight can budget that, and a run \
-             that runs out of space ends COULD NOT RUN. --disk-floor <GiB> replaces the \
+             plus a reserve: a cold footprint less what its build dirs already hold, but never \
+             less than a warm run still adds to them (cargo deletes no artifact a later build \
+             stops using), and a {} reserve for its own writes outside them. What other writers \
+             put on the volume while it runs is not in it: no preflight can budget that, and a \
+             run that runs out of space ends COULD NOT RUN. --disk-floor <GiB> replaces the \
              estimate for one run.",
             gib(plan.budget.reserve)
         ),
@@ -742,7 +742,7 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
         Lanes::Measured(sized) => sized,
         Lanes::Unknown(why) => {
             s.push_str(&format!(
-                "  this run's lanes could not be sized ({why}); every one of them is \
+                "  this run's build dirs could not be sized ({why}); every one of them is \
                  regenerable:\n"
             ));
             for d in lane_dirs(root) {
@@ -754,12 +754,12 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
     if sized.is_empty() {
         s.push_str(&match plan.floor {
             Some(_) => format!(
-                "  this run's root {} holds no target dirs yet, so it has none of its own to \
+                "  this run's root {} holds no build dirs yet, so it has none of its own to \
                  remove.\n",
                 root.display()
             ),
             None => format!(
-                "  this run's root {} holds no target dirs yet, so the run is budgeted cold: it \
+                "  this run's root {} holds no build dirs yet, so the run is budgeted cold: it \
                  writes its whole footprint, and the volume does not have room for that plus \
                  the reserve.\n",
                 root.display()
@@ -770,12 +770,12 @@ fn lanes_remedy(root: &Path, plan: &Plan, lanes: &Lanes, reading: &Reading) -> S
     let held = lanes.total().unwrap_or(0);
     let cold = plan.budget.need(0);
     s.push_str(&format!(
-        "  this run's target dirs hold {}, all of it regenerable",
+        "  this run's build dirs hold {}, all of it regenerable",
         gib(held)
     ));
     match (plan.owner, plan.floor) {
         _ if plan.remove => s.push_str(&format!(
-            " — what is left after the removal of lanes over the {} cap",
+            " — what is left after the removal of build dirs over the {} cap",
             gib(plan.budget.lane_cap)
         )),
         (Owner::Snapshot, None) => {
@@ -1198,7 +1198,7 @@ mod tests {
         );
         assert_eq!(
             header_line(&free, &warm, root),
-            "verify: disk 22.2 GiB free on the volume holding /r; lanes 20.2 GiB; need 24.0 \
+            "verify: disk 22.2 GiB free on the volume holding /r; build dirs 20.2 GiB; need 24.0 \
              GiB = max(27.0 GiB cold - 20.2 GiB credited, 18.0 GiB warm growth) + 6.0 GiB \
              reserve\n"
         );
@@ -1207,7 +1207,7 @@ mod tests {
         let line = header_line(&free, &over, root);
         assert!(
             line.contains(
-                "; lanes 50.0 GiB, over the 45.0 GiB cap, so removed before the free \
+                "; build dirs 50.0 GiB, over the 45.0 GiB cap, so removed before the free \
                            space was read; need 33.0 GiB = max(27.0 GiB cold - 0.0 GiB credited"
             ),
             "{line}"
@@ -1215,7 +1215,7 @@ mod tests {
         over.unremoved = vec!["target not removed: busy".into()];
         let line = header_line(&free, &over, root);
         assert!(
-            line.contains("; removing them failed as the `verify: lanes` line(s) above say"),
+            line.contains("; removing them failed as the `verify: build dirs` line(s) above say"),
             "{line}"
         );
         assert!(!line.contains("so removed"), "{line}");
@@ -1227,8 +1227,9 @@ mod tests {
             Owner::Snapshot,
         );
         assert!(
-            header_line(&free, &unknown, root)
-                .contains("; lanes unmeasured (du -sk failed), so none credited; need 33.0 GiB")
+            header_line(&free, &unknown, root).contains(
+                "; build dirs unmeasured (du -sk failed), so none credited; need 33.0 GiB"
+            )
         );
         let floor = plan(Budget::MEASURED, Some(0), &held(GIB), Owner::Snapshot);
         let line = header_line(&free, &floor, root);
@@ -1473,7 +1474,7 @@ mod tests {
         let lanes = measure_lanes(&tmp);
         let p = plan(Budget::MEASURED, None, &lanes, Owner::Snapshot);
         let text = remedy(&tmp, &p, &lanes, &Reading::Free(GIB), None);
-        assert!(text.contains("holds no target dirs yet"), "{text}");
+        assert!(text.contains("holds no build dirs yet"), "{text}");
         assert!(text.contains("budgeted cold"), "{text}");
         let floor = plan(Budget::MEASURED, Some(40 * GIB), &lanes, Owner::Snapshot);
         let text = remedy(&tmp, &floor, &lanes, &Reading::Free(GIB), None);
@@ -1492,7 +1493,7 @@ mod tests {
         let text = remedy(root, &warm, &lanes, &Reading::Free(14 * GIB), None);
         assert!(
             text.contains(
-                "this run's target dirs hold 20.0 GiB, all of it regenerable. Removing \
+                "this run's build dirs hold 20.0 GiB, all of it regenerable. Removing \
                            them gives that back, and the next run is then cold and needs 33.0 GiB \
                            (27.0 GiB cold + 6.0 GiB reserve): 34.0 GiB would be free — enough:\n"
             ),

@@ -28,6 +28,49 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
+/// The unsaved Settings drafts ONE seamless restore carried, from the leaf
+/// that reopened (or could not reopen) them to the end of the restore (plan
+/// P2-2; round three of the 2026-09 update robustness work).
+///
+/// WHY NOT SAY EACH LEAF'S LOSS WHERE IT HAPPENS, as the first cut did. Two
+/// things were wrong with it. The loss row is keyed one per update
+/// ([`crate::update_words::KEY_SETTINGS_DRAFTS`]), so a second leaf's row
+/// REPLACED the first on glass, and the first view's lost text survived only
+/// in the history. And a draft that LANDED was counted safe at once, though
+/// the restore could still close its view afterwards — a native-only window
+/// the OS would not attach (`apply_restore_manifest` closes it logically), a
+/// tab whose other leaf failed to build (`build_recursive_restore_tab` rolls it
+/// back) — and then the text was gone with nothing said. So the restore
+/// records here, and [`App::settle_carried_settings_drafts`] reads every landed
+/// draft back from its view once the whole restore is done and says what did
+/// not survive, once, with the text.
+#[derive(Debug, Default)]
+pub(crate) struct CarriedDraftsLedger {
+    /// Drafts that landed, with the view that took them: lost if that view is
+    /// gone, or no longer holds the text, when the restore settles.
+    landed: Vec<(crate::tab_model::ViewId, restore::SettingsDraftRestore)>,
+    /// Drafts no view took: a row the new build does not edit as text, a
+    /// Settings leaf that did not reopen, a layout that could not be placed.
+    lost: Vec<restore::SettingsDraftRestore>,
+    /// Drafts the parse had to drop: no text to show, but counted.
+    unreadable: usize,
+}
+
+impl CarriedDraftsLedger {
+    /// A ledger that starts with the drafts of a layout the successor could
+    /// not place (`IncomingHandoff::unplaced_settings_drafts`): none of them
+    /// has a view to land in.
+    pub(crate) fn unplaced(
+        (lost, unreadable): (Vec<restore::SettingsDraftRestore>, usize),
+    ) -> Self {
+        Self {
+            landed: Vec::new(),
+            lost,
+            unreadable,
+        }
+    }
+}
+
 /// Whether this platform tracks a window's NORMAL (un-maximized) frame, so a
 /// maximized window's capture can persist the frame it restores DOWN to. On
 /// Windows and Linux (X11 / Wayland) maximize is a window-manager show state that
@@ -299,7 +342,40 @@ impl App {
     /// restored as a stack after the windows exist (`crate::window_show`) —
     /// never by reordering the windows, which the layout digest and the Commit
     /// comparison are taken over.
+    ///
+    /// This is the DURABLE capture (quit, crash journal): it carries no unsaved
+    /// Settings text. The seamless update's layout is
+    /// [`Self::capture_handoff_layout`].
     pub(crate) fn capture_restore_manifest(&self) -> restore::RestoreManifest {
+        self.capture_manifest(false)
+    }
+
+    /// The seamless update's attempt-bound layout: [`Self::capture_restore_manifest`]
+    /// plus every Settings view's carriable unsaved field drafts
+    /// ([`restore::NativeLeafRestore::settings_drafts`]), so the successor reopens
+    /// each view holding exactly what the person typed, still unsaved (plan P2-2).
+    ///
+    /// ONE capture for the park and the Commit. The park's layout is what the
+    /// successor restores; the Commit re-captures with this same function and
+    /// compares Settings leaves in full (`commit_layout_topology`), so a key
+    /// typed into a Settings field while the successor booted refuses the
+    /// Commit and the outgoing process keeps the newer draft — never a successor
+    /// that reopens the older one. Carried here and nowhere durable: the layout
+    /// is a one-shot, owner-only sidecar the successor consumes, while a quit
+    /// manifest or crash journal outlives the process that promised nothing.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateSettingsDraftCarry",
+            action = "Park",
+            project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+        )
+    )]
+    pub(crate) fn capture_handoff_layout(&self) -> restore::RestoreManifest {
+        self.capture_manifest(true)
+    }
+
+    fn capture_manifest(&self, carry_drafts: bool) -> restore::RestoreManifest {
         // The stack, from the focus MRU the App already keeps — no AppKit query
         // (`window_show::stacking_ranks`). Used by the macOS capture only.
         #[cfg(target_os = "macos")]
@@ -414,7 +490,8 @@ impl App {
                 let mut restored_tabs = Vec::with_capacity(ws.tab_set.len());
                 let mut active_item = None;
                 for tab in ws.tab_set.tabs() {
-                    let Some(restored) = self.tab_restore_descriptor(tab) else {
+                    let Some(restored) = self.tab_restore_descriptor_carrying(tab, carry_drafts)
+                    else {
                         continue;
                     };
                     if ws.tab_set.active_id() == Some(tab.id) {
@@ -523,10 +600,21 @@ impl App {
         &self,
         tab: &crate::tab_model::Tab,
     ) -> Option<restore::RestoredTab> {
+        self.tab_restore_descriptor_carrying(tab, false)
+    }
+
+    /// [`Self::tab_restore_descriptor`], carrying each Settings leaf's unsaved
+    /// drafts when `carry_drafts` (the handoff layout only).
+    fn tab_restore_descriptor_carrying(
+        &self,
+        tab: &crate::tab_model::Tab,
+        carry_drafts: bool,
+    ) -> Option<restore::RestoredTab> {
         fn capture(
             app: &App,
             node: &crate::tab_model::SplitTree<crate::tab_model::ViewId>,
             focus: crate::tab_model::ViewId,
+            carry_drafts: bool,
             path: &mut Vec<restore::RestoreBranch>,
             focused_path: &mut Option<Vec<restore::RestoreBranch>>,
         ) -> Option<restore::RestoredSplitTree> {
@@ -536,7 +624,7 @@ impl App {
                         *focused_path = Some(path.clone());
                     }
                     Some(restore::RestoredSplitTree::leaf(
-                        app.view_restore_descriptor(*view)?,
+                        app.view_restore_descriptor_carrying(*view, carry_drafts)?,
                     ))
                 }
                 crate::tab_model::SplitTree::Split {
@@ -546,10 +634,10 @@ impl App {
                     second,
                 } => {
                     path.push(restore::RestoreBranch::First);
-                    let first = capture(app, first, focus, path, focused_path)?;
+                    let first = capture(app, first, focus, carry_drafts, path, focused_path)?;
                     path.pop();
                     path.push(restore::RestoreBranch::Second);
-                    let second = capture(app, second, focus, path, focused_path)?;
+                    let second = capture(app, second, focus, carry_drafts, path, focused_path)?;
                     path.pop();
                     Some(restore::RestoredSplitTree::Split {
                         axis: match axis {
@@ -571,6 +659,7 @@ impl App {
             self,
             &tab.root,
             tab.focus,
+            carry_drafts,
             &mut Vec::new(),
             &mut focused_path,
         )?;
@@ -584,6 +673,16 @@ impl App {
     pub(crate) fn view_restore_descriptor(
         &self,
         view: crate::tab_model::ViewId,
+    ) -> Option<restore::RestoredView> {
+        self.view_restore_descriptor_carrying(view, false)
+    }
+
+    /// [`Self::view_restore_descriptor`], carrying a Settings view's unsaved
+    /// drafts when `carry_drafts` (the handoff layout only).
+    fn view_restore_descriptor_carrying(
+        &self,
+        view: crate::tab_model::ViewId,
+        carry_drafts: bool,
     ) -> Option<restore::RestoredView> {
         match self.view_store.get(view).copied()? {
             crate::tab_model::View::Terminal(terminal) => {
@@ -675,7 +774,11 @@ impl App {
                     _ => return None,
                 };
                 match state {
-                    crate::native_app::AppViewState::Settings(_) => {}
+                    crate::native_app::AppViewState::Settings(settings) => {
+                        if carry_drafts {
+                            descriptor.settings_drafts = settings.carried_field_drafts().carried;
+                        }
+                    }
                     crate::native_app::AppViewState::Markdown(markdown) => {
                         descriptor.source_anchor = markdown.source_anchor;
                         descriptor.viewport_anchor = markdown.visual_row;
@@ -989,6 +1092,9 @@ impl App {
         // restore (`seamless_adopt` is empty).
         self.adopt_orphan_shells_as_tabs(&handed_off_leaves);
         self.hand_restored_agents();
+        // After EVERY window, tab and leaf the restore built or took down:
+        // only now is a draft that landed known to have stayed.
+        self.settle_carried_settings_drafts();
     }
 
     /// Hand the agents the restore pass found ([`Self::carry_restored_identity`])
@@ -2028,18 +2134,30 @@ impl App {
             }
             restore::RestoredView::Native(native) => match self.restore_native_leaf(wid, native) {
                 Ok(restored) => Ok(restored),
-                Err(error) => self.restore_recovery_leaf_with_capability(
-                    wid,
-                    &restore::PlaceholderLeafRestore {
-                        restore_tag: native.restore_tag.clone(),
-                        reason: Self::bounded_recovery_text(&error),
-                        metadata: Self::bounded_recovery_text(&format!(
-                            "route={:?}\nuri={:?}\ndurable_seq={}",
-                            native.route, native.uri, native.durable_seq
-                        )),
-                    },
-                    recovery_capability(native),
-                ),
+                Err(error) => {
+                    // The view is not reopened, so neither is any draft it
+                    // carried: said, with the text, rather than dropped — once
+                    // the restore settles.
+                    self.carried_settings_drafts
+                        .lost
+                        .extend(native.settings_drafts.iter().cloned());
+                    self.carried_settings_drafts.unreadable = self
+                        .carried_settings_drafts
+                        .unreadable
+                        .saturating_add(native.settings_drafts_unreadable);
+                    self.restore_recovery_leaf_with_capability(
+                        wid,
+                        &restore::PlaceholderLeafRestore {
+                            restore_tag: native.restore_tag.clone(),
+                            reason: Self::bounded_recovery_text(&error),
+                            metadata: Self::bounded_recovery_text(&format!(
+                                "route={:?}\nuri={:?}\ndurable_seq={}",
+                                native.route, native.uri, native.durable_seq
+                            )),
+                        },
+                        recovery_capability(native),
+                    )
+                }
             },
             restore::RestoredView::Placeholder(placeholder) => {
                 self.restore_recovery_leaf(wid, placeholder)
@@ -2444,12 +2562,167 @@ impl App {
             }
             _ => return Err("This app is unavailable in this build".to_string()),
         }
-        let (view, presentation, staging_tab) = self.detach_restore_staging_tab(wid)?;
+        let (view, mut presentation, staging_tab) = self.detach_restore_staging_tab(wid)?;
         if !self.apply_native_view_restore(view, descriptor) {
             self.remove_view_link(view);
             return Err("The saved view state did not match the reopened app".to_string());
         }
+        if self.reopen_carried_settings_drafts(view, descriptor) {
+            // The staging presentation was taken before the drafts landed: the
+            // tab must show them unsaved (dirty, not closable) from its first
+            // frame, as the outgoing tab did.
+            if let Some(live) = self.live_view_presentation(view) {
+                presentation = live;
+            }
+        }
         Ok((view, presentation, Some(staging_tab)))
+    }
+
+    /// Put the unsaved Settings drafts a seamless update carried
+    /// ([`restore::NativeLeafRestore::settings_drafts`]) back into the view the
+    /// restore just reopened, and SAY which could not be reopened — a key this
+    /// build no longer edits as text, or a carry it could not read
+    /// (`settings_drafts_unreadable`). A draft that does not land costs that
+    /// draft, named in the message center with its text; never the view and
+    /// never the handoff (the lenient consumer, plan P2-2). Returns whether any
+    /// draft landed, i.e. whether the view's presentation changed.
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateSettingsDraftCarry",
+            action = "Restore",
+            project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+        )
+    )]
+    #[cfg_attr(
+        test,
+        aterm_spec::refines(
+            machine = "NativeUpdateSettingsDraftCarry",
+            action = "RestoreUnreadable",
+            project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+        )
+    )]
+    fn reopen_carried_settings_drafts(
+        &mut self,
+        view: crate::tab_model::ViewId,
+        descriptor: &restore::NativeLeafRestore,
+    ) -> bool {
+        if descriptor.settings_drafts.is_empty() && descriptor.settings_drafts_unreadable == 0 {
+            return false;
+        }
+        let instance = match self.view_store.get(view).copied() {
+            Some(crate::tab_model::View::Native(native))
+                if matches!(
+                    self.native_runtime.view_state(view),
+                    Some(crate::native_app::AppViewState::Settings(_))
+                ) =>
+            {
+                Some(native.instance)
+            }
+            _ => None,
+        };
+        if let Some(instance) = instance
+            && !descriptor.settings_drafts.is_empty()
+            && let Err(error) = self.native_runtime.dispatch(
+                instance,
+                view,
+                crate::native_app::AppEvent::SettingsDraftsCarried(
+                    descriptor.settings_drafts.clone(),
+                ),
+            )
+        {
+            aterm_log::warn!(
+                "update: the reopened Settings view refused its carried drafts: {error:?}"
+            );
+        }
+        let landed =
+            |draft: &restore::SettingsDraftRestore| match self.native_runtime.view_state(view) {
+                Some(crate::native_app::AppViewState::Settings(state)) => state
+                    .field_inputs
+                    .get(&draft.key)
+                    .is_some_and(|input| input.value() == draft.text),
+                _ => false,
+            };
+        let (took, lost): (Vec<_>, Vec<_>) = descriptor
+            .settings_drafts
+            .iter()
+            .cloned()
+            .partition(|draft| landed(draft));
+        let reopened = took.len();
+        if reopened > 0 {
+            aterm_log::info!(
+                "update: reopened {reopened} unsaved Settings draft(s) carried through the \
+                 update; they are still unsaved"
+            );
+        }
+        let ledger = &mut self.carried_settings_drafts;
+        ledger
+            .landed
+            .extend(took.into_iter().map(|draft| (view, draft)));
+        ledger.lost.extend(lost);
+        ledger.unreadable = ledger
+            .unreadable
+            .saturating_add(descriptor.settings_drafts_unreadable);
+        reopened > 0
+    }
+
+    /// THE RESTORE IS DONE: say which carried Settings drafts did not survive
+    /// it — ONCE, in one row, each with its text, so the person can type it
+    /// again (see [`CarriedDraftsLedger`] for why not leaf by leaf). A draft
+    /// that landed survived only if its view is still here and still holds
+    /// exactly that text; a view the restore closed after it took its drafts
+    /// took them with it. Silent when nothing was lost. Drains the ledger, so a
+    /// second call says nothing again.
+    pub(crate) fn settle_carried_settings_drafts(&mut self) {
+        let CarriedDraftsLedger {
+            landed,
+            mut lost,
+            unreadable,
+        } = std::mem::take(&mut self.carried_settings_drafts);
+        for (view, draft) in landed {
+            let kept = matches!(
+                self.native_runtime.view_state(view),
+                Some(crate::native_app::AppViewState::Settings(state))
+                    if state
+                        .field_inputs
+                        .get(&draft.key)
+                        .is_some_and(|input| input.value() == draft.text)
+            );
+            if !kept {
+                aterm_log::warn!(
+                    "update: the Settings view that reopened the carried draft of `{}` was \
+                     closed before the restore finished",
+                    draft.key
+                );
+                lost.push(draft);
+            }
+        }
+        self.report_unreopened_settings_drafts(&lost, unreadable);
+    }
+
+    /// The loss half of [`Self::settle_carried_settings_drafts`]: every
+    /// carried draft that did not survive the restore is said, once, with its
+    /// text. Silent when nothing was lost.
+    fn report_unreopened_settings_drafts(
+        &mut self,
+        lost: &[restore::SettingsDraftRestore],
+        unreadable: usize,
+    ) {
+        if lost.is_empty() && unreadable == 0 {
+            return;
+        }
+        aterm_log::warn!(
+            "update: {} carried Settings draft(s) could not be reopened ({} unreadable); \
+             their fields: {:?}",
+            lost.len().saturating_add(unreadable),
+            unreadable,
+            lost.iter()
+                .map(|draft| draft.key.as_str())
+                .collect::<Vec<_>>()
+        );
+        self.post_message(crate::update_words::settings_drafts_not_reopened(
+            lost, unreadable,
+        ));
     }
 
     fn stage_settings_restore_view(
@@ -6429,6 +6702,200 @@ mod tests {
         assert!(
             watch.wait(std::time::Duration::ZERO),
             "the session's `events` watcher was woken for them"
+        );
+    }
+}
+
+/// THE CARRIED SETTINGS DRAFTS ARE SETTLED ONCE, AFTER THE WHOLE RESTORE
+/// (round three of the 2026-09 update robustness work): every draft a seamless
+/// update carried either stays in a view that holds it, or is said — in ONE
+/// row, with its text — whatever leaf, window or step lost it.
+#[cfg(test)]
+mod carried_draft_settle_tests {
+    use crate::restore::{
+        NativeLeafRestore, RestoredSplitTree, RestoredTab, RestoredView, SettingsDraftRestore,
+        WindowLayout, WindowShow,
+    };
+    use crate::{App, WindowId};
+
+    /// A window holding one Settings tab that carries `drafts`, as a seamless
+    /// successor's restore receives it.
+    fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
+        let mut leaf = NativeLeafRestore::settings(
+            crate::native_settings::SettingsRoute::TextFonts
+                .path()
+                .to_string(),
+        );
+        leaf.settings_drafts = drafts
+            .iter()
+            .map(|(key, text)| SettingsDraftRestore {
+                key: (*key).to_string(),
+                text: (*text).to_string(),
+            })
+            .collect();
+        WindowLayout {
+            rows: 24,
+            cols: 80,
+            active_tab: 0,
+            outer_x: None,
+            outer_y: None,
+            maximized: None,
+            show: WindowShow::UNKNOWN,
+            tabs: Vec::new(),
+            native_tabs: Vec::new(),
+            tab_order: Vec::new(),
+            active_item: Some(0),
+            restored_tabs: vec![RestoredTab {
+                root: RestoredSplitTree::leaf(RestoredView::Native(leaf)),
+                focused_path: Vec::new(),
+                zoomed: false,
+            }],
+        }
+    }
+
+    /// Every live loss row for carried Settings drafts.
+    fn loss_rows(app: &App) -> Vec<aterm_messages::Message> {
+        app.messages
+            .live_rows()
+            .filter(|row| row.msg.key.as_deref() == Some(crate::update_words::KEY_SETTINGS_DRAFTS))
+            .map(|row| row.msg.clone())
+            .collect()
+    }
+
+    /// Two Settings views, each losing a draft (a row the new build does not
+    /// have): ONE row names both, with their text. The first cut posted a row
+    /// per leaf under the update's one key, so the second view's row REPLACED
+    /// the first on glass and the first text was left only in the history.
+    #[test]
+    fn every_lost_draft_of_the_update_is_said_in_one_row() {
+        let mut app = App::headless_for_test();
+        app.restore_into_window(
+            WindowId(0),
+            settings_window(&[("no_such_row_a", "first words")]),
+        );
+        let second = app.create_native_restore_window(24, 80);
+        app.restore_into_window(
+            second,
+            settings_window(&[("no_such_row_b", "second words")]),
+        );
+        assert!(
+            loss_rows(&app).is_empty(),
+            "nothing is said leaf by leaf: the restore is not done"
+        );
+        app.settle_carried_settings_drafts();
+        let rows = loss_rows(&app);
+        assert_eq!(rows.len(), 1, "one row for the update: {rows:?}");
+        assert_eq!(rows[0].title, "Couldn't reopen 2 Settings drafts");
+        for said in ["no_such_row_a: first words", "no_such_row_b: second words"] {
+            assert!(
+                rows[0].detail.iter().any(|line| line == said),
+                "{said} is on glass: {:?}",
+                rows[0].detail
+            );
+        }
+        app.settle_carried_settings_drafts();
+        assert_eq!(loss_rows(&app).len(), 1, "a second settle says nothing new");
+    }
+
+    /// A draft that LANDED in a view the restore then closed — the native-only
+    /// window arm's answer to a window the OS would not attach
+    /// (`apply_restore_manifest`: `close_window_logical`) — is lost with the
+    /// view, and said with its text. The first cut counted it safe the moment
+    /// it landed, so the Commit went ahead and the text was gone unsaid. The
+    /// control: the same view left standing holds its draft, and nothing is
+    /// said.
+    #[test]
+    fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
+        let field = crate::prefs::EDIT_FONT_FAMILY;
+        for closed in [false, true] {
+            let mut app = App::headless_for_test();
+            let torn_off = app.create_native_restore_window(24, 80);
+            app.restore_into_window(torn_off, settings_window(&[(field, "Carried Mono")]));
+            let (_, view) = app
+                .active_native_view(torn_off)
+                .expect("PRECONDITION: the Settings leaf reopened");
+            assert!(
+                matches!(
+                    app.native_runtime.view_state(view),
+                    Some(crate::native_app::AppViewState::Settings(state))
+                        if state.field_inputs.get(field).map(|input| input.value())
+                            == Some("Carried Mono")
+                ),
+                "PRECONDITION: the draft landed"
+            );
+            if closed {
+                let _ = app.close_window_logical(torn_off);
+            }
+            app.settle_carried_settings_drafts();
+            let rows = loss_rows(&app);
+            if closed {
+                assert_eq!(rows.len(), 1, "the lost draft is said: {rows:?}");
+                assert_eq!(rows[0].title, "Couldn't reopen a Settings draft");
+                assert_eq!(rows[0].detail[0], format!("{field}: Carried Mono"));
+            } else {
+                assert!(rows.is_empty(), "a draft its view still holds is not lost");
+            }
+        }
+    }
+
+    /// A draft for a row the new build shows as a SLIDER is said, not taken:
+    /// the slider row can neither show nor edit free text, and the next config
+    /// snapshot would discard it (`replace_snapshot` keeps only drafts
+    /// `field_accepts_text_input` admits). The first cut took it — the view
+    /// read it back as landed and nothing was said.
+    #[test]
+    fn a_draft_for_a_slider_row_is_said_not_taken() {
+        let mut app = App::headless_for_test();
+        // A numeric font size: the row is a slider in this build.
+        app.native_config_service =
+            crate::native_config_service::VersionedConfigService::new("font_px = 14\n".into())
+                .expect("the config parses");
+        let torn_off = app.create_native_restore_window(24, 80);
+        app.restore_into_window(
+            torn_off,
+            settings_window(&[(crate::prefs::EDIT_FONT_PX, "17 px, maybe")]),
+        );
+        let (_, view) = app.active_native_view(torn_off).expect("reopened");
+        let Some(crate::native_app::AppViewState::Settings(state)) =
+            app.native_runtime.view_state(view)
+        else {
+            panic!("the Settings leaf reopened");
+        };
+        assert!(
+            !state.field_inputs.contains_key(crate::prefs::EDIT_FONT_PX),
+            "the slider row holds no text draft"
+        );
+        app.settle_carried_settings_drafts();
+        let rows = loss_rows(&app);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(
+            rows[0].detail[0],
+            format!("{}: 17 px, maybe", crate::prefs::EDIT_FONT_PX)
+        );
+    }
+
+    /// The drafts of a layout the successor could not PLACE ride the ledger it
+    /// starts with, and are said — never dropped with the layout.
+    #[test]
+    fn an_unplaced_layouts_drafts_are_said_with_their_text() {
+        let mut app = App::headless_for_test();
+        app.carried_settings_drafts = super::CarriedDraftsLedger::unplaced((
+            vec![SettingsDraftRestore {
+                key: crate::prefs::EDIT_FONT_FAMILY.to_string(),
+                text: "Unplaced Mono".to_string(),
+            }],
+            1,
+        ));
+        app.settle_carried_settings_drafts();
+        let rows = loss_rows(&app);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].title, "Couldn't reopen 2 Settings drafts");
+        assert_eq!(
+            rows[0].detail[..2],
+            [
+                format!("{}: Unplaced Mono", crate::prefs::EDIT_FONT_FAMILY),
+                "1 draft could not be read".to_string(),
+            ]
         );
     }
 }

@@ -258,9 +258,8 @@ pub fn left_out_block(mode: Mode, scope: &Scope) -> String {
         return String::new();
     }
     let mut text = String::from(
-        "          MEASURE tier: not part of the merge contract, and not run here (never a\n\
-         \x20         skip): `tools/verify.sh --measure` or --full runs it, and a release cut\n\
-         \x20         refuses to claim without a green one for the tree it cuts:\n",
+        "          MEASURE tier: not part of the merge contract, not run here; a release cut\n\
+         \x20         needs it green (`tools/verify.sh --measure`):\n",
     );
     for title in plan::tier_titles(scope, Tier::Measure) {
         text.push_str(&format!("      - {title}\n"));
@@ -354,9 +353,8 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
             "  VERIFY: FAIL (mode={mode_word} scope={scope_word}) — DO NOT merge\n"
         ));
         text.push_str(&format!(
-            "          {n} gate(s) decided AGAINST the tree — this IS a finding about the\n"
+            "          {n} gate(s) decided AGAINST the tree; each stage's block above says why:\n"
         ));
-        text.push_str("          change, and the stage's own block above says why:\n");
         for f in &t.gate_failures {
             text.push_str(&format!("      - {f}\n"));
         }
@@ -383,29 +381,20 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
         text.push_str(&format!(
             "  VERIFY: COULD NOT RUN (mode={mode_word} scope={scope_word}) — DO NOT merge\n"
         ));
-        text.push_str(&format!(
-            "          {n} stage(s) could not execute, so the gate reached no verdict on\n"
-        ));
         // Nothing decided is not "nothing wrong" (2026-09-27): most often the
         // machine (no driver, a missing helper, a refused test), but a paint
         // or spin probe that could not launch its window is COULD NOT RUN too,
-        // and that can be a crash in the code — so the reader is sent to the
-        // reasons, never told the change is cleared.
-        text.push_str(
-            "          them. This is NOT a verdict on your change — usually the environment\n",
-        );
-        text.push_str(
-            "          is broken (no driver, a helper the gate needs is missing, a refused\n",
-        );
-        text.push_str(
-            "          test), but a probe that could not launch can be a crash: read each reason.\n",
-        );
+        // and that can be a crash in the code — so the reader is sent to each
+        // row's own reason, never told the change is cleared or which cause is
+        // likelier.
+        text.push_str(&format!(
+            "          {n} could not execute — no verdict; one that could not launch may be a \
+             crash in the change:\n"
+        ));
         for c in &t.could_not_run {
             text.push_str(&format!("      - {c}\n"));
         }
-        text.push_str(
-            "          Fix it and run again; a gate that never ran has decided nothing.\n",
-        );
+        text.push_str("          Fix each reason above and run again.\n");
         if let Some(base) = base {
             inherited_block(&mut text, &sorted, base);
         }
@@ -425,9 +414,11 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
         text.push_str(&format!(
             "  VERIFY: PASS (mode={mode_word} scope={scope_word}, {n} skipped{inherited_word}) —\n"
         ));
-        text.push_str(
-            "          NOT the merge contract. Everything that ran was green; the contract\n",
-        );
+        text.push_str(if sorted.inherited.is_empty() {
+            "          NOT the merge contract. Everything that ran was green; the contract\n"
+        } else {
+            "          NOT the merge contract. Nothing new failed; the contract\n"
+        });
         text.push_str(
             "          is the WHOLE-TREE run with nothing skipped, and this run was narrower:\n",
         );
@@ -442,18 +433,17 @@ fn judged_verdict(mode: Mode, scope: &Scope, t: &Tally, against: &Against) -> Ve
         }
         if n != 0 {
             text.push_str(&format!(
-                "      - {n} stage(s) did not run, so nothing is claimed about them:\n"
+                "      - {n} skipped, so nothing is claimed about them:\n"
             ));
             for s in &t.skips {
                 text.push_str(&format!("      - {s}\n"));
             }
         }
         text.push_str(if mode.runs(Tier::Land) {
-            "          Re-run whole-tree, with the missing tools installed, before you land.\n"
+            "          Before you land: `tools/verify.sh`, whole-tree, with nothing skipped.\n"
         } else {
-            "          `tools/verify.sh` is the merge contract. A release cut reads this run's\n\
-             \x20         MEASURE receipt, which says `measured yes` only when the whole tier\n\
-             \x20         ran green with nothing skipped.\n"
+            "          `tools/verify.sh` is the merge contract. A release cut needs a --measure\n\
+             \x20         run of the committed tree it cuts, green with nothing skipped.\n"
         });
         if let Some(base) = base {
             inherited_block(&mut text, &sorted, base);
@@ -541,13 +531,9 @@ pub fn measured(
 pub fn measured_line(m: &Result<(), String>) -> String {
     match m {
         Ok(()) => "verify: MEASURE tier — MEASURED: every MEASURE stage ran over the whole tree \
-                   and was green, nothing skipped (`measured yes` in the receipt, which a \
-                   release cut of this tree requires)\n"
+                   and was green\n"
             .to_string(),
-        Err(why) => format!(
-            "verify: MEASURE tier — NOT MEASURED: {why} (`measured no` in the receipt; a \
-             release cut refuses this tree until a run measures it)\n"
-        ),
+        Err(why) => format!("verify: MEASURE tier — NOT MEASURED: {why}\n"),
     }
 }
 
@@ -559,7 +545,7 @@ fn could_not_run_tail(text: &mut String, t: &Tally) {
     }
     let m = t.could_not_run.len();
     text.push_str(&format!(
-        "          ({m} further stage(s) could not execute and decided nothing:\n"
+        "          ({m} more could not execute and decided nothing:\n"
     ));
     for c in &t.could_not_run {
         text.push_str(&format!("      - {c}\n"));
@@ -888,7 +874,15 @@ mod tests {
             v.text
                 .contains("(mode=fast scope=workspace, 1 skipped, 2 inherited) —")
         );
-        assert!(v.text.contains("NOT the merge contract"));
+        assert!(
+            v.text
+                .contains("NOT the merge contract. Nothing new failed;")
+        );
+        assert!(
+            !v.text.contains("Everything that ran was green"),
+            "{}",
+            v.text
+        );
         assert!(v.text.contains("      - tippy lint (red on main since"));
     }
 
@@ -1005,7 +999,7 @@ mod tests {
         assert!(v.text.contains("(mode=fast scope=changed:2, 0 skipped) —"));
         assert!(v.text.contains(
             "      - change-scoped against main to 2 crate(s) (aterm-grid aterm-gui): \
-             every other workspace crate was not built or tested\n"
+             the per-crate test, doctest and lint stages covered no other crate\n"
         ));
         assert_eq!(v.exit, scoped.exit, "narrow is not failure, in either tier");
         assert_eq!(v.claims_merge_contract, scoped.claims_merge_contract);
@@ -1020,7 +1014,7 @@ mod tests {
         assert!(!nothing.text.contains(MERGE_CONTRACT_SENTENCE));
         assert!(nothing.text.contains(
             "      - change-scoped against origin/main and NO workspace crate changed: \
-             nothing was built or tested\n"
+             the per-crate test, doctest and lint stages were skipped\n"
         ));
     }
 
@@ -1050,7 +1044,8 @@ mod tests {
         assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
         assert!(v.text.contains("NOT the merge contract"));
         assert!(v.text.contains(
-            "- scoped to -p aterm-grid: the rest of the workspace was not built or tested"
+            "- scoped to -p aterm-grid: the per-crate test, doctest and lint stages covered no \
+             other crate"
         ));
         assert_eq!(
             v.exit,
@@ -1075,7 +1070,7 @@ mod tests {
         assert!(v.text.contains("(mode=full scope=workspace, 2 skipped) —"));
         assert!(
             v.text
-                .contains("      - 2 stage(s) did not run, so nothing is claimed about them:")
+                .contains("      - 2 skipped, so nothing is claimed about them:")
         );
         // NAMED, not just counted: an unnamed skip is an invisible skip.
         assert!(
@@ -1109,7 +1104,10 @@ mod tests {
         assert!(v.text.contains("      - license_check.sh"));
         // The could-not-runs a finding outranks are still named, or fixing the
         // finding is followed by a run that decides LESS and looks like progress.
-        assert!(v.text.contains("1 further stage(s) could not execute"));
+        assert!(
+            v.text
+                .contains("(1 more could not execute and decided nothing:")
+        );
         assert!(v.text.contains("      - libc-oracle/run.sh (no cc)"));
     }
 
@@ -1137,9 +1135,8 @@ mod tests {
         assert_eq!(
             v.text,
             "\n=== verdict ===\n  VERIFY: PASS (mode=fast scope=workspace, 0 skipped) — merge contract satisfied\n\
-             \x20         MEASURE tier: not part of the merge contract, and not run here (never a\n\
-             \x20         skip): `tools/verify.sh --measure` or --full runs it, and a release cut\n\
-             \x20         refuses to claim without a green one for the tree it cuts:\n\
+             \x20         MEASURE tier: not part of the merge contract, not run here; a release cut\n\
+             \x20         needs it green (`tools/verify.sh --measure`):\n\
              \x20     - conformance release artifact (paint/spin build it otherwise)\n\
              \x20     - measuring tests (--workspace; run alone)\n\
              \x20     - gui typing-pacing smoke\n"
@@ -1294,7 +1291,8 @@ mod tests {
             "NOT the merge contract",
             "      - --measure ran the MEASURE tier alone: no stage of the merge contract (the \
              LAND tier) ran\n",
-            "`tools/verify.sh` is the merge contract. A release cut reads this run's",
+            "`tools/verify.sh` is the merge contract. A release cut needs a --measure\n\
+             \x20         run of the committed tree it cuts, green with nothing skipped.\n",
         ] {
             assert!(
                 measured.text.contains(want),
@@ -1303,7 +1301,7 @@ mod tests {
             );
         }
         assert!(
-            !measured.text.contains("Re-run whole-tree"),
+            !measured.text.contains("Before you land:"),
             "{}",
             measured.text
         );
@@ -1334,7 +1332,15 @@ mod tests {
             v.text
                 .contains("VERIFY: COULD NOT RUN (mode=fast scope=workspace) — DO NOT merge")
         );
-        assert!(v.text.contains("NOT a verdict on your change"));
+        assert!(v.text.contains(
+            "          2 could not execute — no verdict; one that could not launch may be a \
+             crash in the change:\n"
+        ));
+        assert!(
+            !v.text.contains("NOT a verdict on your change"),
+            "{}",
+            v.text
+        );
         assert!(!v.text.contains(MERGE_CONTRACT_SENTENCE));
     }
 

@@ -49,7 +49,7 @@ struct Status<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery: Option<String>,
     /// The release tag this ledger last AUTHORIZED end to end (verified, and then
-    /// staged, covered, or found up to date). The web lane's steady state: a check whose
+    /// staged, covered, or found up to date). The check's steady state: one whose
     /// evergreen pointer names this tag stops at its one HEAD — but only while the
     /// ledger still describes THIS machine's decision: the reader ([`latest_tag`])
     /// honours it only when `latest_authorized_build` is the caller's build (a manual downgrade

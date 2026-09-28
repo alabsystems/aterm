@@ -7308,7 +7308,9 @@ mod agent_verdict_tests {
             session: sid,
             imported: 5000,
             dropped: 0,
+            withheld: 0,
             failed_lines: 0,
+            links_dropped: 0,
             failed: None,
             cleared: false,
         }];
@@ -7324,7 +7326,9 @@ mod agent_verdict_tests {
             session: sid,
             imported: 0,
             dropped: 1200,
+            withheld: 0,
             failed_lines: 34,
+            links_dropped: 0,
             failed: Some("the sidecar arrived with a sha other than its stamp".into()),
             cleared: false,
         }];

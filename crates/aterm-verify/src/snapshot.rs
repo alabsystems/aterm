@@ -188,7 +188,7 @@ pub struct Snapshot {
     pub caller: PathBuf,
     /// The state the snapshot was verified to hold.
     pub tree: TreeState,
-    /// `verify: lane …` lines for the ladder header.
+    /// `verify: <build dir>/ …` lines for the ladder header.
     pub notes: Vec<String>,
     trash: Option<Child>,
     _lock: Lock,
@@ -335,10 +335,103 @@ pub fn machine_lock_dir(moved: Option<&Path>) -> Option<PathBuf> {
     Some(base.join("aterm-verify"))
 }
 
+/// A waiter's place in line for the machine lock: `<dir>/queue/<arrival>-<pid>`,
+/// exclusively locked for as long as the waiter lives and removed when it stops
+/// waiting ([`acquire_machine_in`]). The lock is the kernel's, so the ticket of a
+/// waiter that died without destructors reads as free and is swept by the next
+/// waiter that looks.
+struct Ticket {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = self.file.unlock();
+    }
+}
+
+/// Join the line in `queue`. The ticket is created and LOCKED under a temporary
+/// name and only then renamed into place — a rename keeps the open file and its
+/// lock — so no other waiter can ever see it unlocked and sweep it as dead. The
+/// name sorts by arrival: nanoseconds since the epoch, zero-padded, then the pid.
+fn take_ticket(queue: &Path) -> Result<Ticket, String> {
+    std::fs::create_dir_all(queue)
+        .map_err(|e| format!("cannot create {}: {e}", queue.display()))?;
+    let arrival = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let name = format!("{arrival:024}-{}", std::process::id());
+    let tmp = queue.join(format!(".{name}.tmp"));
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .map_err(|e| format!("cannot create {}: {e}", tmp.display()))?;
+    if let Err(e) = file.try_lock() {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot lock {}: {e:?}", tmp.display()));
+    }
+    let path = queue.join(name);
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot queue {}: {e}", path.display()));
+    }
+    Ok(Ticket { path, file })
+}
+
+/// How many LIVE waiters are ahead of `mine` in `queue`: every older ticket whose
+/// lock is held. An older ticket that reads as free belongs to a waiter that died,
+/// and is removed on the way. A ticket that cannot be opened is gone already.
+fn ahead_in_line(queue: &Path, mine: &Ticket) -> usize {
+    let Some(own) = mine.path.file_name() else {
+        return 0;
+    };
+    let Ok(entries) = std::fs::read_dir(queue) else {
+        return 0;
+    };
+    let mut older: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            !name.to_string_lossy().starts_with('.') && name.as_os_str() < own
+        })
+        .map(|e| e.path())
+        .collect();
+    older.sort();
+    older
+        .into_iter()
+        .filter(|path| {
+            let Ok(file) = std::fs::File::open(path) else {
+                return false;
+            };
+            match file.try_lock() {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(path);
+                    let _ = file.unlock();
+                    false
+                }
+                Err(std::fs::TryLockError::WouldBlock) => true,
+                // Unreadable as either: never let it hold the line forever — the
+                // wait's own bound is what ends a line that does not move.
+                Err(std::fs::TryLockError::Error(_)) => false,
+            }
+        })
+        .count()
+}
+
 /// Take the machine lock (`<dir>/lock`, an exclusive `File::try_lock`),
 /// WAITING while another gate holds it — a line on stderr when the wait starts
 /// and once a minute after, naming the holder — and refusing once `max_wait`
-/// has passed. A sibling note (`<dir>/holder`) only names the holder for that
+/// has passed.
+///
+/// FIRST COME, FIRST SERVED (2026-09-28). Waiters used to poll the lock, so
+/// whichever polled first after a release took it: a gate that had waited an
+/// hour lost to one that arrived a second before the release, and on m3 one
+/// waited 1h55m while a peer took the machine twice. A waiter now holds a
+/// [`Ticket`] and only the oldest live one tries the lock, so gates start in
+/// the order they arrived. A sibling note (`<dir>/holder`) only names the holder for that
 /// line — never the locked file itself: on
 /// Windows `try_lock` is `LockFileEx`, a MANDATORY lock that fails every other
 /// handle's read of the locked range, even one in this process. The lock is
@@ -353,9 +446,40 @@ fn acquire_machine_in(
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let path = dir.join("lock");
     let note = dir.join("holder");
+    let ticket = take_ticket(&dir.join("queue"))?;
     let started = std::time::Instant::now();
     let mut told: Option<std::time::Instant> = None;
     loop {
+        let ahead = ahead_in_line(&dir.join("queue"), &ticket);
+        if ahead > 0 {
+            if started.elapsed() >= max_wait {
+                return Err(format!(
+                    "waited {} in line for this machine's gate, {ahead} gate(s) queued before \
+                     this one still waiting; gates run one at a time, in the order they arrived \
+                     — stop a gate if one is wedged",
+                    span(max_wait.as_secs())
+                ));
+            }
+            if told.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
+                let holder = holder_words(
+                    &std::fs::read_to_string(&note).unwrap_or_default(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                );
+                let so_far = match told {
+                    None => String::new(),
+                    Some(_) => format!("; {} so far", span(started.elapsed().as_secs())),
+                };
+                eprintln!(
+                    "verify: waiting in line for this machine's gate, {ahead} queued before this \
+                     one{holder}{so_far}"
+                );
+                told = Some(std::time::Instant::now());
+            }
+            std::thread::sleep(poll);
+            continue;
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -381,29 +505,32 @@ fn acquire_machine_in(
                 }
                 if told.is_some() {
                     eprintln!(
-                        "verify: the other gate finished; this one starts after waiting {}s",
-                        started.elapsed().as_secs()
+                        "verify: the other gate finished; this one starts after waiting {}",
+                        span(started.elapsed().as_secs())
                     );
                 }
                 return Ok(MachineHold { file: Some(file) });
             }
             Err(std::fs::TryLockError::WouldBlock) => {
-                let holder = std::fs::read_to_string(&note).unwrap_or_default();
-                let holder = holder.split_whitespace().collect::<Vec<_>>().join(" ");
+                let holder = holder_words(
+                    &std::fs::read_to_string(&note).unwrap_or_default(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                );
                 if started.elapsed() >= max_wait {
                     return Err(format!(
-                        "another gate has held this machine for over {}s ({holder}); two gates at \
-                         once poison each other's timing and daemon checks, so this one waited and \
-                         now gives up — stop the other gate if it is wedged",
-                        max_wait.as_secs()
+                        "waited {} for this machine's gate, held now{holder}; stop that gate if \
+                         it is wedged",
+                        span(max_wait.as_secs())
                     ));
                 }
                 if told.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(60)) {
-                    eprintln!(
-                        "verify: another gate is running on this machine ({holder}); waiting for \
-                         it ({}s so far) — two gates at once poison each other's evidence",
-                        started.elapsed().as_secs()
-                    );
+                    let so_far = match told {
+                        None => String::new(),
+                        Some(_) => format!("; {} so far", span(started.elapsed().as_secs())),
+                    };
+                    eprintln!("verify: waiting for another gate on this machine{holder}{so_far}");
                     told = Some(std::time::Instant::now());
                 }
                 std::thread::sleep(poll);
@@ -412,6 +539,42 @@ fn acquire_machine_in(
                 return Err(format!("cannot lock {}: {e}", path.display()));
             }
         }
+    }
+}
+
+/// The holder note (`pid P`, `started <epoch secs>`, `caller C`, a line each)
+/// in a waiter's words — ` (pid P, running 12 min, in C)` — or nothing when
+/// the note says none of it.
+fn holder_words(note: &str, now: u64) -> String {
+    let mut parts = Vec::new();
+    for line in note.lines() {
+        if let Some(pid) = line.strip_prefix("pid ") {
+            parts.push(format!("pid {}", pid.trim()));
+        } else if let Some(since) = line.strip_prefix("started ")
+            && let Ok(since) = since.trim().parse::<u64>()
+        {
+            parts.push(format!("running {}", span(now.saturating_sub(since))));
+        } else if let Some(caller) = line.strip_prefix("caller ") {
+            parts.push(format!("in {}", caller.trim()));
+        }
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", parts.join(", "))
+    }
+}
+
+/// `secs` as seconds under a minute, whole hours from two hours up, else whole
+/// minutes.
+fn span(secs: u64) -> String {
+    if secs < 60 {
+        return format!("{secs} s");
+    }
+    if secs >= 2 * 3600 {
+        format!("{} h", secs / 3600)
+    } else {
+        format!("{} min", secs / 60)
     }
 }
 
@@ -1513,7 +1676,7 @@ fn stamp_lanes(
             match judge_stamp(&old, &new) {
                 LaneVerdict::Warm => {}
                 LaneVerdict::Cold(vars) => notes.push(format!(
-                    "verify: lane {rel} may rebuild cold — {} changed since its last run",
+                    "verify: {rel}/ may rebuild from scratch — {} changed since its last run",
                     vars.join(", ")
                 )),
                 LaneVerdict::Prune { was, now } => {
@@ -1528,8 +1691,7 @@ fn stamp_lanes(
                     if moved {
                         let _ = std::fs::create_dir_all(&dir);
                         notes.push(format!(
-                            "verify: lane {rel} pruned — trustc {} -> {}, so none of its \
-                             artifacts could be reused",
+                            "verify: {rel}/ cleared — trustc {} -> {}",
                             short(&was),
                             short(&now)
                         ));
@@ -1695,7 +1857,7 @@ mod tests {
         let refused = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
             .expect_err("a held machine is not taken");
         assert!(
-            refused.contains("another gate has held this machine")
+            refused.contains("waited 0 s for this machine's gate, held now (pid ")
                 && refused.contains(&format!("pid {}", std::process::id())),
             "{refused}"
         );
@@ -1735,6 +1897,78 @@ mod tests {
             drop(taken);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// FIRST COME, FIRST SERVED (2026-09-28): a waiter behind an older LIVE one
+    /// does not take a free machine, and refuses past its bound naming the line;
+    /// the ticket of a waiter that died reads as free and is swept; and once the
+    /// older waiter is gone the next one takes the machine and leaves no ticket.
+    #[test]
+    fn gates_take_the_machine_in_the_order_they_arrived() {
+        use std::time::Duration;
+        let dir =
+            std::env::temp_dir().join(format!("aterm-verify-queue-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let queue = dir.join("queue");
+        let caller = Path::new("/tmp/caller");
+        // A dead waiter's ticket: first in line by name, and held by no one.
+        std::fs::create_dir_all(&queue).unwrap();
+        let dead = queue.join(format!("{:024}-1", 0));
+        std::fs::write(&dead, "").unwrap();
+        let first = take_ticket(&queue).expect("a ticket");
+        let second = take_ticket(&queue).expect("a second ticket");
+        assert!(first.path < second.path, "tickets sort by arrival");
+        assert_eq!(
+            ahead_in_line(&queue, &first),
+            0,
+            "the dead ticket holds no one up"
+        );
+        assert!(!dead.exists(), "and is swept by the waiter that found it");
+        assert_eq!(
+            ahead_in_line(&queue, &second),
+            1,
+            "one live waiter is ahead"
+        );
+        // The machine is free, and still not taken past a live waiter in line.
+        let refused = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
+            .expect_err("a later arrival does not jump the line");
+        assert!(
+            refused.contains("2 gate(s) queued before this one"),
+            "{refused}"
+        );
+        drop(first);
+        drop(second);
+        let held = acquire_machine_in(&dir, caller, Duration::ZERO, Duration::from_millis(1))
+            .expect("first in line takes a free machine");
+        let left: Vec<_> = std::fs::read_dir(&queue).unwrap().flatten().collect();
+        assert!(
+            left.is_empty(),
+            "a waiter that stops waiting leaves no ticket: {left:?}"
+        );
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The waiter names the holder by how long it has run, never by the epoch
+    /// second its note records, and a note with nothing in it adds nothing.
+    #[test]
+    fn the_holder_is_named_by_how_long_it_has_run() {
+        let note = "pid 4411\nstarted 1000\ncaller /Users//x/aterm\n";
+        assert_eq!(
+            holder_words(note, 1000 + 12 * 60 + 59),
+            " (pid 4411, running 12 min, in /Users//x/aterm)"
+        );
+        assert_eq!(
+            holder_words(note, 1000 + 3 * 3600 + 5),
+            " (pid 4411, running 3 h, in /Users//x/aterm)"
+        );
+        assert_eq!(
+            holder_words(note, 1000 + 5),
+            " (pid 4411, running 5 s, in /Users//x/aterm)",
+            "a gate that just started is not `running 0 min`"
+        );
+        assert_eq!(holder_words("", 5), "");
+        assert_eq!(holder_words("pid 7\nstarted soon\n", 5), " (pid 7)");
     }
 
     #[test]

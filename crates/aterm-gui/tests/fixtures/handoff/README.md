@@ -25,7 +25,19 @@ release through this build's `take_incoming`. It asserts that:
   at its carried geometry, each control carry read, and the layout placed;
 - the screen and layout digests equal what that release's parent committed to;
 - this build's adoption proof and its `ProofReady` and `Commit` frames match
-  the parent's, byte for byte, over the recorded inputs.
+  the parent's, byte for byte, over the recorded inputs;
+- every history sidecar the parent named (v0.94.0 on) is taken before the
+  proof at the depth it stamps, and after Commit the import puts every one of
+  its lines back: the session's history is then the sidecar's lines in front
+  of the lines its checkpoint restored, line for line and cell for cell, with
+  nothing lost at the hop and the session's running loss (`history_lost`) and
+  foreground holder carried. A session that names no sidecar, which is every
+  session of a release before the history carry, imports nothing and keeps
+  exactly the history its checkpoint restored.
+
+The guard reads the sidecar's lines itself, straight off the checked-in
+bytes with the line codec. It does not use the consumer's reader, because the
+import is what it checks.
 
 **A red guard is never fixed by regenerating or editing a fixture.** Those
 bytes are what that release sends, for as long as installs of it exist. Fix
@@ -42,7 +54,7 @@ lenient (law L3 of the 2026-09-22/23 audit).
 | `seamless-<pid>-<nonce>.s<id>.ctl` | Each session's control-carry sidecar, exactly as written. |
 | `seamless-<pid>-<nonce>.s<id>.hist` | Each session's history-carry sidecar, exactly as written (from v0.94.0, for a session whose history is deeper than its checkpoint carries). |
 | `s<id>.meta.json` | A copy of the meta JSON the manifest embeds for session `<id>`, extracted so it can be reviewed. The guard checks that it equals the embedded copy. |
-| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). The guard does not read these yet. |
+| `parent.toml` | What the parent committed to: the screen and layout digests, an adoption proof and its two frames over fixed inputs (`proof_*`), the list of files, and each session's carried geometry. From v0.94.0 each session row also records `history_take` (the lines its `.hist` sidecar carries), `history_lost` and `fg_holder`, and from v0.95.0 `absolute_row_counter` and `alt_absolute_row_counter` (the numbering the successor continues), `color` (whether an application colour diff rides the meta) and `shell_phase`, `shell_marks` and `shell_completed_seq` (the shell-integration state it carries). From v0.97.0 the parent also records `park_carry_ceiling` (the ceiling the park captured under, from the successor's handoff policy), and each session row `rung` (the `CarryRung` the ladder carried it at: `full`, or `stripped-links`) and `links_stripped` (how many of its lines lost their OSC 8 links). The guard checks the v0.94.0 fields (`history_take`, `history_lost`, `fg_holder`) against the manifest and the sidecar's bytes, and against what this build takes and imports; it does not read the v0.95.0 or v0.97.0 fields yet. |
 
 The bytes are unchanged with one exception. The manifest names each grid
 sidecar by its absolute path in the producer's private directory, and the
@@ -84,11 +96,52 @@ desk for the shape v0.92.0 changed:
   nonce, and the guard checks that this build reassembles both from the
   older producer's meta. v0.92.0 is the first release whose rows carry them.
 
+## The v0.93.0 desks
+
+Added after v0.94.0's, from the v0.93.0 tag (73a9b424007d), because installs
+of v0.93.0 still hand off to every later release. `generator-v0.93.0.rs.txt`
+is the exact code that wrote them. v0.93.0's producer sits between the other
+two:
+
+- Its capture is already the producer ladder: `carry_for_wire` for each
+  session, then `settle_wire_carries`. Every session here is carried at
+  `CarryRung::Full`. `write_outgoing` already takes the repaint set.
+- It has no history carry and no `.hist` sidecar. Its records and layout
+  leaves carry none of the fields v0.94.0 added (`questions`, `fg_holder`,
+  `rekey`, `loader`, `history`, `history_dropped`, `history_lost`), and its
+  layout windows have no `show`.
+
+Its `parent.toml` rows record no `history_take`, so the guard expects no
+sidecar for any session. The desks are the six v0.94.0 has, plus one for the
+shape v0.93.0 changed:
+
+- `history-carry` keeps the name, but here it has only the screens: the
+  1,500-line shell and the shell running `less` in 1049. Carried by a release
+  before the history carry, the first crosses with the 256 lines its
+  checkpoint holds and the second with none. The consumer must adopt both
+  exactly and import nothing.
+- `shell-integration`'s records carry no `rekey` or `loader`.
+- `stalled-sequence`: three sessions whose parsers were left mid-sequence
+  over a quiet PTY. One is a shell after an unterminated OSC title
+  (`printf '\e]0;building'`, `OscString`). One is an ssh session stopped
+  halfway through an SGR (`CsiParam`). The third is an editor in 1049 whose
+  kitty-graphics upload stopped inside its APC payload (`SosPmApcString`).
+  Through v0.92.0 such a session refused every in-session update. v0.93.0
+  carries it with the partial sequence left out, as CAN would
+  (`Terminal::checkpoint_carry_abandoning_partial`), and leaves the live
+  parser as it was. The generator's capture takes the PTYs first, as
+  v0.93.0's does, and checks each such master is quiet before carrying it.
+
+The generator ran with `SOURCE_DATE_EPOCH` set to the release's build number
+from `RELEASES.ledger` (1790305290), so the manifests' `outgoing_build` is
+the one the shipped binary writes. v0.94.0's desks were generated without it,
+so theirs is the tag commit's epoch, one above the ledger's. The consumer
+reads only whether the field is present.
+
 ## The v0.94.0 desks
 
 The same five desks, written by v0.94.0's producer, plus one desk for the
-shapes v0.93.0 and v0.94.0 changed. v0.93.0 has no directory, so nothing
-checks what its producer writes.
+shapes v0.94.0 changed.
 
 v0.94.0's producer differs from v0.92.0's in four ways that reach these
 bytes:
@@ -112,10 +165,14 @@ The new desk:
 - `history-carry`: a shell with 1,500 lines of history, and a shell with
   1,000 lines running `less` in 1049, whose checkpoint carries none of that
   history, so its sidecar carries all of it. The records also carry the other
-  fields v0.93.0 and v0.94.0 added: a running `history_lost` from an earlier
-  handoff, `rekey` and `loader` for shells spawned with integration, and a
-  `questions` word, which is also on its layout leaf. The `shell-integration`
-  desk's shells carry `rekey` and `loader` as well.
+  fields v0.94.0 added (v0.93.0 added none of them): a running
+  `history_lost` from an earlier handoff, `rekey` and `loader` for shells
+  spawned with integration, and a `questions` word, which is also on its
+  layout leaf. The `shell-integration` desk's shells carry `rekey` and
+  `loader` as well.
+
+v0.94.0 has no `stalled-sequence` desk: its generator asserts every parser
+is at Ground.
 
 ## The v0.95.0 desks
 
@@ -153,7 +210,72 @@ The new desk:
   checkpoint carries none of the shell's history, and the marks it carries
   sit on the saved primary.
 
-`generator.rs.txt` is the v0.95.0 generator, the template for the next
+## The v0.97.0 desks
+
+The same seven desks, written by v0.97.0's producer, `stalled-sequence` again,
+and one desk for the shape v0.97.0 changed. v0.96.0 has no directory: it was
+never cut (`RELEASES.ledger` has no build for it and origin has no tag), so no
+install runs its producer.
+
+v0.97.0's writer and meta are v0.95.0's. In the seven desks, every session's
+grids, control and history sidecars and meta are the bytes v0.95.0 wrote,
+except the wall-clock times in the shell marks' meta. What changed is how the
+park decides what to carry:
+
+- The signed handoff policy (75f60b08c, eb807651f, 3d6ebfdda). Every park
+  reads the successor's policy (`App::park_policy`) and captures under its
+  ceiling (`carry_for_wire_within`). The history plan follows the same answer
+  (`HistoryPlan::deferred_under`), and the fork lane's worker refuses a capture
+  taken above the policy it reads. Releases ship `publish/handoff-policy.toml`
+  empty (`schema = 1`), so there is nothing to follow and the park captures at
+  the `Full` ceiling. The generator lays that file out as the cut does, reads it
+  with the producer's own reader (`read_from_bundle`, then `adopt`), and records
+  the ceiling (`park_carry_ceiling = "full"`).
+- The capture walks the pool in session-id order (eb807651f). A parser left
+  mid-sequence is carried, with the partial sequence left out, only over a
+  quiet PTY; over queued output the park misses. So the generator makes the
+  PTYs before the capture, as the v0.93.0 generator did, and `stalled-sequence`
+  is back. v0.94.0's and v0.95.0's generators asserted every parser was at
+  Ground and had no such desk. With the history carry, its title shell and its
+  editor's saved primary now name `.hist` sidecars.
+- The link-stripping rung (b2275989d, its work bounded by 510affa38). A line
+  record over the wire's per-record cap (`16 KiB + cols * 512`) now costs that
+  line its OSC 8 links (`CarryRung::StrippedLinks`), not the screen. Through
+  v0.95.0 such a screen went blank until its program redrew (the Repaint rung).
+  Such a line only in the scrollback cost the whole scrollback, and through the
+  capture's history latch every later tab's too. The stripped carry needs no
+  repaint and keeps its control carry.
+
+The self-check also asserts that each session is carried at the rung its desk
+stands for, and that the pool's self-check lowers nothing. For a stripped
+session, it asserts that only the over-cap lines lost their links, at the whole
+depth asked for. It also asserts that both grids adopt byte for byte and that a
+stalled session's carry says Ground while its live parser is untouched.
+
+The new desk:
+
+- `link-dense`: a shell that listed two CI runs' signed log links. One row of
+  twelve 8 KiB links has scrolled into its history, another is on screen, and a
+  row of two links stays under the cap and keeps them. Its history fits in the
+  256 lines its checkpoint carries, so it names no sidecar. Beside it, a shell
+  with 600 lines of history printed a row of twelve such links and then opened
+  vim in 1049. That row is on the saved primary (the inactive grid), which the
+  carry strips, and the `.hist` sidecar carries the saved primary's whole
+  history. Both sessions are carried at `stripped-links`: two lines lost their
+  links in the first session and one in the second.
+
+The desk keeps every link-dense line out of the `.hist` sidecars. It has to:
+v0.97.0's own consumer refuses a sidecar with such a line in any frame it
+decodes ("the sidecar arrived with a frame that does not decode"). The sidecar
+reader decodes each frame under the strict per-record cap, and the history
+export does not strip links. A tab whose deep history holds such a line
+therefore gets none of the history its sidecar carries: the import fails with
+that reason. This was measured in the v0.97.0 worktree, with the line older
+than the checkpoint's 256 lines and with it inside them. Producers from v0.94.0
+on already write such sidecars, so it is a gap to fix in the consumer, not a
+shape these fixtures record.
+
+`generator.rs.txt` is the v0.97.0 generator, the template for the next
 release.
 
 ## Adding the next release's fixtures
@@ -181,30 +303,43 @@ fresh. A `--dry-run` of the next cut shows whether they are in.
    ```
 
    If its `target` is a dangling symlink, `mkdir -p target.noindex` inside it.
-   A worktree does not check out submodules. If the build cannot find
-   `vendor/astream`, and the tag pins the same `vendor/astream` commit as the
-   main tree (`git ls-tree <tag> vendor/astream`), replace the empty directory
-   with a symlink to the main tree's checkout.
+   A worktree does not check out submodules. Check out the tag's own
+   `vendor/astream`:
+
+   ```sh
+   git -C ~/aterm-vX.Y.0.noindex submodule update --init vendor/astream
+   ```
+
+   That is what the v0.93.0 generation did; its tag pins a different astream
+   commit from the main tree. A symlink to the main tree's checkout is right
+   only when `git ls-tree <tag> vendor/astream` names the same commit as the
+   main tree.
 2. Append `generator.rs.txt` (in this directory) to that worktree's
    `crates/aterm-gui/src/seamless_carry_tests.rs`, and adapt it to that
    release's API:
    - `fx_capture` must be that release's own capture path. The template
-     copies v0.95.0's (unchanged from v0.94.0): `carry_for_wire` for each
-     session at the budgets `App::capture_parked_screens` prices, then
-     `settle_wire_carries` over the pool. The repaint set is the sessions
-     whose rung has `CarryRung::needs_repaint`. If the release changed the
-     capture, copy the change.
-   - `fx_write` must run the release's own worker steps in its order. In
-     v0.94.0 and v0.95.0 that is the control carry's export, then the history
-     carry's export and `stamp_manifest`, then `write_outgoing`, then the
-     layout.
+     copies v0.97.0's: the pool walked in session-id order, each session
+     carried by `carry_for_wire_within` under the park's policy ceiling at
+     the budgets `App::capture_parked_screens` prices, a mid-sequence parser
+     carried only over a quiet PTY, then `settle_wire_carries` over the pool.
+     The repaint set is the sessions whose rung has
+     `CarryRung::needs_repaint`. If the release changed the capture, copy the
+     change.
+   - `fx_write` must run the release's own steps in its order. In v0.97.0
+     that is the policy read (`fx_park_policy`, the release's checked-in
+     `publish/handoff-policy.toml` read out of a bundle), the PTYs, the
+     capture, the fork lane's history plan (`HistoryPlan::deferred_under`),
+     the worker's policy check, the control carry's export, the history
+     carry's export and `stamp_manifest`, `write_outgoing`, then the layout.
    - Give every record field the release added a value that a real session
      would carry, and keep the generator's self-check passing.
-   - Keep the seven desks, and add a desk for any shape that release changed.
+   - Keep the nine desks in `generator.rs.txt`, and add a desk for any shape
+     the release changed.
 3. Run the generator, still in the worktree:
 
    ```sh
    ATERM_BUILD_GIT_COMMIT=<the tag's 12-digit short commit> \
+   SOURCE_DATE_EPOCH=<the release's build number in RELEASES.ledger> \
    ATERM_HANDOFF_FIXTURE_OUT=~/aterm/crates/aterm-gui/tests/fixtures/handoff/vX.Y.0 \
      targo --unverified test -p aterm-gui --lib -- generate_handoff_fixtures --ignored
    ```
@@ -217,6 +352,9 @@ fresh. A `--dry-run` of the next cut shows whether they are in.
    annotated, so take the commit it points at
    (`git rev-parse --short=12 'vX.Y.0^{commit}'`), not the tag object's own
    sha.
+   `SOURCE_DATE_EPOCH` makes the build number the one the release was cut
+   with, so each manifest's `outgoing_build` is what the shipped binary
+   writes. Without it a dev build takes the tag commit's epoch instead.
 4. In the main tree, add the new `(release, desk)` rows to `PINNED_DESKS` in
    `seamless_fixture_tests.rs` and run the guard:
 
@@ -225,7 +363,10 @@ fresh. A `--dry-run` of the next cut shows whether they are in.
    ```
 
 5. Commit the new directory with the pinned rows. Do not commit the generator
-   in the release worktree. Then remove the worktree:
+   in the release worktree. Commit it here, beside the fixtures: as
+   `generator.rs.txt` when this release is the newest one with fixtures (it
+   is then the next release's template), otherwise as
+   `generator-vX.Y.0.rs.txt`. Then remove the worktree:
 
    ```sh
    git worktree remove --force ~/aterm-vX.Y.0.noindex

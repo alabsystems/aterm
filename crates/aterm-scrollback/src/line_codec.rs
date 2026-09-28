@@ -41,6 +41,14 @@ pub(crate) const MAX_HYPERLINK_URL_BYTES: usize = 8192;
 /// stays aligned.
 pub(crate) const MAX_HYPERLINK_ID_BYTES: usize = 256;
 
+/// The most bytes ONE hyperlink span takes in a v3 record whose URL and id are
+/// within the ingestion ceilings above: `start_col:2 + end_col:2 + url_len:4 +
+/// url + id_len:4 + id`, so 8,460 bytes. What an honest writer's links can add
+/// to one line's record is at most this per column
+/// (`line_codec_block::max_linked_record_bytes`).
+pub(crate) const MAX_HYPERLINK_SPAN_BYTES: usize =
+    12 + MAX_HYPERLINK_URL_BYTES + MAX_HYPERLINK_ID_BYTES;
+
 /// Cap on the NUMBER of hyperlink spans in a single deserialized line, matching
 /// `MAX_GRID_COLS` (aterm-grid, 4096). A physical row has at most `cols` cells and
 /// each cell holds one hyperlink, so the legit write path coalesces to `<= cols`
@@ -894,6 +902,7 @@ impl Line {
 // this exact block codec, so it must be reachable from aterm-core.
 pub(crate) use super::line_codec_block::{MAX_DECODE_PAGE_LINES, count_page_lines};
 pub use super::line_codec_block::{
-    deserialize_lines, deserialize_lines_strict, deserialize_lines_tail_strict,
-    deserialize_page_lines, serialize_lines,
+    deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
+    deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
+    serialize_lines,
 };

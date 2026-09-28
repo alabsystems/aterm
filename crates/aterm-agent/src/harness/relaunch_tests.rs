@@ -87,23 +87,26 @@ fn the_program_is_the_script_or_the_image_that_is_claude() {
 fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     let st = |tail: &str| format!("OK schema=1 {tail}");
     let nobody = st("hold=0 hand=- human_ms=-");
-    assert_eq!(on_exit(true, Some(&nobody), 120, false), OnExit::Relaunch);
     assert_eq!(
-        on_exit(true, None, 120, false),
+        on_exit(true, Some(&nobody), 120, false, false),
+        OnExit::Relaunch
+    );
+    assert_eq!(
+        on_exit(true, None, 120, false, false),
         OnExit::Relaunch,
         "unreadable"
     );
     let typed = |ms: u64| st(&format!("hold=0 hand=- human_ms={ms}"));
     assert_eq!(
-        on_exit(true, Some(&typed(119_999)), 120, false),
+        on_exit(true, Some(&typed(119_999)), 120, false, false),
         OnExit::PersonAsked
     );
     assert_eq!(
-        on_exit(true, Some(&typed(120_000)), 120, false),
+        on_exit(true, Some(&typed(120_000)), 120, false, false),
         OnExit::Relaunch
     );
     assert_eq!(
-        on_exit(true, Some(&typed(0)), 0, false),
+        on_exit(true, Some(&typed(0)), 0, false, false),
         OnExit::Relaunch,
         "no grace"
     );
@@ -113,12 +116,12 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
         "hold=0 hand=turn:41:s-9f00 human_ms=-",
     ] {
         assert_eq!(
-            on_exit(true, Some(&st(held)), 120, false),
+            on_exit(true, Some(&st(held)), 120, false, false),
             OnExit::Held,
             "{held}"
         );
         assert_eq!(
-            on_exit(false, Some(&st(held)), 120, false),
+            on_exit(false, Some(&st(held)), 120, false, false),
             OnExit::Held,
             "{held}"
         );
@@ -128,15 +131,18 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
         "hold=0 hand=driving:s-2 human_ms=-",
     ] {
         assert_eq!(
-            on_exit(true, Some(&st(free)), 120, false),
+            on_exit(true, Some(&st(free)), 120, false, false),
             OnExit::Relaunch,
             "{free}"
         );
     }
-    assert_eq!(on_exit(false, Some(&nobody), 120, false), OnExit::Limited);
-    assert_eq!(on_exit(false, None, 120, false), OnExit::Limited);
     assert_eq!(
-        on_exit(false, Some(&typed(1)), 120, false),
+        on_exit(false, Some(&nobody), 120, false, false),
+        OnExit::Limited
+    );
+    assert_eq!(on_exit(false, None, 120, false, false), OnExit::Limited);
+    assert_eq!(
+        on_exit(false, Some(&typed(1)), 120, false, false),
         OnExit::PersonAsked,
         "a person's exit is theirs, never said as a limit"
     );
@@ -144,12 +150,43 @@ fn an_exit_is_relaunched_unless_someone_owns_it_or_it_is_limited() {
     // exited by the stall's remedy: a keystroke just before was read by
     // nothing, so it is no person's exit. A holder still owns it, and the
     // owner's limit still holds.
-    assert_eq!(on_exit(true, Some(&typed(1)), 120, true), OnExit::Relaunch);
     assert_eq!(
-        on_exit(true, Some(&st("hold=1 hand=- human_ms=1")), 120, true),
+        on_exit(true, Some(&typed(1)), 120, true, false),
+        OnExit::Relaunch
+    );
+    assert_eq!(
+        on_exit(
+            true,
+            Some(&st("hold=1 hand=- human_ms=1")),
+            120,
+            true,
+            false
+        ),
         OnExit::Held
     );
-    assert_eq!(on_exit(false, Some(&typed(1)), 120, true), OnExit::Limited);
+    assert_eq!(
+        on_exit(false, Some(&typed(1)), 120, true, false),
+        OnExit::Limited
+    );
+    // S0 of the in-flight review (2026-09-27): the harness's OWN restart
+    // ended the agent — its exit is that restart's whoever is at the tab, a
+    // hold, a lease or the owner's switch (the relaunch line's own look still
+    // waits on them before anything is typed).
+    for status in [
+        Some(nobody.as_str()),
+        Some(typed(1).as_str()),
+        Some("OK schema=1 hold=1 hand=- human_ms=-"),
+        Some("OK schema=1 hold=0 hand=lease:orchestrator human_ms=-"),
+        None,
+    ] {
+        for allowed in [true, false] {
+            assert_eq!(
+                on_exit(allowed, status, 120, false, true),
+                OnExit::Restarted,
+                "{status:?} allowed={allowed}"
+            );
+        }
+    }
     let ok = "OK schema=1 hold=0 hand=- human_ms=5000 level=quiet";
     assert!(person_present(ok, 120));
     assert!(!person_present(ok, 5));
@@ -483,10 +520,14 @@ fn the_back_off_grows_caps_and_forgives_a_healthy_run() {
 /// Drive the real [`Relaunches`], [`on_exit`] and [`outcome`] through every
 /// action of `HarnessRelaunchOnExit` and check, after each, that the state
 /// they produce is the model's after the same action, every invariant
-/// holding, and every action of the model is driven. NEGATIVE CONTROLS: the
-/// model's buggy host relaunches after a person's exit, drops a relaunch it
-/// cannot make without a word and keeps a limit quiet, and each is caught
-/// by an invariant, so the check is not vacuous.
+/// holding, and every action of the model is driven — the harness's own
+/// restart's exit (`Restarted`, S0 of the in-flight review, 2026-09-27)
+/// among them, due though a person typed, a halt stands or the owner
+/// switched the relaunch off. NEGATIVE CONTROLS: the model's buggy host
+/// relaunches after a person's exit, drops a relaunch it cannot make without
+/// a word, keeps a limit quiet, and leaves its own restart to a person or
+/// reads it as the launch's end, and each is caught by an invariant, so the
+/// check is not vacuous.
 #[test]
 fn the_real_relaunch_decisions_conform_to_the_model() {
     let model = aterm_spec::derive::harness_relaunch_on_exit_model();
@@ -523,6 +564,7 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             ("badged", i64::from(badged)),
             ("step", i64::try_from(step).expect("small")),
             ("misses", i64::from(misses.min(badge))),
+            ("restarted", i64::from(r.restarted())),
         ]
         .into_iter()
         .collect::<std::collections::BTreeMap<&'static str, i64>>()
@@ -570,6 +612,17 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
         ("Crash", "exit"),
         ("Ended", "wait:not-exited"),
         ("PersonRuns", ""),
+        // The harness's own restart ended it (S0 of the in-flight review,
+        // 2026-09-27): due though a person typed, a halt stands or the owner
+        // switched the relaunch off — re-asked during its pause, still due.
+        ("Restarted", "person"),
+        ("Miss", "wait:held"),
+        ("Land", "adopted"),
+        ("Restarted", "halted"),
+        ("Cannot", "refused:stale-exit"),
+        ("PersonRuns", ""),
+        ("Restarted", "limited"),
+        ("Land", "done:fresh"),
         ("Limited", "exit"),
         ("PersonRuns", ""),
         ("Crash", "exit"),
@@ -578,10 +631,27 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
     ];
     for (action, input) in schedule {
         match (action, input) {
+            ("Restarted", who) => {
+                running = false;
+                let (allowed, who) = match who {
+                    "person" => (true, &person),
+                    "halted" => (true, &halted),
+                    _ => (false, &nobody),
+                };
+                assert!(
+                    r.exited(on_exit(allowed, Some(who), 120, false, true), now)
+                        .is_ok()
+                );
+                assert_eq!(
+                    r.decide(on_exit(allowed, Some(who), 120, false, true)),
+                    None,
+                    "still due"
+                );
+            }
             ("Crash", _) => {
                 running = false;
                 assert!(
-                    r.exited(on_exit(true, Some(&nobody), 120, false), now)
+                    r.exited(on_exit(true, Some(&nobody), 120, false, false), now)
                         .is_ok()
                 );
             }
@@ -589,27 +659,27 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
                 running = false;
                 let who = if who == "person" { &person } else { &halted };
                 assert_eq!(
-                    r.exited(on_exit(true, Some(who), 120, false), now),
+                    r.exited(on_exit(true, Some(who), 120, false, false), now),
                     Err(Say::Nothing)
                 );
             }
             ("PersonReturns", who) => {
                 let who = if who == "person" { &person } else { &leased };
                 assert_eq!(
-                    r.decide(on_exit(true, Some(who), 120, false)),
+                    r.decide(on_exit(true, Some(who), 120, false, false)),
                     Some(Say::Nothing)
                 );
             }
             ("Limited", "exit") => {
                 running = false;
                 assert_eq!(
-                    r.exited(on_exit(false, Some(&nobody), 120, false), now),
+                    r.exited(on_exit(false, Some(&nobody), 120, false, false), now),
                     Err(Say::Limited)
                 );
             }
             ("Limited", _) => {
                 assert_eq!(
-                    r.decide(on_exit(false, Some(&nobody), 120, false)),
+                    r.decide(on_exit(false, Some(&nobody), 120, false, false)),
                     Some(Say::Limited)
                 );
             }
@@ -646,6 +716,27 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
             );
         }
         assert_eq!(seen, expect, "{action} ({input}): observed vs model");
+        // THE RESTART IS NOTHING ELSE'S (the model's guards on the harness's
+        // own restart, bound here — the review of 2026-09-27: relaxed, only
+        // Tier-0 saw it): no person, no limit and no launch's own end takes
+        // it. The real type is asked each: a person or a limit is decided as
+        // the restart ([`on_exit`], above), and an end its carry could never
+        // answer — an `ended:*` word, an agent that never exited — is said,
+        // as a `Cannot`, never a silent leave, wherever one is pending.
+        if expect["restarted"] == 1 {
+            for off in ["PersonReturns", "Ended", "Limited"] {
+                assert!(!model.action_enabled(off, &expect), "{off} after {action}");
+            }
+        }
+        if expect["restarted"] == 1 && expect["pending"] == 1 {
+            for word in ["ended:one-shot", "ended:graceful-exit", "wait:not-exited"] {
+                let mut probe = r.clone();
+                assert_eq!(probe.attempted(&outcome(word), now), Say::Cannot, "{word}");
+                let mut cannot = expect.clone();
+                assert!(model.fire("Cannot", &mut cannot));
+                assert_eq!(project(&probe, running), cannot, "{word}: a said Cannot");
+            }
+        }
     }
     // Every action of the model was driven.
     for a in &model.actions {
@@ -666,6 +757,13 @@ fn the_real_relaunch_decisions_conform_to_the_model() {
     let mut quiet = buggy.init_state();
     assert!(buggy.fire("Limited", &mut quiet));
     assert!(!buggy.check_invariant("NeverSilent", &quiet));
+    // The host of c4e24cd3e: the harness's own restart left to a person who
+    // typed, and one its back-off let expire read as a graceful exit.
+    for off in ["PersonReturns", "Ended"] {
+        let mut own = buggy.init_state();
+        assert!(buggy.fire("Restarted", &mut own) && buggy.fire(off, &mut own));
+        assert!(!buggy.check_invariant("RestartCarried", &own), "{off}");
+    }
 }
 
 /// The continuation a relaunched agent is typed is one line, whatever the

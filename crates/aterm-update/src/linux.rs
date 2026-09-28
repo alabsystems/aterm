@@ -1687,6 +1687,7 @@ fn linux_status(context: &Context, state: &State) -> crate::LinuxUpdateStatus {
             .map(|trial| format!("{:?}", trial.phase)),
         trial_starts: state.trial.as_ref().map_or(0, |trial| trial.starts),
         trial_healthy: state.trial.as_ref().is_some_and(|trial| trial.healthy),
+        refused_newer: state.rejected_build > state.installed.build,
     }
 }
 

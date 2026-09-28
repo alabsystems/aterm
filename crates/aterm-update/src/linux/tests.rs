@@ -878,6 +878,7 @@ fn verified_native_update_replaces_disk_without_changing_open_old_inode_and_roll
         hash_file(&f.context.backup(&f.state.trial.as_ref().unwrap().old)).unwrap(),
         old_hash
     );
+    assert!(!linux_status(&f.context, &f.state).refused_newer);
     rollback_locked(&f.context, &mut f.state).unwrap();
     assert_eq!(hash_file(&f.context.target).unwrap(), old_hash);
     assert_eq!(
@@ -885,6 +886,10 @@ fn verified_native_update_replaces_disk_without_changing_open_old_inode_and_roll
         "repair is not permission to replay the failed build"
     );
     assert_eq!(f.state.rejected_build, 11);
+    assert!(
+        linux_status(&f.context, &f.state).refused_newer,
+        "`aterm update status` must not call the rolled-back copy up to date"
+    );
 }
 
 #[test]

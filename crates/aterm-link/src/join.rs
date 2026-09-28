@@ -463,7 +463,8 @@ fn read_mint_secret(path: &Path) -> Result<Vec<u8>, String> {
              first host's, and it never leaves that host)"
         ));
     }
-    crate::transport::check_private(&path.to_string_lossy()).map_err(|e| e.to_string())?;
+    let lossy = path.to_string_lossy();
+    crate::transport::check_private(&lossy).map_err(|e| crate::transport::describe(&lossy, &e))?;
     let secret = std::fs::read(path).map_err(|e| format!("{shown}: {e}"))?;
     if secret.len() < enable::SECRET_LEN {
         return Err(format!(
@@ -541,9 +542,11 @@ fn check_inputs(opts: &JoinOpts) -> Result<Checked, String> {
     if let Err(e) = crate::transport::is_loopback_endpoint(&broker) {
         return Err(format!("--broker {}: {e}", safe(&broker, 128)));
     }
-    crate::transport::read_private_key_file(key).map_err(|e| format!("--key-file {key}: {e}"))?;
+    crate::transport::read_private_key_file(key)
+        .map_err(|e| format!("--key-file {}", crate::transport::describe(key, &e)))?;
     let key_bytes = std::fs::read(key).map_err(|e| format!("--key-file {key}: {e}"))?;
-    crate::transport::check_private(cap).map_err(|e| format!("--cap-file {cap}: {e}"))?;
+    crate::transport::check_private(cap)
+        .map_err(|e| format!("--cap-file {}", crate::transport::describe(cap, &e)))?;
     let caps = crate::bridge::read_cap_file(cap).map_err(|e| format!("--cap-file {e}"))?;
     let grants: Vec<String> = caps.iter().map(|c| c.grant.clone()).collect();
     let (fleet, node) = node_ring_of(&grants).map_err(|e| format!("--cap-file {cap}: {e}"))?;
@@ -1010,10 +1013,11 @@ struct NodePresence {
 /// (`Last{/f/<F>/pub/<node>/node/presence}`, which the node ring's
 /// `ro:/f/<F>/pub/>` reads).
 fn probe_remote(c: &Checked, out: &mut Out) -> Result<Option<NodePresence>, ()> {
-    let key = match crate::transport::read_key_file(&c.key_src.to_string_lossy()) {
+    let key_src = c.key_src.to_string_lossy();
+    let key = match crate::transport::read_key_file(&key_src) {
         Ok(k) => k,
         Err(e) => {
-            out.fail("broker", &format!("{}: {e}", c.key_src.display()));
+            out.fail("broker", &crate::transport::describe(&key_src, &e));
             return Err(());
         }
     };

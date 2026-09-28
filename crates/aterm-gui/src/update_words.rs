@@ -70,8 +70,97 @@ pub(crate) const KEY_PROGRESS: &str = "update.progress";
 /// An apply-lane outcome's key (R37) — never [`KEY_PROGRESS`]: both rows
 /// stay live, side by side.
 pub(crate) const KEY_OUTCOME: &str = "update.outcome";
-/// The check-health warning's key (R38).
+/// The check-health warning's FAMILY key (R38): the key every health warning
+/// wore before design ruling 311, and so the one a row carried from an older
+/// build still wears. Today each warning wears its kind's own key
+/// ([`HealthKind::key`]), under this prefix; [`HealthKind::of_row`] reads both.
 pub(crate) const KEY_HEALTH: &str = "update.health";
+
+/// WHICH HALF OF UPDATING A HEALTH WARNING IS ABOUT — the warning's stable
+/// identity (design ruling 311). The latch, the heal proof and the record of the
+/// healing key on this, never on the words: the words are free to take the
+/// family grammar (`Couldn't download updates`), and a warning an older build
+/// raised under its old words still heals by the proof that answers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HealthKind {
+    /// A verified build will not start (the updater's `apply` class, its overdue
+    /// notice, the automatic lane's convergence).
+    Install,
+    /// Downloads fail or will not verify (`pipeline`, `stage`).
+    Download,
+    /// The newest release cannot be read or trusted (`manifest`, and any class
+    /// this build does not know).
+    Check,
+    /// The window's watchdog: the update check stopped answering
+    /// ([`CHECKER_STALLED_TITLE`]).
+    Stalled,
+}
+
+impl HealthKind {
+    /// The kind an updater class names (`aterm_update::HealthNotify`'s classes).
+    pub(crate) fn of_class(class: &str) -> Self {
+        match class {
+            "apply" => Self::Install,
+            "pipeline" | "stage" => Self::Download,
+            _ => Self::Check,
+        }
+    }
+
+    /// The kind of a failing title the updater sent — read back to its class by
+    /// the updater's own reader, beside the writer
+    /// (`aterm_update::health_failing_class`), which knows today's words and the
+    /// ones before them. A title it does not know is the check half, which needs
+    /// the least proof: the lane's old rule, "a check that downloads is a check
+    /// that works".
+    pub(crate) fn of_updater_title(title: &str) -> Self {
+        aterm_update::health_failing_class(title).map_or(Self::Check, Self::of_class)
+    }
+
+    /// The row's supersede key: one per kind, under [`KEY_HEALTH`].
+    pub(crate) const fn key(self) -> &'static str {
+        match self {
+            Self::Install => "update.health.install",
+            Self::Download => "update.health.download",
+            Self::Check => "update.health.check",
+            Self::Stalled => "update.health.stalled",
+        }
+    }
+
+    /// The kind a health row stands for, read from its KEY — or, for a row an
+    /// older build raised under the family key (carried across a handoff), from
+    /// the words that build wrote, which the updater's reader and
+    /// [`CHECKER_STALLED_TITLES`] still know. `None` for a row that is no
+    /// health warning.
+    pub(crate) fn of_row(msg: &Message) -> Option<Self> {
+        let key = msg.key.as_deref()?;
+        if key == KEY_HEALTH {
+            return Some(if CHECKER_STALLED_TITLES.contains(&msg.title.as_str()) {
+                Self::Stalled
+            } else {
+                Self::of_updater_title(&msg.title)
+            });
+        }
+        [Self::Install, Self::Download, Self::Check, Self::Stalled]
+            .into_iter()
+            .find(|kind| kind.key() == key)
+    }
+}
+
+/// The live health warning a test reads, whatever its kind (the first, oldest
+/// first) — the question `live_by_key(KEY_HEALTH)` asked before each kind wore
+/// its own key.
+#[cfg(test)]
+pub(crate) trait LiveHealth {
+    fn live_health(&self) -> Option<&aterm_messages::Live>;
+}
+
+#[cfg(test)]
+impl LiveHealth for aterm_messages::MessageCenter {
+    fn live_health(&self) -> Option<&aterm_messages::Live> {
+        self.live_rows()
+            .find(|l| HealthKind::of_row(&l.msg).is_some())
+    }
+}
 
 /// The glyph of the flow row while it CHECKS what arrived — `↻` is
 /// "working"; the phases that move a build in wear [`MOVING_IN`] (design
@@ -594,6 +683,10 @@ pub(crate) fn landed(
 /// update, as a FAILURE: nothing to press, and a loss is never only a log
 /// line (it was, until this row: 30293eb3a). The count rides the detail,
 /// and the sentence says what did come across and where the per-tab count is.
+///
+/// A FAILURE ONLY: the sentence's comfort — the screen and its newest lines
+/// crossed — is what a fallback keeps, and is false of a carry a successor's
+/// handoff policy withheld. [`scrollback_left_behind`] picks the row.
 pub(crate) fn scrollback_lost(lines: u64, tabs: usize) -> Message {
     row(Severity::Warn, "Couldn't carry all scrollback")
         .glyph(glyph(NEEDS_YOU))
@@ -606,8 +699,125 @@ pub(crate) fn scrollback_lost(lines: u64, tabs: usize) -> Message {
         .key(KEY_SCROLLBACK)
 }
 
+/// R39's row for `lines` of scrollback an update left behind in `tabs` tabs,
+/// `withheld` of them because the successor's signed handoff policy asked
+/// for no scrollback (`carry = "visible"` or `"repaint"`, which the outgoing
+/// build follows by carrying NONE — no lines in the screen carry, no
+/// sidecar). Said by WHY, because the words true of one cause are false of
+/// the other (round 3 of the update-robustness work, 2026-09-27): the
+/// failure row's "everything on screen and the newest lines came across" was
+/// posted for a policy's withholding too, when no newest line had crossed
+/// and, under `repaint`, no screen had either.
+///
+/// * none withheld: the failure row, [`scrollback_lost`], unchanged;
+/// * all withheld: [`scrollback_withheld`], the new version's request;
+/// * both (no producer writes that today; a successor reads what it is
+///   given): the failure's title, both counts, and a sentence that claims
+///   nothing about what crossed.
+pub(crate) fn scrollback_left_behind(lines: u64, tabs: usize, withheld: u64) -> Message {
+    if withheld == 0 {
+        return scrollback_lost(lines, tabs);
+    }
+    if withheld >= lines {
+        return scrollback_withheld(lines, tabs);
+    }
+    row(Severity::Warn, "Couldn't carry all scrollback")
+        .glyph(glyph(NEEDS_YOU))
+        .line(scrollback_lost_words(lines, tabs))
+        .line(format!(
+            "{withheld} of them because the new version asked this update to carry no scrollback"
+        ))
+        .sentence("`aterm ctl status` in a tab says history_lost= for it")
+        .hold(Hold::Default)
+        .key(KEY_SCROLLBACK)
+}
+
+/// R39 for a carry the successor's handoff policy WITHHELD: the new version
+/// asked this update to carry no scrollback, and the outgoing build did as
+/// it asked. Still a loss on glass under the same key — the lines are gone
+/// either way, and `status` counts them — but said as the request it was,
+/// never as a failure, and with no claim about the screen: under `visible`
+/// it crossed, under `repaint` it came over blank and its program redrew it
+/// (the landing record says so, [`landed`]).
+pub(crate) fn scrollback_withheld(lines: u64, tabs: usize) -> Message {
+    row(Severity::Warn, "Update left scrollback behind")
+        .glyph(glyph(NEEDS_YOU))
+        .line(scrollback_lost_words(lines, tabs))
+        .sentence(
+            "the new version asked this update to carry no scrollback; `aterm ctl status` in a \
+             tab says history_lost= for it",
+        )
+        .hold(Hold::Default)
+        .key(KEY_SCROLLBACK)
+}
+
 /// The supersede key of R39: one scrollback row per update.
 pub(crate) const KEY_SCROLLBACK: &str = "update.scrollback";
+
+/// The supersede key of the carried-Settings-draft loss row: one per update,
+/// posted ONCE, after the whole restore (`App::settle_carried_settings_drafts`)
+/// — so it never replaces an earlier leaf's row with a later one's.
+pub(crate) const KEY_SETTINGS_DRAFTS: &str = "update.settings-drafts";
+
+/// What a seamless successor shows in a pane the outgoing process handed no
+/// session for (`RestoreManifest::placed_for_handed`): an exited pane kept open
+/// under `--hold` has no process to carry, and its place in the layout is kept
+/// rather than the whole layout dropped for it. A Recovery view's reason line:
+/// under the restore leaf's 128-byte cap, and it asks nothing of the person.
+pub(crate) const PANE_NOT_CARRIED: &str =
+    "Nothing was running in this pane when aterm updated, so there was no session to carry.";
+
+/// How many lost drafts the row spells out, each on its own line. Far above
+/// what a real update loses (only a Settings row the new build no longer has
+/// loses its draft); the rest are counted.
+const SETTINGS_DRAFTS_SHOWN: usize = 16;
+
+/// An update carried unsaved Settings text across (plan P2-2) and the new
+/// build could not reopen some of it: a Settings row it no longer edits as
+/// text, a Settings tab it could not reopen, or a carry it could not read.
+/// Said as a FAILURE on glass, each lost field on its own line WITH the text
+/// the person typed, so it can be typed again — the text exists nowhere else
+/// now, and a loss is never only a log line. `unreadable` drafts had no text
+/// this build could read; they are counted.
+pub(crate) fn settings_drafts_not_reopened(
+    lost: &[crate::restore::SettingsDraftRestore],
+    unreadable: usize,
+) -> Message {
+    let count = lost.len().saturating_add(unreadable);
+    let title = if count == 1 {
+        "Couldn't reopen a Settings draft".to_string()
+    } else {
+        format!("Couldn't reopen {count} Settings drafts")
+    };
+    let mut m = row(Severity::Warn, title).glyph(glyph(NEEDS_YOU));
+    for draft in lost.iter().take(SETTINGS_DRAFTS_SHOWN) {
+        m = m.line(format!(
+            "{}: {}",
+            sanitize_for_tty(&draft.key, 64),
+            sanitize_for_tty(&draft.text, DETAIL_LINE_CAP)
+        ));
+    }
+    let unshown = lost.len().saturating_sub(SETTINGS_DRAFTS_SHOWN);
+    if unshown > 0 {
+        m = m.line(format!("and {unshown} more"));
+    }
+    match unreadable {
+        0 => {}
+        1 => m = m.line("1 draft could not be read"),
+        n => m = m.line(format!("{n} drafts could not be read")),
+    }
+    m.sentence(
+        "the update carried this unsaved text but this version could not put it back; type it \
+         again in Settings to keep it",
+    )
+    .action(Intent::OpenSettings {
+        route: crate::native_settings::SettingsRoute::Home
+            .path()
+            .to_string(),
+    })
+    .hold(Hold::Default)
+    .key(KEY_SETTINGS_DRAFTS)
+}
 
 /// "1 older line stayed behind in 1 tab" / "12345 older lines stayed behind
 /// in 3 tabs".
@@ -792,7 +1002,7 @@ pub(crate) fn needs_install(title: &str, detail: &str, severity: Severity, build
 /// design ruling 246): it changes what the person does before pressing
 /// `Install now`. A lane that TRIES AGAIN BY ITSELF asks nothing of the
 /// person — a record, never a row (the owner: "FYI/CYA messages need to go
-/// to the log"); the health lane raises `aterm can't install updates` if the
+/// to the log"); the health lane raises `Couldn't install updates` if the
 /// retries keep failing.
 pub(crate) fn needs_install_because(
     title: &str,
@@ -861,7 +1071,7 @@ pub(crate) fn failed(title: &str, detail: &str, actionable: bool) -> Message {
 
 /// R38 — THE CHECK-HEALTH WARNING. The updater's ledger says one half of the
 /// lane is PERSISTENTLY failing, and the title says which in plain words
-/// ("aterm can't install updates" / "can't download" / "can't check",
+/// ("Couldn't install updates" / "download" / "check for",
 /// `aterm_update::health_failing_title`). The excerpt is since when ("since
 /// Sep 14"); the updater's whole sentence — the count, the cause, the command
 /// — is the further detail behind `Details ›` (the backticked command
@@ -871,7 +1081,10 @@ pub(crate) fn failed(title: &str, detail: &str, actionable: bool) -> Message {
 /// standing for weeks with nothing to press is the blather the attention rule
 /// moves to the log (design ruling 59). After it folds, the record, the
 /// Settings headline and the OS banner carry it.
-pub(crate) fn health_warning(title: &str, body: &str) -> Message {
+///
+/// Keyed by its `kind` (design ruling 311), never by its words: the heal and
+/// the latch read the key ([`HealthKind::of_row`]).
+pub(crate) fn health_warning(kind: HealthKind, title: &str, body: &str) -> Message {
     let msg = row(Severity::Warn, sanitize_for_tty(title, 80));
     let msg = match health_since(body) {
         Some(since) => msg.line(format!("since {since}")),
@@ -880,7 +1093,7 @@ pub(crate) fn health_warning(title: &str, body: &str) -> Message {
     msg.sentence(body)
         .action(software_update())
         .hold(Hold::Default)
-        .key(KEY_HEALTH)
+        .key(kind.key())
 }
 
 /// The title of the warning the window's watchdog raises when the update check
@@ -894,7 +1107,15 @@ pub(crate) fn health_warning(title: &str, body: &str) -> Message {
 /// manifest failure hours later was then "already said this launch" — a log line,
 /// no row, no banner. Its own title is healed by what it is about: a completed
 /// check ([`crate::update_checker_watch`]).
-pub(crate) const CHECKER_STALLED_TITLE: &str = "aterm's update check stopped";
+///
+/// Its kind is [`HealthKind::Stalled`] (design ruling 311): the words are no
+/// identity, and they say it the way the page's other rows do.
+pub(crate) const CHECKER_STALLED_TITLE: &str = "Update check stopped";
+
+/// Every title the watchdog's warning has worn, today's first: a row an older
+/// build carried under the family key is read back to its kind by these
+/// ([`HealthKind::of_row`]).
+const CHECKER_STALLED_TITLES: [&str; 2] = [CHECKER_STALLED_TITLE, "aterm's update check stopped"];
 
 /// THE UPDATE CHECK STOPPED ANSWERING (the 2026-09-22/23 update audit, plan
 /// P2-1): the body of the warning the window's watchdog raises
@@ -1413,10 +1634,18 @@ mod tests {
             needs_install("Update installed", "x", Severity::Info, 7),
             needs_install("Couldn't install aterm v0.48.0", "x", Severity::Warn, 7),
             failed("Couldn't finish the update", "", false),
-            health_warning("aterm can't install updates", "3 checks"),
-            health_recovered("aterm can't install updates", "since Sep 14"),
+            health_warning(
+                HealthKind::Install,
+                aterm_update::health_failing_title("apply"),
+                "3 checks",
+            ),
+            health_recovered("Couldn't install updates", "since Sep 14"),
             scrollback_lost(12_345, 3),
             scrollback_lost(1, 1),
+            scrollback_withheld(12_345, 3),
+            scrollback_left_behind(12_345, 3, 10_000),
+            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 0),
+            settings_drafts_not_reopened(&[], 2),
             dev_build(&dev_behind()).expect("a record"),
             dev_build_writes(ALL_WRITES),
         ];
@@ -1625,9 +1854,12 @@ mod tests {
                 crate::App::UNSAVED_NATIVE_WORK_BLOCKS_APPLY,
                 true,
             ),
-            health_recovered("aterm can't install updates", "since Sep 14"),
+            health_recovered("Couldn't install updates", "since Sep 14"),
             staged("0.91.0", 7, None),
             scrollback_lost(12_345, 3),
+            scrollback_withheld(12_345, 3),
+            scrollback_left_behind(12_345, 3, 10_000),
+            settings_drafts_not_reopened(&[draft("font_family", "Menlo")], 1),
         ];
         for lag in every_dev_standing() {
             all.extend(dev_build(&lag));
@@ -1642,6 +1874,7 @@ mod tests {
         }
         for class in ["apply", "pipeline", "stage", "manifest"] {
             all.push(health_warning(
+                HealthKind::of_class(class),
                 aterm_update::health_failing_title(class),
                 "3 failed checks in a row since 2026-09-14T22:04:36Z: x.",
             ));
@@ -1926,6 +2159,115 @@ mod tests {
         assert_eq!(
             scrollback_lost(1, 1).detail[0],
             "1 older line stayed behind in 1 tab"
+        );
+    }
+
+    /// R39 SAYS WHY (round 3, 2026-09-27). A carry the successor's handoff
+    /// policy withheld is the new version's request, with no claim that the
+    /// screen or its newest lines crossed — under that policy no newest line
+    /// did, and under `repaint` no screen did. A failure keeps the failure's
+    /// row word for word; a mix of the two claims nothing about what crossed.
+    /// Every one is a loss on glass under the one key, with the same count.
+    #[test]
+    fn the_scrollback_row_says_a_withheld_carry_as_the_policys_request() {
+        let text = |m: &Message| format!("{} | {}", m.title, m.detail.join(" | "));
+        let comfort = "the newest lines came across";
+        let asked = "the new version asked this update to carry no scrollback";
+
+        let failed = scrollback_left_behind(12_345, 3, 0);
+        assert_eq!(failed, scrollback_lost(12_345, 3), "a failure is unchanged");
+        assert!(text(&failed).contains(comfort), "{}", text(&failed));
+        assert!(!text(&failed).contains(asked), "{}", text(&failed));
+
+        let withheld = scrollback_left_behind(12_345, 3, 12_345);
+        assert_eq!(withheld, scrollback_withheld(12_345, 3));
+        assert_eq!(withheld.title, "Update left scrollback behind");
+        assert_eq!(
+            withheld.detail[0],
+            "12345 older lines stayed behind in 3 tabs"
+        );
+        assert!(text(&withheld).contains(asked), "{}", text(&withheld));
+        assert!(
+            !text(&withheld).contains("came across") && !text(&withheld).contains("on screen"),
+            "no claim about what crossed: {}",
+            text(&withheld)
+        );
+
+        let mixed = scrollback_left_behind(12_345, 3, 10_000);
+        assert_eq!(mixed.title, "Couldn't carry all scrollback");
+        assert_eq!(mixed.detail[0], "12345 older lines stayed behind in 3 tabs");
+        assert!(
+            mixed.detail[1].starts_with("10000 of them because the new version asked"),
+            "{:?}",
+            mixed.detail
+        );
+        assert!(!text(&mixed).contains("came across"), "{}", text(&mixed));
+
+        for m in [&failed, &withheld, &mixed] {
+            assert_eq!(m.severity, Severity::Warn, "{}", m.title);
+            assert_eq!(m.hold, Hold::Default, "a loss is on glass: {}", m.title);
+            assert_eq!(m.key.as_deref(), Some(KEY_SCROLLBACK), "{}", m.title);
+            assert!(text(m).contains("history_lost="), "{}", text(m));
+        }
+    }
+
+    fn draft(key: &str, text: &str) -> crate::restore::SettingsDraftRestore {
+        crate::restore::SettingsDraftRestore {
+            key: key.to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    /// A carried Settings draft the new build could not reopen is a failure
+    /// ON GLASS naming each field WITH the text the person typed — the text
+    /// exists nowhere else now — and counts the ones it could not read; it
+    /// opens Settings, and never asks for a restart.
+    #[test]
+    fn a_settings_draft_the_update_could_not_reopen_is_said_with_its_text() {
+        let m = settings_drafts_not_reopened(&[draft("font_family", "Menlo Nerd")], 0);
+        assert_eq!(m.title, "Couldn't reopen a Settings draft");
+        assert_eq!(m.severity, Severity::Warn);
+        assert_eq!(
+            m.hold,
+            Hold::Default,
+            "a loss is on glass, not only on record"
+        );
+        assert_eq!(m.key.as_deref(), Some(KEY_SETTINGS_DRAFTS));
+        assert_eq!(m.detail[0], "font_family: Menlo Nerd");
+        assert!(
+            m.actions.iter().any(|intent| matches!(
+                intent,
+                Intent::OpenSettings { route }
+                    if route == crate::native_settings::SettingsRoute::Home.path()
+            )),
+            "{:?}",
+            m.actions
+        );
+        let words = m.detail.join(" ").to_lowercase();
+        assert!(
+            !words.contains("restart") && !words.contains("relaunch"),
+            "{words}"
+        );
+
+        let unread = settings_drafts_not_reopened(&[draft("a", "1")], 2);
+        assert_eq!(unread.title, "Couldn't reopen 3 Settings drafts");
+        assert!(
+            unread
+                .detail
+                .iter()
+                .any(|line| line == "2 drafts could not be read"),
+            "{:?}",
+            unread.detail
+        );
+        let many = (0..20)
+            .map(|index| draft(&format!("k{index}"), "v"))
+            .collect::<Vec<_>>();
+        let capped = settings_drafts_not_reopened(&many, 0);
+        assert_eq!(capped.title, "Couldn't reopen 20 Settings drafts");
+        assert!(
+            capped.detail.iter().any(|line| line == "and 4 more"),
+            "{:?}",
+            capped.detail
         );
     }
 
@@ -2242,8 +2584,12 @@ mod tests {
         let body = "20 failed checks in a row since 2026-09-14T22:04:36Z: release manifests \
                     exist but cannot be downloaded. Run `aterm ctl update status` for details.";
         for class in ["apply", "pipeline", "stage", "manifest"] {
-            let m = health_warning(aterm_update::health_failing_title(class), body);
-            assert!(m.title.starts_with("aterm can't "), "{}", m.title);
+            let m = health_warning(
+                HealthKind::of_class(class),
+                aterm_update::health_failing_title(class),
+                body,
+            );
+            assert!(m.title.starts_with("Couldn't "), "{}", m.title);
             assert_eq!(m.detail[0], "since Sep 14", "{class}");
             assert!(
                 m.detail[1..]
@@ -2254,11 +2600,16 @@ mod tests {
             );
             assert_eq!(m.hold, Hold::Default);
             assert_eq!(m.severity, Severity::Warn);
-            assert_eq!(m.key.as_deref(), Some(KEY_HEALTH));
+            assert_eq!(m.key.as_deref(), Some(HealthKind::of_class(class).key()));
+            assert_eq!(HealthKind::of_row(&m), Some(HealthKind::of_class(class)));
             assert_eq!(m.actions, vec![software_update()]);
             assert!(!m.detail.join(" ").contains("click"));
         }
-        let undated = health_warning("aterm can't check for updates", "no date here");
+        let undated = health_warning(
+            HealthKind::Check,
+            aterm_update::health_failing_title("manifest"),
+            "no date here",
+        );
         assert_eq!(undated.detail, vec!["no date here"]);
         assert_eq!(
             health_notification_body(body),
@@ -2268,11 +2619,11 @@ mod tests {
             health_notification_body("no date"),
             "Details are in Settings \u{25b8} Software Update."
         );
-        let healed = health_recovered("aterm can't install updates", "since Sep 14");
+        let healed = health_recovered("Couldn't install updates", "since Sep 14");
         assert_eq!(healed.title, "aterm updates work again");
         assert_eq!(
             healed.detail,
-            vec!["after \"aterm can't install updates\", since Sep 14"]
+            vec!["after \"Couldn't install updates\", since Sep 14"]
         );
         assert_eq!(healed.hold, Hold::LogOnly);
     }
@@ -2443,7 +2794,7 @@ mod tests {
             download_postponed("busy"),
             switch_started(Some("9.9.9"), "9.9.8"),
             switch_started(None, "9.9.8"),
-            health_recovered("aterm can't install updates", "since Sep 14"),
+            health_recovered("Couldn't install updates", "since Sep 14"),
         ]
         .into_iter()
         .chain([true, false].into_iter().flat_map(|routine| {

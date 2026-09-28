@@ -293,7 +293,7 @@ fn malformed_containment_mode_fails_closed_not_open() {
             "a refused Containment exits 1; stderr={stderr:?}"
         );
         assert!(
-            stderr.contains("no OS sandbox on this platform"),
+            stderr.contains("aterm sandboxes a shell only on macOS"),
             "the refusal names the platform gap; stderr={stderr:?}"
         );
     }

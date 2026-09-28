@@ -569,8 +569,25 @@ struct HandoffCommitFacts {
 /// safe: the child inherits the live shells (cwd/title matter only to a cold
 /// respawn), and the digest the child re-proves is taken over the PENDING
 /// layout captured at attempt start, never over this re-capture.
+///
+/// A SETTINGS LEAF'S CARRIED DRAFTS ARE NOT NORMALIZED, and must not be (plan
+/// P2-2). Both captures are `App::capture_handoff_layout`, which puts each
+/// Settings view's unsaved field drafts on its leaf; the successor reopens the
+/// view holding the PENDING layout's drafts. A key typed into a Settings field
+/// while the successor booted therefore makes the two captures differ, and the
+/// Commit is refused as activity: the outgoing process keeps the newer text
+/// and the next attempt carries it. Normalizing them away would commit a
+/// successor holding the older draft.
 #[cfg(unix)]
-fn commit_layout_topology(
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativeUpdateSettingsDraftCarry",
+        action = "Commit",
+        project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+    )
+)]
+pub(crate) fn commit_layout_topology(
     layout: &crate::restore::RestoreManifest,
 ) -> crate::restore::RestoreManifest {
     fn strip_pane(node: &mut crate::restore::PaneLayout) {
@@ -5001,7 +5018,27 @@ impl App {
             foreground_jobs,
             unknown_foregrounds,
         };
-        match crate::native_update_admission::classify(facts) {
+        let decision = crate::native_update_admission::classify(facts);
+        // WHAT THE TOKEN SAYS RIDES MUST BE CARRIED BY THE LANE THAT RUNS. The
+        // preflight let unsaved editor drafts, Settings drafts and failed
+        // checkpoints ride because a successor reopens them from the handed-over
+        // layout; the lane is only decided here. A cold exec hands no layout
+        // over, and an OLDER successor ignores the layout field that carries
+        // Settings drafts — so either refuses them, in the preflight's
+        // person-facing shapes, and the row says what to do (plan P2-2).
+        if let crate::native_update_admission::AdmissionDecision::Apply(lane) = decision
+            && let Some(refusal) = lane_carry_refusal(
+                &safety_token,
+                lane,
+                build,
+                apply_attempt
+                    .as_ref()
+                    .map_or(build, |attempt| attempt.target_build()),
+            )
+        {
+            return Err(crate::UpdateHandoffStartError::refused(refusal));
+        }
+        match decision {
             crate::native_update_admission::AdmissionDecision::Block(reason) => {
                 // A Block is a REFUSAL TO ATTEMPT, never a failed attempt — see
                 // [`crate::UpdateHandoffStartError::Refused`]. Minting it as
@@ -5009,19 +5046,6 @@ impl App {
                 // unavailable here" as a hard apply failure (the field's
                 // failing_applies=23) and erased the standing explanation.
                 return Err(update_admission_refusal(reason, facts, handoff_unavailable));
-            }
-            crate::native_update_admission::AdmissionDecision::Apply(
-                crate::native_update_admission::ApplyLane::Cold,
-            ) if safety_token.carried_drafts() > 0 => {
-                // A CARRIED DRAFT RIDES THE SEAMLESS LANE ONLY. Its successor
-                // reopens every document tab from the handed-over layout and
-                // replays the draft; a cold exec hands no layout over, so the
-                // tab would close with the draft left in its journal until the
-                // file is next opened. Refused — the preflight's person-facing
-                // shape, so the row says what to do.
-                return Err(crate::UpdateHandoffStartError::refused(
-                    cold_lane_carried_drafts_refusal(safety_token.carried_drafts()),
-                ));
             }
             crate::native_update_admission::AdmissionDecision::Apply(
                 crate::native_update_admission::ApplyLane::Cold,
@@ -5603,7 +5627,7 @@ impl App {
         // mutex once readers park, and if it did, the loop above has already
         // aborted the attempt cleanly ("a terminal engine was busy during handoff
         // capture") instead of producing a degraded layout here.
-        let layout = self.capture_restore_manifest();
+        let layout = self.capture_handoff_layout();
 
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
@@ -5746,9 +5770,13 @@ impl App {
     /// never offered a moment to pause in"), every fifteen minutes, forever;
     /// the fork lane deferred on it every 500 ms, recording nothing. The update
     /// could not land while one exited pane was open. There is no live process
-    /// behind that pane to keep, so nothing is handed for it: the successor
-    /// rebuilds its layout leaf the way a relaunch does (a fresh shell in the
-    /// pane's last directory), and every live session goes across exactly.
+    /// behind that pane to keep, so nothing is handed for it, and every live
+    /// session goes across exactly. The layout still names the pane (the
+    /// capture stamps every terminal view), and the successor keeps its place
+    /// as a placeholder saying nothing was running there
+    /// (`RestoreManifest::placed_for_handed`) — it used to drop the WHOLE
+    /// layout for that one extra id, and the unsaved Settings drafts that ride
+    /// only in it (round three of the 2026-09 update robustness work).
     ///
     /// Read ONCE per decision and passed down, so the gate, the capture, the
     /// descriptors and the manifest all describe the same set; the Commit
@@ -5987,17 +6015,24 @@ impl App {
 
     /// Say what the history carry's imports left behind, once they settle:
     /// when this update left ANY line of any tab's history behind (the
-    /// outgoing side's fallbacks and the sidecars that failed here), one row
-    /// on the band says how many, in how many tabs. The per-tab counts are
-    /// already on the registry (`handoff_history::record_reports`).
+    /// outgoing side's fallbacks, what a successor's handoff policy withheld,
+    /// and the sidecars that failed here), one row on the band says how many,
+    /// in how many tabs — and whether it was the policy's choice or a
+    /// failure, because the words true of one are false of the other. The
+    /// per-tab counts are already on the registry
+    /// (`handoff_history::record_reports`).
     #[cfg(unix)]
     pub(crate) fn settle_handoff_history(
         &mut self,
         reports: &[crate::handoff_history::ImportReport],
     ) {
-        let (lines, tabs) = crate::handoff_history::loss_summary(reports);
-        if lines > 0 {
-            self.post_message(crate::update_words::scrollback_lost(lines, tabs));
+        let loss = crate::handoff_history::loss_summary(reports);
+        if loss.lines > 0 {
+            self.post_message(crate::update_words::scrollback_left_behind(
+                loss.lines,
+                loss.tabs,
+                loss.withheld,
+            ));
             self.sync_messages();
         }
     }
@@ -7216,7 +7251,7 @@ impl App {
         let manifest = stamp_fg_holders(manifest, &fg_holders);
         // POST-PARK, AND DELIBERATELY SO — see the fork lane for why a pre-park
         // layout capture revoked healthy attempts.
-        let layout = self.capture_restore_manifest();
+        let layout = self.capture_handoff_layout();
         let Some(layout_digest) = crate::seamless::layout_digest(&layout) else {
             self.rollback_overlap(None, &live);
             // Deterministic: the same layout refuses on every rung.
@@ -7492,7 +7527,7 @@ impl App {
         // line: it is the only place a window drag or a contended session lock
         // becomes visible in the field, and the whole point of this change is
         // that neither may ever again be REPORTED as a topology change.
-        let live_layout = self.capture_restore_manifest();
+        let live_layout = self.capture_handoff_layout();
         let exact_layout =
             commit_layout_topology(&live_layout) == commit_layout_topology(&pending_layout);
         if exact_layout && live_layout != pending_layout {
@@ -8359,6 +8394,76 @@ pub(crate) fn cold_lane_carried_drafts_refusal(carried: usize) -> String {
     )
 }
 
+/// What `lane` cannot carry of what the preflight's `token` let ride, as the
+/// refusal the update row reads (the preflight's person-facing shapes), or
+/// `None` when the lane carries all of it (plan P2-2).
+///
+/// * THE COLD LANE reopens nothing: it execs the new build over a desk with no
+///   terminal session and no layout is handed over. Every carried editor
+///   draft, Settings draft and failed checkpoint is refused — exactly the hold
+///   the preflight itself placed before any of them rode.
+/// * THE SEAMLESS LANE carries all of it to a successor at least this build.
+///   An OLDER successor (a rollback hop, `target_build < running_build`)
+///   parses the handoff layout but ignores the field that carries Settings
+///   drafts — its layout struct denies no unknown field — so it would reopen
+///   the view without them: refused. Editor drafts ride the draft journal,
+///   not this field, so this gate leaves them as gap #32 left them. A hop to
+///   an older build that does read the field is refused too: the build number
+///   is all this process knows about its successor, and the refusal costs
+///   only a wait.
+#[cfg(unix)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativeUpdateSettingsDraftCarry",
+        action = "ColdExec",
+        project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+    )
+)]
+#[cfg_attr(
+    test,
+    aterm_spec::refines(
+        machine = "NativeUpdateSettingsDraftCarry",
+        action = "ParkOlder",
+        project = "aterm_gui::settings_draft_carry_conformance::Rig::project"
+    )
+)]
+pub(crate) fn lane_carry_refusal(
+    token: &crate::app_native::NativeUpdateSafetyToken,
+    lane: crate::native_update_admission::ApplyLane,
+    running_build: u64,
+    target_build: u64,
+) -> Option<String> {
+    use crate::native_update_admission::ApplyLane;
+    match lane {
+        ApplyLane::Cold if token.carried_drafts() > 0 => {
+            Some(cold_lane_carried_drafts_refusal(token.carried_drafts()))
+        }
+        ApplyLane::Cold if token.carried_settings_drafts() > 0 => Some(format!(
+            "{} {} unsaved Settings draft(s) an update cannot carry: no terminal session is \
+             open to carry Settings across, so replacing the app now would close it",
+            crate::app_native::SETTINGS_DRAFTS_BLOCK,
+            token.carried_settings_drafts()
+        )),
+        ApplyLane::Cold if token.failed_checkpoints() > 0 => Some(format!(
+            "{} {} document checkpoint(s) previously failed",
+            crate::app_native::FAILED_CHECKPOINTS_BLOCK,
+            token.failed_checkpoints()
+        )),
+        ApplyLane::Seamless
+            if token.carried_settings_drafts() > 0 && target_build < running_build =>
+        {
+            Some(format!(
+                "{} {} unsaved Settings draft(s) an update cannot carry: the build it installs \
+                 is older than this one and would reopen Settings without them",
+                crate::app_native::SETTINGS_DRAFTS_BLOCK,
+                token.carried_settings_drafts()
+            ))
+        }
+        ApplyLane::Cold | ApplyLane::Seamless => None,
+    }
+}
+
 /// The session registry's projection narrowed to the sessions this attempt
 /// hands over — the ones in `live` ([`App::handoff_live_sessions`]).
 ///
@@ -9027,7 +9132,7 @@ impl App {
         // The foreground holders ride the manifest records, whatever rung, as
         // both lanes stamp them.
         let manifest = stamp_fg_holders(manifest, &fg_holders);
-        let layout = self.capture_restore_manifest();
+        let layout = self.capture_handoff_layout();
         let layout_digest = crate::seamless::layout_digest(&layout);
         // The fork lane's plan, by the fork lane's own call: exported by the
         // caller, as the lane's worker exports it once the capture is done.
@@ -11968,6 +12073,10 @@ mod dry_run_capture_tests {
                     Some(Fallback::Withheld),
                     "{at}: said as the policy's"
                 );
+                assert!(
+                    record.history_withheld,
+                    "{at}: and the record tells the successor so"
+                );
             } else {
                 assert!(
                     record.history.is_some(),
@@ -11977,6 +12086,7 @@ mod dry_run_capture_tests {
                     record.history_dropped, 0,
                     "{at}: and nothing is left behind"
                 );
+                assert!(!record.history_withheld, "{at}: nor withheld");
             }
 
             drop(capture);

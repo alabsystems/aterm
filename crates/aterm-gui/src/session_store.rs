@@ -216,6 +216,19 @@ pub(crate) struct SessionRecord {
     /// successor names on the band for this update. `0` is not written.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub history_dropped: u64,
+    /// WHY `history_dropped` stayed behind, when it was CHOSEN (additive,
+    /// absent ⇒ `false`; 2026-09-27): the successor's signed handoff policy
+    /// carries no scrollback (`carry = "visible"` or `"repaint"`), so the
+    /// outgoing process carried none — no lines in the screen carry, no
+    /// sidecar — at the new build's request, rather than failing to carry
+    /// them (`handoff_history::Fallback::Withheld`). Only the producer knows
+    /// which it was, so it says so here: without the fact the successor's
+    /// row read the policy's withholding as a failure and added that "the
+    /// newest lines came across", when under such a policy none did (and
+    /// under `repaint` no screen did either). `false` is not written, so an
+    /// older reader sees the wire it always saw; in neither proof digest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub history_withheld: bool,
     /// The session's RUNNING count of history lines its handoffs could not
     /// carry, this one's `history_dropped` included (additive, absent ⇒ 0;
     /// 2026-09-26) — what `status` says as `history_lost=`. Per record, like
@@ -707,6 +720,7 @@ impl SessionHandoff {
                         // this handoff's own drop to the running count below.
                         history: None,
                         history_dropped: 0,
+                        history_withheld: false,
                         history_lost: store.history_lost(h.local_id),
                     }
                 })

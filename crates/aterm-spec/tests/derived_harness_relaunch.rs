@@ -76,6 +76,34 @@ fn a_person_wins_and_no_exit_is_dropped_silently() {
     let mut q = buggy.init_state();
     assert!(buggy.fire("Limited", &mut q));
     assert!(!buggy.check_invariant("NeverSilent", &q));
+
+    // The harness's OWN restart ended the agent (S0 of the in-flight review,
+    // 2026-09-27): due whoever is at the tab, and never left — no person
+    // coming back, no limit and no "end of the launch" takes it off. It
+    // lands, is tried again, or is said.
+    let mut own = model.init_state();
+    assert!(model.fire("Restarted", &mut own));
+    assert_eq!(
+        (own["pending"], own["asked"], own["restarted"]),
+        (1, 0, 1),
+        "{own:?}"
+    );
+    for off in ["PersonReturns", "Limited", "Ended"] {
+        assert!(!model.action_enabled(off, &own), "{off} at {own:?}");
+    }
+    let mut said = own.clone();
+    assert!(model.fire("Miss", &mut said) && model.fire("Cannot", &mut said));
+    assert_eq!((said["pending"], said["badged"]), (0, 1), "{said:?}");
+    assert!(model.fire("Land", &mut own));
+    assert_eq!((own["running"], own["restarted"]), (1, 0), "{own:?}");
+    // The host of c4e24cd3e: a person's keystroke or a hold read before the
+    // restart's record left it to them, and a restart its back-off let
+    // expire fell through to the graceful exit its own SIGTERM made.
+    for off in ["PersonReturns", "Ended"] {
+        let mut b = buggy.init_state();
+        assert!(buggy.fire("Restarted", &mut b) && buggy.fire(off, &mut b));
+        assert!(!buggy.check_invariant("RestartCarried", &b), "{off}: {b:?}");
+    }
 }
 
 /// D2 of the 2026-09-26 live test: whether an exit left Claude Code's own

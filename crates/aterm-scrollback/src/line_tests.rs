@@ -1529,3 +1529,300 @@ fn clearing_hyperlinks_drops_the_links_and_keeps_everything_else() {
     never_linked.clear_hyperlinks();
     assert_eq!(never_linked.serialize(), before);
 }
+
+/// The per-line caps the update's history import decodes a `cols`-wide
+/// sidecar frame under (`line_caps` in aterm-gui's `handoff_history`): cells,
+/// content bytes, and the record cap `16 KiB + cols * 512`.
+fn handoff_caps(cols: usize) -> (usize, usize, usize) {
+    (cols, cols * 256, 16 * 1024 + cols * 512)
+}
+
+fn strict_block(data: &[u8], lines: usize, cols: usize) -> Option<Vec<Line>> {
+    let (cells, content, record) = handoff_caps(cols);
+    crate::line::line_codec_block::deserialize_lines_strict(data, lines, cells, content, record)
+}
+
+fn stripping_block(data: &[u8], lines: usize, cols: usize) -> Option<(Vec<Line>, Vec<usize>)> {
+    let (cells, content, record) = handoff_caps(cols);
+    crate::line::line_codec_block::deserialize_lines_strict_dropping_over_cap_links(
+        data, lines, cells, content, record,
+    )
+}
+
+/// `links` one-cell OSC 8 links (`L`, then a space) whose URLs are `url_len`
+/// bytes, styled red, wrapped, with an underline colour — what a row of
+/// long links looks like in a history, and everything a strip must keep.
+fn link_dense_row(links: usize, url_len: usize) -> Line {
+    let red = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
+    let text = "L ".repeat(links);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for _ in text.chars() {
+        rle.push(red);
+    }
+    let spans = (0..links)
+        .map(|link| {
+            let mut url = format!("https://example.test/{link}/");
+            url.push_str(&"u".repeat(url_len.saturating_sub(url.len())));
+            let col = u16::try_from(link * 2).expect("a column");
+            HyperlinkSpan::with_id(col, col + 1, Arc::from(url.as_str()), Some(Arc::from("i")))
+        })
+        .collect();
+    let mut line = Line::with_hyperlinks(&text, rle, spans);
+    line.set_wrapped(true);
+    let width = u16::try_from(text.len()).expect("a width");
+    line.set_underline_colors(vec![UnderlineColorSpan::new(0, width, 0x01_10_20_30)]);
+    line
+}
+
+/// A line of `chars` characters, each styled unlike its neighbour: one attrs
+/// run per character, so its record is over the handoff's record cap at a
+/// narrow width with no link at all.
+fn attr_heavy_row(chars: usize) -> Line {
+    let a = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
+    let b = CellAttrs::new(0x01_00FF00, DEFAULT_BG, 0);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for i in 0..chars {
+        rle.push(if i % 2 == 0 { a } else { b });
+    }
+    Line::with_attrs(&"a".repeat(chars), rle)
+}
+
+#[test]
+fn the_link_ceiling_is_the_record_cap_plus_one_maximal_link_per_column() {
+    let (_, _, cap80) = handoff_caps(80);
+    assert_eq!(cap80, 57_344);
+    assert_eq!(
+        crate::line::line_codec_block::max_linked_record_bytes(cap80, 80),
+        734_144,
+        "80 columns: the cap plus 80 spans of 12 + 8192 + 256 bytes"
+    );
+    let (_, _, cap4096) = handoff_caps(4096);
+    assert_eq!(
+        crate::line::line_codec_block::max_linked_record_bytes(cap4096, 4096),
+        36_765_696,
+        "the widest grid"
+    );
+}
+
+/// Law L3's half of the contract: on every block the strict decoder admits,
+/// the stripping decoder returns the very same lines and strips none.
+#[test]
+fn the_stripping_decoder_reads_whatever_the_strict_one_admits_unchanged() {
+    let mut short_link = link_dense_row(3, 40);
+    short_link.set_wrapped(false);
+    let block = serialize_lines(&[
+        Line::from("plain"),
+        styled_row("styled"),
+        short_link,
+        link_dense_row(1, 8192),
+    ]);
+    let strict = strict_block(&block, 4, 80).expect("PRECONDITION: strict admits the block");
+    let (lines, stripped) = stripping_block(&block, 4, 80).expect("admitted");
+    assert!(stripped.is_empty(), "nothing is stripped: {stripped:?}");
+    assert_eq!(serialize_lines(&lines), serialize_lines(&strict));
+    assert_eq!(
+        serialize_lines(&lines),
+        block,
+        "and it is the block, byte for byte"
+    );
+}
+
+/// THE DEFECT'S SHAPE (2026-09-28): one row of twelve 8 KiB links is a
+/// ~96 KiB record against the 56 KiB cap of an 80-column frame. The strict
+/// decoder refuses the whole block for it (the NEGATIVE CONTROL); the
+/// stripping decoder keeps that line with only its links dropped, and every
+/// other line exactly.
+#[test]
+fn a_link_dense_line_over_the_cap_keeps_its_text_and_loses_only_its_links() {
+    let mut before = link_dense_row(2, 64);
+    before.set_wrapped(false);
+    let dense = link_dense_row(12, 8192);
+    let after = Line::from("after");
+    let block = serialize_lines(&[before.clone(), dense.clone(), after.clone()]);
+    let (_, _, cap) = handoff_caps(80);
+    assert!(
+        dense.serialize().len() > cap,
+        "PRECONDITION: the dense row's record ({} bytes) is over the {cap}-byte cap",
+        dense.serialize().len()
+    );
+    assert!(
+        strict_block(&block, 3, 80).is_none(),
+        "NEGATIVE CONTROL: the strict decoder refuses the whole block"
+    );
+
+    let (lines, stripped) = stripping_block(&block, 3, 80).expect("the block is kept");
+    assert_eq!(stripped, vec![1], "exactly the dense line lost its links");
+    assert_eq!(lines.len(), 3);
+    assert_eq!(
+        lines[0].serialize(),
+        before.serialize(),
+        "the line before, exactly"
+    );
+    assert!(lines[0].has_hyperlinks(), "its links are kept");
+    assert_eq!(
+        lines[2].serialize(),
+        after.serialize(),
+        "the line after, exactly"
+    );
+    let mut expected = dense;
+    expected.clear_hyperlinks();
+    assert!(!lines[1].has_hyperlinks());
+    assert_eq!(
+        lines[1].as_str(),
+        Some("L ".repeat(12).as_str()),
+        "the text"
+    );
+    assert!(lines[1].is_wrapped(), "the wrap flag");
+    assert_eq!(lines[1].get_underline_color(3), Some(0x01_10_20_30));
+    assert_eq!(
+        lines[1].serialize(),
+        expected.serialize(),
+        "text, attrs, flags and underline colours are exact"
+    );
+}
+
+/// Everything else the strict decoder refuses is still refused: the relaxation
+/// is for a record over the cap BECAUSE OF ITS LINKS, within the ceiling.
+#[test]
+fn the_stripping_decoder_refuses_every_record_its_links_do_not_explain() {
+    let cols = 8;
+    let (_, _, cap) = handoff_caps(cols);
+    let ceiling = crate::line::line_codec_block::max_linked_record_bytes(cap, cols);
+    let refused = |what: &str, lines: &[Line]| {
+        let block = serialize_lines(lines);
+        assert!(
+            strict_block(&block, lines.len(), cols).is_none(),
+            "{what}: strict refuses"
+        );
+        assert!(
+            stripping_block(&block, lines.len(), cols).is_none(),
+            "{what}: still refused"
+        );
+    };
+
+    // Over the cap with no link at all: 2048 characters (the content cap at
+    // 8 columns), one attrs run each.
+    let heavy = attr_heavy_row(2048);
+    assert!(heavy.serialize().len() > cap && heavy.serialize().len() <= ceiling);
+    refused("over the cap without a link", &[Line::from("x"), heavy]);
+
+    // Over the cap even with its links dropped.
+    let red = CellAttrs::new(0x01_FF0000, DEFAULT_BG, 0);
+    let mut rle: Rle<CellAttrs> = Rle::new();
+    for i in 0..2048 {
+        rle.push(if i % 2 == 0 {
+            red
+        } else {
+            CellAttrs::default()
+        });
+    }
+    let linked_heavy = Line::with_hyperlinks(
+        &"a".repeat(2048),
+        rle,
+        vec![HyperlinkSpan::new(0, 1, Arc::from("https://a.test"))],
+    );
+    refused("over the cap without its links too", &[linked_heavy]);
+
+    // Past the hard ceiling: eleven 8 KiB links in eight columns is more than
+    // one maximal link per column, which no ingested row can hold.
+    let past = {
+        let mut line = link_dense_row(11, 8192);
+        line.set_underline_colors(Vec::new());
+        let spans: Vec<HyperlinkSpan> = line
+            .hyperlinks()
+            .expect("links")
+            .iter()
+            .map(|span| HyperlinkSpan::new(0, 1, Arc::clone(&span.url)))
+            .collect();
+        Line::with_hyperlinks("L", Rle::new(), spans)
+    };
+    assert!(
+        past.serialize().len() > ceiling,
+        "PRECONDITION: past the ceiling"
+    );
+    refused("a record past the hard ceiling", &[past]);
+    // …while eight of them, one per column, are within it and kept.
+    let within = {
+        let spans: Vec<HyperlinkSpan> = (0..8u16)
+            .map(|col| HyperlinkSpan::new(col, col + 1, Arc::from("u".repeat(8192).as_str())))
+            .collect();
+        Line::with_hyperlinks("LLLLLLLL", Rle::new(), spans)
+    };
+    let block = serialize_lines(std::slice::from_ref(&within));
+    assert!(within.serialize().len() > cap && within.serialize().len() <= ceiling);
+    let (lines, stripped) = stripping_block(&block, 1, cols).expect("within the ceiling");
+    assert_eq!((lines[0].as_str(), stripped), (Some("LLLLLLLL"), vec![0]));
+
+    // Over the content cap, links or not.
+    let mut long = link_dense_row(3, 8192);
+    long.set_underline_colors(Vec::new());
+    let text = "a".repeat(3000);
+    let long = Line::with_hyperlinks(&text, Rle::new(), long.hyperlinks().unwrap().to_vec());
+    refused("content over the content cap", &[long]);
+
+    // Over the cap because of bytes the DECODE drops, not its links: at 80
+    // columns, one short link and 8,000 underline-colour spans (~64 KB against
+    // the 56 KiB cap). `Line::deserialize` keeps only the first
+    // `MAX_UNDERLINE_SPANS` of them, so the decoded line without its link fits
+    // the cap — a rule judged on the decoded line alone would admit ~30 KB of
+    // bytes no link explains. The record is not what the serializer writes
+    // for the line it decodes to, and it is refused like the same record with
+    // no link.
+    let smuggler = |linked: bool| {
+        let spans = if linked {
+            vec![HyperlinkSpan::new(0, 1, Arc::from("https://a.test"))]
+        } else {
+            Vec::new()
+        };
+        let mut line = Line::with_hyperlinks("L", Rle::new(), spans);
+        line.set_underline_colors(vec![UnderlineColorSpan::new(0, 1, 0x01_10_20_30); 8000]);
+        line
+    };
+    let (_, _, cap80) = handoff_caps(80);
+    let linked = smuggler(true);
+    let record = linked.serialize();
+    assert!(
+        record.len() > cap80
+            && record.len() <= crate::line::line_codec_block::max_linked_record_bytes(cap80, 80),
+        "PRECONDITION: over the cap, within the ceiling ({} bytes)",
+        record.len()
+    );
+    let mut decoded = Line::deserialize(&record).expect("PRECONDITION: it decodes");
+    assert_eq!(
+        decoded.underline_colors().map(<[UnderlineColorSpan]>::len),
+        Some(crate::line::line_codec::MAX_UNDERLINE_SPANS),
+        "PRECONDITION: the decode truncates the underline spans"
+    );
+    decoded.clear_hyperlinks();
+    assert!(
+        decoded.serialize().len() <= cap80,
+        "PRECONDITION: judged on the decoded line, dropping the link would fit the cap"
+    );
+    for (what, line) in [
+        ("underline spans the decode drops, with a link", linked),
+        ("the same record with no link", smuggler(false)),
+    ] {
+        let block = serialize_lines(&[Line::from("x"), line]);
+        assert!(
+            strict_block(&block, 2, 80).is_none(),
+            "{what}: strict refuses"
+        );
+        assert!(
+            stripping_block(&block, 2, 80).is_none(),
+            "{what}: still refused"
+        );
+    }
+
+    // A link-dense block with a byte after its last record, or one record
+    // short of its count.
+    let block = serialize_lines(&[Line::from("x"), link_dense_row(12, 8192)]);
+    let mut trailing = block.clone();
+    trailing.push(0);
+    assert!(
+        stripping_block(&trailing, 2, 80).is_none(),
+        "a trailing byte"
+    );
+    let mut short = block;
+    short[..4].copy_from_slice(&3u32.to_le_bytes());
+    assert!(stripping_block(&short, 3, 80).is_none(), "a missing record");
+}

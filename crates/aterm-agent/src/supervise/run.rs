@@ -388,10 +388,13 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// ([`aterm_phase::ScreenReader::background_wait`]) — the break stood
     /// [`BACKGROUND_SETTLE`], with no wall, no limit episode, no stall and no
     /// act of the loop's own in flight. Offered only while the host
-    /// [`Self::wants`] a point. The host may take ONE kind of step here: the
-    /// live upgrade's NOTICE, which interrupts the agent's orchestration and
-    /// ends nothing. That is the first notice, or a re-ask once
-    /// `upgrade::REASK_S` has passed with the work still running. The upgrade
+    /// [`Self::wants`] a point. The host may take ONE kind of step here: a
+    /// line of the live upgrade's that ends nothing — its NOTICE, which
+    /// interrupts the agent's orchestration (the first notice, or a re-ask
+    /// once `upgrade::REASK_S` has passed with the work still running), or
+    /// the RELEASE LINE a give-up, a void or a stop owes until its round's
+    /// rest ends (2026-09-27: a break that never ends is the only point such
+    /// a session has). The upgrade
     /// may also give up asking. The host says what it took (`Some`, journaled
     /// `HOST seq=<n> background <word>`: a turn it typed, awaited as
     /// [`HostStep::typed`] says), or nothing (the default). Anything that

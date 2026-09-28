@@ -133,10 +133,10 @@ fn published_in(
 /// Off Unix there is no `ps` to read; the census says so rather than guessing.
 ///
 /// # Errors
-/// Always: the census is not measured on this platform.
+/// Always: the census reads `ps`, so it runs on macOS and Linux only.
 #[cfg(not(unix))]
 pub fn window_census() -> Result<Census, String> {
-    Err("not measured on this platform".to_string())
+    Err("macOS and Linux only".to_string())
 }
 
 /// The census over an explicit process table, the caller's own pid (whose row

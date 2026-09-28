@@ -182,6 +182,7 @@ impl Cadence {
 
     /// The current base interval — the cross-process checker gate sizes its
     /// freshness window from it (see the check loop in `lib.rs`).
+    #[cfg(target_os = "macos")]
     pub(crate) fn base(&self) -> Duration {
         self.base
     }
@@ -363,6 +364,7 @@ fn jitter(d: Duration, entropy: u8) -> Duration {
 /// One random byte from the audited entropy surface, or a fixed midpoint if it is
 /// unavailable. A missing byte must degrade to "no jitter", never to a panic or a
 /// hand-rolled `/dev/urandom` read. Shared with the skip timer's scatter.
+#[cfg(target_os = "macos")]
 pub(crate) fn entropy_byte() -> u8 {
     let mut b = [128u8; 1];
     let _ = aterm_uds::rand::fill(&mut b);
@@ -418,6 +420,7 @@ pub(crate) fn sleep_watching_for_wake(total: Duration) -> Waited {
 }
 
 /// Wait one cadence interval, jittered, watching for a wake.
+#[cfg(target_os = "macos")]
 pub(crate) fn wait(cadence: &Cadence) -> (Duration, Waited) {
     wait_with(cadence, entropy_byte(), sleep_watching_for_wake)
 }

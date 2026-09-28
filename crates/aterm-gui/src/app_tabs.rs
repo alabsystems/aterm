@@ -478,6 +478,12 @@ impl App {
             self.retire_title_summary(session);
             self.retire_session_status(session);
             self.retire_presence(session);
+            // The owner's upgrade view hands over only LIVE tabs' rows, and
+            // the host looks again only when a supervised tab or a step moves
+            // it: a closed tab's row (a holder the host does not supervise)
+            // stood until the next timed look, and its record kept offering
+            // words for a session that was gone (ruling 315, day eight E3).
+            crate::harness_host::look_at_upgrades_soon();
             // These caches can carry authored descriptions, generated activity,
             // cwd/title text, and debounce deadlines. The final view is the
             // lifecycle boundary: erase them immediately instead of waiting for
@@ -672,7 +678,7 @@ impl App {
         self.closed_recovery.views.push(record, now_ms);
     }
 
-    fn live_view_presentation(
+    pub(crate) fn live_view_presentation(
         &self,
         view: crate::tab_model::ViewId,
     ) -> Option<crate::tab_model::TabPresentation> {

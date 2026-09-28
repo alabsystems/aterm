@@ -1846,6 +1846,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         });
         let mut service = NativeUpdaterService::new(10, "1.0.10", true);
         let CheckStart::Start(ticket) = service.request_check() else {

@@ -249,9 +249,18 @@ pub(crate) struct StructuralLatchFacts {
     /// The latch's ONE re-sample is still owed, due or not: the convergence
     /// notice is promising it ("it tries again by itself in 24 h").
     pub(crate) resample_owed: bool,
-    /// A verified download strictly newer than the latched build that has not
-    /// yet had an attempt, if one is on disk.
+    /// A verified download strictly newer than the latched ACTIVATION that has
+    /// not yet been offered the install path, if one is on disk. The host
+    /// fills it only for a latch on the installed activation: on the download
+    /// side a newer download is imported as the stage and arms by itself.
     pub(crate) unspent_newer_download: Option<u64>,
+    /// A verified download strictly newer than the latched activation is on
+    /// disk, but a retire for it was REFUSED and its retry deadline has not
+    /// passed (round three review): not offered now, and still outranking the
+    /// day's re-sample — the latched build is not launched while a newer one is
+    /// on its way. The host fills it for the activation only, like
+    /// [`Self::unspent_newer_download`].
+    pub(crate) newer_download_waiting: bool,
     /// Whether one more launch of the latched build keeps its boot trial under
     /// the revert threshold: `Some(false)` when that launch would be the one
     /// `check_boot_health` reverts on, `None` when the sentinel's count has not
@@ -259,52 +268,65 @@ pub(crate) struct StructuralLatchFacts {
     pub(crate) trial_room: Option<bool>,
 }
 
-/// The answer [`structural_latch`] gives. `resample` and `newer` name what
-/// earned the attempt; ONE attempt answers both, and either verdict spends
-/// whatever earned it, so a day and a newer release arriving together cost one
-/// park, not two.
+/// The answer [`structural_latch`] gives.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StructuralLatchDecision {
     /// Nothing new: the latch stands as it is.
     Hold,
-    /// Release the latch for ONE automatic attempt.
-    Release { resample: bool, newer: Option<u64> },
-    /// The attempt is earned, but it would be the launch the boot trial
-    /// reverts on: the latch stays, loses its deadline, and the host SAYS so.
-    /// The hold spends the re-sample too, due or not — every launch left is
-    /// the reverting one, so a later look could only say the same again. Also
-    /// the answer with nothing earned (`resample: false, newer: None`) when the
-    /// first count that shows no room finds the re-sample still owed: the
-    /// promise is withdrawn then, not a day later.
-    HoldForTrial { resample: bool, newer: Option<u64> },
-    /// The attempt is earned and the trial has not been measured: decide again
+    /// Release the latch for ONE automatic attempt at the latched build: its
+    /// one re-sample came due and the boot trial has room for the launch.
+    Release,
+    /// The re-sample is due but would be the launch the boot trial reverts on,
+    /// or it is still PROMISED on a trial measured with no room: the latch
+    /// stays, loses its deadline, and the host SAYS so. Every launch left is
+    /// the reverting one, so a later look could only say the same again.
+    HoldForTrial,
+    /// The re-sample is due and the trial has not been measured: decide again
     /// at the next observation, spending nothing.
     Unmeasured,
+    /// A verified download strictly newer than the latched activation is on
+    /// disk: RETIRE the activation from the install path so the newer build
+    /// applies over the running one (`aterm_update::supersede_installed_
+    /// activation`, then the ordinary staged lane). Whatever the trial's room:
+    /// it launches nothing, so it spends no launch of the latched build — and
+    /// it takes precedence over a due re-sample of it, which would launch the
+    /// older build while a newer one waits.
+    Supersede { newer: u64 },
 }
 
-/// THE STRUCTURAL LATCH'S WAY OUT (gap 14, 2026-09-26).
+/// THE STRUCTURAL LATCH'S WAY OUT (gap 14, 2026-09-26; round three of the 2026-09
+/// update robustness work).
 ///
 /// A structural convergence used to be `retry_at: None`, and on the installed
 /// ACTIVATION — where every launched-lane failure lands — nothing automatic
-/// ever moved it: the activation outranks every newer download while the
-/// bundle is newer than this process, so every later release waited for a
-/// person. Two events now earn the latch one more automatic attempt: its one
-/// re-sample coming due a day after convergence, and a verified download
-/// strictly newer than the latched build arriving (the activation's successor
-/// applies that newer stage on its own terms, so this attempt is the one lane
-/// that can carry it here). A day is long enough that the machine, the page
-/// cache and whatever else the proof ran into have all moved; one is all a
-/// verdict confirmed twice is worth.
+/// ever moved it. Two events now move it:
 ///
-/// Never at the boot trial's expense: a structural `ChildDied` keeps its
-/// counted launch, so after two of them the next launch of the build is the
-/// one the sentinel reverts on. An automatic attempt must not be what spends
-/// it — that is the promise `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS <
-/// MAX_BOOT_ATTEMPTS` makes — so an earned attempt the trial cannot afford is
-/// held, and said. Nor is a retry PROMISED past the trial (gap 14 review,
-/// 2026-09-26): convergence promises the day's re-sample before any count has
-/// been read, so the first look whose count rules it out withdraws it and says
-/// so, instead of the notice promising it for a day.
+/// * a verified download strictly newer than the latched activation SUPERSEDES
+///   it. Gap 14 answered a newer release with one more attempt at the latched
+///   build, "whose successor applies the newer stage" — but that successor is
+///   the handoff's authorized target and refuses to boot-apply past itself
+///   (`aterm_update::apply_staged_if_ready`), so the attempt only ever re-ran
+///   the handoff that had already failed twice, walked the older build's boot
+///   trial one launch closer to its revert, and — once the trial had no room —
+///   held the newer release forever. The newer build is now the candidate
+///   itself: the running build takes the install path back and the ordinary
+///   staged lane applies the newer one over it, with a trial of its own;
+/// * the latch's ONE re-sample coming due a day after convergence earns one
+///   more automatic attempt at the latched build — never at the boot trial's
+///   expense: a structural `ChildDied` keeps its counted launch, so after two
+///   of them the next launch is the one the sentinel reverts on. An automatic
+///   attempt must not be what spends it — that is the promise
+///   `STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS < MAX_BOOT_ATTEMPTS` makes — so a
+///   re-sample the trial cannot afford is held, and said; nor is it PROMISED
+///   past the first count that rules it out (gap 14 review, 2026-09-26).
+///
+/// A retire the disk or the moment REFUSED gives its release back, to be
+/// offered again at a retry deadline (round three review); while it waits the
+/// release still outranks the day, and a promise the trial cannot afford is
+/// withdrawn all the same.
+///
+/// With neither, the latch stands: the convergence notice has said so, and the
+/// Version menu's apply is the press that moves it.
 #[cfg_attr(
     test,
     aterm_spec::refines(
@@ -345,26 +367,43 @@ pub(crate) enum StructuralLatchDecision {
         reason = "The checker staging a verified newer download on disk; the host reads it into `unspent_newer_download`."
     )
 )]
+#[cfg_attr(
+    test,
+    aterm_spec::spec_unmodeled(
+        machine = "NativeUpdateStructuralLatch",
+        action = "RetryDue",
+        reason = "The monotonic clock passing a refused retire's retry deadline (`AutoApplyStructuralVerdict::newer_retry`); the host reads it into `unspent_newer_download` / `newer_download_waiting`."
+    )
+)]
 #[must_use]
 pub(crate) fn structural_latch(facts: StructuralLatchFacts) -> StructuralLatchDecision {
-    let resample = facts.resample_due;
-    let newer = facts.unspent_newer_download;
-    if !resample && newer.is_none() {
+    if let Some(newer) = facts.unspent_newer_download {
+        return StructuralLatchDecision::Supersede { newer };
+    }
+    if facts.newer_download_waiting {
+        // A newer build is on its way: the day's re-sample of the older one
+        // waits behind it, whatever the trial — but a re-sample promised on a
+        // trial measured with no room is withdrawn now, as it would be with
+        // nothing newer on disk.
+        return if facts.resample_owed && facts.trial_room == Some(false) {
+            StructuralLatchDecision::HoldForTrial
+        } else {
+            StructuralLatchDecision::Hold
+        };
+    }
+    if !facts.resample_due {
         // Nothing earned — but a re-sample still promised on a trial measured
         // with no room is a promise nothing will keep.
         return if facts.resample_owed && facts.trial_room == Some(false) {
-            StructuralLatchDecision::HoldForTrial {
-                resample: false,
-                newer: None,
-            }
+            StructuralLatchDecision::HoldForTrial
         } else {
             StructuralLatchDecision::Hold
         };
     }
     match facts.trial_room {
         None => StructuralLatchDecision::Unmeasured,
-        Some(false) => StructuralLatchDecision::HoldForTrial { resample, newer },
-        Some(true) => StructuralLatchDecision::Release { resample, newer },
+        Some(false) => StructuralLatchDecision::HoldForTrial,
+        Some(true) => StructuralLatchDecision::Release,
     }
 }
 

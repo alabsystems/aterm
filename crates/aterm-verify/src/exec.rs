@@ -822,8 +822,7 @@ fn over_ceiling(
              \x20 child: {argv}\n\
              {note}\
              {kill}\
-             \x20 This stage decided NOTHING: a child that never exits is a FAIL, never a pass \
-             and never a skip.\n\
+             \x20 Never a pass and never a skip: the child never exited.\n\
              \x20 Raise the ceiling with --stage-timeout <seconds>, or remove it with \
              --stage-timeout off.\n\
              \x20 The kill reached the child's whole process group (a targo's trustc \
@@ -2030,7 +2029,7 @@ mod tests {
             .expect("the ceiling diagnostic");
         let named = out.find("still running when killed").expect("the name");
         let nothing = out
-            .find("This stage decided NOTHING")
+            .find("Never a pass and never a skip")
             .expect("the verdict sentence");
         assert!(
             alive < verdict && verdict < named && named < nothing,
@@ -2076,7 +2075,7 @@ mod tests {
         assert!(!out.contains("test binary:"), "{out}");
         // The `child:` line is followed directly by the verdict sentence.
         assert!(
-            out.contains("exec sleep 600\n  This stage decided NOTHING"),
+            out.contains("exec sleep 600\n  Never a pass and never a skip"),
             "{out}"
         );
         std::fs::remove_dir_all(&tmp).ok();

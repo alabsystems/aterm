@@ -1208,10 +1208,13 @@ fn b6_a_poll_that_gave_up_is_not_mains_flake() {
             "ats: control socket never started listening",
             "        headless smoke child log (last 80 lines):\n          aterm: starting\n",
         ),
-        ("smoke: aterm-ctl cursor -> <no reply>", ""),
-        ("gui smoke [cursor]: the window never presented", ""),
         (
-            "gui smoke: frontmost window never produced an initial present [no metrics reply]",
+            "smoke: metrics carry no wake_heals after the typing burst -> <no reply>",
+            "",
+        ),
+        (
+            "gui smoke [effects=off]: the frontmost window never produced an initial present \
+             [<no reply>]",
             "",
         ),
     ] {
@@ -1224,7 +1227,7 @@ fn b6_a_poll_that_gave_up_is_not_mains_flake() {
         );
     }
     // The control: a reply that says what went wrong, on a row after which
-    // the smoke goes on (the cursor row: `Report::fail_and_continue`), is
+    // the smoke goes on (its last check: `Report::fail_and_continue`), is
     // main's.
     let went_on = |label: &str| {
         let mut r = Report::new("headless control-socket smoke");
@@ -1232,12 +1235,16 @@ fn b6_a_poll_that_gave_up_is_not_mains_flake() {
         r
     };
     inherits(&judge_branch(
-        &went_on("smoke: aterm-ctl cursor -> ERR no session named main"),
-        &went_on("smoke: aterm-ctl cursor -> ERR no session named main"),
+        &went_on(
+            "smoke: 2 lost output wake(s) healed during a plain typing burst -> OK wake_heals=2",
+        ),
+        &went_on(
+            "smoke: 2 lost output wake(s) healed during a plain typing burst -> OK wake_heals=2",
+        ),
     ));
     // …and the same reply on a row that ENDED the smoke hid every check
     // behind it (2026-09-27, fourth review): never main's.
-    let ended = "smoke: perf_reduced engaged during a light typing burst -> OK perf_reduced=1";
+    let ended = "gui smoke [effects=off]: metrics reset -> ERR no session named main";
     let v = judge_branch(&row(ended, ""), &row(ended, ""));
     blocks(&v);
     assert!(

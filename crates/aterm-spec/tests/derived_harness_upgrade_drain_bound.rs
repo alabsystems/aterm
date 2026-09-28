@@ -93,6 +93,54 @@ fn the_drain_never_ends_the_agent_on_an_answer_a_person_held_past_its_bound() {
     );
     assert!(model.fire("ReAsk", &mut at_break));
 
+    // CLAUDE'S OWN STATUS LAGS AN IDLE SCREEN (the review of 2026-09-27):
+    // `busy` or `shell` over a screen read idle, nothing under the agent the
+    // kernel can see. Work in the agent's own process may still run, and the
+    // status is the one word that says so: the agent is never ended on it.
+    // Its READY is asked again past the bound, then given up on — never
+    // waited on in silence. Once Claude writes `idle`, the restart goes.
+    let mut lag = model.init_state();
+    assert!(model.fire("StatusLags", &mut lag));
+    assert!(
+        !model.action_enabled("Terminate", &lag),
+        "never on a status that is not idle"
+    );
+    let mut idles = lag.clone();
+    assert!(model.fire("StatusIdle", &mut idles));
+    assert!(model.fire("Terminate", &mut idles));
+    assert!(model.check_invariant("NeverEndsRunningWork", &idles));
+    assert!(model.fire("Wait", &mut lag));
+    assert!(model.fire("Wait", &mut lag));
+    for step in ["Wait", "Void", "Terminate", "GiveUp"] {
+        assert!(!model.action_enabled(step, &lag), "{step} at the bound");
+    }
+    assert!(model.fire("ReAsk", &mut lag));
+    assert!(model.fire("Answers", &mut lag));
+    assert!(model.fire("Wait", &mut lag));
+    assert!(model.fire("Wait", &mut lag));
+    assert!(model.fire("GiveUp", &mut lag));
+    for invariant in ["NoSilentWait", "NeverEndsRunningWork"] {
+        assert!(model.check_invariant(invariant, &lag), "{invariant}");
+    }
+    // The defect the review found: the restart took the lagging status for
+    // idle (`LagEnds`), and ended the agent over whatever ran in it.
+    let lag_ends = interp::with_consts(&model, &[("LagEnds", 1)]);
+    let mut cut = lag_ends.init_state();
+    assert!(lag_ends.fire("StatusLags", &mut cut));
+    assert!(lag_ends.fire("Terminate", &mut cut));
+    assert!(!lag_ends.check_invariant("NeverEndsRunningWork", &cut));
+    // The tempting wrong fix (`LagHolds`): the restart kept to Claude's
+    // `idle`, and the READY behind the lag waited on for good, in silence.
+    let lag_holds = interp::with_consts(&model, &[("LagHolds", 1)]);
+    let mut silent = lag_holds.init_state();
+    assert!(lag_holds.fire("StatusLags", &mut silent));
+    assert!(!lag_holds.action_enabled("Terminate", &silent));
+    for _ in 0..3 {
+        assert!(lag_holds.fire("Wait", &mut silent));
+    }
+    assert!(!lag_holds.action_enabled("ReAsk", &silent));
+    assert!(!lag_holds.check_invariant("NoSilentWait", &silent));
+
     let buggy = interp::with_buggy(&model, 1);
     let mut stale = buggy.init_state();
     assert!(buggy.fire("PersonHolds", &mut stale));

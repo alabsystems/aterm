@@ -1432,6 +1432,7 @@ mod recovery_tests {
                         animation_phase_ms: 0,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 13.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
@@ -1815,6 +1816,12 @@ pub(crate) enum AppEvent {
         operation: OperationId,
         outcome: RecoveryOutcome,
     },
+    /// A seamless update's successor reopened this Settings view from the
+    /// handoff layout, and these are the unsaved field drafts its predecessor
+    /// carried ([`crate::restore::NativeLeafRestore::settings_drafts`]). The
+    /// view takes each one its build still edits as a draft — unsaved, exactly
+    /// as the person left it. Only the restore sends it.
+    SettingsDraftsCarried(Vec<crate::restore::SettingsDraftRestore>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1903,7 +1910,20 @@ pub(crate) enum CloseScope {
     Tab,
     Window,
     AppQuit,
+    /// The process is replaced by an update whose successor reopens NOTHING of
+    /// this view: a cold exec, the Windows replace, a headless successor. View
+    /// state that is not durable dies with it, so an app holds it here exactly
+    /// as it holds a window close.
     Relaunch,
+    /// The process is replaced by an update whose successor reopens this view
+    /// from the handed-over layout WITH its unsaved view state
+    /// (`App::capture_handoff_layout` carries a Settings view's field drafts,
+    /// and the draft journal an editor's). An app whose unsaved state that
+    /// layout carries may answer Ready here and nowhere else; the host asks
+    /// with this scope only when its successor restores native tabs, and
+    /// counts what rides so the lanes that cannot carry it refuse
+    /// (`App::native_update_close_preflight`).
+    CarriedRelaunch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2254,10 +2274,13 @@ pub(crate) struct ViewCx<'a> {
     /// currently highlighted candidate mode against these exact inputs, so
     /// preview paint and scheduling agree before the candidate is committed.
     pub(crate) motion: ViewMotionCx,
-    /// The terminal renderer's actually-applied font size for this host. This
+    /// The terminal renderer's actually-applied font size in physical pixels. This
     /// keeps an unset/automatic Settings preview honest across scale factors,
     /// environment overrides, live zoom, and future mobile hosts.
     pub(crate) terminal_font_px: f32,
+    /// Device pixels per logical native pixel; previews convert their selected
+    /// physical size before native paint applies this scale.
+    pub(crate) terminal_scale: f32,
     /// The renderer's actually-applied terminal palette. Settings may layer an
     /// uncommitted built-in theme or color draft over this value without
     /// recoloring its own chrome or consulting platform APIs.
@@ -7150,6 +7173,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 0,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -7219,6 +7243,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7304,6 +7329,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7443,6 +7469,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -7494,6 +7521,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -7647,6 +7675,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
@@ -7695,6 +7724,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7728,6 +7758,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7778,6 +7809,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7837,6 +7869,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7864,6 +7897,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: None,
@@ -7926,6 +7960,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
@@ -8119,6 +8154,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
@@ -8179,6 +8215,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
@@ -8271,6 +8308,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8347,6 +8385,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8412,6 +8451,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8577,6 +8617,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8612,6 +8653,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
@@ -8684,6 +8726,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8748,6 +8791,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: Some(&snapshot),
@@ -8803,6 +8847,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8889,6 +8934,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8918,6 +8964,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -8968,6 +9015,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -9010,6 +9058,7 @@ mod markdown_reader_tests {
                     animation_phase_ms: 720,
                     motion: ViewMotionCx::default(),
                     terminal_font_px: 12.0,
+                    terminal_scale: 1.0,
                     terminal_theme: aterm_render::Theme::default(),
                     semantic_font: None,
                     document: Some(&snapshot),
@@ -9063,6 +9112,7 @@ mod markdown_reader_tests {
                             animation_phase_ms: 720,
                             motion: ViewMotionCx::default(),
                             terminal_font_px: 12.0,
+                            terminal_scale: 1.0,
                             terminal_theme: aterm_render::Theme::default(),
                             semantic_font: None,
                             document: Some(&snapshot),
@@ -9128,6 +9178,7 @@ mod markdown_reader_tests {
                             animation_phase_ms: 720,
                             motion: ViewMotionCx::default(),
                             terminal_font_px: 12.0,
+                            terminal_scale: 1.0,
                             terminal_theme: aterm_render::Theme::default(),
                             semantic_font: None,
                             document: Some(&snapshot),
@@ -9207,6 +9258,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,
@@ -9251,6 +9303,7 @@ mod markdown_reader_tests {
                         animation_phase_ms: 720,
                         motion: ViewMotionCx::default(),
                         terminal_font_px: 12.0,
+                        terminal_scale: 1.0,
                         terminal_theme: aterm_render::Theme::default(),
                         semantic_font: None,
                         document: None,

@@ -162,14 +162,17 @@ impl Scope {
         match self {
             Self::Workspace => None,
             Self::Crate(c) => Some(format!(
-                "scoped to -p {c}: the rest of the workspace was not built or tested"
+                "scoped to -p {c}: the per-crate test, doctest and lint stages covered no other \
+                 crate"
             )),
             Self::Changed(c) if c.crates.is_empty() => Some(format!(
-                "change-scoped against {} and NO workspace crate changed: nothing was built or tested",
+                "change-scoped against {} and NO workspace crate changed: the per-crate test, \
+                 doctest and lint stages were skipped",
                 c.base
             )),
             Self::Changed(c) => Some(format!(
-                "change-scoped against {} to {} crate(s) ({}): every other workspace crate was not built or tested",
+                "change-scoped against {} to {} crate(s) ({}): the per-crate test, doctest and \
+                 lint stages covered no other crate",
                 c.base,
                 c.crates.len(),
                 c.crates.join(" ")
@@ -310,18 +313,19 @@ mod tests {
         assert_eq!(
             changed(&["aterm-grid", "aterm-gui"]).narrowing().unwrap(),
             "change-scoped against main to 2 crate(s) (aterm-grid aterm-gui): \
-             every other workspace crate was not built or tested"
+             the per-crate test, doctest and lint stages covered no other crate"
         );
         assert_eq!(
             Scope::changed("origin/main", vec![], true)
                 .narrowing()
                 .unwrap(),
             "change-scoped against origin/main and NO workspace crate changed: \
-             nothing was built or tested"
+             the per-crate test, doctest and lint stages were skipped"
         );
         assert_eq!(
             Scope::crate_only("aterm-grid").narrowing().unwrap(),
-            "scoped to -p aterm-grid: the rest of the workspace was not built or tested"
+            "scoped to -p aterm-grid: the per-crate test, doctest and lint stages covered no \
+             other crate"
         );
     }
 

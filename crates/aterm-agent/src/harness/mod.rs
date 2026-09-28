@@ -85,15 +85,20 @@
 //! STATUS (docs/README.md honesty ratchet): unit-tested; THIRTEEN bounded
 //! machines carry a derived model in `aterm-spec` with a Tier-1 bind to the
 //! real code — `harness_capture_worker_lifecycle_model` ([`align`]'s runner,
-//! in its tests), `harness_upgrade_notice_owner_model` ([`upgrade_drive`]'s
-//! tests), `harness_upgrade_drain_bound_model` ([`upgrade::next_step`], in
-//! [`upgrade`]'s tests), `harness_upgrade_never_strands_model` (no notice into
-//! a session at its usage limit, a late READY honoured, every agent asked
-//! restarted or released — a release dropped only once the agent took up
-//! direction given after its last READY, never a restart over direction given
-//! after it, and no stopped round a permanent wait — each re-armed once it
-//! has rested `upgrade::RETRY_S`; one stated exception, an agent no job of a job-control shell,
-//! refused and owed no line: [`upgrade_drive`]'s tests, over the real reducer,
+//! in its tests), `harness_upgrade_notice_owner_model` (a READY acted on only
+//! from the process and tab its notice reached, and a notice whose process is
+//! gone reopened for the live holder in a new round: [`upgrade_drive`]'s
+//! tests), `harness_upgrade_drain_bound_model` (never an end on running work
+//! or on a status of Claude's own that only lags its idle screen, never a
+//! silent wait: [`upgrade::next_step`], in [`upgrade`]'s tests),
+//! `harness_upgrade_never_strands_model` (no notice into a session at its
+//! usage limit, a late READY honoured, every agent asked restarted or
+//! released, at a break of its own work that never ends too — a release
+//! dropped only once the agent took up direction given after its last READY,
+//! never a restart over direction given after it, and no stopped round a
+//! permanent wait — each re-armed once it has rested `upgrade::RETRY_S`; one
+//! stated exception, an agent no job of a job-control shell, refused and owed
+//! no line: [`upgrade_drive`]'s tests, over the real reducer,
 //! gates, record transitions, READY, direction and release rules and the
 //! window's reading of each step's word), `harness_worker_lifecycle_model` and
 //! `harness_relaunch_on_exit_model` ([`relaunch`]'s and the window host's

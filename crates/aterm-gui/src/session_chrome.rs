@@ -8,7 +8,7 @@
 //! Stage 1 ([`crate::session_timeline`]) gave every session a user identity
 //! (`meta set title|description|icon|role|attention`) and a bounded lifecycle timeline. This
 //! module turns those — plus the generated live activity, the engine's cwd, and
-//! the registry's lifecycle state — into TWO renderings of the SAME facts:
+//! the registry's lifecycle state — into TWO renderings of the same identity facts:
 //!
 //! * [`compose_tooltip`] — the multi-line text applied to a macOS strip
 //!   [`crate::toolbar`] `TabView` via `setToolTip:` (and carried on
@@ -36,9 +36,9 @@ use aterm_session::SessionId;
 
 use crate::menu::MenuAction;
 
-/// How many timeline events the tooltip / menu shows — the "recent" TAIL,
-/// newest-first. Small on purpose: hover chrome is a glance, not a log (the
-/// `timeline` verb serves the full ring).
+/// How many timeline events the context menu shows (the tooltip shows none) —
+/// the "recent" TAIL, newest-first. Small on purpose: the `timeline` verb
+/// serves the full ring.
 pub(crate) const TIMELINE_TAIL: usize = 5;
 
 /// Display cap for authored description and generated activity prose (GRAPHEME

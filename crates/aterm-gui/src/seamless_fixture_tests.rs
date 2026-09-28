@@ -16,13 +16,21 @@
 //! and this guard asserts, for every release and every desk, that the current
 //! consumer adopts EVERY session exactly (no repaint, no lost control carry, the
 //! layout placed) and commits to the SAME digests the parent recorded, so the
-//! older parent's adoption proof matches.
+//! older parent's adoption proof matches — and, for a release that carries
+//! history (v0.94.0 on), that it takes every `.hist` sidecar before its proof
+//! and, after Commit, imports every line of it back in front of the history
+//! the checkpoint restored. Adoption alone could not see a broken import: the
+//! handoff completes, and the tab just comes back with a screen and a half of
+//! its history.
 //!
 //! A red here is never fixed by regenerating a fixture: the bytes are what that
 //! release's producer sends, forever. It is fixed by making the consumer admit
 //! them again (law L3: consumer changes only ever become more lenient).
 
-use std::sync::PoisonError;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use aterm_core::scrollback::Line;
+use aterm_core::terminal::Terminal;
 
 use super::tests::{ENV_LOCK, RestoreVar, child_proof_from, pipe_pair};
 use super::*;
@@ -48,6 +56,13 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.92.0", "incident-55x149"),
     ("v0.92.0", "shell-integration"),
     ("v0.92.0", "twelve-panes"),
+    ("v0.93.0", "claude-code-1049"),
+    ("v0.93.0", "history"),
+    ("v0.93.0", "history-carry"),
+    ("v0.93.0", "incident-55x149"),
+    ("v0.93.0", "shell-integration"),
+    ("v0.93.0", "stalled-sequence"),
+    ("v0.93.0", "twelve-panes"),
     ("v0.94.0", "claude-code-1049"),
     ("v0.94.0", "history"),
     ("v0.94.0", "history-carry"),
@@ -61,6 +76,15 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.95.0", "incident-55x149"),
     ("v0.95.0", "shell-integration"),
     ("v0.95.0", "twelve-panes"),
+    ("v0.97.0", "claude-code-1049"),
+    ("v0.97.0", "colour-and-shell"),
+    ("v0.97.0", "history"),
+    ("v0.97.0", "history-carry"),
+    ("v0.97.0", "incident-55x149"),
+    ("v0.97.0", "link-dense"),
+    ("v0.97.0", "shell-integration"),
+    ("v0.97.0", "stalled-sequence"),
+    ("v0.97.0", "twelve-panes"),
 ];
 
 /// What one desk's producer committed to (`parent.toml`, written beside the
@@ -104,6 +128,21 @@ struct SessionExpectation {
     require_shell_integration_nonce: Option<bool>,
     #[serde(default)]
     shell_integration_nonce: Option<String>,
+    /// The HISTORY CARRY the producer named, recorded from v0.94.0 on (the
+    /// first release that carries it): how many lines of the history older
+    /// than the checkpoint's the session's `.s<id>.hist` sidecar carries (`0`
+    /// when it names none), and the session's running count of lines earlier
+    /// handoffs could not carry. Absent from older releases' `parent.toml`:
+    /// their producers name no sidecar and carry no count, so the guard asks
+    /// for none — nothing taken, nothing imported, nothing counted.
+    #[serde(default)]
+    history_take: Option<u64>,
+    #[serde(default)]
+    history_lost: Option<u64>,
+    /// The foreground holder the park stamped on the record (v0.94.0 on; `0`
+    /// for none), which seeds the adopted session's reader.
+    #[serde(default)]
+    fg_holder: Option<i32>,
 }
 
 /// One desk directory, read.
@@ -122,6 +161,23 @@ impl Desk {
     fn read(&self, file: &str) -> Vec<u8> {
         std::fs::read(self.path.join(file))
             .unwrap_or_else(|error| panic!("{}: {file}: {error}", self.label()))
+    }
+
+    /// What the parent recorded for session `local_id`.
+    fn expected(&self, local_id: u64) -> &SessionExpectation {
+        self.parent
+            .session
+            .iter()
+            .find(|session| session.local_id == local_id)
+            .unwrap_or_else(|| panic!("{}: parent.toml has session {local_id}", self.label()))
+    }
+
+    /// The name of session `local_id`'s history sidecar beside the manifest.
+    fn hist_name(&self, local_id: u64) -> String {
+        format!(
+            "{}.s{local_id}.hist",
+            self.parent.manifest.trim_end_matches(".toml")
+        )
     }
 }
 
@@ -229,6 +285,132 @@ fn assert_fixture_is_self_consistent(desk: &Desk) {
         Some(unhex::<32>(&label, &desk.parent.layout_digest)),
         "{label}: the recorded layout digest is the digest of these bytes"
     );
+    // THE HISTORY CARRY the parent named (v0.94.0 on): each record's stamp,
+    // `"<len> <sha256hex> <take>"`, names the depth `parent.toml` recorded,
+    // and the sidecar beside it is exactly the bytes it stamps — so what the
+    // guard later imports is what the parent sent. A release before the carry
+    // stamps no record and ships no sidecar. Parsed here by hand, not by the
+    // consumer's `parse_stamp`: this function involves no consumer.
+    for rec in &manifest.sessions {
+        let expected = desk.expected(rec.local_id);
+        let name = desk.hist_name(rec.local_id);
+        let take = expected.history_take.unwrap_or(0);
+        match rec.history.as_deref() {
+            Some(stamp) => {
+                let fields = stamp.split(' ').collect::<Vec<_>>();
+                let [len, sha, stamped_take] = fields.as_slice() else {
+                    panic!("{label}: session {}'s stamp {stamp:?}", rec.local_id);
+                };
+                assert_eq!(
+                    stamped_take.parse::<u64>().ok(),
+                    Some(take).filter(|take| *take > 0),
+                    "{label}: session {}'s stamp names the depth parent.toml recorded",
+                    rec.local_id
+                );
+                let bytes = desk.read(&name);
+                assert_eq!(
+                    len.parse::<usize>().ok(),
+                    Some(bytes.len()),
+                    "{label}: session {}'s sidecar is the stamped length",
+                    rec.local_id
+                );
+                assert_eq!(
+                    unhex::<32>(&label, sha),
+                    aterm_digest::Sha256::digest(&bytes),
+                    "{label}: session {}'s sidecar is the stamped bytes",
+                    rec.local_id
+                );
+                assert!(
+                    desk.parent.files.contains(&name),
+                    "{label}: {name} is staged with the desk"
+                );
+            }
+            None => {
+                assert_eq!(
+                    take, 0,
+                    "{label}: session {} names no sidecar",
+                    rec.local_id
+                );
+                assert!(
+                    !desk.parent.files.contains(&name),
+                    "{label}: no sidecar {name} without a stamp"
+                );
+            }
+        }
+        assert_eq!(
+            rec.history_lost,
+            expected.history_lost.unwrap_or(0),
+            "{label}: session {}'s running loss is the recorded one",
+            rec.local_id
+        );
+    }
+}
+
+/// The first `take` lines of a history sidecar, read straight off the bytes
+/// the parent wrote. The format is v0.94.0's (`ATHIST1`): an eight-byte
+/// magic, the width the lines are wrapped at (`u16`, little endian), two zero
+/// bytes, then frames of a `u32` little-endian length and a line-codec block.
+/// It is decoded HERE, by the line codec alone, and not by the consumer's
+/// reader: the import is what this guard checks, so it must not be what says
+/// what the parent sent.
+fn sidecar_history(label: &str, bytes: &[u8], take: u64) -> Vec<Line> {
+    let (head, mut frames) = bytes.split_at_checked(12).expect("a sidecar header");
+    assert_eq!(
+        &head[..8],
+        b"ATHIST1\n",
+        "{label}: a v0.94.0 history sidecar"
+    );
+    assert_eq!(&head[10..], [0, 0], "{label}: the reserved header bytes");
+    let mut lines = Vec::new();
+    while let Some((size, rest)) = frames.split_first_chunk::<4>() {
+        let (frame, rest) = rest
+            .split_at_checked(u32::from_le_bytes(*size) as usize)
+            .expect("a whole frame");
+        lines.extend(aterm_core::scrollback::deserialize_lines(frame));
+        frames = rest;
+    }
+    assert!(frames.is_empty(), "{label}: nothing after the last frame");
+    let take = usize::try_from(take).expect("take");
+    assert!(
+        lines.len() >= take,
+        "{label}: the sidecar holds the {take} line(s) it stamps"
+    );
+    lines.truncate(take);
+    lines
+}
+
+/// Every line of `terminal`'s history-holding grid (the saved primary under
+/// an alternate screen), oldest first.
+fn history_lines(label: &str, terminal: &Terminal) -> Vec<Line> {
+    let grid = terminal.main_grid();
+    (0..grid.scrollback_lines())
+        .map(|i| {
+            grid.get_history_line(i)
+                .unwrap_or_else(|| panic!("{label}: history line {i} reads back"))
+                .into_owned()
+        })
+        .collect()
+}
+
+/// `got` is `want`, line for line: first as text (so a failure reads as the
+/// lines that differ), then as each line's own line-codec encoding — every
+/// cell's style, link and width — so an import that keeps the words and
+/// drops the colours fails too.
+fn assert_same_lines(label: &str, got: &[Line], want: &[Line], what: &str) {
+    let text = |lines: &[Line]| {
+        lines
+            .iter()
+            .map(|line| line.to_string().trim_end().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(text(got), text(want), "{label}: {what}");
+    let wire = |lines: &[Line]| {
+        lines
+            .iter()
+            .map(|line| aterm_core::scrollback::serialize_lines(std::slice::from_ref(line)))
+            .collect::<Vec<_>>()
+    };
+    assert!(wire(got) == wire(want), "{label}: {what}, cell for cell");
 }
 
 /// THE PROOF FUNCTION AND ITS FRAMES ARE THE PARENT'S. The producer recorded
@@ -300,6 +482,9 @@ fn assert_proof_function_is_the_parents(desk: &Desk) {
 /// launch environment `outgoing_parent_env` and the worker would publish.
 struct Staged {
     scratch: std::path::PathBuf,
+    /// The private control dir the desk's files were staged into — where the
+    /// consumer takes (and unlinks) each sidecar.
+    dir: std::path::PathBuf,
     live: Vec<SessionIdentity>,
     slaves: Vec<i32>,
     /// The parent's ends and the Commit channel's read end: always ours.
@@ -429,6 +614,7 @@ fn stage(desk: &Desk, rewrite_meta: Option<MetaRewrite<'_>>) -> Staged {
     );
     Staged {
         scratch,
+        dir,
         live,
         slaves,
         pipes: [ready_read, commit_read, commit_write],
@@ -453,11 +639,138 @@ fn restore_env() -> [RestoreVar; 11] {
     ]
 }
 
+/// THE HISTORY CARRY IS TAKEN, before the proof (v0.94.0 on): the sidecar
+/// the parent named for `adopted` is opened whole — at the depth it stamped —
+/// and unlinked, nothing is counted lost at this hop, and the session's
+/// running loss from earlier handoffs crosses; so does the foreground holder
+/// the park stamped. A release before the carry names no sidecar: nothing is
+/// taken and nothing is counted.
+///
+/// Checked here, before the proof, and not only through the import after it:
+/// the outgoing process retires every sidecar still in its dir once the proof
+/// checks out, so in the field a sidecar the consumer did not open before its
+/// proof is gone by the time the import runs.
+fn assert_history_taken(desk: &Desk, staged: &Staged, adopted: &Adopted) {
+    let label = desk.label();
+    let id = adopted.local_id;
+    let expected = desk.expected(id);
+    let take = expected.history_take.unwrap_or(0);
+    assert_eq!(
+        adopted
+            .history
+            .carry
+            .as_ref()
+            .map(crate::handoff_history::HistoryCarry::take),
+        Some(take).filter(|take| *take > 0),
+        "{label}: session {id}'s history sidecar is taken, {take} line(s) deep"
+    );
+    assert_eq!(
+        (adopted.history.dropped, adopted.history.lost),
+        (0, expected.history_lost.unwrap_or(0)),
+        "{label}: session {id} loses nothing at this hop, and its running loss crosses"
+    );
+    assert!(
+        !staged.dir.join(desk.hist_name(id)).exists(),
+        "{label}: session {id}'s sidecar is unlinked as it is opened, before the proof"
+    );
+    if let Some(holder) = expected.fg_holder {
+        assert_eq!(
+            adopted.fg_holder, holder,
+            "{label}: session {id}'s foreground holder crosses"
+        );
+    }
+}
+
+/// THE HISTORY LANDS, after Commit (v0.94.0 on): each adopted session is
+/// hydrated as `spawn_session` hydrates it — a live engine, the checkpoint
+/// restored, the import's keys reserved, the control carry installed — and
+/// the import runs as the successor's worker runs it. Every line the parent
+/// stamped is imported and none is lost, and the session's history is then
+/// exactly the parent's sidecar lines in front of the lines the checkpoint
+/// restored, oldest first, line for line and cell for cell. By the join
+/// v0.94.0's producer made (its generator checked it against the parent's
+/// live history) that is the whole history the parent held. A session that
+/// names no sidecar (every session of a release before the carry) imports
+/// nothing and keeps exactly the history its checkpoint restored.
+fn assert_history_imports(desk: &Desk, sessions: Vec<Adopted>) {
+    let label = desk.label();
+    for mut session in sessions {
+        let id = session.local_id;
+        let take = desk.expected(id).history_take.unwrap_or(0);
+        let checkpoint = session
+            .checkpoint
+            .take()
+            .unwrap_or_else(|| panic!("{label}: session {id} has its screen"));
+        let mut history = std::mem::take(&mut session.history);
+        let engine = Arc::new(Mutex::new(crate::spawn::new_live_terminal(
+            checkpoint.rows,
+            checkpoint.cols,
+            None,
+            aterm_types::Appearance::Dark,
+            None,
+        )));
+        crate::spawn::hydrate_adopted_engine(
+            &engine,
+            Some(&checkpoint),
+            session.control.take(),
+            None,
+            None,
+            id,
+            &mut history,
+        );
+        let restored = history_lines(
+            &label,
+            &engine.lock().unwrap_or_else(PoisonError::into_inner),
+        );
+        assert_eq!(
+            restored.len(),
+            checkpoint.history_lines as usize,
+            "{label}: session {id} restores the history its checkpoint carries"
+        );
+        let report = crate::handoff_history::run_imports(vec![crate::handoff_history::ImportJob {
+            session: id,
+            term: Arc::clone(&engine),
+            history,
+        }])
+        .remove(0);
+        assert_eq!(
+            (report.failed.as_deref(), report.cleared),
+            (None, false),
+            "{label}: session {id}'s import settles"
+        );
+        assert_eq!(
+            (report.imported, report.lost()),
+            (take, 0),
+            "{label}: session {id} imports every line its parent carried, and loses none"
+        );
+        let mut whole = if take > 0 {
+            sidecar_history(&label, &desk.read(&desk.hist_name(id)), take)
+        } else {
+            Vec::new()
+        };
+        whole.extend(restored);
+        assert_same_lines(
+            &label,
+            &history_lines(
+                &label,
+                &engine.lock().unwrap_or_else(PoisonError::into_inner),
+            ),
+            &whole,
+            &format!(
+                "session {id}'s history is its parent's sidecar in front of the lines its \
+                 checkpoint restored"
+            ),
+        );
+    }
+}
+
 /// THE GUARD. Every desk of every shipped release adopts in THIS build
 /// exactly: every session, none repainted, each screen the carried bytes
 /// verbatim at the carried geometry, each control carry read, the layout
 /// placed — and both digests, and so the adoption proof, equal what that
-/// release's parent committed to.
+/// release's parent committed to. Every history sidecar the parent named is
+/// taken before the proof ([`assert_history_taken`]) and imported whole
+/// after it ([`assert_history_imports`]).
 #[test]
 fn every_shipped_producers_desk_adopts_exactly_and_proves() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
@@ -568,8 +881,9 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
                     adopted.local_id
                 );
             }
+            assert_history_taken(desk, &staged, adopted);
         }
-        let ((proof, ready, adopted), _) = child_proof_from(incoming)
+        let ((proof, ready, adopted), sessions) = child_proof_from(incoming)
             .unwrap_or_else(|| panic!("{label}: the child adopts and proves"));
         let expected = adoption_proof(
             &desk.parent.nonce,
@@ -585,6 +899,7 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
             proof, expected,
             "{label}: THE HANDOFF COMPLETES — the child's proof is the parent's expectation"
         );
+        assert_history_imports(desk, sessions);
         drop(ready);
         staged.ready_write = None;
         staged.teardown();

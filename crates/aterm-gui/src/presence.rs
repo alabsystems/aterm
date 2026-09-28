@@ -827,6 +827,15 @@ pub(crate) enum Hand {
     },
 }
 
+/// Whether `hand` is THIS process's own harness (ruling 313): a drive lease
+/// under the holder name its supervisor loops claim sessions by
+/// ([`crate::harness_host::holder`]). Another instance's harness, a manager
+/// session or an `aterm drive` is somebody else's hand, and stays a fact the
+/// window shows.
+pub(crate) fn is_aterms_hand(hand: &Hand) -> bool {
+    matches!(hand, Hand::DrivenLease { holder } if *holder == crate::harness_host::holder())
+}
+
 /// The standing halt, as the band prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HoldFact {
@@ -1091,6 +1100,11 @@ pub(crate) struct StoryPoint {
     pub(crate) seq: u64,
     pub(crate) at: Instant,
     pub(crate) verb: StoryVerb,
+    /// The point happened under aterm's OWN harness's hand
+    /// ([`Slot::aterm_hand`], ruling 313): kept in the story and counted by
+    /// `story=`, never news — the band and the log already tell what aterm
+    /// did there.
+    pub(crate) aterm: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1152,18 @@ pub(crate) struct Slot {
     story: VecDeque<StoryPoint>,
     /// The seq of the newest story point; 0 = nothing ever happened.
     pub(crate) story_seq: u64,
+    /// The seq of the newest point that is NEWS — one that did not happen
+    /// under aterm's own hand ([`StoryPoint::aterm`]); what the level reads.
+    news_seq: u64,
+    /// aterm's OWN harness has its hand on the session (ruling 313): a drive
+    /// lease this process's harness holds ([`is_aterms_hand`]), or a `turn`
+    /// typed inside one (an Owner-token turn whose lease hands back to it).
+    /// Not a presence fact: the window's own chrome does not show it, and the
+    /// story points it makes are not news.
+    aterm_hand: bool,
+    /// Set for the length of one [`Self::absorb`] in which aterm's hand was on
+    /// the session at either end: every point it notes is aterm's.
+    noting_aterm: bool,
     /// The story up to this seq is CLOSED: the agent it was about left the
     /// session, so it is no longer news to hold the row for (2026-09-24,
     /// D10: `level=story` stood on a bare shell long after the agent exited,
@@ -1171,6 +1197,9 @@ impl Slot {
             baselined: false,
             story: VecDeque::new(),
             story_seq: 0,
+            news_seq: 0,
+            aterm_hand: false,
+            noting_aterm: false,
             story_closed: 0,
             told: None,
         }
@@ -1205,6 +1234,10 @@ impl Slot {
 
     fn note(&mut self, verb: StoryVerb, now: Instant) {
         self.story_seq += 1;
+        let aterm = self.noting_aterm || self.aterm_hand;
+        if !aterm {
+            self.news_seq = self.story_seq;
+        }
         if self.story.len() >= STORY_CAP {
             self.story.pop_front();
         }
@@ -1212,6 +1245,7 @@ impl Slot {
             seq: self.story_seq,
             at: now,
             verb,
+            aterm,
         });
     }
 
@@ -1220,6 +1254,17 @@ impl Slot {
     /// edge, taken from the wake rather than inferred).
     pub(crate) fn absorb(&mut self, facts: Facts, now: Instant) -> bool {
         let mut changed = false;
+        // aterm's own hand at either end of this refresh makes every point it
+        // notes aterm's (ruling 313): a relaunch's turn settles and its lease
+        // is handed back between two refreshes, in either order.
+        let was_aterm = self.aterm_hand;
+        let now_aterm = is_aterms_hand(&facts.hand)
+            || (was_aterm && matches!(facts.hand, Hand::DrivenTurn { holder: None, .. }));
+        self.noting_aterm = was_aterm || now_aterm;
+        if self.aterm_hand != now_aterm {
+            self.aterm_hand = now_aterm;
+            changed = true;
+        }
         if self.role != facts.role {
             self.role = facts.role;
             changed = true;
@@ -1329,6 +1374,7 @@ impl Slot {
             changed = true;
         }
         self.baselined = true;
+        self.noting_aterm = false;
         changed
     }
 
@@ -1352,7 +1398,7 @@ impl Slot {
     /// The severity this slot stands at (`status level=`, `why=` and the
     /// tab chip follow it).
     pub(crate) fn level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, true)
+        self.level_counting(watermark, true, true)
     }
 
     /// The level the window's OWN chrome shows — the rim and the band row's
@@ -1366,10 +1412,13 @@ impl Slot {
     /// fact stays where it is read on purpose: `status level=attention
     /// why=escalation` and the tab's wait mark.
     pub(crate) fn shown_level(&self, watermark: u64) -> Level {
-        self.level_counting(watermark, !self.attention_told_elsewhere)
+        self.level_counting(watermark, !self.attention_told_elsewhere, !self.aterm_hand)
     }
 
-    fn level_counting(&self, watermark: u64, attention: bool) -> Level {
+    /// `attention`: an escalation counts; `hand`: a hand counts even when it
+    /// is aterm's own (ruling 313 — `status level=` keeps the fact, the
+    /// window's chrome does not show it).
+    fn level_counting(&self, watermark: u64, attention: bool, hand: bool) -> Level {
         if self.hold.is_some() {
             return Level::Hold;
         }
@@ -1393,9 +1442,9 @@ impl Slot {
             return Level::Attention;
         }
         match &self.hand {
-            Hand::DrivenTurn { .. } | Hand::DrivenLease { .. } => return Level::Driven,
+            Hand::DrivenTurn { .. } | Hand::DrivenLease { .. } if hand => return Level::Driven,
             Hand::Driving { .. } => return Level::Driving,
-            Hand::None => {}
+            _ => {}
         }
         // An unread task or ask is a wait state only while no hand is on the
         // session: a driven worker with mail waiting stays teal (the mock's
@@ -1405,7 +1454,7 @@ impl Slot {
         }
         // A story outranks waiting mail: "something happened since you
         // looked" is the glance fact, and the mail slot prints the mail.
-        if self.story_seq > watermark.max(self.story_closed) {
+        if self.news_seq > watermark.max(self.story_closed) {
             return Level::Story;
         }
         if self.mail.unread > 0
@@ -1494,7 +1543,7 @@ impl Slot {
     /// first.
     pub(crate) fn story_since(&self, watermark: u64) -> impl Iterator<Item = &StoryPoint> {
         let seen = watermark.max(self.story_closed);
-        self.story.iter().filter(move |p| p.seq > seen)
+        self.story.iter().filter(move |p| p.seq > seen && !p.aterm)
     }
 
     /// The current stop (hold / limit) in progress, for the story's summary.
@@ -2178,6 +2227,13 @@ pub(crate) fn words(slot: &Slot, now: Instant, watermark: u64) -> Words {
 
     // hand (and its short form for a narrow row)
     let (hand, hand_short, spoken_hand) = match (&slot.hold, &slot.hand) {
+        // aterm's own harness is named as aterm, never by its holder's pid
+        // (ruling 313), on the rare row something else raised.
+        (None, Hand::DrivenTurn { .. } | Hand::DrivenLease { .. }) if slot.aterm_hand => (
+            "\u{25c2} aterm".to_string(),
+            "\u{25c2} aterm".to_string(),
+            "driven by aterm".to_string(),
+        ),
         (Some(h), _) => {
             let reason = hold_reason_words(&h.reason);
             let fleet = if h.fleet {
@@ -2884,6 +2940,115 @@ mod tests {
             rss_mb: None,
             restart: crate::input_stall::Restart::default(),
         }
+    }
+
+    /// Ruling 313 (day eight, E1): the turn aterm's OWN harness typed to
+    /// relaunch an agent after a kill raised a teal rim and `◂
+    /// aterm-harness@<pid>` while it typed, then `◇ quiet since … · 1 turn`
+    /// standing until a key — FYI the restart record already told. aterm's
+    /// hand is not shown by the window's chrome and what happens under it is
+    /// not news; `status level=` keeps the hand. Controls: the same exchange
+    /// under a manager's hand is Driven and then a story, and a story from
+    /// before aterm's hand stays news, counted without aterm's turn.
+    #[test]
+    fn aterms_own_hand_is_no_row_and_its_turn_is_no_story() {
+        let now = t0();
+        let turn = |id| {
+            Some(TurnFact {
+                id,
+                settled: true,
+                dur_ms: 10,
+                carried: false,
+            })
+        };
+        // `inside`: the settled turn is first read while the turn's own lease
+        // still stands (a refresh between the ledger push and the hand-back).
+        let run = |holder: String, before: Option<TurnFact>, inside: bool| {
+            let mut s = Slot::new(now);
+            s.absorb(
+                Facts {
+                    turn: before,
+                    ..Facts::default()
+                },
+                now,
+            );
+            let lease = Hand::DrivenLease { holder };
+            let mut shown = Vec::new();
+            let mut at = now;
+            // The lease, the turn typed inside it, the settle as it is handed
+            // back, and the lease given back — each a refresh of its own.
+            for (hand, t) in [
+                (lease.clone(), before),
+                (
+                    Hand::DrivenTurn {
+                        id: 2,
+                        holder: None,
+                    },
+                    if inside { turn(2) } else { before },
+                ),
+                (lease.clone(), turn(2)),
+                (Hand::None, turn(2)),
+            ] {
+                at += Duration::from_secs(1);
+                s.absorb(
+                    Facts {
+                        hand,
+                        turn: t,
+                        ..Facts::default()
+                    },
+                    at,
+                );
+                shown.push(s.shown_level(0));
+            }
+            (s, shown, at)
+        };
+        let own = crate::harness_host::holder();
+        for inside in [false, true] {
+            let (s, shown, _) = run(own.clone(), None, inside);
+            assert_eq!(
+                shown,
+                [Level::Quiet; 4],
+                "aterm's hand raised a row ({inside})"
+            );
+            assert_eq!(
+                s.level(0),
+                Level::Quiet,
+                "aterm's turn read as news ({inside})"
+            );
+            assert_eq!(s.story_seq, 1, "the point is still kept (`story=`)");
+            assert_eq!(s.chip(0), ChipLevel::Off, "no story dot on the tab");
+        }
+        let mut held = Slot::new(now);
+        held.absorb(
+            Facts {
+                hand: Hand::DrivenLease {
+                    holder: own.clone(),
+                },
+                ..Facts::default()
+            },
+            now,
+        );
+        assert_eq!(
+            held.level(0),
+            Level::Driven,
+            "`status level=` keeps the hand"
+        );
+        assert_eq!(held.shown_level(0), Level::Quiet);
+
+        // Control: somebody else's hand is shown, and its turn is a story.
+        let (_, shown, _) = run("manager".into(), None, true);
+        assert_eq!(shown[..3], [Level::Driven; 3], "a manager's hand is shown");
+        assert_eq!(shown[3], Level::Story, "a manager's turn is news");
+        // Control: another instance's harness is somebody else's hand.
+        let (_, shown, _) = run("aterm-harness@1".into(), None, false);
+        assert_eq!(shown[0], Level::Driven);
+
+        // A story from before aterm's hand stays news, without aterm's turn.
+        let (s, shown, at) = run(own, turn(1), false);
+        assert_eq!(shown[3], Level::Story, "the earlier turn is still news");
+        let w = words(&s, at, 0);
+        assert!(w.since.iter().any(|c| c == "1 turn"), "{w:?}");
+        assert!(!w.since.iter().any(|c| c == "2 turns"), "{w:?}");
     }
 
     /// The story row: quiet, with a since-summary of what happened after the

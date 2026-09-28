@@ -9831,8 +9831,9 @@ impl Ribbon {
     /// needs no renderer change: `up` is `0.0`, so `ribbon_profile` is
     /// exactly zero above the rail's top, and the row that holds the top
     /// gets the same sub-pixel edge the body's edges get. It rides the same
-    /// budget as the body, after the body of its run — a saturated frame
-    /// sheds the oldest run's rail before that run's body.
+    /// budget as the body, after the body of its run. If that ordering cuts
+    /// another run's body on the focused row, the capped frame is repainted
+    /// with every focused-row body ahead of its rails.
     pub fn emit(&mut self, ctx: &Ctx<'_>, frame: &mut Frame<'_>) {
         self.ink_quads = 0;
         if self.plan.is_empty() || self.runs.is_empty() {
@@ -9857,138 +9858,122 @@ impl Ribbon {
         // slab boundary (`slabs_per_cell`), so the stride is the slab's own
         // width and the density the budget chose is the density that prints.
         let stride = ctx.geom.cw.max(1).div_ceil(self.slabs_per_cell());
-        // `runs` is in EMIT ORDER — the run at the caret, then newest first —
-        // so when the budget runs out it is the OLDEST row's far end that is
-        // shed (see `build`).
-        for run in &runs {
-            verts.clear();
-            verts.reserve(run.hi - run.lo);
-            for seg in &self.plan[run.lo..run.hi] {
-                // THE STRIP IS PRICED OUT OF THE SAME CEILING THE BODY IS,
-                // never beside it: `cov + lift` is what the spine actually
-                // composites, so a strip clamped against the byte instead of
-                // against the frame top is a second, higher ceiling — which is
-                // exactly the "two ceilings for one bed" §19.1 deletes.
-                let strip = (f32::from(seg.cov) * STRIP_LIFT_GAIN)
-                    .min(ceiling - f32::from(seg.cov))
-                    .max(0.0);
-                verts.push(RibbonVertex {
-                    x: seg.x,
-                    spine: seg.spine,
-                    up: seg.up,
-                    dn: seg.dn,
-                    core_up,
-                    core_dn: 0.0,
-                    color: self.ink.at(seg.t),
-                    cov: f32::from(seg.cov),
-                    lift: strip,
-                    lift_span,
-                });
-            }
-            // Preserve the historical byte order on every uncapped frame.
-            // Only when the budget actually cuts a run whose head is LEFT of
-            // its far right edge do we discard that partial run and repaint
-            // outward from the head. This covers a leftward wake and a long
-            // typed row edited in its middle. The retry starts at the same
-            // stream length, with the same cap, and can never exceed it.
-            verts.reverse();
-            let start = frame.under.len();
-            let mut complete = ribbon_beam(
-                frame.under,
-                clip,
-                &verts,
-                shoulder,
-                stride,
-                budget,
-                GlowBlend::Over,
-            );
-            let head = run.head - run.lo;
-            if !complete && head + 1 < verts.len() {
-                frame.under.truncate(start);
+        // A row edited in its middle can hold adjacent runs from different
+        // cohorts. A vivid rail can spend quads needed for a later run's
+        // body, opening a dark gap inside the typed row. Keep the historical
+        // order when it fits; only a capped multi-run row needs a body-first
+        // retry.
+        let focused_multi_run_row = runs
+            .iter()
+            .find(|run| run.at_caret)
+            .map(|run| run.row)
+            .filter(|&row| runs.iter().filter(|run| run.row == row).take(2).count() > 1);
+        let pane_bot = self.pane_bot(ctx, chf);
+        let plan = &self.plan;
+        let ink = &self.ink;
+        {
+            let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
+                let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
+                if rail_layer && (!rail || row_bottom >= pane_bot) {
+                    return true;
+                }
+                verts.clear();
+                verts.reserve(run.hi - run.lo);
+                for seg in &plan[run.lo..run.hi] {
+                    if rail_layer {
+                        // The vivid rail lies below the row's bottom and uses
+                        // the body's own lower reach, capped at the leading.
+                        let top = row_bottom.max(seg.spine);
+                        let dn = (seg.spine + seg.dn - top)
+                            .max(DN_FLOOR_CH * chf)
+                            .min(RAIL_REACH_MAX_CH * chf);
+                        verts.push(RibbonVertex {
+                            x: seg.x,
+                            spine: top,
+                            up: 0.0,
+                            dn,
+                            core_up: 0.0,
+                            core_dn: dn * RAIL_CORE_SHARE,
+                            color: ink.rail_at(seg.t),
+                            cov: f32::from(seg.cov) * RAIL_GAIN,
+                            lift: 0.0,
+                            lift_span: 0.0,
+                        });
+                    } else {
+                        // The spine's strip is inside the body's one ceiling.
+                        let strip = (f32::from(seg.cov) * STRIP_LIFT_GAIN)
+                            .min(ceiling - f32::from(seg.cov))
+                            .max(0.0);
+                        verts.push(RibbonVertex {
+                            x: seg.x,
+                            spine: seg.spine,
+                            up: seg.up,
+                            dn: seg.dn,
+                            core_up,
+                            core_dn: 0.0,
+                            color: ink.at(seg.t),
+                            cov: f32::from(seg.cov),
+                            lift: strip,
+                            lift_span,
+                        });
+                    }
+                }
+                // A capped run whose head is inside it is repainted outward from
+                // that head, never leaving the light beside the hand behind.
                 verts.reverse();
-                complete = Self::repaint_capped_run_from_head(
-                    frame.under,
-                    clip,
-                    &mut verts,
-                    head,
-                    shoulder,
-                    stride,
-                    budget,
-                );
+                let start = out.len();
+                let shoulder = if rail_layer { 1.0 } else { shoulder };
+                let mut complete =
+                    ribbon_beam(out, clip, &verts, shoulder, stride, budget, GlowBlend::Over);
+                let head = run.head - run.lo;
+                if !complete && head + 1 < verts.len() {
+                    out.truncate(start);
+                    verts.reverse();
+                    complete = Self::repaint_capped_run_from_head(
+                        out, clip, &mut verts, head, shoulder, stride, budget,
+                    );
+                }
+                complete
+            };
+            let mut retry_body_first = false;
+            let mut prior_rail_drawn = false;
+            for (i, run) in runs.iter().enumerate() {
+                if !paint(frame.under, run, false) {
+                    retry_body_first =
+                        prior_rail_drawn && focused_multi_run_row.is_some_and(|row| run.row == row);
+                    break;
+                }
+                let rail_from = frame.under.len();
+                if !paint(frame.under, run, true) {
+                    retry_body_first = focused_multi_run_row
+                        .is_some_and(|row| runs[i + 1..].iter().any(|later| later.row == row));
+                    break;
+                }
+                prior_rail_drawn |= frame.under.len() > rail_from;
             }
-            if !complete {
-                break;
-            }
-            if !rail {
-                continue;
-            }
-            // THE VIVID RAIL: the ink-free reach below the row bottom, in the
-            // full-value spectrum. Its top IS the row bottom — the spine
-            // carries the wave, and a crest would otherwise put vivid ink
-            // under the typed row's descenders — and its bottom is the
-            // body's own, floored at `DN_FLOOR_CH` (the wave's trough lifts
-            // the body's bottom edge by up to the amplitude, and a rail that
-            // followed it thinned to a sliver at the tail), so the rail is
-            // never thinner than the leading the flat body always reached
-            // and is thickest under the hand (the comet's lower lobe). The
-            // grid's last row has no leading below it and draws no rail
-            // (see `sample`: it keeps the flat wedge).
-            let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
-            if row_bottom >= self.pane_bot(ctx, chf) {
-                continue;
-            }
-            verts.clear();
-            verts.reserve(run.hi - run.lo);
-            for seg in &self.plan[run.lo..run.hi] {
-                // The top follows a crest DOWN (the accent's upper half is
-                // never covered) and never rises above the row bottom; the
-                // reach is capped at [`RAIL_REACH_MAX_CH`] — the leading's
-                // ink-free margin the flat body proved — so the lobe's
-                // deeper part below it stays bed ink, at the bar, under the
-                // row below's caps and ascenders (review, 2026-09-13).
-                let top = row_bottom.max(seg.spine);
-                let dn = (seg.spine + seg.dn - top)
-                    .max(DN_FLOOR_CH * chf)
-                    .min(RAIL_REACH_MAX_CH * chf);
-                verts.push(RibbonVertex {
-                    x: seg.x,
-                    spine: top,
-                    up: 0.0,
-                    dn,
-                    core_up: 0.0,
-                    core_dn: dn * RAIL_CORE_SHARE,
-                    color: self.ink.rail_at(seg.t),
-                    cov: f32::from(seg.cov) * RAIL_GAIN,
-                    lift: 0.0,
-                    lift_span: 0.0,
-                });
-            }
-            verts.reverse();
-            let start = frame.under.len();
-            let mut complete = ribbon_beam(
-                frame.under,
-                clip,
-                &verts,
-                1.0,
-                stride,
-                budget,
-                GlowBlend::Over,
-            );
-            if !complete && head + 1 < verts.len() {
-                frame.under.truncate(start);
-                verts.reverse();
-                complete = Self::repaint_capped_run_from_head(
-                    frame.under,
-                    clip,
-                    &mut verts,
-                    head,
-                    1.0,
-                    stride,
-                    budget,
-                );
-            }
-            if !complete {
-                break;
+            if retry_body_first {
+                let row = focused_multi_run_row.expect("retry requires a multi-run focused row");
+                frame.under.truncate(ink_from);
+                // Spend body quads across the ENTIRE edited row before offering
+                // any of its decorative rail. Saturated frames trade accent
+                // length for a continuous body; uncapped bytes never change.
+                let bodies_complete = runs
+                    .iter()
+                    .filter(|run| run.row == row)
+                    .all(|run| paint(frame.under, run, false));
+                if bodies_complete {
+                    let rails_complete = runs
+                        .iter()
+                        .filter(|run| run.row == row)
+                        .all(|run| paint(frame.under, run, true));
+                    if rails_complete {
+                        for run in runs.iter().filter(|run| run.row != row) {
+                            if !paint(frame.under, run, false) || !paint(frame.under, run, true) {
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
         self.runs = runs;
@@ -26091,6 +26076,98 @@ mod tests {
             sink.under.len()
         );
         (sink.under, g.cw as u16)
+    }
+
+    /// Two adjacent cohorts can remain separate while the caret edits a
+    /// settled row. Their body is one continuous trail even when the quad
+    /// budget is tight: the vivid rail is an accent and must not consume the
+    /// older cohort's body budget.
+    #[test]
+    fn a_capped_rail_does_not_cut_the_body_of_an_adjacent_run() {
+        let c = cfg_owner();
+        let g = geom_owner();
+        let now = Instant::now();
+        let cx = ctx_in(now, &c, (OWNER_ROW, 130), 0.7, g);
+        let mut rib = Ribbon::new();
+        rib.plan(&cx); // Sync the real theme ink table.
+        rib.slabs = 1;
+        rib.plan = (0..=130)
+            .map(|col| Segment {
+                x: col as f32 * g.cw as f32,
+                spine: (f32::from(OWNER_ROW) + 1.0) * g.ch as f32,
+                up: g.ch as f32,
+                dn: 0.30 * g.ch as f32,
+                t: 0.4,
+                cov: 220,
+            })
+            .collect();
+        rib.runs.extend([
+            Run {
+                row: OWNER_ROW,
+                col0: 20,
+                col1: 129,
+                lo: 20,
+                hi: 131,
+                head_col: 129,
+                head: 130,
+                wet: true,
+                at_caret: true,
+                born: now,
+                stream_dir: -1,
+            },
+            Run {
+                row: OWNER_ROW,
+                col0: 0,
+                col1: 19,
+                lo: 0,
+                hi: 21,
+                head_col: 19,
+                head: 20,
+                wet: true,
+                at_caret: false,
+                born: now,
+                stream_dir: -1,
+            },
+        ]);
+        let mut sink = Sink::default();
+        rib.emit(&cx, &mut sink.frame());
+        assert!(
+            sink.under.len() + 2 >= RIBBON_QUAD_BUDGET,
+            "precondition: body plus rail must fill the budget ({})",
+            sink.under.len()
+        );
+        assert!(sink.under.len() <= RIBBON_QUAD_BUDGET);
+        assert!(cell_lit(&sink.under, g, OWNER_ROW, 129));
+        assert!(
+            (0..130).all(|col| cell_lit(&sink.under, g, OWNER_ROW, col)),
+            "the vivid rail consumed body quads and opened a dark gap inside the typed row"
+        );
+
+        // Below the cap the same two-run layout must emit the exact same
+        // byte-ordered quads as the historical per-run body/rail order.
+        let mut uncapped = rib.clone();
+        uncapped.plan.truncate(61);
+        uncapped.runs[0].col1 = 59;
+        uncapped.runs[0].hi = 61;
+        uncapped.runs[0].head_col = 59;
+        uncapped.runs[0].head = 60;
+        let short_cx = ctx_in(now, &c, (OWNER_ROW, 60), 0.7, g);
+        let mut joint = Sink::default();
+        uncapped.emit(&short_cx, &mut joint.frame());
+        let mut current = uncapped.clone();
+        current.runs.truncate(1);
+        let mut current_sink = Sink::default();
+        current.emit(&short_cx, &mut current_sink.frame());
+        let mut older = uncapped;
+        older.runs.remove(0);
+        let mut older_sink = Sink::default();
+        older.emit(&short_cx, &mut older_sink.frame());
+        let seam_x = (20 * g.cw) as u16;
+        assert!(current_sink.under.iter().all(|q| q.x >= seam_x));
+        assert!(older_sink.under.iter().all(|q| q.x + q.w <= seam_x));
+        let mut old_order = current_sink.under;
+        old_order.extend(older_sink.under);
+        assert_eq!(joint.under, old_order, "uncapped emission changed");
     }
 
     /// A leftward wake starts at the landing, so saturation must keep its

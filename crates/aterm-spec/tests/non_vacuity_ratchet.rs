@@ -339,6 +339,54 @@ fn no_model_grows_a_ghost_invariant() {
     );
 }
 
+/// THE LIVENESS HALF OF THE RATCHET. An invariant no mutant breaks is a ghost,
+/// and so is a liveness property: `[]<>goal` that holds whatever the lane does
+/// proves nothing about the lane. Every obligation in
+/// `xref::liveness_registry()` goes through `verify::audit_liveness` — proved at
+/// the committed config, every stated fairness assumption load-bearing, the
+/// `Buggy = 1` baseline clean, and each named mutant breaking it alone — and is
+/// stated over a model that is itself registered, byte-for-byte, so a liveness
+/// obligation cannot hang off a private copy of a machine the rest of the
+/// workspace checks differently.
+///
+/// The per-model test (`derived_ring_ty.rs`) runs the same audit and adds the
+/// `ty` tier; this sweep exists so a registered obligation cannot lose its
+/// catches while nobody runs that one test.
+#[test]
+fn every_liveness_obligation_is_proven_minimal_and_caught() {
+    let models: BTreeMap<&str, String> = aterm_spec::xref::model_registry()
+        .iter()
+        .map(|m| (m.name, m.to_tla()))
+        .collect();
+    let obligations = aterm_spec::xref::liveness_registry();
+    assert!(
+        !obligations.is_empty(),
+        "the liveness registry is empty: Law 1 of the apply ladder is registered there"
+    );
+    let mut failures: Vec<String> = Vec::new();
+    for (m, live) in &obligations {
+        match models.get(m.name) {
+            None => failures.push(format!(
+                "{} liveness `{}`: the model is not in `xref::model_registry()`",
+                m.name, live.name
+            )),
+            Some(registered) if *registered != m.to_tla() => failures.push(format!(
+                "{} liveness `{}`: stated over a model that differs from the registered one",
+                m.name, live.name
+            )),
+            Some(_) => {}
+        }
+        if let Err(why) = aterm_spec::verify::audit_liveness(m, live) {
+            failures.push(why);
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "liveness obligations that do not hold, are not minimal, or are not caught:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
 /// Every evaluable model's `Buggy = 1` space, walked with every invariant
 /// stripped, fits the interpreter's state budget. `uncaught_invariants` walks
 /// exactly that space for an invariant no mutant breaks, so where it does not fit

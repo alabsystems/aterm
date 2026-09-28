@@ -4222,6 +4222,297 @@ fn revert_to_rollback(
     ApplyOutcome::ReExecFailed(err.to_string())
 }
 
+/// THE RUNNING BUILD TAKES THE INSTALL PATH BACK FROM AN ACTIVATION A NEWER STAGE
+/// SUPERSEDES — the transaction behind [`crate::supersede_installed_activation`].
+///
+/// THE STRAND IT ENDS. A launched-lane candidate boot-applies its stage before it
+/// dials, so when build N's handoff fails, N is left INSTALLED — with its boot trial
+/// armed and unconfirmed, and this process's own build M retained at the fixed
+/// rollback path. Two such failures the bytes answer for converge the GUI's
+/// automatic lane on that activation. A newer verified stage N' then had no way
+/// in: M cannot swap it (the installed bundle is not M, so a swap has no rollback
+/// source — step 7 of the boot apply refuses), a launch of the install path is a
+/// launch of N (which walks N's trial toward the revert, and as the handoff's
+/// authorized target refuses to boot-apply past itself), and N's unconfirmed trial
+/// owns the only rollback slot. So every later release waited for a person.
+///
+/// THE TRANSACTION, under the apply lock:
+///
+/// 1. the REPLACEMENT is real: `ready.toml` names exactly `newer_build`, which is
+///    strictly newer than the activation, at or above the operator floor, and the
+///    staged bundle's SEALED identity (the full codesign policy in production) is
+///    the marker's — "verified like any stage", before anything moves;
+/// 2. the installed bundle is EXACTLY the activation the GUI latched, sealed, and
+///    newer than the running build;
+/// 3. the boot sentinel is armed for it, the trial is this install's
+///    ([`trial_owned_by`]) and its marker authorizes exactly those bytes
+///    ([`trial_authorizes_candidate`]);
+/// 4. the fixed rollback path holds THIS process's own build, sealed build and
+///    commit ([`identity_matches_running`]) — the predecessor the trial would
+///    revert to, and the one image on the machine known to run;
+/// 5. the inverse exchange ([`restore_rollback`], the crash-loop revert's own):
+///    M back at the install path, N at the fixed path;
+/// 6. the sentinel is DISARMED (`confirm`), never observed: no launch of N is
+///    counted, and N is never executed;
+/// 7. cleanup in `revert_to_rollback`'s order — the retired N at the fixed path,
+///    a receipt that no longer names the installed bundle, the trial marker.
+///
+/// Anything short of all of 1–4 refuses and moves nothing, as a
+/// [`crate::SupersedeRefusal`] that says whether the refusal was about the
+/// MOMENT (the lock, a verification, a stage being replaced — the GUI tries
+/// again after a backoff and puts nothing on glass) or about the DISK's shape
+/// (the GUI still tries again, but says the Version menu moves it). A disarm
+/// that fails AFTER the exchange (step 6) is not a refusal at all: the retire
+/// happened, and [`crate::SupersededActivation::trial_disarm_deferred`] says the
+/// crash cut is left for the next boot apply to finish.
+///
+/// WHY THIS KEEPS THE SENTINEL / TRIAL / ROLLBACK INVARIANTS:
+///
+/// * the only rename is the atomic exchange the disk transaction model already
+///   covers as the inverse swap, and a crash cut after it and before the disarm
+///   (installed = OLD, fixed = NEW, trial armed for NEW, receipt still NEW's) is
+///   exactly the "crash immediately after inverse rollback" shape
+///   [`recover_abandoned_preswap_trial_if_exact`] finishes on the next boot apply
+///   — which the very next candidate (M's own binary, launched for N') runs before
+///   it swaps anything;
+/// * the rollback copy of M is never destroyed: it becomes the installed bundle,
+///   and it is the running image;
+/// * no trial is re-armed here; N' gets a fresh one from [`prepare_trial`] when
+///   the ordinary lane swaps it, with M — the running build — as its rollback;
+/// * N is not QUARANTINED. Its failures were handoffs between two images, not a
+///   boot it could not survive, and it is older than the stage replacing it;
+///   poisoning it is the crash-loop revert's verdict and not this one's.
+pub(crate) fn supersede_installed_activation(
+    current_build: u64,
+    current_commit: &str,
+    activation: (u64, &str),
+    newer_build: u64,
+) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
+    use crate::SupersedeRefusal::{ForNow, Settled};
+    let installed = bundle::resolve().ok_or_else(|| {
+        Settled(
+            "this process does not run from an installed bundle the updater may replace"
+                .to_string(),
+        )
+    })?;
+    let staging = Staging::resolve()
+        .ok_or_else(|| Settled("no private staging root is available".to_string()))?;
+    if !bundle::parent_writable(&installed.app_root) {
+        return Err(Settled(format!(
+            "install location not writable: {}",
+            installed.app_root.display()
+        )));
+    }
+    // A background caller, so the background lane's lock wait: a cold launch that
+    // holds the lock for its own boot apply is bounded well inside it. A lock
+    // held past that is a moment, not a verdict on the disk.
+    let _lock = FileLock::acquire_within(&staging.apply_lock, BACKGROUND_LOCK_WAIT)
+        .map_err(|error| ForNow(format!("apply lock: {error}")))?;
+    // ONE CEILING OVER THE THREE VERIFICATIONS, and under a launch's own lock wait
+    // (`APPLY_LOCK_WAIT`): a cold launch queued behind this transaction still gets
+    // the lock and opens on time instead of deferring its own apply.
+    let _budget = verify::ApplyBudget::start(verify::APPLY_BUDGET);
+    supersede_activation_locked(
+        &staging,
+        &installed.app_root,
+        (current_build, current_commit),
+        activation,
+        newer_build,
+        &verified_bundle_identity,
+    )
+}
+
+/// A bundle's SEALED identity reader — [`verified_bundle_identity`] in production.
+type SealedIdentityReader = dyn Fn(&Path) -> Result<(u64, String), String>;
+
+/// The body of [`supersede_installed_activation`], run under the apply lock, with the
+/// sealed-identity reader injected: the one seam a real-disk test needs, since a
+/// fixture bundle carries no signature. Every exchange, sentinel transition, marker
+/// and receipt write below is the shipping code.
+fn supersede_activation_locked(
+    staging: &Staging,
+    installed: &Path,
+    (current_build, current_commit): (u64, &str),
+    (activation_build, activation_commit): (u64, &str),
+    newer_build: u64,
+    identity: &SealedIdentityReader,
+) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
+    // Every refusal names the build that stays, and says which kind it is: a
+    // MOMENT (`for_now`) — a verification that failed or ran out of its budget,
+    // a stage being replaced, a rename the kernel refused — or the DISK's shape
+    // (`settled`). See `crate::SupersedeRefusal` for why the kind matters.
+    let stays =
+        |why: String| format!("the installed build {activation_build} stays in place: {why}");
+    let for_now = |why: String| -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
+        Err(crate::SupersedeRefusal::ForNow(stays(why)))
+    };
+    let settled = |why: String| -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
+        Err(crate::SupersedeRefusal::Settled(stays(why)))
+    };
+    // 1. THE REPLACEMENT, verified like any stage before anything moves.
+    if newer_build <= activation_build {
+        return settled(format!("build {newer_build} is not newer than it"));
+    }
+    let ready = match read_ready(staging, current_build) {
+        ReadyState::Newer(ready) if ready.build_number == newer_build => ready,
+        // A marker that names another build, or none, is a stage being
+        // replaced or retired under the lock's wait — a moment. A release that
+        // has really left the disk is not offered again: the GUI offers only
+        // what its last observation found there.
+        _ => {
+            return for_now(format!(
+                "no verified stage of build {newer_build} is on disk"
+            ));
+        }
+    };
+    let floor = crate::manifest::Floor::read(&staging.floor()).min_build;
+    if newer_build < floor {
+        return settled(format!(
+            "the staged build {newer_build} is below the operator floor {floor} (yanked)"
+        ));
+    }
+    if !is_non_symlink_dir(&staging.staged_app) {
+        return for_now(format!(
+            "the staged build {newer_build} has no bundle on disk"
+        ));
+    }
+    match identity(&staging.staged_app) {
+        Ok((build, commit))
+            if build == newer_build && sealed_commit_matches(ready.commit.as_deref(), &commit) => {}
+        Ok((build, _)) => {
+            return for_now(format!(
+                "the staged bundle is sealed {build}, not the marker's build {newer_build}"
+            ));
+        }
+        // A verification error is a moment: the full codesign policy includes a
+        // Gatekeeper assessment that rides the network, and the budget over the
+        // three reads is 8 s (`verify::APPLY_BUDGET`) at utility QoS.
+        Err(error) => return for_now(format!("the staged bundle does not verify: {error}")),
+    }
+    // 2. THE ACTIVATION, exactly the bytes the lane latched.
+    let installed_commit = match identity(installed) {
+        Ok((build, commit))
+            if build == activation_build
+                && build > current_build
+                && crate::commit_matches(&commit, activation_commit) =>
+        {
+            commit
+        }
+        Ok((build, _)) => {
+            return settled(format!(
+                "the bundle at the install path is sealed {build}, not the activation"
+            ));
+        }
+        Err(error) => return for_now(format!("the installed bundle does not verify: {error}")),
+    };
+    // 3. ITS TRIAL, armed, this install's, and exact.
+    let sentinel = boot_sentinel(staging);
+    let trial_launches = match sentinel.read_state() {
+        Some((armed, launches)) if armed == activation_build => launches,
+        Some((armed, _)) => {
+            return settled(format!(
+                "the boot trial is armed for build {armed}, not for it"
+            ));
+        }
+        None => {
+            return settled(
+                "no boot trial is armed for it, so nothing retained the build under it".to_string(),
+            );
+        }
+    };
+    if !trial_owned_by(staging, installed) {
+        return settled("its boot trial belongs to another install".to_string());
+    }
+    if !trial_authorizes_candidate(staging, activation_build, &installed_commit) {
+        return settled("its trial marker does not name these bytes".to_string());
+    }
+    // 4. THE ROLLBACK IS THIS PROCESS.
+    let fixed = rollback_path(installed);
+    if !same_volume(&fixed, installed) {
+        return settled("no retained predecessor sits beside it".to_string());
+    }
+    let (restored_build, restored_commit) = match identity(&fixed) {
+        Ok((build, commit))
+            if identity_matches_running(build, &commit, current_build, Some(current_commit)) =>
+        {
+            (build, commit)
+        }
+        Ok((build, commit)) => {
+            return settled(format!(
+                "the retained predecessor is {build}/{commit}, not the running \
+                 {current_build}/{current_commit}"
+            ));
+        }
+        Err(error) => {
+            return for_now(format!("the retained predecessor does not verify: {error}"));
+        }
+    };
+    // 5. THE INVERSE EXCHANGE: the running build back at the install path. It is
+    // one atomic swap, so a refused one moved nothing.
+    if let Err(error) = restore_rollback(&fixed, installed) {
+        return for_now(error);
+    }
+    // 6. DISARMED, NEVER OBSERVED. A failure here leaves the crash cut
+    // `recover_abandoned_preswap_trial_if_exact` finishes on the next boot apply
+    // (see this function's doc), so the stage is still what applies next — the
+    // retire HAPPENED, and is reported as one, with the disarm deferred.
+    if let Err(error) = sentinel.confirm() {
+        let deferred = format!(
+            "build {activation_build}'s boot trial could not be disarmed ({error}); the next \
+             boot apply finishes it"
+        );
+        crate::warn(&format!(
+            "retired build {activation_build}'s activation for build {newer_build}, but \
+             {deferred}"
+        ));
+        crate::status::record(
+            staging,
+            current_build,
+            &format!(
+                "retired the installed build {activation_build} (its switch kept failing) for \
+                 the staged build {newer_build}; build {restored_build} is back at the install \
+                 path, and {deferred}"
+            ),
+        );
+        return Ok(crate::SupersededActivation {
+            activation_build,
+            restored_build,
+            newer_build,
+            trial_launches,
+            trial_disarm_deferred: Some(deferred),
+        });
+    }
+    // 7. CLEANUP, in `revert_to_rollback`'s order — safe only now that the disarm
+    // succeeded.
+    let _ = remove_path_no_follow(&fixed);
+    if !crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
+        .is_some_and(|receipt| receipt.matches_sealed(restored_build, &restored_commit))
+    {
+        crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
+    }
+    crate::manifest::FailedMark::clear(&staging.trial());
+    crate::status::record(
+        staging,
+        current_build,
+        &format!(
+            "retired the installed build {activation_build} (its switch kept failing) for the \
+             staged build {newer_build}; build {restored_build} is back at the install path"
+        ),
+    );
+    crate::log(&format!(
+        "superseded the unconfirmed activation of build {activation_build} with the verified \
+         stage of build {newer_build}: build {restored_build} is back at the install path, the \
+         boot trial was disarmed at {trial_launches} counted launch(es) without counting another"
+    ));
+    Ok(crate::SupersededActivation {
+        activation_build,
+        restored_build,
+        newer_build,
+        trial_launches,
+        trial_disarm_deferred: None,
+    })
+}
+
 fn confirm_trial_health_after_proof(
     staging: &Staging,
     current_build: u64,
@@ -6285,6 +6576,439 @@ staged_at = "2026-08-17T00:00:00Z"
         // Neither fires for a process that is not the installed build.
         assert!(!dead_authority_trial(999, 1001, 1000));
         assert!(!abandoned_preswap_trial(999, 1000, 1001));
+    }
+
+    // --- a newer stage supersedes an unconfirmed activation (round three) --------
+    //
+    // A fixture bundle carries its SEALED identity in a `sealed` file ("<build>
+    // <commit>"): the one stand-in, for the codesign read `verified_bundle_identity`
+    // performs in production. Every exchange, sentinel transition, marker and
+    // receipt write is the shipping code.
+
+    const SUPERSEDE_RUNNING_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const SUPERSEDE_ACTIVATION_COMMIT: &str = "2222222222222222222222222222222222222222";
+    const SUPERSEDE_NEWER_COMMIT: &str = "3333333333333333333333333333333333333333";
+    const SUPERSEDE_ACTIVATION_DIGEST: &str =
+        "abababababababababababababababababababababababababababababababab";
+
+    fn sealed_fixture(app: &Path, build: u64, commit: &str) {
+        std::fs::create_dir_all(app).unwrap();
+        std::fs::write(app.join("sealed"), format!("{build} {commit}")).unwrap();
+    }
+
+    fn sealed_fixture_identity(app: &Path) -> Result<(u64, String), String> {
+        let text = std::fs::read_to_string(app.join("sealed"))
+            .map_err(|error| format!("{}: {error}", app.display()))?;
+        let (build, commit) = text
+            .split_once(' ')
+            .ok_or_else(|| "malformed fixture".to_string())?;
+        Ok((
+            build.parse().map_err(|error| format!("{error}"))?,
+            commit.to_string(),
+        ))
+    }
+
+    fn write_ready_for(s: &Staging, build: u64, commit: &str) {
+        let r = Ready {
+            build_number: build,
+            version: format!("0.{build}.0"),
+            commit: Some(commit.into()),
+            dmg_sha256: "cd".repeat(32),
+            team_id: "T".into(),
+            staged_at: String::new(),
+            changelog: None,
+            machine_id: None,
+            roster_seq: None,
+        };
+        std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
+    }
+
+    /// THE DISK A FAILED LAUNCHED-LANE HANDOFF LEAVES BEHIND, with a newer release
+    /// staged: build 11 INSTALLED and mid-trial (two counted launches — a structural
+    /// `ChildDied` keeps its launch), the running build 10 retained at the fixed
+    /// rollback path, 11's receipt and trial marker, and build 12 staged and ready.
+    fn superseded_activation_desk() -> (Staging, PathBuf, PathBuf) {
+        let (s, root) = temp_staging();
+        let installed = root.join("Applications").join("aterm.app");
+        sealed_fixture(&installed, 11, SUPERSEDE_ACTIVATION_COMMIT);
+        sealed_fixture(&rollback_path(&installed), 10, SUPERSEDE_RUNNING_COMMIT);
+        write_ready_for(&s, 12, SUPERSEDE_NEWER_COMMIT);
+        sealed_fixture(&s.staged_app, 12, SUPERSEDE_NEWER_COMMIT);
+        crate::manifest::FailedMark::record_required(
+            &s.trial(),
+            11,
+            SUPERSEDE_ACTIVATION_DIGEST,
+            Some(&installed),
+        )
+        .unwrap();
+        crate::manifest::InstalledReceipt::record(
+            &s.installed_receipt(),
+            11,
+            SUPERSEDE_ACTIVATION_COMMIT,
+            SUPERSEDE_ACTIVATION_DIGEST,
+        )
+        .unwrap();
+        let sentinel = boot_sentinel(&s);
+        sentinel.arm(11).unwrap();
+        sentinel.observe_launch(11).unwrap();
+        sentinel.observe_launch(11).unwrap();
+        (s, root, installed)
+    }
+
+    fn supersede_desk(
+        s: &Staging,
+        installed: &Path,
+        running: (u64, &str),
+        newer: u64,
+    ) -> Result<crate::SupersededActivation, crate::SupersedeRefusal> {
+        supersede_activation_locked(
+            s,
+            installed,
+            running,
+            (11, SUPERSEDE_ACTIVATION_COMMIT),
+            newer,
+            &sealed_fixture_identity,
+        )
+    }
+
+    /// A NEWER STAGE RETIRES THE UNCONFIRMED ACTIVATION WITHOUT COUNTING A LAUNCH OF
+    /// IT. The running build is back at the install path, the activation's trial is
+    /// DISARMED at the two launches it had counted (never observed a third time —
+    /// the third is the one `check_boot_health` reverts and poisons on), nothing is
+    /// quarantined, and the stage is untouched — and the ordinary boot apply's own
+    /// preconditions now hold for the NEXT candidate, the running build's binary:
+    /// the installed bundle is the running build (a verified rollback source), no
+    /// trial owns the fixed path, and `ready.toml` names the newer build.
+    ///
+    /// Fails on the code before this change: the transaction did not exist, and the
+    /// GUI's only move was to launch build 11 again.
+    #[test]
+    fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch() {
+        let (s, root, installed) = superseded_activation_desk();
+        assert_eq!(boot_sentinel(&s).read_state(), Some((11, 2)));
+
+        let superseded = supersede_desk(&s, &installed, (10, SUPERSEDE_RUNNING_COMMIT), 12)
+            .expect("a newer verified stage supersedes the activation");
+        assert_eq!(
+            superseded,
+            crate::SupersededActivation {
+                activation_build: 11,
+                restored_build: 10,
+                newer_build: 12,
+                trial_launches: 2,
+                trial_disarm_deferred: None,
+            }
+        );
+        assert_eq!(
+            sealed_fixture_identity(&installed),
+            Ok((10, SUPERSEDE_RUNNING_COMMIT.to_string())),
+            "the running build is back at the install path"
+        );
+        assert!(
+            !rollback_path(&installed).exists(),
+            "the retired activation is reclaimed"
+        );
+        assert_eq!(
+            boot_sentinel(&s).read_state(),
+            None,
+            "the trial is disarmed, never walked"
+        );
+        assert!(!s.trial().exists());
+        assert!(
+            crate::manifest::InstalledReceipt::read(&s.installed_receipt()).is_none(),
+            "a receipt naming the retired activation is not proof for what is installed"
+        );
+        assert!(
+            crate::manifest::FailedMark::read(&s.failed()).is_none(),
+            "nothing is quarantined: the activation never failed to BOOT"
+        );
+        assert_eq!(
+            sealed_fixture_identity(&s.staged_app),
+            Ok((12, SUPERSEDE_NEWER_COMMIT.to_string())),
+            "the stage is untouched"
+        );
+
+        // …and it is now an ordinary stage over the running build.
+        assert!(identity_matches_running(
+            10,
+            SUPERSEDE_RUNNING_COMMIT,
+            10,
+            Some(SUPERSEDE_RUNNING_COMMIT)
+        ));
+        let ReadyState::Newer(ready) = read_ready(&s, 10) else {
+            panic!("the newer stage is still ready over the running build");
+        };
+        assert_eq!(ready.build_number, 12);
+        assert!(
+            recover_abandoned_preswap_trial_if_exact(
+                &s,
+                &installed,
+                10,
+                Some(SUPERSEDE_RUNNING_COMMIT)
+            ),
+            "no trial is left for the next boot apply to refuse on"
+        );
+        assert_eq!(
+            recover_orphaned_prepared_candidate(&s, &installed, 10, &ready),
+            Ok(())
+        );
+        assert!(s.ready.exists(), "the stage survives the orphan check");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// THE CRASH CUT: the exchange happened and the disarm did not (here the staging
+    /// root refuses the sentinel's removal). The disk is then EXACTLY the "crash
+    /// immediately after inverse rollback" shape `recover_abandoned_preswap_trial_if
+    /// _exact` finishes — installed = the running build, fixed = the activation, the
+    /// trial still armed for it, owned by this install and authorized by its receipt
+    /// — and the sentinel still reads the two launches: a failed supersede walks
+    /// nothing either.
+    ///
+    /// And it is REPORTED AS THE RETIRE IT WAS (round three review): the running
+    /// build is at the install path, and the newer stage applies next exactly as
+    /// after a clean retire. It used to come back as an `Err`, which the GUI said
+    /// as a refusal naming the Version menu while its lane installed the release
+    /// seconds later. Fails on the code before that change: `expect` on an `Err`.
+    #[test]
+    fn a_supersede_that_cannot_disarm_leaves_the_cut_the_next_boot_apply_finishes() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, root, installed) = superseded_activation_desk();
+        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = supersede_desk(&s, &installed, (10, SUPERSEDE_RUNNING_COMMIT), 12);
+        std::fs::set_permissions(&s.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let retired = result.expect("the exchange happened: a retire, with its disarm deferred");
+        assert_eq!(
+            (
+                retired.activation_build,
+                retired.restored_build,
+                retired.newer_build
+            ),
+            (11, 10, 12)
+        );
+        assert!(
+            retired
+                .trial_disarm_deferred
+                .as_deref()
+                .is_some_and(|why| why.contains("could not be disarmed")
+                    && why.contains("the next boot apply finishes it")),
+            "{retired:?}"
+        );
+
+        assert_eq!(
+            sealed_fixture_identity(&installed),
+            Ok((10, SUPERSEDE_RUNNING_COMMIT.to_string()))
+        );
+        let fixed = rollback_path(&installed);
+        assert_eq!(
+            sealed_fixture_identity(&fixed),
+            Ok((11, SUPERSEDE_ACTIVATION_COMMIT.to_string()))
+        );
+        assert_eq!(
+            boot_sentinel(&s).read_state(),
+            Some((11, 2)),
+            "not one launch counted"
+        );
+        // Every conjunct `recover_abandoned_preswap_trial_if_exact` checks past the
+        // sealed-identity reads.
+        assert!(abandoned_preswap_trial(10, 10, 11));
+        assert!(trial_owned_by(&s, &installed));
+        assert!(same_volume(&fixed, &installed));
+        assert!(trial_authorizes_candidate(
+            &s,
+            11,
+            SUPERSEDE_ACTIVATION_COMMIT
+        ));
+        assert!(
+            s.ready.exists() && s.staged_app.exists(),
+            "the stage the recovery then applies is untouched"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// NOTHING MOVES UNLESS EVERY PRECONDITION HOLDS: each of the ways the disk can
+    /// differ from the one shape the transaction knows how to undo refuses, and
+    /// leaves the activation installed, its trial armed at the same count, the
+    /// predecessor retained, and the stage in place.
+    #[test]
+    fn a_supersede_moves_nothing_unless_every_precondition_holds() {
+        type Mutation = fn(&Staging, &Path, &Path);
+        type Case = (
+            &'static str,
+            Mutation,
+            (u64, &'static str),
+            u64,
+            &'static str,
+            bool,
+        );
+        let other_install = |s: &Staging, _installed: &Path, root: &Path| {
+            let other = root.join("Other").join("aterm.app");
+            sealed_fixture(&other, 11, SUPERSEDE_ACTIVATION_COMMIT);
+            crate::manifest::FailedMark::record_required(
+                &s.trial(),
+                11,
+                SUPERSEDE_ACTIVATION_DIGEST,
+                Some(&other),
+            )
+            .unwrap();
+        };
+        // (why, the disk's difference, the running identity, the newer build, the
+        // words of the refusal that must answer it — each at its own step — and
+        // whether that refusal is about the MOMENT rather than the disk's shape).
+        // A bundle whose sealed identity cannot be read: the stand-in for a
+        // verification that failed or ran out of its budget.
+        fn unverifiable(app: &Path) {
+            std::fs::remove_file(app.join("sealed")).unwrap();
+        }
+        let cases: [Case; 14] = [
+            (
+                "not newer",
+                |_, _, _| {},
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                11,
+                "is not newer than it",
+                false,
+            ),
+            (
+                "the marker names another build",
+                |s, _, _| write_ready_for(s, 13, SUPERSEDE_NEWER_COMMIT),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "no verified stage of build 12",
+                true,
+            ),
+            (
+                "the staged bundle is not the marker's",
+                |s, _, _| sealed_fixture(&s.staged_app, 13, SUPERSEDE_NEWER_COMMIT),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "not the marker's build 12",
+                true,
+            ),
+            (
+                "the staged bundle does not verify",
+                |s, _, _| unverifiable(&s.staged_app),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "the staged bundle does not verify",
+                true,
+            ),
+            (
+                "the stage is yanked",
+                |s, _, _| std::fs::write(s.floor(), "min_build = 13\n").unwrap(),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "below the operator floor 13",
+                false,
+            ),
+            (
+                "the installed bundle is not the activation",
+                |_, installed, _| sealed_fixture(installed, 13, SUPERSEDE_NEWER_COMMIT),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "sealed 13, not the activation",
+                false,
+            ),
+            (
+                "the installed bundle does not verify",
+                |_, installed, _| unverifiable(installed),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "the installed bundle does not verify",
+                true,
+            ),
+            (
+                "the trial is armed for another build",
+                |s, _, _| boot_sentinel(s).arm(12).unwrap(),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "armed for build 12, not for it",
+                false,
+            ),
+            (
+                "no trial is armed",
+                |s, _, _| boot_sentinel(s).confirm().unwrap(),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "no boot trial is armed",
+                false,
+            ),
+            (
+                "the trial belongs to another install",
+                other_install,
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "belongs to another install",
+                false,
+            ),
+            (
+                "the trial marker names other bytes",
+                |s, _, _| {
+                    crate::manifest::InstalledReceipt::clear(&s.installed_receipt());
+                },
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "does not name these bytes",
+                false,
+            ),
+            (
+                "the retained predecessor is not the running build",
+                |_, installed, _| {
+                    sealed_fixture(&rollback_path(installed), 9, SUPERSEDE_RUNNING_COMMIT);
+                },
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "is 9/1111111111111111111111111111111111111111, not the running 10/",
+                false,
+            ),
+            (
+                "the retained predecessor does not verify",
+                |_, installed, _| unverifiable(&rollback_path(installed)),
+                (10, SUPERSEDE_RUNNING_COMMIT),
+                12,
+                "the retained predecessor does not verify",
+                true,
+            ),
+            (
+                "the running build is another commit",
+                |_, _, _| {},
+                (10, "4444444444444444444444444444444444444444"),
+                12,
+                "not the running 10/4444444444444444444444444444444444444444",
+                false,
+            ),
+        ];
+        for (why, mutate, running, newer, words, for_now) in cases {
+            let (s, root, installed) = superseded_activation_desk();
+            mutate(&s, &installed, &root);
+            let installed_before = sealed_fixture_identity(&installed);
+            let fixed_before = sealed_fixture_identity(&rollback_path(&installed));
+            let sentinel_before = boot_sentinel(&s).read_state();
+            let refusal = supersede_desk(&s, &installed, running, newer)
+                .expect_err(&format!("{why}: must refuse"));
+            let error = refusal.reason();
+            assert!(
+                error.contains("stays in place") && error.contains(words),
+                "{why}: {error}"
+            );
+            assert_eq!(
+                refusal.is_for_now(),
+                for_now,
+                "{why}: the refusal's kind ({refusal:?})"
+            );
+            assert_eq!(
+                sealed_fixture_identity(&installed),
+                installed_before,
+                "{why}"
+            );
+            assert_eq!(
+                sealed_fixture_identity(&rollback_path(&installed)),
+                fixed_before,
+                "{why}"
+            );
+            assert_eq!(boot_sentinel(&s).read_state(), sentinel_before, "{why}");
+            assert!(s.ready.exists() && s.staged_app.exists(), "{why}");
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// An out-of-band install (install.sh, a DMG drag) landing inside an armed

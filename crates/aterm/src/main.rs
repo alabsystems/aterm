@@ -579,7 +579,7 @@ pub(crate) fn main() -> ExitCode {
     // `[update]` owner/repo repoint (`aterm_gui::configured_update_settings`, 2026-09-14;
     // no env override since 2026-09-23) — the same resolution the window's loop and the
     // ctl `update check` verb use. "Check for updates automatically" off (`[update]
-    // enabled = false`, Settings ▸ Terminal ▸ Updates) makes the call a no-op, exactly as
+    // enabled = false`, Settings ▸ Software Update) makes the call a no-op, exactly as
     // it does for the window (`aterm_update::automatic`); `aterm update check` still runs.
     // Resolve on the checker thread each cycle so a config reload also changes
     // the channel of an already-running session.
@@ -1313,8 +1313,8 @@ fn nests_inside_aterm(bare: bool, force_session: bool, aterm_child: bool, stdin_
 /// sibling handoff every other window takes.
 #[cfg(windows)]
 fn nested_new_tab() -> ExitCode {
-    const ALREADY_INSIDE: &str = "aterm: already inside aterm — opened a new tab here \
-        (aterm --session nests a transparent session on purpose)";
+    const ALREADY_INSIDE: &str =
+        "aterm: opened a new tab in this aterm window (`aterm --session` nests a session instead)";
     let request = match aterm_cli::parse_window_request(
         "new-tab",
         &[OsString::from("-d"), OsString::from(".")],
@@ -1336,16 +1336,11 @@ fn nested_new_tab() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(Ok(reply)) => {
-            eprintln!(
-                "aterm: already inside aterm, but the running aterm refused a new tab: {reply}"
-            );
+            eprintln!("aterm: this aterm window refused a new tab: {reply}");
             ExitCode::FAILURE
         }
         Some(Err(error)) => {
-            eprintln!(
-                "aterm: already inside aterm, but could not reach it ({error}); opening a new \
-                 window (aterm --session nests a transparent session on purpose)"
-            );
+            eprintln!("aterm: could not reach this aterm window ({error}); opening a new window");
             run_window(
                 request.window_args(),
                 WindowHost::WindowedSibling,
@@ -1353,10 +1348,7 @@ fn nested_new_tab() -> ExitCode {
             )
         }
         None => {
-            eprintln!(
-                "aterm: already inside aterm, but its control socket is not reachable; opening \
-                 a new window (aterm --session nests a transparent session on purpose)"
-            );
+            eprintln!("aterm: could not reach this aterm window; opening a new window");
             run_window(
                 request.window_args(),
                 WindowHost::WindowedSibling,
@@ -2160,18 +2152,28 @@ fn update_summary(
             Some(UPDATE_LOG_HINT.to_string()),
         );
     }
-    // No completed check yet: "up to date" would be a claim nothing has tested.
-    let Some(checked) = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at) else {
-        let mut line = format!("aterm {version} hasn\u{2019}t checked for updates yet");
-        if !automatic_checks {
-            line.push_str(" \u{b7} automatic checks are off (Settings \u{25b8} Software Update)");
+    let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at);
+    let mut line = if st.linux.as_ref().is_some_and(|native| native.refused_newer) {
+        // A Linux copy that rolled a newer build back runs an older one on purpose;
+        // `-v`'s decision line names the build. "Up to date" would hide it. It still
+        // checks, and installs any release newer than the refused one: say when.
+        let refused = format!(
+            "aterm {version} \u{b7} a newer release was rolled back on this copy and won\u{2019}t \
+             install again"
+        );
+        match checked {
+            Some(checked) => format!("{refused} \u{b7} checked {}", ago_words(checked, now)),
+            None => refused,
         }
-        return (line, None);
+    } else if let Some(checked) = checked {
+        format!(
+            "aterm {version} is up to date \u{b7} checked {}",
+            ago_words(checked, now)
+        )
+    } else {
+        // No completed check yet: "up to date" would be a claim nothing has tested.
+        format!("aterm {version} hasn\u{2019}t checked for updates yet")
     };
-    let mut line = format!(
-        "aterm {version} is up to date \u{b7} checked {}",
-        ago_words(checked, now)
-    );
     if !automatic_checks {
         line.push_str(" \u{b7} automatic checks are off (Settings \u{25b8} Software Update)");
     }
@@ -2696,6 +2698,7 @@ mod tests {
             trial_phase: Some("Installed".into()),
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         });
         assert_eq!(
             say(&waiting, true, true),
@@ -2714,6 +2717,33 @@ mod tests {
         );
         waiting.linux.as_mut().expect("linux").trial_healthy = true;
         assert!(say(&waiting, true, true).0.contains("is up to date"));
+        // A copy that rolled a newer build back runs an older one on purpose: never
+        // "up to date" over a ledger whose `-v` line says the newer one was refused.
+        let mut refused = waiting.clone();
+        let native = refused.linux.as_mut().expect("linux");
+        native.trial_phase = None;
+        native.refused_newer = true;
+        // It still checks (a release newer than the refused one installs): say when.
+        assert_eq!(
+            say(&refused, true, true),
+            (
+                "aterm 0.91.0 \u{b7} a newer release was rolled back on this copy and \
+                 won\u{2019}t install again \u{b7} checked 12 min ago"
+                    .to_string(),
+                None
+            )
+        );
+        assert!(say(&refused, true, false).0.ends_with(
+            "won\u{2019}t install again \u{b7} checked 12 min ago \u{b7} automatic checks \
+                 are off (Settings \u{25b8} Software Update)"
+        ));
+        // No completed check on record: the rolled-back fact alone, no time.
+        refused.updated_at = String::new();
+        assert_eq!(
+            say(&refused, true, true).0,
+            "aterm 0.91.0 \u{b7} a newer release was rolled back on this copy and \
+             won\u{2019}t install again"
+        );
         // A Linux failure carries one class that names no cause: no tautology after it.
         let mut linux_failing = update_status();
         linux_failing.failing_checks = 1;
@@ -2736,6 +2766,7 @@ mod tests {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
+            refused_newer: false,
         });
         assert_eq!(
             say(&native, true, true),

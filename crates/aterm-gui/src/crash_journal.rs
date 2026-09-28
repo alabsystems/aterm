@@ -1829,7 +1829,7 @@ pub(crate) mod tests {
     /// killed, the journal claimed and read back, and the reopened row says
     /// what comes back. With the relaunch on and nothing else running it is a
     /// RECORD: only scrollback was lost. Beside a lost vim the warning names
-    /// vim and a detail says aterm starts Claude again. NEGATIVE CONTROLS through the
+    /// vim and its sentence says aterm starts Claude again. NEGATIVE CONTROLS through the
     /// same files: with the relaunch off (the harness off, or headless) the
     /// agent is a program lost as before; an agent that never registered a
     /// conversation is lost too (the relaunch refuses it); and an entry
@@ -1893,14 +1893,19 @@ pub(crate) mod tests {
         let row = journal_reopened_message(&beside, None, None, None, true);
         assert_eq!(row.severity, Severity::Warn);
         assert_eq!(row.title, "Tabs restored, vim lost");
-        assert!(
-            row.detail[0].starts_with("vim was running in 1 of 2 tabs"),
+        // One sentence (ruling 314): the agent coming back rides detail[0],
+        // never the technical lines under it.
+        assert_eq!(
+            row.detail[0],
+            "vim was running in 1 of 2 tabs and did not survive, nor did the scrollback; \
+             aterm starts Claude again on its conversation in tab 2",
             "{:?}",
             row.detail
         );
-        assert_eq!(
-            row.detail[1],
-            "aterm starts Claude again on its conversation in tab 2"
+        assert!(
+            row.detail[1..].iter().all(|l| !l.contains("starts Claude")),
+            "{:?}",
+            row.detail
         );
 
         // NEGATIVE CONTROLS.

@@ -434,12 +434,15 @@ pub(crate) fn cmd_tombstone_content(message: &str) -> String {
 /// Escape a string for safe embedding in a `cmd.exe` `echo` argument: the shell
 /// metacharacters `^ & < > | ( ) "` are `^`-escaped and `%` is doubled (batch
 /// variable-expansion). `^` is handled first so its own escape is not re-escaped.
+/// An em dash becomes `-`: cmd.exe reads the batch file in the console's OEM code
+/// page, where the UTF-8 em dash prints as mojibake.
 #[cfg(any(windows, test))]
 fn cmd_echo_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
             '%' => out.push_str("%%"),
+            '\u{2014}' => out.push('-'),
             '^' | '&' | '<' | '>' | '|' | '(' | ')' | '"' => {
                 out.push('^');
                 out.push(c);
@@ -1096,13 +1099,15 @@ mod tests {
         let c = cmd_tombstone_content("atpkg: ay was yanked/revoked — run `aterm pkg update`");
         assert!(c.contains("1>&2"), "notice goes to stderr: {c}");
         assert!(c.contains("exit /b 70"), "exits 70: {c}");
+        // cmd.exe reads the file in the console's OEM code page: the em dash goes.
+        assert!(c.is_ascii(), "a .cmd tombstone is ASCII: {c}");
         // A tombstone must NOT parse as an installed shim (mirrors read_link Err on Unix).
         assert_eq!(parse_cmd_shim_target(&c), None);
         // Framed like every other `.cmd` (2026-09-18): a tombstone is laid over a shim
         // that may be executing, and the notice must not be what its program's exit
         // resumes into.
         let mut want = cmd_frame();
-        want.push_str("@echo atpkg: ay was yanked/revoked — run `aterm pkg update` 1>&2\r\n");
+        want.push_str("@echo atpkg: ay was yanked/revoked - run `aterm pkg update` 1>&2\r\n");
         want.push_str("@exit /b 70\r\n");
         assert_eq!(c, want);
     }

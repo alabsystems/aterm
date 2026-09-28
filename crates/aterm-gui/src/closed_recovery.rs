@@ -325,6 +325,8 @@ mod tests {
             viewport_anchor: 0,
             durable_seq: 0,
             metadata: "command=rm -rf /".to_string(),
+            settings_drafts: Vec::new(),
+            settings_drafts_unreadable: 0,
         });
         let mut ledger = RecoveryLedger::new(1, 100);
         ledger.push(unavailable.clone(), 0);

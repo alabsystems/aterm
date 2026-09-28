@@ -15,7 +15,7 @@
 //! | Mode | Trust | Enforced |
 //! |------|-------|----------|
 //! | **Master** | Full | Nothing beyond the capability-gated spawn. |
-//! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps the launching shell's resource limits. |
+//! | **User** | Normal (default) | Nothing beyond the capability-gated spawn; the shell keeps aterm's own resource limits. |
 //! | **Safety** | Reduced | Hardened resource limits; no OS sandbox. |
 //! | **Containment** | Hostile | macOS Seatbelt: no network, writes confined to the temp roots, no read or write of the credential and private-data stores — plus the hardened limits. Refuses to start where no OS sandbox exists. |
 //!

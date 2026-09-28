@@ -504,15 +504,21 @@ fn declared(scope: &Scope) -> Vec<StageSpec> {
             Lane::MainTarget,
         ));
     }
+    // THE HEADLESS SMOKE, LAND tier and exclusive: the `cursor` round trip
+    // every `aterm drive` verb preflights with, then a typing burst over the
+    // control socket that must heal no lost output wake, a reading only an idle
+    // machine can make (`smoke_stages`). Being exclusive it is also the LAND
+    // tier's barrier in every scope — the deadline tests above are removed by a
+    // narrowing that drops aterm-update — so the driver-lane rows declared
+    // after it run with nothing else in flight.
     v.push(exclusive(
         StageId::ControlSocketSmoke,
         "control-socket smoke",
         Lane::DriverTarget,
     ));
     // THE PACING SMOKE, MEASURE tier since 2026-09-26: it gates a real
-    // window's input->present, key->write and present->glass percentiles —
-    // the machine's latencies, which the control-socket smoke above (the
-    // AI-first spine, LAND) does not judge.
+    // window's frames, input->present, key->write and present->glass — the
+    // machine's latencies, which the headless smoke above cannot see.
     v.push(exclusive(
         StageId::GuiSmoke,
         "gui typing-pacing smoke",

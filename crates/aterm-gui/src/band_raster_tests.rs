@@ -1126,7 +1126,12 @@ fn every_rows_glyph_is_a_drawn_icon_and_its_character_stays() {
     let theme = Theme::default();
     let col = aterm_messages::GLYPH_COL;
     let icon_of = |r: &Option<RowRaster>| -> Vec<(u16, aterm_render::BandIcon)> {
-        r.as_ref().map(|r| r.icons.clone()).unwrap_or_default()
+        r.as_ref().map_or_else(Vec::new, |r| {
+            r.icons
+                .iter()
+                .map(|&(c, i)| (c, crate::message_band::band_icon(i)))
+                .collect()
+        })
     };
     for &ch in aterm_messages::Glyph::ALLOWED {
         let now = Instant::now();

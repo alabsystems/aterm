@@ -12,7 +12,7 @@
 //!   socket path's permissions and nothing crosses a wire.
 //! * `--tcp` — PLAINTEXT TCP to `<host>:<port>`. §8.6's "trusted-network-only
 //!   setting", and it says so on stderr every time, because a cross-host fabric
-//!   on plaintext TCP carries every keystroke and every message in the clear.
+//!   on plaintext TCP carries every message and presence row in the clear.
 //! * `--tcp --key-file <path>` — the same TCP inside astream's sealed record
 //!   layer: XChaCha20-Poly1305 under a 32-byte pre-shared key, with each
 //!   record's AAD binding both hellos, the direction and the sequence, and a
@@ -31,7 +31,7 @@
 //! exposes no `identity` transport to serve one against. So this rung
 //! implements the two flags §11.2's own synopsis names, and `--handshake` /
 //! `--identity` are refused BY NAME with that reason rather than silently
-//! absent — see the deviation note in `serve`'s usage.
+//! absent (`cli::parse`).
 //!
 //! ## The erased stream and its closer — astream's
 //!
@@ -234,6 +234,19 @@ pub fn read_key_file(path: &str) -> io::Result<[u8; 32]> {
     }
 }
 
+/// One error from [`read_key_file`], [`check_private`] or
+/// [`read_private_key_file`] as text that names `path` ONCE: their own refusals
+/// already lead with it, and an OS error (a missing file, a denied `stat`)
+/// never carries one. A caller prefixes only its flag (`--key-file {…}`).
+#[must_use]
+pub fn describe(path: &str, e: &io::Error) -> String {
+    if e.raw_os_error().is_some() {
+        format!("{path}: {e}")
+    } else {
+        e.to_string()
+    }
+}
+
 /// Whether THIS build carries the sealed TCP transport — the `sealed` cargo
 /// feature (this crate's Cargo.toml says why it is off by default). Every verb
 /// that needs it asks here first and refuses by name with
@@ -242,12 +255,22 @@ pub fn read_key_file(path: &str) -> io::Result<[u8; 32]> {
 pub const SEALED: bool = cfg!(feature = "sealed");
 
 /// What a default build says when a verb needs the sealed transport: the
-/// feature, the rebuild, and why the shipped binary does not carry it.
+/// feature and the rebuild (this crate's Cargo.toml says why it is off).
 pub const SEALED_UNAVAILABLE: &str = "the sealed TCP transport is not in this build: it is \
-     the `sealed` cargo feature, off by default and off in the shipped `aterm` (it compiles \
-     astream-aead's chacha20poly1305 + getrandom tree, which a one-host fleet never opens) — \
-     rebuild with `targo --unverified build --release -p aterm --features sealed` \
+     the `sealed` cargo feature, off in the shipped `aterm` — rebuild with \
+     `targo --unverified build --release -p aterm --features sealed` \
      (or `-p aterm-link --features sealed` for the `aterm-link` binary alone)";
+
+/// Why this build cannot run a command line: `Some` only when `args` ask for
+/// the sealed wire (`--tcp` and `--key-file`) in a build without it
+/// ([`SEALED`]). `serve`, `ls` and `notify` ask it BEFORE parsing, so this one
+/// fact comes first — never after a complaint about the key file a build
+/// without the wire could not use anyway.
+#[must_use]
+pub fn sealed_flags_refusal(args: &[String]) -> Option<&'static str> {
+    let has = |flag: &str| args.iter().any(|a| a == flag);
+    (!SEALED && has("--tcp") && has("--key-file")).then_some(SEALED_UNAVAILABLE)
+}
 
 /// Refuse a SECRET file anyone but its owner can read: a mint secret, a
 /// pre-shared key, a capability file. `mode & 0o077` must be zero — 0600 or
@@ -449,6 +472,47 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("chmod");
         assert_eq!(read_private_key_file(p).expect("read"), [0x5a; 32]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A KEY-FILE ERROR NAMES ITS PATH ONCE, whichever way it failed: the
+    /// reader's own refusal already leads with it, an OS error is given it.
+    #[test]
+    fn describe_names_the_path_once() {
+        let dir = std::env::temp_dir().join(format!("atlink-describe-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        let path = dir.join("k");
+        let p = path.to_str().expect("utf8");
+        let missing = read_key_file(p).expect_err("absent");
+        std::fs::write(&path, "not hex").expect("write");
+        let malformed = read_key_file(p).expect_err("malformed");
+        for e in [missing, malformed] {
+            let text = describe(p, &e);
+            assert!(
+                text.starts_with(&format!("{p}: ")) && text.matches(p).count() == 1,
+                "{text}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only `--tcp --key-file`, and only in a build without the sealed wire, is
+    /// refused before parsing: a Unix socket, plaintext TCP and a key without
+    /// `--tcp` (which `parse` refuses itself) all pass.
+    #[test]
+    fn only_the_sealed_wire_in_a_build_without_it_is_refused() {
+        let argv = |line: &str| line.split(' ').map(str::to_string).collect::<Vec<_>>();
+        let base = "--fleet f1 --broker 127.0.0.1:7000";
+        assert_eq!(sealed_flags_refusal(&argv(base)), None);
+        assert_eq!(sealed_flags_refusal(&argv(&format!("{base} --tcp"))), None);
+        assert_eq!(
+            sealed_flags_refusal(&argv(&format!("{base} --key-file /none/k"))),
+            None
+        );
+        let sealed = sealed_flags_refusal(&argv(&format!("{base} --tcp --key-file /none/k")));
+        assert_eq!(sealed.is_some(), !SEALED);
+        if let Some(why) = sealed {
+            assert!(why.contains("`sealed` cargo feature"), "{why}");
+        }
     }
 
     /// THE KEY FILE A HOST MINTS reads back through the reader every host and

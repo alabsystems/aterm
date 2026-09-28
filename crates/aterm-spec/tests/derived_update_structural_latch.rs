@@ -4,11 +4,16 @@
 use aterm_spec::{derive::native_update_structural_latch_model, interp, verify};
 
 /// A STRUCTURAL convergence no longer strands every later release (gap 14,
-/// 2026-09-26). The latch on build N gets ONE re-sample after a day and one
-/// attempt per newer verified release — never the launch its boot trial
-/// reverts on, which is held and said instead, and never PROMISED past the
-/// first count that rules it out (gap 14 review) — and build N stays covered
-/// whatever the digest. Tier-0 here; the Tier-1 bind to the real
+/// 2026-09-26; round three). The latch on build N gets ONE re-sample after a
+/// day — never the launch its boot trial reverts on, which is held and said
+/// instead, and never PROMISED past the first count that rules it out (gap 14
+/// review) — and a verified newer release takes N's place at the install path,
+/// whatever the trial, without N being launched for it — and a retire that is
+/// REFUSED leaves that release unspent, offered again at its retry deadline
+/// (round three review). Build N stays covered whatever the digest. The
+/// negative controls replay gap 14's own `Decide`, the refusal that spent the
+/// release, the strand before gap 14 and its trial-blind fix, each in its own
+/// runs. Tier-0 here; the Tier-1 bind to the real
 /// `structural_latch`, `spend_physical_failure_budget` and
 /// `AutoApplyManualOnly::covers` is aterm-gui's `native_updater_conformance.rs`.
 #[test]
@@ -26,19 +31,94 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
         verify::uncaught_invariants(&model)
     );
 
-    // The trial has room: a newer release releases the latch once, and the
-    // attempt failing re-latches without a second one for the same release.
+    // A newer release supersedes N, room or none: the retire starts at the
+    // look, and when it lands the latch goes with N's bytes. N is never
+    // launched for it, and nothing is left to attempt.
+    for trial in ["TrialHasRoom", "TrialIsSpent"] {
+        let mut newer = model.init_state();
+        assert!(model.fire(trial, &mut newer));
+        assert!(model.fire("NewerArrives", &mut newer));
+        assert!(model.fire("Decide", &mut newer));
+        assert_eq!(
+            (newer["latched"], newer["superseding"], newer["newer_spent"]),
+            (1, 1, 1),
+            "{trial}: the retire is under way and the latch holds meanwhile"
+        );
+        assert!(model.fire("Supersede", &mut newer));
+        assert_eq!(
+            (newer["latched"], newer["superseded"], newer["booted_old"]),
+            (0, 1, 0),
+            "{trial}: superseded, and N never booted"
+        );
+        assert!(
+            !model.action_enabled("AttemptFails", &newer),
+            "{trial}: no attempt at N follows a supersede"
+        );
+        assert!(!model.action_enabled("DayPasses", &newer));
+    }
+
+    // A refused retire leaves the latch, said, and does NOT spend the release
+    // (round three review): a refusal can be a moment — a verification that ran
+    // out of its budget, the apply lock held too long — so the release is
+    // offered again once its retry deadline passes. Until then it still
+    // outranks the day: N is not launched while a newer build is on its way.
+    for trial in ["TrialHasRoom", "TrialIsSpent"] {
+        let mut refused = model.init_state();
+        assert!(model.fire(trial, &mut refused));
+        assert!(model.fire("NewerArrives", &mut refused));
+        assert!(model.fire("Decide", &mut refused));
+        assert!(model.fire("SupersedeRefused", &mut refused));
+        assert_eq!(
+            (
+                refused["latched"],
+                refused["said"],
+                refused["newer_spent"],
+                refused["backoff"]
+            ),
+            (1, 1, 0, 1),
+            "{trial}: refused, said, unspent, waiting out its retry deadline"
+        );
+        assert!(model.fire("Decide", &mut refused));
+        assert_eq!(
+            (refused["latched"], refused["superseding"]),
+            (1, 0),
+            "{trial}: not offered again before its retry deadline"
+        );
+        assert!(model.fire("DayPasses", &mut refused));
+        assert!(model.fire("Decide", &mut refused));
+        assert_eq!(
+            (refused["latched"], refused["booted_old"]),
+            (1, 0),
+            "{trial}: the waiting release outranks the day"
+        );
+        assert!(model.fire("RetryDue", &mut refused));
+        assert!(model.fire("Decide", &mut refused));
+        assert_eq!(
+            (
+                refused["latched"],
+                refused["superseding"],
+                refused["newer_spent"]
+            ),
+            (1, 1, 1),
+            "{trial}: at its deadline the release is offered again"
+        );
+        assert!(model.fire("Supersede", &mut refused));
+        assert_eq!(
+            (
+                refused["latched"],
+                refused["superseded"],
+                refused["booted_old"]
+            ),
+            (0, 1, 0),
+            "{trial}: and the retry lands, N never booted"
+        );
+    }
+
+    // The day with room and no newer release: the one re-sample, then never
+    // again.
     let mut room = model.init_state();
     assert!(model.fire("TrialHasRoom", &mut room));
-    assert!(model.fire("NewerArrives", &mut room));
     assert!(model.fire("Decide", &mut room));
-    assert_eq!((room["latched"], room["newer_spent"]), (0, 1));
-    assert!(model.fire("AttemptFails", &mut room));
-    assert!(
-        !model.action_enabled("Decide", &room),
-        "nothing new to decide"
-    );
-    // The day passes: the one re-sample, then never again.
     assert!(model.fire("DayPasses", &mut room));
     assert!(model.fire("Decide", &mut room));
     assert_eq!((room["latched"], room["owed"], room["spent"]), (0, 0, 1));
@@ -46,15 +126,16 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
     assert_eq!(room["owed"], 0, "a failed re-sample owes no second one");
     assert!(!model.action_enabled("DayPasses", &room));
 
-    // Both at once: ONE attempt answers both.
+    // Both at once: the newer release outranks the day — no launch of N while a
+    // newer build waits to take its place.
     let mut both = model.init_state();
     assert!(model.fire("TrialHasRoom", &mut both));
     assert!(model.fire("DayPasses", &mut both));
     assert!(model.fire("NewerArrives", &mut both));
     assert!(model.fire("Decide", &mut both));
     assert_eq!(
-        (both["latched"], both["owed"], both["newer_spent"]),
-        (0, 0, 1)
+        (both["latched"], both["superseding"], both["owed"]),
+        (1, 1, 1)
     );
 
     // No room, found by the first count: the promised re-sample is withdrawn
@@ -72,14 +153,8 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
     assert!(model.fire("TrialHasRoom", &mut roomy));
     assert!(model.fire("Decide", &mut roomy));
     assert_eq!((roomy["latched"], roomy["owed"], roomy["said"]), (1, 1, 0));
-
-    // No room: the earned attempt is held and said, the latch stays, and the
-    // hold spends the re-sample too — every launch left is the reverting one.
-    let mut spent = model.init_state();
-    assert!(model.fire("TrialIsSpent", &mut spent));
-    assert!(model.fire("NewerArrives", &mut spent));
-    assert!(model.fire("Decide", &mut spent));
-    assert_eq!((spent["latched"], spent["said"], spent["owed"]), (1, 1, 0));
+    // No room: the day finds nothing left to spend.
+    let mut spent = first.clone();
     assert!(model.fire("DayPasses", &mut spent));
     assert!(model.fire("Decide", &mut spent));
     assert_eq!(spent["latched"], 1, "the day finds nothing left to spend");
@@ -92,20 +167,77 @@ fn a_structural_latch_is_resampled_once_and_yields_to_a_newer_release() {
 
     // NEGATIVE CONTROL, one arc per mutant.
     let buggy = interp::with_buggy(&model, 1);
-    // Today's strand: the newer release is blocked forever and the day
-    // changes nothing.
-    for (event, invariant) in [
-        ("NewerArrives", "NewerReleaseIsTried"),
-        ("DayPasses", "ResampleAfterADay"),
-    ] {
-        let mut strand = buggy.init_state();
-        assert!(buggy.fire("TrialHasRoom", &mut strand));
-        assert!(buggy.fire(event, &mut strand));
-        assert!(buggy.fire("Decide", &mut strand));
-        assert_eq!(strand["latched"], 1, "{event}: the strand holds");
-        assert!(!buggy.check_invariant(invariant, &strand), "{invariant}");
-    }
-    // The trial-blind release: it spends the reverting launch, silently.
+    // GAP 14'S OWN `Decide` (0.94.0), looking at the newer release before the
+    // day. With room: the latch opens for one more attempt at N, launched while
+    // the newer release waits behind it.
+    let mut retried = buggy.init_state();
+    assert!(buggy.fire("TrialHasRoom", &mut retried));
+    assert!(buggy.fire("NewerArrives", &mut retried));
+    assert!(buggy.fire("Decide", &mut retried));
+    assert_eq!(
+        (
+            retried["latched"],
+            retried["superseding"],
+            retried["newer_spent"]
+        ),
+        (0, 0, 1),
+        "gap 14 with room: released for an attempt at N, no retire"
+    );
+    assert!(!buggy.check_invariant("NeverBootsTheOlderActivation", &retried));
+    // …without room: held, said, and the release spent — it waits for the
+    // Version menu.
+    let mut held = buggy.init_state();
+    assert!(buggy.fire("TrialIsSpent", &mut held));
+    assert!(buggy.fire("NewerArrives", &mut held));
+    assert!(buggy.fire("Decide", &mut held));
+    assert_eq!(
+        (
+            held["latched"],
+            held["superseding"],
+            held["newer_spent"],
+            held["said"]
+        ),
+        (1, 0, 1, 1),
+        "gap 14 without room: held and said, the release spent"
+    );
+    assert!(!buggy.check_invariant("ANewerReleaseClearsTheLatch", &held));
+    // THE REFUSAL THAT SPENT THE RELEASE (round three as first shipped), looking
+    // at the newer release after the day: the look starts the retire as the
+    // healthy lane does, and the refusal keeps the release spent, with no retry.
+    let mut spent = buggy.init_state();
+    assert!(buggy.fire("TrialHasRoom", &mut spent));
+    assert!(buggy.fire("DayPasses", &mut spent));
+    assert!(buggy.fire("NewerArrives", &mut spent));
+    assert!(buggy.fire("Decide", &mut spent));
+    assert_eq!(spent["superseding"], 1, "the look is the healthy one");
+    let healthy_refusal = model.successors("SupersedeRefused", &spent);
+    assert!(buggy.fire("SupersedeRefused", &mut spent));
+    assert_ne!(
+        healthy_refusal,
+        vec![spent.clone()],
+        "the healthy refusal unspends and schedules a retry"
+    );
+    assert_eq!((spent["newer_spent"], spent["backoff"]), (1, 0));
+    assert!(buggy.fire("Decide", &mut spent));
+    assert_eq!(
+        (spent["latched"], spent["superseding"]),
+        (1, 0),
+        "the release is never offered again"
+    );
+    assert!(!buggy.check_invariant("ANewerReleaseClearsTheLatch", &spent));
+    // THE STRAND BEFORE GAP 14: with room and no newer release, the day changes
+    // nothing.
+    let mut strand = buggy.init_state();
+    assert!(buggy.fire("TrialHasRoom", &mut strand));
+    assert!(buggy.fire("DayPasses", &mut strand));
+    assert!(buggy.fire("Decide", &mut strand));
+    assert_eq!(
+        (strand["latched"], strand["owed"]),
+        (1, 1),
+        "the strand holds"
+    );
+    assert!(!buggy.check_invariant("ResampleAfterADay", &strand));
+    // The trial-blind re-sample: it spends the reverting launch, silently.
     let mut blind = buggy.init_state();
     assert!(buggy.fire("TrialIsSpent", &mut blind));
     assert!(buggy.fire("DayPasses", &mut blind));

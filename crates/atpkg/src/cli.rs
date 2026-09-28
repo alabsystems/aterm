@@ -6677,7 +6677,7 @@ fn failed_install_state(e: &crate::FlowError) -> Option<String> {
         | crate::FlowError::Unreachable(_)
         | crate::FlowError::Stale => None,
         // The vendor lane's own stamp keeps its verdict; the program's row stays as it is.
-        crate::FlowError::Vendor(_) => None,
+        crate::FlowError::Vendor(_) | crate::FlowError::VendorUnreachable(_) => None,
         _ => Some(format!("error: {e}")),
     }
 }
@@ -9505,7 +9505,7 @@ fn human_marker(line: &str) -> Option<String> {
     }
     if let Some(body) = marked(SEED_UNUSABLE_MARKER) {
         return Some(if body.contains(UNSERVED_ARCHITECTURE_CLAUSE) {
-            "No ALab build is published for this Mac's processor yet.".to_string()
+            "No ALab build is published for this machine's processor yet.".to_string()
         } else {
             sentence(body)
         });
@@ -10166,16 +10166,48 @@ fn installed_line(program: &str, build: u64, laid: &[String]) -> String {
 /// the one hold — which for a coherence-group member holds the whole group, said as a
 /// fact in the same line rather than as a stderr warning with a second, contradictory
 /// remedy (audit, 2026-09-25: the old pair said "pin to hold it there" on stdout and
-/// "consider `aterm pkg update` to re-cohere" on stderr).
-fn rollback_line(program: &str, from: u64, to: u64, group: Option<&str>) -> String {
-    let hold = match group {
-        Some(g) => format!("holds it, and with it the whole {g} group"),
-        None => String::from("holds it there"),
+/// "consider `aterm pkg update` to re-cohere" on stderr). `held_by` names the pins already
+/// holding it ([`crate::flow::RollbackReport::held_by`]): then no update moves it, and the
+/// line names the unpin instead. `revoked` is a group member's revoked current build
+/// ([`crate::flow::RollbackReport::revoked_member`]): the next update moves the group
+/// whatever is pinned, so the line names that build and no pin.
+fn rollback_line(
+    program: &str,
+    from: u64,
+    to: u64,
+    group: Option<&str>,
+    held_by: &[String],
+    revoked: Option<(&str, u64)>,
+) -> String {
+    let head = format!("atpkg: rolled back {program} from build {from} to {to}");
+    if let Some((member, build)) = revoked {
+        return format!(
+            "{head}; the next update moves it forward again ({} is revoked)",
+            crate::vendor_direct::display_build(member, build)
+        );
+    }
+    if held_by.is_empty() {
+        let hold = match group {
+            Some(g) => format!("holds it, and with it the whole {g} group"),
+            None => String::from("holds it there"),
+        };
+        return format!(
+            "{head}; the next update moves it forward again \u{2014} `aterm pkg pin {program}` \
+             {hold}"
+        );
+    }
+    let who = match held_by {
+        [p] if p == program => String::from("it is"),
+        [p] => format!("{p} is"),
+        _ => format!("{} are", held_by.join(" and ")),
     };
-    format!(
-        "atpkg: rolled back {program} from build {from} to {to}; the next update moves it \
-         forward again \u{2014} `aterm pkg pin {program}` {hold}"
-    )
+    let what = group.map_or_else(|| String::from("it"), |g| format!("the whole {g} group"));
+    let unpins = held_by
+        .iter()
+        .map(|h| format!("`aterm pkg unpin {h}`"))
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!("{head}; {who} pinned, so updates leave {what} there until {unpins}")
 }
 
 /// `atpkg rollback <program>` — re-point the program (and its shims + channel `current`) to
@@ -10196,17 +10228,23 @@ fn cmd_rollback(program: Option<&String>) -> ExitCode {
     let Some(layout) = layout() else {
         return ExitCode::from(1);
     };
-    rollback_in(&layout, crate::config::CHANNEL, program, &|| {
-        resolve_fetcher(&layout)
-    })
+    rollback_in(
+        &layout,
+        crate::config::CHANNEL,
+        program,
+        crate::config::cached().exclude(),
+        &|| resolve_fetcher(&layout),
+    )
 }
 
 /// [`cmd_rollback`]'s body over the store it is handed. `fetcher` is built only on the
 /// index lane: a vendor program's rollback ([`cmd_rollback_vendor`]) never makes one.
+/// `excluded` is `[packages].exclude`, which the next update reads beside the pins.
 fn rollback_in(
     layout: &crate::store::Layout,
     channel: &str,
     program: &str,
+    excluded: &[String],
     fetcher: &dyn Fn() -> Box<dyn crate::flow::Fetcher>,
 ) -> ExitCode {
     if let Some(spec) = crate::vendor_direct::spec(program) {
@@ -10220,6 +10258,7 @@ fn rollback_in(
         &effective_anchor(layout),
         channel,
         program,
+        excluded,
         floor,
         now_unix(),
     ) {
@@ -10256,7 +10295,9 @@ fn rollback_in(
                     program,
                     r.from_build,
                     r.to_build,
-                    r.coherence_group.as_deref()
+                    r.coherence_group.as_deref(),
+                    &r.held_by,
+                    r.revoked_member.as_ref().map(|(m, b)| (m.as_str(), *b))
                 )
             );
             if program == crate::seam::SEAM_PROGRAM {
@@ -10314,7 +10355,15 @@ fn cmd_rollback_vendor(
                 },
                 format!("rolled back {program} {} -> {}", moved.from, moved.to),
             );
-            println!("{}", vendor_rolled_back_line(spec, &moved.from, &moved.to));
+            println!(
+                "{}",
+                vendor_rolled_back_line(
+                    spec,
+                    &moved.from,
+                    &moved.to,
+                    crate::pin::is_pinned(layout, program)
+                )
+            );
             ExitCode::SUCCESS
         }
         Err(why) => {
@@ -10324,13 +10373,22 @@ fn cmd_rollback_vendor(
     }
 }
 
-/// [`cmd_rollback_vendor`]'s line: versions, and how the rollback holds.
+/// [`cmd_rollback_vendor`]'s line: versions, and how the rollback holds. A `pinned`
+/// program stays (the vendor lane leaves a pinned program alone), and the line says so in
+/// [`rollback_line`]'s words.
 fn vendor_rolled_back_line(
     spec: &crate::vendor_direct::VendorSpec,
     from: &str,
     to: &str,
+    pinned: bool,
 ) -> String {
     let p = spec.program;
+    if pinned {
+        return format!(
+            "atpkg: rolled back {p} from {from} to {to}; it is pinned, so updates leave it \
+             there until `aterm pkg unpin {p}`"
+        );
+    }
     format!(
         "atpkg: rolled back {p} from {from} to {to}; `aterm pkg pin {p}` holds it there \
          (otherwise the next update returns it to {}'s latest)",
@@ -10913,14 +10971,88 @@ fn has_work(
         || vendor_tombstoned_in_place(layout)
 }
 
-/// [`has_work`] for the store as it stands, under this process's `[packages]` table — what
+/// The long-lived window/session index workers need the CURRENT install consent, not
+/// [`crate::config::cached`]'s one-time CLI snapshot. An empty store may become eligible
+/// after the user enables Automatic updates or adopts the set without restarting aterm.
+/// A metadata stamp keeps the frequent empty-store check from reparsing an unchanged file.
+struct ProbePackagesConfig {
+    path: Option<std::path::PathBuf>,
+    seen: Option<Option<(Option<std::time::SystemTime>, u64)>>,
+    cfg: crate::config::PackagesConfig,
+}
+
+impl ProbePackagesConfig {
+    fn new(path: Option<std::path::PathBuf>, cfg: crate::config::PackagesConfig) -> Self {
+        Self {
+            path,
+            seen: None,
+            cfg,
+        }
+    }
+
+    fn poll(&mut self) -> &crate::config::PackagesConfig {
+        if let Some(path) = self.path.as_deref() {
+            let stamp = match std::fs::metadata(path) {
+                Ok(m) => Some((m.modified().ok(), m.len())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => {
+                    self.cfg = crate::config::PackagesConfig::unreadable_table();
+                    self.seen = None;
+                    return &self.cfg;
+                }
+            };
+            // A chmod or privacy-consent change need not move mtime or length.
+            // Opening is cheap; parsing remains cached. A failed read must not
+            // keep an earlier config's unattended-install permission alive.
+            if stamp.is_some() && std::fs::File::open(path).is_err() {
+                self.cfg = crate::config::PackagesConfig::unreadable_table();
+                self.seen = None;
+                return &self.cfg;
+            }
+            if self.seen != Some(stamp) {
+                match crate::config::load_live(path) {
+                    Some(cfg) => {
+                        self.cfg = cfg;
+                        self.seen = Some(stamp);
+                    }
+                    None => {
+                        self.cfg = crate::config::PackagesConfig::unreadable_table();
+                        // A transient read failure can recover without a new
+                        // mtime. Try again on the next lightweight probe.
+                        self.seen = None;
+                    }
+                }
+            }
+        }
+        &self.cfg
+    }
+}
+
+/// [`has_work`] for the store as it stands, under the LIVE `[packages]` table — what
 /// the next-index probe asks before it spends a HEAD (`index_probe::successor`, audit PK-7):
 /// a published index can wake nothing on a store whose `update` would answer
 /// [`EMPTY_UPDATE`]. Read-only: the dev links are read, never reconciled. A probe
 /// asks this every five seconds while the store is empty, so do not enumerate
 /// the shim and dev-link trees once the cheap set-completion predicate answers yes.
 pub(crate) fn update_pass_has_work(layout: &crate::store::Layout) -> bool {
-    let cfg = crate::config::cached();
+    static PROBE_CONFIG: std::sync::OnceLock<std::sync::Mutex<ProbePackagesConfig>> =
+        std::sync::OnceLock::new();
+    let cfg = PROBE_CONFIG.get_or_init(|| {
+        // `poll` reads the live file on its first call. Seeding from the
+        // short-lived CLI cache only adds a second lazy initializer here.
+        std::sync::Mutex::new(ProbePackagesConfig::new(
+            crate::config::config_path(),
+            crate::config::PackagesConfig::default(),
+        ))
+    });
+    let mut cfg = cfg.lock().unwrap_or_else(|poison| poison.into_inner());
+    update_pass_has_work_with(layout, cfg.poll())
+}
+
+fn update_pass_has_work_with(
+    layout: &crate::store::Layout,
+    cfg: &crate::config::PackagesConfig,
+) -> bool {
     probe_has_work_lazily(
         completes_the_set(layout, cfg),
         || !crate::active_builds(layout).is_empty(),
@@ -12393,7 +12525,7 @@ fn bootstrap_group(
     ) {
         println!(
             "atpkg: {} not installed \u{2014} they install together, and no {m} build is \
-             published for this Mac ({}) yet",
+             published for this machine ({}) yet",
             missing.join(", "),
             current_triple()
         );
@@ -12467,7 +12599,7 @@ fn bootstrap_group(
             // words.
             println!(
                 "atpkg: {} not installed \u{2014} they install together, and no {member} build \
-                 is published for this Mac ({triple}) yet",
+                 is published for this machine ({triple}) yet",
                 missing.join(", ")
             );
             for m in missing {
@@ -16321,7 +16453,7 @@ mod tests {
                  installs until one is published"
             ))
             .as_deref(),
-            Some("No ALab build is published for this Mac's processor yet.")
+            Some("No ALab build is published for this machine's processor yet.")
         );
         assert_eq!(
             said(&format!(
@@ -16364,13 +16496,17 @@ mod tests {
             said("atpkg: not a marker").as_deref(),
             Some("atpkg: not a marker")
         );
-        // Every marker the ledger lists is a sentence or nothing: none leaks its raw prefix.
+        // Every marker the ledger lists is a sentence — but `seed-busy:`, silent above — and
+        // none leaks its raw prefix.
         for (marker, _) in announcement::MARKERS {
+            if *marker == SEED_BUSY_MARKER {
+                continue;
+            }
             let shown = said(&format!("atpkg: {marker}3 things (~1 GiB download)"));
             assert!(
                 shown
                     .as_deref()
-                    .is_none_or(|s| !s.contains(marker.trim_end())),
+                    .is_some_and(|s| !s.contains(marker.trim_end())),
                 "{marker}: {shown:?}"
             );
         }
@@ -19080,15 +19216,48 @@ mod tests {
     #[test]
     fn the_rollback_line_is_exact_and_names_the_group_it_holds() {
         assert_eq!(
-            rollback_line("ay", 8256, 8250, None),
+            rollback_line("ay", 8256, 8250, None, &[], None),
             "atpkg: rolled back ay from build 8256 to 8250; the next update moves it forward \
              again \u{2014} `aterm pkg pin ay` holds it there"
         );
         assert_eq!(
-            rollback_line("trust", 9192, 9178, Some("rustc")),
+            rollback_line("trust", 9192, 9178, Some("rustc"), &[], None),
             "atpkg: rolled back trust from build 9192 to 9178; the next update moves it \
              forward again \u{2014} `aterm pkg pin trust` holds it, and with it the whole rustc \
              group"
+        );
+        // Already pinned — its own pin, or a group sibling's — no update moves it: the line
+        // says so and names the unpin, never a pin that is already there.
+        let held = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+        assert_eq!(
+            rollback_line("ay", 8256, 8250, None, &held(&["ay"]), None),
+            "atpkg: rolled back ay from build 8256 to 8250; it is pinned, so updates leave it \
+             there until `aterm pkg unpin ay`"
+        );
+        assert_eq!(
+            rollback_line("trust", 9192, 9178, Some("rustc"), &held(&["ay"]), None),
+            "atpkg: rolled back trust from build 9192 to 9178; ay is pinned, so updates leave \
+             the whole rustc group there until `aterm pkg unpin ay`"
+        );
+        assert_eq!(
+            rollback_line(
+                "trust",
+                9192,
+                9178,
+                Some("rustc"),
+                &held(&["ay", "trust"]),
+                None
+            ),
+            "atpkg: rolled back trust from build 9192 to 9178; ay and trust are pinned, so \
+             updates leave the whole rustc group there until `aterm pkg unpin ay` and `aterm \
+             pkg unpin trust`"
+        );
+        // A sibling's revoked current build: the next update moves the group whatever is
+        // pinned, so the line names that build and offers no pin.
+        assert_eq!(
+            rollback_line("trust", 9192, 9178, Some("rustc"), &[], Some(("ay", 8250))),
+            "atpkg: rolled back trust from build 9192 to 9178; the next update moves it \
+             forward again (ay build 8250 is revoked)"
         );
     }
 
@@ -20022,6 +20191,9 @@ mod tests {
             crate::FlowError::NoIndex,
             crate::FlowError::Unreachable("dns".into()),
             crate::FlowError::Stale,
+            crate::FlowError::VendorUnreachable(
+                "Anthropic's release channel was not reached".into(),
+            ),
         ] {
             assert_eq!(
                 failed_install_state(&env),
@@ -20271,6 +20443,7 @@ mod tests {
             &crate::sig::testkit::anchor(),
             "stable",
             "ay",
+            &[],
             vendor_floor(),
             world_now(),
         )
@@ -23724,6 +23897,55 @@ mod tests {
             },
         ));
         assert!(linked_read.get(), "a dev-only store remains eligible");
+    }
+
+    /// The probe worker outlives a CLI invocation. An adopted but empty store
+    /// must start looking for newly published members after the user enables
+    /// Automatic updates in the same running window/session. The old one-time
+    /// `config::cached()` read kept it ineligible until the process restarted.
+    #[test]
+    fn near_index_work_check_reads_live_install_consent() {
+        let dir = scratch("has-work-live-config");
+        let layout = crate::store::Layout {
+            prefix: dir.join("prefix"),
+        };
+        std::fs::create_dir_all(&layout.prefix).unwrap();
+        let config_path = dir.join("aterm.toml");
+        std::fs::write(&config_path, "[packages]\nenabled = false\n").unwrap();
+        let mut live = ProbePackagesConfig::new(
+            Some(config_path.clone()),
+            crate::config::PackagesConfig::default(),
+        );
+        assert!(!update_pass_has_work_with(&layout, live.poll()));
+
+        std::fs::write(&config_path, "[packages]\nenabled = true\n").unwrap();
+        assert!(!update_pass_has_work_with(&layout, live.poll()));
+
+        std::fs::write(layout.adopted(), "").unwrap();
+        assert!(update_pass_has_work_with(&layout, live.poll()));
+        assert!(update_pass_has_work_with(&layout, live.poll()));
+
+        std::fs::write(&config_path, "[packages]\nenabled = false\n").unwrap();
+        assert!(!update_pass_has_work_with(&layout, live.poll()));
+
+        // A malformed table must revoke unattended install eligibility even
+        // though the previous readable table allowed it; a repaired table
+        // restores the next probe without restarting the worker.
+        std::fs::write(&config_path, "[packages]\nenabled = [\n").unwrap();
+        assert!(!update_pass_has_work_with(&layout, live.poll()));
+        std::fs::write(&config_path, "[packages]\nenabled = true\n").unwrap();
+        assert!(update_pass_has_work_with(&layout, live.poll()));
+
+        // A path that exists but cannot be read as a config behaves the same
+        // way. The read failure is retried rather than cached as a permanent
+        // answer when the path becomes readable again.
+        std::fs::remove_file(&config_path).unwrap();
+        std::fs::create_dir(&config_path).unwrap();
+        assert!(!update_pass_has_work_with(&layout, live.poll()));
+        std::fs::remove_dir(&config_path).unwrap();
+        std::fs::write(&config_path, "[packages]\nenabled = true\n").unwrap();
+        assert!(update_pass_has_work_with(&layout, live.poll()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Read-only surfaces keep working WHILE a mutator holds the store lock — the
@@ -29293,7 +29515,7 @@ mod tests {
         let no_index = || -> Box<dyn crate::flow::Fetcher> {
             panic!("a vendor rollback reached the index lane")
         };
-        let rollback = || rollback_in(&layout, "stable", "claude", &no_index);
+        let rollback = || rollback_in(&layout, "stable", "claude", &[], &no_index);
         let active = || crate::active_builds(&layout).get("claude").copied();
         let err = lane::roll_back_by_hand(&layout, &none, spec).unwrap_err();
         assert!(err.contains("not installed"), "{err}");
@@ -29351,13 +29573,21 @@ mod tests {
             ),
             "atpkg verify passes on the rolled-back build"
         );
-        let line = vendor_rolled_back_line(spec, "2.1.282", "2.1.281");
+        let line = vendor_rolled_back_line(spec, "2.1.282", "2.1.281", false);
         assert_eq!(
             line,
             "atpkg: rolled back claude from 2.1.282 to 2.1.281; `aterm pkg pin claude` holds it \
              there (otherwise the next update returns it to Anthropic's latest)"
         );
         assert_eq!(crate::vendor_direct::retired_wording(&line), None);
+        // Already pinned, the vendor lane leaves it where it lands: the index lane's words.
+        let pinned = vendor_rolled_back_line(spec, "2.1.282", "2.1.281", true);
+        assert_eq!(
+            pinned,
+            "atpkg: rolled back claude from 2.1.282 to 2.1.281; it is pinned, so updates leave \
+             it there until `aterm pkg unpin claude`"
+        );
+        assert_eq!(crate::vendor_direct::retired_wording(&pinned), None);
         let _ = std::fs::remove_dir_all(&layout.prefix);
     }
 
@@ -29490,7 +29720,7 @@ mod tests {
         let v281 = vendor_version("2.1.281").build_id();
         assert_eq!(crate::active_builds(&layout).get("claude"), Some(&v281));
         assert_eq!(
-            rollback_in(&layout, "stable", "claude", &no_index),
+            rollback_in(&layout, "stable", "claude", &[], &no_index),
             ExitCode::SUCCESS
         );
         assert_eq!(
@@ -29507,7 +29737,7 @@ mod tests {
         assert_eq!(row.installed_build, Some(2_026_091_901));
         assert_eq!(row.state, "managed 2026091901 — rolled back from 2.1.281");
         assert!(row.tree_root.is_empty(), "no root was ever recorded for it");
-        let line = vendor_rolled_back_line(spec, "2.1.281", "build 2026091901");
+        let line = vendor_rolled_back_line(spec, "2.1.281", "build 2026091901", false);
         for text in [&row.state, &line] {
             assert_eq!(crate::vendor_direct::retired_wording(text), None, "{text}");
         }
@@ -29597,7 +29827,7 @@ mod tests {
             "the vendor build's row replaced it"
         );
         assert_eq!(
-            rollback_in(&layout, "stable", "claude", &no_index),
+            rollback_in(&layout, "stable", "claude", &[], &no_index),
             ExitCode::SUCCESS
         );
         assert_eq!(row(&layout).installed_build, Some(legacy_build));
@@ -29657,7 +29887,7 @@ mod tests {
         *f.index.borrow_mut() = None;
         f.forget_legacy_pkgs();
         assert_eq!(
-            rollback_in(&layout, "stable", "claude", &no_index),
+            rollback_in(&layout, "stable", "claude", &[], &no_index),
             ExitCode::SUCCESS
         );
         assert_eq!(row(&layout).tree_root, root);
@@ -29718,7 +29948,7 @@ mod tests {
         *f.index.borrow_mut() = None;
         f.forget_legacy_pkgs();
         assert_eq!(
-            rollback_in(&layout, "stable", "claude", &no_index),
+            rollback_in(&layout, "stable", "claude", &[], &no_index),
             ExitCode::SUCCESS
         );
         assert_eq!(row(&layout).tree_root, root);
@@ -29915,11 +30145,14 @@ mod tests {
             &std::collections::BTreeSet::new(),
             world::NOW,
         )));
-        lines.push(vendor_rolled_back_line(
-            crate::vendor_direct::spec("codex").unwrap(),
-            "0.157.0",
-            "0.156.0",
-        ));
+        for pinned in [false, true] {
+            lines.push(vendor_rolled_back_line(
+                crate::vendor_direct::spec("codex").unwrap(),
+                "0.157.0",
+                "0.156.0",
+                pinned,
+            ));
+        }
         // A download killed between extract and swap leaves stage scratch named by the
         // store id; the sweep line names the version.
         let v282 = vendor_version("2.1.282").build_id();

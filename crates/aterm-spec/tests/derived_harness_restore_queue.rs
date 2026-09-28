@@ -14,3 +14,14 @@ fn restored_tabs_get_first_attempts_before_a_retry() {
     );
     verify::prove_and_catch_scalar(&model, "restored tabs' first attempts precede retry");
 }
+
+#[test]
+fn network_probe_shutdown_cannot_notify_before_the_waiter_parks() {
+    let model = aterm_spec::derive::netprobe_shutdown_park_model();
+    assert!(
+        aterm_spec::xref::model_registry()
+            .iter()
+            .any(|registered| registered.name == model.name)
+    );
+    verify::prove_and_catch_scalar(&model, "network probe shutdown cannot lose its wake");
+}

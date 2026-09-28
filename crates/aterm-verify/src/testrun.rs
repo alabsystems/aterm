@@ -687,9 +687,9 @@ pub fn not_started(b: &Binary, limit: std::time::Duration) -> Run {
         ok: false,
         output: format!(
             "{}\n{} — not started: the test run's {:.1}s wall-clock ceiling was spent before \
-             this binary's turn\n\x20 test binary: {}\n\x20 It decided NOTHING: a run that \
-             never finishes is a FAIL, never a pass and never a skip.\n\x20 Raise the ceiling \
-             with --stage-timeout <seconds>, or remove it with --stage-timeout off.\n",
+             this binary's turn\n\x20 test binary: {}\n\x20 Counted as a FAIL: it never ran.\n\
+             \x20 Raise the ceiling with --stage-timeout <seconds>, or remove it with \
+             --stage-timeout off.\n",
             b.header,
             crate::differential::CEILING_KILL,
             limit.as_secs_f64(),

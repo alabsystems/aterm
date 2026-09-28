@@ -100,12 +100,12 @@ pub struct Manifest {
     /// The container's browser download URL as the PUBLISHER wrote it —
     /// `https://github.com/{owner}/{repo}/releases/download/v{version}/{dmg}`
     /// (`aterm-release/src/manifest_out.rs`). NEVER followed: the client downloads
-    /// from the URL it DERIVES for the tag the channel head names. On the web lane it
-    /// is the second half of the bind between the evergreen pointer and the signed
-    /// bytes (`github::web_container_url_agrees`): the tag the pointer chose must be
-    /// `v` + [`Self::version`] AND the tag inside this URL, so a signed appcast
-    /// copied onto another tag cannot be elected under it. Absent ⇒ None (a
-    /// hand-written manifest), which the web lane refuses.
+    /// from the URL it DERIVES for the tag the channel head names. It is the second
+    /// half of the bind between the evergreen pointer and the signed bytes
+    /// (`github::web_container_url_agrees`): the tag the pointer chose must be `v` +
+    /// [`Self::version`] AND the tag inside this URL, so a signed appcast copied onto
+    /// another tag cannot be elected under it. Absent ⇒ None (a hand-written
+    /// manifest), which the check refuses.
     pub url: Option<String>,
     /// The updater container's file name, e.g. `"aterm-0.2.0-mac.zip"` — the same
     /// signed bundle as the DMG, packed with `ditto` instead of `hdiutil`. PREFERRED

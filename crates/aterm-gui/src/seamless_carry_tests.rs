@@ -101,6 +101,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 loader: false,
                 history: None,
                 history_dropped: 0,
+                history_withheld: false,
                 history_lost: 0,
             })
             .collect(),
@@ -715,6 +716,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             loader: false,
             history: None,
             history_dropped: 0,
+            history_withheld: false,
             history_lost: 0,
         }],
     };

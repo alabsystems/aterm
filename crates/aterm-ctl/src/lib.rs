@@ -527,7 +527,7 @@ fn completion_script(shell: &str) -> Option<String> {
 fn emit_completions(shell: &str) -> io::Result<ExitCode> {
     let script = completion_script(shell).ok_or_else(unknown_shell_error)?;
     let stdout = stdout_handle();
-    let mut out = stdout.lock();
+    let mut out = StdoutSink(stdout.lock());
     out.write_all(script.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -820,6 +820,8 @@ pub fn front_door_completions_entry(
 ) -> ExitCode {
     match front_door_completions_result(shell, verbs, flags) {
         Ok(code) => code,
+        // `aterm --completions zsh | head`: the reader has what it wanted.
+        Err(e) if is_stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
             // Manual form of `eprintln!("aterm: {e}")` (the strict Trust gate
             // cannot lower inline `format_args!`); a failed diagnostic write is
@@ -856,7 +858,7 @@ fn front_door_completions_result(
         )
     })?;
     let stdout = stdout_handle();
-    let mut out = stdout.lock();
+    let mut out = StdoutSink(stdout.lock());
     out.write_all(script.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }
@@ -2529,7 +2531,7 @@ fn run_discovery(
     let self_sid = env::var(SELF_SID_ENV).ok();
     let self_sock = self_instance_sock(self_sid.as_deref());
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = StdoutSink(stdout.lock());
     // `--sock`/`--pid` name the target, so the directory is not the question
     // there; unscoped discovery classifies the directory itself, because "no
     // such directory" and "an empty directory" are different answers.
@@ -2773,6 +2775,15 @@ pub fn local_instances() -> Result<Vec<(u32, String)>, FleetListError> {
 pub fn instance_token(sock: &str) -> io::Result<String> {
     read_token_at(sock)
         .map_err(|(path, e)| io::Error::new(e.kind(), format!("{}: {e}", path.display())))
+}
+
+/// Whether `aterm ctl --pid <pid>` reaches the instance listening on `sock`:
+/// `--pid` dials only the default directory's per-instance socket, so an
+/// explicit-`--control-sock` instance is reached by `--sock` alone. The same
+/// test this crate's own "aterm IS running" remedy picks its flag by.
+#[must_use]
+pub fn pid_reaches(pid: u32, sock: &str) -> bool {
+    pid != 0 && reached_by_pid(socket_dir().as_deref(), pid, sock)
 }
 
 /// The sessions one ANSWERED instance contributes to a listing — PURE, so the
@@ -3478,8 +3489,10 @@ fn is_stdout_closed(e: &io::Error) -> bool {
 }
 
 /// A stdout writer whose broken pipe is [`StdoutClosed`]: every stdout path —
-/// the one-line and line-framed printers, the byte-body copy and the subscribe
-/// relay — writes through it, so `| head` ends each of them the same way.
+/// the one-line and line-framed printers, the discovery rows (`ls`, `instances`,
+/// `windows`), the completion scripts, the byte-body copy and the subscribe relay
+/// — writes through it, so `| head` ends each of them the same way
+/// (`every_stdout_writer_goes_through_the_sink`).
 struct StdoutSink<W>(W);
 
 impl<W: Write> Write for StdoutSink<W> {
@@ -4988,7 +5001,7 @@ fn read_guarded_payload<R: BufRead>(
 
 fn print_guarded_payload(lines: &[String]) -> io::Result<()> {
     let stdout = stdout_handle();
-    let mut out = stdout.lock();
+    let mut out = StdoutSink(stdout.lock());
     for line in lines {
         out.write_all(line.as_bytes())?;
         out.write_all(b"\n")?;
@@ -7117,6 +7130,52 @@ mod tests {
             .write_all(b"x")
             .expect_err("the sink fails");
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+    }
+
+    /// Every stdout writer goes through [`StdoutSink`], and every entry that runs
+    /// one ends a closed stdout with status 0: `aterm ctl ls | head` printed
+    /// `aterm-ctl: Broken pipe (os error 32)` and exited 1 from a bare lock the
+    /// sink's own test above never reached.
+    #[test]
+    fn every_stdout_writer_goes_through_the_sink() {
+        let shipped = |src: &'static str| {
+            src.split("\n#[cfg(test)]\nmod tests {")
+                .next()
+                .expect("the shipped half")
+        };
+        let files = [
+            ("lib.rs", shipped(include_str!("lib.rs"))),
+            ("conn.rs", shipped(include_str!("conn.rs"))),
+        ];
+        let mut writers = 0;
+        for (file, src) in files {
+            for (n, line) in src.lines().enumerate() {
+                if line.contains("stdout.lock()") || line.contains("stdout().lock()") {
+                    assert!(
+                        line.contains("StdoutSink("),
+                        "{file}:{}: a stdout writer outside the sink: {line}",
+                        n + 1
+                    );
+                    writers += 1;
+                }
+            }
+        }
+        assert!(writers >= 11, "the scan found {writers} stdout writers");
+        for (file, entry) in [
+            (files[0].1, "pub fn main_entry("),
+            (files[0].1, "pub fn front_door_completions_entry("),
+            (files[1].1, "pub fn conn_main_entry("),
+        ] {
+            let body = file
+                .split(entry)
+                .nth(1)
+                .and_then(|rest| rest.split("\n}\n").next())
+                .unwrap_or_else(|| panic!("{entry} is gone"));
+            assert!(
+                body.contains("is_stdout_closed(&e)"),
+                "{entry} reports a closed stdout as a failure"
+            );
+        }
     }
 
     /// `help <client verb>` is answered from the CLIENT VERBS block, framed like

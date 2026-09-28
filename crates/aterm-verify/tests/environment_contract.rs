@@ -28,6 +28,8 @@
 //! checkable from a machine that is not Windows.
 #![cfg(unix)]
 
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -38,7 +40,7 @@ use aterm_verify::disk::{Budget, Reading};
 use aterm_verify::identity::{self, PathState, ToolchainIdentity, TreeState, Tripwire};
 use aterm_verify::snapshot;
 use aterm_verify::verdict::MERGE_CONTRACT_SENTENCE;
-use aterm_verify::{Ctx, EnvSnapshot, Mode, Scope, exit, mktemp_dir};
+use aterm_verify::{Ctx, Mode, Scope, exit, mktemp_dir};
 
 const IGNORES: &str = "*.log\n/target/\n/target-*/\n/.aterm-verify/\n";
 
@@ -106,38 +108,9 @@ fn mtime(p: &Path) -> std::time::SystemTime {
     fs::metadata(p).expect("stat").modified().expect("mtime")
 }
 
-/// The stage2 driver body that also produces the two binaries the smokes drive
-/// — the same stand-in `gate_contract.rs` uses, so a whole ladder runs green.
-/// Its `aterm-gui` points the control socket at `@LISTENER@`, the fixture's
-/// real listening socket ([`Fixture::answering_smoke`] fills it in): the smoke
-/// waits for a socket that accepts a connect, not for a file.
-const ANSWERING_SMOKE: &str = r#"case "$*" in
-  *aterm-gui*aterm-ctl*)
-    mkdir -p target-drivers/debug
-    cat >target-drivers/debug/aterm-gui <<'GUI'
-#!/bin/sh
-mkdir -p "$XDG_RUNTIME_DIR/aterm"
-ln -s '@LISTENER@' "$XDG_RUNTIME_DIR/aterm/aterm.sock"
-exec sleep 300
-GUI
-    cat >target-drivers/debug/aterm-ctl <<'CTL'
-#!/bin/sh
-# The smoke pins its socket with `--sock <path>` before the verb.
-if [ "$1" = --sock ]; then shift 2; fi
-case "$1" in
-  cursor)  echo "OK row=0 col=0" ;;
-  metrics) echo "OK frames=41 max_input_present_ms=8.100 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0 perf_reduced=0 wake_heals=0 " ;;
-  send|key) echo "OK accepted" ;;
-  *) echo "ERR unknown verb"; exit 1 ;;
-esac
-CTL
-    chmod 755 target-drivers/debug/aterm-gui target-drivers/debug/aterm-ctl
-    ;;
-esac
-exit 0"#;
-
 /// A repo-shaped directory whose every helper passes — `gate_contract.rs`'s
-/// synthetic repo, rebuilt here because integration tests share no code.
+/// synthetic repo, rebuilt here; the two share their context and their
+/// stand-in smoke through `common`.
 struct Fixture {
     base: PathBuf,
     root: PathBuf,
@@ -244,24 +217,14 @@ impl Fixture {
     /// [`Self::ctx`] over another checkout of the fixture (a clone), with the
     /// fixture's own toolchain and scratch.
     fn ctx_at(&self, root: &Path) -> Ctx {
-        let mut env = EnvSnapshot::capture();
-        env.trust_stage2_bin = Some(self.stage2.clone());
-        env.trust_mc_sysroot = Some(self.root.join("no-trust-mc"));
-        env.ay_bin_dir = Some(self.root.join("no-ay"));
-        // Floor 0: a fixture builds nothing, and the real floor made these
-        // ladders refuse whenever the HOST volume held less than it (2026-09-23,
-        // 17.6 GiB free, 12 failures here). The estimate that replaced it would
-        // too: a fixture's empty lanes are budgeted cold. The preflight laws
-        // below set their own requirement, or their own budget and reading.
-        Ctx::new(
-            root.to_path_buf(),
+        common::fixture_ctx(
+            root,
+            &self.stage2,
+            &self.scratch,
             Mode::Fast,
             Scope::workspace(),
-            env,
-            self.scratch.clone(),
+            |_| {},
         )
-        .with_disk_floor(0)
-        .with_gui_smoke_skipped(true)
     }
 
     fn run(&self, ctx: &Ctx) -> (String, i32) {
@@ -272,11 +235,11 @@ impl Fixture {
 }
 
 impl Fixture {
-    /// [`ANSWERING_SMOKE`] pointed at this fixture's listening socket.
+    /// [`common::answering_smoke`] pointed at this fixture's listening socket.
     fn answering_smoke(&self) -> String {
-        ANSWERING_SMOKE.replace(
-            "@LISTENER@",
-            &self.base.join("ctl.sock").display().to_string(),
+        format!(
+            "{}\nexit 0",
+            common::answering_smoke(&self.base.join("ctl.sock"))
         )
     }
 }
@@ -930,10 +893,8 @@ fn a_new_compiler_prunes_every_snapshot_lane_and_a_changed_variable_is_named() {
         .prepare(&[("RUSTFLAGS", "-Zsomething")], Some("c1"))
         .expect("env change");
     assert!(
-        s.notes
-            .iter()
-            .any(|n| n
-                == "verify: lane target may rebuild cold — RUSTFLAGS changed since its last run"),
+        s.notes.iter().any(|n| n
+            == "verify: target/ may rebuild from scratch — RUSTFLAGS changed since its last run"),
         "{:?}",
         s.notes
     );
@@ -949,7 +910,7 @@ fn a_new_compiler_prunes_every_snapshot_lane_and_a_changed_variable_is_named() {
     assert!(
         s.notes
             .iter()
-            .any(|n| n.starts_with("verify: lane target pruned — trustc c1 -> c2")),
+            .any(|n| n.starts_with("verify: target/ cleared — trustc c1 -> c2")),
         "{:?}",
         s.notes
     );
@@ -1747,20 +1708,19 @@ fn verify_sh_ranks_a_rustup_trust_older_than_the_store_below_it() {
     );
     fs::remove_dir_all(&entry).expect("rm the directory");
 
-    // atpkg's OWN VIEW, left on an older build (review of 2026-09-25): the store is
-    // still the answer, and the note says atpkg re-lays the view — never `aterm pkg
-    // repair`, which only adopts a view entry — the same sentence as
-    // `aterm_verify::toolchain::REMEDY_VIEW`.
+    // atpkg's OWN VIEW, even one left on an older build: read through to the build it
+    // presents (2026-09-28) — the store's own directory, never the view's clones, which
+    // the cutter's MEASURE gate refused as another compiler — and so never demoted.
     sysroot(&prefix.join("rustup/trust"), "2026-09-10");
     std::os::unix::fs::symlink(prefix.join("rustup/trust"), &entry).expect("ln view");
     let (dir, said) = picked();
     assert_eq!(
         dir, store_bin,
-        "a lagging view ranks below the store: {said}"
+        "the view presents the store's build: {said}"
     );
     assert!(
-        said.contains(aterm_verify::toolchain::REMEDY_VIEW) && !said.contains("aterm pkg repair"),
-        "a lagging VIEW is atpkg's to re-lay: {said}"
+        !said.contains("ranked below the store"),
+        "a view read through is not demoted: {said}"
     );
     fs::remove_file(&entry).expect("rm the view link");
     std::os::unix::fs::symlink(&stage2, &entry).expect("ln again");
@@ -2375,10 +2335,6 @@ fn a_narrowed_run_says_so_before_its_first_stage_and_its_receipt_names_its_base(
         &ladder,
         "verify: NARROWED — change-scoped against origin/main",
     );
-    assert!(
-        ladder.contains("its receipt will say `scope changed:origin/main` and `merge-contract no`"),
-        "{ladder}"
-    );
     let r = standing();
     assert_eq!(
         (r.scope.as_str(), r.merge_contract),
@@ -2506,7 +2462,7 @@ fn a_volume_under_the_requirement_is_could_not_run_before_any_stage_and_leaves_n
         .unwrap_or_else(|| panic!("no disk line: {ladder}"));
     assert!(
         line.contains(" free on the volume holding ")
-            && line.contains("; lanes ")
+            && line.contains("; build dirs ")
             && line.ends_with("(--disk-floor: exactly this, no estimate)"),
         "{line}"
     );
@@ -2617,7 +2573,7 @@ fn warm_snapshot_lanes_are_credited_so_a_run_the_flat_floor_refused_proceeds() {
         .lines()
         .find(|l| l.starts_with("verify: disk "))
         .unwrap_or_else(|| panic!("no disk line: {ladder}"));
-    assert!(line.contains("; lanes 0.0 GiB; need "), "{line}");
+    assert!(line.contains("; build dirs 0.0 GiB; need "), "{line}");
     for other in ["over the ", "unmeasured", "--disk-floor"] {
         assert!(!line.contains(other), "{other}: {line}");
     }
@@ -2658,7 +2614,10 @@ fn snapshot_lanes_over_the_cap_are_removed_before_the_reading_and_budgeted_cold(
         line.contains(" cap, so removed before the free space was read; need "),
         "{line}"
     );
-    assert!(!ladder.contains("verify: lanes over the cap:"), "{ladder}");
+    assert!(
+        !ladder.contains("verify: build dirs over the cap:"),
+        "{ladder}"
+    );
     assert!(
         !repo.root.join("target/debug/warm").exists(),
         "the lane was not removed: {ladder}"
@@ -2668,7 +2627,7 @@ fn snapshot_lanes_over_the_cap_are_removed_before_the_reading_and_budgeted_cold(
         "the lane dir is recreated"
     );
     assert!(
-        ladder.contains("what is left after the removal of lanes over the "),
+        ladder.contains("what is left after the removal of build dirs over the "),
         "{ladder}"
     );
     assert!(
@@ -3072,6 +3031,66 @@ fn without_a_base_receipt_every_red_counts_and_the_run_says_why() {
     );
     let r = repo.receipt(&feature);
     assert_eq!((r.base, r.failures.map(|f| f.len())), (None, Some(1)));
+}
+
+/// THE BASE LINE NAMES A MAIN COMMIT TO MERGE ONLY WHEN MERGING IT MOVES THE
+/// BASE. With no usable receipt for the base, the newest main commit that has
+/// one is named — but only when it is newer than the base: an ancestor of it
+/// is already merged, and merging it again leaves the merge-base where it is.
+#[test]
+fn the_base_line_names_a_main_commit_to_merge_only_when_it_is_newer_than_the_base() {
+    const HINT: &str = "the newest main commit with one is";
+    let repo = Fixture::new("atv-env-basehint");
+    repo.git_init().with_failing_tests();
+    repo.tests_fail(&[("probe", "lock held")]);
+    let old_main = git(&repo.root, &["rev-parse", "HEAD"]);
+    // A receipt for the first main commit, then main moves on without one.
+    let (ladder, _) = repo.run(&repo.ctx());
+    assert!(ladder.contains("verify: base — "), "{ladder}");
+    repo.with_origin();
+    write(&repo.root.join("README"), "main moves");
+    git(&repo.root, &["add", "README"]);
+    git(&repo.root, &["commit", "-q", "-m", "main moves"]);
+    git(
+        &repo.root,
+        &["push", "-q", "origin", "HEAD:refs/heads/main"],
+    );
+    git(&repo.root, &["fetch", "-q", "origin"]);
+    let new_main = git(&repo.root, &["rev-parse", "HEAD"]);
+
+    // A branch off the new main: the only receipt is its base's ancestor.
+    repo.branch_commit("a change");
+    let (ladder, _) = repo.run(&repo.ctx());
+    assert!(
+        ladder.contains(&format!(
+            "verify: base — no usable receipt for the base {}",
+            short(&new_main)
+        )),
+        "{ladder}"
+    );
+    assert!(!ladder.contains(HINT), "an ancestor of the base: {ladder}");
+
+    // The positive control: main's newer commit has a receipt, and a branch
+    // off the older one (its receipt gone) is told to merge it.
+    git(&repo.root, &["switch", "-q", "main"]);
+    let _ = repo.run(&repo.ctx());
+    let store = aterm_verify::receipt::dir(&repo.root).expect("store");
+    let old_tree = git(&repo.root, &["rev-parse", &format!("{old_main}^{{tree}}")]);
+    for key in [old_main.clone(), aterm_verify::receipt::tree_key(&old_tree)] {
+        let _ = fs::remove_file(store.join(key));
+    }
+    git(&repo.root, &["switch", "-q", "-C", "old", &old_main]);
+    write(&repo.root.join("README"), "an old change");
+    git(&repo.root, &["add", "README"]);
+    git(&repo.root, &["commit", "-q", "-m", "an old change"]);
+    let (ladder, _) = repo.run(&repo.ctx());
+    assert!(
+        ladder.contains(&format!(
+            "; {HINT} {} — merge it to be judged against it",
+            short(&new_main)
+        )),
+        "{ladder}"
+    );
 }
 
 /// `--baseline` PUBLISHES MAIN'S REDS, AND ANOTHER MACHINE IS JUDGED AGAINST

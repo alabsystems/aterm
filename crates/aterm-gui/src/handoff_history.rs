@@ -67,7 +67,12 @@
 //!   sidecar, check its length and sha, decode it strictly, build it into a
 //!   tiered store off any lock (`aterm_grid::OlderHistory`) and place it in
 //!   front of the session's oldest line under one brief lock. A sidecar that
-//!   fails any check costs exactly its `take` lines, counted like the rest. A
+//!   fails any check costs exactly its `take` lines, counted like the rest.
+//!   The one leniency: a line over the line-record cap because of its OSC 8
+//!   links crosses with those links dropped and its text exact, as the
+//!   screen carry's does ([`read_sidecar`]); the export drops them before it
+//!   writes, and the import still admits the frames exports through v0.97.0
+//!   wrote without dropping them (2026-09-28). A
 //!   pane whose scrollback was CLEARED between the adopt and the import (an
 //!   ED3 or a reset the adopted shell sent) is not imported into at all: the
 //!   history stays cleared, and nothing is counted. The pane's own retention
@@ -84,7 +89,11 @@
 //! export when it already knows the policy, and its park stops one it started
 //! before it did, removing every sidecar), no sidecar is named, and the join
 //! COUNTS every line the park saw as left behind, said as the policy's
-//! ([`Fallback::Withheld`]). A `full` ceiling is the carry above, unchanged.
+//! ([`Fallback::Withheld`]) — in the log, and on the record
+//! (`history_withheld`), so the successor's band row says the new version
+//! asked for it instead of reading it as a failure that kept "the newest
+//! lines" (it kept none; [`LossSummary::withheld`]). A `full` ceiling is the
+//! carry above, unchanged.
 //!
 //! The sidecar is in NEITHER adoption-proof digest and no schema moved: an
 //! older successor skips the record keys and adopts exactly as before (the
@@ -185,7 +194,16 @@ fn header(cols: u16) -> [u8; HEADER_LEN] {
 
 /// The strict per-line bounds a frame is decoded under, from the width the
 /// header names — the ones the screen carry decodes its grids under
-/// (`seamless::strict_grid_lines`).
+/// (`seamless::strict_grid_lines`): at most `cols * 256` content bytes, and a
+/// line record of at most `16 KiB + cols * 512` bytes (57,344 at 80 columns).
+///
+/// The record cap binds what the import KEEPS, not what it reads: a record
+/// over it because of its OSC 8 links is kept with those links dropped
+/// ([`read_sidecar`]), up to the hard ceiling
+/// `aterm_core::scrollback::max_linked_record_bytes` (the cap plus 8,460 bytes
+/// a column — one link at the ingestion ceilings per column: 734,144 bytes at
+/// 80 columns, 36,765,696 at the widest grid). The export drops those links
+/// before it writes ([`strip_over_cap_links`]).
 fn line_caps(cols: u16) -> (usize, usize) {
     let content_cap = usize::from(cols).saturating_mul(256);
     let record_cap = 16usize
@@ -232,16 +250,63 @@ fn hex(bytes: &[u8]) -> String {
         })
 }
 
+/// Drop the hyperlinks of every line in `lines` whose record would be over the
+/// frame decode's record cap at `cols` ([`line_caps`]), and nothing else, so
+/// no frame the export writes holds a record the import has to repair. The
+/// screen carry's rule (`seamless::strip_over_cap_links`, plan P2-4 of the
+/// 2026-09-22/23 update audit): the line keeps its text, attributes,
+/// underline colours and wrap flag; only its link destinations are lost.
+/// Returns how many lines lost their links.
+///
+/// Through v0.97.0 the export wrote such a line as it was, and the import
+/// refused the whole sidecar for it: one row of a dozen 8 KiB links cost a tab
+/// its entire carried history (2026-09-28).
+fn strip_over_cap_links(lines: &mut [Line], cols: u16) -> u64 {
+    let (_, record_cap) = line_caps(cols);
+    let mut stripped = 0;
+    for line in lines.iter_mut().filter(|line| line.has_hyperlinks()) {
+        if line.serialize().len() > record_cap {
+            line.clear_hyperlinks();
+            stripped += 1;
+        }
+    }
+    stripped
+}
+
+/// A sidecar's lines, as the import reads them.
+#[derive(Debug)]
+struct SidecarLines {
+    /// The width the lines are wrapped at.
+    cols: u16,
+    /// The FIRST `take` lines.
+    lines: Vec<Line>,
+    /// Of `lines`, how many were over the record cap because of their links
+    /// and are kept with those links dropped.
+    links_dropped: u64,
+}
+
 /// Stream one sidecar: `take` must not exceed what the header names, the
 /// bytes must be exactly `len` long and hash to `sha`, and every frame read
 /// must decode strictly. Returns the width the lines are wrapped at and the
 /// FIRST `take` lines. Frames past `take` are hashed and never decoded.
+///
+/// ONE LENIENCY (2026-09-28, law L3 of the fixture README: a consumer only
+/// ever becomes more lenient). A line record over the record cap
+/// ([`line_caps`]) BECAUSE OF ITS OSC 8 LINKS — which every export through
+/// v0.97.0 wrote as it was — is kept with its links dropped and its text,
+/// attributes, underline colours and wrap flag exact, and every other line of
+/// the frame is kept as it is. Such a record is decoded only up to the hard
+/// ceiling `aterm_core::scrollback::max_linked_record_bytes`, and only if it
+/// decodes under every other bound and is within the cap without its links
+/// (`deserialize_lines_strict_dropping_over_cap_links`). A frame corrupt in any
+/// other way still refuses the whole sidecar, as before; nothing is repaired
+/// by dropping a line or a frame.
 fn read_sidecar(
     mut reader: impl std::io::Read,
     len: u64,
     sha: &[u8; 32],
     take: u64,
-) -> Result<(u16, Vec<Line>), &'static str> {
+) -> Result<SidecarLines, &'static str> {
     let mut hasher = aterm_digest::Sha256::new();
     let mut head = [0u8; HEADER_LEN];
     reader
@@ -264,6 +329,7 @@ fn read_sidecar(
     let (content_cap, record_cap) = line_caps(cols);
     let mut read = HEADER_LEN as u64;
     let mut out: Vec<Line> = Vec::new();
+    let mut links_dropped = 0_u64;
     let want = usize::try_from(take).map_err(|_| "more lines than this process can hold")?;
     out.try_reserve_exact(want)
         .map_err(|_| "more lines than this process can hold")?;
@@ -290,15 +356,19 @@ fn read_sidecar(
         hasher.update(&frame);
         read += size;
         if out.len() < want {
-            let decoded = aterm_core::scrollback::deserialize_lines_strict(
-                &frame,
-                CHUNK_LINES,
-                usize::from(cols),
-                content_cap,
-                record_cap,
-            )
-            .ok_or("a frame that does not decode")?;
+            let (decoded, stripped) =
+                aterm_core::scrollback::deserialize_lines_strict_dropping_over_cap_links(
+                    &frame,
+                    CHUNK_LINES,
+                    usize::from(cols),
+                    content_cap,
+                    record_cap,
+                )
+                .ok_or("a frame that does not decode")?;
             let room = want - out.len();
+            // Only the lines kept count: one past `take` is the checkpoint's
+            // to carry, and the screen carry says its own.
+            links_dropped += stripped.iter().filter(|&&at| at < room).count() as u64;
             out.extend(decoded.into_iter().take(room));
         }
     }
@@ -313,7 +383,11 @@ fn read_sidecar(
     if out.len() != want {
         return Err("fewer lines than its stamp names");
     }
-    Ok((cols, out))
+    Ok(SidecarLines {
+        cols,
+        lines: out,
+        links_dropped,
+    })
 }
 
 /// Create `path` afresh, owner-only, never through a symlink, never over
@@ -371,6 +445,8 @@ pub(crate) struct HistoryExport {
     file: OwnedFile,
     len: u64,
     sha: [u8; 32],
+    /// Lines written with their links dropped ([`strip_over_cap_links`]).
+    links_dropped: u64,
 }
 
 impl std::fmt::Debug for HistoryExport {
@@ -380,6 +456,7 @@ impl std::fmt::Debug for HistoryExport {
             .field("local_id", &self.local_id)
             .field("facts", &self.facts)
             .field("len", &self.len)
+            .field("links_dropped", &self.links_dropped)
             .finish_non_exhaustive()
     }
 }
@@ -786,6 +863,8 @@ struct OpenExport {
     /// A write that failed after the first pass: the file is no longer what
     /// the hash says, so it cannot be named at all.
     broken: Option<String>,
+    /// Lines written with their links dropped ([`strip_over_cap_links`]).
+    links_dropped: u64,
 }
 
 impl OpenExport {
@@ -834,7 +913,7 @@ impl OpenExport {
                 t.history_lines_since_fence(&ahead, fence.end, CHUNK_LINES)
                     .map_err(|_| ())
             });
-            let lines = match read {
+            let mut lines = match read {
                 Ok(lines) if lines.is_empty() => return,
                 Ok(lines) => lines,
                 Err(()) => {
@@ -842,6 +921,7 @@ impl OpenExport {
                     return;
                 }
             };
+            let stripped = strip_over_cap_links(&mut lines, fence.cols);
             let body = aterm_core::scrollback::serialize_lines(&lines);
             if self.facts.lines + lines.len() as u64 > MAX_EXPORT_LINES
                 || !self.fits(body.len(), *written, MAX_AGGREGATE_BYTES)
@@ -850,7 +930,10 @@ impl OpenExport {
                 return;
             }
             match self.append(&lines, &body) {
-                Ok(()) => *written = written.saturating_add(4 + body.len() as u64),
+                Ok(()) => {
+                    *written = written.saturating_add(4 + body.len() as u64);
+                    self.links_dropped += stripped;
+                }
                 Err(error) => {
                     self.broken = Some(format!("could not write ({})", error.kind()));
                     return;
@@ -879,6 +962,7 @@ impl OpenExport {
             file: self.file,
             len: self.len,
             sha: self.hasher.finalize(),
+            links_dropped: self.links_dropped,
         })
     }
 }
@@ -932,6 +1016,7 @@ fn begin_export(
         hasher: aterm_digest::Sha256::new(),
         following: true,
         broken: None,
+        links_dropped: 0,
     };
     let head = header(fence.cols);
     export
@@ -943,6 +1028,7 @@ fn begin_export(
         if lines.is_empty() {
             return Err("the history ended before its fence".to_string());
         }
+        export.links_dropped += strip_over_cap_links(&mut lines, fence.cols);
         let body = aterm_core::scrollback::serialize_lines(&lines);
         if !export.fits(body.len(), export.len, room) {
             return Err(format!(
@@ -1139,10 +1225,20 @@ pub(crate) fn stamp_manifest(
             ));
             // A hard link is the O_EXCL of a rename: it never replaces what
             // is already at the name.
+            let links_dropped = export.links_dropped;
             let source = export.file.keep();
             match std::fs::hard_link(&source, &named) {
                 Ok(()) => {
                     record.history = Some(stamp(export.len, &export.sha, joined.take));
+                    if links_dropped > 0 {
+                        aterm_log::warn!(
+                            "update apply: session {}'s scrollback crosses with the links of \
+                             {links_dropped} line(s) dropped: each was over the {}-byte \
+                             line-record cap because of its links; their text is exact",
+                            record.local_id,
+                            line_caps(export.facts.fence.cols).1
+                        );
+                    }
                 }
                 Err(_) => {
                     joined.dropped += joined.take;
@@ -1153,6 +1249,10 @@ pub(crate) fn stamp_manifest(
             let _ = std::fs::remove_file(source);
         }
         record.history_dropped = joined.dropped;
+        // Why they stayed behind, when the policy chose it: the successor
+        // says a withheld carry as the new build's request, never as a
+        // failure that kept "the newest lines" (it kept none).
+        record.history_withheld = joined.fallback == Some(Fallback::Withheld);
         record.history_lost = record.history_lost.saturating_add(joined.dropped);
         verdicts.push((record.local_id, joined));
     }
@@ -1252,7 +1352,7 @@ impl HistoryCarry {
     }
 
     /// Read, check and decode the sidecar — see [`read_sidecar`].
-    fn read_verified(self) -> Result<(u16, Vec<Line>), &'static str> {
+    fn read_verified(self) -> Result<SidecarLines, &'static str> {
         read_sidecar(
             std::io::BufReader::new(self.file),
             self.len,
@@ -1318,6 +1418,11 @@ pub(crate) fn take_sidecar(
 pub(crate) struct AdoptedHistory {
     pub(crate) carry: Option<HistoryCarry>,
     pub(crate) dropped: u64,
+    /// Of `dropped`, the lines the outgoing process left behind because the
+    /// successor's handoff policy carries no scrollback
+    /// (`SessionRecord::history_withheld`) — a choice, said as one — rather
+    /// than for want of a way to carry them.
+    pub(crate) withheld: u64,
     pub(crate) lost: u64,
     pub(crate) claim: Option<OlderHistoryClaim>,
 }
@@ -1355,6 +1460,11 @@ pub(crate) fn incoming(
     let mut history = AdoptedHistory {
         carry: None,
         dropped: record.history_dropped,
+        withheld: if record.history_withheld {
+            record.history_dropped
+        } else {
+            0
+        },
         lost: record.history_lost,
         claim: None,
     };
@@ -1393,8 +1503,16 @@ pub(crate) struct ImportReport {
     /// This handoff's lines the outgoing side could not carry (already on
     /// the session's running count since its registration).
     pub(crate) dropped: u64,
+    /// Of `dropped`, the lines a successor's handoff policy asked the
+    /// outgoing side to leave behind ([`AdoptedHistory::withheld`]).
+    pub(crate) withheld: u64,
     /// The named carry's lines, when it failed HERE (not yet counted).
     pub(crate) failed_lines: u64,
+    /// Of `imported`, the lines whose records were over the line-record cap
+    /// because of their OSC 8 links and crossed with those links dropped (a
+    /// producer through v0.97.0 wrote them so; [`read_sidecar`]). Their text
+    /// crossed, so they are not lost lines; the log names them.
+    pub(crate) links_dropped: u64,
     /// Why a named carry failed here, when one did.
     pub(crate) failed: Option<String>,
     /// The pane's scrollback was CLEARED between the adopt and the import
@@ -1410,6 +1528,14 @@ impl ImportReport {
         self.dropped.saturating_add(self.failed_lines)
     }
 
+    /// Of [`Self::lost`], the lines a handoff policy withheld — never more
+    /// than the outgoing side's own count, so a malformed record cannot make
+    /// a failure here read as the policy's.
+    #[must_use]
+    pub(crate) fn withheld(&self) -> u64 {
+        self.withheld.min(self.dropped)
+    }
+
     /// The report for a job whose import never ran (its worker could not
     /// start): everything it named is lost.
     #[must_use]
@@ -1418,7 +1544,9 @@ impl ImportReport {
             session: job.session,
             imported: 0,
             dropped: job.history.dropped,
+            withheld: job.history.withheld,
             failed_lines: job.history.reserve(),
+            links_dropped: 0,
             failed: job.history.carry.as_ref().map(|_| why.to_string()),
             cleared: false,
         }
@@ -1428,9 +1556,10 @@ impl ImportReport {
 /// How one import settled when it did not fail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Imported {
-    /// Placed in front of the history; how many lines the pane's own
-    /// retention kept.
-    Retained(u64),
+    /// Placed in front of the history: how many lines the pane's own
+    /// retention kept, and how many of the sidecar's lines crossed with
+    /// their links dropped ([`SidecarLines::links_dropped`]).
+    Retained { kept: u64, links_dropped: u64 },
     /// The pane's scrollback was cleared since the adopt: not put back.
     Cleared,
 }
@@ -1447,7 +1576,11 @@ pub(crate) fn import(
     if !locked(term, |t| t.older_history_claim_holds(claim)) {
         return Ok(Imported::Cleared);
     }
-    let (from_cols, lines) = carry
+    let SidecarLines {
+        cols: from_cols,
+        lines,
+        links_dropped,
+    } = carry
         .read_verified()
         .map_err(|why| format!("the sidecar arrived with {why}"))?;
     let deadline = std::time::Instant::now() + IMPORT_PATIENCE;
@@ -1455,7 +1588,12 @@ pub(crate) fn import(
         let cols = locked(term, |t| t.history_cols());
         let older = OlderHistory::build(&lines, from_cols, cols);
         match locked(term, |t| t.attach_older_history(older, claim)) {
-            Ok(retained) => return Ok(Imported::Retained(retained as u64)),
+            Ok(retained) => {
+                return Ok(Imported::Retained {
+                    kept: retained as u64,
+                    links_dropped,
+                });
+            }
             Err(OlderHistoryRefusal::Cleared(_)) => return Ok(Imported::Cleared),
             Err(OlderHistoryRefusal::NoTieredStore(_)) => {
                 return Err("the pane keeps no history store to import into".to_string());
@@ -1501,18 +1639,43 @@ pub(crate) fn record_reports(store: &crate::session_store::Store, reports: &[Imp
             ),
             None => {}
         }
+        if report.failed.is_none() && report.links_dropped > 0 {
+            aterm_log::warn!(
+                "overlap handoff: session {}'s scrollback crossed with the links of {} line(s) \
+                 dropped: each was over the line-record cap because of its links; their text \
+                 is exact",
+                report.session,
+                report.links_dropped
+            );
+        }
     }
 }
 
+/// This update's loss across every adopted session, as the band says it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LossSummary {
+    /// Every line left behind…
+    pub(crate) lines: u64,
+    /// …in how many tabs…
+    pub(crate) tabs: usize,
+    /// …and how many of those lines a successor's handoff policy asked the
+    /// update to leave. The row says a withheld carry as the new build's
+    /// request and a failed one as a failure; the words that are true of the
+    /// one are false of the other (`update_words::scrollback_left_behind`).
+    pub(crate) withheld: u64,
+}
+
 /// This update's loss across every adopted session: the lines left behind,
-/// and in how many tabs.
+/// in how many tabs, and how many of them a policy withheld.
 #[must_use]
-pub(crate) fn loss_summary(reports: &[ImportReport]) -> (u64, usize) {
+pub(crate) fn loss_summary(reports: &[ImportReport]) -> LossSummary {
     reports
         .iter()
         .filter(|report| report.lost() > 0)
-        .fold((0, 0), |(lines, tabs), report| {
-            (lines.saturating_add(report.lost()), tabs + 1)
+        .fold(LossSummary::default(), |sum, report| LossSummary {
+            lines: sum.lines.saturating_add(report.lost()),
+            tabs: sum.tabs + 1,
+            withheld: sum.withheld.saturating_add(report.withheld()),
         })
 }
 
@@ -1543,14 +1706,16 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
             let AdoptedHistory {
                 carry,
                 dropped,
+                withheld,
                 claim,
                 ..
             } = history;
-            let (imported, failed_lines, failed, cleared) = match (carry, claim) {
-                (None, _) => (0, 0, None, false),
+            let (imported, links_dropped, failed_lines, failed, cleared) = match (carry, claim) {
+                (None, _) => (0, 0, 0, None, false),
                 // The adopt reserves a claim for every carry it keeps; one
                 // without is a carry nothing was restored in front of.
                 (Some(carry), None) => (
+                    0,
                     0,
                     carry.take(),
                     Some("no screen was restored for it to meet".to_string()),
@@ -1559,9 +1724,12 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                 (Some(carry), Some(claim)) => {
                     let take = carry.take();
                     match import(&term, carry, claim) {
-                        Ok(Imported::Retained(imported)) => (imported, 0, None, false),
-                        Ok(Imported::Cleared) => (0, 0, None, true),
-                        Err(why) => (0, take, Some(why), false),
+                        Ok(Imported::Retained {
+                            kept,
+                            links_dropped,
+                        }) => (kept, links_dropped, 0, None, false),
+                        Ok(Imported::Cleared) => (0, 0, 0, None, true),
+                        Err(why) => (0, 0, take, Some(why), false),
                     }
                 }
             };
@@ -1569,7 +1737,9 @@ pub(crate) fn run_imports(jobs: Vec<ImportJob>) -> Vec<ImportReport> {
                 session,
                 imported,
                 dropped,
+                withheld,
                 failed_lines,
+                links_dropped,
                 failed,
                 cleared,
             }

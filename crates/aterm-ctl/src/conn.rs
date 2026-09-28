@@ -94,6 +94,8 @@ const CONN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 pub fn conn_main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     match conn_real_main(argv) {
         Ok(code) => code,
+        // `aterm conn ls | head`: the reader has what it wanted.
+        Err(e) if super::is_stdout_closed(&e) => ExitCode::SUCCESS,
         Err(e) => {
             let _ = conn_stderr_line(&e.to_string());
             ExitCode::FAILURE
@@ -174,7 +176,7 @@ fn conn_real_main(argv: Vec<std::ffi::OsString>) -> io::Result<ExitCode> {
 /// Print [`CONN_USAGE`] and exit SUCCESS.
 fn print_usage() -> io::Result<ExitCode> {
     let stdout = io::stdout();
-    let mut out = stdout.lock();
+    let mut out = super::StdoutSink(stdout.lock());
     out.write_all(CONN_USAGE.as_bytes())?;
     Ok(ExitCode::SUCCESS)
 }

@@ -211,15 +211,16 @@ pub fn activate_macos_gui_pid(pid: u32) -> bool {
         "aterm-verify-activate-{}-{pid}.swift",
         std::process::id()
     ));
-    let program = ACTIVATE_SWIFT
-        .replace("{deadline}", &ACTIVATE_DEADLINE_SECS.to_string())
-        .replace("{reissue}", &ACTIVATE_REISSUE_SECS.to_string());
-    if std::fs::write(&script, &program).is_err() {
+    if std::fs::write(&script, ACTIVATE_SWIFT).is_err() {
         return false;
     }
+    // The budget travels as ARGUMENTS, so the Swift waits exactly what the Rust
+    // states: there is no second copy of either number to drift.
     let ok = Command::new(SWIFT)
         .arg(&script)
         .arg(pid.to_string())
+        .arg(ACTIVATE_DEADLINE_SECS.to_string())
+        .arg(ACTIVATE_REISSUE_SECS.to_string())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -246,23 +247,24 @@ pub(crate) const ACTIVATE_DEADLINE_SECS: u32 = 12;
 /// app can come forward, and re-asking is free.
 pub(crate) const ACTIVATE_REISSUE_SECS: u32 = 2;
 
-/// The activation program. `{deadline}` and `{reissue}` are substituted from the
-/// two constants above so the Swift and the Rust can never disagree about the
-/// budget.
+/// The activation program: `<pid> <deadline secs> <reissue secs>`, the last two
+/// handed over from the two constants above.
 const ACTIVATE_SWIFT: &str = r#"
 import AppKit
 import Foundation
 
 let pid = pid_t(CommandLine.arguments[1])!
+let deadlineSecs = TimeInterval(CommandLine.arguments[2])!
+let reissueSecs = TimeInterval(CommandLine.arguments[3])!
 guard let app = NSRunningApplication(processIdentifier: pid) else { exit(2) }
-let deadline = Date().addingTimeInterval({deadline})
+let deadline = Date().addingTimeInterval(deadlineSecs)
 var nextActivate = Date()
 while Date() < deadline {
     // RE-ISSUED, not asked once: under a loaded WindowServer the first call can
     // simply lose the race, which is not the same as being refused.
     if Date() >= nextActivate {
         _ = app.activate(options: [.activateAllWindows])
-        nextActivate = Date().addingTimeInterval({reissue})
+        nextActivate = Date().addingTimeInterval(reissueSecs)
     }
     if NSWorkspace.shared.frontmostApplication?.processIdentifier == pid { exit(0) }
     RunLoop.current.run(until: Date().addingTimeInterval(0.05))
@@ -453,58 +455,5 @@ mod tests {
         std::os::unix::fs::symlink(&plain, &link).expect("symlink");
         assert!(is_socket_or_symlink(&link), "the script accepted a symlink");
         std::fs::remove_dir_all(&tmp).ok();
-    }
-
-    /// THE SWIFT AND THE RUST MAY NOT DISAGREE ABOUT THE BUDGET. The activation
-    /// program carries its deadline as a placeholder substituted from
-    /// [`ACTIVATE_DEADLINE_SECS`] / [`ACTIVATE_REISSUE_SECS`], because a number
-    /// typed twice is a number that drifts — and when it drifts here the whole
-    /// merge contract silently becomes unclaimable on a loaded machine, which is
-    /// exactly what happened on 2026-09-24.
-    #[test]
-    fn the_activation_program_carries_the_rust_budget_and_no_placeholders() {
-        let program = ACTIVATE_SWIFT
-            .replace("{deadline}", &ACTIVATE_DEADLINE_SECS.to_string())
-            .replace("{reissue}", &ACTIVATE_REISSUE_SECS.to_string());
-        // The Swift has braces of its own, so name the placeholders exactly.
-        assert!(
-            !program.contains("{deadline}") && !program.contains("{reissue}"),
-            "every placeholder must be substituted:\n{program}"
-        );
-        assert!(
-            ACTIVATE_SWIFT.contains("{deadline}") && ACTIVATE_SWIFT.contains("{reissue}"),
-            "the template must still CARRY the placeholders, or the substitution \
-             is silently doing nothing"
-        );
-        assert!(
-            program.contains("addingTimeInterval(12)"),
-            "the deadline the Rust states must be the deadline the Swift waits:\n{program}"
-        );
-        assert!(
-            program.contains("addingTimeInterval(2)"),
-            "the re-issue interval must reach the Swift:\n{program}"
-        );
-        // The re-issue is the point: asking once is what failed.
-        assert!(
-            program.matches("app.activate").count() == 1 && program.contains("nextActivate"),
-            "activation must be re-issued on a schedule, not called once:\n{program}"
-        );
-        // And the budget has to be big enough to outlast a loaded WindowServer,
-        // while still failing closed well inside a human's patience. Both are
-        // constants, so the build decides this, not a test run.
-        const {
-            assert!(
-                ACTIVATE_DEADLINE_SECS >= 8 && ACTIVATE_DEADLINE_SECS <= 30,
-                "the activation deadline is outside the reasoned range: too short \
-                 and a loaded WindowServer reads as a refusal, too long and a \
-                 genuinely refused activation stalls the stage"
-            )
-        };
-        const {
-            assert!(
-                ACTIVATE_REISSUE_SECS >= 1 && ACTIVATE_REISSUE_SECS < ACTIVATE_DEADLINE_SECS,
-                "the re-issue must fit inside the deadline several times over"
-            )
-        };
     }
 }

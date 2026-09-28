@@ -3065,7 +3065,7 @@ impl Config {
 #[derive(Default, Clone, PartialEq, serde::Deserialize)]
 #[serde(default)]
 pub(crate) struct UpdateConfig {
-    /// "Check for updates automatically" (Settings ▸ Terminal ▸ Updates). Absent ⇒ ON. Off
+    /// "Check for updates automatically" (Settings ▸ Software Update). Absent ⇒ ON. Off
     /// stops the BACKGROUND checker (`aterm_update::automatic`) in the window and every
     /// terminal session; a check or an apply a person asks for still runs — the row says
     /// "automatically". Read ONCE per process by

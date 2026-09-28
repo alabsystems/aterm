@@ -219,6 +219,46 @@ fn the_column_names_the_state_the_target_the_reason_and_the_age() {
     }
 }
 
+/// THE VIEW AND THE DRIVE READ ONE WORD AFTER A GONE NOTICE (the review of
+/// 2026-09-27 asked whether they disagreed): a `--skip` or `--defer` given
+/// for the notice's tab keeps its fence when the new round moves the record
+/// to the holder's tab ([`St::notice_gone`]). The drive does not honour it
+/// there ([`St::request_for`]), and neither does the owner's row, which is
+/// read through the same fence ([`Row::of`]): no `skipped` or `deferred`
+/// shown over notices being typed. NEGATIVE CONTROL: a holder in the tab the
+/// word named is held, in both.
+#[test]
+fn a_word_fenced_to_a_gone_notices_tab_holds_neither_the_view_nor_the_drive() {
+    for request in [
+        Request::Skip("2.1.282".to_string()),
+        Request::DeferUntil(NOW + 3_600),
+    ] {
+        for (holder, holds) in [("s-b", false), (TAB, true)] {
+            let mut st = St {
+                from: "2.1.281".to_string(),
+                to: "2.1.282".to_string(),
+                tab: TAB.to_string(),
+                notice_pid: 4242,
+                notice_start: "Fri Sep 25 16:00:00 2026".to_string(),
+                request: request.clone(),
+                request_tab: TAB.to_string(),
+                request_at: NOW - 60,
+                ..St::default()
+            };
+            st.announced("ATERM-UPGRADE-READY-0badf00d".to_string(), NOW - 120, 1);
+            let _ = st.notice_gone(holder, NOW);
+            let drive = st.request_for(holder) != Request::None;
+            let column = Row::of("c", &st, NOW).column(NOW);
+            let view = column.starts_with("skipped/") || column.starts_with("deferred/");
+            assert_eq!(
+                (drive, view),
+                (holds, holds),
+                "{request:?} {holder}: {column}"
+            );
+        }
+    }
+}
+
 /// N2 OF THE LIVE RE-TEST OF 2026-09-26: A RESTART WHOSE CARRY-ON IS TYPED
 /// IS RESTARTING WHILE ITS MODEL IS WAITED FOR — the column read blank for
 /// the 24 s between the carry-on and its answer: the typed path saves the
@@ -347,7 +387,8 @@ fn status_rows_come_from_the_state_files_and_filter_by_tab() {
         only[0].line(NOW),
         format!(
             "upgrade tab={TAB} session=aaa from=2.1.281 to=2.1.282(managed) phase=pending \
-             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- stalled=overdue"
+             pending_for=8h22m wait=not-idle:busy wait_for=8h20m request=- next_round=- \
+             stalled=overdue held_by=-"
         )
     );
     let json = only[0].to_json(NOW);
@@ -660,11 +701,23 @@ fn the_view_names_the_instant_it_next_changes() {
         None,
         "already overdue"
     );
+    // A restart under way turns `stuck` at its bound, by time alone (S2 of
+    // the in-flight review, 2026-09-27) — and once stuck, changes no more.
     let restarting = Row {
         phase: Phase::Exiting { at_s: NOW },
         ..pending(60)
     };
-    assert_eq!(next_change(&[restarting], NOW), None);
+    assert_eq!(
+        next_change(&[restarting], NOW),
+        Some(NOW + super::super::STALE_S + 1)
+    );
+    let stuck = Row {
+        phase: Phase::Relaunched {
+            at_s: NOW - super::super::STALE_S - 1,
+        },
+        ..pending(60)
+    };
+    assert_eq!(next_change(&[stuck], NOW), None);
     assert_eq!(next_change(&[], NOW), None);
 }
 
@@ -1269,7 +1322,7 @@ fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
     assert!(
         hurried
             .line(NOW)
-            .ends_with(" request=now next_round=- stalled=-"),
+            .ends_with(" request=now next_round=- stalled=- held_by=-"),
         "{}",
         hurried.line(NOW)
     );
@@ -1285,6 +1338,8 @@ fn an_owners_now_ends_an_overdue_stall_and_its_remedy_is_the_waits() {
         ("busy", Remedy::Now),
         ("not-idle:busy", Remedy::Now),
         ("not-idle:shell", Remedy::Waits),
+        ("status-stale:busy", Remedy::Waits),
+        ("status-stale:shell", Remedy::Waits),
         ("not-idle:waiting", Remedy::Waits),
         ("not-idle", Remedy::Waits),
         ("awaiting-ready", Remedy::Waits),
@@ -1452,7 +1507,9 @@ fn a_give_up_rests_unmarked_and_now_re_arms_it_at_once() {
         last[0]
     );
     assert!(
-        last[0].line(now).ends_with(" next_round=1h59m stalled=-"),
+        last[0]
+            .line(now)
+            .ends_with(" next_round=1h59m stalled=- held_by=-"),
         "{}",
         last[0].line(now)
     );
@@ -1974,6 +2031,250 @@ fn a_codex_move_in_flight_refuses_the_owners_word_in_its_own_terms() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A Claude Code state for [`TAB`] in `phase`, its agent seen gone at
+/// `exited_at` (`0`: never).
+fn claude_state(o: &Opts, phase: Phase, exited_at: u64) -> String {
+    let session = "0badf00d-1111-2222-3333-444455556666".to_string();
+    save(
+        o,
+        &session,
+        &St {
+            phase,
+            from: "2.1.281".to_string(),
+            to: "2.1.283".to_string(),
+            source: "managed".to_string(),
+            tab: TAB.to_string(),
+            pending_since: now_s() - 600,
+            exited_at,
+            ..St::default()
+        },
+    );
+    session
+}
+
+/// S1 OF THE IN-FLIGHT REVIEW (2026-09-27): A CLAUDE CODE MOVE THAT FAILED
+/// AFTER ITS SIGTERM ENDED THE AGENT stands with no holder, as a Codex one
+/// does (`a_codex_move_that_failed_after_its_exit_stands_with_no_holder`):
+/// until then it was vetted against a live Claude Code on the old build in
+/// its tab — gone by construction — and dropped from `--status`, the band
+/// and `upgrade=`; the owner learned of it from the ledger alone. It says
+/// what takes the conversation back (`claude --resume`), never "quit it":
+/// nothing runs to quit. NEGATIVE CONTROLS: a failure before any exit (a
+/// signal the kernel refused) is still vetted against a holder; and once a
+/// live process holds the conversation again — resumed by hand — the record
+/// is an ordinary stopped upgrade: shown for a holder on the old build in
+/// its tab (quit it and resume it by hand), gone for one on the target.
+#[test]
+fn a_claude_move_that_failed_after_its_exit_stands_with_no_holder() {
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    for why in ["stale-exit", "shell-gone", "no-resume", "relaunch-refused"] {
+        let dir = scratch(&format!("cl-failed-{why}"));
+        let o = opts(&dir);
+        let exited = now_s() - 120;
+        claude_state(&o, Phase::Failed(why.to_string()), exited);
+        let (shown, vetted) = status_rows(&o);
+        assert!(vetted, "{why}");
+        assert_eq!(shown.len(), 1, "{why}: listed by --status");
+        let mut sent: Vec<Vec<Row>> = Vec::new();
+        let mut view = View::default();
+        view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |r| {
+            sent.push(r.to_vec());
+        });
+        let rows = sent.last().cloned().unwrap_or_default();
+        assert_eq!(rows.len(), 1, "{why}: handed to the window");
+        assert_eq!(rows[0].stall(now_s()), Some(format!("failed:{why}")));
+        assert_eq!(rows[0].remedy(now_s()), Some(Remedy::ResumeInTab), "{why}");
+        let words = rows[0].stall_words(now_s()).expect("stalled");
+        assert!(!words.starts_with("the move stopped"), "{why}: {words}");
+        assert!(!words.contains("Codex"), "{why}: {words}");
+        // A person's words (ruling 284): no raw stop word, no parenthesis.
+        assert!(
+            !words.contains(why) && !words.contains('('),
+            "{why}: {words}"
+        );
+        // Nothing runs in the tab to ask: no round asks it on its own, so it
+        // is the tab's standing row, never a record (ruling 283).
+        assert!(!rows[0].asks_on_its_own(now_s()), "{why}");
+        // The owner's `--now` names what takes it back.
+        let err = ask(&o, TAB, Ask::Now).expect_err("stopped");
+        assert!(err.contains("claude --resume"), "{why}: {err}");
+        assert!(!err.contains("quit it"), "{why}: {err}");
+        // A day on, the window lets it go; the ledger keeps it.
+        let mut view = View::default();
+        view.refresh_with(
+            &o,
+            &tabs,
+            exited + EXITED_FAILURE_SHOWN_S + 1,
+            &nobody,
+            &mut |r| sent.push(r.to_vec()),
+        );
+        assert_eq!(sent.last().map(Vec::len), Some(0), "{why}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    // NEGATIVE CONTROL: before any exit — the kernel refused the signal, and
+    // the agent lives on — it is vetted against a holder as before.
+    let dir = scratch("cl-failed-before");
+    let o = opts(&dir);
+    claude_state(&o, Phase::Failed("signal-refused".to_string()), 0);
+    let mut sent: Vec<Vec<Row>> = Vec::new();
+    let mut view = View::default();
+    view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |r| sent.push(r.to_vec()));
+    assert_eq!(sent.last().map(Vec::len), Some(0));
+    let _ = std::fs::remove_dir_all(dir);
+    // Resumed by hand: an ordinary stopped upgrade, vetted by its holder.
+    let dir = scratch("cl-failed-resumed");
+    let o = opts(&dir);
+    claude_state(&o, Phase::Failed("stale-exit".to_string()), now_s() - 60);
+    let held_on = |version: &'static str| {
+        move |s: &BTreeSet<String>| -> Option<Vec<Holder>> {
+            Some(s.iter().map(|s| holder(s, version, Some(TAB))).collect())
+        }
+    };
+    let mut view = View::default();
+    view.refresh_with(&o, &tabs, now_s(), &held_on("2.1.281"), &mut |r| {
+        sent.push(r.to_vec());
+    });
+    let rows = sent.last().cloned().unwrap_or_default();
+    assert_eq!(rows.len(), 1, "held again on the old build: shown");
+    assert_eq!(rows[0].remedy(now_s()), Some(Remedy::ByHand));
+    let mut view = View::default();
+    view.refresh_with(&o, &tabs, now_s(), &held_on("2.1.283"), &mut |r| {
+        sent.push(r.to_vec());
+    });
+    assert_eq!(sent.last().map(Vec::len), Some(0), "on the target: gone");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A NEW ROUND INHERITS NOTHING OF THE OLD ONE'S RESTART ([`St::rearm`], the
+/// merge with the rest and re-arm of 2026-09-27): a Claude Code move that
+/// stopped after its SIGTERM ended the agent is re-armed on the same record
+/// once it has rested. A stop of the new round before any signal (the
+/// conversation resumed elsewhere) is one whose agent lives — never read as a
+/// failure after an exit, which would show `claude --resume` for a live
+/// agent and skip the holder's vetting for a day. NEGATIVE CONTROL: before
+/// the re-arm, the old stop is the old restart's.
+#[test]
+fn a_rearmed_round_forgets_when_the_old_restarts_agent_was_seen_gone() {
+    let mut st = St {
+        phase: Phase::Failed("stale-exit".to_string()),
+        exited_at: NOW - 3 * upgrade::RETRY_S,
+        failed_at: NOW - 2 * upgrade::RETRY_S,
+        resumed_pid: 4_000_002,
+        relaunched_pid: 4_000_002,
+        tab: TAB.to_string(),
+        from: "2.1.281".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        ..St::default()
+    };
+    assert!(
+        Row::of("c", &st, NOW).failed_after_exit(),
+        "the old restart's"
+    );
+    let _ = st.rearm(NOW);
+    assert_eq!((st.exited_at, st.resumed_pid, st.relaunched_pid), (0, 0, 0));
+    st.fail("resumed-elsewhere", NOW + 60);
+    assert!(!Row::of("c", &st, NOW + 60).failed_after_exit(), "{st:?}");
+}
+
+/// S2 OF THE IN-FLIGHT REVIEW (2026-09-27): A RESTART UNDER WAY THAT DOES
+/// NOT MOVE READS STALLED. Until then `Row::stall` answered `None` for an
+/// exiting or relaunched row at any age, and the column read
+/// `restarting/<to>/exiting/<age>` for good — a SIGTERMed agent hung in its
+/// shutdown, or a relaunched one that never reaches an idle point, was
+/// named nowhere. Past [`super::super::STALE_S`] from the phase's own start it reads
+/// `stuck:<what>` — checked before the column turns an in-flight row into
+/// `restarting` — says what it waits on (nothing is forced: no harder
+/// signal, no kill), and its remedy is to wait ([`Remedy::Waits`]); its
+/// mark is stable, and the owner's view wakes at the bound by time alone.
+/// NEGATIVE CONTROL: within the bound it reads `restarting`, as before.
+#[test]
+fn a_restart_under_way_past_its_bound_reads_stuck_and_says_what_it_waits_on() {
+    let stale = super::super::STALE_S;
+    let row = |phase: Phase, exited_at: u64| Row {
+        phase,
+        exited_at,
+        ..pending(120)
+    };
+    let young = row(Phase::Exiting { at_s: NOW - stale }, 0);
+    assert_eq!(young.stall(NOW), None, "within the bound");
+    assert_eq!(young.column(NOW), "restarting/2.1.282/exiting/2m");
+    assert!(young.moving(NOW));
+    for (phase, exited_at, kind, needle) in [
+        (
+            Phase::Exiting {
+                at_s: NOW - stale - 1,
+            },
+            0,
+            "stuck:exiting",
+            "has not exited",
+        ),
+        (
+            Phase::Exiting {
+                at_s: NOW - stale - 1,
+            },
+            NOW - stale,
+            "stuck:exited",
+            "prompt",
+        ),
+        (
+            Phase::Relaunched {
+                at_s: NOW - stale - 1,
+            },
+            NOW - stale - 30,
+            "stuck:relaunched",
+            "idle point",
+        ),
+    ] {
+        let r = row(phase.clone(), exited_at);
+        assert_eq!(r.stall(NOW).as_deref(), Some(kind), "{phase:?}");
+        assert_eq!(r.column(NOW), format!("stalled/2.1.282/{kind}/2m"));
+        assert_eq!(r.remedy(NOW), Some(Remedy::Waits), "{kind}");
+        assert!(!r.moving(NOW), "{kind}");
+        let words = r.stall_words(NOW).expect("stalled");
+        assert!(words.contains(needle), "{kind}: {words}");
+        assert!(words.contains("nothing is forced"), "{kind}: {words}");
+        // The band's words ask for no restart (the reporters' guard).
+        for asks in ["restart", "relaunch", "kill"] {
+            assert!(!words.to_lowercase().contains(asks), "{kind}: {words}");
+        }
+        // The tab's mark is sent once per stall: it does not age.
+        assert_eq!(r.badge(NOW), r.badge(NOW + 3_600), "{kind}");
+        assert!(r.badge(NOW).is_some_and(|b| b.len() <= 200), "{kind}");
+    }
+    // The owner's view wakes at the bound, by time alone.
+    let dir = scratch("stuck-wake");
+    let o = opts(&dir);
+    std::fs::create_dir_all(state_dir(&o)).expect("state");
+    let at = now_s() - 10;
+    claude_state(&o, Phase::Exiting { at_s: at }, 0);
+    let tabs = [LiveTab {
+        sid: TAB.to_string(),
+        fgpgid: Some(7),
+    }];
+    let nobody = |_: &BTreeSet<String>| -> Option<Vec<Holder>> { Some(Vec::new()) };
+    let mut view = View::default();
+    let next = view.refresh_with(&o, &tabs, now_s(), &nobody, &mut |_| {});
+    assert_eq!(next, Some(at + stale + 1));
+    let _ = std::fs::remove_dir_all(dir);
+    // A Codex row's words are its own.
+    let codex = Row {
+        agent: upgrade::Agent::Codex,
+        ..row(
+            Phase::Exiting {
+                at_s: NOW - stale - 1,
+            },
+            0,
+        )
+    };
+    let words = codex.stall_words(NOW).expect("stalled");
+    assert!(words.contains("/exit"), "{words}");
+}
+
 /// A CLAUDE CODE WAITING ON ITS OWN WORK IS WORDED FOR THE OWNER (2026-09-26:
 /// two poll loops that could never end held a tab four days behind, and the
 /// row read a bare `waiting (background)`). The words fit the band's first
@@ -1997,6 +2298,91 @@ fn a_claude_wait_on_its_own_work_is_worded_for_the_owner() {
         ..pending(7 * 3_600)
     };
     assert!(!busy.stall_words(NOW).expect("overdue").contains("own work"));
+    // A status that disagrees with an idle screen (2026-09-27) is named, and
+    // `--now` — which still asks Claude idle — is not offered for it.
+    for status in ["busy", "shell"] {
+        let stale = Row {
+            wait: format!("status-stale:{status}"),
+            ..pending(10 * 86_400 + 23 * 3_600)
+        };
+        let words = stale.stall_words(NOW).expect("overdue");
+        assert!(words.ends_with("its status lags"), "{words}");
+        assert!(words.chars().count() <= 64, "{words}");
+        assert_eq!(stale.remedy(NOW), Some(Remedy::Waits), "{status}");
+    }
+}
+
+/// THE OWNER IS TOLD WHAT HOLDS THE MOVE (2026-09-27): the agent's notice
+/// named the shells under it by pid, age and command, and the owner saw only
+/// `waiting (background): its own work runs` — the processes were named to
+/// the owner only in the give-up's ledger row, after four notices. `--status`
+/// now carries `held_by=` (each by pid, name and age at the read — never what
+/// it runs: a command is the agent's own words, quoted to the agent alone),
+/// its JSON the same as a list, and the row the owner's words for the band.
+/// The row keeps each process's START, so the same shells read the same row
+/// at every look and the window sends it once. At most five are named, the
+/// rest counted. NEGATIVE CONTROL: nothing held reads `held_by=-` and no words.
+#[test]
+fn the_owner_is_told_which_processes_hold_the_move() {
+    let started = NOW - (5 * 86_400 + 4 * 3_600);
+    let shell = |pid: u32| HeldBy {
+        pid,
+        name: "zsh".to_string(),
+        since: started,
+    };
+    let row = Row {
+        wait: "background".to_string(),
+        held_by: vec![shell(63_492), shell(63_493)],
+        ..pending(5 * 86_400 + 12 * 3_600)
+    };
+    let line = row.line(NOW);
+    assert!(
+        line.ends_with(" stalled=overdue held_by=63492(zsh:5d4h),63493(zsh:5d4h)"),
+        "{line}"
+    );
+    assert_eq!(
+        row.held_words(NOW).as_deref(),
+        Some("pid 63492 (zsh, 5d4h); pid 63493 (zsh, 5d4h)")
+    );
+    let json = row.to_json(NOW);
+    let held = json
+        .get("held_by")
+        .and_then(Value::as_array)
+        .expect("a list");
+    assert_eq!(held.len(), 2);
+    assert_eq!(held[0].get("pid").and_then(Value::as_u64), Some(63_492));
+    assert_eq!(held[0].get("name").and_then(Value::as_str), Some("zsh"));
+    assert_eq!(
+        held[0].get("age_s").and_then(Value::as_u64),
+        Some(5 * 86_400 + 4 * 3_600)
+    );
+    // Its age moves; the row does not.
+    assert_eq!(Row { ..row.clone() }, row);
+    let many = Row {
+        held_by: (1..=7).map(shell).collect(),
+        ..row.clone()
+    };
+    assert!(
+        many.line(NOW).ends_with(",5(zsh:5d4h),+2"),
+        "{}",
+        many.line(NOW)
+    );
+    assert!(
+        many.held_words(NOW)
+            .is_some_and(|w| w.ends_with("; and 2 more")),
+        "{:?}",
+        many.held_words(NOW)
+    );
+    // NEGATIVE CONTROL: nothing held.
+    let free = pending(7 * 3_600);
+    assert!(free.line(NOW).ends_with(" held_by=-"), "{}", free.line(NOW));
+    assert_eq!(free.held_words(NOW), None);
+    assert!(
+        free.to_json(NOW)
+            .get("held_by")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    );
 }
 
 /// NO RAW WAIT WORD IN A PERSON'S WORDS (round 18, day four, D3: `waiting
@@ -2014,6 +2400,8 @@ fn a_claude_stall_never_prints_its_wait_word() {
         "not-idle:waiting",
         "not-idle",
         "not-idle:shell",
+        "status-stale:busy",
+        "status-stale:shell",
         "background",
         "settling",
         "attended",
@@ -2188,7 +2576,7 @@ fn a_stopped_round_says_when_its_next_round_starts() {
     assert_eq!(row.next_round_in(NOW), Some(upgrade::RETRY_S - 3_600));
     assert!(
         row.line(NOW)
-            .ends_with(" request=- next_round=1h stalled=overdue"),
+            .ends_with(" request=- next_round=1h stalled=overdue held_by=-"),
         "{}",
         row.line(NOW)
     );
